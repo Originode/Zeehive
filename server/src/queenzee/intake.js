@@ -6,6 +6,7 @@ import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
 import { provisionXell } from '../lib/provision.js';
+import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
@@ -84,6 +85,19 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   const pool = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id = $1`, [projectId]);
   const rt = runtime ? await runtimeByKey(runtime) : await runtimeById(pool?.default_runtime_id);
   const viewer = viewerUrlFor(rt, session_id, null);
+
+  // Enforce "ready ⟺ diff(0,0)" at the point of use: fast-forward the worktree onto the source
+  // tip so the zee starts from current source, even if it drifted since the last pool tick.
+  if (PROVISION_MODE === 'real') {
+    const src = (await one(`SELECT main_branch FROM project WHERE id=$1`, [projectId]))?.main_branch || 'main';
+    const res = landOne(xell.worktree_path, src);
+    if (isAtSourceTip(res) && res.head && res.head !== xell.head_commit) {
+      await one(`UPDATE xell SET head_commit=$2, last_synced_commit=$2 WHERE id=$1`, [xell.id, res.head]);
+      xell.head_commit = res.head;
+    } else if (res && !isAtSourceTip(res)) {
+      logline('intake', `warn: ${xell.slug} not at source tip at claim (${res.reason}, behind ${res.behind}) — proceeding`);
+    }
+  }
 
   // cwd is guaranteed === worktree_path here, so the stored cwd is honest.
   const zee = await one(
