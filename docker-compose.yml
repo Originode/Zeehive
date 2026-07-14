@@ -1,0 +1,22 @@
+# Local Postgres for the XEEHIVE meta database.
+# Runs on host :5433 to avoid colliding with any project Postgres (OmniBiz dev uses 5434).
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: xeehive_db
+    environment:
+      POSTGRES_USER: xeehive
+      POSTGRES_PASSWORD: xeehive
+      POSTGRES_DB: xeehive
+    ports:
+      - "${XEEHIVE_DB_PORT:-5445}:5432"
+    volumes:
+      - xeehive_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xeehive -d xeehive"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  xeehive_pgdata:

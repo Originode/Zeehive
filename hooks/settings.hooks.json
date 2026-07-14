@@ -1,0 +1,13 @@
+{
+  "_comment": "Merge this 'hooks' block into ~/.claude/settings.json. The harness fires these deterministically (the model cannot skip them) and POSTs each event to the queenzee. This is the PRIMARY, agent-independent status channel. Change the URL/port if XEEHIVE_API differs.",
+  "hooks": {
+    "SessionStart":     [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }],
+    "UserPromptSubmit": [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }],
+    "PreToolUse":       [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }],
+    "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }],
+    "Stop":             [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }],
+    "SubagentStop":     [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }],
+    "SessionEnd":       [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }],
+    "Notification":     [{ "matcher": "*", "hooks": [{ "type": "http", "url": "http://localhost:4700/api/hooks", "async": true }] }]
+  }
+}
