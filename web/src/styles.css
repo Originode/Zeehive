@@ -36,6 +36,45 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .proj .k { color: var(--muted); font-weight: 400; }
 .proj .folder { margin-left: 18px; }
 .proj .mono { color: var(--muted); font-size: 14px; }
+
+/* ── project switcher (icon beside the Project label) ───────────────────────── */
+.projmenu { position: relative; display: inline-block; margin-left: 8px; vertical-align: middle; }
+.projmenu-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; width: 30px; height: 30px; font-size: 15px; cursor: pointer; line-height: 1; }
+.projmenu-btn:hover { color: var(--text); border-color: var(--accent); }
+.projpop { position: absolute; top: 36px; left: 0; z-index: 20; width: 280px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.5); padding: 8px; font-size: 13px; }
+.projpop-h { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  padding: 4px 6px 8px; }
+.projpop-list { list-style: none; margin: 0; padding: 0; }
+.projpop-list li { display: flex; align-items: center; gap: 4px; border-radius: 7px; }
+.projpop-list li.sel { background: var(--panel2); }
+.projpop-pick { flex: 1; display: flex; align-items: center; gap: 8px; background: none; border: 0;
+  color: var(--text); text-align: left; padding: 7px 8px; cursor: pointer; border-radius: 7px; min-width: 0; }
+.projpop-pick:hover { background: var(--panel2); }
+.projpop-pick .dot { color: var(--accent); font-size: 10px; }
+.projpop-pick .pn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.projpop-pick .pc { color: var(--muted); font-size: 11px; }
+.projpop-del { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 13px;
+  padding: 6px 8px; border-radius: 6px; }
+.projpop-del:hover:not(:disabled) { color: var(--down); background: var(--panel2); }
+.projpop-del:disabled { opacity: .3; cursor: not-allowed; }
+.projpop-add { width: 100%; margin-top: 8px; background: var(--panel2); border: 1px dashed var(--line);
+  color: var(--muted); border-radius: 8px; padding: 8px; cursor: pointer; font-size: 12px; }
+.projpop-add:hover { color: var(--text); border-color: var(--accent); }
+.projpop-err { color: var(--down); font-size: 12px; padding: 6px 8px; }
+.projpop-form { display: flex; flex-direction: column; gap: 8px; margin-top: 8px;
+  border-top: 1px solid var(--line); padding-top: 10px; }
+.projpop-form label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 11px; }
+.projpop-form input { background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: 'Cascadia Code', monospace; }
+.projpop-form input:focus { outline: none; border-color: var(--accent); }
+.projpop-formbtns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 2px; }
+.projpop-formbtns button { border: 1px solid var(--line); background: var(--accent); color: #fff;
+  border-radius: 7px; padding: 6px 14px; cursor: pointer; font-size: 12px; }
+.projpop-formbtns button.ghost { background: var(--panel2); color: var(--muted); }
+.projpop-formbtns button:disabled { opacity: .5; cursor: not-allowed; }
 .right { display: flex; align-items: center; gap: 14px; }
 .conn { font-size: 12px; color: var(--muted); }
 .conn.live { color: var(--up); }
@@ -148,6 +187,14 @@ a.cbox:hover { border-color: var(--accent); }
   background: rgba(229,85,78,.16); color: var(--down); border: 1px solid var(--down); padding: 1px 6px; border-radius: 20px; }
 
 /* terminal button + modal */
+.pooltarget { margin-left: 18px; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+.pooltarget .k { color: var(--muted); }
+.pooltarget b { min-width: 14px; text-align: center; }
+.pooltarget .step { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  width: 22px; height: 22px; border-radius: 6px; cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+.pooltarget .step:hover:not(:disabled) { border-color: var(--accent); }
+.pooltarget .step:disabled { opacity: .35; cursor: not-allowed; }
+
 .term-btn { margin-left: 12px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
   font-family: 'Cascadia Code', monospace; font-size: 12px; padding: 2px 9px; border-radius: 6px; cursor: pointer; }
 .term-btn:hover { color: var(--text); border-color: var(--accent); }

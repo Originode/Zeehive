@@ -7,7 +7,11 @@ import { config } from '../config.js';
 async function seed() {
   // ── agent runtimes (the UI runtime toggle lists the enabled ones) ──────────
   const runtimes = [
-    { key: 'claude-code-local',  label: 'Claude Code (local)',  vendor: 'anthropic', driver: 'agent-sdk',  viewer_kind: 'desktop-protocol', tmpl: null, enabled: true,  sort: 100 },
+    // local viewer = the desktop-protocol deep link (same claude:// scheme the T-Keyboard
+    // uses to jump Claude Desktop to a session); built per-zee from its session id at spawn.
+    { key: 'claude-code-local',  label: 'Claude Code (local)',  vendor: 'anthropic', driver: 'agent-sdk',  viewer_kind: 'desktop-protocol', tmpl: 'claude://resume?session={session}', enabled: true,  sort: 100 },
+    // remote viewer_url is captured LIVE from `claude remote` output at spawn (the real
+    // claude.ai session URL) — no template, so a URL scheme is never fabricated.
     { key: 'claude-code-remote', label: 'Claude Code (remote)', vendor: 'anthropic', driver: 'remote-api', viewer_kind: 'web',             tmpl: null, enabled: true,  sort: 200 },
     // Others are registered but disabled until a real driver + viewer URL exist:
     { key: 'gpt-codex',          label: 'GPT (Codex CLI)',      vendor: 'openai',    driver: 'none',       viewer_kind: 'none',            tmpl: null, enabled: false, sort: 300 },

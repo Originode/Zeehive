@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
+import { cleanGitEnv } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 
 export async function reapXell(xellId, reason = 'task-done') {
@@ -31,7 +32,7 @@ export async function reapXell(xellId, reason = 'task-done') {
   if (existsSync(script) && xell.worktree_path && existsSync(xell.worktree_path)) {
     const r = spawnSync('bash', [script, xell.worktree_path], {
       cwd: config.omnibizRoot, encoding: 'utf8', timeout: 120000,
-      env: { ...process.env, SPINOFF_DOCKER_CONTEXT: config.dockerCtx },
+      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: config.dockerCtx }),
     });
     despawn = { code: r.status, stdout: (r.stdout || '').slice(-2000), stderr: (r.stderr || '').slice(-1000) };
   }

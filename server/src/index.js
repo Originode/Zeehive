@@ -6,6 +6,7 @@ import { startPoller } from './queenzee/poller.js';
 import { startPool } from './queenzee/pool.js';
 import { startMaintenance } from './queenzee/maintenance.js';
 import { startMonitor } from './queenzee/monitor.js';
+import { startContainerMonitor } from './queenzee/containers.js';
 import { logline } from './lib/logbus.js';
 
 const app = express();
@@ -30,6 +31,7 @@ app.listen(config.port, () => {
   logline('api', `queenzee online — API on :${config.port}, DB connected`);
   startPool();
   startMonitor();
+  startContainerMonitor();
   startMaintenance();
 });
 export { app };

@@ -1,9 +1,13 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime } from './api.js';
+import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
+         getProjects, createProject, deleteProject, setPoolTarget } from './api.js';
 import GitRail from './GitRail.jsx';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
+import ProjectMenu from './ProjectMenu.jsx';
 import { nick } from './nick.js';
+
+const PROJECT_KEY = 'xeehive.project';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'Webapp', other: 'Other' };
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');
@@ -19,6 +23,8 @@ function ChipBox({ c }) {
 }
 
 export default function App() {
+  const [projects, setProjects] = useState([]);
+  const [projectId, setProjectId] = useState(null);
   const [fleet, setFleet] = useState(null);
   const [timeline, setTimeline] = useState(null);
   const [runtimes, setRuntimes] = useState([]);
@@ -31,33 +37,82 @@ export default function App() {
   const [showTerm, setShowTerm] = useState(false);
   const layoutRef = useRef(null);
 
-  const refresh = useCallback(async () => {
-    try {
-      const [f, t, d] = await Promise.all([getFleet(), getTimeline(), getDiffs()]);
-      if (f) setFleet(f);
-      if (t) setTimeline(t);
-      if (d) setDiffs(d);
-      setVersion((v) => v + 1);
-    } catch { /* keep last */ }
+  // Always-current selected project, so async fetches from a *previous* selection can be
+  // dropped instead of clobbering the newly-selected project's data (fixes the switch race).
+  const projectIdRef = useRef(null);
+  useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
+  const applyFleet = useCallback((f) => {
+    if (f && (!projectIdRef.current || f.project?.id === projectIdRef.current)) setFleet(f);
   }, []);
 
+  const loadProjects = useCallback(async () => {
+    const ps = await getProjects();
+    setProjects(ps);
+    return ps;
+  }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [f, t, d] = await Promise.all([getFleet(projectId), getTimeline(projectId), getDiffs(projectId)]);
+      applyFleet(f);
+      if (t) setTimeline(t);
+      if (d) setDiffs(d);
+      loadProjects();               // keep the switcher's xell counts fresh
+      setVersion((v) => v + 1);
+    } catch { /* keep last */ }
+  }, [projectId, loadProjects, applyFleet]);
+
+  // once: global runtimes + logs, and pick the active project (persisted → first)
   useEffect(() => {
     getRuntimes().then((rs) => {
       const enabled = rs.filter((r) => r.enabled);
       setRuntimes(enabled);
       if (enabled[0]) setRuntime(enabled[0].key);
     });
-    getTimeline().then((t) => { if (t) { setTimeline(t); setVersion((v) => v + 1); } });
-    getDiffs().then((d) => d && setDiffs(d));
     getLogs().then((ls) => setLogs(ls));
-    const unsub = subscribe({
-      onSnapshot: (f) => { if (f) setFleet(f); setConn('live'); },
+    loadProjects().then((ps) => {
+      const stored = localStorage.getItem(PROJECT_KEY);
+      setProjectId(ps.find((p) => p.id === stored) ? stored : (ps[0]?.id || null));
+    });
+  }, [loadProjects]);
+
+  // (re)load the selected project's data + subscribe to its live stream. Re-runs when the
+  // selected project changes (projectId may be null on first paint → server uses the default).
+  useEffect(() => {
+    setConn('connecting');
+    setTimeline(null); setDiffs({});   // don't show the previous project's git graph while loading
+    getTimeline(projectId).then((t) => { if (t) { setTimeline(t); setVersion((v) => v + 1); } });
+    getDiffs(projectId).then((d) => d && setDiffs(d));
+    const unsub = subscribe(projectId, {
+      onSnapshot: (f) => { applyFleet(f); setConn('live'); },
       onChange: refresh,
       onStatus: setConn,
       onLog: (l) => setLogs((prev) => [...prev.slice(-499), l]),
     });
     return unsub;
-  }, [refresh]);
+  }, [projectId, refresh, applyFleet]);
+
+  const selectProject = useCallback((id) => {
+    setProjectId(id);
+    localStorage.setItem(PROJECT_KEY, id);
+  }, []);
+
+  const handleCreate = useCallback(async (body) => {
+    const p = await createProject(body);
+    await loadProjects();
+    return p;
+  }, [loadProjects]);
+
+  const handleDelete = useCallback(async (id, force) => {
+    const r = await deleteProject(id, force);
+    const ps = await loadProjects();
+    if (id === projectId) {
+      const next = ps[0]?.id || null;
+      setProjectId(next);
+      if (next) localStorage.setItem(PROJECT_KEY, next); else localStorage.removeItem(PROJECT_KEY);
+    }
+    return r;
+  }, [loadProjects, projectId]);
 
   if (!fleet) return <div className="app"><p className="loading">Connecting to queenzee…</p></div>;
 
@@ -83,6 +138,8 @@ export default function App() {
       <header className="topbar">
         <div className="proj">
           <span className="k">Project:</span> <b>{project.name}</b>
+          <ProjectMenu projects={projects} currentId={projectId || project.id}
+                       onSelect={selectProject} onCreate={handleCreate} onDelete={handleDelete} />
           <span className="k folder">Folder:</span> <span className="mono">{project.repo_root}</span>
         </div>
         <div className="right">
@@ -96,6 +153,7 @@ export default function App() {
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
+        <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
@@ -123,6 +181,27 @@ export default function App() {
   );
 }
 
+// How many ready xells queenzee pre-warms for this project (pool_config.target_ready).
+// Takes effect only when the pool maintainer is running (POOL_ENABLED != false).
+function PoolTarget({ pool, projectId }) {
+  const [n, setN] = useState(pool?.target_ready ?? 0);
+  useEffect(() => { setN(pool?.target_ready ?? 0); }, [pool?.target_ready]);
+  const set = (v) => {
+    const clamped = Math.max(0, Math.min(50, v));
+    setN(clamped);
+    setPoolTarget(clamped, projectId);
+  };
+  return (
+    <span className="pooltarget"
+          title="How many ready (pre-warmed) xells the queenzee keeps in the pool. Requires the pool maintainer running (POOL_ENABLED=true).">
+      <span className="k">pool target:</span>
+      <button className="step" onClick={() => set(n - 1)} disabled={n <= 0} aria-label="fewer">−</button>
+      <b data-testid="pool-target">{n}</b>
+      <button className="step" onClick={() => set(n + 1)} aria-label="more">＋</button>
+    </span>
+  );
+}
+
 function RuntimeToggle({ runtimes, value, onChange }) {
   if (!runtimes.length) return null;
   return (
@@ -137,11 +216,32 @@ function RuntimeToggle({ runtimes, value, onChange }) {
   );
 }
 
+// Hand a custom-scheme URL (e.g. claude://resume?session=…) to the OS protocol handler.
+// Using an anchor click instead of window.open avoids leaving a blank about:blank tab,
+// and unlike setting window.location it never unloads this single-page app.
+function openProtocol(url) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 function XellCard({ x, diff, onDone }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const clickable = !!x.viewer_url && !isProd;
-  const open = () => { if (clickable) window.open(x.viewer_url, '_blank', 'noopener'); };
+  // Open the session in the right surface for its runtime: a claude.ai web session opens
+  // in a browser tab; a local (desktop-protocol) session deep-links into Claude Desktop.
+  const open = () => {
+    if (!clickable) return;
+    if (x.viewer_kind === 'desktop-protocol') openProtocol(x.viewer_url);
+    else window.open(x.viewer_url, '_blank', 'noopener');
+  };
+  const openHint = !clickable ? ''
+    : x.viewer_kind === 'desktop-protocol' ? 'Open this session in Claude Desktop'
+    : 'Open this session in claude.ai';
 
   const done = async (e) => {
     e.stopPropagation();
@@ -160,7 +260,7 @@ function XellCard({ x, diff, onDone }) {
     <div className={`card status-${x.status} ${clickable ? 'clickable' : ''} ${isProd ? 'prod' : ''}`}
          data-testid="xell-card" data-slug={x.slug} data-status={x.status} data-xell-id={x.id}
          data-production={isProd ? '1' : '0'}
-         onClick={open} title={clickable ? 'Open this session in its viewer' : ''}>
+         onClick={open} title={openHint}>
       {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
       {x.holds_prod_lock && (
         <span className="lock" data-testid="prod-lock"

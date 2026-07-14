@@ -5,14 +5,16 @@ import { projectHook } from '../lib/status.js';
 import { getFleet, listRuntimes } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
-import { bus } from '../lib/events.js';
+import { bus, broadcast } from '../lib/events.js';
 import { claimXell } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
+import { checkContainers } from '../queenzee/containers.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
 import { acquireProdLock, releaseProdLock, prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
+import { listProjects, createProject, deleteProject } from '../lib/projects.js';
 
 export const router = Router();
 
@@ -34,7 +36,17 @@ router.get('/fleet', async (req, res) => {
   res.json(fleet);
 });
 
-router.get('/projects', async (_req, res) => res.json(await q(`SELECT * FROM project ORDER BY created_at`)));
+router.get('/projects', async (_req, res) => res.json(await listProjects()));
+
+// ── project management (add / remove via the header project menu) ─────────────
+router.post('/projects', async (req, res) => {
+  try { res.json(await createProject(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/projects/:id', async (req, res) => {
+  try { res.json(await deleteProject(req.params.id, req.query.force === '1')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
 router.get('/xells', async (_req, res) => res.json(await q(`SELECT * FROM xell WHERE status <> 'retired' ORDER BY created_at`)));
 router.get('/zees', async (_req, res) => res.json(await q(`SELECT * FROM zee ORDER BY created_at DESC`)));
 router.get('/containers', async (_req, res) => res.json(await q(`SELECT * FROM container ORDER BY role, tier, name`)));
@@ -53,14 +65,29 @@ router.get('/logs', async (req, res) => res.json(recentLogs(Number(req.query.n) 
 router.get('/zees/:id/events', async (req, res) =>
   res.json(await q(`SELECT * FROM session_event WHERE zee_id = $1 ORDER BY ts DESC LIMIT 200`, [req.params.id])));
 
-// ── /xell skill → claim the freshest ready xell for the caller's session ─────
+// ── /xell skill → claim a ready xell, but ONLY if the session is inside its worktree ──
 router.post('/xell/claim', async (req, res) => {
   try {
     const binding = await claimXell(req.body || {});
     res.json(binding);
   } catch (err) {
-    res.status(409).json({ error: err.message });
+    // Not standing in a worktree → 409 with actionable detail; no claim, so no work begins.
+    if (err.code === 'NEEDS_WORKTREE') return res.status(409).json({ status: 'needs-worktree', ...err.detail });
+    res.status(409).json({ status: 'error', error: err.message });
   }
+});
+
+// ── pool size: how many ready (pre-warmed) xells the queenzee keeps per project ─
+router.post('/pool/config', async (req, res) => {
+  const n = Number(req.body?.target_ready);
+  if (!Number.isInteger(n) || n < 0 || n > 50) {
+    return res.status(400).json({ error: 'target_ready must be an integer 0–50' });
+  }
+  const proj = req.body?.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+  const row = await one(`UPDATE pool_config SET target_ready=$2 WHERE project_id=$1 RETURNING target_ready`, [proj, n]);
+  if (!row) return res.status(404).json({ error: 'no pool_config for project' });
+  broadcast('project', { id: proj, target_ready: row.target_ready });
+  res.json({ ok: true, target_ready: row.target_ready });
 });
 
 // ── runtime toggle: set the pool's default runtime (what queenzee spawns next) ─
@@ -76,6 +103,9 @@ router.post('/pool/runtime', async (req, res) => {
 // ── monitoring: is a session REALLY active (per the claude CLI)? ──────────────
 router.post('/monitor/run', async (_req, res) => res.json(await monitorTick()));
 router.get('/monitor/remote', async (_req, res) => res.json(remoteAvailable()));
+
+// ── container health: is each container actually running (per `docker ps`)? ───
+router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
 
 // ── task intake + human "done" (triggers the reaper) ─────────────────────────
 router.post('/tasks', async (req, res) => {

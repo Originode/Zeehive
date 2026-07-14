@@ -8,6 +8,11 @@
 # Env: SPINOFF_DOCKER_CONTEXT (default ugreen-nas), DEV_HOST_IP (default 10.1.0.18)
 set -euo pipefail
 
+# Never inherit a stray git context from the launching shell — GIT_DIR/GIT_WORK_TREE
+# override `git -C` and would make us act on the wrong repo (e.g. Xeehive's .git, which
+# has no `main` → "fatal: invalid reference: main"). Always resolve via the -C path below.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY 2>/dev/null || true
+
 SLUG="${1:?usage: provision-xell.sh <slug> [root]}"
 ROOT="${2:-${OMNIBIZ_ROOT:-D:/Repos/OmniBiz/omnibiz}}"
 CTX="${SPINOFF_DOCKER_CONTEXT:-ugreen-nas}"
@@ -28,8 +33,9 @@ if [ ! -e "$WT/.git" ]; then
 fi
 HEAD="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-# 2) bring up this worktree's ephemeral app tier (shares dev db/infra)
-if [ -f "$WT/scripts/spin-env.sh" ]; then
+# 2) bring up this worktree's ephemeral app tier (shares dev db/infra).
+#    Skipped when PROVISION_APP_TIER=false — worktree-only provisioning (no NAS churn).
+if [ "${PROVISION_APP_TIER:-true}" = "true" ] && [ -f "$WT/scripts/spin-env.sh" ]; then
   ( cd "$WT" && SPINOFF_DOCKER_CONTEXT="$CTX" DEV_HOST_IP="$HOST_IP" bash scripts/spin-env.sh up >&2 )
 fi
 

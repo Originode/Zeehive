@@ -5,21 +5,28 @@ import { q, one } from '../db/pool.js';
 import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
+import { provisionXell } from '../lib/provision.js';
 import { logline } from '../lib/logbus.js';
+
+// PROVISION_MODE=real actually creates the git worktree (and app tier unless
+// PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 function norm(p) { return String(p || '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
 
-// Resolve which pooled xell the caller is standing in, by cwd (matches the worktree path).
-async function readyXellForCwd(projectId, cwd) {
-  const ready = await q(
+async function readyXells(projectId) {
+  return q(
     `SELECT * FROM xell WHERE project_id = $1 AND status = 'ready' ORDER BY ready_at DESC NULLS LAST, created_at DESC`,
     [projectId]);
-  if (cwd) {
-    const target = norm(cwd);
-    const match = ready.find((x) => norm(x.worktree_path) === target);
-    if (match) return match;
-  }
-  return ready[0] || null; // else the freshest ready xell
+}
+
+// The ready xell the caller is physically STANDING IN (cwd === its worktree), or null.
+// Exact match only — no "freshest ready" fallback: binding a session that isn't in the
+// worktree would let it edit the xource (main repo), which is the isolation hole we forbid.
+function readyXellForCwd(ready, cwd) {
+  if (!cwd) return null;
+  const target = norm(cwd);
+  return ready.find((x) => norm(x.worktree_path) === target) || null;
 }
 
 async function defaultProjectId() {
@@ -27,35 +34,68 @@ async function defaultProjectId() {
   return p?.id;
 }
 
+// Raised when the caller isn't standing in a xell worktree. The route turns it into a
+// 409 the skill shows verbatim — NO claim, NO 'claimed' status, so the zee does not work.
+class NeedsWorktree extends Error {
+  constructor(detail) { super('not-in-worktree'); this.code = 'NEEDS_WORKTREE'; this.detail = detail; }
+}
+
 // POST /api/xell/claim  { session_id, cwd, task, runtime?, project? }
+// The zee gets 'claimed' — and may begin work — ONLY when its session is physically inside a
+// ready xell's worktree. Anything else refuses: a session in the xource (main repo) or a
+// foreign worktree would edit the wrong tree, defeating isolation.
 export async function claimXell({ session_id, cwd, task, runtime, project }) {
   const projectId = project || (await defaultProjectId());
   if (!projectId) throw new Error('no project configured');
 
-  // idempotent: if this session already owns a live zee, return its binding
+  // idempotent: if this session already owns a live zee, return its (already-claimed) binding
   const existing = await one(
     `SELECT z.*, x.worktree_path, x.branch FROM zee z JOIN xell x ON x.id = z.xell_id
        WHERE z.claude_session_id = $1 AND z.status IN ('spawning','online','working','idle')`,
     [session_id]);
   if (existing) return bindingFor(existing.xell_id, existing);
 
-  const xell = await readyXellForCwd(projectId, cwd);
-  if (!xell) throw new Error('no ready xell available — pool is empty, try again shortly');
+  const ready = await readyXells(projectId);
+  const xell = readyXellForCwd(ready, cwd); // the worktree the caller is STANDING IN, or null
+
+  if (!xell) {
+    // Not in a worktree → cannot claim. Make sure a ready worktree EXISTS to open (provision
+    // on demand if the pool is dry), then tell the caller to open it and re-run /xell there.
+    let open = ready[0];
+    if (!open) {
+      logline('intake', `no ready worktree — provisioning one to open on demand (${PROVISION_MODE})…`);
+      const p = await provisionXell({ projectId, mode: PROVISION_MODE });
+      open = await one(`SELECT * FROM xell WHERE id=$1`, [p.id]);
+    }
+    logline('intake', `claim refused — session ${String(session_id).slice(0, 8)} is not in a xell worktree (cwd=${cwd || '?'})`);
+    throw new NeedsWorktree({
+      needs_worktree: true,
+      your_cwd: cwd || null,
+      open_worktree: open.worktree_path,
+      open_slug: open.slug,
+      also_ready: ready.filter((x) => x.id !== open.id).map((x) => ({ slug: x.slug, worktree_path: x.worktree_path })),
+      message:
+        'A xell is an isolated git worktree. Your session is NOT inside one, so it was not claimed — ' +
+        'a session in the main repo (xource) would edit the wrong tree. Open the worktree folder below ' +
+        'in a NEW Claude Code session and run /xell from THERE; work begins only once the API returns status "claimed".',
+    });
+  }
 
   const pool = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id = $1`, [projectId]);
   const rt = runtime ? await runtimeByKey(runtime) : await runtimeById(pool?.default_runtime_id);
   const viewer = viewerUrlFor(rt, session_id, null);
 
+  // cwd is guaranteed === worktree_path here, so the stored cwd is honest.
   const zee = await one(
     `INSERT INTO zee (xell_id, claude_session_id, attach_mode, runtime_id, viewer_url, viewer_kind,
                       status, cwd, session_name, attached_at)
      VALUES ($1,$2,'skill-claim',$3,$4,$5,'online',$6,$7, now()) RETURNING *`,
-    [xell.id, session_id, rt?.id || null, viewer.url, viewer.kind, cwd || xell.worktree_path, session_id]);
+    [xell.id, session_id, rt?.id || null, viewer.url, viewer.kind, xell.worktree_path, session_id]);
 
   const updatedXell = await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1 RETURNING *`, [xell.id]);
   broadcast('zee', zee);
   broadcast('xell', updatedXell);
-  logline('intake', `xell ${xell.slug} claimed (skill) by session ${String(session_id).slice(0, 8)}`);
+  logline('intake', `xell ${xell.slug} claimed (skill) by session ${String(session_id).slice(0, 8)} — in-worktree ✓`);
 
   // link the opaque task (if any) to this xell/zee — queenzee never inspects prompt_text
   if (task) {
@@ -75,6 +115,7 @@ async function bindingFor(xellId, zee, task) {
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xellId]);
   return {
+    status: 'claimed', // the gate: the zee may begin work ONLY when this is 'claimed'
     xell: {
       id: xell.id, slug: xell.slug, branch: xell.branch, worktree_path: xell.worktree_path,
       source: xell.xource_ref, source_coupling: xell.source_coupling, db_coupling: xell.db_coupling,

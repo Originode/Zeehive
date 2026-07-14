@@ -1,8 +1,18 @@
 // Read-only git helpers for the timeline rail.
 import { spawnSync } from 'node:child_process';
 
+// Inherited git-context env vars (a stray GIT_DIR from the launching shell) override `-C`
+// and make git act on the WRONG repo — e.g. Xeehive's .git, which has no `main`, yielding
+// "fatal: invalid reference: main". Strip them so git/scripts act only on the repo we point at.
+const GIT_CONTEXT_VARS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'];
+export function cleanGitEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  for (const k of GIT_CONTEXT_VARS) delete env[k];
+  return env;
+}
+
 function git(repoRoot, args, timeout = 15000) {
-  const r = spawnSync('git', ['-C', repoRoot, ...args], { encoding: 'utf8', timeout, windowsHide: true });
+  const r = spawnSync('git', ['-C', repoRoot, ...args], { encoding: 'utf8', timeout, windowsHide: true, env: cleanGitEnv() });
   return { status: r.status, out: r.stdout || '', err: r.stderr || '' };
 }
 

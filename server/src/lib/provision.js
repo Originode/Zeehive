@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { pool, q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
-import { headCommit } from './git.js';
+import { headCommit, cleanGitEnv } from './git.js';
 
 const ADJ = ['swift', 'calm', 'bright', 'bold', 'keen', 'lively', 'nimble', 'quiet', 'sunny', 'wise'];
 const NOUN = ['harbor', 'meadow', 'summit', 'delta', 'ember', 'grove', 'atlas', 'cove', 'ridge', 'vale'];
@@ -47,14 +47,17 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   let head = headCommit(project.repo_root, project.main_branch);
   let health = 'unknown';
   if (mode === 'real') {
+    // PROVISION_APP_TIER=false → create only the isolated worktree (no spin-env / NAS
+    // containers). A gentle on-ramp: code isolation now, app tier when you want it.
+    const appTier = process.env.PROVISION_APP_TIER !== 'false';
     const script = resolve(config.repoRoot, 'scripts', 'provision-xell.sh');
     const r = spawnSync('bash', [script, slug, project.repo_root.replace(/\\/g, '/')], {
       encoding: 'utf8', timeout: 600000,
-      env: { ...process.env, SPINOFF_DOCKER_CONTEXT: config.dockerCtx, DEV_HOST_IP: project.dev_host_ip },
+      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: config.dockerCtx, DEV_HOST_IP: project.dev_host_ip,
+             PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
     });
     if (r.status !== 0) throw new Error(`provision-xell.sh failed: ${(r.stderr || '').slice(-500)}`);
-    health = 'up'; // head_commit stays the full xource tip captured above
-
+    health = appTier ? 'up' : 'down'; // worktree exists; containers only up if the app tier ran
   }
 
   const client = await pool.connect();

@@ -18,8 +18,24 @@ const req = http.request(`${api}/api/xell/claim`, {
   let b = '';
   res.on('data', (c) => (b += c));
   res.on('end', () => {
+    let j; try { j = JSON.parse(b); } catch { /* non-JSON */ }
+    if (j && j.status === 'needs-worktree') {
+      // The gate said NO: this session isn't in a xell worktree, so it was NOT claimed.
+      const others = (j.also_ready || []).map((x) => `    • ${x.worktree_path}`).join('\n');
+      console.log(
+`NOT CLAIMED — do not start any work.
+
+Your session is running in ${j.your_cwd || 'a non-xell directory'}, which is NOT an isolated xell
+worktree. A zee may only work inside its own worktree, so no xell was claimed for this session.
+
+To proceed: open this worktree folder in a NEW Claude Code session and run /xell there —
+    ${j.open_worktree}   (${j.open_slug})
+${others ? `\nOther ready worktrees you may open instead:\n${others}\n` : ''}
+Work begins ONLY once the API returns status "claimed".`);
+      process.exit(0);
+    }
     if (res.statusCode >= 400) {
-      console.log(`No xell available (HTTP ${res.statusCode}): ${b}`);
+      console.log(`Not claimed (HTTP ${res.statusCode}): ${b}\nDo not start any work.`);
       process.exit(0);
     }
     console.log(b);

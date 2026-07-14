@@ -60,10 +60,17 @@ async function seedDemo() {
   });
   // xell 1 — WORKING, local runtime. Pin to a REAL live session (if any) so the monitor
   // can prove it distinguishes really-active from the fabricated sessions on the others.
-  const realSid = listActiveAgents().agents[0]?.sessionId || 'sess-local-2222bbbb';
+  // Pin this local "working" zee to a REAL live session so the monitor genuinely shows
+  // "● really active" AND the desktop deep-link opens a sensible session. Prefer THIS
+  // Xeehive session (when it's live) over an arbitrary borrowed agent, so clicking the card
+  // never hijacks an unrelated project's Claude session; fall back to any live agent, then a stub.
+  const live = listActiveAgents().agents.map((a) => a.sessionId);
+  const self = process.env.CLAUDE_CODE_SESSION_ID;
+  const realSid = (self && live.includes(self)) ? self : (live[0] || 'sess-local-2222bbbb');
   await attach(xells[1], {
     status: 'working', runtime: local, sid: realSid,
-    viewer: { url: null, kind: 'desktop-protocol' },
+    // local zee → desktop-protocol deep link into Claude Desktop (the T-Keyboard scheme)
+    viewer: { url: `claude://resume?session=${realSid}`, kind: 'desktop-protocol' },
   });
   // xell 2 — IDLE (active but not working), remote runtime
   await attach(xells[2], {

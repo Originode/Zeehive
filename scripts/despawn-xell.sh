@@ -5,6 +5,10 @@
 #   despawn-xell.sh <worktree_path>
 set -euo pipefail
 
+# Don't inherit a stray git context (GIT_DIR/GIT_WORK_TREE) from the launching shell — it
+# overrides `git -C` and would make us tear down against the wrong repo. Resolve via -C only.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY 2>/dev/null || true
+
 WT="${1:?usage: despawn-xell.sh <worktree_path>}"
 CTX="${SPINOFF_DOCKER_CONTEXT:-ugreen-nas}"
 
