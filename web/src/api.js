@@ -66,6 +66,30 @@ export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog }) 
   return () => es.close();
 }
 
+// (Re)build a per-xell container. hot=true → fast reload (lime dot); false → full rebuild.
+export async function buildContainer(containerId, hot = false) {
+  const r = await fetch(`/api/containers/${containerId}/build`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hot }),
+  });
+  return r.ok ? r.json() : Promise.reject(await r.json().catch(() => ({ error: r.statusText })));
+}
+
+// Build every buildable (server + webapp) container of a xell.
+export async function buildXell(xellId, hot = false) {
+  const r = await fetch(`/api/xells/${xellId}/build`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hot }),
+  });
+  return r.ok ? r.json() : Promise.reject(await r.json().catch(() => ({ error: r.statusText })));
+}
+
+// Open a xell's worktree folder in the host file manager (Explorer on Windows).
+export async function revealWorktree(xellId) {
+  const r = await fetch(`/api/xells/${xellId}/reveal`, { method: 'POST' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `open failed (${r.status})`);
+  return data;
+}
+
 // How many ready (pre-warmed) xells queenzee keeps for this project (pool_config.target_ready).
 export async function setPoolTarget(target_ready, projectId) {
   const r = await fetch('/api/pool/config', {
@@ -81,6 +105,51 @@ export async function setDefaultRuntime(runtime) {
     body: JSON.stringify({ runtime }),
   });
   return r.ok ? r.json() : null;
+}
+
+// ── prod DB backups (panel + settings + all-backups modal) ────────────────────
+// Full list + current settings (the modal + settings form). The panel itself reads the
+// last-backup summary straight off the fleet snapshot (fleet.backup).
+export async function getBackups(projectId) {
+  const r = await fetch(`/api/backups${pq(projectId)}`);
+  return r.ok ? r.json() : { config: null, backups: [] };
+}
+
+export async function setBackupConfig(body) {
+  const r = await fetch('/api/backups/config', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `save failed (${r.status})`);
+  return data;
+}
+
+// Trigger a backup right now (used by the "Back up now" button in the modal).
+export async function runBackup(projectId) {
+  const r = await fetch('/api/backups/run', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ project: projectId }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `backup failed (${r.status})`);
+  return data;
+}
+
+// Reveal a backup file in the host's file manager (Explorer on Windows).
+export async function revealBackup(id) {
+  const r = await fetch(`/api/backups/${id}/reveal`, { method: 'POST' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `open failed (${r.status})`);
+  return data;
+}
+
+// Restore a backup into a db container (that container spins until the restore finishes).
+export async function restoreBackup(id, container) {
+  const r = await fetch(`/api/backups/${id}/restore`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ container }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `restore failed (${r.status})`);
+  return data;
 }
 
 export async function markDone(taskId, doneBy = 'human') {

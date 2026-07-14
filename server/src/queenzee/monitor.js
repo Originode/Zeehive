@@ -5,16 +5,19 @@ import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { listActiveAgents, remoteList, remoteStatus } from '../lib/claude-cli.js';
 import { broadcast } from '../lib/events.js';
+import { sessionTitle } from '../lib/session-title.js';
 import { logline } from '../lib/logbus.js';
 
 async function setActive(zee, active, source) {
   const prev = zee.cli_active;
+  // also refresh the human session title the provider shows (Claude Code / Codex sidebar)
+  const title = sessionTitle(zee.claude_session_id) || zee.title || null;
   const row = await one(
-    `UPDATE zee SET cli_active=$2, monitor_source=$3, last_monitor_at=now() WHERE id=$1 RETURNING *`,
-    [zee.id, active, source]);
-  if (row && prev !== active) {
+    `UPDATE zee SET cli_active=$2, monitor_source=$3, title=$4, last_monitor_at=now() WHERE id=$1 RETURNING *`,
+    [zee.id, active, source, title]);
+  if (row && (prev !== active || zee.title !== title)) {
     broadcast('zee', row);
-    logline('monitor', `zee ${zee.name || zee.claude_session_id?.slice(0, 8) || zee.id.slice(0, 8)} → ${active ? 'REALLY ACTIVE' : 'not active'} (via ${source})`);
+    if (prev !== active) logline('monitor', `zee ${zee.title || zee.name || zee.claude_session_id?.slice(0, 8) || zee.id.slice(0, 8)} → ${active ? 'REALLY ACTIVE' : 'not active'} (via ${source})`);
   }
   return row;
 }

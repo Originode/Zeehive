@@ -187,6 +187,41 @@ a.cbox:hover { border-color: var(--accent); }
   background: rgba(229,85,78,.16); color: var(--down); border: 1px solid var(--down); padding: 1px 6px; border-radius: 20px; }
 
 /* terminal button + modal */
+/* container build affordances */
+/* unbuilt buildable container → hammer INSIDE the box, in the bottom-right so it never
+   overlaps the health dot (which sits top-right) */
+.cbuild-in { position: absolute; bottom: 0; right: 1px; background: none; border: none; cursor: pointer;
+  font-size: 10px; line-height: 1; padding: 1px; opacity: .8; filter: grayscale(.2); }
+.cbuild-in:hover { opacity: 1; filter: none; transform: scale(1.15); }
+.cdot.up.hot { background: #7CFC00; box-shadow: 0 0 5px #7CFC00; }  /* hot build → lime, vs plain green */
+
+.xbuild { position: absolute; top: 8px; right: 10px; z-index: 2; background: var(--panel2);
+  border: 1px solid var(--line); color: var(--muted); border-radius: 6px; cursor: pointer;
+  font-size: 11px; padding: 2px 7px; opacity: .55; transition: opacity .12s, border-color .12s; }
+.xbuild:hover { opacity: 1; border-color: var(--accent); color: var(--text); }
+
+.sesstitle { color: var(--text); font-weight: 500; text-align: right; max-width: 62%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* worktree → click to open in Explorer */
+.wtlink { background: none; border: none; cursor: pointer; padding: 0; color: var(--text);
+  font-family: 'Cascadia Code', monospace; font-size: 12px; text-decoration: underline dotted;
+  text-underline-offset: 2px; }
+.wtlink:hover { color: var(--accent); }
+.ctxempty { padding: 7px 8px; font-size: 12px; color: var(--muted); }
+
+/* right-click container context menu */
+.ctxmenu { position: fixed; z-index: 41; min-width: 190px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 4px; box-shadow: 0 8px 28px rgba(0,0,0,.5); }
+.ctxmenu .ctxhead { font-size: 11px; color: var(--muted); padding: 4px 8px 6px; border-bottom: 1px solid var(--line);
+  margin-bottom: 4px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctxmenu button, .ctxmenu a { display: flex; align-items: baseline; gap: 6px; width: 100%; text-align: left;
+  background: none; border: none; color: var(--text); cursor: pointer; font-size: 13px; padding: 7px 8px;
+  border-radius: 5px; text-decoration: none; }
+.ctxmenu button:hover, .ctxmenu a:hover { background: var(--accent); color: #fff; }
+.ctxmenu .ctxsub { font-size: 10px; color: var(--muted); }
+.ctxmenu button:hover .ctxsub { color: rgba(255,255,255,.75); }
+
 .pooltarget { margin-left: 18px; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
 .pooltarget .k { color: var(--muted); }
 .pooltarget b { min-width: 14px; text-align: center; }
@@ -213,3 +248,93 @@ a.cbox:hover { border-color: var(--accent); }
 .term-ts { color: #4a5568; flex: 0 0 auto; }
 .term-scope { flex: 0 0 auto; white-space: pre; font-weight: 600; }
 .term-msg { color: var(--text); word-break: break-word; }
+
+/* ── backups panel (above the container inventory) ── */
+.backups { display: flex; align-items: center; gap: 10px; padding: 10px 0;
+  border-bottom: 1px solid var(--line); font-size: 14px; }
+.bklabel { color: var(--muted); min-width: 62px; }
+.bklast { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 8px; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: baseline;
+  gap: 8px; font-size: 13px; }
+.bklast:hover { border-color: var(--accent); }
+.bklast .mono { font-family: 'Cascadia Code', 'Consolas', monospace; }
+.bklast.none { color: var(--muted); }
+.bkago { color: var(--muted); font-size: 12px; }
+.bkcount { color: var(--muted); font-size: 12px; }
+.bkcog { margin-left: auto; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  width: 30px; height: 30px; border-radius: 8px; font-size: 15px; cursor: pointer; line-height: 1; }
+.bkcog:hover { color: var(--text); border-color: var(--accent); }
+
+/* all-backups modal (reuses the .term-overlay backdrop) */
+.bkmodal { width: min(860px, 94vw); max-height: 80vh; background: #0a0d12; border: 1px solid var(--line);
+  border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+.bkhead-actions { display: flex; align-items: center; gap: 10px; }
+.bkmsg { color: var(--up); font-size: 12px; }
+.bkbody { flex: 1; overflow-y: auto; padding: 6px 10px 12px; }
+.bkrow { display: grid; grid-template-columns: auto auto auto 1fr auto; gap: 12px; align-items: center;
+  padding: 8px 6px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.bkstamp { color: var(--text); }
+.bkago2 { color: var(--muted); }
+.bksize { color: var(--muted); min-width: 56px; text-align: right; }
+.bkpath { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bkacts { display: flex; gap: 6px; }
+.bkbtn { background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 7px;
+  padding: 5px 12px; font-size: 12px; cursor: pointer; }
+.bkbtn:hover:not(:disabled) { filter: brightness(1.1); }
+.bkbtn:disabled { opacity: .5; cursor: not-allowed; }
+.bkbtn.sm { background: var(--panel2); color: var(--muted); border-color: var(--line); padding: 4px 9px; }
+.bkbtn.sm:hover:not(:disabled) { color: var(--text); border-color: var(--accent); filter: none; }
+
+/* backup settings modal */
+.bkcfg { width: min(440px, 92vw); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+.bkcfg-body { padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+.bkcfg-body label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 12px; }
+.bkcfg-body input, .bkcfg-body select { background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: 'Cascadia Code', monospace; }
+.bkcfg-body input:focus, .bkcfg-body select:focus { outline: none; border-color: var(--accent); }
+.bkival { display: flex; gap: 8px; }
+.bkival input { width: 90px; }
+.bkival select { flex: 1; }
+.bkhint { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+.bkerr { color: var(--down); font-size: 12px; }
+.bkcfg-btns { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px;
+  border-top: 1px solid var(--line); background: var(--panel2); }
+.bkcfg-btns button { border: 1px solid var(--line); background: var(--accent); color: #fff;
+  border-radius: 7px; padding: 7px 16px; cursor: pointer; font-size: 13px; }
+.bkcfg-btns button.ghost { background: var(--panel2); color: var(--muted); }
+.bkcfg-btns button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ── busy container spinner (building / backing up / restoring) ── */
+@keyframes cspin { to { transform: rotate(360deg); } }
+/* replaces the health dot while busy: amber ring = building, teal = backup, blue = restore.
+   Also reused inline (static) in the backups modal + panel job indicators. */
+.cspin { position: absolute; top: 2px; right: 2px; width: 10px; height: 10px; border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,.16); border-top-color: var(--building);
+  animation: cspin .7s linear infinite; box-sizing: border-box; }
+.cspin.backup  { border-top-color: #3bc6c0; }
+.cspin.restore { border-top-color: var(--accent); }
+.cbox.busy { cursor: progress; }
+.cbox.busy.busy-building { border-color: var(--building); }
+.cbox.busy.busy-backup   { border-color: #3bc6c0; box-shadow: 0 0 0 1px rgba(59,198,192,.25) inset; }
+.cbox.busy.busy-restore  { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,140,255,.25) inset; }
+.xbuild:disabled { opacity: .65; cursor: progress; }
+
+/* busy note inside the container context menu (no build actions while busy) */
+.ctxbusy { display: flex; align-items: center; gap: 8px; padding: 7px 10px; color: var(--muted); font-size: 12px; }
+.ctxbusy .cspin { position: static; }
+
+/* inline job spinners in the backups panel + modal (cspin flows inline, not absolute) */
+.bkrunning, .bkrestoring, .bkjob { display: inline-flex; align-items: center; gap: 6px; }
+.bkrunning { color: #3bc6c0; font-size: 12px; }
+.bkrestoring { color: var(--accent); font-size: 11px; }
+.bkrunning .cspin, .bkrestoring .cspin, .bkjob .cspin, .bkbtn .cspin { position: static; }
+.bkjob { color: #3bc6c0; font-size: 12px; }
+.bkjob.failed { color: var(--down); }
+.bkrow.running, .bkrow.failed { grid-template-columns: auto auto 1fr; }
+.bkrow.running { opacity: .9; }
+
+/* "restore into <db container>" selector in the backups modal header */
+.bkrestore-into { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.bkrestore-into select { background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 4px 6px; font-size: 12px; font-family: 'Cascadia Code', monospace; }

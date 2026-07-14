@@ -68,17 +68,27 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
       const p = await provisionXell({ projectId, mode: PROVISION_MODE });
       open = await one(`SELECT * FROM xell WHERE id=$1`, [p.id]);
     }
-    logline('intake', `claim refused — session ${String(session_id).slice(0, 8)} is not in a xell worktree (cwd=${cwd || '?'})`);
+    // resolve the runtime the queenzee would spawn (the pool default / UI runtime toggle)
+    const pcfg = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id=$1`, [projectId]);
+    const drt = await runtimeById(pcfg?.default_runtime_id);
+    logline('intake', `claim refused (not in worktree) — offering dispatch to ${open.slug} (${drt?.label || 'default'})`);
     throw new NeedsWorktree({
       needs_worktree: true,
+      can_dispatch: true,
+      // the recommended path: queenzee spawns a zee INTO this worktree (human confirms first)
+      dispatch: {
+        xell_id: open.id, slug: open.slug, worktree_path: open.worktree_path,
+        runtime_key: drt?.key || null, runtime_label: drt?.label || 'default runtime',
+      },
+      task: task || null,
       your_cwd: cwd || null,
       open_worktree: open.worktree_path,
       open_slug: open.slug,
       also_ready: ready.filter((x) => x.id !== open.id).map((x) => ({ slug: x.slug, worktree_path: x.worktree_path })),
       message:
-        'A xell is an isolated git worktree. Your session is NOT inside one, so it was not claimed — ' +
-        'a session in the main repo (xource) would edit the wrong tree. Open the worktree folder below ' +
-        'in a NEW Claude Code session and run /xell from THERE; work begins only once the API returns status "claimed".',
+        'Your session is in the main repo (xource), not a xell worktree, so it was NOT claimed. ' +
+        'Recommended: DISPATCH this task to the ready xell below — the queenzee spawns a zee inside its ' +
+        'worktree to do the work. Confirm with the user first. (Or open the worktree yourself and /xell there.)',
     });
   }
 
@@ -119,6 +129,18 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
       [projectId, task, xell.id, zee.id]);
   }
   return bindingFor(xell.id, zee, task);
+}
+
+// POST /api/xell/dispatch — the confirmed auto-dispatch path for /xell run OUTSIDE a worktree.
+// The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
+// per the runtime) to run the task. Human confirms in their session before this is called.
+export async function dispatchXell({ xell_id, task, runtime, project }) {
+  if (!task) throw new Error('task (prompt) required to dispatch');
+  const projectId = project || (await defaultProjectId());
+  const spawned = await spawnHeadless({ projectId, xellId: xell_id || null, task, runtime });
+  const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
+  logline('intake', `dispatched a zee into ${xell?.slug} to run the task (${runtime || 'default runtime'})`);
+  return { status: 'dispatched', slug: xell?.slug, worktree: xell?.worktree_path, ...spawned };
 }
 
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.

@@ -21,4 +21,13 @@ export const config = {
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),
   poolIntervalMs: int(process.env.POOL_INTERVAL_MS, 15000),
+  // where prod DB dumps land by default (per-project override via pool_config.backup_dir),
+  // and how often the maintenance scheduler wakes to check whether a backup is due.
+  backupDir: process.env.BACKUP_DIR || resolve(repoRoot, 'db_backups'),
+  maintTickMs: int(process.env.MAINT_TICK_MS, 60000),
+  // The PRODUCTION application database to dump (inside the modeled prod db container) — NOT
+  // the xeehive meta DB above. db name defaults to the project name; role/tier resolve the
+  // container from the inventory, so only user/name need overriding for an off-convention prod.
+  prodDbName: process.env.PROD_DB_NAME || null,
+  prodDbUser: process.env.PROD_DB_USER || 'postgres',
 };

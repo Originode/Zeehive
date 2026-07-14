@@ -20,18 +20,25 @@ const req = http.request(`${api}/api/xell/claim`, {
   res.on('end', () => {
     let j; try { j = JSON.parse(b); } catch { /* non-JSON */ }
     if (j && j.status === 'needs-worktree') {
-      // The gate said NO: this session isn't in a xell worktree, so it was NOT claimed.
+      // Not in a worktree → NOT claimed. Offer the confirmed auto-dispatch path.
+      const d = j.dispatch || {};
+      const home = process.env.XEEHIVE_HOME || 'D:/Repos/Xeehive';
       const others = (j.also_ready || []).map((x) => `    • ${x.worktree_path}`).join('\n');
       console.log(
-`NOT CLAIMED — do not start any work.
+`NOT CLAIMED — this session is in the main repo (${j.your_cwd || '?'}), NOT a xell worktree.
+Do not read/edit/write any files here (it is the read-only xource).
 
-Your session is running in ${j.your_cwd || 'a non-xell directory'}, which is NOT an isolated xell
-worktree. A zee may only work inside its own worktree, so no xell was claimed for this session.
+RECOMMENDED — dispatch this task to a ready xell. The queenzee will spawn a zee INSIDE its
+worktree to do the work. CONFIRM WITH THE USER first, then run this exact command:
 
-To proceed: open this worktree folder in a NEW Claude Code session and run /xell there —
+    node "${home}/scripts/xell-dispatch.mjs" ${d.xell_id || ''} ${JSON.stringify(task)}
+
+    → target xell : ${d.slug || '?'}   (runtime: ${d.runtime_label || 'default'})
+    → worktree    : ${d.worktree_path || '?'}
+
+ALTERNATIVE — open the worktree yourself and run /xell there:
     ${j.open_worktree}   (${j.open_slug})
-${others ? `\nOther ready worktrees you may open instead:\n${others}\n` : ''}
-Work begins ONLY once the API returns status "claimed".`);
+${others ? `\nOther ready worktrees:\n${others}\n` : ''}`);
       process.exit(0);
     }
     if (res.statusCode >= 400) {

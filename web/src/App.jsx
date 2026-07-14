@@ -1,11 +1,15 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
-         getProjects, createProject, deleteProject, setPoolTarget } from './api.js';
+         getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree } from './api.js';
+
+const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import GitRail from './GitRail.jsx';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
+import BackupsPanel from './Backups.jsx';
 import { nick } from './nick.js';
+import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 
 const PROJECT_KEY = 'xeehive.project';
 
@@ -13,14 +17,6 @@ const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'Webapp', other: 'Other
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');
 const base = (p) => (p ? p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() : '—');
 
-// small square container box: 3-hex nickname + online/offline dot (hover = full name)
-function ChipBox({ c }) {
-  const inner = (<><span className="cnick">{nick(c.name)}</span><span className={`cdot ${c.health}`} /></>);
-  const title = `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}`;
-  return c.url
-    ? <a className={`cbox h-${c.health}`} href={c.url} target="_blank" rel="noopener" title={title} onClick={(e) => e.stopPropagation()}>{inner}</a>
-    : <span className={`cbox h-${c.health}`} title={title}>{inner}</span>;
-}
 
 export default function App() {
   const [projects, setProjects] = useState([]);
@@ -35,6 +31,29 @@ export default function App() {
   const [diffs, setDiffs] = useState({});
   const [logs, setLogs] = useState([]);
   const [showTerm, setShowTerm] = useState(false);
+  const [menu, setMenu] = useState(null); // container context menu {x,y,c}
+
+  // open the container context menu at the cursor — passed down to each xell's ContainerChips.
+  // onMenu stops propagation so opening one doesn't trip the document closer below.
+  const openMenu = useCallback((e, c) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, c }); }, []);
+  // Close on any outside interaction — NO full-screen scrim (that could block the whole UI).
+  // Effect is keyed on `menu`, so listeners attach only while a menu is open and after the
+  // opening event has finished (so it can't immediately close itself).
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e) => e.key === 'Escape' && close();
+    document.addEventListener('click', close);
+    document.addEventListener('contextmenu', close);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('contextmenu', close);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [menu]);
   const layoutRef = useRef(null);
 
   // Always-current selected project, so async fetches from a *previous* selection can be
@@ -158,12 +177,14 @@ export default function App() {
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
 
+      <BackupsPanel backup={fleet.backup} projectId={projectId || project.id} />
+
       <section className="inventory">
         {['db', 'server', 'webapp', 'other'].map((role) => (
           <div className="invrow" key={role} data-role={role}>
             <span className="invlabel">{ROLE_LABEL[role]}:</span>
             <span className="boxes">
-              {(containers[role] || []).map((c) => <ChipBox key={c.id} c={c} />)}
+              {(containers[role] || []).map((c) => <ContainerChip key={c.id} c={c} onMenu={openMenu} />)}
               {(!containers[role] || containers[role].length === 0) && <span className="cbox empty">—</span>}
             </span>
           </div>
@@ -172,11 +193,12 @@ export default function App() {
 
       <h2 className="xells-h">xells:</h2>
       <section className="xells">
-        {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} />)}
+        {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu} />)}
         {xells.length === 0 && <p className="loading">No active xells. The pool maintainer will fill it shortly…</p>}
       </section>
       </div>
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
+      <ContainerMenu menu={menu} onClose={() => setMenu(null)} />
     </div>
   );
 }
@@ -228,7 +250,7 @@ function openProtocol(url) {
   a.remove();
 }
 
-function XellCard({ x, diff, onDone }) {
+function XellCard({ x, diff, onDone, onMenu }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const clickable = !!x.viewer_url && !isProd;
@@ -268,6 +290,18 @@ function XellCard({ x, diff, onDone }) {
           🔒 prod
         </span>
       )}
+      {!isProd && x.stack.some(isBuildable) && (() => {
+        const busy = x.stack.some(isBusy);   // don't allow a build-all while anything is building/restoring
+        return (
+          <button className="xbuild" data-testid="xell-build" disabled={busy}
+                  title={busy ? 'A container is busy (building/restoring) — wait for it to finish'
+                              : 'Build all — rebuild this xell\'s server + webapp (right-click for hot build)'}
+                  onClick={(e) => { e.stopPropagation(); if (!busy) buildXell(x.id, false).catch(buildErr); }}
+                  onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!busy) buildXell(x.id, true).catch(buildErr); }}>
+            {busy ? '⏳ busy…' : '🔨 build all'}
+          </button>
+        );
+      })()}
       <div className="stack">
         {['db', 'server', 'webapp'].map((role) => {
           const c = x.stack.find((s) => s.role === role);
@@ -275,15 +309,32 @@ function XellCard({ x, diff, onDone }) {
           return (
             <div className="srow" key={role}>
               <span className="srole">{lbl}</span>
-              {c ? <ChipBox c={c} /> : <span className="cbox empty">—</span>}
+              {c ? <ContainerChip c={c} onMenu={onMenu} hammer /> : <span className="cbox empty">—</span>}
             </div>
           );
         })}
       </div>
       <div className="meta">
-        {!isProd && <Row k="session" v={shortSid(x.claude_session_id)} mono />}
+        {!isProd && (
+          <div className="row"><span className="rk">session</span>
+            <span className={x.zee_title ? 'sesstitle' : 'mono'} data-testid="session"
+                  title={x.zee_title ? `${x.zee_title}\n${shortSid(x.claude_session_id)}` : x.claude_session_id || ''}>
+              {x.zee_title || shortSid(x.claude_session_id)}
+            </span>
+          </div>
+        )}
         {!isProd && <Row k="zee" v={working ? x.zee_name : '—'} highlight={working} testid="zee-name" />}
-        <Row k="worktree" v={isProd ? '(production)' : base(x.worktree_path)} mono />
+        {isProd
+          ? <Row k="worktree" v="(production)" mono />
+          : (
+            <div className="row"><span className="rk">worktree</span>
+              <button className="wtlink" data-testid="worktree"
+                      title={`${x.worktree_path}\n(click to open in Explorer)`}
+                      onClick={(e) => { e.stopPropagation(); revealWorktree(x.id).catch((err) => alert('Open failed: ' + (err?.message || err))); }}>
+                {base(x.worktree_path)}
+              </button>
+            </div>
+          )}
         <Row k="source" v={x.source || x.xource_ref} />
         {!isProd && <Row k="commit" v={x.head_commit ? x.head_commit.slice(0, 8) : '—'} mono testid="commit-head" />}
         {!isProd && (

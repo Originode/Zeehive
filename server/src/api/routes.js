@@ -6,11 +6,13 @@ import { getFleet, listRuntimes } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
-import { claimXell } from '../queenzee/intake.js';
+import { claimXell, dispatchXell } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
-import { backupProd, refreshStaleXellDbs } from '../queenzee/maintenance.js';
+import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers } from '../queenzee/containers.js';
+import { buildContainer, buildXell } from '../lib/build.js';
+import { revealXellWorktree } from '../lib/reveal.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
 import { acquireProdLock, releaseProdLock, prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
@@ -77,6 +79,12 @@ router.post('/xell/claim', async (req, res) => {
   }
 });
 
+// ── /xell dispatch → queenzee spawns a zee INTO a ready worktree (confirmed) ───
+router.post('/xell/dispatch', async (req, res) => {
+  try { res.json(await dispatchXell(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 // ── pool size: how many ready (pre-warmed) xells the queenzee keeps per project ─
 router.post('/pool/config', async (req, res) => {
   const n = Number(req.body?.target_ready);
@@ -106,6 +114,22 @@ router.get('/monitor/remote', async (_req, res) => res.json(remoteAvailable()));
 
 // ── container health: is each container actually running (per `docker ps`)? ───
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
+
+// ── build: (re)build a per-xell server/webapp container (or a whole xell's stack) ──
+router.post('/containers/:id/build', async (req, res) => {
+  try { res.json(await buildContainer(req.params.id, { hot: !!req.body?.hot })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xells/:id/build', async (req, res) => {
+  try { res.json(await buildXell(req.params.id, { hot: !!req.body?.hot })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── reveal a xell's worktree folder in the host file manager (Explorer) ────────
+router.post('/xells/:id/reveal', async (req, res) => {
+  try { res.json(await revealXellWorktree(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 // ── task intake + human "done" (triggers the reaper) ─────────────────────────
 router.post('/tasks', async (req, res) => {
@@ -156,6 +180,40 @@ router.post('/maintenance/backup', async (req, res) => {
 router.post('/maintenance/refresh', async (req, res) => {
   const proj = req.body?.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
   res.json(await refreshStaleXellDbs(proj));
+});
+
+// ── prod DB backups (the backup panel: last-backup label, settings cog, all-backups modal) ──
+router.get('/backups', async (req, res) => {
+  const proj = req.query.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+  const cfg = await one(
+    `SELECT backup_dir, backup_interval_sec, max_backups FROM pool_config WHERE project_id=$1`, [proj]);
+  const backups = await q(
+    `SELECT id, dump_path, size_bytes, taken_at, source, status, error FROM db_snapshot
+       WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC`, [proj]);
+  // db containers a backup may be restored INTO (prod excluded — never restore over production);
+  // busy_since/busy_op tell the modal which target is mid-restore.
+  const targets = await q(
+    `SELECT id, name, tier, busy_since, busy_op FROM container
+       WHERE project_id=$1 AND role='db' AND tier <> 'prod' ORDER BY tier, name`, [proj]);
+  res.json({ config: cfg, backups, targets });
+});
+router.post('/backups/config', async (req, res) => {
+  try { res.json(await setBackupConfig(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/backups/run', async (req, res) => {
+  const proj = req.body?.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+  try { res.json(await backupProd(proj)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/backups/:id/reveal', async (req, res) => {
+  try { res.json(await revealBackup(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// restore a backup INTO a db container (spins that container until done)
+router.post('/backups/:id/restore', async (req, res) => {
+  try { res.json(await restoreBackup({ snapshot: req.params.id, container: req.body?.container })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── live stream (SSE) ─────────────────────────────────────────────────────────
