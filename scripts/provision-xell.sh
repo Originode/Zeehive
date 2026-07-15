@@ -3,7 +3,12 @@
 # plus its ephemeral app tier (server + webapp) via the project's spin-env.sh.
 # Prints a single JSON line describing the provisioned xell. No AI in the loop.
 #
-#   provision-xell.sh <slug> [omnibiz_root]
+#   provision-xell.sh <slug> [repo_root] [source_ref]
+#
+# source_ref is the project's main_branch — NOT always "main". This was hardcoded, so any project
+# whose source branch is named something else (Zeehive itself is on master) failed with
+# "fatal: invalid reference: main" no matter what its project row said. The caller knows the
+# branch; it must pass it rather than let the script assume.
 #
 # Env: SPINOFF_DOCKER_CONTEXT (default ugreen-nas), DEV_HOST_IP (default 10.1.0.18)
 set -euo pipefail
@@ -15,6 +20,7 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY 2
 
 SLUG="${1:?usage: provision-xell.sh <slug> [root]}"
 ROOT="${2:-${OMNIBIZ_ROOT:-D:/Repos/OmniBiz/omnibiz}}"
+SRC_REF="${3:-main}"
 CTX="${SPINOFF_DOCKER_CONTEXT:-ugreen-nas}"
 HOST_IP="${DEV_HOST_IP:-10.1.0.18}"
 BRANCH="spinoff/$SLUG"
@@ -27,9 +33,11 @@ SERVER_PORT=$((3100 + SLOT))
 WEB_PORT=$((5200 + SLOT))
 URL="http://$HOST_IP:$WEB_PORT"
 
-# 1) create the isolated worktree on its own branch off local main (never origin)
+# 1) create the isolated worktree on its own branch off the LOCAL source ref (never origin)
 if [ ! -e "$WT/.git" ]; then
-  git -C "$ROOT" worktree add "$WT" -b "$BRANCH" main >&2
+  git -C "$ROOT" rev-parse --verify --quiet "$SRC_REF" >/dev/null \
+    || { echo "source ref '$SRC_REF' does not exist in $ROOT" >&2; exit 1; }
+  git -C "$ROOT" worktree add "$WT" -b "$BRANCH" "$SRC_REF" >&2
 fi
 HEAD="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 

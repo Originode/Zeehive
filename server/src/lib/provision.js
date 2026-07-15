@@ -51,7 +51,9 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // containers). A gentle on-ramp: code isolation now, app tier when you want it.
     const appTier = process.env.PROVISION_APP_TIER !== 'false';
     const script = resolve(config.repoRoot, 'scripts', 'provision-xell.sh');
-    const r = spawnSync('bash', [script, slug, project.repo_root.replace(/\\/g, '/')], {
+    // Pass the project's source branch — the script used to hardcode 'main', which silently
+    // ignored main_branch and broke every project that isn't on main.
+    const r = spawnSync('bash', [script, slug, project.repo_root.replace(/\\/g, '/'), project.main_branch], {
       encoding: 'utf8', timeout: 600000,
       env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: config.dockerCtx, DEV_HOST_IP: project.dev_host_ip,
              PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
