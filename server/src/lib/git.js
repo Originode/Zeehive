@@ -21,6 +21,30 @@ export function headCommit(repoRoot, branch = 'main') {
   return r.status === 0 ? r.out.trim() : null;
 }
 
+// What a ZEE has actually done: diff its WORKTREE against the source.
+//
+// Do not diff the xell's stored head_commit against main — that is the commit it was PROVISIONED
+// at, which is identical for every xell cut from the same tip, so every card renders the same
+// meaningless number and a zee's real work never shows. Diff from inside the worktree instead:
+//   ahead/behind → its branch vs the source
+//   shortstat    → working tree (INCLUDING uncommitted edits) vs the source, i.e. the live work
+export function worktreeDiff(worktree, ref = 'main') {
+  const rl = git(worktree, ['rev-list', '--left-right', '--count', `${ref}...HEAD`]);
+  let ahead = 0, behind = 0;
+  if (rl.status === 0) { const [b, a] = rl.out.trim().split(/\s+/).map(Number); behind = b || 0; ahead = a || 0; }
+
+  const ss = git(worktree, ['diff', '--shortstat', ref]);
+  let files = 0, ins = 0, del = 0;
+  if (ss.status === 0) {
+    files = +(ss.out.match(/(\d+) files? changed/)?.[1] || 0);
+    ins = +(ss.out.match(/(\d+) insertions?/)?.[1] || 0);
+    del = +(ss.out.match(/(\d+) deletions?/)?.[1] || 0);
+  }
+  const st = git(worktree, ['status', '--porcelain']);
+  const dirty = st.status === 0 ? st.out.split('\n').filter(Boolean).length : 0;
+  return { ahead, behind, files, insertions: ins, deletions: del, dirty };
+}
+
 // Divergence + diffstat of a base commit vs a ref (what the xell is "behind"/differs by).
 export function diffStat(repoRoot, baseHash, ref = 'main') {
   if (!baseHash) return null;

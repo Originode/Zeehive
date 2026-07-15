@@ -1,35 +1,60 @@
 #!/usr/bin/env bash
-# Build one per-xell container (server or webapp) from its worktree code. Run BY the queenzee
-# (like provision/despawn/land). Reports the worktree HEAD it built at + whether it was a HOT
-# build (fast reload of the running container) vs a COLD build (full image rebuild). Emits one
-# JSON line. In simulate mode it records the build without touching Docker (safe on-ramp).
+# REAL build of ONE service (server|webapp) of a xell's ephemeral app tier, on the dev context.
+# Run BY the queenzee (like provision/despawn/land). Mirrors the project's own scripts/spin-env.sh
+# exactly — same compose file, project name, --env-file, slug and deterministic ports — but targets
+# a single service instead of the whole tier. Emits one JSON line for the Node projector.
 #
-#   build-container.sh <worktree> <service> <docker_ctx> <compose_project> <compose_file> <mode> <hot>
-#     mode ∈ real | simulate     hot ∈ true | false
+#   build-container.sh <worktree> <role:server|webapp> <docker_ctx> <hot:true|false> [mode]
+#
+#   build (hot=false) : `compose build <svc>` + `up -d <svc>`  — rebuilds the image from THIS
+#                       worktree's code (layer-cached) and recreates the container.
+#   hot   (hot=true)  : `compose up -d --no-build <svc>`       — bounce the container from the
+#                       existing image, no rebuild. Fast, but does NOT pick up code changes
+#                       (the compose bakes code into the image; there is no source mount).
+#   mode=simulate     : record the build without touching Docker (demo/on-ramp escape hatch).
 set -uo pipefail
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY 2>/dev/null || true
 
-WT="${1:?usage: build-container.sh <worktree> <service> <ctx> <project> <file> <mode> <hot>}"
-SVC="${2:?service}"; CTX="${3:-ugreen-nas}"; CPROJ="${4:-}"; CFILE="${5:-}"; MODE="${6:-simulate}"; HOT="${7:-false}"
+WT="${1:?usage: build-container.sh <worktree> <role> <ctx> <hot> [mode]}"
+ROLE="${2:?role}"; CTX="${3:-ugreen-nas}"; HOT="${4:-false}"; MODE="${5:-real}"
+case "$ROLE" in
+  server) SVC=server ;;
+  webapp) SVC=webapp ;;
+  *) echo "role '$ROLE' is not buildable (server|webapp only)" >&2; exit 2 ;;
+esac
 
 HEAD="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-ok=true; method=simulate
 
-if [ "$MODE" = "real" ]; then
-  COMPOSE=(docker --context "$CTX" compose)
-  [ -n "$CPROJ" ] && COMPOSE+=(-p "$CPROJ")
-  [ -n "$CFILE" ] && [ -f "$WT/$CFILE" ] && COMPOSE+=(-f "$WT/$CFILE")
-  if [ "$HOT" = "true" ]; then
-    # hot: restart the already-running container so it picks up mounted worktree code — no rebuild
-    method=hot
-    ( cd "$WT" && "${COMPOSE[@]}" up -d --no-build "$SVC" >&2 ) || ok=false
-  else
-    # cold: rebuild the image from the current worktree, then recreate
-    method=cold
-    ( cd "$WT" && "${COMPOSE[@]}" up -d --build "$SVC" >&2 ) || ok=false
-  fi
+# --- mirror spin-env.sh's environment exactly -------------------------------------------------
+COMPOSE="$WT/docker-compose.spinoff.yml"
+# MAIN = the primary checkout (not under .claude/worktrees) — it owns the real .env.
+MAIN="$(git -C "$WT" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | grep -v '/\.claude/worktrees/' | head -1)"
+ENV_FILE="$MAIN/.env"
+SLUG="$(basename "$WT" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')"
+PROJECT="omnibiz-spin-$SLUG"
+HASH="$(printf '%s' "$SLUG" | md5sum | cut -c1-4)"
+SLOT="$(( 16#$HASH % 90 ))"
+export SPINOFF_SLUG="$SLUG"
+export SPINOFF_SERVER_PORT="${SPINOFF_SERVER_PORT:-$((3100 + SLOT))}"
+export SPINOFF_WEB_PORT="${SPINOFF_WEB_PORT:-$((5200 + SLOT))}"
+export GIT_COMMIT_HASH="$HEAD"
+
+emit() { printf '{"ok":%s,"head":"%s","hot":%s,"method":"%s","service":"%s","project":"%s"}\n' \
+  "$1" "$HEAD" "$HOT" "$2" "$SVC" "$PROJECT"; }
+
+if [ "$MODE" = "simulate" ]; then emit true "simulate"; exit 0; fi
+
+[ -f "$COMPOSE" ]  || { echo "compose file not found: $COMPOSE (is docker-compose.spinoff.yml on this branch?)" >&2; emit false none; exit 1; }
+[ -f "$ENV_FILE" ] || { echo "env file not found: $ENV_FILE (the main checkout must have its .env)" >&2; emit false none; exit 1; }
+
+dc() { docker --context "$CTX" compose -p "$PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE" "$@"; }
+
+ok=true
+if [ "$HOT" = "true" ]; then
+  method=hot
+  dc up -d --no-build "$SVC" >&2 || ok=false
 else
-  method=$([ "$HOT" = "true" ] && echo hot || echo cold)   # simulate: just record the build
+  method=cold
+  dc build "$SVC" >&2 && dc up -d "$SVC" >&2 || ok=false
 fi
-
-printf '{"ok":%s,"head":"%s","hot":%s,"method":"%s","service":"%s"}\n' "$ok" "$HEAD" "$HOT" "$method" "$SVC"
+emit "$ok" "$method"

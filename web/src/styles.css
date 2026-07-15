@@ -180,6 +180,8 @@ a.cbox:hover { border-color: var(--accent); }
 .diff .dstat { color: var(--muted); }
 .diff .ins { color: var(--up); }
 .diff .del { color: var(--down); }
+/* uncommitted work sitting in the worktree — the thing the old base-vs-source diff hid entirely */
+.diff .dirty { color: var(--building); font-weight: 600; }
 
 /* production card */
 .card.prod { border-top-color: var(--down); background: linear-gradient(180deg, rgba(229,85,78,.06), transparent); }

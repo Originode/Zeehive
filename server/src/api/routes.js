@@ -6,7 +6,7 @@ import { getFleet, listRuntimes } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
-import { claimXell, dispatchXell } from '../queenzee/intake.js';
+import { claimXell, dispatchXell, DISPATCH_MODES } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
@@ -82,8 +82,11 @@ router.post('/xell/claim', async (req, res) => {
 // ── /xell dispatch → queenzee spawns a zee INTO a ready worktree (confirmed) ───
 router.post('/xell/dispatch', async (req, res) => {
   try { res.json(await dispatchXell(req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
 });
+// the autonomy scale a dispatch can pick from (1=recon … 5=bypass)
+router.get('/xell/modes', (_req, res) =>
+  res.json(Object.entries(DISPATCH_MODES).map(([n, m]) => ({ mode: Number(n), key: m.key, permission_mode: m.permissionMode, tools: m.tools || 'all', label: m.label }))));
 
 // ── pool size: how many ready (pre-warmed) xells the queenzee keeps per project ─
 router.post('/pool/config', async (req, res) => {
@@ -121,8 +124,10 @@ router.post('/containers/:id/build', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/xells/:id/build', async (req, res) => {
-  try { res.json(await buildXell(req.params.id, { hot: !!req.body?.hot })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try {
+    const role = req.body?.role && req.body.role !== 'all' ? req.body.role : null;
+    res.json(await buildXell(req.params.id, { hot: !!req.body?.hot, role }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── reveal a xell's worktree folder in the host file manager (Explorer) ────────

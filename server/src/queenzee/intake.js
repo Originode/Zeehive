@@ -1,11 +1,15 @@
 // Intake router — binds a zee to a ready xell. Two modes, same DB + observability:
 //   skill-claim   : a human's Claude session (via /xell) claims the freshest ready xell
 //   headless-spawn: queenzee spawns a headless zee via the Agent SDK (see spawnHeadless)
+import { resolve } from 'node:path';
 import { q, one } from '../db/pool.js';
+import { config } from '../config.js';
 import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
 import { provisionXell } from '../lib/provision.js';
+import { sessionTitle } from '../lib/session-title.js';
+import { renameXellForTask } from '../lib/rename-xell.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 
@@ -134,13 +138,40 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
 // POST /api/xell/dispatch — the confirmed auto-dispatch path for /xell run OUTSIDE a worktree.
 // The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
 // per the runtime) to run the task. Human confirms in their session before this is called.
-export async function dispatchXell({ xell_id, task, runtime, project }) {
+export async function dispatchXell({ xell_id, task, runtime, project, mode, session_id, title, headless = true, model }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
+  const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   const projectId = project || (await defaultProjectId());
-  const spawned = await spawnHeadless({ projectId, xellId: xell_id || null, task, runtime });
+  // The spawned zee never titles itself, so it takes the DISPATCHING session's title — but
+  // prefixed. Plain inheritance made the two identical in the sidebar: the human clicks the title
+  // expecting the zee and lands on the dispatcher, a dead artifact sitting in the read-only
+  // xource. "xell : X" is the one doing the work; the bare "X" is the launcher.
+  // This exact string is also stored on zee.title, so the sidebar and the XEEHIVE dashboard match.
+  const from = title || (session_id ? sessionTitle(session_id) : null);
+  const inherited = from ? `xell : ${from}` : null;
+
+  // Now that we know the job, give the worktree a human-trackable name — BEFORE spawning, so the
+  // zee's cwd is the final path and Claude Code's sidebar (which names a worktree by its folder)
+  // shows something findable instead of "calm-summit-403da6". Best-effort: if it can't rename
+  // (already built, name taken), the xell just keeps its pooled slug and the dispatch proceeds.
+  if (xell_id && from) await renameXellForTask(xell_id, from);
+
+  const spawned = await spawnHeadless({
+    projectId, xellId: xell_id || null, task, runtime, mode, title: inherited,
+    headless: headless !== false, ...(model ? { model } : {}),
+  });
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
-  logline('intake', `dispatched a zee into ${xell?.slug} to run the task (${runtime || 'default runtime'})`);
-  return { status: 'dispatched', slug: xell?.slug, worktree: xell?.worktree_path, ...spawned };
+
+  // Report only what actually happened — spawnHeadless/spawnRemote await the real start.
+  if (spawned.ok === false) {
+    logline('intake', `dispatch FAILED into ${xell?.slug}: ${spawned.error}`);
+    const err = new Error(spawned.error || 'spawn failed');
+    err.detail = { status: 'dispatch-failed', slug: xell?.slug, zee_id: spawned.zee_id, error: spawned.error };
+    throw err;
+  }
+  logline('intake', `dispatched a zee into ${xell?.slug} — confirmed working (${runtime || 'default runtime'}, mode ${m.key})`);
+  return { status: 'dispatched', slug: xell?.slug, worktree: xell?.worktree_path,
+           mode: m.key, mode_label: m.label, ...spawned };
 }
 
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
@@ -150,6 +181,24 @@ async function bindingFor(xellId, zee, task) {
     `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, uc.relation
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xellId]);
+  // How this zee builds its own app tier — ALWAYS via the queenzee, never by hand. Running
+  // docker/compose/spin-env.sh directly leaves the orchestrator blind (no built-commit, no hot
+  // flag, no health/spinner) and can mangle a container mid-operation.
+  const bs = `node "${resolve(config.repoRoot, 'scripts', 'xell-build.mjs')}"`;
+  const build = {
+    how: 'Build ONLY through the queenzee with these commands. Do NOT run docker, docker compose, '
+       + 'scripts/spin-env.sh, or ad-hoc build scripts yourself.',
+    all: `${bs} ${xell.id} all`,
+    server: `${bs} ${xell.id} server`,
+    webapp: `${bs} ${xell.id} webapp`,
+    hot_suffix: '--hot',
+    semantics: {
+      build: 'rebuilds the image from THIS worktree\'s code and recreates the container — use this to see your changes run',
+      hot: 'append --hot to bounce the container from the existing image (fast, but does NOT pick up code changes — there is no source mount)',
+    },
+    note: 'Builds run in the background and are non-blocking; watch container health on the dashboard (building → up = ok, down = failed).',
+  };
+
   return {
     status: 'claimed', // the gate: the zee may begin work ONLY when this is 'claimed'
     xell: {
@@ -158,20 +207,99 @@ async function bindingFor(xellId, zee, task) {
     },
     zee: { id: zee.id, name: zee.name, viewer_url: zee.viewer_url },
     containers: stack,
+    build,
     task: task || null,
     rules: [
       'Work ONLY inside worktree_path. Never touch the xource (read-only).',
       'Use ONLY your assigned containers/URLs above.',
+      'To run/see your changes, BUILD via the `build` commands above — never run docker, docker compose, or spin-env.sh yourself.',
       'Land locally: commit on your branch, then `git push . HEAD:main`. origin is off-limits.',
     ],
   };
+}
+
+// Dispatch autonomy, 1..5 — how much rope the spawned zee gets. Escalating capability:
+// tools widen and prompting falls away, ending at 5 = no permission prompts at all.
+//
+// NOTE for headless zees: nobody is attached to answer a permission prompt, so modes that can
+// still ask (2–4, on a tool outside their allow-list) will STALL rather than ask. 5 is the one
+// that always runs unattended; 1 is the safe "look, don't touch" recon.
+export const DISPATCH_MODES = {
+  1: { key: 'plan',   permissionMode: 'plan',              tools: ['Read', 'Glob', 'Grep'],                                  label: 'read-only recon — investigates, changes nothing' },
+  2: { key: 'edits',  permissionMode: 'acceptEdits',       tools: ['Read', 'Glob', 'Grep', 'Edit', 'Write'],                 label: 'edit files, no shell' },
+  3: { key: 'shell',  permissionMode: 'acceptEdits',       tools: ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash'],         label: 'edit files + run shell' },
+  4: { key: 'auto',   permissionMode: 'acceptEdits',       tools: null,                                                      label: 'all tools, auto-accept edits' },
+  5: { key: 'bypass', permissionMode: 'bypassPermissions', tools: null,                                                      label: 'bypass all permission prompts (fully unattended)' },
+};
+export function resolveMode(mode) {
+  if (mode === undefined || mode === null || mode === '') return DISPATCH_MODES[5]; // current default
+  const n = Number(mode);
+  if (!Number.isInteger(n) || !DISPATCH_MODES[n]) {
+    throw new Error(`mode must be 1–5 (1=${DISPATCH_MODES[1].key} … 5=${DISPATCH_MODES[5].key})`);
+  }
+  return DISPATCH_MODES[n];
+}
+
+// A dispatched zee never runs the /xell skill, so nothing tells it what it is. Hand it the SAME
+// binding a skill-claim would inline (worktree, containers, build commands, rules) plus the facts
+// of running headless. Without this it gets a bare task string — it doesn't know it's a zee, what
+// it owns, how to build, or that nobody can answer a question, so it researches and then stalls
+// asking "want me to continue?" into a void.
+async function briefing(xellId, zee, task, { headless = true } = {}) {
+  const b = await bindingFor(xellId, zee, task);
+  // Be truthful about who (if anyone) can answer. A dispatched session is still a real session the
+  // human can open and talk to — claiming "nobody can answer you" when they can is a lie that
+  // pushes the zee to guess instead of surfacing a genuine blocker.
+  const running = headless
+    ? [
+      '- UNATTENDED: nobody is watching this run. Do not stop to ask for confirmation or direction —',
+      '  decide, act, and keep going until the job is done.',
+      '- Ambiguity is not a blocker: pick the most reasonable option, note the assumption in your',
+      '  final message, and continue. Research with nothing built is a FAILURE, not a status update.',
+    ]
+    : [
+      '- ATTENDED: nobody is reading this exact turn, but a human CAN open this session and reply.',
+      '  Default to deciding and proceeding — do not idle waiting for input.',
+      '- If you hit a decision that is genuinely load-bearing and you would be guessing (a schema',
+      '  choice, destructive migration, product behaviour), you MAY stop and ask — state the options',
+      '  and your recommendation clearly, then wait. Do the reversible work first regardless.',
+    ];
+  return [
+    'You are a ZEE: an autonomous agent the XEEHIVE queenzee placed in an isolated git worktree',
+    '(a "xell") to do ONE job, start to finish.',
+    '',
+    '## Your binding (authoritative — this is the environment you own)',
+    '```json',
+    JSON.stringify({ xell: b.xell, containers: b.containers, build: b.build }, null, 2),
+    '```',
+    '',
+    '## Rules',
+    ...b.rules.map((r) => `- ${r}`),
+    '',
+    '## How you are running (read this carefully)',
+    ...running,
+    '- Do the work in THIS turn. Background sub-agents can be killed when the turn ends, so do not',
+    '  put the critical path in one and wait on it — read the code yourself with Read/Glob/Grep.',
+    '- Explore the codebase before designing: find the existing patterns and build on them.',
+    '- When the job is done, stop. A human marks it done in the XEEHIVE dashboard — never despawn',
+    '  yourself, and never touch the xource (the read-only main repo).',
+    '',
+    '## Your task',
+    task,
+  ].join('\n');
 }
 
 // headless-spawn — queenzee spawns a zee itself via the Agent SDK, no human click.
 // Binds to a ready xell (cwd = its worktree), injects the opaque task, and drives the
 // stream in the background, updating the zee row as the harness reports. The SAME hooks +
 // poller observe it, so status/telemetry is identical to a skill-claimed zee.
-export async function spawnHeadless({ projectId, xellId, task, runtime, model = 'sonnet' }) {
+// What model a dispatched zee runs. It was hard-defaulted to 'sonnet' while humans drive Opus —
+// so every zee was quietly the weaker model on the hardest, least-supervised work. Override per
+// dispatch, or set ZEE_MODEL. Default is opus: a zee runs unattended with no one to catch it.
+const DEFAULT_ZEE_MODEL = process.env.ZEE_MODEL || 'opus';
+
+export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true }) {
+  const m = resolveMode(mode);
   const pid = projectId || (await defaultProjectId());
   const xell = xellId
     ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId])
@@ -183,40 +311,102 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   const rt = runtime ? await runtimeByKey(runtime) : await runtimeById(cfgRow?.default_runtime_id);
 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
-  if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model });
+  if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });
 
   let sdk;
   try { sdk = await import('@anthropic-ai/claude-agent-sdk'); }
   catch { throw new Error('@anthropic-ai/claude-agent-sdk not installed'); }
 
+  // A zee never auto-titles itself. Always give it one: without a title Claude Code's sidebar
+  // falls back to the worktree folder name ("calm-summit-403da6"), which is unreadable for a
+  // human trying to find their work. Same string goes on zee.title so the dashboard matches.
+  const zeeTitle = title || `xell : ${xell.slug}`;
   const zee = await one(
     `INSERT INTO zee (xell_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
-                      model, permission_mode, cwd)
-     VALUES ($1,'headless-spawn',$2,$3,'spawning','headless','headless-sdk',$4,'bypassPermissions',$5)
+                      model, permission_mode, cwd, title)
+     VALUES ($1,'headless-spawn',$2,$3,'spawning','headless','headless-sdk',$4,$5,$6,$7)
      RETURNING *`,
-    [xell.id, rt?.id || null, rt?.viewer_kind || 'none', model, xell.worktree_path]);
+    [xell.id, rt?.id || null, rt?.viewer_kind || 'none', model, m.permissionMode, xell.worktree_path, zeeTitle]);
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
+  logline('intake', `spawning zee in ${xell.slug} — mode ${m.key} (${m.permissionMode})`);
 
-  // drive the SDK stream in the background — do NOT block the caller
+  const it = sdk.query({
+    prompt: await briefing(xell.id, zee, task, { headless }), // the binding + rules, not a bare task
+    options: {
+      cwd: xell.worktree_path,
+      model,
+      // PROJECT KNOWLEDGE. Set both explicitly — do not rely on SDK defaults. Without them the
+      // zee runs with no CLAUDE.md and no Claude Code system prompt, so it lands in a repo it
+      // knows nothing about and burns its turn asking "where does the HRM module live?".
+      // 'project' is REQUIRED for CLAUDE.md to load.
+      systemPrompt: { type: 'preset', preset: 'claude_code' },
+      settingSources: ['user', 'project', 'local'],
+      permissionMode: m.permissionMode,
+      // The SDK REQUIRES this companion flag for 'bypassPermissions' — without it the bypass is
+      // rejected and the session silently falls back to prompting (shows as "Manual" in the UI),
+      // which is exactly why dispatched zees came up asking for permission.
+      ...(m.permissionMode === 'bypassPermissions' ? { allowDangerouslySkipPermissions: true } : {}),
+      // tools: null → the SDK's full default set (modes 4–5); otherwise the mode's allow-list
+      ...(m.tools ? { allowedTools: m.tools } : {}),
+    },
+  });
+  const iter = it[Symbol.asyncIterator]();
+
+  // AWAIT the first event so we report only what actually happened — a dispatch that says
+  // "spawned" while the agent silently died is worse than an honest failure.
+  let first;
+  try {
+    first = await Promise.race([
+      iter.next(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for the agent to start')), 45000)),
+    ]);
+  } catch (err) {
+    const reason = `headless spawn failed: ${err.message}`;
+    const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
+    broadcast('zee', dead);
+    await releaseXell(xell.id);
+    return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
+  }
+
+  const m0 = first?.value;
+  let sid = (m0?.type === 'system' && m0.subtype === 'init') ? (m0.session_id || m0.data?.session_id) : null;
+
+  // Title the REAL Claude Code session (renameSession appends a custom-title entry to its JSONL).
+  // Without this the spawned session shows as "Untitled" in the sidebar — zee.title only ever
+  // labelled the XEEHIVE dashboard row, not the session itself.
+  // Retry in the background: at init the session's JSONL may not exist yet, so an immediate
+  // rename races file creation and silently loses the title.
+  // Fast backoff, not a flat 1.5s wait: the session's JSONL appears almost immediately, and every
+  // millisecond it sits untitled is a window where the human opens it and sees "Untitled" (the
+  // panel header caches the title at open and won't refresh).
+  if (sid && zeeTitle && typeof sdk.renameSession === 'function') {
+    (async () => {
+      for (let i = 0, wait = 100; i < 12; i++, wait = Math.min(wait * 1.6, 2000)) {
+        try { await sdk.renameSession(sid, zeeTitle); logline('intake', `titled session ${sid.slice(0, 8)} → "${zeeTitle}"`); return; }
+        catch { await new Promise((r) => setTimeout(r, wait)); } // JSONL not written yet — retry
+      }
+      logline('intake', `could not title session ${sid.slice(0, 8)} (renameSession kept failing)`);
+    })();
+  }
+  const { url } = viewerUrlFor(rt, sid, null);
+  const live = await one(
+    `UPDATE zee SET claude_session_id=COALESCE($2, claude_session_id), session_name=COALESCE($2, session_name),
+                    viewer_url=$3, status='working', attached_at=now() WHERE id=$1 RETURNING *`,
+    [zee.id, sid, url]);
+  broadcast('zee', live);
+
+  // drive the REST of the stream in the background — do NOT block the caller
   (async () => {
     try {
-      const it = sdk.query({
-        prompt: task,
-        options: {
-          cwd: xell.worktree_path,
-          model,
-          permissionMode: 'bypassPermissions',
-          allowedTools: ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
-        },
-      });
-      for await (const msg of it) {
-        if (msg?.type === 'system' && (msg.subtype === 'init')) {
-          const sid = msg.session_id || msg.data?.session_id;
-          if (sid) {
-            const { url } = viewerUrlFor(rt, sid, null);
-            await q(`UPDATE zee SET claude_session_id=$2, session_name=$2, viewer_url=$3, status='working', attached_at=now() WHERE id=$1`,
-              [zee.id, sid, url]);
+      for (let n = await iter.next(); !n.done; n = await iter.next()) {
+        const msg = n.value;
+        if (msg?.type === 'system' && msg.subtype === 'init') {
+          const s = msg.session_id || msg.data?.session_id;
+          if (s && s !== sid) {
+            sid = s;
+            const v = viewerUrlFor(rt, s, null);
+            await q(`UPDATE zee SET claude_session_id=$2, session_name=$2, viewer_url=$3 WHERE id=$1`, [zee.id, s, v.url]);
           }
         }
         if (msg?.type === 'result') {
@@ -229,41 +419,50 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
     }
   })();
 
-  return { zee_id: zee.id, xell_id: xell.id, worktree: xell.worktree_path };
+  return { ok: true, zee_id: zee.id, xell_id: xell.id, worktree: xell.worktree_path, session: sid,
+           mode: m.key, permission_mode: m.permissionMode };
+}
+
+// A spawn that failed must hand the xell back — otherwise a dead zee strands it as 'claimed'.
+async function releaseXell(xellId) {
+  const row = await one(`UPDATE xell SET status='ready', is_pooled=true WHERE id=$1 AND status='claimed' RETURNING *`, [xellId]);
+  if (row) broadcast('xell', row);
 }
 
 // REMOTE spawn — runs the literal `claude remote` command (Remote Control). Records the
 // real CLI result; if claude.ai isn't logged in, the zee is marked errored with the CLI's
 // own message (no fabricated success).
-async function spawnRemote({ pid, xell, task, rt, model }) {
+async function spawnRemote({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true }) {
   const name = `xell-${xell.slug}`;
   const zee = await one(
     `INSERT INTO zee (xell_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
-                      model, permission_mode, cwd, remote_ref)
-     VALUES ($1,'headless-spawn',$2,'web','spawning','remote','claude-remote',$3,'bypassPermissions',$4,$5)
+                      model, permission_mode, cwd, remote_ref, title)
+     VALUES ($1,'headless-spawn',$2,'web','spawning','remote','claude-remote',$3,$4,$5,$6,$7)
      RETURNING *`,
-    [xell.id, rt.id, model, xell.worktree_path, name]);
+    [xell.id, rt.id, model, m.permissionMode, xell.worktree_path, name, title || null]);
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
 
-  // run `claude remote start …` in the background — never block the request/event loop
-  (async () => {
-    const res = await remoteStart({ name, prompt: task, cwd: xell.worktree_path, model });
-    if (res.ok) {
-      const viewer = viewerUrlFor(rt, res.sessionId, res.url);
-      const updated = await one(
-        `UPDATE zee SET claude_session_id=$2, session_name=$2, viewer_url=$3, viewer_kind=$4,
-                        status='working', attached_at=now() WHERE id=$1 RETURNING *`,
-        [zee.id, res.sessionId || name, viewer.url, viewer.kind]);
-      broadcast('zee', updated);
-    } else {
-      const reason = res.loggedOut
-        ? 'claude remote: not logged in to claude.ai (Remote Control requires a subscription)'
-        : `claude remote start failed (exit ${res.status}): ${(res.stderr || '').slice(0, 160) || 'no output / timed out'}`;
-      const updated = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason]);
-      broadcast('zee', updated);
-    }
-  })();
+  // AWAIT the real CLI result — never claim a zee started before we've observed it. (remoteStart
+  // is async and fails fast, e.g. when claude.ai isn't logged in.)
+  const res = await remoteStart({ name, prompt: await briefing(xell.id, zee, task, { headless }), cwd: xell.worktree_path, model });
+  if (res.ok) {
+    const viewer = viewerUrlFor(rt, res.sessionId, res.url);
+    const updated = await one(
+      `UPDATE zee SET claude_session_id=$2, session_name=$2, viewer_url=$3, viewer_kind=$4,
+                      status='working', attached_at=now() WHERE id=$1 RETURNING *`,
+      [zee.id, res.sessionId || name, viewer.url, viewer.kind]);
+    broadcast('zee', updated);
+    return { ok: true, zee_id: zee.id, xell_id: xell.id, session: res.sessionId || name,
+             remote: { ran: `claude ${remoteStartArgs({ name, model }).join(' ')}`, started: true } };
+  }
 
-  return { zee_id: zee.id, xell_id: xell.id, remote: { ran: `claude ${remoteStartArgs({ name, model }).join(' ')}`, started: true } };
+  const reason = res.loggedOut
+    ? 'claude remote: not logged in to claude.ai (Remote Control requires a subscription). '
+      + 'Switch the runtime to "Claude Code (local)" or run `claude /login`.'
+    : `claude remote start failed (exit ${res.status}): ${(res.stderr || '').slice(0, 160) || 'no output / timed out'}`;
+  const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
+  broadcast('zee', dead);
+  await releaseXell(xell.id); // a dead zee must not hold the xell hostage
+  return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
 }

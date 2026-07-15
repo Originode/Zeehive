@@ -4,6 +4,9 @@
 import http from 'node:http';
 
 const api = process.env.XEEHIVE_API || 'http://localhost:4700';
+// The task is intentionally NOT an argument: the skill interpolates it into a shell line, and real
+// task text (backticks, quotes, $) breaks bash before this script ever runs. Claiming doesn't need
+// it — the task reaches the queenzee via --task-file on dispatch, or the model just does the work.
 const task = process.argv[2] || '';
 const body = JSON.stringify({
   session_id: process.env.CLAUDE_CODE_SESSION_ID || '',
@@ -29,12 +32,28 @@ const req = http.request(`${api}/api/xell/claim`, {
 Do not read/edit/write any files here (it is the read-only xource).
 
 RECOMMENDED — dispatch this task to a ready xell. The queenzee will spawn a zee INSIDE its
-worktree to do the work. CONFIRM WITH THE USER first, then run this exact command:
+worktree to do the work. CONFIRM WITH THE USER first, then:
 
-    node "${home}/scripts/xell-dispatch.mjs" ${d.xell_id || ''} ${JSON.stringify(task)}
+  1. WRITE the full task text to a file using the Write tool (NOT the shell — task text contains
+     backticks/quotes/$ that break bash):   <tmp>/xell-task.md
+  2. RUN:
+     node "${home}/scripts/xell-dispatch.mjs" ${d.xell_id || ''} --task-file "<tmp>/xell-task.md"
 
     → target xell : ${d.slug || '?'}   (runtime: ${d.runtime_label || 'default'})
     → worktree    : ${d.worktree_path || '?'}
+
+    Autonomy (optional, append --mode N; default 5):
+      1 plan   read-only recon — changes nothing      3 shell  edit + run shell
+      2 edits  edit files, no shell                   4 auto   all tools, auto-accept edits
+      5 bypass no permission prompts at all (default; the only one that never stalls unattended)
+    Ask the user which mode they want if the task looks risky.
+
+    Attended? (optional, append --attended)
+      default    the zee is told to decide and keep going without asking (fire-and-forget).
+      --attended the zee is told a human CAN open its session and reply, so it may stop and ask
+                 on a genuinely load-bearing decision instead of guessing.
+    The spawned session IS openable either way — this only sets what the zee is TOLD.
+    Ask the user which they want when the task has real unknowns.
 
 ALTERNATIVE — open the worktree yourself and run /xell there:
     ${j.open_worktree}   (${j.open_slug})

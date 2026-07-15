@@ -339,9 +339,11 @@ function XellCard({ x, diff, onDone, onMenu }) {
         {!isProd && <Row k="commit" v={x.head_commit ? x.head_commit.slice(0, 8) : '—'} mono testid="commit-head" />}
         {!isProd && (
           <div className="row"><span className="rk">diff</span>
-            <span className="diff" data-testid="diff">
+            <span className="diff" data-testid="diff"
+                  title={diff ? `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted)${diff.dirty ? `\n${diff.dirty} uncommitted file(s) in the worktree` : ''}` : ''}>
               {diff
-                ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span></>
+                ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span>
+                    {diff.dirty > 0 && <span className="dirty" data-testid="dirty" title={`${diff.dirty} uncommitted file(s)`}> ●{diff.dirty}</span>}</>
                 : '—'}
             </span>
           </div>

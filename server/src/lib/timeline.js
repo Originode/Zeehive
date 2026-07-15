@@ -1,19 +1,31 @@
 // Builds the git-timeline payload the web app renders on the left rail, plus each xell's
 // anchor commit (its worktree base) so the frontend can draw a connector to the card.
+import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
-import { gitLog, diffStat } from './git.js';
+import { gitLog, diffStat, worktreeDiff } from './git.js';
 import { defaultProject } from './fleet.js';
 
 // Per-xell divergence vs its tracked xource (ahead/behind + shortstat).
+//
+// Measured from the WORKTREE, not from the stored head_commit. head_commit is the commit the xell
+// was provisioned at — the same value for every xell cut from one tip — so diffing it against main
+// made every card show an identical number and hid the zee's actual work entirely (a zee could
+// commit, or have a dirty tree, and the card never moved). Falls back to the old base-vs-source
+// comparison only when there is no worktree on disk (simulate mode).
 export async function getDiffs(projectId) {
   const project = projectId ? await one(`SELECT * FROM project WHERE id=$1`, [projectId]) : await defaultProject();
   if (!project) return {};
   const branch = project.main_branch || 'main';
   const xells = await q(
-    `SELECT id, head_commit FROM xell WHERE project_id=$1 AND status<>'retired' AND NOT is_production`,
+    `SELECT id, head_commit, worktree_path FROM xell
+       WHERE project_id=$1 AND status<>'retired' AND NOT is_production`,
     [project.id]);
   const out = {};
-  for (const x of xells) out[x.id] = x.head_commit ? diffStat(project.repo_root, x.head_commit, branch) : null;
+  for (const x of xells) {
+    out[x.id] = x.worktree_path && existsSync(x.worktree_path)
+      ? worktreeDiff(x.worktree_path, branch)
+      : (x.head_commit ? diffStat(project.repo_root, x.head_commit, branch) : null);
+  }
   return out;
 }
 

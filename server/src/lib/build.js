@@ -1,8 +1,11 @@
-// Container build — (re)build a per-xell server/webapp container from its worktree code, and
-// record what commit it was built at + whether it was a HOT build. The docker work lives in
-// scripts/build-container.sh (queenzee-run); this projector schedules it and persists the result.
-// BUILD_MODE=real runs docker compose; default 'simulate' records the build with no side effects.
-import { spawnSync } from 'node:child_process';
+// Container build — a REAL `docker compose build` + `up -d` of a per-xell server/webapp from its
+// worktree code, recording the commit it was built at and whether it was a HOT build. The docker
+// work lives in scripts/build-container.sh (queenzee-run, mirroring the project's spin-env.sh).
+//
+// Builds take MINUTES, so this never blocks: the container flips to health='building' (the UI
+// shows a spinner), the build runs via async spawn, and the row + SSE update when it finishes.
+// BUILD_MODE=simulate opts out of Docker entirely (demo escape hatch); default is REAL.
+import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
@@ -10,57 +13,71 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 
-const MODE = process.env.BUILD_MODE === 'real' ? 'real' : 'simulate';
+const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
 
-function runBuild({ worktree, service, ctx, project, file, hot }) {
-  const script = resolve(config.repoRoot, 'scripts', 'build-container.sh');
-  const r = spawnSync('bash',
-    [script, worktree, service, ctx || 'ugreen-nas', project || '', file || '', MODE, hot ? 'true' : 'false'],
-    { encoding: 'utf8', timeout: 600000, windowsHide: true, env: cleanGitEnv() });
-  const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
-  try { return JSON.parse(line); } catch { return null; }
+// Async spawn (NOT spawnSync) — a real image build would otherwise freeze the event loop.
+function runBuild({ worktree, role, ctx, hot }) {
+  return new Promise((res) => {
+    const script = resolve(config.repoRoot, 'scripts', 'build-container.sh');
+    const p = spawn('bash', [script, worktree, role, ctx || 'ugreen-nas', hot ? 'true' : 'false', MODE],
+      { env: cleanGitEnv(), windowsHide: true });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (err += d));
+    p.on('close', () => {
+      const line = out.trim().split('\n').filter(Boolean).pop();
+      let json = null; try { json = JSON.parse(line); } catch { /* no JSON line */ }
+      res({ json, err: err.slice(-1500) });
+    });
+    p.on('error', (e) => res({ json: null, err: String(e.message) }));
+  });
 }
 
-// Build one container. Returns the updated container row, or throws with a clear reason.
+// Kick off a build. Returns as soon as it's queued (health='building'); the row updates live.
 export async function buildContainer(containerId, { hot = false } = {}) {
   const c = await one(`SELECT * FROM container WHERE id=$1`, [containerId]);
   if (!c) throw new Error('container not found');
   if (!BUILDABLE.has(c.role)) throw new Error(`role '${c.role}' is not buildable (only server/webapp)`);
   if (!c.owner_xell_id) throw new Error('not a per-xell container');
+  if (c.health === 'building') throw new Error(`${c.name} is already building`);
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [c.owner_xell_id]);
   if (!xell?.worktree_path) throw new Error('owner xell has no worktree');
 
-  // building…
-  await one(`UPDATE container SET health='building' WHERE id=$1 RETURNING id`, [containerId])
-    .then((r) => r && broadcast('container', { id: containerId, health: 'building' }));
+  const building = await one(`UPDATE container SET health='building' WHERE id=$1 RETURNING *`, [containerId]);
+  broadcast('container', building);
+  logline('build', `${hot ? 'HOT ' : ''}build started: ${c.name} (${MODE}) from ${xell.slug}`);
 
-  const res = runBuild({
-    worktree: xell.worktree_path, service: c.name, ctx: c.docker_ctx,
-    project: c.compose_project, file: c.compose_file, hot,
-  });
-  const ok = !!res && res.ok !== false;
+  // background — do NOT await; a real build takes minutes
+  (async () => {
+    const { json, err } = await runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot });
+    const ok = !!json && json.ok !== false;
+    const row = await one(
+      `UPDATE container
+          SET health = $2::container_health, hot_build = $3,
+              last_build_commit = COALESCE($4, last_build_commit),
+              last_built_at = CASE WHEN $5 THEN now() ELSE last_built_at END
+        WHERE id=$1 RETURNING *`,
+      [containerId, ok ? 'up' : 'down', !!hot && ok, json?.head && json.head !== 'unknown' ? json.head : null, ok]);
+    broadcast('container', row);
+    logline('build', ok
+      ? `${hot ? 'HOT ' : ''}build OK: ${c.name} @ ${json?.head} (${json?.method})`
+      : `build FAILED: ${c.name} — ${(err || 'see docker output').split('\n').filter(Boolean).pop()}`);
+  })();
 
-  const row = await one(
-    `UPDATE container
-        SET health = $2::container_health,
-            hot_build = $3,
-            last_build_commit = COALESCE($4, last_build_commit),
-            last_built_at = now()
-      WHERE id=$1 RETURNING *`,
-    [containerId, ok ? 'up' : 'down', !!hot, res?.head && res.head !== 'unknown' ? res.head : null]);
-  broadcast('container', row);
-  logline('build', `${hot ? 'HOT ' : ''}build ${c.name} (${MODE}/${res?.method || '?'}) @ ${res?.head || '?'} → ${ok ? 'up' : 'FAILED'}`);
-  if (!ok) throw new Error(`build failed for ${c.name}`);
-  return row;
+  return { status: 'building', container: c.name, role: c.role, hot, mode: MODE };
 }
 
-// Build every buildable (server + webapp) container owned by a xell.
-export async function buildXell(xellId, { hot = false } = {}) {
+// Build a xell's buildable containers. role=null → both (server + webapp); otherwise just that
+// one. This is the sanctioned entry point for a zee: it goes through the queenzee, so the commit,
+// hot flag, health and dashboard all stay truthful.
+export async function buildXell(xellId, { hot = false, role = null } = {}) {
+  if (role && !BUILDABLE.has(role)) throw new Error(`role '${role}' is not buildable (server|webapp|all)`);
   const cs = await q(
     `SELECT id FROM container WHERE owner_xell_id=$1 AND role = ANY($2) ORDER BY role`,
-    [xellId, [...BUILDABLE]]);
-  const built = [];
-  for (const c of cs) built.push(await buildContainer(c.id, { hot }));
-  return built;
+    [xellId, role ? [role] : [...BUILDABLE]]);
+  if (!cs.length) throw new Error(`xell has no buildable ${role || 'server/webapp'} container`);
+  const started = [];
+  for (const c of cs) started.push(await buildContainer(c.id, { hot }).catch((e) => ({ error: e.message })));
+  return started;
 }

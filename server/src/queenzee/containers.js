@@ -57,8 +57,12 @@ export async function checkContainers() {
   // one script run over every distinct context (queenzee's deterministic probe)
   const psByCtx = probeContexts([...new Set(containers.map((c) => c.docker_ctx))]);
 
-  let up = 0, down = 0, unknown = 0, changed = 0;
+  let up = 0, down = 0, unknown = 0, changed = 0, busy = 0;
   for (const c of containers) {
+    // A build owns the 'building' state — don't clobber it from `docker ps`. Mid-build the old
+    // container may still be Up (or already gone), and overwriting it would kill the UI spinner
+    // and lie about what's happening. buildContainer sets the real health when it finishes.
+    if (c.health === 'building') { busy++; continue; }
     const ps = psByCtx[c.docker_ctx];
     let health;
     if (ps == null) health = 'unknown';                 // unreachable daemon — don't claim 'down'
@@ -77,8 +81,8 @@ export async function checkContainers() {
     }
   }
   const unreach = Object.entries(psByCtx).filter(([, m]) => m == null).map(([k]) => k);
-  logline('containers', `docker health: ${up} up · ${down} down · ${unknown} unknown${unreach.length ? ` (unreachable: ${unreach.join(', ')})` : ''}${changed ? ` · ${changed} changed` : ''}`);
-  return { up, down, unknown, changed, unreachable: unreach };
+  logline('containers', `docker health: ${up} up · ${down} down · ${unknown} unknown${busy ? ` · ${busy} building (skipped)` : ''}${unreach.length ? ` (unreachable: ${unreach.join(', ')})` : ''}${changed ? ` · ${changed} changed` : ''}`);
+  return { up, down, unknown, changed, building: busy, unreachable: unreach };
 }
 
 export function startContainerMonitor() {
