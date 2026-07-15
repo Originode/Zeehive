@@ -5,7 +5,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-const API = process.env.ZEEHIVE_API || process.env.ZEEHIVE_API || 'http://localhost:4700';
+const API = process.env.ZEEHIVE_API || 'http://localhost:4700';
 const SID = () => process.env.CLAUDE_CODE_SESSION_ID || '';
 
 async function call(method, path, body) {
