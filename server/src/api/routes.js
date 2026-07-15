@@ -14,6 +14,7 @@ import { checkContainers } from '../queenzee/containers.js';
 import { buildContainer, buildXell } from '../lib/build.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
+import { attachXellDb, DB_MODES } from '../lib/xell-db.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
 import { acquireProdLock, releaseProdLock, prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
@@ -85,6 +86,15 @@ router.post('/xell/dispatch', async (req, res) => {
   try { res.json(await dispatchXell(req.body || {})); }
   catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
 });
+// Re-point a xell's database: { coupling: db-shared-dev|db-shared-prod|db-isolated,
+// container: <name|id>, dump: <snapshot id|'latest'> }. db-shared-prod is LIVE production.
+router.post('/xells/:id/db', async (req, res) => {
+  try { res.json(await attachXellDb(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.get('/xell/db-modes', (_req, res) =>
+  res.json(Object.entries(DB_MODES).map(([key, label]) => ({ key, label }))));
+
 // the autonomy scale a dispatch can pick from (1=recon … 5=bypass)
 router.get('/xell/modes', (_req, res) =>
   res.json(Object.entries(DISPATCH_MODES).map(([n, m]) => ({ mode: Number(n), key: m.key, permission_mode: m.permissionMode, tools: m.tools || 'all', label: m.label }))));

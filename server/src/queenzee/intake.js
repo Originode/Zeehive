@@ -10,6 +10,7 @@ import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
 import { provisionXell } from '../lib/provision.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { renameXellForTask } from '../lib/rename-xell.js';
+import { attachXellDb } from '../lib/xell-db.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 
@@ -138,7 +139,8 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
 // POST /api/xell/dispatch — the confirmed auto-dispatch path for /xell run OUTSIDE a worktree.
 // The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
 // per the runtime) to run the task. Human confirms in their session before this is called.
-export async function dispatchXell({ xell_id, task, runtime, project, mode, session_id, title, headless = true, model }) {
+export async function dispatchXell({ xell_id, task, runtime, project, mode, session_id, title,
+                                     headless = true, model, db, db_container, dump }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   const projectId = project || (await defaultProjectId());
@@ -160,6 +162,13 @@ export async function dispatchXell({ xell_id, task, runtime, project, mode, sess
   // shows something findable instead of "calm-summit-403da6". Best-effort: if it can't rename
   // (already built, name taken), the xell just keeps its pooled slug and the dispatch proceeds.
   if (targetId && from) await renameXellForTask(targetId, from);
+
+  // Point the xell at the right database BEFORE the zee starts — a pooled xell comes up on the
+  // shared dev db, so "start from the latest prod dump" or "hotfix against prod" must be attached
+  // now or the zee spends its turn on the wrong data.
+  if (targetId && (db || db_container || dump)) {
+    await attachXellDb(targetId, { coupling: db, container: db_container, dump });
+  }
 
   const spawned = await spawnHeadless({
     projectId, xellId: targetId, task, runtime, mode, title: inherited,
@@ -225,6 +234,16 @@ async function bindingFor(xellId, zee, task) {
     rules: [
       'Work ONLY inside worktree_path. Never touch the xource (read-only).',
       'Use ONLY your assigned containers/URLs above.',
+      ...(xell.db_coupling === 'db-shared-prod'
+        ? ['⚠ YOUR DATABASE IS LIVE PRODUCTION (db_coupling=db-shared-prod). Every write is real and '
+         + 'irreversible — there is no undo and no snapshot between you and an outage. Read freely; '
+         + 'before ANY write or migration, state exactly what it will change and get a human to agree. '
+         + 'Never run a destructive statement to "test" something.']
+        : []),
+      ...(xell.db_coupling === 'db-isolated'
+        ? ['Your database is your OWN container, restored from a dump — it is a copy, so you may '
+         + 'migrate/seed/destroy it freely. Nothing you do to it touches dev or prod.']
+        : []),
       'To run/see your changes, BUILD via the `build` commands above — never run docker, docker compose, or spin-env.sh yourself.',
       'Land locally: commit on your branch, then `git push . HEAD:main`. origin is off-limits.',
     ],

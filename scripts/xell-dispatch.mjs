@@ -37,6 +37,15 @@ const mode = takeFlag('mode');
 const taskFile = takeFlag('task-file');
 // --model: zees default to opus (they run unattended). Pass sonnet for cheap/simple jobs.
 const model = takeFlag('model');
+// Which database the zee works against (default: the shared dev db).
+//   --db shared-dev | shared-prod | isolated
+//   --dump latest|<snapshot-id>   with --db isolated: its own postgres restored from that dump
+//   --db-container <name|id>      attach a specific db container outright
+// --db shared-prod is LIVE PRODUCTION: writes are real and irreversible.
+const dbArg = takeFlag('db');
+const dump = takeFlag('dump');
+const dbContainer = takeFlag('db-container');
+const db = dbArg ? (dbArg.startsWith('db-') ? dbArg : `db-${dbArg}`) : (dump ? 'db-isolated' : undefined);
 // --attended: the zee is told a human CAN open the session and answer, so it may stop and ask on a
 // genuinely load-bearing decision. Default (unattended) tells it to decide and keep going.
 const attended = argv.includes('--attended');
@@ -62,7 +71,13 @@ const body = JSON.stringify({
   ...(attended ? { headless: false } : {}),
   ...(mode ? { mode } : {}),
   ...(model ? { model } : {}),
+  ...(db ? { db } : {}),
+  ...(dump ? { dump } : {}),
+  ...(dbContainer ? { db_container: dbContainer } : {}),
 });
+if (db === 'db-shared-prod' || /(^|_)prod/.test(dbContainer || '')) {
+  console.log('⚠ This dispatch attaches the LIVE PRODUCTION database. The zee\'s writes are real and irreversible.');
+}
 const req = http.request(`${api}/api/xell/dispatch`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
