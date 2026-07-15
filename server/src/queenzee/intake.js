@@ -11,6 +11,7 @@ import { provisionXell } from '../lib/provision.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { renameXellForTask } from '../lib/rename-xell.js';
 import { attachXellDb } from '../lib/xell-db.js';
+import { resolveProjectId } from '../lib/project-resolve.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 
@@ -35,6 +36,9 @@ function readyXellForCwd(ready, cwd) {
   return ready.find((x) => norm(x.worktree_path) === target) || null;
 }
 
+// Last-resort default, for internal callers that genuinely have no project signal (the task
+// poller). Intake never uses it: claim/dispatch resolve from the invoker's cwd instead, because
+// "oldest project row" silently means OmniBiz even when you are standing in XeeHive.
 async function defaultProjectId() {
   const p = await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`);
   return p?.id;
@@ -51,8 +55,8 @@ class NeedsWorktree extends Error {
 // ready xell's worktree. Anything else refuses: a session in the xource (main repo) or a
 // foreign worktree would edit the wrong tree, defeating isolation.
 export async function claimXell({ session_id, cwd, task, runtime, project }) {
-  const projectId = project || (await defaultProjectId());
-  if (!projectId) throw new Error('no project configured');
+  // The invoker hands over its project: explicit `project`, else the repo/worktree its cwd is in.
+  const projectId = await resolveProjectId({ project, cwd });
 
   // idempotent: if this session already owns a live zee, return its (already-claimed) binding
   const existing = await one(
@@ -76,10 +80,14 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
     // resolve the runtime the queenzee would spawn (the pool default / UI runtime toggle)
     const pcfg = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id=$1`, [projectId]);
     const drt = await runtimeById(pcfg?.default_runtime_id);
-    logline('intake', `claim refused (not in worktree) — offering dispatch to ${open.slug} (${drt?.label || 'default'})`);
+    const proj = await one(`SELECT name, repo_root FROM project WHERE id=$1`, [projectId]);
+    logline('intake', `claim refused (not in worktree) — offering dispatch to ${open.slug} in ${proj?.name} (${drt?.label || 'default'})`);
     throw new NeedsWorktree({
       needs_worktree: true,
       can_dispatch: true,
+      // Which project the caller's cwd resolved to — the human confirming the dispatch must be
+      // able to see it landed on the right repo before saying yes.
+      project: { id: projectId, name: proj?.name, repo_root: proj?.repo_root },
       // the recommended path: queenzee spawns a zee INTO this worktree (human confirms first)
       dispatch: {
         xell_id: open.id, slug: open.slug, worktree_path: open.worktree_path,
@@ -139,11 +147,13 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
 // POST /api/xell/dispatch — the confirmed auto-dispatch path for /xell run OUTSIDE a worktree.
 // The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
 // per the runtime) to run the task. Human confirms in their session before this is called.
-export async function dispatchXell({ xell_id, task, runtime, project, mode, session_id, title,
+export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
                                      headless = true, model, db, db_container, dump }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
-  const projectId = project || (await defaultProjectId());
+  // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
+  // cwd cannot contradict the worktree the zee will actually run in.
+  const projectId = await resolveProjectId({ project, cwd, xell_id });
   // The spawned zee never titles itself, so it takes the DISPATCHING session's title — but
   // prefixed. Plain inheritance made the two identical in the sidebar: the human clicks the title
   // expecting the zee and lands on the dispatcher, a dead artifact sitting in the read-only

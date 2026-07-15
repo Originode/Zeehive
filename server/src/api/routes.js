@@ -77,6 +77,8 @@ router.post('/xell/claim', async (req, res) => {
   } catch (err) {
     // Not standing in a worktree → 409 with actionable detail; no claim, so no work begins.
     if (err.code === 'NEEDS_WORKTREE') return res.status(409).json({ status: 'needs-worktree', ...err.detail });
+    // The invoker's cwd is in no known project → refuse rather than guess one for it.
+    if (err.code === 'UNKNOWN_PROJECT') return res.status(409).json({ ...err.detail, error: err.message });
     res.status(409).json({ status: 'error', error: err.message });
   }
 });

@@ -2,8 +2,10 @@
 // outside a worktree). Tells the queenzee to spawn a zee INTO a ready xell's worktree to run
 // the task, and prints the result.
 //
-//   xell-dispatch.mjs <xell_id> --task-file <path> [--mode 1..5]     ← PREFERRED
+//   xell-dispatch.mjs <xell_id> --task-file <path> [--mode 1..5] [--project <name>]  ← PREFERRED
 //   xell-dispatch.mjs <xell_id> "<task>"           [--mode 1..5]     (only for trivial text)
+//
+// The project comes from this process's cwd (the invoking session's repo), or --project.
 //
 // Use --task-file for anything real. A task description typically contains backticks, quotes and
 // `$`; passing it as a shell argument gets mangled or fails outright ("unexpected EOF while
@@ -42,6 +44,11 @@ const model = takeFlag('model');
 //   --dump latest|<snapshot-id>   with --db isolated: its own postgres restored from that dump
 //   --db-container <name|id>      attach a specific db container outright
 // --db shared-prod is LIVE PRODUCTION: writes are real and irreversible.
+// --project <name|id>: which project to dispatch into. Normally unnecessary — the queenzee
+// resolves it from this process's cwd (the invoking session's repo/worktree). Pass it when the
+// session is outside any managed repo, or to dispatch into a project you are not standing in.
+// A named <xell_id> always wins: its own project is a fact, not an inference.
+const project = takeFlag('project') || process.env.XEEHIVE_PROJECT;
 const dbArg = takeFlag('db');
 const dump = takeFlag('dump');
 const dbContainer = takeFlag('db-container');
@@ -68,6 +75,9 @@ const body = JSON.stringify({
   xell_id: xellId || undefined,
   task,
   session_id: process.env.CLAUDE_CODE_SESSION_ID || undefined,
+  // the project handover: where the invoking session is standing
+  cwd: process.cwd(),
+  ...(project ? { project } : {}),
   ...(attended ? { headless: false } : {}),
   ...(mode ? { mode } : {}),
   ...(model ? { model } : {}),

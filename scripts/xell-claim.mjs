@@ -1,6 +1,10 @@
 // Called by the /xell skill at load time. Claims the freshest ready xell for THIS
 // Claude session and prints the binding JSON, which the skill inlines into the prompt.
 // Uses only ambient signals: $CLAUDE_CODE_SESSION_ID and the session cwd.
+//
+// The cwd is also the PROJECT handover: the queenzee resolves which project you are in from it
+// (repo_root / xell worktree) instead of defaulting to the oldest project row. XEEHIVE_PROJECT
+// overrides it when a session runs outside any managed repo.
 import http from 'node:http';
 
 const api = process.env.XEEHIVE_API || 'http://localhost:4700';
@@ -11,6 +15,7 @@ const task = process.argv[2] || '';
 const body = JSON.stringify({
   session_id: process.env.CLAUDE_CODE_SESSION_ID || '',
   cwd: process.cwd(),
+  ...(process.env.XEEHIVE_PROJECT ? { project: process.env.XEEHIVE_PROJECT } : {}),
   task,
 });
 
@@ -22,6 +27,22 @@ const req = http.request(`${api}/api/xell/claim`, {
   res.on('data', (c) => (b += c));
   res.on('end', () => {
     let j; try { j = JSON.parse(b); } catch { /* non-JSON */ }
+    if (j && j.status === 'unknown-project') {
+      // Refusing beats guessing: the old default silently handed out an OmniBiz xell to a session
+      // standing in a different repo.
+      const list = (j.projects || []).map((p) => `    • ${p.name}  (${p.repo_root})`).join('\n');
+      console.log(
+`NOT CLAIMED — the queenzee cannot tell which project this session belongs to.
+Your cwd (${j.your_cwd || '?'}) is not inside any managed repo or xell worktree.
+
+Do not start any work. Ask the user which project this is, then re-run with it named:
+
+  XEEHIVE_PROJECT="<name>" node "${process.env.XEEHIVE_HOME || 'D:/Repos/Xeehive'}/scripts/xell-claim.mjs"
+
+Known projects:
+${list || '    (none configured)'}`);
+      process.exit(0);
+    }
     if (j && j.status === 'needs-worktree') {
       // Not in a worktree → NOT claimed. Offer the confirmed auto-dispatch path.
       const d = j.dispatch || {};
@@ -39,8 +60,12 @@ worktree to do the work. CONFIRM WITH THE USER first, then:
   2. RUN:
      node "${home}/scripts/xell-dispatch.mjs" ${d.xell_id || ''} --task-file "<tmp>/xell-task.md"
 
+    → project     : ${j.project?.name || '?'}   (${j.project?.repo_root || '?'})
     → target xell : ${d.slug || '?'}   (runtime: ${d.runtime_label || 'default'})
     → worktree    : ${d.worktree_path || '?'}
+
+    The project came from your cwd. If it is the WRONG project, stop and tell the user —
+    re-run with XEEHIVE_PROJECT="<name>" rather than dispatching into the wrong repo.
 
     Autonomy (optional, append --mode N; default 5):
       1 plan   read-only recon — changes nothing      3 shell  edit + run shell
