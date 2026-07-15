@@ -5,9 +5,9 @@ allowed-tools: Bash
 ---
 
 The user invoked `/xell-done`. Here is the **current status** of the xell this session is the
-zee of (fetched live from the XEEHIVE API):
+zee of (fetched live from the ZEEHIVE API):
 
-!`node "${XEEHIVE_HOME:-D:/Repos/Xeehive}/scripts/xell-status.mjs"`
+!`node "${ZEEHIVE_HOME:-D:/Repos/Zeehive}/scripts/xell-status.mjs"`
 
 ## How "done" works here
 
@@ -23,7 +23,7 @@ Verify your work first (build/tests pass, changes committed and landed to local 
 your xell rules). Then report it for confirmation:
 
 ```bash
-node "${XEEHIVE_HOME:-D:/Repos/Xeehive}/scripts/xell-report-done.mjs" "one-line summary of what you finished"
+node "${ZEEHIVE_HOME:-D:/Repos/Zeehive}/scripts/xell-report-done.mjs" "one-line summary of what you finished"
 ```
 
 Then tell the user you've reported the job as finished and are awaiting their confirmation.

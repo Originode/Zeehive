@@ -1,6 +1,6 @@
 ---
 name: xell
-description: Claim a ready xell environment from the queenzee and work on it as its zee. Use when the user types "/xell <task>" — pulls the isolated worktree + its assigned containers from the XEEHIVE API and binds this session to it.
+description: Claim a ready xell environment from the queenzee and work on it as its zee. Use when the user types "/xell <task>" — pulls the isolated worktree + its assigned containers from the ZEEHIVE API and binds this session to it.
 argument-hint: <what you want done in the xell>
 allowed-tools: Bash Read Edit Write Glob Grep
 ---
@@ -8,7 +8,7 @@ allowed-tools: Bash Read Edit Write Glob Grep
 The user invoked `/xell`. Below is the **live binding** for the xell this session is now
 the **zee** of — fetched from the queenzee API at load time (not from memory):
 
-!`node "${XEEHIVE_HOME:-D:/Repos/Xeehive}/scripts/xell-claim.mjs" "$ARGUMENTS"`
+!`node "${ZEEHIVE_HOME:-D:/Repos/Zeehive}/scripts/xell-claim.mjs" "$ARGUMENTS"`
 
 ## You are now this xell's zee
 
@@ -22,7 +22,7 @@ Act on the binding above:
 - **Land locally:** commit on your branch, then `git push . HEAD:main`. `origin` is
   off-limits (stale by design) — never fetch/pull/push origin, ignore any "Create PR" chip.
 - If a **production** deploy is needed, follow the deploy-guard protocol before deploying.
-- When the work is done, the **human** marks the task done in the XEEHIVE web app; that is
+- When the work is done, the **human** marks the task done in the ZEEHIVE web app; that is
   what tells the queenzee to tear this xell down. You do not despawn yourself.
 
 Now do the task described in `task` (and `$ARGUMENTS`).

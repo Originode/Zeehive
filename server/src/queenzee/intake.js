@@ -38,7 +38,7 @@ function readyXellForCwd(ready, cwd) {
 
 // Last-resort default, for internal callers that genuinely have no project signal (the task
 // poller). Intake never uses it: claim/dispatch resolve from the invoker's cwd instead, because
-// "oldest project row" silently means OmniBiz even when you are standing in XeeHive.
+// "oldest project row" silently means OmniBiz even when you are standing in ZeeHive.
 async function defaultProjectId() {
   const p = await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`);
   return p?.id;
@@ -158,7 +158,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // prefixed. Plain inheritance made the two identical in the sidebar: the human clicks the title
   // expecting the zee and lands on the dispatcher, a dead artifact sitting in the read-only
   // xource. "xell : X" is the one doing the work; the bare "X" is the launcher.
-  // This exact string is also stored on zee.title, so the sidebar and the XEEHIVE dashboard match.
+  // This exact string is also stored on zee.title, so the sidebar and the ZEEHIVE dashboard match.
   const from = title || (session_id ? sessionTitle(session_id) : null);
   const inherited = from ? `xell : ${from}` : null;
 
@@ -307,7 +307,7 @@ async function briefing(xellId, zee, task, { headless = true } = {}) {
       '  and your recommendation clearly, then wait. Do the reversible work first regardless.',
     ];
   return [
-    'You are a ZEE: an autonomous agent the XEEHIVE queenzee placed in an isolated git worktree',
+    'You are a ZEE: an autonomous agent the ZEEHIVE queenzee placed in an isolated git worktree',
     '(a "xell") to do ONE job, start to finish.',
     '',
     '## Your binding (authoritative — this is the environment you own)',
@@ -323,7 +323,7 @@ async function briefing(xellId, zee, task, { headless = true } = {}) {
     '- Do the work in THIS turn. Background sub-agents can be killed when the turn ends, so do not',
     '  put the critical path in one and wait on it — read the code yourself with Read/Glob/Grep.',
     '- Explore the codebase before designing: find the existing patterns and build on them.',
-    '- When the job is done, stop. A human marks it done in the XEEHIVE dashboard — never despawn',
+    '- When the job is done, stop. A human marks it done in the ZEEHIVE dashboard — never despawn',
     '  yourself, and never touch the xource (the read-only main repo).',
     '',
     '## Your task',
@@ -419,7 +419,7 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 
   // Title the REAL Claude Code session (renameSession appends a custom-title entry to its JSONL).
   // Without this the spawned session shows as "Untitled" in the sidebar — zee.title only ever
-  // labelled the XEEHIVE dashboard row, not the session itself.
+  // labelled the ZEEHIVE dashboard row, not the session itself.
   // Retry in the background: at init the session's JSONL may not exist yet, so an immediate
   // rename races file creation and silently loses the title.
   // Fast backoff, not a flat 1.5s wait: the session's JSONL appears almost immediately, and every

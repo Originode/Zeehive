@@ -62,7 +62,7 @@ async function seedDemo() {
   // can prove it distinguishes really-active from the fabricated sessions on the others.
   // Pin this local "working" zee to a REAL live session so the monitor genuinely shows
   // "● really active" AND the desktop deep-link opens a sensible session. Prefer THIS
-  // Xeehive session (when it's live) over an arbitrary borrowed agent, so clicking the card
+  // Zeehive session (when it's live) over an arbitrary borrowed agent, so clicking the card
   // never hijacks an unrelated project's Claude session; fall back to any live agent, then a stub.
   const live = listActiveAgents().agents.map((a) => a.sessionId);
   const self = process.env.CLAUDE_CODE_SESSION_ID;

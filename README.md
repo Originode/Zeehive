@@ -1,4 +1,4 @@
-# XEEHIVE
+# ZEEHIVE
 
 Deterministic agent-environment orchestrator.
 

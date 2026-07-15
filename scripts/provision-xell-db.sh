@@ -26,7 +26,7 @@ export MSYS2_ARG_CONV_EXCL='*'
 
 NAME="${1:?name}"; CTX="${2:?docker ctx}"; IMAGE="${3:?image}"
 DUMP="${4:-}"; DBUSER="${5:-postgres}"; DBNAME="${6:-omnibiz}"
-PW="${XEEHIVE_SPIN_DB_PASSWORD:-omnibiz}"
+PW="${ZEEHIVE_SPIN_DB_PASSWORD:-omnibiz}"
 PORT=0
 ERR=""
 

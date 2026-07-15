@@ -10,7 +10,7 @@
 // This checks for unlanded work first and refuses unless you pass --force.
 import http from 'node:http';
 
-const api = process.env.XEEHIVE_API || 'http://localhost:4700';
+const api = process.env.ZEEHIVE_API || 'http://localhost:4700';
 const sid = process.env.CLAUDE_CODE_SESSION_ID || '';
 const force = process.argv.includes('--force');
 const checkOnly = process.argv.includes('--check');
@@ -53,5 +53,5 @@ Land it first (commit, then: git push . HEAD:main), or re-run with --force to di
   if (r.code >= 400) { console.log(`Mark done failed (HTTP ${r.code}): ${r.body}`); process.exit(0); }
   console.log(`DONE — ${slug} marked done and torn down (worktree, branch and per-xell containers removed).\n${r.body}`);
 } catch (e) {
-  console.log(`XEEHIVE API unreachable at ${api}: ${e.message}`);
+  console.log(`ZEEHIVE API unreachable at ${api}: ${e.message}`);
 }

@@ -23,7 +23,7 @@ Event → meaning the queenzee records:
 ## Install (command fallback)
 
 If your build lacks the `http` hook type, copy [`post-hook.sh`](./post-hook.sh) to
-`~/.claude/hooks/xeehive-post-hook.sh` and use `type: "command"` entries that run it.
+`~/.claude/hooks/zeehive-post-hook.sh` and use `type: "command"` entries that run it.
 
 ## Not required for correctness
 

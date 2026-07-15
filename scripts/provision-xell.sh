@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Never inherit a stray git context from the launching shell — GIT_DIR/GIT_WORK_TREE
-# override `git -C` and would make us act on the wrong repo (e.g. Xeehive's .git, which
+# override `git -C` and would make us act on the wrong repo (e.g. Zeehive's .git, which
 # has no `main` → "fatal: invalid reference: main"). Always resolve via the -C path below.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY 2>/dev/null || true
 

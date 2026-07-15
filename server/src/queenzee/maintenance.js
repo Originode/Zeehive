@@ -3,7 +3,7 @@
 //   2. prune finished backups beyond max_backups (delete file + row)
 //   3. restore a backup INTO a db container; refresh stale pooled db-isolated xells
 // The backup target is the project's PRODUCTION database — the modeled prod db container
-// (role='db', tier='prod') on the prod docker context — NOT the xeehive meta DB that this
+// (role='db', tier='prod') on the prod docker context — NOT the zeehive meta DB that this
 // orchestrator keeps its own bookkeeping in (config.databaseUrl).
 //
 // Jobs run ASYNCHRONOUSLY: the heavy docker work is a non-blocking child process (spawn, not
@@ -137,7 +137,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
       try { size = statSync(fullPath).size; } catch { size = null; }
     } else {
       await wait(SIM_BACKUP_MS);   // simulate: hold 'running' briefly so the spinner is visible
-      const body = `-- XEEHIVE simulated backup of ${project.name} PRODUCTION database\n`
+      const body = `-- ZEEHIVE simulated backup of ${project.name} PRODUCTION database\n`
         + `-- target: ${dbc?.name || '(prod db container)'} / db=${dbName} user=${dbUser}\n`
         + `-- taken ${new Date().toISOString()}\n`;
       writeFileSync(fullPath, body);

@@ -1,10 +1,10 @@
-# XEEHIVE — handover
+# ZEEHIVE — handover
 
-Paste this into a fresh Claude Code session **opened in `D:\Repos\Xeehive`**.
+Paste this into a fresh Claude Code session **opened in `D:\Repos\Zeehive`**.
 
 ---
 
-You are picking up **XEEHIVE**, a deterministic agent-environment orchestrator. Read this
+You are picking up **ZEEHIVE**, a deterministic agent-environment orchestrator. Read this
 whole file, then `README.md`, then skim the design doc at
 `C:\Users\Mark\.claude\plans\okay-so-here-is-merry-gizmo.md` (the full rationale).
 
@@ -43,7 +43,7 @@ hooks/       settings.hooks.json (harness status hooks) + README
 ## Run it
 
 Meta-DB is Postgres. **Local Docker Desktop was down**, so it currently runs on the
-`ugreen-nas` Docker context as container `xeehive_db` at `10.1.0.18:5445` (see `.env`
+`ugreen-nas` Docker context as container `zeehive_db` at `10.1.0.18:5445` (see `.env`
 `DATABASE_URL`). To (re)create + seed + run:
 
 ```bash
@@ -87,14 +87,14 @@ Flip `PROVISION_MODE=real` to actually `git worktree add` + `spin-env up` on ugr
    it to local Docker (`docker compose up -d db`, port 5433 per compose default) and updating
    `.env`.
 4. Cosmetic: `mcp/server.js` and `scripts/xell-status.mjs` have a harmless duplicated
-   `XEEHIVE_API || XEEHIVE_API` fallback from the rename.
+   `ZEEHIVE_API || ZEEHIVE_API` fallback from the rename.
 
 ## How to talk to it as an agent
 
 - Skill `/xell <task>` claims a ready xell (context injected, not prompted).
 - Skill `/xell-done` checks status / reports the job finished (human confirms via "Mark done").
-- MCP tools (register `mcp/server.js`, see `mcp/README.md`): `xeehive_get_context`,
-  `xeehive_status`, `xeehive_report_done`, `xeehive_prod_lock_{acquire,release,status}`.
+- MCP tools (register `mcp/server.js`, see `mcp/README.md`): `zeehive_get_context`,
+  `zeehive_status`, `zeehive_report_done`, `zeehive_prod_lock_{acquire,release,status}`.
 
 The web app is **read-only** (no prompting there); the **▚_ terminal** button by "Status"
 opens a live queenzee activity log.

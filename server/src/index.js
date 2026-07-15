@@ -1,4 +1,4 @@
-// XEEHIVE server: HTTP API + queenzee loops (poller now; pool/maintenance added in later steps).
+// ZEEHIVE server: HTTP API + queenzee loops (poller now; pool/maintenance added in later steps).
 import express from 'express';
 import { config } from './config.js';
 import { router } from './api/routes.js';
@@ -21,11 +21,11 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'xeehive', ts: Date.now() }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'zeehive', ts: Date.now() }));
 app.use('/api', router);
 
 app.listen(config.port, () => {
-  console.log(`[xeehive] API on http://localhost:${config.port}  (db: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);
+  console.log(`[zeehive] API on http://localhost:${config.port}  (db: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);
   startPoller();
   console.log(`[queenzee] poller started (${config.pollerIntervalMs}ms)`);
   logline('api', `queenzee online — API on :${config.port}, DB connected`);

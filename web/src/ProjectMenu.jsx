@@ -32,7 +32,7 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
   };
 
   const remove = async (p) => {
-    if (!window.confirm(`Remove project "${p.name}"?\n\nThis deletes its xells, containers, and config from XEEHIVE (the actual repo folder is left untouched).`)) return;
+    if (!window.confirm(`Remove project "${p.name}"?\n\nThis deletes its xells, containers, and config from ZEEHIVE (the actual repo folder is left untouched).`)) return;
     setBusy(true); setErr(null);
     try {
       await onDelete(p.id, false);

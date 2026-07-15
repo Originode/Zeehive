@@ -12,7 +12,7 @@ import BackupsPanel from './Backups.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 
-const PROJECT_KEY = 'xeehive.project';
+const PROJECT_KEY = 'zeehive.project';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'Webapp', other: 'Other' };
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');

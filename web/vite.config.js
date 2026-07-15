@@ -8,7 +8,7 @@ export default defineConfig({
     port: 5180,
     proxy: {
       '/api': {
-        target: process.env.XEEHIVE_API || 'http://localhost:4700',
+        target: process.env.ZEEHIVE_API || 'http://localhost:4700',
         changeOrigin: true,
       },
     },

@@ -1,4 +1,4 @@
--- XEEHIVE meta schema — the single source of truth for xells / zees / containers / events.
+-- ZEEHIVE meta schema — the single source of truth for xells / zees / containers / events.
 -- Enums encode the xell capability matrix; triggers/constraints encode the impossibilities.
 -- Applied once by server/src/db/migrate.js (tracked in schema_migrations).
 

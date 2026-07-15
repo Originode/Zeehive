@@ -2,7 +2,7 @@
 import { spawnSync } from 'node:child_process';
 
 // Inherited git-context env vars (a stray GIT_DIR from the launching shell) override `-C`
-// and make git act on the WRONG repo — e.g. Xeehive's .git, which has no `main`, yielding
+// and make git act on the WRONG repo — e.g. Zeehive's .git, which has no `main`, yielding
 // "fatal: invalid reference: main". Strip them so git/scripts act only on the repo we point at.
 const GIT_CONTEXT_VARS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY'];
 export function cleanGitEnv(extra = {}) {

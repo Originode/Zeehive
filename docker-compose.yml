@@ -1,22 +1,29 @@
-# Local Postgres for the XEEHIVE meta database.
-# Runs on host :5433 to avoid colliding with any project Postgres (OmniBiz dev uses 5434).
+# Local Postgres for the ZEEHIVE meta database.
+# Runs on host :5445 to avoid colliding with any project Postgres (OmniBiz dev uses 5434).
+#
+# `name:` is pinned deliberately. Compose otherwise derives the project name — and therefore the
+# VOLUME PREFIX — from the directory it is run from, so renaming this folder would make compose
+# look for a volume that doesn't exist and silently bring up an EMPTY meta database. The stack's
+# identity must not depend on where the repo happens to sit on disk.
+name: zeehive
+
 services:
   db:
     image: postgres:17-alpine
-    container_name: xeehive_db
+    container_name: zeehive_db
     environment:
-      POSTGRES_USER: xeehive
-      POSTGRES_PASSWORD: xeehive
-      POSTGRES_DB: xeehive
+      POSTGRES_USER: zeehive
+      POSTGRES_PASSWORD: zeehive
+      POSTGRES_DB: zeehive
     ports:
-      - "${XEEHIVE_DB_PORT:-5445}:5432"
+      - "${ZEEHIVE_DB_PORT:-5445}:5432"
     volumes:
-      - xeehive_pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U xeehive -d xeehive"]
+      test: ["CMD-SHELL", "pg_isready -U zeehive -d zeehive"]
       interval: 5s
       timeout: 3s
       retries: 10
 
 volumes:
-  xeehive_pgdata:
+  pgdata:

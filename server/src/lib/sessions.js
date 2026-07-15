@@ -11,7 +11,7 @@ const sessionsDir = join(config.claudeHome, 'sessions');
 const projectsDir = join(config.claudeHome, 'projects');
 
 // A cwd is turned into a projects/ subdir by replacing ':', slashes, and dots with '-'.
-// e.g. "D:\Repos\XEEHIVE"                 → "D--Repos-XEEHIVE"
+// e.g. "D:\Repos\ZEEHIVE"                 → "D--Repos-ZEEHIVE"
 //      "…\omnibiz\.claude\worktrees\foo"    → "…-omnibiz--claude-worktrees-foo"
 export function sanitizeCwd(cwd) {
   return String(cwd).replace(/[:\\/.]/g, '-');

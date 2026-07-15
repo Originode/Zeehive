@@ -3,11 +3,11 @@
 // Uses only ambient signals: $CLAUDE_CODE_SESSION_ID and the session cwd.
 //
 // The cwd is also the PROJECT handover: the queenzee resolves which project you are in from it
-// (repo_root / xell worktree) instead of defaulting to the oldest project row. XEEHIVE_PROJECT
+// (repo_root / xell worktree) instead of defaulting to the oldest project row. ZEEHIVE_PROJECT
 // overrides it when a session runs outside any managed repo.
 import http from 'node:http';
 
-const api = process.env.XEEHIVE_API || 'http://localhost:4700';
+const api = process.env.ZEEHIVE_API || 'http://localhost:4700';
 // The task is intentionally NOT an argument: the skill interpolates it into a shell line, and real
 // task text (backticks, quotes, $) breaks bash before this script ever runs. Claiming doesn't need
 // it — the task reaches the queenzee via --task-file on dispatch, or the model just does the work.
@@ -15,7 +15,7 @@ const task = process.argv[2] || '';
 const body = JSON.stringify({
   session_id: process.env.CLAUDE_CODE_SESSION_ID || '',
   cwd: process.cwd(),
-  ...(process.env.XEEHIVE_PROJECT ? { project: process.env.XEEHIVE_PROJECT } : {}),
+  ...(process.env.ZEEHIVE_PROJECT ? { project: process.env.ZEEHIVE_PROJECT } : {}),
   task,
 });
 
@@ -37,7 +37,7 @@ Your cwd (${j.your_cwd || '?'}) is not inside any managed repo or xell worktree.
 
 Do not start any work. Ask the user which project this is, then re-run with it named:
 
-  XEEHIVE_PROJECT="<name>" node "${process.env.XEEHIVE_HOME || 'D:/Repos/Xeehive'}/scripts/xell-claim.mjs"
+  ZEEHIVE_PROJECT="<name>" node "${process.env.ZEEHIVE_HOME || 'D:/Repos/Zeehive'}/scripts/xell-claim.mjs"
 
 Known projects:
 ${list || '    (none configured)'}`);
@@ -46,7 +46,7 @@ ${list || '    (none configured)'}`);
     if (j && j.status === 'needs-worktree') {
       // Not in a worktree → NOT claimed. Offer the confirmed auto-dispatch path.
       const d = j.dispatch || {};
-      const home = process.env.XEEHIVE_HOME || 'D:/Repos/Xeehive';
+      const home = process.env.ZEEHIVE_HOME || 'D:/Repos/Zeehive';
       const others = (j.also_ready || []).map((x) => `    • ${x.worktree_path}`).join('\n');
       console.log(
 `NOT CLAIMED — this session is in the main repo (${j.your_cwd || '?'}), NOT a xell worktree.
@@ -65,7 +65,7 @@ worktree to do the work. CONFIRM WITH THE USER first, then:
     → worktree    : ${d.worktree_path || '?'}
 
     The project came from your cwd. If it is the WRONG project, stop and tell the user —
-    re-run with XEEHIVE_PROJECT="<name>" rather than dispatching into the wrong repo.
+    re-run with ZEEHIVE_PROJECT="<name>" rather than dispatching into the wrong repo.
 
     Autonomy (optional, append --mode N; default 5):
       1 plan   read-only recon — changes nothing      3 shell  edit + run shell

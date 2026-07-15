@@ -2,7 +2,7 @@
 //
 // Both claim and dispatch used `project || (SELECT id FROM project ORDER BY created_at LIMIT 1)`
 // — the OLDEST row, i.e. OmniBiz, no matter where the caller was standing. Run /xell from
-// D:\Repos\Xeehive and the queenzee would happily hand you an OmniBiz worktree. The invoker
+// D:\Repos\Zeehive and the queenzee would happily hand you an OmniBiz worktree. The invoker
 // knows which project it is in; it just never said so.
 //
 // Resolution order, most-explicit first. There is NO default: guessing wrong means a zee edits

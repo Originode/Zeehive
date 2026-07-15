@@ -11,7 +11,7 @@
 // or re-run `xell-status.mjs`. Never blocks.
 import http from 'node:http';
 
-const api = process.env.XEEHIVE_API || 'http://localhost:4700';
+const api = process.env.ZEEHIVE_API || 'http://localhost:4700';
 const args = process.argv.slice(2);
 const hot = args.includes('--hot');
 const [xellId, roleArg] = args.filter((a) => a !== '--hot');
@@ -32,7 +32,7 @@ const req = http.request(`${api}/api/xells/${xellId}/build`, {
   res.on('end', () => {
     if (res.statusCode >= 400) { console.log(`Build request failed (HTTP ${res.statusCode}): ${b}`); process.exit(0); }
     console.log(`${hot ? 'HOT build' : 'Build'} started for ${role} — running in the background.\n${b}\n` +
-      `Watch its health on the XEEHIVE dashboard (spinner → up = built, down = failed).`);
+      `Watch its health on the ZEEHIVE dashboard (spinner → up = built, down = failed).`);
   });
 });
 req.on('error', (e) => { console.log(`queenzee API unreachable at ${api}: ${e.message}`); process.exit(0); });

@@ -23,7 +23,7 @@
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 
-const api = process.env.XEEHIVE_API || 'http://localhost:4700';
+const api = process.env.ZEEHIVE_API || 'http://localhost:4700';
 const argv = process.argv.slice(2);
 
 // pull `--flag value` / `--flag=value` out of argv without disturbing the positionals
@@ -48,7 +48,7 @@ const model = takeFlag('model');
 // resolves it from this process's cwd (the invoking session's repo/worktree). Pass it when the
 // session is outside any managed repo, or to dispatch into a project you are not standing in.
 // A named <xell_id> always wins: its own project is a fact, not an inference.
-const project = takeFlag('project') || process.env.XEEHIVE_PROJECT;
+const project = takeFlag('project') || process.env.ZEEHIVE_PROJECT;
 const dbArg = takeFlag('db');
 const dump = takeFlag('dump');
 const dbContainer = takeFlag('db-container');
