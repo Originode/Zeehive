@@ -150,14 +150,19 @@ export async function dispatchXell({ xell_id, task, runtime, project, mode, sess
   const from = title || (session_id ? sessionTitle(session_id) : null);
   const inherited = from ? `xell : ${from}` : null;
 
+  // Resolve the target xell UP FRONT. If the caller didn't name one we must still pick it here,
+  // not inside spawnHeadless — otherwise the rename below is skipped and the xell keeps its
+  // cryptic pooled slug, which is the whole thing the rename exists to fix.
+  const targetId = xell_id || (await readyXells(projectId))[0]?.id || null;
+
   // Now that we know the job, give the worktree a human-trackable name — BEFORE spawning, so the
   // zee's cwd is the final path and Claude Code's sidebar (which names a worktree by its folder)
   // shows something findable instead of "calm-summit-403da6". Best-effort: if it can't rename
   // (already built, name taken), the xell just keeps its pooled slug and the dispatch proceeds.
-  if (xell_id && from) await renameXellForTask(xell_id, from);
+  if (targetId && from) await renameXellForTask(targetId, from);
 
   const spawned = await spawnHeadless({
-    projectId, xellId: xell_id || null, task, runtime, mode, title: inherited,
+    projectId, xellId: targetId, task, runtime, mode, title: inherited,
     headless: headless !== false, ...(model ? { model } : {}),
   });
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
@@ -169,6 +174,14 @@ export async function dispatchXell({ xell_id, task, runtime, project, mode, sess
     err.detail = { status: 'dispatch-failed', slug: xell?.slug, zee_id: spawned.zee_id, error: spawned.error };
     throw err;
   }
+  // Record the task, exactly as a skill-claim does. Without this the xell has no task row, so the
+  // dashboard cannot render "Mark done" — a dispatched zee that reports done would strand in
+  // awaiting-done with no way for a human to confirm it and no path to being reaped.
+  await q(
+    `INSERT INTO task (project_id, prompt_text, source, status, xell_id, zee_id, assigned_at)
+     VALUES ($1,$2,'dispatch','assigned',$3,$4, now())`,
+    [projectId, task, spawned.xell_id, spawned.zee_id]);
+
   logline('intake', `dispatched a zee into ${xell?.slug} — confirmed working (${runtime || 'default runtime'}, mode ${m.key})`);
   return { status: 'dispatched', slug: xell?.slug, worktree: xell?.worktree_path,
            mode: m.key, mode_label: m.label, ...spawned };
@@ -303,7 +316,10 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   const pid = projectId || (await defaultProjectId());
   const xell = xellId
     ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId])
-    : await readyXellForCwd(pid, null);
+    // No xell named → take the freshest ready one. (readyXellForCwd matches a caller's cwd to a
+    // worktree and takes the ready ARRAY — passing projectId here silently matched nothing, so
+    // every dispatch without an explicit xell_id died with "no ready xell available".)
+    : (await readyXells(pid))[0];
   if (!xell) throw new Error('no ready xell available for headless spawn');
   if (!task) throw new Error('task (prompt) required for headless spawn');
 

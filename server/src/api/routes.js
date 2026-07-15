@@ -13,6 +13,7 @@ import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers } from '../queenzee/containers.js';
 import { buildContainer, buildXell } from '../lib/build.js';
 import { revealXellWorktree } from '../lib/reveal.js';
+import { reapXell } from '../queenzee/reaper.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
 import { acquireProdLock, releaseProdLock, prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
@@ -130,6 +131,15 @@ router.post('/xells/:id/build', async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── decommission a xell directly (no task row required) ───────────────────────
+// The "Mark done" path goes through the task, but a xell can exist WITHOUT one (a dispatched
+// zee that reported done, a pooled xell gone bad). Without this those strand forever: no task
+// means no button, and nothing ever reaps them. Production is refused by reapXell itself.
+router.post('/xells/:id/reap', async (req, res) => {
+  try { res.json(await reapXell(req.params.id, req.body?.reason || 'human-cleanup', { force: !!req.body?.force })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 // ── reveal a xell's worktree folder in the host file manager (Explorer) ────────
 router.post('/xells/:id/reveal', async (req, res) => {
   try { res.json(await revealXellWorktree(req.params.id)); }
@@ -146,7 +156,7 @@ router.post('/tasks', async (req, res) => {
 });
 router.post('/tasks/:id/done', async (req, res) => {
   try {
-    res.json(await markTaskDone(req.params.id, req.body?.done_by || 'human'));
+    res.json(await markTaskDone(req.params.id, req.body?.done_by || 'human', { force: !!req.body?.force }));
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

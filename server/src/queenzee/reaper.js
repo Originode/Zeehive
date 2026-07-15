@@ -9,10 +9,31 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 
-export async function reapXell(xellId, reason = 'task-done') {
+export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
   if (!xell) return { ok: false, error: 'xell not found' };
   if (xell.is_production) return { ok: false, error: 'production is protected — cannot be decommissioned by a zee' };
+
+  // An ACTIVE xell has a zee still working in it. Tearing it down kills the agent mid-task and
+  // deletes its worktree + branch. Refuse unless the caller explicitly forces it — this lives on
+  // the server, not just the UI, because a UI-only guard is bypassed by anyone (human OR AI)
+  // calling the API directly. That is exactly how a working xell got destroyed.
+  if (!force) {
+    const live = await one(
+      `SELECT id, status, cli_active FROM zee
+        WHERE xell_id=$1 AND status IN ('spawning','online','working','idle') ORDER BY created_at DESC LIMIT 1`,
+      [xellId]);
+    const active = live && (live.cli_active === true || ['spawning', 'online', 'working'].includes(live.status));
+    if (active) {
+      return {
+        ok: false, active: true, xell: xell.slug,
+        error: `xell "${xell.slug}" is ACTIVE — its zee is still ${live.status}`
+             + `${live.cli_active ? ' (monitor confirms it is really active)' : ''}.`
+             + ' Tearing it down kills the agent mid-task and deletes its worktree + branch.'
+             + ' Pass force:true to do it anyway.',
+      };
+    }
+  }
 
   logline('reaper', `decommissioning ${xell.slug} (${reason}) — releasing resources, removing worktree + branch`);
   await one(`UPDATE xell SET status='tearing-down' WHERE id=$1 RETURNING *`, [xellId])
@@ -34,7 +55,9 @@ export async function reapXell(xellId, reason = 'task-done') {
       cwd: config.omnibizRoot, encoding: 'utf8', timeout: 120000,
       env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: config.dockerCtx }),
     });
-    despawn = { code: r.status, stdout: (r.stdout || '').slice(-2000), stderr: (r.stderr || '').slice(-1000) };
+    const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
+    let verdict = null; try { verdict = JSON.parse(line); } catch { /* no JSON line */ }
+    despawn = { code: r.status, ...(verdict || {}), stderr: (r.stderr || '').slice(-600) };
   }
 
   // drop this xell's per-xell containers from the meta DB
@@ -43,7 +66,16 @@ export async function reapXell(xellId, reason = 'task-done') {
   const retired = await one(
     `UPDATE xell SET status='retired', retired_at=now(), is_pooled=false WHERE id=$1 RETURNING *`, [xellId]);
   broadcast('xell', retired);
-  logline('reaper', `retired ${xell.slug}: zee decommissioned, per-xell containers dropped ✓`);
 
-  return { ok: true, reason, despawn, zee_id: zee?.id };
+  // The DB row is retired either way (the xell is gone as far as the fleet is concerned), but do
+  // NOT report a clean teardown when the folder is still on disk — that is how orphaned worktrees
+  // pile up unnoticed. Say it plainly instead.
+  const orphaned = xell.worktree_path && existsSync(xell.worktree_path);
+  if (orphaned) {
+    logline('reaper', `retired ${xell.slug} BUT its worktree is still on disk: ${xell.worktree_path} — ${despawn.reason || 'despawn failed'}`);
+  } else {
+    logline('reaper', `retired ${xell.slug}: zee decommissioned, worktree + containers removed ✓`);
+  }
+
+  return { ok: true, reason, orphaned_worktree: orphaned ? xell.worktree_path : null, despawn, zee_id: zee?.id };
 }

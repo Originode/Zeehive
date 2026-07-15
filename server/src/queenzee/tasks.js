@@ -74,14 +74,25 @@ export async function proposeDone({ session_id, xell_id, task_id, note }) {
 }
 
 // POST /api/tasks/:id/done  → the ONLY signal that a xell is finished (human-decided)
-export async function markTaskDone(taskId, doneBy) {
+export async function markTaskDone(taskId, doneBy, { force = false } = {}) {
   const task = await one(`SELECT * FROM task WHERE id = $1`, [taskId]);
   if (!task) throw new Error('task not found');
+
+  // Check the reap BEFORE flipping the task to done: an ACTIVE xell is refused unless forced, and
+  // marking the task done while its zee keeps working would leave the two lying about each other.
+  if (task.xell_id) {
+    const reap = await reapXell(task.xell_id, 'task-done', { force });
+    if (reap?.ok === false) return { task: null, reap, blocked: true };
+    const done = await one(
+      `UPDATE task SET status='done', done_at=now(), done_by=$2 WHERE id=$1 RETURNING *`,
+      [taskId, doneBy]);
+    broadcast('task', done);
+    return { task: done, reap };
+  }
+
   const done = await one(
     `UPDATE task SET status='done', done_at=now(), done_by=$2 WHERE id=$1 RETURNING *`,
     [taskId, doneBy]);
   broadcast('task', done);
-  let reap = null;
-  if (task.xell_id) reap = await reapXell(task.xell_id, 'task-done');
-  return { task: done, reap };
+  return { task: done, reap: null };
 }

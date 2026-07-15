@@ -82,6 +82,20 @@ export async function buildXell(xellId, hot = false) {
   return r.ok ? r.json() : Promise.reject(await r.json().catch(() => ({ error: r.statusText })));
 }
 
+// Tear a xell down directly — for xells with no task row to "Mark done" (e.g. a dispatched zee
+// that reported done). Removes its worktree, branch and per-xell containers.
+export async function reapXell(xellId, reason = 'human-cleanup', force = false) {
+  const r = await fetch(`/api/xells/${xellId}/reap`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason, force }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `cleanup failed (${r.status})`);
+  // The server refuses an ACTIVE xell without force and returns ok:false — surface that as an
+  // error rather than letting the caller treat a refusal as a successful teardown.
+  if (data?.ok === false) throw new Error(data.error || 'cleanup refused');
+  return data;
+}
+
 // Open a xell's worktree folder in the host file manager (Explorer on Windows).
 export async function revealWorktree(xellId) {
   const r = await fetch(`/api/xells/${xellId}/reveal`, { method: 'POST' });
@@ -152,11 +166,14 @@ export async function restoreBackup(id, container) {
   return data;
 }
 
-export async function markDone(taskId, doneBy = 'human') {
+export async function markDone(taskId, doneBy = 'human', force = false) {
   const r = await fetch(`/api/tasks/${taskId}/done`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ done_by: doneBy }),
+    body: JSON.stringify({ done_by: doneBy, force }),
   });
-  return r.json();
+  const data = await r.json().catch(() => ({}));
+  // An ACTIVE xell is refused server-side (blocked:true) — don't let that read as "done".
+  if (data?.blocked || data?.reap?.ok === false) throw new Error(data?.reap?.error || 'mark done refused');
+  return data;
 }

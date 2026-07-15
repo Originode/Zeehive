@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
-         getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree } from './api.js';
+         getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
+         reapXell } from './api.js';
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import GitRail from './GitRail.jsx';
@@ -265,17 +266,53 @@ function XellCard({ x, diff, onDone, onMenu }) {
     : x.viewer_kind === 'desktop-protocol' ? 'Open this session in Claude Desktop'
     : 'Open this session in claude.ai';
 
+  // Confirm-and-tear-down. Goes through the task when there is one; otherwise reaps the xell
+  // directly — a xell can legitimately have no task row (a dispatched zee that reported done),
+  // and gating the only teardown button on task_id stranded those forever.
   const done = async (e) => {
     e.stopPropagation();
-    if (!x.task_id) return;
+    // Teardown deletes the worktree AND the branch, so anything not landed on main dies with it.
+    // Spell out exactly what is at stake BEFORE asking — a generic "cannot be undone" let a single
+    // click destroy a working xell that had an uncommitted file in it.
+    const unlanded = diff && (diff.ahead > 0 || diff.dirty > 0);
+    const atStake = unlanded
+      ? `\n\n⚠ THIS XELL HAS WORK THAT IS NOT ON MAIN:\n` +
+        (diff.ahead > 0 ? `   • ${diff.ahead} commit(s) not landed on main\n` : '') +
+        (diff.dirty > 0 ? `   • ${diff.dirty} uncommitted file(s) in the worktree\n` : '') +
+        `   This work will be PERMANENTLY LOST.\n`
+      : '\n\n(Nothing unlanded — its work is already on main.)\n';
+    // ACTIVE = a zee is still working in there. Killing it mid-task is the worst thing this button
+    // can do, so it takes more than a click: you must TYPE the slug. (The server refuses an active
+    // xell without force too — this dialog only decides whether we're allowed to ask for it.)
+    const active = !!x.zee_id && (x.cli_active === true || ['spawning', 'online', 'working'].includes(x.zee_status));
     const ok = window.confirm(
-      `Mark "${x.slug}" done?\n\n` +
-      `This tears the xell down — removes its worktree, branch, and per-xell containers, ` +
-      `and decommissions its zee${x.holds_prod_lock ? ' (and it currently HOLDS the prod lock)' : ''}. ` +
-      `This cannot be undone.`);
+      `${x.task_id ? 'Mark done' : 'Clean up'} "${x.slug}"?` +
+      (active ? `\n\n🛑 THIS XELL IS ACTIVE — its zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''}.\n   Tearing it down KILLS the agent mid-task.\n` : '') +
+      atStake +
+      `\nThis removes its worktree, branch, and per-xell containers, and decommissions its zee` +
+      `${x.holds_prod_lock ? ' (it currently HOLDS the prod lock)' : ''}.\nThis cannot be undone.`);
     if (!ok) return;
-    await markDone(x.task_id, 'mark');
-    onDone();
+    // Second gate for unlanded work: one mis-click should not be able to destroy it.
+    if (unlanded && !window.confirm(`Really discard the unlanded work in "${x.slug}"? Last chance.`)) return;
+    // Hard gate for an ACTIVE zee: force-yes by typing the slug. A confirm() is one stray click.
+    if (active) {
+      const typed = window.prompt(
+        `"${x.slug}" is ACTIVE and its zee is still working.\n\n` +
+        `To force this, type the xell name exactly:\n${x.slug}`);
+      if (typed !== x.slug) { if (typed !== null) alert('Name did not match — nothing was touched.'); return; }
+    }
+    try {
+      const r = x.task_id ? await markDone(x.task_id, 'mark', active) : await reapXell(x.id, 'human-cleanup', active);
+      // The xell is retired either way, but don't let a half-teardown pass as clean: if the folder
+      // survived (something still holds it open — usually the zee's own session), say so.
+      const orphan = r?.orphaned_worktree || r?.reap?.orphaned_worktree;
+      if (orphan) {
+        alert(`"${x.slug}" was retired, but its worktree could NOT be removed:\n\n${orphan}\n\n` +
+              `Something still has it open — usually that zee's session in Claude Code. ` +
+              `Close the session, then run Clean up again.`);
+      }
+      onDone();
+    } catch (err) { alert('Cleanup failed: ' + (err?.message || err)); }
   };
 
   return (
@@ -365,9 +402,15 @@ function XellCard({ x, diff, onDone, onMenu }) {
           </div>
         )}
       </div>
-      {!isProd && x.task_id && ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status) && (
-        <button className={`donebtn ${x.status === 'awaiting-done' ? 'await' : ''}`} onClick={done}>
-          {x.status === 'awaiting-done' ? '✓ Confirm done (zee reported finished)' : 'Mark done'}
+      {/* Never gate this on task_id: a dispatched zee's xell may have no task row, and without a
+          button it can never be confirmed OR reaped — it just strands in awaiting-done forever. */}
+      {!isProd && ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status) && (
+        <button className={`donebtn ${x.status === 'awaiting-done' ? 'await' : ''}`} onClick={done}
+                data-testid="done-btn"
+                title={x.task_id ? 'Mark the task done — the queenzee tears this xell down'
+                                 : 'No task row on this xell — this cleans it up (tears it down) directly'}>
+          {x.status === 'awaiting-done' ? '✓ Confirm done (zee reported finished)'
+            : (x.task_id ? 'Mark done' : 'Clean up xell')}
         </button>
       )}
     </div>
