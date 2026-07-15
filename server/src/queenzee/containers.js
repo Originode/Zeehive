@@ -29,7 +29,15 @@ function probeContexts(ctxs) {
 // Docker state → container_health enum.
 function toHealth(state) {
   if (state === 'running') return 'up';
-  if (state === 'restarting' || state === 'created') return 'building';
+  if (state === 'restarting') return 'building';   // crash-looping or coming up — genuinely in flux
+  // 'created' is NOT building. It means compose created the container and never started it —
+  // an INTERRUPTED build (e.g. the queenzee was restarted mid-`up -d`). Nothing is building it,
+  // so calling it 'building' made the spinner permanent: a real build's row is 'building' and the
+  // monitor SKIPS it (below), so anything we actually map here has no build behind it. Worse, it
+  // silently defeated recoverOrphanBuilds() — that hands the row back as 'unknown', and this
+  // mapping put it straight back into 'building' on the next tick. A created-but-never-started
+  // container is not running: say DOWN, so a human/zee knows to rebuild.
+  if (state === 'created') return 'down';
   return 'down'; // exited | paused | dead | removing
 }
 

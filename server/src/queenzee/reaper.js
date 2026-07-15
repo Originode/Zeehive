@@ -7,6 +7,7 @@ import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
+import { removeXellImages } from '../lib/images.js';
 import { logline } from '../lib/logbus.js';
 
 export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
@@ -59,6 +60,13 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
     let verdict = null; try { verdict = JSON.parse(line); } catch { /* no JSON line */ }
     despawn = { code: r.status, ...(verdict || {}), stderr: (r.stderr || '').slice(-600) };
   }
+
+  // --rm SEMANTICS: reclaim this xell's built images BEFORE dropping the container rows — those
+  // rows are the only record of which image_tags were its. The despawn script above tries to purge
+  // them too, but only via `spin-env.sh purge` run from INSIDE the worktree: if the worktree is
+  // gone/broken (or the purge silently failed), ~2.6 GB per xell leaks with nobody watching. The
+  // queenzee knows the exact tags, so it does not need the worktree to clean up after itself.
+  await removeXellImages(xellId, xell.slug).catch((e) => logline('reaper', `image cleanup failed for ${xell.slug}: ${e.message}`));
 
   // drop this xell's per-xell containers from the meta DB
   await q(`DELETE FROM container WHERE owner_xell_id = $1`, [xellId]);

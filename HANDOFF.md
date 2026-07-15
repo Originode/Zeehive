@@ -220,6 +220,30 @@ assigned containers" is *satisfied*, because a human deliberately gave it that o
   the sibling shell hook, undefined in the .mjs) and threw a ReferenceError — which let a dev-db
   xell straight through to prod. Every branch must call `deny()`. Re-run the canary after editing.
 
+## Image garbage (2.6 GB per xell, nobody collecting)
+
+A spinoff image is ~1.3 GB; a xell builds two. Teardown was supposed to purge them, but it only
+delegated to `spin-env.sh purge` run FROM INSIDE the worktree — so a missing/broken worktree, or a
+purge that failed, leaked ~2.6 GB silently. The NAS was at **140 GB of images, 131 GB reclaimable
+(93%)**, plus 8 GB of build cache.
+
+- **Teardown `--rm`**: `removeXellImages()` runs in the reaper BEFORE the container rows are
+  deleted (those rows are the only record of the `image_tag`s). It does not need the worktree.
+- **Janitor**: `startImageJanitor()` sweeps hourly (`IMAGE_JANITOR_ENABLED=false` to stop,
+  `IMAGE_JANITOR_DRY_RUN=true` to watch). It only ever touches image REPOS that this project's own
+  per-xell containers use (derived from the DB, never hardcoded) — it is NOT `docker image prune -a`,
+  which on a shared NAS would eat the dev stack and prod.
+- ⚠ **"Not a live xell" does NOT mean unused.** This machine also runs **pre-ZEEHIVE
+  `/spin:spinoff`** environments whose images use the SAME names and are invisible to the `xell`
+  table. A first dry run flagged 12 images (~15 GB) as orphans — **all 12 were backing RUNNING
+  containers** (`cashier-checks`, `elegant-payne-…`, `exciting-hawking-…`, …). So:
+  - **NEVER `rmi -f`.** Force UNTAGS an image a container is still using: it keeps running, but the
+    next restart fails with "image not found". Plain `rmi` makes docker the judge.
+  - The sweep also skips anything in `docker ps -a`, and deletes NOTHING if it cannot read the
+    container list.
+  With the guard in place the sweep correctly finds 0 — the leak is real but its victims are all
+  still in use. It will reclaim them as those environments are torn down.
+
 ## Builds: how a zee waits (and why it used to hang)
 
 `xell-build.mjs` was fire-and-forget and said *"watch its health on the dashboard"* — which a zee

@@ -9,6 +9,7 @@ import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { startShipReaper } from './queenzee/shipgate.js';
+import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
 
 // LAST-RESORT BACKSTOP. The queenzee is the thing that keeps every xell honest: if it dies, the
@@ -58,5 +59,6 @@ app.listen(config.port, () => {
   startContainerMonitor();
   startMaintenance();
   startShipReaper();
+  startImageJanitor();
 });
 export { app };
