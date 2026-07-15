@@ -196,6 +196,30 @@ prod, absent from main, silently reverted by the next rebuild from main.
   hover → 🔓, click → confirm → force release. Reaper tick: 5s; it also starts any approved ship
   that was waiting for prod to free up.
 
+## Hotfix / data-manipulation xells (prod DATA is not prod CODE)
+
+A xell dispatched with **`--db prod`** has `db_coupling='db-shared-prod'`: the live production
+database IS its assigned container. Querying it is the job, not a violation — "use ONLY your
+assigned containers" is *satisfied*, because a human deliberately gave it that one.
+
+- The prod DB has **no `conn_ref`** and prod postgres isn't exposed, so `docker --context
+  mardale-prod exec -i omnibiz_db_prod psql …` is the sanctioned path (it's what OmniBiz's own docs
+  use). The binding now hands the zee that exact command (`binding.db.psql`) instead of making it
+  guess — guessing is how a zee reaches for a container it was never given.
+- **The prod guard allows it for that xell only.** `hooks/prod-guard.mjs` asks
+  `GET /api/xell/db-access?cwd=…`; the queenzee resolves the xell by worktree path and answers
+  whether the prod DB is *its* database. Allowed: `exec`/`cp` against **its own** db container.
+  Still denied for everyone: prod code deploys (compose build/up, prodsrc), exec into any other
+  prod container, and `restart` of anything — including its own db (that's ops, not data work).
+  Gate unreachable → fail closed.
+- **Writes are prompt-gated only** (deliberate, for now): read freely; before any write/migration,
+  state exactly what it will change and get a human to agree. Unlike landing/shipping there is no
+  enforcement here — an UPDATE has no gate. If a zee abuses it, the next step is a data-change
+  request approved in the console and executed by the queenzee (mirroring the ship gate).
+- ⚠ A hook that CRASHES fails open **silently**. An early version called `decline()` (copied from
+  the sibling shell hook, undefined in the .mjs) and threw a ReferenceError — which let a dev-db
+  xell straight through to prod. Every branch must call `deny()`. Re-run the canary after editing.
+
 ## Builds: how a zee waits (and why it used to hang)
 
 `xell-build.mjs` was fire-and-forget and said *"watch its health on the dashboard"* — which a zee

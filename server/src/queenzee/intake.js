@@ -211,9 +211,30 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
 async function bindingFor(xellId, zee, task) {
   const xell = await one(`SELECT x.*, xo.ref AS xource_ref FROM xell x JOIN xource xo ON xo.id=x.xource_id WHERE x.id=$1`, [xellId]);
   const stack = await q(
-    `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, uc.relation
+    `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, c.docker_ctx, uc.relation
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xellId]);
+
+  // HOW TO REACH YOUR DATABASE — spelled out, because guessing is how a zee ends up running
+  // docker against a container it was never given (and getting denied by the prod guard). The db
+  // has no conn_ref and prod's postgres isn't exposed on the network, so `docker exec` IS the
+  // sanctioned path for data work — the prod guard allows it for exactly the xell whose assigned
+  // database this is, and denies it for everyone else.
+  const dbc = stack.find((c) => c.role === 'db');
+  const db = dbc ? {
+    container: dbc.name,
+    coupling: xell.db_coupling,
+    is_production: dbc.tier === 'prod',
+    psql: dbc.conn_ref
+      ? `psql "${dbc.conn_ref}"`
+      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U postgres -d omnibiz`,
+    note: dbc.tier === 'prod'
+      ? 'This IS the live production database — a human deliberately assigned it to you (--db prod). '
+        + 'It is YOUR container: querying it is expected, not a violation. Reads are free. Before ANY '
+        + 'write/migration, state exactly what it will change and get a human to agree.'
+      : 'Your assigned database. Do not reach for prod: you were not given it, and the prod guard '
+        + 'will deny it.',
+  } : null;
   // How this zee builds its own app tier — ALWAYS via the queenzee, never by hand. Running
   // docker/compose/spin-env.sh directly leaves the orchestrator blind (no built-commit, no hot
   // flag, no health/spinner) and can mangle a container mid-operation.
@@ -251,6 +272,7 @@ async function bindingFor(xellId, zee, task) {
     zee: { id: zee.id, name: zee.name, viewer_url: zee.viewer_url },
     containers: stack,
     build,
+    db,
     task: task || null,
     rules: [
       'Work ONLY inside worktree_path. Never touch the xource (read-only).',

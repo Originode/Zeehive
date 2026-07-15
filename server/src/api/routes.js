@@ -14,7 +14,7 @@ import { checkContainers } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus } from '../lib/build.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
-import { attachXellDb, DB_MODES } from '../lib/xell-db.js';
+import { attachXellDb, dbAccessForCwd, DB_MODES } from '../lib/xell-db.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
 import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
@@ -183,6 +183,16 @@ router.post('/xells/:id/db', async (req, res) => {
   try { res.json(await attachXellDb(req.params.id, req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Asked by the prod-guard hook (hooks/prod-guard.mjs) when a command in a xell worktree touches
+// prod: is the prod DB THIS xell's assigned database? A hotfix/data xell dispatched with
+// `--db prod` is entitled to its own database; a feature xell is not. The hook cannot know this
+// from a cwd + a command string, so it asks. Must be fast and must not throw — a blocked zee is
+// waiting on it.
+router.get('/xell/db-access', async (req, res) => {
+  try { res.json(await dbAccessForCwd(req.query.cwd || '')); }
+  catch (err) { res.status(500).json({ allowed: false, reason: `db-access check failed: ${err.message}` }); }
+});
+
 router.get('/xell/db-modes', (_req, res) =>
   res.json(Object.entries(DB_MODES).map(([key, label]) => ({ key, label }))));
 

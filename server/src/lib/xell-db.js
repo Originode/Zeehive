@@ -101,6 +101,44 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
 //   coupling  : 'db-shared-dev' | 'db-shared-prod' | 'db-isolated'
 //   container : explicit container name/id — overrides coupling (attach ANY db, e.g. prod)
 //   dump      : snapshot id, or 'latest' — only meaningful for db-isolated
+// Which database is THIS worktree's, and may its zee touch it? Answers the prod-guard hook.
+//
+// The point: db_coupling='db-shared-prod' means the prod DB *is* this xell's assigned container —
+// the human chose that at dispatch (`--db prod`), so using it obeys "use only your assigned
+// containers" rather than violating it. But the hook only sees a cwd and a command string, so it
+// cannot tell "read the prod DB" (legitimate for a hotfix/data xell) from "deploy prod code"
+// (never a zee's job). It asks here instead of guessing.
+//
+// Returns the xell's db container by NAME so the hook can allow exec against THAT one only — not
+// into omnibiz_webapp_prod, and never a compose build.
+export async function dbAccessForCwd(cwd) {
+  const norm = (p) => String(p || '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
+  const target = norm(cwd);
+  if (!target) return { xell: null, allowed: false, reason: 'no cwd' };
+
+  const xells = await q(
+    `SELECT id, slug, status, worktree_path, db_coupling FROM xell
+       WHERE status <> 'retired' AND NOT is_production`);
+  const xell = xells.find((x) => norm(x.worktree_path) === target);
+  if (!xell) return { xell: null, allowed: false, reason: 'cwd is not a live xell worktree' };
+
+  const db = await one(
+    `SELECT c.name, c.tier, c.docker_ctx FROM container c
+       JOIN xell_uses_container uc ON uc.container_id = c.id
+      WHERE uc.xell_id = $1 AND c.role = 'db' LIMIT 1`, [xell.id]);
+
+  return {
+    xell: { slug: xell.slug, db_coupling: xell.db_coupling },
+    db_container: db?.name || null,
+    docker_ctx: db?.docker_ctx || null,
+    // Only a xell a human deliberately pointed at prod may touch prod data.
+    allowed: xell.db_coupling === 'db-shared-prod' && !!db && db.tier === 'prod',
+    reason: xell.db_coupling === 'db-shared-prod'
+      ? (db ? null : 'db-shared-prod but no db container attached')
+      : `this xell's database is '${xell.db_coupling}', not prod`,
+  };
+}
+
 export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   if (!xell) throw new Error('xell not found');

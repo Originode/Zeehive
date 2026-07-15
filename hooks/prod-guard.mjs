@@ -22,6 +22,33 @@
 // the match itself is pure local string work. Anything it does understand, it decides.
 
 import { appendFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+
+const API = process.env.ZEEHIVE_API || 'http://localhost:4700';
+
+// Ask the queenzee a yes/no question, synchronously and briefly. Only ever called for a command
+// that already looks like it touches prod, so this costs nothing on ordinary Bash calls. Returns
+// null if the gate can't answer — the caller then FAILS CLOSED, same as the land gate: no
+// approval service means no privileged prod access.
+function ask(url) {
+  try {
+    const out = execFileSync('curl', ['-s', '--max-time', '5', '--connect-timeout', '2', url],
+      { encoding: 'utf8', timeout: 8000, windowsHide: true });
+    return JSON.parse(out);
+  } catch { return null; }
+}
+
+// ONE deny path, used by every branch. (An earlier version called a `decline()` copied from the
+// sibling shell hook, which does not exist here: the hook threw a ReferenceError, and a hook that
+// CRASHES fails OPEN silently — it let a dev-db xell straight through to the prod database. Any
+// new branch must call this, never invent its own exit.)
+function deny(reason) {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason },
+  }));
+  process.exit(0);
+}
+
 let raw = '';
 process.stdin.on('data', (c) => (raw += c));
 process.stdin.on('end', () => {
@@ -55,7 +82,30 @@ process.stdin.on('end', () => {
     /\bcontext\s+use\b/i.test(cmd);   // switching the default context to prod, then building "locally"
   if (!mutates) process.exit(0);      // ps / images / logs / inspect / stats → look all you like
 
-  const reason = [
+  // ── prod DATA is not prod CODE ──────────────────────────────────────────────────────────────
+  // A hotfix / data-manipulation xell is dispatched with `--db prod`, which makes the prod DB its
+  // ASSIGNED container — using it obeys the rules rather than breaking them. This hook only sees a
+  // cwd and a string, so it asks the queenzee whose database that is. Deploying prod CODE stays
+  // denied for everyone (that is the ship gate's job), and exec into any OTHER prod container
+  // (webapp/server/caddy) is still a deploy by hand.
+  const dbVerb = /\b(exec|cp)\b/i.test(cmd) && !/\bcompose\b/i.test(cmd);
+  if (dbVerb) {
+    const answer = ask(`${API}/api/xell/db-access?cwd=${encodeURIComponent(cwd)}`);
+    if (answer && answer.allowed && answer.db_container && cmd.includes(answer.db_container)) {
+      // Its own database, in a xell a human pointed at prod. Let it work.
+      process.exit(0);
+    }
+    if (answer && !answer.allowed) {
+      deny(`DENIED by the ZEEHIVE prod guard: this is not your database.\n\n`
+        + `${answer.reason || 'this xell is not attached to the prod database'}.\n\n`
+        + 'A hotfix / data-manipulation xell is dispatched with `--db prod`, which ASSIGNS it the '
+        + 'prod database — then this exact command is allowed. Ask your human to re-dispatch you '
+        + 'that way, or use the database you were actually given.');
+    }
+    // answer===null → the gate is unreachable → fall through to the deny below (fail closed).
+  }
+
+  deny([
     'DENIED by the ZEEHIVE prod guard: a zee may not deploy to production by hand.',
     '',
     'You are in a xell, and this command mutates PRODUCTION. Building prod yourself ships a',
@@ -70,15 +120,7 @@ process.stdin.on('end', () => {
     'lock itself. Your work must be LANDED on main first.',
     '',
     'Do not try to route around this. Do not use /spin:deploy-guard — its lock is invisible to the',
-    'queenzee. Read-only docker against prod (ps, logs, inspect, images) is still allowed.',
-  ].join('\n');
-
-  process.stdout.write(JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: 'deny',
-      permissionDecisionReason: reason,
-    },
-  }));
-  process.exit(0);
+    'queenzee. Read-only docker against prod (ps, logs, inspect, images) is still allowed, and a',
+    'xell dispatched with --db prod may use its own prod DATABASE (that is data work, not a deploy).',
+  ].join('\n'));
 });
