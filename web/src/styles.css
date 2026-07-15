@@ -340,3 +340,82 @@ a.cbox:hover { border-color: var(--accent); }
 .bkrestore-into { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 .bkrestore-into select { background: var(--bg); border: 1px solid var(--line); color: var(--text);
   border-radius: 6px; padding: 4px 6px; font-size: 12px; font-family: 'Cascadia Code', monospace; }
+
+/* ── landing gate — a push to main held for human verification ────────────────
+   Loud on purpose: a held landing blocks a zee until a human decides. Uses --error
+   rather than --building because this is not "in progress", it is "stopped, needs you". */
+.land-panel { border: 1px solid var(--error); border-radius: 10px; background: var(--panel);
+  padding: 12px 14px; margin: 12px 0; }
+.land-title { color: var(--error); font-weight: 600; font-size: 13px; letter-spacing: .02em;
+  text-transform: uppercase; margin-bottom: 10px; }
+.land-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; margin-top: 8px; }
+.land-card.approved { border-color: var(--up); }
+.land-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  flex-wrap: wrap; }
+.land-what { font-size: 14px; }
+.land-meta { color: var(--muted); font-size: 12px;
+  font-family: 'Cascadia Code', 'Consolas', monospace; }
+.land-stat { color: var(--muted); font-size: 12px; margin: 6px 0 4px; }
+.land-stat .ins { color: var(--up); }
+.land-stat .del { color: var(--error); }
+.land-commits { list-style: none; margin: 6px 0 0; padding: 0; max-height: 168px; overflow-y: auto;
+  font-size: 12.5px; }
+.land-commits li { padding: 2px 0; color: var(--text); }
+.land-commits code { color: var(--accent); font-family: 'Cascadia Code', 'Consolas', monospace; }
+.land-author { color: var(--muted); }
+.land-more { color: var(--muted); font-style: italic; }
+.land-err { color: var(--error); font-size: 12px; margin-top: 8px; }
+.land-approved { color: var(--up); font-size: 12.5px; margin-top: 10px; }
+.land-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+.land-actions button { border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.land-actions button:disabled { opacity: .5; cursor: default; }
+.land-approve { border-color: var(--up) !important; color: var(--up) !important; font-weight: 600; }
+.land-approve:hover:not(:disabled) { background: rgba(53,196,107,.12); }
+.land-reject { border-color: var(--error) !important; color: var(--error) !important; }
+.land-reject:hover:not(:disabled) { background: rgba(229,85,78,.12); }
+/* nothing held any more — approved and waiting on the zee. Green, not alarm-red. */
+.land-panel.settled { border-color: var(--up); }
+.land-panel.settled .land-title { color: var(--up); }
+
+/* ── ship gate — production ships + the prod lock countdown ───────────────────
+   Prod is the one irreversible target, so an awaiting approval is the loudest thing
+   on the page; a settled panel drops back to a quiet informational bar. */
+.ship-panel { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  padding: 12px 14px; margin: 12px 0; }
+.ship-panel.urgent { border-color: var(--error); box-shadow: 0 0 0 1px rgba(229,85,78,.25); }
+.ship-title { color: var(--muted); font-weight: 600; font-size: 13px; letter-spacing: .02em;
+  text-transform: uppercase; margin-bottom: 10px; }
+.ship-panel.urgent .ship-title { color: var(--error); }
+.ship-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; margin-top: 8px; }
+.ship-card.s-shipping { border-color: var(--building); }
+.ship-card.s-approved { border-color: var(--ready); }
+.ship-reason { color: var(--text); font-size: 13px; font-style: italic; margin: 6px 0; }
+.ship-progress { color: var(--building); font-size: 12.5px; margin-top: 8px; }
+.ship-approve { border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--error) !important; background: var(--panel); color: var(--error) !important;
+  font-weight: 600; }
+.ship-approve:hover:not(:disabled) { background: rgba(229,85,78,.14); }
+.ship-approve:disabled { opacity: .5; cursor: default; }
+
+/* the countdown bar: silence = release, so the clock is prominent and Hold is one click */
+.lock-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--panel2); border: 1px solid var(--building); border-radius: 8px;
+  padding: 8px 12px; font-size: 13px; }
+.lock-bar.held { border-color: var(--up); color: var(--up); }
+.lock-clock { font-family: 'Cascadia Code', 'Consolas', monospace; color: var(--building);
+  font-size: 15px; }
+.lock-q { color: var(--muted); }
+.lock-hold { margin-left: auto; border-radius: 8px; padding: 5px 12px; font-size: 12.5px;
+  cursor: pointer; border: 1px solid var(--up); background: var(--panel); color: var(--up); }
+.lock-hold:hover:not(:disabled) { background: rgba(53,196,107,.12); }
+.lock-hold:disabled { opacity: .5; cursor: default; }
+
+/* padlock badge on the holding xell — hover reveals the unlock affordance */
+.lock-badge { background: none; border: none; cursor: pointer; font-size: 13px; padding: 0 0 0 4px;
+  line-height: 1; }
+.lock-badge:hover { transform: scale(1.15); }
+.lock-badge.held { filter: drop-shadow(0 0 3px var(--up)); }
+.lock-badge:disabled { opacity: .5; cursor: default; }

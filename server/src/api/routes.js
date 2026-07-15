@@ -11,14 +11,17 @@ import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers } from '../queenzee/containers.js';
-import { buildContainer, buildXell } from '../lib/build.js';
+import { buildContainer, buildXell, getBuildStatus } from '../lib/build.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
 import { attachXellDb, DB_MODES } from '../lib/xell-db.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
-import { acquireProdLock, releaseProdLock, prodLockStatus } from '../queenzee/deploylock.js';
+import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, deleteProject } from '../lib/projects.js';
+import { checkPush, listLandRequests, decideLandRequest } from '../queenzee/landgate.js';
+import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock }
+  from '../queenzee/shipgate.js';
 
 export const router = Router();
 
@@ -33,11 +36,97 @@ router.post('/hooks', async (req, res) => {
   }
 });
 
+// ── Channel B: the landing gate (the xource's `update` hook calls this synchronously) ────────
+//
+// This is the ONLY endpoint a blocked push waits on, so it must answer fast and it must never
+// throw a bare 500 that the hook can't read. The hook fails closed on anything unexpected; we
+// still return an explicit allow:false so the zee gets a useful reason instead of a timeout.
+router.post('/land/check', async (req, res) => {
+  const { project_id, ref, old, new: newSha } = req.body || {};
+  if (!project_id || !ref || !newSha) return res.status(400).json({ allow: false, reason: 'bad-request' });
+  try {
+    res.json(await checkPush({ projectId: project_id, ref, oldSha: old, newSha }));
+  } catch (err) {
+    console.error('[landgate] check failed:', err.message);
+    res.status(500).json({ allow: false, reason: 'gate-error', error: err.message });
+  }
+});
+
+router.get('/land/requests', async (req, res) => {
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  res.json(await listLandRequests(req.query.project, { open: req.query.all !== '1' }));
+});
+
+// A HUMAN approves/rejects. There is deliberately no self-approval path for a zee: nothing in
+// the skill, the MCP server or the dispatch prompt knows this route exists.
+router.post('/land/requests/:id/:decision(approve|reject)', async (req, res) => {
+  const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
+  try {
+    res.json(await decideLandRequest(req.params.id, decision, req.body?.by || 'human@console'));
+  } catch (err) {
+    res.status(409).json({ error: err.message });
+  }
+});
+
+// ── Channel C: shipping to production (the zee asks; the queenzee ships) ─────
+//
+// The zee's ONLY prod verb. It cannot take the lock and cannot run a deploy: approving is a human
+// act, and the build is the queenzee's, from the xource at main.
+router.post('/ship/request', async (req, res) => {
+  const { xell_id, zee_id, reason } = req.body || {};
+  if (!xell_id) return res.status(400).json({ error: 'xell_id required' });
+  try { res.json(await requestShip({ xellId: xell_id, zeeId: zee_id || null, reason: reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+router.get('/ship/requests', async (req, res) => {
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  res.json(await listShipRequests(req.query.project, { open: req.query.all !== '1' }));
+});
+
+// What a waiting zee polls (xell-ship.mjs --wait) — its exit is the zee's nudge.
+router.get('/ship/status', async (req, res) => {
+  if (!req.query.xell) return res.status(400).json({ error: 'xell required' });
+  const s = await shipStatus(req.query.xell);
+  if (!s) return res.status(404).json({ error: 'no ship request for this xell' });
+  res.json(s);
+});
+
+router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => {
+  const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
+  try { res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// Lock lifecycle — both HUMAN-only. Hold stops the auto-release countdown; force release takes
+// prod back from whoever has it.
+router.post('/prod-lock/hold', async (req, res) => {
+  if (!req.body?.project) return res.status(400).json({ error: 'project required' });
+  try { res.json(await holdProdLock(req.body.project, req.body.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+router.post('/prod-lock/force-release', async (req, res) => {
+  if (!req.body?.project) return res.status(400).json({ error: 'project required' });
+  try { res.json(await forceReleaseProdLock(req.body.project, req.body.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
 // ── read models ──────────────────────────────────────────────────────────────
+// The meta-DB is on the NAS, so a network blip makes this throw. Express 4 does NOT catch a
+// rejected async handler: it became an unhandled rejection and KILLED the whole queenzee —
+// pool, monitor and ship reaper with it — on 2026-07-15, from one ETIMEDOUT. The loops all
+// catch their own errors; this route was the hole. A read model that fails must 503, not
+// take the orchestrator down with it.
 router.get('/fleet', async (req, res) => {
-  const fleet = await getFleet(req.query.project || null);
-  if (!fleet) return res.status(404).json({ error: 'no project' });
-  res.json(fleet);
+  try {
+    const fleet = await getFleet(req.query.project || null);
+    if (!fleet) return res.status(404).json({ error: 'no project' });
+    res.json(fleet);
+  } catch (err) {
+    console.error('[api] /fleet failed:', err.message);
+    res.status(503).json({ error: `fleet unavailable: ${err.message}` });
+  }
 });
 
 router.get('/projects', async (_req, res) => res.json(await listProjects()));
@@ -136,6 +225,13 @@ router.post('/containers/:id/build', async (req, res) => {
   try { res.json(await buildContainer(req.params.id, { hot: !!req.body?.hot })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Is the xell's stack built from its worktree's current HEAD? This is what `xell-build --wait`
+// polls, so a zee never has to invent a curl-grep loop against its own app to find out.
+router.get('/xells/:id/build/status', async (req, res) => {
+  try { res.json(await getBuildStatus(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+
 router.post('/xells/:id/build', async (req, res) => {
   try {
     const role = req.body?.role && req.body.role !== 'all' ? req.body.role : null;
@@ -186,14 +282,18 @@ router.get('/xell/status', async (req, res) => {
 });
 
 // ── production deploy lock (padlock in the UI) ───────────────────────────────
-router.post('/prod-lock/acquire', async (req, res) => {
-  try { res.json(await acquireProdLock(req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-router.post('/prod-lock/release', async (req, res) => {
-  try { res.json(await releaseProdLock(req.body || {})); }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
+//
+// RETIRED: a zee may no longer take or drop prod itself. The lock is the queenzee's to assign
+// (after a human approves a ship) and to take back (on the auto-release countdown). Leaving these
+// live would leave the old back door open — a zee could hold prod and deploy by hand, which is
+// exactly the band-aid path the ship gate exists to close. They answer 409 with the way in.
+const RETIRED_LOCK = {
+  error: 'retired: a zee cannot take or release the production lock',
+  use_instead: 'POST /api/ship/request (or scripts/xell-ship.mjs) — a human approves, then the '
+    + 'queenzee assigns the lock, deploys from main, and releases it automatically.',
+};
+router.post('/prod-lock/acquire', (_req, res) => res.status(409).json(RETIRED_LOCK));
+router.post('/prod-lock/release', (_req, res) => res.status(409).json(RETIRED_LOCK));
 router.get('/prod-lock', async (req, res) => {
   const proj = req.query.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
   res.json((await prodLockStatus(proj)) || { held: false });
@@ -252,9 +352,16 @@ router.get('/stream', async (req, res) => {
   });
   res.flushHeaders?.();
 
-  // initial snapshot so a fresh client renders immediately
-  const fleet = await getFleet(req.query.project || null);
-  res.write(`event: snapshot\ndata: ${JSON.stringify(fleet)}\n\n`);
+  // initial snapshot so a fresh client renders immediately. Same trap as /fleet: this is an
+  // async handler, and the dashboard holds this connection open — a NAS blip here used to throw
+  // an unhandled rejection and kill the queenzee. Degrade to a live stream with no snapshot.
+  try {
+    const fleet = await getFleet(req.query.project || null);
+    res.write(`event: snapshot\ndata: ${JSON.stringify(fleet)}\n\n`);
+  } catch (err) {
+    console.error('[api] /stream snapshot failed:', err.message);
+    res.write(`event: error\ndata: ${JSON.stringify({ error: err.message })}\n\n`);
+  }
 
   const onEvent = (e) => res.write(`event: ${e.type}\ndata: ${JSON.stringify(e.payload)}\n\n`);
   bus.on('event', onEvent);

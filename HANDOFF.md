@@ -44,7 +44,7 @@ out an OmniBiz worktree to a session standing in this repo).
 ```
 db/migrations/*.sql      001 init · 002 monitor · 003 deploy_lock · 004 production
                          005 container_build · 006 db_backups · 007 container_restoring
-                         008 async_backup_jobs
+                         008 async_backup_jobs · 009 land_gate
 server/src/
   db/        migrate.js, seed.js, seed_demo.js  ← seed_demo is DEAD to us (see House rules)
   api/routes.js          all HTTP routes
@@ -87,10 +87,14 @@ containers) · `POOL_ENABLED` · `POLLER_ENABLED` · `BUILD_MODE=real|simulate` 
 ## What's real vs simulate
 
 - **Real**: provisioning (git worktrees), container health, docker builds, per-xell diffs, the git
-  graph, prod backups, the db-attach flags, `claude://resume` deep-links on xell cards.
-- **Hooks are NOT installed.** `POST /api/hooks` exists and returns 202, but there are no hooks in
-  `~/.claude/settings.json` — nothing calls it. Live session state comes from the **active-session
-  monitor** instead. (`hooks/settings.hooks.json` is a template, not something that's running.)
+  graph, prod backups, the db-attach flags, `claude://resume` deep-links on xell cards, the
+  **landing gate** (live on OmniBiz `main` — a real `update` hook that really declines pushes).
+- **The hooks STATUS channel is still not installed.** `POST /api/hooks` exists and returns 202, but
+  nothing calls it; live session state comes from the **active-session monitor** instead.
+  (`hooks/settings.hooks.json` is a template, not something that's running.)
+- **But one hook IS installed now**: `PreToolUse → hooks/prod-guard.mjs`, registered in
+  `~/.claude/settings.json` (see "Shipping"). Verified firing on a live session via a canary —
+  no restart needed, the harness file-watches settings.json.
 - **Provisioning is `simulate` by default in code** — Mark always runs `real`.
 
 ## House rules (learned the hard way — do not relearn them)
@@ -100,9 +104,143 @@ containers) · `POOL_ENABLED` · `POLLER_ENABLED` · `BUILD_MODE=real|simulate` 
    targeted **by explicit slug or id** — never "the first card", never a `ready` xell (Mark
    commissions those too). A past session reaped his live DTR zee mid-task and lost real work.
 3. **`origin` is off-limits to zees** — they land with `git push . HEAD:main`, never to origin.
+   That push is now **HELD by a git hook on the xource** until a human approves it in the console
+   (see "Landing gate"). A zee landing on main unannounced is what the gate exists to stop.
 4. **A human marks a xell done**, not the zee. `/xell-done` typed by a human IS the confirmation.
 5. **Builds go through the queenzee** (`build.*` in the binding), never ad-hoc `docker compose`.
 6. **`db-shared-prod` is LIVE production data** — never a default, must be asked for.
+
+## Landing gate (a push to main is a REQUEST)
+
+Added 2026-07-15, after `mardale-dtr-payroll` put its work on OmniBiz `main` with nobody told.
+"Land locally: `git push . HEAD:main`" was only ever an *instruction* in the zee's prompt — nothing
+enforced it and nothing announced it. The queenzee can't police that from outside: by the time its
+poller sees the new tip, main has already moved. So the gate lives in git itself.
+
+- **`update` hook on the xource** (`hooks/land-gate-update.sh`, installed by
+  `scripts/install-land-gate.sh`) fires on every push to `main_branch`, asks
+  `POST /api/land/check`, and **declines unless a human already approved that exact sha**.
+- **FAILS CLOSED** — queenzee unreachable = no landing. Deliberate: the server being down is
+  exactly when a silent landing would go unnoticed. (Opposite stance to the sibling
+  `reference-transaction` hook, which guards ordinary local work and must never wedge it.)
+- Fires **only on push**, and only for `main_branch`. Committing/merging on main directly (Mark
+  working normally) is untouched, and a queenzee outage can never block a non-main push.
+- Approval is bound to the **exact sha** a human read; it is **spent on use**. Amend/rebase → new
+  sha → new decision. Approve → the zee re-runs the **same** push and it goes through.
+- Console: held landings render **above everything** (`web/src/Landing.jsx`) with the commit list
+  + diffstat and Approve/Reject. A T-Keyboard ping fires too (`lib/notify.js`, `TKB_NOTIFY=0` to
+  mute) — a held push blocks a zee, so it must reach you off-screen.
+- **Zees checkpoint-commit freely** on their own branch — a commit only moves their branch ref and
+  lands nothing, so the prompt now tells them to commit early and often rather than hoard
+  uncommitted work while waiting on approval. Only the *push* is gated.
+- The xell card therefore shows **two** diffs (`lib/git.js → worktreeDiff`):
+  - **source diff** = worktree vs the source (`↑ahead ↓behind · files +ins/−del`, includes
+    uncommitted) — everything the zee has produced; what would land.
+  - **diff** = worktree vs its OWN HEAD (`own`) — work not yet checkpointed. Drops to 0 on every
+    checkpoint while source diff persists. `●N` = dirty files incl. untracked.
+- **Installed for OmniBiz only.** `.git/hooks` is machine-local and not version-controlled, so it
+  does NOT travel with a clone — re-run the installer per machine, and after any `main_branch`
+  change (the protected ref is baked in). Zeehive's own repo is NOT gated yet.
+  - status: `bash scripts/install-land-gate.sh --status D:/Repos/OmniBiz/omnibiz`
+  - override (human, on purpose): `git -c core.hooksPath=/dev/null push . HEAD:main`
+
+## Shipping to production (the zee asks; the QUEENZEE ships)
+
+Added 2026-07-15. Prod used to be zee-driven: the zee grabbed the lock (MCP
+`zeehive_prod_lock_acquire`) and deployed by hand, ungated. That ships **band-aids** — live in
+prod, absent from main, silently reverted by the next rebuild from main.
+
+- **`scripts/xell-ship.mjs <xell_id> --reason "..." [--wait]`** is a zee's ONLY prod verb. It may
+  only ASK. It never holds the lock, never runs a prod build, never releases anything.
+- **A ship is REFUSED unless the work is already landed on main** (clean tree, 0 ahead). Prod
+  builds from the **xource at main**, so unlanded work would not be in the ship. This is what makes
+  band-aids impossible by construction rather than by rule.
+- **Human approves** in the console → the **queenzee** takes the prod lock and runs each prod
+  container's OWN build script. `--wait` (in the background) exits when it's shipped/failed → nudge.
+- **Per-container build scripts are DB fields**, not hardcoded: `container.build_script` +
+  `build_exec` (010). Contract: `<build_exec> <build_script> <source_path> <role> <ctx> <mode>` →
+  one JSON line `{"ok":…,"head":…}` (same as build-container.sh, so one projector reads both).
+  Seeded for prod server+webapp → `scripts/ship-prod.sh`. db/infra are deliberately NOT shippable
+  (swapping the prod postgres image is a coordinated infra change, never a side effect of a ship).
+- **`SHIP_MODE=simulate`** prints the docker commands and ships nothing — how the pipeline was
+  verified end-to-end. **Default is now `real`.** `ship-prod.sh` runs
+  `docker --context mardale-prod compose -f docker-compose.prodsrc.yml build/up -d <svc>`.
+  ⚠ THE REAL COMMAND HAS NEVER RUN. Everything around it is verified; the deploy itself is
+  modelled on build-container.sh + the prodsrc stack. Read it before the first real ship.
+- **ENFORCED by a `PreToolUse` hook** (`hooks/prod-guard.mjs`, registered in
+  `~/.claude/settings.json`). The prompt version of this rule FAILED in the wild: a zee ran
+  `/spin:deploy-guard` and then `docker --context mardale-prod compose build webapp` by hand —
+  and, because it built without `up -d`, left a fresh image that nothing ran while reporting
+  success. Prod stayed on the old image. Prompts don't bind an already-running session, and
+  `defaultMode: bypassPermissions` means nothing prompts. So:
+  - Denies Bash that MUTATES prod (prod context / prodsrc / `*_prod` names + a mutating verb)
+    **only when cwd is inside `.claude/worktrees/`** — i.e. zees. Mark's own sessions are untouched.
+  - Read-only docker against prod (ps/logs/inspect/images) stays ALLOWED — a zee verifying a ship
+    should be able to look.
+  - Fails OPEN only on a malformed payload (it sees every Bash call on this machine; a crash must
+    not wedge the tool). No network dependency, so there is no "gate unreachable" case.
+  - Not adversary-proof: a determined zee could obfuscate the command. It stops instruction-
+    following and accident, which is what actually happened.
+  - Debug: `ZEEHIVE_HOOK_TRACE=<file>` logs every invocation. Verified live via a canary.
+- **`/spin:deploy-guard` is a SECOND, file-based lock** (`.git/spin-deploy-locks`) that the
+  queenzee cannot see — they disagreed in the wild (file lock "deploying", DB lock "free"). All
+  three copies of that skill now refuse for xells and point at the ship flow. The two plugin copies
+  (`~/.claude/plugins/{cache,marketplaces}/...`) can be clobbered by a plugin update — the hook is
+  the real enforcement, the skill text is only a courtesy.
+- **The old zee-driven lock path is retired**: MCP `zeehive_prod_lock_acquire/release` are gone
+  (replaced by `zeehive_ship_request` / `zeehive_ship_status`), and `POST /api/prod-lock/{acquire,
+  release}` now answer 409 pointing at the ship flow. Read-only `GET /api/prod-lock` still works.
+- **The lock auto-releases after `SHIP_LOCK_RELEASE_SEC` (default 180s)** — silence must mean "let
+  it go", or an unattended hold blocks every other xell. The console shows a countdown + **Hold**
+  (stops the clock for a human who is verifying). A **padlock** sits on the holding xell's card:
+  hover → 🔓, click → confirm → force release. Reaper tick: 5s; it also starts any approved ship
+  that was waiting for prod to free up.
+
+## Builds: how a zee waits (and why it used to hang)
+
+`xell-build.mjs` was fire-and-forget and said *"watch its health on the dashboard"* — which a zee
+cannot do. With no completion signal, zees invent `curl | grep` loops against their own webapp and
+hang for 45+ minutes on a condition that never matches, long after the build succeeded.
+
+- **`--wait`** blocks until the build settles and reports whether the container is serving the
+  worktree's **current HEAD** — from `container.last_build_commit`, which the queenzee records at
+  build time. Exit 0 = built, 1 = failed/timeout (20 min cap). It answers from fact, not a guess.
+- **`--watch`** = same report, but starts nothing. Read-only "is what's running actually my code?".
+- **Run it in the background: its exit IS the nudge.** The harness re-invokes a session when a
+  background task finishes, so the zee keeps working and gets told the moment the build lands.
+  Nothing pushes into a session — the wait just has to *end*.
+- `GET /api/xells/:id/build/status` is the underlying truth (`serving_head`, `never_built`).
+- A **`--hot`** build re-used the old image, so `serving_head` is false for it *by design* — hot
+  never picks up code changes.
+- **Fixed: orphaned builds.** `buildContainer` finalizes health from an in-process promise, and the
+  health monitor SKIPS `health='building'` so it can't clobber a live build's spinner. A server
+  restart mid-build therefore stranded the container at `building` **forever** — the promise died
+  and the one thing that could fix it refused to look. `recoverOrphanBuilds()` now runs at boot
+  (every `building` row is by definition an orphan in a fresh process) and hands them back to the
+  monitor. Verified: without it, a stuck row survives a full monitor tick.
+
+## The "Claude binary won't launch" red herring (do NOT chase the binary)
+
+If a dispatch dies with:
+
+> *Claude Code native binary at …\claude.exe exists but failed to launch. This usually means the
+> binary does not match this system's libc — e.g. spawning a musl-linked binary on a glibc Linux
+> host…*
+
+**the binary is almost certainly fine, and none of that text applies on Windows.** It is `sZ()` in
+the SDK's `sdk.mjs`, printed for *ANY* spawn error, and it DISCARDS the real error code. Two
+sessions lost an hour to it on 2026-07-15.
+
+The real cause was **`cwd` did not exist**: the dispatch carried a stale `xell_id` from an earlier
+turn, the reaper had since retired that xell and deleted its worktree, and Node raises `ENOENT`
+when spawning into a missing cwd — which the SDK reports as a broken executable.
+
+`spawnHeadless` now rejects a retired/tearing-down xell, and any xell whose `worktree_path` is not
+on disk, with a message that says so. Before blaming the SDK, check:
+`node -e "console.log(require('fs').existsSync('<worktree_path>'))"`.
+The binary itself: `node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe --version`
+(prints `2.1.208`). The SDK's own resolution + a `sdk.query()` with the queenzee's exact options
+were both verified working — it is not the install, and reinstalling is a waste of time.
 
 ## KNOWN ISSUES / NEXT STEPS
 
@@ -118,8 +256,12 @@ containers) · `POOL_ENABLED` · `POLLER_ENABLED` · `BUILD_MODE=real|simulate` 
    them back."* Either add a continuation loop in `spawnHeadless`, or keep one-shot and size tasks
    to fit one turn. Not decided.
 4. **Zeehive's pool target is 0** — set `pool_config.target_ready` if you want it warming xells.
-5. **Skills are duplicated** — `skill/` in the repo vs the installed `~/.claude/skills/`. Editing
-   one silently leaves the other stale.
+5. **Skills are duplicated, and they HAVE already drifted** — `skill/` in the repo vs the
+   installed `~/.claude/skills/`. Not hypothetical: as of 2026-07-15 `skill/xell/SKILL.md` is 33
+   lines and the installed copy is 61 — the installed one has the claim GATE, the project-handover
+   note and the build rules; the repo copy has none of them. **The installed copy is what actually
+   runs**, so treat it as authoritative and back-port, don't overwrite it with the repo's. (The
+   landing-gate text was added to both.) Worth making the repo the source and installing from it.
 
 ## How to talk to it as an agent
 

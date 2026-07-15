@@ -57,7 +57,7 @@ export async function deleteProject(id, force = false) {
 export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog }) {
   const es = new EventSource(`/api/stream${pq(projectId)}`);
   es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
-  for (const type of ['zee', 'xell', 'container', 'task', 'project']) {
+  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship']) {
     es.addEventListener(type, () => onChange());
   }
   if (onLog) es.addEventListener('log', (e) => onLog(JSON.parse(e.data)));
@@ -163,6 +163,55 @@ export async function restoreBackup(id, container) {
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `restore failed (${r.status})`);
+  return data;
+}
+
+// ── landing gate (pushes to main held for human verification) ─────────────────
+// The panel reads open requests off the fleet snapshot (fleet.landing); this is for the
+// full history modal.
+export async function getLandRequests(projectId, all = false) {
+  const r = await fetch(`/api/land/requests${pq(projectId)}${all ? '&all=1' : ''}`);
+  return r.ok ? r.json() : [];
+}
+
+// approve → the zee's NEXT push of this exact sha is let through by the xource's update hook.
+// reject → that sha is refused for good; re-pushing it will not help.
+export async function decideLanding(id, decision, by = 'human@console') {
+  const r = await fetch(`/api/land/requests/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+
+// ── shipping to production (zee asks · human approves · queenzee ships) ───────
+// approve → the queenzee takes the prod lock and runs the deploy ITSELF, from main.
+export async function decideShip(id, decision, by = 'human@console') {
+  const r = await fetch(`/api/ship/requests/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+
+// Stop the auto-release countdown — for a human who is actively verifying prod.
+export async function holdProdLock(projectId, by = 'human@console') {
+  const r = await fetch('/api/prod-lock/hold', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ project: projectId, by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `hold failed (${r.status})`);
+  return data;
+}
+
+export async function forceReleaseProdLock(projectId, by = 'human@console') {
+  const r = await fetch('/api/prod-lock/force-release', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ project: projectId, by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `release failed (${r.status})`);
   return data;
 }
 

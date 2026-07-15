@@ -10,7 +10,7 @@ import { resolve } from 'node:path';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
-import { cleanGitEnv } from '../lib/git.js';
+import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
@@ -66,6 +66,65 @@ export async function buildContainer(containerId, { hot = false } = {}) {
   })();
 
   return { status: 'building', container: c.name, role: c.role, hot, mode: MODE };
+}
+
+// Is this xell's stack built from the code that is in its worktree RIGHT NOW?
+//
+// This is the question a zee actually has after a build ("is the container serving MY fix?"), and
+// without an answer it invents a curl-poll loop against its own webapp that greps for a string —
+// which hangs forever when it guesses the condition wrong. The queenzee already knows: it records
+// last_build_commit at build time. So answer it here, from server truth.
+// build-container.sh records a SHORT sha (8) while git rev-parse HEAD is the full 40, so `===`
+// is never true and every container looks stale. Compare on the shorter one's length.
+function sameCommit(a, b) {
+  if (!a || !b) return false;
+  const n = Math.min(a.length, b.length);
+  return n >= 7 && a.slice(0, n) === b.slice(0, n);
+}
+
+export async function getBuildStatus(xellId) {
+  const xell = await one(`SELECT id, slug, worktree_path FROM xell WHERE id=$1`, [xellId]);
+  if (!xell) throw new Error('xell not found');
+  const head = xell.worktree_path ? headCommit(xell.worktree_path, 'HEAD') : null;
+
+  const cs = await q(
+    `SELECT id, name, role, health, last_build_commit, last_built_at, hot_build
+       FROM container WHERE owner_xell_id=$1 AND role = ANY($2) ORDER BY role`,
+    [xellId, [...BUILDABLE]]);
+
+  const containers = cs.map((c) => ({
+    ...c,
+    // A HOT build re-used the old image, so its recorded commit does NOT mean the code is live.
+    serving_head: !!head && !c.hot_build && c.health === 'up' && sameCommit(c.last_build_commit, head),
+    never_built: !c.last_build_commit,
+  }));
+  return {
+    xell: { id: xell.id, slug: xell.slug },
+    head,
+    building: containers.some((c) => c.health === 'building'),
+    settled: containers.every((c) => c.health !== 'building'),
+    all_serving_head: containers.length > 0 && containers.every((c) => c.serving_head),
+    containers,
+  };
+}
+
+// Recover builds orphaned by a server restart.
+//
+// buildContainer finalizes health from an in-process background promise, and the health monitor
+// deliberately SKIPS health='building' so it can't clobber a live build's spinner. Together that
+// means a restart mid-build strands the container at 'building' FOREVER: the promise died, and
+// the one thing that would fix it refuses to look. The dashboard spins and a waiting zee waits
+// forever. At boot there can be no in-flight build in THIS process, so every 'building' row is by
+// definition an orphan — hand them back to the monitor.
+export async function recoverOrphanBuilds() {
+  const rows = await q(
+    `UPDATE container SET health='unknown' WHERE health='building' RETURNING id, name`);
+  for (const r of rows) broadcast('container', r);
+  if (rows.length) {
+    logline('build', `recovered ${rows.length} orphaned build(s) after restart: `
+      + `${rows.map((r) => r.name).join(', ')} — health monitor will re-derive from docker`);
+  }
+  return rows.length;
 }
 
 // Build a xell's buildable containers. role=null → both (server + webapp); otherwise just that

@@ -1,6 +1,7 @@
 // Idempotent seed: the OmniBiz project, its xource, agent runtimes, pool config,
 // and the fleet-shared container inventory (from the container-topology research).
 // Re-runnable: everything is upserted on natural keys.
+import { resolve } from 'node:path';
 import { pool, q, one } from './pool.js';
 import { config } from '../config.js';
 
@@ -97,6 +98,18 @@ async function seed() {
       [projectId, role, tier, name, tier === 'dev' ? dev : prod, hostPort, intPort, url, ctx]
     );
   }
+
+  // ── how the queenzee ships each prod container (010_ship_gate) ─────────────
+  // The path + interpreter live on the CONTAINER row so the queenzee looks up how to build a
+  // thing instead of hardcoding one project's deploy. Only server/webapp are shippable: the db
+  // and infra are NOT redeployed by a ship (swapping the prod postgres image is a coordinated
+  // infra change, never a side effect of shipping a feature).
+  const shipScript = resolve(config.repoRoot, 'scripts', 'ship-prod.sh').replace(/\\/g, '/');
+  await q(
+    `UPDATE container SET build_script=$2, build_exec='bash'
+       WHERE project_id=$1 AND tier='prod' AND role IN ('server','webapp')`,
+    [projectId, shipScript]
+  );
 
   // ── production as an untouchable xell (references the prod containers) ──────
   const xourceRow = await one(`SELECT id FROM xource WHERE project_id=$1 AND ref='main'`, [projectId]);

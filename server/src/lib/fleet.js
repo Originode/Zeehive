@@ -83,6 +83,24 @@ export async function getFleet(projectId) {
     running: runningBackup || null,
   };
 
+  // Pushes to main being HELD for human verification. Open ones only: this drives a blocking
+  // banner, and a blocked zee is stuck until someone acts on it.
+  const landing = await q(
+    `SELECT lr.*, x.slug AS xell_slug
+       FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
+       WHERE lr.project_id = $1 AND lr.status IN ('pending','approved')
+       ORDER BY lr.requested_at DESC`, [pid]);
+
+  // Ships awaiting a human, plus whoever holds prod right now. `auto_release_at` drives the
+  // console's countdown + Hold prompt; the card renders a padlock on the holder.
+  const shipping = await q(
+    `SELECT s.*, x.slug AS xell_slug FROM ship_request s JOIN xell x ON x.id = s.xell_id
+       WHERE s.project_id = $1 AND s.status IN ('pending','approved','shipping')
+       ORDER BY s.requested_at DESC`, [pid]);
+  const prodLock = await one(
+    `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id
+       WHERE dl.project_id = $1 AND dl.container = 'prod'`, [pid]);
+
   return {
     project,
     pool,
@@ -90,6 +108,9 @@ export async function getFleet(projectId) {
     containers: groups,
     backup,
     xells,
+    landing,
+    shipping,
+    prod_lock: prodLock || null,
   };
 }
 

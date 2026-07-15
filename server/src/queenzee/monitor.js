@@ -1,11 +1,13 @@
 // Monitor — confirms a zee's session is REALLY active per the `claude` CLI itself, not
 // per the model. Local/headless zees are checked against `claude agents --json`; remote
 // zees against `claude remote list`/`status`. Writes zee.cli_active + surfaces it live.
+import { existsSync } from 'node:fs';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { listActiveAgents, remoteList, remoteStatus } from '../lib/claude-cli.js';
 import { broadcast } from '../lib/events.js';
 import { sessionTitle } from '../lib/session-title.js';
+import { worktreeDiff } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 
 async function setActive(zee, active, source) {
@@ -22,6 +24,63 @@ async function setActive(zee, active, source) {
   return row;
 }
 
+// ── stale claims: the xell leak ──────────────────────────────────────────────
+//
+// A failed dispatch strands its xell. `releaseXell` only fires on ONE path (the first-event race
+// in spawnHeadless); a zee that dies AFTER init just leaves the xell 'claimed'. And the pool
+// reconciler only ever looks at status='ready', so a claimed xell is invisible to it — forever.
+// Real case: hotel-complimentary-…-43330c sat 'claimed' from 11:50 (its zee exited -1) until a
+// human clicked "Mark done" at 16:34. Nothing automatic would EVER have freed it.
+//
+// The dangerous half: releasing a xell back to 'ready' hands it to the reconciler, which
+// DECOMMISSIONS anything dirty or diverged — i.e. deletes the worktree. A session that merely
+// ended (zee 'stopped') can still hold uncommitted work, and a past session reaped Mark's live
+// DTR zee exactly this way. So: never release a xell that has anything to lose. Unlanded work is
+// a HUMAN's call (House rule 4) — we surface it and leave it alone.
+async function reclaimStaleClaims() {
+  const stale = await q(
+    `SELECT x.id, x.slug, x.worktree_path, x.project_id
+       FROM xell x
+      WHERE x.status = 'claimed' AND NOT x.is_production
+        -- nobody is in there: no zee spawning/online/working, and not even idle (an idle zee is
+        -- how a one-shot dispatched zee legitimately waits for its human to prompt it again)
+        AND NOT EXISTS (SELECT 1 FROM zee z WHERE z.xell_id = x.id
+                          AND z.status IN ('spawning','online','working','idle'))
+        -- it HAD a zee, and that zee is done for: errored, or its session stopped
+        AND EXISTS (SELECT 1 FROM zee z WHERE z.xell_id = x.id)
+        AND (SELECT z.status FROM zee z WHERE z.xell_id = x.id
+              ORDER BY z.created_at DESC LIMIT 1) IN ('errored','stopped')`);
+  if (!stale.length) return 0;
+
+  let freed = 0;
+  for (const x of stale) {
+    const project = await one(`SELECT main_branch FROM project WHERE id=$1`, [x.project_id]);
+    const src = project?.main_branch || 'main';
+
+    if (!x.worktree_path || !existsSync(x.worktree_path)) {
+      // No worktree = nothing to lose. Hand it back so the reconciler can bin it properly.
+      const row = await one(
+        `UPDATE xell SET status='ready', is_pooled=true WHERE id=$1 AND status='claimed' RETURNING *`, [x.id]);
+      if (row) { broadcast('xell', row); freed++; logline('monitor', `reclaimed stale claim ${x.slug} — dead zee, no worktree on disk; pool will decommission it`); }
+      continue;
+    }
+
+    const d = worktreeDiff(x.worktree_path, src);
+    if (d.dirty > 0 || d.ahead > 0) {
+      // HAS WORK. Releasing this would let the reconciler delete it. Say so; do not touch it.
+      logline('monitor',
+        `stale claim ${x.slug} has UNLANDED WORK (${d.ahead} commit(s), ${d.dirty} dirty file(s)) — `
+        + 'its zee is dead but the work is not. Leaving it alone: a human decides (Mark done / land it).');
+      continue;
+    }
+
+    const row = await one(
+      `UPDATE xell SET status='ready', is_pooled=true WHERE id=$1 AND status='claimed' RETURNING *`, [x.id]);
+    if (row) { broadcast('xell', row); freed++; logline('monitor', `reclaimed stale claim ${x.slug} — dead zee, clean worktree; back in the pool`); }
+  }
+  return freed;
+}
+
 export async function monitorTick() {
   const zees = await q(
     `SELECT z.*, r.key AS runtime_key FROM zee z
@@ -32,8 +91,12 @@ export async function monitorTick() {
     `SELECT count(*) FILTER (WHERE NOT is_production AND status='ready') ready,
             count(*) FILTER (WHERE NOT is_production AND status IN ('working','idle','claimed','awaiting-done')) busy,
             count(*) FILTER (WHERE is_production) prod FROM xell WHERE status<>'retired'`);
-  logline('monitor', `housekeeping: ${zees.length} live zee(s) · xells ${cen.busy} busy / ${cen.ready} ready · prod ${cen.prod}`);
-  if (!zees.length) return { checked: 0 };
+  // This line used to say "housekeeping" while doing nothing but counting — which is how a leak
+  // sat in plain sight for hours: the census cheerfully reported a dead xell as "busy".
+  const freed = await reclaimStaleClaims().catch((e) => { console.error('[monitor] reclaim:', e.message); return 0; });
+  logline('monitor', `census: ${zees.length} live zee(s) · xells ${cen.busy} busy / ${cen.ready} ready · prod ${cen.prod}`
+    + (freed ? ` · reclaimed ${freed} stale claim(s)` : ''));
+  if (!zees.length) return { checked: 0, freed };
 
   const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote');
   const remote = zees.filter((z) => z.runtime_key === 'claude-code-remote');

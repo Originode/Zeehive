@@ -19,9 +19,35 @@ Act on the binding above:
   never track a different branch.
 - **Use ONLY your assigned containers** (the `containers` list): reach the server/webapp at
   their URLs and the database via its `conn_ref`. Do not touch other xells' containers.
+- **VERIFY IN THIS XELL — you already have everything you need.** Those containers are *yours*:
+  your own server, webapp and database, isolated from prod and from every other zee. This is the
+  whole point of a xell. So: don't ask for a xell (you are in one), don't ask to use dev or prod,
+  and never stop at *"I can't verify this here"* — build into your own containers and exercise the
+  real thing before calling the work done.
+- **Checkpoint-commit freely.** `git commit` on your branch as you go, whenever a step works. A
+  commit only moves *your* branch ref — it lands nothing and touches nobody else. Nothing is
+  integrated until you push, and that push needs a human, so there is no reason to hoard
+  uncommitted work: commit early and often. It is the only thing protecting what you've done.
+- **Waiting for a build: append `--wait`** to the build command. NEVER hand-roll a wait — don't
+  curl your own webapp in a poll loop or `sleep` and re-check; those loops guess a condition and
+  hang for 45 minutes on a build that finished long ago. `--wait` blocks until the build settles
+  and tells you whether the container is serving your current HEAD. Run it in the BACKGROUND and
+  its exit is your nudge.
 - **Land locally:** commit on your branch, then `git push . HEAD:main`. `origin` is
   off-limits (stale by design) — never fetch/pull/push origin, ignore any "Create PR" chip.
-- If a **production** deploy is needed, follow the deploy-guard protocol before deploying.
+- **Landing is HELD for a human.** That push is a *request*: the xource's git hook declines it
+  and raises it in the ZEEHIVE console for verification. This is expected — your work is safe on
+  your branch, nothing was lost. Tell your human it is waiting, and re-run the **same** push once
+  they approve. Do not amend/rebase to a new sha (approval is bound to the exact commit they
+  read), and never try to route around the hook.
+- **Shipping to PRODUCTION: you may only ASK.** Run the binding's ship command
+  (`xell-ship.mjs <xell_id> --reason "..." --wait`, in the BACKGROUND — its exit is your nudge).
+  A human approves it, then the **queenzee** takes the prod lock and runs the deploy itself, from
+  the xource at **main**. You never hold the lock, never run a prod build, and never release
+  anything. This is deliberate: a zee deploying by hand ships a *band-aid* — live in prod, absent
+  from main, silently reverted by the next rebuild. A ship is **refused unless your work is
+  already landed**. Never run docker/compose against prod yourself, and don't use the old
+  deploy-guard acquire path.
 - When the work is done, the **human** marks the task done in the ZEEHIVE web app; that is
   what tells the queenzee to tear this xell down. You do not despawn yourself.
 

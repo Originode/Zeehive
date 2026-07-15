@@ -9,6 +9,8 @@ import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel from './Backups.jsx';
+import LandingPanel from './Landing.jsx';
+import ShipPanel, { LockBadge } from './Ship.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 
@@ -178,6 +180,15 @@ export default function App() {
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
 
+      {/* Held landings sit ABOVE everything: a blocked push means a zee is stuck waiting on a
+          human, and this is the only thing on the page that can't wait for you to scroll. */}
+      <LandingPanel landing={fleet.landing} onDecided={refresh} />
+
+      {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
+          both are decisions only a human may make, and both block a zee until made. */}
+      <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock}
+                 projectId={projectId || project.id} onDecided={refresh} />
+
       <BackupsPanel backup={fleet.backup} projectId={projectId || project.id} />
 
       <section className="inventory">
@@ -194,7 +205,8 @@ export default function App() {
 
       <h2 className="xells-h">xells:</h2>
       <section className="xells">
-        {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu} />)}
+        {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu}
+                                   prodLock={fleet.prod_lock} projectId={projectId || project.id} />)}
         {xells.length === 0 && <p className="loading">No active xells. The pool maintainer will fill it shortly…</p>}
       </section>
       </div>
@@ -251,7 +263,7 @@ function openProtocol(url) {
   a.remove();
 }
 
-function XellCard({ x, diff, onDone, onMenu }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const clickable = !!x.viewer_url && !isProd;
@@ -281,24 +293,27 @@ function XellCard({ x, diff, onDone, onMenu }) {
         (diff.dirty > 0 ? `   • ${diff.dirty} uncommitted file(s) in the worktree\n` : '') +
         `   This work will be PERMANENTLY LOST.\n`
       : '\n\n(Nothing unlanded — its work is already on main.)\n';
-    // ACTIVE = a zee is still working in there. Killing it mid-task is the worst thing this button
-    // can do, so it takes more than a click: you must TYPE the slug. (The server refuses an active
-    // xell without force too — this dialog only decides whether we're allowed to ask for it.)
+    // ACTIVE = a zee is still in there; the server needs `force` to touch it. It is NOT, on its
+    // own, a reason for more friction: marking done is the human's job (House rule 4), and a live
+    // zee whose work is already on main loses nothing when it goes — you just restart it.
     const active = !!x.zee_id && (x.cli_active === true || ['spawning', 'online', 'working'].includes(x.zee_status));
     const ok = window.confirm(
       `${x.task_id ? 'Mark done' : 'Clean up'} "${x.slug}"?` +
-      (active ? `\n\n🛑 THIS XELL IS ACTIVE — its zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''}.\n   Tearing it down KILLS the agent mid-task.\n` : '') +
+      (active ? `\n\nIts zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills the agent mid-task.\n` : '') +
       atStake +
       `\nThis removes its worktree, branch, and per-xell containers, and decommissions its zee` +
       `${x.holds_prod_lock ? ' (it currently HOLDS the prod lock)' : ''}.\nThis cannot be undone.`);
     if (!ok) return;
-    // Second gate for unlanded work: one mis-click should not be able to destroy it.
-    if (unlanded && !window.confirm(`Really discard the unlanded work in "${x.slug}"? Last chance.`)) return;
-    // Hard gate for an ACTIVE zee: force-yes by typing the slug. A confirm() is one stray click.
-    if (active) {
+    // The ONE hard gate, and only where something is actually destroyed forever: unlanded work.
+    // Gate on LOSS, not on liveness — keying it to "active" made the common case (a finished zee
+    // sitting clean at the source tip) demand a typed 40-char slug to do the very thing the whole
+    // system asks you to do, while a stray click on a dirty-but-idle xell only cost one confirm.
+    if (unlanded) {
       const typed = window.prompt(
-        `"${x.slug}" is ACTIVE and its zee is still working.\n\n` +
-        `To force this, type the xell name exactly:\n${x.slug}`);
+        `"${x.slug}" has work that is NOT on main:\n` +
+        (diff.ahead > 0 ? `  • ${diff.ahead} commit(s) not landed\n` : '') +
+        (diff.dirty > 0 ? `  • ${diff.dirty} uncommitted file(s)\n` : '') +
+        `\nThis will be PERMANENTLY LOST. To confirm, type the xell name exactly:\n${x.slug}`);
       if (typed !== x.slug) { if (typed !== null) alert('Name did not match — nothing was touched.'); return; }
     }
     try {
@@ -321,10 +336,16 @@ function XellCard({ x, diff, onDone, onMenu }) {
          data-production={isProd ? '1' : '0'}
          onClick={open} title={openHint}>
       {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
+      {/* The padlock is now interactive: hover swaps it to an unlock icon, clicking asks before
+          taking prod back. `held` (countdown cancelled) renders differently from a ship that is
+          simply still counting down. */}
       {x.holds_prod_lock && (
         <span className="lock" data-testid="prod-lock"
-              title={`Holds the PRODUCTION deploy lock — phase: ${x.prod_lock_phase || 'deploying'}`}>
+              title={`Holds the PRODUCTION deploy lock — phase: ${x.prod_lock_phase || 'deploying'}`}
+              onClick={(e) => e.stopPropagation()}>
           🔒 prod
+          <LockBadge lock={prodLock && prodLock.xell_id === x.id ? prodLock : null}
+                     projectId={projectId} onChanged={onDone} />
         </span>
       )}
       {!isProd && x.stack.some(isBuildable) && (() => {
@@ -373,14 +394,29 @@ function XellCard({ x, diff, onDone, onMenu }) {
             </div>
           )}
         <Row k="source" v={x.source || x.xource_ref} />
+        {/* SOURCE DIFF: everything the zee has produced vs the source — what would land. */}
+        {!isProd && (
+          <div className="row"><span className="rk">source diff</span>
+            <span className="diff" data-testid="source-diff"
+                  title={diff ? `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted work)` : ''}>
+              {diff
+                ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span></>
+                : '—'}
+            </span>
+          </div>
+        )}
         {!isProd && <Row k="commit" v={x.head_commit ? x.head_commit.slice(0, 8) : '—'} mono testid="commit-head" />}
+        {/* DIFF: work since its own last checkpoint commit — the "not yet saved" number, which
+            drops to 0 every time the zee checkpoints. ●N counts dirty files incl. untracked. */}
         {!isProd && (
           <div className="row"><span className="rk">diff</span>
             <span className="diff" data-testid="diff"
-                  title={diff ? `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted)${diff.dirty ? `\n${diff.dirty} uncommitted file(s) in the worktree` : ''}` : ''}>
-              {diff
-                ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span>
-                    {diff.dirty > 0 && <span className="dirty" data-testid="dirty" title={`${diff.dirty} uncommitted file(s)`}> ●{diff.dirty}</span>}</>
+                  title={diff?.own
+                    ? `Uncommitted: ${diff.own.files} file(s), +${diff.own.insertions}/−${diff.own.deletions} vs its own last checkpoint (HEAD)${diff.dirty ? `\n${diff.dirty} dirty file(s) in the worktree (incl. untracked)` : '\nnothing uncommitted — all work is checkpointed'}`
+                    : ''}>
+              {diff?.own
+                ? <><span className="dstat">{diff.own.files}f <span className="ins">+{diff.own.insertions}</span>/<span className="del">−{diff.own.deletions}</span></span>
+                    {diff.dirty > 0 && <span className="dirty" data-testid="dirty" title={`${diff.dirty} dirty file(s) incl. untracked`}> ●{diff.dirty}</span>}</>
                 : '—'}
             </span>
           </div>

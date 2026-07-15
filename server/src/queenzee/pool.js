@@ -28,7 +28,10 @@ async function reconcileProject(projectId, target) {
       const { verdict, res } = await reconcileXell(x, src);
       if (verdict === 'decommission') {
         logline('pool', `decommissioning ${x.slug} — ${res?.reason || 'unreconcilable'} (behind ${res?.behind ?? '?'}); will reprovision fresh`);
-        await reapXell(x.id, `stale:${res?.reason || 'drift'}`).catch((e) => console.error('[pool] reap', e.message));
+        // A reap that FAILS must be loud: it leaves the xell exactly where it was, and a
+        // console.error nobody reads is how a stuck xell survives for hours.
+        await reapXell(x.id, `stale:${res?.reason || 'drift'}`)
+          .catch((e) => logline('pool', `REAP FAILED for ${x.slug}: ${e.message} — it stays ready and will be retried next tick`));
       }
     }
   }
@@ -51,7 +54,8 @@ async function reconcileProject(projectId, target) {
   } else if (ready.length > target) {
     const surplus = ready.slice(target); // freshest kept, oldest surplus reaped
     logline('pool', `trimming ${surplus.length} surplus ready xell(s): ${surplus.map((s) => s.slug).join(', ')}`);
-    for (const s of surplus) await reapXell(s.id, 'pool-surplus').catch((e) => console.error('[pool] trim', e.message));
+    for (const s of surplus) await reapXell(s.id, 'pool-surplus')
+      .catch((e) => logline('pool', `TRIM FAILED for ${s.slug}: ${e.message} — surplus xell stays`));
   }
 }
 

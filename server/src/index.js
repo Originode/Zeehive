@@ -7,7 +7,28 @@ import { startPool } from './queenzee/pool.js';
 import { startMaintenance } from './queenzee/maintenance.js';
 import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
+import { recoverOrphanBuilds } from './lib/build.js';
+import { startShipReaper } from './queenzee/shipgate.js';
 import { logline } from './lib/logbus.js';
+
+// LAST-RESORT BACKSTOP. The queenzee is the thing that keeps every xell honest: if it dies, the
+// pool stops reconciling, stale claims never get reclaimed and nothing reaps anything — silently,
+// because the dashboard just says "connecting…". That is exactly what happened on 2026-07-15: one
+// ETIMEDOUT to the NAS meta-DB inside an async route became an unhandled rejection and took the
+// whole orchestrator down for ~25 minutes.
+//
+// A local orchestrator that stays up degraded beats one that exits: every loop already catches its
+// own errors and retries on the next tick, so surviving a blip costs nothing and dying costs the
+// fleet. Log LOUDLY (this must never become a silent swallow) and keep going.
+process.on('unhandledRejection', (err) => {
+  const msg = err?.message || String(err);
+  console.error('[zeehive] UNHANDLED REJECTION (staying up):', msg);
+  try { logline('api', `unhandled rejection (queenzee stayed up): ${msg}`); } catch { /* logbus itself failed */ }
+});
+process.on('uncaughtException', (err) => {
+  console.error('[zeehive] UNCAUGHT EXCEPTION (staying up):', err?.stack || err?.message || err);
+  try { logline('api', `uncaught exception (queenzee stayed up): ${err?.message || err}`); } catch { /* ignore */ }
+});
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -29,9 +50,13 @@ app.listen(config.port, () => {
   startPoller();
   console.log(`[queenzee] poller started (${config.pollerIntervalMs}ms)`);
   logline('api', `queenzee online — API on :${config.port}, DB connected`);
+  // BEFORE the monitors: a build in flight when we died left its container pinned at 'building',
+  // which the health monitor skips by design — so nothing would ever un-stick it.
+  recoverOrphanBuilds().catch((e) => console.error('[build] orphan recovery failed:', e.message));
   startPool();
   startMonitor();
   startContainerMonitor();
   startMaintenance();
+  startShipReaper();
 });
 export { app };

@@ -21,13 +21,17 @@ export function headCommit(repoRoot, branch = 'main') {
   return r.status === 0 ? r.out.trim() : null;
 }
 
-// What a ZEE has actually done: diff its WORKTREE against the source.
+// What a ZEE has actually done. TWO different questions, so the card shows two numbers:
+//
+//   SOURCE DIFF (top-level ahead/behind/files/…) — the worktree vs the SOURCE. Everything the
+//     zee has produced, committed or not: what would land.
+//   OWN DIFF (`own`) — the worktree vs its OWN HEAD, i.e. work it has not checkpointed yet.
+//     Zees checkpoint-commit freely on their branch, so this is the "unsaved" number: it goes
+//     to 0 on every checkpoint while the source diff keeps growing.
 //
 // Do not diff the xell's stored head_commit against main — that is the commit it was PROVISIONED
 // at, which is identical for every xell cut from the same tip, so every card renders the same
-// meaningless number and a zee's real work never shows. Diff from inside the worktree instead:
-//   ahead/behind → its branch vs the source
-//   shortstat    → working tree (INCLUDING uncommitted edits) vs the source, i.e. the live work
+// meaningless number and a zee's real work never shows. Diff from inside the worktree instead.
 export function worktreeDiff(worktree, ref = 'main') {
   const rl = git(worktree, ['rev-list', '--left-right', '--count', `${ref}...HEAD`]);
   let ahead = 0, behind = 0;
@@ -42,7 +46,21 @@ export function worktreeDiff(worktree, ref = 'main') {
   }
   const st = git(worktree, ['status', '--porcelain']);
   const dirty = st.status === 0 ? st.out.split('\n').filter(Boolean).length : 0;
-  return { ahead, behind, files, insertions: ins, deletions: del, dirty };
+
+  // Uncommitted work: tracked changes vs its own last checkpoint. (`git diff HEAD` covers staged
+  // + unstaged but NOT untracked files — those only show in `dirty`, which counts them.)
+  const own = git(worktree, ['diff', '--shortstat', 'HEAD']);
+  let ofiles = 0, oins = 0, odel = 0;
+  if (own.status === 0) {
+    ofiles = +(own.out.match(/(\d+) files? changed/)?.[1] || 0);
+    oins = +(own.out.match(/(\d+) insertions?/)?.[1] || 0);
+    odel = +(own.out.match(/(\d+) deletions?/)?.[1] || 0);
+  }
+
+  return {
+    ahead, behind, files, insertions: ins, deletions: del, dirty,
+    own: { files: ofiles, insertions: oins, deletions: odel },
+  };
 }
 
 // Divergence + diffstat of a base commit vs a ref (what the xell is "behind"/differs by).

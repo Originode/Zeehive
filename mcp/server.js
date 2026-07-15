@@ -39,17 +39,25 @@ server.tool('zeehive_report_done',
   { note: z.string().optional().describe('one-line summary of what you finished') },
   async ({ note }) => asText(await call('POST', '/api/xell/report-done', { session_id: SID(), note })));
 
-server.tool('zeehive_prod_lock_acquire',
-  'Acquire the PRODUCTION deploy lock before deploying to prod (only one xell may hold it). Returns the current holder if already held.',
-  { xell_id: z.string().describe('your xell id'), phase: z.string().optional() },
-  async ({ xell_id, phase }) => asText(await call('POST', '/api/prod-lock/acquire', { xell_id, phase })));
+// A zee's ONLY prod verb: ask. It cannot take the lock and cannot run a deploy — the
+// acquire/release tools that used to live here are gone on purpose. A zee holding prod and
+// deploying by hand is exactly how band-aid deploys happened: live in prod, absent from main,
+// silently reverted by the next rebuild. A human approves; the QUEENZEE deploys, from main.
+server.tool('zeehive_ship_request',
+  'ASK to ship to PRODUCTION. You do not deploy: a human approves, then the queenzee takes the prod '
+  + 'lock and builds from the xource at main, and releases the lock itself. REFUSED unless your work '
+  + 'is already landed on main (prod builds from main, so unlanded work would not be in the ship). '
+  + 'Poll zeehive_ship_status, or run scripts/xell-ship.mjs --wait in the background.',
+  { xell_id: z.string().describe('your xell id'), reason: z.string().optional().describe('what you are shipping') },
+  async ({ xell_id, reason }) => asText(await call('POST', '/api/ship/request', { xell_id, reason })));
 
-server.tool('zeehive_prod_lock_release',
-  'Release the PRODUCTION deploy lock your xell holds (after the deploy is verified).',
+server.tool('zeehive_ship_status',
+  'Status of your xell\'s production ship request (pending → approved → shipping → shipped/failed).',
   { xell_id: z.string() },
-  async ({ xell_id }) => asText(await call('POST', '/api/prod-lock/release', { xell_id })));
+  async ({ xell_id }) => asText(await call('GET', `/api/ship/status?xell=${encodeURIComponent(xell_id)}`)));
 
-server.tool('zeehive_prod_lock_status', 'Who holds the production deploy lock right now?', {},
+server.tool('zeehive_prod_lock_status',
+  'Who holds the production deploy lock right now? (Read-only. You can never take or release it.)', {},
   async () => asText(await call('GET', '/api/prod-lock')));
 
 await server.connect(new StdioServerTransport());

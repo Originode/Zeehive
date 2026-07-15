@@ -2,6 +2,7 @@
 //   skill-claim   : a human's Claude session (via /xell) claims the freshest ready xell
 //   headless-spawn: queenzee spawns a headless zee via the Agent SDK (see spawnHeadless)
 import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
@@ -224,11 +225,21 @@ async function bindingFor(xellId, zee, task) {
     server: `${bs} ${xell.id} server`,
     webapp: `${bs} ${xell.id} webapp`,
     hot_suffix: '--hot',
+    wait_suffix: '--wait',
     semantics: {
       build: 'rebuilds the image from THIS worktree\'s code and recreates the container — use this to see your changes run',
       hot: 'append --hot to bounce the container from the existing image (fast, but does NOT pick up code changes — there is no source mount)',
+      wait: 'append --wait to BLOCK until the build settles and be told whether the container is '
+          + 'actually serving your current HEAD (exit 0 = built, 1 = failed/timeout, 20min cap)',
     },
-    note: 'Builds run in the background and are non-blocking; watch container health on the dashboard (building → up = ok, down = failed).',
+    how_to_wait: 'NEVER hand-roll a wait. Do not curl your own webapp in a poll loop, do not grep '
+      + 'it for your changed text, do not `sleep` and re-check: those loops guess at a condition, '
+      + 'and when they guess wrong they hang for 45 minutes on a build that finished long ago. '
+      + `Instead run \`${bs} ${xell.id} <role> --wait\`. The queenzee RECORDS the commit each `
+      + 'container was built at, so --wait answers from fact. Run it in the BACKGROUND and its exit '
+      + 'is your nudge — the harness re-invokes you the moment it finishes, so you can keep working.',
+    note: 'Without --wait, builds are non-blocking and you get no completion signal at all (the '
+      + 'dashboard spinner is for the human, not for you).',
   };
 
   return {
@@ -254,8 +265,31 @@ async function bindingFor(xellId, zee, task) {
         ? ['Your database is your OWN container, restored from a dump — it is a copy, so you may '
          + 'migrate/seed/destroy it freely. Nothing you do to it touches dev or prod.']
         : []),
+      'VERIFY YOUR WORK IN THIS XELL — you already have everything you need. The containers listed '
+      + 'above are YOURS: your own server, webapp and database, isolated from prod and from every '
+      + 'other zee. Do not ask for a xell (you are in one), do not ask to use dev or prod, and do '
+      + 'not stop at "I cannot verify this here". Build into your own containers with the `build` '
+      + 'commands above and exercise the real thing before you call the work done.',
       'To run/see your changes, BUILD via the `build` commands above — never run docker, docker compose, or spin-env.sh yourself.',
+      'To wait for a build, append --wait to the build command (see build.how_to_wait). NEVER poll '
+      + 'your own container in a bash loop to find out if a build landed — that is how zees end up '
+      + 'blocked for an hour on a build that succeeded long ago.',
+      'CHECKPOINT-COMMIT FREELY on your own branch (`git commit` as you go, whenever a step works). '
+      + 'A commit only moves YOUR branch ref — it lands nothing, touches no one else, and is the '
+      + 'only thing protecting your work. Nothing is integrated until you push, and that push needs '
+      + 'a human. So commit early and often; do not hoard uncommitted changes waiting for approval.',
+      `To SHIP TO PRODUCTION you may only ASK: \`node "${resolve(config.repoRoot, 'scripts', 'xell-ship.mjs')}" ${xell.id} --reason "<what you are shipping>" --wait\` `
+      + '(run it in the BACKGROUND — its exit is your nudge). A human approves it, then the '
+      + 'QUEENZEE takes the prod lock and runs the deploy itself, from the xource at main. You do '
+      + 'NOT hold the lock, you do NOT run a prod build, and you do NOT release anything — that is '
+      + 'deliberate: a zee deploying by hand ships a band-aid (live in prod, absent from main, '
+      + 'silently reverted by the next rebuild from main). A ship is REFUSED unless your work is '
+      + 'already landed on main. Never run docker/compose against prod yourself.',
       'Land locally: commit on your branch, then `git push . HEAD:main`. origin is off-limits.',
+      'That push is a REQUEST, not an action: a git hook on the xource declines it and raises it '
+      + 'in the ZEEHIVE console for a human to verify. Expected — your work is safe on your branch. '
+      + 'Re-run the SAME push once a human approves it; do not amend to a new sha, and never try to '
+      + 'bypass the hook.',
     ],
   };
 }
@@ -351,6 +385,25 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
     : (await readyXells(pid))[0];
   if (!xell) throw new Error('no ready xell available for headless spawn');
   if (!task) throw new Error('task (prompt) required for headless spawn');
+
+  // A stale xell_id is the whole ballgame here. An explicit id resolved in an earlier turn can
+  // point at a xell the reaper has since RETIRED — and a retired xell's worktree is deleted. We
+  // then hand that dead path to the SDK as `cwd`, Node raises ENOENT on the spawn, and the SDK
+  // blames the EXECUTABLE: "native binary ... exists but failed to launch ... musl vs glibc".
+  // That message is boilerplate (sZ() in sdk.mjs — it prints it for ANY spawn error) and it is a
+  // lie on Windows: the binary is fine. Two sessions burned an hour debugging a perfectly good
+  // claude.exe because of it. So check here, and say what is ACTUALLY wrong.
+  if (xell.status === 'retired' || xell.status === 'tearing-down') {
+    throw new Error(
+      `xell ${xell.slug} is ${xell.status} — its worktree is gone, so there is nothing to spawn into. `
+      + 'You are holding a stale xell id from an earlier turn; ask the queenzee for a ready xell instead.');
+  }
+  if (!xell.worktree_path || !existsSync(xell.worktree_path)) {
+    throw new Error(
+      `xell ${xell.slug} has no worktree on disk (${xell.worktree_path}) — the DB says '${xell.status}' but the `
+      + 'directory is missing, so a spawn there would fail. Do NOT chase the Claude binary if you see a '
+      + '"failed to launch / libc" error: that is the SDK misreporting ENOENT on this cwd.');
+  }
 
   const cfgRow = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id=$1`, [pid]);
   const rt = runtime ? await runtimeByKey(runtime) : await runtimeById(cfgRow?.default_runtime_id);
