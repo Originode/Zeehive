@@ -16,6 +16,7 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
+import { pendingMigrations, applyMigrations } from './shipmigrate.js';
 
 // Real deploys are gated on a human anyway; SHIP_MODE=simulate exists to verify ZEEHIVE itself.
 const MODE = process.env.SHIP_MODE === 'simulate' ? 'simulate' : 'real';
@@ -72,10 +73,12 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   if (existing) return { ok: true, request: existing, note: 'you already have an open ship request' };
 
   const commit = headCommit(project.repo_root, main);
+  // What schema rides along — decided NOW so the human approves code and migrations as one thing.
+  const mig = await pendingMigrations(project, commit);
   const row = await one(
-    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [project.id, xellId, zeeId, commit, reason, t]);
+    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING *`,
+    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(mig.pending || [])]);
   broadcast('ship', row);
   logline('ship', `HELD ship request from ${xell.slug} @ ${String(commit).slice(0, 8)} — awaiting human approval`);
   notifyShipRequest({ project, xell, request: row });
@@ -150,11 +153,27 @@ async function runShip(shipId) {
 
   const results = [];
   let ok = cs.length > 0;
+
+  // SCHEMA FIRST, code second. Pending server/sql/migrations/*.sql at the approved sha are
+  // applied before any container builds: new code must never come up against the old schema, and
+  // a failed migration must fail the ship while prod still runs the old code untouched. This is
+  // the half of "prod builds from main" that containers alone cannot deliver — dev builds fresh
+  // databases from sql/schema/ and always has every table; prod is never rebuilt, so without this
+  // step it drifts behind main's schema forever (7 tournament columns deep, as of this morning).
+  if (ok) {
+    const mig = await applyMigrations(project, ship.commit);
+    if (mig.applied?.length || !mig.ok) {
+      results.push({ role: 'migrations', ok: mig.ok, applied: mig.applied, error: mig.ok ? null : mig.error });
+    }
+    if (!mig.ok) ok = false;
+  }
+
   if (!cs.length) {
     ok = false;
     results.push({ error: 'no prod container has a build_script configured — nothing to ship' });
   }
   for (const c of cs) {
+    if (!ok) break;   // a failed migration means NO container builds — old code, old schema, intact
     // ship.commit is the sha the HUMAN approved. Passing it (rather than letting the script say
     // "main") also means a main that moved between approval and build cannot smuggle in commits
     // nobody signed off on.
