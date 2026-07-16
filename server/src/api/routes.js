@@ -15,6 +15,7 @@ import { buildContainer, buildXell, getBuildStatus } from '../lib/build.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
 import { attachXellDb, dbAccessForCwd, DB_MODES } from '../lib/xell-db.js';
+import { attachProdStack, detachProdStack, prodStackStatus } from '../lib/xell-prod.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
 import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
@@ -262,6 +263,25 @@ router.post('/xells/:id/reap', async (req, res) => {
 // ── reveal a xell's worktree folder in the host file manager (Explorer) ────────
 router.post('/xells/:id/reveal', async (req, res) => {
   try { res.json(await revealXellWorktree(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── bind a xell to the PRODUCTION stack (prod db + prod app tier) ────────────
+// A human typing the skill IS the gate — there is no approval flow here, deliberately: this grants
+// prod DATA, which HANDOFF already treats as a human's call to make (`--db shared-prod` at
+// dispatch does the same thing). It does NOT grant prod CODE; see lib/xell-prod.js.
+router.get('/xells/:id/prod-stack', async (req, res) => {
+  try { res.json(await prodStackStatus(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+router.post('/xells/:id/prod-stack', async (req, res) => {
+  try { res.json(await attachProdStack(req.params.id, { by: req.body?.by || 'human@console' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+router.delete('/xells/:id/prod-stack', async (req, res) => {
+  try { res.json(await detachProdStack(req.params.id, { by: req.body?.by || 'human@console' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

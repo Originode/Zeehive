@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
+import { resolveRealDbContainer } from '../lib/xell-db.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
 import { provisionXell } from '../lib/provision.js';
@@ -225,9 +226,15 @@ async function bindingFor(xellId, zee, task) {
     container: dbc.name,
     coupling: xell.db_coupling,
     is_production: dbc.tier === 'prod',
+    // RESOLVE the container — do not hand out the inventory name. Prod's row says
+    // `omnibiz_db_prod`, the live database is `omnibiz_db_prod_v184`, and `omnibiz_db_prod` is an
+    // EXITED husk still holding the pre-v184 volume. Un-resolved, this line hands a zee a command
+    // that either errors (it is stopped) or — if anyone starts that husk — silently reads and
+    // WRITES the wrong database while looking correct. proddiff.js already resolves; this, the one
+    // place a zee is actually told what to run, did not.
     psql: dbc.conn_ref
       ? `psql "${dbc.conn_ref}"`
-      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U postgres -d omnibiz`,
+      : `docker --context ${dbc.docker_ctx} exec -i ${resolveRealDbContainer(dbc.docker_ctx, dbc.name)} psql -U postgres -d omnibiz`,
     note: dbc.tier === 'prod'
       ? 'This IS the live production database — a human deliberately assigned it to you (--db shared-prod). '
         + 'It is YOUR container: querying it is expected, not a violation. Reads are free. Before ANY '
