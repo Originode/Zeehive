@@ -36,6 +36,34 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
     }
   }
 
+  // ── PRODUCTION IS DISCONNECTED, NEVER TORN DOWN ─────────────────────────────
+  // A /xell-prod xell has the LIVE production db, server and webapp as its assigned containers.
+  // Marking it done must release them, not reap them.
+  //
+  // Today nothing below could delete them anyway: every teardown path is scoped by ownership —
+  // `DELETE FROM container WHERE owner_xell_id=$1`, removeXellImages' same filter, and
+  // spin-env.sh purge's `omnibiz-spin-<slug>` project on the DEV context — and prod's containers
+  // are shared, so owner_xell_id is NULL and they match none of it.
+  //
+  // That is ownership saving us, not intent. Nothing here SAYS "never delete prod". One change
+  // from `owner_xell_id = $1` to a xell_uses_container join — an entirely reasonable-looking
+  // refactor, since that junction is what the card renders from — and marking a data xell done
+  // would delete production. So: state the rule, and unlink FIRST, before any teardown machinery
+  // runs. After this point the xell has no prod containers to lose.
+  const prodLinks = await q(
+    `SELECT c.name, c.role FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+      WHERE uc.xell_id = $1 AND c.tier = 'prod'`, [xellId]);
+  if (prodLinks.length) {
+    await q(
+      `DELETE FROM xell_uses_container uc USING container c
+        WHERE uc.container_id = c.id AND uc.xell_id = $1 AND c.tier = 'prod'`, [xellId]);
+    // Drop the coupling too, so a half-torn-down row can never answer the prod guard with "yes".
+    await q(`UPDATE xell SET db_coupling='db-shared-dev' WHERE id=$1 AND db_coupling='db-shared-prod'`, [xellId]);
+    logline('reaper',
+      `${xell.slug} was bound to PRODUCTION — DISCONNECTED ${prodLinks.map((c) => c.name).join(', ')} `
+      + '(released, NOT deleted) before teardown. Production is untouched.');
+  }
+
   logline('reaper', `decommissioning ${xell.slug} (${reason}) — releasing resources, removing worktree + branch`);
   await one(`UPDATE xell SET status='tearing-down' WHERE id=$1 RETURNING *`, [xellId])
     .then((x) => x && broadcast('xell', x));
