@@ -251,7 +251,7 @@ async function seedZeehive(runtimeIds) {
   const rows = [
     ['db', 'prod', 'zeehive_db', 'ugreen-nas', dbUrl.hostname, Number(dbUrl.port) || 5445, 5432, null, zeeSiteIds.prod],
     ['server', 'prod', 'zeehive_server', null, null, config.port, config.port, `http://localhost:${config.port}/api/projects`, zeeSiteIds.prod],
-    ['webapp', 'prod', 'zeehive_web', null, null, 5173, 5173, 'http://localhost:5173', zeeSiteIds.prod],
+    ['webapp', 'prod', 'zeehive_web', null, null, 5180, 5180, 'http://localhost:5180', zeeSiteIds.prod], // web/vite.config.js pins 5180
   ];
   for (const [role, tier, name, ctx, host, hostPort, intPort, url, siteId] of rows) {
     await q(
