@@ -179,10 +179,12 @@ export async function decideLandRequest(id, decision, by = 'human') {
 function ffState(repoRoot, ref, sha) {
   const git = (...a) => spawnSync('git', ['-C', repoRoot, ...a],
     { encoding: 'utf8', timeout: 20000, windowsHide: true, env: cleanGitEnv() });
-  if (git('merge-base', '--is-ancestor', sha, ref).status === 0) return 'already';
+  if (git('merge-base', '--is-ancestor', sha, ref).status === 0) return { state: 'already' };
   const tip = git('rev-parse', ref);
-  if (tip.status !== 0) return 'no-ref';
-  return git('merge-base', '--is-ancestor', tip.stdout.trim(), sha).status === 0 ? 'ff' : 'diverged';
+  if (tip.status !== 0) return { state: 'no-ref' };
+  const t = tip.stdout.trim();
+  return git('merge-base', '--is-ancestor', t, sha).status === 0
+    ? { state: 'ff', tip: t } : { state: 'diverged', tip: t };
 }
 
 // Ids already reported as unlandable. Without this the tick re-reports every 10s and the log
@@ -193,12 +195,11 @@ async function landApproved(row, by = 'human') {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
   if (!project) return row;
 
-  const state = ffState(project.repo_root, row.ref, row.new_sha);
+  const { state, tip } = ffState(project.repo_root, row.ref, row.new_sha);
 
   if (state === 'already') {
     // It is in. Something else landed it (the zee re-pushed, a human pushed by hand) and the row
-    // never caught up. Reconcile rather than push: `git push` here exits 0 without firing the hook,
-    // so nothing would ever flip this row and the tick would retry it for the rest of time.
+    // never caught up. Reconcile rather than move: nothing to do to the ref, just record reality.
     const landed = await one(
       `UPDATE land_request SET status='landed', landed_at=COALESCE(landed_at, now())
          WHERE id=$1 RETURNING *`, [row.id]);
@@ -218,13 +219,24 @@ async function landApproved(row, by = 'human') {
     return { ...row, stale: true };
   }
 
-  const p = spawnSync('git', ['-C', project.repo_root, 'push', '.', `${row.new_sha}:${row.ref}`],
-    { encoding: 'utf8', timeout: 60000, windowsHide: true, env: cleanGitEnv() });
-  const out = `${p.stdout || ''}${p.stderr || ''}`.trim();
+  // MOVE THE REF WITH update-ref, NOT `git push`. A push re-invokes the xource's `update` hook,
+  // which curls back into THIS server — but the server is single-threaded and, having initiated
+  // the push, is blocked inside spawnSync waiting for it. The hook times out (curl rc=28), fails
+  // closed, and the push is declined. That self-deadlock is the actual cause of "I approved and
+  // nothing happened" — verified: /api/land/check answers in 57ms when the loop is free and times
+  // out during a server-initiated push. update-ref moves the ref with NO receive-pack hooks, so
+  // there is no re-entrancy; it still fires reference-transaction, whose non-ff guard is the
+  // backstop, and we only reach here on a proven fast-forward anyway. The old-value arg makes it a
+  // compare-and-swap: if the ref moved since ffState read it, this fails instead of clobbering.
+  const u = spawnSync('git', ['-C', project.repo_root, 'update-ref', row.ref, row.new_sha, tip],
+    { encoding: 'utf8', timeout: 30000, windowsHide: true, env: cleanGitEnv() });
+  const now = spawnSync('git', ['-C', project.repo_root, 'rev-parse', row.ref],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+  const moved = u.status === 0 && now.stdout.trim() === row.new_sha;
 
-  if (p.status === 0) {
-    // checkPush already flipped it to 'landed' when the hook asked — re-read rather than assume.
-    const landed = await one(`SELECT * FROM land_request WHERE id=$1`, [row.id]);
+  if (moved) {
+    const landed = await one(
+      `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [row.id]);
     broadcast('land', landed);
     broadcast('xell', { id: row.xell_id });
     logline('landgate', `LANDED ${row.new_sha.slice(0, 8)} → ${row.ref.replace('refs/heads/', '')} (approved by ${row.decided_by || by})`);
@@ -234,9 +246,10 @@ async function landApproved(row, by = 'human') {
   // Left 'approved' on purpose: the approval is still valid for this exact sha, so a retry is
   // legitimate — tick() below will take it. Say why the ref did not move rather than let a green
   // tick lie about it.
+  const out = `${u.stdout || ''}${u.stderr || ''}`.trim();
   logline('landgate',
-    `approved ${row.new_sha.slice(0, 8)} but the push did NOT move ${row.ref.replace('refs/heads/', '')}: `
-    + (out.split('\n').filter(Boolean).pop() || 'unknown'));
+    `approved ${row.new_sha.slice(0, 8)} but ${row.ref.replace('refs/heads/', '')} did NOT move: `
+    + (out.split('\n').filter(Boolean).pop() || 'update-ref failed'));
   return { ...row, push_failed: out.slice(-800) };
 }
 

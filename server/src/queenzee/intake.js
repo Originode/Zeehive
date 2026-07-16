@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
-import { resolveRealDbContainer } from '../lib/xell-db.js';
+import { resolveRealDbContainerCached } from '../lib/xell-db.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
 import { provisionXell } from '../lib/provision.js';
@@ -211,30 +211,38 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
 async function bindingFor(xellId, zee, task) {
   const xell = await one(`SELECT x.*, xo.ref AS xource_ref FROM xell x JOIN xource xo ON xo.id=x.xource_id WHERE x.id=$1`, [xellId]);
-  const stack = await q(
+  const rows = await q(
     `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, c.docker_ctx, uc.relation
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xellId]);
+
+  // RESOLVE AT THE BOUNDARY — every consumer below inherits it, so no field can drift back to the
+  // inventory name. The row carries a LOGICAL name; the daemon runs a versioned one, and the
+  // logical name can be an EXITED husk still holding the old volume. Un-resolved it either errors
+  // (`container … is not running`) or — if anyone starts that husk — silently reads and WRITES the
+  // wrong database while looking correct.
+  //
+  // Resolving field-by-field is what broke this before: `db.psql` resolved while `db.container`
+  // and the whole `containers[]` list stayed raw — and `rules` says "use ONLY your assigned
+  // containers above", pointing the zee AT the dead name. It got a working command beside a dead
+  // name, used the name, and read `container … is not running` as "I am blocked from prod".
+  const stack = rows.map((c) => (c.role === 'db'
+    ? { ...c, name: resolveRealDbContainerCached(c.docker_ctx, c.name) }
+    : c));
 
   // HOW TO REACH YOUR DATABASE — spelled out, because guessing is how a zee ends up running
   // docker against a container it was never given (and getting denied by the prod guard). The db
   // has no conn_ref and prod's postgres isn't exposed on the network, so `docker exec` IS the
   // sanctioned path for data work — the prod guard allows it for exactly the xell whose assigned
   // database this is, and denies it for everyone else.
-  const dbc = stack.find((c) => c.role === 'db');
+  const dbc = stack.find((c) => c.role === 'db');   // already resolved at the boundary above
   const db = dbc ? {
     container: dbc.name,
     coupling: xell.db_coupling,
     is_production: dbc.tier === 'prod',
-    // RESOLVE the container — do not hand out the inventory name. Prod's row says
-    // `omnibiz_db_prod`, the live database is `omnibiz_db_prod_v184`, and `omnibiz_db_prod` is an
-    // EXITED husk still holding the pre-v184 volume. Un-resolved, this line hands a zee a command
-    // that either errors (it is stopped) or — if anyone starts that husk — silently reads and
-    // WRITES the wrong database while looking correct. proddiff.js already resolves; this, the one
-    // place a zee is actually told what to run, did not.
     psql: dbc.conn_ref
       ? `psql "${dbc.conn_ref}"`
-      : `docker --context ${dbc.docker_ctx} exec -i ${resolveRealDbContainer(dbc.docker_ctx, dbc.name)} psql -U postgres -d omnibiz`,
+      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U postgres -d omnibiz`,
     note: dbc.tier === 'prod'
       ? 'This IS the live production database — a human deliberately assigned it to you (--db shared-prod). '
         + 'It is YOUR container: querying it is expected, not a violation. Reads are free. Before ANY '
@@ -375,7 +383,11 @@ async function briefing(xellId, zee, task, { headless = true } = {}) {
     '',
     '## Your binding (authoritative — this is the environment you own)',
     '```json',
-    JSON.stringify({ xell: b.xell, containers: b.containers, build: b.build }, null, 2),
+    // Include `db` — without it a dispatched zee has ONLY containers[] for its database, so it
+    // reconstructs the `docker exec … psql` line by hand (guessing the exact form) and never sees
+    // db.note, the prod-write warning. A claiming zee gets the whole binding; a dispatched one got
+    // three keys. Same handoff, same fields.
+    JSON.stringify({ xell: b.xell, containers: b.containers, db: b.db, build: b.build }, null, 2),
     '```',
     '',
     '## Rules',

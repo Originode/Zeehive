@@ -19,7 +19,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { attachXellDb, resolveRealDbContainer } from './xell-db.js';
+import { attachXellDb, resolveRealDbContainer, resolveRealDbContainerCached } from './xell-db.js';
 
 const APP_ROLES = ['server', 'webapp'];
 
@@ -131,12 +131,18 @@ export async function detachProdStack(xellId, { by = 'human@console' } = {}) {
 export async function prodStackStatus(xellId) {
   const { xell } = await ctx(xellId);
   const cs = await q(
-    `SELECT c.role, c.name, c.tier FROM xell_uses_container uc JOIN container c ON c.id=uc.container_id
+    `SELECT c.role, c.name, c.tier, c.docker_ctx FROM xell_uses_container uc JOIN container c ON c.id=uc.container_id
       WHERE uc.xell_id=$1 ORDER BY c.role`, [xellId]);
   return {
     xell: xell.slug,
     db_coupling: xell.db_coupling,
     on_prod: xell.db_coupling === 'db-shared-prod',
-    containers: cs.map((c) => ({ role: c.role, name: c.name, tier: c.tier })),
+    // Resolved, like every other name this API emits: `--status` is a zee-reachable call, and a
+    // logical db name printed here is a name someone will paste into `docker exec`.
+    containers: cs.map((c) => ({
+      role: c.role,
+      name: c.role === 'db' ? resolveRealDbContainerCached(c.docker_ctx, c.name) : c.name,
+      tier: c.tier,
+    })),
   };
 }

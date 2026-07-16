@@ -198,6 +198,11 @@ prod, absent from main, silently reverted by the next rebuild from main.
 
 ## Hotfix / data-manipulation xells (prod DATA is not prod CODE)
 
+**Read the MCP tools or the API.** Container names, bindings, couplings and status are DATA: they
+live in the database and the API resolves them from live docker state on every call. Nothing here
+restates them — a name written into a doc is stale the next rebuild, and the last one sent zees at
+an exited husk for weeks.
+
 A xell dispatched with **`--db shared-prod`** has `db_coupling='db-shared-prod'`: the live production
 database IS its assigned container. Querying it is the job, not a violation — "use ONLY your
 assigned containers" is *satisfied*, because a human deliberately gave it that one.
@@ -208,18 +213,6 @@ guard both said `--db prod` for a while, and `attachXellDb` silently fell back t
 unknown coupling — so following the instructions attached the dev db, the guard then denied the
 zee and repeated the same broken advice. Unrecognized couplings now throw.
 
-- The prod DB has **no `conn_ref`** and prod postgres isn't exposed, so `docker --context
-  mardale-prod exec -i <db> psql …` is the sanctioned path (it's what OmniBiz's own docs use).
-  **Use `binding.db.psql` verbatim; never type the container name from memory or the inventory.**
-  The inventory models the db as the LOGICAL `omnibiz_db_prod`, but that name belongs to an
-  **exited `postgres:18beta1` husk** sitting on the pre-v184 volume — the live database is
-  `omnibiz_db_prod_v184`. `exec -i omnibiz_db_prod psql` therefore fails with `container … is not
-  running`, which reads like "prod is down" or "I'm blocked", and is neither. (This doc itself
-  printed the husk's name as "the sanctioned path" for a while, so a zee following its
-  instructions was guaranteed that error.) Everything zee-facing now resolves the running
-  versioned container: `binding.db.psql`, and `GET /api/xell/db-access` (`db_container` /
-  `db_containers`). Do not "fix" this by starting `omnibiz_db_prod` — it is a DIFFERENT database
-  on an old volume, and writes to it are silently lost.
 - **The prod guard allows it for that xell only.** `hooks/prod-guard.mjs` asks
   `GET /api/xell/db-access?cwd=…`; the queenzee resolves the xell by worktree path and answers
   whether the prod DB is *its* database. Allowed: `exec`/`cp` against **its own** db container.
