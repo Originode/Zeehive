@@ -335,31 +335,40 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
          data-testid="xell-card" data-slug={x.slug} data-status={x.status} data-xell-id={x.id}
          data-production={isProd ? '1' : '0'}
          onClick={open} title={openHint}>
-      {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
-      {/* The padlock is now interactive: hover swaps it to an unlock icon, clicking asks before
-          taking prod back. `held` (countdown cancelled) renders differently from a ship that is
-          simply still counting down. */}
-      {x.holds_prod_lock && (
-        <span className="lock" data-testid="prod-lock"
-              title={`Holds the PRODUCTION deploy lock — phase: ${x.prod_lock_phase || 'deploying'}`}
-              onClick={(e) => e.stopPropagation()}>
-          🔒 prod
-          <LockBadge lock={prodLock && prodLock.xell_id === x.id ? prodLock : null}
-                     projectId={projectId} onChanged={onDone} />
+      {/* CARD HEADER — a real flow row, not floating badges.
+          These three used to be position:absolute at top:8, while .stack began at the card's top
+          edge — so every badge sat ON the db row, and .lock (right:8) + .xbuild (right:10) landed
+          on EACH OTHER whenever a non-prod xell held the prod lock. Laying them out puts the stack
+          naturally below and makes the overlap unrepresentable rather than tuned-around. */}
+      <div className="cardtop">
+        {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
+        <span className="cardtop-right">
+          {/* The padlock is interactive: hover swaps it to an unlock icon, clicking asks before
+              taking prod back. `held` (countdown cancelled) renders differently from a ship that is
+              simply still counting down. */}
+          {x.holds_prod_lock && (
+            <span className="lock" data-testid="prod-lock"
+                  title={`Holds the PRODUCTION deploy lock — phase: ${x.prod_lock_phase || 'deploying'}`}
+                  onClick={(e) => e.stopPropagation()}>
+              🔒 prod
+              <LockBadge lock={prodLock && prodLock.xell_id === x.id ? prodLock : null}
+                         projectId={projectId} onChanged={onDone} />
+            </span>
+          )}
+          {!isProd && x.stack.some(isBuildable) && (() => {
+            const busy = x.stack.some(isBusy);   // don't allow a build-all while anything is building/restoring
+            return (
+              <button className="xbuild" data-testid="xell-build" disabled={busy}
+                      title={busy ? 'A container is busy (building/restoring) — wait for it to finish'
+                                  : 'Build all — rebuild this xell\'s server + webapp (right-click for hot build)'}
+                      onClick={(e) => { e.stopPropagation(); if (!busy) buildXell(x.id, false).catch(buildErr); }}
+                      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!busy) buildXell(x.id, true).catch(buildErr); }}>
+                {busy ? '⏳ busy…' : '🔨 build all'}
+              </button>
+            );
+          })()}
         </span>
-      )}
-      {!isProd && x.stack.some(isBuildable) && (() => {
-        const busy = x.stack.some(isBusy);   // don't allow a build-all while anything is building/restoring
-        return (
-          <button className="xbuild" data-testid="xell-build" disabled={busy}
-                  title={busy ? 'A container is busy (building/restoring) — wait for it to finish'
-                              : 'Build all — rebuild this xell\'s server + webapp (right-click for hot build)'}
-                  onClick={(e) => { e.stopPropagation(); if (!busy) buildXell(x.id, false).catch(buildErr); }}
-                  onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!busy) buildXell(x.id, true).catch(buildErr); }}>
-            {busy ? '⏳ busy…' : '🔨 build all'}
-          </button>
-        );
-      })()}
+      </div>
       <div className="stack">
         {['db', 'server', 'webapp'].map((role) => {
           const c = x.stack.find((s) => s.role === role);
@@ -393,19 +402,32 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
               </button>
             </div>
           )}
-        <Row k="source" v={x.source || x.xource_ref} />
-        {/* SOURCE DIFF: everything the zee has produced vs the source — what would land. */}
-        {!isProd && (
-          <div className="row"><span className="rk">source diff</span>
-            <span className="diff" data-testid="source-diff"
-                  title={diff ? `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted work)` : ''}>
-              {diff
-                ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span></>
-                : '—'}
-            </span>
-          </div>
-        )}
-        {!isProd && <Row k="commit" v={x.head_commit ? x.head_commit.slice(0, 8) : '—'} mono testid="commit-head" />}
+        {/* What this xell TRACKS — its xource — with the head it currently resolves to. The head is
+            the point: "source: main" was true and useless, and it stayed on screen while the thing
+            behind it sat 542 commits back. A ref name alone cannot tell you the tree moved. */}
+        <SourceRow k="remote source" src={x.remote_source} testid="remote-source" />
+        {/* SOURCE DIFF — this xell's content vs the source it tracks. Production is a xell too, so
+            it gets one: its content is what it has deployed, its source is origin. It was excluded
+            here, which is how it drifted unwatched. Prod reads '—' until a ship lands, because
+            nothing recorded the hand-deploys that predate the ship gate — that is honest, not a
+            placeholder: the system does not know what prod is running. */}
+        <div className="row"><span className="rk">source diff</span>
+          <span className="diff" data-testid="source-diff"
+                title={diff
+                  ? (isProd
+                    ? `Deployed is ${diff.ahead} commit(s) ahead of origin · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs origin`
+                    : `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted work)`)
+                  : (isProd ? 'No ship has landed yet, so nothing recorded what production is running' : '')}>
+            {diff
+              ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span></>
+              : '—'}
+          </span>
+        </div>
+        {/* For prod: the commit it is SERVING. For a work xell: the commit it was provisioned at. */}
+        <Row k="commit" mono testid="commit-head"
+             v={isProd
+               ? (x.deployed_commit ? x.deployed_commit.slice(0, 8) : '—')
+               : (x.head_commit ? x.head_commit.slice(0, 8) : '—')} />
         {/* DIFF: work since its own last checkpoint commit — the "not yet saved" number, which
             drops to 0 every time the zee checkpoints. ●N counts dirty files incl. untracked. */}
         {!isProd && (
@@ -449,6 +471,20 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
             : (x.task_id ? 'Mark done' : 'Clean up xell')}
         </button>
       )}
+    </div>
+  );
+}
+
+// "main 8dc4134a" — a ref and the head it currently resolves to, since the head is the whole point.
+function SourceRow({ k, src, testid }) {
+  if (!src) return null;
+  return (
+    <div className="row">
+      <span className="rk">{k}</span>
+      <span className="rv" data-testid={testid} title={src.head ? `${src.ref} @ ${src.head}` : src.ref}>
+        {src.ref || '—'}
+        {src.head ? <span className="srchead mono">{src.head}</span> : null}
+      </span>
     </div>
   );
 }

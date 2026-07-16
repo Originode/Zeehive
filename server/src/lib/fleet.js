@@ -1,6 +1,7 @@
 // Read model for the dashboard: project header, N-of-M status line, grouped container
 // inventory, and one entry per xell (container stack + its live zee + runtime badge).
 import { q, one } from '../db/pool.js';
+import { projectHeads } from './git.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -15,10 +16,20 @@ export async function getFleet(projectId) {
 
   const pool = await one(`SELECT * FROM pool_config WHERE project_id = $1`, [pid]);
 
+  // Two local ref reads for the whole fleet, not one per xell — this is a dashboard poll.
+  const heads = projectHeads(project.repo_root, project.main_branch || 'main');
+
+  // What production is RUNNING: the last ship that actually landed. NULL until one does — see the
+  // note in timeline.js getDiffs; nothing recorded the hand-deploys that predate the ship gate.
+  const deployed = await one(
+    `SELECT commit, finished_at FROM ship_request WHERE project_id=$1 AND status='shipped'
+       ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [pid]);
+
   // grouped container inventory
   const containers = await q(
     `SELECT id, role, tier, isolation, name, url, host_port, health, owner_xell_id,
-            hot_build, last_build_commit, last_built_at, busy_since, busy_op
+            hot_build, last_build_commit, last_built_at, busy_since, busy_op,
+            prod_diff, prod_diff_at
        FROM container WHERE project_id = $1
        ORDER BY role, tier, name`, [pid]);
   const groups = { db: [], server: [], webapp: [], other: [] };
@@ -46,7 +57,8 @@ export async function getFleet(projectId) {
   for (const x of xells) {
     const stack = await q(
       `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id,
-              c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op, uc.relation
+              c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
+              c.prod_diff, c.prod_diff_at, uc.relation
          FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
         WHERE uc.xell_id = $1
         ORDER BY CASE c.role WHEN 'db' THEN 1 WHEN 'server' THEN 2 WHEN 'webapp' THEN 3 ELSE 4 END`,
@@ -54,6 +66,17 @@ export async function getFleet(projectId) {
     x.stack = stack;
     // pretty-print the name column exactly like the mockup expects
     x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
+
+    // What this xell TRACKS (its xource), and the head that ref currently resolves to.
+    //   a work xell → local main.
+    //   production  → origin, the backup mirror. Read from the local origin/main tracking ref, so
+    //                 this never touches the network — and nothing builds from it either.
+    x.remote_source = x.is_production ? { ...heads.origin } : { ...heads.local };
+
+    // Production's equivalent of a xell's head: the commit it is actually serving. Kept separate
+    // from head_commit rather than overloading it — head_commit means "provisioned at", which is
+    // a different (and, for prod, meaningless) question.
+    if (x.is_production) x.deployed_commit = deployed?.commit || null;
   }
 
   // production is a xell too, but it's not a pooled work-xell — exclude it from the counts
@@ -104,6 +127,7 @@ export async function getFleet(projectId) {
   return {
     project,
     pool,
+    heads,
     status: { total, inUse, working, ready: work.filter((x) => x.status === 'ready').length },
     containers: groups,
     backup,

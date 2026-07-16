@@ -63,7 +63,19 @@ export async function buildContainer(containerId, { hot = false } = {}) {
     logline('build', ok
       ? `${hot ? 'HOT ' : ''}build OK: ${c.name} @ ${json?.head} (${json?.method})`
       : `build FAILED: ${c.name} — ${(err || 'see docker output').split('\n').filter(Boolean).pop()}`);
-  })();
+  })().catch(async (e) => {
+    // The ONLY thing that can move this row off 'building' is this callback — the health monitor
+    // deliberately skips 'building' so it can't clobber a live build. So an unhandled throw in
+    // here (runBuild blowing up, or a single ETIMEDOUT to the NAS meta-DB on the UPDATE above —
+    // see the note in index.js; that exact blip has already taken this orchestrator down once)
+    // strands the container at 'building' FOREVER, spinner and all, with no build behind it.
+    // Land it on a terminal state and say so, rather than leave a permanent lie on the chip.
+    try {
+      const row = await one(`UPDATE container SET health='down' WHERE id=$1 AND health='building' RETURNING *`, [containerId]);
+      if (row) broadcast('container', row);
+    } catch { /* the DB is what failed — the boot-time recoverOrphanBuilds() is the backstop */ }
+    logline('build', `build ERRORED: ${c.name} — ${e?.message || e} (marked down; rebuild when ready)`);
+  });
 
   return { status: 'building', container: c.name, role: c.role, hot, mode: MODE };
 }

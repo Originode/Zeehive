@@ -229,7 +229,7 @@ async function bindingFor(xellId, zee, task) {
       ? `psql "${dbc.conn_ref}"`
       : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U postgres -d omnibiz`,
     note: dbc.tier === 'prod'
-      ? 'This IS the live production database — a human deliberately assigned it to you (--db prod). '
+      ? 'This IS the live production database — a human deliberately assigned it to you (--db shared-prod). '
         + 'It is YOUR container: querying it is expected, not a violation. Reads are free. Before ANY '
         + 'write/migration, state exactly what it will change and get a human to agree.'
       : 'Your assigned database. Do not reach for prod: you were not given it, and the prod guard '

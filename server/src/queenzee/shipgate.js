@@ -133,7 +133,9 @@ async function runShip(shipId) {
     `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 RETURNING *`, [ship.id]);
   broadcast('ship', shipping);
 
-  // Build from the XOURCE at main — not the xell's worktree. This is the anti-band-aid rule.
+  // Production's BUILD SOURCE is local main — not the xell's worktree, and not the xource
+  // checkout's wandering HEAD (which is what this actually built until 2026-07-16). origin is a
+  // backup and is never read. This is the anti-band-aid rule.
   const cs = await q(
     `SELECT * FROM container WHERE project_id=$1 AND tier='prod' AND role = ANY($2)
        AND build_script IS NOT NULL ORDER BY role`, [project.id, SHIPPABLE]);
@@ -145,7 +147,25 @@ async function runShip(shipId) {
     results.push({ error: 'no prod container has a build_script configured — nothing to ship' });
   }
   for (const c of cs) {
-    const r = await runScript(c, project.repo_root);
+    // ship.commit is the sha the HUMAN approved. Passing it (rather than letting the script say
+    // "main") also means a main that moved between approval and build cannot smuggle in commits
+    // nobody signed off on.
+    const r = await runScript(c, project.repo_root, ship.commit);
+
+    // Record what prod now RUNS — the same projection lib/build.js does for dev builds. A ship
+    // used to skip this entirely, so a successful deploy left last_build_commit untouched and
+    // nothing in the system could say what code production was serving. That is why prod's chips
+    // read "never built" while the site was up, and why its card had nothing to compare.
+    const row = await one(
+      `UPDATE container
+          SET health = $2::container_health,
+              last_build_commit = COALESCE($3, last_build_commit),
+              last_built_at = CASE WHEN $4 THEN now() ELSE last_built_at END
+        WHERE id=$1 RETURNING *`,
+      [c.id, r.ok ? 'up' : 'down',
+        r.json?.head && r.json.head !== 'unknown' ? r.json.head : null, r.ok]);
+    if (row) broadcast('container', row);
+
     results.push({ container: c.name, role: c.role, ok: r.ok, method: r.json?.method || null, error: r.ok ? null : r.err });
     if (!r.ok) { ok = false; break; }   // stop at the first failure — do not half-ship prod
   }
@@ -169,10 +189,10 @@ async function runShip(shipId) {
   notifyShipDone({ project, xell, ok, request: done, seconds: AUTO_RELEASE_SEC });
 }
 
-function runScript(container, sourcePath) {
+function runScript(container, sourcePath, buildRef = 'main') {
   return new Promise((res) => {
     const exec = container.build_exec || 'bash';
-    const p = spawn(exec, [container.build_script, sourcePath, container.role, container.docker_ctx || '', MODE],
+    const p = spawn(exec, [container.build_script, sourcePath, container.role, container.docker_ctx || '', MODE, buildRef],
       { env: cleanGitEnv(), windowsHide: true });
     let out = '', err = '';
     p.stdout.on('data', (d) => (out += d));

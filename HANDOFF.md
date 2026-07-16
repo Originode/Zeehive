@@ -198,9 +198,15 @@ prod, absent from main, silently reverted by the next rebuild from main.
 
 ## Hotfix / data-manipulation xells (prod DATA is not prod CODE)
 
-A xell dispatched with **`--db prod`** has `db_coupling='db-shared-prod'`: the live production
+A xell dispatched with **`--db shared-prod`** has `db_coupling='db-shared-prod'`: the live production
 database IS its assigned container. Querying it is the job, not a violation — "use ONLY your
 assigned containers" is *satisfied*, because a human deliberately gave it that one.
+
+⚠ The flag value is **`shared-prod`**, not `prod`. Dispatch prefixes it with `db-`
+(`xell-dispatch.mjs`), so `--db prod` → `db-prod`, which is not a mode. This doc and the prod
+guard both said `--db prod` for a while, and `attachXellDb` silently fell back to **dev** on an
+unknown coupling — so following the instructions attached the dev db, the guard then denied the
+zee and repeated the same broken advice. Unrecognized couplings now throw.
 
 - The prod DB has **no `conn_ref`** and prod postgres isn't exposed, so `docker --context
   mardale-prod exec -i omnibiz_db_prod psql …` is the sanctioned path (it's what OmniBiz's own docs

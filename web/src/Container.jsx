@@ -27,12 +27,49 @@ export const isBusy = (c) => busyReason(c) != null;
 
 const BUSY_LABEL = { building: 'building…', backup: 'backing up…', restore: 'restoring from backup…', busy: 'working…' };
 
+// ── schema drift vs production (container.prod_diff, written by queenzee/proddiff.js) ──────────
+// null   → never checked, or this IS prod (prod is the ruler, it is compared against nothing)
+// 'sync' → total 0
+// 'drift'→ total > 0
+// 'err'  → could not be compared (db down / mid-restore / unreadable)
+export function driftState(c) {
+  const d = c.prod_diff;
+  if (!d) return null;
+  if (!d.ok) return 'err';
+  return d.total > 0 ? 'drift' : 'sync';
+}
+
+// The drift half of the tooltip. Counts are exact; the lists are a SAMPLE (proddiff truncates), so
+// say so rather than let a reader think 8 is the whole story.
+function driftText(c) {
+  const d = c.prod_diff;
+  if (!d) return '';
+  const when = c.prod_diff_at ? ` (${new Date(c.prod_diff_at).toLocaleString()})` : '';
+  if (!d.ok) return `\n\n⚠ prod diff failed${when}\n${d.error || 'unknown error'}`;
+  if (!d.total) return `\n\n✓ schema matches prod${when}`;
+
+  const out = [`\n\n⚠ DRIFTED from prod — ${d.total} difference(s)${when}`];
+  for (const [kind, v] of Object.entries(d.kinds || {})) {
+    const miss = v.missing_count || 0, extra = v.extra_count || 0;
+    if (!miss && !extra) continue;
+    out.push(`\n${kind}: ${miss} missing, ${extra} extra`);
+    // "missing" first and always: prod has it and this db does not, which is what breaks code.
+    for (const x of (v.missing || [])) out.push(`\n  − ${x}`);
+    if (miss > (v.missing || []).length) out.push(`\n  … +${miss - v.missing.length} more missing`);
+    for (const x of (v.extra || [])) out.push(`\n  + ${x}`);
+    if (extra > (v.extra || []).length) out.push(`\n  … +${extra - v.extra.length} more extra`);
+  }
+  out.push('\n\n− = prod has it, this db does not (code may expect it)');
+  out.push('\n+ = this db has it, prod does not');
+  return out.join('');
+}
+
 function tooltip(c, buildable, busy) {
   if (busy) return `${c.name}\n${c.tier} · ${BUSY_LABEL[busy] || 'working…'}`;
   const built = c.last_build_commit
     ? `\nlast build: ${c.last_build_commit}${c.hot_build ? ' (hot)' : ''}${c.last_built_at ? ' · ' + new Date(c.last_built_at).toLocaleString() : ''}`
     : (buildable ? '\nnever built — click the hammer to build' : '');
-  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}`;
+  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${driftText(c)}`;
 }
 
 // onMenu  → the chip is right-clickable (context menu). Passed by BOTH the inventory and the
@@ -44,6 +81,10 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
   const busy = busyReason(c);
   const unbuilt = hammer && buildable && !c.last_build_commit && !busy;   // no hammer while busy
   const onCtx = onMenu ? (e) => onMenu(e, c) : undefined;
+  // Drift is about the DATABASE's schema, not the container process — so it must not masquerade as
+  // the health dot. It gets its own corner mark, and only while idle: a chip that is mid-restore is
+  // already saying something more urgent, and its drift reading is stale by definition.
+  const drift = busy ? null : driftState(c);
 
   // While busy the health dot is replaced by a spinner (amber = building, blue = restoring).
   const indicator = busy
@@ -54,6 +95,10 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
     <>
       <span className="cnick">{nick(c.name)}</span>
       {indicator}
+      {drift && drift !== 'sync' && (
+        <span className={`cdrift ${drift}`} data-testid="cdrift"
+              aria-label={drift === 'drift' ? 'schema drifted from prod' : 'prod diff failed'} />
+      )}
       {unbuilt && (
         <button className="cbuild-in" data-testid="build-in" title="Build this container"
                 onClick={(e) => { e.preventDefault(); e.stopPropagation(); buildContainer(c.id, false).catch(buildErr); }}>🔨</button>
@@ -61,7 +106,7 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
     </>
   );
   const common = {
-    className: `cbox h-${c.health}${busy ? ` busy busy-${busy}` : ''}`,
+    className: `cbox h-${c.health}${busy ? ` busy busy-${busy}` : ''}${drift ? ` d-${drift}` : ''}`,
     title: tooltip(c, buildable, busy), onContextMenu: onCtx,
   };
 

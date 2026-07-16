@@ -27,18 +27,31 @@ set -u
 # ── baked by the installer ───────────────────────────────────────────────────
 API="${ZEEHIVE_API:-__API__}"
 PROJECT_ID="__PROJECT_ID__"
-PROTECTED_REF="refs/heads/__MAIN_BRANCH__"
+# Every ref that is a XOURCE — one per line. main is always in it; a xell that is itself a xource
+# (its children land into it) adds its spinoff/ branch. The QUEENZEE rewrites this file whenever a
+# xource is created or removed; see server/src/lib/protected-refs.js.
+PROTECTED_REFS_FILE="__PROTECTED_REFS_FILE__"
+# Fallback if the file is missing (fresh install, or someone deleted it): protect main and nothing
+# else — the pre-tree behaviour, which is the safe direction to degrade in.
+FALLBACK_REF="refs/heads/__MAIN_BRANCH__"
 
 REF="$1"; OLD="$2"; NEW="$3"
 
-# Not the protected branch → not our business. Note this check is LOCAL and deliberate: it means
-# fail-closed only ever bites pushes to main, never a push to some other branch.
-[ "$REF" = "$PROTECTED_REF" ] || exit 0
+# Is this ref protected? The check is LOCAL and stays local ON PURPOSE. Asking the API "is this
+# ref a xource?" would be tidier, but it would mean an unreachable queenzee fails closed on EVERY
+# push — wedging every zee on every branch, when the thing being protected is a handful of refs.
+# A local list keeps the blast radius of an outage exactly where it was before the tree existed:
+# pushes to a xource, never anything else.
+if [ -f "$PROTECTED_REFS_FILE" ]; then
+  grep -qxF "$REF" "$PROTECTED_REFS_FILE" 2>/dev/null || exit 0
+else
+  [ "$REF" = "$FALLBACK_REF" ] || exit 0
+fi
 
 decline() {
   echo "" >&2
   echo "  ┌─ ZEEHIVE ─────────────────────────────────────────────────────────────" >&2
-  echo "  │ LANDING HELD — a human must verify this before it reaches ${PROTECTED_REF#refs/heads/}." >&2
+  echo "  │ LANDING HELD — a human must verify this before it reaches ${REF#refs/heads/}." >&2
   echo "  │" >&2
   echo "  │ $1" >&2
   echo "  │" >&2
@@ -47,7 +60,7 @@ decline() {
   echo "  │" >&2
   echo "  │ WHAT TO DO: tell your human the landing is waiting in the ZEEHIVE" >&2
   echo "  │ console, then re-run the SAME push once they approve it:" >&2
-  echo "  │     git push . HEAD:${PROTECTED_REF#refs/heads/}" >&2
+  echo "  │     git push . HEAD:${REF#refs/heads/}" >&2
   echo "  │ Do NOT try to work around this hook. Do NOT amend/rebase to a new sha —" >&2
   echo "  │ approval is bound to the exact commit a human read." >&2
   echo "  └───────────────────────────────────────────────────────────────────────" >&2

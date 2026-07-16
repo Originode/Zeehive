@@ -49,6 +49,58 @@ function deny(reason) {
   process.exit(0);
 }
 
+// ── is this psql invocation provably READ-ONLY? ───────────────────────────────────────────────
+//
+// Reads of a database are not this hook's business — it exists to stop hand-deploys and writes to
+// someone else's data. But the hook only sees a COMMAND STRING, so "is this a read" has to be
+// decided from text. That is decidable only when we can SEE the whole statement.
+//
+// CONSERVATIVE BY CONSTRUCTION. A false "no" costs one clear message and a re-dispatch. A false
+// "yes" puts a write on production. So: unknowable => not read-only.
+//
+// LIMIT, stated plainly: this proves the STATEMENT SHAPE, not the effect. `SELECT f()` where f()
+// writes would pass. That is consistent with this hook's stated threat model (it stops
+// instruction-following and accident; it is not adversary-proof — a determined zee can obfuscate
+// any command). The airtight version is a postgres ROLE with only SELECT grants, where the SERVER
+// enforces it and no regex is involved.
+function readOnlyPsql(cmd) {
+  if (!/\bpsql\b/i.test(cmd)) return false;
+
+  // A shell wrapper means the -c we find belongs to sh, not psql — we would be parsing the wrong
+  // language. Don't guess.
+  if (/\b(sh|bash|zsh)\s+-c\b/i.test(cmd)) return false;
+
+  // SQL we cannot see: a file, a stdin redirect, a heredoc, or a pipe into psql.
+  if (/\s(-f|--file)\b/i.test(cmd)) return false;
+  if (/<|\|/.test(cmd)) return false;
+
+  // Every -c payload must be present AND read-only. No -c at all = an interactive shell, whose
+  // statements we will never see.
+  const stmts = [...cmd.matchAll(/-c\s+(['"])([\s\S]*?)\1/g)].map((m) => m[2]);
+  if (!stmts.length) return false;
+
+  // Anything that can write, anywhere in the text — including inside a CTE (`WITH x AS (INSERT…)`),
+  // `SELECT … INTO` (which creates a table), and COPY … FROM. EXPLAIN ANALYZE actually RUNS the
+  // statement, so it is a write when wrapping one. Cheaper to reject the lot than to parse SQL.
+  const WRITES = /\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|vacuum|reindex|cluster|copy|call|do|refresh|import|merge|lock|analyze|reassign|comment|security\s+label)\b/i;
+  const READ_LEAD = /^\s*(select|with|show|explain|table|values)\b/i;
+
+  for (const sql of stmts) {
+    for (const part of sql.split(';')) {
+      const s = part.trim();
+      if (!s) continue;
+      if (s.startsWith('\\')) {                    // psql meta-commands: \d \dt \l \dn are reads
+        if (!/^\\(d|dt|dv|di|ds|df|dn|l|z|sf|echo|pset|timing|x)\b/i.test(s)) return false;
+        continue;
+      }
+      if (!READ_LEAD.test(s)) return false;        // must LEAD with a read verb
+      if (WRITES.test(s)) return false;            // …and contain no write verb anywhere
+      if (/\binto\b/i.test(s) && /^\s*select\b/i.test(s)) return false;  // SELECT … INTO writes
+    }
+  }
+  return true;
+}
+
 let raw = '';
 process.stdin.on('data', (c) => (raw += c));
 process.stdin.on('end', () => {
@@ -83,7 +135,7 @@ process.stdin.on('end', () => {
   if (!mutates) process.exit(0);      // ps / images / logs / inspect / stats → look all you like
 
   // ── prod DATA is not prod CODE ──────────────────────────────────────────────────────────────
-  // A hotfix / data-manipulation xell is dispatched with `--db prod`, which makes the prod DB its
+  // A hotfix / data-manipulation xell is dispatched with `--db shared-prod`, which makes the prod DB its
   // ASSIGNED container — using it obeys the rules rather than breaking them. This hook only sees a
   // cwd and a string, so it asks the queenzee whose database that is. Deploying prod CODE stays
   // denied for everyone (that is the ship gate's job), and exec into any OTHER prod container
@@ -95,12 +147,30 @@ process.stdin.on('end', () => {
       // Its own database, in a xell a human pointed at prod. Let it work.
       process.exit(0);
     }
+
+    // ── READS ARE NOT GATED ───────────────────────────────────────────────────────────────────
+    // A provably read-only psql against a DATABASE container is allowed for any xell, assigned or
+    // not. This gate exists to stop hand-deploys and writes to data that isn't yours; a SELECT is
+    // neither. It used to deny on the command SHAPE alone (`docker --context …-prod exec … psql`),
+    // so `SELECT count(*)` and `DROP TABLE` were identical to it — which made a zee ask its human
+    // for prod access just to READ, and taught it that the gate is noise to route around.
+    // Deliberately narrow: the target must be a known db container (never omnibiz_webapp_prod),
+    // and the SQL must be visible and read-only (see readOnlyPsql — unknowable => denied).
+    const dbTarget = (answer?.db_containers || []).some((n) => n && cmd.includes(n));
+    if (dbTarget && readOnlyPsql(cmd)) process.exit(0);
+
     if (answer && !answer.allowed) {
       deny(`DENIED by the ZEEHIVE prod guard: this is not your database.\n\n`
         + `${answer.reason || 'this xell is not attached to the prod database'}.\n\n`
-        + 'A hotfix / data-manipulation xell is dispatched with `--db prod`, which ASSIGNS it the '
-        + 'prod database — then this exact command is allowed. Ask your human to re-dispatch you '
-        + 'that way, or use the database you were actually given.');
+        + 'A hotfix / data-manipulation xell is dispatched with `--db shared-prod`, which ASSIGNS it '
+        + 'the prod database — then this exact command is allowed. Ask your human to re-dispatch you '
+        + 'that way, or use the database you were actually given.\n\n'
+        + 'The flag value is `shared-prod`, NOT `prod`: dispatch prefixes it with "db-", so `--db prod` '
+        + 'becomes the non-existent mode `db-prod`.\n\n'
+        + 'READS ARE NOT GATED: a plain `psql -c "SELECT …"` against a db container is allowed for '
+        + 'any xell. If you are seeing this for a read, the SQL was not VISIBLE to the gate — it was '
+        + 'behind -f, a pipe, a stdin redirect, or `sh -c`. Put the statement directly in -c and it '
+        + 'goes through. Writes still need the database you were assigned.');
     }
     // answer===null → the gate is unreachable → fall through to the deny below (fail closed).
   }
@@ -121,6 +191,6 @@ process.stdin.on('end', () => {
     '',
     'Do not try to route around this. Do not use /spin:deploy-guard — its lock is invisible to the',
     'queenzee. Read-only docker against prod (ps, logs, inspect, images) is still allowed, and a',
-    'xell dispatched with --db prod may use its own prod DATABASE (that is data work, not a deploy).',
+    'xell dispatched with --db shared-prod may use its own prod DATABASE (that is data work, not a deploy).',
   ].join('\n'));
 });

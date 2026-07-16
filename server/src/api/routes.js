@@ -185,7 +185,7 @@ router.post('/xells/:id/db', async (req, res) => {
 });
 // Asked by the prod-guard hook (hooks/prod-guard.mjs) when a command in a xell worktree touches
 // prod: is the prod DB THIS xell's assigned database? A hotfix/data xell dispatched with
-// `--db prod` is entitled to its own database; a feature xell is not. The hook cannot know this
+// `--db shared-prod` is entitled to its own database; a feature xell is not. The hook cannot know this
 // from a cwd + a command string, so it asks. Must be fast and must not throw — a blocked zee is
 // waiting on it.
 router.get('/xell/db-access', async (req, res) => {

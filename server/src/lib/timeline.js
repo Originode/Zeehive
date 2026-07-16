@@ -17,11 +17,28 @@ export async function getDiffs(projectId) {
   if (!project) return {};
   const branch = project.main_branch || 'main';
   const xells = await q(
-    `SELECT id, head_commit, worktree_path FROM xell
-       WHERE project_id=$1 AND status<>'retired' AND NOT is_production`,
+    `SELECT id, head_commit, worktree_path, is_production FROM xell
+       WHERE project_id=$1 AND status<>'retired'`,
     [project.id]);
+
+  // Production is a xell, so it gets a diff too — it was excluded here, which is precisely why it
+  // could drift unwatched. Its CONTENT is whatever the last successful ship deployed, and its
+  // xource is origin, so its diff answers "has what is live drifted from the backup?".
+  //
+  // NULL until a ship actually lands: prod's current code predates the ship gate and was deployed
+  // by hand, so nothing recorded what it is. A blank beats a guess about production.
+  const shipped = await one(
+    `SELECT commit FROM ship_request WHERE project_id=$1 AND status='shipped'
+       ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [project.id]);
+
   const out = {};
   for (const x of xells) {
+    if (x.is_production) {
+      out[x.id] = shipped?.commit
+        ? diffStat(project.repo_root, shipped.commit, `origin/${branch}`)
+        : null;
+      continue;
+    }
     out[x.id] = x.worktree_path && existsSync(x.worktree_path)
       ? worktreeDiff(x.worktree_path, branch)
       : (x.head_commit ? diffStat(project.repo_root, x.head_commit, branch) : null);

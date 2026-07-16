@@ -10,6 +10,18 @@ import React, { useState, useEffect } from 'react';
 import { decideShip, holdProdLock, forceReleaseProdLock } from './api.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
+
+// ONE force-release path, shared by the padlock badge and the countdown bar's "Release now".
+// Same act → same words. Two different confirmations for one consequential click is how a human
+// learns to skim past the one that matters. The warning escalates when the lock is HELD: a
+// countdown release only skips a wait that was going to happen anyway, but releasing a HELD lock
+// cuts off a human who deliberately stopped the clock to verify prod.
+function confirmForceRelease(lock) {
+  return confirm(
+    `Force-release the production lock from ${lock.xell_slug}?\n\n`
+    + `${lock.held ? 'It is being HELD open by a human — someone may be verifying prod right now.\n\n' : ''}`
+    + `Prod becomes free for another xell to ship immediately.`);
+}
 const mmss = (ms) => {
   const s = Math.max(0, Math.round(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
@@ -41,8 +53,11 @@ function ShipCard({ req, onDone }) {
         <span className="land-meta">{req.status}</span>
       </div>
       {req.reason && <div className="ship-reason">“{req.reason}”</div>}
+      {/* Names the sha, not just "main". This line used to promise "builds from main in the xource"
+          while the build took whatever that shared checkout was parked at — for a long while, 542
+          commits behind. What it names now is exactly what ship-prod.sh checks out. */}
       <div className="land-stat">
-        builds from <b>main</b> in the xource — not from the xell's worktree
+        builds local <b>main</b> @ <b>{short(req.commit)}</b> — not the xell's worktree, not origin
       </div>
       {req.status === 'shipping' && <div className="ship-progress">⟳ queenzee is deploying — it holds the prod lock</div>}
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
@@ -79,11 +94,25 @@ function LockCountdown({ lock, projectId, onChanged }) {
     finally { setBusy(false); }
   };
 
+  // Release now — the other half of the decision the countdown poses. Without it the only options
+  // were "wait out the clock" or "go hunt for the padlock on the xell's card", which is the same
+  // act two screens away from where it is being asked about.
+  const release = async () => {
+    if (!confirmForceRelease(lock)) return;
+    setBusy(true);
+    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (e) { alert(e.message); }
+    finally { setBusy(false); }
+  };
+
   if (lock.held) {
+    // A HELD lock has no countdown to wait out — it blocks every other xell until someone acts.
+    // So this is the state that most needs the button, not the one that least needs it.
     return (
       <div className="lock-bar held">
         🔒 <b>{lock.xell_slug}</b> is holding the production lock — countdown cancelled, it will not
-        auto-release. Click the padlock on its card to release.
+        auto-release.
+        <button className="lock-release" data-testid="lock-release-held"
+                disabled={busy} onClick={release}>{busy ? '…' : 'Release now'}</button>
       </div>
     );
   }
@@ -93,6 +122,8 @@ function LockCountdown({ lock, projectId, onChanged }) {
       🔒 <b>{lock.xell_slug}</b> holds production · releasing in <b className="lock-clock">{mmss(left)}</b>
       <span className="lock-q"> — still verifying? Hold it and the countdown stops.</span>
       <button className="lock-hold" disabled={busy} onClick={hold}>{busy ? '…' : 'Hold the lock'}</button>
+      <button className="lock-release" data-testid="lock-release"
+              disabled={busy} onClick={release}>{busy ? '…' : 'Release now'}</button>
     </div>
   );
 }
@@ -123,10 +154,7 @@ export function LockBadge({ lock, projectId, onChanged }) {
 
   const release = async (e) => {
     e.stopPropagation();
-    if (!confirm(
-      `Force-release the production lock from ${lock.xell_slug}?\n\n`
-      + `${lock.held ? 'It is being HELD open by a human — someone may be verifying prod right now.\n\n' : ''}`
-      + `Prod becomes free for another xell to ship immediately.`)) return;
+    if (!confirmForceRelease(lock)) return;
     setBusy(true);
     try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (err) { alert(err.message); }
     finally { setBusy(false); }

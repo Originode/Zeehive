@@ -58,6 +58,12 @@ git -C "$REPO_ROOT" rev-parse --verify --quiet "$MAIN_BRANCH" >/dev/null \
 HD="$(hooks_dir "$REPO_ROOT")"; HOOK="$HD/update"
 mkdir -p "$HD"
 
+# The protected-ref list lives in the git COMMON dir, not the hooks dir: core.hooksPath can point
+# anywhere (OmniBiz sets it to an absolute path outside the repo), and this file describes THIS
+# repo's refs. Machine-local and not version-controlled, like the hook itself.
+GIT_COMMON="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+REFS_FILE="$GIT_COMMON/zeehive-protected-refs"
+
 if [ -f "$HOOK" ] && ! grep -q "$MARKER" "$HOOK" 2>/dev/null; then
   echo "REFUSING: a foreign 'update' hook already exists at $HOOK" >&2
   echo "  Move it aside (or merge the gate into it) yourself — it is not mine to overwrite." >&2
@@ -68,12 +74,17 @@ fi
 sed -e "s|__API__|$API_BASE|g" \
     -e "s|__PROJECT_ID__|$PROJECT_ID|g" \
     -e "s|__MAIN_BRANCH__|$MAIN_BRANCH|g" \
+    -e "s|__PROTECTED_REFS_FILE__|$REFS_FILE|g" \
     "$TEMPLATE" > "$HOOK"
 chmod +x "$HOOK"
 
+# Seed the list with main so the gate is correct before the queenzee ever runs. It rewrites this
+# file whenever a xource is created; until then main is the only xource, which is exactly this.
+[ -f "$REFS_FILE" ] || printf 'refs/heads/%s\n' "$MAIN_BRANCH" > "$REFS_FILE"
+
 echo "installed landing gate → $HOOK"
 echo "  project : $PROJECT_ID"
-echo "  protects: refs/heads/$MAIN_BRANCH  in  $REPO_ROOT"
+echo "  protects: $(tr '\n' ' ' < "$REFS_FILE")  (list: $REFS_FILE)"
 echo "  api     : $API_BASE  (FAILS CLOSED if unreachable)"
 echo
 echo "Verify with:  $0 --status $REPO_ROOT"

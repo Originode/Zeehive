@@ -104,7 +104,7 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
 // Which database is THIS worktree's, and may its zee touch it? Answers the prod-guard hook.
 //
 // The point: db_coupling='db-shared-prod' means the prod DB *is* this xell's assigned container —
-// the human chose that at dispatch (`--db prod`), so using it obeys "use only your assigned
+// the human chose that at dispatch (`--db shared-prod`), so using it obeys "use only your assigned
 // containers" rather than violating it. But the hook only sees a cwd and a command string, so it
 // cannot tell "read the prod DB" (legitimate for a hotfix/data xell) from "deploy prod code"
 // (never a zee's job). It asks here instead of guessing.
@@ -114,13 +114,20 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
 export async function dbAccessForCwd(cwd) {
   const norm = (p) => String(p || '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
   const target = norm(cwd);
-  if (!target) return { xell: null, allowed: false, reason: 'no cwd' };
+
+  // Every db container's name, regardless of who owns it or whether the cwd resolves to a xell.
+  // The guard needs this to tell "exec into a DATABASE" (where a read is nobody's business to
+  // block) from "exec into omnibiz_webapp_prod" (a deploy by hand, always denied). Names only —
+  // no credentials, nothing sensitive — and the guard still decides; this only informs it.
+  const dbNames = (await q(`SELECT name FROM container WHERE role='db'`)).map((r) => r.name);
+
+  if (!target) return { xell: null, allowed: false, reason: 'no cwd', db_containers: dbNames };
 
   const xells = await q(
     `SELECT id, slug, status, worktree_path, db_coupling FROM xell
        WHERE status <> 'retired' AND NOT is_production`);
   const xell = xells.find((x) => norm(x.worktree_path) === target);
-  if (!xell) return { xell: null, allowed: false, reason: 'cwd is not a live xell worktree' };
+  if (!xell) return { xell: null, allowed: false, reason: 'cwd is not a live xell worktree', db_containers: dbNames };
 
   const db = await one(
     `SELECT c.name, c.tier, c.docker_ctx FROM container c
@@ -130,6 +137,7 @@ export async function dbAccessForCwd(cwd) {
   return {
     xell: { slug: xell.slug, db_coupling: xell.db_coupling },
     db_container: db?.name || null,
+    db_containers: dbNames,
     docker_ctx: db?.docker_ctx || null,
     // Only a xell a human deliberately pointed at prod may touch prod data.
     allowed: xell.db_coupling === 'db-shared-prod' && !!db && db.tier === 'prod',
@@ -140,6 +148,16 @@ export async function dbAccessForCwd(cwd) {
 }
 
 export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
+  // Validate the coupling BEFORE touching anything. An unrecognized value must NOT reach the dev
+  // default at the bottom of the if/else: `--db prod` prefixes to `db-prod` (not a mode), landed in
+  // that else, and SILENTLY attached DEV. The zee was then denied by the prod guard — which told it
+  // to re-dispatch with `--db prod`, which did the same thing. A closed loop, and nothing anywhere
+  // said why. Checked first so a bad flag costs a clear error instead of a re-pointed database.
+  if (coupling && !(coupling in DB_MODES)) {
+    throw new Error(`unknown db coupling "${coupling}" — valid: ${Object.keys(DB_MODES).join(', ')}. `
+      + 'Note the flag value is prefixed with "db-": use `--db shared-prod`, not `--db prod`.');
+  }
+
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   if (!xell) throw new Error('xell not found');
   if (xell.is_production) throw new Error('production xell — refusing to re-point its database');

@@ -7,6 +7,7 @@ import { startPool } from './queenzee/pool.js';
 import { startMaintenance } from './queenzee/maintenance.js';
 import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
+import { startProdDiff } from './queenzee/proddiff.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { startShipReaper } from './queenzee/shipgate.js';
 import { startImageJanitor } from './lib/images.js';
@@ -60,5 +61,6 @@ app.listen(config.port, () => {
   startMaintenance();
   startShipReaper();
   startImageJanitor();
+  startProdDiff();
 });
 export { app };

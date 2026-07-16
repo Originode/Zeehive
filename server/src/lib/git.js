@@ -63,6 +63,23 @@ export function worktreeDiff(worktree, ref = 'main') {
   };
 }
 
+// The heads behind each xell's "remote source" — the ref it tracks, plus where that ref actually
+// points, so the card can answer "which head is this tracking?" instead of just naming a branch.
+//
+//   local  → what a work xell tracks.
+//   origin → what production tracks. A BACKUP mirror, pushed by hand; nothing here builds from it.
+//
+// Both are LOCAL ref reads: `origin/main` is the remote-tracking ref, so this never hits the
+// network (and is only as fresh as the last push/fetch, which is fine for a label).
+export function projectHeads(repoRoot, branch = 'main') {
+  const localMain = git(repoRoot, ['rev-parse', '--short', branch]);
+  const originMain = git(repoRoot, ['rev-parse', '--short', `origin/${branch}`]);
+  return {
+    local: { ref: branch, head: localMain.status === 0 ? localMain.out.trim() : null },
+    origin: { ref: `origin/${branch}`, head: originMain.status === 0 ? originMain.out.trim() : null },
+  };
+}
+
 // Divergence + diffstat of a base commit vs a ref (what the xell is "behind"/differs by).
 export function diffStat(repoRoot, baseHash, ref = 'main') {
   if (!baseHash) return null;

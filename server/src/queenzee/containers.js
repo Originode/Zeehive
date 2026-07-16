@@ -29,15 +29,21 @@ function probeContexts(ctxs) {
 // Docker state → container_health enum.
 function toHealth(state) {
   if (state === 'running') return 'up';
-  if (state === 'restarting') return 'building';   // crash-looping or coming up — genuinely in flux
-  // 'created' is NOT building. It means compose created the container and never started it —
-  // an INTERRUPTED build (e.g. the queenzee was restarted mid-`up -d`). Nothing is building it,
-  // so calling it 'building' made the spinner permanent: a real build's row is 'building' and the
-  // monitor SKIPS it (below), so anything we actually map here has no build behind it. Worse, it
-  // silently defeated recoverOrphanBuilds() — that hands the row back as 'unknown', and this
-  // mapping put it straight back into 'building' on the next tick. A created-but-never-started
-  // container is not running: say DOWN, so a human/zee knows to rebuild.
-  if (state === 'created') return 'down';
+  // NOTHING HERE MAY EVER RETURN 'building'. That state is owned exclusively by buildContainer,
+  // and the monitor SKIPS a 'building' row (below) precisely so it can't clobber a live build's
+  // spinner. So any docker state mapped to 'building' here becomes PERMANENT: the row is skipped
+  // from then on, no build exists to finish it, and it survives even recoverOrphanBuilds() —
+  // which hands the row back as 'unknown' only for this mapping to re-stamp 'building' next tick.
+  //
+  // 'created'    — compose made the container and never started it (an interrupted build). Not
+  //                running, nothing building it → DOWN, so a human/zee knows to rebuild.
+  // 'restarting' — the restart policy is bouncing it after a crash. This USED to map to
+  //                'building' and had exactly the failure above: one crash-loop pinned the chip's
+  //                spinner forever, and it stayed spinning long after the container recovered.
+  //                A crash-looping container is not being built by anyone — it is broken. Say
+  //                DOWN. If it is merely bouncing, the very next tick sees 'running' and says up;
+  //                a truthful one-tick 'down' beats a permanent lie.
+  if (state === 'created' || state === 'restarting') return 'down';
   return 'down'; // exited | paused | dead | removing
 }
 
