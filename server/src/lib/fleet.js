@@ -48,8 +48,17 @@ export async function getFleet(projectId) {
        FROM xell x
        LEFT JOIN deploy_lock dl ON dl.xell_id = x.id AND dl.container = 'prod'
        JOIN xource xo ON xo.id = x.xource_id
-       LEFT JOIN zee z ON z.xell_id = x.id
-            AND z.status IN ('spawning','online','working','idle')
+       -- The xell's zee, PREFERRING a living one but falling back to the most recent dead one.
+       -- The old join took only living zees, so a session whose PROCESS died (app closed, laptop
+       -- rebooted, one liveness blip) vanished from its card entirely — reading as "no session"
+       -- when the session JSONL is on disk and resumable and the zee row still holds the viewer
+       -- link. Process death is not session death; the card shows detached instead of nothing.
+       LEFT JOIN LATERAL (
+         SELECT * FROM zee zz WHERE zz.xell_id = x.id
+          ORDER BY CASE WHEN zz.status IN ('spawning','online','working','idle') THEN 0 ELSE 1 END,
+                   zz.created_at DESC
+          LIMIT 1
+       ) z ON true
        LEFT JOIN agent_runtime r ON r.id = z.runtime_id
       WHERE x.project_id = $1 AND x.status <> 'retired'
       ORDER BY x.created_at`, [pid]);

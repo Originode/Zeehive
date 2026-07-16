@@ -171,6 +171,14 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
 /* the head sits beside its ref, dimmer — the ref is the label, the head is the evidence */
 .srchead { color: var(--muted); font-size: 11px; margin-left: 6px; }
 
+/* A session whose PROCESS died but whose transcript lives on disk. Amber, not red: it is not an
+   error, it is a session at rest — one click resumes it. It used to render as "—", which read as
+   lost and taught people their sessions evaporate. */
+.detached { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px;
+  font-size: 9px; letter-spacing: .3px; color: var(--building);
+  border: 1px solid rgba(224,165,59,.45); background: rgba(224,165,59,.10);
+  font-family: 'Segoe UI', sans-serif; vertical-align: middle; }
+
 /* Can it ship? Colour-coded by what YOU have to do about it, not by severity:
    `no` is the only one that needs you (land it); `queue` resolves itself when the
    lock frees, so it is muted, not a warning — a red "blocked" there would send you

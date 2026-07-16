@@ -441,8 +441,14 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
         {!isProd && (
           <div className="row"><span className="rk">session</span>
             <span className={x.zee_title ? 'sesstitle' : 'mono'} data-testid="session"
-                  title={x.zee_title ? `${x.zee_title}\n${shortSid(x.claude_session_id)}` : x.claude_session_id || ''}>
+                  title={(x.zee_title ? `${x.zee_title}\n${shortSid(x.claude_session_id)}` : x.claude_session_id || '')
+                    + (['stopped', 'errored'].includes(x.zee_status) && x.claude_session_id
+                      ? '\n\nThe session PROCESS ended (app closed / reboot / liveness blip) but the session itself is on disk — click the card to resume it.' : '')}>
               {x.zee_title || shortSid(x.claude_session_id)}
+              {/* Process death is not session death: the transcript persists and the deep-link
+                  resumes it. This used to render as session "—", which read as "lost". */}
+              {['stopped', 'errored'].includes(x.zee_status) && x.claude_session_id
+                && <span className="detached" data-testid="detached">detached · click to resume</span>}
             </span>
           </div>
         )}
