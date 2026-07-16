@@ -10,6 +10,7 @@ import { startContainerMonitor } from './queenzee/containers.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { startShipReaper } from './queenzee/shipgate.js';
+import { startLandReaper } from './queenzee/landgate.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
 
@@ -60,6 +61,7 @@ app.listen(config.port, () => {
   startContainerMonitor();
   startMaintenance();
   startShipReaper();
+  startLandReaper();
   startImageJanitor();
   startProdDiff();
 });

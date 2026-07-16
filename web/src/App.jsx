@@ -165,11 +165,19 @@ export default function App() {
   const dismiss = (id) => setDismissed((d) => ({ ...d, [id]: true }));
   const visible = (rs) => (rs || []).filter((r) => !dismissed[r.id]);
 
+  // Route each landing to the card that will actually RENDER it — which is not the same question as
+  // "does it have a xell_id". The fleet only lists xells with status <> 'retired', so a landing
+  // whose xell has since been reaped has an id, no card, and (once the top panel stopped taking
+  // anything with an id) nowhere at all. That is how nimble-atlas-d6e6d4's approved landing went
+  // invisible. Ask whether a card exists, not whether an id does.
+  const carded = new Set((fleet.xells || []).map((x) => x.id));
   const landingByXell = {};
   const prsByRef = {};
+  const orphanLandings = [];
   for (const r of fleet.landing || []) {
     if (r.kind === 'pull') (prsByRef[r.ref] ||= []).push(r);
-    else if (r.xell_id) (landingByXell[r.xell_id] ||= []).push(r);
+    else if (r.xell_id && carded.has(r.xell_id)) (landingByXell[r.xell_id] ||= []).push(r);
+    else orphanLandings.push(r);   // no xell (gate could not match the sha), or its xell is gone
   }
   const prsFor = (x) => prsByRef[`refs/heads/${x.remote_source?.ref || ''}`]
     // production IS local main, so PRs against main are production's to answer. Its remote_source
@@ -218,9 +226,17 @@ export default function App() {
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
 
-      {/* Held landings sit ABOVE everything: a blocked push means a zee is stuck waiting on a
-          human, and this is the only thing on the page that can't wait for you to scroll. */}
-      <LandingPanel landing={fleet.landing} onDecided={refresh} />
+      {/* THE BAR. Landings and PRs now live on their xell's card, which is where you can judge them
+          — but moving them there quietly cost the property the old panel existed for: "a blocked
+          push means a zee is stuck waiting on a human, and this is the only thing on the page that
+          can't wait for you to scroll." It stopped being unmissable. A zee said "approve it in the
+          console", Mark looked where it had always been, and there was nothing there.
+          So: the CARD keeps the decision, and this keeps the interrupt. It is a pointer, not a
+          copy — one line, only when something is actually waiting, and it scrolls you to the card
+          rather than letting you decide from a banner with no context around it. */}
+      <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} />
+
+      <LandingPanel landing={orphanLandings} onDecided={refresh} />
 
       {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
           both are decisions only a human may make, and both block a zee until made. */}
@@ -371,7 +387,8 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
   };
 
   return (
-    <div className={`card status-${x.status} ${clickable ? 'clickable' : ''} ${isProd ? 'prod' : ''}`}
+    <div data-xell={x.id}
+         className={`card status-${x.status} ${clickable ? 'clickable' : ''} ${isProd ? 'prod' : ''}`}
          data-testid="xell-card" data-slug={x.slug} data-status={x.status} data-xell-id={x.id}
          data-production={isProd ? '1' : '0'}
          onClick={open} title={openHint}>
@@ -583,6 +600,44 @@ function shipState(x, diff, prodLock, ship) {
     };
   }
   return { k: 'ready', text: 'ready', why: 'Landed and clean, and prod is free — a ship would start as soon as a human approves it.' };
+}
+
+// One line at the top of the page naming every xell that is waiting on a human, and nothing else.
+// Deliberately NOT a copy of the cards: it holds no commits and no Approve button, because a
+// decision made from a banner is a decision made without the diff, the ship state or the xell's
+// own numbers sitting next to it. It answers "is anything waiting, and where" — then gets out of
+// the way. Only PENDING counts: an approved landing is a receipt, and dressing receipts up as
+// demands is how a warning bar trains you to ignore it.
+function NeedsYouBar({ xells, landingByXell, prsFor }) {
+  const waiting = xells.map((x) => {
+    const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
+    const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
+    return { x, held, prs, n: held + prs };
+  }).filter((w) => w.n > 0);
+  if (!waiting.length) return null;
+
+  const go = (id) => {
+    const el = document.querySelector(`[data-xell="${id}"]`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 1200);
+  };
+
+  return (
+    <section className="needsyou">
+      <span className="ny-t">⚠ waiting on you:</span>
+      {waiting.map((w) => (
+        <button key={w.x.id} className="ny-chip" onClick={() => go(w.x.id)}
+                title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''} — jump to the card`}>
+          {w.x.slug}
+          <span className="ny-n">{w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`}
+            {w.held > 0 && w.prs > 0 && ' · '}
+            {w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`}</span>
+        </button>
+      ))}
+    </section>
+  );
 }
 
 // A PR waiting on THIS xource. It renders on the card being ASKED — production for work aimed at

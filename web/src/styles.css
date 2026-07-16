@@ -111,6 +111,30 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
   padding: 0; overflow: hidden; border-top: 3px solid var(--line); position: relative; }
 .card.status-awaiting-done { border-top-color: var(--claimed); box-shadow: 0 0 0 1px var(--claimed) inset; }
+
+/* ── "waiting on you" bar ───────────────────────────────────────────────────
+   A pointer, not a second console. Landings/PRs live on their card (that is
+   where the diff and the ship state are, so that is where a decision belongs) —
+   but the old top panel existed because "a blocked push means a zee is stuck
+   waiting on a human, and this is the only thing on the page that can't wait
+   for you to scroll", and moving the cards quietly threw that away. This is
+   that property, and only that: who is waiting, and a click to get there. */
+.needsyou { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; margin: 12px 0 0; border-radius: 8px;
+  background: rgba(224,165,59,.10); border: 1px solid rgba(224,165,59,.45); }
+.ny-t { color: var(--building); font-size: 12px; font-weight: 600; }
+.ny-chip { display: inline-flex; align-items: baseline; gap: 6px; cursor: pointer;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--text); font-size: 12px; padding: 3px 8px;
+  font-family: 'Cascadia Code', monospace; }
+.ny-chip:hover { border-color: var(--building); }
+.ny-n { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+/* Jumping to a card is useless if you then can't tell WHICH one it scrolled to. */
+.card.flash { animation: cardflash 1.2s ease-out; }
+@keyframes cardflash {
+  0%, 40% { box-shadow: 0 0 0 2px var(--building), 0 0 18px rgba(224,165,59,.55); }
+  100% { box-shadow: none; }
+}
 /* Card header strip. Holds the prod tag (left) and the lock / build-all (right). It is a real row
    in the flow — previously each badge was position:absolute over the card, which put all of them
    on top of the first stack row, and stacked .lock and .xbuild on each other. min-height keeps the

@@ -112,21 +112,26 @@ export function LandCard({ req, onDone, onDismiss }) {
   );
 }
 
-// ORPHANS ONLY. Everything the gate could match to a xell now renders on that xell's card, and the
-// cards with something waiting sort to the top — so this panel is no longer where landings live.
-// It exists for the case a card cannot cover: the hook resolves the pusher by sha (receive-pack
-// runs in the xource, not the worktree), and an unmatched push is still gated but belongs to
-// "unknown xell". Those would vanish silently if this just went away.
+// LANDINGS WITH NO CARD. Everything the gate could match to a LIVE xell renders on that xell's
+// card now; this catches the two cases a card cannot, both of which would otherwise vanish
+// silently while still being open and still gating a push:
+//
+//   • no xell_id — the hook resolves the pusher by sha (receive-pack runs in the xource, not the
+//     worktree), so an unmatched push is gated but belongs to "unknown xell".
+//   • its xell is RETIRED — the fleet only lists status <> 'retired', so the id points at a card
+//     that no longer exists. This is the one that actually bit: an approved landing sat invisible.
+//
+// The caller decides what is orphaned (it knows which cards exist); this just renders them.
 export default function LandingPanel({ landing, onDecided }) {
-  const open = (landing || []).filter((r) => !r.xell_id);
+  const open = landing || [];
   if (!open.length) return null;
   const held = open.filter((r) => r.status === 'pending').length;
   return (
     <section className={`land-panel${held ? '' : ' settled'}`}>
       <div className="land-title">
         {held
-          ? `⚠ ${held} landing${held === 1 ? '' : 's'} HELD from an UNKNOWN xell — needs your verification`
-          : '✓ Landing approved (unknown xell) — waiting for the pusher to re-push'}
+          ? `⚠ ${held} landing${held === 1 ? '' : 's'} HELD with no xell card — needs your verification`
+          : '✓ Landing approved, but its xell is gone — nothing will re-push it'}
       </div>
       {open.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} />)}
     </section>

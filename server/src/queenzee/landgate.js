@@ -139,6 +139,18 @@ export async function listLandRequests(projectId, { open = true } = {}) {
 
 // A HUMAN decides. `by` is recorded for the audit trail — the console sends the operator, and
 // there is deliberately no API path for a zee to approve its own landing.
+//
+// APPROVING LANDS IT. Until now approving only *authorised* a push and then waited for the zee to
+// re-run it — so a human clicked Approve and nothing happened, possibly for hours, because the zee
+// had no way to learn the click had occurred. That is not a gate, it is a gate plus a guessing
+// game: "approved — waiting for the zee to re-push" sat on the card while the zee sat blind, and
+// the attempts counter ticked up as it re-pushed on hunches.
+//
+// The queenzee has everything it needs the moment you decide: the exact sha, the ref, and the
+// approval. So it moves the ref itself — through the SAME update hook, which finds the row we just
+// wrote and spends it. No bypass, no new sha, nothing unreviewed: the gate still decides, it just
+// stops outsourcing the last step to an agent that cannot see. This is what acceptPullIn() already
+// does for PRs; landing never got it.
 export async function decideLandRequest(id, decision, by = 'human') {
   if (!['approved', 'rejected'].includes(decision)) throw new Error(`bad decision: ${decision}`);
   const row = await one(
@@ -147,5 +159,115 @@ export async function decideLandRequest(id, decision, by = 'human') {
   if (!row) throw new Error('no such pending request (already decided?)');
   broadcast('land', row);
   logline('landgate', `${decision.toUpperCase()} ${row.new_sha.slice(0, 8)} by ${by}`);
-  return row;
+  if (decision !== 'approved') return row;
+  return landApproved(row, by);
+}
+
+// Spend an approval: move the ref to the sha a human signed off.
+//
+// Works even when the xell is RETIRED or its worktree is gone — we push a SHA out of the xource's
+// own object store, not from a worktree. That is exactly the case that left nimble-atlas's
+// approval dangling under "nothing will re-push it".
+// Is this sha still landable on that ref, and is it even still worth trying?
+//   'already'  — the ref already contains it. Pushing says "Everything up-to-date" and exits 0,
+//                which naive code reads as success and then retries forever because the row never
+//                flips (the hook never fires, so nothing marks it landed). Ask first.
+//   'ff'       — clean fast-forward. Push it.
+//   'diverged' — the ref moved past it. This approval is DEAD: the gate binds an approval to one
+//                exact sha, and no amount of retrying makes a non-fast-forward land. Retrying it
+//                is a git push every tick, forever, for nothing.
+function ffState(repoRoot, ref, sha) {
+  const git = (...a) => spawnSync('git', ['-C', repoRoot, ...a],
+    { encoding: 'utf8', timeout: 20000, windowsHide: true, env: cleanGitEnv() });
+  if (git('merge-base', '--is-ancestor', sha, ref).status === 0) return 'already';
+  const tip = git('rev-parse', ref);
+  if (tip.status !== 0) return 'no-ref';
+  return git('merge-base', '--is-ancestor', tip.stdout.trim(), sha).status === 0 ? 'ff' : 'diverged';
+}
+
+// Ids already reported as unlandable. Without this the tick re-reports every 10s and the log
+// becomes the noise it is meant to cut through.
+const staleReported = new Set();
+
+async function landApproved(row, by = 'human') {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
+  if (!project) return row;
+
+  const state = ffState(project.repo_root, row.ref, row.new_sha);
+
+  if (state === 'already') {
+    // It is in. Something else landed it (the zee re-pushed, a human pushed by hand) and the row
+    // never caught up. Reconcile rather than push: `git push` here exits 0 without firing the hook,
+    // so nothing would ever flip this row and the tick would retry it for the rest of time.
+    const landed = await one(
+      `UPDATE land_request SET status='landed', landed_at=COALESCE(landed_at, now())
+         WHERE id=$1 RETURNING *`, [row.id]);
+    broadcast('land', landed);
+    logline('landgate', `${row.new_sha.slice(0, 8)} is already on ${row.ref.replace('refs/heads/', '')} — marking landed`);
+    return landed || row;
+  }
+
+  if (state === 'diverged' || state === 'no-ref') {
+    if (!staleReported.has(row.id)) {
+      staleReported.add(row.id);
+      logline('landgate',
+        `approval for ${row.new_sha.slice(0, 8)} is STALE — ${row.ref.replace('refs/heads/', '')} has `
+        + 'moved past it, so it can never fast-forward. The gate binds an approval to one exact sha: '
+        + 'this one needs a fresh commit and a fresh decision. Not retrying it.');
+    }
+    return { ...row, stale: true };
+  }
+
+  const p = spawnSync('git', ['-C', project.repo_root, 'push', '.', `${row.new_sha}:${row.ref}`],
+    { encoding: 'utf8', timeout: 60000, windowsHide: true, env: cleanGitEnv() });
+  const out = `${p.stdout || ''}${p.stderr || ''}`.trim();
+
+  if (p.status === 0) {
+    // checkPush already flipped it to 'landed' when the hook asked — re-read rather than assume.
+    const landed = await one(`SELECT * FROM land_request WHERE id=$1`, [row.id]);
+    broadcast('land', landed);
+    broadcast('xell', { id: row.xell_id });
+    logline('landgate', `LANDED ${row.new_sha.slice(0, 8)} → ${row.ref.replace('refs/heads/', '')} (approved by ${row.decided_by || by})`);
+    return landed || row;
+  }
+
+  // Left 'approved' on purpose: the approval is still valid for this exact sha, so a retry is
+  // legitimate — tick() below will take it. Say why the ref did not move rather than let a green
+  // tick lie about it.
+  logline('landgate',
+    `approved ${row.new_sha.slice(0, 8)} but the push did NOT move ${row.ref.replace('refs/heads/', '')}: `
+    + (out.split('\n').filter(Boolean).pop() || 'unknown'));
+  return { ...row, push_failed: out.slice(-800) };
+}
+
+// APPROVALS NOBODY SPENT. decideLandRequest lands on the click, so in the normal case this finds
+// nothing. It exists for the ones that slip through anyway, because the failure is silent and
+// indistinguishable from working: an 'approved' row renders a green tick and a "waiting for the
+// zee to re-push" that may wait forever.
+//
+// Real examples, both live when this was written: an approval granted before landing auto-landed
+// (a human clicked, a zee never came back), and one whose xell was reaped afterwards so nothing
+// existed to re-push it at all. A transient push failure lands here too.
+export async function tick() {
+  const stuck = await q(
+    `SELECT * FROM land_request WHERE status='approved' ORDER BY decided_at LIMIT 5`);
+  let landed = 0, stale = 0;
+  for (const row of stuck) {
+    if (staleReported.has(row.id)) { stale++; continue; }   // known dead — do not push again
+    const r = await landApproved(row).catch((e) => { logline('landgate', `retry failed: ${e.message}`); return null; });
+    if (r && r.status === 'landed') landed++;
+    if (r && r.stale) stale++;
+  }
+  return { checked: stuck.length, landed, stale };
+}
+
+export function startLandReaper() {
+  if (process.env.LAND_REAPER_ENABLED === 'false') {
+    console.log('[queenzee] land reaper DISABLED');
+    return null;
+  }
+  const interval = Number(process.env.LAND_TICK_MS) || 10000;
+  setInterval(() => tick().catch((e) => console.error('[landgate] tick:', e.message)), interval);
+  console.log(`[queenzee] land reaper started (${interval}ms) — spends approvals nobody acted on`);
+  return true;
 }
