@@ -118,6 +118,16 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
   return { allow: false, reason: 'pending', request: row };
 }
 
+// What a WAITING zee polls (scripts/xell-land.mjs --wait). The gate tells a declined zee to
+// "re-run the SAME push once a human approves it" and, until this existed, gave it no way to learn
+// that had happened — so it either sat blind or re-pushed on a guess. The ship gate has had
+// shipStatus() for exactly this since 010; landing never got its half.
+export async function landStatus(xellId) {
+  return one(
+    `SELECT lr.*, x.slug AS xell_slug FROM land_request lr JOIN xell x ON x.id = lr.xell_id
+       WHERE lr.xell_id = $1 ORDER BY lr.requested_at DESC LIMIT 1`, [xellId]);
+}
+
 export async function listLandRequests(projectId, { open = true } = {}) {
   const where = open ? `AND lr.status IN ('pending','approved')` : '';
   return q(

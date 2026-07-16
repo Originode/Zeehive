@@ -20,7 +20,7 @@ import { remoteAvailable } from '../lib/claude-cli.js';
 import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, deleteProject } from '../lib/projects.js';
-import { checkPush, listLandRequests, decideLandRequest } from '../queenzee/landgate.js';
+import { checkPush, listLandRequests, decideLandRequest, landStatus } from '../queenzee/landgate.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock }
   from '../queenzee/shipgate.js';
@@ -52,6 +52,16 @@ router.post('/land/check', async (req, res) => {
     console.error('[landgate] check failed:', err.message);
     res.status(500).json({ allow: false, reason: 'gate-error', error: err.message });
   }
+});
+
+// What a waiting zee polls (xell-land.mjs --wait) — its exit is the zee's nudge. Mirrors
+// /ship/status, which has existed since 010; landing had no equivalent, so an approved zee had no
+// way to find out and sat blind.
+router.get('/land/status', async (req, res) => {
+  if (!req.query.xell) return res.status(400).json({ error: 'xell query param required' });
+  const s = await landStatus(req.query.xell);
+  if (!s) return res.status(404).json({ error: 'no land request for this xell' });
+  res.json(s);
 });
 
 router.get('/land/requests', async (req, res) => {

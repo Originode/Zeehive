@@ -445,9 +445,32 @@ a.cbox:hover { border-color: var(--accent); }
 .land-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
   padding: 10px 12px; margin-top: 8px; }
 .land-card.approved { border-color: var(--up); }
-.land-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
-  flex-wrap: wrap; }
-.land-what { font-size: 14px; }
+
+/* ── collapsed / dismissible notifications ──────────────────────────────────
+   An APPROVED landing is a receipt, not a question: still true, still worth
+   seeing, but a 12-commit list has no business burying the xell's own buttons
+   for the rest of the day. Collapsed it keeps its identity (who, onto what) and
+   drops the detail; ✕ hides it for this sitting only.
+   Neither is offered while a card is PENDING — a held landing means a zee is
+   blocked waiting on a human, and a decision you can sweep off the screen is a
+   decision that gets forgotten. */
+.land-card.mini { padding: 6px 8px; }
+.land-card.mini .land-head { margin: 0; }
+.land-mini { font-size: 11px; color: var(--muted); padding: 3px 0 0 18px; }
+.land-toggle {
+  background: none; border: 0; color: var(--muted); cursor: pointer;
+  font-size: 10px; padding: 0 4px 0 0; line-height: 1; flex: 0 0 auto;
+}
+.land-toggle:hover { color: var(--text); }
+.land-x {
+  background: none; border: 0; color: var(--muted); cursor: pointer;
+  font-size: 11px; padding: 0 2px; line-height: 1; flex: 0 0 auto; margin-left: auto;
+}
+.land-x:hover { color: var(--text); }
+/* toggle · what · (✕). `what` takes the slack so ✕ sits hard right; centre rather than baseline,
+   because the row now holds buttons and a baseline hangs them off the text. */
+.land-head { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }
+.land-what { font-size: 14px; flex: 1; min-width: 0; }
 .land-meta { color: var(--muted); font-size: 12px;
   font-family: 'Cascadia Code', 'Consolas', monospace; }
 .land-stat { color: var(--muted); font-size: 12px; margin: 6px 0 4px; }

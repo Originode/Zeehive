@@ -34,6 +34,7 @@ export default function App() {
   const [version, setVersion] = useState(0);
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [diffs, setDiffs] = useState({});
+  const [dismissed, setDismissed] = useState({});
   const [logs, setLogs] = useState([]);
   const [showTerm, setShowTerm] = useState(false);
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
@@ -157,6 +158,13 @@ export default function App() {
   const shipByXell = {};
   for (const s of fleet.shipping || []) shipByXell[s.xell_id] ||= s;
 
+  // Dismissed notifications, by request id. VIEW-ONLY and deliberately not persisted: it hides a
+  // decided receipt for this sitting, and a reload brings it back. Persisting "I don't want to see
+  // this" about a landing that has not actually landed yet would be inventing a third state the
+  // server does not have — the request is still open, and the zee is still expected to re-push.
+  const dismiss = (id) => setDismissed((d) => ({ ...d, [id]: true }));
+  const visible = (rs) => (rs || []).filter((r) => !dismissed[r.id]);
+
   const landingByXell = {};
   const prsByRef = {};
   for (const r of fleet.landing || []) {
@@ -236,7 +244,8 @@ export default function App() {
       <h2 className="xells-h">xells:</h2>
       <section className="xells">
         {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu}
-                                   landing={landingByXell[x.id]} prs={prsFor(x)} ship={shipByXell[x.id]}
+                                   landing={visible(landingByXell[x.id])} prs={visible(prsFor(x))}
+                                   ship={shipByXell[x.id]} onDismiss={dismiss}
                                    prodLock={fleet.prod_lock} projectId={projectId || project.id} />)}
         {xells.length === 0 && <p className="loading">No active xells. The pool maintainer will fill it shortly…</p>}
       </section>
@@ -294,7 +303,7 @@ function openProtocol(url) {
   a.remove();
 }
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const clickable = !!x.viewer_url && !isProd;
@@ -506,8 +515,8 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           nimble-atlas to see whether that was reasonable. Cards carrying one of these sort first. */}
       {(landing?.length > 0 || prs?.length > 0) && (
         <div className="xnotify">
-          {landing?.map((r) => <LandCard key={r.id} req={r} onDone={onDone} />)}
-          {prs?.map((r) => <PrCard key={r.id} req={r} onDone={onDone} />)}
+          {landing?.map((r) => <LandCard key={r.id} req={r} onDone={onDone} onDismiss={onDismiss} />)}
+          {prs?.map((r) => <PrCard key={r.id} req={r} onDone={onDone} onDismiss={onDismiss} />)}
         </div>
       )}
 
@@ -579,9 +588,10 @@ function shipState(x, diff, prodLock, ship) {
 // A PR waiting on THIS xource. It renders on the card being ASKED — production for work aimed at
 // main, a parent xell for a child's work — because the side receiving the code is the side that
 // decides to take it.
-function PrCard({ req, onDone }) {
+function PrCard({ req, onDone, onDismiss }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [open, setOpen] = useState(true);
   const commits = Array.isArray(req.commits) ? req.commits : [];
   const stat = req.stat || {};
 
@@ -601,30 +611,44 @@ function PrCard({ req, onDone }) {
   };
 
   return (
-    <div className="land-card pr">
+    <div className={`land-card pr${open ? '' : ' mini'}`}>
       <div className="land-head">
+        <button className="land-toggle" onClick={() => setOpen((v) => !v)}
+                title={open ? 'Collapse' : 'Show the commits'} aria-expanded={open}>
+          {open ? '▾' : '▸'}
+        </button>
         <span className="land-what">
           <b>{req.xell_slug || 'a xell'}</b> asks to land into{' '}
           <b>{(req.ref || '').replace('refs/heads/', '')}</b>
         </span>
-        <span className="land-meta">{String(req.new_sha).slice(0, 10)}</span>
+        {/* No ✕ while it is pending: an unanswered PR is somebody waiting on you. Collapse it if it
+            is in the way — that keeps it on the card, which a dismiss would not. */}
       </div>
-      <div className="land-stat">
-        {commits.length} commit{commits.length === 1 ? '' : 's'}
-        {stat.files != null && <> · {stat.files}f <span className="ins">+{stat.insertions}</span>/<span className="del">−{stat.deletions}</span></>}
-      </div>
-      <ul className="land-commits">
-        {commits.slice(0, 8).map((c) => (
-          <li key={c.short}><code>{c.short}</code> {c.subject} <span className="land-author">{c.author}</span></li>
-        ))}
-        {commits.length > 8 && <li className="land-more">…and {commits.length - 8} more</li>}
-      </ul>
-      {err && <div className="land-err">{err}</div>}
-      <div className="land-actions">
-        <button className="land-approve" disabled={busy} onClick={accept}>
-          {busy ? '…' : 'Accept PR'}
-        </button>
-      </div>
+      {!open ? (
+        <div className="land-mini">
+          {String(req.new_sha).slice(0, 10)} · {commits.length} commit{commits.length === 1 ? '' : 's'} · awaiting your Accept
+        </div>
+      ) : (
+        <>
+          <div className="land-meta">{String(req.new_sha).slice(0, 10)}</div>
+          <div className="land-stat">
+            {commits.length} commit{commits.length === 1 ? '' : 's'}
+            {stat.files != null && <> · {stat.files}f <span className="ins">+{stat.insertions}</span>/<span className="del">−{stat.deletions}</span></>}
+          </div>
+          <ul className="land-commits">
+            {commits.slice(0, 8).map((c) => (
+              <li key={c.short}><code>{c.short}</code> {c.subject} <span className="land-author">{c.author}</span></li>
+            ))}
+            {commits.length > 8 && <li className="land-more">…and {commits.length - 8} more</li>}
+          </ul>
+          {err && <div className="land-err">{err}</div>}
+          <div className="land-actions">
+            <button className="land-approve" disabled={busy} onClick={accept}>
+              {busy ? '…' : 'Accept PR'}
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
