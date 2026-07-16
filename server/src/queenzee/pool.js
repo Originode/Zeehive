@@ -74,6 +74,21 @@ export function startPool() {
     return null;
   }
   console.log(`[queenzee] pool maintainer started (mode=${MODE}, ${config.poolIntervalMs}ms)`);
+  // SAY THE QUIET HALF OUT LOUD. "mode=simulate" reads as "provisioning is fake", which sounds
+  // harmless. The unadvertised half is that it also switches the RECONCILER off (see ensureReady:
+  // the whole catch-up/decommission pass is inside `if (MODE === 'real')`), because a simulated
+  // xell legitimately has no worktree and reconciling would bin the lot.
+  //
+  // Both halves are fine against a demo database and ruinous against a real one: the maintainer
+  // backfills the pool with rows it never provisioned, and the one check that would notice is off.
+  // On 2026-07-16 a restart dropped PROVISION_MODE=real and this ran for an hour — three xells sat
+  // 'ready' with no worktree on disk, dispatch kept handing them out, and the only symptom was a
+  // confusing spawn failure inside a zee. One line of startup noise is cheaper than that hour.
+  if (MODE !== 'real') {
+    console.log('[queenzee] ⚠ POOL IS IN SIMULATE — it will mark xells `ready` with NO worktree on '
+      + 'disk, AND the reconciler that would decommission them is OFF. Do not point this at a real '
+      + 'registry: run with PROVISION_MODE=real (see HANDOFF "Run it").');
+  }
   const tick = () => ensureReady().catch((e) => console.error('[pool]', e.message));
   tick();
   return setInterval(tick, config.poolIntervalMs);
