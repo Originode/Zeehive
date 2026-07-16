@@ -154,6 +154,9 @@ export default function App() {
   // Landings/PRs live on the card of the xell they concern, so route them there first. A landing
   // belongs to the xell that RAISED it ("approved — re-push"); a PR belongs to the xource being
   // ASKED, which is a different card entirely — that is the point of a PR.
+  const shipByXell = {};
+  for (const s of fleet.shipping || []) shipByXell[s.xell_id] ||= s;
+
   const landingByXell = {};
   const prsByRef = {};
   for (const r of fleet.landing || []) {
@@ -233,7 +236,7 @@ export default function App() {
       <h2 className="xells-h">xells:</h2>
       <section className="xells">
         {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu}
-                                   landing={landingByXell[x.id]} prs={prsFor(x)}
+                                   landing={landingByXell[x.id]} prs={prsFor(x)} ship={shipByXell[x.id]}
                                    prodLock={fleet.prod_lock} projectId={projectId || project.id} />)}
         {xells.length === 0 && <p className="loading">No active xells. The pool maintainer will fill it shortly…</p>}
       </section>
@@ -291,7 +294,7 @@ function openProtocol(url) {
   a.remove();
 }
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const clickable = !!x.viewer_url && !isProd;
@@ -474,6 +477,17 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs }
           <span className="rk">status</span>
           <span className={`badge b-${x.status}`} data-testid="xell-status">{isProd ? 'live · protected' : x.status}</span>
         </div>
+        {/* Can this xell ship to prod, and if not, why? Two different "no"s that the gate itself
+            treats differently — collapsing them into one "blocked" would be a lie in both
+            directions. See shipState(). */}
+        {!isProd && (() => {
+          const s = shipState(x, diff, prodLock, ship);
+          return (
+            <div className="row"><span className="rk">ship</span>
+              <span className={`shipst s-${s.k}`} data-testid="ship-state" title={s.why}>{s.text}</span>
+            </div>
+          );
+        })()}
         {!isProd && x.runtime_label && (
           <div className="row"><span className="rk">runtime</span>
             <span className="runtime">{x.runtime_label}</span></div>
@@ -518,6 +532,48 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs }
       )}
     </div>
   );
+}
+
+// Can this xell ship to production right now? Mirrors queenzee/shipgate.js — and the distinction it
+// makes matters, because the two "no"s are not the same thing:
+//
+//   UNLANDED  → requestShip() REFUSES outright. A ship builds from main, so unlanded work would
+//               simply not be in it. Nothing you can do at the console changes this: land it.
+//   PROD HELD → the request is fine and a human can approve it; runShip() then WAITS as 'approved'
+//               rather than queue-jumping, and the reaper starts it when the lock frees. So this is
+//               "you'll queue", not "you can't" — showing it as blocked would send you hunting for
+//               a problem that resolves itself.
+//
+// Read from data the card already has (diff + prod_lock + the open ship request), so it costs
+// nothing and cannot disagree with the numbers displayed right above it.
+function shipState(x, diff, prodLock, ship) {
+  if (ship) {
+    const m = {
+      pending:  { k: 'wait',  text: 'awaiting a human', why: 'Ship requested — a human must approve it in the console.' },
+      approved: { k: 'go',    text: 'approved — taking prod', why: 'Approved. The queenzee is taking the prod lock.' },
+      shipping: { k: 'go',    text: 'shipping now', why: 'The queenzee is building prod from main and holds the lock.' },
+    };
+    if (m[ship.status]) return m[ship.status];
+  }
+  const unlanded = diff && (diff.ahead > 0 || diff.dirty > 0);
+  if (unlanded) {
+    const bits = [
+      diff.ahead > 0 ? `${diff.ahead} commit(s) not landed` : null,
+      diff.dirty > 0 ? `${diff.dirty} uncommitted file(s)` : null,
+    ].filter(Boolean);
+    return {
+      k: 'no', text: `no — ${diff.ahead > 0 ? `${diff.ahead} unlanded` : `${diff.dirty} dirty`}`,
+      why: `A ship builds from main, so this would NOT be in it:\n  • ${bits.join('\n  • ')}\nLand it first — the request is refused until you do.`,
+    };
+  }
+  if (prodLock && prodLock.xell_id !== x.id) {
+    return {
+      k: 'queue', text: `queues — ${prodLock.xell_slug || 'another xell'} holds prod`,
+      why: `${prodLock.xell_slug || 'Another xell'} holds the prod lock (${prodLock.phase || 'busy'}).\n`
+        + 'You can still request a ship: it waits for the lock rather than queue-jumping, and starts when prod frees.',
+    };
+  }
+  return { k: 'ready', text: 'ready', why: 'Landed and clean, and prod is free — a ship would start as soon as a human approves it.' };
 }
 
 // A PR waiting on THIS xource. It renders on the card being ASKED — production for work aimed at

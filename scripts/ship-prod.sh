@@ -109,5 +109,40 @@ fi
 
 echo "shipping $SVC → $CTX from build source $BUILD_REF @ $HEAD" >&2
 if ! dc build "$SVC" >&2; then emit false build-failed; exit 1; fi
-if ! dc up -d "$SVC" >&2; then emit false up-failed; exit 1; fi
+
+# ── --no-deps is not an optimisation. It is the whole safety property. ────────
+# `up -d omnibiz` names ONE service and starts SIX: compose walks depends_on, and this project's
+# omnibiz depends_on postgres. That postgres is `container_name: omnibiz_db_prod` on
+# `postgres:18beta1-alpine`, mounting `postgres_data_prod` — while the REAL production database is
+# omnibiz_db_prod_v184, pinned outside compose on the same volume. So a bare `up -d <app service>`
+# asks the daemon to open prod's live data directory with a second, different-version postgres.
+#
+# On 2026-07-16 it did exactly that. The only thing that stopped it was the container NAME being
+# taken, which is luck, not a guard. A ship deploys CODE; it must never create, recreate or touch
+# the database — swapping the prod postgres is a coordinated infra change, never a side effect of
+# shipping a feature (the same reason 010 made only server/webapp shippable).
+#
+# ── and then PROVE it, rather than trust it ──────────────────────────────────
+# --no-deps *should* touch exactly one container. "Should" is precisely what was believed about
+# `up -d <svc>` right up until it tried to open prod's data directory. compose will state its plan
+# for free, so make it, and refuse anything that names infrastructure. This is the cheap half of
+# the lesson: the flag is the fix, the dry run is what stops the NEXT unnoticed dependency edge —
+# somebody adding `depends_on: postgres` to webapp a year from now must not be able to reach the
+# database through a ship.
+PLAN="$(dc up -d --no-deps --dry-run "$SVC" 2>&1)" || {
+  printf '%s\n' "$PLAN" >&2; emit false plan-failed; exit 1; }
+printf '%s\n' "$PLAN" >&2
+
+if printf '%s\n' "$PLAN" | grep -qiE '^[[:space:]]*Container[[:space:]]+[^[:space:]]*(db|postgres|pgdata|redis|synapse|livekit|mosquitto|caddy|element|tunnel)'; then
+  echo "" >&2
+  echo "  REFUSING TO SHIP: the plan for '$SVC' touches infrastructure, not just the app." >&2
+  echo "  A ship deploys CODE. It must never create or recreate the database." >&2
+  echo "  Offending plan lines:" >&2
+  printf '%s\n' "$PLAN" | grep -iE '^[[:space:]]*Container[[:space:]]+[^[:space:]]*(db|postgres|redis|synapse|livekit|mosquitto|caddy|element|tunnel)' | sed 's/^/    /' >&2
+  echo "  Likely cause: a depends_on edge from '$SVC' into infra. Fix the compose file or this" >&2
+  echo "  script's scoping — do NOT relax this check." >&2
+  emit false plan-touches-infra; exit 1
+fi
+
+if ! dc up -d --no-deps "$SVC" >&2; then emit false up-failed; exit 1; fi
 emit true compose-build

@@ -147,6 +147,17 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
 /* the head sits beside its ref, dimmer — the ref is the label, the head is the evidence */
 .srchead { color: var(--muted); font-size: 11px; margin-left: 6px; }
 
+/* Can it ship? Colour-coded by what YOU have to do about it, not by severity:
+   `no` is the only one that needs you (land it); `queue` resolves itself when the
+   lock frees, so it is muted, not a warning — a red "blocked" there would send you
+   hunting for a problem that is already handling itself. */
+.shipst { font-size: 11px; text-align: right; }
+.shipst.s-ready { color: var(--up); }
+.shipst.s-no    { color: var(--building); }
+.shipst.s-queue { color: var(--muted); }
+.shipst.s-wait  { color: var(--claimed); }
+.shipst.s-go    { color: var(--accent); font-weight: 600; }
+
 /* ── a xell and its xource: what's waiting, and what you can do ────────────── */
 /* Notifications sit INSIDE the card, above its actions: the thing waiting on you and the xell it
    concerns are one object, so they read as one. Cards carrying one of these sort to the top. */
