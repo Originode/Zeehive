@@ -35,11 +35,18 @@ const NOISE_SCHEMAS = ["'pg_catalog'", "'information_schema'", "'tiger'", "'tige
 
 // Extension-owned functions are engine noise too (~1400 of them from postgis alone) and are
 // implied by the extension set, not by anyone's migration. pg_depend deptype='e' marks them.
+// zeehive_migrations is the ship's own ledger (shipmigrate.js) — it lives ONLY in prod, by
+// design, so comparing it is comparing the ruler's serial number instead of what it measures.
+// Unexcluded, the migration system's own bookkeeping tripped the parity gate it exists to serve,
+// for every xell, forever: a chicken-and-egg a zee correctly diagnosed from the outside on day one.
+const LEDGER_TABLE = `'zeehive_migrations'`;
 const Q = {
   table: `SELECT table_schema||'.'||table_name FROM information_schema.tables
-           WHERE table_schema NOT IN (${NOISE_SCHEMAS}) AND table_type='BASE TABLE'`,
+           WHERE table_schema NOT IN (${NOISE_SCHEMAS}) AND table_type='BASE TABLE'
+             AND table_name <> ${LEDGER_TABLE}`,
   column: `SELECT table_schema||'.'||table_name||'.'||column_name||':'||data_type
-             FROM information_schema.columns WHERE table_schema NOT IN (${NOISE_SCHEMAS})`,
+             FROM information_schema.columns WHERE table_schema NOT IN (${NOISE_SCHEMAS})
+             AND table_name <> ${LEDGER_TABLE}`,
   trigger: `SELECT n.nspname||'.'||c.relname||'.'||t.tgname
               FROM pg_trigger t
               JOIN pg_class c ON c.oid=t.tgrelid
