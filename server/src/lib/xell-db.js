@@ -18,6 +18,8 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { computePorts } from './provision.js';
+import { resolveSite } from './sites.js';
+import { namingFor } from './manifest.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
@@ -70,13 +72,15 @@ async function sharedDb(projectId, tier) {
 // custom postgis build).
 async function provisionIsolatedDb({ project, xell, snapshot }) {
   const src = await sharedDb(project.id, 'prod') || await sharedDb(project.id, 'dev');
-  const ctx = project.docker_ctx_dev;
+  const devSite = await resolveSite(project.id, 'dev');
+  const ctx = devSite?.docker_ctx || project.docker_ctx_dev;
+  const devHost = devSite?.host || project.dev_host_ip;
   const realSrc = MODE === 'real' ? resolveRealDbContainer(src?.docker_ctx || ctx, src?.name) : src?.name;
   const image = MODE === 'real'
     ? (spawnSync('docker', ['--context', src?.docker_ctx || ctx, 'inspect', '-f', '{{.Config.Image}}', realSrc],
         { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim()
     : 'omnibiz-postgis:18-3.6-h3';
-  const name = `omnibiz_db_spin_${xell.slug}`;
+  const name = namingFor(project, 'db', xell.slug).container;
   // Do NOT derive the port from the slug: it collides with host services docker can't see.
   // The script publishes with -p 0 and reports the port docker actually chose.
   let port = 5400 + computePorts(xell.slug).slot;   // simulate-mode placeholder only
@@ -88,7 +92,7 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
     // handled by passing it as a single argv entry (never interpolated into a command string).
     const dumpPath = snapshot?.dump_path ? String(snapshot.dump_path).replace(/\\/g, '/') : '';
     const r = spawnSync('bash', [script, name, ctx, image || 'omnibiz-postgis:18-3.6-h3',
-      dumpPath, config.prodDbUser || 'postgres', config.prodDbName || 'omnibiz'],
+      dumpPath, project.db_user || config.prodDbUser || 'postgres', project.db_name || config.prodDbName || 'omnibiz'],
       { encoding: 'utf8', timeout: 1800000, windowsHide: true });
     const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
     let res = null; try { res = JSON.parse(line); } catch { /* no JSON */ }
@@ -100,18 +104,18 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
   // Upsert: the container name is unique per project, and re-attaching (e.g. attach empty, then
   // attach again WITH a dump) must update the existing row — not explode on the unique key after
   // a 4-minute restore has already succeeded. Docker picks a new port each rebuild, so refresh it.
-  const conn = `postgresql://${config.prodDbUser || 'postgres'}@${project.dev_host_ip}:${port}/${config.prodDbName || 'omnibiz'}`;
+  const conn = `postgresql://${project.db_user || config.prodDbUser || 'postgres'}@${devHost}:${port}/${project.db_name || config.prodDbName || 'omnibiz'}`;
   const row = await one(
     `INSERT INTO container (project_id, role, tier, isolation, name, image_tag, docker_ctx, host,
-                            host_port, internal_port, conn_ref, owner_xell_id, health)
-     VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9)
+                            host_port, internal_port, conn_ref, owner_xell_id, site_id, health)
+     VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10)
      ON CONFLICT (project_id, name) DO UPDATE
        SET image_tag=EXCLUDED.image_tag, docker_ctx=EXCLUDED.docker_ctx, host=EXCLUDED.host,
            host_port=EXCLUDED.host_port, conn_ref=EXCLUDED.conn_ref,
-           owner_xell_id=EXCLUDED.owner_xell_id, health=EXCLUDED.health
+           owner_xell_id=EXCLUDED.owner_xell_id, site_id=EXCLUDED.site_id, health=EXCLUDED.health
      RETURNING *`,
-    [project.id, name, image || null, ctx, project.dev_host_ip, port, conn,
-     xell.id, MODE === 'real' ? 'up' : 'down']);
+    [project.id, name, image || null, ctx, devHost, port, conn,
+     xell.id, devSite?.id || null, MODE === 'real' ? 'up' : 'down']);
   broadcast('container', row);
   return row;
 }

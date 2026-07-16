@@ -29,7 +29,7 @@ import { worktreeDiff, worktreeBound } from '../lib/git.js';
 import { getBuildStatus, buildXell } from '../lib/build.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { requestShip } from './shipgate.js';
-import { pendingMigrations } from './shipmigrate.js';
+import { pendingMigrations, SCHEMA_DIR } from './shipmigrate.js';
 import { logline } from '../lib/logbus.js';
 import { spawnSync } from 'node:child_process';
 import { cleanGitEnv } from '../lib/git.js';
@@ -141,20 +141,24 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
       .map(([k, v]) => `${k}: ${v.missing_count} missing / ${v.extra_count} extra`).join('; ');
     // Drift that SHIPS WITH YOU is not a dead end: pending server/sql/migrations/*.sql at main's
     // tip are applied by the queenzee before the containers build. Only unexplained drift denies.
+    // Only SCHEMA_DIR files can excuse catalog drift — a pending ops/ data fix rides the ship
+    // too, but it changes rows, not the catalog, so it explains nothing this gate measures.
     const tip = git(project.repo_root, ['rev-parse', main]);
     const mig = tip.ok ? await pendingMigrations(project, tip.out.trim()) : { ok: false, pending: [] };
-    if (mig.ok && mig.pending.length) {
+    const ddl = (mig.pending || []).filter((f) => f.startsWith(`${SCHEMA_DIR}/`));
+    if (mig.ok && ddl.length) {
       steps.push(gate('schema', 'pass',
-        `schema differs from prod (${diff.total} difference(s)), but ${mig.pending.length} pending `
+        `schema differs from prod (${diff.total} difference(s)), but ${ddl.length} pending `
         + `migration(s) ride this ship and are applied BEFORE the containers build: `
-        + `${mig.pending.join(', ')}. The human sees them on the ship request.`));
+        + `${ddl.join(', ')}. The human sees them on the ship request.`));
     } else {
       return deny(gate('schema', 'deny',
         `Your database schema DIFFERS from production (${diff.total} difference(s) — ${kinds}) and NO `
         + `pending migration accounts for it. Your code was verified against a schema prod will not `
         + `have. Write the change as a file under server/sql/migrations/ (idempotent DDL — ADD COLUMN `
         + `IF NOT EXISTS and friends), land it, and it ships with you: the queenzee applies it to prod `
-        + `before the containers build. Then re-run this check.`, diff));
+        + `before the containers build. (One-time DATA fixes ride the same way from server/sql/ops/ — `
+        + `run once against prod, ledgered, never re-run.) Then re-run this check.`, diff));
     }
   } else {
     steps.push(gate('schema', 'pass', 'tables, columns and triggers are identical to prod.'));

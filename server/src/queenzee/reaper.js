@@ -9,6 +9,7 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { removeXellImages } from '../lib/images.js';
 import { logline } from '../lib/logbus.js';
+import { resolveSite } from '../lib/sites.js';
 
 export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
@@ -80,9 +81,13 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   const script = resolve(config.repoRoot, 'scripts', 'despawn-xell.sh');
   let despawn = { skipped: true };
   if (existsSync(script) && xell.worktree_path && existsSync(xell.worktree_path)) {
+    // Despawn on the xell's OWN project's dev site — the global env default is only a
+    // fallback; a second project with a different dev context must not purge on the wrong daemon.
+    const project = await one(`SELECT repo_root FROM project WHERE id=$1`, [xell.project_id]);
+    const devSite = await resolveSite(xell.project_id, 'dev');
     const r = spawnSync('bash', [script, xell.worktree_path], {
-      cwd: config.omnibizRoot, encoding: 'utf8', timeout: 120000,
-      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: config.dockerCtx }),
+      cwd: project?.repo_root || config.omnibizRoot, encoding: 'utf8', timeout: 120000,
+      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devSite?.docker_ctx || config.dockerCtx }),
     });
     const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
     let verdict = null; try { verdict = JSON.parse(line); } catch { /* no JSON line */ }

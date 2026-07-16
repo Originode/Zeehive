@@ -17,6 +17,7 @@
 // The gate is a human typing the skill, and prod writes remain prompt-gated (HANDOFF: "Hotfix /
 // data-manipulation xells").
 import { q, one } from '../db/pool.js';
+import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { attachXellDb, resolveRealDbContainer, resolveRealDbContainerCached } from './xell-db.js';
@@ -73,7 +74,7 @@ export async function attachProdStack(xellId, { by = 'human@console' } = {}) {
   const psql = dbRow
     ? (dbRow.conn_ref
       ? `psql "${dbRow.conn_ref}"`
-      : `docker --context ${dbRow.docker_ctx} exec -i ${realDb} psql -U postgres -d omnibiz`)
+      : `docker --context ${dbRow.docker_ctx} exec -i ${realDb} psql -U ${project.db_user || config.prodDbUser || 'postgres'} -d ${project.db_name || config.prodDbName || 'omnibiz'}`)
     : null;
 
   const app = [];

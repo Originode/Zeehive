@@ -1,0 +1,39 @@
+# zeehive.yml — ZEEHIVE is a project of ZEEHIVE (docs/deploy-topology-spec.md §6).
+# The orchestrator's own shape: server + web run as LOCAL PROCESSES (runner: process — health is
+# probed by URL, not docker ps); only databases are containers. A Zeehive xell gets its own
+# per-xell meta-DB container plus the safety env below, so a nested queenzee can never touch
+# real state (§6.2).
+version: 1
+project: zeehive
+
+env:
+  file: .env
+  example: .env.example
+  generated: .zeehive.env
+
+tiers:
+  prod:
+    compose: docker-compose.yml          # the pinned meta-DB only; server/web are processes
+  spinoff:
+    runner: process
+    ports:
+      server: { env: PORT, base: 4800, mod: 90 }
+      webapp: { env: ZEEHIVE_WEB_PORT, base: 5300, mod: 90 }
+    # Safety defaults every Zeehive xell inherits via .zeehive.env — a nested queenzee is a
+    # subject under test, not a manager: it provisions nothing real and reaps nothing real.
+    env:
+      BUILD_MODE: simulate
+      PROVISION_MODE: simulate
+      SHIP_MODE: simulate
+      PROVISION_APP_TIER: "false"
+      POOL_TARGET_READY: "0"
+
+roles:
+  server: { service: server, buildable: false, runner: process, start: "npm run server" }
+  webapp: { service: web, buildable: false, runner: process, start: "npm run web" }
+  db:     { service: db, buildable: false }
+
+naming:
+  container: { db: "zeehive_db_spin_{slug}" }
+
+db: { name: zeehive, user: zeehive }

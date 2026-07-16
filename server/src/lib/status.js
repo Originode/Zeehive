@@ -77,6 +77,17 @@ export async function projectHook(payload) {
 
   if (!zee) return { matched: false }; // event for a session we don't manage — logged only
 
+  // Mirror the session's REAL permission mode onto the zee. Hooks are the only channel that
+  // reports what mode a session is actually in — a skill-claimed zee never records one at claim,
+  // and a human flipping modes in-session (shift+tab) changes it without telling anyone. Without
+  // this the dashboard's mode chip shows the spawn-time value forever (or nothing at all).
+  if (payload.permission_mode && payload.permission_mode !== zee.permission_mode) {
+    const withMode = await one(
+      `UPDATE zee SET permission_mode = $2 WHERE id = $1 RETURNING *`,
+      [zee.id, payload.permission_mode]);
+    if (withMode) { zee.permission_mode = withMode.permission_mode; broadcast('zee', withMode); }
+  }
+
   switch (name) {
     case 'SessionStart':               await setZeeStatus(zee, 'online'); break;
     case 'UserPromptSubmit':           await setZeeStatus(zee, 'working'); break;

@@ -17,11 +17,15 @@ const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
 
 // Async spawn (NOT spawnSync) — a real image build would otherwise freeze the event loop.
-function runBuild({ worktree, role, ctx, hot }) {
+// `recorded` carries the meta-DB's compose/env/port facts as env overrides; the script keeps its
+// own derivation as fallback, so a bare invocation (or an old row with NULLs) still works.
+function runBuild({ worktree, role, ctx, hot, recorded = {} }) {
   return new Promise((res) => {
     const script = resolve(config.repoRoot, 'scripts', 'build-container.sh');
+    const env = {};
+    for (const [k, v] of Object.entries(recorded)) if (v != null && v !== '') env[k] = String(v);
     const p = spawn('bash', [script, worktree, role, ctx || 'ugreen-nas', hot ? 'true' : 'false', MODE],
-      { env: cleanGitEnv(), windowsHide: true });
+      { env: cleanGitEnv(env), windowsHide: true });
     let out = '', err = '';
     p.stdout.on('data', (d) => (out += d));
     p.stderr.on('data', (d) => (err += d));
@@ -41,8 +45,27 @@ export async function buildContainer(containerId, { hot = false } = {}) {
   if (!BUILDABLE.has(c.role)) throw new Error(`role '${c.role}' is not buildable (only server/webapp)`);
   if (!c.owner_xell_id) throw new Error('not a per-xell container');
   if (c.health === 'building') throw new Error(`${c.name} is already building`);
-  const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [c.owner_xell_id]);
+  const xell = await one(`SELECT slug, worktree_path, project_id FROM xell WHERE id=$1`, [c.owner_xell_id]);
   if (!xell?.worktree_path) throw new Error('owner xell has no worktree');
+
+  // What the meta-DB already recorded about this stack: compose file/project on the container
+  // row (stamped at provision), env-file convention on the project, and the ACTUAL allocated
+  // host ports of both buildable roles (the compose file interpolates both, whichever we build).
+  const project = await one(
+    `SELECT repo_root, env_file FROM project WHERE id=$1`, [xell.project_id]);
+  const siblings = await q(
+    `SELECT role, host_port FROM container WHERE owner_xell_id=$1 AND role = ANY($2)`,
+    [c.owner_xell_id, [...BUILDABLE]]);
+  const portOf = (role) => siblings.find((s) => s.role === role)?.host_port;
+  const recorded = {
+    BUILD_COMPOSE_FILE: c.compose_file,
+    BUILD_COMPOSE_PROJECT: c.compose_project,
+    BUILD_ENV_FILE: project?.env_file && project?.repo_root
+      ? `${String(project.repo_root).replace(/\\/g, '/')}/${project.env_file}` : null,
+    SPINOFF_SLUG: xell.slug,
+    SPINOFF_SERVER_PORT: portOf('server'),
+    SPINOFF_WEB_PORT: portOf('webapp'),
+  };
 
   const building = await one(`UPDATE container SET health='building' WHERE id=$1 RETURNING *`, [containerId]);
   broadcast('container', building);
@@ -50,7 +73,7 @@ export async function buildContainer(containerId, { hot = false } = {}) {
 
   // background — do NOT await; a real build takes minutes
   (async () => {
-    const { json, err } = await runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot });
+    const { json, err } = await runBuild({ worktree: xell.worktree_path, role: c.role, ctx: c.docker_ctx, hot, recorded });
     const ok = !!json && json.ok !== false;
     const row = await one(
       `UPDATE container

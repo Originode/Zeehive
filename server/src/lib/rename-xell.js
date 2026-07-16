@@ -15,6 +15,7 @@ import { pool, q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { computePorts } from '../lib/provision.js';
+import { namingFor } from '../lib/manifest.js';
 import { logline } from '../lib/logbus.js';
 
 const MAX_BASE = 44; // keep the folder name (and the container names built from it) sane
@@ -59,7 +60,9 @@ export async function renameXellForTask(xellId, title) {
   const guard = await canRename(xellId);
   if (!guard.ok) { logline('rename', `skipped ${xell.slug}: ${guard.reason}`); return { renamed: false, reason: guard.reason }; }
 
-  const project = await one(`SELECT repo_root, dev_host_ip FROM project WHERE id=$1`, [xell.project_id]);
+  const project = await one(
+    `SELECT name, manifest, repo_root, dev_host_ip, port_server_base, port_web_base, port_slot_mod
+       FROM project WHERE id=$1`, [xell.project_id]);
   const root = String(project.repo_root).replace(/\\/g, '/');
 
   const script = resolve(config.repoRoot, 'scripts', 'rename-xell.sh');
@@ -74,7 +77,7 @@ export async function renameXellForTask(xellId, title) {
 
   // Ports/names are a pure function of the slug — recompute so the DB matches what a future
   // build will actually create.
-  const ports = computePorts(newSlug);
+  const ports = computePorts(newSlug, project);
   const worktree = `${root}/.claude/worktrees/${newSlug}`;
   const url = `http://${project.dev_host_ip}:${ports.webPort}`;
 
@@ -84,16 +87,18 @@ export async function renameXellForTask(xellId, title) {
     const { rows: [row] } = await client.query(
       `UPDATE xell SET slug=$2, branch=$3, worktree_path=$4, git_dir=$5 WHERE id=$1 RETURNING *`,
       [xellId, newSlug, `spinoff/${newSlug}`, worktree, `${worktree}/.git`]);
+    // Names are a pure function of (project naming templates, slug) — same source provision uses.
+    const nmS = namingFor(project, 'server', newSlug);
+    const nmW = namingFor(project, 'webapp', newSlug);
     await client.query(
-      `UPDATE container SET name='omnibiz_spin_server_' || $2, image_tag='omnibiz-spin-server:' || $2,
-              compose_project='omnibiz-spin-' || $2, host_port=$3, url=$4
+      `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5, url=$6
          WHERE owner_xell_id=$1 AND role='server'`,
-      [xellId, newSlug, ports.serverPort, `http://${project.dev_host_ip}:${ports.serverPort}`]);
+      [xellId, nmS.container, nmS.image, nmS.composeProject, ports.serverPort,
+       `http://${project.dev_host_ip}:${ports.serverPort}`]);
     await client.query(
-      `UPDATE container SET name='omnibiz_spin_web_' || $2, image_tag='omnibiz-spin-webapp:' || $2,
-              compose_project='omnibiz-spin-' || $2, host_port=$3, url=$4
+      `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5, url=$6
          WHERE owner_xell_id=$1 AND role='webapp'`,
-      [xellId, newSlug, ports.webPort, url]);
+      [xellId, nmW.container, nmW.image, nmW.composeProject, ports.webPort, url]);
     await client.query('COMMIT');
     broadcast('xell', row);
     logline('rename', `${xell.slug} → ${newSlug} (worktree + branch + containers)`);

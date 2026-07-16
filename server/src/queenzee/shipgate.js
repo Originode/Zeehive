@@ -48,8 +48,25 @@ function gitDirty(cwd) {
   return r.status === 0 ? r.stdout.split('\n').filter(Boolean).length : 0;
 }
 
+// Which prod SITE a ship (or lock) is about (spec §5). Named key → that site, error if unknown;
+// unnamed → the project's default prod site. Returns null only for a pre-sites project (legacy:
+// no site rows, behavior unchanged). The DEFAULT site keeps lock key exactly 'prod' so ships and
+// /spin:deploy-guard locks (which use 'prod') still mutually exclude; only additional sites get
+// their own key — a VPS ship must not block a LAN-prod hotfix.
+async function resolveShipSite(projectId, siteKey = null) {
+  if (siteKey) {
+    const s = await one(
+      `SELECT * FROM deploy_site WHERE project_id=$1 AND key=$2 AND tier='prod'`, [projectId, siteKey]);
+    if (!s) throw new Error(`no prod deploy site keyed "${siteKey}" for this project`);
+    return s;
+  }
+  return one(
+    `SELECT * FROM deploy_site WHERE project_id=$1 AND tier='prod' AND is_default LIMIT 1`, [projectId]);
+}
+const lockKeyFor = (site) => (site && !site.is_default ? `prod@${site.key}` : 'prod');
+
 // ── the zee's only prod verb ─────────────────────────────────────────────────
-export async function requestShip({ xellId, zeeId = null, reason = null, targets = null }) {
+export async function requestShip({ xellId, zeeId = null, reason = null, targets = null, site = null }) {
   // Which roles to rebuild — the zee names them (/ooney webapp|server|both). Silently dropping an
   // unknown role would ship less than the zee asked for and report success, so validate loudly.
   const t = (Array.isArray(targets) && targets.length ? targets : SHIPPABLE).map(String);
@@ -59,6 +76,7 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   if (!xell) throw new Error('unknown xell');
   if (xell.is_production) throw new Error('production cannot ship itself');
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  const shipSite = await resolveShipSite(project.id, site);
   const main = project.main_branch || 'main';
 
   const state = landedState(xell.worktree_path, main);
@@ -74,13 +92,14 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
 
   const commit = headCommit(project.repo_root, main);
   // What schema rides along — decided NOW so the human approves code and migrations as one thing.
-  const mig = await pendingMigrations(project, commit);
+  const mig = await pendingMigrations(project, commit, shipSite);
   const row = await one(
-    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING *`,
-    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(mig.pending || [])]);
+    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8) RETURNING *`,
+    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(mig.pending || []), shipSite?.id || null]);
   broadcast('ship', row);
-  logline('ship', `HELD ship request from ${xell.slug} @ ${String(commit).slice(0, 8)} — awaiting human approval`);
+  logline('ship', `HELD ship request from ${xell.slug} @ ${String(commit).slice(0, 8)}`
+    + `${shipSite ? ` → site ${shipSite.key}` : ''} — awaiting human approval`);
   notifyShipRequest({ project, xell, request: row });
   return { ok: true, request: row };
 }
@@ -119,23 +138,28 @@ async function runShip(shipId) {
   if (!ship || ship.status !== 'approved') return;
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [ship.xell_id]);
   const project = await one(`SELECT * FROM project WHERE id=$1`, [ship.project_id]);
+  // The site this ship targets — recorded at request time; NULL = the default (or a pre-sites
+  // row), which keeps every legacy behavior including the shared 'prod' lock key.
+  const site = ship.site_id ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [ship.site_id]) : null;
+  const lockKey = lockKeyFor(site);
 
-  // The lock is the queenzee's to grant — the zee never touches it. Atomic: if another xell holds
-  // prod, this ship WAITS as 'approved' rather than queue-jumping; the reaper retries when free.
+  // The lock is the queenzee's to grant — the zee never touches it. Atomic and PER SITE: if
+  // another xell holds THIS site, this ship WAITS as 'approved' rather than queue-jumping; the
+  // reaper retries when free. A different prod site's lock does not block it.
   const got = await one(
-    `INSERT INTO deploy_lock (project_id, container, xell_id, zee_id, phase, task, ship_id)
-       VALUES ($1,'prod',$2,$3,'shipping',$4,$5)
+    `INSERT INTO deploy_lock (project_id, container, xell_id, zee_id, phase, task, ship_id, site_id)
+       VALUES ($1,$2,$3,$4,'shipping',$5,$6,$7)
        ON CONFLICT (project_id, container) DO NOTHING RETURNING *`,
-    [project.id, xell.id, ship.zee_id, ship.reason || 'ship to production', ship.id]);
+    [project.id, lockKey, xell.id, ship.zee_id, ship.reason || 'ship to production', ship.id, site?.id || null]);
   if (!got) {
     const held = await one(
       `SELECT dl.*, x.slug FROM deploy_lock dl JOIN xell x ON x.id=dl.xell_id
-         WHERE dl.project_id=$1 AND dl.container='prod'`, [project.id]);
-    logline('ship', `${xell.slug} ship WAITING — ${held?.slug || 'another xell'} holds prod`);
+         WHERE dl.project_id=$1 AND dl.container=$2`, [project.id, lockKey]);
+    logline('ship', `${xell.slug} ship WAITING — ${held?.slug || 'another xell'} holds ${lockKey}`);
     return; // stays 'approved'; tick() retries when the lock frees
   }
   broadcast('xell', { id: xell.id });
-  logline('lock', `queenzee ASSIGNED prod lock to ${xell.slug} for ship ${String(ship.commit).slice(0, 8)}`);
+  logline('lock', `queenzee ASSIGNED ${lockKey} lock to ${xell.slug} for ship ${String(ship.commit).slice(0, 8)}`);
 
   const shipping = await one(
     `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 RETURNING *`, [ship.id]);
@@ -146,10 +170,16 @@ async function runShip(shipId) {
   // backup and is never read. This is the anti-band-aid rule.
   // Only the roles the ZEE NAMED (ship.targets, validated at request time) — a webapp-only change
   // has no business recreating the live prod server as a side effect.
+  // Only THIS site's containers. NULL-site rows are pre-migration legacy and belong to the
+  // default site; a named non-default site builds exactly its own inventory.
   const cs = await q(
     `SELECT * FROM container WHERE project_id=$1 AND tier='prod' AND role = ANY($2)
-       AND build_script IS NOT NULL ORDER BY role`,
-    [project.id, ship.targets?.length ? ship.targets : SHIPPABLE]);
+       AND build_script IS NOT NULL
+       AND ($3::uuid IS NULL AND (site_id IS NULL OR site_id IN
+              (SELECT id FROM deploy_site WHERE project_id=$1 AND tier='prod' AND is_default))
+            OR site_id = $3::uuid OR ($3::uuid IS NOT NULL AND site_id IS NULL AND $4))
+       ORDER BY role`,
+    [project.id, ship.targets?.length ? ship.targets : SHIPPABLE, site?.id || null, !!site?.is_default]);
 
   const results = [];
   let ok = cs.length > 0;
@@ -161,7 +191,7 @@ async function runShip(shipId) {
   // databases from sql/schema/ and always has every table; prod is never rebuilt, so without this
   // step it drifts behind main's schema forever (7 tournament columns deep, as of this morning).
   if (ok) {
-    const mig = await applyMigrations(project, ship.commit);
+    const mig = await applyMigrations(project, ship.commit, site);
     if (mig.applied?.length || !mig.ok) {
       results.push({ role: 'migrations', ok: mig.ok, applied: mig.applied, error: mig.ok ? null : mig.error });
     }
@@ -210,8 +240,8 @@ async function runShip(shipId) {
   // Countdown starts either way: a failed ship must not sit on prod forever either.
   const lock = await one(
     `UPDATE deploy_lock SET phase=$2, auto_release_at = now() + ($3 || ' seconds')::interval
-       WHERE project_id=$1 AND container='prod' AND ship_id=$4 RETURNING *`,
-    [project.id, ok ? 'awaiting-verification' : 'failed', String(AUTO_RELEASE_SEC), ship.id]);
+       WHERE project_id=$1 AND container=$5 AND ship_id=$4 RETURNING *`,
+    [project.id, ok ? 'awaiting-verification' : 'failed', String(AUTO_RELEASE_SEC), ship.id, lockKey]);
   if (lock) broadcast('xell', { id: xell.id });
   notifyShipDone({ project, xell, ok, request: done, seconds: AUTO_RELEASE_SEC });
 }
@@ -236,45 +266,92 @@ function runScript(container, sourcePath, buildRef = 'main') {
 // ── the lock's own lifecycle ─────────────────────────────────────────────────
 // HOLD cancels the countdown for a human who is actively verifying. Only a human can do this —
 // there is no zee path to it, by design.
-export async function holdProdLock(projectId, by = 'human@console') {
+export async function holdProdLock(projectId, by = 'human@console', siteKey = null) {
+  const key = siteKey ? `prod@${siteKey}` : 'prod';
   const row = await one(
     `UPDATE deploy_lock SET held=true, auto_release_at=NULL
-       WHERE project_id=$1 AND container='prod' RETURNING *`, [projectId]);
-  if (!row) throw new Error('nobody holds prod');
+       WHERE project_id=$1 AND container=$2 RETURNING *`, [projectId, key]);
+  if (!row) throw new Error(`nobody holds ${key}`);
   broadcast('xell', { id: row.xell_id });
-  logline('lock', `prod lock HELD open by ${by} — countdown cancelled, release is manual now`);
+  logline('lock', `${key} lock HELD open by ${by} — countdown cancelled, release is manual now`);
   return row;
 }
 
-export async function forceReleaseProdLock(projectId, by = 'human@console') {
-  const row = await one(`SELECT * FROM deploy_lock WHERE project_id=$1 AND container='prod'`, [projectId]);
-  if (!row) throw new Error('nobody holds prod');
+export async function forceReleaseProdLock(projectId, by = 'human@console', siteKey = null) {
+  const key = siteKey ? `prod@${siteKey}` : 'prod';
+  const row = await one(`SELECT * FROM deploy_lock WHERE project_id=$1 AND container=$2`, [projectId, key]);
+  if (!row) throw new Error(`nobody holds ${key}`);
   await q(`DELETE FROM deploy_lock WHERE id=$1`, [row.id]);
   broadcast('xell', { id: row.xell_id });
   broadcast('ship', { id: row.ship_id });
-  logline('lock', `prod lock FORCE-RELEASED by ${by}`);
+  logline('lock', `${key} lock FORCE-RELEASED by ${by}`);
   return { released: true };
 }
 
 // Reaper tick: release expired locks, and start any ship that was waiting for prod to free up.
 export async function tick() {
+  // 'prod' is the default site's key; 'prod@<site>' the others — expire them all the same way.
   const expired = await q(
     `DELETE FROM deploy_lock
-       WHERE container='prod' AND held=false AND auto_release_at IS NOT NULL AND auto_release_at <= now()
+       WHERE container LIKE 'prod%' AND held=false AND auto_release_at IS NOT NULL AND auto_release_at <= now()
        RETURNING *`);
   for (const l of expired) {
     const x = await one(`SELECT slug FROM xell WHERE id=$1`, [l.xell_id]);
-    logline('lock', `prod lock auto-released from ${x?.slug || l.xell_id} (countdown expired) — prod is free`);
+    logline('lock', `${l.container} lock auto-released from ${x?.slug || l.xell_id} (countdown expired) — that site is free`);
     broadcast('xell', { id: l.xell_id });
   }
-  // Approved-but-waiting ships: prod may be free now.
+  // Approved-but-waiting ships: their site may be free now. runShip itself is the arbiter — it
+  // no-ops (stays 'approved') when the SITE's lock is held, so trying all of them is safe and a
+  // busy default site cannot starve a free second site.
   const waiting = await q(
-    `SELECT s.id FROM ship_request s
-       WHERE s.status='approved'
-         AND NOT EXISTS (SELECT 1 FROM deploy_lock dl WHERE dl.project_id=s.project_id AND dl.container='prod')
-       ORDER BY s.decided_at LIMIT 1`);
+    `SELECT s.id FROM ship_request s WHERE s.status='approved' ORDER BY s.decided_at LIMIT 5`);
   for (const w of waiting) await runShip(w.id).catch((e) => console.error('[ship] retry failed:', e.message));
   return { released: expired.length, started: waiting.length };
+}
+
+// Recover ships orphaned by a restart (spec §6.3). A ship stuck at 'shipping' at boot has no
+// process behind it — either the queenzee died mid-ship, or a SELF-ship deliberately restarted
+// us. At boot the target containers' health has been… whatever it is; probe what we can NOW and
+// finish the record from evidence: every targeted thing answering → shipped (this is exactly how
+// a self-ship completes: the new process being alive IS the health check); anything else → failed
+// with a truthful note. Either way the site's lock countdown starts so nothing holds prod forever.
+export async function recoverOrphanShips() {
+  const stranded = await q(`SELECT * FROM ship_request WHERE status='shipping'`);
+  for (const ship of stranded) {
+    const site = ship.site_id ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [ship.site_id]) : null;
+    const cs = await q(
+      `SELECT name, url, docker_ctx, health FROM container
+        WHERE project_id=$1 AND tier='prod' AND role = ANY($2)`,
+      [ship.project_id, ship.targets?.length ? ship.targets : SHIPPABLE]);
+    let allUp = cs.length > 0;
+    for (const c of cs) {
+      if (c.docker_ctx == null && c.url) {
+        // process role — probe it live; the URL answering is the whole truth
+        try { const r = await fetch(c.url, { signal: AbortSignal.timeout(5000) }); allUp = allUp && r.status < 500; }
+        catch { allUp = false; }
+      } else {
+        allUp = allUp && c.health === 'up';   // container role — trust the monitor's last word
+      }
+    }
+    // COALESCE the decider fields: a normally-approved ship already has them, but the
+    // ship_decided_has_decider CHECK requires them on any terminal status, so recovery must
+    // never produce a row that cannot land.
+    const done = await one(
+      `UPDATE ship_request SET status=$2, finished_at=now(), error=$3,
+              decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'recovery@boot')
+        WHERE id=$1 RETURNING *`,
+      [ship.id, allUp ? 'shipped' : 'failed',
+        allUp ? null : 'orphaned by a queenzee restart mid-ship; targets not verifiably up — re-request']);
+    broadcast('ship', done);
+    logline('ship', `recovered orphaned ship ${String(ship.commit).slice(0, 8)} → ${done.status}`
+      + (allUp ? ' (post-restart health check passed — the self-ship pattern)' : ` (${done.error})`));
+    // start the countdown on its lock if the dying process never did
+    await q(
+      `UPDATE deploy_lock SET auto_release_at = COALESCE(auto_release_at, now() + ($2 || ' seconds')::interval)
+        WHERE project_id=$1 AND ship_id=$3 AND held=false`,
+      [ship.project_id, String(AUTO_RELEASE_SEC), ship.id]);
+  }
+  return stranded.length;
 }
 
 export function startShipReaper() {

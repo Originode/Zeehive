@@ -14,6 +14,7 @@ import { sessionTitle } from '../lib/session-title.js';
 import { renameXellForTask } from '../lib/rename-xell.js';
 import { attachXellDb } from '../lib/xell-db.js';
 import { resolveProjectId } from '../lib/project-resolve.js';
+import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 
@@ -211,6 +212,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
 async function bindingFor(xellId, zee, task) {
   const xell = await one(`SELECT x.*, xo.ref AS xource_ref FROM xell x JOIN xource xo ON xo.id=x.xource_id WHERE x.id=$1`, [xellId]);
+  const dbid = await dbIdentity(xell.project_id);
   const rows = await q(
     `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, c.docker_ctx, uc.relation
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
@@ -242,7 +244,7 @@ async function bindingFor(xellId, zee, task) {
     is_production: dbc.tier === 'prod',
     psql: dbc.conn_ref
       ? `psql "${dbc.conn_ref}"`
-      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U postgres -d omnibiz`,
+      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U ${dbid.user} -d ${dbid.name}`,
     note: dbc.tier === 'prod'
       ? 'This IS the live production database — a human deliberately assigned it to you (--db shared-prod). '
         + 'It is YOUR container: querying it is expected, not a violation. Reads are free. Before ANY '
@@ -372,6 +374,53 @@ export function resolveMode(mode) {
     throw new Error(`mode must be 1–5 (1=${DISPATCH_MODES[1].key} … 5=${DISPATCH_MODES[5].key})`);
   }
   return DISPATCH_MODES[n];
+}
+
+// The harness's permission modes — what a RUNNING session can be switched between. Distinct from
+// DISPATCH_MODES above: a dispatch level also picks a tool allow-list, which is fixed at spawn
+// and cannot change mid-session. This is the changeable half.
+export const PERMISSION_MODES = ['default', 'plan', 'acceptEdits', 'bypassPermissions'];
+
+// Live control handles for headless SDK zees: zee_id → the SDK query object, held while its
+// stream is being driven. This is the ONLY channel that can change a running session's mode —
+// setPermissionMode is a control request over the CLI's stdin, and the SDK keeps stdin open
+// until the turn's first result even for a string prompt. A skill-claimed (interactive) zee
+// lives in the human's own Claude Code process, so it never appears here.
+const LIVE_QUERIES = new Map();
+
+// Change a zee's permission mode from the dashboard. Live-applies when we hold the session's
+// handle; otherwise records on the zee row and says so — for an interactive session the mode is
+// changed in-session (shift+tab), and the hook sync in status.js keeps the chip truthful either
+// way (it mirrors whatever mode the session actually reports next).
+export async function setZeeMode(zeeId, permissionMode) {
+  if (!PERMISSION_MODES.includes(permissionMode)) {
+    throw new Error(`permission_mode must be one of: ${PERMISSION_MODES.join(', ')}`);
+  }
+  const zee = await one(`SELECT * FROM zee WHERE id=$1`, [zeeId]);
+  if (!zee) throw new Error('no such zee');
+
+  let applied = false;
+  let note = null;
+  const it = LIVE_QUERIES.get(zee.id);
+  if (it) {
+    try { await it.setPermissionMode(permissionMode); applied = true; }
+    catch (err) {
+      // Recorded anyway — the next hook event re-syncs the chip to the session's REAL mode, so a
+      // failed apply cannot leave a lie on screen for long. Most common causes: the turn already
+      // ended (stdin closed), or bypass was refused (session spawned without the danger flag).
+      note = `could not apply to the running session (${String(err?.message || err).slice(0, 140)}) — `
+        + 'recorded on the zee; the chip re-syncs to the session’s real mode on its next event.';
+    }
+  } else if (['spawning', 'online', 'working', 'idle'].includes(zee.status)) {
+    note = 'no control channel to this session (it runs in its own Claude Code process) — recorded '
+      + 'on the zee; change the mode in the session itself (shift+tab) to make it real. The chip '
+      + 'follows whatever mode the session actually reports.';
+  }
+
+  const updated = await one(`UPDATE zee SET permission_mode=$2 WHERE id=$1 RETURNING *`, [zeeId, permissionMode]);
+  broadcast('zee', updated);
+  logline('intake', `zee ${String(zee.id).slice(0, 8)} mode → ${permissionMode}${applied ? ' (live)' : ' (recorded)'}`);
+  return { ok: true, zee_id: zee.id, permission_mode: permissionMode, applied, note };
 }
 
 // A dispatched zee never runs the /xell skill, so nothing tells it what it is. Hand it the SAME
@@ -512,6 +561,7 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
     },
   });
   const iter = it[Symbol.asyncIterator]();
+  LIVE_QUERIES.set(zee.id, it); // dashboard mode changes reach this session while we drive it
 
   // AWAIT the first event so we report only what actually happened — a dispatch that says
   // "spawned" while the agent silently died is worse than an honest failure.
@@ -522,6 +572,7 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
       new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for the agent to start')), 45000)),
     ]);
   } catch (err) {
+    LIVE_QUERIES.delete(zee.id);
     const reason = `headless spawn failed: ${err.message}`;
     const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
     broadcast('zee', dead);
@@ -576,6 +627,8 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
       }
     } catch (err) {
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, String(err.message).slice(0, 200)]);
+    } finally {
+      LIVE_QUERIES.delete(zee.id); // stream over → no live control channel to hand out
     }
   })();
 

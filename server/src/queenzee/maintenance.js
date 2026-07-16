@@ -18,6 +18,7 @@ import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
+import { resolveSite } from '../lib/sites.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -102,8 +103,8 @@ export async function backupProd(projectId) {
     `SELECT id, name, docker_ctx FROM container
        WHERE project_id=$1 AND role='db' AND tier='prod' AND isolation='shared'
        ORDER BY created_at LIMIT 1`, [projectId]);
-  const dbName = config.prodDbName || project.name.toLowerCase();
-  const dbUser = config.prodDbUser;
+  const dbName = project.db_name || config.prodDbName || project.name.toLowerCase();
+  const dbUser = project.db_user || config.prodDbUser;
 
   const snap = await one(
     `INSERT INTO db_snapshot (project_id, source, dump_path, status) VALUES ($1,'prod',$2,'running') RETURNING *`,
@@ -123,7 +124,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
   try {
     if (MODE === 'real') {
       if (!dbc?.name) throw new Error('no production db container modeled for this project');
-      const ctx = dbc.docker_ctx || project.docker_ctx_prod;
+      const ctx = dbc.docker_ctx || (await resolveSite(project.id, 'prod'))?.docker_ctx || project.docker_ctx_prod;
       const container = await resolveRunningContainer(ctx, dbc.name);
       if (!container) throw new Error(`prod db container '${dbc.name}' not running on context '${ctx}'`);
       const remoteTmp = `/tmp/${file}`;
@@ -236,9 +237,9 @@ export async function restoreBackup({ snapshot, container }) {
   if (c.tier === 'prod') throw new Error('refusing to restore over the PRODUCTION database');
   if (c.busy_since) throw new Error('this container is busy (a backup/restore is already running)');
 
-  const dbName = config.prodDbName
-    || (await one(`SELECT name FROM project WHERE id=$1`, [c.project_id]))?.name?.toLowerCase() || 'postgres';
-  const dbUser = config.prodDbUser;
+  const proj = await one(`SELECT name, db_name, db_user FROM project WHERE id=$1`, [c.project_id]);
+  const dbName = proj?.db_name || config.prodDbName || proj?.name?.toLowerCase() || 'postgres';
+  const dbUser = proj?.db_user || config.prodDbUser;
 
   await setBusy(c.id, 'restore');
   logline('maint', `restore started → ${c.name} from ${snap.dump_path} (${MODE})`);

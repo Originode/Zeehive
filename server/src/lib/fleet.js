@@ -41,6 +41,7 @@ export async function getFleet(projectId) {
             z.id AS zee_id, z.name AS zee_name, z.status AS zee_status, z.title AS zee_title,
             z.claude_session_id, z.session_name, z.viewer_url, z.viewer_kind,
             z.cost_usd, z.attach_mode, z.cli_active, z.monitor_source, z.last_monitor_at,
+            z.permission_mode, z.kind AS zee_kind,
             r.label AS runtime_label, r.key AS runtime_key,
             (SELECT t.id FROM task t WHERE t.xell_id = x.id
                AND t.status IN ('assigned','working') ORDER BY t.created_at DESC LIMIT 1) AS task_id,

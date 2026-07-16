@@ -52,6 +52,41 @@ export async function deleteProject(id, force = false) {
   return data;
 }
 
+export async function updateProject(id, body) {
+  const r = await fetch(`/api/projects/${id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `update failed (${r.status})`);
+  return data;
+}
+
+// ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────
+export async function getDockerContexts() {
+  const r = await fetch('/api/docker/contexts');
+  const data = await r.json().catch(() => ({ ok: false, contexts: [] }));
+  return data.contexts || [];
+}
+
+export async function getSites(projectId) {
+  const r = await fetch(`/api/projects/${projectId}/sites`);
+  return r.ok ? r.json() : [];
+}
+
+async function siteCall(url, method, body) {
+  const r = await fetch(url, {
+    method, headers: body ? { 'content-type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `site ${method} failed (${r.status})`);
+  return data;
+}
+export const createSite = (projectId, body) => siteCall(`/api/projects/${projectId}/sites`, 'POST', body);
+export const updateSite = (siteId, body) => siteCall(`/api/sites/${siteId}`, 'PATCH', body);
+export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${siteId}${force ? '?force=1' : ''}`, 'DELETE');
+
 // Subscribe to /api/stream for the selected project. Calls onSnapshot(fleet) on the
 // initial snapshot and onChange() on every subsequent event (the app re-fetches on change).
 export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog }) {
@@ -93,6 +128,19 @@ export async function reapXell(xellId, reason = 'human-cleanup', force = false) 
   // The server refuses an ACTIVE xell without force and returns ok:false — surface that as an
   // error rather than letting the caller treat a refusal as a successful teardown.
   if (data?.ok === false) throw new Error(data.error || 'cleanup refused');
+  return data;
+}
+
+// Change a zee's permission mode (the mode chip on a xell card). The server live-applies when
+// it holds the session's handle (headless zees mid-turn); otherwise it records the value and
+// returns { applied:false, note } explaining that the running session keeps its own mode.
+export async function setZeeMode(zeeId, permission_mode) {
+  const r = await fetch(`/api/zees/${zeeId}/mode`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ permission_mode }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `mode change failed (${r.status})`);
   return data;
 }
 

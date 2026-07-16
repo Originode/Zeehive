@@ -13,6 +13,7 @@ import LandingPanel, { LandCard } from './Landing.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
+import ModeChip from './ModeChip.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
 
@@ -207,7 +208,8 @@ export default function App() {
         <div className="proj">
           <span className="k">Project:</span> <b>{project.name}</b>
           <ProjectMenu projects={projects} currentId={projectId || project.id}
-                       onSelect={selectProject} onCreate={handleCreate} onDelete={handleDelete} />
+                       onSelect={selectProject} onCreate={handleCreate} onDelete={handleDelete}
+                       onChanged={loadProjects} />
           <span className="k folder">Folder:</span> <span className="mono">{project.repo_root}</span>
         </div>
         <div className="right">
@@ -440,6 +442,11 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
       <div className="meta">
         {!isProd && (
           <div className="row"><span className="rk">session</span>
+            {/* The session's mode, inline before its name — click to change it. margin-left:auto
+                (in .modemenu) keeps chip + name grouped on the right despite the row's
+                space-between; the chip lives OUTSIDE the title span because .sesstitle clips
+                overflow, which would eat the chip on a long title. */}
+            {x.zee_id && <ModeChip zeeId={x.zee_id} mode={x.permission_mode} />}
             <span className={x.zee_title ? 'sesstitle' : 'mono'} data-testid="session"
                   title={(x.zee_title ? `${x.zee_title}\n${shortSid(x.claude_session_id)}` : x.claude_session_id || '')
                     + (['stopped', 'errored'].includes(x.zee_status) && x.claude_session_id

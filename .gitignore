@@ -11,3 +11,4 @@ coverage/
 web/dist/
 *.dump
 data/
+.zeehive.env

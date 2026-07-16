@@ -20,7 +20,7 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { resolveRealDbContainer } from '../lib/xell-db.js';
-import { config } from '../config.js';
+import { dbIdentity } from '../lib/projects.js';
 
 const SAMPLE = 8;          // per kind, per direction — this feeds a tooltip, not an audit
 const CONCURRENCY = 3;     // db containers probed at once; the NAS is not a datacentre
@@ -57,11 +57,11 @@ const Q = {
 // Non-blocking docker exec → stdout. Never rejects: resolves {ok,out} so one unreachable container
 // cannot take the tick down. spawn (not spawnSync) — this loop must not freeze the event loop, the
 // same reason maintenance.js spawns.
-function dockerPsql(ctx, container, sql, timeout = 30000) {
+function dockerPsql(ctx, container, sql, dbid, timeout = 30000) {
   return new Promise((resolve) => {
     let out = '', err = '', child;
     const args = ['--context', ctx, 'exec', '-i', container,
-      'psql', '-U', config.prodDbUser || 'postgres', '-d', config.prodDbName || 'omnibiz',
+      'psql', '-U', dbid.user, '-d', dbid.name,
       '-tAF', '\x1f', '-c', sql];
     try { child = spawn('docker', args, { windowsHide: true }); }
     catch (e) { return resolve({ ok: false, out: '', err: String(e?.message || e) }); }
@@ -77,10 +77,10 @@ const lines = (s) => String(s || '').split('\n').map((x) => x.trim()).filter(Boo
 
 // One catalog fingerprint per kind → { table:Set, column:Set, trigger:Set }, or null if the db
 // could not be read at all (down, restoring, wrong creds).
-async function fingerprint(ctx, container) {
+async function fingerprint(ctx, container, dbid) {
   const fp = {};
   for (const [kind, sql] of Object.entries(Q)) {
-    const r = await dockerPsql(ctx, container, sql);
+    const r = await dockerPsql(ctx, container, sql, dbid);
     if (!r.ok) return { error: (r.err || 'psql failed').trim().split('\n').pop().slice(0, 160) };
     fp[kind] = new Set(lines(r.out));
   }
@@ -94,9 +94,9 @@ function diffSets(prodSet, devSet) {
 }
 
 // Compare one db container against a prod fingerprint and persist the verdict.
-async function diffContainer(c, prodFp) {
+async function diffContainer(c, prodFp, dbid) {
   const real = resolveRealDbContainer(c.docker_ctx, c.name);
-  const got = await fingerprint(c.docker_ctx, real);
+  const got = await fingerprint(c.docker_ctx, real, dbid);
 
   let payload;
   if (got.error) {
@@ -151,11 +151,12 @@ export async function diffXellDbAgainstProd(projectId, xellId) {
   if (!mine) return { ok: false, error: 'this xell has no database container linked', total: null };
   if (mine.id === prod.id) return { ok: true, same_db: true, total: 0, kinds: null };
 
+  const dbid = await dbIdentity(projectId);
   const realProd = resolveRealDbContainer(prod.docker_ctx, prod.name);
-  const got = await fingerprint(prod.docker_ctx, realProd);
+  const got = await fingerprint(prod.docker_ctx, realProd, dbid);
   if (got.error) return { ok: false, error: `prod db unreadable: ${got.error}`, total: null };
 
-  return diffContainer(mine, got.fp);
+  return diffContainer(mine, got.fp, dbid);
 }
 
 export async function prodDiffTick() {
@@ -167,8 +168,9 @@ export async function prodDiffTick() {
       `SELECT * FROM container WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [project_id]);
     if (!prod) continue;                                  // no ruler → nothing to measure against
 
+    const dbid = await dbIdentity(project_id);
     const realProd = resolveRealDbContainer(prod.docker_ctx, prod.name);
-    const got = await fingerprint(prod.docker_ctx, realProd);
+    const got = await fingerprint(prod.docker_ctx, realProd, dbid);
     if (got.error) {                                      // the RULER is unreadable — measure nothing
       logline('proddiff', `prod db ${prod.name} unreadable, skipping drift check — ${got.error}`);
       continue;
@@ -185,7 +187,7 @@ export async function prodDiffTick() {
     for (let i = 0; i < targets.length; i += CONCURRENCY) {
       const batch = targets.slice(i, i + CONCURRENCY);
       const out = await Promise.all(batch.map((c) =>
-        diffContainer(c, got.fp).catch((e) => ({ ok: false, error: e.message, total: null }))));
+        diffContainer(c, got.fp, dbid).catch((e) => ({ ok: false, error: e.message, total: null }))));
       checked += out.length;
       drifted += out.filter((p) => p.ok && p.total > 0).length;
     }

@@ -25,13 +25,27 @@ esac
 
 HEAD="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-# --- mirror spin-env.sh's environment exactly -------------------------------------------------
-COMPOSE="$WT/docker-compose.spinoff.yml"
-# MAIN = the primary checkout (not under .claude/worktrees) — it owns the real .env.
-MAIN="$(git -C "$WT" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | grep -v '/\.claude/worktrees/' | head -1)"
-ENV_FILE="$MAIN/.env"
-SLUG="$(basename "$WT" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')"
-PROJECT="omnibiz-spin-$SLUG"
+# --- the meta-DB's recorded facts win; derivation below is the fallback ------------------------
+# The queenzee passes what it recorded at provision time (BUILD_COMPOSE_FILE, BUILD_COMPOSE_PROJECT,
+# BUILD_ENV_FILE, SPINOFF_SLUG, SPINOFF_*_PORT). A bare invocation still derives the OmniBiz-shaped
+# defaults, exactly mirroring the project's spin-env.sh.
+if [ -n "${BUILD_COMPOSE_FILE:-}" ]; then
+  case "$BUILD_COMPOSE_FILE" in
+    /*|[A-Za-z]:*) COMPOSE="$BUILD_COMPOSE_FILE" ;;   # absolute (posix or windows drive)
+    *)             COMPOSE="$WT/$BUILD_COMPOSE_FILE" ;;
+  esac
+else
+  COMPOSE="$WT/docker-compose.spinoff.yml"
+fi
+if [ -n "${BUILD_ENV_FILE:-}" ]; then
+  ENV_FILE="$BUILD_ENV_FILE"
+else
+  # MAIN = the primary checkout (not under .claude/worktrees) — it owns the real .env.
+  MAIN="$(git -C "$WT" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | grep -v '/\.claude/worktrees/' | head -1)"
+  ENV_FILE="$MAIN/.env"
+fi
+SLUG="${SPINOFF_SLUG:-$(basename "$WT" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')}"
+PROJECT="${BUILD_COMPOSE_PROJECT:-omnibiz-spin-$SLUG}"
 HASH="$(printf '%s' "$SLUG" | md5sum | cut -c1-4)"
 SLOT="$(( 16#$HASH % 90 ))"
 export SPINOFF_SLUG="$SLUG"

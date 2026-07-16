@@ -6,12 +6,13 @@ import { getFleet, listRuntimes } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
-import { claimXell, dispatchXell, DISPATCH_MODES } from '../queenzee/intake.js';
+import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus } from '../lib/build.js';
+import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
 import { attachXellDb, dbAccessForCwd, DB_MODES } from '../lib/xell-db.js';
@@ -19,7 +20,9 @@ import { attachProdStack, detachProdStack, prodStackStatus } from '../lib/xell-p
 import { remoteAvailable } from '../lib/claude-cli.js';
 import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
-import { listProjects, createProject, deleteProject } from '../lib/projects.js';
+import { listProjects, createProject, updateProject, deleteProject,
+         getProjectManifest, refreshProjectManifest, draftProjectManifest } from '../lib/projects.js';
+import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { checkPush, listLandRequests, decideLandRequest, landStatus } from '../queenzee/landgate.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
@@ -88,7 +91,8 @@ router.post('/land/requests/:id/:decision(approve|reject)', async (req, res) => 
 router.post('/ship/request', async (req, res) => {
   const { xell_id, zee_id, reason } = req.body || {};
   if (!xell_id) return res.status(400).json({ error: 'xell_id required' });
-  try { res.json(await requestShip({ xellId: xell_id, zeeId: zee_id || null, reason: reason || null })); }
+  try { res.json(await requestShip({ xellId: xell_id, zeeId: zee_id || null, reason: reason || null,
+                                     targets: req.body?.targets || null, site: req.body?.site || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -115,13 +119,13 @@ router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => 
 // prod back from whoever has it.
 router.post('/prod-lock/hold', async (req, res) => {
   if (!req.body?.project) return res.status(400).json({ error: 'project required' });
-  try { res.json(await holdProdLock(req.body.project, req.body.by || 'human@console')); }
+  try { res.json(await holdProdLock(req.body.project, req.body.by || 'human@console', req.body.site || null)); }
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 
 router.post('/prod-lock/force-release', async (req, res) => {
   if (!req.body?.project) return res.status(400).json({ error: 'project required' });
-  try { res.json(await forceReleaseProdLock(req.body.project, req.body.by || 'human@console')); }
+  try { res.json(await forceReleaseProdLock(req.body.project, req.body.by || 'human@console', req.body.site || null)); }
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 
@@ -149,9 +153,52 @@ router.post('/projects', async (req, res) => {
   try { res.json(await createProject(req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+router.patch('/projects/:id', async (req, res) => {
+  try { res.json(await updateProject(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 router.delete('/projects/:id', async (req, res) => {
   try { res.json(await deleteProject(req.params.id, req.query.force === '1')); }
   catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────
+// The contexts list feeds the console's picker, so a typo'd context can't be entered at all.
+router.get('/docker/contexts', (_req, res) => res.json(listDockerContexts()));
+router.get('/projects/:id/sites', async (req, res) => res.json(await listSites(req.params.id)));
+router.post('/projects/:id/sites', async (req, res) => {
+  try { res.json(await createSite(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.patch('/sites/:id', async (req, res) => {
+  try { res.json(await updateSite(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/sites/:id', async (req, res) => {
+  try { res.json(await deleteSite(req.params.id, req.query.force === '1')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// Regenerate a xell's .zeehive.env projection (spec §3.4) — e.g. after a site edit or a rename.
+router.post('/xells/:id/env', async (req, res) => {
+  try { res.json(await emitXellEnv(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── project manifest: the repo's zeehive.yml vs the stored cache (spec §3.1) ─
+router.get('/projects/:id/manifest', async (req, res) => {
+  try { res.json(await getProjectManifest(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+router.post('/projects/:id/manifest/refresh', async (req, res) => {
+  try { res.json(await refreshProjectManifest(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Draft generation; {write:true} writes zeehive.yml into the repo root (refused if one exists) —
+// the human reviews and commits it. The ONE artifact ZEEHIVE may write into a project repo.
+router.post('/projects/:id/manifest/draft', async (req, res) => {
+  try { res.json(await draftProjectManifest(req.params.id, { write: req.body?.write === true })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.get('/xells', async (_req, res) => res.json(await q(`SELECT * FROM xell WHERE status <> 'retired' ORDER BY created_at`)));
 router.get('/zees', async (_req, res) => res.json(await q(`SELECT * FROM zee ORDER BY created_at DESC`)));
@@ -212,6 +259,17 @@ router.get('/xell/db-modes', (_req, res) =>
 // the autonomy scale a dispatch can pick from (1=recon … 5=bypass)
 router.get('/xell/modes', (_req, res) =>
   res.json(Object.entries(DISPATCH_MODES).map(([n, m]) => ({ mode: Number(n), key: m.key, permission_mode: m.permissionMode, tools: m.tools || 'all', label: m.label }))));
+
+// Change a zee's permission mode from the console (the mode chip on a xell card). Live-applies
+// to a headless zee we hold the handle for; otherwise recorded, with a note saying so.
+router.post('/zees/:id/mode', async (req, res) => {
+  const wanted = req.body?.permission_mode;
+  if (!PERMISSION_MODES.includes(wanted)) {
+    return res.status(400).json({ error: `permission_mode must be one of: ${PERMISSION_MODES.join(', ')}` });
+  }
+  try { res.json(await setZeeMode(req.params.id, wanted)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 // ── pool size: how many ready (pre-warmed) xells the queenzee keeps per project ─
 router.post('/pool/config', async (req, res) => {

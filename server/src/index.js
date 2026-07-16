@@ -9,7 +9,7 @@ import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { recoverOrphanBuilds } from './lib/build.js';
-import { startShipReaper } from './queenzee/shipgate.js';
+import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
@@ -54,8 +54,11 @@ app.listen(config.port, () => {
   console.log(`[queenzee] poller started (${config.pollerIntervalMs}ms)`);
   logline('api', `queenzee online — API on :${config.port}, DB connected`);
   // BEFORE the monitors: a build in flight when we died left its container pinned at 'building',
-  // which the health monitor skips by design — so nothing would ever un-stick it.
+  // which the health monitor skips by design — so nothing would ever un-stick it. Same for a
+  // ship stranded at 'shipping' — including the SELF-ship that deliberately restarted us, which
+  // this call is what marks 'shipped' (spec §6.3).
   recoverOrphanBuilds().catch((e) => console.error('[build] orphan recovery failed:', e.message));
+  recoverOrphanShips().catch((e) => console.error('[ship] orphan recovery failed:', e.message));
   startPool();
   startMonitor();
   startContainerMonitor();

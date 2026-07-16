@@ -75,6 +75,23 @@ body { margin: 0; background: var(--bg); color: var(--text); }
   border-radius: 7px; padding: 6px 14px; cursor: pointer; font-size: 12px; }
 .projpop-formbtns button.ghost { background: var(--panel2); color: var(--muted); }
 .projpop-formbtns button:disabled { opacity: .5; cursor: not-allowed; }
+
+/* project edit panel (deploy sites): wider popup, compact per-site rows */
+.projpop.wide { width: 440px; }
+.siterow { display: flex; align-items: center; gap: 5px; }
+.siterow input, .siterow select { background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 4px 6px; font-size: 12px; min-width: 0; }
+.siterow input:focus { outline: none; border-color: var(--accent); }
+.siterow input:first-of-type, .siterow input[list] { flex: 1; }
+.sitetier { font-size: 9px; text-transform: uppercase; letter-spacing: .4px; border-radius: 4px;
+  padding: 1px 5px; border: 1px solid var(--line); color: var(--muted); }
+.sitetier.t-prod { color: var(--down); border-color: rgba(229,85,78,.45); background: rgba(229,85,78,.10); }
+.sitetier.t-dev  { color: var(--ready); border-color: rgba(91,140,255,.45); background: rgba(91,140,255,.10); }
+.sitekey { font-family: 'Cascadia Code', monospace; font-size: 11px; min-width: 76px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sitehost { width: 92px; }
+.sitekey-in { width: 110px; }
+.addsite { margin-top: 2px; border-top: 1px dashed var(--line); padding-top: 6px; }
 .right { display: flex; align-items: center; gap: 14px; }
 .conn { font-size: 12px; color: var(--muted); }
 .conn.live { color: var(--up); }
@@ -330,6 +347,21 @@ a.cbox:hover { border-color: var(--accent); }
 
 .sesstitle { color: var(--text); font-weight: 500; text-align: right; max-width: 62%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Session-mode chip, inline in the session row before the name. margin-left:auto groups
+   chip + name on the right despite the row's space-between. Colour says how much rope the
+   session has: plan = safe blue, edits = amber, bypass = red, manual = muted. */
+.modemenu { position: relative; display: inline-flex; margin-left: auto; }
+.modechip { border-radius: 4px; cursor: pointer; font-size: 9px; letter-spacing: .3px;
+  padding: 0 5px; line-height: 15px; font-family: 'Segoe UI', sans-serif;
+  background: var(--panel2); border: 1px solid var(--line); color: var(--muted); }
+.modechip:hover { border-color: var(--accent); color: var(--text); }
+.modechip:disabled { opacity: .5; cursor: wait; }
+.modechip[data-mode="plan"]              { color: var(--ready);    border-color: rgba(91,140,255,.45); background: rgba(91,140,255,.10); }
+.modechip[data-mode="acceptEdits"]       { color: var(--building); border-color: rgba(224,165,59,.45); background: rgba(224,165,59,.10); }
+.modechip[data-mode="bypassPermissions"] { color: var(--down);     border-color: rgba(229,85,78,.45);  background: rgba(229,85,78,.10); }
+.modepop { min-width: 250px; }
+.modepop .modedot { color: var(--accent); font-size: 9px; }
 
 /* worktree → click to open in Explorer */
 .wtlink { background: none; border: none; cursor: pointer; padding: 0; color: var(--text);
