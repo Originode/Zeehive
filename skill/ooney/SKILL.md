@@ -19,4 +19,6 @@ To be told when the verdict changes instead of polling by hand, run in the **bac
 node "${ZEEHIVE_HOME:-D:/Repos/Zeehive}/scripts/xell-ooney.mjs" $ARGUMENTS --wait
 ```
 
-Its exit is your nudge. `deny` exits 1 with the reason; `live` exits 0 — your work is in production.
+Its exit is your nudge. Read the **final output** for the verdict — `live` means your work is in
+production; `deny` states exactly what to fix. (Exit 0 either way: a deny is the gate answering,
+not the command failing. Non-zero means the check itself could not run.)

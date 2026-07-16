@@ -57,13 +57,19 @@ function render(v) {
 const xellId = await resolveXell();
 const check = () => req('POST', '/api/ooney/check', { xell_id: xellId, targets, reason });
 
+// EXIT 0 WHENEVER A VERDICT WAS DELIVERED — including DENY. A deny is the gate answering, not
+// this command failing, and the skill harness renders any non-zero exit as "Error: Shell command
+// failed" — which dressed a correct, actionable verdict up as a crash (seen live: a zee's deny
+// for 2 uncommitted files displayed as a shell error, and its --wait as "Background shell
+// failed"). The verdict is in the OUTPUT; non-zero is reserved for plumbing that genuinely broke
+// (API unreachable, xell unresolvable).
 let r = await check();
 let v = json(r);
 if (r.code >= 400) { console.log(`ooney check failed: ${v.error || r.code}`); process.exit(1); }
 render(v);
 
 if (!waitArg || v.verdict === 'deny' || v.verdict === 'live') {
-  process.exit(v.verdict === 'deny' ? 1 : 0);
+  process.exit(0);
 }
 
 const deadline = Date.now() + waitSecs * 1000;
@@ -76,8 +82,7 @@ while (Date.now() < deadline) {
   if (r.code >= 400) { console.log(`  ✗ ${v.error || r.code}`); process.exit(1); }
   const g = v.next?.gate + ':' + v.next?.verdict;
   if (g !== lastGate) { render(v); lastGate = g; }
-  if (v.verdict === 'live') process.exit(0);
-  if (v.verdict === 'deny') process.exit(1);
+  if (v.verdict === 'live' || v.verdict === 'deny') process.exit(0);   // verdict delivered = success
 }
 console.log(`\n  ✗ TIMEOUT after ${waitSecs}s — still waiting (likely on a human). Re-run to resume.\n`);
 process.exit(1);
