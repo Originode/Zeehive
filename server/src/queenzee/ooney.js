@@ -75,6 +75,23 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
       `${d.dirty} uncommitted file(s) in your worktree. Commit them (or discard them) first — a ship `
       + `builds from ${main}, so anything uncommitted cannot be in it.`, { dirty: d.dirty }));
   }
+  // DIVERGED — the zee has real work AND main moved on without it. This must come BEFORE the
+  // plain ahead case: "land now" is a dead end here (the push is a non-fast-forward, git refuses
+  // it, and even an approved landing dies as a stale approval). Integration comes first, and it is
+  // genuinely the zee's work — merging main in and resolving conflicts is judgment about ITS
+  // changes, the one thing the pipeline never does on its behalf. Nothing is lost: the merged
+  // result lands as a fast-forward and ships with everything main gained meanwhile.
+  if (d.ahead > 0 && d.behind > 0) {
+    return deny(gate('sync', 'deny',
+      `Your worktree has ${d.ahead} commit(s) of real work, but ${main} has moved ${d.behind} commit(s) `
+      + `past you — you have DIVERGED. Do NOT try to land yet: that push cannot fast-forward and will be `
+      + `refused. Integrate first, in your own worktree:\n`
+      + `  1. git merge --no-edit ${main}   (resolve any conflicts — that is your judgment to make,\n`
+      + `     nobody else can decide how ${main}'s changes and yours fit together)\n`
+      + `  2. rebuild and RE-VERIFY your change still works on top of current ${main}\n`
+      + `  3. re-run this check — it will then walk you through landing the merged result.`,
+      { ahead: d.ahead, behind: d.behind }));
+  }
   if (d.ahead > 0) {
     return deny(gate('sync', 'deny',
       `${d.ahead} commit(s) are not on ${main} yet. Land them now — this is the one step you perform, `
