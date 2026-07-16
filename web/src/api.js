@@ -226,3 +226,32 @@ export async function markDone(taskId, doneBy = 'human', force = false) {
   if (data?.blocked || data?.reap?.ok === false) throw new Error(data?.reap?.error || 'mark done refused');
   return data;
 }
+
+// ── a xell and its xource: push / pull / PR ──────────────────────────────────
+// None of these is an override. push runs the same gated `git push . HEAD:<ref>` a zee runs;
+// accepting a PR fast-forwards to a sha a human read. The gate is upstream of all of them.
+async function xellVerb(id, verb, body = {}) {
+  const r = await fetch(`/api/xells/${id}/${verb}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `${verb} failed`);
+  return data;
+}
+
+export const pushXell = (id) => xellVerb(id, 'push');
+export const pullXell = (id) => xellVerb(id, 'pull');
+export const prXell = (id, note) => xellVerb(id, 'pr', { note });
+
+export async function acceptPull(requestId) {
+  const r = await fetch(`/api/land/requests/${requestId}/accept`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || 'accept failed');
+  return data;
+}

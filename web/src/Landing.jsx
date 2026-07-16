@@ -14,7 +14,12 @@ const ago = (ts) => {
   return `${Math.floor(s / 3600)}h ago`;
 };
 
-function LandCard({ req, onDone }) {
+// Exported because a landing now renders on the CARD of the xell that raised it, not only in the
+// top panel: "nimble-atlas wants to land" is information about nimble-atlas, and reading it three
+// feet from that xell's own diff and status is the difference between a notice and a nag. The
+// panel keeps only the ones with no card to live on (the gate resolves the xell by sha, so an
+// unmatched push has no xell_id).
+export function LandCard({ req, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const commits = Array.isArray(req.commits) ? req.commits : [];
@@ -74,18 +79,21 @@ function LandCard({ req, onDone }) {
   );
 }
 
+// ORPHANS ONLY. Everything the gate could match to a xell now renders on that xell's card, and the
+// cards with something waiting sort to the top — so this panel is no longer where landings live.
+// It exists for the case a card cannot cover: the hook resolves the pusher by sha (receive-pack
+// runs in the xource, not the worktree), and an unmatched push is still gated but belongs to
+// "unknown xell". Those would vanish silently if this just went away.
 export default function LandingPanel({ landing, onDecided }) {
-  const open = landing || [];
+  const open = (landing || []).filter((r) => !r.xell_id);
   if (!open.length) return null;
   const held = open.filter((r) => r.status === 'pending').length;
   return (
     <section className={`land-panel${held ? '' : ' settled'}`}>
-      {/* Once nothing is HELD this panel is informational, not a demand — "needs your
-          verification" over an all-approved list contradicts itself and trains you to ignore it. */}
       <div className="land-title">
         {held
-          ? `⚠ ${held} landing${held === 1 ? '' : 's'} HELD — a push to main needs your verification`
-          : '✓ Landing approved — waiting for the zee to re-push'}
+          ? `⚠ ${held} landing${held === 1 ? '' : 's'} HELD from an UNKNOWN xell — needs your verification`
+          : '✓ Landing approved (unknown xell) — waiting for the pusher to re-push'}
       </div>
       {open.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} />)}
     </section>

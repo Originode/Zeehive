@@ -298,6 +298,31 @@ were both verified working — it is not the install, and reinstalling is a wast
 
 ## KNOWN ISSUES / NEXT STEPS
 
+0. **ROADMAP — xells that spawn xells (the xource tree).** Deferred 2026-07-16, deliberately: the
+   foundation is IN and live, the last mile is not. What already works:
+   - `xource.xell_id` (012) lets a xource BE a xell, so a xell can track another xell's branch
+     instead of main. Guards are on and tested: ref must equal the xell's branch, one xource per
+     xell, and no cycles. The cycle check lives on the XOURCE trigger, not only `xell_guard` —
+     `xell.xource_id` is immutable so a xell cannot be re-pointed into a loop, but re-pointing a
+     xource at its own descendant makes `a→b→a` in one UPDATE that `xell_guard` never sees. That
+     leaked in testing before it was caught; do not "simplify" it back onto xell alone.
+   - The land gate protects ANY xource ref, from a machine-local list the queenzee rewrites
+     (`lib/protected-refs.js`). The ref check stays ABOVE the curl in the hook on purpose: an
+     unreachable queenzee must not fail closed on every push to every branch.
+   - push / pull / PR (`queenzee/xellgit.js`) read the xell's xource ref — nothing hardcodes main,
+     so they work at any depth the moment children exist.
+
+   **What's missing: provisioning.** Nothing can create a xell that tracks another xell, so the
+   tree has no children yet. `provision-xell.sh` already takes `source_ref`, so branching off
+   `spinoff/<parent>` may work as-is; the work is in `lib/provision.js` — create/reuse a xource row
+   backed by the parent xell, pass its branch as the source ref, and call `writeProtectedRefs()` so
+   the gate starts guarding the new xource.
+
+   **Also unverified: accepting a PR.** `acceptPullIn()` has never run — not the fast-forward
+   check, not approve-then-push through the gate, not the merge-into-a-parent-worktree branch. It
+   needs a xell with commits ahead of its xource. Use a DUMMY, targeted by explicit slug (House
+   rule: never test on live xells).
+
 1. **Delete the leftover `D:\Repos\Xeehive`** — Zeehive was built fresh from the pushed commit
    because the folder could not be renamed while a Claude Code session held it as its cwd. The old
    folder is a clean, fully-pushed duplicate holding nothing unique. Run

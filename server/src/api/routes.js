@@ -20,6 +20,7 @@ import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, deleteProject } from '../lib/projects.js';
 import { checkPush, listLandRequests, decideLandRequest } from '../queenzee/landgate.js';
+import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock }
   from '../queenzee/shipgate.js';
 
@@ -261,6 +262,31 @@ router.post('/xells/:id/reap', async (req, res) => {
 // ── reveal a xell's worktree folder in the host file manager (Explorer) ────────
 router.post('/xells/:id/reveal', async (req, res) => {
   try { res.json(await revealXellWorktree(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── a xell and its xource: push / pull / PR ──────────────────────────────────
+// A HUMAN drives these from the console. Note none of them is an override: push runs the same
+// gated `git push . HEAD:<ref>` a zee runs, and accepting a PR fast-forwards to a sha a human
+// read. There is deliberately no zee-facing path to accept — same rule as the landing gate.
+router.post('/xells/:id/push', async (req, res) => {
+  try { res.json(await pushToXource(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+router.post('/xells/:id/pull', async (req, res) => {
+  try { res.json(await pullFromXource(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+router.post('/xells/:id/pr', async (req, res) => {
+  try { res.json(await requestPullIn(req.params.id, { by: req.body?.by || 'human@console', note: req.body?.note || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Accepting happens on the XOURCE's card — the side being asked to take the code.
+router.post('/land/requests/:id/accept', async (req, res) => {
+  try { res.json(await acceptPullIn(req.params.id, req.body?.by || 'human@console')); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

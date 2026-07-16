@@ -76,6 +76,7 @@ function tooltip(c, buildable, busy) {
 //           xell stack, so every container box has a menu.
 // hammer  → show the build hammer INSIDE the box for an unbuilt buildable container. Only the
 //           xell stack passes this (the top inventory stays icon-free, per spec).
+
 export function ContainerChip({ c, onMenu, hammer = false }) {
   const buildable = isBuildable(c);
   const busy = busyReason(c);
@@ -107,6 +108,10 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
   );
   const common = {
     className: `cbox h-${c.health}${busy ? ` busy busy-${busy}` : ''}${drift ? ` d-${drift}` : ''}`,
+    // Drives the faint role glyph behind the chip (see .cbox[data-role] in styles.css). Kept as a
+    // data attribute rather than a class so it cannot collide with the health/busy/drift classes,
+    // which own the chip's border and are the ones that actually mean something.
+    'data-role': c.role,
     title: tooltip(c, buildable, busy), onContextMenu: onCtx,
   };
 

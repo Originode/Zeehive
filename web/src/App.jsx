@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
-         reapXell } from './api.js';
+         reapXell, pushXell, pullXell, prXell, acceptPull } from './api.js';
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import GitRail from './GitRail.jsx';
@@ -9,14 +9,16 @@ import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel from './Backups.jsx';
-import LandingPanel from './Landing.jsx';
+import LandingPanel, { LandCard } from './Landing.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
 
-const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'Webapp', other: 'Other' };
+// Display only — the DB role is still 'webapp'. "App" is what the thing IS; "webapp" was naming
+// its delivery mechanism, which is the least interesting fact about it.
+const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' };
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');
 const base = (p) => (p ? p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() : '—');
 
@@ -149,7 +151,32 @@ export default function App() {
       order[tx.id] = ci < 0 ? 9999 : ci;
     }
   }
-  const xells = [...fleet.xells].sort((a, b) => (order[a.id] ?? 9999) - (order[b.id] ?? 9999));
+  // Landings/PRs live on the card of the xell they concern, so route them there first. A landing
+  // belongs to the xell that RAISED it ("approved — re-push"); a PR belongs to the xource being
+  // ASKED, which is a different card entirely — that is the point of a PR.
+  const landingByXell = {};
+  const prsByRef = {};
+  for (const r of fleet.landing || []) {
+    if (r.kind === 'pull') (prsByRef[r.ref] ||= []).push(r);
+    else if (r.xell_id) (landingByXell[r.xell_id] ||= []).push(r);
+  }
+  const prsFor = (x) => prsByRef[`refs/heads/${x.remote_source?.ref || ''}`]
+    // production IS local main, so PRs against main are production's to answer. Its remote_source
+    // is origin (what it tracks), which is NOT what it receives work on — hence the special case.
+    || (x.is_production ? prsByRef[`refs/heads/${project.main_branch || 'main'}`] : null)
+    || [];
+
+  // Sort: things WAITING ON YOU, then things that are alive, then everything else. The old order
+  // was by base commit, which is stable and meaningless to look at — a held landing could sit
+  // below four idle pool xells. Ties keep the commit order, so the rail's connectors stay sane.
+  const rank = (x) => {
+    if ((landingByXell[x.id]?.length || 0) + prsFor(x).length > 0) return 0;
+    const live = ['spawning', 'online', 'working'].includes(x.zee_status)
+      || ['working', 'claimed', 'awaiting-done'].includes(x.status);
+    return live ? 1 : 2;
+  };
+  const xells = [...fleet.xells].sort((a, b) =>
+    (rank(a) - rank(b)) || ((order[a.id] ?? 9999) - (order[b.id] ?? 9999)));
 
   return (
     <div className="layout" ref={layoutRef}>
@@ -206,6 +233,7 @@ export default function App() {
       <h2 className="xells-h">xells:</h2>
       <section className="xells">
         {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu}
+                                   landing={landingByXell[x.id]} prs={prsFor(x)}
                                    prodLock={fleet.prod_lock} projectId={projectId || project.id} />)}
         {xells.length === 0 && <p className="loading">No active xells. The pool maintainer will fill it shortly…</p>}
       </section>
@@ -263,7 +291,7 @@ function openProtocol(url) {
   a.remove();
 }
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const clickable = !!x.viewer_url && !isProd;
@@ -360,7 +388,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
             return (
               <button className="xbuild" data-testid="xell-build" disabled={busy}
                       title={busy ? 'A container is busy (building/restoring) — wait for it to finish'
-                                  : 'Build all — rebuild this xell\'s server + webapp (right-click for hot build)'}
+                                  : 'Build all — rebuild this xell\'s server + app (right-click for hot build)'}
                       onClick={(e) => { e.stopPropagation(); if (!busy) buildXell(x.id, false).catch(buildErr); }}
                       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!busy) buildXell(x.id, true).catch(buildErr); }}>
                 {busy ? '⏳ busy…' : '🔨 build all'}
@@ -369,16 +397,15 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
           })()}
         </span>
       </div>
+      {/* One row, no labels: the chip's own glyph says which role it is, so a "db"/"srv"/"web"
+          column was naming what you can already see and costing three rows of card height. Order
+          is fixed (db, server, webapp) so the shape reads the same on every card. */}
       <div className="stack">
         {['db', 'server', 'webapp'].map((role) => {
           const c = x.stack.find((s) => s.role === role);
-          const lbl = role === 'server' ? 'srv' : role === 'webapp' ? 'web' : 'db';
-          return (
-            <div className="srow" key={role}>
-              <span className="srole">{lbl}</span>
-              {c ? <ContainerChip c={c} onMenu={onMenu} hammer /> : <span className="cbox empty">—</span>}
-            </div>
-          );
+          return c
+            ? <ContainerChip key={role} c={c} onMenu={onMenu} hammer />
+            : <span key={role} className="cbox empty" data-role={role} title={`no ${role} container`}>—</span>;
         })}
       </div>
       <div className="meta">
@@ -460,6 +487,24 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
           </div>
         )}
       </div>
+      {/* What is WAITING on you about this xell, on the xell itself. These used to be one banner at
+          the top of the page, which meant reading "nimble-atlas wants to land" and then hunting for
+          nimble-atlas to see whether that was reasonable. Cards carrying one of these sort first. */}
+      {(landing?.length > 0 || prs?.length > 0) && (
+        <div className="xnotify">
+          {landing?.map((r) => <LandCard key={r.id} req={r} onDone={onDone} />)}
+          {prs?.map((r) => <PrCard key={r.id} req={r} onDone={onDone} />)}
+        </div>
+      )}
+
+      {/* ── this xell and its xource ───────────────────────────────────────────
+          Confirmations here are sized to what is actually at RISK, not applied evenly — the same
+          reasoning as the teardown gate above. PULL can entangle a zee's uncommitted work, so it
+          says whose tree it is touching. PUSH is gated by the hook anyway, so its confirm is
+          informational: it tells you it will be HELD, so a decline reads as the system working
+          rather than an error. PR destroys nothing, so it just asks. */}
+      {!isProd && x.worktree_path && <XourceActions x={x} diff={diff} onDone={onDone} />}
+
       {/* Never gate this on task_id: a dispatched zee's xell may have no task row, and without a
           button it can never be confirmed OR reaped — it just strands in awaiting-done forever. */}
       {!isProd && ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status) && (
@@ -471,6 +516,136 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId }) {
             : (x.task_id ? 'Mark done' : 'Clean up xell')}
         </button>
       )}
+    </div>
+  );
+}
+
+// A PR waiting on THIS xource. It renders on the card being ASKED — production for work aimed at
+// main, a parent xell for a child's work — because the side receiving the code is the side that
+// decides to take it.
+function PrCard({ req, onDone }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const commits = Array.isArray(req.commits) ? req.commits : [];
+  const stat = req.stat || {};
+
+  const accept = async () => {
+    if (!confirm(
+      `Accept ${req.xell_slug}'s PR into ${(req.ref || '').replace('refs/heads/', '')}?\n\n`
+      + `This fast-forwards to ${String(req.new_sha).slice(0, 10)} — the exact commit listed here. `
+      + `It cannot pull in anything you haven't read: if it is no longer a fast-forward, it is `
+      + `refused rather than merged.`)) return;
+    setBusy(true); setErr(null);
+    try {
+      const r = await acceptPull(req.id);
+      if (r?.ok === false) setErr(r.reason || 'refused');
+      else onDone?.();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="land-card pr">
+      <div className="land-head">
+        <span className="land-what">
+          <b>{req.xell_slug || 'a xell'}</b> asks to land into{' '}
+          <b>{(req.ref || '').replace('refs/heads/', '')}</b>
+        </span>
+        <span className="land-meta">{String(req.new_sha).slice(0, 10)}</span>
+      </div>
+      <div className="land-stat">
+        {commits.length} commit{commits.length === 1 ? '' : 's'}
+        {stat.files != null && <> · {stat.files}f <span className="ins">+{stat.insertions}</span>/<span className="del">−{stat.deletions}</span></>}
+      </div>
+      <ul className="land-commits">
+        {commits.slice(0, 8).map((c) => (
+          <li key={c.short}><code>{c.short}</code> {c.subject} <span className="land-author">{c.author}</span></li>
+        ))}
+        {commits.length > 8 && <li className="land-more">…and {commits.length - 8} more</li>}
+      </ul>
+      {err && <div className="land-err">{err}</div>}
+      <div className="land-actions">
+        <button className="land-approve" disabled={busy} onClick={accept}>
+          {busy ? '…' : 'Accept PR'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// PUSH / PULL / PR — a human doing, from here, what only a zee could do before (and only by being
+// told to, in a prompt). All three act on ONE relationship: this xell and its xource.
+function XourceActions({ x, diff, onDone }) {
+  const [busy, setBusy] = useState(null);
+  const [msg, setMsg] = useState(null);
+  const src = x.remote_source?.ref || 'its xource';
+
+  const run = async (verb, fn) => {
+    setBusy(verb); setMsg(null);
+    try {
+      const r = await fn();
+      // These verbs answer with a REASON rather than throwing when they refuse — a dirty tree is
+      // not an error, it is the check doing its job. Show it as the answer, not as a failure.
+      if (r?.ok === false || r?.merged === false || r?.landed === false) {
+        setMsg({ bad: true, text: r.reason || (r.output || '').split('\n').filter(Boolean).slice(-1)[0] || 'refused' });
+      } else if (verb === 'push') setMsg({ text: `landed on ${src}` });
+      else if (verb === 'pull') setMsg({ text: `merged ${src} → ${x.slug}` });
+      else setMsg({ text: `PR raised — it is now on ${src}'s card` });
+      onDone?.();
+    } catch (e) { setMsg({ bad: true, text: e.message }); }
+    finally { setBusy(null); }
+  };
+
+  const push = () => {
+    if (!confirm(
+      `Push ${x.slug} → ${src}?\n\n`
+      + `This runs the same gated push a zee runs. Unless a human has ALREADY approved this exact `
+      + `commit, the gate will HOLD it and raise it for verification — that is the expected outcome, `
+      + `not a failure.\n\nNothing is lost either way: your commits stay on the branch.`)) return;
+    run('push', () => pushXell(x.id));
+  };
+
+  const pull = () => {
+    // Say whose worktree is about to move, and warn BEFORE the click rather than let the server's
+    // refusal be the first time you hear about it. The server refuses dirty anyway — this is so a
+    // human knows what they are aiming at, not a substitute for that check.
+    const dirty = diff?.dirty || 0;
+    if (!confirm(
+      `Pull ${src} into ${x.slug}?\n\n`
+      + `This merges ${src} into ${x.slug}'s WORKING TREE on disk`
+      + `${x.zee_status === 'working' ? ' — and its zee is still working in there right now' : ''}.\n`
+      + (dirty > 0
+        ? `\n⚠ It has ${dirty} uncommitted file(s). This will be REFUSED: merging over a dirty tree `
+          + `can entangle in-progress work with the merge. Commit or stash first.\n`
+        : ''))) return;
+    run('pull', () => pullXell(x.id));
+  };
+
+  const pr = () => {
+    if (!confirm(
+      `Raise a PR from ${x.slug} → ${src}?\n\n`
+      + `This asks ${src} to take ${x.slug}'s commits in. Nothing moves now: it appears on ${src}'s `
+      + `card, and a human accepts it there.`)) return;
+    run('pr', () => prXell(x.id));
+  };
+
+  return (
+    <div className="xact">
+      <div className="xact-row">
+        <button className="xbtn" disabled={!!busy} onClick={pull} data-testid="pull-btn"
+                title={`Merge ${src} into ${x.slug}'s worktree (refused if it has uncommitted work)`}>
+          {busy === 'pull' ? '…' : '↓ pull'}
+        </button>
+        <button className="xbtn" disabled={!!busy} onClick={push} data-testid="push-btn"
+                title={`Push ${x.slug}'s commits to ${src} — the gate holds it unless already approved`}>
+          {busy === 'push' ? '…' : '↑ push'}
+        </button>
+        <button className="xbtn pr" disabled={!!busy} onClick={pr} data-testid="pr-btn"
+                title={`Ask ${src} to pull ${x.slug} in — a human accepts it on ${src}'s card`}>
+          {busy === 'pr' ? '…' : 'PR'}
+        </button>
+      </div>
+      {msg && <div className={`xact-msg${msg.bad ? ' bad' : ''}`}>{msg.text}</div>}
     </div>
   );
 }

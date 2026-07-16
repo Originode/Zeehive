@@ -129,7 +129,8 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .card.status-claimed { border-top-color: var(--claimed); }
 .card.status-tearing-down { border-top-color: var(--tearing-down); }
 
-.stack { background: var(--panel2); padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.stack { background: var(--panel2); padding: 10px 12px; border-bottom: 1px solid var(--line);
+         display: flex; gap: 8px; align-items: center; }
 .srow { display: flex; gap: 8px; font-size: 12px; padding: 2px 0; }
 .srole { color: var(--muted); min-width: 30px; }
 .sname { font-family: 'Cascadia Code', monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -145,6 +146,28 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
 .rv.hot { color: var(--working); font-weight: 700; }
 /* the head sits beside its ref, dimmer — the ref is the label, the head is the evidence */
 .srchead { color: var(--muted); font-size: 11px; margin-left: 6px; }
+
+/* ── a xell and its xource: what's waiting, and what you can do ────────────── */
+/* Notifications sit INSIDE the card, above its actions: the thing waiting on you and the xell it
+   concerns are one object, so they read as one. Cards carrying one of these sort to the top. */
+.xnotify { padding: 8px; border-top: 1px solid var(--line, #2a2f3a); display: grid; gap: 8px; }
+.xnotify .land-card { margin: 0; }
+.land-card.pr { border-left: 3px solid var(--accent, #5b8cff); }
+
+.xact { padding: 8px; border-top: 1px solid var(--line, #2a2f3a); }
+.xact-row { display: flex; gap: 6px; }
+.xact .xbtn {
+  flex: 1; padding: 5px 0; font-size: 11px; cursor: pointer;
+  background: var(--btn, #232833); color: var(--fg, #d6dae3);
+  border: 1px solid var(--line, #2a2f3a); border-radius: 4px;
+}
+.xact .xbtn:hover:not(:disabled) { background: var(--btn-hover, #2c3340); }
+.xact .xbtn:disabled { opacity: .5; cursor: default; }
+.xact .xbtn.pr { color: var(--accent, #5b8cff); }
+/* The answer to a click, in place. These verbs refuse for good reasons (a dirty tree, a held
+   push) and a refusal is not an error — so it is muted, not red, unless it really failed. */
+.xact-msg { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.xact-msg.bad { color: var(--warn, #e0a53b); }
 .runtime { font-size: 11px; color: var(--accent); }
 .mon { font-size: 11px; }
 .mon.on { color: var(--up); }
@@ -167,8 +190,11 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
 .invrow { align-items: center; }
 .invlabel { min-width: 62px; }
 .boxes { display: flex; flex-wrap: wrap; gap: 5px; }
-.cbox { position: relative; width: 42px; height: 32px; border-radius: 6px; background: var(--panel2);
-  border: 1px solid var(--line); display: inline-flex; align-items: center; justify-content: center;
+/* The name sits in the BOTTOM half so the top half is free for the role glyph — the two never
+   overlap, which is what lets the glyph be a real icon instead of a watermark behind text. */
+.cbox { position: relative; width: 42px; height: 36px; border-radius: 6px; background: var(--panel2);
+  border: 1px solid var(--line); display: inline-flex; flex-direction: column;
+  align-items: center; justify-content: flex-end; line-height: 1; padding-bottom: 4px;
   font-family: 'Cascadia Code', monospace; font-size: 11px; text-decoration: none; color: var(--text); }
 a.cbox { cursor: pointer; }
 a.cbox:hover { border-color: var(--accent); }
@@ -178,6 +204,38 @@ a.cbox:hover { border-color: var(--accent); }
 .cdot.down, .cdot.purged { background: var(--down); }
 .cdot.building { background: var(--building); }
 .cbox.empty { color: var(--muted); border-style: dashed; }
+
+/* ── what KIND of thing this chip is: glyph + tint ──────────────────────────
+   The glyph OWNS the top half — the name is pushed to the bottom precisely so
+   it can. It is a real icon there, not a watermark fighting the text for the
+   same pixels, which is why it can be legible at 42px wide.
+   HUES ARE CHOSEN AROUND HEALTH, not freely: green/red/amber belong to the
+   border (up/down/building) and the dots, so a fill in those colours would read
+   as a status this chip does not have. Kept low so the border still wins —
+   role is context, health is the signal.
+   Glyph opacity is baked into the SVG: a CSS `opacity` would fade the name too.
+   Nothing for `other`/infra — a grab-bag (caddy, synapse, redis, livekit…) with
+   no single honest icon, and a wrong glyph is worse than none. */
+.cbox[data-role="db"], .cbox[data-role="server"], .cbox[data-role="webapp"] {
+  background-repeat: no-repeat; background-position: center 3px; background-size: 14px 14px;
+}
+.cbox[data-role="db"] {
+  background-color: rgba(224, 138, 59, .18);   /* orange */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='1.8' stroke-linecap='round' opacity='0.55'%3E%3Cellipse cx='12' cy='5.5' rx='7' ry='2.8'/%3E%3Cpath d='M5 5.5v13c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8v-13'/%3E%3Cpath d='M5 12c0 1.55 3.13 2.8 7 2.8s7-1.25 7-2.8'/%3E%3C/svg%3E");
+}
+.cbox[data-role="server"] {
+  background-color: rgba(155, 140, 255, .18);  /* purple */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='1.8' opacity='0.55'%3E%3Crect x='3' y='4' width='18' height='6.5' rx='1.6'/%3E%3Crect x='3' y='13.5' width='18' height='6.5' rx='1.6'/%3E%3Cpath d='M6.6 7.25h0.01M6.6 16.75h0.01' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.cbox[data-role="webapp"] {
+  background-color: rgba(91, 140, 255, .18);   /* blue */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='1.8' opacity='0.55'%3E%3Crect x='3' y='4' width='18' height='16' rx='2'/%3E%3Cpath d='M3 9h18'/%3E%3Cpath d='M6.4 6.5h0.01M9.2 6.5h0.01' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+/* An empty slot keeps the tint but loses the glyph: it marks WHERE the missing
+   thing would be without drawing a container that does not exist. */
+.cbox.empty[data-role] { background-image: none; }
+
+
 .cbox.h-up { border-color: rgba(53,196,107,.35); }
 
 /* stack rows use boxes now */

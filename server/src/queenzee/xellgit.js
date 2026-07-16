@@ -1,0 +1,245 @@
+// PUSH / PULL / PR — the three things a human can do to a xell's git state from the console.
+//
+// All three are about ONE relationship: a xell and its XOURCE, the thing it tracks. That
+// relationship used to have exactly one verb, and it lived in the zee's prompt as an instruction
+// ("land locally: git push . HEAD:main"). A human had no way to do it at all — they watched a zee
+// be told to do it. These are that verb, plus its two missing siblings, as buttons.
+//
+// 012 is what makes them general: a xource can BE a xell, so `<xource ref>` is main for a top-level
+// xell and spinoff/<parent> for a child. Nothing below hardcodes main.
+//
+// origin appears nowhere here. It is a backup mirror Mark pushes by hand; the tree is entirely
+// local, and a push to `.` is a push into this same repo.
+import { spawnSync } from 'node:child_process';
+import { q, one } from '../db/pool.js';
+import { broadcast } from '../lib/events.js';
+import { logline } from '../lib/logbus.js';
+import { cleanGitEnv } from '../lib/git.js';
+
+function git(cwd, args, timeout = 60000) {
+  const r = spawnSync('git', ['-C', cwd, ...args],
+    { encoding: 'utf8', timeout, windowsHide: true, env: cleanGitEnv() });
+  return { ok: r.status === 0, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
+}
+
+// A xell, its xource ref, and — if that xource is itself a xell — the worktree that ref is checked
+// out in. That worktree is the difference between "push it" and "merge it": git refuses a push to
+// a branch someone has checked out, so a xell-backed xource must be merged from the inside.
+async function ctx(xellId) {
+  const x = await one(
+    `SELECT x.*, xo.ref AS xource_ref, xo.xell_id AS xource_xell_id
+       FROM xell x JOIN xource xo ON xo.id = x.xource_id WHERE x.id=$1`, [xellId]);
+  if (!x) throw new Error('unknown xell');
+  if (x.is_production) throw new Error('production does not push, pull or raise PRs — it is shipped to');
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [x.project_id]);
+  const parent = x.xource_xell_id
+    ? await one(`SELECT id, slug, worktree_path FROM xell WHERE id=$1`, [x.xource_xell_id])
+    : null;
+  if (!x.worktree_path) throw new Error(`${x.slug} has no worktree on disk`);
+  return { x, project, parent, ref: x.xource_ref, fullRef: `refs/heads/${x.xource_ref}` };
+}
+
+const dirtyCount = (wt) => {
+  const r = git(wt, ['status', '--porcelain']);
+  return r.ok ? r.out.split('\n').filter(Boolean).length : 0;
+};
+
+// ── PUSH: the xell's commits → its xource ────────────────────────────────────
+// Deliberately NOT special: this runs the same `git push . HEAD:<ref>` a zee runs, so it hits the
+// same update hook and gets held the same way. A human clicking it is not an override — it is the
+// same request, raised from a nicer place. If it lands, it is because a human had already approved
+// this exact sha; if it does not, the hook's own message says why.
+export async function pushToXource(xellId, by = 'human@console') {
+  const { x, ref, fullRef } = await ctx(xellId);
+  const head = git(x.worktree_path, ['rev-parse', 'HEAD']);
+  if (!head.ok) throw new Error('cannot read the xell HEAD');
+
+  logline('landgate', `${by} pushed ${x.slug} → ${ref}`);
+  const r = git(x.worktree_path, ['push', '.', `HEAD:${fullRef}`]);
+  const text = `${r.out}\n${r.err}`.trim();
+  const landed = r.ok;
+
+  if (landed) {
+    await one(`UPDATE xell SET head_commit=$2, last_synced_commit=$2 WHERE id=$1 RETURNING id`,
+      [x.id, head.out]);
+    broadcast('xell', { id: x.id });
+    logline('landgate', `${x.slug} LANDED on ${ref} @ ${head.out.slice(0, 8)}`);
+  }
+  return { landed, ref, head: head.out, output: text.slice(-2000) };
+}
+
+// ── PULL: the xource → the xell's worktree ───────────────────────────────────
+// REFUSES on a dirty tree, and that is the whole point of it being a separate check rather than
+// letting git decide. git will happily merge over a dirty worktree when the changed files do not
+// overlap — so the failure mode is not a clean error, it is a zee's uncommitted work quietly
+// entangled with a merge it did not ask for. A human clicking this cannot see what the zee is
+// mid-way through; the tree can.
+export async function pullFromXource(xellId, by = 'human@console') {
+  const { x, ref } = await ctx(xellId);
+  const dirty = dirtyCount(x.worktree_path);
+  if (dirty > 0) {
+    return {
+      merged: false, ref, dirty,
+      reason: `${x.slug} has ${dirty} uncommitted file(s) — commit or stash them first. Merging `
+        + 'over a dirty worktree can entangle a zee\'s in-progress work with the merge.',
+    };
+  }
+  // No fetch: the xource ref is a local branch in this same repo, so the worktree can already see
+  // it. "Fetch and merge" is just merge, once origin is out of the picture.
+  const r = git(x.worktree_path, ['merge', '--no-edit', ref]);
+  const head = git(x.worktree_path, ['rev-parse', 'HEAD']);
+  if (r.ok && head.ok) {
+    await one(`UPDATE xell SET last_synced_commit=$2 WHERE id=$1 RETURNING id`, [x.id, head.out]);
+    broadcast('xell', { id: x.id });
+    logline('landgate', `${by} pulled ${ref} into ${x.slug} → ${head.out.slice(0, 8)}`);
+  }
+  return { merged: r.ok, ref, dirty: 0, head: head.out, output: `${r.out}\n${r.err}`.trim().slice(-2000) };
+}
+
+// ── PR: ask the xource to pull the xell in ───────────────────────────────────
+// The inversion of push: the xell ASKS, and a human accepts on the XOURCE's card — the side that
+// receives the code decides to take it. Same land_request table, same gate, same rule that an
+// approval is bound to one exact sha.
+export async function requestPullIn(xellId, { by = 'human@console', note = null } = {}) {
+  const { x, project, ref, fullRef } = await ctx(xellId);
+  const head = git(x.worktree_path, ['rev-parse', 'HEAD']);
+  if (!head.ok) throw new Error('cannot read the xell HEAD');
+
+  const dirty = dirtyCount(x.worktree_path);
+  if (dirty > 0) {
+    return { ok: false, reason: `${dirty} uncommitted file(s) — commit them first, or they will not be in the PR.` };
+  }
+
+  const tip = git(project.repo_root, ['rev-parse', fullRef]);
+  if (tip.ok && tip.out === head.out) {
+    return { ok: false, reason: `${x.slug} has nothing ${ref} does not already have.` };
+  }
+
+  const existing = await one(
+    `SELECT * FROM land_request
+       WHERE project_id=$1 AND xell_id=$2 AND ref=$3 AND new_sha=$4
+         AND status IN ('pending','approved')`, [project.id, x.id, fullRef, head.out]);
+  if (existing) return { ok: true, request: existing, note: 'this PR is already open' };
+
+  const SEP = '\x1f';
+  const log = git(project.repo_root, ['log', `--pretty=format:%h${SEP}%s${SEP}%an`, '-n', '50',
+    `${tip.out}..${head.out}`]);
+  const commits = log.ok ? log.out.split('\n').filter(Boolean).map((l) => {
+    const [short, subject, author] = l.split(SEP);
+    return { short, subject, author };
+  }) : [];
+
+  const ss = git(project.repo_root, ['diff', '--shortstat', tip.out, head.out]);
+  const stat = {
+    commits: commits.length,
+    files: +(ss.out.match(/(\d+) files? changed/)?.[1] || 0),
+    insertions: +(ss.out.match(/(\d+) insertions?/)?.[1] || 0),
+    deletions: +(ss.out.match(/(\d+) deletions?/)?.[1] || 0),
+  };
+
+  const row = await one(
+    `INSERT INTO land_request (project_id, xell_id, ref, old_sha, new_sha, commits, stat, kind, note)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,'pull',$8) RETURNING *`,
+    [project.id, x.id, fullRef, tip.out || null, head.out,
+      JSON.stringify(commits), JSON.stringify(stat), note]);
+  broadcast('land', row);
+  logline('landgate',
+    `PR raised by ${by}: ${x.slug} @ ${head.out.slice(0, 8)} → ${ref} (${commits.length} commit(s)) — `
+    + `waiting on a human at ${ref}`);
+  return { ok: true, request: row };
+}
+
+// ── accept a PR: the xource takes it in ──────────────────────────────────────
+// FAST-FORWARD ONLY, and that constraint is what keeps this honest rather than convenient. A real
+// merge would create a NEW sha that nobody read, which is exactly what the gate's
+// approval-bound-to-a-sha rule exists to prevent. A fast-forward moves the ref to the sha on the
+// card — no new commit, nothing unreviewed. If it is not a fast-forward, the answer is "pull
+// first", which is the button next to this one.
+export async function acceptPullIn(requestId, by = 'human@console') {
+  const req = await one(`SELECT * FROM land_request WHERE id=$1`, [requestId]);
+  if (!req) throw new Error('no such request');
+  if (req.status !== 'pending') throw new Error(`this PR is already ${req.status}`);
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [req.project_id]);
+  const xell = await one(`SELECT * FROM xell WHERE id=$1`, [req.xell_id]);
+
+  // Re-read the tip: it may have moved since the PR was raised, which is precisely when a stale
+  // "it was a fast-forward when I asked" would stop being true.
+  const tip = git(project.repo_root, ['rev-parse', req.ref]);
+  if (!tip.ok) throw new Error(`cannot read ${req.ref}`);
+
+  const ff = git(project.repo_root, ['merge-base', '--is-ancestor', tip.out, req.new_sha]);
+  if (!ff.ok) {
+    return {
+      ok: false,
+      reason: `${req.ref.replace('refs/heads/', '')} has moved on since this PR was raised, so `
+        + `taking it in would need a merge commit nobody has read. Pull ${req.ref.replace('refs/heads/', '')} `
+        + `into ${xell?.slug || 'the xell'} first, then raise it again.`,
+    };
+  }
+
+  // Approve BEFORE moving the ref: for a main-backed xource the push below goes through the update
+  // hook, which looks for exactly this row. The hook spends it and marks it landed.
+  const approved = await one(
+    `UPDATE land_request SET status='approved', decided_at=now(), decided_by=$2
+       WHERE id=$1 AND status='pending' RETURNING *`, [requestId, by]);
+  if (!approved) throw new Error('no such pending request (already decided?)');
+  broadcast('land', approved);
+
+  const xource = await one(
+    `SELECT xo.*, px.slug AS parent_slug, px.worktree_path AS parent_worktree
+       FROM xource xo LEFT JOIN xell px ON px.id = xo.xell_id
+       WHERE xo.project_id=$1 AND xo.ref=$2`, [project.id, req.ref.replace('refs/heads/', '')]);
+
+  let landed = false, output = '';
+
+  if (xource?.parent_worktree) {
+    // The target branch is checked out in the parent's worktree, so it cannot be pushed to — merge
+    // from the inside instead. NOTE this path does NOT pass through the update hook (a merge is not
+    // a push): the human clicking accept on the parent's card IS the approval. The gate exists to
+    // keep unreviewed commits off main; this is a xell taking work into itself, on purpose.
+    const dirty = dirtyCount(xource.parent_worktree);
+    if (dirty > 0) {
+      await q(`UPDATE land_request SET status='pending', decided_at=NULL, decided_by=NULL WHERE id=$1`, [requestId]);
+      return {
+        ok: false,
+        reason: `${xource.parent_slug} has ${dirty} uncommitted file(s) — it cannot take work in `
+          + 'while its own tree is dirty. Commit or stash there first.',
+      };
+    }
+    const m = git(xource.parent_worktree, ['merge', '--ff-only', req.new_sha]);
+    landed = m.ok;
+    output = `${m.out}\n${m.err}`.trim();
+  } else {
+    // Root xource (local main): nothing has it checked out, so move it with a push — which fires
+    // the gate, which finds the approval we just wrote and spends it.
+    const p = git(project.repo_root, ['push', '.', `${req.new_sha}:${req.ref}`]);
+    landed = p.ok;
+    output = `${p.out}\n${p.err}`.trim();
+  }
+
+  if (landed) {
+    const row = await one(
+      `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [requestId]);
+    broadcast('land', row);
+    broadcast('xell', { id: req.xell_id });
+    logline('landgate',
+      `PR ACCEPTED by ${by}: ${xell?.slug} @ ${req.new_sha.slice(0, 8)} is on ${req.ref.replace('refs/heads/', '')}`);
+  } else {
+    await q(`UPDATE land_request SET status='pending', decided_at=NULL, decided_by=NULL WHERE id=$1`, [requestId]);
+    logline('landgate', `PR accept FAILED for ${xell?.slug}: ${output.split('\n').filter(Boolean).pop()}`);
+  }
+  return { ok: landed, output: output.slice(-2000) };
+}
+
+// Open PRs grouped by the ref they target — the console renders them on THAT xource's card, which
+// is the point: the side being asked to take the code is the side that sees the ask.
+export async function openPullsByRef(projectId) {
+  const rows = await q(
+    `SELECT lr.*, x.slug AS xell_slug FROM land_request lr
+       LEFT JOIN xell x ON x.id = lr.xell_id
+      WHERE lr.project_id=$1 AND lr.kind='pull' AND lr.status IN ('pending','approved')
+      ORDER BY lr.requested_at DESC`, [projectId]);
+  const out = {};
+  for (const r of rows) (out[r.ref] ||= []).push(r);
+  return out;
+}
