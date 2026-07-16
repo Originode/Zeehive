@@ -123,6 +123,12 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
 - **FAILS CLOSED** — queenzee unreachable = no landing. Deliberate: the server being down is
   exactly when a silent landing would go unnoticed. (Opposite stance to the sibling
   `reference-transaction` hook, which guards ordinary local work and must never wedge it.)
+  That sibling hook (machine-local, OmniBiz `.git/hooks/reference-transaction`, NOT
+  version-controlled anywhere) was amended 2026-07-16: `refs/heads/spinoff/*` is EXEMPT from its
+  non-fast-forward guard, so a zee may `git rebase main` its own workspace branch when main has
+  drifted too far to merge sanely. Everything else keeps the hard guard — verified both ways with
+  dummy branches. If that hook is ever reinstalled from scratch, re-add the exemption or zees
+  lose rebase.
 - Fires **only on push**, and only for `main_branch`. Committing/merging on main directly (Mark
   working normally) is untouched, and a queenzee outage can never block a non-main push.
 - Approval is bound to the **exact sha** a human read; it is **spent on use**. Amend/rebase → new

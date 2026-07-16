@@ -57,26 +57,23 @@ async function reclaimStaleClaims() {
     const project = await one(`SELECT main_branch FROM project WHERE id=$1`, [x.project_id]);
     const src = project?.main_branch || 'main';
 
+    // REPORT ONLY — never repool, never decommission. A claimed xell ends exactly two ways, both
+    // human: /xell-done typed, or "Mark done" clicked (Mark, 2026-07-16). This function used to
+    // hand dead-zee-clean-tree claims back to the pool, where the trimmer deletes the surplus —
+    // but "clean tree, quiet zee" is ALSO precisely what a xell looks like the moment its work
+    // lands and ships, resting between strides. Automation cannot tell an abandoned claim from a
+    // workspace mid-job, so it no longer tries; it says what it sees and a human decides. (A past
+    // session's automation reaped a live DTR zee — House rule 2 exists because of it.)
     if (!x.worktree_path || !existsSync(x.worktree_path)) {
-      // No worktree = nothing to lose. Hand it back so the reconciler can bin it properly.
-      const row = await one(
-        `UPDATE xell SET status='ready', is_pooled=true WHERE id=$1 AND status='claimed' RETURNING *`, [x.id]);
-      if (row) { broadcast('xell', row); freed++; logline('monitor', `reclaimed stale claim ${x.slug} — dead zee, no worktree on disk; pool will decommission it`); }
-      continue;
-    }
-
-    const d = worktreeDiff(x.worktree_path, src);
-    if (d.dirty > 0 || d.ahead > 0) {
-      // HAS WORK. Releasing this would let the reconciler delete it. Say so; do not touch it.
       logline('monitor',
-        `stale claim ${x.slug} has UNLANDED WORK (${d.ahead} commit(s), ${d.dirty} dirty file(s)) — `
-        + 'its zee is dead but the work is not. Leaving it alone: a human decides (Mark done / land it).');
+        `stale claim ${x.slug}: zee is gone and its worktree is missing from disk. Not touching it — `
+        + 'if it is finished, Mark done releases it.');
       continue;
     }
-
-    const row = await one(
-      `UPDATE xell SET status='ready', is_pooled=true WHERE id=$1 AND status='claimed' RETURNING *`, [x.id]);
-    if (row) { broadcast('xell', row); freed++; logline('monitor', `reclaimed stale claim ${x.slug} — dead zee, clean worktree; back in the pool`); }
+    const d = worktreeDiff(x.worktree_path, src);
+    logline('monitor',
+      `stale claim ${x.slug}: zee is gone (${d.ahead} commit(s) unlanded, ${d.dirty} dirty file(s)). `
+      + 'Not touching it — resume it, or Mark done when it is finished.');
   }
   return freed;
 }

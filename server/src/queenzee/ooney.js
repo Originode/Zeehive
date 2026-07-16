@@ -85,11 +85,16 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
     return deny(gate('sync', 'deny',
       `Your worktree has ${d.ahead} commit(s) of real work, but ${main} has moved ${d.behind} commit(s) `
       + `past you — you have DIVERGED. Do NOT try to land yet: that push cannot fast-forward and will be `
-      + `refused. Integrate first, in your own worktree:\n`
-      + `  1. git merge --no-edit ${main}   (resolve any conflicts — that is your judgment to make,\n`
-      + `     nobody else can decide how ${main}'s changes and yours fit together)\n`
-      + `  2. rebuild and RE-VERIFY your change still works on top of current ${main}\n`
-      + `  3. re-run this check — it will then walk you through landing the merged result.`,
+      + `refused. Integrate first, in your own worktree — pick ONE:\n`
+      + `  MERGE (default):  git merge --no-edit ${main}\n`
+      + `     keeps your history as-is; one merge commit ties the strands together.\n`
+      + `  REBASE (if ${main} drifted far and you want your commits replayed cleanly on top):\n`
+      + `     git rebase ${main}\n`
+      + `     rewrites your commits onto current ${main} — allowed on your own spinoff/ branch, and\n`
+      + `     your old tip stays in the branch reflog if you need to back out (git reflog <branch>).\n`
+      + `  Either way, conflicts are YOUR judgment — nobody else can decide how ${main}'s changes and\n`
+      + `  yours fit together. Then rebuild, RE-VERIFY your change still works on top of current\n`
+      + `  ${main}, and re-run this check — it will walk you through landing the integrated result.`,
       { ahead: d.ahead, behind: d.behind }));
   }
   if (d.ahead > 0) {
@@ -182,7 +187,9 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
     if (last?.status === 'shipped' && last.finished_at && (Date.now() - new Date(last.finished_at)) < 15 * 60 * 1000) {
       steps.push(gate('ship', 'live',
         `LIVE: commit ${String(last.commit).slice(0, 8)} shipped ${last.targets?.join(' + ') || 'server + webapp'} `
-        + 'to production. The queenzee holds the prod lock and auto-releases it — you release nothing.'));
+        + 'to production. The queenzee holds the prod lock and auto-releases it — you release nothing. '
+        + 'Your xell stays YOURS: shipping does not end it, and nothing will reclaim it while you have '
+        + 'more to do. When the whole job is truly finished, tell your human — only they mark it done.'));
       return { verdict: 'live', next: steps[steps.length - 1], steps, targets: t };
     }
     if (last?.status === 'rejected') {
