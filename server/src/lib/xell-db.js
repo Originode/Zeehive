@@ -151,7 +151,7 @@ export async function dbAccessForCwd(cwd) {
   if (!target) return { xell: null, allowed: false, reason: 'no cwd', db_containers: dbNames };
 
   const xells = await q(
-    `SELECT id, slug, status, worktree_path, db_coupling FROM xell
+    `SELECT id, slug, status, worktree_path, db_coupling, project_id FROM xell
        WHERE status <> 'retired' AND NOT is_production`);
   const xell = xells.find((x) => norm(x.worktree_path) === target);
   if (!xell) return { xell: null, allowed: false, reason: 'cwd is not a live xell worktree', db_containers: dbNames };
@@ -160,6 +160,32 @@ export async function dbAccessForCwd(cwd) {
     `SELECT c.name, c.tier, c.docker_ctx FROM container c
        JOIN xell_uses_container uc ON uc.container_id = c.id
       WHERE uc.xell_id = $1 AND c.role = 'db' LIMIT 1`, [xell.id]);
+
+  // HOLDING THE PROD LOCK is the second legitimate path to prod's database (the first is being
+  // dispatched --db shared-prod). The lock is held during exactly one window: a ship's
+  // verification — the queenzee assigned it to THIS xell when a human approved the ship, and the
+  // whole point of the hold is to check the deploy landed sanely. A zee that just shipped and
+  // cannot read prod to verify it is a gate defeating its own purpose (seen live: the tournament
+  // zee, lock in hand, denied a SELECT against prod mid-verification). The window closes itself:
+  // auto-release takes the lock — and this grant — away.
+  const lock = await one(
+    `SELECT phase FROM deploy_lock WHERE xell_id=$1 AND container='prod'`, [xell.id]);
+  if (lock) {
+    const prod = await one(
+      `SELECT name, docker_ctx FROM container
+        WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [xell.project_id]);
+    if (prod) {
+      return {
+        xell: { slug: xell.slug, db_coupling: xell.db_coupling },
+        db_container: resolveRealDbContainerCached(prod.docker_ctx, prod.name),
+        db_containers: dbNames,
+        docker_ctx: prod.docker_ctx,
+        allowed: true,
+        holds_prod_lock: true,
+        reason: null,
+      };
+    }
+  }
 
   return {
     xell: { slug: xell.slug, db_coupling: xell.db_coupling },
@@ -170,7 +196,8 @@ export async function dbAccessForCwd(cwd) {
     allowed: xell.db_coupling === 'db-shared-prod' && !!db && db.tier === 'prod',
     reason: xell.db_coupling === 'db-shared-prod'
       ? (db ? null : 'db-shared-prod but no db container attached')
-      : `this xell's database is '${xell.db_coupling}', not prod`,
+      : `this xell's database is '${xell.db_coupling}', not prod — and it does not hold the prod `
+        + 'deploy lock (the lock holder may exec against the prod db during its verification window)',
   };
 }
 
