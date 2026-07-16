@@ -98,11 +98,23 @@ export async function monitorTick() {
   const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote');
   const remote = zees.filter((z) => z.runtime_key === 'claude-code-remote');
 
-  // local/headless: one CLI call, cross-check session ids
+  // local/headless: one CLI call, cross-check session ids.
+  // TRUST IT ONLY WHEN IT ANSWERED. listActiveAgents() returns {ok:false, agents:[]} on any
+  // failure (timeout, busy binary, transient), and an unchecked empty list is indistinguishable
+  // from "every session is dead" — one hiccup marked the whole local fleet inactive in a single
+  // tick (two zees flipped in the same second, 2026-07-16 01:30:30Z). Same failure class the
+  // codebase already paid for twice: the ETIMEDOUT that took the pool loops down, and the crashed
+  // prod-guard that failed open. No answer = no verdict; skip the pass and say so.
   if (local.length) {
-    const active = new Set(listActiveAgents().agents.map((a) => a.sessionId));
-    for (const z of local) {
-      await setActive(z, z.claude_session_id ? active.has(z.claude_session_id) : false, 'agents-json');
+    const agents = listActiveAgents();
+    if (!agents.ok) {
+      logline('monitor', `agents-json unreadable (${agents.error || 'unknown'}) — skipping liveness pass; `
+        + 'nobody gets marked dead on a failed reading');
+    } else {
+      const active = new Set(agents.agents.map((a) => a.sessionId));
+      for (const z of local) {
+        await setActive(z, z.claude_session_id ? active.has(z.claude_session_id) : false, 'agents-json');
+      }
     }
   }
 
