@@ -22,6 +22,7 @@ import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, deleteProject } from '../lib/projects.js';
 import { checkPush, listLandRequests, decideLandRequest, landStatus } from '../queenzee/landgate.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
+import { ooneyCheck } from '../queenzee/ooney.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock }
   from '../queenzee/shipgate.js';
 
@@ -293,6 +294,19 @@ router.post('/xells/:id/prod-stack', async (req, res) => {
 router.delete('/xells/:id/prod-stack', async (req, res) => {
   try { res.json(await detachProdStack(req.params.id, { by: req.body?.by || 'human@console' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── /ooney: the ship-to-production gate cascade ──────────────────────────────
+// One endpoint, called repeatedly. Re-measures every gate live and answers with the verdict plus
+// the exact next step — the PROCEDURE IS THE RESPONSE, so it can never drift from what the
+// queenzee enforces the way a hardcoded skill .md would. Idempotent: safe to poll.
+router.post('/ooney/check', async (req, res) => {
+  try {
+    res.json(await ooneyCheck({
+      xellId: req.body?.xell_id, targets: req.body?.targets || null,
+      reason: req.body?.reason || null, zeeId: req.body?.zee_id || null,
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── a xell and its xource: push / pull / PR ──────────────────────────────────

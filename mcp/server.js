@@ -43,6 +43,19 @@ server.tool('zeehive_report_done',
 // acquire/release tools that used to live here are gone on purpose. A zee holding prod and
 // deploying by hand is exactly how band-aid deploys happened: live in prod, absent from main,
 // silently reverted by the next rebuild. A human approves; the QUEENZEE deploys, from main.
+server.tool('zeehive_ooney',
+  'The ONE pipeline to get your work into PRODUCTION. Re-measures every gate live (in sync with '
+  + 'main → schema identical to prod → your containers built from your current commit → human '
+  + 'clearance → queenzee builds prod) and returns the verdict plus the EXACT next step. The '
+  + 'response IS the procedure — follow it, then call again. Idempotent; poll until live/deny, or '
+  + 'run scripts/xell-ooney.mjs --wait in the background instead.',
+  {
+    xell_id: z.string().describe('your xell id'),
+    targets: z.array(z.enum(['server', 'webapp'])).optional().describe('what you are shipping (default both)'),
+    reason: z.string().optional().describe('one line: what this ship changes'),
+  },
+  async ({ xell_id, targets, reason }) => asText(await call('POST', '/api/ooney/check', { xell_id, targets, reason })));
+
 server.tool('zeehive_ship_request',
   'ASK to ship to PRODUCTION. You do not deploy: a human approves, then the queenzee takes the prod '
   + 'lock and builds from the xource at main, and releases the lock itself. REFUSED unless your work '

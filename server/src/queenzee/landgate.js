@@ -219,6 +219,20 @@ async function landApproved(row, by = 'human') {
     return { ...row, stale: true };
   }
 
+  // THE MERGE MUTEX. Two approvals landing at once would each pass ffState against the same tip
+  // and race the ref. Take the project's 'land' lock for exactly the duration of the ref move —
+  // acquired here, released in the finally below, never held across a human decision or a build.
+  // If someone else is mid-merge, return retryable: the tick (10s) takes it next round.
+  const mutex = await one(
+    `INSERT INTO deploy_lock (project_id, container, xell_id, phase, task)
+       VALUES ($1,'land',$2,'merging',$3)
+       ON CONFLICT (project_id, container) DO NOTHING RETURNING id`,
+    [row.project_id, row.xell_id, `landing ${row.new_sha.slice(0, 8)}`]);
+  if (!mutex) {
+    logline('landgate', `${row.new_sha.slice(0, 8)} waiting — another landing holds the merge lock`);
+    return { ...row, retry: true };
+  }
+
   // MOVE THE REF WITH update-ref, NOT `git push`. A push re-invokes the xource's `update` hook,
   // which curls back into THIS server — but the server is single-threaded and, having initiated
   // the push, is blocked inside spawnSync waiting for it. The hook times out (curl rc=28), fails
@@ -228,11 +242,18 @@ async function landApproved(row, by = 'human') {
   // there is no re-entrancy; it still fires reference-transaction, whose non-ff guard is the
   // backstop, and we only reach here on a proven fast-forward anyway. The old-value arg makes it a
   // compare-and-swap: if the ref moved since ffState read it, this fails instead of clobbering.
-  const u = spawnSync('git', ['-C', project.repo_root, 'update-ref', row.ref, row.new_sha, tip],
-    { encoding: 'utf8', timeout: 30000, windowsHide: true, env: cleanGitEnv() });
-  const now = spawnSync('git', ['-C', project.repo_root, 'rev-parse', row.ref],
-    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
-  const moved = u.status === 0 && now.stdout.trim() === row.new_sha;
+  let u, now;
+  try {
+    u = spawnSync('git', ['-C', project.repo_root, 'update-ref', row.ref, row.new_sha, tip],
+      { encoding: 'utf8', timeout: 30000, windowsHide: true, env: cleanGitEnv() });
+    now = spawnSync('git', ['-C', project.repo_root, 'rev-parse', row.ref],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+  } finally {
+    // Released IMMEDIATELY — the lock covers the ref move, nothing else. A 'land' row that
+    // outlives this function is a bug that blocks every future landing.
+    await q(`DELETE FROM deploy_lock WHERE id=$1`, [mutex.id]);
+  }
+  const moved = u.status === 0 && (now.stdout || '').trim() === row.new_sha;
 
   if (moved) {
     const landed = await one(

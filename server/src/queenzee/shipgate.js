@@ -48,7 +48,12 @@ function gitDirty(cwd) {
 }
 
 // ── the zee's only prod verb ─────────────────────────────────────────────────
-export async function requestShip({ xellId, zeeId = null, reason = null }) {
+export async function requestShip({ xellId, zeeId = null, reason = null, targets = null }) {
+  // Which roles to rebuild — the zee names them (/ooney webapp|server|both). Silently dropping an
+  // unknown role would ship less than the zee asked for and report success, so validate loudly.
+  const t = (Array.isArray(targets) && targets.length ? targets : SHIPPABLE).map(String);
+  const bad = t.filter((r) => !SHIPPABLE.includes(r));
+  if (bad.length) throw new Error(`unshippable target(s): ${bad.join(', ')} — only ${SHIPPABLE.join('/')}`);
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   if (!xell) throw new Error('unknown xell');
   if (xell.is_production) throw new Error('production cannot ship itself');
@@ -68,9 +73,9 @@ export async function requestShip({ xellId, zeeId = null, reason = null }) {
 
   const commit = headCommit(project.repo_root, main);
   const row = await one(
-    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [project.id, xellId, zeeId, commit, reason]);
+    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [project.id, xellId, zeeId, commit, reason, t]);
   broadcast('ship', row);
   logline('ship', `HELD ship request from ${xell.slug} @ ${String(commit).slice(0, 8)} — awaiting human approval`);
   notifyShipRequest({ project, xell, request: row });
@@ -136,9 +141,12 @@ async function runShip(shipId) {
   // Production's BUILD SOURCE is local main — not the xell's worktree, and not the xource
   // checkout's wandering HEAD (which is what this actually built until 2026-07-16). origin is a
   // backup and is never read. This is the anti-band-aid rule.
+  // Only the roles the ZEE NAMED (ship.targets, validated at request time) — a webapp-only change
+  // has no business recreating the live prod server as a side effect.
   const cs = await q(
     `SELECT * FROM container WHERE project_id=$1 AND tier='prod' AND role = ANY($2)
-       AND build_script IS NOT NULL ORDER BY role`, [project.id, SHIPPABLE]);
+       AND build_script IS NOT NULL ORDER BY role`,
+    [project.id, ship.targets?.length ? ship.targets : SHIPPABLE]);
 
   const results = [];
   let ok = cs.length > 0;

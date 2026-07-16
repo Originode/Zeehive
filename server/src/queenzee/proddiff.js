@@ -129,6 +129,28 @@ async function diffContainer(c, prodFp) {
   return payload;
 }
 
+// On-demand diff of ONE xell's database against prod — the /ooney gate calls this so its verdict
+// is measured NOW, not read from whatever the last 10-minute tick happened to record. Returns the
+// same payload shape diffContainer persists. `same_db: true` when the xell's database IS the prod
+// container (db-shared-prod): identical by identity, nothing to measure.
+export async function diffXellDbAgainstProd(projectId, xellId) {
+  const prod = await one(
+    `SELECT * FROM container WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [projectId]);
+  if (!prod) return { ok: false, error: 'no prod db container in the inventory', total: null };
+
+  const mine = await one(
+    `SELECT c.* FROM container c JOIN xell_uses_container uc ON uc.container_id=c.id
+      WHERE uc.xell_id=$1 AND c.role='db' LIMIT 1`, [xellId]);
+  if (!mine) return { ok: false, error: 'this xell has no database container linked', total: null };
+  if (mine.id === prod.id) return { ok: true, same_db: true, total: 0, kinds: null };
+
+  const realProd = resolveRealDbContainer(prod.docker_ctx, prod.name);
+  const got = await fingerprint(prod.docker_ctx, realProd);
+  if (got.error) return { ok: false, error: `prod db unreadable: ${got.error}`, total: null };
+
+  return diffContainer(mine, got.fp);
+}
+
 export async function prodDiffTick() {
   const projects = await q(`SELECT DISTINCT project_id FROM container WHERE role='db'`);
   let checked = 0, drifted = 0;

@@ -278,6 +278,26 @@ async function bindingFor(xellId, zee, task) {
       + 'dashboard spinner is for the human, not for you).',
   };
 
+  // SHIPPING TO PRODUCTION — one pipeline, and the queenzee narrates it. The zee is told only
+  // where the gate is, never the procedure: /api/ooney/check answers every call with the exact
+  // next step measured from live state, so instructions cannot drift the way a baked-in document
+  // would. Everything in the cascade is queenzee-executed and deterministic (sync check, schema
+  // diff vs prod, container builds, the prod build itself); the ONLY step the zee performs is the
+  // human-cleared merge to the source, and the only human step is clearance.
+  const oo = `node "${resolve(config.repoRoot, 'scripts', 'xell-ooney.mjs')}"`;
+  const ship = {
+    how: 'To put your work in PRODUCTION, run /ooney (or the command below). It is a gate cascade: '
+       + 'in-sync-with-source, schema identical to prod, your containers built from your current '
+       + 'commit, then HUMAN clearance — the queenzee then builds prod itself, holding the prod '
+       + 'lock for your xell (the prod build API rejects any non-holder). The response of every '
+       + 'call IS the procedure: do what the failing gate says, then re-run. Do not improvise '
+       + 'around a deny, and do not attempt any prod docker/compose command yourself — the guard '
+       + 'denies it and the gate exists so you never need it.',
+    check: `${oo} [server|webapp|both]`,
+    wait: `${oo} [server|webapp|both] --wait   # run in the BACKGROUND; its exit is your nudge (live=0, deny=1)`,
+    targets: 'Name what you are shipping: server, webapp, or both (default both).',
+  };
+
   return {
     status: 'claimed', // the gate: the zee may begin work ONLY when this is 'claimed'
     xell: {
@@ -288,6 +308,7 @@ async function bindingFor(xellId, zee, task) {
     containers: stack,
     build,
     db,
+    ship,
     task: task || null,
     rules: [
       'Work ONLY inside worktree_path. Never touch the xource (read-only).',
