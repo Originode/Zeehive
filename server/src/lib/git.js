@@ -21,6 +21,19 @@ export function headCommit(repoRoot, branch = 'main') {
   return r.status === 0 ? r.out.trim() : null;
 }
 
+// Is this directory REALLY the xell's worktree — bound to its branch — or a husk? A de-registered
+// worktree (no .git file: /spinon-style cleanup, a prune, a hand deletion) makes `git -C <dir>`
+// walk UP and answer for the PARENT repo. Every caller then silently operates on the XOURCE:
+// diffs report the xource's dirty files as the xell's (seen live — ooney denied m-dialog for two
+// files that belonged to the main checkout), and a `push . HEAD:main` from there would push
+// SOMEONE ELSE'S in-progress branch toward main. Check the branch before trusting the directory.
+export function worktreeBound(worktree, branch) {
+  if (!worktree || !branch) return { bound: false, actual: null };
+  const r = git(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const actual = r.status === 0 ? r.out.trim() : null;
+  return { bound: actual === branch, actual };
+}
+
 // What a ZEE has actually done. TWO different questions, so the card shows two numbers:
 //
 //   SOURCE DIFF (top-level ahead/behind/files/…) — the worktree vs the SOURCE. Everything the

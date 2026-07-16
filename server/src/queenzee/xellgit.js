@@ -14,7 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { cleanGitEnv } from '../lib/git.js';
+import { cleanGitEnv, worktreeBound } from '../lib/git.js';
 
 function git(cwd, args, timeout = 60000) {
   const r = spawnSync('git', ['-C', cwd, ...args],
@@ -36,6 +36,16 @@ async function ctx(xellId) {
     ? await one(`SELECT id, slug, worktree_path FROM xell WHERE id=$1`, [x.xource_xell_id])
     : null;
   if (!x.worktree_path) throw new Error(`${x.slug} has no worktree on disk`);
+  // A de-registered worktree (no .git file) makes `git -C` answer for the PARENT repo — push would
+  // then move SOMEONE ELSE'S branch toward the xource, and pull would merge into the xource's
+  // checkout. Refuse before any verb runs; nothing done in an unbound directory is this xell's.
+  const bind = worktreeBound(x.worktree_path, x.branch);
+  if (!bind.bound) {
+    throw new Error(
+      `${x.slug}'s worktree is no longer bound to ${x.branch} (git there answers `
+      + `${bind.actual ? `'${bind.actual}'` : 'nothing'}) — its registration or branch is gone. `
+      + 'Refusing every git verb: operating there would act on the xource, not this xell.');
+  }
   return { x, project, parent, ref: x.xource_ref, fullRef: `refs/heads/${x.xource_ref}` };
 }
 

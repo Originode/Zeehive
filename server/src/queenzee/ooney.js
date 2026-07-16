@@ -25,7 +25,7 @@
 // with clearance and (b) polls this endpoint.
 import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
-import { worktreeDiff } from '../lib/git.js';
+import { worktreeDiff, worktreeBound } from '../lib/git.js';
 import { getBuildStatus, buildXell } from '../lib/build.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { requestShip } from './shipgate.js';
@@ -54,6 +54,20 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
   // ── 1. SYNC — is this xell's code exactly what production would be built from? ─────────────
   if (!xell.worktree_path || !existsSync(xell.worktree_path)) {
     return deny(gate('sync', 'deny', 'This xell has no worktree on disk — nothing here can ship.'));
+  }
+  // The directory must actually BE this xell's worktree. A de-registered one (no .git file) makes
+  // every git command in it answer for the PARENT repo — so without this check, the numbers below
+  // would describe the XOURCE's checkout, and the land procedure would push someone else's branch.
+  const bind = worktreeBound(xell.worktree_path, xell.branch);
+  if (!bind.bound) {
+    return deny(gate('sync', 'deny',
+      `Your worktree is NO LONGER BOUND to this xell: it should be on ${xell.branch}, but git there `
+      + `answers ${bind.actual ? `'${bind.actual}'` : 'nothing'} — the registration or branch is gone `
+      + '(a cleanup ran after your work landed, most likely). Nothing measured from that directory '
+      + 'can be trusted, and nothing can ship from it. If your work is already landed on main, it '
+      + 'ships with the next ship of main — nothing further is needed from you; tell your human this '
+      + 'xell is finished so they can mark it done. If you have UNLANDED work, stop and tell your '
+      + 'human exactly that — do not commit or push anything from this directory.'));
   }
   const d = worktreeDiff(xell.worktree_path, main);
   if (d.dirty > 0) {
