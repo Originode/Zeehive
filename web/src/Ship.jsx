@@ -27,6 +27,34 @@ const mmss = (ms) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
+// What the ship actually DID, step by step — migrations first, then each container build — with
+// the captured build log behind a disclosure. This is the human's post-hoc window: the live feed
+// scrolls by in the ▚ terminal, but the record here survives (15 min on the card, forever on the
+// ship_request row).
+function ShipResults({ results }) {
+  if (!Array.isArray(results) || !results.length) return null;
+  return (
+    <div className="ship-results">
+      {results.map((r, i) => (
+        <div key={i} className={`ship-step ${r.ok ? 'ok' : 'bad'}`}>
+          <span className="ship-step-head">
+            {r.ok ? '✓' : '✗'} {r.role || r.container || 'step'}
+            {r.method ? <span className="ship-step-meta"> · {r.method}</span> : null}
+            {r.applied?.length ? <span className="ship-step-meta"> · applied {r.applied.join(', ')}</span> : null}
+          </span>
+          {r.error && <div className="land-err">{r.error}</div>}
+          {r.log && (
+            <details className="ship-log">
+              <summary>build log ({Math.max(1, Math.round(r.log.length / 1024))} KB)</summary>
+              <pre>{r.log}</pre>
+            </details>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ShipCard({ req, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -59,8 +87,15 @@ function ShipCard({ req, onDone }) {
       <div className="land-stat">
         builds local <b>main</b> @ <b>{short(req.commit)}</b> — not the xell's worktree, not origin
       </div>
-      {req.status === 'shipping' && <div className="ship-progress">⟳ queenzee is deploying — it holds the prod lock</div>}
+      {req.status === 'shipping' && (
+        <div className="ship-progress">
+          ⟳ queenzee is deploying — it holds the prod lock. Watch the build live in the ▚ terminal.
+        </div>
+      )}
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
+      {req.status === 'shipped' && <div className="ship-progress done">★ LIVE — shipped {req.finished_at ? `at ${new Date(req.finished_at).toLocaleTimeString()}` : ''}</div>}
+      {req.status === 'failed' && <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>}
+      <ShipResults results={req.containers} />
       {err && <div className="land-err">{err}</div>}
       {pending && (
         <div className="land-actions">

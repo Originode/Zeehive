@@ -620,6 +620,20 @@ a.cbox:hover { border-color: var(--accent); }
   font-weight: 600; }
 .ship-approve:hover:not(:disabled) { background: rgba(229,85,78,.14); }
 .ship-approve:disabled { opacity: .5; cursor: default; }
+.ship-card.s-shipped { border-color: var(--ready); opacity: .92; }
+.ship-card.s-failed { border-color: var(--error); }
+.ship-progress.done { color: var(--ready); }
+.ship-results { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.ship-step { font-size: 12.5px; }
+.ship-step.ok .ship-step-head { color: var(--ready); }
+.ship-step.bad .ship-step-head { color: var(--error); }
+.ship-step-meta { color: var(--muted); font-weight: 400; }
+.ship-log { margin-top: 4px; }
+.ship-log summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.ship-log summary:hover { color: var(--text); }
+.ship-log pre { max-height: 320px; overflow: auto; background: #0b0e14; border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 10px; margin: 6px 0 0; font-family: 'Cascadia Code', monospace;
+  font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
 
 /* the countdown bar: silence = release, so the clock is prominent and Hold is one click */
 .lock-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;

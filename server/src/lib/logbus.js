@@ -2,7 +2,9 @@
 // can show what the orchestrator is doing (checks, updates, maintenance, decommission).
 import { broadcast } from './events.js';
 
-const MAX = 500;
+// Big enough that a full docker-build feed (a ship streams every build line here) doesn't evict
+// the rest of the queenzee's recent history on its way through.
+const MAX = 2000;
 const ring = [];
 let seq = 0;
 

@@ -141,9 +141,14 @@ export async function getFleet(projectId) {
 
   // Ships awaiting a human, plus whoever holds prod right now. `auto_release_at` drives the
   // console's countdown + Hold prompt; the card renders a padlock on the holder.
+  // Open ships, plus anything that FINISHED in the last 15 minutes: a card that vanished the
+  // instant the build ended took its result — and its build log — with it, so the human's only
+  // view of a just-shipped (or just-failed) deploy was gone before they could read it.
   const shipping = await q(
     `SELECT s.*, x.slug AS xell_slug FROM ship_request s JOIN xell x ON x.id = s.xell_id
-       WHERE s.project_id = $1 AND s.status IN ('pending','approved','shipping')
+       WHERE s.project_id = $1 AND (s.status IN ('pending','approved','shipping')
+          OR (s.status IN ('shipped','failed')
+              AND COALESCE(s.finished_at, s.decided_at) > now() - interval '15 minutes'))
        ORDER BY s.requested_at DESC`, [pid]);
   const prodLock = await one(
     `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id

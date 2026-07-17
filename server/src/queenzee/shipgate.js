@@ -220,7 +220,10 @@ async function runShip(shipId) {
     // ship.commit is the sha the HUMAN approved. Passing it (rather than letting the script say
     // "main") also means a main that moved between approval and build cannot smuggle in commits
     // nobody signed off on.
-    const r = await runScript(c, project.repo_root, ship.commit);
+    // Live-feed every build line to the logbus: the console's ▚ terminal is the human's window
+    // into a ship that is actually running. The full tail also lands on the request row below.
+    const r = await runScript(c, project.repo_root, ship.commit,
+      (line) => logline('ship', `[${c.role}] ${line}`));
 
     // Record what prod now RUNS — the same projection lib/build.js does for dev builds. A ship
     // used to skip this entirely, so a successful deploy left last_build_commit untouched and
@@ -236,7 +239,8 @@ async function runShip(shipId) {
         r.json?.head && r.json.head !== 'unknown' ? r.json.head : null, r.ok]);
     if (row) broadcast('container', row);
 
-    results.push({ container: c.name, role: c.role, ok: r.ok, method: r.json?.method || null, error: r.ok ? null : r.err });
+    results.push({ container: c.name, role: c.role, ok: r.ok, method: r.json?.method || null,
+                   error: r.ok ? null : r.err, log: r.log || null });
     if (!r.ok) { ok = false; break; }   // stop at the first failure — do not half-ship prod
   }
 
@@ -259,20 +263,41 @@ async function runShip(shipId) {
   notifyShipDone({ project, xell, ok, request: done, seconds: AUTO_RELEASE_SEC });
 }
 
-function runScript(container, sourcePath, buildRef = 'main') {
+// How much of a build's output survives on the ship_request row. The tail, not the head: the
+// verdict (and any failure) is at the bottom of a build log, the cache-hit noise at the top.
+const LOG_TAIL_BYTES = 64 * 1024;
+
+function runScript(container, sourcePath, buildRef = 'main', onLine = null) {
   return new Promise((res) => {
     const exec = container.build_exec || 'bash';
     const p = spawn(exec, [container.build_script, sourcePath, container.role, container.docker_ctx || '', MODE, buildRef],
       { env: cleanGitEnv(), windowsHide: true });
-    let out = '', err = '';
-    p.stdout.on('data', (d) => (out += d));
-    p.stderr.on('data', (d) => (err += d));
+    let out = '', err = '', buf = '';
+    // Line-buffered live feed (stdout AND stderr — docker build writes its progress to stderr).
+    // The ship used to run in total silence and only a 1500-char error tail survived a failure;
+    // "ledger unreadable: " with nothing after the colon cost a day. Never again silent.
+    const emit = (d) => {
+      if (!onLine) return;
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trimEnd();
+        buf = buf.slice(i + 1);
+        if (line.trim()) onLine(line);
+      }
+    };
+    p.stdout.on('data', (d) => { out += d; emit(String(d)); });
+    p.stderr.on('data', (d) => { err += d; emit(String(d)); });
     p.on('close', () => {
+      if (buf.trim() && onLine) onLine(buf.trimEnd());
       const line = out.trim().split('\n').filter(Boolean).pop();
       let json = null; try { json = JSON.parse(line); } catch { /* no json line */ }
-      res({ ok: !!json && json.ok !== false, json, err: (err || out).slice(-1500) });
+      const full = out + (err ? `\n--- stderr ---\n${err}` : '');
+      res({ ok: !!json && json.ok !== false, json, err: (err || out).slice(-1500),
+            log: full.slice(-LOG_TAIL_BYTES) });
     });
-    p.on('error', (e) => res({ ok: false, json: null, err: String(e.message) }));
+    p.on('error', (e) => res({ ok: false, json: null, err: String(e.message),
+                               log: (out + err).slice(-LOG_TAIL_BYTES) }));
   });
 }
 

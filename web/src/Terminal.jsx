@@ -3,6 +3,7 @@ import React, { useEffect, useRef } from 'react';
 const SCOPE = {
   poller: '#5b8cff', monitor: '#35c46b', pool: '#9ccf3f', maint: '#e0a53b',
   reaper: '#e5554e', intake: '#9b8cff', lock: '#e26fae', api: '#3bc6c0',
+  ship: '#f0883e', shipmigrate: '#d29922', 'xell-db': '#79c0ff',
 };
 
 // Modal terminal streaming the queenzee's live activity (checks, updates, maintenance…).
