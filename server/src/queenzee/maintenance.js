@@ -33,15 +33,21 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 // async: the event loop stays free while docker runs.
 function execAsync(cmd, args, { timeout = 600000 } = {}) {
   return new Promise((resolveP) => {
-    let out = '', err = '';
+    let out = '', err = '', timedOut = false;
     let child;
     try { child = spawn(cmd, args, { windowsHide: true }); }
     catch (e) { return resolveP({ status: -1, stdout: '', stderr: String(e?.message || e) }); }
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, timeout);
+    const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch { /* already gone */ } }, timeout);
     child.stdout?.on('data', (d) => { out += d; });
     child.stderr?.on('data', (d) => { err += d; });
-    child.on('error', (e) => { clearTimeout(timer); resolveP({ status: -1, stdout: out, stderr: String(e?.message || e) }); });
-    child.on('close', (code) => { clearTimeout(timer); resolveP({ status: code, stdout: out, stderr: err }); });
+    child.on('error', (e) => { clearTimeout(timer); resolveP({ status: -1, stdout: out, stderr: String(e?.message || e), timedOut }); });
+    // A SIGKILLed child closes with code null and NOTHING on stderr — which rendered a day of
+    // slow-link backup failures as "docker cp failed: " and sent the debugging at the share
+    // instead of the wire. Say it was the timeout.
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolveP({ status: code, stdout: out, stderr: timedOut ? `killed at the ${Math.round(timeout / 1000)}s timeout${err ? ` · ${err}` : ''}` : err, timedOut });
+    });
   });
 }
 
