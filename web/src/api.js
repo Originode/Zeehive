@@ -87,6 +87,19 @@ export const createSite = (projectId, body) => siteCall(`/api/projects/${project
 export const updateSite = (siteId, body) => siteCall(`/api/sites/${siteId}`, 'PATCH', body);
 export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${siteId}${force ? '?force=1' : ''}`, 'DELETE');
 
+// ── onboarding surface: probe / readiness / inventory / spawn template / manifest ──
+export const probeRepo = (repo_root) => siteCall('/api/projects/probe', 'POST', { repo_root });
+export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
+export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
+export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
+export const getSharedContainers = (projectId) => fetch(`/api/projects/${projectId}/containers`).then((r) => r.json());
+export const createSharedContainer = (projectId, body) => siteCall(`/api/projects/${projectId}/containers`, 'POST', body);
+export const patchSharedContainer = (id, body) => siteCall(`/api/containers/${id}`, 'PATCH', body);
+export const deleteSharedContainer = (id, force = false) => siteCall(`/api/containers/${id}${force ? '?force=1' : ''}`, 'DELETE');
+export const getProjectManifestInfo = (projectId) => fetch(`/api/projects/${projectId}/manifest`).then((r) => r.json());
+export const refreshProjectManifest = (projectId) => siteCall(`/api/projects/${projectId}/manifest/refresh`, 'POST');
+export const draftProjectManifest = (projectId, write = false) => siteCall(`/api/projects/${projectId}/manifest/draft`, 'POST', { write });
+
 // Subscribe to /api/stream for the selected project. Calls onSnapshot(fleet) on the
 // initial snapshot and onChange() on every subsequent event (the app re-fetches on change).
 export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog }) {

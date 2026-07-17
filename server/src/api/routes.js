@@ -21,8 +21,11 @@ import { remoteAvailable } from '../lib/claude-cli.js';
 import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
-         getProjectManifest, refreshProjectManifest, draftProjectManifest } from '../lib/projects.js';
+         getProjectManifest, refreshProjectManifest, draftProjectManifest,
+         probeRepo, projectReadiness, getPoolConfig, updatePoolConfig } from '../lib/projects.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
+import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
+  from '../lib/inventory.js';
 import { checkPush, listLandRequests, decideLandRequest, landStatus } from '../queenzee/landgate.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
@@ -199,6 +202,35 @@ router.post('/projects/:id/manifest/refresh', async (req, res) => {
 router.post('/projects/:id/manifest/draft', async (req, res) => {
   try { res.json(await draftProjectManifest(req.params.id, { write: req.body?.write === true })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── onboarding surface (Project Setup panel) ──────────────────────────────────
+// Probe a FOLDER (works before the project exists): git state, manifest, compose files, env.
+router.post('/projects/probe', (req, res) => res.json(probeRepo(req.body?.repo_root)));
+// The readiness checklist: which gates pass, can it provision, can it SHIP.
+router.get('/projects/:id/readiness', async (req, res) => {
+  try { res.json(await projectReadiness(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+// The dev spawn template: what a new xell gets by default (couplings, runtime, pool size).
+router.get('/projects/:id/pool-config', async (req, res) => res.json(await getPoolConfig(req.params.id)));
+router.patch('/projects/:id/pool-config', async (req, res) => {
+  try { res.json(await updatePoolConfig(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Shared-container inventory (prod containers included — a ship needs at least one shippable).
+router.get('/projects/:id/containers', async (req, res) => res.json(await listSharedContainers(req.params.id)));
+router.post('/projects/:id/containers', async (req, res) => {
+  try { res.json(await createSharedContainer(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.patch('/containers/:id', async (req, res) => {
+  try { res.json(await updateSharedContainer(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/containers/:id', async (req, res) => {
+  try { res.json(await deleteSharedContainer(req.params.id, req.query.force === '1')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
 });
 router.get('/xells', async (_req, res) => res.json(await q(`SELECT * FROM xell WHERE status <> 'retired' ORDER BY created_at`)));
 router.get('/zees', async (_req, res) => res.json(await q(`SELECT * FROM zee ORDER BY created_at DESC`)));

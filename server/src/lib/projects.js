@@ -4,11 +4,13 @@
 // If the repo carries a zeehive.yml, onboarding reads it (spec §3.1): the manifest's
 // declared compose files / env / ports / db identity become the row's values, and the
 // parsed manifest is cached on the row (manifest_hash detects drift from the repo file).
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { pool, one, q } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from './events.js';
+import { cleanGitEnv } from './git.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
 
 // Live statuses that mean a zee is actively bound — deleting such a project is refused.
@@ -106,12 +108,15 @@ export async function createProject(body) {
         [project.id, body.docker_ctx_prod, body.prod_host_ip || null, body.compose_prod || null]);
     }
 
+    // NEW projects start with pool target 0: a half-configured project must not have a
+    // REAL-mode queenzee cutting worktrees for it as an onboarding side effect. The readiness
+    // checklist prompts raising it once the gates pass.
     await client.query(
       `INSERT INTO pool_config (project_id, target_ready, default_source_coupling,
           default_db_coupling, default_runtime_id, refresh_interval_sec)
        VALUES ($1,$2,'sparse-overlay','db-shared-dev',$3,3600)
        ON CONFLICT (project_id) DO NOTHING`,
-      [project.id, config.poolTargetReady, rt?.id || null]);
+      [project.id, Number(body.pool_target) || 0, rt?.id || null]);
 
     await client.query('COMMIT');
     broadcast('project', project);
@@ -159,6 +164,137 @@ export async function refreshProjectManifest(id) {
   return { ...updated, manifest_warnings: repo.warnings };
 }
 
+// ── onboarding: inspect a folder BEFORE (or after) it becomes a project ─────
+// Everything the setup UI needs to guide a human: is it a git repo, what branches/remotes exist,
+// is there a manifest (and is it valid), which compose files are lying around, does the env
+// contract hold. Read-only — probing never changes the repo.
+export function probeRepo(repoRoot) {
+  const dir = String(repoRoot || '').trim().replace(/\\/g, '/');
+  if (!dir) return { ok: false, error: 'repo_root is required' };
+  if (!existsSync(dir)) return { ok: false, error: `folder does not exist: ${dir}` };
+
+  const git = (args) => spawnSync('git', ['-C', dir, ...args],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+  const isRepo = git(['rev-parse', '--git-dir']).status === 0;
+  const branches = isRepo
+    ? git(['branch', '--format=%(refname:short)']).stdout.split('\n').map((s) => s.trim()).filter(Boolean)
+    : [];
+  const currentBranch = isRepo ? git(['branch', '--show-current']).stdout.trim() : null;
+  const remotes = isRepo
+    ? [...new Set(git(['remote']).stdout.split('\n').map((s) => s.trim()).filter(Boolean))]
+        .map((name) => ({ name, url: git(['remote', 'get-url', name]).stdout.trim() }))
+    : [];
+
+  const mf = loadManifest(dir);
+  const composeFiles = readdirSync(dir).filter((f) => /^docker-compose.*\.ya?ml$/.test(f)).sort();
+  return {
+    ok: true,
+    git: { is_repo: isRepo, branches, current_branch: currentBranch, remotes },
+    manifest: mf.found
+      ? { found: true, file: mf.file, valid: !mf.errors.length, errors: mf.errors, warnings: mf.warnings }
+      : { found: false },
+    compose_files: composeFiles,
+    env: { has_env: existsSync(resolve(dir, '.env')), has_example: existsSync(resolve(dir, '.env.example')) },
+  };
+}
+
+// ── readiness: the gates between "row exists" and "this project can actually work" ─────
+// The setup UI's checklist. can_ship is the one Mark asked by name: without a prod site AND at
+// least one shippable prod container, /ooney has nothing to build.
+export async function projectReadiness(id) {
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  const gates = [];
+  const gate = (key, ok, detail, level = null) =>
+    gates.push({ key, ok, level: level || (ok ? 'pass' : 'fail'), detail });
+
+  const probe = probeRepo(p.repo_root);
+  gate('repo', probe.ok && probe.git?.is_repo,
+    probe.ok ? (probe.git.is_repo ? `git repo at ${p.repo_root}` : 'folder exists but is not a git repo')
+             : probe.error);
+  if (probe.ok && probe.git?.is_repo) {
+    const hasMain = probe.git.branches.includes(p.main_branch);
+    gate('main_branch', hasMain,
+      hasMain ? `branch "${p.main_branch}" exists`
+              : `main_branch "${p.main_branch}" not found (have: ${probe.git.branches.slice(0, 6).join(', ')}) — the pool cannot provision from it`);
+  }
+  gate('env', !probe.ok ? false : existsSync(resolve(String(p.repo_root).replace(/\\/g, '/'), p.env_file || '.env')),
+    `${p.env_file || '.env'} ${probe.ok ? 'in the main checkout' : ''}`,
+    probe.ok && !existsSync(resolve(String(p.repo_root).replace(/\\/g, '/'), p.env_file || '.env')) ? 'warn' : null);
+  if (probe.ok) {
+    gate('manifest', probe.manifest.found ? probe.manifest.valid : true,
+      probe.manifest.found
+        ? (probe.manifest.valid ? `${probe.manifest.file} valid` : `${probe.manifest.file} INVALID: ${probe.manifest.errors.join('; ')}`)
+        : 'no zeehive.yml — running on form/DB config (a draft can be generated)',
+      probe.manifest.found ? null : 'warn');
+  }
+
+  const sites = await q(`SELECT * FROM deploy_site WHERE project_id=$1`, [id]);
+  const devSite = sites.find((s) => s.tier === 'dev' && s.is_default);
+  const prodSite = sites.find((s) => s.tier === 'prod' && s.is_default);
+  gate('dev_site', !!devSite, devSite ? `dev → ${devSite.docker_ctx}` : 'no default dev site');
+  gate('prod_site', !!prodSite,
+    prodSite ? `prod → ${prodSite.docker_ctx}${prodSite.ingress?.kind ? ` (${prodSite.ingress.kind})` : ''}`
+             : 'no prod site — the project cannot ship anywhere', prodSite ? null : 'warn');
+
+  const shippable = await q(
+    `SELECT name FROM container WHERE project_id=$1 AND tier='prod' AND build_script IS NOT NULL`, [id]);
+  gate('shippable', shippable.length > 0,
+    shippable.length ? `${shippable.length} shippable prod container(s): ${shippable.map((c) => c.name).join(', ')}`
+                     : 'no prod container has a build_script — /ooney has nothing to build',
+    shippable.length ? null : (prodSite ? 'fail' : 'warn'));
+
+  const pc = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [id]);
+  gate('pool', true,
+    `pool target ${pc?.target_ready ?? 0}${Number(pc?.target_ready) === 0 ? ' — no pre-warmed xells until raised' : ''}`,
+    Number(pc?.target_ready) > 0 ? 'pass' : 'warn');
+
+  return {
+    gates,
+    can_ship: !!prodSite && shippable.length > 0,
+    can_provision: gates.find((g) => g.key === 'repo')?.ok && gates.find((g) => g.key === 'main_branch')?.ok !== false && !!devSite,
+  };
+}
+
+// ── the dev spawn template: what a NEW xell gets by default ─────────────────
+export async function getPoolConfig(projectId) {
+  return one(
+    `SELECT pc.*, r.key AS runtime_key, r.label AS runtime_label
+       FROM pool_config pc LEFT JOIN agent_runtime r ON r.id = pc.default_runtime_id
+      WHERE pc.project_id=$1`, [projectId]);
+}
+
+const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
+                        'refresh_interval_sec'];
+const DB_COUPLINGS = ['db-shared-dev', 'db-isolated', 'db-shared-prod'];
+
+export async function updatePoolConfig(projectId, body = {}) {
+  const pc = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [projectId]);
+  if (!pc) throw new Error('project has no pool_config');
+  if (body.default_db_coupling !== undefined && !DB_COUPLINGS.includes(body.default_db_coupling)) {
+    throw new Error(`default_db_coupling must be one of: ${DB_COUPLINGS.join(', ')}`);
+  }
+  if (body.default_db_coupling === 'db-shared-prod') {
+    throw new Error('db-shared-prod cannot be a DEFAULT — prod data access is per-xell and human-granted (/xell-prod)');
+  }
+  const sets = [], vals = [projectId];
+  for (const f of POOL_PATCHABLE) {
+    if (body[f] === undefined) continue;
+    vals.push(body[f]);
+    sets.push(`${f} = $${vals.length}`);
+  }
+  if (body.default_runtime_key !== undefined) {
+    const r = await one(`SELECT id FROM agent_runtime WHERE key=$1 AND enabled`, [body.default_runtime_key]);
+    if (!r) throw new Error(`no enabled runtime keyed "${body.default_runtime_key}"`);
+    vals.push(r.id);
+    sets.push(`default_runtime_id = $${vals.length}`);
+  }
+  if (!sets.length) return pc;
+  const row = await one(`UPDATE pool_config SET ${sets.join(', ')} WHERE project_id=$1 RETURNING *`, vals);
+  broadcast('project', { id: projectId, pool_config: row });
+  return row;
+}
+
 // A best-effort zeehive.yml draft from a compose-file scan (spec §7 Phase 2.3). write:true puts
 // it in the repo root — refused if one already exists; the human reviews and commits it.
 export async function draftProjectManifest(id, { write = false } = {}) {
@@ -180,6 +316,7 @@ const PATCHABLE = [
   'name', 'main_branch', 'docker_ctx_dev', 'docker_ctx_prod', 'dev_host_ip', 'prod_host_ip',
   'compose_dev', 'compose_spinoff', 'compose_prod', 'env_file',
   'port_server_base', 'port_web_base', 'port_slot_mod',
+  'db_name', 'db_user', 'ship_ref',
 ];
 
 export async function updateProject(id, body = {}) {

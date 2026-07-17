@@ -90,7 +90,20 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
        AND status IN ('pending','approved','shipping')`, [project.id, xellId]);
   if (existing) return { ok: true, request: existing, note: 'you already have an open ship request' };
 
-  const commit = headCommit(project.repo_root, main);
+  // WHERE the ship's code comes from: local main by default (the anti-band-aid rule); a project
+  // whose integration truth is remote (ship_ref like 'origin/main') gets that remote fetched
+  // FIRST so the human approves the sha that is actually current, not a stale mirror.
+  const shipRef = project.ship_ref || main;
+  if (shipRef.includes('/')) {
+    const remote = shipRef.split('/')[0];
+    const f = spawnSync('git', ['-C', project.repo_root, 'fetch', remote],
+      { encoding: 'utf8', timeout: 60000, windowsHide: true, env: cleanGitEnv() });
+    if (f.status !== 0) {
+      return { ok: false, reason: `cannot fetch ${remote} for ship_ref ${shipRef}: ${(f.stderr || '').slice(-200)}`, request: null };
+    }
+  }
+  const commit = headCommit(project.repo_root, shipRef);
+  if (!commit) return { ok: false, reason: `ship_ref "${shipRef}" does not resolve in ${project.repo_root}`, request: null };
   // What schema rides along — decided NOW so the human approves code and migrations as one thing.
   const mig = await pendingMigrations(project, commit, shipSite);
   const row = await one(
