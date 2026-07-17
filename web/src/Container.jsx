@@ -64,12 +64,28 @@ function driftText(c) {
   return out.join('');
 }
 
+// What lives INSIDE a db container (db_instance rows, aggregated onto the row by fleet.js):
+// the primary db, the clone template, and each schema-work xell's clone. A clone names its xell;
+// a clone with no owner is an ORPHAN (its xell is gone but the database survived) — say so.
+function instancesText(c) {
+  const list = c.instances;
+  if (!Array.isArray(list) || list.length < 2) return '';   // just the primary = nothing to tell
+  const out = [`\n\ndatabases (${list.length}):`];
+  for (const i of list) {
+    const d = i.prod_diff;
+    const drift = !d ? '' : d.ok === false ? ' · diff err' : d.total > 0 ? ` · ⚠ ${d.total} drift` : ' · ✓ sync';
+    const who = i.kind === 'clone' ? (i.owner_slug ? ` → ${i.owner_slug}` : ' → ORPHAN (xell gone)') : '';
+    out.push(`\n  ${i.name} — ${i.kind}${who}${drift}`);
+  }
+  return out.join('');
+}
+
 function tooltip(c, buildable, busy) {
   if (busy) return `${c.name}\n${c.tier} · ${BUSY_LABEL[busy] || 'working…'}`;
   const built = c.last_build_commit
     ? `\nlast build: ${c.last_build_commit}${c.hot_build ? ' (hot)' : ''}${c.last_built_at ? ' · ' + new Date(c.last_built_at).toLocaleString() : ''}`
     : (buildable ? '\nnever built — click the hammer to build' : '');
-  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${driftText(c)}`;
+  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${driftText(c)}${instancesText(c)}`;
 }
 
 // onMenu  → the chip is right-clickable (context menu). Passed by BOTH the inventory and the

@@ -70,14 +70,29 @@ export async function emitXellEnv(xellId) {
   // The xell's OWN database, when it has one. HARD GUARD (spec §6.2): never emit the managing
   // instance's meta-DB — two queenzees reconciling one meta-DB reap each other's xells; that
   // failure class has destroyed live work before, so it is a refusal, not a warning.
-  const ownDb = cs.find((c) => c.role === 'db')?.conn_ref;
-  if (ownDb) {
-    if (sameDatabase(ownDb, config.databaseUrl)) {
+  let dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
+  // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
+  // dev postgres — the shared container's conn_ref with the database name swapped for the
+  // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
+  if (!dbUrl && xell.db_coupling === 'db-clone') {
+    const inst = await one(
+      `SELECT di.name, c.conn_ref FROM db_instance di JOIN container c ON c.id = di.container_id
+        WHERE di.owner_xell_id=$1 AND di.kind='clone' AND c.conn_ref IS NOT NULL LIMIT 1`, [xellId]);
+    if (inst?.conn_ref) {
+      try {
+        const u = new URL(String(inst.conn_ref).replace(/^postgres(ql)?:/, 'http:'));
+        u.pathname = `/${inst.name}`;
+        dbUrl = String(u).replace(/^http:/, 'postgresql:');
+      } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
+    }
+  }
+  if (dbUrl) {
+    if (sameDatabase(dbUrl, config.databaseUrl)) {
       throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
         + `managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}) — `
         + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
     }
-    lines.push(`DATABASE_URL=${ownDb}`);
+    lines.push(`DATABASE_URL=${dbUrl}`);
   }
 
   // Manifest-declared extra env for spinoffs — for Zeehive itself these are the §6.2 safety
@@ -234,8 +249,10 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     await mk('server', ports.serverPort, 3000, `http://${devHost}:${ports.serverPort}`);
     await mk('webapp', ports.webPort, 5173, url);
 
-    // db coupling: link the shared dev db it USES (db-shared-dev default)
-    if ((dbCoupling || cfg.default_db_coupling) === 'db-shared-dev') {
+    // db coupling: link the shared dev db it USES (db-shared-dev default). db-clone lives in the
+    // SAME container — the clone database itself is cut lazily (at dispatch, or by the
+    // schema-work watch), never for a pristine pooled xell.
+    if (['db-shared-dev', 'db-clone'].includes(dbCoupling || cfg.default_db_coupling)) {
       const shared = await client.query(
         `SELECT id FROM container WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared' LIMIT 1`, [projectId]);
       if (shared.rows[0]) {

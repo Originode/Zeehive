@@ -266,7 +266,7 @@ export async function getPoolConfig(projectId) {
 
 const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
                         'refresh_interval_sec'];
-const DB_COUPLINGS = ['db-shared-dev', 'db-isolated', 'db-shared-prod'];
+const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod'];
 
 export async function updatePoolConfig(projectId, body = {}) {
   const pc = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [projectId]);

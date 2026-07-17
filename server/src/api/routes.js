@@ -29,6 +29,7 @@ import { listSharedContainers, createSharedContainer, updateSharedContainer, del
 import { checkPush, listLandRequests, decideLandRequest, landStatus } from '../queenzee/landgate.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
+import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock }
   from '../queenzee/shipgate.js';
 
@@ -235,6 +236,13 @@ router.delete('/containers/:id', async (req, res) => {
 router.get('/xells', async (_req, res) => res.json(await q(`SELECT * FROM xell WHERE status <> 'retired' ORDER BY created_at`)));
 router.get('/zees', async (_req, res) => res.json(await q(`SELECT * FROM zee ORDER BY created_at DESC`)));
 router.get('/containers', async (_req, res) => res.json(await q(`SELECT * FROM container ORDER BY role, tier, name`)));
+// The databases INSIDE one db container (db_instance): primary, clone template, per-xell clones.
+router.get('/containers/:id/instances', async (req, res) => res.json(await q(
+  `SELECT di.*, x.slug AS owner_slug FROM db_instance di
+     LEFT JOIN xell x ON x.id = di.owner_xell_id
+    WHERE di.container_id = $1
+    ORDER BY CASE di.kind WHEN 'primary' THEN 0 WHEN 'template' THEN 1 WHEN 'clone' THEN 2 ELSE 3 END, di.name`,
+  [req.params.id])));
 router.get('/runtimes', async (_req, res) => res.json(await listRuntimes()));
 
 router.get('/git/timeline', async (req, res) => {
@@ -269,10 +277,18 @@ router.post('/xell/dispatch', async (req, res) => {
   try { res.json(await dispatchXell(req.body || {})); }
   catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
 });
-// Re-point a xell's database: { coupling: db-shared-dev|db-shared-prod|db-isolated,
-// container: <name|id>, dump: <snapshot id|'latest'> }. db-shared-prod is LIVE production.
+// Re-point a xell's database: { coupling: db-shared-dev|db-clone|db-shared-prod|db-isolated,
+// container: <name|id>, dump: <snapshot id|'latest'> }. db-shared-prod is LIVE production;
+// db-clone cuts the xell its own database inside the shared dev postgres (seconds, template copy).
 router.post('/xells/:id/db', async (req, res) => {
   try { res.json(await attachXellDb(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Apply the xell's pending server/sql/migrations + ops files (at ITS branch head) to ITS OWN
+// database (clone/isolated only — shared dev is schema-frozen, prod only ships). This is how a
+// zee TESTS a migration before landing it; the same files ride the ship to prod.
+router.post('/xells/:id/db/migrate', async (req, res) => {
+  try { res.json(await applyMigrationsToXell(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Asked by the prod-guard hook (hooks/prod-guard.mjs) when a command in a xell worktree touches

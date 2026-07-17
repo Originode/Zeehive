@@ -10,6 +10,7 @@ import { cleanGitEnv } from '../lib/git.js';
 import { removeXellImages } from '../lib/images.js';
 import { logline } from '../lib/logbus.js';
 import { resolveSite } from '../lib/sites.js';
+import { dropCloneDb } from '../lib/xell-db.js';
 
 export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
@@ -68,6 +69,18 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   logline('reaper', `decommissioning ${xell.slug} (${reason}) — releasing resources, removing worktree + branch`);
   await one(`UPDATE xell SET status='tearing-down' WHERE id=$1 RETURNING *`, [xellId])
     .then((x) => x && broadcast('xell', x));
+
+  // A db-clone xell owns a DATABASE inside the shared dev postgres (its db_instance row) — drop
+  // it, or every retired schema-work xell leaks a full copy of dev into the container. Best-
+  // effort: a failed drop logs and the teardown continues, and the instance row it leaves behind
+  // is exactly how the leak stays visible (discovery flags it as an orphan).
+  {
+    const dropped = await dropCloneDb(xell).catch((e) => ({ ok: false, error: e.message }));
+    if (dropped?.ok === false) {
+      logline('reaper', `could not drop ${xell.slug}'s clone database: ${dropped.error} — its `
+        + 'db_instance row stays as the orphan record');
+    }
+  }
 
   // stop the zee
   const zee = await one(

@@ -25,13 +25,28 @@ export async function getFleet(projectId) {
     `SELECT commit, finished_at FROM ship_request WHERE project_id=$1 AND status='shipped'
        ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [pid]);
 
+  // What each db container CONTAINS (db_instance, 019): primary + clone template + per-xell
+  // clones. Shipped as a JSON aggregate so the chip can say what lives inside without another
+  // round-trip; owner_slug names a clone's xell, and a clone with NO owner is an orphan worth
+  // seeing. Non-db containers aggregate to [].
+  const instancesAgg = `
+    (SELECT coalesce(json_agg(json_build_object(
+              'id', di.id, 'name', di.name, 'kind', di.kind,
+              'owner_xell_id', di.owner_xell_id, 'owner_slug', ox.slug,
+              'prod_diff', di.prod_diff, 'prod_diff_at', di.prod_diff_at,
+              'refreshed_at', di.refreshed_at)
+            ORDER BY CASE di.kind WHEN 'primary' THEN 0 WHEN 'template' THEN 1
+                                  WHEN 'clone' THEN 2 ELSE 3 END, di.name), '[]'::json)
+       FROM db_instance di LEFT JOIN xell ox ON ox.id = di.owner_xell_id
+      WHERE di.container_id = c.id) AS instances`;
+
   // grouped container inventory
   const containers = await q(
-    `SELECT id, role, tier, isolation, name, url, host_port, health, owner_xell_id,
-            hot_build, last_build_commit, last_built_at, busy_since, busy_op,
-            prod_diff, prod_diff_at
-       FROM container WHERE project_id = $1
-       ORDER BY role, tier, name`, [pid]);
+    `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host_port, c.health,
+            c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
+            c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at, ${instancesAgg}
+       FROM container c WHERE c.project_id = $1
+       ORDER BY c.role, c.tier, c.name`, [pid]);
   const groups = { db: [], server: [], webapp: [], other: [] };
   for (const c of containers) (groups[c.role] || groups.other).push(c);
 
@@ -68,7 +83,7 @@ export async function getFleet(projectId) {
     const stack = await q(
       `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id,
               c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
-              c.prod_diff, c.prod_diff_at, uc.relation
+              c.prod_diff, c.prod_diff_at, uc.relation, ${instancesAgg}
          FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
         WHERE uc.xell_id = $1
         ORDER BY CASE c.role WHEN 'db' THEN 1 WHEN 'server' THEN 2 WHEN 'webapp' THEN 3 ELSE 4 END`,

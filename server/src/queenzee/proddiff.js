@@ -19,7 +19,8 @@ import { spawn } from 'node:child_process';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { resolveRealDbContainer } from '../lib/xell-db.js';
+import { resolveRealDbContainer, resolveRealDbContainerCached } from '../lib/xell-db.js';
+import { cloneInstanceFor, setInstanceProdDiff, syncDbInstances } from '../lib/db-instances.js';
 import { dbIdentity } from '../lib/projects.js';
 
 const SAMPLE = 8;          // per kind, per direction — this feeds a tooltip, not an audit
@@ -93,33 +94,40 @@ function diffSets(prodSet, devSet) {
   return { missing, extra };
 }
 
+// Pure comparison of two fingerprints → the persisted payload shape.
+function diffPayload(prodFp, fp) {
+  const kinds = {};
+  let total = 0;
+  for (const kind of Object.keys(Q)) {
+    const { missing, extra } = diffSets(prodFp[kind], fp[kind]);
+    total += missing.length + extra.length;
+    kinds[kind] = {
+      missing_count: missing.length, extra_count: extra.length,
+      missing: missing.slice(0, SAMPLE), extra: extra.slice(0, SAMPLE),
+    };
+  }
+  return { ok: true, error: null, total, kinds };
+}
+
 // Compare one db container against a prod fingerprint and persist the verdict.
 async function diffContainer(c, prodFp, dbid) {
   const real = resolveRealDbContainer(c.docker_ctx, c.name);
   const got = await fingerprint(c.docker_ctx, real, dbid);
 
-  let payload;
-  if (got.error) {
-    payload = { ok: false, error: got.error, total: null, kinds: null };
-  } else {
-    const kinds = {};
-    let total = 0;
-    for (const kind of Object.keys(Q)) {
-      const { missing, extra } = diffSets(prodFp[kind], got.fp[kind]);
-      total += missing.length + extra.length;
-      kinds[kind] = {
-        missing_count: missing.length, extra_count: extra.length,
-        missing: missing.slice(0, SAMPLE), extra: extra.slice(0, SAMPLE),
-      };
-    }
-    payload = { ok: true, error: null, total, kinds };
-  }
+  const payload = got.error
+    ? { ok: false, error: got.error, total: null, kinds: null }
+    : diffPayload(prodFp, got.fp);
 
   const prev = c.prod_diff?.total;
   const row = await one(
     `UPDATE container SET prod_diff=$2::jsonb, prod_diff_at=now() WHERE id=$1 RETURNING *`,
     [c.id, JSON.stringify(payload)]);
   if (row) broadcast('container', row);
+  // container.prod_diff has always described the container's PRIMARY database — now that
+  // instances are first-class, mirror the verdict onto that row so the two never disagree.
+  await q(
+    `UPDATE db_instance SET prod_diff=$2::jsonb, prod_diff_at=now()
+      WHERE container_id=$1 AND kind='primary'`, [c.id, JSON.stringify(payload)]);
 
   // Only log on a CHANGE. This runs on a loop; logging every tick would bury the terminal in
   // "still in sync" and make the one line that matters invisible.
@@ -156,6 +164,25 @@ export async function diffXellDbAgainstProd(projectId, xellId) {
   const got = await fingerprint(prod.docker_ctx, realProd, dbid);
   if (got.error) return { ok: false, error: `prod db unreadable: ${got.error}`, total: null };
 
+  // db-clone: the xell's database is its OWN instance inside the shared dev container. Measure
+  // THAT catalog and persist onto ITS db_instance row — never the container row, whose prod_diff
+  // chip describes the shared primary database, not any one xell's clone.
+  const xell = await one(`SELECT db_coupling FROM xell WHERE id=$1`, [xellId]);
+  if (xell?.db_coupling === 'db-clone') {
+    const inst = await cloneInstanceFor(xellId);
+    if (!inst) return { ok: false, error: 'db-clone coupling but no clone database on record — re-attach it', total: null };
+    const realMine = resolveRealDbContainer(mine.docker_ctx, mine.name);
+    const own = await fingerprint(mine.docker_ctx, realMine, { ...dbid, name: inst.name });
+    if (own.error) {
+      const payload = { ok: false, error: own.error, total: null, kinds: null };
+      await setInstanceProdDiff(inst.id, payload);
+      return { ok: false, error: `clone db ${inst.name} unreadable: ${own.error}`, total: null };
+    }
+    const payload = diffPayload(got.fp, own.fp);
+    await setInstanceProdDiff(inst.id, payload);
+    return { ...payload, database: inst.name };
+  }
+
   return diffContainer(mine, got.fp, dbid);
 }
 
@@ -190,6 +217,26 @@ export async function prodDiffTick() {
         diffContainer(c, got.fp, dbid).catch((e) => ({ ok: false, error: e.message, total: null }))));
       checked += out.length;
       drifted += out.filter((p) => p.ok && p.total > 0).length;
+    }
+
+    // INSTANCES: keep db_instance in line with what pg_database actually reports (discovery —
+    // this is what surfaces orphaned clones), then measure each CLONE's catalog against prod.
+    // The container pass above already covered every PRIMARY; templates are build artifacts of
+    // the dev db and deliberately not measured.
+    for (const c of [prod, ...targets]) {
+      const real = resolveRealDbContainerCached(c.docker_ctx, c.name);
+      const s = await syncDbInstances(c, real, dbid).catch((e) => ({ ok: false, error: e.message }));
+      if (!s.ok || c.id === prod.id) continue;     // prod is the ruler — nothing in it is measured
+      const clones = await q(`SELECT * FROM db_instance WHERE container_id=$1 AND kind='clone'`, [c.id]);
+      for (const inst of clones) {
+        const own = await fingerprint(c.docker_ctx, real, { ...dbid, name: inst.name });
+        const payload = own.error
+          ? { ok: false, error: own.error, total: null, kinds: null }
+          : diffPayload(got.fp, own.fp);
+        await setInstanceProdDiff(inst.id, payload);
+        checked++;
+        if (payload.ok && payload.total > 0) drifted++;
+      }
     }
   }
   return { checked, drifted };

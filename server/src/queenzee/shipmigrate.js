@@ -31,10 +31,11 @@ import { config } from '../config.js';
 import { logline } from '../lib/logbus.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { resolveRealDbContainer } from '../lib/xell-db.js';
+import { cloneInstanceFor } from '../lib/db-instances.js';
 
 // Schema dir first in sort order (m < o) — DDL lands before the data that may depend on it.
 export const SCHEMA_DIR = 'server/sql/migrations';
-const OPS_DIR = 'server/sql/ops';
+export const OPS_DIR = 'server/sql/ops';
 const MIG_DIRS = [SCHEMA_DIR, OPS_DIR];
 // Dirs every ledger has watched since creation. A marker-less ledger (created before markers
 // existed) covered exactly these — inserting their marker must NOT baseline, or a genuinely
@@ -148,14 +149,10 @@ export async function pendingMigrations(project, sha, site = null) {
   }
 }
 
-// Apply everything pending at `sha`, in filename order, each file in its own transaction,
-// recording each success. First failure stops the run — and the ship.
-export async function applyMigrations(project, sha, site = null) {
-  const db = await prodDb(project, site);
-  if (!db) return { ok: false, error: 'no prod db container', applied: [] };
-  const { ok, error, pending } = await pendingMigrations(project, sha, site);
-  if (!ok) return { ok: false, error, applied: [] };
-
+// Apply `pending` files as they exist at `sha`, in filename order, each in its own transaction,
+// ledgering each success in `db`. First failure stops the run. Shared by the prod ship and the
+// per-xell dev apply — same files, same loop, so testing on a clone IS testing the deploy.
+async function runPending(project, db, sha, pending) {
   const applied = [];
   for (const f of pending) {
     const show = spawnSync('git', ['-C', project.repo_root, 'show', `${sha}:${f}`],
@@ -170,7 +167,79 @@ export async function applyMigrations(project, sha, site = null) {
     await psql(db, ['-c',
       `INSERT INTO ${LEDGER} (filename, sha) VALUES ('${f.replace(/'/g, "''")}', '${sha}') ON CONFLICT DO NOTHING`]);
     applied.push(f);
-    logline('shipmigrate', `applied ${f} @ ${sha.slice(0, 8)}`);
+    logline('shipmigrate', `applied ${f} @ ${sha.slice(0, 8)} → ${db.container}/${db.name}`);
   }
   return { ok: true, applied };
+}
+
+// Apply everything pending at `sha` to PROD, recording each success. First failure stops the
+// run — and the ship.
+export async function applyMigrations(project, sha, site = null) {
+  const db = await prodDb(project, site);
+  if (!db) return { ok: false, error: 'no prod db container', applied: [] };
+  const { ok, error, pending } = await pendingMigrations(project, sha, site);
+  if (!ok) return { ok: false, error, applied: [] };
+  return runPending(project, db, sha, pending);
+}
+
+const gitOut = (cwd, args) => {
+  const r = spawnSync('git', ['-C', cwd, ...args],
+    { encoding: 'utf8', timeout: 20000, windowsHide: true, env: cleanGitEnv() });
+  return r.status === 0 ? (r.stdout || '').trim() : null;
+};
+
+// Apply a XELL's pending migration files to its OWN database — the missing forward-apply for
+// dev work. A zee writes server/sql/migrations/*.sql on its branch; this runs those files
+// against its clone/isolated db so the migration is TESTED before it ever lands, and the
+// /ooney schema gate then sees "prod + my pending migrations" — the green condition.
+//
+// The ledger is per-database (same table the prod ship uses). On first contact it is BASELINED
+// at the branch's fork point from main: everything main carried when this xell branched is
+// already reflected in the database it was cloned/restored from, so only files added SINCE —
+// the zee's own, plus anything landed on main afterwards (idempotent DDL by contract) — run.
+export async function applyMigrationsToXell(xellId) {
+  const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
+  if (!xell) return { ok: false, error: 'unknown xell', applied: [] };
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+
+  if (xell.db_coupling === 'db-shared-prod') {
+    return { ok: false, applied: [], error: 'your database IS live production — migrations reach prod '
+      + 'only through an approved ship (/ooney), never by hand.' };
+  }
+  const clone = xell.db_coupling === 'db-clone' ? await cloneInstanceFor(xellId) : null;
+  if (xell.db_coupling === 'db-shared-dev' || (xell.db_coupling === 'db-clone' && !clone)) {
+    return { ok: false, applied: [], error: 'your database is the SHARED dev db — its schema is frozen, '
+      + 'so migrations are not applied there. Attach your own clone first '
+      + `(POST /api/xells/${xellId}/db {"coupling":"db-clone"}, or dispatch with --db clone); `
+      + 'the queenzee also auto-attaches one when it sees migration files on your branch.' };
+  }
+
+  const c = await one(
+    `SELECT c.* FROM container c JOIN xell_uses_container uc ON uc.container_id=c.id
+      WHERE uc.xell_id=$1 AND c.role='db' LIMIT 1`, [xellId]);
+  if (!c) return { ok: false, error: 'this xell has no database container linked', applied: [] };
+
+  const dbid = {
+    user: project.db_user || config.prodDbUser || 'postgres',
+    name: clone ? clone.name : (project.db_name || config.prodDbName || 'omnibiz'),
+  };
+  const db = { ctx: c.docker_ctx, container: resolveRealDbContainer(c.docker_ctx, c.name),
+               user: dbid.user, name: dbid.name };
+
+  const head = xell.worktree_path ? gitOut(xell.worktree_path, ['rev-parse', 'HEAD']) : null;
+  if (!head) return { ok: false, error: 'cannot read the worktree HEAD — is the worktree still bound?', applied: [] };
+  const main = project.main_branch || 'main';
+  const base = gitOut(project.repo_root, ['merge-base', main, head]) || head;
+
+  try {
+    const done = await ledgerFiles(project, db, base);   // first contact baselines at the fork point
+    const all = listMigrationFiles(project.repo_root, head) || [];
+    const pending = all.filter((f) => !done.has(f));
+    if (!pending.length) return { ok: true, applied: [], pending: [], database: db.name,
+      note: 'nothing pending — your database already reflects every migration file on your branch.' };
+    const r = await runPending(project, db, head, pending);
+    return { ...r, pending, database: db.name };
+  } catch (e) {
+    return { ok: false, error: e.message, applied: [] };
+  }
 }

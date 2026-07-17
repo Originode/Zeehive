@@ -13,6 +13,7 @@ import { provisionXell } from '../lib/provision.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { renameXellForTask } from '../lib/rename-xell.js';
 import { attachXellDb } from '../lib/xell-db.js';
+import { cloneInstanceFor } from '../lib/db-instances.js';
 import { resolveProjectId } from '../lib/project-resolve.js';
 import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
@@ -238,19 +239,29 @@ async function bindingFor(xellId, zee, task) {
   // sanctioned path for data work — the prod guard allows it for exactly the xell whose assigned
   // database this is, and denies it for everyone else.
   const dbc = stack.find((c) => c.role === 'db');   // already resolved at the boundary above
+  // db-clone: the CONTAINER is shared, but this DATABASE inside it is the xell's own (its
+  // db_instance row). The container's conn_ref names the SHARED database, so a clone must never
+  // inherit it — every handle below carries the clone's name instead.
+  const clone = xell.db_coupling === 'db-clone' ? (await cloneInstanceFor(xellId))?.name || null : null;
   const db = dbc ? {
     container: dbc.name,
     coupling: xell.db_coupling,
+    ...(clone ? { database: clone } : {}),
     is_production: dbc.tier === 'prod',
-    psql: dbc.conn_ref
+    psql: (dbc.conn_ref && !clone)
       ? `psql "${dbc.conn_ref}"`
-      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U ${dbid.user} -d ${dbid.name}`,
+      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U ${dbid.user} -d ${clone || dbid.name}`,
     note: dbc.tier === 'prod'
       ? 'This IS the live production database — a human deliberately assigned it to you (--db shared-prod). '
         + 'It is YOUR container: querying it is expected, not a violation. Reads are free. Before ANY '
         + 'write/migration, state exactly what it will change and get a human to agree.'
-      : 'Your assigned database. Do not reach for prod: you were not given it, and the prod guard '
-        + 'will deny it.',
+      : clone
+        ? `Your assigned database is YOUR OWN CLONE (${clone}) inside the shared dev postgres — `
+          + 'migrate/seed/destroy it freely; nothing you do to it touches dev, prod, or any other zee. '
+          + `Always connect with -d ${clone}: the container's default database is the SHARED dev db, `
+          + 'and its schema is frozen (DDL there trips every xell\'s ship gate).'
+        : 'Your assigned database. Do not reach for prod: you were not given it, and the prod guard '
+          + 'will deny it.',
   } : null;
   // How this zee builds its own app tier — ALWAYS via the queenzee, never by hand. Running
   // docker/compose/spin-env.sh directly leaves the orchestrator blind (no built-commit, no hot
@@ -305,6 +316,7 @@ async function bindingFor(xellId, zee, task) {
     xell: {
       id: xell.id, slug: xell.slug, branch: xell.branch, worktree_path: xell.worktree_path,
       source: xell.xource_ref, source_coupling: xell.source_coupling, db_coupling: xell.db_coupling,
+      ...(clone ? { clone_db_name: clone } : {}),
     },
     zee: { id: zee.id, name: zee.name, viewer_url: zee.viewer_url },
     containers: stack,
@@ -324,6 +336,22 @@ async function bindingFor(xellId, zee, task) {
       ...(xell.db_coupling === 'db-isolated'
         ? ['Your database is your OWN container, restored from a dump — it is a copy, so you may '
          + 'migrate/seed/destroy it freely. Nothing you do to it touches dev or prod.']
+        : []),
+      ...(xell.db_coupling === 'db-clone'
+        ? [`Your database is your OWN CLONE (${clone || 'see db.database'}) inside the shared `
+         + 'dev postgres — migrate/seed/destroy it freely, nothing touches dev/prod/other zees. ALWAYS '
+         + 'connect with -d to YOUR database: the container default is the shared dev db, whose schema is '
+         + 'FROZEN. Write schema changes as files under server/sql/migrations/ (idempotent DDL; one-time '
+         + `data fixes under server/sql/ops/), then apply them to your clone with `
+         + `\`node "${resolve(config.repoRoot, 'scripts', 'xell-db-migrate.mjs')}" ${xell.id}\` — the SAME `
+         + 'files ride your ship to prod, so testing them here is testing the deploy.']
+        : []),
+      ...(xell.db_coupling === 'db-shared-dev'
+        ? ['NEVER run DDL (CREATE/ALTER/DROP …) on your database — it is the SHARED dev db and its '
+         + 'schema is frozen; ad-hoc DDL there trips every other xell\'s ship gate. If this job needs '
+         + 'schema changes, write them as files under server/sql/migrations/ — the queenzee detects '
+         + 'those on your branch and auto-attaches your own clone database (watch for the db-clone '
+         + 'switch, then rebuild your app tier so it picks up its own DATABASE_URL).']
         : []),
       'VERIFY YOUR WORK IN THIS XELL — you already have everything you need. The containers listed '
       + 'above are YOURS: your own server, webapp and database, isolated from prod and from every '

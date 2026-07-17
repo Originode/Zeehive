@@ -12,7 +12,16 @@ const TIERS = ['dev', 'prod'];
 export async function listSharedContainers(projectId) {
   return q(
     `SELECT c.*, s.key AS site_key,
-            (SELECT count(*) FROM xell_uses_container uc WHERE uc.container_id = c.id) AS linked_xells
+            (SELECT count(*) FROM xell_uses_container uc WHERE uc.container_id = c.id) AS linked_xells,
+            (SELECT coalesce(json_agg(json_build_object(
+                      'id', di.id, 'name', di.name, 'kind', di.kind,
+                      'owner_xell_id', di.owner_xell_id, 'owner_slug', ox.slug,
+                      'prod_diff', di.prod_diff, 'prod_diff_at', di.prod_diff_at,
+                      'refreshed_at', di.refreshed_at)
+                    ORDER BY CASE di.kind WHEN 'primary' THEN 0 WHEN 'template' THEN 1
+                                          WHEN 'clone' THEN 2 ELSE 3 END, di.name), '[]'::json)
+               FROM db_instance di LEFT JOIN xell ox ON ox.id = di.owner_xell_id
+              WHERE di.container_id = c.id) AS instances
        FROM container c LEFT JOIN deploy_site s ON s.id = c.site_id
       WHERE c.project_id = $1 AND c.isolation = 'shared'
       ORDER BY c.tier, c.role, c.name`, [projectId]);

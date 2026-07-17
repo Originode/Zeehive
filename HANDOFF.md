@@ -233,6 +233,53 @@ zee and repeated the same broken advice. Unrecognized couplings now throw.
   the sibling shell hook, undefined in the .mjs) and threw a ReferenceError — which let a dev-db
   xell straight through to prod. Every branch must call `deny()`. Re-run the canary after editing.
 
+## Schema-work xells: db-clone (the shared dev db's schema is FROZEN)
+
+Added 2026-07-17. Every xell shared ONE dev database, and the /ooney **schema gate diffs the
+xell's catalog against prod** — so two xells doing DDL each tripped the other's ship: A's unlanded
+migration is not at main's tip, so B's gate read A's tables as unexplained drift. Shared catalog =
+shared blame; no gate can attribute it. The fix is attribution by isolation:
+
+- **`db-clone`** (`db_coupling` value, migration 018): the xell gets its **own DATABASE inside the
+  shared dev postgres** — `CREATE DATABASE zee_<slug> TEMPLATE <db>_zeehive_tpl`, a file-level
+  copy in seconds, zero extra containers.
+- **Databases inside a container are FIRST-CLASS: `db_instance` (migration 019).** A db container
+  CONTAINS instances — `primary` (the application db), `template`, a `clone` per schema-work xell,
+  `other` for strays. One row per database, `UNIQUE (container_id, name)`; a clone carries
+  `owner_xell_id` (ON DELETE **SET NULL**, so a drop-failed clone outlives its xell as a visible
+  **orphan** instead of vanishing). Everything that used to read `xell.clone_db_name` /
+  `container.clone_tpl_at` (both dropped in 019) resolves through `lib/db-instances.js` now.
+  **Per-instance `prod_diff`** lives on the row; `container.prod_diff` = the PRIMARY's verdict
+  (mirrored, so the chip and the instance can never disagree).
+- **DISCOVERY**: the proddiff tick reconciles `db_instance` with `pg_database` per container —
+  upserts what appeared, deletes what's gone, names orphaned clones out loud. `pg_database` is
+  ground truth; the table follows it. Surfaced: the container chip tooltip lists its databases
+  (kind, owning xell, drift), `GET /api/containers/:id/instances` for machines.
+- **The template** (`<db>_zeehive_tpl`) is rebuilt from the live dev db via in-container
+  `pg_dump|psql` when its instance row's `refreshed_at` is older than `CLONE_TPL_MAX_AGE_MS`
+  (6 h default) — slow is fine, it's not on the clone path. Kept `datallowconn=false` so a
+  template copy can never be blocked by a connection. (`CREATE DATABASE … TEMPLATE` refuses a
+  source with live connections — that is WHY the template exists; the live dev db can never be
+  cloned directly.)
+- **AUTO-ATTACHED**: `queenzee/dbclone.js` (60 s tick, `DBCLONE_ENABLED=false` to stop) scans
+  claimed `db-shared-dev` xells for migration files on their branch (`server/sql/migrations|ops`,
+  committed or dirty) and re-points them to a clone, loudly. Also honors explicit
+  `--db clone` at dispatch / `POST /api/xells/:id/db {"coupling":"db-clone"}`.
+  ⚠ The app tier picks the new DATABASE_URL up only on its **next build** — nothing is restarted
+  under the zee; the binding rules tell it to rebuild.
+- **Forward-apply exists now**: `scripts/xell-db-migrate.mjs <xell_id>`
+  (`POST /api/xells/:id/db/migrate`) applies the xell's pending migration files **at its branch
+  HEAD** to **its own** db (clone/isolated only), same ledger + loop the prod ship uses
+  (`shipmigrate.js`), baselined at the branch's **fork point** from main. Testing the migration on
+  the clone IS testing the deploy. Refused on shared dev (frozen) and prod (ships only).
+- **The schema gate measures the clone** (`proddiff.diffXellDbAgainstProd` fingerprints the
+  xell's clone instance and persists onto ITS `db_instance` row — never the shared container's
+  chip). Green condition per xell: *my catalog = prod + my pending migration files*.
+- **Consequence: DDL on the shared dev database is a rule violation** (binding says so) and, now
+  that schema xells are cloned off, drift on the shared dev chip means something again.
+- Not built (deliberately, yet): a land-gate check for two in-flight migrations touching the same
+  table — ordering is filename discipline (date-prefix) + idempotent DDL by contract.
+
 ## Image garbage (2.6 GB per xell, nobody collecting)
 
 A spinoff image is ~1.3 GB; a xell builds two. Teardown was supposed to purge them, but it only

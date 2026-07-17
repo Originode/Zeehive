@@ -1,17 +1,22 @@
 // Choose which database a xell works against.
 //
-// A pooled xell is provisioned on the shared DEV db (pool_config.default_db_coupling). Two real
+// A pooled xell is provisioned on the shared DEV db (pool_config.default_db_coupling). Three real
 // needs break that:
 //   • "start from the latest prod data"  → db-isolated: its OWN postgres, restored from a dump.
 //   • "hotfix against prod"              → db-shared-prod: attach the live prod container.
+//   • "this xell changes the SCHEMA"     → db-clone: its own DATABASE inside the shared dev
+//     postgres, cloned in seconds from a maintained template. Two xells doing DDL on the ONE
+//     shared dev db each tripped the other's /ooney schema gate (the gate diffs the xell's
+//     catalog against prod, and a shared catalog is shared blame) — a clone makes
+//     "my database = prod + MY migrations" checkable per xell.
 //
-// The db_coupling enum already had all three; only db-shared-dev was ever implemented, so
+// The db_coupling enum already had the first three; only db-shared-dev was ever implemented, so
 // db-isolated and db-shared-prod silently linked NOTHING and the xell had no database at all.
 //
 // SAFETY: db-shared-prod points a zee at LIVE PRODUCTION DATA. Nothing here is reversible by the
 // orchestrator — a bad UPDATE is a real outage. It is never a default, it must be asked for, and
 // the binding shouts about it (see bindingFor).
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
@@ -20,11 +25,14 @@ import { logline } from '../lib/logbus.js';
 import { computePorts } from './provision.js';
 import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
+import { execPsql, cloneInstanceFor, templateInstanceFor, upsertInstance, deleteInstance }
+  from './db-instances.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 export const DB_MODES = {
-  'db-shared-dev': 'the shared dev database (default) — other xells share it',
+  'db-shared-dev': 'the shared dev database (default) — other xells share it; its SCHEMA is frozen (write migrations instead)',
+  'db-clone': 'its OWN database inside the shared dev postgres, cloned in seconds from a maintained template — for xells doing schema/migration work',
   'db-shared-prod': 'the LIVE PRODUCTION database — writes are real and irreversible',
   'db-isolated': 'its own postgres container, restored from a dump (e.g. the latest prod backup)',
 };
@@ -65,6 +73,153 @@ async function sharedDb(projectId, tier) {
   return one(
     `SELECT * FROM container WHERE project_id=$1 AND role='db' AND tier=$2 AND isolation='shared' LIMIT 1`,
     [projectId, tier]);
+}
+
+// ── db-clone: a per-xell DATABASE inside the shared dev postgres ──────────────
+//
+// CREATE DATABASE … TEMPLATE is a file-level copy: schema AND data, in seconds, zero extra
+// containers. The catch is postgres refuses to copy a database with active connections — which
+// the live shared dev db always has — so the source of clones is a maintained TEMPLATE database
+// (<db>_zeehive_tpl), rebuilt from the live db via an in-container pg_dump|psql (slow, but
+// tolerant of connections) and kept datallowconn=false so nothing can ever sit on it.
+//
+// Every database this section creates or drops is a db_instance ROW too (migration 019) — the
+// container's card can then say what it contains, and discovery can catch what leaked.
+
+// `docker exec <c> sh -c <cmd>` — for the pg_dump|psql pipe, which must run INSIDE the container
+// (no network transfer, and the versions match by construction). Never rejects.
+function dockerSh(ctx, container, cmd, timeout = 1800000) {
+  return new Promise((res) => {
+    let out = '', err = '', child;
+    try { child = spawn('docker', ['--context', ctx, 'exec', '-i', container, 'sh', '-c', cmd], { windowsHide: true }); }
+    catch (e) { return res({ ok: false, out: '', err: String(e?.message || e) }); }
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, timeout);
+    child.stdout?.on('data', (d) => { out += d; });
+    child.stderr?.on('data', (d) => { err += d; });
+    child.on('error', (e) => { clearTimeout(t); res({ ok: false, out, err: String(e?.message || e) }); });
+    child.on('close', (code) => { clearTimeout(t); res({ ok: code === 0, out, err }); });
+  });
+}
+
+function projectDbId(project) {
+  return {
+    user: project.db_user || config.prodDbUser || 'postgres',
+    name: project.db_name || config.prodDbName || 'omnibiz',
+  };
+}
+
+// A postgres identifier from the slug: zee_<slug>, [a-z0-9_] only, inside the 63-char limit.
+// Recorded as a db_instance row at creation, so a later xell RENAME cannot orphan the database.
+export function cloneDbNameFor(slug) {
+  const base = String(slug || '').toLowerCase().replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '').slice(0, 55);
+  return `zee_${base || 'xell'}`;
+}
+
+const tplName = (dbid) => `${dbid.name}_zeehive_tpl`;
+const TPL_MAX_AGE_MS = Number(process.env.CLONE_TPL_MAX_AGE_MS) || 6 * 3600 * 1000;
+const TPL_BUILD_TIMEOUT_MS = Number(process.env.CLONE_TPL_TIMEOUT_MS) || 1800000;
+
+// One rebuild per container at a time, in-process. Two dispatches racing would otherwise DROP
+// the template out from under each other's restore; the queenzee is a single process, so a Map
+// of in-flight promises is a sufficient mutex.
+const tplBuilds = new Map();
+
+// Ensure <db>_zeehive_tpl exists in the shared dev container and is younger than
+// CLONE_TPL_MAX_AGE_MS. Returns { tpl, rebuilt }.
+async function ensureCloneTemplate(project, devC) {
+  const dbid = projectDbId(project);
+  const tpl = tplName(dbid);
+  if (MODE !== 'real') return { tpl, rebuilt: false };
+
+  const inflight = tplBuilds.get(devC.id);
+  if (inflight) return inflight;
+
+  const run = (async () => {
+    const ctx = devC.docker_ctx;
+    const real = resolveRealDbContainer(ctx, devC.name);
+    const have = await execPsql(ctx, real, dbid.user, `SELECT 1 FROM pg_database WHERE datname='${tpl}'`);
+    const inst = await templateInstanceFor(devC.id);
+    const fresh = inst?.refreshed_at && (Date.now() - new Date(inst.refreshed_at).getTime()) < TPL_MAX_AGE_MS;
+    if (have.ok && have.out.trim() === '1' && fresh) return { tpl, rebuilt: false };
+
+    logline('xell-db', `rebuilding clone template ${tpl} from ${dbid.name} in ${real} — `
+      + 'in-container pg_dump|psql (slow is fine; clones from it are seconds)');
+    // FORCE kicks any straggler connection; the template is never anyone's working database.
+    let r = await execPsql(ctx, real, dbid.user, `DROP DATABASE IF EXISTS "${tpl}" WITH (FORCE)`);
+    if (!r.ok) throw new Error(`template drop failed: ${r.err.trim().slice(-200)}`);
+    r = await execPsql(ctx, real, dbid.user, `CREATE DATABASE "${tpl}"`);
+    if (!r.ok) throw new Error(`template create failed: ${r.err.trim().slice(-200)}`);
+    // No ON_ERROR_STOP here: a plain-SQL dump of an extension-bearing db (postgis) emits a few
+    // harmless permission/comment errors. The emptiness check below is the real verdict.
+    r = await dockerSh(ctx, real,
+      `pg_dump -U ${dbid.user} -d ${dbid.name} | psql -q -U ${dbid.user} -d ${tpl}`, TPL_BUILD_TIMEOUT_MS);
+    if (!r.ok) throw new Error(`template restore failed: ${r.err.trim().slice(-300)}`);
+    const count = await execPsql(ctx, real, dbid.user,
+      `SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')`,
+      { db: tpl });
+    if (!count.ok || Number(count.out.trim()) === 0) {
+      throw new Error(`template ${tpl} came out EMPTY — refusing to clone from it (${count.err.trim().slice(-160)})`);
+    }
+    // datallowconn=false: nobody can connect to it, so CREATE DATABASE … TEMPLATE always works.
+    await execPsql(ctx, real, dbid.user, `UPDATE pg_database SET datallowconn=false WHERE datname='${tpl}'`);
+
+    await upsertInstance({ containerId: devC.id, name: tpl, kind: 'template', refreshed: true });
+    logline('xell-db', `clone template ${tpl} rebuilt (${count.out.trim()} tables)`);
+    return { tpl, rebuilt: true };
+  })();
+
+  tplBuilds.set(devC.id, run);
+  try { return await run; } finally { tplBuilds.delete(devC.id); }
+}
+
+// Give a xell its own database inside the shared dev container. Idempotent: an existing clone is
+// KEPT (it holds the zee's work — re-attach must not silently reset it). Returns
+// { target: <shared dev container row>, dbname }.
+async function provisionCloneDb({ project, xell }) {
+  const devC = await sharedDb(project.id, 'dev');
+  if (!devC) throw new Error('no shared dev db container registered for this project');
+  const dbid = projectDbId(project);
+  const existing = await cloneInstanceFor(xell.id);
+  const dbname = existing?.name || cloneDbNameFor(xell.slug);
+
+  if (MODE === 'real') {
+    const ctx = devC.docker_ctx;
+    const real = resolveRealDbContainer(ctx, devC.name);
+    const have = await execPsql(ctx, real, dbid.user, `SELECT 1 FROM pg_database WHERE datname='${dbname}'`);
+    if (!(have.ok && have.out.trim() === '1')) {
+      const { tpl } = await ensureCloneTemplate(project, devC);
+      const r = await execPsql(ctx, real, dbid.user,
+        `CREATE DATABASE "${dbname}" TEMPLATE "${tpl}"`, { timeout: 300000 });
+      if (!r.ok) throw new Error(`clone create failed: ${r.err.trim().slice(-200)}`);
+      logline('xell-db', `${xell.slug} → cloned its own database ${dbname} from ${tpl} (file-level copy)`);
+    }
+  }
+
+  await upsertInstance({ containerId: devC.id, name: dbname, kind: 'clone',
+                         ownerXellId: xell.id, refreshed: !existing });
+  return { target: devC, dbname };
+}
+
+// Teardown's half: drop the xell's clone database, if it ever had one. Best-effort — the reaper
+// logs a failure and moves on; a leaked database stays ON THE BOOKS as an instance row (orphan),
+// so it costs disk visibly instead of silently.
+export async function dropCloneDb(xell) {
+  const inst = await cloneInstanceFor(xell.id);
+  if (!inst) return { ok: true, skipped: true };
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  const devC = await one(`SELECT * FROM container WHERE id=$1`, [inst.container_id]);
+  if (!project || !devC) return { ok: false, error: 'no project/db container to drop from' };
+  if (MODE === 'real') {
+    const dbid = projectDbId(project);
+    const real = resolveRealDbContainer(devC.docker_ctx, devC.name);
+    const r = await execPsql(devC.docker_ctx, real, dbid.user,
+      `DROP DATABASE IF EXISTS "${inst.name}" WITH (FORCE)`);
+    if (!r.ok) return { ok: false, error: r.err.trim().slice(-200) };
+  }
+  await deleteInstance(inst.container_id, inst.name);
+  logline('xell-db', `dropped clone database ${inst.name} (${xell.slug} torn down)`);
+  return { ok: true };
 }
 
 // Provision a per-xell postgres and restore `dump` into it. Uses the SAME image as the source db
@@ -194,6 +349,10 @@ export async function dbAccessForCwd(cwd) {
   return {
     xell: { slug: xell.slug, db_coupling: xell.db_coupling },
     db_container: db ? resolveRealDbContainerCached(db.docker_ctx, db.name) : null,
+    // db-clone: the container is shared, but THIS database inside it is the xell's own.
+    database: xell.db_coupling === 'db-clone'
+      ? (await cloneInstanceFor(xell.id))?.name || null
+      : null,
     db_containers: dbNames,
     docker_ctx: db?.docker_ctx || null,
     // Only a xell a human deliberately pointed at prod may touch prod data.
@@ -221,7 +380,7 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
   if (xell.is_production) throw new Error('production xell — refusing to re-point its database');
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
 
-  let target = null, mode = coupling || null, snapshot = null;
+  let target = null, mode = coupling || null, snapshot = null, cloneName = null;
 
   if (container) {
     target = await one(`SELECT * FROM container WHERE role='db' AND (name=$1 OR id::text=$1)`, [String(container)]);
@@ -230,6 +389,10 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
   } else if (mode === 'db-shared-prod') {
     target = await sharedDb(project.id, 'prod');
     if (!target) throw new Error('no prod db container registered for this project');
+  } else if (mode === 'db-clone') {
+    const r = await provisionCloneDb({ project, xell });
+    target = r.target;
+    cloneName = r.dbname;
   } else if (mode === 'db-isolated') {
     if (dump) {
       if (String(dump) === 'latest') {
@@ -261,10 +424,10 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
   const row = await one(`UPDATE xell SET db_coupling=$2::db_coupling WHERE id=$1 RETURNING *`, [xellId, mode]);
   broadcast('xell', row);
 
-  logline('xell-db', `${xell.slug} → ${mode} (${target.name})`
+  logline('xell-db', `${xell.slug} → ${mode} (${target.name}${cloneName ? ` / ${cloneName}` : ''})`
     + (snapshot ? ` restored from ${snapshot.dump_path}` : '')
     + (mode === 'db-shared-prod' ? '  ⚠ LIVE PRODUCTION DATA' : ''));
 
-  return { coupling: mode, container: target.name, container_id: target.id,
+  return { coupling: mode, container: target.name, container_id: target.id, database: cloneName,
            restored_from: snapshot?.dump_path || null, prod: mode === 'db-shared-prod' };
 }

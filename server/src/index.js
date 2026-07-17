@@ -8,6 +8,7 @@ import { startMaintenance } from './queenzee/maintenance.js';
 import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
 import { startProdDiff } from './queenzee/proddiff.js';
+import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { startLandReaper } from './queenzee/landgate.js';
@@ -67,5 +68,6 @@ app.listen(config.port, () => {
   startLandReaper();
   startImageJanitor();
   startProdDiff();
+  startDbCloneWatch();
 });
 export { app };

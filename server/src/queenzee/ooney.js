@@ -152,13 +152,25 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
         + `migration(s) ride this ship and are applied BEFORE the containers build: `
         + `${ddl.join(', ')}. The human sees them on the ship request.`));
     } else {
+      // ATTRIBUTION matters here. On the SHARED dev db the drift may not even be this xell's —
+      // it is the union of every xell's leftovers, which is exactly why schema work now happens
+      // on per-xell clones. Say which situation the zee is in instead of one generic scolding.
+      const onShared = xell.db_coupling === 'db-shared-dev';
       return deny(gate('schema', 'deny',
         `Your database schema DIFFERS from production (${diff.total} difference(s) — ${kinds}) and NO `
         + `pending migration accounts for it. Your code was verified against a schema prod will not `
         + `have. Write the change as a file under server/sql/migrations/ (idempotent DDL — ADD COLUMN `
         + `IF NOT EXISTS and friends), land it, and it ships with you: the queenzee applies it to prod `
         + `before the containers build. (One-time DATA fixes ride the same way from server/sql/ops/ — `
-        + `run once against prod, ledgered, never re-run.) Then re-run this check.`, diff));
+        + `run once against prod, ledgered, never re-run.) Then re-run this check.`
+        + (onShared
+          ? ` NOTE: your database is the SHARED dev db, so some of this drift may be other xells' or `
+            + `legacy leftovers — not yours to fix. Once a migration file exists on your branch the `
+            + `queenzee attaches your OWN clone database (db-clone) automatically; apply your files to `
+            + `it with \`node "${process.env.ZEEHIVE_HOME || 'D:/Repos/Zeehive'}/scripts/xell-db-migrate.mjs" ${xell.id}\` `
+            + `and this gate will then measure YOUR catalog, not the shared one. Never run DDL directly `
+            + `on the shared dev db — its schema is frozen.`
+          : ''), diff));
     }
   } else {
     steps.push(gate('schema', 'pass', 'tables, columns and triggers are identical to prod.'));
