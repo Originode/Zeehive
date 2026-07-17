@@ -6,7 +6,7 @@
 //   2. After a ship, the queenzee holds prod and counts down to auto-release. Silence must mean
 //      "let it go" — an unattended hold blocks every other xell. HOLD stops the clock for a human
 //      who is actively verifying.
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { decideShip, holdProdLock, forceReleaseProdLock } from './api.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
@@ -55,7 +55,28 @@ function ShipResults({ results }) {
   );
 }
 
-function ShipCard({ req, onDone }) {
+// The ship's OWN build feed, live while it deploys — its lane, not the shared terminal's
+// firehose. Follows the tail unless the human scrolls up to read something.
+function LiveBuildLog({ lines }) {
+  const boxRef = useRef(null);
+  const follow = useRef(true);
+  useEffect(() => {
+    const el = boxRef.current;
+    if (el && follow.current) el.scrollTop = el.scrollHeight;
+  }, [lines]);
+  if (!lines?.length) return null;
+  const onScroll = () => {
+    const el = boxRef.current;
+    if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  };
+  return (
+    <pre className="ship-live" ref={boxRef} onScroll={onScroll} data-testid="ship-live-log">
+      {lines.map((l) => `[${l.role}] ${l.line}`).join('\n')}
+    </pre>
+  );
+}
+
+function ShipCard({ req, live, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const pending = req.status === 'pending';
@@ -89,9 +110,11 @@ function ShipCard({ req, onDone }) {
       </div>
       {req.status === 'shipping' && (
         <div className="ship-progress">
-          ⟳ queenzee is deploying — it holds the prod lock. Watch the build live in the ▚ terminal.
+          ⟳ queenzee is deploying — it holds the prod lock.
+          {!live?.length && ' Build output appears here as it streams.'}
         </div>
       )}
+      {req.status === 'shipping' && <LiveBuildLog lines={live} />}
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
       {req.status === 'shipped' && <div className="ship-progress done">★ LIVE — shipped {req.finished_at ? `at ${new Date(req.finished_at).toLocaleTimeString()}` : ''}</div>}
       {req.status === 'failed' && <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>}
@@ -163,7 +186,7 @@ function LockCountdown({ lock, projectId, onChanged }) {
   );
 }
 
-export default function ShipPanel({ shipping, prodLock, projectId, onDecided }) {
+export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onDecided }) {
   const open = shipping || [];
   if (!open.length && !prodLock) return null;
   const pending = open.filter((s) => s.status === 'pending').length;
@@ -175,7 +198,7 @@ export default function ShipPanel({ shipping, prodLock, projectId, onDecided }) 
           : '⇪ production'}
       </div>
       <LockCountdown lock={prodLock} projectId={projectId} onChanged={onDecided} />
-      {open.map((s) => <ShipCard key={s.id} req={s} onDone={onDecided} />)}
+      {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} onDone={onDecided} />)}
     </section>
   );
 }

@@ -220,10 +220,13 @@ async function runShip(shipId) {
     // ship.commit is the sha the HUMAN approved. Passing it (rather than letting the script say
     // "main") also means a main that moved between approval and build cannot smuggle in commits
     // nobody signed off on.
-    // Live-feed every build line to the logbus: the console's ▚ terminal is the human's window
-    // into a ship that is actually running. The full tail also lands on the request row below.
-    const r = await runScript(c, project.repo_root, ship.commit,
-      (line) => logline('ship', `[${c.role}] ${line}`));
+    // Live-feed every build line TWICE: to the logbus (the ▚ terminal firehose), and as a
+    // 'ship-log' event addressed to THIS ship — the request's own card renders that stream, so
+    // watching a deploy doesn't mean fishing its lines out of everything else the hive is saying.
+    const r = await runScript(c, project.repo_root, ship.commit, (line) => {
+      logline('ship', `[${c.role}] ${line}`);
+      broadcast('ship-log', { id: ship.id, role: c.role, line, ts: Date.now() });
+    });
 
     // Record what prod now RUNS — the same projection lib/build.js does for dev builds. A ship
     // used to skip this entirely, so a successful deploy left last_build_commit untouched and

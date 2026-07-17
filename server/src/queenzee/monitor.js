@@ -37,6 +37,17 @@ async function setActive(zee, active, source) {
 // ended (zee 'stopped') can still hold uncommitted work, and a past session reaped Mark's live
 // DTR zee exactly this way. So: never release a xell that has anything to lose. Unlanded work is
 // a HUMAN's call (House rule 4) — we surface it and leave it alone.
+// Say it when it CHANGES, not every 12 seconds. The terminal was ~90% verbatim repeats of the
+// census and stale-claim lines — continuous housekeeping noise that drowned the lines that
+// actually carried news (a ship's build feed scrolled past in it). The map remembers the last
+// thing said per key; an identical line is silence, a changed one logs.
+const lastSaid = new Map();
+function logChanged(key, msg) {
+  if (lastSaid.get(key) === msg) return;
+  lastSaid.set(key, msg);
+  logline('monitor', msg);
+}
+
 async function reclaimStaleClaims() {
   const stale = await q(
     `SELECT x.id, x.slug, x.worktree_path, x.project_id
@@ -50,6 +61,12 @@ async function reclaimStaleClaims() {
         AND EXISTS (SELECT 1 FROM zee z WHERE z.xell_id = x.id)
         AND (SELECT z.status FROM zee z WHERE z.xell_id = x.id
               ORDER BY z.created_at DESC LIMIT 1) IN ('errored','stopped')`);
+  // A claim that stops being stale (resumed, or Marked done) must be able to log again if it
+  // ever goes stale anew — forget the silenced lines of everything not in this batch.
+  const staleKeys = new Set(stale.map((x) => `stale:${x.slug}`));
+  for (const k of lastSaid.keys()) {
+    if (k.startsWith('stale:') && !staleKeys.has(k)) lastSaid.delete(k);
+  }
   if (!stale.length) return 0;
 
   let freed = 0;
@@ -65,13 +82,13 @@ async function reclaimStaleClaims() {
     // workspace mid-job, so it no longer tries; it says what it sees and a human decides. (A past
     // session's automation reaped a live DTR zee — House rule 2 exists because of it.)
     if (!x.worktree_path || !existsSync(x.worktree_path)) {
-      logline('monitor',
+      logChanged(`stale:${x.slug}`,
         `stale claim ${x.slug}: zee is gone and its worktree is missing from disk. Not touching it — `
         + 'if it is finished, Mark done releases it.');
       continue;
     }
     const d = worktreeDiff(x.worktree_path, src);
-    logline('monitor',
+    logChanged(`stale:${x.slug}`,
       `stale claim ${x.slug}: zee is gone (${d.ahead} commit(s) unlanded, ${d.dirty} dirty file(s)). `
       + 'Not touching it — resume it, or Mark done when it is finished.');
   }
@@ -91,7 +108,7 @@ export async function monitorTick() {
   // This line used to say "housekeeping" while doing nothing but counting — which is how a leak
   // sat in plain sight for hours: the census cheerfully reported a dead xell as "busy".
   const freed = await reclaimStaleClaims().catch((e) => { console.error('[monitor] reclaim:', e.message); return 0; });
-  logline('monitor', `census: ${zees.length} live zee(s) · xells ${cen.busy} busy / ${cen.ready} ready · prod ${cen.prod}`
+  logChanged('census', `census: ${zees.length} live zee(s) · xells ${cen.busy} busy / ${cen.ready} ready · prod ${cen.prod}`
     + (freed ? ` · reclaimed ${freed} stale claim(s)` : ''));
   if (!zees.length) return { checked: 0, freed };
 
@@ -106,7 +123,7 @@ export async function monitorTick() {
   // codebase already paid for twice: the ETIMEDOUT that took the pool loops down, and the crashed
   // prod-guard that failed open. No answer = no verdict; skip the pass and say so.
   if (local.length) {
-    const agents = listActiveAgents();
+    const agents = await listActiveAgents();
     if (!agents.ok) {
       logline('monitor', `agents-json unreadable (${agents.error || 'unknown'}) — skipping liveness pass; `
         + 'nobody gets marked dead on a failed reading');
@@ -120,13 +137,13 @@ export async function monitorTick() {
 
   // remote: one `claude remote list`, then per-session status if needed
   if (remote.length) {
-    const rl = remoteList();
+    const rl = await remoteList();
     const activeRefs = new Set((rl.sessions || []).map((s) => s.id || s.sessionId || s.name).filter(Boolean));
     for (const z of remote) {
       let active = false;
       const key = z.claude_session_id || z.remote_ref;
       if (rl.ok && key) active = activeRefs.has(key);
-      else if (!rl.ok && key) active = remoteStatus(key).active; // fallback per-session probe
+      else if (!rl.ok && key) active = (await remoteStatus(key)).active; // fallback per-session probe
       await setActive(z, active, rl.ok ? 'remote-list' : 'remote-status');
     }
   }

@@ -37,6 +37,7 @@ export default function App() {
   const [diffs, setDiffs] = useState({});
   const [dismissed, setDismissed] = useState({});
   const [logs, setLogs] = useState([]);
+  const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
 
@@ -113,7 +114,9 @@ export default function App() {
       onSnapshot: (f) => { applyFleet(f); setConn('live'); },
       onChange: refresh,
       onStatus: setConn,
-      onLog: (l) => setLogs((prev) => [...prev.slice(-499), l]),
+      onLog: (l) => setLogs((prev) => [...prev.slice(-1999), l]),
+      // Per-ship build feed, keyed by ship id, capped so a chatty build can't eat the tab.
+      onShipLog: (l) => setShipLogs((prev) => ({ ...prev, [l.id]: [...(prev[l.id] || []).slice(-399), l] })),
     });
     return unsub;
   }, [projectId, refresh, applyFleet]);
@@ -242,7 +245,7 @@ export default function App() {
 
       {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
           both are decisions only a human may make, and both block a zee until made. */}
-      <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock}
+      <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock} shipLogs={shipLogs}
                  projectId={projectId || project.id} onDecided={refresh} />
 
       <BackupsPanel backup={fleet.backup} projectId={projectId || project.id} />

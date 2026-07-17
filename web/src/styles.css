@@ -441,6 +441,12 @@ a.cbox:hover { border-color: var(--accent); }
   background: var(--panel2); border-bottom: 1px solid var(--line); }
 .term-title { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text); }
 .term-x { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 14px; }
+.term-filters { display: flex; gap: 4px; flex-wrap: wrap; margin: 0 10px; flex: 1; justify-content: flex-end; }
+.term-chip { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+  padding: 1px 8px; font-family: 'Cascadia Code', monospace; font-size: 11px; cursor: pointer; }
+.term-chip.off { opacity: .35; }
+.term-chip.clear { color: var(--muted); }
+.term-chip:hover { border-color: var(--accent); }
 .term-x:hover { color: var(--text); }
 .term-body { flex: 1; overflow-y: auto; padding: 8px 12px; font-family: 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; }
 .term-line { display: flex; gap: 8px; padding: 1px 0; }
@@ -634,6 +640,9 @@ a.cbox:hover { border-color: var(--accent); }
 .ship-log pre { max-height: 320px; overflow: auto; background: #0b0e14; border: 1px solid var(--line);
   border-radius: 6px; padding: 8px 10px; margin: 6px 0 0; font-family: 'Cascadia Code', monospace;
   font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.ship-live { max-height: 260px; overflow: auto; background: #0b0e14; border: 1px solid var(--building);
+  border-radius: 6px; padding: 8px 10px; margin: 8px 0 0; font-family: 'Cascadia Code', monospace;
+  font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; color: var(--text); }
 
 /* the countdown bar: silence = release, so the clock is prominent and Hold is one click */
 .lock-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;

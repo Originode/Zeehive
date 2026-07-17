@@ -64,7 +64,7 @@ async function seedDemo() {
   // "● really active" AND the desktop deep-link opens a sensible session. Prefer THIS
   // Zeehive session (when it's live) over an arbitrary borrowed agent, so clicking the card
   // never hijacks an unrelated project's Claude session; fall back to any live agent, then a stub.
-  const live = listActiveAgents().agents.map((a) => a.sessionId);
+  const live = (await listActiveAgents()).agents.map((a) => a.sessionId);
   const self = process.env.CLAUDE_CODE_SESSION_ID;
   const realSid = (self && live.includes(self)) ? self : (live[0] || 'sess-local-2222bbbb');
   await attach(xells[1], {

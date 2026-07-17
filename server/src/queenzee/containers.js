@@ -2,7 +2,7 @@
 // probe lives in scripts/check-containers.sh (queenzee runs it, like provision/despawn); this
 // Node projector schedules it, maps the Docker state onto our container_health enum, and drives
 // the health dots live. Read-only; like the session monitor it trusts the tool, not a model.
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
@@ -13,9 +13,25 @@ import { logline } from '../lib/logbus.js';
 // where info = { state, xell, project, role } (the zeehive.* identity labels, null when the
 // container is unlabeled) and a null map means the daemon was unreachable (so we report
 // 'unknown', never a false 'down').
-function probeContexts(ctxs) {
+// ASYNC — this probe crosses the network (remote docker daemons over TCP) every 30 seconds, and
+// as a spawnSync it froze the whole event loop for the round-trip. Same clog class as the
+// monitor's CLI call; a periodic loop never gets to block the process it lives in.
+function runProbe(script, ctxs, timeout = 30000) {
+  return new Promise((res) => {
+    let child;
+    try { child = spawn('bash', [script, ...ctxs], { windowsHide: true }); }
+    catch (e) { return res({ stdout: '', error: String(e.message) }); }
+    let stdout = '';
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, timeout);
+    child.stdout?.on('data', (d) => (stdout += d));
+    child.on('error', () => { clearTimeout(t); res({ stdout }); });
+    child.on('close', () => { clearTimeout(t); res({ stdout }); });
+  });
+}
+
+async function probeContexts(ctxs) {
   const script = resolve(config.repoRoot, 'scripts', 'check-containers.sh');
-  const r = spawnSync('bash', [script, ...ctxs], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+  const r = await runProbe(script, ctxs);
   const byCtx = {};
   for (const ctx of ctxs) byCtx[ctx] = new Map();     // reachable-but-empty by default
   for (const line of (r.stdout || '').split('\n')) {
@@ -89,6 +105,8 @@ function matchState(psMap, c) {
 // Orphan memory: which labeled-but-unmodeled containers we've already reported, so the log
 // says it once per appearance instead of every 30-second tick.
 let knownOrphans = '';
+// Same discipline for the health summary line: repeat it only when it changes.
+let lastHealthLine = '';
 
 export async function checkContainers() {
   // project/xell identity rides along so labeled containers match exactly (sanitized project
@@ -105,7 +123,7 @@ export async function checkContainers() {
   // one script run over every distinct context (queenzee's deterministic probe). No early return
   // on empty — process roles (below) are probed by URL and exist without any docker rows.
   const psByCtx = containers.length
-    ? probeContexts([...new Set(containers.map((c) => c.docker_ctx))])
+    ? await probeContexts([...new Set(containers.map((c) => c.docker_ctx))])
     : {};
 
   let up = 0, down = 0, unknown = 0, changed = 0, busy = 0;
@@ -180,7 +198,11 @@ export async function checkContainers() {
   }
 
   const unreach = Object.entries(psByCtx).filter(([, m]) => m == null).map(([k]) => k);
-  logline('containers', `docker health: ${up} up · ${down} down · ${unknown} unknown${busy ? ` · ${busy} building (skipped)` : ''}${procs.length ? ` (incl. ${procs.length} process role(s) by URL)` : ''}${unreach.length ? ` (unreachable: ${unreach.join(', ')})` : ''}${changed ? ` · ${changed} changed` : ''}${orphans.length ? ` · ${orphans.length} ORPHANED` : ''}`);
+  // Change-only: this ran every 30s and said the same thing every 30s, which in a shared
+  // terminal is noise wearing a uniform. Note `changed` is part of the line, so any actual
+  // health movement always logs.
+  const healthLine = `docker health: ${up} up · ${down} down · ${unknown} unknown${busy ? ` · ${busy} building (skipped)` : ''}${procs.length ? ` (incl. ${procs.length} process role(s) by URL)` : ''}${unreach.length ? ` (unreachable: ${unreach.join(', ')})` : ''}${changed ? ` · ${changed} changed` : ''}${orphans.length ? ` · ${orphans.length} ORPHANED` : ''}`;
+  if (healthLine !== lastHealthLine) { lastHealthLine = healthLine; logline('containers', healthLine); }
   return { up, down, unknown, changed, building: busy, unreachable: unreach, orphans };
 }
 

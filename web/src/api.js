@@ -102,13 +102,15 @@ export const draftProjectManifest = (projectId, write = false) => siteCall(`/api
 
 // Subscribe to /api/stream for the selected project. Calls onSnapshot(fleet) on the
 // initial snapshot and onChange() on every subsequent event (the app re-fetches on change).
-export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog }) {
+export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog }) {
   const es = new EventSource(`/api/stream${pq(projectId)}`);
   es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
   for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship']) {
     es.addEventListener(type, () => onChange());
   }
   if (onLog) es.addEventListener('log', (e) => onLog(JSON.parse(e.data)));
+  // Per-ship build feed ({id, role, line}) — rendered live on that ship's own card.
+  if (onShipLog) es.addEventListener('ship-log', (e) => onShipLog(JSON.parse(e.data)));
   es.onopen = () => onStatus?.('live');
   es.onerror = () => onStatus?.('reconnecting');
   return () => es.close();

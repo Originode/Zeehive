@@ -344,7 +344,7 @@ router.post('/pool/runtime', async (req, res) => {
 
 // ── monitoring: is a session REALLY active (per the claude CLI)? ──────────────
 router.post('/monitor/run', async (_req, res) => res.json(await monitorTick()));
-router.get('/monitor/remote', async (_req, res) => res.json(remoteAvailable()));
+router.get('/monitor/remote', async (_req, res) => res.json(await remoteAvailable()));
 
 // ── container health: is each container actually running (per `docker ps`)? ───
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
