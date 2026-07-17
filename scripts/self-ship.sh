@@ -31,7 +31,15 @@ if [ "$ROLE" = "webapp" ]; then emit true "noop-rides-with-server"; exit 0; fi
 # Detached restart helper. Grace period 3s: long enough for runShip to write 'shipped' and start
 # the lock countdown; short enough that the port frees before anyone notices. The new process
 # resumes anything the old one left mid-flight (recoverOrphanBuilds + recoverOrphanShips at boot).
+#
+# TWO LESSONS FROM 2026-07-17, both from a relaunch losing its parent's environment:
+#   1. Operational mode flags (PROVISION_MODE=real etc.) must live in .env — dotenv loads them at
+#      boot, so a bare `npm run server` cannot silently regress the queenzee to simulate. This
+#      script deliberately does NOT try to smuggle the dying process's env through; .env is truth.
+#   2. `bash` must resolve to GIT bash. A detached PowerShell inherits the SYSTEM PATH, where
+#      C:\Windows\system32\bash.exe (WSL, no distro) shadows Git bash — every provisioning script
+#      then fails with an empty error. Prepend Git's bin explicitly.
 SRCWIN="$(echo "$SRC" | sed 's|/|\\\\|g')"
-powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('Start-Sleep 3; Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }; Start-Sleep 1; Set-Location \"${SRCWIN}\"; npm run server')" >&2 \
+powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('Start-Sleep 3; Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }; Start-Sleep 1; \$env:Path = \"C:\Program Files\Git\bin;\" + \$env:Path; Set-Location \"${SRCWIN}\"; npm run server')" >&2 \
   && emit true "detached-restart" \
   || emit false "detach-failed"

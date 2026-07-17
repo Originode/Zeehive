@@ -25,7 +25,10 @@ emit() { # reason
 
 [ -e "$WT/.git" ] || { printf '{"reason":"no-worktree","head":"unknown","ahead":0,"behind":0}\n'; exit 0; }
 
-dirty="$(G status --porcelain 2>/dev/null | head -1)"
+# .zeehive.env is OUR OWN generated projection (emitXellEnv writes it into every worktree,
+# and it is not in the project's .gitignore) — counting it as dirt made the pool decommission
+# every freshly provisioned xell on the next tick, churning forever (2026-07-17).
+dirty="$(G status --porcelain -- ':(exclude).zeehive.env' 2>/dev/null | head -1)"
 behind="$(G rev-list --count "HEAD..$SRC" 2>/dev/null || echo 0)"
 ahead="$(G rev-list --count "$SRC..HEAD" 2>/dev/null || echo 0)"
 

@@ -4,8 +4,8 @@
 // (correctly-computed ports/names) with NO live side effects on the dev NAS.
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
 import { pool, q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
@@ -85,8 +85,27 @@ export async function emitXellEnv(xellId) {
   for (const [k, v] of Object.entries(spin.env || {})) lines.push(`${k}=${v}`);
   lines.push('');
 
-  const path = `${xell.worktree_path.replace(/\\/g, '/')}/.zeehive.env`;
+  const wt = xell.worktree_path.replace(/\\/g, '/');
+  const path = `${wt}/.zeehive.env`;
   writeFileSync(path, lines.join('\n'));
+
+  // Keep the projection out of git's sight WITHOUT touching the project's committed .gitignore:
+  // the repo-local exclude file (info/exclude, shared across this repo's worktrees) exists for
+  // exactly this class of machine-local artifact. Skipping this made land-xell.sh count every
+  // fresh xell as dirty and the pool decommissioned them in a loop (2026-07-17). Best-effort —
+  // land-xell.sh also excludes it explicitly as defense in depth.
+  try {
+    const r = spawnSync('git', ['-C', wt, 'rev-parse', '--path-format=absolute', '--git-path', 'info/exclude'],
+      { encoding: 'utf8', timeout: 10000, windowsHide: true });
+    const excl = r.status === 0 ? r.stdout.trim() : null;
+    if (excl) {
+      const cur = existsSync(excl) ? readFileSync(excl, 'utf8') : '';
+      if (!cur.split(/\r?\n/).includes('.zeehive.env')) {
+        mkdirSync(dirname(excl), { recursive: true });
+        writeFileSync(excl, `${cur}${cur && !cur.endsWith('\n') ? '\n' : ''}.zeehive.env\n`);
+      }
+    }
+  } catch { /* exclusion is a nicety; the projection itself matters more */ }
   return { ok: true, path, slug: xell.slug };
 }
 
