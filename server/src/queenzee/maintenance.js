@@ -170,10 +170,21 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
       const dump = await execAsync('docker',
         ['--context', ctx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName, '-f', remoteTmp],
         { timeout: 1200000 });
-      if (dump.status !== 0) throw new Error(`pg_dump of ${container}/${dbName} failed: ${(dump.stderr || '').slice(-300)}`);
+      if (dump.status !== 0) {
+        throw new Error(`pg_dump of ${container}/${dbName} failed (exit ${dump.status}): `
+          + `${((dump.stderr || dump.stdout) || '(no output)').slice(-300)}`);
+      }
       const cp = await execAsync('docker', ['--context', ctx, 'cp', `${container}:${remoteTmp}`, fullPath], { timeout: 1200000 });
-      if (cp.status !== 0) throw new Error(`docker cp failed: ${(cp.stderr || '').slice(-300)}`);
+      // rm the in-container dump WHATEVER the cp did — the rm used to run only after a good cp,
+      // so every failed copy leaked ~870MB into the container's writable layer (16 dumps / 13GB
+      // found in prod's /tmp on 2026-07-17, overlay at 86%).
       await execAsync('docker', ['--context', ctx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
+      if (cp.status !== 0) {
+        // stderr AND stdout: a day of "docker cp failed: " with the real complaint discarded is
+        // a day of debugging the wrong thing. exit -1 = the child errored/was killed (timeout).
+        throw new Error(`docker cp failed (exit ${cp.status}): `
+          + `${((cp.stderr || cp.stdout) || '(no output)').slice(-300)}`);
+      }
       try { size = statSync(fullPath).size; } catch { size = null; }
     } else {
       await wait(SIM_BACKUP_MS);   // simulate: hold 'running' briefly so the spinner is visible
