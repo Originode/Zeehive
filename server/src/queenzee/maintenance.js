@@ -81,6 +81,39 @@ async function clearBusy(containerId) {
   return row;
 }
 
+// ── prod is IN USE → no backups ───────────────────────────────────────────────
+// A pg_dump is not a free observer: it holds ACCESS SHARE on every table for the whole dump, so
+// a ship's migration (ACCESS EXCLUSIVE ALTERs) wedges behind a long dump — and a dump taken
+// mid-ship or mid-data-fix preserves a half-finished job as if it were a good restore point.
+// So prod is off-limits to backups while EITHER:
+//   • the prod deploy lock is held (a ship is deploying, or its verification window is open), or
+//   • a live work xell is BOUND to the prod database (db-shared-prod — a human-granted
+//     hotfix/data binding; it may write at any moment while it holds that coupling).
+// Returns the human-readable reason, or null when prod is free.
+export async function prodBusyReason(projectId) {
+  const lock = await one(
+    `SELECT dl.phase, x.slug FROM deploy_lock dl LEFT JOIN xell x ON x.id = dl.xell_id
+      WHERE dl.project_id=$1 AND dl.container='prod'`, [projectId]);
+  if (lock) {
+    return `the prod deploy lock is held${lock.slug ? ` by ${lock.slug}` : ''}`
+      + `${lock.phase ? ` (${lock.phase})` : ''}`;
+  }
+  // NOT is_production: the production pseudo-xell IS prod — only a work xell pointed at prod
+  // (via /xell-prod or --db shared-prod) counts as someone operating on it. And only while a
+  // zee is actually IN there (live zee row): a binding whose zee stopped days ago is a parked
+  // grant, not an operation — blocking on it would silently stop backups forever (found live on
+  // day one: pautang-express held db-shared-prod with a zee stopped since the day before).
+  const bound = await one(
+    `SELECT x.slug FROM xell x
+      WHERE x.project_id=$1 AND x.status <> 'retired' AND NOT x.is_production
+        AND x.db_coupling='db-shared-prod'
+        AND EXISTS (SELECT 1 FROM zee z WHERE z.xell_id = x.id
+                      AND z.status IN ('spawning','online','working','idle'))
+      LIMIT 1`, [projectId]);
+  if (bound) return `xell ${bound.slug} is bound to the prod database (db-shared-prod) with a live zee`;
+  return null;
+}
+
 // ── BACKUP ────────────────────────────────────────────────────────────────────
 // Kick off an async prod backup: create the 'running' row, flag the prod db container busy, and
 // return immediately. The dump/copy runs in the background (runBackupJob) and finalizes the row.
@@ -91,6 +124,12 @@ export async function backupProd(projectId) {
   const running = await one(
     `SELECT id FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='running' LIMIT 1`, [projectId]);
   if (running) throw new Error('a backup is already running');
+  // prod in use → refuse (manual click or scheduler alike); the scheduler defers and retries
+  const busy = await prodBusyReason(projectId);
+  if (busy) {
+    throw new Error(`prod backup refused: ${busy} — a dump would contend with live prod work `
+      + '(pg_dump locks every table for its duration). It runs automatically once prod is released.');
+  }
 
   const pool = await one(`SELECT backup_dir, max_backups FROM pool_config WHERE project_id=$1`, [projectId]);
   const dir = backupDirFor(pool);
@@ -342,13 +381,27 @@ export function startMaintenance() {
     return null;
   }
   console.log(`[queenzee] maintenance scheduler armed (mode=${MODE}, tick=${config.maintTickMs}ms)`);
+  // Deferral memory: reason we last logged per project, so a held lock logs ONCE when the
+  // deferral starts and once when prod frees up — not every 60s tick in between.
+  const deferred = new Map();
   const tick = async () => {
     try {
       const projects = await q(`SELECT id FROM project`);
       for (const p of projects) {
-        if (await backupDue(p.id)) await backupProd(p.id).catch((e) => {   // starts an async job; may no-op if one runs
-          if (!/already running/.test(e.message)) throw e;
-        });
+        if (await backupDue(p.id)) {
+          const busy = await prodBusyReason(p.id);
+          if (busy) {
+            if (deferred.get(p.id) !== busy) {
+              deferred.set(p.id, busy);
+              logline('maint', `prod backup DEFERRED — ${busy}. It runs on the first tick after prod is released.`);
+            }
+          } else {
+            if (deferred.delete(p.id)) logline('maint', 'prod is free again — running the deferred backup now');
+            await backupProd(p.id).catch((e) => {   // starts an async job; may no-op if one runs
+              if (!/already running/.test(e.message)) throw e;
+            });
+          }
+        }
         await refreshStaleXellDbs(p.id);
       }
     } catch (e) { console.error('[maintenance]', e.message); }
