@@ -14,6 +14,27 @@ export function hexVertices(cx, cy, size) {
   return out;
 }
 
+// "Assume an infinite maze": the honeycomb's cell lattice extends past the drawn hexes so a wire can
+// thread corridors through the empty gap between the graph and the honeycomb too. Generate the cell
+// centres of that lattice covering `bbox`, aligned to an anchor cell (any real hex centre) — pointy-
+// top axial tiling with basis (√3·s, 0) and (√3·s/2, 1.5·s), which coincides with the offset grid.
+export function latticeCells(anchorX, anchorY, size, bbox, ids = 'v') {
+  const W = Math.sqrt(3) * size, H = 1.5 * size;
+  const cells = [];
+  const rMin = Math.floor((bbox.y0 - anchorY) / H) - 1;
+  const rMax = Math.ceil((bbox.y1 - anchorY) / H) + 1;
+  let n = 0;
+  for (let r = rMin; r <= rMax; r++) {
+    const rowX = anchorX + r * (W / 2);
+    const qMin = Math.floor((bbox.x0 - rowX) / W) - 1;
+    const qMax = Math.ceil((bbox.x1 - rowX) / W) + 1;
+    for (let q = qMin; q <= qMax; q++) {
+      cells.push({ id: `${ids}${n++}`, cx: rowX + q * W, cy: anchorY + r * H, size });
+    }
+  }
+  return cells;
+}
+
 // Build the shared vertex graph from a list of hexes ({id, cx, cy, size}). Coincident vertices of
 // adjacent hexes are merged by quantised key so the lattice is connected. Returns
 // { nodes: Map(key→{x,y}), adj: Map(key→Set(key)), vertsById: Map(id→[{x,y,key}]) }.

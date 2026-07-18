@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb } from './hex.js';
+import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
@@ -97,7 +97,14 @@ function cellNeighbors(row, col) {
   ];
 }
 
-export default function HiveCanvas({ xells, diffs, timeline, onOpenSession, machines,
+// Connector wires thread the corridors BETWEEN hexes, so the honeycomb is drawn spaced: each hex is
+// shrunk inside its (gapless) layout cell to open a gap wide enough for the traces that must pass —
+// sized by the grid dimension a wire fans across (columns in portrait, rows in landscape). The
+// routing lattice (<Connectors>) still uses the full CELL size so it stays connected; only the drawn
+// hex shrinks. WIRE_PITCH is the on-screen width one trace needs (stroke + clearance).
+const WIRE_PITCH = 6;
+
+export default function HiveCanvas({ xells, diffs, timeline, orientation, onOpenSession, machines,
                                     expandedId, onExpand, hexPosRef, onGeometry }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
@@ -136,7 +143,13 @@ export default function HiveCanvas({ xells, diffs, timeline, onOpenSession, mach
     // until the user pans/zooms). The git graph is a separate pane; nothing is reserved here.
     const pad = 14;
     const lay = layoutHoneycomb(list.length, w - pad * 2, h - pad * 2, { min: 24 });
-    const sizeHex = lay.size;
+    const cellSize = lay.size;                    // gapless layout cell → the routing lattice
+    // corridor gap: room for `count` traces to pass (cols in portrait, rows in landscape). Shrink the
+    // drawn hex within its cell to open it, but keep enough hex to stay legible.
+    const portrait = orientation === 'portrait';
+    const count = Math.max(1, portrait ? lay.cols : lay.rows);
+    const gap = count * WIRE_PITCH;
+    const drawSize = Math.max(cellSize * 0.5, cellSize - gap / SQRT3);   // shrink to open the gap
     const originX = pad, originY = pad;
     // base cell per xell (row-major, exactly layoutHoneycomb's shape)
     const baseCells = {};
@@ -170,8 +183,8 @@ export default function HiveCanvas({ xells, diffs, timeline, onOpenSession, mach
     }
     const hexes = list.map((x) => {
       const [row, col] = cells[x.id];
-      const [cx, cy] = cellCenter(row, col, sizeHex, originX, originY);
-      return { x, id: x.id, row, col, cx, cy, size: sizeHex, color: tById[x.id]?.color || null };
+      const [cx, cy] = cellCenter(row, col, cellSize, originX, originY);   // centres on the gapless grid
+      return { x, id: x.id, row, col, cx, cy, size: drawSize, cell: cellSize, color: tById[x.id]?.color || null };
     });
     const hexById = {}; for (const hx of hexes) hexById[hx.id] = hx;
 
@@ -186,25 +199,27 @@ export default function HiveCanvas({ xells, diffs, timeline, onOpenSession, mach
     geomRef.current.flower = null;
     if (expanded && cells[expanded.id]) {
       const [er, ec] = cells[expanded.id];
-      const centers = [cellCenter(er, ec, sizeHex, originX, originY),
-        ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, sizeHex, originX, originY))];
-      drawFlower(ctx, centers, sizeHex, expanded, diffs?.[expanded.id], machines);
-      geomRef.current.flower = { centers, size: sizeHex, id: expanded.id,
+      const centers = [cellCenter(er, ec, cellSize, originX, originY),
+        ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, cellSize, originX, originY))];
+      drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines);
+      geomRef.current.flower = { centers, size: cellSize, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
     }
 
-    // publish each hex's live CLIENT-space centre+radius so <Connectors> can anchor its wires here
-    // and re-route them as the honeycomb is panned/zoomed.
+    // publish each hex's live CLIENT-space geometry so <Connectors> can route its wires here and
+    // re-route on pan/zoom. `size` is the full CELL radius (the gapless routing lattice); `draw` is
+    // the shrunk drawn radius (the visible hex the corridors run between).
     if (hexPosRef) {
       const r = canvas.getBoundingClientRect();
       const pos = {};
       for (const hx of hexes) {
-        pos[hx.id] = { x: r.left + v.k * hx.cx + v.x, y: r.top + v.k * hx.cy + v.y, size: hx.size * v.k };
+        pos[hx.id] = { x: r.left + v.k * hx.cx + v.x, y: r.top + v.k * hx.cy + v.y,
+          size: hx.cell * v.k, draw: hx.size * v.k };
       }
       hexPosRef.current = pos;
     }
     onGeometry && onGeometry();
-  }, [size, xells, diffs, timeline, expandedId, hoverId, expanded, machines, hexPosRef, onGeometry]);
+  }, [size, xells, diffs, timeline, orientation, expandedId, hoverId, expanded, machines, hexPosRef, onGeometry]);
 
   useLayoutEffect(() => { draw(); }, [draw]);
 

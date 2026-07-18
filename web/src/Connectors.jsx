@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useLayoutEffect, useEffect } from 'react';
-import { buildHexGraph, shortestPath, nearestVertex, nearestNode } from './hive/maze.js';
+import { buildHexGraph, shortestPath, nearestVertex, nearestNode, latticeCells } from './hive/maze.js';
 
 // SVG overlay spanning the whole hive-split. For each xell it draws a colored wire from the xell's
 // commit dot in the centre <GraphPane> (the point in history it sits at) to that xell's hexagon in
@@ -26,34 +26,50 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     const portrait = orientation === 'portrait';
     const f1 = (n) => n.toFixed(1);
 
-    // the honeycomb lattice (cont-relative), rebuilt from live hex positions every frame
-    const hexes = Object.entries(hexPos).map(([id, hp]) => ({ id, cx: hp.x - cr.left, cy: hp.y - cr.top, size: hp.size || 20 }));
-    const graph = buildHexGraph(hexes);
+    // real hexes (cont-relative). `size` is the full CELL radius — the routing lattice is gapless and
+    // connected even though the drawn hexes are shrunk, so wires run in the corridors between them.
+    const realHexes = Object.entries(hexPos).map(([id, hp]) => ({ id, cx: hp.x - cr.left, cy: hp.y - cr.top, size: hp.size || 20 }));
+    if (!realHexes.length) { setPaths([]); return; }
+    const cellSize = realHexes[0].size;
 
-    const items = [];
+    // pre-measure the commit dots so the virtual lattice can span from the graph out to the honeycomb
+    const dots = [];
     for (const x of (timeline.xells || [])) {
       const dot = cont.querySelector(`[data-commit="${x.base_commit}"][data-dot]`);
-      const hp = hexPos[x.id];
-      const verts = graph.vertsById.get(x.id);
-      if (!dot || !hp || !verts) continue;
+      if (!dot || !hexPos[x.id]) continue;
       const n = dot.getBoundingClientRect();
-      const dcx = (n.left + n.right) / 2 - cr.left;
-      const dcy = (n.top + n.bottom) / 2 - cr.top;
+      dots.push({ id: x.id, base: x.base_commit, color: x.color,
+        dx: (n.left + n.right) / 2 - cr.left, dy: (n.top + n.bottom) / 2 - cr.top });
+    }
+
+    // "infinite maze": tile invisible cells across the bbox of the dots + honeycomb (+ margin) so a
+    // wire threads corridors through the empty gap too, never a free diagonal.
+    const xs = realHexes.map((h) => h.cx).concat(dots.map((d) => d.dx));
+    const ys = realHexes.map((h) => h.cy).concat(dots.map((d) => d.dy));
+    const M = cellSize * 1.5;
+    const bbox = { x0: Math.min(...xs) - M, y0: Math.min(...ys) - M, x1: Math.max(...xs) + M, y1: Math.max(...ys) + M };
+    const virtual = latticeCells(realHexes[0].cx, realHexes[0].cy, cellSize, bbox);
+    const graph = buildHexGraph(realHexes.concat(virtual));
+
+    const items = [];
+    for (const dd of dots) {
+      const verts = graph.vertsById.get(dd.id);
+      if (!verts) continue;
+      const { dx: dcx, dy: dcy } = dd;
       // aim at the vertex of the target hex closest to the commit head (the dot)
       const target = nearestVertex(verts, dcx, dcy);
       let d, ex = target.x, ey = target.y;
 
-      if (prodIds.includes(x.id)) {
+      if (prodIds.includes(dd.id)) {
         // straight wire to that vertex (kept ⟂ by the graph tracking the prod-hex median)
         d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;
       } else {
-        // Lead-in obeys the rule even in the open gap: leave the graph PERPENDICULAR, then a 90°
-        // turn runs along the honeycomb face to the entrance vertex — no free diagonal. Then thread
-        // the hex maze inside to the target vertex.
+        // leave the graph PERPENDICULAR, a 90° turn onto the lattice, then thread the (infinite)
+        // corridor maze to the target — no free diagonal anywhere.
         const entryKey = nearestNode(graph, dcx, dcy);
         const path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
         if (path && path.length) {
-          const e0 = path[0];                                   // entrance vertex
+          const e0 = path[0];                                   // entry vertex on the lattice
           const corner = portrait ? [dcx, e0.y] : [e0.x, dcy];  // ⟂ off the spine, then 90° turn
           const poly = [[dcx, dcy], corner, ...path.map((p) => [p.x, p.y])];
           d = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
@@ -61,8 +77,8 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
           d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;   // disconnected fallback: straight
         }
       }
-      items.push({ id: x.id, color: x.color, d, x1: dcx, y1: dcy, x2: ex, y2: ey,
-        dim: expandedId && expandedId !== x.id });
+      items.push({ id: dd.id, color: dd.color, d, x1: dcx, y1: dcy, x2: ex, y2: ey,
+        dim: expandedId && expandedId !== dd.id });
     }
     setPaths(items);
   }, [timeline, layoutRef, hexPosRef, orientation, honeySide, expandedId, prodIds.join(',')]);   // eslint-disable-line react-hooks/exhaustive-deps
