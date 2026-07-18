@@ -9,6 +9,27 @@
 #          then the queenzee runs on the host via the self-ship pattern.
 name: zeehive-prod
 services:
+  # The meta-DB — ZEEHIVE's single source of truth, LIVE on machine 'local' (migrated off
+  # ugreen-nas 2026-07-18: every Zeehive prod container belongs on the machine its prod site
+  # names, the meta-db included; and the queenzee that reads it runs on this host anyway, so
+  # colocating removes the network from every query). Port 5445 kept from the ugreen era so the
+  # DATABASE_URL only changes host. The data lives in the zeehive_db_data volume; the old ugreen
+  # container is kept STOPPED as a cold fallback of the pre-migration state.
+  db:
+    image: postgres:17-alpine
+    container_name: zeehive_db
+    restart: unless-stopped
+    ports: ["5445:5432"]
+    environment:
+      POSTGRES_USER: zeehive
+      POSTGRES_PASSWORD: zeehive
+      POSTGRES_DB: zeehive
+    volumes:
+      - zeehive_db_data:/var/lib/postgresql/data
+    labels:
+      zeehive.project: Zeehive
+      zeehive.role: db
+
   web:
     build: { context: ../.., dockerfile: docker/zeehive/Dockerfile.web }
     image: zeehive-web:prod
@@ -38,3 +59,4 @@ services:
 
 volumes:
   zeehive_repos:
+  zeehive_db_data:
