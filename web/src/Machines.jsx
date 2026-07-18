@@ -68,7 +68,11 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
       <span className="mx-corner" />
       {cols.map((col, i) => col.kind === 'machine'
         ? <MachineHead key={col.m.id} m={col.m} projectId={projectId}
-                       hasDevDb={all.some((c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared' && c.docker_ctx === col.m.docker_ctx)}
+                       // "no dev db" is only a warning for a project that USES one: a machine
+                       // can't be missing what the project has nowhere (Zeehive's spinoffs are
+                       // worktree-only — flagging every column taught the warning to be ignored).
+                       needsDevDb={all.some((c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared')
+                         && !all.some((c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared' && c.docker_ctx === col.m.docker_ctx)}
                        empty={!all.some((c) => ctxOf(c) === col.m.docker_ctx)}
                        onChanged={onChanged} />
         : <div key={`col-${i}`} className="mx-head elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them into a column">elsewhere</div>)}
@@ -92,7 +96,7 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
 
 // A machine's header: identity + the policy knobs, edited in place. Numbers commit on blur/Enter;
 // every change PATCHes and refreshes, so what you read is always the server's truth.
-function MachineHead({ m, projectId, hasDevDb, empty, onChanged }) {
+function MachineHead({ m, projectId, needsDevDb, empty, onChanged }) {
   const [busy, setBusy] = useState(false);
   const patch = async (p) => {
     setBusy(true);
@@ -162,7 +166,7 @@ function MachineHead({ m, projectId, hasDevDb, empty, onChanged }) {
           🔨
         </label>
       </div>
-      {m.dev_priority > 0 && !hasDevDb && (
+      {m.dev_priority > 0 && needsDevDb && (
         <button className="mx-devdb" data-testid={`mx-devdb-${m.key}`} disabled={busy} onClick={provisionDb}
                 title={`${m.key} is a dev spawn target but has NO shared dev db for this project — xells cannot spawn here until it does (their db must never live on another machine).`}>
           ⚠ no dev db — provision
