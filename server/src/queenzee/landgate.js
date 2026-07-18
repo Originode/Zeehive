@@ -82,11 +82,28 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
        ORDER BY requested_at DESC LIMIT 1`, [projectId, ref, newSha]);
 
   if (existing && existing.status === 'rejected') {
+    // A human said no to THIS sha. Auto-approve is a policy for UNJUDGED pushes; it must never
+    // resurrect something a human explicitly refused.
     logline('landgate', `DECLINED ${ref} → ${newSha.slice(0, 8)} on ${project.name} (previously rejected)`);
     return { allow: false, reason: 'rejected', request: existing };
   }
 
+  // Operator policy: when auto-approve is on, an unjudged push is let straight through. The push is
+  // already in flight (the hook is waiting on this answer), so returning allow:true lets THIS push
+  // move the ref — no update-ref, no re-entrancy. The row is recorded as landed-by-policy so the
+  // audit trail shows exactly what went in without a human. (Prior rejections are handled above.)
+  const auto = !!project.auto_approve_land;
+
   if (existing) {
+    if (auto) {
+      const row = await one(
+        `UPDATE land_request SET status='landed', attempts=attempts+1,
+            decided_at=now(), decided_by='auto-approve@policy', landed_at=now()
+           WHERE id=$1 RETURNING *`, [existing.id]);
+      broadcast('land', row);
+      logline('landgate', `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — auto-approve policy (no human review)`);
+      return { allow: true, reason: 'auto-approved', request: row };
+    }
     const row = await one(
       `UPDATE land_request SET attempts = attempts + 1 WHERE id=$1 RETURNING *`, [existing.id]);
     broadcast('land', row);
@@ -103,6 +120,21 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
   const stat = d
     ? { commits: commits.length, files: d.files, insertions: d.insertions, deletions: d.deletions }
     : { commits: commits.length };
+
+  if (auto) {
+    const row = await one(
+      `INSERT INTO land_request (project_id, xell_id, ref, old_sha, new_sha, commits, stat,
+          status, decided_at, decided_by, landed_at)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,'landed',now(),'auto-approve@policy',now()) RETURNING *`,
+      [projectId, xell?.id || null, ref, oldSha || null, newSha,
+        JSON.stringify(commits), stat ? JSON.stringify(stat) : null]);
+    broadcast('land', row);
+    broadcast('xell', { id: xell?.id });
+    logline('landgate',
+      `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
+      + `${xell?.slug || 'unknown'} (auto-approve policy, no human review)`);
+    return { allow: true, reason: 'auto-approved', request: row };
+  }
 
   const row = await one(
     `INSERT INTO land_request (project_id, xell_id, ref, old_sha, new_sha, commits, stat)

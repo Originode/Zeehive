@@ -338,6 +338,7 @@ const PATCHABLE = [
   'port_server_base', 'port_web_base', 'port_slot_mod',
   'db_name', 'db_user', 'ship_ref',
   'registry',   // OCI registry for split builds (compile on one docker context, run on another)
+  'auto_approve_land', 'auto_approve_ship',   // operator policy: skip the human gate (default off)
 ];
 
 export async function updateProject(id, body = {}) {

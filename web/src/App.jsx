@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
-         reapXell, pushXell, pullXell, prXell, acceptPull } from './api.js';
+         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject } from './api.js';
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import GitRail from './GitRail.jsx';
@@ -227,6 +227,7 @@ export default function App() {
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
         <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />
+        <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
@@ -294,6 +295,37 @@ function PoolTarget({ pool, projectId }) {
       <button className="step" onClick={() => set(n - 1)} disabled={n <= 0} aria-label="fewer">−</button>
       <b data-testid="pool-target">{n}</b>
       <button className="step" onClick={() => set(n + 1)} aria-label="more">＋</button>
+    </span>
+  );
+}
+
+// Operator policy: auto-approve landings and/or ships. Two independent switches — landing→main is
+// far lower stakes than shipping→prod, so they toggle separately. Enabling ships asks first (it
+// puts code LIVE with no human review). Reads the flags off the project row in the fleet snapshot.
+function AutoApprove({ project, projectId, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const set = async (field, checked) => {
+    if (field === 'auto_approve_ship' && checked
+      && !confirm('Auto-approve PRODUCTION ships?\n\nEvery ship request will deploy to prod immediately with NO human review. The queenzee still only builds landed work from main, but nobody signs off per ship.')) return;
+    setBusy(true);
+    try { await updateProject(projectId, { [field]: checked }); onChanged?.(); }
+    catch (e) { alert('Auto-approve change failed: ' + e.message); }
+    finally { setBusy(false); }
+  };
+  const Switch = ({ field, label, title, danger }) => (
+    <label className={`autoappr${project?.[field] ? ' on' : ''}${danger ? ' danger' : ''}`} title={title}>
+      <input type="checkbox" checked={!!project?.[field]} disabled={busy}
+             data-testid={`auto-${field}`} onChange={(e) => set(field, e.target.checked)} />
+      {label}
+    </label>
+  );
+  return (
+    <span className="autoappr-group" data-testid="auto-approve">
+      <span className="k">auto-approve:</span>
+      <Switch field="auto_approve_land" label="landings"
+              title="Automatically approve every push to main — the landing gate lets it through with no human review." />
+      <Switch field="auto_approve_ship" label="ships" danger
+              title="Automatically approve every production ship — code goes LIVE with no human review (still built from landed main)." />
     </span>
   );
 }

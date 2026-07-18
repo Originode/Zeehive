@@ -123,6 +123,18 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
        VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8) RETURNING *`,
     [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(mig.pending || []), shipSite?.id || null]);
   broadcast('ship', row);
+
+  // Operator policy: auto-approve ships for this project → the queenzee approves and deploys with
+  // no human in the loop. Still goes through the SAME decideShip → runShip path (lock, build from
+  // main, countdown) — nothing about the deploy itself is bypassed, only the human decision. The
+  // landed-work refusal above still applies, so an unlanded ship is refused even under auto-approve.
+  if (project.auto_approve_ship) {
+    logline('ship', `AUTO-APPROVING ship from ${xell.slug} @ ${String(commit).slice(0, 8)}`
+      + `${shipSite ? ` → site ${shipSite.key}` : ''} — auto-approve policy (no human review)`);
+    const approved = await decideShip(row.id, 'approved', 'auto-approve@policy');
+    return { ok: true, request: approved, note: 'auto-approved by policy — deploying' };
+  }
+
   logline('ship', `HELD ship request from ${xell.slug} @ ${String(commit).slice(0, 8)}`
     + `${shipSite ? ` → site ${shipSite.key}` : ''} — awaiting human approval`);
   notifyShipRequest({ project, xell, request: row });

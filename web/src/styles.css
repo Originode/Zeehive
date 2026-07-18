@@ -438,6 +438,16 @@ a.cbox:hover { border-color: var(--accent); }
 .pooltarget .step:hover:not(:disabled) { border-color: var(--accent); }
 .pooltarget .step:disabled { opacity: .35; cursor: not-allowed; }
 
+/* auto-approve policy switches (statusline) */
+.autoappr-group { margin-left: 18px; font-size: 14px; display: inline-flex; align-items: center; gap: 8px; }
+.autoappr-group .k { color: var(--muted); }
+.autoappr { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); cursor: pointer;
+  padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; user-select: none; }
+.autoappr input { cursor: pointer; margin: 0; }
+.autoappr.on { color: var(--text); border-color: var(--accent); }
+/* an armed prod-ship auto-approve is a standing risk — make it read as one */
+.autoappr.danger.on { color: #ffb4a2; border-color: #d9553b; background: rgba(217,85,59,.12); }
+
 .term-btn { margin-left: 12px; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
   font-family: 'Cascadia Code', monospace; font-size: 12px; padding: 2px 9px; border-radius: 6px; cursor: pointer; }
 .term-btn:hover { color: var(--text); border-color: var(--accent); }
