@@ -267,7 +267,7 @@ export default function App() {
       <section className="xells">
         {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu}
                                    landing={visible(landingByXell[x.id])} prs={visible(prsFor(x))}
-                                   ship={shipByXell[x.id]} onDismiss={dismiss}
+                                   ship={shipByXell[x.id]} onDismiss={dismiss} machines={fleet.machines}
                                    prodLock={fleet.prod_lock} projectId={projectId || project.id} />)}
         {xells.length === 0 && <p className="loading">No active xells. The pool maintainer will fill it shortly…</p>}
       </section>
@@ -356,9 +356,17 @@ function openProtocol(url) {
   a.remove();
 }
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
+
+  // WHERE this xell runs. Its stack is context-stamped per container; the machine is the one whose
+  // docker_ctx matches the SERVER container (the stack's anchor), falling back to any stack
+  // container that carries a ctx. No ctx anywhere → we don't know, so render no chip rather than
+  // guess. A ctx with no matching machine row still tells the truth: show the raw ctx.
+  const stackCtx = (x.stack.find((c) => c.role === 'server' && c.docker_ctx)
+    || x.stack.find((c) => c.docker_ctx))?.docker_ctx || null;
+  const machine = stackCtx ? (machines || []).find((m) => m.docker_ctx === stackCtx) : null;
   const clickable = !!x.viewer_url && !isProd;
   // Open the session in the right surface for its runtime: a claude.ai web session opens
   // in a browser tab; a local (desktop-protocol) session deep-links into Claude Desktop.
@@ -436,6 +444,14 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           naturally below and makes the overlap unrepresentable rather than tuned-around. */}
       <div className="cardtop">
         {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
+        {stackCtx && (
+          <span className="machinechip" data-testid="machine-chip"
+                title={machine
+                  ? `machine ${machine.key}${machine.label ? ` (${machine.label})` : ''} — ${machine.docker_ctx}@${machine.host_ip || '?'}`
+                  : `machine context ${stackCtx}`}>
+            ⌂ {machine ? machine.key : stackCtx}
+          </span>
+        )}
         <span className="cardtop-right">
           {/* The padlock is interactive: hover swaps it to an unlock icon, clicking asks before
               taking prod back. `held` (countdown cancelled) renders differently from a ship that is

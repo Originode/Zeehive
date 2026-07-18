@@ -356,6 +356,11 @@ a.cbox:hover { border-color: var(--accent); }
 .prodtag { font-size: 10px; letter-spacing: .04em; white-space: nowrap;
   background: rgba(229,85,78,.16); color: var(--down); border: 1px solid var(--down); padding: 1px 6px; border-radius: 20px; }
 
+/* WHERE the xell runs. Sits in .cardtop, same muted-border/small-font language as the other card
+   chips — it names a fact, not an action, so it stays quiet. */
+.machinechip { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: default;
+  font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+
 /* terminal button + modal */
 /* container build affordances */
 /* unbuilt buildable container → hammer INSIDE the box, in the bottom-right so it never
