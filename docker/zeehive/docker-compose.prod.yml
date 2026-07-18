@@ -1,0 +1,40 @@
+# ZEEHIVE production on machine 'local' (docker context desktop-linux).
+#
+#   docker --context desktop-linux compose -f docker/zeehive/docker-compose.prod.yml up -d --build web
+#
+# web    — LIVE: the production dashboard (built bundle behind nginx, /api proxied to the
+#          queenzee). This is what http://10.1.0.15:5180 serves.
+# server — EXPERIMENTAL (profile): the containerized queenzee. Builds today; goes live only
+#          after the repo migration to the Linux side (see Dockerfile.server header). Until
+#          then the queenzee runs on the host via the self-ship pattern.
+name: zeehive-prod
+services:
+  web:
+    build: { context: ../.., dockerfile: docker/zeehive/Dockerfile.web }
+    image: zeehive-web:prod
+    container_name: zeehive_web
+    restart: unless-stopped
+    ports: ["5180:5180"]
+    labels:
+      zeehive.project: Zeehive
+      zeehive.role: webapp
+
+  server:
+    profiles: ["experimental"]
+    build: { context: ../.., dockerfile: docker/zeehive/Dockerfile.server }
+    image: zeehive-server:prod
+    container_name: zeehive_server_ctr    # _ctr: never shadow the live host process's row name
+    restart: unless-stopped
+    ports: ["4701:4700"]                  # 4701 while experimental — the host queenzee owns 4700
+    environment:
+      DATABASE_URL: ${ZEEHIVE_DATABASE_URL:-}   # NEVER default to the live meta-DB: two queenzees
+                                                # reconciling one meta-DB reap each other's xells
+    volumes:
+      - zeehive_repos:/repos                        # the migrated project folders (Linux-native git)
+      - /var/run/docker.sock:/var/run/docker.sock   # the local daemon; TCP contexts for the rest
+    labels:
+      zeehive.project: Zeehive
+      zeehive.role: server
+
+volumes:
+  zeehive_repos:

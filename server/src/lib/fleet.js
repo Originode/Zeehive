@@ -45,6 +45,9 @@ export async function getFleet(projectId) {
     `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host_port, c.health,
             c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
             c.docker_ctx, c.build_ctx,
+            -- where a PROCESS role (docker_ctx NULL) lives: its site's context, so the machine
+            -- matrix can place it in the right column instead of 'elsewhere'
+            (SELECT ds.docker_ctx FROM deploy_site ds WHERE ds.id = c.site_id) AS site_docker_ctx,
             c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at, ${instancesAgg}
        FROM container c WHERE c.project_id = $1
        ORDER BY c.role, c.tier, c.name`, [pid]);

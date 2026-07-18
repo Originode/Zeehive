@@ -1,0 +1,11 @@
+# Build-context hygiene for docker/zeehive/* images. Without this, `docker build` uploads the
+# whole working copy — node_modules, every xell worktree, gigabytes of db backups — to the daemon
+# before the first layer runs. Keep the context to source.
+node_modules
+**/node_modules
+.git
+.claude
+db_backups
+web/dist
+*.log
+*.dump

@@ -20,11 +20,16 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
   const ms = machines || [];
   const all = ROLES.flatMap((r) => (containers[r] || []).map((c) => ({ ...c, _role: r })));
 
+  // Where a container lives, for column placement: its own run context — or, for a PROCESS role
+  // (docker_ctx NULL, probed by URL: the self-shipped queenzee), its deploy site's context. A
+  // process on machine 'local' belongs in local's column, not in limbo.
+  const ctxOf = (c) => c.docker_ctx || c.site_docker_ctx || null;
+
   // Containers whose context matches no machine row (or has none at all) still must be SEEN —
   // an "elsewhere" column appears only when such containers exist, and disappears when the
   // machines fully describe the fleet.
   const known = new Set(ms.map((m) => m.docker_ctx));
-  const orphans = all.filter((c) => !known.has(c.docker_ctx));
+  const orphans = all.filter((c) => !known.has(ctxOf(c)));
   const cols = [...ms.map((m) => ({ kind: 'machine', m })),
                 ...(orphans.length ? [{ kind: 'elsewhere' }] : [])];
 
@@ -49,7 +54,7 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
 
   const cell = (role, col) => {
     const cs = col.kind === 'machine'
-      ? all.filter((c) => c._role === role && c.docker_ctx === col.m.docker_ctx)
+      ? all.filter((c) => c._role === role && ctxOf(c) === col.m.docker_ctx)
       : orphans.filter((c) => c._role === role);
     return cs.length
       ? cs.map((c) => <ContainerChip key={c.id} c={c} onMenu={onMenu} />)
@@ -64,7 +69,7 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
       {cols.map((col, i) => col.kind === 'machine'
         ? <MachineHead key={col.m.id} m={col.m} projectId={projectId}
                        hasDevDb={all.some((c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared' && c.docker_ctx === col.m.docker_ctx)}
-                       empty={!all.some((c) => c.docker_ctx === col.m.docker_ctx)}
+                       empty={!all.some((c) => ctxOf(c) === col.m.docker_ctx)}
                        onChanged={onChanged} />
         : <div key={`col-${i}`} className="mx-head elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them into a column">elsewhere</div>)}
       <AddMachine onChanged={onChanged} />
