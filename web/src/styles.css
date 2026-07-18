@@ -751,28 +751,36 @@ a.cbox:hover { border-color: var(--accent); }
 .lock-badge.held { filter: drop-shadow(0 0 3px var(--up)); }
 .lock-badge:disabled { opacity: .5; cursor: default; }
 
-/* ── honeycomb shell: viewport split in two, git timeline bisecting ─────────────
-   The honeycomb canvas fills one half of the viewport, the project/machine/ship
-   panels the other. Orientation decides the split axis; the flip (honey-a/b) swaps
-   which half is which. The git timeline itself is drawn INSIDE the honey canvas on
-   its panel-facing edge (see HiveCanvas), so it always sits on the dividing line. */
+/* ── honeycomb shell: three panes, the git graph as the exact centre divider ─────
+   [ honeycomb | graph | panels ]. Orientation decides the split axis (row/column);
+   the graph pane always holds the middle slot while the flip (honey-a/b) swaps which
+   outer slot is the honeycomb vs the panels. Connector wires (SVG overlay) bridge each
+   xell's commit dot in the graph to its hexagon in the honeycomb canvas. */
 .hive-split { position: fixed; inset: 0; display: flex; background: var(--bg); overflow: hidden; }
 .hive-split.o-landscape { flex-direction: row; }
 .hive-split.o-portrait  { flex-direction: column; }
 
 .hive-pane { min-width: 0; min-height: 0; }
-.hive-pane.honey  { flex: 1 1 50%; position: relative; }
-.hive-pane.panels { flex: 1 1 50%; overflow: auto; border-left: 1px solid var(--line); }
-.hive-split.o-portrait .hive-pane.panels { border-left: none; border-top: 1px solid var(--line); }
+.hive-pane.honey  { flex: 1 1 0; position: relative; }
+.hive-pane.panels { flex: 1 1 0; overflow: auto; }
 
-/* flip: honey-b puts the panels first so the honeycomb lands on the far side, and
-   the timeline edge flips with it (edgeFor) so merge points still face the honeycomb. */
+/* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The
+   inner SVG is absolutely positioned and scrolls along its length (group transform) to track prod. */
+.graph-pane { order: 1; position: relative; overflow: hidden; background: var(--bg); }
+.hive-split.o-landscape .graph-pane { border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+.hive-split.o-portrait  .graph-pane { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.graph-svg { overflow: visible; }
+.graph-svg .ghash { fill: var(--muted); font: 9px 'Cascadia Code', ui-monospace, monospace; }
+.graph-branch { position: absolute; color: var(--accent); font: 600 10px 'Cascadia Code', ui-monospace, monospace;
+  pointer-events: none; }
+.graph-branch[data-orient="landscape"] { top: 6px; left: 50%; transform: translateX(-50%); }
+.graph-branch[data-orient="portrait"]  { left: 8px; top: 50%; transform: translateY(-50%); }
+
+/* flip: honey-a → honeycomb in the first slot, honey-b → last slot; graph stays centred (order:1) */
 .hive-split.honey-a .hive-pane.honey  { order: 0; }
-.hive-split.honey-a .hive-pane.panels { order: 1; }
-.hive-split.honey-b .hive-pane.honey  { order: 1; }
+.hive-split.honey-a .hive-pane.panels { order: 2; }
+.hive-split.honey-b .hive-pane.honey  { order: 2; }
 .hive-split.honey-b .hive-pane.panels { order: 0; }
-.hive-split.honey-b .hive-pane.panels { border-left: none; border-right: 1px solid var(--line); }
-.hive-split.o-portrait.honey-b .hive-pane.panels { border-right: none; border-bottom: 1px solid var(--line); border-top: none; }
 
 .hive-canvas-wrap { position: absolute; inset: 0; overflow: hidden; }
 .hive-canvas { position: absolute; inset: 0; }

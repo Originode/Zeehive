@@ -6,6 +6,8 @@ import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markD
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import HiveCanvas from './hive/HiveCanvas.jsx';
+import GraphPane from './GraphPane.jsx';
+import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel from './Backups.jsx';
@@ -24,18 +26,6 @@ const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' }
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');
 const base = (p) => (p ? p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() : '—');
 
-// Which edge of the honeycomb canvas carries the git timeline. The timeline always bisects the
-// viewport: it lives on the edge of the honey pane that borders the panels, with its merge points
-// on the honey side. Landscape → vertical divider; portrait → horizontal. `honeySide` flips which
-// half is the honeycomb, which in turn flips the edge (so merge points always face the honeycomb).
-//   landscape + honey 'a' (left)  → timeline on the RIGHT of honey
-//   landscape + honey 'b' (right) → timeline on the LEFT
-//   portrait  + honey 'a' (top)   → timeline on the BOTTOM
-//   portrait  + honey 'b' (bottom)→ timeline on the TOP
-function edgeFor(orientation, honeySide) {
-  if (orientation === 'portrait') return honeySide === 'a' ? 'bottom' : 'top';
-  return honeySide === 'a' ? 'right' : 'left';
-}
 
 // Portrait when the viewport is taller than it is wide. Re-measured on resize so the timeline
 // re-orients live when the window is reshaped.
@@ -112,7 +102,18 @@ export default function App() {
   const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
-  const edge = edgeFor(orientation, honeySide);
+  // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
+  // per-frame "geometry changed" fire so a pan/zoom re-tracks the graph and re-routes the wires
+  // WITHOUT re-rendering the whole app.
+  const hexPosRef = useRef({});
+  const geomListeners = useRef(new Set());
+  const subscribeGeom = useCallback((fn) => {
+    geomListeners.current.add(fn);
+    return () => geomListeners.current.delete(fn);
+  }, []);
+  const fireGeom = useCallback(() => {
+    geomListeners.current.forEach((fn) => { try { fn(); } catch { /* listener detached mid-fire */ } });
+  }, []);
 
   // open the container context menu at the cursor — passed down to each xell's ContainerChips.
   // onMenu stops propagation so opening one doesn't trip the document closer below.
@@ -282,6 +283,7 @@ export default function App() {
     (rank(a) - rank(b)) || ((order[a.id] ?? 9999) - (order[b.id] ?? 9999)));
 
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
+  const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
 
   // Open a xell's session in the right surface — the honeycomb flower's click target, and the
   // drawer card's. Web sessions open a tab; desktop-protocol sessions deep-link into Claude Desktop.
@@ -291,16 +293,24 @@ export default function App() {
     else window.open(x.viewer_url, '_blank', 'noopener');
   };
 
-  // The honeycomb ALWAYS occupies one half of the viewport and the panels the other; the git
-  // timeline bisects them (drawn on the honey pane's panel-facing edge). Flipping swaps the halves
-  // and re-orients the timeline so its merge points still face the honeycomb.
+  // Three panes: the honeycomb, the git graph as the exact centre divider, and the control panels.
+  // Landscape → three columns, portrait → three rows; the graph stays centred while flip swaps which
+  // side is honeycomb vs panels. Connector wires bridge each xell's commit dot (graph) to its hex.
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
       <section className="hive-pane honey">
-        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} edge={edge}
+        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline}
                     machines={fleet.machines} onOpenSession={openSession}
-                    expandedId={expandedId} onExpand={setExpandedId} />
+                    expandedId={expandedId} onExpand={setExpandedId}
+                    hexPosRef={hexPosRef} onGeometry={fireGeom} />
       </section>
+
+      <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
+                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom} />
+
+      <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
+                  hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
+                  expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom} />
 
       <section className="hive-pane panels">
       <div className="content">

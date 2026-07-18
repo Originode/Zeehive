@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
-import { computeGraph } from './graph.js';
+import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb } from './hex.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
@@ -13,10 +12,10 @@ const HEALTH = { up: '#35c46b', building: '#e0a53b', down: '#e5554e', unknown: '
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff',
   '#e5554e', '#3bc6c0', '#d98c5f', '#7bd0e0', '#c98cff', '#8cd98c'];
 
-// ── timeline geometry (world coords; the whole world pans/zooms) ───────────────
-const TL_TOP = 26;            // first commit row y
-const TL_LANE0 = 64;          // main graph lane 0 x (hash labels sit to its left)
-const CORRIDOR_X0 = 8;        // circuit corridors live between the branch lanes and the honeycomb
+// The git graph now lives in its own centre-divider pane (<GraphPane>) and the connector wires in
+// an SVG overlay (<Connectors>). This canvas is purely the honeycomb: hexes + the bloom flower, on
+// a freely pannable/zoomable world. After each draw it publishes every hex's live client-space
+// centre+radius (via `hexPosRef` + `onGeometry`) so the overlay can anchor connectors to them.
 
 function statusColor(x) {
   if (x.is_production) return COL.prod;
@@ -98,8 +97,8 @@ function cellNeighbors(row, col) {
   ];
 }
 
-export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession, machines,
-                                    expandedId, onExpand }) {
+export default function HiveCanvas({ xells, diffs, timeline, onOpenSession, machines,
+                                    expandedId, onExpand, hexPosRef, onGeometry }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], flower: null });
@@ -128,43 +127,17 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
     const v = viewRef.current;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
 
     const list = xells || [];
     const tById = {};
     for (const tx of (timeline?.xells || [])) tById[tx.id] = tx;
 
-    // 1) the git graph — classic lanes (old style), vertical, in world space
-    const commits = timeline?.commits || [];
-    const graph = commits.length ? computeGraph(commits) : null;
-    const rowGap = 18, laneW = 11;
-    const commitY = (row) => TL_TOP + 14 + row * rowGap;
-    const laneX = (lane) => TL_LANE0 + lane * laneW;
-    const mainLanesW = graph ? graph.laneCount * laneW : laneW;
-
-    // live (unmerged) xell branches: one extra lane each, to the right of the main graph
-    const liveXells = list.filter((x) => !x.is_production && tById[x.id]);
-    const rowOf = {};
-    commits.forEach((c, i) => { rowOf[c.hash] = i; });
-    const branchLaneX = (i) => TL_LANE0 + mainLanesW + 12 + i * 13;
-    const branches = liveXells.map((x, i) => {
-      const tx = tById[x.id];
-      const d = diffs?.[x.id];
-      const ahead = Math.max(0, d?.ahead ?? 0);
-      const baseRow = rowOf[tx.base_commit] ?? 0;
-      const forkY = commitY(baseRow);
-      const lift = Math.max(1, Math.min(ahead || 1, 9));
-      const tipY = Math.max(TL_TOP + 6 + i * 14, forkY - lift * rowGap);
-      return { x, tx, i, lx: branchLaneX(i), forkY, tipY, ahead, color: tx.color || statusColor(x) };
-    });
-    const tlWidth = TL_LANE0 + mainLanesW + 12 + branches.length * 13 + 8;
-    const corridor0 = tlWidth + CORRIDOR_X0;
-
-    // 2) honeycomb layout on the offset grid, to the right of the corridors
-    const honeyX = corridor0 + branches.length * 10 + 26;
-    const lay = layoutHoneycomb(list.length, Math.max(120, w - honeyX), h, { min: 24 });
+    // honeycomb WORLD layout across the whole pane (initial view = identity, so world ≈ screen
+    // until the user pans/zooms). The git graph is a separate pane; nothing is reserved here.
+    const pad = 14;
+    const lay = layoutHoneycomb(list.length, w - pad * 2, h - pad * 2, { min: 24 });
     const sizeHex = lay.size;
-    const originX = honeyX + 10, originY = 10;
+    const originX = pad, originY = pad;
     // base cell per xell (row-major, exactly layoutHoneycomb's shape)
     const baseCells = {};
     list.forEach((x, i) => {
@@ -172,7 +145,7 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
       baseCells[x.id] = [c.row, c.col];
     });
     // flower reflow: expanded keeps its cell, its 6 neighbours are consumed; everyone else takes
-    // the next free cell in reading order (rows extend downward as needed — the canvas pans).
+    // the next free cell in reading order (rows extend as needed — the canvas pans).
     const cells = {};
     const reserved = new Set();
     if (expanded && baseCells[expanded.id]) {
@@ -195,7 +168,6 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
       };
       for (const x of list) { if (!cells[x.id]) cells[x.id] = nextFree(); }
     }
-    const occupied = new Set([...reserved, ...Object.values(cells).map(([r, c]) => cellKey(r, c))]);
     const hexes = list.map((x) => {
       const [row, col] = cells[x.id];
       const [cx, cy] = cellCenter(row, col, sizeHex, originX, originY);
@@ -203,51 +175,14 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
     });
     const hexById = {}; for (const hx of hexes) hexById[hx.id] = hx;
 
-    // 3) circuit traces — branch tip → hex. Straight H/V segments only, vias at bends.
-    for (const b of branches) {
-      const hx = hexById[b.x.id];
-      if (!hx) continue;
-      const corridor = corridor0 + b.i * 10;
-      const wHalf = hexWidth(hx.size) / 2;
-      const westFree = hx.col === 0 || !occupied.has(cellKey(hx.row, hx.col - 1));
-      const [tRow1, tRow2] = cellNeighbors(hx.row, hx.col).slice(2, 4);
-      const topFree = !occupied.has(cellKey(...tRow1)) && !occupied.has(cellKey(...tRow2));
-      let segs;
-      if (westFree) segs = [[b.lx, b.tipY], [corridor, b.tipY], [corridor, hx.cy], [hx.cx - wHalf - 2, hx.cy]];
-      else if (topFree) {
-        const rail = hx.cy - hx.size - 12 - b.i * 6;
-        segs = [[b.lx, b.tipY], [corridor, b.tipY], [corridor, rail], [hx.cx, rail], [hx.cx, hx.cy - hx.size - 2]];
-      } else {
-        const rail = hx.cy + hx.size + 12 + b.i * 6;
-        segs = [[b.lx, b.tipY], [corridor, b.tipY], [corridor, rail], [hx.cx, rail], [hx.cx, hx.cy + hx.size + 2]];
-      }
-      const dimmed = expandedId && expandedId !== b.x.id;
-      ctx.strokeStyle = withAlpha(b.color, dimmed ? 0.15 : 0.85);
-      ctx.fillStyle = ctx.strokeStyle;
-      ctx.lineWidth = 1.7; ctx.lineCap = 'square';
-      ctx.beginPath();
-      ctx.moveTo(segs[0][0], segs[0][1]);
-      for (let s = 1; s < segs.length; s++) ctx.lineTo(segs[s][0], segs[s][1]);
-      ctx.stroke();
-      for (let s = 1; s < segs.length - 1; s++) {
-        ctx.beginPath(); ctx.arc(segs[s][0], segs[s][1], 2.1, 0, Math.PI * 2); ctx.fill();
-      }
-      const end = segs[segs.length - 1];
-      ctx.fillRect(end[0] - 2.6, end[1] - 2.6, 5.2, 5.2);
-    }
-
-    // 4) the graph itself (drawn over the traces' left ends)
-    if (graph) drawGraph(ctx, commits, graph, branches, { rowGap, laneW, commitY, laneX, tlWidth, h, branch: timeline?.branch, expandedId });
-
-    // 5) hexes — compact card: machine+chips on the upper half, sha/diff/status/ship on the lower
+    // honeycomb + flower, on the pan/zoom world transform
+    ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
     geomRef.current.hexes = hexes;
     for (const hx of hexes) {
       if (expanded && hx.id === expanded.id) continue;     // the flower draws it
       const dim = expandedId && expandedId !== hx.id;
       drawCompactHex(ctx, hx, { hover: hoverId === hx.id, dim, diff: diffs?.[hx.id], machines });
     }
-
-    // 6) flower — IN the grid: the xell's own cell + its 6 neighbours, no overlay
     geomRef.current.flower = null;
     if (expanded && cells[expanded.id]) {
       const [er, ec] = cells[expanded.id];
@@ -257,7 +192,19 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
       geomRef.current.flower = { centers, size: sizeHex, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
     }
-  }, [size, xells, diffs, timeline, edge, expandedId, hoverId, expanded, machines]);
+
+    // publish each hex's live CLIENT-space centre+radius so <Connectors> can anchor its wires here
+    // and re-route them as the honeycomb is panned/zoomed.
+    if (hexPosRef) {
+      const r = canvas.getBoundingClientRect();
+      const pos = {};
+      for (const hx of hexes) {
+        pos[hx.id] = { x: r.left + v.k * hx.cx + v.x, y: r.top + v.k * hx.cy + v.y, size: hx.size * v.k };
+      }
+      hexPosRef.current = pos;
+    }
+    onGeometry && onGeometry();
+  }, [size, xells, diffs, timeline, expandedId, hoverId, expanded, machines, hexPosRef, onGeometry]);
 
   useLayoutEffect(() => { draw(); }, [draw]);
 
@@ -404,79 +351,6 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
   );
 }
 
-// ── the git graph: classic lanes + the live xell branch lanes ─────────────────
-function drawGraph(ctx, commits, graph, branches, { rowGap, laneW, commitY, laneX, tlWidth, h, branch, expandedId }) {
-  ctx.save();
-  if (expandedId) ctx.globalAlpha = 0.55;
-
-  // main-graph lane edges (merged branches weave here, like the old panel)
-  ctx.lineWidth = 1.6;
-  for (const e of graph.edges) {
-    const from = commits[e.fromRow] && { x: laneX(e.fromLane), y: commitY(e.fromRow) };
-    const toY = e.toRow < commits.length ? commitY(e.toRow) : commitY(commits.length - 1) + rowGap;
-    const to = { x: laneX(e.toLane), y: toY };
-    if (!from) continue;
-    ctx.strokeStyle = withAlpha(LANE[e.fromLane % LANE.length], 0.8);
-    ctx.beginPath();
-    ctx.moveTo(from.x, from.y);
-    if (from.x === to.x) ctx.lineTo(to.x, to.y);
-    else {
-      const my = (from.y + to.y) / 2;
-      ctx.bezierCurveTo(from.x, my, to.x, my, to.x, to.y);
-    }
-    ctx.stroke();
-  }
-
-  // live xell branch lanes: fork join at the base commit, dots up the lane, ringed tip
-  for (const b of branches) {
-    ctx.strokeStyle = withAlpha(b.color, 0.9);
-    ctx.fillStyle = b.color;
-    ctx.lineWidth = 1.6;
-    const bx = laneX(0);                       // branches fork off the main lane
-    ctx.beginPath();
-    ctx.moveTo(bx, b.forkY);
-    ctx.quadraticCurveTo(b.lx, b.forkY, b.lx, Math.max(b.tipY, b.forkY - rowGap));
-    ctx.stroke();
-    if (b.forkY - rowGap > b.tipY) {
-      ctx.beginPath(); ctx.moveTo(b.lx, b.forkY - rowGap); ctx.lineTo(b.lx, b.tipY); ctx.stroke();
-    }
-    // ahead-commit dots between tip and fork
-    const n = Math.max(0, Math.min(b.ahead, 8));
-    for (let i = 1; i <= n - 1; i++) {
-      const y = b.tipY + i * ((b.forkY - rowGap - b.tipY) / Math.max(1, n));
-      ctx.beginPath(); ctx.arc(b.lx, y, 2.6, 0, Math.PI * 2); ctx.fill();
-    }
-    // ringed tip — the trace starts here
-    ctx.beginPath(); ctx.arc(b.lx, b.tipY, 5.4, 0, Math.PI * 2);
-    ctx.lineWidth = 1.8; ctx.stroke();
-    ctx.beginPath(); ctx.arc(b.lx, b.tipY, 2.2, 0, Math.PI * 2); ctx.fill();
-  }
-
-  // main commit dots + labels
-  ctx.textBaseline = 'middle';
-  for (const { c, lane, row } of graph.rows) {
-    const dx = laneX(lane), dy = commitY(row);
-    const isMerge = c.parents.length > 1;
-    ctx.beginPath(); ctx.arc(dx, dy, isMerge ? 4.4 : 3.3, 0, Math.PI * 2);
-    ctx.fillStyle = isMerge ? COL.bg : LANE[lane % LANE.length];
-    ctx.fill();
-    if (isMerge) { ctx.lineWidth = 2; ctx.strokeStyle = LANE[lane % LANE.length]; ctx.stroke(); }
-    if (row === 0) {
-      ctx.fillStyle = COL.ready; ctx.font = `10px 'Cascadia Code', monospace`;
-      ctx.textAlign = 'left';
-      ctx.fillText('⎇ ' + (branch || ''), dx + 10, dy - rowGap * 0.7);
-    }
-  }
-  // hash labels on hover-free left margin — keep it sparse: every 3rd row
-  ctx.font = `9px 'Cascadia Code', monospace`;
-  ctx.fillStyle = COL.muted;
-  ctx.textAlign = 'right';
-  for (const { c, row } of graph.rows) {
-    if (row % 3 !== 0) continue;
-    ctx.fillText(c.short, TL_LANE0 - 8, commitY(row));
-  }
-  ctx.restore();
-}
 
 // ── compact hex: the two-half card ────────────────────────────────────────────
 // upper half: ⌂ machine + container chips (nick + health dot)
