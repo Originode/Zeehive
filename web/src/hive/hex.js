@@ -61,7 +61,7 @@ export function flowerCenters(cx, cy, size) {
 // We try every plausible column count and keep the one that yields the largest legible hex — a few
 // wide rows vs many short columns is a real trade-off and the best answer depends on the area's
 // aspect ratio, so we let the geometry decide rather than guessing a grid.
-export function layoutHoneycomb(count, w, h, { min = 26, max = 132, pad = 10 } = {}) {
+export function layoutHoneycomb(count, w, h, { min = 15, max = 132, pad = 10 } = {}) {
   if (count <= 0 || w <= 0 || h <= 0) return { size: min, cells: [], cols: 0, rows: 0 };
   const availW = Math.max(1, w - pad * 2);
   const availH = Math.max(1, h - pad * 2);
