@@ -1,0 +1,4 @@
+# Shell scripts are executed by Git bash — a CRLF checkout breaks every one of them
+# ("\r: command not found"), and autocrlf=true on Windows does exactly that to fresh
+# checkouts, including every xell worktree. Pin them to LF everywhere.
+*.sh text eol=lf
