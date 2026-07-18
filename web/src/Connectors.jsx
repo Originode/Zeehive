@@ -63,14 +63,15 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     const ys = realHexes.map((h) => h.cy).concat(dots.map((d) => d.dy));
     const M = cellSize * 1.5;
     const bbox = { x0: Math.min(...xs) - M, y0: Math.min(...ys) - M, x1: Math.max(...xs) + M, y1: Math.max(...ys) + M };
-    // ...and never over the graph pane itself (its lanes/hashes live there) — disregard cells whose
-    // centre falls within it, so wires exit the graph perpendicular and only maze once past it.
-    const gp = cont.querySelector('.graph-pane');
-    let gb = null;
-    if (gp) { const g = gp.getBoundingClientRect(); gb = { x0: g.left - cr.left, y0: g.top - cr.top, x1: g.right - cr.left, y1: g.bottom - cr.top }; }
-    const overGraph = (cx, cy) => gb && cx >= gb.x0 && cx <= gb.x1 && cy >= gb.y0 && cy <= gb.y1;
+    // ...and only inside the honeycomb PANE: a virtual cell is used only if its whole footprint fits
+    // within it, so pathfinding never routes through cells clipped at the pane's top/bottom edges (nor
+    // over the graph/panels). The perpendicular+90° lead-in bridges the gap from the dot to the pane.
+    const honeyEl = cont.querySelector('.hive-pane.honey');
+    let hb = null;
+    if (honeyEl) { const h = honeyEl.getBoundingClientRect(); hb = { x0: h.left - cr.left, y0: h.top - cr.top, x1: h.right - cr.left, y1: h.bottom - cr.top }; }
+    const insideHoney = (cx, cy) => !!hb && cx - cellSize >= hb.x0 && cx + cellSize <= hb.x1 && cy - cellSize >= hb.y0 && cy + cellSize <= hb.y1;
     const virtual = latticeCells(realHexes[0].cx, realHexes[0].cy, cellSize, bbox)
-      .filter((c) => forward(c.cx, c.cy) && !overGraph(c.cx, c.cy));
+      .filter((c) => forward(c.cx, c.cy) && insideHoney(c.cx, c.cy));
     const graph = buildHexGraph(realHexes.concat(virtual));
 
     // pass 1: pathfind every wire (prod included) through the corridor maze

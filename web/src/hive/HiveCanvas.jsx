@@ -306,7 +306,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     } else {
       const hx = hitHex(wx, wy);
       const id = hx?.id || null;
-      emitHover({ id, commit: id ? baseOf(id) : null });   // dedups internally; only fires on change
+      emitHover({ id, commit: null });   // a hex is ONE xell → key on id, so only this hex lights up
       cursor = hx ? 'pointer' : 'default';
     }
     canvasRef.current.style.cursor = cursor;
