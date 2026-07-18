@@ -14,7 +14,7 @@
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { provisionXell } from '../lib/provision.js';
-import { devMachines, liveXellCount } from '../lib/machines.js';
+import { devMachines, liveXellCount, machinePoolSize } from '../lib/machines.js';
 import { reapXell } from './reaper.js';
 import { reconcileXell } from './landing.js';
 import { logline } from '../lib/logbus.js';
@@ -43,11 +43,14 @@ async function reconcileProject(projectId, target) {
   }
 
   // 3+4. Fill or trim (all pooled xells now guaranteed at the source tip). Machine mode: each
-  // machine keeps pool_size ready xells for THIS project; legacy project-wide target otherwise.
+  // machine keeps ITS OWN number of ready xells for THIS project (machine_pool, 025 — a
+  // high-load project pools bigger than a quiet one on the same host); legacy project-wide
+  // target otherwise.
   const machines = await devMachines();
   if (!machines.length) return fillTrim(projectId, target, null);
   for (const m of machines) {
-    await fillTrim(projectId, m.pool_size, m).catch((e) => console.error(`[pool] ${m.key}:`, e.message));
+    const size = await machinePoolSize(m.id, projectId);
+    await fillTrim(projectId, size, m).catch((e) => console.error(`[pool] ${m.key}:`, e.message));
   }
 }
 

@@ -184,6 +184,14 @@ export async function deleteMachine(id) {
   const r = await fetch(`/api/machines/${id}`, { method: 'DELETE' });
   return jsonOrThrow(r, 'delete machine');
 }
+// Per-project pool size on a machine — how many ready xells THIS project keeps warm there.
+export async function setMachinePool(machineId, projectId, pool_size) {
+  const r = await fetch(`/api/machines/${machineId}/pool`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, pool_size }),
+  });
+  return jsonOrThrow(r, 'set pool size');
+}
 // Stand up the project's shared dev db ON a machine (background; restores the latest prod backup).
 export async function provisionMachineDevDb(machineId, projectId) {
   const r = await fetch(`/api/machines/${machineId}/dev-db`, {

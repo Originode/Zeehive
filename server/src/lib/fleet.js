@@ -2,6 +2,7 @@
 // inventory, and one entry per xell (container stack + its live zee + runtime badge).
 import { q, one } from '../db/pool.js';
 import { projectHeads } from './git.js';
+import { listMachines } from './machines.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -54,9 +55,9 @@ export async function getFleet(projectId) {
   const groups = { db: [], server: [], webapp: [], other: [] };
   for (const c of containers) (groups[c.role] || groups.other).push(c);
 
-  // The hive's machines (global, not per-project) — the container matrix renders one column per
-  // row here, and the spawn/build policy knobs live on them.
-  const machines = await q(`SELECT * FROM machine ORDER BY dev_priority DESC, created_at`);
+  // The hive's machines with THIS project's pool sizes (machine_pool, 025) — the matrix renders
+  // one column per row here, and its pool knob edits this project's number, not a global one.
+  const machines = await listMachines(pid);
 
   // xells with their resolved container stack + live zee + runtime label
   const xells = await q(

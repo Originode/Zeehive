@@ -20,8 +20,43 @@ import { namingFor } from './manifest.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
-export async function listMachines() {
-  return q(`SELECT * FROM machine ORDER BY dev_priority DESC, created_at`);
+// projectId (optional) scopes pool_size to that project (machine_pool, 025) — the matrix shows
+// and edits THIS project's pool on each machine. Without it, rows carry no pool_size at all:
+// there is no such thing as a machine-wide pool anymore.
+export async function listMachines(projectId = null) {
+  if (!projectId) {
+    return q(`SELECT id, key, label, docker_ctx, host_ip, can_build, dev_priority, max_xells,
+                     enabled, notes, created_at
+                FROM machine ORDER BY dev_priority DESC, created_at`);
+  }
+  return q(
+    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.dev_priority,
+            m.max_xells, m.enabled, m.notes, m.created_at,
+            COALESCE(mp.pool_size, 0) AS pool_size
+       FROM machine m LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
+      ORDER BY m.dev_priority DESC, m.created_at`, [projectId]);
+}
+
+// This machine's warm-pool target for ONE project. No row → 0: a project pools nowhere it
+// hasn't been given a number.
+export async function machinePoolSize(machineId, projectId) {
+  const r = await one(
+    `SELECT pool_size FROM machine_pool WHERE machine_id=$1 AND project_id=$2`, [machineId, projectId]);
+  return r?.pool_size || 0;
+}
+
+export async function setMachinePool(machineId, projectId, poolSize) {
+  const n = Number(poolSize);
+  if (!Number.isInteger(n) || n < 0) throw new Error('pool_size must be a non-negative integer');
+  const m = await one(`SELECT key FROM machine WHERE id=$1`, [machineId]);
+  if (!m) throw new Error('machine not found');
+  const row = await one(
+    `INSERT INTO machine_pool (machine_id, project_id, pool_size) VALUES ($1,$2,$3)
+     ON CONFLICT (machine_id, project_id) DO UPDATE SET pool_size=EXCLUDED.pool_size
+     RETURNING *`, [machineId, projectId, n]);
+  broadcast('machine', { id: machineId });
+  logline('machine', `pool on ${m.key} → ${n} for project ${String(projectId).slice(0, 8)}`);
+  return row;
 }
 
 // Machines that may host DEV xells, best first. Empty ⇒ machine-aware placement is off and
@@ -62,18 +97,23 @@ export async function createMachine(body = {}) {
   const known = await resolveContext(ctx).catch(() => null);
   if (!known) throw new Error(`docker context '${ctx}' is not configured on this machine — \`docker context ls\` doesn't know it`);
   const row = await one(
-    `INSERT INTO machine (key,label,docker_ctx,host_ip,can_build,dev_priority,pool_size,max_xells,enabled,notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,true),$10) RETURNING *`,
+    `INSERT INTO machine (key,label,docker_ctx,host_ip,can_build,dev_priority,max_xells,enabled,notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,true),$9) RETURNING *`,
     [body.key, body.label || null, ctx, body.host_ip || null, !!body.can_build,
-     Number(body.dev_priority) || 0, Number(body.pool_size) || 0, Number(body.max_xells) || 0,
+     Number(body.dev_priority) || 0, Number(body.max_xells) || 0,
      body.enabled === undefined ? null : !!body.enabled, body.notes || null]);
+  // Pool is per (machine, project): a pool_size on create applies to the project the console is
+  // looking at — other projects start at 0 here and get their own numbers in their own views.
+  if (body.project_id && Number(body.pool_size) > 0) {
+    await setMachinePool(row.id, body.project_id, Number(body.pool_size));
+  }
   broadcast('machine', row);
-  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}, priority ${row.dev_priority}, pool ${row.pool_size}/${row.max_xells})`);
+  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}, priority ${row.dev_priority}, cap ${row.max_xells})`);
   return row;
 }
 
 const PATCHABLE = ['key', 'label', 'docker_ctx', 'host_ip', 'can_build', 'dev_priority',
-                   'pool_size', 'max_xells', 'enabled', 'notes'];
+                   'max_xells', 'enabled', 'notes'];
 
 export async function updateMachine(id, body = {}) {
   validate(body, { partial: true });

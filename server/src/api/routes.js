@@ -12,7 +12,7 @@ import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restore
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
-import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb } from '../lib/machines.js';
+import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool } from '../lib/machines.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
@@ -372,6 +372,13 @@ router.patch('/machines/:id', async (req, res) => {
 router.delete('/machines/:id', async (req, res) => {
   try { res.json(await deleteMachine(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Per-project pool size on a machine (machine_pool) — the matrix pool knob writes here.
+router.put('/machines/:id/pool', async (req, res) => {
+  try {
+    const projectId = req.body?.project_id || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+    res.json(await setMachinePool(req.params.id, projectId, req.body?.pool_size));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Stand up this project's shared dev db ON a machine (latest prod backup by default) — the
 // prerequisite for the machine hosting dev xells. Background; watch the queenzee log.
