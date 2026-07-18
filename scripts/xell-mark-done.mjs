@@ -49,8 +49,17 @@ Land it first (commit, then: git push . HEAD:main), or re-run with --force to di
     process.exit(0);
   }
 
-  const r = await post(`/api/xells/${xellId}/reap`, { reason: 'human-marked-done' });
+  // --force covers BOTH refusals: the local unlanded check above, and the server's active-zee
+  // guard (which answers HTTP 200 with ok:false — a refusal, not an error code).
+  const r = await post(`/api/xells/${xellId}/reap`, { reason: 'human-marked-done', force });
   if (r.code >= 400) { console.log(`Mark done failed (HTTP ${r.code}): ${r.body}`); process.exit(0); }
+  let out = null; try { out = JSON.parse(r.body); } catch { /* non-JSON body */ }
+  if (out && out.ok === false) {
+    // A refusal is not a DONE — saying so trained a human to believe teardowns that never ran.
+    console.log(`REFUSED — ${out.error || r.body}`
+      + (out.active && !force ? '\nA typed /xell-done is the confirmation: re-run with --force to proceed.' : ''));
+    process.exit(0);
+  }
   console.log(`DONE — ${slug} marked done and torn down (worktree, branch and per-xell containers removed).\n${r.body}`);
 } catch (e) {
   console.log(`ZEEHIVE API unreachable at ${api}: ${e.message}`);
