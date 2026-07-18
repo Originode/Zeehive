@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useLayoutEffect, useEffect } from 'react';
+import { buildHexGraph, shortestPath, nearestVertex, nearestNode } from './hive/maze.js';
 
 // SVG overlay spanning the whole hive-split. For each xell it draws a colored wire from the xell's
 // commit dot in the centre <GraphPane> (the point in history it sits at) to that xell's hexagon in
@@ -6,13 +7,11 @@ import React, { useState, useCallback, useLayoutEffect, useEffect } from 'react'
 // the graph's scroll transform); the hex centre comes from HiveCanvas via `hexPosRef`.
 //
 //   • production: a single STRAIGHT wire — the graph scroll-tracks the prod hexes (median) so each
-//     prod dot stays across from its hexagon, keeping this perpendicular.
-//   • everyone else: a hex-aligned trace whose segments run only VERTICAL or at ±30° — parallel to
-//     a pointy-top hexagon's edges — so a bend is always along a hex side. One bend, two segments:
-//     landscape leaves the vertical spine on a 30° diagonal then runs vertical into the hex;
-//     portrait leaves the horizontal spine vertically then runs a 30° diagonal into the hex.
-const T30 = Math.tan(Math.PI / 6);   // ≈0.5774 — slope of a pointy-top hex's slanted edge
-
+//     prod dot stays across from its hexagon, keeping this perpendicular. It ends at the prod hex's
+//     vertex nearest the dot.
+//   • everyone else: the wire threads the honeycomb like a MAZE — it hops from the dot across the
+//     open gap to the nearest lattice vertex, then pathfinds along hex EDGES to the target hex's
+//     vertex nearest the dot, so it never crosses a hexagon and every segment runs along a hex side.
 export default function Connectors({ timeline, layoutRef, version, hexPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom }) {
   const [paths, setPaths] = useState([]);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -24,40 +23,37 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     setSize({ w: cont.clientWidth, h: cont.clientHeight });
 
     const hexPos = (hexPosRef && hexPosRef.current) || {};
-    const portrait = orientation === 'portrait';
     const f1 = (n) => n.toFixed(1);
+
+    // the honeycomb lattice (cont-relative), rebuilt from live hex positions every frame
+    const hexes = Object.entries(hexPos).map(([id, hp]) => ({ id, cx: hp.x - cr.left, cy: hp.y - cr.top, size: hp.size || 20 }));
+    const graph = buildHexGraph(hexes);
 
     const items = [];
     for (const x of (timeline.xells || [])) {
       const dot = cont.querySelector(`[data-commit="${x.base_commit}"][data-dot]`);
       const hp = hexPos[x.id];
-      if (!dot || !hp) continue;
+      const verts = graph.vertsById.get(x.id);
+      if (!dot || !hp || !verts) continue;
       const n = dot.getBoundingClientRect();
       const dcx = (n.left + n.right) / 2 - cr.left;
       const dcy = (n.top + n.bottom) / 2 - cr.top;
-      const hx = hp.x - cr.left, hy = hp.y - cr.top;
-      const stop = (hp.size || 20) + 3;
-      let d, ex, ey;
+      // aim at the vertex of the target hex closest to the commit head (the dot)
+      const target = nearestVertex(verts, dcx, dcy);
+      let d, ex = target.x, ey = target.y;
 
       if (prodIds.includes(x.id)) {
-        // straight wire to the hex edge (kept ⟂ by the graph tracking the prod-hex median)
-        const vx = hx - dcx, vy = hy - dcy, L = Math.hypot(vx, vy) || 1;
-        ex = hx - (vx / L) * stop; ey = hy - (vy / L) * stop;
+        // straight wire to that vertex (kept ⟂ by the graph tracking the prod-hex median)
         d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;
       } else {
-        // hex-aligned route: a corner C splits it into a VERTICAL leg and a ±30° diagonal leg, the
-        // 30° leg carrying the full cross-spine distance (dx). Trim the final point to the hex edge
-        // along the incoming leg's direction.
-        const dx = hx - dcx, dy = hy - dcy;
-        const vDiag = Math.abs(dx) * T30;              // vertical distance the 30° leg spans
-        const sgn = dy >= 0 ? 1 : -1;
-        let cx, cy;
-        if (portrait) { cx = dcx; cy = hy - sgn * vDiag; }   // vertical leg first, then diagonal → hex
-        else { cx = hx; cy = dcy + sgn * vDiag; }            // diagonal off the spine, then vertical → hex
-        // trim endpoint back along C→hex by `stop`
-        const lx = hx - cx, ly = hy - cy, LL = Math.hypot(lx, ly) || 1;
-        ex = hx - (lx / LL) * stop; ey = hy - (ly / LL) * stop;
-        d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(cx)} ${f1(cy)} L ${f1(ex)} ${f1(ey)}`;
+        // hop from the dot across the open gap to the nearest lattice vertex, then thread hex edges
+        const entryKey = nearestNode(graph, dcx, dcy);
+        const path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
+        if (path && path.length) {
+          d = `M ${f1(dcx)} ${f1(dcy)} ` + path.map((p) => `L ${f1(p.x)} ${f1(p.y)}`).join(' ');
+        } else {
+          d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;   // disconnected fallback: straight
+        }
       }
       items.push({ id: x.id, color: x.color, d, x1: dcx, y1: dcy, x2: ex, y2: ey,
         dim: expandedId && expandedId !== x.id });
