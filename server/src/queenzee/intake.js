@@ -156,6 +156,16 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   return bindingFor(xell.id, zee, task);
 }
 
+// First heading (or first non-empty line) of a task's text — the human-readable name of the job.
+// Markdown '#' prefixes are stripped; long lines truncated (slugifyTitle caps the folder anyway).
+function titleFromTask(task) {
+  for (const raw of String(task || '').split(/\r?\n/)) {
+    const line = raw.replace(/^#+\s*/, '').trim();
+    if (line) return line.slice(0, 80);
+  }
+  return null;
+}
+
 // POST /api/xell/dispatch — the confirmed auto-dispatch path for /xell run OUTSIDE a worktree.
 // The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
 // per the runtime) to run the task. Human confirms in their session before this is called.
@@ -166,12 +176,15 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
   // cwd cannot contradict the worktree the zee will actually run in.
   const projectId = await resolveProjectId({ project, cwd, xell_id });
-  // The spawned zee never titles itself, so it takes the DISPATCHING session's title — but
-  // prefixed. Plain inheritance made the two identical in the sidebar: the human clicks the title
-  // expecting the zee and lands on the dispatcher, a dead artifact sitting in the read-only
-  // xource. "xell : X" is the one doing the work; the bare "X" is the launcher.
-  // This exact string is also stored on zee.title, so the sidebar and the ZEEHIVE dashboard match.
-  const from = title || (session_id ? sessionTitle(session_id) : null);
+  // The TASK names this work — not the dispatcher. Naming from the invoking session's title
+  // produced worktrees named after whatever the dispatcher happened to be doing earlier: a
+  // "machine chip on xell cards" task dispatched from a session titled "Windows Subsystem for
+  // Linux setup" became windows-subsystem-for-linux-setup-49ac05 on the dashboard. The task's
+  // own first heading/line is the job's name; an explicit `title` param still wins, and the
+  // session title remains only the fallback for a caller with no readable task text.
+  // The spawned zee never titles itself, so the same string (prefixed "xell : ") becomes
+  // zee.title — the sidebar, the worktree folder and the dashboard all name the same job.
+  const from = title || titleFromTask(task) || (session_id ? sessionTitle(session_id) : null);
   const inherited = from ? `xell : ${from}` : null;
 
   // Resolve the target xell UP FRONT. If the caller didn't name one we must still pick it here,
