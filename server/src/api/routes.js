@@ -116,8 +116,10 @@ router.get('/ship/status', async (req, res) => {
 
 router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => {
   const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
-  try { res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console')); }
-  catch (err) { res.status(409).json({ error: err.message }); }
+  try {
+    res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console',
+      { siteId: req.body?.site_id || undefined }));
+  } catch (err) { res.status(409).json({ error: err.message }); }
 });
 
 // Lock lifecycle — both HUMAN-only. Hold stops the auto-release countdown; force release takes

@@ -8,7 +8,8 @@
 // provision that makes it able to host xells at all. "+ machine" adds a host as the hive grows.
 import React, { useState, useEffect } from 'react';
 import { ContainerChip } from './Container.jsx';
-import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb } from './api.js';
+import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
+         getSites, createSite } from './api.js';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' };
 const ROLES = ['db', 'server', 'webapp', 'other'];
@@ -108,6 +109,24 @@ function MachineHead({ m, projectId, hasDevDb, empty, onChanged }) {
     try { await deleteMachine(m.id); onChanged?.(); } catch (e) { fail('Delete machine')(e); }
   };
 
+  // A human placing PRODUCTION on this machine: creates the prod deploy site here, which brings
+  // its production xell with it (one per prod site). The first prod site becomes the default ship
+  // target; ships offer the choice in the approve dialog once there is more than one.
+  const addProd = async () => {
+    setBusy(true);
+    try {
+      const sites = await getSites(projectId);
+      const existing = (sites || []).find((s) => s.tier === 'prod' && s.docker_ctx === m.docker_ctx);
+      if (existing) { alert(`${m.key} already hosts a production site for this project ("${existing.key}").`); return; }
+      const first = !(sites || []).some((s) => s.tier === 'prod');
+      const key = `prod-${m.key}`;
+      if (!confirm(`Add a PRODUCTION on ${m.key}?\n\nThis creates prod site "${key}" (${m.docker_ctx}${m.host_ip ? ` @ ${m.host_ip}` : ''}) and its production xell${first ? ', and makes it the DEFAULT ship target' : ' — ships can target it from the approve dialog'}.\n\nNothing deploys yet; this only models where production lives.`)) return;
+      await createSite(projectId, { key, tier: 'prod', docker_ctx: m.docker_ctx, host: m.host_ip || null, is_default: first });
+      onChanged?.();
+    } catch (e) { fail('Add production')(e); }
+    finally { setBusy(false); }
+  };
+
 
   const num = (field, v, title, min = 0) => (
     <label className="mx-knob" title={title}>
@@ -122,6 +141,8 @@ function MachineHead({ m, projectId, hasDevDb, empty, onChanged }) {
     <div className={`mx-head${m.enabled ? '' : ' off'}`} data-testid={`machine-${m.key}`}>
       <div className="mx-name" title={`${m.label || m.key}\ncontext: ${m.docker_ctx}${m.host_ip ? `\nhost: ${m.host_ip}` : ''}${m.notes ? `\n${m.notes}` : ''}`}>
         <b>{m.key}</b>
+        <button className="mx-prod" data-testid={`mx-prod-${m.key}`} disabled={busy} onClick={addProd}
+                title={`Place a PRODUCTION on ${m.key} — creates the prod site + its production xell here`}>＋prod</button>
         {empty && <button className="mx-del" title="Remove this machine row" onClick={remove}>✕</button>}
       </div>
       <div className="mx-knobs">

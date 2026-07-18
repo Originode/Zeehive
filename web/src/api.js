@@ -308,9 +308,12 @@ export async function decideLanding(id, decision, by = 'human@console') {
 
 // ── shipping to production (zee asks · human approves · queenzee ships) ───────
 // approve → the queenzee takes the prod lock and runs the deploy ITSELF, from main.
-export async function decideShip(id, decision, by = 'human@console') {
+// siteId (approve only): aim the ship at a chosen prod site — the dialog's target picker when a
+// project has more than one production. Omit to ship to the request's recorded (default) site.
+export async function decideShip(id, decision, by = 'human@console', siteId = undefined) {
   const r = await fetch(`/api/ship/requests/${id}/${decision}`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by, ...(siteId ? { site_id: siteId } : {}) }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);

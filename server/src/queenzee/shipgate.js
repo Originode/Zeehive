@@ -144,8 +144,9 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
 export async function listShipRequests(projectId, { open = true } = {}) {
   const where = open ? `AND s.status IN ('pending','approved','shipping')` : '';
   return q(
-    `SELECT s.*, x.slug AS xell_slug FROM ship_request s
+    `SELECT s.*, x.slug AS xell_slug, ds.key AS site_key FROM ship_request s
        JOIN xell x ON x.id = s.xell_id
+       LEFT JOIN deploy_site ds ON ds.id = s.site_id
        WHERE s.project_id=$1 ${where} ORDER BY s.requested_at DESC LIMIT 50`, [projectId]);
 }
 
@@ -156,14 +157,37 @@ export async function shipStatus(xellId) {
 }
 
 // ── the human's decision ─────────────────────────────────────────────────────
-export async function decideShip(id, decision, by = 'human@console') {
+// siteId (optional, approve only): the human aims the ship at a CHOSEN prod site — the dialog's
+// target picker when a project has more than one production. The request recorded the default at
+// request time; re-aiming here re-resolves the migration set against the chosen site's ledger, so
+// what deploys is exactly what the human approved FOR that site. One production → nothing to
+// choose, the recorded (default) site ships as always.
+export async function decideShip(id, decision, by = 'human@console', { siteId } = {}) {
   if (!['approved', 'rejected'].includes(decision)) throw new Error(`bad decision: ${decision}`);
-  const row = await one(
-    `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3
-       WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by]);
+  let retarget = null;
+  if (decision === 'approved' && siteId) {
+    const pending = await one(`SELECT * FROM ship_request WHERE id=$1 AND status='pending'`, [id]);
+    if (!pending) throw new Error('no such pending ship request (already decided?)');
+    if (siteId !== pending.site_id) {
+      const site = await one(
+        `SELECT * FROM deploy_site WHERE id=$1 AND project_id=$2 AND tier='prod'`, [siteId, pending.project_id]);
+      if (!site) throw new Error('chosen site is not a prod site of this project');
+      const project = await one(`SELECT * FROM project WHERE id=$1`, [pending.project_id]);
+      const mig = await pendingMigrations(project, pending.commit, site);
+      retarget = { site, migrations: JSON.stringify(mig.pending || []) };
+    }
+  }
+  const row = retarget
+    ? await one(
+      `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3, site_id=$4, migrations=$5::jsonb
+         WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by, retarget.site.id, retarget.migrations])
+    : await one(
+      `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3
+         WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by]);
   if (!row) throw new Error('no such pending ship request (already decided?)');
   broadcast('ship', row);
-  logline('ship', `${decision.toUpperCase()} ship ${String(row.commit).slice(0, 8)} by ${by}`);
+  logline('ship', `${decision.toUpperCase()} ship ${String(row.commit).slice(0, 8)} by ${by}`
+    + (retarget ? ` → site ${retarget.site.key} (re-aimed at approval)` : ''));
   if (decision === 'approved') runShip(row.id).catch((e) => console.error('[ship] run failed:', e.message));
   return row;
 }

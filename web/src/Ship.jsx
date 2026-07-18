@@ -7,7 +7,7 @@
 //      "let it go" — an unattended hold blocks every other xell. HOLD stops the clock for a human
 //      who is actively verifying.
 import React, { useState, useEffect, useRef } from 'react';
-import { decideShip, holdProdLock, forceReleaseProdLock } from './api.js';
+import { decideShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
@@ -76,19 +76,29 @@ function LiveBuildLog({ lines }) {
   );
 }
 
-function ShipCard({ req, live, onDone }) {
+function ShipCard({ req, live, prodSites, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const pending = req.status === 'pending';
+  // WHERE this ship deploys. One production → nothing to choose, it ships there (the recorded
+  // site). More than one → a human picks in THIS dialog, defaulting to the request's recorded
+  // site (the project default) — approving with a different pick re-aims the ship, and the server
+  // re-resolves its migrations against the chosen site's ledger.
+  const sites = prodSites || [];
+  const defaultSiteId = req.site_id || sites.find((s) => s.is_default)?.id || sites[0]?.id || null;
+  const [siteId, setSiteId] = useState(defaultSiteId);
+  useEffect(() => { setSiteId(defaultSiteId); }, [defaultSiteId]);
+  const chosen = sites.find((s) => s.id === siteId) || null;
+  const siteName = chosen?.key || req.site_key || null;
 
   const decide = async (decision) => {
     if (decision === 'approve' && !confirm(
-      `Ship ${short(req.commit)} to PRODUCTION?\n\n`
+      `Ship ${short(req.commit)} to PRODUCTION${siteName ? ` @ ${siteName}` : ''}?\n\n`
       + `The queenzee will take the prod lock and deploy it from main — this is real production.\n\n`
       + `Requested by: ${req.xell_slug}\n${req.reason ? `Reason: ${req.reason}\n` : ''}`)) return;
     if (decision === 'reject' && !confirm(`Reject this ship request from ${req.xell_slug}?`)) return;
     setBusy(true); setErr(null);
-    try { await decideShip(req.id, decision); onDone?.(); }
+    try { await decideShip(req.id, decision, undefined, decision === 'approve' ? siteId || undefined : undefined); onDone?.(); }
     catch (e) { setErr(e.message); }
     finally { setBusy(false); }
   };
@@ -97,10 +107,23 @@ function ShipCard({ req, live, onDone }) {
     <div className={`ship-card s-${req.status}`}>
       <div className="land-head">
         <span className="land-what">
-          <b>{req.xell_slug}</b> wants to ship <b>{short(req.commit)}</b> to <b>PRODUCTION</b>
+          <b>{req.xell_slug}</b> wants to ship <b>{short(req.commit)}</b> to{' '}
+          <b>PRODUCTION{!pending && siteName ? ` @ ${siteName}` : ''}</b>
         </span>
         <span className="land-meta">{req.status}</span>
       </div>
+      {pending && sites.length > 1 && (
+        <div className="ship-target" data-testid="ship-target">
+          <span className="k">deploy to:</span>
+          <select value={siteId || ''} disabled={busy} onChange={(e) => setSiteId(e.target.value)}>
+            {sites.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.key}{s.is_default ? ' (default)' : ''} — {s.docker_ctx}{s.host ? ` @ ${s.host}` : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       {req.reason && <div className="ship-reason">“{req.reason}”</div>}
       {/* Names the sha, not just "main". This line used to promise "builds from main in the xource"
           while the build took whatever that shared checkout was parked at — for a long while, 542
@@ -188,6 +211,16 @@ function LockCountdown({ lock, projectId, onChanged }) {
 
 export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onDecided }) {
   const open = shipping || [];
+  // The project's prod sites — the approve dialog's target choices. Loaded once per project and
+  // only while something is actually open (no ships → no fetch).
+  const [prodSites, setProdSites] = useState([]);
+  useEffect(() => {
+    if (!open.length || !projectId) return;
+    let live = true;
+    getSites(projectId).then((ss) => { if (live) setProdSites((ss || []).filter((s) => s.tier === 'prod')); })
+      .catch(() => { /* picker simply doesn't render */ });
+    return () => { live = false; };
+  }, [projectId, open.length]);
   if (!open.length && !prodLock) return null;
   const pending = open.filter((s) => s.status === 'pending').length;
   return (
@@ -198,7 +231,7 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
           : '⇪ production'}
       </div>
       <LockCountdown lock={prodLock} projectId={projectId} onChanged={onDecided} />
-      {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} onDone={onDecided} />)}
+      {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} prodSites={prodSites} onDone={onDecided} />)}
     </section>
   );
 }

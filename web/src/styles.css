@@ -449,6 +449,14 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-name b { font-size: 13px; }
 .mx-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 10px; padding: 0 2px; }
 .mx-del:hover { color: #d9553b; }
+.mx-prod { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
+  cursor: pointer; font-size: 9px; padding: 0 4px; }
+.mx-prod:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+/* deploy-target picker on a pending ship card */
+.ship-target { display: flex; align-items: center; gap: 7px; margin: 6px 0 2px; font-size: 13px; }
+.ship-target .k { color: var(--muted); }
+.ship-target select { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 5px; padding: 2px 6px; font-size: 12px; }
 .mx-knobs { display: flex; align-items: center; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
 .mx-knob { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); }
 .mx-knob .k { font-size: 10px; }

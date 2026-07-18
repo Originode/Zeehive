@@ -3,6 +3,7 @@ import {
   createProject, updateProject, probeRepo, getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
+  getMachines,
 } from './api.js';
 
 // PROJECT SETUP — the onboarding surface (spec §7 Phase 2.2 + the console half of everything the
@@ -222,10 +223,19 @@ function ManifestSection({ project, run, onProject }) {
 
 function SitesSection({ project, run, busy }) {
   const [sites, setSites] = useState(null);
-  const [add, setAdd] = useState({ key: '', tier: 'prod', docker_ctx: '' });
+  const [machines, setMachines] = useState([]);
+  const [add, setAdd] = useState({ key: '', tier: 'prod', docker_ctx: '', host: '' });
   const load = useCallback(() => getSites(project.id).then(setSites).catch(() => {}), [project.id]);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); getMachines().then(setMachines).catch(() => {}); }, [load]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  // Picking a machine fills the site's placement (context + host) from the machine row — a
+  // PRODUCTION on a machine a human chose, not a context string typed from memory. The fields
+  // stay editable after: the machine is a starting point, not a lock.
+  const pickMachine = (key) => {
+    const m = machines.find((x) => x.key === key);
+    if (!m) return;
+    setAdd({ ...add, docker_ctx: m.docker_ctx, host: m.host_ip || '', key: add.key || `${add.tier}-${m.key}` });
+  };
   return (
     <div className="setup-sec">
       <h3>Deploy sites <span className="pc">(where each tier runs — and how it's reached: DNS, tunnel, VPN)</span></h3>
@@ -234,11 +244,30 @@ function SitesSection({ project, run, busy }) {
         <select value={add.tier} onChange={(e) => setAdd({ ...add, tier: e.target.value })}>
           <option value="dev">dev</option><option value="prod">prod</option>
         </select>
+        {machines.length > 0 && (
+          <select value={machines.find((m) => m.docker_ctx === add.docker_ctx)?.key || ''}
+                  title="Which machine this site runs on — fills context + host from the machine row"
+                  onChange={(e) => pickMachine(e.target.value)}>
+            <option value="">machine…</option>
+            {machines.map((m) => <option key={m.key} value={m.key}>{m.key}</option>)}
+          </select>
+        )}
         <input value={add.key} placeholder="site key (e.g. vps)" onChange={(e) => setAdd({ ...add, key: e.target.value })} />
         <input list="zh-docker-ctxs" value={add.docker_ctx} placeholder="docker context" onChange={(e) => setAdd({ ...add, docker_ctx: e.target.value })} />
+        <input className="sitehost" value={add.host} placeholder="host IP" onChange={(e) => setAdd({ ...add, host: e.target.value })} />
         <button type="button" disabled={busy || !add.key.trim()}
-                onClick={() => wrapped(() => createSite(project.id, { ...add, docker_ctx: add.docker_ctx.trim() || 'default' })).then(() => setAdd({ key: '', tier: 'prod', docker_ctx: '' }))}>＋ Add site</button>
+                onClick={() => wrapped(() => createSite(project.id, {
+                  ...add, docker_ctx: add.docker_ctx.trim() || 'default', host: add.host.trim() || null,
+                  // the first prod site becomes the default target automatically
+                  is_default: add.tier === 'prod' && !(sites || []).some((s) => s.tier === 'prod'),
+                })).then(() => setAdd({ key: '', tier: 'prod', docker_ctx: '', host: '' }))}>＋ Add site</button>
       </div>
+      {add.tier === 'prod' && (
+        <div className="pc" style={{ marginTop: 4 }}>
+          Adding a <b>prod</b> site creates its production xell — ships can then target it
+          (the approve dialog offers the choice when there is more than one).
+        </div>
+      )}
     </div>
   );
 }
