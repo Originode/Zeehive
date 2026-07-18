@@ -93,8 +93,17 @@ server.tool('zeehive_ooney',
     xell_id: z.string().describe('your xell id'),
     targets: z.array(z.enum(['server', 'webapp'])).optional().describe('what you are shipping (default both)'),
     reason: z.string().optional().describe('one line: what this ship changes'),
+    db_ok: z.string().optional().describe('your DIAGNOSIS when the schema gate denies on drift: the deny '
+      + 'names the differing objects — if your change never touches them, say WHY the drift cannot break '
+      + 'this change (e.g. "drift is paddle.* tables; this ships an accounting fix"). The gate then '
+      + 'passes with your assessment attached and the human judges it on the ship request. Assess '
+      + 'honestly; never pass a reason you have not verified against the drift detail.'),
+    skip_db: z.boolean().optional().describe('scope the ship to CODE ONLY: pending sql/migrations + '
+      + 'sql/ops files are recorded on the request but NOT applied. Use when the db side must wait; '
+      + 'a drift then needs db_ok, since the files that would fix it will not run.'),
   },
-  async ({ xell_id, targets, reason }) => asText(await call('POST', '/api/ooney/check', { xell_id, targets, reason })));
+  async ({ xell_id, targets, reason, db_ok, skip_db }) =>
+    asText(await call('POST', '/api/ooney/check', { xell_id, targets, reason, db_ok, skip_db })));
 
 server.tool('zeehive_ship_request',
   'ASK to ship to PRODUCTION. You do not deploy: a human approves, then the queenzee takes the prod '

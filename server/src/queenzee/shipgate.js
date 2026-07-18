@@ -78,7 +78,11 @@ async function resolveShipSite(projectId, siteKey = null) {
 const lockKeyFor = (site) => (site && !site.is_default ? `prod@${site.key}` : 'prod');
 
 // ── the zee's only prod verb ─────────────────────────────────────────────────
-export async function requestShip({ xellId, zeeId = null, reason = null, targets = null, site = null }) {
+// skipDb: the zee scoped this ship to CODE ONLY — runShip will NOT apply pending migration/ops
+// files (recorded on the row; the human approves the scope with the click, the results show the
+// skip). dbNote: the zee's drift diagnosis from the /ooney schema gate, shown on the card.
+export async function requestShip({ xellId, zeeId = null, reason = null, targets = null, site = null,
+                                    skipDb = false, dbNote = null }) {
   // Which roles to rebuild — the zee names them (/ooney webapp|server|both). Silently dropping an
   // unknown role would ship less than the zee asked for and report success, so validate loudly.
   const t = (Array.isArray(targets) && targets.length ? targets : SHIPPABLE).map(String);
@@ -117,11 +121,15 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   const commit = headCommit(project.repo_root, shipRef);
   if (!commit) return { ok: false, reason: `ship_ref "${shipRef}" does not resolve in ${project.repo_root}`, request: null };
   // What schema rides along — decided NOW so the human approves code and migrations as one thing.
+  // Pending files are recorded EVEN when the ship skips them — the human must see exactly what a
+  // code-only ship is choosing not to run.
   const mig = await pendingMigrations(project, commit, shipSite);
   const row = await one(
-    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8) RETURNING *`,
-    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(mig.pending || []), shipSite?.id || null]);
+    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id,
+                               skip_migrations, db_note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10) RETURNING *`,
+    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(mig.pending || []), shipSite?.id || null,
+     !!skipDb, dbNote]);
   broadcast('ship', row);
 
   // Operator policy: auto-approve ships for this project → the queenzee approves and deploys with
@@ -278,7 +286,17 @@ async function runShipBody(ship, xell, project, site, lockKey) {
   // the half of "prod builds from main" that containers alone cannot deliver — dev builds fresh
   // databases from sql/schema/ and always has every table; prod is never rebuilt, so without this
   // step it drifts behind main's schema forever (7 tournament columns deep, as of this morning).
-  if (ok) {
+  if (ok && ship.skip_migrations) {
+    // The zee scoped this ship to CODE ONLY and the human approved that scope. Skipping is a
+    // recorded step, not an absence — the results must say what was deliberately not run.
+    const skipped = Array.isArray(ship.migrations) ? ship.migrations : [];
+    if (skipped.length) {
+      results.push({ role: 'migrations', ok: true, method: 'skipped-by-zee',
+        error: null, log: `db scope: SKIPPED at the zee's request — ${skipped.length} pending file(s) NOT applied:\n`
+          + skipped.join('\n') + (ship.db_note ? `\n\nzee's assessment: ${ship.db_note}` : '') });
+      logline('ship', `migrations SKIPPED by zee scope (${skipped.length} pending file(s) not applied)`);
+    }
+  } else if (ok) {
     const mig = await applyMigrations(project, ship.commit, site);
     if (mig.applied?.length || !mig.ok) {
       results.push({ role: 'migrations', ok: mig.ok, applied: mig.applied, error: mig.ok ? null : mig.error });

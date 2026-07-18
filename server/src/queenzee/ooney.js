@@ -45,7 +45,13 @@ const SHIPPABLE = ['server', 'webapp'];
 const gate = (name, verdict, instruction, detail = null) =>
   ({ gate: name, verdict, instruction, ...(detail ? { detail } : {}) });
 
-export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId = null }) {
+// dbOk (string): the zee's diagnosis that the measured schema drift cannot break ITS change —
+//   the schema gate then passes WITH the assessment attached, and the human judges it on the
+//   ship card. Never bypasses an UNMEASURABLE comparison: "could not compare" stays a deny.
+// skipDb (bool): scope the ship to CODE ONLY — pending migration/ops files are not applied.
+//   Skipping the very files that would fix a drift means the drift needs a dbOk assessment.
+export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId = null,
+                                   dbOk = null, skipDb = false }) {
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   if (!xell) throw new Error('unknown xell');
   if (xell.is_production) throw new Error('production does not ship itself');
@@ -143,14 +149,24 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
     // tip are applied by the queenzee before the containers build. Only unexplained drift denies.
     // Only SCHEMA_DIR files can excuse catalog drift — a pending ops/ data fix rides the ship
     // too, but it changes rows, not the catalog, so it explains nothing this gate measures.
+    // A skipDb ship applies NOTHING, so pending files excuse nothing either — only the zee's own
+    // assessment (dbOk) can carry a drift then.
     const tip = git(project.repo_root, ['rev-parse', main]);
     const mig = tip.ok ? await pendingMigrations(project, tip.out.trim()) : { ok: false, pending: [] };
     const ddl = (mig.pending || []).filter((f) => f.startsWith(`${SCHEMA_DIR}/`));
-    if (mig.ok && ddl.length) {
+    if (!skipDb && mig.ok && ddl.length) {
       steps.push(gate('schema', 'pass',
         `schema differs from prod (${diff.total} difference(s)), but ${ddl.length} pending `
         + `migration(s) ride this ship and are applied BEFORE the containers build: `
         + `${ddl.join(', ')}. The human sees them on the ship request.`));
+    } else if (dbOk) {
+      // The zee DIAGNOSED the drift (the deny below hands it the object names) and judged it
+      // cannot break this change. The gate passes carrying the assessment — the ship request
+      // shows it, so the human approves the reasoning, not a bare green tick.
+      steps.push(gate('schema', 'pass',
+        `schema differs from prod (${diff.total} difference(s) — ${kinds}), and you assessed the `
+        + `drift as non-breaking for this change: "${String(dbOk).slice(0, 300)}". Your assessment `
+        + `rides the ship request for the human to judge${skipDb ? ' (db scope: SKIPPED by your request)' : ''}.`));
     } else {
       // ATTRIBUTION matters here. On the SHARED dev db the drift may not even be this xell's —
       // it is the union of every xell's leftovers, which is exactly why schema work now happens
@@ -158,11 +174,17 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
       const onShared = xell.db_coupling === 'db-shared-dev';
       return deny(gate('schema', 'deny',
         `Your database schema DIFFERS from production (${diff.total} difference(s) — ${kinds}) and NO `
-        + `pending migration accounts for it. Your code was verified against a schema prod will not `
+        + `pending migration accounts for it${skipDb ? ' (and your ship is scoped to skip the db, so pending files would not run anyway)' : ''}. `
+        + `Your code was verified against a schema prod will not `
         + `have. Write the change as a file under server/sql/migrations/ (idempotent DDL — ADD COLUMN `
         + `IF NOT EXISTS and friends), land it, and it ships with you: the queenzee applies it to prod `
         + `before the containers build. (One-time DATA fixes ride the same way from server/sql/ops/ — `
-        + `run once against prod, ledgered, never re-run.) Then re-run this check.`
+        + `run once against prod, ledgered, never re-run.) Then re-run this check.\n`
+        + `OR: DIAGNOSE the drift instead. The detail below names the differing objects — if your `
+        + `change never touches them (someone else's tables, legacy leftovers), say so and re-run with\n`
+        + `  --db-ok "why this drift cannot break this change"\n`
+        + `The gate then passes WITH your assessment attached, and the human judges your reasoning on `
+        + `the ship request. Assess honestly: this is your name on the drift.`
         + (onShared
           ? ` NOTE: your database is the SHARED dev db, so some of this drift may be other xells' or `
             + `legacy leftovers — not yours to fix. Once a migration file exists on your branch the `
@@ -240,10 +262,11 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
         + 'Raising a fresh request requires the failure to be understood first — tell your human.'));
       return { verdict: 'deny', next: steps[steps.length - 1], steps, targets: t };
     }
-    const r = await requestShip({ xellId, zeeId, reason, targets: t });
+    const r = await requestShip({ xellId, zeeId, reason, targets: t,
+      skipDb: !!skipDb, dbNote: dbOk ? String(dbOk).slice(0, 500) : null });
     if (r.ok === false) return deny(gate('human', 'deny', `Ship request refused: ${r.reason}`));
     steps.push(gate('human', 'wait',
-      `All gates green — ship request raised for ${t.join(' + ')} @ ${String(r.request.commit).slice(0, 8)}. `
+      `All gates green — ship request raised for ${t.join(' + ')}${skipDb ? ' (db SKIPPED at your request)' : ''} @ ${String(r.request.commit).slice(0, 8)}. `
       + 'A HUMAN must approve it in the ZEEHIVE console. Tell them it is waiting; nothing you do speeds it up. '
       + 'Keep polling — approval flips this to shipping, then live.'));
     return { verdict: 'wait', next: steps[steps.length - 1], steps, targets: t, request: r.request };

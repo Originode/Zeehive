@@ -131,6 +131,21 @@ function ShipCard({ req, live, prodSites, onDone }) {
       <div className="land-stat">
         builds local <b>main</b> @ <b>{short(req.commit)}</b> — not the xell's worktree, not origin
       </div>
+      {/* DB scope + the zee's drift assessment — the human approves the SCOPE and the REASONING,
+          not a bare green tick. A code-only ship says what it deliberately will not run. */}
+      {req.skip_migrations && (
+        <div className="ship-dbscope" data-testid="ship-dbscope">
+          ⚠ db scope: code only — {Array.isArray(req.migrations) && req.migrations.length
+            ? `${req.migrations.length} pending sql file(s) will NOT be applied`
+            : 'pending sql files (if any) will NOT be applied'}
+        </div>
+      )}
+      {req.db_note && (
+        <div className="ship-dbnote" data-testid="ship-dbnote"
+             title="The zee diagnosed its schema drift against the drift detail and judged it non-breaking — this is its reasoning.">
+          zee's drift assessment: “{req.db_note}”
+        </div>
+      )}
       {req.status === 'shipping' && (
         <div className="ship-progress">
           ⟳ queenzee is deploying — it holds the prod lock.

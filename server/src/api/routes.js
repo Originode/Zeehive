@@ -469,6 +469,7 @@ router.post('/ooney/check', async (req, res) => {
     res.json(await ooneyCheck({
       xellId: req.body?.xell_id, targets: req.body?.targets || null,
       reason: req.body?.reason || null, zeeId: req.body?.zee_id || null,
+      dbOk: req.body?.db_ok || null, skipDb: !!req.body?.skip_db,
     }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
