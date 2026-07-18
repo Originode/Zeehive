@@ -6,7 +6,7 @@ import { getFleet, listRuntimes } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
-import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode } from '../queenzee/intake.js';
+import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
@@ -317,6 +317,9 @@ router.get('/xell/db-modes', (_req, res) =>
 // the autonomy scale a dispatch can pick from (1=recon … 5=bypass)
 router.get('/xell/modes', (_req, res) =>
   res.json(Object.entries(DISPATCH_MODES).map(([n, m]) => ({ mode: Number(n), key: m.key, permission_mode: m.permissionMode, tools: m.tools || 'all', label: m.label }))));
+
+// the models a dispatch can run (opus/sonnet/haiku); `default` marks the current ZEE_MODEL default
+router.get('/xell/models', (_req, res) => res.json(listDispatchModels()));
 
 // Change a zee's permission mode from the console (the mode chip on a xell card). Live-applies
 // to a headless zee we hold the handle for; otherwise recorded, with a note saying so.

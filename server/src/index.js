@@ -35,7 +35,10 @@ process.on('uncaughtException', (err) => {
 });
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+// 2mb was fine for hooks + control bodies, but the dashboard's "+" dispatch can carry pasted
+// screenshots inline (base64 in the task body). A single screenshot is a few MB and base64 inflates
+// it ~33%, so the old cap rejected the compose-with-image path outright. 30mb covers a handful.
+app.use(express.json({ limit: '30mb' }));
 
 // permissive CORS for the local Vite dev app + localhost hooks
 app.use((req, res, next) => {

@@ -15,6 +15,7 @@ import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 import MachineMatrix from './Machines.jsx';
 import ModeChip from './ModeChip.jsx';
+import Dispatch from './Dispatch.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
 
@@ -40,6 +41,7 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
+  const [showDispatch, setShowDispatch] = useState(false); // the "+" prompt composer
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
 
   // open the container context menu at the cursor — passed down to each xell's ContainerChips.
@@ -235,6 +237,9 @@ export default function App() {
         {!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0)
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
+        <button className="new-prompt-btn" data-testid="new-prompt-btn"
+                title="Compose a prompt and dispatch a zee into a ready xell"
+                onClick={() => setShowDispatch(true)}>＋ new prompt</button>
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
@@ -273,6 +278,11 @@ export default function App() {
       </section>
       </div>
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
+      {showDispatch && (
+        <Dispatch projectId={projectId || project.id} projectName={project.name}
+                  onClose={() => setShowDispatch(false)}
+                  onDispatched={() => { setShowDispatch(false); refresh(); }} />
+      )}
       <ContainerMenu menu={menu} onClose={() => setMenu(null)} />
     </div>
   );

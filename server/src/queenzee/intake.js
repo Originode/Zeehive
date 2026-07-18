@@ -2,7 +2,7 @@
 //   skill-claim   : a human's Claude session (via /xell) claims the freshest ready xell
 //   headless-spawn: queenzee spawns a headless zee via the Agent SDK (see spawnHeadless)
 import { resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
@@ -166,11 +166,44 @@ function titleFromTask(task) {
   return null;
 }
 
+// Pasted images ride the dispatch body as base64 data URLs (the dashboard "+" composer lets a
+// human paste a screenshot into the prompt). Decode them into the TARGET worktree so the spawned
+// zee can Read them by a path relative to its cwd — the same way a human would hand it a file.
+// Returns the worktree-relative paths saved (drops any that fail; never throws — a bad image must
+// not sink the dispatch). The folder gets a `.gitignore` of `*` so pasted screenshots never show
+// up as dirty files or get accidentally committed by the zee.
+function saveDispatchImages(worktreePath, images) {
+  if (!worktreePath || !existsSync(worktreePath) || !Array.isArray(images) || !images.length) return [];
+  const dir = resolve(worktreePath, '.zeehive', 'prompt-attachments');
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(resolve(dir, '.gitignore'), '*\n'); // git ignores the whole folder, incl. this file
+  } catch (e) { logline('intake', `could not prepare attachments dir: ${e.message}`); return []; }
+  const stamp = Date.now();
+  const saved = [];
+  images.forEach((img, i) => {
+    const data = typeof img === 'string' ? img : img?.data;
+    if (!data) return;
+    const m = /^data:([^;,]+)?(?:;base64)?,(.*)$/s.exec(data);
+    const mime = (m && m[1]) || 'image/png';
+    const b64 = m ? m[2] : data;
+    const ext = (mime.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'png';
+    const raw = (typeof img === 'object' && img?.name) ? String(img.name) : '';
+    const base = raw.replace(/\.[^.]*$/, '').replace(/[^a-z0-9._-]/gi, '_').slice(0, 40) || `pasted-${i + 1}`;
+    const rel = `.zeehive/prompt-attachments/${stamp}-${i + 1}-${base}.${ext}`;
+    try {
+      writeFileSync(resolve(worktreePath, rel), Buffer.from(b64, 'base64'));
+      saved.push(rel);
+    } catch (e) { logline('intake', `could not save pasted image #${i + 1}: ${e.message}`); }
+  });
+  return saved;
+}
+
 // POST /api/xell/dispatch — the confirmed auto-dispatch path for /xell run OUTSIDE a worktree.
 // The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
 // per the runtime) to run the task. Human confirms in their session before this is called.
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
-                                     headless = true, model, db, db_container, dump }) {
+                                     headless = true, model, db, db_container, dump, images }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -205,8 +238,23 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
     await attachXellDb(targetId, { coupling: db, container: db_container, dump });
   }
 
+  // Pasted images: save them into the (possibly just-renamed) target worktree and append a
+  // reference block so the zee is handed PATHS to Read, not a base64 blob in its prompt. Done
+  // AFTER the rename above, which moves the worktree folder — so we re-read the current path.
+  let taskText = task;
+  if (targetId && Array.isArray(images) && images.length) {
+    const wt = (await one(`SELECT worktree_path FROM xell WHERE id=$1`, [targetId]))?.worktree_path;
+    const saved = saveDispatchImages(wt, images);
+    if (saved.length) {
+      taskText += `\n\n## Attached images\n`
+        + `The human pasted ${saved.length} image(s) into this prompt. They are saved in your `
+        + `worktree — open them with the Read tool (paths are relative to your worktree root):\n`
+        + saved.map((p) => `- ${p}`).join('\n');
+    }
+  }
+
   const spawned = await spawnHeadless({
-    projectId, xellId: targetId, task, runtime, mode, title: inherited,
+    projectId, xellId: targetId, task: taskText, runtime, mode, title: inherited,
     headless: headless !== false, ...(model ? { model } : {}),
   });
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
@@ -224,7 +272,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   await q(
     `INSERT INTO task (project_id, prompt_text, source, status, xell_id, zee_id, assigned_at)
      VALUES ($1,$2,'dispatch','assigned',$3,$4, now())`,
-    [projectId, task, spawned.xell_id, spawned.zee_id]);
+    [projectId, taskText, spawned.xell_id, spawned.zee_id]);
 
   logline('intake', `dispatched a zee into ${xell?.slug} — confirmed working (${runtime || 'default runtime'}, mode ${m.key})`);
   return { status: 'dispatched', slug: xell?.slug, worktree: xell?.worktree_path,
@@ -533,6 +581,18 @@ async function briefing(xellId, zee, task, { headless = true } = {}) {
 // so every zee was quietly the weaker model on the hardest, least-supervised work. Override per
 // dispatch, or set ZEE_MODEL. Default is opus: a zee runs unattended with no one to catch it.
 const DEFAULT_ZEE_MODEL = process.env.ZEE_MODEL || 'opus';
+
+// The models a dispatched zee can run — the aliases the Agent SDK/CLI resolves to the current
+// Claude generation (so we never hardcode a dated model id here). The dashboard "+" composer reads
+// this for its model picker; `default` marks whatever DEFAULT_ZEE_MODEL currently is.
+const ZEE_MODELS = [
+  { key: 'opus',   label: 'Opus',   note: 'most capable — best for unattended, load-bearing work' },
+  { key: 'sonnet', label: 'Sonnet', note: 'fast and cheaper — good for well-scoped or simple jobs' },
+  { key: 'haiku',  label: 'Haiku',  note: 'fastest and cheapest — light edits and quick tasks' },
+];
+export function listDispatchModels() {
+  return ZEE_MODELS.map((m) => ({ ...m, default: m.key === DEFAULT_ZEE_MODEL }));
+}
 
 export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true }) {
   const m = resolveMode(mode);

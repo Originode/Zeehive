@@ -14,6 +14,30 @@ export async function getRuntimes() {
   return r.ok ? r.json() : [];
 }
 
+// ── dispatch composer (the "+" button): modes, models, and the dispatch itself ──
+// The autonomy scale (1=plan … 5=bypass) and the model list power the composer's pickers.
+export async function getDispatchModes() {
+  const r = await fetch('/api/xell/modes');
+  return r.ok ? r.json() : [];
+}
+export async function getDispatchModels() {
+  const r = await fetch('/api/xell/models');
+  return r.ok ? r.json() : [];
+}
+
+// Dispatch a human-composed prompt EXACTLY like a /xell dispatch: the queenzee claims a ready xell
+// for this project and spawns a zee into its worktree with the task (and any pasted images).
+// `images` is [{ name, data }] where data is a base64 data URL. Throws with the server's message
+// (e.g. "no ready xell available") so the composer can surface it without losing the prompt.
+export async function dispatchTask(body) {
+  const r = await fetch('/api/xell/dispatch', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dispatch failed (${r.status})`);
+  return data;
+}
+
 export async function getTimeline(projectId) {
   const r = await fetch(`/api/git/timeline${pq(projectId)}`);
   return r.ok ? r.json() : null;
