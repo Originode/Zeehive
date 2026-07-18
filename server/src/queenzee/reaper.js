@@ -105,13 +105,17 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   const script = resolve(config.repoRoot, 'scripts', 'despawn-xell.sh');
   let despawn = { skipped: true };
   if (existsSync(script) && xell.worktree_path && existsSync(xell.worktree_path)) {
-    // Despawn on the xell's OWN project's dev site — the global env default is only a
-    // fallback; a second project with a different dev context must not purge on the wrong daemon.
+    // Despawn on the xell's OWN machine — its containers' stamped context, which since machines
+    // (023) can differ per xell. The project dev site and the global env default are fallbacks
+    // for rows that predate stamping; purging on the wrong daemon removes nothing and leaks.
     const project = await one(`SELECT repo_root FROM project WHERE id=$1`, [xell.project_id]);
+    const ownCtx = (await one(
+      `SELECT docker_ctx FROM container WHERE owner_xell_id=$1 AND role='server' AND docker_ctx IS NOT NULL LIMIT 1`,
+      [xellId]))?.docker_ctx || null;
     const devSite = await resolveSite(xell.project_id, 'dev');
     const r = spawnSync(resolveBash(), [script, xell.worktree_path], {
       cwd: project?.repo_root || config.omnibizRoot, encoding: 'utf8', timeout: 120000,
-      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devSite?.docker_ctx || config.dockerCtx }),
+      env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: ownCtx || devSite?.docker_ctx || config.dockerCtx }),
     });
     const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
     let verdict = null; try { verdict = JSON.parse(line); } catch { /* no JSON line */ }

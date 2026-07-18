@@ -1,14 +1,20 @@
-// Pool maintainer / reconciler — keeps EXACTLY `pool_config.target_ready` pooled xells that
-// are each pristine: sitting on the source tip (diff 0,0), claimable immediately. Pure script,
-// no AI. Each tick, per project:
+// Pool maintainer / reconciler — keeps the pool of pristine pooled xells: each sitting on the
+// source tip (diff 0,0), claimable immediately. Pure script, no AI. Each tick, per project:
 //   1. reconcile every pooled xell to the source — clean fast-forward (catch up), else
 //      decommission it (dirty / diverged / too far behind / ff impossible).
 //   2. INVARIANT: a xell is 'ready' only when its diff to source is (0 ahead, 0 behind).
-//   3. fill  — if ready < target, provision fresh xells (which start at the source tip).
-//   4. trim  — if ready > target, decommission the surplus (oldest first).
+//   3. fill  — provision fresh xells (which start at the source tip) up to target.
+//   4. trim  — decommission the surplus (oldest first).
+//
+// TARGETS: machine-aware when machine rows exist (023) — each dev machine keeps
+// `machine.pool_size` ready xells PER PROJECT, and `max_xells` caps the machine's total live
+// dev xells across EVERY project (the host only has so much muscle). Filled in dev_priority
+// order so the preferred machine warms first. With no machines, the legacy project-wide
+// `pool_config.target_ready` applies unchanged on the one dev site.
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { provisionXell } from '../lib/provision.js';
+import { devMachines, liveXellCount } from '../lib/machines.js';
 import { reapXell } from './reaper.js';
 import { reconcileXell } from './landing.js';
 import { logline } from '../lib/logbus.js';
@@ -36,24 +42,43 @@ async function reconcileProject(projectId, target) {
     }
   }
 
-  // 3+4. Fill or trim to hit exactly `target` ready (all now guaranteed at the source tip).
-  const ready = await q(
-    `SELECT id, slug FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production
-       ORDER BY ready_at DESC NULLS LAST, created_at DESC`, [projectId]);
+  // 3+4. Fill or trim (all pooled xells now guaranteed at the source tip). Machine mode: each
+  // machine keeps pool_size ready xells for THIS project; legacy project-wide target otherwise.
+  const machines = await devMachines();
+  if (!machines.length) return fillTrim(projectId, target, null);
+  for (const m of machines) {
+    await fillTrim(projectId, m.pool_size, m).catch((e) => console.error(`[pool] ${m.key}:`, e.message));
+  }
+}
+
+// Fill to / trim past `target` ready xells — on one machine (m) or project-wide (m = null).
+async function fillTrim(projectId, target, m) {
+  const ready = m
+    ? await q(
+      `SELECT x.id, x.slug FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
+        WHERE x.project_id=$1 AND x.status='ready' AND NOT x.is_production AND c.docker_ctx=$2
+        ORDER BY x.ready_at DESC NULLS LAST, x.created_at DESC`, [projectId, m.docker_ctx])
+    : await q(
+      `SELECT id, slug FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production
+        ORDER BY ready_at DESC NULLS LAST, created_at DESC`, [projectId]);
 
   if (ready.length < target) {
-    for (let i = 0; i < target - ready.length; i++) {
+    // max_xells is MACHINE-WIDE: every live dev xell on the host counts (all projects, claimed
+    // and working too), so a busy machine fills less than pool_size rather than blowing past it.
+    let room = target - ready.length;
+    if (m) room = Math.min(room, Math.max(0, m.max_xells - await liveXellCount(m.docker_ctx)));
+    for (let i = 0; i < room; i++) {
       try {
-        const x = await provisionXell({ projectId, mode: MODE });
-        logline('pool', `provisioned ready xell ${x.slug} (${MODE}) → server :${x.ports.serverPort} web :${x.ports.webPort}`);
+        const x = await provisionXell({ projectId, mode: MODE, machineCtx: m?.docker_ctx });
+        logline('pool', `provisioned ready xell ${x.slug} (${MODE}${m ? ` on ${m.key}` : ''}) → server :${x.ports.serverPort} web :${x.ports.webPort}`);
       } catch (err) {
-        console.error('[pool] provision failed:', err.message);
+        console.error(`[pool] provision failed${m ? ` on ${m.key}` : ''}:`, err.message);
         break; // stop hammering on persistent failure this tick
       }
     }
   } else if (ready.length > target) {
     const surplus = ready.slice(target); // freshest kept, oldest surplus reaped
-    logline('pool', `trimming ${surplus.length} surplus ready xell(s): ${surplus.map((s) => s.slug).join(', ')}`);
+    logline('pool', `trimming ${surplus.length} surplus ready xell(s)${m ? ` on ${m.key}` : ''}: ${surplus.map((s) => s.slug).join(', ')}`);
     for (const s of surplus) await reapXell(s.id, 'pool-surplus')
       .catch((e) => logline('pool', `TRIM FAILED for ${s.slug}: ${e.message} — surplus xell stays`));
   }

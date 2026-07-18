@@ -13,6 +13,7 @@ import LandingPanel, { LandCard } from './Landing.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
+import MachineMatrix from './Machines.jsx';
 import ModeChip from './ModeChip.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
@@ -226,7 +227,10 @@ export default function App() {
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
-        <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />
+        {/* Per-machine pool sizes (matrix column headers) replace the project-wide target once
+            any dev machine exists — showing both would leave one knob lying. */}
+        {!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0)
+          && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
@@ -251,17 +255,10 @@ export default function App() {
 
       <BackupsPanel backup={fleet.backup} projectId={projectId || project.id} />
 
-      <section className="inventory">
-        {['db', 'server', 'webapp', 'other'].map((role) => (
-          <div className="invrow" key={role} data-role={role}>
-            <span className="invlabel">{ROLE_LABEL[role]}:</span>
-            <span className="boxes">
-              {(containers[role] || []).map((c) => <ContainerChip key={c.id} c={c} onMenu={openMenu} />)}
-              {(!containers[role] || containers[role].length === 0) && <span className="cbox empty">—</span>}
-            </span>
-          </div>
-        ))}
-      </section>
+      {/* The inventory as a role × machine MATRIX: one column per machine, so what-runs-where is
+          the panel's shape. Chips sit where they RUN; the ⇄ marker says where they compile. */}
+      <MachineMatrix machines={fleet.machines} containers={containers}
+                     projectId={projectId || project.id} onMenu={openMenu} onChanged={refresh} />
 
       <h2 className="xells-h">xells:</h2>
       <section className="xells">

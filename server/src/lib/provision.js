@@ -13,6 +13,7 @@ import { headCommit, cleanGitEnv } from './git.js';
 import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
+import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
 
 const ADJ = ['swift', 'calm', 'bright', 'bold', 'keen', 'lively', 'nimble', 'quiet', 'sunny', 'wise'];
 const NOUN = ['harbor', 'meadow', 'summit', 'delta', 'ember', 'grove', 'atlas', 'cove', 'ridge', 'vale'];
@@ -52,9 +53,12 @@ export async function emitXellEnv(xellId) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
   const site = await resolveSite(xell.project_id, 'dev');
   const cs = await q(
-    `SELECT role, host_port, conn_ref FROM container
+    `SELECT role, host_port, conn_ref, docker_ctx FROM container
       WHERE owner_xell_id=$1 AND role IN ('server','webapp','db')`, [xellId]);
   const portOf = (role) => cs.find((c) => c.role === role)?.host_port ?? '';
+  // The context the xell's stack ACTUALLY runs on — machines made this per-xell, so the site's
+  // default is only the fallback for rows that predate context stamping.
+  const xellCtx = cs.find((c) => c.role === 'server')?.docker_ctx || null;
 
   const spin = project?.manifest?.tiers?.spinoff || {};
   const serverEnv = spin.ports?.server?.env || 'SPINOFF_SERVER_PORT';
@@ -65,7 +69,7 @@ export async function emitXellEnv(xellId) {
     `${serverEnv}=${portOf('server')}`,
     `${webEnv}=${portOf('webapp')}`,
     `ZEEHIVE_SITE=${site?.key || 'dev'}`,
-    `ZEEHIVE_DOCKER_CONTEXT=${site?.docker_ctx || config.dockerCtx}`,
+    `ZEEHIVE_DOCKER_CONTEXT=${xellCtx || site?.docker_ctx || config.dockerCtx}`,
   ];
 
   // The xell's OWN database, when it has one. HARD GUARD (spec §6.2): never emit the managing
@@ -184,8 +188,10 @@ export async function makeSlug(projectId) {
   throw new Error('could not allocate a unique slug');
 }
 
-// Provision one pooled (empty, ready) xell for a project.
-export async function provisionXell({ projectId, mode = 'simulate', sourceCoupling, dbCoupling }) {
+// Provision one pooled (empty, ready) xell for a project. machineCtx (optional) pins the target
+// machine — the pool maintainer passes it when filling per-machine targets; omitted, the
+// highest-priority machine with room is chosen (or legacy site placement when no machines exist).
+export async function provisionXell({ projectId, mode = 'simulate', sourceCoupling, dbCoupling, machineCtx }) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
   const xource = await one(`SELECT * FROM xource WHERE project_id=$1 AND ref=$2`, [projectId, project.main_branch]);
   const cfg = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [projectId]);
@@ -194,13 +200,34 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   const worktree = `${project.repo_root.replace(/\\/g, '/')}/.claude/worktrees/${slug}`;
   const ports = computePorts(slug, project);
 
-  // WHERE this xell's app tier runs: the project's default dev site (falls back to the
-  // deprecated project columns, then the global env default — see lib/sites.js).
+  // WHERE this xell's app tier runs. Machine-aware when machine rows exist (highest dev_priority
+  // with room under max_xells — spec: "if local priority is higher, dev xells get spawned there
+  // first"); legacy otherwise: the project's default dev site → deprecated project columns →
+  // global env default (see lib/sites.js).
+  const machine = machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine();
+  if (machineCtx && !machine) throw new Error(`no machine row for docker context '${machineCtx}'`);
   const devSite = await resolveSite(projectId, 'dev');
-  const devCtx = devSite?.docker_ctx || config.dockerCtx;
-  const devHost = devSite?.host || project.dev_host_ip || config.devHostIp;
+  const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
+  const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
   const devSiteId = devSite?.id || null;
   const url = `http://${devHost}:${ports.webPort}`;
+
+  // A xell's app tier must never reach across docker contexts for its database, so a machine
+  // without this project's own shared dev db cannot host xells that need one. Refused HERE, by
+  // name, with the fix — not discovered as a crash-looping stack after provisioning. Only for
+  // projects that HAVE a shared dev db somewhere: one with none at all (Zeehive itself) never
+  // linked one before machines existed either, and must keep provisioning exactly as it did.
+  const coupling = dbCoupling || cfg.default_db_coupling;
+  if (machine && ['db-shared-dev', 'db-clone'].includes(coupling)) {
+    const anywhere = await one(
+      `SELECT 1 FROM container WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared' LIMIT 1`,
+      [projectId]);
+    if (anywhere && !(await sharedDevDb(projectId, devCtx))) {
+      throw new Error(`machine '${machine.key}' has no shared dev db for ${project.name} — `
+        + `provision one there first (console → container matrix → ${machine.key} column → provision dev db), `
+        + `or set its pool/priority to 0`);
+    }
+  }
 
   // the xell branches off the CURRENT xource tip — capture it (cheap, both modes)
   let head = headCommit(project.repo_root, project.main_branch);
@@ -238,10 +265,21 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // per-xell containers: its own server + webapp
     // Names/images/compose-project come from the project's naming templates (manifest-backed,
     // defaults derived from the project name — see lib/manifest.js). Never hardcoded per project.
-    // Spawn-template default for WHERE these images compile. NULL (or equal to the run context) ⇒
-    // build on the run host, unchanged. A foreign value was already validated to have a registry
-    // when it was set on pool_config, so a pooled xell inherits a build host that actually works.
-    const defaultBuildCtx = cfg.default_build_ctx && cfg.default_build_ctx !== devCtx ? cfg.default_build_ctx : null;
+    // WHERE these images compile. Machine-aware first: a machine that can build compiles its own
+    // (NULL); one that can't (the NAS) points at the best build-capable machine — but only when a
+    // registry exists to hand the image over, else fall back to building on the run host rather
+    // than fail every provision. Legacy (no machines): pool_config.default_build_ctx, already
+    // registry-validated when it was set.
+    let defaultBuildCtx = machine
+      ? await defaultBuildCtxFor(machine)
+      : (cfg.default_build_ctx && cfg.default_build_ctx !== devCtx ? cfg.default_build_ctx : null);
+    if (defaultBuildCtx && defaultBuildCtx !== devCtx
+        && !((project.registry && project.registry.trim()) || config.registry)) {
+      console.error(`[provision] ${slug}: build host ${defaultBuildCtx} needs a registry to hand `
+        + `images to ${devCtx} but none is configured — building on the run host instead`);
+      defaultBuildCtx = null;
+    }
+    if (defaultBuildCtx === devCtx) defaultBuildCtx = null;
     const mk = async (role, hostPort, intPort, curl) => {
       const nm = namingFor(project, role, slug);
       const { rows: [c] } = await client.query(
@@ -258,8 +296,13 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // SAME container — the clone database itself is cut lazily (at dispatch, or by the
     // schema-work watch), never for a pristine pooled xell.
     if (['db-shared-dev', 'db-clone'].includes(dbCoupling || cfg.default_db_coupling)) {
+      // THIS machine's dev db — never another context's (cross-context db traffic is forbidden).
+      // Ordered so an exact docker_ctx match wins; the ctx-less fallback only serves legacy rows
+      // from before contexts were stamped.
       const shared = await client.query(
-        `SELECT id FROM container WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared' LIMIT 1`, [projectId]);
+        `SELECT id FROM container WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared'
+            AND (docker_ctx = $2 OR docker_ctx IS NULL)
+          ORDER BY (docker_ctx = $2) DESC NULLS LAST LIMIT 1`, [projectId, devCtx]);
       if (shared.rows[0]) {
         await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'uses') ON CONFLICT DO NOTHING`, [xell.id, shared.rows[0].id]);
       }

@@ -68,6 +68,21 @@ for i in $(seq 1 60); do
 done
 [ "$ready" = true ] || { emit false "postgres never became ready"; exit 1; }
 
+# Optional: attach to the project network under an alias (DB_NETWORK / DB_NETWORK_ALIAS env).
+# A SHARED dev db must be resolvable as (typically) `postgres` on the compose network, and a
+# recreated db that lost its alias crash-loops the whole fleet on that daemon — the known trap.
+# The network is created if absent: on a brand-new machine nothing else has made it yet.
+# Per-xell ISOLATED dbs don't pass these (their apps connect by host:port) — total no-op then.
+if [ -n "${DB_NETWORK:-}" ]; then
+  d network inspect "$DB_NETWORK" >/dev/null 2>&1 || d network create "$DB_NETWORK" >&2 2>&1 \
+    || { emit false "could not create network ${DB_NETWORK}"; exit 1; }
+  if ! d inspect -f '{{json .NetworkSettings.Networks}}' "$NAME" 2>/dev/null | grep -q "\"${DB_NETWORK}\""; then
+    if ! d network connect ${DB_NETWORK_ALIAS:+--alias "$DB_NETWORK_ALIAS"} "$DB_NETWORK" "$NAME" >&2 2>&1; then
+      emit false "could not attach ${NAME} to ${DB_NETWORK}${DB_NETWORK_ALIAS:+ (alias $DB_NETWORK_ALIAS)}"; exit 1
+    fi
+  fi
+fi
+
 [ -z "$DUMP" ] && { emit true "started (no dump requested)"; exit 0; }
 [ -f "$DUMP" ] || { emit false "dump not found: $DUMP"; exit 1; }
 

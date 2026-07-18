@@ -26,8 +26,16 @@ const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulat
 function norm(p) { return String(p || '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
 
 async function readyXells(projectId) {
+  // Machine-priority first (023): a claim takes a ready xell from the preferred machine before
+  // any other — "if local priority is higher, dev xells get spawned there first" applies to
+  // dispatch exactly like it does to the pool fill. With no machine rows every priority is 0
+  // and this is the old freshest-first order unchanged.
   return q(
-    `SELECT * FROM xell WHERE project_id = $1 AND status = 'ready' ORDER BY ready_at DESC NULLS LAST, created_at DESC`,
+    `SELECT x.* FROM xell x
+       LEFT JOIN container sc ON sc.owner_xell_id = x.id AND sc.role = 'server'
+       LEFT JOIN machine m ON m.docker_ctx = sc.docker_ctx AND m.enabled
+      WHERE x.project_id = $1 AND x.status = 'ready'
+      ORDER BY COALESCE(m.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
     [projectId]);
 }
 

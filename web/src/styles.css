@@ -438,6 +438,45 @@ a.cbox:hover { border-color: var(--accent); }
 .pooltarget .step:hover:not(:disabled) { border-color: var(--accent); }
 .pooltarget .step:disabled { opacity: .35; cursor: not-allowed; }
 
+/* ── the container MATRIX: role rows × machine columns ─────────────────────── */
+.matrix { display: grid; gap: 4px 14px; align-items: start; margin: 10px 0 4px;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+.matrix .mx-corner, .matrix .mx-pad { min-width: 0; }
+.mx-head { font-size: 12px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
+.mx-head.off { opacity: .45; }
+.mx-head.elsewhere { color: var(--muted); font-style: italic; align-self: end; }
+.mx-name { display: flex; align-items: center; gap: 6px; }
+.mx-name b { font-size: 13px; }
+.mx-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 10px; padding: 0 2px; }
+.mx-del:hover { color: #d9553b; }
+.mx-knobs { display: flex; align-items: center; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+.mx-knob { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); }
+.mx-knob .k { font-size: 10px; }
+.mx-knob input { width: 38px; background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 4px; padding: 1px 3px; font-size: 11px; }
+.mx-build { cursor: pointer; opacity: .4; display: inline-flex; align-items: center; gap: 2px; }
+.mx-build.on { opacity: 1; }
+.mx-build input { display: none; }
+.mx-devdb { margin-top: 5px; font-size: 11px; background: rgba(217,85,59,.12); color: #ffb4a2;
+  border: 1px solid #d9553b; border-radius: 5px; padding: 2px 7px; cursor: pointer; }
+.mx-devdb:hover:not(:disabled) { background: rgba(217,85,59,.25); }
+.mx-role { align-self: center; }
+.mx-cell { min-height: 26px; }
+.mx-add { align-self: start; justify-self: start; background: var(--panel2); border: 1px dashed var(--line);
+  color: var(--muted); border-radius: 6px; padding: 3px 9px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.mx-add:hover { color: var(--text); border-color: var(--accent); }
+.mx-addform { grid-column: 1 / -1; display: flex; align-items: end; gap: 10px; flex-wrap: wrap;
+  padding: 8px; border: 1px dashed var(--line); border-radius: 6px; font-size: 12px; }
+.mx-addform label { display: flex; flex-direction: column; gap: 2px; color: var(--muted); }
+.mx-addform input, .mx-addform select { background: var(--panel2); border: 1px solid var(--line);
+  color: var(--text); border-radius: 4px; padding: 2px 5px; font-size: 12px; }
+.mx-addform input[type=number] { width: 48px; }
+.mx-addform .mx-cb { flex-direction: row; align-items: center; }
+.mx-addform button { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 5px; padding: 3px 10px; cursor: pointer; }
+.mx-addform button:hover:not(:disabled) { border-color: var(--accent); }
+.mx-addform .mx-cancel { border: none; background: none; color: var(--muted); }
+
 /* auto-approve policy switches (statusline) */
 .autoappr-group { margin-left: 18px; font-size: 14px; display: inline-flex; align-items: center; gap: 8px; }
 .autoappr-group .k { color: var(--muted); }

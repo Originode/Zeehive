@@ -51,6 +51,10 @@ export async function getFleet(projectId) {
   const groups = { db: [], server: [], webapp: [], other: [] };
   for (const c of containers) (groups[c.role] || groups.other).push(c);
 
+  // The hive's machines (global, not per-project) — the container matrix renders one column per
+  // row here, and the spawn/build policy knobs live on them.
+  const machines = await q(`SELECT * FROM machine ORDER BY dev_priority DESC, created_at`);
+
   // xells with their resolved container stack + live zee + runtime label
   const xells = await q(
     `SELECT x.*, xo.ref AS xource_ref,
@@ -162,6 +166,7 @@ export async function getFleet(projectId) {
     heads,
     status: { total, inUse, working, ready: work.filter((x) => x.status === 'ready').length },
     containers: groups,
+    machines,
     backup,
     xells,
     landing,

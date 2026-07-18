@@ -148,6 +148,40 @@ export async function setContainerBuildCtx(containerId, build_ctx) {
   return data;
 }
 
+// ── machines: the hive's docker hosts (placement, caps, build policy) ─────────
+const jsonOrThrow = async (r, what) => {
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${what} failed (${r.status})`);
+  return data;
+};
+export async function getMachines() {
+  const r = await fetch('/api/machines');
+  return jsonOrThrow(r, 'list machines');
+}
+export async function createMachine(body) {
+  const r = await fetch('/api/machines', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  return jsonOrThrow(r, 'add machine');
+}
+export async function updateMachine(id, patch) {
+  const r = await fetch(`/api/machines/${id}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),
+  });
+  return jsonOrThrow(r, 'update machine');
+}
+export async function deleteMachine(id) {
+  const r = await fetch(`/api/machines/${id}`, { method: 'DELETE' });
+  return jsonOrThrow(r, 'delete machine');
+}
+// Stand up the project's shared dev db ON a machine (background; restores the latest prod backup).
+export async function provisionMachineDevDb(machineId, projectId) {
+  const r = await fetch(`/api/machines/${machineId}/dev-db`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ project_id: projectId }),
+  });
+  return jsonOrThrow(r, 'provision dev db');
+}
+
 // Build every buildable (server + webapp) container of a xell.
 export async function buildXell(xellId, hot = false) {
   const r = await fetch(`/api/xells/${xellId}/build`, {

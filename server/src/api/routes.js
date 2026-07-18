@@ -12,6 +12,7 @@ import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restore
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
+import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb } from '../lib/machines.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
@@ -348,6 +349,29 @@ router.get('/monitor/remote', async (_req, res) => res.json(await remoteAvailabl
 
 // ── container health: is each container actually running (per `docker ps`)? ───
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
+
+// ── machines: the hive's docker hosts as data (023) — placement, caps, build policy ──
+router.get('/machines', async (_req, res) => res.json(await listMachines()));
+router.post('/machines', async (req, res) => {
+  try { res.json(await createMachine(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.patch('/machines/:id', async (req, res) => {
+  try { res.json(await updateMachine(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/machines/:id', async (req, res) => {
+  try { res.json(await deleteMachine(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Stand up this project's shared dev db ON a machine (latest prod backup by default) — the
+// prerequisite for the machine hosting dev xells. Background; watch the queenzee log.
+router.post('/machines/:id/dev-db', async (req, res) => {
+  try {
+    const projectId = req.body?.project_id || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+    res.json(await provisionDevDb(projectId, req.params.id, { snapshotId: req.body?.snapshot_id || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 // ── build: (re)build a per-xell server/webapp container (or a whole xell's stack) ──
 // Optional build_ctx in the body sets the build host first ("build on X now"); omit to keep the
