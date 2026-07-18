@@ -810,3 +810,54 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 7px; padding: 6px 18px; font-size: 13px; font-weight: 600; cursor: pointer; }
 .disp-submit:hover { filter: brightness(1.1); }
 .disp-submit:disabled, .disp-cancel:disabled { opacity: .5; cursor: default; }
+
+/* ── honeycomb shell: three panes, the git graph as the exact centre divider ─────
+   [ honeycomb | graph | panels ]. Orientation decides the split axis (row/column);
+   the graph pane always holds the middle slot while the flip (honey-a/b) swaps which
+   outer slot is the honeycomb vs the panels. Connector wires (SVG overlay) bridge each
+   xell's commit dot in the graph to its hexagon in the honeycomb canvas. */
+.hive-split { position: fixed; inset: 0; display: flex; background: var(--bg); overflow: hidden; }
+.hive-split.o-landscape { flex-direction: row; }
+.hive-split.o-portrait  { flex-direction: column; }
+
+.hive-pane { min-width: 0; min-height: 0; }
+.hive-pane.honey  { flex: 1 1 0; position: relative; }
+.hive-pane.panels { flex: 1 1 0; overflow: auto; }
+
+/* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The
+   inner SVG is absolutely positioned and scrolls along its length (group transform) to track prod. */
+.graph-pane { order: 1; position: relative; overflow: hidden; background: var(--bg); }
+.hive-split.o-landscape .graph-pane { border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+.hive-split.o-portrait  .graph-pane { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.graph-svg { overflow: visible; }
+.graph-svg .ghash { fill: var(--muted); font: 9px 'Cascadia Code', ui-monospace, monospace; }
+.graph-branch { position: absolute; color: var(--accent); font: 600 10px 'Cascadia Code', ui-monospace, monospace;
+  pointer-events: none; }
+.graph-branch[data-orient="landscape"] { top: 6px; left: 50%; transform: translateX(-50%); }
+.graph-branch[data-orient="portrait"]  { left: 8px; top: 50%; transform: translateY(-50%); }
+
+/* flip: honey-a → honeycomb in the first slot, honey-b → last slot; graph stays centred (order:1) */
+.hive-split.honey-a .hive-pane.honey  { order: 0; }
+.hive-split.honey-a .hive-pane.panels { order: 2; }
+.hive-split.honey-b .hive-pane.honey  { order: 2; }
+.hive-split.honey-b .hive-pane.panels { order: 0; }
+
+.hive-canvas-wrap { position: absolute; inset: 0; overflow: hidden; }
+.hive-canvas { position: absolute; inset: 0; }
+.hive-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  color: var(--muted); font-size: 13px; }
+
+/* the panels half scrolls independently; drop the old flex/rail padding assumptions */
+.hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }
+
+.flip-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+.flip-btn:hover { color: var(--text); border-color: var(--accent); }
+
+/* the selected-xell drawer: a single card, not a grid */
+.xells.drawer { display: block; }
+.xells-h { display: flex; align-items: center; gap: 10px; }
+.drawer-close { margin-left: auto; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--muted); border-radius: 6px; width: 24px; height: 24px; cursor: pointer; font-size: 12px; }
+.drawer-close:hover { color: var(--down); border-color: var(--down); }
+.drawer-hint { font-size: 13px; }

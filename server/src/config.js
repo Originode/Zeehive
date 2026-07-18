@@ -5,6 +5,12 @@ import dotenv from 'dotenv';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..', '..');
+// A xell worktree has no .env (gitignored) — its parameters live in the GENERATED .zeehive.env
+// projection (spec §6.1: ports, DATABASE_URL → the xell's own db, §6.2 safety modes). Load it
+// FIRST so it wins over .env when both exist; dotenv never overrides keys already set, so real
+// environment variables still beat both. The live checkout has no .zeehive.env — for it this
+// line is a no-op and .env stays truth (the 2026-07-17 lesson).
+dotenv.config({ path: resolve(repoRoot, '.zeehive.env') });
 dotenv.config({ path: resolve(repoRoot, '.env') });
 
 const int = (v, d) => (v == null || v === '' ? d : parseInt(v, 10));

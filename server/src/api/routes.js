@@ -2,7 +2,7 @@
 import { Router } from 'express';
 import { q, one } from '../db/pool.js';
 import { projectHook } from '../lib/status.js';
-import { getFleet, listRuntimes } from '../lib/fleet.js';
+import { getFleet, listRuntimes, streamXells } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
@@ -158,6 +158,36 @@ router.get('/fleet', async (req, res) => {
     console.error('[api] /fleet failed:', err.message);
     res.status(503).json({ error: `fleet unavailable: ${err.message}` });
   }
+});
+
+// Lazy/streaming xell list: NDJSON, one line per xell, flushed as each xell's container stack
+// resolves — so the honeycomb can paint a hexagon the moment its data lands instead of blocking on
+// the whole fleet. First line is {type:'meta', project}; then {type:'xell', xell} per xell; a final
+// {type:'end', count} closes it. Same rows + decoration as /fleet, just incremental. Never throws
+// out (a read model must not take the queenzee down): an error becomes a JSON tail line.
+router.get('/fleet/xells-stream', async (req, res) => {
+  res.set({
+    'Content-Type': 'application/x-ndjson; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',   // belt-and-braces: never let a proxy buffer the stream
+  });
+  const send = (obj) => res.write(JSON.stringify(obj) + '\n');
+  let count = 0;
+  try {
+    const project = await streamXells(req.query.project || null, async (x) => {
+      send({ type: 'xell', xell: x });
+      count += 1;
+    });
+    if (!project) { send({ type: 'error', error: 'no project' }); return res.end(); }
+    // meta rides at the END (project already known) so the client gets xells as early as possible;
+    // it carries the project id so a late client can confirm which project it streamed.
+    send({ type: 'end', count, project: { id: project.id, name: project.name } });
+  } catch (err) {
+    console.error('[api] /fleet/xells-stream failed:', err.message);
+    send({ type: 'error', error: err.message });
+  }
+  res.end();
 });
 
 router.get('/projects', async (_req, res) => res.json(await listProjects()));

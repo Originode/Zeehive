@@ -8,29 +8,12 @@ export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
 }
 
-export async function getFleet(projectId) {
-  const project = projectId
-    ? await one(`SELECT * FROM project WHERE id = $1`, [projectId])
-    : await defaultProject();
-  if (!project) return null;
-  const pid = project.id;
-
-  const pool = await one(`SELECT * FROM pool_config WHERE project_id = $1`, [pid]);
-
-  // Two local ref reads for the whole fleet, not one per xell — this is a dashboard poll.
-  const heads = projectHeads(project.repo_root, project.main_branch || 'main');
-
-  // What production is RUNNING: the last ship that actually landed. NULL until one does — see the
-  // note in timeline.js getDiffs; nothing recorded the hand-deploys that predate the ship gate.
-  const deployed = await one(
-    `SELECT commit, finished_at FROM ship_request WHERE project_id=$1 AND status='shipped'
-       ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [pid]);
-
-  // What each db container CONTAINS (db_instance, 019): primary + clone template + per-xell
-  // clones. Shipped as a JSON aggregate so the chip can say what lives inside without another
-  // round-trip; owner_slug names a clone's xell, and a clone with NO owner is an orphan worth
-  // seeing. Non-db containers aggregate to [].
-  const instancesAgg = `
+// What each db container CONTAINS (db_instance, 019): primary + clone template + per-xell
+// clones. Shipped as a JSON aggregate so the chip can say what lives inside without another
+// round-trip; owner_slug names a clone's xell, and a clone with NO owner is an orphan worth
+// seeing. Non-db containers aggregate to []. Correlated on `c.id`, so it drops into any query
+// that has a `container c` in scope (the inventory query AND each xell's stack query).
+const INSTANCES_AGG = `
     (SELECT coalesce(json_agg(json_build_object(
               'id', di.id, 'name', di.name, 'kind', di.kind,
               'owner_xell_id', di.owner_xell_id, 'owner_slug', ox.slug,
@@ -41,26 +24,25 @@ export async function getFleet(projectId) {
        FROM db_instance di LEFT JOIN xell ox ON ox.id = di.owner_xell_id
       WHERE di.container_id = c.id) AS instances`;
 
-  // grouped container inventory
-  const containers = await q(
-    `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host_port, c.health,
-            c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
-            c.docker_ctx, c.build_ctx,
-            -- where a PROCESS role (docker_ctx NULL) lives: its site's context, so the machine
-            -- matrix can place it in the right column instead of 'elsewhere'
-            (SELECT ds.docker_ctx FROM deploy_site ds WHERE ds.id = c.site_id) AS site_docker_ctx,
-            c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at, ${instancesAgg}
-       FROM container c WHERE c.project_id = $1
-       ORDER BY c.role, c.tier, c.name`, [pid]);
-  const groups = { db: [], server: [], webapp: [], other: [] };
-  for (const c of containers) (groups[c.role] || groups.other).push(c);
+// The per-fleet git/ship context shared by every xell: the heads its xource refs resolve to, and
+// what production is currently serving. Read ONCE for the whole fleet, never per xell — a dashboard
+// poll must not shell out to git N times.
+async function fleetGitContext(project) {
+  // Two local ref reads for the whole fleet, not one per xell — this is a dashboard poll.
+  const heads = projectHeads(project.repo_root, project.main_branch || 'main');
+  // What production is RUNNING: the last ship that actually landed. NULL until one does — see the
+  // note in timeline.js getDiffs; nothing recorded the hand-deploys that predate the ship gate.
+  const deployed = await one(
+    `SELECT commit, finished_at FROM ship_request WHERE project_id=$1 AND status='shipped'
+       ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [project.id]);
+  return { heads, deployed };
+}
 
-  // The hive's machines with THIS project's pool sizes (machine_pool, 025) — the matrix renders
-  // one column per row here, and its pool knob edits this project's number, not a global one.
-  const machines = await listMachines(pid);
-
-  // xells with their resolved container stack + live zee + runtime label
-  const xells = await q(
+// The xell rows (one per non-retired xell) BEFORE their container stacks are attached. Kept
+// separate from decoration so a caller can stream: fetch the cheap list first, then resolve each
+// xell's stack one at a time and emit it the moment it is ready.
+async function fetchXellRows(pid) {
+  return q(
     `SELECT x.*, xo.ref AS xource_ref,
             z.id AS zee_id, z.name AS zee_name, z.status AS zee_status, z.title AS zee_title,
             z.claude_session_id, z.session_name, z.viewer_url, z.viewer_kind,
@@ -87,32 +69,90 @@ export async function getFleet(projectId) {
        LEFT JOIN agent_runtime r ON r.id = z.runtime_id
       WHERE x.project_id = $1 AND x.status <> 'retired'
       ORDER BY x.created_at`, [pid]);
+}
 
-  for (const x of xells) {
-    const stack = await q(
-      `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id,
-              c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
-              c.docker_ctx, c.build_ctx,
-              c.prod_diff, c.prod_diff_at, uc.relation, ${instancesAgg}
-         FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
-        WHERE uc.xell_id = $1
-        ORDER BY CASE c.role WHEN 'db' THEN 1 WHEN 'server' THEN 2 WHEN 'webapp' THEN 3 ELSE 4 END`,
-      [x.id]);
-    x.stack = stack;
-    // pretty-print the name column exactly like the mockup expects
-    x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
+// Attach a xell's resolved container stack + xource/deploy heads. Mutates and returns `x`. One
+// stack query per xell — the streamable unit of work.
+async function decorateXell(x, heads, deployed) {
+  const stack = await q(
+    `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id,
+            c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
+            c.docker_ctx, c.build_ctx,
+            c.prod_diff, c.prod_diff_at, uc.relation, ${INSTANCES_AGG}
+       FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+      WHERE uc.xell_id = $1
+      ORDER BY CASE c.role WHEN 'db' THEN 1 WHEN 'server' THEN 2 WHEN 'webapp' THEN 3 ELSE 4 END`,
+    [x.id]);
+  x.stack = stack;
+  // pretty-print the name column exactly like the mockup expects
+  x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
 
-    // What this xell TRACKS (its xource), and the head that ref currently resolves to.
-    //   a work xell → local main.
-    //   production  → origin, the backup mirror. Read from the local origin/main tracking ref, so
-    //                 this never touches the network — and nothing builds from it either.
-    x.remote_source = x.is_production ? { ...heads.origin } : { ...heads.local };
+  // What this xell TRACKS (its xource), and the head that ref currently resolves to.
+  //   a work xell → local main.
+  //   production  → origin, the backup mirror. Read from the local origin/main tracking ref, so
+  //                 this never touches the network — and nothing builds from it either.
+  x.remote_source = x.is_production ? { ...heads.origin } : { ...heads.local };
 
-    // Production's equivalent of a xell's head: the commit it is actually serving. Kept separate
-    // from head_commit rather than overloading it — head_commit means "provisioned at", which is
-    // a different (and, for prod, meaningless) question.
-    if (x.is_production) x.deployed_commit = deployed?.commit || null;
+  // Production's equivalent of a xell's head: the commit it is actually serving. Kept separate
+  // from head_commit rather than overloading it — head_commit means "provisioned at", which is
+  // a different (and, for prod, meaningless) question.
+  if (x.is_production) x.deployed_commit = deployed?.commit || null;
+  return x;
+}
+
+// Stream a project's xells one at a time: the cheap list is fetched up front, then each xell's
+// container stack is resolved and handed to `onXell` the moment it is ready — so the dashboard can
+// paint a hexagon per xell as its data arrives instead of blocking on the whole fleet. Returns the
+// project (or null) so the caller can still emit a "no project" tail.
+export async function streamXells(projectId, onXell) {
+  const project = projectId
+    ? await one(`SELECT * FROM project WHERE id = $1`, [projectId])
+    : await defaultProject();
+  if (!project) return null;
+  const { heads, deployed } = await fleetGitContext(project);
+  const rows = await fetchXellRows(project.id);
+  for (const x of rows) {
+    await decorateXell(x, heads, deployed);
+    await onXell(x);
   }
+  return project;
+}
+
+export async function getFleet(projectId) {
+  const project = projectId
+    ? await one(`SELECT * FROM project WHERE id = $1`, [projectId])
+    : await defaultProject();
+  if (!project) return null;
+  const pid = project.id;
+
+  const pool = await one(`SELECT * FROM pool_config WHERE project_id = $1`, [pid]);
+
+  const { heads, deployed } = await fleetGitContext(project);
+
+  const instancesAgg = INSTANCES_AGG;
+
+  // grouped container inventory
+  const containers = await q(
+    `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host_port, c.health,
+            c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
+            c.docker_ctx, c.build_ctx,
+            -- where a PROCESS role (docker_ctx NULL) lives: its site's context, so the machine
+            -- matrix can place it in the right column instead of 'elsewhere'
+            (SELECT ds.docker_ctx FROM deploy_site ds WHERE ds.id = c.site_id) AS site_docker_ctx,
+            c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at, ${instancesAgg}
+       FROM container c WHERE c.project_id = $1
+       ORDER BY c.role, c.tier, c.name`, [pid]);
+  const groups = { db: [], server: [], webapp: [], other: [] };
+  for (const c of containers) (groups[c.role] || groups.other).push(c);
+
+  // The hive's machines with THIS project's pool sizes (machine_pool, 025) — the matrix renders
+  // one column per row here, and its pool knob edits this project's number, not a global one.
+  const machines = await listMachines(pid);
+
+  // xells with their resolved container stack + live zee + runtime label. Same rows + decoration
+  // the streaming path emits — just collected into an array here rather than flushed one by one.
+  const xells = await fetchXellRows(pid);
+  for (const x of xells) await decorateXell(x, heads, deployed);
 
   // production is a xell too, but it's not a pooled work-xell — exclude it from the counts
   const work = xells.filter((x) => !x.is_production);

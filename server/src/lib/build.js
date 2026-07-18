@@ -109,10 +109,6 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   if (!BUILDABLE.has(c.role)) throw new Error(`role '${c.role}' is not buildable (only server/webapp)`);
   if (!c.owner_xell_id) throw new Error('not a per-xell container');
   if (c.health === 'building') throw new Error(`${c.name} is already building`);
-  if (buildCtx !== undefined) c = await setBuildCtxRow(c, buildCtx);
-  // Validate the build target NOW (before flipping to 'building'), so a foreign context with no
-  // registry fails fast with an actionable error rather than stranding a spinner.
-  const target = await resolveBuildTarget(c);
   const xell = await one(`SELECT slug, worktree_path, project_id FROM xell WHERE id=$1`, [c.owner_xell_id]);
   if (!xell?.worktree_path) throw new Error('owner xell has no worktree');
 
@@ -120,7 +116,18 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   // row (stamped at provision), env-file convention on the project, and the ACTUAL allocated
   // host ports of both buildable roles (the compose file interpolates both, whichever we build).
   const project = await one(
-    `SELECT repo_root, env_file FROM project WHERE id=$1`, [xell.project_id]);
+    `SELECT repo_root, env_file, manifest FROM project WHERE id=$1`, [xell.project_id]);
+
+  // runner: process (spec §6.1) — there is no image and no compose; the hammer's verb here is
+  // (re)START the role in its worktree. Build-context knobs are meaningless for a process.
+  const runner = project?.manifest?.roles?.[c.role]?.runner
+    || project?.manifest?.tiers?.spinoff?.runner || null;
+  if (runner === 'process') return startProcessRole(c, xell, project);
+
+  if (buildCtx !== undefined) c = await setBuildCtxRow(c, buildCtx);
+  // Validate the build target NOW (before flipping to 'building'), so a foreign context with no
+  // registry fails fast with an actionable error rather than stranding a spinner.
+  const target = await resolveBuildTarget(c);
   const siblings = await q(
     `SELECT role, host_port FROM container WHERE owner_xell_id=$1 AND role = ANY($2)`,
     [c.owner_xell_id, [...BUILDABLE]]);
@@ -174,6 +181,62 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   });
 
   return { status: 'building', container: c.name, role: c.role, hot, mode: MODE };
+}
+
+// (Re)start a process role in its worktree — the process-runner twin of the docker build above.
+// Same lifecycle contract: health='building' while the script runs, terminal 'up'/'down' set ONLY
+// by this callback (the monitor skips 'building'), same strand-guard, same recorded commit. The
+// process reads its own ports/DATABASE_URL/modes from the worktree's .zeehive.env, so the script
+// is handed nothing but where, what, and which port to wait on.
+function startProcessRole(c, xell, project) {
+  const startCmd = project?.manifest?.roles?.[c.role]?.start
+    || (c.role === 'server' ? 'npm run server' : 'npm run web');
+  return (async () => {
+    const building = await one(`UPDATE container SET health='building' WHERE id=$1 RETURNING *`, [c.id]);
+    broadcast('container', building);
+    logline('build', `process start: ${c.name} (${MODE}) — "${startCmd}" in ${xell.slug} @ :${c.host_port}`);
+
+    // background — do NOT await; npm install on a cold worktree takes minutes
+    (async () => {
+      const { json, err } = await new Promise((res) => {
+        const script = resolve(config.repoRoot, 'scripts', 'start-xell-process.sh');
+        const p = spawn(resolveBash(),
+          [script, String(xell.worktree_path).replace(/\\/g, '/'), c.role, String(c.host_port), MODE, ...startCmd.split(/\s+/)],
+          { env: cleanGitEnv(), windowsHide: true });
+        let out = '', errBuf = '';
+        p.stdout.on('data', (d) => (out += d));
+        p.stderr.on('data', (d) => (errBuf += d));
+        p.on('close', () => {
+          const line = out.trim().split('\n').filter(Boolean).pop();
+          let json = null; try { json = JSON.parse(line); } catch { /* no JSON line */ }
+          res({ json, err: errBuf.slice(-1500) });
+        });
+        p.on('error', (e) => res({ json: null, err: String(e.message) }));
+      });
+      const ok = !!json && json.ok !== false;
+      const row = await one(
+        `UPDATE container
+            SET health = $2::container_health, hot_build = false,
+                last_build_commit = COALESCE($3, last_build_commit),
+                last_built_at = CASE WHEN $4 THEN now() ELSE last_built_at END
+          WHERE id=$1 RETURNING *`,
+        [c.id, ok ? 'up' : 'down', json?.head && json.head !== 'unknown' ? json.head : null, ok]);
+      broadcast('container', row);
+      logline('build', ok
+        ? `process UP: ${c.name} @ ${json?.head} (${json?.method})`
+        : `process start FAILED: ${c.name} — ${(err || '').split('\n').filter(Boolean).pop() || json?.method || 'see .zeehive log'}`);
+    })().catch(async (e) => {
+      // Same stranded-'building' hazard as the docker path: this callback is the only thing that
+      // can move the row off 'building', so it must always land somewhere terminal.
+      try {
+        const row = await one(`UPDATE container SET health='down' WHERE id=$1 AND health='building' RETURNING *`, [c.id]);
+        if (row) broadcast('container', row);
+      } catch { /* the DB is what failed — recoverOrphanBuilds() at boot is the backstop */ }
+      logline('build', `process start ERRORED: ${c.name} — ${e?.message || e} (marked down; hammer again when ready)`);
+    });
+
+    return { status: 'building', container: c.name, role: c.role, hot: false, mode: MODE, runner: 'process' };
+  })();
 }
 
 // Is this xell's stack built from the code that is in its worktree RIGHT NOW?

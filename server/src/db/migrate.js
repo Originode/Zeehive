@@ -1,14 +1,18 @@
 // Minimal forward-only migration runner.
 // Applies db/migrations/*.sql in filename order, each in its own transaction,
 // tracked in schema_migrations. Safe to re-run — already-applied files are skipped.
+// Callable at BOOT (spec §6.3: meta-DB migrations ride the self-ship — the restart IS the
+// deploy, so the new process must bring its own schema up before serving) and as the
+// `npm run db:migrate` CLI, which additionally closes the pool so the script exits.
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { pool } from './pool.js';
 import { config } from '../config.js';
 
 const migrationsDir = resolve(config.repoRoot, 'db', 'migrations');
 
-async function run() {
+export async function runMigrations() {
   const client = await pool.connect();
   try {
     await client.query(`
@@ -44,13 +48,18 @@ async function run() {
       }
     }
     console.log(count ? `Applied ${count} migration(s).` : 'Already up to date.');
+    return count;
   } finally {
     client.release();
-    await pool.end();
   }
 }
 
-run().catch((err) => {
-  console.error(err.message);
-  process.exit(1);
-});
+// CLI entry (`node server/src/db/migrate.js`) — boot callers import runMigrations instead.
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href || fileURLToPath(import.meta.url) === resolve(process.argv[1] || '')) {
+  runMigrations()
+    .then(() => pool.end())
+    .catch((err) => {
+      console.error(err.message);
+      process.exit(1);
+    });
+}

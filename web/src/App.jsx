@@ -1,10 +1,12 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
-         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding } from './api.js';
+         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
+         streamFleetXells } from './api.js';
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
-import GitRail from './GitRail.jsx';
+import HiveCanvas from './hive/HiveCanvas.jsx';
+import GraphPane from './GraphPane.jsx';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
@@ -26,6 +28,59 @@ const shortSid = (s) => (s ? s.slice(0, 8) : '—');
 const base = (p) => (p ? p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() : '—');
 
 
+// Portrait when the viewport is taller than it is wide. Re-measured on resize so the timeline
+// re-orients live when the window is reshaped.
+function useOrientation() {
+  const [o, setO] = useState(() =>
+    (typeof window !== 'undefined' && window.innerHeight > window.innerWidth) ? 'portrait' : 'landscape');
+  useEffect(() => {
+    const on = () => setO(window.innerHeight > window.innerWidth ? 'portrait' : 'landscape');
+    window.addEventListener('resize', on);
+    return () => window.removeEventListener('resize', on);
+  }, []);
+  return o;
+}
+
+// The honeycomb's xell list, streamed in lazily as NDJSON so hexagons appear as their data arrives
+// rather than after the whole fleet resolves. Returns [xells, restream]: `restream` re-runs the
+// stream (called on every live change so the grid stays current). Each pass upserts by id while it
+// streams — existing hexes never flicker — then prunes ids the pass didn't see.
+function useStreamedXells(projectId) {
+  const [xells, setXells] = useState([]);
+  const mapRef = useRef(new Map());
+  const acRef = useRef(null);
+  const runStream = useCallback(async () => {
+    acRef.current?.abort();
+    const ac = new AbortController();
+    acRef.current = ac;
+    const seen = new Set();
+    try {
+      await streamFleetXells(projectId, {
+        signal: ac.signal,
+        onXell: (x) => {
+          if (ac.signal.aborted) return;
+          seen.add(x.id);
+          mapRef.current.set(x.id, x);
+          setXells(Array.from(mapRef.current.values()));
+        },
+      });
+      if (ac.signal.aborted) return;
+      for (const id of Array.from(mapRef.current.keys())) if (!seen.has(id)) mapRef.current.delete(id);
+      setXells(Array.from(mapRef.current.values()));
+    } catch (e) { /* aborted or transient — keep the last good set */ }
+  }, [projectId]);
+
+  useEffect(() => {
+    mapRef.current = new Map();
+    setXells([]);
+    runStream();
+    return () => acRef.current?.abort();
+  }, [projectId, runStream]);
+
+  return [xells, runStream];
+}
+
+
 export default function App() {
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState(null);
@@ -43,6 +98,38 @@ export default function App() {
   const [showTerm, setShowTerm] = useState(false);
   const [showDispatch, setShowDispatch] = useState(false); // the "+" prompt composer
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
+
+  // ── honeycomb shell ──────────────────────────────────────────────────────────
+  const orientation = useOrientation();          // 'portrait' | 'landscape'
+  const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
+  const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
+  const [streamedXells, restreamXells] = useStreamedXells(projectId);
+  // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
+  // per-frame "geometry changed" fire so a pan/zoom re-tracks the graph and re-routes the wires
+  // WITHOUT re-rendering the whole app.
+  const hexPosRef = useRef({});
+  const geomListeners = useRef(new Set());
+  const subscribeGeom = useCallback((fn) => {
+    geomListeners.current.add(fn);
+    return () => geomListeners.current.delete(fn);
+  }, []);
+  const fireGeom = useCallback(() => {
+    geomListeners.current.forEach((fn) => { try { fn(); } catch { /* listener detached mid-fire */ } });
+  }, []);
+  // shared hover: hovering a hex or a commit dot highlights the hex, its wire, and its dot together.
+  // A ref + subscription (not state) so a hover doesn't re-render the whole app.
+  const hoverRef = useRef({ id: null, commit: null });
+  const hoverListeners = useRef(new Set());
+  const setHover = useCallback((h) => {
+    const c = hoverRef.current;
+    if (c.id === h.id && c.commit === h.commit) return;
+    hoverRef.current = h;
+    hoverListeners.current.forEach((fn) => { try { fn(); } catch { /* detached */ } });
+  }, []);
+  const subscribeHover = useCallback((fn) => {
+    hoverListeners.current.add(fn);
+    return () => hoverListeners.current.delete(fn);
+  }, []);
 
   // open the container context menu at the cursor — passed down to each xell's ContainerChips.
   // onMenu stops propagation so opening one doesn't trip the document closer below.
@@ -87,10 +174,11 @@ export default function App() {
       applyFleet(f);
       if (t) setTimeline(t);
       if (d) setDiffs(d);
+      restreamXells();              // re-stream the honeycomb's xells so the grid stays current
       loadProjects();               // keep the switcher's xell counts fresh
       setVersion((v) => v + 1);
     } catch { /* keep last */ }
-  }, [projectId, loadProjects, applyFleet]);
+  }, [projectId, loadProjects, applyFleet, restreamXells]);
 
   // once: global runtimes + logs, and pick the active project (persisted → first)
   useEffect(() => {
@@ -180,7 +268,10 @@ export default function App() {
   // whose xell has since been reaped has an id, no card, and (once the top panel stopped taking
   // anything with an id) nowhere at all. That is how nimble-atlas-d6e6d4's approved landing went
   // invisible. Ask whether a card exists, not whether an id does.
-  const carded = new Set((fleet.xells || []).map((x) => x.id));
+  // The honeycomb's xells come from the lazy NDJSON stream (hexagons appear as data arrives); fall
+  // back to the fleet snapshot if the stream hasn't produced anything yet (e.g. it errored).
+  const gridXells = streamedXells.length ? streamedXells : (fleet.xells || []);
+  const carded = new Set(gridXells.map((x) => x.id));
   const landingByXell = {};
   const prsByRef = {};
   const orphanLandings = [];
@@ -204,14 +295,43 @@ export default function App() {
       || ['working', 'claimed', 'awaiting-done'].includes(x.status);
     return live ? 1 : 2;
   };
-  const xells = [...fleet.xells].sort((a, b) =>
+  const xells = [...gridXells].sort((a, b) =>
     (rank(a) - rank(b)) || ((order[a.id] ?? 9999) - (order[b.id] ?? 9999)));
 
+  const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
+  const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
+
+  // Open a xell's session in the right surface — the honeycomb flower's click target, and the
+  // drawer card's. Web sessions open a tab; desktop-protocol sessions deep-link into Claude Desktop.
+  const openSession = (x) => {
+    if (!x?.viewer_url || x.is_production) return;
+    if (x.viewer_kind === 'desktop-protocol') openProtocol(x.viewer_url);
+    else window.open(x.viewer_url, '_blank', 'noopener');
+  };
+
+  // Three panes: the honeycomb, the git graph as the exact centre divider, and the control panels.
+  // Landscape → three columns, portrait → three rows; the graph stays centred while flip swaps which
+  // side is honeycomb vs panels. Connector wires bridge each xell's commit dot (graph) to its hex.
   return (
-    <div className="layout" ref={layoutRef}>
-      <Connectors timeline={timeline} layoutRef={layoutRef} version={version} />
-      <GitRail timeline={timeline} collapsed={railCollapsed}
-               onToggle={() => { setRailCollapsed((c) => !c); setVersion((v) => v + 1); }} />
+    <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
+      <section className="hive-pane honey">
+        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
+                    machines={fleet.machines} onOpenSession={openSession}
+                    expandedId={expandedId} onExpand={setExpandedId}
+                    hexPosRef={hexPosRef} onGeometry={fireGeom}
+                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+      </section>
+
+      <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
+                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+
+      <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
+                  hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
+                  expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
+                  hoverRef={hoverRef} subscribeHover={subscribeHover} />
+
+      <section className="hive-pane panels">
       <div className="content">
       <header className="topbar">
         <div className="proj">
@@ -222,6 +342,10 @@ export default function App() {
           <span className="k folder">Folder:</span> <span className="mono">{project.repo_root}</span>
         </div>
         <div className="right">
+          <button className="flip-btn" data-testid="flip-btn" onClick={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
+                  title={`Flip the honeycomb to the other side (timeline follows so merge points keep facing it). Now: ${orientation}, honeycomb ${honeySide === 'a' ? (orientation === 'portrait' ? 'top' : 'left') : (orientation === 'portrait' ? 'bottom' : 'right')}`}>
+            ⇄ flip
+          </button>
           <RuntimeToggle runtimes={runtimes} value={runtime}
                          onChange={(k) => { setRuntime(k); setDefaultRuntime(k); }} />
           <span className={`conn ${conn}`}>{conn === 'live' ? '● live' : '○ ' + conn}</span>
@@ -244,15 +368,9 @@ export default function App() {
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
 
-      {/* THE BAR. Landings and PRs now live on their xell's card, which is where you can judge them
-          — but moving them there quietly cost the property the old panel existed for: "a blocked
-          push means a zee is stuck waiting on a human, and this is the only thing on the page that
-          can't wait for you to scroll." It stopped being unmissable. A zee said "approve it in the
-          console", Mark looked where it had always been, and there was nothing there.
-          So: the CARD keeps the decision, and this keeps the interrupt. It is a pointer, not a
-          copy — one line, only when something is actually waiting, and it scrolls you to the card
-          rather than letting you decide from a banner with no context around it. */}
-      <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} />
+      {/* THE BAR — the one thing on the page that can't wait for you to scroll: a zee blocked on a
+          human. A pointer, not a copy; clicking a chip expands that xell's flower + action drawer. */}
+      <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} />
 
@@ -268,15 +386,27 @@ export default function App() {
       <MachineMatrix machines={fleet.machines} containers={containers}
                      projectId={projectId || project.id} onMenu={openMenu} onChanged={refresh} />
 
-      <h2 className="xells-h">xells:</h2>
-      <section className="xells">
-        {xells.map((x) => <XellCard key={x.id} x={x} diff={diffs[x.id]} onDone={refresh} onMenu={openMenu}
-                                   landing={visible(landingByXell[x.id])} prs={visible(prsFor(x))}
-                                   ship={shipByXell[x.id]} onDismiss={dismiss} machines={fleet.machines}
-                                   prodLock={fleet.prod_lock} projectId={projectId || project.id} />)}
-        {xells.length === 0 && <p className="loading">No active xells. The pool maintainer will fill it shortly…</p>}
+      {/* The selected hexagon's card — the honeycomb replaced the card GRID, but a single card is
+          still where the per-xell actions live (build, push/pull/PR, landings/PRs, mark done). It
+          appears here when a hexagon is expanded, in step with the canvas flower. */}
+      <h2 className="xells-h">
+        {expandedXell ? 'selected xell:' : 'xells:'}
+        {expandedXell && <button className="drawer-close" onClick={() => setExpandedId(null)} title="Close (Esc)">✕</button>}
+      </h2>
+      <section className="xells drawer">
+        {expandedXell
+          ? <XellCard key={expandedXell.id} x={expandedXell} diff={diffs[expandedXell.id]} onDone={refresh} onMenu={openMenu}
+                      landing={visible(landingByXell[expandedXell.id])} prs={visible(prsFor(expandedXell))}
+                      ship={shipByXell[expandedXell.id]} onDismiss={dismiss} machines={fleet.machines}
+                      prodLock={fleet.prod_lock} projectId={projectId || project.id} />
+          : <p className="loading drawer-hint">
+              {xells.length === 0
+                ? 'No active xells. The pool maintainer will fill it shortly…'
+                : 'Click a hexagon to expand it — its full details, git anchor, and actions appear here.'}
+            </p>}
       </section>
       </div>
+      </section>
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
@@ -682,7 +812,7 @@ function shipState(x, diff, prodLock, ship) {
 // own numbers sitting next to it. It answers "is anything waiting, and where" — then gets out of
 // the way. Only PENDING counts: an approved landing is a receipt, and dressing receipts up as
 // demands is how a warning bar trains you to ignore it.
-function NeedsYouBar({ xells, landingByXell, prsFor }) {
+function NeedsYouBar({ xells, landingByXell, prsFor, onJump }) {
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
@@ -690,20 +820,15 @@ function NeedsYouBar({ xells, landingByXell, prsFor }) {
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
-  const go = (id) => {
-    const el = document.querySelector(`[data-xell="${id}"]`);
-    if (!el) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    el.classList.add('flash');
-    setTimeout(() => el.classList.remove('flash'), 1200);
-  };
+  // Expand the xell's flower + action drawer — where its landings/PRs can actually be judged.
+  const go = (id) => onJump?.(id);
 
   return (
     <section className="needsyou">
       <span className="ny-t">⚠ waiting on you:</span>
       {waiting.map((w) => (
         <button key={w.x.id} className="ny-chip" onClick={() => go(w.x.id)}
-                title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''} — jump to the card`}>
+                title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''} — open the card`}>
           {w.x.slug}
           <span className="ny-n">{w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`}
             {w.held > 0 && w.prs > 0 && ' · '}

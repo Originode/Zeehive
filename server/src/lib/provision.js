@@ -91,6 +91,33 @@ export async function emitXellEnv(xellId) {
       } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
     }
   }
+  // db-shared-dev on a PROCESS-runner project: the xell's server is a bare process, so unlike a
+  // compose stack there is no network alias handing it a database — the projection must carry
+  // the shared dev db's conn_ref outright. Scoped to process runners so compose projects keep
+  // their env exactly as it was. The §6.2 guard below still applies unchanged.
+  const spinRunner = spin.runner || null;
+  if (!dbUrl && xell.db_coupling === 'db-shared-dev' && spinRunner === 'process') {
+    const used = await one(
+      `SELECT c.conn_ref FROM xell_uses_container xuc JOIN container c ON c.id = xuc.container_id
+        WHERE xuc.xell_id=$1 AND xuc.relation='uses' AND c.role='db' AND c.conn_ref IS NOT NULL LIMIT 1`,
+      [xellId]);
+    if (used?.conn_ref) dbUrl = used.conn_ref;
+  }
+  // conn_refs are stored passwordless ("parameters, not secrets") — fine for docker-exec psql,
+  // fatal for a bare process that must SCRAM-authenticate over TCP. The manifest's db block may
+  // carry the committed dev credential (the same one the compose files already commit); inject
+  // it for process xells when the ref has none. Anything genuinely secret stays out of manifests.
+  const manifestDb = project?.manifest?.db || {};
+  if (dbUrl && spinRunner === 'process' && manifestDb.password) {
+    try {
+      const u = new URL(String(dbUrl).replace(/^postgres(ql)?:/, 'http:'));
+      if (!u.password) {
+        if (!u.username && manifestDb.user) u.username = manifestDb.user;
+        u.password = manifestDb.password;
+        dbUrl = String(u).replace(/^http:/, 'postgresql:');
+      }
+    } catch { /* unparseable ref — emit as-is and let the guard/consumer complain */ }
+  }
   if (dbUrl) {
     if (sameDatabase(dbUrl, config.databaseUrl)) {
       throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
@@ -210,7 +237,11 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
   const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
   const devSiteId = devSite?.id || null;
-  const url = `http://${devHost}:${ports.webPort}`;
+  // A machine row with no host_ip used to produce literal "http://null:PORT" URLs — a URL the
+  // health prober can never answer. localhost is always true for same-machine process roles and
+  // harmless as a fallback elsewhere.
+  const urlHost = devHost || 'localhost';
+  const url = `http://${urlHost}:${ports.webPort}`;
 
   // A xell's app tier must never reach across docker contexts for its database, so a machine
   // without this project's own shared dev db cannot host xells that need one. Refused HERE, by
@@ -280,16 +311,25 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       defaultBuildCtx = null;
     }
     if (defaultBuildCtx === devCtx) defaultBuildCtx = null;
+    // runner: process (spec §6.1) — the role is a bare process in the worktree, not a container:
+    // no docker context, no compose, no image. Its row exists for ports/URL/health; the health
+    // monitor probes rows with docker_ctx NULL by URL, so the modeling IS the wiring. Declared
+    // per-role in the manifest, with the spinoff tier's runner as the fallback.
+    const spinTier = project.manifest?.tiers?.spinoff || {};
+    const runnerOf = (role) => project.manifest?.roles?.[role]?.runner || spinTier.runner || null;
     const mk = async (role, hostPort, intPort, curl) => {
       const nm = namingFor(project, role, slug);
+      const isProc = runnerOf(role) === 'process';
       const { rows: [c] } = await client.query(
         `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,build_ctx,host,host_port,internal_port,url,compose_project,compose_file,owner_xell_id,site_id,health)
          VALUES ($1,$2,'spinoff','per-xell',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
-        [projectId, role, nm.container, nm.image, devCtx, defaultBuildCtx, devHost, hostPort, intPort, curl,
-         nm.composeProject, project.compose_spinoff, xell.id, devSiteId, health]);
+        [projectId, role, nm.container, isProc ? null : nm.image,
+         isProc ? null : devCtx, isProc ? null : defaultBuildCtx, devHost, hostPort, intPort, curl,
+         isProc ? null : nm.composeProject, isProc ? null : project.compose_spinoff,
+         xell.id, devSiteId, isProc ? 'down' : health]);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, c.id]);
     };
-    await mk('server', ports.serverPort, 3000, `http://${devHost}:${ports.serverPort}`);
+    await mk('server', ports.serverPort, 3000, `http://${urlHost}:${ports.serverPort}`);
     await mk('webapp', ports.webPort, 5173, url);
 
     // db coupling: link the shared dev db it USES (db-shared-dev default). db-clone lives in the

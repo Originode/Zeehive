@@ -9,6 +9,38 @@ export async function getFleet(projectId) {
   return r.json();
 }
 
+// Lazily stream the xell list as NDJSON so hexagons paint as their data arrives instead of waiting
+// for the whole fleet. Calls onXell(xell) per line; resolves with {count} when the stream ends.
+// Abortable via an AbortController signal (the caller cancels a stale stream on project switch).
+export async function streamFleetXells(projectId, { onXell, signal } = {}) {
+  const r = await fetch(`/api/fleet/xells-stream${pq(projectId)}`, { signal });
+  if (!r.ok || !r.body) throw new Error(`xells-stream ${r.status}`);
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let count = 0;
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }   // skip a partial/garbled line
+    if (msg.type === 'xell' && msg.xell) { onXell?.(msg.xell); count += 1; }
+    else if (msg.type === 'error') throw new Error(msg.error || 'stream error');
+  };
+  // Read chunks, split on newlines, hand each complete line to handleLine.
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      handleLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+    }
+  }
+  if (buf) handleLine(buf);   // trailing line with no newline
+  return { count };
+}
+
 export async function getRuntimes() {
   const r = await fetch('/api/runtimes');
   return r.ok ? r.json() : [];
