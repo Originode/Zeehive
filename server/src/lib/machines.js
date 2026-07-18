@@ -173,15 +173,25 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   const lockKey = `${projectId}::${machineId}`;
   if (provisioning.has(lockKey)) throw new Error(`a dev db provision for ${project.name} on ${m.key} is already running`);
 
-  // Image AND name from the project's existing shared dev db (prod dumps need the custom postgis
-  // build, not stock postgres; and `omnibiz_db_dev` on another machine should read as its sibling
-  // `omnibiz_db_dev_<machine>`, not as a per-xell spin name). Falls back to the naming template +
-  // known OmniBiz image only when no row exists anywhere yet.
+  // Image AND name from the project's OWN db lineage: its existing shared dev db first (a prod
+  // dump needs the custom postgis build, and `omnibiz_db_dev` on another machine should read as
+  // its sibling `omnibiz_db_dev_<machine>`, not as a per-xell spin name) — else its prod db
+  // (bootstrapping a project's FIRST dev db: Zeehive's meta-db is stock postgres, and guessing
+  // another project's image would stand up a database its dumps can't even restore into).
   const source = await one(
     `SELECT name, image_tag FROM container
       WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared'
       ORDER BY (image_tag IS NOT NULL) DESC LIMIT 1`, [projectId]);
-  const image = source?.image_tag || 'omnibiz-postgis:18-3.6-h3';
+  const prodDb = source ? null : await one(
+    `SELECT name, image_tag, docker_ctx FROM container
+      WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [projectId]);
+  // A modeled prod db row often has no image_tag — the LIVE container knows what it runs.
+  let prodImage = prodDb?.image_tag || null;
+  if (prodDb && !prodImage && MODE === 'real') {
+    prodImage = (spawnSync('docker', ['--context', prodDb.docker_ctx || 'default', 'inspect', '-f', '{{.Config.Image}}', prodDb.name],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim() || null;
+  }
+  const image = source?.image_tag || prodImage || 'omnibiz-postgis:18-3.6-h3';
 
   // Data: the requested snapshot, else the latest completed prod backup. No dump is allowed but
   // loudly so — an empty dev db is only schema-less postgres, useless until something fills it.
@@ -198,8 +208,9 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   const network = netEntry?.name || null;
   const alias = netEntry?.aliases?.[0] || 'postgres';
 
-  const name = source?.name
-    ? `${source.name}_${m.key.replace(/-/g, '_')}`
+  const mkey = m.key.replace(/-/g, '_');
+  const name = source?.name ? `${source.name}_${mkey}`
+    : prodDb?.name ? `${prodDb.name}_dev_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
   const host = m.host_ip || project.dev_host_ip || config.devHostIp;
   const dbUser = project.db_user || config.prodDbUser || 'postgres';

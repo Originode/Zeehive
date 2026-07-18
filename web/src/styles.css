@@ -468,6 +468,9 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-devdb { margin-top: 5px; font-size: 11px; background: rgba(217,85,59,.12); color: #ffb4a2;
   border: 1px solid #d9553b; border-radius: 5px; padding: 2px 7px; cursor: pointer; }
 .mx-devdb:hover:not(:disabled) { background: rgba(217,85,59,.25); }
+/* bootstrap state — the project's FIRST dev db: an offer, not an alarm */
+.mx-devdb.quiet { background: none; color: var(--muted); border: 1px dashed var(--line); }
+.mx-devdb.quiet:hover:not(:disabled) { color: var(--text); border-color: var(--accent); background: none; }
 .mx-role { align-self: center; }
 .mx-cell { min-height: 26px; }
 .mx-add { align-self: start; justify-self: start; background: var(--panel2); border: 1px dashed var(--line);

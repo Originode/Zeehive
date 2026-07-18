@@ -66,16 +66,20 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
              style={{ gridTemplateColumns: `max-content repeat(${cols.length}, minmax(120px, 1fr)) max-content` }}>
       {/* header row */}
       <span className="mx-corner" />
-      {cols.map((col, i) => col.kind === 'machine'
+      {cols.map((col, i) => {
+        const devDb = (c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared';
+        return col.kind === 'machine'
         ? <MachineHead key={col.m.id} m={col.m} projectId={projectId}
-                       // "no dev db" is only a warning for a project that USES one: a machine
-                       // can't be missing what the project has nowhere (Zeehive's spinoffs are
-                       // worktree-only — flagging every column taught the warning to be ignored).
-                       needsDevDb={all.some((c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared')
-                         && !all.some((c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared' && c.docker_ctx === col.m.docker_ctx)}
+                       // Spec: a xell never crosses docker contexts for its database, so every dev
+                       // machine wants this project's own dev db. Missing-here-but-exists-elsewhere
+                       // is a WARNING (spawns here are being refused); missing-everywhere is the
+                       // quiet bootstrap affordance for the project's first one.
+                       hasDevDb={all.some((c) => devDb(c) && c.docker_ctx === col.m.docker_ctx)}
+                       devDbElsewhere={all.some(devDb)}
                        empty={!all.some((c) => ctxOf(c) === col.m.docker_ctx)}
                        onChanged={onChanged} />
-        : <div key={`col-${i}`} className="mx-head elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them into a column">elsewhere</div>)}
+        : <div key={`col-${i}`} className="mx-head elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them into a column">elsewhere</div>;
+      })}
       <AddMachine onChanged={onChanged} />
       {/* one row per role */}
       {ROLES.map((role) => (
@@ -96,7 +100,7 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
 
 // A machine's header: identity + the policy knobs, edited in place. Numbers commit on blur/Enter;
 // every change PATCHes and refreshes, so what you read is always the server's truth.
-function MachineHead({ m, projectId, needsDevDb, empty, onChanged }) {
+function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged }) {
   const [busy, setBusy] = useState(false);
   const patch = async (p) => {
     setBusy(true);
@@ -166,10 +170,13 @@ function MachineHead({ m, projectId, needsDevDb, empty, onChanged }) {
           🔨
         </label>
       </div>
-      {m.dev_priority > 0 && needsDevDb && (
-        <button className="mx-devdb" data-testid={`mx-devdb-${m.key}`} disabled={busy} onClick={provisionDb}
-                title={`${m.key} is a dev spawn target but has NO shared dev db for this project — xells cannot spawn here until it does (their db must never live on another machine).`}>
-          ⚠ no dev db — provision
+      {m.dev_priority > 0 && !hasDevDb && (
+        <button className={`mx-devdb${devDbElsewhere ? '' : ' quiet'}`} data-testid={`mx-devdb-${m.key}`}
+                disabled={busy} onClick={provisionDb}
+                title={devDbElsewhere
+                  ? `${m.key} is a dev spawn target but has NO shared dev db for this project — xells cannot spawn here until it does (their db must never live on another machine).`
+                  : `Stand up this project's first shared dev db, here on ${m.key} — from the project's own db image, restoring the latest backup when one exists.`}>
+          {devDbElsewhere ? '⚠ no dev db — provision' : '＋ dev db'}
         </button>
       )}
     </div>
