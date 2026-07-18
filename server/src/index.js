@@ -10,6 +10,7 @@ import { startContainerMonitor } from './queenzee/containers.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { recoverOrphanBuilds } from './lib/build.js';
+import { runMigrations } from './db/migrate.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startImageJanitor } from './lib/images.js';
@@ -48,6 +49,17 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'zeehive', ts: Date.now() }));
 app.use('/api', router);
+
+// Schema first, serve second (spec §6.3): a self-ship replaces the process, so the restart is
+// the deploy — the new code must bring its own meta-DB schema up before anything queries it.
+// A failed migration is loud but NOT fatal: files are per-transaction (earlier ones stick), and
+// a queenzee that stays up degraded beats one that exits (see the backstop note above).
+try {
+  await runMigrations();
+} catch (e) {
+  console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
+  try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }
+}
 
 app.listen(config.port, () => {
   console.log(`[zeehive] API on http://localhost:${config.port}  (db: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);

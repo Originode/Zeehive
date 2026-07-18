@@ -14,7 +14,7 @@ import { config } from '../config.js';
 import { pool, q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
-import { computePorts } from '../lib/provision.js';
+import { computePorts, emitXellEnv } from '../lib/provision.js';
 import { namingFor } from '../lib/manifest.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
@@ -80,7 +80,10 @@ export async function renameXellForTask(xellId, title) {
   // build will actually create.
   const ports = computePorts(newSlug, project);
   const worktree = `${root}/.claude/worktrees/${newSlug}`;
-  const url = `http://${project.dev_host_ip}:${ports.webPort}`;
+  // runner: process rows carry NO image/compose — the rename must not re-stamp them (they were
+  // deliberately NULL at provision). Same per-role/tier resolution provision uses.
+  const runnerOf = (role) => project.manifest?.roles?.[role]?.runner
+    || project.manifest?.tiers?.spinoff?.runner || null;
 
   const client = await pool.connect();
   try {
@@ -89,20 +92,25 @@ export async function renameXellForTask(xellId, title) {
       `UPDATE xell SET slug=$2, branch=$3, worktree_path=$4, git_dir=$5 WHERE id=$1 RETURNING *`,
       [xellId, newSlug, `spinoff/${newSlug}`, worktree, `${worktree}/.git`]);
     // Names are a pure function of (project naming templates, slug) — same source provision uses.
-    const nmS = namingFor(project, 'server', newSlug);
-    const nmW = namingFor(project, 'webapp', newSlug);
-    await client.query(
-      `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5, url=$6
-         WHERE owner_xell_id=$1 AND role='server'`,
-      [xellId, nmS.container, nmS.image, nmS.composeProject, ports.serverPort,
-       `http://${project.dev_host_ip}:${ports.serverPort}`]);
-    await client.query(
-      `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5, url=$6
-         WHERE owner_xell_id=$1 AND role='webapp'`,
-      [xellId, nmW.container, nmW.image, nmW.composeProject, ports.webPort, url]);
+    // The URL keeps the row's OWN host (project.dev_host_ip is NULL for machine-placed xells —
+    // interpolating it wrote literal "http://null:PORT" once already); localhost is the fallback.
+    for (const [role, port] of [['server', ports.serverPort], ['webapp', ports.webPort]]) {
+      const nm = namingFor(project, role, newSlug);
+      const isProc = runnerOf(role) === 'process';
+      await client.query(
+        `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5,
+                url = 'http://' || COALESCE(host(host), $6) || ':' || $5
+           WHERE owner_xell_id=$1 AND role=$7`,
+        [xellId, nm.container, isProc ? null : nm.image, isProc ? null : nm.composeProject,
+         port, project.dev_host_ip || 'localhost', role]);
+    }
     await client.query('COMMIT');
     broadcast('xell', row);
-    logline('rename', `${xell.slug} → ${newSlug} (worktree + branch + containers)`);
+    // Ports moved with the slug, so the worktree's .zeehive.env projection is now stale — the
+    // exact drift that left ui-revamp's env 16 ports behind its rows. Regenerate; best-effort
+    // (the rename itself is already landed and true).
+    await emitXellEnv(xellId).catch((e) => logline('rename', `${newSlug}: .zeehive.env not regenerated — ${e.message}`));
+    logline('rename', `${xell.slug} → ${newSlug} (worktree + branch + containers + env)`);
     return { renamed: true, slug: newSlug, worktree, from: xell.slug };
   } catch (err) {
     await client.query('ROLLBACK');
