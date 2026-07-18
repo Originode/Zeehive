@@ -105,16 +105,19 @@ function cellNeighbors(row, col) {
 const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
-                                    expandedId, onExpand, hexPosRef, onGeometry }) {
+                                    expandedId, onExpand, hexPosRef, onGeometry,
+                                    hoverRef, setHover, subscribeHover }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], flower: null });
   const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
   const dragRef = useRef(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
-  const [hoverId, setHoverId] = useState(null);
   const rafRef = useRef(0);
   const setExpandedId = onExpand || (() => {});
+  const emitHover = setHover || (() => {});
+  // the base commit a xell sits on (for tying a hex hover to its commit dot, and vice-versa)
+  const baseOf = useCallback((id) => (timeline?.xells || []).find((t) => t.id === id)?.base_commit || null, [timeline]);
 
   const expanded = expandedId ? (xells || []).find((x) => x.id === expandedId) : null;
   useEffect(() => { if (expandedId && !expanded) setExpandedId?.(null); }, [expandedId, expanded, setExpandedId]);
@@ -188,13 +191,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     });
     const hexById = {}; for (const hx of hexes) hexById[hx.id] = hx;
 
+    // hover highlight: a hovered hex OR a hovered commit dot lights up the matching hex(es)
+    const H = hoverRef ? hoverRef.current : { id: null, commit: null };
+    const hoverActive = !!(H.id || H.commit);
+    const isHov = (id) => id === H.id || (!!H.commit && baseOf(id) === H.commit);
+
     // honeycomb + flower, on the pan/zoom world transform
     ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
     geomRef.current.hexes = hexes;
     for (const hx of hexes) {
       if (expanded && hx.id === expanded.id) continue;     // the flower draws it
-      const dim = expandedId && expandedId !== hx.id;
-      drawCompactHex(ctx, hx, { hover: hoverId === hx.id, dim, diff: diffs?.[hx.id], machines });
+      const hovered = isHov(hx.id);
+      const dim = (expandedId && expandedId !== hx.id) || (hoverActive && !hovered);
+      drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines });
     }
     geomRef.current.flower = null;
     if (expanded && cells[expanded.id]) {
@@ -221,9 +230,18 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     onGeometry && onGeometry();
     // honeySide is a dep so a flip (which moves this pane on screen) re-runs draw and republishes the
     // hexes' fresh client-space positions — otherwise <Connectors> would trace to their old spots.
-  }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, hoverId, expanded, machines, hexPosRef, onGeometry]);
+  }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, expanded, machines, hexPosRef, onGeometry, baseOf]);
 
   useLayoutEffect(() => { draw(); }, [draw]);
+
+  // redraw the canvas when the shared hover changes (hover is read from a ref, not a draw dep)
+  useEffect(() => {
+    if (!subscribeHover) return undefined;
+    return subscribeHover(() => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(draw);
+    });
+  }, [subscribeHover, draw]);
 
   // ── sizing ──────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -284,14 +302,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (expandedId) {
       const f = hitFlower(wx, wy);
       cursor = f && f.cell === 0 && f.openable ? 'pointer' : 'default';
-      if (hoverId) setHoverId(null);
+      emitHover({ id: null, commit: null });
     } else {
       const hx = hitHex(wx, wy);
       const id = hx?.id || null;
-      if (id !== hoverId) {
-        if (rafRef.current) cancelAnimationFrame(rafRef.current);
-        rafRef.current = requestAnimationFrame(() => setHoverId(id));
-      }
+      emitHover({ id, commit: id ? baseOf(id) : null });   // dedups internally; only fires on change
       cursor = hx ? 'pointer' : 'default';
     }
     canvasRef.current.style.cursor = cursor;
@@ -334,7 +349,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     rafRef.current = requestAnimationFrame(draw);
   };
 
-  const onLeave = () => { if (hoverId) setHoverId(null); dragRef.current = null; };
+  const onLeave = () => { emitHover({ id: null, commit: null }); dragRef.current = null; };
 
   useEffect(() => {
     const onKey = (e) => {

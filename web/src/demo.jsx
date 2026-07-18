@@ -59,6 +59,14 @@ function Demo() {
   const fireGeom = React.useCallback(() => { geomListeners.current.forEach((fn) => { try { fn(); } catch {} }); }, []);
   const [version, setVersion] = useState(0);
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);
+  const hoverRef = useRef({ id: null, commit: null });
+  const hoverListeners = useRef(new Set());
+  const setHover = React.useCallback((h) => {
+    const c = hoverRef.current;
+    if (c.id === h.id && c.commit === h.commit) return;
+    hoverRef.current = h; hoverListeners.current.forEach((fn) => { try { fn(); } catch {} });
+  }, []);
+  const subscribeHover = React.useCallback((fn) => { hoverListeners.current.add(fn); return () => hoverListeners.current.delete(fn); }, []);
 
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
@@ -66,15 +74,18 @@ function Demo() {
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={machines} onOpenSession={() => {}}
                     expandedId={expandedId} onExpand={setExpandedId}
-                    hexPosRef={hexPosRef} onGeometry={fireGeom} />
+                    hexPosRef={hexPosRef} onGeometry={fireGeom}
+                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
       </section>
 
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
-                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom} />
+                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
-                  expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom} />
+                  expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
+                  hoverRef={hoverRef} subscribeHover={subscribeHover} />
 
       <section className="hive-pane panels">
         <div className="content" style={{ padding: 16 }}>

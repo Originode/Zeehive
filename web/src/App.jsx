@@ -114,6 +114,20 @@ export default function App() {
   const fireGeom = useCallback(() => {
     geomListeners.current.forEach((fn) => { try { fn(); } catch { /* listener detached mid-fire */ } });
   }, []);
+  // shared hover: hovering a hex or a commit dot highlights the hex, its wire, and its dot together.
+  // A ref + subscription (not state) so a hover doesn't re-render the whole app.
+  const hoverRef = useRef({ id: null, commit: null });
+  const hoverListeners = useRef(new Set());
+  const setHover = useCallback((h) => {
+    const c = hoverRef.current;
+    if (c.id === h.id && c.commit === h.commit) return;
+    hoverRef.current = h;
+    hoverListeners.current.forEach((fn) => { try { fn(); } catch { /* detached */ } });
+  }, []);
+  const subscribeHover = useCallback((fn) => {
+    hoverListeners.current.add(fn);
+    return () => hoverListeners.current.delete(fn);
+  }, []);
 
   // open the container context menu at the cursor — passed down to each xell's ContainerChips.
   // onMenu stops propagation so opening one doesn't trip the document closer below.
@@ -302,15 +316,18 @@ export default function App() {
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession}
                     expandedId={expandedId} onExpand={setExpandedId}
-                    hexPosRef={hexPosRef} onGeometry={fireGeom} />
+                    hexPosRef={hexPosRef} onGeometry={fireGeom}
+                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
       </section>
 
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
-                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom} />
+                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
-                  expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom} />
+                  expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
+                  hoverRef={hoverRef} subscribeHover={subscribeHover} />
 
       <section className="hive-pane panels">
       <div className="content">

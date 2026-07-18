@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useLayoutEffect, useEffect } from 'react';
+import React, { useState, useCallback, useLayoutEffect, useEffect, useReducer } from 'react';
 import { buildHexGraph, shortestPath, nearestVertex, nearestNode, latticeCells, assignLanes, offsetPolyline } from './hive/maze.js';
 
 const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
@@ -14,9 +14,11 @@ const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
 //   • everyone else: the wire threads the honeycomb like a MAZE — it hops from the dot across the
 //     open gap to the nearest lattice vertex, then pathfinds along hex EDGES to the target hex's
 //     vertex nearest the dot, so it never crosses a hexagon and every segment runs along a hex side.
-export default function Connectors({ timeline, layoutRef, version, hexPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom }) {
+export default function Connectors({ timeline, layoutRef, version, hexPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom, hoverRef, subscribeHover }) {
   const [paths, setPaths] = useState([]);
   const [size, setSize] = useState({ w: 0, h: 0 });
+  const [, forceHover] = useReducer((x) => x + 1, 0);
+  useEffect(() => (subscribeHover ? subscribeHover(forceHover) : undefined), [subscribeHover]);
 
   const measure = useCallback(() => {
     const cont = layoutRef.current;
@@ -100,7 +102,7 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
       } else {
         d = `M ${f1(dd.dx)} ${f1(dd.dy)} L ${f1(ex)} ${f1(ey)}`;   // single-vertex / disconnected
       }
-      items.push({ id: r.id, color: r.color, d, x1: dd.dx, y1: dd.dy, x2: ex, y2: ey,
+      items.push({ id: r.id, base: dd.base, color: r.color, d, x1: dd.dx, y1: dd.dy, x2: ex, y2: ey,
         dim: expandedId && expandedId !== r.id });
     }
     setPaths(items);
@@ -131,18 +133,26 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     };
   }, [measure, layoutRef]);
 
+  const hov = hoverRef ? hoverRef.current : { id: null, commit: null };
+  const hoverActive = !!(hov.id || hov.commit);
+  const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit);
+
   return (
     <svg className="connectors" width={size.w} height={size.h}
          style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', zIndex: 5 }}>
-      {paths.map((p) => (
-        <g key={p.id} opacity={p.dim ? 0.12 : 0.92}>
-          <path d={p.d} fill="none" stroke={p.color} strokeWidth="2"
+      {paths.map((p) => {
+        const hovered = isHov(p);
+        const opacity = p.dim ? 0.12 : (hoverActive ? (hovered ? 1 : 0.1) : 0.92);
+        return (
+        <g key={p.id} opacity={opacity}>
+          <path d={p.d} fill="none" stroke={p.color} strokeWidth={hovered ? 3.2 : 2}
                 strokeLinejoin="round" strokeLinecap="round" />
-          <circle cx={p.x1} cy={p.y1} r="3" fill={p.color} />
+          <circle cx={p.x1} cy={p.y1} r={hovered ? 4 : 3} fill={p.color} />
           <rect x={p.x2 - 3.5} y={p.y2 - 3.5} width="7" height="7" rx="1.5"
                 fill={p.color} stroke="var(--bg)" strokeWidth="1.5" />
         </g>
-      ))}
+        );
+      })}
     </svg>
   );
 }

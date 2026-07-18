@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from 'react';
 import { computeGraph } from './hive/graph.js';
 
 // The git graph as the centre divider — proper GitLens-style lanes (ported from GitRail), oriented
@@ -18,9 +18,13 @@ const median = (a) => {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
 
-export default function GraphPane({ timeline, orientation, honeySide, hexPosRef, prodIds = [], subscribeGeom }) {
+export default function GraphPane({ timeline, orientation, honeySide, hexPosRef, prodIds = [], subscribeGeom,
+                                   hoverRef, setHover, subscribeHover }) {
   const groupRef = useRef(null);
   const portrait = orientation === 'portrait';
+  const [, forceHover] = useReducer((x) => x + 1, 0);
+  useEffect(() => (subscribeHover ? subscribeHover(forceHover) : undefined), [subscribeHover]);
+  const emitHover = setHover || (() => {});
 
   const commits = timeline?.commits || [];
   const graph = commits.length ? computeGraph(commits) : null;
@@ -93,6 +97,10 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
     return `M${pt(fA, fC)} C${pt(fA + ROW * 0.5, fC)} ${pt(fA + ROW * 0.4, tC)} ${pt(fA + ROW, tC)} L${pt(tA, tC)}`;
   };
 
+  // which commit is highlighted: a hovered dot, or the commit a hovered hex/wire sits on
+  const hov = hoverRef ? hoverRef.current : { id: null, commit: null };
+  const hovCommit = hov.commit || (hov.id ? (timeline.xells || []).find((t) => t.id === hov.id)?.base_commit : null);
+
   return (
     <div className="graph-pane" data-orient={orientation} style={paneStyle}>
       <svg className="graph-svg" width={svgW} height={svgH}
@@ -107,12 +115,17 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
             const isMerge = c.parents.length > 1;
             const ring = anchors[c.hash]?.[0];
             const [lx, ly] = P(alongOf(row), labelRaw);
+            const hovered = hovCommit === c.hash;
             return (
               <g key={c.hash}>
-                {ring && <circle cx={cx} cy={cy} r={DOT + 3} fill="none" stroke={ring} strokeWidth="2" />}
-                <circle cx={cx} cy={cy} r={DOT} data-commit={c.hash} data-dot
+                {(ring || hovered) && <circle cx={cx} cy={cy} r={DOT + 3} fill="none"
+                        stroke={hovered ? 'var(--text)' : ring} strokeWidth={hovered ? 2.5 : 2} />}
+                <circle cx={cx} cy={cy} r={hovered ? DOT + 1 : DOT} data-commit={c.hash} data-dot
                         fill={isMerge ? 'var(--bg)' : LANE[lane % LANE.length]}
                         stroke={LANE[lane % LANE.length]} strokeWidth={isMerge ? 2 : 0} />
+                {ring && <circle cx={cx} cy={cy} r={DOT + 6} fill="transparent" style={{ cursor: 'pointer' }}
+                        onMouseEnter={() => emitHover({ id: null, commit: c.hash })}
+                        onMouseLeave={() => emitHover({ id: null, commit: null })} />}
                 {portrait
                   ? <text className="ghash" x={lx} y={ly} textAnchor="middle"
                           transform={`rotate(-45 ${lx} ${ly})`}>{c.short}</text>
