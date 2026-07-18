@@ -33,6 +33,17 @@ Act on the binding above:
   hang for 45 minutes on a build that finished long ago. `--wait` blocks until the build settles
   and tells you whether the container is serving your current HEAD. Run it in the BACKGROUND and
   its exit is your nudge.
+- **Slow builds? Move the compile, not the run.** Your containers RUN on the fleet's docker host
+  (a NAS that was never meant for heavy compute), so a cold rebuild can crawl. You can point the
+  *compile* at a beefier docker context while the container still runs on your normal host — the
+  built image is handed over through the project's registry. Set it once and it sticks for both
+  server + webapp:
+  - MCP: `zeehive_build_contexts` (see what's available) → `zeehive_set_build_context` (pick one),
+    or pass `build_ctx` straight to `zeehive_build` to set-and-build in one call.
+  - This is dev-only and needs no approval — it touches only your isolated stack. If the project
+    has no registry configured, a foreign build context is refused with the fix (a human sets
+    `project.registry` in the console). Keep the registry on the LAN: a build host or registry
+    behind a slow link makes builds *slower*, not faster.
 - **Land locally:** commit on your branch, then `git push . HEAD:main`. `origin` is
   off-limits (stale by design) — never fetch/pull/push origin, ignore any "Create PR" chip.
 - **Landing is HELD for a human.** That push is a *request*: the xource's git hook declines it

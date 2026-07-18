@@ -17,6 +17,14 @@ export const config = {
   claudeHome: process.env.CLAUDE_HOME || resolve(process.env.USERPROFILE || process.env.HOME || '.', '.claude'),
   omnibizRoot: process.env.OMNIBIZ_ROOT || 'D:\\Repos\\OmniBiz\\omnibiz',
   dockerCtx: process.env.SPINOFF_DOCKER_CONTEXT || 'ugreen-nas',
+  // OCI registry for split builds (compile on one docker context, run on another). Global
+  // fallback when a project has no registry of its own; NULL ⇒ split builds are unavailable.
+  // Keep it on the LAN — a registry across a slow link defeats the point of building elsewhere.
+  registry: process.env.SPINOFF_REGISTRY || null,
+  // Where the docker CLI keeps contexts/meta/<sha256(name)>/meta.json — lib/docker.js reads the
+  // endpoint from there instead of shelling out to `docker context inspect`.
+  dockerConfigDir: process.env.DOCKER_CONFIG
+    || resolve(process.env.USERPROFILE || process.env.HOME || '.', '.docker'),
   devHostIp: process.env.DEV_HOST_IP || '10.1.0.18',
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),

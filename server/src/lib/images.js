@@ -56,15 +56,18 @@ function imagesInUse(ctx) {
 // TEARDOWN --rm: called by the reaper BEFORE it deletes the container rows (those rows are the
 // only record of which images belong to this xell).
 export async function removeXellImages(xellId, slug) {
+  // build_ctx too: a split build (compile-here / run-there) leaves the SAME image_tag on the build
+  // host as well as the run host. Miss it and the beefy build host slowly fills the way the NAS did.
   const cs = await q(
-    `SELECT image_tag, docker_ctx FROM container
+    `SELECT image_tag, docker_ctx, build_ctx FROM container
        WHERE owner_xell_id = $1 AND image_tag IS NOT NULL AND docker_ctx IS NOT NULL`, [xellId]);
   if (!cs.length) return { removed: [], failed: [] };
 
   const byCtx = new Map();
+  const add = (ctx, tag) => { if (!ctx) return; if (!byCtx.has(ctx)) byCtx.set(ctx, []); byCtx.get(ctx).push(tag); };
   for (const c of cs) {
-    if (!byCtx.has(c.docker_ctx)) byCtx.set(c.docker_ctx, []);
-    byCtx.get(c.docker_ctx).push(c.image_tag);
+    add(c.docker_ctx, c.image_tag);
+    if (c.build_ctx && c.build_ctx !== c.docker_ctx) add(c.build_ctx, c.image_tag);   // split-build residue
   }
   const all = { removed: [], failed: [] };
   for (const [ctx, tags] of byCtx) {
@@ -83,11 +86,19 @@ export async function removeXellImages(xellId, slug) {
 // never hardcoded), and only tags that match no live xell. It is not `docker image prune -a`:
 // a blanket prune on a shared NAS would eat the dev stack, prod images and anyone else's work.
 export async function sweepOrphanSpinImages({ dryRun = false } = {}) {
-  // Which image repositories are per-xell ones, and on which context? Ask the data.
+  // Which image repositories are per-xell ones, and on which context? Ask the data — and count
+  // BOTH the run context and any split-build context, since a split build leaves the same repo on
+  // the build host too. (The UNION over docker_ctx + build_ctx keeps a failed split-build teardown
+  // from leaking on the beefy build host the way it once did on the NAS.)
   const rows = await q(
-    `SELECT DISTINCT split_part(image_tag, ':', 1) AS repo, docker_ctx
-       FROM container
-      WHERE owner_xell_id IS NOT NULL AND image_tag IS NOT NULL AND docker_ctx IS NOT NULL`);
+    `SELECT DISTINCT split_part(image_tag, ':', 1) AS repo, ctx AS docker_ctx FROM (
+        SELECT image_tag, docker_ctx AS ctx FROM container
+          WHERE owner_xell_id IS NOT NULL AND image_tag IS NOT NULL AND docker_ctx IS NOT NULL
+        UNION ALL
+        SELECT image_tag, build_ctx AS ctx FROM container
+          WHERE owner_xell_id IS NOT NULL AND image_tag IS NOT NULL
+            AND build_ctx IS NOT NULL AND build_ctx <> docker_ctx
+     ) t`);
   if (!rows.length) return { swept: 0, reason: 'no per-xell image repos known yet' };
 
   // q() returns the ROWS, not a pg result — `.rows` here silently yielded undefined and threw.

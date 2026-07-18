@@ -39,6 +39,46 @@ server.tool('zeehive_report_done',
   { note: z.string().optional().describe('one-line summary of what you finished') },
   async ({ note }) => asText(await call('POST', '/api/xell/report-done', { session_id: SID(), note })));
 
+// ── build: a zee's own inner loop. It CAN build its own containers (dev only, its own stack) and
+// tune WHERE they compile to cut build time. This is nothing like prod: it touches only the zee's
+// isolated dev tier, so there is no gate — unlike ship/land below, which a human must approve.
+server.tool('zeehive_build',
+  'Build THIS xell\'s dev container(s) from your current commit. hot=true bounces the existing '
+  + 'image (fast, no code changes); otherwise a full rebuild. build_ctx optionally sets WHERE the '
+  + 'image compiles ("build on X now") — use a beefier docker context than the fleet\'s run host to '
+  + 'cut build time (see zeehive_build_contexts). Returns immediately; poll zeehive_build_status.',
+  {
+    xell_id: z.string().describe('your xell id'),
+    role: z.enum(['server', 'webapp', 'all']).optional().describe('which container (default all)'),
+    hot: z.boolean().optional().describe('fast reload from existing image, no rebuild'),
+    build_ctx: z.string().optional().describe('docker context to COMPILE on; omit to keep current, empty string to reset to the run host'),
+  },
+  async ({ xell_id, role, hot, build_ctx }) => asText(await call('POST', `/api/xells/${encodeURIComponent(xell_id)}/build`,
+    { role: role || 'all', hot: !!hot, ...(build_ctx !== undefined ? { build_ctx } : {}) })));
+
+server.tool('zeehive_build_status',
+  'Is this xell\'s stack built from its worktree\'s CURRENT head yet? Reports each container\'s '
+  + 'health, last build commit, whether it is serving your head, and where it compiles vs runs '
+  + '(split_build). Poll this instead of curl-grepping your own app.',
+  { xell_id: z.string().describe('your xell id') },
+  async ({ xell_id }) => asText(await call('GET', `/api/xells/${encodeURIComponent(xell_id)}/build/status`)));
+
+server.tool('zeehive_build_contexts',
+  'List the docker contexts available to compile on (name, endpoint, which is current). Pick a '
+  + 'beefier one as your xell\'s build_ctx when the fleet\'s run host is slow to build on.', {},
+  async () => asText(await call('GET', '/api/docker/contexts')));
+
+server.tool('zeehive_set_build_context',
+  'Set WHERE this xell\'s images compile (persisted for both server+webapp). Point it at a beefier '
+  + 'docker context to run the build off the fleet host; the compiled image is handed back via the '
+  + 'registry and RUN on your normal containers. Pass an empty build_ctx to reset to the run host. '
+  + 'Refused if the context is foreign and no registry is configured (it tells you how to fix it).',
+  {
+    xell_id: z.string().describe('your xell id'),
+    build_ctx: z.string().describe('docker context to compile on; empty string resets to the run host'),
+  },
+  async ({ xell_id, build_ctx }) => asText(await call('PATCH', `/api/xells/${encodeURIComponent(xell_id)}/build-ctx`, { build_ctx })));
+
 // A zee's ONLY prod verb: ask. It cannot take the lock and cannot run a deploy — the
 // acquire/release tools that used to live here are gone on purpose. A zee holding prod and
 // deploying by hand is exactly how band-aid deploys happened: live in prod, absent from main,

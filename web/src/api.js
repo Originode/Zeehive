@@ -117,11 +117,35 @@ export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, on
 }
 
 // (Re)build a per-xell container. hot=true → fast reload (lime dot); false → full rebuild.
-export async function buildContainer(containerId, hot = false) {
+// buildCtx (optional): compile on this docker context now ('' resets to the run host). Omit to
+// keep whatever build host the container already has.
+export async function buildContainer(containerId, hot = false, buildCtx) {
+  const body = { hot, ...(buildCtx !== undefined ? { build_ctx: buildCtx } : {}) };
   const r = await fetch(`/api/containers/${containerId}/build`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hot }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
   return r.ok ? r.json() : Promise.reject(await r.json().catch(() => ({ error: r.statusText })));
+}
+
+// Set WHERE a xell's images compile (both server+webapp). build_ctx='' resets to the run host.
+// Throws with an actionable message if the context is foreign and no registry is configured.
+export async function setXellBuildCtx(xellId, build_ctx) {
+  const r = await fetch(`/api/xells/${xellId}/build-ctx`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ build_ctx }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `set build host failed (${r.status})`);
+  return data;
+}
+
+// Same, but for a single container (server OR webapp) rather than the whole xell.
+export async function setContainerBuildCtx(containerId, build_ctx) {
+  const r = await fetch(`/api/containers/${containerId}/build-ctx`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ build_ctx }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `set build host failed (${r.status})`);
+  return data;
 }
 
 // Build every buildable (server + webapp) container of a xell.

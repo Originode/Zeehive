@@ -174,10 +174,13 @@ function BasicsSection({ project, run, onProject }) {
   const [f, setF] = useState({
     name: project.name, main_branch: project.main_branch || 'main', env_file: project.env_file || '.env',
     db_name: project.db_name || '', db_user: project.db_user || '', ship_ref: project.ship_ref || '',
+    registry: project.registry || '',
   });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = () => run(async () => {
-    const p = await updateProject(project.id, { ...f, ship_ref: f.ship_ref.trim() || null });
+    const p = await updateProject(project.id, {
+      ...f, ship_ref: f.ship_ref.trim() || null, registry: f.registry.trim() || null,
+    });
     onProject(p);
   });
   return (
@@ -191,6 +194,8 @@ function BasicsSection({ project, run, onProject }) {
         <label>App db user<input value={f.db_user} onChange={set('db_user')} placeholder="postgres" /></label>
         <label>Prod build source <span className="pc">(blank = local main; e.g. origin/main = fetch + build remote)</span>
           <input value={f.ship_ref} onChange={set('ship_ref')} placeholder={`local ${f.main_branch}`} /></label>
+        <label>Build registry <span className="pc">(blank = split builds off; host:port on the LAN, e.g. 10.1.0.18:5000)</span>
+          <input value={f.registry} onChange={set('registry')} placeholder="none — compile on the run host" /></label>
       </div>
       <div className="projpop-formbtns"><button type="button" onClick={save}>Save project</button></div>
     </div>
@@ -336,9 +341,11 @@ function InvRow({ c, run, busy }) {
 function SpawnSection({ project, run }) {
   const [pc, setPc] = useState(null);
   const [runtimes, setRuntimes] = useState([]);
+  const [ctxs, setCtxs] = useState([]);
   useEffect(() => {
     getPoolConfig(project.id).then(setPc).catch(() => {});
     getRuntimes().then(setRuntimes).catch(() => {});
+    getDockerContexts().then(setCtxs).catch(() => {});
   }, [project.id]);
   if (!pc) return null;
   const save = (patch) => run(async () => setPc(await patchPoolConfig(project.id, patch)));
@@ -357,6 +364,12 @@ function SpawnSection({ project, run }) {
         <label>Default runtime
           <select value={pc.runtime_key || ''} onChange={(e) => save({ default_runtime_key: e.target.value })}>
             {runtimes.filter((r) => r.enabled !== false).map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
+          </select></label>
+        <label>Compile on <span className="pc">(build host for new xells{project.registry ? '' : ' — set a Build registry to enable'})</span>
+          <select value={pc.default_build_ctx || ''} onChange={(e) => save({ default_build_ctx: e.target.value })}
+                  disabled={!project.registry}>
+            <option value="">run host (default)</option>
+            {ctxs.map((k) => <option key={k.name} value={k.name}>{k.name}</option>)}
           </select></label>
         <label>Refresh interval (sec)
           <input type="number" min="60" defaultValue={pc.refresh_interval_sec}

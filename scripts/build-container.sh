@@ -12,6 +12,12 @@
 #                       existing image, no rebuild. Fast, but does NOT pick up code changes
 #                       (the compose bakes code into the image; there is no source mount).
 #   mode=simulate     : record the build without touching Docker (demo/on-ramp escape hatch).
+#
+# SPLIT BUILD (compile-here / run-there): the run context is $CTX (positional). If the queenzee
+# passes BUILD_BUILD_CTX and it DIFFERS from $CTX, we compile on that (beefier) daemon, push the
+# image to BUILD_REGISTRY, pull it on the run daemon, and `up --no-build` there. The NAS that runs
+# the fleet was never meant for heavy compute; this moves ONLY the compile off it. When build ctx
+# == run ctx (or no registry) this file behaves EXACTLY as before — the fast path is untouched.
 set -uo pipefail
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY 2>/dev/null || true
 
@@ -53,22 +59,51 @@ export SPINOFF_SERVER_PORT="${SPINOFF_SERVER_PORT:-$((3100 + SLOT))}"
 export SPINOFF_WEB_PORT="${SPINOFF_WEB_PORT:-$((5200 + SLOT))}"
 export GIT_COMMIT_HASH="$HEAD"
 
-emit() { printf '{"ok":%s,"head":"%s","hot":%s,"method":"%s","service":"%s","project":"%s"}\n' \
-  "$1" "$HEAD" "$HOT" "$2" "$SVC" "$PROJECT"; }
+# Split-build inputs (all optional). RUN_CTX is where the container must RUN — always $CTX, the
+# positional the rest of the queenzee already stamps on the row. BUILD_CTX is where it COMPILES.
+RUN_CTX="$CTX"
+BUILD_CTX="${BUILD_BUILD_CTX:-$RUN_CTX}"
+REG="${BUILD_REGISTRY:-}"
+IMG="${BUILD_IMAGE:-}"
+
+emit() { printf '{"ok":%s,"head":"%s","hot":%s,"method":"%s","service":"%s","project":"%s","build_ctx":"%s","run_ctx":"%s"}\n' \
+  "$1" "$HEAD" "$HOT" "$2" "$SVC" "$PROJECT" "$BUILD_CTX" "$RUN_CTX"; }
 
 if [ "$MODE" = "simulate" ]; then emit true "simulate"; exit 0; fi
 
 [ -f "$COMPOSE" ]  || { echo "compose file not found: $COMPOSE (is docker-compose.spinoff.yml on this branch?)" >&2; emit false none; exit 1; }
 [ -f "$ENV_FILE" ] || { echo "env file not found: $ENV_FILE (the main checkout must have its .env)" >&2; emit false none; exit 1; }
 
-dc() { docker --context "$CTX" compose -p "$PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE" "$@"; }
+# Two compose handles: dc() targets the RUN daemon, dcb() the BUILD daemon. When they are the same
+# context these are identical and nothing below transfers anything.
+dc()  { docker --context "$RUN_CTX"   compose -p "$PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE" "$@"; }
+dcb() { docker --context "$BUILD_CTX" compose -p "$PROJECT" --env-file "$ENV_FILE" -f "$COMPOSE" "$@"; }
 
 ok=true
 if [ "$HOT" = "true" ]; then
+  # A hot build never rebuilds and never moves an image — it just bounces the container that is
+  # already on the run daemon. Split-build has nothing to do here; behave exactly as before.
   method=hot
   dc up -d --no-build "$SVC" >&2 || ok=false
-else
+
+elif [ "$BUILD_CTX" = "$RUN_CTX" ] || [ -z "$REG" ] || [ -z "$IMG" ]; then
+  # ── FAST PATH — byte-for-byte the original: build and run on the one daemon. ──
   method=cold
   dc build "$SVC" >&2 && dc up -d "$SVC" >&2 || ok=false
+
+else
+  # ── SPLIT BUILD — compile on BUILD_CTX, run on RUN_CTX, image handed over via the registry. ──
+  # compose build tags the image as $IMG (e.g. omnibiz-spin-server:<slug>) on the BUILD daemon. We
+  # retag it registry-qualified, push, pull on the RUN daemon, then retag BACK to the bare $IMG so
+  # the project's compose `up --no-build` finds it locally — the compose file stays untouched.
+  method=cold-remote
+  REGIMG="$REG/$IMG"
+  dcb build "$SVC" >&2 \
+    && docker --context "$BUILD_CTX" tag  "$IMG"    "$REGIMG" >&2 \
+    && docker --context "$BUILD_CTX" push "$REGIMG"           >&2 \
+    && docker --context "$RUN_CTX"   pull "$REGIMG"           >&2 \
+    && docker --context "$RUN_CTX"   tag  "$REGIMG" "$IMG"    >&2 \
+    && dc up -d --no-build "$SVC" >&2 \
+    || ok=false
 fi
 emit "$ok" "$method"

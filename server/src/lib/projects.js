@@ -12,6 +12,7 @@ import { config } from '../config.js';
 import { broadcast } from './events.js';
 import { cleanGitEnv } from './git.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
+import { resolveSite } from './sites.js';
 
 // Live statuses that mean a zee is actively bound — deleting such a project is refused.
 const LIVE_ZEE = ['spawning', 'online', 'working', 'idle'];
@@ -265,7 +266,7 @@ export async function getPoolConfig(projectId) {
 }
 
 const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
-                        'refresh_interval_sec'];
+                        'refresh_interval_sec', 'default_build_ctx'];
 const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod'];
 
 export async function updatePoolConfig(projectId, body = {}) {
@@ -276,6 +277,25 @@ export async function updatePoolConfig(projectId, body = {}) {
   }
   if (body.default_db_coupling === 'db-shared-prod') {
     throw new Error('db-shared-prod cannot be a DEFAULT — prod data access is per-xell and human-granted (/xell-prod)');
+  }
+  // Default compile host: normalize empty → NULL (compile on the run host), and refuse a foreign
+  // context unless the project can hand the image over (a registry). Same rule as a per-xell knob,
+  // enforced here so a broken default can't be baked into every future xell.
+  if (body.default_build_ctx !== undefined) {
+    const v = String(body.default_build_ctx || '').trim();
+    const devSite = await resolveSite(projectId, 'dev');
+    const runCtx = devSite?.docker_ctx || config.dockerCtx;
+    body.default_build_ctx = (!v || v === runCtx) ? null : v;
+    if (body.default_build_ctx) {
+      const project = await one(`SELECT registry FROM project WHERE id=$1`, [projectId]);
+      const registry = (project?.registry && project.registry.trim()) || config.registry || null;
+      if (!registry) {
+        throw new Error(
+          `default build context '${body.default_build_ctx}' differs from the run context '${runCtx}', `
+          + `which needs a registry to hand the image over — but none is configured. Set the project's `
+          + `Build registry first.`);
+      }
+    }
   }
   const sets = [], vals = [projectId];
   for (const f of POOL_PATCHABLE) {
@@ -317,6 +337,7 @@ const PATCHABLE = [
   'compose_dev', 'compose_spinoff', 'compose_prod', 'env_file',
   'port_server_base', 'port_web_base', 'port_slot_mod',
   'db_name', 'db_user', 'ship_ref',
+  'registry',   // OCI registry for split builds (compile on one docker context, run on another)
 ];
 
 export async function updateProject(id, body = {}) {

@@ -12,9 +12,34 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
+import { resolveBash } from './bash.js';
 
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
+
+// The registry a split build hands its image through: the project's own, else the global default.
+// null when neither is set → split builds are simply unavailable (validated where build_ctx is set).
+async function registryFor(projectId) {
+  const p = await one(`SELECT registry FROM project WHERE id=$1`, [projectId]);
+  return (p?.registry && p.registry.trim()) || config.registry || null;
+}
+
+// Where does THIS container compile? build_ctx when set, else its run context (docker_ctx). A
+// foreign build_ctx with no registry cannot hand the image back — refuse it here, not at push
+// time, so the caller gets an actionable error instead of a half-built stack.
+async function resolveBuildTarget(c) {
+  const runCtx = c.docker_ctx;
+  const buildCtx = c.build_ctx || runCtx;
+  if (buildCtx === runCtx) return { runCtx, buildCtx, registry: null };
+  const registry = await registryFor(c.project_id);
+  if (!registry) {
+    throw new Error(
+      `build_ctx '${buildCtx}' differs from run context '${runCtx}', which needs a registry to hand `
+      + `the image over — but no registry is configured. Set project.registry (or SPINOFF_REGISTRY), `
+      + `on the LAN, then retry.`);
+  }
+  return { runCtx, buildCtx, registry };
+}
 
 // Async spawn (NOT spawnSync) — a real image build would otherwise freeze the event loop.
 // `recorded` carries the meta-DB's compose/env/port facts as env overrides; the script keeps its
@@ -24,7 +49,7 @@ function runBuild({ worktree, role, ctx, hot, recorded = {} }) {
     const script = resolve(config.repoRoot, 'scripts', 'build-container.sh');
     const env = {};
     for (const [k, v] of Object.entries(recorded)) if (v != null && v !== '') env[k] = String(v);
-    const p = spawn('bash', [script, worktree, role, ctx || 'ugreen-nas', hot ? 'true' : 'false', MODE],
+    const p = spawn(resolveBash(), [script, worktree, role, ctx || 'ugreen-nas', hot ? 'true' : 'false', MODE],
       { env: cleanGitEnv(env), windowsHide: true });
     let out = '', err = '';
     p.stdout.on('data', (d) => (out += d));
@@ -38,13 +63,56 @@ function runBuild({ worktree, role, ctx, hot, recorded = {} }) {
   });
 }
 
-// Kick off a build. Returns as soon as it's queued (health='building'); the row updates live.
-export async function buildContainer(containerId, { hot = false } = {}) {
+// Persist one container's build context (normalized). A value equal to the run context or empty
+// resets to NULL (= build where you run). Returns the updated row (already broadcast).
+async function setBuildCtxRow(c, buildCtx) {
+  const s = buildCtx == null ? null : String(buildCtx).trim();
+  const norm = (!s || s === c.docker_ctx) ? null : s;
+  const row = await one(`UPDATE container SET build_ctx=$2 WHERE id=$1 RETURNING *`, [c.id, norm]);
+  broadcast('container', row);
+  return row;
+}
+
+// Set the build context on ONE buildable container. Validates the registry so a foreign context is
+// refused at set time (with the way to fix it), not discovered mid-build.
+export async function setContainerBuildCtx(containerId, buildCtx) {
   const c = await one(`SELECT * FROM container WHERE id=$1`, [containerId]);
+  if (!c) throw new Error('container not found');
+  if (!BUILDABLE.has(c.role) || !c.owner_xell_id) throw new Error('not a buildable per-xell container');
+  const row = await setBuildCtxRow(c, buildCtx);
+  await resolveBuildTarget(row);   // throws if foreign ctx + no registry
+  return { id: row.id, name: row.name, role: row.role, build_ctx: row.build_ctx, run_ctx: row.docker_ctx };
+}
+
+// Set the build context on BOTH buildable containers of a xell at once — the per-xell knob a zee
+// or the console flips to move its compile to a beefier host.
+export async function setXellBuildCtx(xellId, buildCtx) {
+  const cs = await q(`SELECT * FROM container WHERE owner_xell_id=$1 AND role = ANY($2) ORDER BY role`,
+    [xellId, [...BUILDABLE]]);
+  if (!cs.length) throw new Error('xell has no buildable container');
+  const containers = [];
+  for (const c of cs) {
+    const row = await setBuildCtxRow(c, buildCtx);
+    await resolveBuildTarget(row);
+    containers.push({ id: row.id, name: row.name, role: row.role, build_ctx: row.build_ctx, run_ctx: row.docker_ctx });
+  }
+  logline('build', `xell build context → ${containers[0]?.build_ctx || '(run host)'} for ${containers.length} role(s) of ${xellId}`);
+  return { xell_id: xellId, build_ctx: containers[0]?.build_ctx || null, containers };
+}
+
+// Kick off a build. Returns as soon as it's queued (health='building'); the row updates live.
+// buildCtx: undefined → leave the container's stored build context as-is; a string/null → set it
+// first (one-shot "build on X now"). A value equal to the run context, or empty, resets to NULL.
+export async function buildContainer(containerId, { hot = false, buildCtx } = {}) {
+  let c = await one(`SELECT * FROM container WHERE id=$1`, [containerId]);
   if (!c) throw new Error('container not found');
   if (!BUILDABLE.has(c.role)) throw new Error(`role '${c.role}' is not buildable (only server/webapp)`);
   if (!c.owner_xell_id) throw new Error('not a per-xell container');
   if (c.health === 'building') throw new Error(`${c.name} is already building`);
+  if (buildCtx !== undefined) c = await setBuildCtxRow(c, buildCtx);
+  // Validate the build target NOW (before flipping to 'building'), so a foreign context with no
+  // registry fails fast with an actionable error rather than stranding a spinner.
+  const target = await resolveBuildTarget(c);
   const xell = await one(`SELECT slug, worktree_path, project_id FROM xell WHERE id=$1`, [c.owner_xell_id]);
   if (!xell?.worktree_path) throw new Error('owner xell has no worktree');
 
@@ -65,11 +133,16 @@ export async function buildContainer(containerId, { hot = false } = {}) {
     SPINOFF_SLUG: xell.slug,
     SPINOFF_SERVER_PORT: portOf('server'),
     SPINOFF_WEB_PORT: portOf('webapp'),
+    // Split-build handoff (all no-ops when buildCtx === runCtx / no registry — see build-container.sh).
+    BUILD_BUILD_CTX: target.buildCtx,
+    BUILD_REGISTRY: target.registry,
+    BUILD_IMAGE: c.image_tag,
   };
 
   const building = await one(`UPDATE container SET health='building' WHERE id=$1 RETURNING *`, [containerId]);
   broadcast('container', building);
-  logline('build', `${hot ? 'HOT ' : ''}build started: ${c.name} (${MODE}) from ${xell.slug}`);
+  const where = target.buildCtx !== target.runCtx ? ` — compiling on ${target.buildCtx} → run on ${target.runCtx}` : '';
+  logline('build', `${hot ? 'HOT ' : ''}build started: ${c.name} (${MODE}) from ${xell.slug}${where}`);
 
   // background — do NOT await; a real build takes minutes
   (async () => {
@@ -123,12 +196,20 @@ export async function getBuildStatus(xellId) {
   const head = xell.worktree_path ? headCommit(xell.worktree_path, 'HEAD') : null;
 
   const cs = await q(
-    `SELECT id, name, role, health, last_build_commit, last_built_at, hot_build
-       FROM container WHERE owner_xell_id=$1 AND role = ANY($2) ORDER BY role`,
+    `SELECT c.id, c.name, c.role, c.health, c.last_build_commit, c.last_built_at, c.hot_build,
+            c.docker_ctx, c.build_ctx, c.project_id
+       FROM container c WHERE c.owner_xell_id=$1 AND c.role = ANY($2) ORDER BY c.role`,
     [xellId, [...BUILDABLE]]);
 
+  // The registry that a split build would use (project's own, else the global default). Reported so
+  // a zee can tell whether a foreign build_ctx is even possible before it tries.
+  const registry = cs.length ? await registryFor(cs[0].project_id) : (config.registry || null);
   const containers = cs.map((c) => ({
     ...c,
+    // where it COMPILES vs where it RUNS — 'split' when they differ (the image rides the registry).
+    build_ctx: c.build_ctx || c.docker_ctx,
+    run_ctx: c.docker_ctx,
+    split_build: !!c.build_ctx && c.build_ctx !== c.docker_ctx,
     // A HOT build re-used the old image, so its recorded commit does NOT mean the code is live.
     serving_head: !!head && !c.hot_build && c.health === 'up' && sameCommit(c.last_build_commit, head),
     never_built: !c.last_build_commit,
@@ -136,6 +217,7 @@ export async function getBuildStatus(xellId) {
   return {
     xell: { id: xell.id, slug: xell.slug },
     head,
+    registry,                                            // null → split builds unavailable
     building: containers.some((c) => c.health === 'building'),
     settled: containers.every((c) => c.health !== 'building'),
     all_serving_head: containers.length > 0 && containers.every((c) => c.serving_head),
@@ -165,13 +247,13 @@ export async function recoverOrphanBuilds() {
 // Build a xell's buildable containers. role=null → both (server + webapp); otherwise just that
 // one. This is the sanctioned entry point for a zee: it goes through the queenzee, so the commit,
 // hot flag, health and dashboard all stay truthful.
-export async function buildXell(xellId, { hot = false, role = null } = {}) {
+export async function buildXell(xellId, { hot = false, role = null, buildCtx } = {}) {
   if (role && !BUILDABLE.has(role)) throw new Error(`role '${role}' is not buildable (server|webapp|all)`);
   const cs = await q(
     `SELECT id FROM container WHERE owner_xell_id=$1 AND role = ANY($2) ORDER BY role`,
     [xellId, role ? [role] : [...BUILDABLE]]);
   if (!cs.length) throw new Error(`xell has no buildable ${role || 'server/webapp'} container`);
   const started = [];
-  for (const c of cs) started.push(await buildContainer(c.id, { hot }).catch((e) => ({ error: e.message })));
+  for (const c of cs) started.push(await buildContainer(c.id, { hot, buildCtx }).catch((e) => ({ error: e.message })));
   return started;
 }

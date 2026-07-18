@@ -12,6 +12,7 @@ import { broadcast } from '../lib/events.js';
 import { headCommit, cleanGitEnv } from './git.js';
 import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
+import { resolveBash } from './bash.js';
 
 const ADJ = ['swift', 'calm', 'bright', 'bold', 'keen', 'lively', 'nimble', 'quiet', 'sunny', 'wise'];
 const NOUN = ['harbor', 'meadow', 'summit', 'delta', 'ember', 'grove', 'atlas', 'cove', 'ridge', 'vale'];
@@ -214,7 +215,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     const script = resolve(config.repoRoot, 'scripts', 'provision-xell.sh');
     // Pass the project's source branch — the script used to hardcode 'main', which silently
     // ignored main_branch and broke every project that isn't on main.
-    const r = spawnSync('bash', [script, slug, project.repo_root.replace(/\\/g, '/'), project.main_branch], {
+    const r = spawnSync(resolveBash(), [script, slug, project.repo_root.replace(/\\/g, '/'), project.main_branch], {
       encoding: 'utf8', timeout: 600000,
       env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devCtx, DEV_HOST_IP: devHost,
              PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
@@ -237,12 +238,16 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // per-xell containers: its own server + webapp
     // Names/images/compose-project come from the project's naming templates (manifest-backed,
     // defaults derived from the project name — see lib/manifest.js). Never hardcoded per project.
+    // Spawn-template default for WHERE these images compile. NULL (or equal to the run context) ⇒
+    // build on the run host, unchanged. A foreign value was already validated to have a registry
+    // when it was set on pool_config, so a pooled xell inherits a build host that actually works.
+    const defaultBuildCtx = cfg.default_build_ctx && cfg.default_build_ctx !== devCtx ? cfg.default_build_ctx : null;
     const mk = async (role, hostPort, intPort, curl) => {
       const nm = namingFor(project, role, slug);
       const { rows: [c] } = await client.query(
-        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,url,compose_project,compose_file,owner_xell_id,site_id,health)
-         VALUES ($1,$2,'spinoff','per-xell',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
-        [projectId, role, nm.container, nm.image, devCtx, devHost, hostPort, intPort, curl,
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,build_ctx,host,host_port,internal_port,url,compose_project,compose_file,owner_xell_id,site_id,health)
+         VALUES ($1,$2,'spinoff','per-xell',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+        [projectId, role, nm.container, nm.image, devCtx, defaultBuildCtx, devHost, hostPort, intPort, curl,
          nm.composeProject, project.compose_spinoff, xell.id, devSiteId, health]);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, c.id]);
     };

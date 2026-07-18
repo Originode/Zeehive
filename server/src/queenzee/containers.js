@@ -1,53 +1,34 @@
-// Container health monitor — the deterministic "is it actually running?" oracle. The raw
-// probe lives in scripts/check-containers.sh (queenzee runs it, like provision/despawn); this
-// Node projector schedules it, maps the Docker state onto our container_health enum, and drives
-// the health dots live. Read-only; like the session monitor it trusts the tool, not a model.
-import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
-import { config } from '../config.js';
+// Container health monitor — the deterministic "is it actually running?" oracle. lib/docker.js
+// asks each daemon over its HTTP API; this Node projector schedules the probe, maps the Docker
+// state onto our container_health enum, and drives the health dots live. Read-only; like the
+// session monitor it trusts the tool, not a model.
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
+import { dockerPs } from '../lib/docker.js';
 
-// Run scripts/check-containers.sh over the given contexts → { ctx: Map<name,info> | null },
-// where info = { state, xell, project, role } (the zeehive.* identity labels, null when the
-// container is unlabeled) and a null map means the daemon was unreachable (so we report
-// 'unknown', never a false 'down').
-// ASYNC — this probe crosses the network (remote docker daemons over TCP) every 30 seconds, and
-// as a spawnSync it froze the whole event loop for the round-trip. Same clog class as the
-// monitor's CLI call; a periodic loop never gets to block the process it lives in.
-function runProbe(script, ctxs, timeout = 30000) {
-  return new Promise((res) => {
-    let child;
-    try { child = spawn('bash', [script, ...ctxs], { windowsHide: true }); }
-    catch (e) { return res({ stdout: '', error: String(e.message) }); }
-    let stdout = '';
-    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, timeout);
-    child.stdout?.on('data', (d) => (stdout += d));
-    child.on('error', () => { clearTimeout(t); res({ stdout }); });
-    child.on('close', () => { clearTimeout(t); res({ stdout }); });
-  });
-}
-
+// Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
+// role } (the zeehive.* identity labels, null when the container is unlabeled) and a null map
+// means the daemon could not be reached, so we report 'unknown' and never a false 'down'.
+//
+// THE DISTINCTION IS THE WHOLE JOB. This previously shelled out to bash and inferred the fleet
+// from the script's STDOUT, treating empty output as "reachable, no containers". When `bash`
+// itself failed to run (WSL shadowing Git bash on PATH — exits 1, complains on stderr, stdout
+// empty) that inference marked all 35 modeled containers `down` while the entire fleet was up.
+// A probe that cannot run must be UNKNOWN. Only a daemon that answers can testify that something
+// is absent, so the only path to `down` is a successful response that omits the container.
+// Contexts are probed concurrently: one slow daemon shouldn't delay the others.
 async function probeContexts(ctxs) {
-  const script = resolve(config.repoRoot, 'scripts', 'check-containers.sh');
-  const r = await runProbe(script, ctxs);
   const byCtx = {};
-  for (const ctx of ctxs) byCtx[ctx] = new Map();     // reachable-but-empty by default
-  for (const line of (r.stdout || '').split('\n')) {
-    if (!line) continue;
-    const [ctx, name, state, xell, project, role] = line.split('\t');
-    if (!ctx || byCtx[ctx] === undefined) continue;
-    if (name === '__UNREACHABLE__') byCtx[ctx] = null;
-    else if (name) {
-      byCtx[ctx].set(name, {
-        state,
-        xell: xell && xell !== '-' ? xell : null,
-        project: project && project !== '-' ? project : null,
-        role: role && role !== '-' ? role : null,
-      });
+  await Promise.all(ctxs.map(async (ctx) => {
+    try {
+      byCtx[ctx] = await dockerPs(ctx);
+    } catch (e) {
+      byCtx[ctx] = null;                              // unreachable → 'unknown', never 'down'
+      logline('containers', `docker probe FAILED for context '${ctx}': ${e.message} — reporting `
+        + 'its containers as unknown (not down); health for that daemon is stale until it answers.');
     }
-  }
+  }));
   return byCtx;
 }
 

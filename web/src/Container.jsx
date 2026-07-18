@@ -8,8 +8,8 @@
 //  • BUSY (building, or a db container being restored): the health dot becomes a spinner and
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
-import React from 'react';
-import { buildContainer } from './api.js';
+import React, { useState, useEffect } from 'react';
+import { buildContainer, getDockerContexts, setContainerBuildCtx } from './api.js';
 import { nick } from './nick.js';
 
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
@@ -80,12 +80,25 @@ function instancesText(c) {
   return out.join('');
 }
 
+// Where a buildable container COMPILES vs RUNS. Only interesting when they differ (a split build):
+// the image is compiled on build_ctx and handed to docker_ctx via the registry.
+export function buildHost(c) {
+  if (!isBuildable(c)) return null;
+  const run = c.docker_ctx || null;
+  const build = c.build_ctx || run;
+  return { run, build, split: !!c.build_ctx && c.build_ctx !== run };
+}
+
 function tooltip(c, buildable, busy) {
   if (busy) return `${c.name}\n${c.tier} · ${BUSY_LABEL[busy] || 'working…'}`;
   const built = c.last_build_commit
     ? `\nlast build: ${c.last_build_commit}${c.hot_build ? ' (hot)' : ''}${c.last_built_at ? ' · ' + new Date(c.last_built_at).toLocaleString() : ''}`
     : (buildable ? '\nnever built — click the hammer to build' : '');
-  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${driftText(c)}${instancesText(c)}`;
+  const bh = buildHost(c);
+  const host = bh
+    ? (bh.split ? `\ncompiles on ${bh.build} → runs on ${bh.run}` : (bh.run ? `\nbuilds & runs on ${bh.run}` : ''))
+    : '';
+  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${host}${driftText(c)}${instancesText(c)}`;
 }
 
 // onMenu  → the chip is right-clickable (context menu). Passed by BOTH the inventory and the
@@ -120,6 +133,10 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
         <button className="cbuild-in" data-testid="build-in" title="Build this container"
                 onClick={(e) => { e.preventDefault(); e.stopPropagation(); buildContainer(c.id, false).catch(buildErr); }}>🔨</button>
       )}
+      {!busy && buildHost(c)?.split && (
+        <span className="cbuildhost" data-testid="cbuildhost"
+              aria-label={`compiles on ${buildHost(c).build}`}>⇄</span>
+      )}
     </>
   );
   const common = {
@@ -140,19 +157,60 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
 // Right-click context menu for a container. Build actions only when the container is buildable
 // AND idle; a busy container shows a "please wait" note instead so it can't be mangled mid-op.
 export function ContainerMenu({ menu, onClose }) {
+  // Hooks must run unconditionally (before any early return). The build-host picker lists the
+  // docker contexts this machine can compile on; loaded lazily the first time a buildable+idle
+  // container's menu opens, then cached for the life of the menu component.
+  const [ctxs, setCtxs] = useState(null);
+  const c = menu?.c;
+  const buildable = c ? isBuildable(c) : false;
+  const busy = c ? busyReason(c) : null;
+  const showPicker = !!c && buildable && !busy;
+  useEffect(() => {
+    if (!showPicker || ctxs) return;
+    let live = true;
+    getDockerContexts().then((list) => { if (live) setCtxs(list || []); }).catch(() => { if (live) setCtxs([]); });
+    return () => { live = false; };
+  }, [showPicker, ctxs]);
+
   if (!menu) return null;
-  const { x, y, c } = menu;
-  const buildable = isBuildable(c);
-  const busy = busyReason(c);
+  const { x, y } = menu;
   const act = (hot) => { buildContainer(c.id, hot).catch(buildErr); onClose(); };
+  const bh = buildHost(c);
+  const runCtx = bh?.run || null;
+  const current = bh?.build || runCtx;
+  // Build ON a chosen context (set-then-build in one click). Empty → reset to the run host. This is
+  // the "optimize build time" action: point the compile at a beefier daemon and rebuild now.
+  const buildOn = (ctxName) => {
+    const bc = (!ctxName || ctxName === runCtx) ? '' : ctxName;
+    buildContainer(c.id, false, bc).catch(buildErr);
+    onClose();
+  };
+  // Contexts to offer: whatever docker reports, always including the run host itself (reset target).
+  const picker = [];
+  if (runCtx) picker.push({ name: runCtx, run: true });
+  for (const k of (ctxs || [])) if (k.name && k.name !== runCtx) picker.push({ name: k.name, endpoint: k.endpoint });
+
   // No blocking scrim — App closes the menu via document-level listeners. Stop propagation so a
   // click INSIDE the menu doesn't also bubble to that closer before the item handler runs.
   return (
     <div className="ctxmenu" style={{ left: x, top: y }} role="menu" onClick={(e) => e.stopPropagation()}>
       <div className="ctxhead">{c.name}</div>
       {busy && <div className="ctxbusy" data-testid="ctx-busy"><span className={`cspin ${busy}`} />{busy === 'restoring' ? 'restoring from backup…' : 'building…'}</div>}
-      {!busy && buildable && <button role="menuitem" onClick={() => act(false)}>🔨 Build <span className="ctxsub">full rebuild</span></button>}
+      {!busy && buildable && <button role="menuitem" onClick={() => act(false)}>🔨 Build <span className="ctxsub">full rebuild{bh?.split ? ` on ${current}` : ''}</span></button>}
       {!busy && buildable && <button role="menuitem" onClick={() => act(true)}>⚡ Hot build <span className="ctxsub">fast reload</span></button>}
+      {showPicker && (
+        <>
+          <div className="ctxsubhead" data-testid="buildhost-head">compile on {ctxs ? '' : '…'}</div>
+          {ctxs && picker.map((p) => (
+            <button key={p.name} role="menuitem" data-testid={`buildhost-${p.name}`}
+                    className={p.name === current ? 'ctxsel' : ''} onClick={() => buildOn(p.name)}
+                    title={p.run ? 'the fleet host — builds & runs here' : (p.endpoint || 'compile here, run on the fleet host')}>
+              {p.name === current ? '✓ ' : '  '}{p.name}
+              <span className="ctxsub">{p.run ? 'run host' : 'build & ship image'}</span>
+            </button>
+          ))}
+        </>
+      )}
       {c.url && <a role="menuitem" href={c.url} target="_blank" rel="noopener" onClick={onClose}>↗ Open URL</a>}
       {!busy && !buildable && !c.url && <div className="ctxempty">no actions</div>}
     </div>

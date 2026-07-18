@@ -44,6 +44,7 @@ export async function getFleet(projectId) {
   const containers = await q(
     `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host_port, c.health,
             c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
+            c.docker_ctx, c.build_ctx,
             c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at, ${instancesAgg}
        FROM container c WHERE c.project_id = $1
        ORDER BY c.role, c.tier, c.name`, [pid]);
@@ -83,6 +84,7 @@ export async function getFleet(projectId) {
     const stack = await q(
       `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id,
               c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
+              c.docker_ctx, c.build_ctx,
               c.prod_diff, c.prod_diff_at, uc.relation, ${instancesAgg}
          FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
         WHERE uc.xell_id = $1

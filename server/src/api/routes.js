@@ -11,7 +11,7 @@ import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers } from '../queenzee/containers.js';
-import { buildContainer, buildXell, getBuildStatus } from '../lib/build.js';
+import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
@@ -350,8 +350,25 @@ router.get('/monitor/remote', async (_req, res) => res.json(await remoteAvailabl
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
 
 // ── build: (re)build a per-xell server/webapp container (or a whole xell's stack) ──
+// Optional build_ctx in the body sets the build host first ("build on X now"); omit to keep the
+// stored one. build_ctx:null (or '') resets to build-where-you-run.
 router.post('/containers/:id/build', async (req, res) => {
-  try { res.json(await buildContainer(req.params.id, { hot: !!req.body?.hot })); }
+  const buildCtx = Object.prototype.hasOwnProperty.call(req.body || {}, 'build_ctx') ? req.body.build_ctx : undefined;
+  try { res.json(await buildContainer(req.params.id, { hot: !!req.body?.hot, buildCtx })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── build context knob: WHERE a xell's images compile (compile-here / run-there) ──
+// The NAS that runs the fleet is not a build box; point the compile at a beefier context to cut
+// build time. Persisted per container; a foreign context is refused unless a registry is set.
+router.patch('/xells/:id/build-ctx', async (req, res) => {
+  const buildCtx = Object.prototype.hasOwnProperty.call(req.body || {}, 'build_ctx') ? req.body.build_ctx : null;
+  try { res.json(await setXellBuildCtx(req.params.id, buildCtx)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.patch('/containers/:id/build-ctx', async (req, res) => {
+  const buildCtx = Object.prototype.hasOwnProperty.call(req.body || {}, 'build_ctx') ? req.body.build_ctx : null;
+  try { res.json(await setContainerBuildCtx(req.params.id, buildCtx)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Is the xell's stack built from its worktree's current HEAD? This is what `xell-build --wait`
@@ -364,7 +381,8 @@ router.get('/xells/:id/build/status', async (req, res) => {
 router.post('/xells/:id/build', async (req, res) => {
   try {
     const role = req.body?.role && req.body.role !== 'all' ? req.body.role : null;
-    res.json(await buildXell(req.params.id, { hot: !!req.body?.hot, role }));
+    const buildCtx = Object.prototype.hasOwnProperty.call(req.body || {}, 'build_ctx') ? req.body.build_ctx : undefined;
+    res.json(await buildXell(req.params.id, { hot: !!req.body?.hot, role, buildCtx }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 

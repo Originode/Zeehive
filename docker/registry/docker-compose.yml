@@ -1,0 +1,42 @@
+# OCI registry for SPLIT BUILDS — the handoff point that lets a xell's image compile on a beefy
+# docker context and RUN on the fleet's (weak) one. See scripts/build-container.sh (the cold-remote
+# path) and server/src/lib/build.js (resolveBuildTarget).
+#
+# WHERE THIS RUNS: on the LAN daemon, next to the fleet — NOT across the mardale link. A registry
+# behind a slow link makes split builds SLOWER than building on the NAS, which defeats the point.
+# Bring it up against the run host's context, e.g.:
+#
+#     docker --context ugreen-nas compose -f docker/registry/docker-compose.yml up -d
+#
+# Then set it as the project's registry (console → Project Setup → Build registry, or
+# project.registry / SPINOFF_REGISTRY) to `10.1.0.18:5000`.
+#
+# `name:` is pinned for the same reason the meta-db compose pins it — the volume prefix (and so the
+# stored images) must not depend on which folder compose is invoked from.
+name: zeehive-registry
+
+services:
+  registry:
+    image: registry:2
+    container_name: zeehive_registry
+    restart: unless-stopped
+    ports:
+      # Host :5000 on the LAN daemon. This is the address every docker context pushes/pulls at, so
+      # it is also the value that goes in project.registry and in each daemon's insecure-registries.
+      - "${ZEEHIVE_REGISTRY_PORT:-5000}:5000"
+    environment:
+      # Allow manifest DELETE so retired-xell tags can be reclaimed (garbage-collect, see README).
+      # Without this a `registry garbage-collect` can never actually free a deleted image's blobs.
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - registry-data:/var/lib/registry
+    healthcheck:
+      # registry:2 is Alpine-based, so busybox wget is present. /v2/ is the API root — a 200 (or the
+      # 401 an authed registry returns) means the registry is serving.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:5000/v2/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  registry-data:
