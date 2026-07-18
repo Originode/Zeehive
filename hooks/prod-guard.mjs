@@ -26,14 +26,21 @@ import { execFileSync } from 'node:child_process';
 
 const API = process.env.ZEEHIVE_API || 'http://localhost:4700';
 
-// Ask the queenzee a yes/no question, synchronously and briefly. Only ever called for a command
-// that already looks like it touches prod, so this costs nothing on ordinary Bash calls. Returns
-// null if the gate can't answer — the caller then FAILS CLOSED, same as the land gate: no
-// approval service means no privileged prod access.
+// Ask the queenzee a yes/no question, synchronously. Only ever called for a command that already
+// looks like it touches prod, so this costs nothing on ordinary Bash calls. Returns null if the
+// gate can't answer — the caller then FAILS CLOSED, same as the land gate: no approval service
+// means no privileged prod access.
+//
+// The budget is 15s, not 5: db-access resolves container names against the REMOTE prod docker
+// context, and over a degraded mardale link that takes 7-10s uncached. With a 5s budget the
+// answer never arrived, so a xell a human had bound to prod (/xell-prod) was fail-closed DENIED
+// its own database — and allowed on the rare warm-cache call, which is worse than either: a gate
+// that flaps teaches a zee it is noise. 15s is paid only on prod-touching commands, and only
+// until the queenzee's stale-serving name cache (xell-db.js) makes the endpoint fast again.
 function ask(url) {
   try {
-    const out = execFileSync('curl', ['-s', '--max-time', '5', '--connect-timeout', '2', url],
-      { encoding: 'utf8', timeout: 8000, windowsHide: true });
+    const out = execFileSync('curl', ['-s', '--max-time', '15', '--connect-timeout', '2', url],
+      { encoding: 'utf8', timeout: 18000, windowsHide: true });
     return JSON.parse(out);
   } catch { return null; }
 }

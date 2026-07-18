@@ -25,6 +25,7 @@ import { logline } from '../lib/logbus.js';
 import { computePorts } from './provision.js';
 import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
+import { resolveBash } from './bash.js';
 import { execPsql, cloneInstanceFor, templateInstanceFor, upsertInstance, deleteInstance }
   from './db-instances.js';
 
@@ -51,19 +52,50 @@ export function resolveRealDbContainer(ctx, logicalName, { timeout = 15000 } = {
 }
 
 // Same resolution, but safe to call on the prod-guard's hot path. The guard gives its whole
-// db-access request 5s (`curl --max-time 5`) and FAILS CLOSED on a timeout, so an uncached
-// `docker ps` against a remote prod context — which is a network round-trip — could turn a slow
-// day into "the zee is denied and told it may not deploy by hand". Cache per (ctx, name) for a
-// few seconds: container names change only across a rebuild, and a stale name for 5s is strictly
-// better than a false deny. The docker timeout is cut to 3s to stay inside the guard's budget;
-// on a miss resolveRealDbContainer already falls back to the logical name.
+// db-access request a bounded curl budget and FAILS CLOSED on a timeout, so a blocking
+// `docker ps` against a remote prod context — a network round-trip over a link that is sometimes
+// 68KB/s — turns a slow day into "the zee is denied and told it may not deploy by hand". That
+// happened live: the ESR migration xell, human-bound to prod, was denied its own database on
+// every call where mardale answered slower than the budget, and allowed on the rare fast one —
+// a gate that FLAPS teaches a zee that the gate is noise.
+//
+// So: NEVER block on the network once a name is known. A hit is served even when stale;
+// staleness only kicks off a background refresh. Container names change only across a rebuild,
+// and even the worst stale answer — the LOGICAL name — is one the guard's substring match still
+// tolerates against a versioned container (omnibiz_db_prod is a prefix of omnibiz_db_prod_v184).
+// Only the first sighting of a (ctx, name) pair ever waits, and only up to 3s, to stay inside
+// the guard's budget.
 const nameCache = new Map();
-const NAME_TTL_MS = 5000;
+const NAME_TTL_MS = 5 * 60 * 1000;
+
+function refreshRealDbName(ctx, logicalName, key) {
+  let child;
+  try { child = spawn('docker', ['--context', ctx, 'ps', '--format', '{{.Names}}'], { windowsHide: true }); }
+  catch { return; }
+  let out = '';
+  const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 30000);
+  child.stdout?.on('data', (d) => { out += d; });
+  child.on('error', () => clearTimeout(t));
+  child.on('close', (code) => {
+    clearTimeout(t);
+    if (code !== 0) return;   // keep serving the last known name; retry at the next TTL expiry
+    const running = out.split('\n').map((s) => s.trim()).filter(Boolean);
+    const versioned = running.find((n) => n !== logicalName && n.startsWith(`${logicalName}_`));
+    nameCache.set(key, { name: versioned || logicalName, at: Date.now() });
+  });
+}
+
 export function resolveRealDbContainerCached(ctx, logicalName, now = Date.now()) {
   if (!ctx || !logicalName) return logicalName;
   const key = `${ctx}::${logicalName}`;
   const hit = nameCache.get(key);
-  if (hit && now - hit.at < NAME_TTL_MS) return hit.name;
+  if (hit) {
+    if (now - hit.at >= NAME_TTL_MS) {
+      hit.at = now;                       // bump first: one refresh per expiry, even if it fails
+      refreshRealDbName(ctx, logicalName, key);
+    }
+    return hit.name;
+  }
   const name = resolveRealDbContainer(ctx, logicalName, { timeout: 3000 });
   nameCache.set(key, { name, at: now });
   return name;
@@ -246,7 +278,7 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
     // (\\10.1.0.18\maki\Omnibiz Backups\x.dump). Bash needs forward slashes; the spaces are
     // handled by passing it as a single argv entry (never interpolated into a command string).
     const dumpPath = snapshot?.dump_path ? String(snapshot.dump_path).replace(/\\/g, '/') : '';
-    const r = spawnSync('bash', [script, name, ctx, image || 'omnibiz-postgis:18-3.6-h3',
+    const r = spawnSync(resolveBash(), [script, name, ctx, image || 'omnibiz-postgis:18-3.6-h3',
       dumpPath, project.db_user || config.prodDbUser || 'postgres', project.db_name || config.prodDbName || 'omnibiz'],
       { encoding: 'utf8', timeout: 1800000, windowsHide: true });
     const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
@@ -312,7 +344,13 @@ export async function dbAccessForCwd(cwd) {
   const xells = await q(
     `SELECT id, slug, status, worktree_path, db_coupling, project_id FROM xell
        WHERE status <> 'retired' AND NOT is_production`);
-  const xell = xells.find((x) => norm(x.worktree_path) === target);
+  // The cwd is wherever the zee happened to RUN the command — often a subdirectory (server/,
+  // scripts/) of its worktree, not the worktree root. An exact match answered "not a live xell
+  // worktree" for a xell standing in its own tree, which downstream reads as a deny.
+  const xell = xells.find((x) => {
+    const wt = norm(x.worktree_path);
+    return wt && (target === wt || target.startsWith(`${wt}/`));
+  });
   if (!xell) return { xell: null, allowed: false, reason: 'cwd is not a live xell worktree', db_containers: dbNames };
 
   const db = await one(
