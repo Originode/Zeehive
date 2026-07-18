@@ -23,6 +23,7 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     setSize({ w: cont.clientWidth, h: cont.clientHeight });
 
     const hexPos = (hexPosRef && hexPosRef.current) || {};
+    const portrait = orientation === 'portrait';
     const f1 = (n) => n.toFixed(1);
 
     // the honeycomb lattice (cont-relative), rebuilt from live hex positions every frame
@@ -46,11 +47,16 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
         // straight wire to that vertex (kept ⟂ by the graph tracking the prod-hex median)
         d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;
       } else {
-        // hop from the dot across the open gap to the nearest lattice vertex, then thread hex edges
+        // Lead-in obeys the rule even in the open gap: leave the graph PERPENDICULAR, then a 90°
+        // turn runs along the honeycomb face to the entrance vertex — no free diagonal. Then thread
+        // the hex maze inside to the target vertex.
         const entryKey = nearestNode(graph, dcx, dcy);
         const path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
         if (path && path.length) {
-          d = `M ${f1(dcx)} ${f1(dcy)} ` + path.map((p) => `L ${f1(p.x)} ${f1(p.y)}`).join(' ');
+          const e0 = path[0];                                   // entrance vertex
+          const corner = portrait ? [dcx, e0.y] : [e0.x, dcy];  // ⟂ off the spine, then 90° turn
+          const poly = [[dcx, dcy], corner, ...path.map((p) => [p.x, p.y])];
+          d = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
         } else {
           d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;   // disconnected fallback: straight
         }
