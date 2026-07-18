@@ -299,7 +299,7 @@ export default function App() {
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
       <section className="hive-pane honey">
-        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation}
+        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession}
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} onGeometry={fireGeom} />

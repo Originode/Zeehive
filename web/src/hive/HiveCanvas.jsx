@@ -104,7 +104,7 @@ function cellNeighbors(row, col) {
 // hex shrinks. WIRE_PITCH is the on-screen width one trace needs (stroke + clearance).
 const WIRE_PITCH = 6;
 
-export default function HiveCanvas({ xells, diffs, timeline, orientation, onOpenSession, machines,
+export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
                                     expandedId, onExpand, hexPosRef, onGeometry }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
@@ -219,7 +219,9 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, onOpen
       hexPosRef.current = pos;
     }
     onGeometry && onGeometry();
-  }, [size, xells, diffs, timeline, orientation, expandedId, hoverId, expanded, machines, hexPosRef, onGeometry]);
+    // honeySide is a dep so a flip (which moves this pane on screen) re-runs draw and republishes the
+    // hexes' fresh client-space positions — otherwise <Connectors> would trace to their old spots.
+  }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, hoverId, expanded, machines, hexPosRef, onGeometry]);
 
   useLayoutEffect(() => { draw(); }, [draw]);
 

@@ -63,7 +63,7 @@ function Demo() {
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
       <section className="hive-pane honey">
-        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation}
+        <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={machines} onOpenSession={() => {}}
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} onGeometry={fireGeom} />

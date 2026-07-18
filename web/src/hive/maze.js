@@ -59,11 +59,11 @@ export function buildHexGraph(hexes, quant = 1.5) {
 }
 
 // Dijkstra along the lattice. Small graphs (≤ a few hundred nodes) → a sorted-array frontier is fine.
-// Returns an array of {x,y} from start to goal (inclusive), or null if disconnected.
+// Returns an array of {x,y,key} from start to goal (inclusive), or null if disconnected.
 export function shortestPath(graph, startKey, goalKey) {
   const { nodes, adj } = graph;
   if (!nodes.has(startKey) || !nodes.has(goalKey)) return null;
-  if (startKey === goalKey) return [nodes.get(startKey)];
+  if (startKey === goalKey) return [{ ...nodes.get(startKey), key: startKey }];
   const dist = new Map([[startKey, 0]]);
   const prev = new Map();
   const done = new Set();
@@ -86,10 +86,70 @@ export function shortestPath(graph, startKey, goalKey) {
   if (!prev.has(goalKey)) return null;
   const path = [];
   for (let cur = goalKey; cur != null; cur = prev.get(cur)) {
-    path.unshift(nodes.get(cur));
+    path.unshift({ ...nodes.get(cur), key: cur });
     if (cur === startKey) return path;
   }
   return null;
+}
+
+const edgeKey = (a, b) => (a < b ? a + '|' + b : b + '|' + a);
+
+// When several wires traverse the same corridor (lattice edge), give each its own channel: assign a
+// lane per (edge, wire) and return, per wire, a perpendicular offset VECTOR for each of its segments.
+// The offset is taken from the edge's canonical orientation (low→high key) so wires crossing an edge
+// in opposite directions still separate onto consistent sides. `wires`: [{id, pts:[{x,y,key}]}].
+export function assignLanes(wires, pitch) {
+  const users = new Map();                       // edgeKey → [wireId…]
+  for (const w of wires) {
+    for (let i = 0; i < w.pts.length - 1; i++) {
+      const k = edgeKey(w.pts[i].key, w.pts[i + 1].key);
+      if (!users.has(k)) users.set(k, []);
+      users.get(k).push(w.id);
+    }
+  }
+  const laneOff = new Map();                      // edgeKey → Map(wireId → signed offset)
+  for (const [k, list] of users) {
+    const uniq = [...new Set(list)].sort();
+    const m = new Map();
+    uniq.forEach((id, l) => m.set(id, (l - (uniq.length - 1) / 2) * pitch));
+    laneOff.set(k, m);
+  }
+  const out = new Map();
+  for (const w of wires) {
+    const offs = [];
+    for (let i = 0; i < w.pts.length - 1; i++) {
+      const a = w.pts[i], b = w.pts[i + 1];
+      const s = laneOff.get(edgeKey(a.key, b.key)).get(w.id) || 0;
+      const [lo, hi] = a.key < b.key ? [a, b] : [b, a];   // canonical orientation
+      const dx = hi.x - lo.x, dy = hi.y - lo.y, L = Math.hypot(dx, dy) || 1;
+      offs.push([(-dy / L) * s, (dx / L) * s]);           // perpendicular × signed lane offset
+    }
+    out.set(w.id, offs);
+  }
+  return out;
+}
+
+function lineIntersect(p1, d1, p2, d2) {
+  const den = d1[0] * d2[1] - d1[1] * d2[0];
+  if (Math.abs(den) < 1e-6) return null;         // parallel → no miter
+  const t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / den;
+  return [p1[0] + d1[0] * t, p1[1] + d1[1] * t];
+}
+
+// Offset a vertex polyline by a per-segment offset vector, mitring interior corners so the lanes stay
+// continuous. pts: [{x,y}], offs: [[ox,oy]] (one per segment). Returns [[x,y]].
+export function offsetPolyline(pts, offs) {
+  const n = pts.length;
+  if (n < 2) return pts.map((p) => [p.x, p.y]);
+  const out = [[pts[0].x + offs[0][0], pts[0].y + offs[0][1]]];
+  for (let i = 1; i < n - 1; i++) {
+    const a = pts[i - 1], b = pts[i], c = pts[i + 1], o1 = offs[i - 1], o2 = offs[i];
+    const p1 = [b.x + o1[0], b.y + o1[1]], d1 = [b.x - a.x, b.y - a.y];
+    const p2 = [b.x + o2[0], b.y + o2[1]], d2 = [c.x - b.x, c.y - b.y];
+    out.push(lineIntersect(p1, d1, p2, d2) || [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2]);
+  }
+  out.push([pts[n - 1].x + offs[n - 2][0], pts[n - 1].y + offs[n - 2][1]]);
+  return out;
 }
 
 // The vertex of a hex (its verts list) nearest to point (px,py).

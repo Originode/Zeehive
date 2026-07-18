@@ -1,5 +1,7 @@
 import React, { useState, useCallback, useLayoutEffect, useEffect } from 'react';
-import { buildHexGraph, shortestPath, nearestVertex, nearestNode, latticeCells } from './hive/maze.js';
+import { buildHexGraph, shortestPath, nearestVertex, nearestNode, latticeCells, assignLanes, offsetPolyline } from './hive/maze.js';
+
+const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
 
 // SVG overlay spanning the whole hive-split. For each xell it draws a colored wire from the xell's
 // commit dot in the centre <GraphPane> (the point in history it sits at) to that xell's hexagon in
@@ -42,43 +44,64 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
         dx: (n.left + n.right) / 2 - cr.left, dy: (n.top + n.bottom) / 2 - cr.top });
     }
 
-    // "infinite maze": tile invisible cells across the bbox of the dots + honeycomb (+ margin) so a
-    // wire threads corridors through the empty gap too, never a free diagonal.
+    // forward = from the spine toward the honeycomb; wires must never route backward (past the dots
+    // away from the honeycomb). Work on the perpendicular-to-spine axis.
+    const perpOf = (px, py) => (portrait ? py : px);
+    const mean = (a) => a.reduce((s, v) => s + v, 0) / (a.length || 1);
+    const dotPerps = dots.map((d) => perpOf(d.dx, d.dy));
+    const fwd = Math.sign(mean(realHexes.map((h) => perpOf(h.cx, h.cy))) - mean(dotPerps)) || -1;
+    const spine = fwd < 0 ? Math.max(...dotPerps) : Math.min(...dotPerps);   // backward-most dot line
+    // keep a virtual cell only if its whole footprint clears the spine (its backward-most vertex,
+    // ≈cellSize from the centre, is still forward) — so no lattice vertex ever sits behind the dots.
+    const forward = (cx, cy) => (perpOf(cx, cy) - spine) * fwd >= cellSize;
+
+    // "infinite maze": tile invisible cells across the dots→honeycomb bbox, but only on the honeycomb
+    // side of the spine, so a wire threads corridors through the gap without ever going backward.
     const xs = realHexes.map((h) => h.cx).concat(dots.map((d) => d.dx));
     const ys = realHexes.map((h) => h.cy).concat(dots.map((d) => d.dy));
     const M = cellSize * 1.5;
     const bbox = { x0: Math.min(...xs) - M, y0: Math.min(...ys) - M, x1: Math.max(...xs) + M, y1: Math.max(...ys) + M };
-    const virtual = latticeCells(realHexes[0].cx, realHexes[0].cy, cellSize, bbox);
+    // ...and never over the graph pane itself (its lanes/hashes live there) — disregard cells whose
+    // centre falls within it, so wires exit the graph perpendicular and only maze once past it.
+    const gp = cont.querySelector('.graph-pane');
+    let gb = null;
+    if (gp) { const g = gp.getBoundingClientRect(); gb = { x0: g.left - cr.left, y0: g.top - cr.top, x1: g.right - cr.left, y1: g.bottom - cr.top }; }
+    const overGraph = (cx, cy) => gb && cx >= gb.x0 && cx <= gb.x1 && cy >= gb.y0 && cy <= gb.y1;
+    const virtual = latticeCells(realHexes[0].cx, realHexes[0].cy, cellSize, bbox)
+      .filter((c) => forward(c.cx, c.cy) && !overGraph(c.cx, c.cy));
     const graph = buildHexGraph(realHexes.concat(virtual));
 
-    const items = [];
+    // pass 1: pathfind every wire (prod included) through the corridor maze
+    const routed = [];
     for (const dd of dots) {
       const verts = graph.vertsById.get(dd.id);
       if (!verts) continue;
-      const { dx: dcx, dy: dcy } = dd;
-      // aim at the vertex of the target hex closest to the commit head (the dot)
-      const target = nearestVertex(verts, dcx, dcy);
-      let d, ex = target.x, ey = target.y;
+      const target = nearestVertex(verts, dd.dx, dd.dy);   // hex vertex nearest the commit head
+      const entryKey = nearestNode(graph, dd.dx, dd.dy);
+      const path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
+      routed.push({ id: dd.id, color: dd.color, dot: dd, target, pts: path });
+    }
 
-      if (prodIds.includes(dd.id)) {
-        // straight wire to that vertex (kept ⟂ by the graph tracking the prod-hex median)
-        d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;
+    // pass 2: where wires share a corridor, split them into parallel channels
+    const lanes = assignLanes(routed.filter((r) => r.pts && r.pts.length > 1), LANE_PITCH);
+
+    const items = [];
+    for (const r of routed) {
+      const { dot: dd, target } = r;
+      let d, ex = target.x, ey = target.y;
+      if (r.pts && r.pts.length > 1) {
+        const off = lanes.get(r.id) || r.pts.slice(1).map(() => [0, 0]);
+        const maze = offsetPolyline(r.pts, off);           // channel-offset corridor path
+        const e0 = maze[0];                                // offset entry point
+        const corner = portrait ? [dd.dx, e0[1]] : [e0[0], dd.dy];  // ⟂ off the spine, then 90° turn
+        const poly = [[dd.dx, dd.dy], corner, ...maze];
+        d = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
+        ex = maze[maze.length - 1][0]; ey = maze[maze.length - 1][1];
       } else {
-        // leave the graph PERPENDICULAR, a 90° turn onto the lattice, then thread the (infinite)
-        // corridor maze to the target — no free diagonal anywhere.
-        const entryKey = nearestNode(graph, dcx, dcy);
-        const path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
-        if (path && path.length) {
-          const e0 = path[0];                                   // entry vertex on the lattice
-          const corner = portrait ? [dcx, e0.y] : [e0.x, dcy];  // ⟂ off the spine, then 90° turn
-          const poly = [[dcx, dcy], corner, ...path.map((p) => [p.x, p.y])];
-          d = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
-        } else {
-          d = `M ${f1(dcx)} ${f1(dcy)} L ${f1(ex)} ${f1(ey)}`;   // disconnected fallback: straight
-        }
+        d = `M ${f1(dd.dx)} ${f1(dd.dy)} L ${f1(ex)} ${f1(ey)}`;   // single-vertex / disconnected
       }
-      items.push({ id: dd.id, color: dd.color, d, x1: dcx, y1: dcy, x2: ex, y2: ey,
-        dim: expandedId && expandedId !== dd.id });
+      items.push({ id: r.id, color: r.color, d, x1: dd.dx, y1: dd.dy, x2: ex, y2: ey,
+        dim: expandedId && expandedId !== r.id });
     }
     setPaths(items);
   }, [timeline, layoutRef, hexPosRef, orientation, honeySide, expandedId, prodIds.join(',')]);   // eslint-disable-line react-hooks/exhaustive-deps
