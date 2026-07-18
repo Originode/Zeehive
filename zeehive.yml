@@ -36,4 +36,6 @@ roles:
 naming:
   container: { db: "zeehive_db_spin_{slug}" }
 
-db: { name: zeehive, user: zeehive }
+# password is the committed dev credential (same one docker-compose.yml carries) — a process
+# xell must SCRAM-authenticate over TCP, unlike a compose sibling reaching its db by alias.
+db: { name: zeehive, user: zeehive, password: zeehive }

@@ -274,7 +274,12 @@ async function runShipBody(ship, xell, project, site, lockKey) {
        AND ($3::uuid IS NULL AND (site_id IS NULL OR site_id IN
               (SELECT id FROM deploy_site WHERE project_id=$1 AND tier='prod' AND is_default))
             OR site_id = $3::uuid OR ($3::uuid IS NOT NULL AND site_id IS NULL AND $4))
-       ORDER BY role`,
+       ORDER BY role DESC`,
+    // DESC (webapp before server) is load-bearing for self-hosting (§6.3): Zeehive's server
+    // target is the SELF-restart — it kills this very process seconds after it runs, so anything
+    // ordered after it never ships (and boot recovery would then mark the ship 'shipped' off the
+    // OLD webapp container still answering its URL). The suicide step goes last. For projects
+    // whose targets are independent container builds, the order never mattered.
     [project.id, ship.targets?.length ? ship.targets : SHIPPABLE, site?.id || null, !!site?.is_default]);
 
   const results = [];
