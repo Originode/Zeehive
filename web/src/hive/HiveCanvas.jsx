@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { hexPath, pointInHex, flowerCenters, layoutHoneycomb, hexWidth } from './hex.js';
+import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
 import { computeGraph } from './graph.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
@@ -7,10 +7,16 @@ const COL = {
   bg: '#0d1017', panel: '#161b24', line: '#2a3242', text: '#e6ebf2', muted: '#8b97a8',
   working: '#35c46b', idle: '#e0a53b', ready: '#5b8cff', claimed: '#9b8cff',
   awaiting: '#e0a53b', spawning: '#5b8cff', error: '#e5554e', prod: '#f2c14e',
+  sha: '#e0a53b', add: '#35c46b', del: '#e5554e',
 };
 const HEALTH = { up: '#35c46b', building: '#e0a53b', down: '#e5554e', unknown: '#6b7688', starting: '#5b8cff' };
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff',
   '#e5554e', '#3bc6c0', '#d98c5f', '#7bd0e0', '#c98cff', '#8cd98c'];
+
+// ── timeline geometry (world coords; the whole world pans/zooms) ───────────────
+const TL_TOP = 26;            // first commit row y
+const TL_LANE0 = 64;          // main graph lane 0 x (hash labels sit to its left)
+const CORRIDOR_X0 = 8;        // circuit corridors live between the branch lanes and the honeycomb
 
 function statusColor(x) {
   if (x.is_production) return COL.prod;
@@ -22,13 +28,6 @@ function statusColor(x) {
   if (s === 'awaiting-done') return COL.awaiting;
   if (['errored', 'error', 'stopped'].includes(x.zee_status)) return COL.error;
   return COL.muted;
-}
-// A one-glyph runtime hint for the compact hex (Claude → ✦, others → first letter).
-function runtimeGlyph(x) {
-  const l = (x.runtime_label || '').toLowerCase();
-  if (!l) return '';
-  if (l.includes('claude')) return '✦';
-  return (x.runtime_label[0] || '').toUpperCase();
 }
 const shortSlug = (s) => String(s || '');
 const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
@@ -48,8 +47,6 @@ function ageText(iso) {
   if (h < 48) return `${h}h`;
   return `${Math.floor(h / 24)}d`;
 }
-
-// truncate a string to fit `maxW` px in the current ctx font, adding an ellipsis.
 function fit(ctx, s, maxW) {
   s = String(s ?? '');
   if (ctx.measureText(s).width <= maxW) return s;
@@ -60,32 +57,14 @@ function fit(ctx, s, maxW) {
   }
   return s.slice(0, lo) + '…';
 }
-
-// The geometry frame for a given timeline edge: the honeycomb rect, plus how the timeline band
-// lays out (which coord runs ALONG the timeline vs ACROSS it, where the honey-facing merge edge is,
-// and which way the lanes grow away from the honeycomb).
-const VBAND = 168, HBAND = 138, AXIS_MARGIN = 16;
-function frameFor(edge, w, h) {
-  if (edge === 'right') {
-    const bx = w - VBAND;
-    return { vertical: true, honey: { x: 0, y: 0, w: bx, h }, band: { x: bx, y: 0, w: VBAND, h },
-      mergeAcross: bx + AXIS_MARGIN, laneDir: 1, alongStart: 20, alongEnd: h - 20 };
-  }
-  if (edge === 'left') {
-    return { vertical: true, honey: { x: VBAND, y: 0, w: w - VBAND, h }, band: { x: 0, y: 0, w: VBAND, h },
-      mergeAcross: VBAND - AXIS_MARGIN, laneDir: -1, alongStart: 20, alongEnd: h - 20 };
-  }
-  if (edge === 'top') {
-    return { vertical: false, honey: { x: 0, y: HBAND, w, h: h - HBAND }, band: { x: 0, y: 0, w, h: HBAND },
-      mergeAcross: HBAND - AXIS_MARGIN, laneDir: -1, alongStart: 24, alongEnd: w - 24 };
-  }
-  // default: bottom
-  const by = h - HBAND;
-  return { vertical: false, honey: { x: 0, y: 0, w, h: by }, band: { x: 0, y: by, w, h: HBAND },
-    mergeAcross: by + AXIS_MARGIN, laneDir: 1, alongStart: 24, alongEnd: w - 24 };
+function withAlpha(hex, a) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 
-// A xell's machine (from its server container's docker context), for the flower's machine facet.
+// A xell's machine (from its server container's docker context).
 function machineOf(x, machines) {
   const ctx = (x.stack || []).find((c) => c.role === 'server' && c.docker_ctx)?.docker_ctx
     || (x.stack || []).find((c) => c.docker_ctx)?.docker_ctx || null;
@@ -93,20 +72,45 @@ function machineOf(x, machines) {
   const m = (machines || []).find((mm) => mm.docker_ctx === ctx);
   return m ? (m.key || m.label || ctx) : ctx;
 }
+// "no — 2 unlanded" | "no — dirty" | "ready": the zee-facing ship gate answer, derived the same
+// way the old card derived it (unlanded = commits ahead of main; dirty = uncommitted files).
+function shipLine(x, diff) {
+  if (x.is_production) return null;
+  if (!diff) return null;
+  if (diff.ahead > 0) return `no — ${diff.ahead} unlanded`;
+  if (diff.dirty > 0) return `no — dirty`;
+  return 'ready';
+}
+
+// ── offset-grid helpers (odd rows shift right — matches layoutHoneycomb) ───────
+const cellKey = (row, col) => row + ',' + col;
+function cellCenter(row, col, size, originX, originY) {
+  const w = hexWidth(size);
+  return [originX + w / 2 + col * w + (row % 2 ? w / 2 : 0), originY + size + row * rowStep(size)];
+}
+// The six neighbours of an offset cell (odd-r layout).
+function cellNeighbors(row, col) {
+  const odd = row % 2 === 1;
+  return [
+    [row, col - 1], [row, col + 1],
+    [row - 1, odd ? col : col - 1], [row - 1, odd ? col + 1 : col],
+    [row + 1, odd ? col : col - 1], [row + 1, odd ? col + 1 : col],
+  ];
+}
 
 export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession, machines,
                                     expandedId, onExpand }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], flower: null });
+  const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
+  const dragRef = useRef(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [hoverId, setHoverId] = useState(null);
   const rafRef = useRef(0);
   const setExpandedId = onExpand || (() => {});
 
-  // The xell currently expanded into a flower — resolved fresh each render so live updates flow.
   const expanded = expandedId ? (xells || []).find((x) => x.id === expandedId) : null;
-  // If the expanded xell disappears (reaped), fall back to the honeycomb.
   useEffect(() => { if (expandedId && !expanded) setExpandedId?.(null); }, [expandedId, expanded, setExpandedId]);
 
   // ── draw ──────────────────────────────────────────────────────────────────
@@ -121,95 +125,136 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
       canvas.height = Math.round(h * dpr);
     }
     const ctx = canvas.getContext('2d');
+    const v = viewRef.current;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
+    ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
 
     const list = xells || [];
-    const fr = frameFor(edge, w, h);
-    const toXY = fr.vertical ? (along, across) => [across, along] : (along, across) => [along, across];
-
-    // colour + base-commit per xell from the timeline (anchors the connectors).
     const tById = {};
     for (const tx of (timeline?.xells || [])) tById[tx.id] = tx;
 
-    // 1) honeycomb layout
-    const lay = layoutHoneycomb(list.length, fr.honey.w, fr.honey.h);
-    const hexes = list.map((x, i) => {
-      const cell = lay.cells[i] || { cx: fr.honey.w / 2, cy: fr.honey.h / 2 };
-      return { x, id: x.id, cx: fr.honey.x + cell.cx, cy: fr.honey.y + cell.cy, size: lay.size,
-        color: tById[x.id]?.color || null };
-    });
-    const hexById = {};
-    for (const hx of hexes) hexById[hx.id] = hx;
-
-    // 2) timeline commit positions (along the axis) + lanes
+    // 1) the git graph — classic lanes (old style), vertical, in world space
     const commits = timeline?.commits || [];
-    let commitPos = {};
-    let graph = null;
-    if (commits.length) {
-      graph = computeGraph(commits);
-      const span = fr.alongEnd - fr.alongStart;
-      const gap = Math.max(11, Math.min(30, span / Math.max(1, commits.length - 1)));
-      const total = gap * (commits.length - 1);
-      const start = fr.alongStart + Math.max(0, (span - total) / 2);
-      const laneW = Math.max(7, Math.min(13, (VBAND - AXIS_MARGIN - 96) / Math.max(1, graph.laneCount)));
-      for (const { c, lane, row } of graph.rows) {
-        const along = start + row * gap;
-        const across = fr.mergeAcross + fr.laneDir * lane * laneW;
-        commitPos[c.hash] = { along, across, lane, row, laneW,
-          dot: toXY(along, across), merge: toXY(along, fr.mergeAcross) };
+    const graph = commits.length ? computeGraph(commits) : null;
+    const rowGap = 18, laneW = 11;
+    const commitY = (row) => TL_TOP + 14 + row * rowGap;
+    const laneX = (lane) => TL_LANE0 + lane * laneW;
+    const mainLanesW = graph ? graph.laneCount * laneW : laneW;
+
+    // live (unmerged) xell branches: one extra lane each, to the right of the main graph
+    const liveXells = list.filter((x) => !x.is_production && tById[x.id]);
+    const rowOf = {};
+    commits.forEach((c, i) => { rowOf[c.hash] = i; });
+    const branchLaneX = (i) => TL_LANE0 + mainLanesW + 12 + i * 13;
+    const branches = liveXells.map((x, i) => {
+      const tx = tById[x.id];
+      const d = diffs?.[x.id];
+      const ahead = Math.max(0, d?.ahead ?? 0);
+      const baseRow = rowOf[tx.base_commit] ?? 0;
+      const forkY = commitY(baseRow);
+      const lift = Math.max(1, Math.min(ahead || 1, 9));
+      const tipY = Math.max(TL_TOP + 6 + i * 14, forkY - lift * rowGap);
+      return { x, tx, i, lx: branchLaneX(i), forkY, tipY, ahead, color: tx.color || statusColor(x) };
+    });
+    const tlWidth = TL_LANE0 + mainLanesW + 12 + branches.length * 13 + 8;
+    const corridor0 = tlWidth + CORRIDOR_X0;
+
+    // 2) honeycomb layout on the offset grid, to the right of the corridors
+    const honeyX = corridor0 + branches.length * 10 + 26;
+    const lay = layoutHoneycomb(list.length, Math.max(120, w - honeyX), h, { min: 24 });
+    const sizeHex = lay.size;
+    const originX = honeyX + 10, originY = 10;
+    // base cell per xell (row-major, exactly layoutHoneycomb's shape)
+    const baseCells = {};
+    list.forEach((x, i) => {
+      const c = lay.cells[i] || { row: 0, col: i };
+      baseCells[x.id] = [c.row, c.col];
+    });
+    // flower reflow: expanded keeps its cell, its 6 neighbours are consumed; everyone else takes
+    // the next free cell in reading order (rows extend downward as needed — the canvas pans).
+    const cells = {};
+    const reserved = new Set();
+    if (expanded && baseCells[expanded.id]) {
+      const [er, ec] = baseCells[expanded.id];
+      cells[expanded.id] = [er, ec];
+      reserved.add(cellKey(er, ec));
+      for (const [nr, nc] of cellNeighbors(er, ec)) reserved.add(cellKey(nr, nc));
+    }
+    {
+      const cols = Math.max(1, lay.cols);
+      let row = 0, col = 0;
+      const nextFree = () => {
+        for (;;) {
+          const k = cellKey(row, col);
+          const taken = reserved.has(k) || Object.values(cells).some(([r2, c2]) => r2 === row && c2 === col);
+          const out = [row, col];
+          col++; if (col >= cols) { col = 0; row++; }
+          if (!taken) return out;
+        }
+      };
+      for (const x of list) { if (!cells[x.id]) cells[x.id] = nextFree(); }
+    }
+    const occupied = new Set([...reserved, ...Object.values(cells).map(([r, c]) => cellKey(r, c))]);
+    const hexes = list.map((x) => {
+      const [row, col] = cells[x.id];
+      const [cx, cy] = cellCenter(row, col, sizeHex, originX, originY);
+      return { x, id: x.id, row, col, cx, cy, size: sizeHex, color: tById[x.id]?.color || null };
+    });
+    const hexById = {}; for (const hx of hexes) hexById[hx.id] = hx;
+
+    // 3) circuit traces — branch tip → hex. Straight H/V segments only, vias at bends.
+    for (const b of branches) {
+      const hx = hexById[b.x.id];
+      if (!hx) continue;
+      const corridor = corridor0 + b.i * 10;
+      const wHalf = hexWidth(hx.size) / 2;
+      const westFree = hx.col === 0 || !occupied.has(cellKey(hx.row, hx.col - 1));
+      const [tRow1, tRow2] = cellNeighbors(hx.row, hx.col).slice(2, 4);
+      const topFree = !occupied.has(cellKey(...tRow1)) && !occupied.has(cellKey(...tRow2));
+      let segs;
+      if (westFree) segs = [[b.lx, b.tipY], [corridor, b.tipY], [corridor, hx.cy], [hx.cx - wHalf - 2, hx.cy]];
+      else if (topFree) {
+        const rail = hx.cy - hx.size - 12 - b.i * 6;
+        segs = [[b.lx, b.tipY], [corridor, b.tipY], [corridor, rail], [hx.cx, rail], [hx.cx, hx.cy - hx.size - 2]];
+      } else {
+        const rail = hx.cy + hx.size + 12 + b.i * 6;
+        segs = [[b.lx, b.tipY], [corridor, b.tipY], [corridor, rail], [hx.cx, rail], [hx.cx, hx.cy + hx.size + 2]];
       }
-      // stash for label/edge drawing
-      commitPos.__meta = { gap, laneW, start };
-    }
-
-    // 3) connectors — merge point (honey edge) → hex centre, coloured per xell. Drawn first so hexes
-    //    and the timeline sit on top. Origin on the honey side = "merge points face the honeycomb".
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'round';
-    for (const tx of (timeline?.xells || [])) {
-      const hx = hexById[tx.id];
-      const cp = commitPos[tx.base_commit];
-      if (!hx || !cp) continue;
-      const [mx, my] = cp.merge;
-      const col = tx.color || COL.muted;
-      ctx.strokeStyle = expandedId ? withAlpha(col, 0.18) : withAlpha(col, 0.85);
-      ctx.beginPath();
-      ctx.moveTo(mx, my);
-      // bow the curve out toward the honeycomb so traces read as roots, not straight spokes.
-      const midx = (mx + hx.cx) / 2, midy = (my + hx.cy) / 2;
-      const bow = fr.vertical ? [midx, my] : [mx, midy];
-      ctx.quadraticCurveTo(bow[0], bow[1], hx.cx, hx.cy);
-      ctx.stroke();
-      // solder pad at the merge edge
+      const dimmed = expandedId && expandedId !== b.x.id;
+      ctx.strokeStyle = withAlpha(b.color, dimmed ? 0.15 : 0.85);
       ctx.fillStyle = ctx.strokeStyle;
-      ctx.beginPath(); ctx.arc(mx, my, 2.6, 0, Math.PI * 2); ctx.fill();
+      ctx.lineWidth = 1.7; ctx.lineCap = 'square';
+      ctx.beginPath();
+      ctx.moveTo(segs[0][0], segs[0][1]);
+      for (let s = 1; s < segs.length; s++) ctx.lineTo(segs[s][0], segs[s][1]);
+      ctx.stroke();
+      for (let s = 1; s < segs.length - 1; s++) {
+        ctx.beginPath(); ctx.arc(segs[s][0], segs[s][1], 2.1, 0, Math.PI * 2); ctx.fill();
+      }
+      const end = segs[segs.length - 1];
+      ctx.fillRect(end[0] - 2.6, end[1] - 2.6, 5.2, 5.2);
     }
 
-    // 4) timeline band
-    drawTimeline(ctx, fr, commits, graph, commitPos, toXY, timeline?.branch, expandedId);
+    // 4) the graph itself (drawn over the traces' left ends)
+    if (graph) drawGraph(ctx, commits, graph, branches, { rowGap, laneW, commitY, laneX, tlWidth, h, branch: timeline?.branch, expandedId });
 
-    // 5) honeycomb hexes (compact)
+    // 5) hexes — compact card: machine+chips on the upper half, sha/diff/status/ship on the lower
     geomRef.current.hexes = hexes;
     for (const hx of hexes) {
+      if (expanded && hx.id === expanded.id) continue;     // the flower draws it
       const dim = expandedId && expandedId !== hx.id;
-      drawCompactHex(ctx, hx, { hover: hoverId === hx.id, dim, diff: diffs?.[hx.id] });
+      drawCompactHex(ctx, hx, { hover: hoverId === hx.id, dim, diff: diffs?.[hx.id], machines });
     }
 
-    // 6) flower overlay
+    // 6) flower — IN the grid: the xell's own cell + its 6 neighbours, no overlay
     geomRef.current.flower = null;
-    if (expanded) {
-      // scrim over the honeycomb (not the timeline band) so the flower reads as focus
-      ctx.fillStyle = 'rgba(8,10,15,0.62)';
-      ctx.fillRect(fr.honey.x, fr.honey.y, fr.honey.w, fr.honey.h);
-      const fsize = Math.min(
-        Math.min(fr.honey.w, fr.honey.h) / 6.2,
-        118,
-      );
-      const fcx = fr.honey.x + fr.honey.w / 2;
-      const fcy = fr.honey.y + fr.honey.h / 2;
-      drawFlower(ctx, fcx, fcy, fsize, expanded, diffs?.[expanded.id], machines);
-      geomRef.current.flower = { cx: fcx, cy: fcy, size: fsize, id: expanded.id,
+    if (expanded && cells[expanded.id]) {
+      const [er, ec] = cells[expanded.id];
+      const centers = [cellCenter(er, ec, sizeHex, originX, originY),
+        ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, sizeHex, originX, originY))];
+      drawFlower(ctx, centers, sizeHex, expanded, diffs?.[expanded.id], machines);
+      geomRef.current.flower = { centers, size: sizeHex, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
     }
   }, [size, xells, diffs, timeline, edge, expandedId, hoverId, expanded, machines]);
@@ -227,16 +272,23 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
     return () => ro.disconnect();
   }, []);
 
-  // ── interaction ─────────────────────────────────────────────────────────────
-  const hitHex = useCallback((mx, my) => {
-    for (const hx of geomRef.current.hexes) if (pointInHex(mx, my, hx.cx, hx.cy, hx.size)) return hx;
+  // ── interaction (screen → world through the pan/zoom transform) ─────────────
+  const toWorld = (mx, my) => {
+    const v = viewRef.current;
+    return [(mx - v.x) / v.k, (my - v.y) / v.k];
+  };
+  const hitHex = useCallback((wx, wy) => {
+    for (const hx of geomRef.current.hexes) if (pointInHex(wx, wy, hx.cx, hx.cy, hx.size)) return hx;
     return null;
   }, []);
-  const inFlower = useCallback((mx, my) => {
+  const hitFlower = useCallback((wx, wy) => {
     const f = geomRef.current.flower;
-    if (!f) return false;
-    for (const [cx, cy] of flowerCenters(f.cx, f.cy, f.size)) if (pointInHex(mx, my, cx, cy, f.size)) return true;
-    return false;
+    if (!f) return null;
+    for (let i = 0; i < f.centers.length; i++) {
+      const [cx, cy] = f.centers[i];
+      if (pointInHex(wx, wy, cx, cy, f.size)) return { ...f, cell: i };   // 0 = centre
+    }
+    return null;
   }, []);
 
   const relPos = (e) => {
@@ -244,15 +296,33 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
     return [e.clientX - r.left, e.clientY - r.top];
   };
 
-  const onMove = (e) => {
+  const onPointerDown = (e) => {
     const [mx, my] = relPos(e);
+    dragRef.current = { mx, my, vx: viewRef.current.x, vy: viewRef.current.y, moved: false };
+    canvasRef.current.setPointerCapture?.(e.pointerId);
+  };
+  const onPointerMove = (e) => {
+    const [mx, my] = relPos(e);
+    const d = dragRef.current;
+    if (d) {
+      if (Math.abs(mx - d.mx) + Math.abs(my - d.my) > 4) d.moved = true;
+      if (d.moved) {
+        viewRef.current.x = d.vx + (mx - d.mx);
+        viewRef.current.y = d.vy + (my - d.my);
+        canvasRef.current.style.cursor = 'grabbing';
+        if (rafRef.current) cancelAnimationFrame(rafRef.current);
+        rafRef.current = requestAnimationFrame(draw);
+        return;
+      }
+    }
+    const [wx, wy] = toWorld(mx, my);
     let cursor = 'default';
     if (expandedId) {
-      const f = geomRef.current.flower;
-      cursor = inFlower(mx, my) ? (f?.openable ? 'pointer' : 'default') : 'default';
+      const f = hitFlower(wx, wy);
+      cursor = f && f.cell === 0 && f.openable ? 'pointer' : 'default';
       if (hoverId) setHoverId(null);
     } else {
-      const hx = hitHex(mx, my);
+      const hx = hitHex(wx, wy);
       const id = hx?.id || null;
       if (id !== hoverId) {
         if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -262,35 +332,71 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
     }
     canvasRef.current.style.cursor = cursor;
   };
-
-  const onClick = (e) => {
-    const [mx, my] = relPos(e);
+  const onPointerUp = (e) => {
+    const d = dragRef.current;
+    dragRef.current = null;
+    canvasRef.current.style.cursor = 'default';
+    if (d?.moved) return;                                    // it was a pan, not a click
+    const [wx, wy] = toWorld(...relPos(e));
     if (expandedId) {
-      if (inFlower(mx, my)) {
-        const f = geomRef.current.flower;
-        if (f?.openable) { const x = (xells || []).find((xx) => xx.id === f.id); if (x) onOpenSession?.(x); }
-        return;   // clicking the flower opens the session (or does nothing for prod)
+      const f = hitFlower(wx, wy);
+      if (f) {
+        if (f.cell === 0 && f.openable) {
+          const x = (xells || []).find((xx) => xx.id === f.id);
+          if (x) onOpenSession?.(x);
+        }
+        return;                                              // petal clicks keep the flower open
       }
-      setExpandedId(null);   // click outside collapses
+      const hx = hitHex(wx, wy);
+      if (hx && hx.id !== expandedId) { setExpandedId(hx.id); return; }
+      setExpandedId(null);
       return;
     }
-    const hx = hitHex(mx, my);
+    const hx = hitHex(wx, wy);
     if (hx) setExpandedId(hx.id);
   };
 
-  const onLeave = () => { if (hoverId) setHoverId(null); };
+  const onWheel = (e) => {
+    e.preventDefault();
+    const [mx, my] = relPos(e);
+    const v = viewRef.current;
+    const f = e.deltaY > 0 ? 1 / 1.12 : 1.12;
+    const k = Math.min(3.2, Math.max(0.3, v.k * f));
+    // zoom about the cursor: keep the world point under the mouse fixed
+    v.x = mx - ((mx - v.x) / v.k) * k;
+    v.y = my - ((my - v.y) / v.k) * k;
+    v.k = k;
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(draw);
+  };
+
+  const onLeave = () => { if (hoverId) setHoverId(null); dragRef.current = null; };
 
   useEffect(() => {
-    const onKey = (e) => { if (e.key === 'Escape' && expandedId) setExpandedId(null); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        if (expandedId) setExpandedId(null);
+        else { viewRef.current = { x: 0, y: 0, k: 1 }; draw(); }   // Esc with nothing open: reset view
+      }
+    };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [expandedId]);
+  }, [expandedId, draw]);
+
+  // wheel must be non-passive to preventDefault page scroll
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  });
 
   return (
     <div ref={wrapRef} className="hive-canvas-wrap">
       <canvas ref={canvasRef} className="hive-canvas"
-              style={{ width: size.w, height: size.h, display: 'block' }}
-              onMouseMove={onMove} onClick={onClick} onMouseLeave={onLeave} />
+              style={{ width: size.w, height: size.h, display: 'block', touchAction: 'none' }}
+              onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp} onMouseLeave={onLeave} />
       {(!xells || xells.length === 0) && (
         <p className="hive-empty">No active xells. The pool maintainer will fill it shortly…</p>
       )}
@@ -298,195 +404,216 @@ export default function HiveCanvas({ xells, diffs, timeline, edge, onOpenSession
   );
 }
 
-// ── drawing primitives ─────────────────────────────────────────────────────────
-function withAlpha(hex, a) {
-  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
-  if (!m) return hex;
-  const n = parseInt(m[1], 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
-}
-
-function drawCompactHex(ctx, hx, { hover, dim, diff }) {
-  const { cx, cy, size, x } = hx;
-  const col = statusColor(x);
+// ── the git graph: classic lanes + the live xell branch lanes ─────────────────
+function drawGraph(ctx, commits, graph, branches, { rowGap, laneW, commitY, laneX, tlWidth, h, branch, expandedId }) {
   ctx.save();
-  if (dim) ctx.globalAlpha = 0.32;
-  // fill
-  hexPath(ctx, cx, cy, size);
-  const g = ctx.createLinearGradient(cx, cy - size, cx, cy + size);
-  g.addColorStop(0, withAlpha(col, hover ? 0.34 : 0.20));
-  g.addColorStop(1, withAlpha(col, hover ? 0.20 : 0.10));
-  ctx.fillStyle = g;
-  ctx.fill();
-  // seam / border
-  ctx.lineWidth = hover ? 2.4 : 1.4;
-  ctx.strokeStyle = hover ? col : withAlpha(col, 0.6);
-  ctx.stroke();
+  if (expandedId) ctx.globalAlpha = 0.55;
 
-  // connector-colour ring (ties the hex to its commit anchor)
-  if (hx.color) {
-    hexPath(ctx, cx, cy, size - 3);
-    ctx.lineWidth = 1.4; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
-  }
-
-  const w = hexWidth(size);
-  // only render text when the hex is big enough to be legible
-  if (size >= 30) {
-    // production shield / status dot at top
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    if (x.is_production) {
-      ctx.font = `${Math.min(15, size * 0.34)}px 'Segoe UI', sans-serif`;
-      ctx.fillStyle = COL.prod;
-      ctx.fillText('🛡', cx, cy - size * 0.42);
-    } else {
-      ctx.beginPath(); ctx.arc(cx, cy - size * 0.44, Math.max(2.5, size * 0.07), 0, Math.PI * 2);
-      ctx.fillStyle = col; ctx.fill();
-      if (x.zee_status === 'working') { ctx.strokeStyle = withAlpha(col, 0.5); ctx.lineWidth = 2; ctx.stroke(); }
-    }
-    // slug (main label) — abbreviated to fit
-    ctx.fillStyle = COL.text;
-    ctx.font = `600 ${Math.min(13, Math.max(9, size * 0.24))}px 'Segoe UI', sans-serif`;
-    const label = x.is_production ? 'PRODUCTION' : shortSlug(x.slug);
-    ctx.fillText(fit(ctx, label, w * 0.82), cx, cy + size * 0.02);
-    // status word + runtime glyph
-    if (size >= 40) {
-      ctx.font = `${Math.min(10, size * 0.18)}px 'Segoe UI', sans-serif`;
-      ctx.fillStyle = COL.muted;
-      const sub = x.is_production ? 'live' : x.status;
-      ctx.fillText(fit(ctx, sub, w * 0.7), cx, cy + size * 0.34);
-      const gl = runtimeGlyph(x);
-      if (gl && !x.is_production) {
-        ctx.fillStyle = withAlpha(col, 0.9);
-        ctx.font = `${Math.min(11, size * 0.2)}px 'Segoe UI', sans-serif`;
-        ctx.fillText(gl, cx, cy + size * 0.58);
-      }
-    }
-    // dirty marker
-    if (diff && diff.dirty > 0 && size >= 34) {
-      ctx.fillStyle = COL.idle;
-      ctx.beginPath(); ctx.arc(cx + w * 0.34, cy - size * 0.34, 3, 0, Math.PI * 2); ctx.fill();
-    }
-  } else {
-    // tiny hex: just a centred status dot
-    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.22), 0, Math.PI * 2);
-    ctx.fillStyle = col; ctx.fill();
-  }
-  ctx.restore();
-}
-
-// The timeline band: commit graph lanes + dots + hash/subject labels (slanted in portrait).
-function drawTimeline(ctx, fr, commits, graph, commitPos, toXY, branch, expandedId) {
-  if (!commits.length || !graph) return;
-  ctx.save();
-  if (expandedId) ctx.globalAlpha = 0.5;
-  const meta = commitPos.__meta || {};
-  const laneW = meta.laneW || 12;
-
-  // faint divider line marking where the timeline bisects the viewport (the merge edge)
-  ctx.strokeStyle = withAlpha(COL.line, 1);
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  if (fr.vertical) {
-    const [x0] = toXY(fr.alongStart, fr.mergeAcross - fr.laneDir * 6);
-    ctx.moveTo(x0, fr.honey.y); ctx.lineTo(x0, fr.honey.y + fr.honey.h);
-  } else {
-    const [, y0] = toXY(fr.alongStart, fr.mergeAcross - fr.laneDir * 6);
-    ctx.moveTo(fr.honey.x, y0); ctx.lineTo(fr.honey.x + fr.honey.w, y0);
-  }
-  ctx.stroke();
-
-  // lane edges (parent lines)
+  // main-graph lane edges (merged branches weave here, like the old panel)
   ctx.lineWidth = 1.6;
   for (const e of graph.edges) {
-    const cFrom = commits[e.fromRow]?.hash;
-    const from = cFrom && commitPos[cFrom];
-    const toHash = commits[e.toRow]?.hash;
-    const to = toHash && commitPos[toHash];
+    const from = commits[e.fromRow] && { x: laneX(e.fromLane), y: commitY(e.fromRow) };
+    const toY = e.toRow < commits.length ? commitY(e.toRow) : commitY(commits.length - 1) + rowGap;
+    const to = { x: laneX(e.toLane), y: toY };
     if (!from) continue;
-    const fromAcross = fr.mergeAcross + fr.laneDir * e.fromLane * laneW;
-    const toAcross = fr.mergeAcross + fr.laneDir * e.toLane * laneW;
-    const fromAlong = from.along;
-    const toAlong = to ? to.along : (fr.vertical ? fr.honey.y + fr.honey.h : fr.honey.x + fr.honey.w);
-    const [x1, y1] = toXY(fromAlong, fromAcross);
-    const [x2, y2] = toXY(toAlong, toAcross);
     ctx.strokeStyle = withAlpha(LANE[e.fromLane % LANE.length], 0.8);
     ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    if (fromAcross === toAcross) ctx.lineTo(x2, y2);
+    ctx.moveTo(from.x, from.y);
+    if (from.x === to.x) ctx.lineTo(to.x, to.y);
     else {
-      // gentle S between lanes
-      const mAlong = (fromAlong + toAlong) / 2;
-      const [cx1, cy1] = toXY(mAlong, fromAcross);
-      const [cx2, cy2] = toXY(mAlong, toAcross);
-      ctx.bezierCurveTo(cx1, cy1, cx2, cy2, x2, y2);
+      const my = (from.y + to.y) / 2;
+      ctx.bezierCurveTo(from.x, my, to.x, my, to.x, to.y);
     }
     ctx.stroke();
   }
 
-  // dots + labels
+  // live xell branch lanes: fork join at the base commit, dots up the lane, ringed tip
+  for (const b of branches) {
+    ctx.strokeStyle = withAlpha(b.color, 0.9);
+    ctx.fillStyle = b.color;
+    ctx.lineWidth = 1.6;
+    const bx = laneX(0);                       // branches fork off the main lane
+    ctx.beginPath();
+    ctx.moveTo(bx, b.forkY);
+    ctx.quadraticCurveTo(b.lx, b.forkY, b.lx, Math.max(b.tipY, b.forkY - rowGap));
+    ctx.stroke();
+    if (b.forkY - rowGap > b.tipY) {
+      ctx.beginPath(); ctx.moveTo(b.lx, b.forkY - rowGap); ctx.lineTo(b.lx, b.tipY); ctx.stroke();
+    }
+    // ahead-commit dots between tip and fork
+    const n = Math.max(0, Math.min(b.ahead, 8));
+    for (let i = 1; i <= n - 1; i++) {
+      const y = b.tipY + i * ((b.forkY - rowGap - b.tipY) / Math.max(1, n));
+      ctx.beginPath(); ctx.arc(b.lx, y, 2.6, 0, Math.PI * 2); ctx.fill();
+    }
+    // ringed tip — the trace starts here
+    ctx.beginPath(); ctx.arc(b.lx, b.tipY, 5.4, 0, Math.PI * 2);
+    ctx.lineWidth = 1.8; ctx.stroke();
+    ctx.beginPath(); ctx.arc(b.lx, b.tipY, 2.2, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // main commit dots + labels
   ctx.textBaseline = 'middle';
   for (const { c, lane, row } of graph.rows) {
-    const cp = commitPos[c.hash];
-    if (!cp) continue;
-    const [dx, dy] = cp.dot;
+    const dx = laneX(lane), dy = commitY(row);
     const isMerge = c.parents.length > 1;
-    ctx.beginPath(); ctx.arc(dx, dy, isMerge ? 4.5 : 3.4, 0, Math.PI * 2);
+    ctx.beginPath(); ctx.arc(dx, dy, isMerge ? 4.4 : 3.3, 0, Math.PI * 2);
     ctx.fillStyle = isMerge ? COL.bg : LANE[lane % LANE.length];
     ctx.fill();
     if (isMerge) { ctx.lineWidth = 2; ctx.strokeStyle = LANE[lane % LANE.length]; ctx.stroke(); }
-
-    // label
-    const hash = c.short;
-    const subj = c.subject || '';
-    if (fr.vertical) {
-      // text on the panel side of the lanes
-      const tx = fr.mergeAcross + fr.laneDir * (graph.laneCount * laneW + 8);
-      ctx.textAlign = fr.laneDir > 0 ? 'left' : 'right';
-      ctx.font = `10px 'Cascadia Code', monospace`;
-      ctx.fillStyle = COL.muted;
-      ctx.fillText(hash, tx, dy);
-      const hw = ctx.measureText(hash).width + 6;
-      ctx.font = `11px 'Segoe UI', sans-serif`;
-      ctx.fillStyle = COL.text;
-      const room = fr.laneDir > 0 ? (fr.band.x + fr.band.w - (tx + hw) - 6) : (tx - hw - fr.band.x - 6);
-      ctx.fillText(fit(ctx, subj, Math.max(20, room)), tx + fr.laneDir * hw, dy);
-      if (row === 0) {
-        ctx.fillStyle = COL.ready; ctx.font = `10px 'Cascadia Code', monospace`;
-        ctx.textAlign = 'center';
-        ctx.fillText('⎇ ' + (branch || ''), dx, dy - 12);
-      }
-    } else {
-      // PORTRAIT: slant the hash/subject diagonally off each dot
-      ctx.save();
-      ctx.translate(dx, dy + fr.laneDir * -2);
-      ctx.rotate(fr.laneDir > 0 ? (34 * Math.PI) / 180 : (-34 * Math.PI) / 180);
-      ctx.textAlign = fr.laneDir > 0 ? 'left' : 'right';
-      const off = fr.laneDir > 0 ? 8 : -8;
-      ctx.font = `10px 'Cascadia Code', monospace`;
-      ctx.fillStyle = COL.muted;
-      ctx.fillText(hash, off, 0);
-      const hw = ctx.measureText(hash).width + 5;
-      ctx.font = `11px 'Segoe UI', sans-serif`;
-      ctx.fillStyle = COL.text;
-      ctx.fillText(fit(ctx, subj, 90), off + fr.laneDir * hw, 0);
-      ctx.restore();
-      if (row === 0) {
-        ctx.fillStyle = COL.ready; ctx.font = `10px 'Cascadia Code', monospace`;
-        ctx.textAlign = 'center';
-        ctx.fillText('⎇ ' + (branch || ''), dx, dy + fr.laneDir * -14);
-      }
+    if (row === 0) {
+      ctx.fillStyle = COL.ready; ctx.font = `10px 'Cascadia Code', monospace`;
+      ctx.textAlign = 'left';
+      ctx.fillText('⎇ ' + (branch || ''), dx + 10, dy - rowGap * 0.7);
     }
+  }
+  // hash labels on hover-free left margin — keep it sparse: every 3rd row
+  ctx.font = `9px 'Cascadia Code', monospace`;
+  ctx.fillStyle = COL.muted;
+  ctx.textAlign = 'right';
+  for (const { c, row } of graph.rows) {
+    if (row % 3 !== 0) continue;
+    ctx.fillText(c.short, TL_LANE0 - 8, commitY(row));
   }
   ctx.restore();
 }
 
-// ── the flower: one xell blown up into 7 hexes (centre + 6 facet petals) ────────
-function drawFlower(ctx, cx, cy, size, x, diff, machines) {
-  const centers = flowerCenters(cx, cy, size);
+// ── compact hex: the two-half card ────────────────────────────────────────────
+// upper half: ⌂ machine + container chips (nick + health dot)
+// lower half: head sha · own diff · status pill · ship line
+function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
+  const { cx, cy, size, x } = hx;
   const col = statusColor(x);
+  const w = hexWidth(size);
+  ctx.save();
+  if (dim) ctx.globalAlpha = 0.3;
 
+  hexPath(ctx, cx, cy, size);
+  const g = ctx.createLinearGradient(cx, cy - size, cx, cy + size);
+  g.addColorStop(0, withAlpha(col, hover ? 0.30 : 0.18));
+  g.addColorStop(1, withAlpha(col, hover ? 0.16 : 0.08));
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = hover ? 2.4 : 1.4;
+  ctx.strokeStyle = hover ? col : withAlpha(col, 0.6);
+  ctx.stroke();
+  if (hx.color) {
+    hexPath(ctx, cx, cy, size - 3);
+    ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
+  }
+  ctx.save();
+  hexPath(ctx, cx, cy, size - 2);
+  ctx.clip();
+
+  if (size < 30) {                     // tiny: just the status dot
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.22), 0, Math.PI * 2);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.restore(); ctx.restore(); return;
+  }
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const full = size >= 52;             // the two-half card needs room; else degrade
+
+  // ── upper half ──
+  const mach = machineOf(x, machines);
+  if (full && mach) {
+    ctx.font = `${Math.max(8, size * 0.14)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.muted;
+    ctx.fillText(fit(ctx, '⌂ ' + mach, w * 0.62), cx, cy - size * 0.62);
+  }
+  const stack = ['db', 'server', 'webapp']
+    .map((r) => (x.stack || []).find((s) => s.role === r))
+    .filter(Boolean);
+  if (full && stack.length) {
+    const chipW = Math.min(30, w * 0.21), chipH = Math.max(12, size * 0.2);
+    const gap = 4;
+    const total = stack.length * chipW + (stack.length - 1) * gap;
+    let px0 = cx - total / 2;
+    const py = cy - size * 0.34;
+    ctx.font = `600 ${Math.max(7.5, chipH * 0.55)}px 'Cascadia Code', monospace`;
+    for (const c of stack) {
+      // chip body
+      ctx.beginPath();
+      ctx.roundRect(px0, py - chipH / 2, chipW, chipH, 3);
+      ctx.fillStyle = withAlpha('#0a0d13', 0.72);
+      ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(COL.line, 1); ctx.stroke();
+      // nick
+      ctx.fillStyle = COL.text;
+      ctx.fillText(nick(c.name), px0 + chipW / 2, py + 0.5);
+      // health dot pinned to the chip's top-right corner
+      ctx.beginPath(); ctx.arc(px0 + chipW - 1.5, py - chipH / 2 + 1.5, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = HEALTH[c.health] || HEALTH.unknown; ctx.fill();
+      px0 += chipW + gap;
+    }
+  }
+
+  // ── middle seam: identity ──
+  ctx.fillStyle = COL.text;
+  ctx.font = `600 ${Math.min(12, Math.max(8.5, size * 0.17))}px 'Segoe UI', sans-serif`;
+  const label = x.is_production ? '🛡 PRODUCTION' : shortSlug(x.slug);
+  ctx.fillText(fit(ctx, label, w * 0.8), cx, cy - (full ? size * 0.06 : size * 0.2));
+
+  // ── lower half ──
+  const sha = (x.is_production ? x.deployed_commit : x.head_commit)?.slice(0, 8);
+  if (full) {
+    if (sha) {
+      ctx.font = `600 ${Math.max(8.5, size * 0.155)}px 'Cascadia Code', monospace`;
+      ctx.fillStyle = COL.sha;
+      ctx.fillText(sha, cx, cy + size * 0.14);
+    }
+    // own diff: "0f +0/−0"
+    const own = diff?.own;
+    if (own && !x.is_production) {
+      const y = cy + size * 0.32;
+      ctx.font = `${Math.max(8, size * 0.14)}px 'Cascadia Code', monospace`;
+      const fPart = `${own.files}f `, aPart = `+${own.insertions}`, dPart = `/−${own.deletions}`;
+      const tw = ctx.measureText(fPart + aPart + dPart).width;
+      let tx0 = cx - tw / 2;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = COL.muted; ctx.fillText(fPart, tx0, y); tx0 += ctx.measureText(fPart).width;
+      ctx.fillStyle = COL.add; ctx.fillText(aPart, tx0, y); tx0 += ctx.measureText(aPart).width;
+      ctx.fillStyle = COL.del; ctx.fillText(dPart, tx0, y);
+      ctx.textAlign = 'center';
+    }
+    // status pill
+    const st = x.is_production ? 'live · protected' : x.status;
+    if (st) {
+      ctx.font = `600 ${Math.max(7.5, size * 0.13)}px 'Segoe UI', sans-serif`;
+      const pw = ctx.measureText(st).width + 12, ph = Math.max(11, size * 0.19);
+      const py2 = cy + size * 0.5;
+      ctx.beginPath(); ctx.roundRect(cx - pw / 2, py2 - ph / 2, pw, ph, ph / 2);
+      ctx.fillStyle = withAlpha(col, 0.22); ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(col, 0.7); ctx.stroke();
+      ctx.fillStyle = col;
+      ctx.fillText(st, cx, py2 + 0.5);
+    }
+    // ship line
+    const ship = shipLine(x, diff);
+    if (ship) {
+      ctx.font = `${Math.max(7.5, size * 0.125)}px 'Segoe UI', sans-serif`;
+      ctx.fillStyle = ship === 'ready' ? COL.working : COL.muted;
+      ctx.fillText(fit(ctx, ship === 'ready' ? 'ship ready' : ship, w * 0.5), cx, cy + size * 0.7);
+    }
+  } else {
+    // mid sizes: sha + status only
+    if (sha) {
+      ctx.font = `600 ${Math.max(8, size * 0.17)}px 'Cascadia Code', monospace`;
+      ctx.fillStyle = COL.sha;
+      ctx.fillText(sha, cx, cy + size * 0.08);
+    }
+    ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.muted;
+    ctx.fillText(fit(ctx, x.is_production ? 'live' : x.status, w * 0.6), cx, cy + size * 0.34);
+  }
+  ctx.restore();   // unclip
+  ctx.restore();
+}
+
+// ── the flower: rendered ON the grid cells it consumes (no overlay) ───────────
+function drawFlower(ctx, centers, size, x, diff, machines) {
+  const col = statusColor(x);
   const petals = flowerFacets(x, diff, machines);
-  // petals[0] is the centre; 1..6 the ring
   centers.forEach(([hx, hy], i) => {
     const facet = petals[i];
     const isCenter = i === 0;
@@ -498,21 +625,12 @@ function drawFlower(ctx, cx, cy, size, x, diff, machines) {
     ctx.fillStyle = g;
     ctx.fill();
     ctx.lineWidth = isCenter ? 2.4 : 1.4;
-    ctx.strokeStyle = isCenter ? col : withAlpha(col, 0.4);
+    ctx.strokeStyle = isCenter ? col : withAlpha(col, 0.45);
     ctx.stroke();
-    ctx.clip();   // keep text inside the petal
+    ctx.clip();
     drawFacet(ctx, hx, hy, size, facet, col, isCenter, x);
     ctx.restore();
   });
-
-  // hint ribbon under the flower
-  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.font = `11px 'Segoe UI', sans-serif`;
-  ctx.fillStyle = COL.muted;
-  const hint = x.is_production ? 'production — protected'
-    : x.viewer_url ? 'click to open this session · Esc / click away to close'
-    : 'no live session · Esc / click away to close';
-  ctx.fillText(hint, cx, cy + size * 2 + 6);
 }
 
 function flowerFacets(x, diff, machines) {
@@ -527,10 +645,8 @@ function flowerFacets(x, diff, machines) {
     : (diff && x.is_production ? `↑${diff.ahead} ↓${diff.behind}` : '—');
   const own = diff?.own ? `${diff.own.files}f +${diff.own.insertions}/−${diff.own.deletions}` : '—';
   return [
-    // centre
     { title: null, lines: [x.is_production ? 'PRODUCTION' : shortSlug(x.slug),
       x.is_production ? 'live · protected' : x.status] },
-    // ring
     { title: 'branch', lines: [stripBranch(x.branch) || '—', `src ${src.ref || '—'}`] },
     { title: 'session', lines: [x.zee_title || (x.claude_session_id ? x.claude_session_id.slice(0, 8) : '—'),
       x.zee_status === 'working' ? (x.zee_name || 'working') : (x.zee_status || '')] },
@@ -547,21 +663,19 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   if (isCenter) {
     ctx.textBaseline = 'middle';
     ctx.fillStyle = COL.text;
-    ctx.font = `700 ${Math.min(16, size * 0.2)}px 'Segoe UI', sans-serif`;
+    ctx.font = `700 ${Math.min(15, size * 0.2)}px 'Segoe UI', sans-serif`;
     ctx.fillText(fit(ctx, facet.lines[0], size * 1.5), cx, cy - size * 0.12);
     ctx.fillStyle = withAlpha(col, 0.95);
-    ctx.font = `${Math.min(12, size * 0.15)}px 'Segoe UI', sans-serif`;
+    ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
     ctx.fillText(fit(ctx, facet.lines[1], size * 1.5), cx, cy + size * 0.2);
     return;
   }
-  // title
   ctx.textBaseline = 'top';
   ctx.fillStyle = withAlpha(col, 0.9);
-  ctx.font = `600 ${Math.min(10, size * 0.14)}px 'Segoe UI', sans-serif`;
+  ctx.font = `600 ${Math.min(9.5, size * 0.14)}px 'Segoe UI', sans-serif`;
   ctx.fillText(String(facet.title || '').toUpperCase(), cx, cy - size * 0.5);
 
   if (facet.kind === 'stack') {
-    // three health dots with role letters
     const roles = facet.stack;
     const gapx = size * 0.42;
     const y = cy + size * 0.02;
@@ -577,14 +691,13 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     });
     return;
   }
-  // up to two value lines
   ctx.textBaseline = 'middle';
   ctx.fillStyle = COL.text;
-  ctx.font = `${Math.min(12, size * 0.15)}px 'Segoe UI', sans-serif`;
+  ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
   ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy);
   if (facet.lines[1]) {
     ctx.fillStyle = COL.muted;
-    ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
+    ctx.font = `${Math.min(9.5, size * 0.13)}px 'Segoe UI', sans-serif`;
     ctx.fillText(fit(ctx, facet.lines[1], size * 1.45), cx, cy + size * 0.28);
   }
 }
