@@ -17,6 +17,7 @@ import { cleanGitEnv } from '../lib/git.js';
 import { computePorts } from '../lib/provision.js';
 import { namingFor } from '../lib/manifest.js';
 import { logline } from '../lib/logbus.js';
+import { resolveBash } from './bash.js';
 
 const MAX_BASE = 44; // keep the folder name (and the container names built from it) sane
 
@@ -66,7 +67,7 @@ export async function renameXellForTask(xellId, title) {
   const root = String(project.repo_root).replace(/\\/g, '/');
 
   const script = resolve(config.repoRoot, 'scripts', 'rename-xell.sh');
-  const r = spawnSync('bash', [script, root, xell.slug, newSlug],
+  const r = spawnSync(resolveBash(), [script, root, xell.slug, newSlug],
     { encoding: 'utf8', timeout: 60000, windowsHide: true, env: cleanGitEnv() });
   const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
   let res = null; try { res = JSON.parse(line); } catch { /* no JSON */ }

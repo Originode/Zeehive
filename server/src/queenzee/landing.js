@@ -9,6 +9,7 @@ import { config } from '../config.js';
 import { one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
+import { resolveBash } from '../lib/bash.js';
 
 // How far behind the source a pooled xell may be before we decommission instead of catch up.
 export const MAX_BEHIND = Number(process.env.LAND_MAX_BEHIND) || 200;
@@ -18,7 +19,7 @@ export const MAX_BEHIND = Number(process.env.LAND_MAX_BEHIND) || 200;
 export function landOne(worktree, source, maxBehind = MAX_BEHIND) {
   if (!worktree || !existsSync(worktree)) return { reason: 'no-worktree', head: null, ahead: 0, behind: 0 };
   const script = resolve(config.repoRoot, 'scripts', 'land-xell.sh');
-  const r = spawnSync('bash', [script, worktree, source, String(maxBehind)], {
+  const r = spawnSync(resolveBash(), [script, worktree, source, String(maxBehind)], {
     encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv(),
   });
   const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();

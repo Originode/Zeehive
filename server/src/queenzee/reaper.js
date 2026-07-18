@@ -9,8 +9,10 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { removeXellImages } from '../lib/images.js';
 import { logline } from '../lib/logbus.js';
+import { resolveBash } from '../lib/bash.js';
 import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
+import { releaseXellShips } from './shipgate.js';
 
 export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
@@ -37,6 +39,15 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
       };
     }
   }
+
+  // ── SHIPS AND THE PROD LOCK GO WITH THE XELL ────────────────────────────────
+  // Open ship requests are withdrawn, a stranded 'shipping' row is completed from evidence, and
+  // the xell's deploy lock is released — BEFORE teardown, or "done" leaves a card reading
+  // "shipping now" forever with prod locked under it (2026-07-18, the whole night). The one case
+  // that blocks instead: a ship this queenzee is actively deploying right now — force does not
+  // override that either, because yanking prod's lock mid-build is worse than waiting.
+  const ships = await releaseXellShips(xellId, `done:${reason}`);
+  if (!ships.ok) return { ok: false, error: ships.error };
 
   // ── PRODUCTION IS DISCONNECTED, NEVER TORN DOWN ─────────────────────────────
   // A /xell-prod xell has the LIVE production db, server and webapp as its assigned containers.
@@ -98,7 +109,7 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
     // fallback; a second project with a different dev context must not purge on the wrong daemon.
     const project = await one(`SELECT repo_root FROM project WHERE id=$1`, [xell.project_id]);
     const devSite = await resolveSite(xell.project_id, 'dev');
-    const r = spawnSync('bash', [script, xell.worktree_path], {
+    const r = spawnSync(resolveBash(), [script, xell.worktree_path], {
       cwd: project?.repo_root || config.omnibizRoot, encoding: 'utf8', timeout: 120000,
       env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devSite?.docker_ctx || config.dockerCtx }),
     });

@@ -15,6 +15,7 @@ import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
+import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations } from './shipmigrate.js';
 
@@ -23,7 +24,18 @@ const MODE = process.env.SHIP_MODE === 'simulate' ? 'simulate' : 'real';
 // How long the shipping xell keeps prod before the queenzee takes it back. An unattended hold
 // blocks every other xell for as long as the human is away, so silence must NOT mean "keep it".
 const AUTO_RELEASE_SEC = Number(process.env.SHIP_LOCK_RELEASE_SEC) || 180;
+// A build that outlives this is not slow, it is gone — kill it and fail the ship rather than
+// hold prod hostage. Generous on purpose: prod builds cross the mardale link, which has run at
+// 68KB/s for days at a time, and a killed-but-legitimate build costs one re-request, while an
+// unbounded one cost a whole night of "shipping now" with the site's lock pinned under it.
+const BUILD_TIMEOUT_MS = Number(process.env.SHIP_BUILD_TIMEOUT_MS) || 45 * 60 * 1000;
 const SHIPPABLE = ['server', 'webapp'];
+
+// Ships whose runShip promise is alive in THIS process. The DB says 'shipping'; only this set
+// says "and something is actually doing it". Everything that recovers stranded ships — the tick
+// sweep, boot recovery, the reaper's done-path — keys off membership here, because a 'shipping'
+// row with no entry has no process behind it and will never finish on its own.
+const liveShips = new Set();
 
 // Is this xell's work actually ON main? A ship builds from main, so shipping unlanded work would
 // deploy code the zee doesn't have — the request is meaningless, not merely unwise.
@@ -174,6 +186,33 @@ async function runShip(shipId) {
   broadcast('xell', { id: xell.id });
   logline('lock', `queenzee ASSIGNED ${lockKey} lock to ${xell.slug} for ship ${String(ship.commit).slice(0, 8)}`);
 
+  // From here to the terminal UPDATE the ship is 'shipping', and 'shipping' with no live process
+  // is the wedge that held prod all night on 2026-07-18: a throw anywhere in this stretch used to
+  // be swallowed by the caller's .catch, leaving the row open forever and the lock with no
+  // countdown. Register as live, and no matter what throws, land on 'failed' with the countdown
+  // running — the site frees itself even when the deploy machinery is what broke.
+  liveShips.add(ship.id);
+  try {
+    await runShipBody(ship, xell, project, site, lockKey);
+  } catch (e) {
+    try {
+      const done = await one(
+        `UPDATE ship_request SET status='failed', finished_at=now(), error=$2
+           WHERE id=$1 AND status IN ('approved','shipping') RETURNING *`,
+        [ship.id, `ship machinery crashed mid-run: ${String(e.message || e).slice(0, 1400)}`]);
+      if (done) broadcast('ship', done);
+      await q(
+        `UPDATE deploy_lock SET phase='failed', auto_release_at=COALESCE(auto_release_at, now() + ($2 || ' seconds')::interval)
+          WHERE ship_id=$1 AND held=false`, [ship.id, String(AUTO_RELEASE_SEC)]);
+      broadcast('xell', { id: xell.id });
+      logline('ship', `ship ${String(ship.commit).slice(0, 8)} CRASHED mid-run — marked failed, ${lockKey} countdown started: ${e.message}`);
+    } catch { /* the DB is what failed — the tick() stranded sweep is the backstop */ }
+  } finally {
+    liveShips.delete(ship.id);
+  }
+}
+
+async function runShipBody(ship, xell, project, site, lockKey) {
   const shipping = await one(
     `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 RETURNING *`, [ship.id]);
   broadcast('ship', shipping);
@@ -247,10 +286,13 @@ async function runShip(shipId) {
     if (!r.ok) { ok = false; break; }   // stop at the first failure — do not half-ship prod
   }
 
+  // Build logs are arbitrary bytes and ride along in `results`; postgres jsonb REJECTS the
+  // escaped-NUL sequence (backslash-u-0000), so one NUL anywhere in a build's output would throw
+  // HERE — at the exact statement whose failure used to strand the ship at 'shipping'.
   const done = await one(
     `UPDATE ship_request SET status=$2, finished_at=now(), containers=$3::jsonb, error=$4
        WHERE id=$1 RETURNING *`,
-    [ship.id, ok ? 'shipped' : 'failed', JSON.stringify(results),
+    [ship.id, ok ? 'shipped' : 'failed', JSON.stringify(results).replaceAll('\\u0000', ''),
       ok ? null : (results.find((r) => !r.ok)?.error || 'ship failed').slice(0, 1500)]);
   broadcast('ship', done);
   logline('ship', ok
@@ -272,10 +314,15 @@ const LOG_TAIL_BYTES = 64 * 1024;
 
 function runScript(container, sourcePath, buildRef = 'main', onLine = null) {
   return new Promise((res) => {
-    const exec = container.build_exec || 'bash';
+    // A bare `bash` (the stored default on every prod container) resolves to C:\Windows\System32\
+    // bash.exe (WSL) ahead of Git bash on Windows — with no distro it exits 1 with "WSL has no
+    // installed distributions" and builds NOTHING, which is exactly how a prod ship wedged at
+    // 'shipping' having deployed nothing. Dev builds already go through resolveBash(); ships must
+    // too. A real interpreter set by an operator (sh, pwsh, …) is still respected.
+    const exec = (!container.build_exec || container.build_exec === 'bash') ? resolveBash() : container.build_exec;
     const p = spawn(exec, [container.build_script, sourcePath, container.role, container.docker_ctx || '', MODE, buildRef],
       { env: cleanGitEnv(), windowsHide: true });
-    let out = '', err = '', buf = '';
+    let out = '', err = '', buf = '', settled = false;
     // Line-buffered live feed (stdout AND stderr — docker build writes its progress to stderr).
     // The ship used to run in total silence and only a 1500-char error tail survived a failure;
     // "ledger unreadable: " with nothing after the colon cost a day. Never again silent.
@@ -291,16 +338,33 @@ function runScript(container, sourcePath, buildRef = 'main', onLine = null) {
     };
     p.stdout.on('data', (d) => { out += d; emit(String(d)); });
     p.stderr.on('data', (d) => { err += d; emit(String(d)); });
-    p.on('close', () => {
+
+    // One resolution, whichever event gets there first. 'close' is the honest one (stdio fully
+    // drained) — but 'close' waits on the PIPES, not the child: a build whose grandchild (a
+    // docker CLI mid-upload over a dead link) inherits stdout and outlives bash never fires it,
+    // and that exact shape left runShip awaiting a process that no longer existed. So: resolve on
+    // 'close' when it comes, on 'exit' + a short drain grace when it doesn't, and on the watchdog
+    // when nothing exits at all.
+    const finish = (forcedErr = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(watchdog);
       if (buf.trim() && onLine) onLine(buf.trimEnd());
       const line = out.trim().split('\n').filter(Boolean).pop();
       let json = null; try { json = JSON.parse(line); } catch { /* no json line */ }
       const full = out + (err ? `\n--- stderr ---\n${err}` : '');
-      res({ ok: !!json && json.ok !== false, json, err: (err || out).slice(-1500),
+      res({ ok: !forcedErr && !!json && json.ok !== false, json,
+            err: forcedErr || (err || out).slice(-1500),
             log: full.slice(-LOG_TAIL_BYTES) });
-    });
-    p.on('error', (e) => res({ ok: false, json: null, err: String(e.message),
-                               log: (out + err).slice(-LOG_TAIL_BYTES) }));
+    };
+    const watchdog = setTimeout(() => {
+      try { p.kill('SIGKILL'); } catch { /* already gone */ }
+      finish(`build killed after ${Math.round(BUILD_TIMEOUT_MS / 60000)} minutes without finishing — `
+        + 'not slow, gone (a hung build must fail the ship, never hold its site\'s lock open)');
+    }, BUILD_TIMEOUT_MS);
+    p.on('close', () => finish());
+    p.on('exit', () => setTimeout(() => finish(), 10000));
+    p.on('error', (e) => finish(String(e.message)));
   });
 }
 
@@ -341,13 +405,24 @@ export async function tick() {
     logline('lock', `${l.container} lock auto-released from ${x?.slug || l.xell_id} (countdown expired) — that site is free`);
     broadcast('xell', { id: l.xell_id });
   }
+  // A 'shipping' row this process is not actually running is already dead — its promise crashed,
+  // or its build resolved into nothing. Boot recovery only fires at boot, and the queenzee stays
+  // up for weeks; without this sweep such a row reads "shipping now" forever and its site's lock
+  // (countdown never started) holds prod with nothing behind it. Recover DURING the run, from the
+  // same evidence boot recovery uses.
+  const stranded = (await q(`SELECT * FROM ship_request WHERE status='shipping'`))
+    .filter((s) => !liveShips.has(s.id));
+  for (const s of stranded) {
+    await recoverStrandedShip(s, 'its deploy process died mid-run')
+      .catch((e) => console.error('[ship] stranded recovery failed:', e.message));
+  }
   // Approved-but-waiting ships: their site may be free now. runShip itself is the arbiter — it
   // no-ops (stays 'approved') when the SITE's lock is held, so trying all of them is safe and a
   // busy default site cannot starve a free second site.
   const waiting = await q(
     `SELECT s.id FROM ship_request s WHERE s.status='approved' ORDER BY s.decided_at LIMIT 5`);
   for (const w of waiting) await runShip(w.id).catch((e) => console.error('[ship] retry failed:', e.message));
-  return { released: expired.length, started: waiting.length };
+  return { released: expired.length, recovered: stranded.length, started: waiting.length };
 }
 
 // Recover ships orphaned by a restart (spec §6.3). A ship stuck at 'shipping' at boot has no
@@ -358,41 +433,79 @@ export async function tick() {
 // with a truthful note. Either way the site's lock countdown starts so nothing holds prod forever.
 export async function recoverOrphanShips() {
   const stranded = await q(`SELECT * FROM ship_request WHERE status='shipping'`);
-  for (const ship of stranded) {
-    const site = ship.site_id ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [ship.site_id]) : null;
-    const cs = await q(
-      `SELECT name, url, docker_ctx, health FROM container
-        WHERE project_id=$1 AND tier='prod' AND role = ANY($2)`,
-      [ship.project_id, ship.targets?.length ? ship.targets : SHIPPABLE]);
-    let allUp = cs.length > 0;
-    for (const c of cs) {
-      if (c.docker_ctx == null && c.url) {
-        // process role — probe it live; the URL answering is the whole truth
-        try { const r = await fetch(c.url, { signal: AbortSignal.timeout(5000) }); allUp = allUp && r.status < 500; }
-        catch { allUp = false; }
-      } else {
-        allUp = allUp && c.health === 'up';   // container role — trust the monitor's last word
-      }
-    }
-    // COALESCE the decider fields: a normally-approved ship already has them, but the
-    // ship_decided_has_decider CHECK requires them on any terminal status, so recovery must
-    // never produce a row that cannot land.
-    const done = await one(
-      `UPDATE ship_request SET status=$2, finished_at=now(), error=$3,
-              decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'recovery@boot')
-        WHERE id=$1 RETURNING *`,
-      [ship.id, allUp ? 'shipped' : 'failed',
-        allUp ? null : 'orphaned by a queenzee restart mid-ship; targets not verifiably up — re-request']);
-    broadcast('ship', done);
-    logline('ship', `recovered orphaned ship ${String(ship.commit).slice(0, 8)} → ${done.status}`
-      + (allUp ? ' (post-restart health check passed — the self-ship pattern)' : ` (${done.error})`));
-    // start the countdown on its lock if the dying process never did
-    await q(
-      `UPDATE deploy_lock SET auto_release_at = COALESCE(auto_release_at, now() + ($2 || ' seconds')::interval)
-        WHERE project_id=$1 AND ship_id=$3 AND held=false`,
-      [ship.project_id, String(AUTO_RELEASE_SEC), ship.id]);
-  }
+  for (const ship of stranded) await recoverStrandedShip(ship, 'orphaned by a queenzee restart mid-ship');
   return stranded.length;
+}
+
+// Complete ONE stranded 'shipping' row from evidence. Shared by boot recovery, the tick sweep,
+// and the reaper's done-path — three different ways to notice the same fact: nothing alive is
+// running this ship. `why` names the caller's evidence in the failure note.
+async function recoverStrandedShip(ship, why) {
+  const cs = await q(
+    `SELECT name, url, docker_ctx, health FROM container
+      WHERE project_id=$1 AND tier='prod' AND role = ANY($2)`,
+    [ship.project_id, ship.targets?.length ? ship.targets : SHIPPABLE]);
+  let allUp = cs.length > 0;
+  for (const c of cs) {
+    if (c.docker_ctx == null && c.url) {
+      // process role — probe it live; the URL answering is the whole truth
+      try { const r = await fetch(c.url, { signal: AbortSignal.timeout(5000) }); allUp = allUp && r.status < 500; }
+      catch { allUp = false; }
+    } else {
+      allUp = allUp && c.health === 'up';   // container role — trust the monitor's last word
+    }
+  }
+  // COALESCE the decider fields: a normally-approved ship already has them, but the
+  // ship_decided_has_decider CHECK requires them on any terminal status, so recovery must
+  // never produce a row that cannot land.
+  const done = await one(
+    `UPDATE ship_request SET status=$2, finished_at=now(), error=$3,
+            decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'recovery@queenzee')
+      WHERE id=$1 AND status='shipping' RETURNING *`,
+    [ship.id, allUp ? 'shipped' : 'failed',
+      allUp ? null : `${why}; targets not verifiably up — re-request`]);
+  if (!done) return;   // someone else landed it between our SELECT and now — nothing to recover
+  broadcast('ship', done);
+  logline('ship', `recovered stranded ship ${String(ship.commit).slice(0, 8)} → ${done.status}`
+    + (allUp ? ' (health check passed — the self-ship pattern)' : ` (${done.error})`));
+  // start the countdown on its lock if the dying process never did
+  await q(
+    `UPDATE deploy_lock SET auto_release_at = COALESCE(auto_release_at, now() + ($2 || ' seconds')::interval)
+      WHERE project_id=$1 AND ship_id=$3 AND held=false`,
+    [ship.project_id, String(AUTO_RELEASE_SEC), ship.id]);
+}
+
+// ── the reaper's half: a xell marked done takes its ship state with it ────────
+// "Mark done" used to ignore ships entirely, and the 2026-07-18 wedge is what that looks like:
+// the xell retired while its stranded ship kept reading "shipping now" forever and the prod lock
+// sat under it with nothing left alive to release either one. Called by reapXell BEFORE any
+// teardown. A ship this process is ACTIVELY running blocks the reap instead — releasing prod's
+// lock out from under a live deploy is how two builds end up interleaved on the same site.
+export async function releaseXellShips(xellId, by = 'reaper@done') {
+  const active = (await q(`SELECT * FROM ship_request WHERE xell_id=$1 AND status='shipping'`, [xellId]))
+    .filter((s) => liveShips.has(s.id));
+  if (active.length) {
+    return { ok: false, error: `a ship (${String(active[0].commit).slice(0, 8)}) is deploying to prod RIGHT NOW — `
+      + 'let it finish (or force-release its site\'s lock) before marking this xell done' };
+  }
+  // Undecided requests die with the xell — approving one later would deploy for nobody.
+  const closed = await q(
+    `UPDATE ship_request SET status='rejected', decided_at=now(), decided_by=$2
+      WHERE xell_id=$1 AND status IN ('pending','approved') RETURNING *`, [xellId, by]);
+  for (const s of closed) {
+    broadcast('ship', s);
+    logline('ship', `ship request ${String(s.commit).slice(0, 8)} withdrawn — its xell was marked done`);
+  }
+  // Stranded 'shipping' rows complete from evidence, exactly like boot recovery.
+  const stranded = await q(`SELECT * FROM ship_request WHERE xell_id=$1 AND status='shipping'`, [xellId]);
+  for (const s of stranded) await recoverStrandedShip(s, 'its xell was marked done while the ship was stranded');
+  // And the lock: done means the human is finished verifying — the site frees NOW, not on a timer.
+  const locks = await q(`DELETE FROM deploy_lock WHERE xell_id=$1 RETURNING *`, [xellId]);
+  for (const l of locks) {
+    broadcast('xell', { id: xellId });
+    logline('lock', `${l.container} lock released — its holder was marked done`);
+  }
+  return { ok: true, withdrawn: closed.length, recovered: stranded.length, locks_released: locks.length };
 }
 
 export function startShipReaper() {
