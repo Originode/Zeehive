@@ -83,6 +83,16 @@ async function siteCall(url, method, body) {
   if (!r.ok) throw new Error(data.error || `site ${method} failed (${r.status})`);
   return data;
 }
+// Durably hide a decided landing's receipt (server records dismissed_at — reloads keep it hidden).
+export async function dismissLanding(id) {
+  const r = await fetch(`/api/land/requests/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
+  return data;
+}
+
 export const createSite = (projectId, body) => siteCall(`/api/projects/${projectId}/sites`, 'POST', body);
 export const updateSite = (siteId, body) => siteCall(`/api/sites/${siteId}`, 'PATCH', body);
 export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${siteId}${force ? '?force=1' : ''}`, 'DELETE');

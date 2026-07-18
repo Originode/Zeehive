@@ -58,13 +58,13 @@ export function LandCard({ req, onDone, onDismiss }) {
           <b>{req.xell_slug || 'unknown xell'}</b> wants to land onto{' '}
           <b>{(req.ref || '').replace('refs/heads/', '')}</b>
         </span>
-        {/* Dismiss is VIEW-ONLY and only offered once decided — it hides a receipt, it does not
-            reject anything, and the request stays exactly as it is server-side. A PENDING card has
+        {/* Dismiss hides a receipt DURABLY (the server records it — reloads keep it hidden); it
+            never rejects anything, and the land reaper keeps working the row. A PENDING card has
             no ✕ on purpose: a held landing means a zee is blocked waiting on you, and letting that
             be swept off the screen is how it gets forgotten. Decide it or leave it. */}
         {onDismiss && approved && (
           <button className="land-x" onClick={() => onDismiss(req.id)}
-                  title="Hide this (it stays approved — the zee still has to re-push)">✕</button>
+                  title="Hide this receipt (stays hidden — the queenzee still lands it, or closes it as stale, on its own)">✕</button>
         )}
       </div>
 

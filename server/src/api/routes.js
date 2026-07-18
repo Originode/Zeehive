@@ -27,7 +27,7 @@ import { listProjects, createProject, updateProject, deleteProject,
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
-import { checkPush, listLandRequests, decideLandRequest, landStatus } from '../queenzee/landgate.js';
+import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
@@ -87,6 +87,13 @@ router.post('/land/requests/:id/:decision(approve|reject)', async (req, res) => 
   } catch (err) {
     res.status(409).json({ error: err.message });
   }
+});
+
+// Dismiss a decided request's receipt — durable (a reload does not resurrect it). Visibility
+// only: the reaper keeps landing/staling the row on its own schedule.
+router.post('/land/requests/:id/dismiss', async (req, res) => {
+  try { res.json(await dismissLandRequest(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
 });
 
 // ── Channel C: shipping to production (the zee asks; the queenzee ships) ─────

@@ -161,7 +161,9 @@ export async function landStatus(xellId) {
 }
 
 export async function listLandRequests(projectId, { open = true } = {}) {
-  const where = open ? `AND lr.status IN ('pending','approved')` : '';
+  // Open view: undecided or still-working rows a human has NOT dismissed. A dismissed approval
+  // keeps being retried by the reaper — it just stops being shown.
+  const where = open ? `AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL` : '';
   return q(
     `SELECT lr.*, x.slug AS xell_slug
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
@@ -219,10 +221,6 @@ function ffState(repoRoot, ref, sha) {
     ? { state: 'ff', tip: t } : { state: 'diverged', tip: t };
 }
 
-// Ids already reported as unlandable. Without this the tick re-reports every 10s and the log
-// becomes the noise it is meant to cut through.
-const staleReported = new Set();
-
 async function landApproved(row, by = 'human') {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
   if (!project) return row;
@@ -241,14 +239,20 @@ async function landApproved(row, by = 'human') {
   }
 
   if (state === 'diverged' || state === 'no-ref') {
-    if (!staleReported.has(row.id)) {
-      staleReported.add(row.id);
+    // DEAD, and the ROW says so now. This used to live in an in-memory set — the log quieted down
+    // but the row stayed 'approved', so its "waiting for the zee to re-push" receipt rendered
+    // forever (and outlived every restart, which also emptied the set and re-ran the futile push).
+    // A stale row leaves the open list, the tick's SELECT, and the console in one honest move.
+    const stale = await one(
+      `UPDATE land_request SET status='stale' WHERE id=$1 AND status='approved' RETURNING *`, [row.id]);
+    if (stale) {
+      broadcast('land', stale);
       logline('landgate',
         `approval for ${row.new_sha.slice(0, 8)} is STALE — ${row.ref.replace('refs/heads/', '')} has `
         + 'moved past it, so it can never fast-forward. The gate binds an approval to one exact sha: '
-        + 'this one needs a fresh commit and a fresh decision. Not retrying it.');
+        + 'this one needs a fresh commit and a fresh decision. Closed.');
     }
-    return { ...row, stale: true };
+    return { ...(stale || row), stale: true };
   }
 
   // THE MERGE MUTEX. Two approvals landing at once would each pass ffState against the same tip
@@ -315,16 +319,30 @@ async function landApproved(row, by = 'human') {
 // (a human clicked, a zee never came back), and one whose xell was reaped afterwards so nothing
 // existed to re-push it at all. A transient push failure lands here too.
 export async function tick() {
+  // Dead rows are 'stale' in the DB now, so this SELECT simply stops finding them — no in-memory
+  // been-there set to leak, forget across restarts, or consult.
   const stuck = await q(
     `SELECT * FROM land_request WHERE status='approved' ORDER BY decided_at LIMIT 5`);
   let landed = 0, stale = 0;
   for (const row of stuck) {
-    if (staleReported.has(row.id)) { stale++; continue; }   // known dead — do not push again
     const r = await landApproved(row).catch((e) => { logline('landgate', `retry failed: ${e.message}`); return null; });
     if (r && r.status === 'landed') landed++;
     if (r && r.stale) stale++;
   }
   return { checked: stuck.length, landed, stale };
+}
+
+// "Seen it — stop showing me." A durable fact about VISIBILITY, never about status: a dismissed
+// approval still lands or goes stale on its own schedule, just quietly. Pending is refused here
+// for the same reason the card offers it no ✕: a held landing is a zee blocked on a human, and
+// sweeping that off the screen is how it gets forgotten.
+export async function dismissLandRequest(id, by = 'human@console') {
+  const row = await one(
+    `UPDATE land_request SET dismissed_at=now(), dismissed_by=$2
+       WHERE id=$1 AND status <> 'pending' RETURNING *`, [id, by]);
+  if (!row) throw new Error('no such request (or it is still pending — decide it, don\'t hide it)');
+  broadcast('land', row);
+  return row;
 }
 
 export function startLandReaper() {

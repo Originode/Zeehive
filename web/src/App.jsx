@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
-         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject } from './api.js';
+         reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding } from './api.js';
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import GitRail from './GitRail.jsx';
@@ -163,12 +163,15 @@ export default function App() {
   const shipByXell = {};
   for (const s of fleet.shipping || []) shipByXell[s.xell_id] ||= s;
 
-  // Dismissed notifications, by request id. VIEW-ONLY and deliberately not persisted: it hides a
-  // decided receipt for this sitting, and a reload brings it back. Persisting "I don't want to see
-  // this" about a landing that has not actually landed yet would be inventing a third state the
-  // server does not have — the request is still open, and the zee is still expected to re-push.
-  const dismiss = (id) => setDismissed((d) => ({ ...d, [id]: true }));
-  const visible = (rs) => (rs || []).filter((r) => !dismissed[r.id]);
+  // Dismissed notifications, by request id. The server records the dismissal (dismissed_at on the
+  // row) so it survives reloads and SSE refreshes — receipts used to pop back on every refresh
+  // because hiding them was view-only state. The local map is just optimism: the card disappears
+  // on the click, not on the round-trip. Visibility only — the land reaper keeps working the row.
+  const dismiss = (id) => {
+    setDismissed((d) => ({ ...d, [id]: true }));
+    dismissLanding(id).catch(() => setDismissed((d) => ({ ...d, [id]: false })));
+  };
+  const visible = (rs) => (rs || []).filter((r) => !dismissed[r.id] && !r.dismissed_at);
 
   // Route each landing to the card that will actually RENDER it — which is not the same question as
   // "does it have a xell_id". The fleet only lists xells with status <> 'retired', so a landing
