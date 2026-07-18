@@ -103,6 +103,21 @@ export async function emitXellEnv(xellId) {
       [xellId]);
     if (used?.conn_ref) dbUrl = used.conn_ref;
   }
+  // conn_refs are stored passwordless ("parameters, not secrets") — fine for docker-exec psql,
+  // fatal for a bare process that must SCRAM-authenticate over TCP. The manifest's db block may
+  // carry the committed dev credential (the same one the compose files already commit); inject
+  // it for process xells when the ref has none. Anything genuinely secret stays out of manifests.
+  const manifestDb = project?.manifest?.db || {};
+  if (dbUrl && spinRunner === 'process' && manifestDb.password) {
+    try {
+      const u = new URL(String(dbUrl).replace(/^postgres(ql)?:/, 'http:'));
+      if (!u.password) {
+        if (!u.username && manifestDb.user) u.username = manifestDb.user;
+        u.password = manifestDb.password;
+        dbUrl = String(u).replace(/^http:/, 'postgresql:');
+      }
+    } catch { /* unparseable ref — emit as-is and let the guard/consumer complain */ }
+  }
   if (dbUrl) {
     if (sameDatabase(dbUrl, config.databaseUrl)) {
       throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
