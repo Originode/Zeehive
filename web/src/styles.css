@@ -750,3 +750,46 @@ a.cbox:hover { border-color: var(--accent); }
 .lock-badge:hover { transform: scale(1.15); }
 .lock-badge.held { filter: drop-shadow(0 0 3px var(--up)); }
 .lock-badge:disabled { opacity: .5; cursor: default; }
+
+/* ── honeycomb shell: viewport split in two, git timeline bisecting ─────────────
+   The honeycomb canvas fills one half of the viewport, the project/machine/ship
+   panels the other. Orientation decides the split axis; the flip (honey-a/b) swaps
+   which half is which. The git timeline itself is drawn INSIDE the honey canvas on
+   its panel-facing edge (see HiveCanvas), so it always sits on the dividing line. */
+.hive-split { position: fixed; inset: 0; display: flex; background: var(--bg); overflow: hidden; }
+.hive-split.o-landscape { flex-direction: row; }
+.hive-split.o-portrait  { flex-direction: column; }
+
+.hive-pane { min-width: 0; min-height: 0; }
+.hive-pane.honey  { flex: 1 1 50%; position: relative; }
+.hive-pane.panels { flex: 1 1 50%; overflow: auto; border-left: 1px solid var(--line); }
+.hive-split.o-portrait .hive-pane.panels { border-left: none; border-top: 1px solid var(--line); }
+
+/* flip: honey-b puts the panels first so the honeycomb lands on the far side, and
+   the timeline edge flips with it (edgeFor) so merge points still face the honeycomb. */
+.hive-split.honey-a .hive-pane.honey  { order: 0; }
+.hive-split.honey-a .hive-pane.panels { order: 1; }
+.hive-split.honey-b .hive-pane.honey  { order: 1; }
+.hive-split.honey-b .hive-pane.panels { order: 0; }
+.hive-split.honey-b .hive-pane.panels { border-left: none; border-right: 1px solid var(--line); }
+.hive-split.o-portrait.honey-b .hive-pane.panels { border-right: none; border-bottom: 1px solid var(--line); border-top: none; }
+
+.hive-canvas-wrap { position: absolute; inset: 0; overflow: hidden; }
+.hive-canvas { position: absolute; inset: 0; }
+.hive-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  color: var(--muted); font-size: 13px; }
+
+/* the panels half scrolls independently; drop the old flex/rail padding assumptions */
+.hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }
+
+.flip-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+.flip-btn:hover { color: var(--text); border-color: var(--accent); }
+
+/* the selected-xell drawer: a single card, not a grid */
+.xells.drawer { display: block; }
+.xells-h { display: flex; align-items: center; gap: 10px; }
+.drawer-close { margin-left: auto; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--muted); border-radius: 6px; width: 24px; height: 24px; cursor: pointer; font-size: 12px; }
+.drawer-close:hover { color: var(--down); border-color: var(--down); }
+.drawer-hint { font-size: 13px; }
