@@ -119,6 +119,7 @@ export default function App() {
   const orientation = useOrientation();          // 'portrait' | 'landscape'
   const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
+  const [termXell, setTermXell] = useState(null);  // caged-zee terminal modal, opened from the flower
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
   // per-frame "geometry changed" fire so a pan/zoom re-tracks the graph and re-routes the wires
@@ -328,6 +329,51 @@ export default function App() {
     else window.open(x.viewer_url, '_blank', 'noopener');
   };
 
+  // The flower's canvas action buttons dispatch here (HiveCanvas onAction) — same verbs the old DOM
+  // toolbar/drawer ran, with the same confirmations, so nothing changed but WHERE they are clicked.
+  const handleFlowerAction = (kind, x, diff) => {
+    if (!x || x.is_production) return;
+    const src = x.remote_source?.ref || 'its xource';
+    if (kind === 'terminal') { setTermXell(x); return; }
+    if (kind === 'build') {
+      if (x.stack.some(isBusy)) { alert('A container is busy (building/restoring) — wait for it to finish.'); return; }
+      buildXell(x.id, false).catch(buildErr); return;
+    }
+    if (kind === 'done') {
+      markXellDone(x, diff, refresh, { landing: landingByXell[x.id], prs: prsFor(x), ship: shipByXell[x.id] });
+      return;
+    }
+    if (kind === 'push') {
+      if (!confirm(`Push ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
+        + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
+        + `Your commits stay on the branch either way.`)) return;
+      pushXell(x.id).then((r) => { if (r?.landed === false) alert(r.reason || 'push held at the gate'); refresh(); })
+        .catch((e) => alert('Push failed: ' + (e?.message || e))); return;
+    }
+    if (kind === 'pull') {
+      const dirty = diff?.dirty || 0;
+      if (!confirm(`Pull ${src} into ${x.slug}?\n\nMerges ${src} into ${x.slug}'s working tree on disk`
+        + `${x.zee_status === 'working' ? ' — its zee is still working in there' : ''}.`
+        + (dirty > 0 ? `\n\n⚠ ${dirty} uncommitted file(s): this will be REFUSED (commit or stash first).` : ''))) return;
+      pullXell(x.id).then((r) => { if (r?.merged === false) alert(r.reason || 'pull refused'); refresh(); })
+        .catch((e) => alert('Pull failed: ' + (e?.message || e))); return;
+    }
+    if (kind === 'pr') {
+      if (!confirm(`Raise a PR from ${x.slug} → ${src}?\n\nNothing moves now: it appears on ${src}'s card, and a `
+        + `human accepts it there.`)) return;
+      prXell(x.id).then(refresh).catch((e) => alert('PR failed: ' + (e?.message || e))); return;
+    }
+  };
+
+  // Only the SELECTED xell's pending DECISIONS still need a DOM card (approve/reject with reasons —
+  // the one thing the canvas flower can't carry). Everything else (identity, containers, diff, the
+  // action buttons) now lives ON the flower, so the drawer appears only when there's something to
+  // decide and is otherwise gone.
+  const expandedDecides = !!expandedXell && (
+    (landingByXell[expandedXell.id] || []).some((r) => r.status === 'pending')
+    || (prsFor(expandedXell) || []).some((r) => r.status === 'pending')
+    || (shipByXell[expandedXell.id] && ['pending', 'approved', 'shipping'].includes(shipByXell[expandedXell.id].status)));
+
   // Three panes: the honeycomb, the git graph as the exact centre divider, and the control panels.
   // Landscape → three columns, portrait → three rows; the graph stays centred while flip swaps which
   // side is honeycomb vs panels. Connector wires bridge each xell's commit dot (graph) to its hex.
@@ -335,14 +381,16 @@ export default function App() {
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
       <section className="hive-pane honey">
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
-                    machines={fleet.machines} onOpenSession={openSession}
+                    machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} onGeometry={fireGeom}
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
-        {/* Docked to the flower pane itself — build/pull/push/PR/mark-done on the SELECTED xell,
-            without dropping down to the drawer at the bottom of the page. */}
-        {expandedXell && (
-          <FlowerToolbar x={expandedXell} diff={diffs[expandedXell.id]} onMenu={openMenu} onDone={refresh} />
+        {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
+            and hit-tested there — no DOM toolbar. The caged-zee terminal is the one piece that needs
+            DOM, so it opens as a modal from the flower's ⌨ button. */}
+        {termXell && (
+          <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
+                       onClose={() => setTermXell(null)} />
         )}
       </section>
 
@@ -420,25 +468,24 @@ export default function App() {
       <MachineMatrix machines={fleet.machines} containers={containers}
                      projectId={projectId || project.id} onMenu={openMenu} onChanged={refresh} />
 
-      {/* The selected hexagon's card — the honeycomb replaced the card GRID, but a single card is
-          still where the per-xell actions live (build, push/pull/PR, landings/PRs, mark done). It
-          appears here when a hexagon is expanded, in step with the canvas flower. */}
-      <h2 className="xells-h">
-        {expandedXell ? 'selected xell:' : 'xells:'}
-        {expandedXell && <button className="drawer-close" onClick={() => setExpandedId(null)} title="Close (Esc)">✕</button>}
-      </h2>
-      <section className="xells drawer">
-        {expandedXell
-          ? <XellCard key={expandedXell.id} x={expandedXell} diff={diffs[expandedXell.id]} onDone={refresh} onMenu={openMenu}
+      {/* The selected xell's card appears ONLY when it has a pending DECISION (a held landing, an
+          open PR, or an in-flight ship) — the approve/reject-with-reasons UI the canvas flower can't
+          carry. Its identity, containers, diff and action buttons all live on the flower now, so in
+          the common case there is no drawer here at all. */}
+      {expandedDecides && (
+        <>
+          <h2 className="xells-h">
+            decision needed · {expandedXell.slug}
+            <button className="drawer-close" onClick={() => setExpandedId(null)} title="Close (Esc)">✕</button>
+          </h2>
+          <section className="xells drawer">
+            <XellCard key={expandedXell.id} x={expandedXell} diff={diffs[expandedXell.id]} onDone={refresh} onMenu={openMenu}
                       landing={visible(landingByXell[expandedXell.id])} prs={visible(prsFor(expandedXell))}
                       ship={shipByXell[expandedXell.id]} onDismiss={dismiss} machines={fleet.machines}
                       prodLock={fleet.prod_lock} projectId={projectId || project.id} />
-          : <p className="loading drawer-hint">
-              {xells.length === 0
-                ? 'No active xells. The pool maintainer will fill it shortly…'
-                : 'Click a hexagon to expand it — its full details, git anchor, and actions appear here.'}
-            </p>}
-      </section>
+          </section>
+        </>
+      )}
       </div>
       </section>
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
@@ -626,42 +673,8 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
   } catch (err) { alert('Cleanup failed: ' + (err?.message || err)); }
 }
 
-// A compact action bar docked to the honeycomb pane itself, so Mark doesn't have to scroll down to
-// the drawer to act on the xell he already has the flower open for. It renders when a hexagon is
-// expanded and acts on THAT xell — reusing the exact same pieces as the drawer card (BuildAllButton,
-// ContainerChip per-container build, XourceActions' pull/push/PR, markXellDone) rather than a second
-// implementation that could answer differently than the card sitting right below it.
-function FlowerToolbar({ x, diff, onMenu, onDone }) {
-  if (!x || x.is_production) return null;
-  const showDone = ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status);
-  return (
-    <div className="flower-toolbar" data-testid="flower-toolbar">
-      <div className="fa-id">
-        <b className="fa-slug" title={x.slug}>{x.slug}</b>
-        <span className={`badge b-${x.status}`}>{x.status}</span>
-      </div>
-      <div className="fa-stack">
-        {['db', 'server', 'webapp'].map((role) => {
-          const c = x.stack.find((s) => s.role === role);
-          return c ? <ContainerChip key={role} c={c} onMenu={onMenu} hammer /> : null;
-        })}
-      </div>
-      <div className="fa-actions">
-        <BuildAllButton x={x} />
-        <XourceActions x={x} diff={diff} onDone={onDone} />
-        {showDone && (
-          <button className={`donebtn fa-done ${x.status === 'awaiting-done' ? 'await' : ''}`}
-                  data-testid="flower-done"
-                  onClick={() => markXellDone(x, diff, onDone)}
-                  title={x.task_id ? 'Mark the task done — the queenzee tears this xell down'
-                                   : 'No task row on this xell — this cleans it up (tears it down) directly'}>
-            {x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? 'mark done' : 'clean up')}
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
+// (The old DOM FlowerToolbar was removed: its build/pull/push/PR/mark-done buttons are now drawn
+// directly on the flower by HiveCanvas and hit-tested there — see handleFlowerAction above.)
 
 function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines }) {
   const working = x.zee_status === 'working';

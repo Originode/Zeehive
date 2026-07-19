@@ -176,11 +176,11 @@ function cellNeighbors(row, col) {
 const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
-                                    expandedId, onExpand, hexPosRef, onGeometry,
+                                    expandedId, onExpand, hexPosRef, onGeometry, onAction,
                                     hoverRef, setHover, subscribeHover }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
-  const geomRef = useRef({ hexes: [], flower: null });
+  const geomRef = useRef({ hexes: [], flower: null, buttons: null });
   const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
   const dragRef = useRef(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -280,6 +280,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines });
     }
     geomRef.current.flower = null;
+    geomRef.current.buttons = null;
     if (expanded && cells[expanded.id]) {
       const [er, ec] = cells[expanded.id];
       const centers = [cellCenter(er, ec, cellSize, originX, originY),
@@ -287,6 +288,9 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines);
       geomRef.current.flower = { centers, size: cellSize, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
+      // Per-xell ACTIONS drawn straight onto the flower (no DOM toolbar): a hit-tested button row
+      // under the bloom. Their world-space rects are recorded so onPointerUp can dispatch onAction.
+      geomRef.current.buttons = drawFlowerButtons(ctx, centers, cellSize, expanded);
     }
 
     // publish each hex's live CLIENT-space geometry so <Connectors> can route its wires here and
@@ -346,6 +350,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     }
     return null;
   }, []);
+  const hitButton = useCallback((wx, wy) => {
+    const bs = geomRef.current.buttons;
+    if (!bs) return null;
+    for (const b of bs) if (wx >= b.x && wx <= b.x + b.w && wy >= b.y && wy <= b.y + b.h) return b;
+    return null;
+  }, []);
 
   const relPos = (e) => {
     const r = canvasRef.current.getBoundingClientRect();
@@ -374,8 +384,9 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     const [wx, wy] = toWorld(mx, my);
     let cursor = 'default';
     if (expandedId) {
+      const b = hitButton(wx, wy);
       const f = hitFlower(wx, wy);
-      cursor = f && f.cell === 0 && f.openable ? 'pointer' : 'default';
+      cursor = b || (f && f.cell === 0 && f.openable) ? 'pointer' : 'default';
       emitHover({ id: null, commit: null });
     } else {
       const hx = hitHex(wx, wy);
@@ -392,6 +403,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (d?.moved) return;                                    // it was a pan, not a click
     const [wx, wy] = toWorld(...relPos(e));
     if (expandedId) {
+      // Action buttons first — they sit just below the flower and own their clicks.
+      const b = hitButton(wx, wy);
+      if (b) {
+        const x = (xells || []).find((xx) => xx.id === expandedId);
+        if (x) onAction?.(b.kind, x, diffs?.[expandedId]);
+        return;
+      }
       const f = hitFlower(wx, wy);
       if (f) {
         if (f.cell === 0 && f.openable) {
@@ -611,6 +629,57 @@ function drawFlower(ctx, centers, size, x, diff, machines) {
     drawFacet(ctx, hx, hy, size, facet, col, isCenter, x);
     ctx.restore();
   });
+}
+
+// The flower's own action row — canvas-native buttons, hit-tested in onPointerUp (no DOM toolbar).
+// Returns their WORLD-space rects [{x,y,w,h,kind,label}] so the same transform used for the click
+// (toWorld) lines up. Empty for production, which has no per-xell actions.
+function drawFlowerButtons(ctx, centers, size, x) {
+  if (x.is_production) return [];
+  const buildable = (x.stack || []).some((c) => c.role === 'server' || c.role === 'webapp');
+  const caged = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
+  const showDone = ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status);
+  const specs = [];
+  if (buildable) specs.push({ kind: 'build', label: '🔨 build' });
+  specs.push({ kind: 'pull', label: '↓ pull' });
+  specs.push({ kind: 'push', label: '↑ push' });
+  specs.push({ kind: 'pr', label: 'PR' });
+  if (caged) specs.push({ kind: 'terminal', label: '⌨ terminal' });
+  if (showDone) specs.push({ kind: 'done', label: x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? 'mark done' : 'clean up') });
+
+  const h = size * 0.36;
+  const padX = size * 0.17;
+  const gap = size * 0.13;
+  const fs = Math.max(9, size * 0.16);
+  ctx.font = `600 ${fs}px 'Segoe UI', sans-serif`;
+  const widths = specs.map((s) => ctx.measureText(s.label).width + padX * 2);
+  const totalW = widths.reduce((a, b) => a + b, 0) + gap * Math.max(0, specs.length - 1);
+
+  // Centred on the flower centre, one row below the flower's lowest petal.
+  const cx0 = centers[0][0];
+  let maxY = -Infinity;
+  for (const c of centers) maxY = Math.max(maxY, c[1]);
+  const rowY = maxY + size * 0.55;
+  let bx = cx0 - totalW / 2;
+  const rects = [];
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  specs.forEach((s, i) => {
+    const w = widths[i];
+    const accent = s.kind === 'done' ? COL.error : COL.ready;
+    ctx.beginPath();
+    ctx.roundRect(bx, rowY, w, h, h / 2);
+    ctx.fillStyle = withAlpha(COL.panel, 0.95);
+    ctx.fill();
+    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = withAlpha(accent, 0.6);
+    ctx.stroke();
+    ctx.fillStyle = withAlpha(COL.text, 0.92);
+    ctx.fillText(s.label, bx + w / 2, rowY + h / 2 + 0.5);
+    rects.push({ x: bx, y: rowY, w, h, kind: s.kind, label: s.label });
+    bx += w + gap;
+  });
+  return rects;
 }
 
 function flowerFacets(x, diff, machines) {
