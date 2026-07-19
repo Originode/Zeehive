@@ -13,6 +13,7 @@ import { logline } from '../lib/logbus.js';
 import { gitLog, diffStat, cleanGitEnv } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
+import { nudgeXellAfterLand } from './nudge.js';
 
 const ZERO = /^0+$/;
 
@@ -235,6 +236,8 @@ async function landApproved(row, by = 'human') {
          WHERE id=$1 RETURNING *`, [row.id]);
     broadcast('land', landed);
     logline('landgate', `${row.new_sha.slice(0, 8)} is already on ${row.ref.replace('refs/heads/', '')} — marking landed`);
+    // A caged zee that raised this landing is waiting to continue — resume its session (best-effort).
+    nudgeXellAfterLand(row.xell_id, { by }).catch(() => {});
     return landed || row;
   }
 
@@ -297,6 +300,9 @@ async function landApproved(row, by = 'human') {
     broadcast('land', landed);
     broadcast('xell', { id: row.xell_id });
     logline('landgate', `LANDED ${row.new_sha.slice(0, 8)} → ${row.ref.replace('refs/heads/', '')} (approved by ${row.decided_by || by})`);
+    // Primary async-continuation: if a CAGED zee raised this, resume its session so it ships/does
+    // done with no human re-invocation. Best-effort and logged (a dead cage just logs).
+    nudgeXellAfterLand(row.xell_id, { by }).catch(() => {});
     return landed || row;
   }
 

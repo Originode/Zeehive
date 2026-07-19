@@ -63,56 +63,93 @@ export async function selfStatus(xell) {
   };
 }
 
-// ── POST /api/xell/self/land — collect the cage's commits and run the gated push ──
+// ── POST /api/xell/self/land — collect the cage's commits, catch up, and run the gated push ──
 // The missing piece for a caged zee: its commits live INSIDE the container, but the land gate pushes
-// from the host worktree. So we pull the cage's commits onto the worktree (collectCageDiffToWorktree)
-// and then run the SAME gated `git push . HEAD:main` (pushToXource) a host-side zee runs — which
-// trips the land gate and is HELD for a human. We never move main ourselves.
+// from the host worktree. So we (1) pull the cage's commits onto the worktree, (2) CATCH THE
+// WORKTREE UP to the current xource tip — because the zee committed on top of master-as-it-was and
+// master moved, so a raw push would be a non-fast-forward the gate silently drops — then (3) run the
+// SAME gated `git push . HEAD:main` a host-side zee runs, HELD for a human. We never move main.
+//
+// And we REPORT THE REAL OUTCOME: `landed` (a human already approved this sha), `held` (a genuine
+// pending land_request now exists — verified), or `needs-resolution` (couldn't catch up: a real
+// conflict). Never "held" when nothing was actually raised — the fleet-burn-tracker lie.
 export async function selfLand(xell) {
-  if (!xell.worktree_path) return { ok: false, error: `${xell.slug} has no host worktree to land from` };
-  // Collect is best-effort: if the queenzee cannot reach the cage (or it made no new commits) we
-  // still push whatever the worktree already has — the gate, not this step, is the decision point.
+  if (!xell.worktree_path) return { ok: false, status: 'error', error: `${xell.slug} has no host worktree to land from` };
+
+  // 1) COLLECT — best-effort: a missing docker/cage or an already-collected worktree is a no-op,
+  // not a failure. Only a worktree that has DIVERGED from the cage is a real refusal.
   let collected;
   try {
     collected = await collectCageDiffToWorktree({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path });
   } catch (e) {
-    // A DIVERGED worktree is a real refusal (surface it); a missing docker/cage is just "nothing to
-    // collect" and must not block the push.
-    if (/do not fast-forward/i.test(e.message)) return { ok: false, stage: 'collect', error: e.message };
+    if (/do not fast-forward/i.test(e.message)) return { ok: false, status: 'needs-resolution', stage: 'collect', error: e.message };
     collected = { collected: false, warning: `cage collection skipped: ${e.message}` };
     logline('self', `${xell.slug} land: cage collection skipped (${e.message})`);
   }
 
-  // CATCH UP to the xource tip before pushing — the fix for diverged caged work (see xellgit.js).
-  const caught = await catchUpToXource(xell.id).catch((e) => ({ error: e.message }));
-  if (caught?.error && !caught.conflict) return { ok: false, stage: 'catch-up', error: caught.error, collected };
-  if (caught?.conflict) {
-    logline('self', `${xell.slug} land: catch-up CONFLICT on ${caught.ref} — needs resolution`);
+  // 2) CATCH UP to the current xource tip so an older-based commit still fast-forwards. A rebase
+  // conflict is a real, honest stop — do NOT silently proceed to a doomed push.
+  let caughtUp;
+  try {
+    caughtUp = await catchUpToXource(xell.id);
+  } catch (e) {
+    return { ok: false, status: 'needs-resolution', stage: 'catch-up', error: e.message, collected };
+  }
+  if (caughtUp.state === 'conflict' || caughtUp.state === 'no-head') {
     return {
-      ok: false, stage: 'catch-up', needs_resolution: true, collected,
-      message: `Your work CONFLICTS with changes already on ${caught.ref}. Nothing was pushed. Pull the `
-        + `latest ${caught.ref} into your branch, resolve the conflicts in /work/repo, commit, then re-run `
-        + '`zee land`.',
-      detail: caught.error,
+      ok: false, status: 'needs-resolution', stage: 'catch-up', collected, catch_up: caughtUp,
+      conflict: caughtUp.output || null,
+      message: caughtUp.state === 'conflict'
+        ? `Could not catch up to ${caughtUp.ref}: your commits CONFLICT with work that landed while you were `
+          + 'running. Nothing was pushed and your branch is untouched. Pull the latest into your cage, resolve '
+          + 'the conflict, commit, and `zee land` again.'
+        : `Could not read HEAD in the worktree for ${xell.slug} — nothing to land.`,
     };
   }
 
+  // 3) PUSH — the same gated `git push . HEAD:<ref>`. The landgate's update hook decides.
   const push = await pushToXource(xell.id, `zee@${xell.slug}`).catch((e) => ({ error: e.message }));
-  if (push.error) return { ok: false, stage: 'push', error: push.error, collected };
+  if (push.error) return { ok: false, status: 'error', stage: 'push', error: push.error, collected, catch_up: caughtUp };
 
-  // HONEST status: only say "held" when a real land_request is actually pending in the console.
+  // 4) REPORT THE REAL OUTCOME.
+  const caughtNote = (caughtUp.state === 'rebased' || caughtUp.state === 'fast-forwarded')
+    ? ` (after catching up to ${caughtUp.ref} — ${caughtUp.state})` : '';
+
+  if (push.landed) {
+    return {
+      ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, request: await landStatus(xell.id),
+      message: `LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`,
+    };
+  }
+
+  // Push was HELD → a pending land_request for THIS EXACT sha must now exist. Verify it before we
+  // dare say "held" — the whole point of the fix is that the status can be trusted.
   const request = await landStatus(xell.id);
-  const heldPending = !push.landed && request && request.status === 'pending';
+  const trulyHeld = request && request.status === 'pending' && request.new_sha === push.head;
+  if (trulyHeld) {
+    return {
+      ok: true, status: 'held', landed: false, collected, catch_up: caughtUp, request,
+      message: `Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
+        + `(land_request ${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote}. Your commits `
+        + 'are safe on your branch; nothing lands until a human agrees. You do NOT need to re-run land: when a human '
+        + 'approves, the queenzee lands it AND nudges you to continue. To block meanwhile, `zee land --wait` (or '
+        + '`zee status --wait`) in the background — its exit is your nudge.',
+    };
+  }
+
+  // Push did not land AND there is no fresh pending hold for this sha — this is NOT a clean held
+  // landing, so do not pretend it is. Say what actually happened.
   return {
-    ok: true, collected, caught_up: !!caught?.rebased, landed: !!push.landed,
+    ok: false, status: request ? request.status : 'unknown', landed: false, collected, catch_up: caughtUp,
     request: request || null,
-    status: push.landed ? 'landed' : heldPending ? 'held' : 'unknown',
-    message: push.landed
-      ? `LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)}.`
-      : heldPending
-        ? `Landing REQUESTED and HELD at the gate — it is now IN THE ZEEHIVE CONSOLE for a human to approve `
-          + `(commit ${String(request.new_sha || '').slice(0, 8)}). The queenzee will nudge you when it lands.`
-        : `Push raised NO landing (${(push.output || '').slice(-160)}) — should not happen after catch-up; flag it.`,
+    push_output: push.output ? String(push.output).slice(-800) : null,
+    message: request
+      ? (request.status === 'rejected'
+        ? `A human REJECTED this exact sha (${String(request.new_sha).slice(0, 8)}) — re-pushing will not help; talk to them.`
+        : `Push did not land and the latest land_request is '${request.status}' (sha ${String(request.new_sha).slice(0, 8)}), `
+          + `not a fresh pending hold for ${String(push.head).slice(0, 8)}. Check the ZEEHIVE console — this is NOT a clean held landing.`)
+      : 'Push did not land and NO land_request was raised — the gate held nothing (a non-fast-forward the catch-up '
+        + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.',
   };
 }
 

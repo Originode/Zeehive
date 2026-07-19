@@ -10,7 +10,7 @@
 //
 // origin appears nowhere here. It is a backup mirror Mark pushes by hand; the tree is entirely
 // local, and a push to `.` is a push into this same repo.
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
@@ -20,6 +20,26 @@ function git(cwd, args, timeout = 60000) {
   const r = spawnSync('git', ['-C', cwd, ...args],
     { encoding: 'utf8', timeout, windowsHide: true, env: cleanGitEnv() });
   return { ok: r.status === 0, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
+}
+
+// ASYNC git — for the ONE call that MUST NOT block the event loop: the `git push` to a xource whose
+// `update` hook curls BACK into this very server (hooks/land-gate-update.sh → POST /api/land/check).
+// spawnSync there is a self-deadlock: the queenzee is single-threaded, so a synchronous push freezes
+// the loop while git waits on the hook — and the hook's curl can't be served until the push returns.
+// It never does; curl times out (rc=28), the hook fails CLOSED, and the push is declined with NO
+// land_request raised. That is a second, quieter cause of "I landed but nothing was raised" (the
+// first being the non-fast-forward the catch-up now fixes). landApproved sidesteps it with
+// update-ref; a genuine gated PUSH cannot, so it must run async and leave the loop free for the hook.
+function gitAsyncPush(cwd, args, timeout = 60000) {
+  return new Promise((resolve) => {
+    const p = spawn('git', ['-C', cwd, ...args], { windowsHide: true, env: cleanGitEnv() });
+    let out = '', err = '';
+    const t = setTimeout(() => p.kill(), timeout);
+    p.stdout.on('data', (d) => (out += d.toString()));
+    p.stderr.on('data', (d) => (err += d.toString()));
+    p.on('error', (e) => { clearTimeout(t); resolve({ ok: false, out: out.trim(), err: (err + e.message).trim() }); });
+    p.on('close', (code) => { clearTimeout(t); resolve({ ok: code === 0, out: out.trim(), err: err.trim() }); });
+  });
 }
 
 // A xell, its xource ref, and — if that xource is itself a xell — the worktree that ref is checked
@@ -54,29 +74,63 @@ const dirtyCount = (wt) => {
   return r.ok ? r.out.split('\n').filter(Boolean).length : 0;
 };
 
-// ── CATCH UP: rebase the xell's branch onto its xource tip so a push fast-forwards ───────────
-// A caged zee's work is based on whatever master was when its cage was cut; master keeps moving
-// while the zee works, so by land time the branch is DIVERGED and `git push . HEAD:main` is a
-// non-fast-forward — the gate raises NO landing, yet the old code reported "held" (the exact bug
-// behind "zee land said held but nothing appeared"). Rebase (linear — the zee's commit stays on
-// top). A conflict is a real "needs resolution", never a fabricated merge; we abort so the tree
-// is left clean rather than mid-rebase.
-export async function catchUpToXource(xellId) {
-  const x = await one(
-    `SELECT x.worktree_path, x.slug, p.main_branch FROM xell x JOIN project p ON p.id=x.project_id WHERE x.id=$1`,
-    [xellId]);
-  if (!x?.worktree_path) throw new Error('xell has no worktree');
-  const ref = x.main_branch || 'main';
-  const behind = git(x.worktree_path, ['rev-list', '--count', `HEAD..${ref}`]);
-  if (behind.ok && behind.out.trim() === '0') return { caughtUp: true, rebased: false, ref };
-  if (dirtyCount(x.worktree_path) > 0) return { caughtUp: false, ref, error: 'worktree has uncommitted changes — commit or discard them first' };
-  const r = git(x.worktree_path, ['rebase', ref]);
-  if (!r.ok) {
-    git(x.worktree_path, ['rebase', '--abort']);
-    return { caughtUp: false, conflict: true, ref, error: `${r.out}\n${r.err}`.trim().slice(-500) };
+// ── CATCH UP: replay the xell's commits onto the CURRENT xource tip ──────────
+// A caged (or host) zee commits on top of the xource AS IT WAS when it started. The xource moves
+// while the zee works, so a straight `git push . HEAD:<ref>` is a NON-fast-forward — and the
+// landgate's update hook only ever ADVANCES a ref; a non-ff push is simply declined with nothing
+// raised. That is the fleet-burn-tracker bug: the commit diverged, no landing card appeared, yet
+// the zee was told "held". The fix is to bring the worktree up to the current tip BEFORE pushing,
+// so the push that follows is a real fast-forward the gate can actually hold or land.
+//
+// Pure git, no DB — takes a worktree and the ref to catch up to. Returns { state, head, base } where
+// state is:
+//   'up-to-date'     — the worktree already contains the tip (a push is already a ff); nothing done.
+//   'fast-forwarded' — the worktree had no commits of its own; advanced it to the tip.
+//   'rebased'        — replayed the zee's commits onto the tip (HEAD is a NEW sha; a ff now).
+//   'conflict'       — the rebase hit a real conflict; ABORTED, the worktree left exactly as it was.
+//   'no-ref'/'no-head' — the ref or HEAD could not be read (nothing to do safely).
+export function catchUpWorktree(worktree, ref) {
+  const tipR = git(worktree, ['rev-parse', ref]);
+  if (!tipR.ok) return { state: 'no-ref', ref };
+  const tip = tipR.out;
+  const headR = git(worktree, ['rev-parse', 'HEAD']);
+  if (!headR.ok) return { state: 'no-head', ref, base: tip };
+  const head = headR.out;
+
+  // Our HEAD already contains the tip → at or ahead of the xource; a push is already a ff.
+  if (git(worktree, ['merge-base', '--is-ancestor', tip, head]).ok) {
+    return { state: 'up-to-date', head, ref, base: tip };
   }
-  logline('landgate', `${x.slug}: caught up onto ${ref} (rebased) before landing`);
-  return { caughtUp: true, rebased: true, ref };
+  // Our HEAD is an ancestor of the tip → we added nothing of our own; just fast-forward to it.
+  if (git(worktree, ['merge-base', '--is-ancestor', head, tip]).ok) {
+    const m = git(worktree, ['merge', '--ff-only', ref]);
+    if (!m.ok) return { state: 'conflict', ref, base: tip, output: `${m.out}\n${m.err}`.trim().slice(-1200) };
+    const h = git(worktree, ['rev-parse', 'HEAD']);
+    return { state: 'fast-forwarded', head: h.out, ref, base: tip };
+  }
+  // Diverged → replay our commits onto the current tip. On conflict, ABORT and report — never
+  // leave the worktree wedged mid-rebase (the next land would trip over it). We resolve trivially
+  // (a clean replay) or surface the real conflict; we never fabricate a merge nobody reviewed.
+  const rb = git(worktree, ['rebase', ref], 180000);
+  if (!rb.ok) {
+    git(worktree, ['rebase', '--abort']);
+    return { state: 'conflict', ref, base: tip, output: `${rb.out}\n${rb.err}`.trim().slice(-1200) };
+  }
+  const h = git(worktree, ['rev-parse', 'HEAD']);
+  return { state: 'rebased', head: h.out, ref, base: tip };
+}
+
+// DB-aware wrapper: resolve the xell's worktree + xource ref, then catch that worktree up. Same
+// binding/guard as every other verb here (a de-registered worktree is refused before any git runs).
+export async function catchUpToXource(xellId) {
+  const { x, ref } = await ctx(xellId);
+  const res = catchUpWorktree(x.worktree_path, ref);
+  if (res.state === 'rebased' || res.state === 'fast-forwarded') {
+    logline('landgate', `${x.slug} caught up to ${ref} (${res.state} → ${String(res.head).slice(0, 8)})`);
+  } else if (res.state === 'conflict') {
+    logline('landgate', `${x.slug} could NOT catch up to ${ref} — rebase conflict (aborted, worktree untouched)`);
+  }
+  return { ...res, ref, slug: x.slug };
 }
 
 // ── PUSH: the xell's commits → its xource ────────────────────────────────────
@@ -90,7 +144,9 @@ export async function pushToXource(xellId, by = 'human@console') {
   if (!head.ok) throw new Error('cannot read the xell HEAD');
 
   logline('landgate', `${by} pushed ${x.slug} → ${ref}`);
-  const r = git(x.worktree_path, ['push', '.', `HEAD:${fullRef}`]);
+  // ASYNC push (see gitAsyncPush): this is the call whose `update` hook curls back into this server,
+  // so a synchronous push self-deadlocks and the gate raises nothing.
+  const r = await gitAsyncPush(x.worktree_path, ['push', '.', `HEAD:${fullRef}`]);
   const text = `${r.out}\n${r.err}`.trim();
   const landed = r.ok;
 

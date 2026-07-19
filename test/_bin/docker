@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Fake `docker` for the land-loop test — records every invocation (argv + stdin) to $DOCKER_LOG so
+# the test can assert the queenzee tried to RESUME the caged session. Answers the one read the nudge
+# makes (cat /etc/environment) with fake tokens; everything else just logs and succeeds.
+LOG="${DOCKER_LOG:-/tmp/fake-docker.log}"
+{
+  echo "=== docker $* ==="
+} >> "$LOG"
+# read stdin (the resume prompt) if any, record it
+if [ ! -t 0 ]; then
+  IN="$(cat)"
+  if [ -n "$IN" ]; then printf 'STDIN<<\n%s\n>>STDIN\n' "$IN" >> "$LOG"; fi
+fi
+for a in "$@"; do
+  if [ "$a" = "/etc/environment" ]; then
+    printf 'ANTHROPIC_AUTH_TOKEN=sk-ant-fake-tok\nZEEHIVE_XELL_TOKEN=fake-ident-tok\n'
+    exit 0
+  fi
+done
+exit 0

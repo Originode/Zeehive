@@ -33,7 +33,13 @@ COPY zee /usr/local/bin/zee
 COPY cage-claude-seed.mjs /usr/local/bin/cage-claude-seed.mjs
 COPY zee-live.mjs /usr/local/bin/zee-live.mjs
 COPY zee-attach.sh /usr/local/bin/zee-attach.sh
-RUN chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee \
+# Belt-and-suspenders CRLF strip: .gitattributes pins these to LF, but if the build context was
+# checked out on Windows with autocrlf=true (or copied through a Windows tool) a `#!/usr/bin/env
+# node\r` shebang would make `zee` die with `node\r: No such file or directory`. Strip any trailing
+# CR from the shebang-bearing scripts BEFORE chmod so `zee` (and the .sh/.mjs helpers) run bare.
+RUN sed -i 's/\r$//' /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee \
+             /usr/local/bin/cage-claude-seed.mjs /usr/local/bin/zee-live.mjs /usr/local/bin/zee-attach.sh \
+    && chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee \
              /usr/local/bin/cage-claude-seed.mjs /usr/local/bin/zee-live.mjs /usr/local/bin/zee-attach.sh
 
 RUN useradd -m -s /bin/bash zee \

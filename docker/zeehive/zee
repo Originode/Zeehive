@@ -3,11 +3,15 @@
 // queenzee API is its only door out of the cage. This wraps the /api/xell/self/* verbs so the zee
 // (or an attending human in the cage's SSH shell) doesn't hand-roll curl.
 //
-//   zee status
-//   zee land
+//   zee status [--wait]
+//   zee land [--wait]
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
 //   zee done --summary "what you finished"
+//
+// --wait (on `land` and `status`) BLOCKS, polling until the landing is decided (landed/rejected/
+// stale), and exits with that verdict — its exit is your nudge, so run it in the BACKGROUND. The
+// queenzee ALSO nudges a caged zee on approval (it resumes your session); --wait is the backup.
 //
 // Auth is $ZEEHIVE_XELL_TOKEN (injected into the cage env at spawn). The queenzee is reached at
 // host.docker.internal:4700 by default (already firewall-allowed); override with $ZEEHIVE_API.
@@ -22,6 +26,37 @@ const token = process.env.ZEEHIVE_XELL_TOKEN || '';
 const [cmd, ...rest] = process.argv.slice(2);
 
 function flag(name) { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : null; }
+// --wait is a boolean flag with an optional =<secs> (default 1h). `--wait 30` is NOT supported —
+// the value form is `--wait=30`, so a bare `--wait` never eats the next positional.
+function waitFlag() {
+  const eq = rest.find((a) => a.startsWith('--wait='));
+  if (eq) return { on: true, secs: Number(eq.split('=')[1]) || 3600 };
+  return { on: rest.includes('--wait'), secs: 3600 };
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Poll self/status until the landing is decided. Exit is the caller's nudge: landed=0, rejected/
+// stale/timeout=1. 'approved' just keeps waiting — the queenzee lands an approval itself now.
+async function pollLanding(secs) {
+  const deadline = Date.now() + secs * 1000;
+  let last = '';
+  console.error(`\n  Waiting up to ${secs}s for a human to decide. The queenzee will ALSO nudge you on`);
+  console.error(`  approval (it resumes your session); this --wait is the backup signal.\n`);
+  while (Date.now() < deadline) {
+    await sleep(4000);
+    let land;
+    try { land = (await req('GET', '/api/xell/self/status')).json?.landing; }
+    catch (e) { console.error(`  (status unreadable: ${e.message}) — retrying`); continue; }
+    if (!land) { console.error('  … no landing on record yet'); continue; }
+    if (land.status !== last) { console.error(`  … ${land.status || 'unknown'}`); last = land.status; }
+    if (land.status === 'landed') { console.error(`\n  ✓ LANDED on main${land.new_sha ? ` @ ${String(land.new_sha).slice(0, 8)}` : ''}.\n`); process.exit(0); }
+    if (land.status === 'rejected') { console.error('\n  ✗ REJECTED by a human — re-pushing this sha will not help; talk to them.\n'); process.exit(1); }
+    if (land.status === 'stale') { console.error('\n  ✗ STALE — main moved past this sha; make a fresh commit and `zee land` again.\n'); process.exit(1); }
+    // 'pending' / 'approved' → keep waiting (an approval lands automatically).
+  }
+  console.error(`\n  ✗ TIMEOUT after ${secs}s — still waiting on a human. Your work is safe on your branch.\n`);
+  process.exit(1);
+}
 // --targets takes one-or-more values until the next --flag (or end)
 function multi(name) {
   const i = rest.indexOf(`--${name}`);
@@ -59,8 +94,8 @@ function out(r) {
 function usage() {
   console.log(`zee — caged-zee ↔ queenzee verbs (each is a REQUEST that lands on a human gate)
 
-  zee status                         where you stand (task + pending land/ship/prod/done)
-  zee land                           collect your commits + run the gated push to main (HELD for a human)
+  zee status [--wait]                where you stand (task + pending land/ship/prod/done); --wait blocks until a landing is decided
+  zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); --wait blocks until decided (run in background)
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms)
   zee done --summary "..."           propose done (a human confirms with "Mark done")
@@ -75,8 +110,31 @@ if (!token && cmd && cmd !== 'help') {
 }
 
 switch (cmd) {
-  case 'status': out(await req('GET', '/api/xell/self/status')); break;
-  case 'land':   out(await req('POST', '/api/xell/self/land', {})); break;
+  case 'status': {
+    const r = await req('GET', '/api/xell/self/status');
+    console.log(JSON.stringify(r.json, null, 2));
+    const w = waitFlag();
+    if (!w.on) process.exit(r.code >= 400 ? 1 : 0);
+    const land = r.json?.landing;
+    // Nothing pending to wait on → answer now (landed=0, decided-otherwise=1, no landing=0).
+    if (!land || !['pending', 'approved'].includes(land.status)) {
+      process.exit(land && land.status !== 'landed' ? (['rejected', 'stale'].includes(land.status) ? 1 : 0) : 0);
+    }
+    await pollLanding(w.secs); // exits
+    break;
+  }
+  case 'land': {
+    const r = await req('POST', '/api/xell/self/land', {});
+    console.log(JSON.stringify(r.json, null, 2));
+    const w = waitFlag();
+    const status = r.json?.status;
+    if (r.code >= 400 || status === 'needs-resolution' || status === 'error') process.exit(1);
+    if (status === 'landed') process.exit(0);
+    if (!w.on) process.exit(0); // held, but not asked to wait — the queenzee will nudge on approval
+    if (status === 'held') { await pollLanding(w.secs); } // exits
+    process.exit(0);
+    break;
+  }
   case 'ship': {
     const reason = flag('reason'); const targets = multi('targets');
     if (!reason) { console.error('ship needs --reason "what you are shipping"'); process.exit(1); }

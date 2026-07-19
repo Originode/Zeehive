@@ -304,6 +304,37 @@ export async function collectCageDiffToWorktree({ ctx = 'default', slug, worktre
   }
 }
 
+// NUDGE a caged zee: RESUME its claude session inside the cage so its workflow continues with no
+// human re-invocation. A headless caged zee's turn ENDS at `zee land`; nothing tells it the human
+// later approved. So when a landing raised by a caged zee lands, the queenzee re-invokes the
+// session — `docker exec <cage> claude --bare --resume <sid> -p` — with a short prompt. The prompt
+// rides in on stdin (no shell-quoting of model text); the session id is sanitised to a uuid because
+// it is interpolated into the command.
+//
+// Tokens: prefer the ones the cage was SPAWNED with, read back from /etc/environment, so we do NOT
+// invalidate a token a `zee … --wait` poll is still holding (re-minting would 401 that poll right
+// as it should report success). Fall back to whatever the caller passes. Best-effort: a torn-down
+// or unreachable cage rejects, and the caller just logs it.
+export async function nudgeCagedZee({ ctx = 'default', name, sessionId, prompt, model, token = null, xellToken = null, timeoutMs = 1200000 } = {}) {
+  let claudeTok = token, identTok = xellToken;
+  if (!claudeTok || !identTok) {
+    try {
+      const r = await dk(ctx, ['exec', '-u', '0', name, 'cat', '/etc/environment'], { timeoutMs: 15000 });
+      const pick = (k) => (r.out.match(new RegExp(`^${k}=(.*)$`, 'm')) || [])[1]?.trim();
+      claudeTok = claudeTok || pick('ANTHROPIC_AUTH_TOKEN');
+      identTok = identTok || pick('ZEEHIVE_XELL_TOKEN');
+    } catch { /* fall through with whatever the caller gave us */ }
+  }
+  const env = [];
+  if (claudeTok) env.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${claudeTok}`, '-e', `ANTHROPIC_AUTH_TOKEN=${claudeTok}`);
+  if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);
+  const sid = String(sessionId || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — it is interpolated
+  const resume = sid ? ` --resume ${sid}` : '';
+  const cmd = ['exec', '-i', ...env, name, 'bash', '-lc',
+    `cd /work/repo && claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions${resume}${model ? ` --model ${model}` : ''}`];
+  return dk(ctx, cmd, { input: prompt, timeoutMs });
+}
+
 export async function removeCage({ ctx, slug }) {
   await dk(ctx, ['rm', '-f', cageName(slug)]).catch(() => {});
 }
