@@ -658,8 +658,8 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
       (heldLanding ? `  • ${heldLanding} landing held for approval\n` : '') +
       (openPr ? `  • ${openPr} open PR\n` : '') +
       (pendingShip ? `  • a production ship is ${pendingShip}\n` : '') +
-      `\nProceeding is irreversible. To confirm, type the xell name exactly:\n${x.slug}`);
-    if (typed !== x.slug) { if (typed !== null) alert('Name did not match — nothing was touched.'); return; }
+      `\nProceeding is irreversible. To confirm, type: done`);
+    if ((typed || '').trim().toLowerCase() !== 'done') { if (typed !== null) alert('Not confirmed — type "done" to proceed. Nothing was touched.'); return; }
   }
   try {
     const r = x.task_id ? await markDone(x.task_id, 'mark', active) : await reapXell(x.id, 'human-cleanup', active);
