@@ -883,14 +883,37 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
   const R = COL.ready, D = COL.error, G = COL.working, P = COL.prod;
   const h = Math.max(15, size * 0.28);
   const padX = size * 0.13;
-  const yOff = size * 0.56;                 // low in the petal, below the facet's own text
-  const opts = { h, padX, gap: size * 0.06, accent: R };
+  const yOff = size * 0.5;                   // preferred depth: low in the petal, below the facet's own text
+  const gap = size * 0.06;
+  const opts = { h, padX, gap, accent: R };
   ctx.font = `600 ${Math.max(9, size * 0.145)}px 'Segoe UI', sans-serif`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   const rects = [];
   const at = (i) => centers[i];
-  const row = (i, btns) => { if (btns.length && at(i)) rects.push(...drawPetalRow(ctx, at(i)[0], at(i)[1] + yOff, btns, opts)); };
+  // A pointy-top hex narrows toward its bottom vertex, so a button parked at a fixed depth pokes out
+  // through the lower slanted edges (worst for the wider two-button rows). Instead, fit each row: given
+  // its measured total width, raise it just enough that its bottom corners stay inside the hex — with a
+  // small inset off the stroked edge — and never lower than the preferred depth. Each row is also
+  // clipped to its own petal as a hard guarantee that nothing can ever escape the hexagon.
+  const halfW = hexWidth(size) / 2;                       // half flat-to-flat (widest half-width)
+  const inset = size * 0.08;                              // breathing room off the edge stroke
+  const rowDepth = (total) => {
+    // lower-slant constraint (see pointInHex): a corner at (±total/2, dy) is inside while
+    // size·halfW − (size/2)·(total/2) − halfW·dy ≥ 0, i.e. dy ≤ size·(1 − total/(4·halfW)).
+    const yMax = size * (1 - total / (4 * halfW)) - h / 2 - inset;
+    return Math.max(size * 0.28, Math.min(yOff, yMax));   // fit, but keep clear of the facet text above
+  };
+  const row = (i, btns) => {
+    if (!btns.length || !at(i)) return;
+    const total = btns.reduce((a, b) => a + ctx.measureText(b.label).width + padX * 2, 0) + gap * (btns.length - 1);
+    const [px, py] = at(i);
+    ctx.save();
+    hexPath(ctx, px, py, size - 1.5);
+    ctx.clip();
+    rects.push(...drawPetalRow(ctx, px, py + rowDepth(total), btns, opts));
+    ctx.restore();
+  };
 
   // build → CONTAINERS petal
   if (buildable) row(3, [{ label: '🔨 build', kind: 'build' }]);
