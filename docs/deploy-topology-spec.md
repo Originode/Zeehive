@@ -333,6 +333,26 @@ runs `recoverOrphanBuilds()`; it additionally resumes any `ship_request` in
 Meta-DB migrations ride the ship exactly as app migrations do for OmniBiz (the
 ledger-in-app-db mechanism from migration 014 applies to Zeehive's own db unchanged).
 
+Two steps the self-ship must perform that a container ship does not (closed 2026-07-19,
+after landing ed805cc exposed both):
+
+- **Working-tree sync.** The queenzee runs from the main checkout's *working tree*, but
+  the landing gate advances `master` with `git update-ref` (a real push would re-invoke
+  the xource hook and self-deadlock the single-threaded server — see `landgate.js`), and
+  update-ref never touches the working tree. So after a gate-landing the files on disk are
+  still the *old* code; a bare restart boots stale bytes. `scripts/self-ship-sync.sh`
+  (invoked by the detached restart **after** the kill, **before** the start) resets the
+  checkout to the exact approved ship sha. It is defensive: genuinely-uncommitted work is
+  preserved in a labeled `git stash` first, while the *expected* update-ref delta (the tree
+  matching an ancestor of the ship sha) is recognised and reset without a redundant stash.
+- **Cage-image rebuild.** New caged-zee capabilities ship inside `zeehive/zee-agent`
+  (`docker/zeehive/Dockerfile.zee-agent` — the `zee` CLI, cage-sshd/seed/attach scripts).
+  `self-ship.sh` rebuilds that image on the `default` docker context (where cages run) as
+  part of the approved ship, so new cages carry the shipped code. Best-effort with loud,
+  recorded failure: a build failure is reported on the ship card but does not abort the
+  code deploy. Both steps live in `self-ship.sh` (Zeehive's own `build_script`), so they are
+  scoped to self-hosting and never touch OmniBiz's container-build ship path.
+
 ## 7. Implementation plan (ZEEHIVE side)
 
 Each phase lands independently and is useful on its own.
