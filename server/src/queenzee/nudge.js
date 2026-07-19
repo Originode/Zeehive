@@ -25,8 +25,33 @@ const CONTINUE_PROMPT =
   + '  3. When you are satisfied the whole job is complete, run `zee done --summary "…"`.\n'
   + 'Do NOT try to re-run `zee land` for the work that just landed; it is done. Pick the next step and act.';
 
+// An OPERATOR-initiated nudge: ask the running zee for a short status update on its work, WITHOUT
+// changing anything. Same delivery path as the post-land nudge (resume the caged session with a
+// one-shot prompt) — this is what the flower's "nudge" button fires.
+const STATUS_PROMPT =
+  'The operator is asking for a STATUS UPDATE — no code changes, just report. In a few sentences, say:\n'
+  + '  1. what you have DONE so far,\n'
+  + '  2. what you are working on RIGHT NOW,\n'
+  + '  3. what is LEFT before the job is complete, and\n'
+  + '  4. any BLOCKERS or decisions you are waiting on.\n'
+  + 'Keep it concise. Do not run builds or edit files for this — then carry on with your work.';
+
+// Nudge THIS xell's live caged zee for a status update. Mirrors nudgeXellAfterLand's delivery but
+// with the status prompt. Returns the same { nudged, reason?/error? } shape so the route/UI can
+// tell the operator whether there was a live zee to reach. NEVER throws.
+export async function nudgeXellForStatus(xellId, { by = 'human' } = {}) {
+  return nudgeCaged(xellId, { by, prompt: STATUS_PROMPT, why: 'status update' });
+}
+
 // Re-invoke the caged zee that owns this xell, if one is live. NEVER throws.
 export async function nudgeXellAfterLand(xellId, { by = 'human' } = {}) {
+  return nudgeCaged(xellId, { by, prompt: CONTINUE_PROMPT,
+    why: 'landing approved', log: (slug, sid) => `${slug}: landing approved by ${by} — resuming caged session ${sid} to continue` });
+}
+
+// The shared delivery: resolve this xell's live caged zee and resume its claude session with
+// `prompt`. Fire-and-forget (the turn can run for minutes), best-effort, NEVER throws.
+async function nudgeCaged(xellId, { by = 'human', prompt, why = 'nudge', log } = {}) {
   try {
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
@@ -43,17 +68,17 @@ export async function nudgeXellAfterLand(xellId, { by = 'human' } = {}) {
     // so a running `zee … --wait` poll keeps its identity.
     const token = await tokenForSpawn(zee.project_id, 'claude').catch(() => null);
 
-    logline('nudge', `${zee.slug}: landing approved by ${by} — resuming caged session ${String(zee.claude_session_id).slice(0, 8)} to continue`);
-    // Fire and forget: the continuation turn (ship/done) can run for minutes; do NOT block the
-    // landing on it. Its own exit is logged.
+    const sid = String(zee.claude_session_id).slice(0, 8);
+    logline('nudge', log ? log(zee.slug, sid) : `${zee.slug}: ${why} by ${by} — resuming caged session ${sid}`);
+    // Fire and forget: the continuation turn can run for minutes; do NOT block the caller on it.
     nudgeCagedZee({
       ctx: 'default', name: cageName(zee.slug), sessionId: zee.claude_session_id,
-      prompt: CONTINUE_PROMPT, model: zee.model, token,
+      prompt, model: zee.model, token,
     })
       .then((r) => logline('nudge', `${zee.slug}: nudge session exited (code ${r?.code ?? '?'})`))
       .catch((e) => logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cage may be down; no retry`));
 
-    return { nudged: true, zee_id: zee.id, session: zee.claude_session_id, prompt: CONTINUE_PROMPT };
+    return { nudged: true, zee_id: zee.id, session: zee.claude_session_id, prompt };
   } catch (e) {
     logline('nudge', `nudge for xell ${String(xellId).slice(0, 8)} failed: ${String(e.message).slice(0, 160)}`);
     return { nudged: false, error: e.message };

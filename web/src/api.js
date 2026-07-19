@@ -472,6 +472,22 @@ async function xellVerb(id, verb, body = {}) {
 export const pushXell = (id) => xellVerb(id, 'push');
 export const pullXell = (id) => xellVerb(id, 'pull');
 export const prXell = (id, note) => xellVerb(id, 'pr', { note });
+// Nudge the xell's running zee for a status update. Resolves { nudged, reason? } — nudged:false
+// (not a throw) means there was no live caged zee to reach.
+export const nudgeXell = (id) => xellVerb(id, 'nudge');
+
+// File a production ship request for this xell (the operator asking on the zee's behalf). It is
+// REFUSED server-side unless the work is already landed on main; a human then approves it in the
+// ship panel (or auto-approve does). Returns { ok, request?, reason? }.
+export async function requestShipXell(xellId, reason) {
+  const r = await fetch('/api/ship/request', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ xell_id: xellId, reason: reason || null }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `ship request failed (${r.status})`);
+  return data;
+}
 
 export async function acceptPull(requestId) {
   const r = await fetch(`/api/land/requests/${requestId}/accept`, {

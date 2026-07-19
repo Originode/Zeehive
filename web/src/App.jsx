@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells, dispatchTask } from './api.js';
+         streamFleetXells, dispatchTask, nudgeXell, requestShipXell } from './api.js';
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import HiveCanvas from './hive/HiveCanvas.jsx';
@@ -382,12 +382,40 @@ export default function App() {
       markXellDone(x, diff, refresh, { landing: landingByXell[x.id], prs: prsFor(x), ship: shipByXell[x.id] });
       return;
     }
-    if (kind === 'push') {
-      if (!confirm(`Push ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
+    if (kind === 'push' || kind === 'land') {
+      if (!confirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
         + `Your commits stay on the branch either way.`)) return;
       pushXell(x.id).then((r) => { if (r?.landed === false) alert(r.reason || 'push held at the gate'); refresh(); })
         .catch((e) => alert('Push failed: ' + (e?.message || e))); return;
+    }
+    if (kind === 'ship') {
+      if (!confirm(`Ship ${x.slug} to PRODUCTION?\n\nThis files a ship request. It is REFUSED unless the work is `
+        + `already landed on main; a human then approves it in the ship panel, and the queenzee deploys from main.`)) return;
+      const id = `ship-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Requesting ship of ${x.slug}…` });
+      requestShipXell(x.id, `ship ${x.slug} from the dashboard`).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: 'Ship requested', onRetry: null,
+          body: r?.note || 'awaiting approval in the ship panel' });
+        else updateToast(id, { kind: 'error', title: 'Ship refused', body: r?.reason || 'not landed', onRetry: null });
+        setTimeout(() => dismissToast(id), 7000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Ship failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 7000); });
+      return;
+    }
+    if (kind === 'nudge') {
+      const id = `nudge-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Nudging ${x.slug}…`, body: 'asking it for a status update' });
+      nudgeXell(x.id).then((r) => {
+        if (r?.nudged) updateToast(id, { kind: 'success', title: `Nudged ${x.slug}`, onRetry: null,
+          body: 'asked it for a status update on its work' });
+        else updateToast(id, { kind: 'error', title: 'Nudge not delivered', onRetry: null,
+          body: r?.reason || r?.error || 'no live zee to reach' });
+        setTimeout(() => dismissToast(id), 6000);
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Nudge failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
+      return;
     }
     if (kind === 'pull') {
       const dirty = diff?.dirty || 0;
@@ -412,6 +440,7 @@ export default function App() {
       <section className="hive-pane honey">
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
+                    onContainerMenu={openMenu}
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} onGeometry={fireGeom}
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />

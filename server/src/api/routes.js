@@ -30,6 +30,7 @@ import { listSharedContainers, createSharedContainer, updateSharedContainer, del
   from '../lib/inventory.js';
 import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
+import { nudgeXellForStatus } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
@@ -577,6 +578,13 @@ router.post('/xells/:id/pull', async (req, res) => {
 
 router.post('/xells/:id/pr', async (req, res) => {
   try { res.json(await requestPullIn(req.params.id, { by: req.body?.by || 'human@console', note: req.body?.note || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Nudge the xell's live caged zee for a STATUS UPDATE — the flower's "nudge" button. Best-effort:
+// returns { nudged:false, reason } (200) when there is no live zee to reach, so the UI can say so.
+router.post('/xells/:id/nudge', async (req, res) => {
+  try { res.json(await nudgeXellForStatus(req.params.id, { by: req.body?.by || 'human@console' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

@@ -256,6 +256,37 @@ function drawContainerBox(ctx, cx, cy, w, h, c) {
   ctx.fill();
 }
 
+// The CONTAINERS facet draws its three container icons at 75% of their natural size (operator ask:
+// smaller icons). Both the drawer AND the right-click hit-test read the geometry from ONE place so a
+// click lands exactly on the box that was painted.
+const CONTAINER_ICON_SCALE = 0.75;
+function containerBoxLayout(cx, cy, size) {
+  const boxW = size * 0.42 * CONTAINER_ICON_SCALE;
+  const boxH = size * 0.56 * CONTAINER_ICON_SCALE;
+  const gapx = size * 0.46;                       // spacing unchanged — only the boxes shrink
+  const y = cy + size * 0.08;
+  return { boxW, boxH, gapx, y, cxOf: (i) => cx + (i - 1) * gapx };
+}
+// World-space rects of the expanded flower's container icons (CONTAINERS petal = centers[3]), each
+// carrying its FULL stack container so a right-click can open the same ContainerMenu the inventory
+// uses. Present containers only — an absent slot is a dashed placeholder with nothing to act on.
+const STACK_ROLES = ['db', 'server', 'webapp'];
+function flowerContainerRects(centers, size, x) {
+  const c3 = centers[3];
+  if (!c3) return [];
+  const [cx, cy] = c3;
+  const { boxW, boxH, y, cxOf } = containerBoxLayout(cx, cy, size);
+  const stack = x.stack || [];
+  const out = [];
+  STACK_ROLES.forEach((role, i) => {
+    const c = stack.find((s) => s.role === role);
+    if (!c) return;
+    const px = cxOf(i);
+    out.push({ x: px - boxW / 2, y: y - boxH / 2, w: boxW, h: boxH, c });
+  });
+  return out;
+}
+
 // ── offset-grid helpers (odd rows shift right — matches layoutHoneycomb) ───────
 const cellKey = (row, col) => row + ',' + col;
 function cellCenter(row, col, size, originX, originY) {
@@ -280,11 +311,11 @@ function cellNeighbors(row, col) {
 const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
-                                    expandedId, onExpand, hexPosRef, onGeometry, onAction,
+                                    expandedId, onExpand, hexPosRef, onGeometry, onAction, onContainerMenu,
                                     hoverRef, setHover, subscribeHover }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
-  const geomRef = useRef({ hexes: [], flower: null, buttons: null });
+  const geomRef = useRef({ hexes: [], flower: null, buttons: null, containers: null });
   const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
   const dragRef = useRef(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -385,6 +416,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     }
     geomRef.current.flower = null;
     geomRef.current.buttons = null;
+    geomRef.current.containers = null;
     if (expanded && cells[expanded.id]) {
       const [er, ec] = cells[expanded.id];
       const centers = [cellCenter(er, ec, cellSize, originX, originY),
@@ -394,7 +426,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         openable: !!expanded.viewer_url && !expanded.is_production };
       // Per-xell ACTIONS drawn straight onto the flower (no DOM toolbar): a hit-tested button row
       // under the bloom. Their world-space rects are recorded so onPointerUp can dispatch onAction.
-      geomRef.current.buttons = drawFlowerButtons(ctx, centers, cellSize, expanded);
+      geomRef.current.buttons = drawFlowerButtons(ctx, centers, cellSize, expanded, diffs?.[expanded.id]);
+      // Container icons in the CONTAINERS petal are right-clickable — record their rects so a
+      // context-menu event can open the same ContainerMenu the inventory chips use.
+      geomRef.current.containers = flowerContainerRects(centers, cellSize, expanded);
     }
 
     // publish each hex's live CLIENT-space geometry so <Connectors> can route its wires here and
@@ -475,6 +510,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     for (const b of bs) if (wx >= b.x && wx <= b.x + b.w && wy >= b.y && wy <= b.y + b.h) return b;
     return null;
   }, []);
+  const hitContainer = useCallback((wx, wy) => {
+    const cs = geomRef.current.containers;
+    if (!cs) return null;
+    for (const r of cs) if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) return r.c;
+    return null;
+  }, []);
 
   const relPos = (e) => {
     const r = canvasRef.current.getBoundingClientRect();
@@ -505,7 +546,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (expandedId) {
       const b = hitButton(wx, wy);
       const f = hitFlower(wx, wy);
-      cursor = b || (f && f.cell === 0 && f.openable) ? 'pointer' : 'default';
+      cursor = b || (f && f.cell === 0 && f.openable) ? 'pointer'
+        : hitContainer(wx, wy) ? 'context-menu' : 'default';   // right-click hint on an icon
       emitHover({ id: null, commit: null });
     } else {
       const hx = hitHex(wx, wy);
@@ -560,6 +602,18 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     rafRef.current = requestAnimationFrame(draw);
   };
 
+  // Right-click a container icon in the expanded flower → open the SAME context menu the inventory
+  // chips use. Only a hit preventDefaults (swallowing the browser menu); a right-click on empty
+  // canvas is left alone.
+  const onContextMenu = (e) => {
+    if (!expandedId) return;
+    const [wx, wy] = toWorld(...relPos(e));
+    const c = hitContainer(wx, wy);
+    if (!c) return;
+    e.preventDefault();
+    onContainerMenu?.(e, c);
+  };
+
   const onLeave = () => { emitHover({ id: null, commit: null }); dragRef.current = null; };
 
   useEffect(() => {
@@ -586,7 +640,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       <canvas ref={canvasRef} className="hive-canvas"
               style={{ width: size.w, height: size.h, display: 'block', touchAction: 'none' }}
               onPointerDown={onPointerDown} onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp} onMouseLeave={onLeave} />
+              onPointerUp={onPointerUp} onMouseLeave={onLeave} onContextMenu={onContextMenu} />
       {(!xells || xells.length === 0) && (
         <p className="hive-empty">No active xells. The pool maintainer will fill it shortly…</p>
       )}
@@ -800,45 +854,69 @@ function drawPetalBtn(ctx, cx, cy, label, kind, accent, h, padX) {
   return { x: cx - w / 2, y: cy - h / 2, w, h, kind };
 }
 
+// Lay out a row of 1–2 buttons centred at (cx, cy), left→right. Each btn is {label, kind, accent}.
+// Returns their WORLD-space rects. (Extends the old bespoke pull/push side-by-side to any short row.)
+function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
+  const ws = btns.map((b) => ctx.measureText(b.label).width + padX * 2);
+  const total = ws.reduce((a, b) => a + b, 0) + gap * (btns.length - 1);
+  let x0 = cx - total / 2;
+  const rects = [];
+  btns.forEach((b, i) => {
+    rects.push(drawPetalBtn(ctx, x0 + ws[i] / 2, cy, b.label, b.kind, b.accent || accent, h, padX));
+    x0 += ws[i] + gap;
+  });
+  return rects;
+}
+
 // The flower's per-xell actions, drawn INSIDE the facet each verb belongs to and hit-tested in
-// onPointerUp (no DOM toolbar). Placement mirrors meaning: build in CONTAINERS(3), terminal in
-// SESSION(2), pull/push in COMMIT(5), PR in DIFF·AGE(6), mark-done in BRANCH(1). Buttons sit low in
-// their petal so the facet's own text still reads above them. Returns WORLD-space rects for hit-test.
-function drawFlowerButtons(ctx, centers, size, x) {
+// onPointerUp (no DOM toolbar). Placement mirrors meaning: build in CONTAINERS(3), terminal+nudge in
+// SESSION(2), pull(+land) in COMMIT(5), PR(+ship) in DIFF·AGE(6), mark-done in BRANCH(1). Land and
+// ship appear ONLY when the action is actually available (there is work to land / it is landed &
+// clean). Buttons sit low in their petal so the facet's own text still reads above them.
+function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];
   const buildable = (x.stack || []).some((c) => c.role === 'server' || c.role === 'webapp');
   const caged = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
   const showDone = ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status);
-  const R = COL.ready, D = COL.error;
+  const canLand = !!diff && diff.ahead > 0;                       // has committed work to push to main
+  const canShip = shipLine(x, diff) === 'ready';                  // landed, clean, not already in prod
+  const R = COL.ready, D = COL.error, G = COL.working, P = COL.prod;
   const h = Math.max(15, size * 0.28);
   const padX = size * 0.13;
   const yOff = size * 0.56;                 // low in the petal, below the facet's own text
+  const opts = { h, padX, gap: size * 0.06, accent: R };
   ctx.font = `600 ${Math.max(9, size * 0.145)}px 'Segoe UI', sans-serif`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   const rects = [];
   const at = (i) => centers[i];
+  const row = (i, btns) => { if (btns.length && at(i)) rects.push(...drawPetalRow(ctx, at(i)[0], at(i)[1] + yOff, btns, opts)); };
 
   // build → CONTAINERS petal
-  if (buildable && at(3)) rects.push(drawPetalBtn(ctx, at(3)[0], at(3)[1] + yOff, '🔨 build', 'build', R, h, padX));
-  // terminal → SESSION petal (only a caged zee has an SSH terminal)
-  if (caged && at(2)) rects.push(drawPetalBtn(ctx, at(2)[0], at(2)[1] + yOff, '⌨ terminal', 'terminal', R, h, padX));
-  // pull + push → COMMIT petal, side by side
-  if (at(5)) {
-    const [ccx, ccy] = at(5);
-    const lw = ctx.measureText('↓ pull').width + padX * 2;
-    const rw = ctx.measureText('↑ push').width + padX * 2;
-    const gap = size * 0.06;
-    const total = lw + gap + rw;
-    rects.push(drawPetalBtn(ctx, ccx - total / 2 + lw / 2, ccy + yOff, '↓ pull', 'pull', R, h, padX));
-    rects.push(drawPetalBtn(ctx, ccx + total / 2 - rw / 2, ccy + yOff, '↑ push', 'push', R, h, padX));
+  if (buildable) row(3, [{ label: '🔨 build', kind: 'build' }]);
+  // terminal + nudge → SESSION petal (both act on the live zee; only a caged zee is reachable)
+  {
+    const s = [];
+    if (caged) s.push({ label: '⌨ terminal', kind: 'terminal' });
+    if (caged) s.push({ label: '💬 nudge', kind: 'nudge', accent: G });
+    row(2, s);
   }
-  // PR → DIFF·AGE petal
-  if (at(6)) rects.push(drawPetalBtn(ctx, at(6)[0], at(6)[1] + yOff, 'PR', 'pr', R, h, padX));
+  // pull, and LAND when there is work to land → COMMIT petal
+  {
+    const s = [{ label: '↓ pull', kind: 'pull' }];
+    if (canLand) s.push({ label: '⬆ land', kind: 'land', accent: G });
+    row(5, s);
+  }
+  // PR, and SHIP when it is shippable → DIFF·AGE petal
+  {
+    const s = [{ label: 'PR', kind: 'pr' }];
+    if (canShip) s.push({ label: '🚀 ship', kind: 'ship', accent: P });
+    row(6, s);
+  }
   // mark-done → BRANCH petal (the teardown verb, kept away from the git actions)
-  if (showDone && at(1)) {
+  if (showDone) {
     const label = x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? '✓ mark done' : '✕ clean up');
-    rects.push(drawPetalBtn(ctx, at(1)[0], at(1)[1] + yOff, label, 'done', D, h, padX));
+    row(1, [{ label, kind: 'done', accent: D }]);
   }
   return rects;
 }
@@ -893,10 +971,9 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   // the same object the machine columns show below, just drawn small enough to fit the petal.
   if (facet.kind === 'stack') {
     const roles = facet.stack;
-    const boxW = size * 0.42, boxH = size * 0.56, gapx = size * 0.46;
-    const y = cy + size * 0.08;
+    const { boxW, boxH, y, cxOf } = containerBoxLayout(cx, cy, size);
     roles.forEach((rr, i) => {
-      const px = cx + (i - 1) * gapx;
+      const px = cxOf(i);
       if (rr.present) {
         drawContainerBox(ctx, px, y, boxW, boxH, rr);
       } else {
