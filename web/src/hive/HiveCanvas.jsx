@@ -119,6 +119,92 @@ function drawDiffRow(ctx, cx, y, parts) {
   ctx.textAlign = prevAlign;
 }
 
+// ── text that FILLS its hex ────────────────────────────────────────────────────
+// The honeycomb used to pin every label to a fixed fraction of the hex radius (`size * 0.15` …),
+// capped small — so a hex could be huge and its diffstat still a whisper. These three helpers size
+// text to the room it actually has instead: measure it, grow it to fill the width, and wrap it onto
+// a second line rather than shrink-to-truncate when a single line won't fit.
+
+// Interior half-width of a pointy-top hex `dy` above/below its centre. The full flat-width holds
+// within the middle band (|dy| ≤ size/2) then tapers straight to the top/bottom vertex — so a line
+// drawn off-centre knows the real room it has and text can fill right up to the slanted edges
+// without spilling past them.
+function hexHalfWidthAt(size, dy) {
+  const w = hexWidth(size) / 2;
+  const a = Math.abs(dy);
+  if (a <= size / 2) return w;
+  if (a >= size) return 0;
+  return (w * (size - a)) / (size / 2);
+}
+
+// Grow a font to FILL `maxW`: binary-search a pixel size in [minPx,maxPx] so `text` is as wide as it
+// can be without crossing maxW. `fontFn(px)` builds the CSS font string (weight/family are the
+// caller's). Leaves ctx.font set to the winner and returns the chosen px. This is the core of
+// "size text to fill the space" — text is measured and scaled up, not fixed to the hex radius.
+function fillFont(ctx, text, maxW, minPx, maxPx, fontFn) {
+  if (maxPx <= minPx) { ctx.font = fontFn(minPx); return minPx; }
+  let lo = minPx, hi = maxPx, best = minPx;
+  for (let i = 0; i < 16; i++) {
+    const mid = (lo + hi) / 2;
+    ctx.font = fontFn(mid);
+    if (ctx.measureText(text).width <= maxW) { best = mid; lo = mid; } else hi = mid;
+  }
+  ctx.font = fontFn(best);
+  return best;
+}
+
+// Break `text` into at most `maxLines` lines that each fit `maxW` at the CURRENT ctx.font, splitting
+// at word/slug joints (space / slash / underscore / hyphen) so a long branch like
+// `adjust-text-sizes-…` wraps at its dashes instead of being cut off. Only the overflowing final
+// line is ellipsised — wrap first, truncate as a last resort. One line is returned when it fits.
+function wrapText(ctx, text, maxW, maxLines = 2) {
+  text = String(text ?? '');
+  if (maxLines <= 1 || ctx.measureText(text).width <= maxW) return [fit(ctx, text, maxW)];
+  const toks = text.match(/[^\s/_-]+[\s/_-]*|[\s/_-]+/g) || [text];
+  const lines = [];
+  let cur = '';
+  for (let i = 0; i < toks.length; i++) {
+    const tk = toks[i];
+    if (cur && ctx.measureText(cur + tk).width > maxW) {
+      lines.push(fit(ctx, cur.trimEnd(), maxW));
+      cur = tk;
+      if (lines.length === maxLines - 1) { cur += toks.slice(i + 1).join(''); break; }
+    } else {
+      cur += tk;
+    }
+  }
+  lines.push(fit(ctx, cur.trimEnd(), maxW));
+  return lines;
+}
+
+// Draw a coloured diffstat (the git-convention +ins/−del run) sized to FILL its hex, wrapping onto a
+// second line when it can't fit one. `parts` is the [{t,c}] run; `split` is the index the row breaks
+// at (head above, tail below) when wrapping is allowed. Returns `{ y, width, wrapped }` describing the
+// first drawn line, so the caller can pin the "actively working" dot beside it.
+function drawDiffFilled(ctx, cx, cy, parts, { maxW, minPx, maxPx, weight = 600, split = null }) {
+  const fontFn = (px) => `${weight} ${px}px 'Cascadia Code', monospace`;
+  const full = parts.map((p) => p.t).join('');
+  ctx.font = fontFn(minPx);
+  const wrap = split != null && split > 0 && split < parts.length && ctx.measureText(full).width > maxW;
+  if (!wrap) {
+    fillFont(ctx, full, maxW, minPx, maxPx, fontFn);
+    drawDiffRow(ctx, cx, cy, parts);
+    return { y: cy, width: ctx.measureText(full).width, wrapped: false };
+  }
+  const head = parts.slice(0, split), tail = parts.slice(split);
+  const headTxt = head.map((p) => p.t).join(''), tailTxt = tail.map((p) => p.t).join('');
+  // both lines share one size (the smaller of the two fits) so the stat reads as one unit
+  const pxH = fillFont(ctx, headTxt, maxW, minPx, maxPx, fontFn);
+  const pxT = fillFont(ctx, tailTxt, maxW, minPx, maxPx, fontFn);
+  const px = Math.min(pxH, pxT);
+  const gap = px * 0.32;
+  const y1 = cy - (px + gap) / 2, y2 = cy + (px + gap) / 2;
+  ctx.font = fontFn(px);
+  drawDiffRow(ctx, cx, y1, head);
+  drawDiffRow(ctx, cx, y2, tail);
+  return { y: y1, width: ctx.measureText(headTxt).width, wrapped: true };
+}
+
 // A tiny role glyph, canvas-drawn to match the DOM chip's SVG icons (Container.jsx / styles.css) —
 // same silhouette (cylinder / rack bars / browser window), same low-opacity white stroke.
 function drawRoleIcon(ctx, role, cx, cy, s) {
@@ -596,11 +682,11 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     }
   }
 
-  // ── middle seam: identity ──
-  ctx.fillStyle = COL.text;
-  ctx.font = `600 ${Math.min(12, Math.max(8.5, size * 0.17))}px 'Segoe UI', sans-serif`;
+  // ── middle seam: identity ── grow a short slug to fill the card width (single line — it's the seam)
   const label = x.is_production ? '🛡 PRODUCTION' : shortSlug(x.slug);
-  ctx.fillText(fit(ctx, label, w * 0.8), cx, cy - (full ? size * 0.06 : size * 0.2));
+  fillFont(ctx, label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
+  ctx.fillStyle = COL.text;
+  ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * 0.06 : size * 0.2));
 
   // ── lower half ──
   // Live head (diff.head, read from the worktree) over the frozen head_commit provisioning base, so
@@ -617,17 +703,16 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     const own = diff?.own;
     if (own && !x.is_production) {
       const y = cy + size * 0.32;
-      ctx.font = `600 ${Math.max(9.5, size * 0.165)}px 'Cascadia Code', monospace`;
       const parts = [
         { t: `${own.files}f `, c: COL.muted },
         { t: `+${own.insertions}`, c: COL.add },
         { t: `/−${own.deletions}`, c: COL.del },
       ];
-      drawDiffRow(ctx, cx, y, parts);
+      // fill the card width (capped so it clears the sha above and the status pill below)
+      const row = drawDiffFilled(ctx, cx, y, parts, { maxW: w * 0.82, minPx: 9, maxPx: size * 0.2 });
       // yellow blinking "actively working" dot, just left of the diff row
       if (isBusyZee(x)) {
-        const dw = parts.reduce((a, p) => a + ctx.measureText(p.t).width, 0);
-        drawBusyDot(ctx, cx - dw / 2 - size * 0.11, y, Math.max(2.4, size * 0.055));
+        drawBusyDot(ctx, cx - row.width / 2 - size * 0.11, y, Math.max(2.4, size * 0.055));
       }
     }
     // status pill
@@ -784,12 +869,19 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   ctx.textAlign = 'center';
   if (isCenter) {
     ctx.textBaseline = 'middle';
+    const titleMaxW = hexHalfWidthAt(size, 0) * 2 * 0.86;
+    // grow a short slug to fill the bloom; a long one drops to min and wraps onto a second line
+    const px = fillFont(ctx, facet.lines[0], titleMaxW, 11, Math.min(22, size * 0.26),
+      (p) => `700 ${p}px 'Segoe UI', sans-serif`);
+    const lines = wrapText(ctx, facet.lines[0], titleMaxW, 2);
+    const lh = px * 1.06;
+    const y0 = cy - size * 0.08 - ((lines.length - 1) * lh) / 2;
     ctx.fillStyle = COL.text;
-    ctx.font = `700 ${Math.min(15, size * 0.2)}px 'Segoe UI', sans-serif`;
-    ctx.fillText(fit(ctx, facet.lines[0], size * 1.5), cx, cy - size * 0.12);
+    lines.forEach((ln, i) => ctx.fillText(ln, cx, y0 + i * lh));
     ctx.fillStyle = withAlpha(col, 0.95);
-    ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
-    ctx.fillText(fit(ctx, facet.lines[1], size * 1.5), cx, cy + size * 0.2);
+    fillFont(ctx, facet.lines[1], titleMaxW, 9, Math.min(14, size * 0.17),
+      (p) => `${p}px 'Segoe UI', sans-serif`);
+    ctx.fillText(facet.lines[1], cx, cy + size * 0.32 + ((lines.length - 1) * lh) / 2);
     return;
   }
   ctx.textBaseline = 'top';
@@ -823,16 +915,20 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   if (facet.kind === 'commitdiff') {
     ctx.textBaseline = 'middle';
     ctx.fillStyle = COL.text;
-    ctx.font = `600 ${Math.min(12, size * 0.16)}px 'Cascadia Code', monospace`;
-    ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy - size * 0.16);
+    // sha grows to fill the petal width (this facet is crowded with the burn line + pull/push
+    // buttons below, so it stays single-line — width-fill only, no wrap).
+    const shaW = hexHalfWidthAt(size, size * 0.16) * 2 * 0.9;
+    fillFont(ctx, facet.lines[0] || '—', shaW, 9, size * 0.22,
+      (px) => `600 ${px}px 'Cascadia Code', monospace`);
+    ctx.fillText(facet.lines[0] || '—', cx, cy - size * 0.16);
     const d = facet.diff;
     if (d) {
-      ctx.font = `600 ${Math.min(11.5, size * 0.15)}px 'Cascadia Code', monospace`;
-      drawDiffRow(ctx, cx, cy + size * 0.08, [
+      const dW = hexHalfWidthAt(size, size * 0.08) * 2 * 0.9;
+      drawDiffFilled(ctx, cx, cy + size * 0.08, [
         { t: `↑${d.ahead} ↓${d.behind} · ${d.files}f `, c: COL.muted },
         { t: `+${d.insertions}`, c: COL.add },
         { t: `/−${d.deletions}`, c: COL.del },
-      ]);
+      ], { maxW: dW, minPx: 9, maxPx: size * 0.2 });
     } else {
       ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
       ctx.fillStyle = COL.muted;
@@ -854,42 +950,47 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   }
 
   // DIFF · AGE facet: own (uncommitted-since-checkpoint) diff, git-coloured, then the xell's age.
+  // This is the "make the diffs easily visible" facet — the stat is grown to fill the petal width
+  // (well past the old 13px cap) and wraps its +ins/−del onto a second line when it runs long.
   if (facet.kind === 'owndiff') {
     ctx.textBaseline = 'middle';
     const own = facet.diff?.own;
     if (own) {
-      ctx.font = `600 ${Math.min(13, size * 0.175)}px 'Cascadia Code', monospace`;
       const parts = [
         { t: '◈ ', c: withAlpha(col, 0.95) },
         { t: `${own.files}f `, c: COL.muted },
         { t: `+${own.insertions}`, c: COL.add },
         { t: `/−${own.deletions}`, c: COL.del },
       ];
-      drawDiffRow(ctx, cx, cy - size * 0.02, parts);
-      // yellow blinking "actively working" dot, just left of the diff row
+      const maxW = hexHalfWidthAt(size, size * 0.05) * 2 * 0.9;
+      const row = drawDiffFilled(ctx, cx, cy - size * 0.04, parts,
+        { maxW, minPx: 9, maxPx: size * 0.34, split: 2 });
+      // yellow blinking "actively working" dot, just left of the (first) diff row
       if (isBusyZee(x)) {
-        const dw = parts.reduce((a, p) => a + ctx.measureText(p.t).width, 0);
-        drawBusyDot(ctx, cx - dw / 2 - size * 0.14, cy - size * 0.02, Math.max(3, size * 0.06));
+        drawBusyDot(ctx, cx - row.width / 2 - size * 0.14, row.y, Math.max(3, size * 0.06));
       }
     } else {
-      ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
+      fillFont(ctx, '◈ —', hexHalfWidthAt(size, 0) * 2 * 0.9, 9, size * 0.3,
+        (px) => `${px}px 'Segoe UI', sans-serif`);
       ctx.fillStyle = COL.text;
-      ctx.fillText('◈ —', cx, cy - size * 0.02);
+      ctx.fillText('◈ —', cx, cy - size * 0.04);
     }
     if (facet.age) {
       ctx.fillStyle = COL.muted;
       ctx.font = `${Math.min(9.5, size * 0.13)}px 'Segoe UI', sans-serif`;
-      ctx.fillText(`age ${facet.age}`, cx, cy + size * 0.3);
+      ctx.fillText(`age ${facet.age}`, cx, cy + size * 0.36);
     }
     return;
   }
 
   ctx.textBaseline = 'middle';
-  ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
+  const bodyMaxW = hexHalfWidthAt(size, size * 0.1) * 2 * 0.9;
   // MACHINE facet gets the cage lock prefixed to the machine name (tinted), like the compact hex.
   const lock = facet.title === 'machine' ? cageLock(x) : null;
+  let subShift = 0;                                   // pushed down when the body wraps to two lines
   if (lock) {
-    const name = fit(ctx, facet.lines[0] || '—', size * 1.25);
+    ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
+    const name = fit(ctx, facet.lines[0] || '—', bodyMaxW - ctx.measureText(lock.g + ' ').width);
     const pre = lock.g + ' ';
     const preW = ctx.measureText(pre).width;
     const txtW = ctx.measureText(name).width;
@@ -899,12 +1000,20 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     ctx.fillStyle = COL.text; ctx.fillText(name, x0 + preW, cy);
     ctx.textAlign = prev;
   } else {
+    // grow to fill; wrap a long branch/session (its dashes/slashes are the break points) rather than
+    // clip it, so the whole ref stays readable.
     ctx.fillStyle = COL.text;
-    ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy);
+    const px = fillFont(ctx, facet.lines[0] || '—', bodyMaxW, 9, size * 0.19,
+      (p) => `${p}px 'Segoe UI', sans-serif`);
+    const lines = wrapText(ctx, facet.lines[0] || '—', bodyMaxW, 2);
+    const lh = px * 1.08;
+    const y0 = cy - ((lines.length - 1) * lh) / 2;
+    lines.forEach((ln, i) => ctx.fillText(ln, cx, y0 + i * lh));
+    if (lines.length > 1) subShift = lh * 0.6;
   }
   if (facet.lines[1]) {
     ctx.fillStyle = COL.muted;
     ctx.font = `${Math.min(9.5, size * 0.13)}px 'Segoe UI', sans-serif`;
-    ctx.fillText(fit(ctx, facet.lines[1], size * 1.45), cx, cy + size * 0.28);
+    ctx.fillText(fit(ctx, facet.lines[1], bodyMaxW), cx, cy + size * 0.28 + subShift);
   }
 }
