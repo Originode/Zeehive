@@ -112,7 +112,7 @@ export async function selfLand(xell) {
   if (push.error) return { ok: false, status: 'error', stage: 'push', error: push.error, collected, catch_up: caughtUp };
 
   // 4) REPORT THE REAL OUTCOME.
-  const caughtNote = (caughtUp.state === 'rebased' || caughtUp.state === 'fast-forwarded')
+  const caughtNote = (caughtUp.state === 'merged' || caughtUp.state === 'rebased' || caughtUp.state === 'fast-forwarded')
     ? ` (after catching up to ${caughtUp.ref} — ${caughtUp.state})` : '';
 
   if (push.landed) {
