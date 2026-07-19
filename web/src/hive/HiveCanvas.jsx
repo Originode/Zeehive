@@ -532,7 +532,9 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   ctx.fillText(fit(ctx, label, w * 0.8), cx, cy - (full ? size * 0.06 : size * 0.2));
 
   // ── lower half ──
-  const sha = (x.is_production ? x.deployed_commit : x.head_commit)?.slice(0, 8);
+  // Live head (diff.head, read from the worktree) over the frozen head_commit provisioning base, so
+  // a xell that has committed/rebased/landed shows where it actually is, not its old fork sha.
+  const sha = (x.is_production ? x.deployed_commit : (diff?.head || x.head_commit))?.slice(0, 8);
   if (full) {
     if (sha) {
       ctx.font = `600 ${Math.max(8.5, size * 0.155)}px 'Cascadia Code', monospace`;
@@ -625,7 +627,7 @@ function flowerFacets(x, diff, machines) {
     { title: 'containers', kind: 'stack', stack: cont },
     { title: 'machine', lines: [machineOf(x, machines) || '—', x.runtime_label || ''] },
     { title: 'commit', kind: 'commitdiff',
-      lines: [(x.is_production ? x.deployed_commit : x.head_commit)?.slice(0, 8) || '—'], diff },
+      lines: [(x.is_production ? x.deployed_commit : (diff?.head || x.head_commit))?.slice(0, 8) || '—'], diff },
     { title: 'diff · age', kind: 'owndiff', diff, age: ageText(x.created_at) },
   ];
 }

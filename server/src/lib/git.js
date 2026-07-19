@@ -64,13 +64,18 @@ export function worktreeBound(worktree, branch) {
 // ASYNC (see gitAsync): every caller loops over xells, and the four git calls per xell must
 // not block the event loop. They run concurrently — independent read-only queries.
 export async function worktreeDiff(worktree, ref = 'main') {
-  const [rl, ss, st, own] = await Promise.all([
+  const [rl, ss, st, own, hd] = await Promise.all([
     gitAsync(worktree, ['rev-list', '--left-right', '--count', `${ref}...HEAD`]),
     gitAsync(worktree, ['diff', '--shortstat', ref]),
     gitAsync(worktree, ['status', '--porcelain']),
     // Uncommitted work: tracked changes vs its own last checkpoint. (`git diff HEAD` covers
     // staged + unstaged but NOT untracked files — those only show in `dirty`, which counts them.)
     gitAsync(worktree, ['diff', '--shortstat', 'HEAD']),
+    // The LIVE head of the branch — what the zee is actually sitting on right now. The card's sha
+    // used to render the stored head_commit (the PROVISIONING base, frozen at cage-cut), so a xell
+    // that had committed/rebased/landed still showed its old fork sha and looked "behind" the tip
+    // it was level with. Read it here, next to the diff, so the card can show where it truly is.
+    gitAsync(worktree, ['rev-parse', 'HEAD']),
   ]);
   let ahead = 0, behind = 0;
   if (rl.status === 0) { const [b, a] = rl.out.trim().split(/\s+/).map(Number); behind = b || 0; ahead = a || 0; }
@@ -90,10 +95,19 @@ export async function worktreeDiff(worktree, ref = 'main') {
     odel = +(own.out.match(/(\d+) deletions?/)?.[1] || 0);
   }
 
+  const head = hd.status === 0 ? hd.out.trim() : null;
+
   return {
-    ahead, behind, files, insertions: ins, deletions: del, dirty,
+    ahead, behind, files, insertions: ins, deletions: del, dirty, head,
     own: { files: ofiles, insertions: oins, deletions: odel },
   };
+}
+
+// The live HEAD of a worktree — a one-shot for callers (getTimeline's anchor) that need where a
+// xell actually sits without the full diff. Null if the worktree is gone or git can't read it.
+export function worktreeHead(worktree) {
+  const r = git(worktree, ['rev-parse', 'HEAD']);
+  return r.status === 0 ? r.out.trim() : null;
 }
 
 // The heads behind each xell's "remote source" — the ref it tracks, plus where that ref actually

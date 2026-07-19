@@ -2,7 +2,7 @@
 // anchor commit (its worktree base) so the frontend can draw a connector to the card.
 import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
-import { gitLog, diffStat, worktreeDiff } from './git.js';
+import { gitLog, diffStat, worktreeDiff, worktreeHead } from './git.js';
 import { defaultProject } from './fleet.js';
 
 // Per-xell divergence vs its tracked xource (ahead/behind + shortstat).
@@ -62,11 +62,17 @@ export async function getTimeline(projectId, n = 30) {
        ORDER BY created_at`, [project.id]);
 
   const anchored = xells.map((x, i) => {
-    // anchor to the xell's base commit if it's in the window, else the tip (commits[0])
-    const base = x.head_commit && known.has(x.head_commit) ? x.head_commit : commits[0]?.hash;
+    // Anchor to where the xell ACTUALLY sits now — its live worktree HEAD — not the frozen
+    // head_commit (the provisioning base). Once its work lands, HEAD is a real commit on the branch
+    // (in `known`), so the connector snaps to the tip instead of dangling at the old fork point and
+    // making a level xell look "behind". Fall back to the stored base, then the tip.
+    const live = x.worktree_path && existsSync(x.worktree_path) ? worktreeHead(x.worktree_path) : null;
+    const base = live && known.has(live) ? live
+      : x.head_commit && known.has(x.head_commit) ? x.head_commit
+      : commits[0]?.hash;
     return {
       id: x.id, slug: x.slug, branch: x.branch, status: x.status,
-      worktree_path: x.worktree_path, base_commit: base, color: COLORS[i % COLORS.length],
+      worktree_path: x.worktree_path, base_commit: base, head: live, color: COLORS[i % COLORS.length],
     };
   });
 
