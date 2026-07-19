@@ -54,6 +54,31 @@ const dirtyCount = (wt) => {
   return r.ok ? r.out.split('\n').filter(Boolean).length : 0;
 };
 
+// ── CATCH UP: rebase the xell's branch onto its xource tip so a push fast-forwards ───────────
+// A caged zee's work is based on whatever master was when its cage was cut; master keeps moving
+// while the zee works, so by land time the branch is DIVERGED and `git push . HEAD:main` is a
+// non-fast-forward — the gate raises NO landing, yet the old code reported "held" (the exact bug
+// behind "zee land said held but nothing appeared"). Rebase (linear — the zee's commit stays on
+// top). A conflict is a real "needs resolution", never a fabricated merge; we abort so the tree
+// is left clean rather than mid-rebase.
+export async function catchUpToXource(xellId) {
+  const x = await one(
+    `SELECT x.worktree_path, x.slug, p.main_branch FROM xell x JOIN project p ON p.id=x.project_id WHERE x.id=$1`,
+    [xellId]);
+  if (!x?.worktree_path) throw new Error('xell has no worktree');
+  const ref = x.main_branch || 'main';
+  const behind = git(x.worktree_path, ['rev-list', '--count', `HEAD..${ref}`]);
+  if (behind.ok && behind.out.trim() === '0') return { caughtUp: true, rebased: false, ref };
+  if (dirtyCount(x.worktree_path) > 0) return { caughtUp: false, ref, error: 'worktree has uncommitted changes — commit or discard them first' };
+  const r = git(x.worktree_path, ['rebase', ref]);
+  if (!r.ok) {
+    git(x.worktree_path, ['rebase', '--abort']);
+    return { caughtUp: false, conflict: true, ref, error: `${r.out}\n${r.err}`.trim().slice(-500) };
+  }
+  logline('landgate', `${x.slug}: caught up onto ${ref} (rebased) before landing`);
+  return { caughtUp: true, rebased: true, ref };
+}
+
 // ── PUSH: the xell's commits → its xource ────────────────────────────────────
 // Deliberately NOT special: this runs the same `git push . HEAD:<ref>` a zee runs, so it hits the
 // same update hook and gets held the same way. A human clicking it is not an override — it is the

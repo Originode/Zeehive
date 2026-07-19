@@ -14,7 +14,7 @@ import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { collectCageDiffToWorktree, sealCage, cageName } from '../lib/cage.js';
-import { pushToXource } from './xellgit.js';
+import { pushToXource, catchUpToXource } from './xellgit.js';
 import { landStatus } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { proposeDone } from './tasks.js';
@@ -83,20 +83,36 @@ export async function selfLand(xell) {
     logline('self', `${xell.slug} land: cage collection skipped (${e.message})`);
   }
 
+  // CATCH UP to the xource tip before pushing — the fix for diverged caged work (see xellgit.js).
+  const caught = await catchUpToXource(xell.id).catch((e) => ({ error: e.message }));
+  if (caught?.error && !caught.conflict) return { ok: false, stage: 'catch-up', error: caught.error, collected };
+  if (caught?.conflict) {
+    logline('self', `${xell.slug} land: catch-up CONFLICT on ${caught.ref} — needs resolution`);
+    return {
+      ok: false, stage: 'catch-up', needs_resolution: true, collected,
+      message: `Your work CONFLICTS with changes already on ${caught.ref}. Nothing was pushed. Pull the `
+        + `latest ${caught.ref} into your branch, resolve the conflicts in /work/repo, commit, then re-run `
+        + '`zee land`.',
+      detail: caught.error,
+    };
+  }
+
   const push = await pushToXource(xell.id, `zee@${xell.slug}`).catch((e) => ({ error: e.message }));
   if (push.error) return { ok: false, stage: 'push', error: push.error, collected };
 
+  // HONEST status: only say "held" when a real land_request is actually pending in the console.
   const request = await landStatus(xell.id);
+  const heldPending = !push.landed && request && request.status === 'pending';
   return {
-    ok: true,
-    collected,
-    landed: !!push.landed,
+    ok: true, collected, caught_up: !!caught?.rebased, landed: !!push.landed,
     request: request || null,
+    status: push.landed ? 'landed' : heldPending ? 'held' : 'unknown',
     message: push.landed
-      ? `LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha.`
-      : 'Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console. '
-        + 'Your commits are safe on your branch; nothing lands until a human agrees. Re-run `zee land` '
-        + 'after approval (or poll `zee status`).',
+      ? `LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)}.`
+      : heldPending
+        ? `Landing REQUESTED and HELD at the gate — it is now IN THE ZEEHIVE CONSOLE for a human to approve `
+          + `(commit ${String(request.new_sha || '').slice(0, 8)}). The queenzee will nudge you when it lands.`
+        : `Push raised NO landing (${(push.output || '').slice(-160)}) — should not happen after catch-up; flag it.`,
   };
 }
 
