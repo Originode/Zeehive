@@ -709,7 +709,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
         { t: `/−${own.deletions}`, c: COL.del },
       ];
       // fill the card width (capped so it clears the sha above and the status pill below)
-      const row = drawDiffFilled(ctx, cx, y, parts, { maxW: w * 0.82, minPx: 9, maxPx: size * 0.2 });
+      const row = drawDiffFilled(ctx, cx, y, parts, { maxW: w * 0.82, minPx: 9, maxPx: size * 0.17 });
       // yellow blinking "actively working" dot, just left of the diff row
       if (isBusyZee(x)) {
         drawBusyDot(ctx, cx - row.width / 2 - size * 0.11, y, Math.max(2.4, size * 0.055));
