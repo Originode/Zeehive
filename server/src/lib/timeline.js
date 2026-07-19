@@ -53,13 +53,26 @@ export async function getDiffs(projectId) {
 
 // stable, distinct connector colors per xell
 const COLORS = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff', '#e5554e', '#3bc6c0'];
+// production's gold — matches its hexagon (COL.prod in HiveCanvas) so its ring + wire read as prod.
+const PROD_COLOR = '#f2c14e';
 
-export async function getTimeline(projectId, n = 30) {
+export async function getTimeline(projectId, n = 250) {
   const project = projectId ? await one(`SELECT * FROM project WHERE id=$1`, [projectId]) : await defaultProject();
   if (!project) return null;
   const branch = project.main_branch || 'main';
-  const commits = gitLog(project.repo_root, branch, n);
-  const known = new Set(commits.map((c) => c.hash));
+  // Fetch a deep window, then TRIM it back to the oldest xell fork point below. n is a safety cap,
+  // not the display length: the graph only ever shows down to where the oldest live branch left the
+  // trunk, so cutting the fetch short (the old n=30) would sometimes stop ABOVE that fork and strand
+  // a branch with nowhere to anchor.
+  const allCommits = gitLog(project.repo_root, branch, n);
+  const known = new Set(allCommits.map((c) => c.hash));
+  const rowOf = new Map(allCommits.map((c, i) => [c.hash, i]));
+
+  // The commit production is serving — the last successful ship — so prod can be anchored to it
+  // below. NULL until a ship lands (prod's pre-gate deploys were by hand and unrecorded).
+  const shipped = await one(
+    `SELECT commit FROM ship_request WHERE project_id=$1 AND status='shipped'
+       ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [project.id]);
 
   const xells = await q(
     `SELECT id, slug, branch, head_commit, status, worktree_path
@@ -74,12 +87,45 @@ export async function getTimeline(projectId, n = 30) {
     const live = x.worktree_path && existsSync(x.worktree_path) ? worktreeHead(x.worktree_path) : null;
     const base = live && known.has(live) ? live
       : x.head_commit && known.has(x.head_commit) ? x.head_commit
-      : commits[0]?.hash;
+      : allCommits[0]?.hash;
     return {
       id: x.id, slug: x.slug, branch: x.branch, status: x.status,
       worktree_path: x.worktree_path, base_commit: base, head: live, color: COLORS[i % COLORS.length],
     };
   });
 
-  return { branch, repo_root: project.repo_root, commits, xells: anchored };
+  // Production is a xell too, and the graph SCROLLS to keep its dot across from the prod hexagon —
+  // but it can only do that if prod has a dot, so it must be in this list. It is anchored to the
+  // commit it is actually SERVING (the last shipped commit); prod's gold matches its hexagon so the
+  // ring + connector read as production. Excluded before, which is exactly why the graph never
+  // tracked it. (getTimeline's other query filters prod out, so it is added explicitly here.)
+  const prodRow = await one(
+    `SELECT id, slug, branch, head_commit, status, worktree_path
+       FROM xell WHERE project_id=$1 AND is_production AND status<>'retired' LIMIT 1`, [project.id]);
+  let prod = null;
+  if (prodRow) {
+    const pbase = shipped?.commit && known.has(shipped.commit) ? shipped.commit
+      : prodRow.head_commit && known.has(prodRow.head_commit) ? prodRow.head_commit
+      : allCommits[0]?.hash;
+    prod = {
+      id: prodRow.id, slug: prodRow.slug, branch: prodRow.branch, status: prodRow.status,
+      is_production: true, worktree_path: prodRow.worktree_path, base_commit: pbase,
+      head: shipped?.commit || null, color: PROD_COLOR,
+    };
+  }
+
+  const anchors = prod ? [...anchored, prod] : anchored;
+
+  // TRIM to the oldest xell branch: the graph shows the trunk down to the DEEPEST fork point among
+  // all live branches (prod included), and no further. Everything below that is history no live
+  // branch touches, so it is just noise pushing the interesting rows off the top. Keep one commit of
+  // padding past the fork so the oldest branch's dot isn't flush against the bottom edge.
+  let cut = 0;
+  for (const a of anchors) { const r = rowOf.get(a.base_commit); if (r != null && r > cut) cut = r; }
+  // A small floor so a project whose branches all fork near the tip still draws a usable spine
+  // instead of two lonely rows; the deepest fork wins whenever it is deeper than the floor.
+  const depth = Math.max(cut + 2, Math.min(allCommits.length, 12));
+  const commits = allCommits.slice(0, Math.min(allCommits.length, depth));
+
+  return { branch, repo_root: project.repo_root, commits, xells: anchors };
 }
