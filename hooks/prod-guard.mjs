@@ -108,6 +108,50 @@ function readOnlyPsql(cmd) {
   return true;
 }
 
+// ── does this psql invocation make a SCHEMA CHANGE (DDL)? ───────────────────────────────────────
+//
+// Prod DB access (the dispatch "Production DB access" toggle → db-shared-prod) is DATA-ONLY by
+// promise: a human turns it on for manual data processing — reads and writes — and is told, in a
+// very obvious warning, that SCHEMA CHANGES ARE HARD-BLOCKED. Schema on prod moves one way only:
+// a migration file, landed on main, shipped by the queenzee. Never a live psql `ALTER`/`DROP`.
+//
+// This is the enforcement of that promise. Same discipline as readOnlyPsql: we only see a COMMAND
+// STRING, so the verdict is decided from text, and it is CONSERVATIVE — a write we cannot fully
+// see is treated as possibly-DDL and refused, because a false "no schema change" puts a DROP on
+// production. Returns:
+//   'ddl'    — a visible statement changes the schema           → HARD BLOCK
+//   'ok'     — every statement is visible and contains no DDL   → allow (data read/write)
+//   'opaque' — the SQL is not visible (-f / pipe / heredoc / sh -c / no -c) → cannot prove DDL-free
+// A command that is not psql at all (docker cp, pg_dump) returns 'ok' — it is not this check's job.
+const DDL = /\b(create|alter|drop|truncate|reindex|cluster|reassign|(?:comment\s+on)|grant|revoke|(?:security\s+label)|(?:import\s+foreign\s+schema))\b/i;
+function schemaVerdict(cmd) {
+  if (!/\bpsql\b/i.test(cmd)) return 'ok';               // not psql — not a schema-change vector here
+  if (/\b(sh|bash|zsh)\s+-c\b/i.test(cmd)) return 'opaque'; // the -c we'd read belongs to the shell
+  if (/\s(-f|--file)\b/i.test(cmd)) return 'opaque';     // SQL is in a file we cannot inspect
+  if (/<|\|/.test(cmd)) return 'opaque';                 // stdin redirect / heredoc / pipe
+  const stmts = [...cmd.matchAll(/-c\s+(['"])([\s\S]*?)\1/g)].map((m) => m[2]);
+  if (!stmts.length) return 'opaque';                    // interactive shell — statements never seen
+  for (const sql of stmts) if (DDL.test(sql)) return 'ddl';
+  return 'ok';
+}
+
+const SCHEMA_DENIED = [
+  'DENIED by the ZEEHIVE prod guard: SCHEMA CHANGES on the production database are hard-blocked.',
+  '',
+  'Your xell was given the prod database for DATA work — reading and writing rows. It was NOT',
+  'given permission to change the SCHEMA. CREATE / ALTER / DROP / TRUNCATE / GRANT / REINDEX and',
+  'other DDL are refused here, on purpose: a live schema edit on prod is a band-aid the next',
+  'rebuild from main silently reverts, and it is irreversible in the moment.',
+  '',
+  'THE WAY IN for a schema change:',
+  '  1. write it as a migration file under server/sql/migrations/ on your branch,',
+  '  2. land it on main (a human approves the push),',
+  '  3. it ships to prod through the queenzee with the next deploy.',
+  '',
+  'Reads and row writes (SELECT / INSERT / UPDATE / DELETE) against your assigned prod db are',
+  'still allowed — just put the SQL directly in `psql -c "…"` so this guard can see it.',
+].join('\n');
+
 let raw = '';
 process.stdin.on('data', (c) => (raw += c));
 process.stdin.on('end', () => {
@@ -151,8 +195,19 @@ process.stdin.on('end', () => {
   if (dbVerb) {
     const answer = ask(`${API}/api/xell/db-access?cwd=${encodeURIComponent(cwd)}`);
     if (answer && answer.allowed && answer.db_container && cmd.includes(answer.db_container)) {
-      // Its own database, in a xell a human pointed at prod. Let it work.
-      process.exit(0);
+      // Its own database, in a xell a human pointed at prod (the "Production DB access" toggle).
+      // DATA work is allowed — but SCHEMA CHANGES are hard-blocked. Prod access is read+write on
+      // rows only; DDL goes through a migration + ship, never a live edit. A write we cannot see
+      // (a -f file, a piped/heredoc statement) could carry DDL, so it is refused as conservatively
+      // as a visible DROP: put the SQL in -c and the guard can prove it is data-only.
+      const verdict = schemaVerdict(cmd);
+      if (verdict === 'ddl') deny(SCHEMA_DENIED);
+      if (verdict === 'opaque') deny(
+        SCHEMA_DENIED + '\n\n'
+        + 'This command was refused because the SQL was NOT VISIBLE to the guard (it was behind -f, a '
+        + 'pipe, a stdin redirect, or `sh -c`) — so it could not be proven free of schema changes. '
+        + 'Inline the statement(s) in `psql -c "…"` and re-run.');
+      process.exit(0);  // visible, DDL-free — legitimate prod DATA work
     }
 
     // ── READS ARE NOT GATED ───────────────────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
   const [mode, setMode] = useState(5);            // default 5 = bypass (fully unattended)
   const [model, setModel] = useState('opus');     // overwritten by the server's default once loaded
   const [headless, setHeadless] = useState(true); // default headless (fire-and-forget)
+  const [prodDb, setProdDb] = useState(false);    // OFF by default — LIVE production data, opt-in only
   const [images, setImages] = useState([]);       // [{ id, name, data(dataURL), size }]
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -81,6 +82,10 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
         mode,
         model,
         headless,
+        // OPT-IN prod DATA access. The value is the full db_coupling ('db-shared-prod'), which the
+        // dispatch hands to attachXellDb → the prod db container becomes THIS xell's assigned
+        // database. Reads and writes are allowed; the prod guard HARD-BLOCKS schema changes (DDL).
+        ...(prodDb ? { db: 'db-shared-prod' } : {}),
         images: images.map(({ name, data }) => ({ name, data })),
       });
       onDispatched?.(r);   // parent refreshes + closes
@@ -166,7 +171,34 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
                         onClick={() => setHeadless(false)}>attended</button>
               </div>
             </div>
+
+            <div className="disp-field">
+              <label className="disp-label">Production DB access</label>
+              <div className="disp-sup" role="group" aria-label="Production database access">
+                <button className={`disp-seg ${!prodDb ? 'on' : ''}`} data-testid="dispatch-proddb-off"
+                        title="The xell uses its normal (dev) database — the safe default."
+                        onClick={() => setProdDb(false)}>off</button>
+                <button className={`disp-seg disp-seg-danger ${prodDb ? 'on' : ''}`} data-testid="dispatch-proddb-on"
+                        title="Point this xell at the LIVE PRODUCTION database — real, irreversible writes. Schema changes are hard-blocked."
+                        onClick={() => setProdDb(true)}>⚠ LIVE PROD</button>
+              </div>
+              <div className="disp-hint">For manual data processing on prod. Read + write only — schema changes (DDL) are hard-blocked.</div>
+            </div>
           </div>
+
+          {prodDb && (
+            <div className="disp-warn" data-testid="dispatch-proddb-warning" role="alert">
+              <div className="disp-warn-title">⚠ LIVE PRODUCTION DATABASE</div>
+              <div className="disp-warn-body">
+                This zee will be pointed at the <b>real production database</b>. Every <b>INSERT / UPDATE / DELETE</b> it
+                runs is <b>immediate and irreversible</b> — there is no undo. Only use this for deliberate, manual data
+                processing that a human is watching.
+                <br />
+                <b>Schema changes are hard-blocked:</b> CREATE / ALTER / DROP / TRUNCATE and any other DDL are refused by
+                the prod guard — those must go through a migration and a ship, never a live edit.
+              </div>
+            </div>
+          )}
 
           {err && <div className="disp-err" data-testid="dispatch-error">{err}</div>}
         </div>

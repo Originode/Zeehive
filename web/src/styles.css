@@ -849,6 +849,23 @@ a.cbox:hover { border-color: var(--accent); }
 .disp-err { background: rgba(229,85,78,.12); border: 1px solid var(--down); color: #ffb4a2;
   border-radius: 8px; padding: 8px 11px; font-size: 12px; white-space: pre-wrap; }
 
+/* ── prod-db access: an opt-in that must LOOK dangerous ─────────────────────────── */
+.disp-seg-danger { border-color: rgba(229,85,78,.5); }
+.disp-seg-danger:hover { border-color: var(--down); }
+.disp-seg-danger.on { border-color: var(--down); color: #ffd7d2;
+  background: rgba(229,85,78,.22); font-weight: 700; }
+.disp-warn { background: rgba(229,85,78,.14); border: 1px solid var(--down);
+  border-left: 4px solid var(--down); border-radius: 8px; padding: 10px 13px;
+  animation: disp-warn-pulse 1.4s ease-in-out infinite; }
+.disp-warn-title { color: #ff8f86; font-weight: 800; font-size: 13px; letter-spacing: .03em;
+  margin-bottom: 5px; }
+.disp-warn-body { color: #ffcfc9; font-size: 12px; line-height: 1.5; }
+.disp-warn-body b { color: #ffece9; }
+@keyframes disp-warn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(229,85,78,.0); }
+  50% { box-shadow: 0 0 0 3px rgba(229,85,78,.22); }
+}
+
 .disp-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 12px 16px;
   border-top: 1px solid var(--line); background: var(--panel2); }
 .disp-cancel { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);

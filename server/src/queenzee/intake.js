@@ -421,8 +421,13 @@ async function bindingFor(xellId, zee, task) {
       ...(xell.db_coupling === 'db-shared-prod'
         ? ['⚠ YOUR DATABASE IS LIVE PRODUCTION (db_coupling=db-shared-prod). Every write is real and '
          + 'irreversible — there is no undo and no snapshot between you and an outage. Read freely; '
-         + 'before ANY write or migration, state exactly what it will change and get a human to agree. '
-         + 'Never run a destructive statement to "test" something.']
+         + 'before ANY write, state exactly what it will change and get a human to agree. '
+         + 'Never run a destructive statement to "test" something.',
+           '⚠ SCHEMA CHANGES ARE HARD-BLOCKED on your prod database — this access is DATA-ONLY '
+         + '(SELECT/INSERT/UPDATE/DELETE). The prod guard REFUSES any DDL (CREATE/ALTER/DROP/TRUNCATE/'
+         + 'GRANT/REINDEX …) against prod, and refuses any psql whose SQL it cannot see (put statements '
+         + 'directly in `psql -c "…"`). A schema change goes through a migration file under '
+         + 'server/sql/migrations/, landed on main and shipped by the queenzee — never a live edit.']
         : []),
       ...(xell.db_coupling === 'db-isolated'
         ? ['Your database is your OWN container, restored from a dump — it is a copy, so you may '
