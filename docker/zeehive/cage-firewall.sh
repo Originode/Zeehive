@@ -14,12 +14,16 @@
 #     with an egress proxy later
 #   - the queenzee API at $CAGE_QUEENZEE (host:port, e.g. host.docker.internal:4700)
 #   - anything on the xell's own docker network ($CAGE_SUBNET, e.g. 172.28.0.0/16)
+#   - the xell's OWN stack, as explicit host:port pairs in $CAGE_ALLOW_TCP (space-separated,
+#     e.g. "10.1.0.18:3145 10.1.0.18:5245") — this is how a caged zee reaches its assigned
+#     app/db containers when they live on another docker host, without the LAN opening up
 # Everything else: DROP.
 set -euo pipefail
 
 ALLOW_DOMAINS=${CAGE_ALLOW_DOMAINS:-api.anthropic.com}
 QUEENZEE=${CAGE_QUEENZEE:-}
 SUBNET=${CAGE_SUBNET:-}
+ALLOW_TCP=${CAGE_ALLOW_TCP:-}
 
 iptables -F OUTPUT
 iptables -P OUTPUT DROP
@@ -47,5 +51,13 @@ if [[ -n "$SUBNET" ]]; then
   iptables -A OUTPUT -d "$SUBNET" -j ACCEPT
   echo "allow xell subnet $SUBNET"
 fi
+
+for hp in $ALLOW_TCP; do
+  ahost=${hp%:*}; aport=${hp##*:}
+  for ip in $(getent ahostsv4 "$ahost" | awk '{print $1}' | sort -u); do
+    iptables -A OUTPUT -d "$ip" -p tcp --dport "$aport" -j ACCEPT
+    echo "allow stack $ahost -> $ip:$aport"
+  done
+done
 
 echo "cage sealed: default egress DROP"

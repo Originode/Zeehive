@@ -12,6 +12,7 @@ import { logline } from '../lib/logbus.js';
 import { resolveBash } from '../lib/bash.js';
 import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
+import { removeCage } from '../lib/cage.js';
 import { releaseXellShips } from './shipgate.js';
 
 export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
@@ -128,6 +129,12 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   // gone/broken (or the purge silently failed), ~2.6 GB per xell leaks with nobody watching. The
   // queenzee knows the exact tags, so it does not need the worktree to clean up after itself.
   await removeXellImages(xellId, xell.slug).catch((e) => logline('reaper', `image cleanup failed for ${xell.slug}: ${e.message}`));
+
+  // the xell's zee CAGE, if a caged zee ever ran here (lib/cage.js) — it idles sealed on the
+  // queenzee's local daemon after its turn so commits stay collectible; retirement is the point
+  // of no return, so it goes too. Best-effort like the rest: a leak is visible in `docker ps`
+  // by its zeehive.cage label.
+  await removeCage({ ctx: 'default', slug: xell.slug }).catch((e) => logline('reaper', `cage cleanup failed for ${xell.slug}: ${e.message}`));
 
   // drop this xell's per-xell containers from the meta DB
   await q(`DELETE FROM container WHERE owner_xell_id = $1`, [xellId]);
