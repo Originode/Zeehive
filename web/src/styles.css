@@ -930,6 +930,17 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-split.o-portrait  .graph-pane { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .graph-svg { overflow: visible; }
 .graph-svg .ghash { fill: var(--muted); font: 9px 'Cascadia Code', ui-monospace, monospace; }
+/* GitLens-style row: head (hash) then subject. The hash stays monospace + muted so the prepended
+   head reads as metadata; the subject is the message in the normal UI font/colour. */
+.graph-svg .gline .ghash { font: 10px 'Cascadia Code', ui-monospace, monospace; }
+.graph-svg .gline .gsubj { fill: var(--text); font: 11px 'Segoe UI', system-ui, sans-serif; }
+.graph-svg .gline.hov .gsubj { fill: #fff; }
+.graph-svg .gline.hov .ghash { fill: var(--text); }
+
+/* resize grip on the panels-facing edge. Invisible until hovered/dragged so it never draws a line
+   over the graph, but always a fat enough hit target to grab. */
+.graph-resize { z-index: 4; background: transparent; transition: background .12s ease; }
+.graph-resize:hover, .graph-resize:active { background: var(--accent); opacity: .55; }
 .graph-branch { position: absolute; color: var(--accent); font: 600 10px 'Cascadia Code', ui-monospace, monospace;
   pointer-events: none; }
 .graph-branch[data-orient="landscape"] { top: 6px; left: 50%; transform: translateX(-50%); }

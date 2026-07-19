@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { computeGraph } from './hive/graph.js';
 
 // The git graph as the centre divider — proper GitLens-style lanes (ported from GitRail), oriented
@@ -7,10 +7,21 @@ import { computeGraph } from './hive/graph.js';
 // the prod hexagon and tracks it as the honeycomb pans — which is what keeps prod's connector wire a
 // straight perpendicular line. The scroll offset is applied imperatively (group transform) on every
 // canvas frame so it stays glued without re-rendering. Dots carry data-commit for <Connectors>.
+//
+// Each landscape row reads like GitLens: <short hash> <commit subject>, the head PREPENDED before
+// the message. The pane is user-RESIZABLE (drag the panels-facing edge); its width persists per
+// orientation. Squeeze it narrow and it COMPRESSES — the subjects drop out and it shows only the
+// commit heads (short hashes), exactly as it does in portrait where a rotated spine has no room for
+// a message anyway.
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff',
   '#e5554e', '#3bc6c0', '#d98c5f', '#7bd0e0', '#c98cff', '#8cd98c'];
 
-const LANE_W = 13, DOT = 4.5, PAD = 20, LABEL = 66, ROW = 24;
+const LANE_W = 13, DOT = 4.5, PAD = 20, ROW = 24;
+const HASH_LABEL = 66;      // room a rotated/short-hash label needs
+const MSG_W = 236;          // default room for a commit subject in landscape
+const CHAR_W = 6.2;         // ~px per char at the 11px subject font (for truncation)
+const HASH_COLS = 8;        // "abc1234 " — hash + trailing space, in char columns
+const MSG_MIN_PX = 96;      // below this much text room, compress to heads only
 
 const median = (a) => {
   if (!a.length) return null;
@@ -30,13 +41,65 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
   const graph = commits.length ? computeGraph(commits) : null;
   const laneCount = graph ? graph.laneCount : 1;
 
-  // across geometry (perpendicular to the spine): lanes on the honey side, hash labels away from it
+  // across geometry (perpendicular to the spine): lanes on the honey side, labels away from it
   const acrossExtent = laneCount * LANE_W;
-  const thickness = PAD * 2 + acrossExtent + LABEL;
+  const labelRaw = PAD + acrossExtent + 10;           // where the text column starts (raw coord)
+
+  // ── user-resizable thickness ────────────────────────────────────────────────
+  // Width persists PER ORIENTATION: a landscape drag shouldn't dictate the portrait band's height.
+  // The stored value is the cross-size in px; it is clamped to [min, max] against the CURRENT lane
+  // count so growing the graph can never make the pane smaller than its own lanes + a hash.
+  const sizeKey = `zeehive.graphSize.${orientation}`;
+  const [userSize, setUserSize] = useState(null);
+  useEffect(() => {
+    const v = parseFloat(localStorage.getItem(sizeKey));
+    setUserSize(Number.isFinite(v) ? v : null);
+  }, [sizeKey]);
+  const minThickness = labelRaw + HASH_LABEL + PAD;
+  const maxThickness = labelRaw + 620;
+  const baseThickness = portrait ? minThickness : (labelRaw + MSG_W + PAD);
+  const thickness = Math.max(minThickness, Math.min(maxThickness, userSize || baseThickness));
+
+  // text room left after the lanes → decides whether we can show subjects at all
+  const textPx = thickness - labelRaw - PAD;
+  const compressed = portrait || textPx < MSG_MIN_PX;   // heads-only when squeezed (or rotated)
+  const msgChars = Math.max(0, Math.floor(textPx / CHAR_W) - HASH_COLS);
+
+  const persistSize = useCallback((v) => {
+    setUserSize(v);
+    try { localStorage.setItem(sizeKey, String(Math.round(v))); } catch { /* private mode */ }
+  }, [sizeKey]);
+
+  // Drag the panels-facing edge to resize. That edge is the one AWAY from the honeycomb: with the
+  // honey low (order 0) the panels sit high, so the handle is on the high edge and dragging further
+  // out (toward the panels) widens the pane; flip the honeycomb and both mirror. clientX in
+  // landscape, clientY in portrait.
   const honeyLow = honeySide === 'a';
+  const onResizeDown = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const axis = (ev) => (portrait ? ev.clientY : ev.clientX);
+    const start = axis(e);
+    const from = thickness;
+    const dir = honeyLow ? 1 : -1;
+    const onMove = (ev) => {
+      const next = from + (axis(ev) - start) * dir;
+      persistSize(Math.max(minThickness, Math.min(maxThickness, next)));
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = portrait ? 'row-resize' : 'col-resize';
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }, [portrait, honeyLow, thickness, persistSize, minThickness, maxThickness]);
+
   const acrossActual = (raw) => (honeyLow ? raw : thickness - raw);
   const laneRaw = (l) => PAD + l * LANE_W;            // lane 0 nearest the honey side
-  const labelRaw = PAD + acrossExtent + 10;
 
   const alongOf = (row) => PAD + row * ROW;           // fixed step — the spine scrolls, doesn't squash
   const fullLen = PAD * 2 + Math.max(1, commits.length) * ROW;
@@ -116,6 +179,8 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
             const ring = anchors[c.hash]?.[0];
             const [lx, ly] = P(alongOf(row), labelRaw);
             const hovered = hovCommit === c.hash;
+            const subj = c.subject || '';
+            const shownSubj = subj.length > msgChars ? subj.slice(0, Math.max(0, msgChars - 1)) + '…' : subj;
             return (
               <g key={c.hash}>
                 {(ring || hovered) && <circle cx={cx} cy={cy} r={DOT + 3} fill="none"
@@ -126,17 +191,28 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
                 {ring && <circle cx={cx} cy={cy} r={DOT + 6} fill="transparent" style={{ cursor: 'pointer' }}
                         onMouseEnter={() => emitHover({ id: null, commit: c.hash })}
                         onMouseLeave={() => emitHover({ id: null, commit: null })} />}
+                {/* head PREPENDED before the subject; heads-only when compressed / rotated */}
                 {portrait
                   ? <text className="ghash" x={lx} y={ly} textAnchor="middle"
                           transform={`rotate(-45 ${lx} ${ly})`}>{c.short}</text>
-                  : <text className="ghash" x={lx} y={ly + 3}
-                          textAnchor={honeyLow ? 'start' : 'end'}>{c.short}</text>}
+                  : <text className={`gline${hovered ? ' hov' : ''}`} x={lx} y={ly + 3}
+                          textAnchor={honeyLow ? 'start' : 'end'}>
+                      <tspan className="ghash">{c.short}</tspan>
+                      {!compressed && shownSubj && <tspan className="gsubj" dx="7">{shownSubj}</tspan>}
+                    </text>}
               </g>
             );
           })}
         </g>
       </svg>
       <span className="graph-branch" data-orient={orientation}>⎇ {timeline.branch}</span>
+      {/* drag the panels-facing edge to resize; squeeze it to collapse subjects to heads only */}
+      <div className={`graph-resize${compressed && !portrait ? ' compressed' : ''}`} data-orient={orientation}
+           onPointerDown={onResizeDown}
+           title="Drag to resize the graph — squeeze it to show only the commit heads"
+           style={portrait
+             ? { position: 'absolute', left: 0, right: 0, height: 9, cursor: 'row-resize', [honeyLow ? 'bottom' : 'top']: 0 }
+             : { position: 'absolute', top: 0, bottom: 0, width: 9, cursor: 'col-resize', [honeyLow ? 'right' : 'left']: 0 }} />
     </div>
   );
 }
