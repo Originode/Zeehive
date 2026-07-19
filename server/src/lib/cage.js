@@ -326,6 +326,19 @@ export async function collectCageDiffToWorktree({ ctx = 'default', slug, worktre
     // since caging, we refuse instead of fabricating a merge nobody asked for.
     await git(['fetch', bundle, `${branch}:refs/zeehive/cage-land`]);
     const target = await git(['rev-parse', 'refs/zeehive/cage-land']);
+    // Clear host-worktree noise the caged zee cannot reach so the --ff-only below is not blocked
+    // with "refuses to touch <file>". On a Windows checkout mcp/server.js recurs dirty two ways: an
+    // exec-bit flip (644↔755) and CRLF↔LF normalization (git status flags it "modified" with an
+    // EMPTY content diff). Ignoring file-mode kills the first; the second only clears with a stash.
+    // So do both: ignore mode, then park any remaining dirt in a labelled stash — a caged zee's work
+    // is its COMMITS from the cage, so nothing UNCOMMITTED in the host worktree is ever its to lose.
+    // Both are safe and self-healing — the whole point is that `zee land` never needs a human.
+    await git(['config', 'core.fileMode', 'false']).catch(() => {});
+    const dirty = await git(['status', '--porcelain']).catch(() => '');
+    if (dirty.trim()) {
+      await git(['stash', 'push', '--include-untracked', '-m',
+        'zee-land: stray host-worktree changes parked before collect']).catch(() => {});
+    }
     let ff;
     try { await git(['merge', '--ff-only', target]); ff = true; }
     catch (e) { ff = false; await git(['update-ref', '-d', 'refs/zeehive/cage-land']).catch(() => {});

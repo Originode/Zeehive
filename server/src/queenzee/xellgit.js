@@ -105,10 +105,12 @@ export function catchUpWorktree(worktree, ref) {
   // We are about to MOVE the branch (ff or rebase), which git refuses over a dirty tree — and that
   // refusal is what kept wedging `zee land` with "cannot rebase: you have unstaged changes", forcing
   // the caged zee (which cannot touch the host worktree) to tell a human to `git checkout` by hand.
-  // A caged zee's real work arrives as COMMITS collected from the cage; ANY uncommitted change in
-  // the host worktree is local noise (the recurring one: a Windows exec-bit flip on mcp/server.js).
-  // So park it in a labelled stash and carry on unattended — it stays recoverable (`git stash list`)
-  // and is never lost, and the catch-up no longer needs a babysitter.
+  // First, tell git to IGNORE file-mode changes here — the recurring wedge is a Windows exec-bit flip
+  // (mcp/server.js: 644 in the tree, 755 on checkout) git calls dirty forever; ignoring mode makes it
+  // vanish without a stash. Then, for any REAL remaining dirt: a caged zee's work arrives as COMMITS
+  // collected from the cage, so ANY uncommitted change in the host worktree is local noise — park it
+  // in a labelled stash and carry on unattended (recoverable via `git stash list`, never lost).
+  git(worktree, ['config', 'core.fileMode', 'false']);
   let stashed = false;
   if (dirtyCount(worktree) > 0) {
     const s = git(worktree, ['stash', 'push', '--include-untracked', '-m',
