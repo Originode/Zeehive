@@ -2,7 +2,7 @@
 import { Router } from 'express';
 import { q, one } from '../db/pool.js';
 import { projectHook } from '../lib/status.js';
-import { getFleet, listRuntimes, streamXells } from '../lib/fleet.js';
+import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
@@ -192,6 +192,20 @@ router.get('/fleet/xells-stream', async (req, res) => {
     send({ type: 'error', error: err.message });
   }
   res.end();
+});
+
+// Fleet burn: per-xell token + $ consumption and a project-cumulative total, summed across every
+// zee. Same 503-not-throw contract as /fleet (a read model must never take the queenzee down).
+// NB: FLEET-OWN consumption only — Anthropic's account-wide %/limits are NOT surfaced here.
+router.get('/fleet/burn', async (req, res) => {
+  try {
+    const burn = await getFleetBurn(req.query.project || null);
+    if (!burn) return res.status(404).json({ error: 'no project' });
+    res.json(burn);
+  } catch (err) {
+    console.error('[api] /fleet/burn failed:', err.message);
+    res.status(503).json({ error: `fleet burn unavailable: ${err.message}` });
+  }
 });
 
 router.get('/projects', async (_req, res) => res.json(await listProjects()));

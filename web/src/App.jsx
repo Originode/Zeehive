@@ -28,6 +28,21 @@ const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' }
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');
 const base = (p) => (p ? p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() : '—');
 
+// FLEET BURN formatters. Compact token counts (1.2M, 890K, 4.2k → keep it short on a card) and a
+// dollar figure that keeps cents but never a distracting tail of zeros. These render fleet-OWN
+// consumption; account-wide %/limits are NOT available (only Anthropic's /usage shows those).
+const fmtTok = (n) => {
+  const v = Number(n || 0);
+  if (v >= 1e9) return (v / 1e9).toFixed(v >= 1e10 ? 0 : 1).replace(/\.0$/, '') + 'B';
+  if (v >= 1e6) return (v / 1e6).toFixed(v >= 1e7 ? 0 : 1).replace(/\.0$/, '') + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(v >= 1e4 ? 0 : 1).replace(/\.0$/, '') + 'K';
+  return String(Math.round(v));
+};
+const fmtUsd = (n) => {
+  const v = Number(n || 0);
+  return '$' + (v >= 100 ? v.toFixed(0) : v.toFixed(2));
+};
+
 
 // Portrait when the viewport is taller than it is wide. Re-measured on resize so the timeline
 // re-orients live when the window is reshaped.
@@ -360,6 +375,16 @@ export default function App() {
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
+        {/* FLEET-CUMULATIVE BURN — every run across the project, tokens + $. Fleet-own consumption
+            only; account-wide %/limits are NOT available (Anthropic's /usage alone shows those). */}
+        {fleet.fleet_burn?.fleet && (fleet.fleet_burn.fleet.tokens > 0 || fleet.fleet_burn.fleet.cost > 0) && (
+          <span className="fleetburn" data-testid="fleet-burn"
+                title={`Every run across this project consumed ${Number(fleet.fleet_burn.fleet.tokens).toLocaleString()} tokens `
+                  + `for ${fmtUsd(fleet.fleet_burn.fleet.cost)}, over ${fleet.fleet_burn.fleet.zees} zee run(s).\n`
+                  + 'Fleet-own consumption only — not your Anthropic account %/limits.'}>
+            {' · '}fleet burn: <b>{fmtTok(fleet.fleet_burn.fleet.tokens)} tok · {fmtUsd(fleet.fleet_burn.fleet.cost)}</b>
+          </span>
+        )}
         {/* Per-machine pool sizes (matrix column headers) replace the project-wide target once
             any dev machine exists — showing both would leave one knob lying. */}
         {!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0)
@@ -724,6 +749,18 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           <span className="rk">status</span>
           <span className={`badge b-${x.status}`} data-testid="xell-status">{isProd ? 'live · protected' : x.status}</span>
         </div>
+        {/* FLEET BURN — what every zee this xell hosted consumed (tokens + $), summed. Compact by
+            design (Σ 1.2M tok · $8.90). This is the xell's OWN spend; account-wide %/limits are not
+            available to us (only Anthropic's /usage shows those). Shown once there's anything to show. */}
+        {!isProd && x.burn && (x.burn.tokens > 0 || x.burn.cost > 0) && (
+          <div className="row"><span className="rk">burn</span>
+            <span className="burn" data-testid="xell-burn"
+                  title={`This xell's zees consumed ${Number(x.burn.tokens).toLocaleString()} tokens for ${fmtUsd(x.burn.cost)}.\n`
+                    + 'Fleet-own consumption only — not your Anthropic account %/limits.'}>
+              Σ {fmtTok(x.burn.tokens)} tok · {fmtUsd(x.burn.cost)}
+            </span>
+          </div>
+        )}
         {/* Can this xell ship to prod, and if not, why? Two different "no"s that the gate itself
             treats differently — collapsing them into one "blocked" would be a lie in both
             directions. See shipState(). */}

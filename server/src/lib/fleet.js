@@ -49,6 +49,15 @@ async function fetchXellRows(pid) {
             z.cost_usd, z.attach_mode, z.cli_active, z.monitor_source, z.last_monitor_at,
             z.permission_mode, z.kind AS zee_kind,
             r.label AS runtime_label, r.key AS runtime_key,
+            -- FLEET BURN (per xell): sum of what EVERY zee this xell has ever hosted consumed —
+            -- tokens + $ — not just the currently-shown zee (z above is one row). A caged xell can
+            -- outlive several zees; the card figure must be the xell's whole burn. Cheap subquery on
+            -- the zee(xell_id) index. NB: fleet-own consumption, NOT Anthropic account %/limits.
+            (SELECT COALESCE(SUM(zb.input_tokens + zb.output_tokens
+                                 + zb.cache_read_tokens + zb.cache_write_tokens), 0)
+               FROM zee zb WHERE zb.xell_id = x.id) AS burn_tokens,
+            (SELECT COALESCE(SUM(zb.cost_usd), 0)
+               FROM zee zb WHERE zb.xell_id = x.id) AS burn_cost,
             (SELECT t.id FROM task t WHERE t.xell_id = x.id
                AND t.status IN ('assigned','working') ORDER BY t.created_at DESC LIMIT 1) AS task_id,
             dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
@@ -86,6 +95,11 @@ async function decorateXell(x, heads, deployed) {
   x.stack = stack;
   // pretty-print the name column exactly like the mockup expects
   x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
+
+  // Fleet burn for THIS xell — sum across all its zees. pg returns bigint/numeric as strings; coerce
+  // to Number so the dashboard can format it (a xell's lifetime burn is well within double precision).
+  x.burn = { tokens: Number(x.burn_tokens || 0), cost: Number(x.burn_cost || 0) };
+  delete x.burn_tokens; delete x.burn_cost;
 
   // What this xell TRACKS (its xource), and the head that ref currently resolves to.
   //   a work xell → local main.
@@ -154,6 +168,13 @@ export async function getFleet(projectId) {
   const xells = await fetchXellRows(pid);
   for (const x of xells) await decorateXell(x, heads, deployed);
 
+  // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
+  // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
+  // figures on the client, so it also counts zees on retired xells the card list no longer shows.
+  // NB: this is the fleet's OWN consumption only — Anthropic's account-wide %/limits are not exposed
+  // to us (only their /usage shows those).
+  const fleetBurn = await getFleetBurn(pid);
+
   // production is a xell too, but it's not a pooled work-xell — exclude it from the counts
   const work = xells.filter((x) => !x.is_production);
   const total = work.length;
@@ -213,9 +234,62 @@ export async function getFleet(projectId) {
     machines,
     backup,
     xells,
+    fleet_burn: fleetBurn,
     landing,
     shipping,
     prod_lock: prodLock || null,
+  };
+}
+
+// The fleet burn read model, standalone (also its own endpoint: GET /api/fleet/burn). Returns the
+// project-cumulative total AND a per-xell breakdown grouped by xell, both summed across every zee
+// the xell has hosted. Retired xells still count toward the cumulative total (their zees really did
+// burn tokens) but are not listed per-xell, matching the card list which hides retired xells.
+//   { fleet: { tokens, cost, input, output, cache_read, cache_write, zees },
+//     xells: [{ xell_id, slug, is_production, tokens, cost, zees }, …] }
+// IMPORTANT: these are the FLEET's OWN consumption only. Account-wide %/limits (how much of the
+// plan is used) are NOT available here — only Anthropic's /usage surfaces those; this tracks solely
+// what our own runs spent.
+export async function getFleetBurn(projectId) {
+  const pid = projectId
+    || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
+  if (!pid) return null;
+
+  const fleet = await one(
+    `SELECT COALESCE(SUM(z.input_tokens), 0)::bigint       AS input,
+            COALESCE(SUM(z.output_tokens), 0)::bigint      AS output,
+            COALESCE(SUM(z.cache_read_tokens), 0)::bigint  AS cache_read,
+            COALESCE(SUM(z.cache_write_tokens), 0)::bigint AS cache_write,
+            COALESCE(SUM(z.input_tokens + z.output_tokens
+                         + z.cache_read_tokens + z.cache_write_tokens), 0)::bigint AS tokens,
+            COALESCE(SUM(z.cost_usd), 0) AS cost,
+            COUNT(z.id)::int AS zees
+       FROM zee z JOIN xell x ON x.id = z.xell_id
+      WHERE x.project_id = $1`, [pid]);
+
+  const perXell = await q(
+    `SELECT x.id AS xell_id, x.slug, x.is_production,
+            COALESCE(SUM(z.input_tokens + z.output_tokens
+                         + z.cache_read_tokens + z.cache_write_tokens), 0)::bigint AS tokens,
+            COALESCE(SUM(z.cost_usd), 0) AS cost,
+            COUNT(z.id)::int AS zees
+       FROM xell x LEFT JOIN zee z ON z.xell_id = x.id
+      WHERE x.project_id = $1 AND x.status <> 'retired'
+      GROUP BY x.id, x.slug, x.is_production
+      ORDER BY tokens DESC, cost DESC`, [pid]);
+
+  const num = (v) => Number(v || 0);
+  return {
+    fleet: {
+      tokens: num(fleet?.tokens), cost: num(fleet?.cost),
+      input: num(fleet?.input), output: num(fleet?.output),
+      cache_read: num(fleet?.cache_read), cache_write: num(fleet?.cache_write),
+      zees: num(fleet?.zees),
+    },
+    xells: perXell.map((r) => ({
+      xell_id: r.xell_id, slug: r.slug, is_production: r.is_production,
+      tokens: num(r.tokens), cost: num(r.cost), zees: num(r.zees),
+    })),
   };
 }
 

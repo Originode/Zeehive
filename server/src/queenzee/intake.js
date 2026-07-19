@@ -29,6 +29,22 @@ const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulat
 
 function norm(p) { return String(p || '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
 
+// Full per-run usage off a final `result` event, for the fleet burn tracker. The event carries
+// total_cost_usd plus a `usage` object; capture ALL of it (was: cost_usd only) so the dashboard
+// can show tokens too. NB: these are the FLEET's own consumption — NOT the account-wide %/limits
+// that only Anthropic's /usage exposes. Tolerant of shape drift: usage may sit on the result or
+// (SDK) alongside total_cost_usd, and any field may be absent → 0. Never throws.
+function usageFrom(result) {
+  const u = result?.usage || {};
+  return {
+    cost: Number(result?.total_cost_usd ?? u.total_cost_usd ?? 0) || 0,
+    input: Number(u.input_tokens || 0) || 0,
+    output: Number(u.output_tokens || 0) || 0,
+    cacheRead: Number(u.cache_read_input_tokens || 0) || 0,
+    cacheWrite: Number(u.cache_creation_input_tokens || 0) || 0,
+  };
+}
+
 async function readyXells(projectId) {
   // Machine-priority first (023): a claim takes a ready xell from the preferred machine before
   // any other — "if local priority is higher, dev xells get spawned there first" applies to
@@ -736,8 +752,14 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
           }
         }
         if (msg?.type === 'result') {
-          const cost = msg.total_cost_usd ?? msg.usage?.total_cost_usd ?? 0;
-          await q(`UPDATE zee SET cost_usd=$2, status='idle', last_stop_reason='end_turn' WHERE id=$1`, [zee.id, cost]);
+          // Persist full usage for the fleet burn tracker (was cost_usd only). Best-effort on the
+          // SDK path: if the result exposes `usage`, tokens land too; otherwise they stay 0.
+          const b = usageFrom(msg);
+          await q(
+            `UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                            cache_read_tokens=$5, cache_write_tokens=$6,
+                            status='idle', last_stop_reason='end_turn' WHERE id=$1`,
+            [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite]);
         }
       }
     } catch (err) {
@@ -913,13 +935,21 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // so its commits can be collected (lib/cage.js exportCageDiff) — the reaper owns teardown.
   handle.done
     .then(async ({ result }) => {
-      const cost = result?.total_cost_usd ?? 0;
+      // CAGED is the priority for the burn tracker: capture the full usage object (tokens + $),
+      // not just cost_usd. The caged CLI's final result event carries usage.{input,output,
+      // cache_read_input,cache_creation_input}_tokens alongside total_cost_usd.
+      const b = usageFrom(result);
       const errored = result?.is_error;
-      await q(`UPDATE zee SET cost_usd=$2, status=$3, last_stop_reason=$4 WHERE id=$1`,
-        [zee.id, cost, errored ? 'errored' : 'idle', errored ? String(result?.result || 'error').slice(0, 200) : 'end_turn']);
+      await q(
+        `UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                        cache_read_tokens=$5, cache_write_tokens=$6,
+                        status=$7, last_stop_reason=$8 WHERE id=$1`,
+        [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite,
+         errored ? 'errored' : 'idle', errored ? String(result?.result || 'error').slice(0, 200) : 'end_turn']);
       const row = await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]);
       broadcast('zee', row);
-      logline('intake', `caged zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, $${cost})`);
+      const tok = b.input + b.output + b.cacheRead + b.cacheWrite;
+      logline('intake', `caged zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})`);
     })
     .catch(async (err) => {
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, String(err.message).slice(0, 200)]);

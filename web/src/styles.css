@@ -350,6 +350,12 @@ a.cbox:hover { border-color: var(--accent); }
 /* uncommitted work sitting in the worktree — the thing the old base-vs-source diff hid entirely */
 .diff .dirty { color: var(--building); font-weight: 600; }
 
+/* Fleet burn: per-xell tokens + $ on the card, and the project-cumulative total on the status
+   line. Muted + monospace so the figure reads as telemetry, not an alert. */
+.burn { font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--muted); }
+.statusline .fleetburn { color: var(--muted); font-size: 14px; }
+.statusline .fleetburn b { color: var(--fg, inherit); font-family: 'Cascadia Code', monospace; font-size: 12px; }
+
 /* production card */
 .card.prod { border-top-color: var(--down); background: linear-gradient(180deg, rgba(229,85,78,.06), transparent); }
 /* Sits in .cardtop now, not floating over the db row. */
