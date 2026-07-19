@@ -576,7 +576,7 @@ a.cbox:hover { border-color: var(--accent); }
 .term-line { display: flex; gap: 8px; padding: 1px 0; }
 .term-line.dim { color: var(--muted); }
 .term-ts { color: #4a5568; flex: 0 0 auto; }
-.term-scope { flex: 0 0 auto; white-space: pre; font-weight: 600; }
+.term-scope { flex: 0 0 20ch; white-space: pre; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 .term-msg { color: var(--text); word-break: break-word; }
 
 /* ── backups panel (above the container inventory) ── */

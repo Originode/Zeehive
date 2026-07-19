@@ -6,6 +6,17 @@ const SCOPE = {
   ship: '#f0883e', shipmigrate: '#d29922', 'xell-db': '#79c0ff',
 };
 
+// A zee's output is logged under scope `zee:<slug>`, and the slug can be 50+ chars — long enough
+// to eat half the line and crush the message. Middle-truncate it so it fits the fixed scope
+// column while keeping BOTH the `zee:` prefix (so you still know it's a zee) and the trailing hash
+// (so two zees never collapse to the same label). The full scope is on the row's title tooltip.
+const SCOPE_MAX = 20;
+function shortScope(scope) {
+  const s = scope || '';
+  if (s.length <= SCOPE_MAX) return s;
+  return `${s.slice(0, SCOPE_MAX - 7)}…${s.slice(-6)}`;
+}
+
 // Modal terminal streaming the queenzee's live activity (checks, updates, maintenance…).
 // One firehose, but filterable: the scope chips in the header toggle channels on and off, so
 // "just the ship" or "everything but the monitor" is one click, not a scroll hunt.
@@ -41,9 +52,9 @@ export default function Terminal({ logs, onClose }) {
         <div className="term-body">
           {shown.length === 0 && <div className="term-line dim">waiting for queenzee activity…</div>}
           {shown.map((l) => (
-            <div className="term-line" key={l.seq}>
+            <div className="term-line" key={l.seq} title={l.scope || ''}>
               <span className="term-ts">{new Date(l.ts).toLocaleTimeString()}</span>
-              <span className="term-scope" style={{ color: SCOPE[l.scope] || '#8b97a8' }}>{(l.scope || '').padEnd(7)}</span>
+              <span className="term-scope" style={{ color: SCOPE[l.scope] || '#8b97a8' }}>{shortScope(l.scope)}</span>
               <span className="term-msg">{l.msg}</span>
             </div>
           ))}
