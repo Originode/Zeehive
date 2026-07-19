@@ -120,8 +120,13 @@ export async function sealCage({ ctx, name, queenzee, allowTcp = [], allowDomain
 // --dangerously-skip-permissions: safe HERE and only here — the cage is the permission
 // system, and the CLI requires non-root, which the image guarantees.
 export function runZee({ ctx, name, prompt, model, token, onEvent }) {
+  // BOTH env names, measured on claude 2.1.214 (2026-07-19): --bare skips the OAuth credential
+  // chain entirely — CLAUDE_CODE_OAUTH_TOKEN alone yields "Not logged in" without one API call —
+  // but honors ANTHROPIC_AUTH_TOKEN (the raw bearer header, which an sk-ant-oat01 token is).
+  // Keep the OAuth var too so a future CLI that prefers it keeps working.
   const cmd = ['exec', '-i',
     '-e', `CLAUDE_CODE_OAUTH_TOKEN=${token}`,
+    '-e', `ANTHROPIC_AUTH_TOKEN=${token}`,
     name, 'bash', '-lc',
     `cd /work/repo && claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions${model ? ` --model ${model}` : ''}`];
   const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...cmd];
