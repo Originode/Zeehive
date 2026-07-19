@@ -61,10 +61,15 @@ rebuild_cage_image() {
 }
 
 if [ "$MODE" = "simulate" ]; then
-  # Prove the new steps WITHOUT touching any process/daemon (Zeehive's own test path). Assert the
-  # exact cage-image command a real deploy would run, and the worktree-sync the restart would do.
-  echo "self-ship: [simulate] would rebuild cage image with: $(cage_build_cmd)" >&2
-  echo "self-ship: [simulate] would sync working tree with: bash \"$SRC/scripts/self-ship-sync.sh\" \"$SRC\" \"$REF\"" >&2
+  # Prove the new steps WITHOUT touching any process/daemon (Zeehive's own test path). Mirror REAL
+  # mode exactly: only the server role rebuilds the cage image and syncs the tree (webapp rides
+  # along as a no-op restart), so only the server role asserts the commands a real deploy would run.
+  if [ "$ROLE" = "server" ]; then
+    echo "self-ship: [simulate] would rebuild cage image with: $(cage_build_cmd)" >&2
+    echo "self-ship: [simulate] would sync working tree with: bash \"$SRC/scripts/self-ship-sync.sh\" \"$SRC\" \"$REF\"" >&2
+  else
+    echo "self-ship: [simulate] role $ROLE is a no-op restart (rides with the server); no cage/sync steps" >&2
+  fi
   emit true "simulate"; exit 0
 fi
 if [ "$ROLE" = "webapp" ]; then emit true "noop-rides-with-server"; exit 0; fi
@@ -94,6 +99,9 @@ rebuild_cage_image
 # server regardless of the sync's exit (`;`, not `&&`): a running queenzee on old-but-committed code
 # is recoverable; a dead one cannot even self-ship the fix.
 SRCWIN="$(echo "$SRC" | sed 's|/|\\\\|g')"
-powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('Start-Sleep 3; Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }; Start-Sleep 1; \$env:Path = \"C:\Program Files\Git\bin;\" + \$env:Path; Set-Location \"${SRCWIN}\"; bash \"${SRC}/scripts/self-ship-sync.sh\" \"${SRC}\" \"${REF}\"; npm run server')" >&2 \
+# Forward-slash form for the INNER Git bash: it reliably accepts D:/… paths, whereas backslashes
+# routed through the nested PowerShell string are ambiguous (PowerShell/quoting can eat them).
+SRCUNIX="$(echo "$SRC" | sed 's|\\\\|/|g')"
+powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('Start-Sleep 3; Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }; Start-Sleep 1; \$env:Path = \"C:\Program Files\Git\bin;\" + \$env:Path; Set-Location \"${SRCWIN}\"; bash \"${SRCUNIX}/scripts/self-ship-sync.sh\" \"${SRCUNIX}\" \"${REF}\"; npm run server')" >&2 \
   && emit true "detached-restart" \
   || emit false "detach-failed"
