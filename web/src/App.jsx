@@ -366,15 +366,6 @@ export default function App() {
     }
   };
 
-  // Only the SELECTED xell's pending DECISIONS still need a DOM card (approve/reject with reasons —
-  // the one thing the canvas flower can't carry). Everything else (identity, containers, diff, the
-  // action buttons) now lives ON the flower, so the drawer appears only when there's something to
-  // decide and is otherwise gone.
-  const expandedDecides = !!expandedXell && (
-    (landingByXell[expandedXell.id] || []).some((r) => r.status === 'pending')
-    || (prsFor(expandedXell) || []).some((r) => r.status === 'pending')
-    || (shipByXell[expandedXell.id] && ['pending', 'approved', 'shipping'].includes(shipByXell[expandedXell.id].status)));
-
   // Three panes: the honeycomb, the git graph as the exact centre divider, and the control panels.
   // Landscape → three columns, portrait → three rows; the graph stays centred while flip swaps which
   // side is honeycomb vs panels. Connector wires bridge each xell's commit dot (graph) to its hex.
@@ -477,7 +468,8 @@ export default function App() {
 
       {/* THE BAR — the one thing on the page that can't wait for you to scroll: a zee blocked on a
           human. A pointer, not a copy; clicking a chip expands that xell's flower + action drawer. */}
-      <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId} />
+      <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
+                   expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} />
 
@@ -493,24 +485,9 @@ export default function App() {
       <MachineMatrix machines={fleet.machines} containers={containers}
                      projectId={projectId || project.id} onMenu={openMenu} onChanged={refresh} />
 
-      {/* The selected xell's card appears ONLY when it has a pending DECISION (a held landing, an
-          open PR, or an in-flight ship) — the approve/reject-with-reasons UI the canvas flower can't
-          carry. Its identity, containers, diff and action buttons all live on the flower now, so in
-          the common case there is no drawer here at all. */}
-      {expandedDecides && (
-        <>
-          <h2 className="xells-h">
-            decision needed · {expandedXell.slug}
-            <button className="drawer-close" onClick={() => setExpandedId(null)} title="Close (Esc)">✕</button>
-          </h2>
-          <section className="xells drawer">
-            <XellCard key={expandedXell.id} x={expandedXell} diff={diffs[expandedXell.id]} onDone={refresh} onMenu={openMenu}
-                      landing={visible(landingByXell[expandedXell.id])} prs={visible(prsFor(expandedXell))}
-                      ship={shipByXell[expandedXell.id]} onDismiss={dismiss} machines={fleet.machines}
-                      prodLock={fleet.prod_lock} projectId={projectId || project.id} />
-          </section>
-        </>
-      )}
+      {/* The decision UI (held landing / open PR, with Approve/Reject) now renders INLINE under the
+          "waiting on you" bar when its chip is clicked — next to nothing else, and the flower on the
+          canvas highlights the same xell. No whole-xell drawer at the bottom of the page anymore. */}
       </div>
       </section>
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
@@ -984,13 +961,11 @@ function shipState(x, diff, prodLock, ship) {
   return { k: 'ready', text: 'ready', why: 'Landed and clean, and prod is free — a ship would start as soon as a human approves it.' };
 }
 
-// One line at the top of the page naming every xell that is waiting on a human, and nothing else.
-// Deliberately NOT a copy of the cards: it holds no commits and no Approve button, because a
-// decision made from a banner is a decision made without the diff, the ship state or the xell's
-// own numbers sitting next to it. It answers "is anything waiting, and where" — then gets out of
-// the way. Only PENDING counts: an approved landing is a receipt, and dressing receipts up as
-// demands is how a warning bar trains you to ignore it.
-function NeedsYouBar({ xells, landingByXell, prsFor, onJump }) {
+// One line at the top of the page naming every xell that is waiting on a human. Clicking a chip
+// EXPANDS that xell's flower (highlighting it on the canvas) AND drops its decision card(s) — the
+// held landing / open PR, with the Approve/Reject buttons — inline right below the bar, so the
+// judgement is made next to its own commits without hunting for a card at the bottom of the page.
+function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible }) {
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
@@ -998,21 +973,31 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump }) {
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
-  // Expand the xell's flower + action drawer — where its landings/PRs can actually be judged.
-  const go = (id) => onJump?.(id);
+  const go = (id) => onJump?.(id === expandedId ? null : id);  // click the open one again to collapse
+  const open = waiting.find((w) => w.x.id === expandedId);
+  const landings = open ? visible(landingByXell[open.x.id]).filter((r) => r.status === 'pending') : [];
+  const prs = open ? visible(prsFor(open.x)).filter((r) => r.status === 'pending') : [];
 
   return (
     <section className="needsyou">
-      <span className="ny-t">⚠ waiting on you:</span>
-      {waiting.map((w) => (
-        <button key={w.x.id} className="ny-chip" onClick={() => go(w.x.id)}
-                title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''} — open the card`}>
-          {w.x.slug}
-          <span className="ny-n">{w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`}
-            {w.held > 0 && w.prs > 0 && ' · '}
-            {w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`}</span>
-        </button>
-      ))}
+      <div className="ny-row">
+        <span className="ny-t">⚠ waiting on you:</span>
+        {waiting.map((w) => (
+          <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
+                  title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''} — click to review`}>
+            {w.x.slug}
+            <span className="ny-n">{w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`}
+              {w.held > 0 && w.prs > 0 && ' · '}
+              {w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`}</span>
+          </button>
+        ))}
+      </div>
+      {open && (
+        <div className="ny-decision">
+          {landings.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
+          {prs.map((r) => <PrCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
+        </div>
+      )}
     </section>
   );
 }

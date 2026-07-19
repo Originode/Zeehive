@@ -176,16 +176,21 @@ body { margin: 0; background: var(--bg); color: var(--text); }
    waiting on a human, and this is the only thing on the page that can't wait
    for you to scroll", and moving the cards quietly threw that away. This is
    that property, and only that: who is waiting, and a click to get there. */
-.needsyou { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+.needsyou { display: flex; flex-direction: column; gap: 10px;
   padding: 8px 10px; margin: 12px 0 0; border-radius: 8px;
   background: rgba(224,165,59,.10); border: 1px solid rgba(224,165,59,.45); }
+.ny-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ny-t { color: var(--building); font-size: 12px; font-weight: 600; }
 .ny-chip { display: inline-flex; align-items: baseline; gap: 6px; cursor: pointer;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   color: var(--text); font-size: 12px; padding: 3px 8px;
   font-family: 'Cascadia Code', monospace; }
 .ny-chip:hover { border-color: var(--building); }
+.ny-chip.active { border-color: var(--building); background: rgba(224,165,59,.18);
+  box-shadow: 0 0 0 1px var(--building) inset; }
 .ny-n { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+/* the decision card(s) for the clicked chip, inline right under the bar */
+.ny-decision { display: flex; flex-direction: column; gap: 8px; }
 /* Jumping to a card is useless if you then can't tell WHICH one it scrolled to. */
 .card.flash { animation: cardflash 1.2s ease-out; }
 @keyframes cardflash {
