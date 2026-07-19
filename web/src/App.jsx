@@ -457,9 +457,15 @@ export default function App() {
             {' · '}fleet burn: <b>{fmtTok(fleet.fleet_burn.fleet.tokens)} tok · {fmtUsd(fleet.fleet_burn.fleet.cost)}</b>
           </span>
         )}
-        {/* Per-machine pool sizes (matrix column headers) replace the project-wide target once
-            any dev machine exists — showing both would leave one knob lying. */}
-        {!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0)
+        {/* The prewarmed-pool knob, right here in the status line so it never hides in project
+            settings. Per-machine pool sizes (matrix column headers) replace this project-wide
+            target ONLY when they actually govern — i.e. a dev machine exists AND the project has a
+            per-xell app tier to place on it (compose_spinoff). A bare-worktree project (no
+            compose_spinoff, e.g. Zeehive itself) always pools by the project-wide target no matter
+            how many machines exist (see queenzee/pool.js), so its knob must stay visible here —
+            otherwise the ONLY working control is buried in the ⚙ Spawn-template modal. Mirrors the
+            server's own `!machines.length || !compose_spinoff` branch exactly. */}
+        {(!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0) || !project.compose_spinoff)
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
         <button className="new-prompt-btn" data-testid="new-prompt-btn"
