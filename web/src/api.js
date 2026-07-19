@@ -149,6 +149,13 @@ export async function dismissLanding(id) {
   return data;
 }
 
+// ── provider tokens (masked — the server never returns the token itself) ──────
+export const getProviderTokens = (projectId) => fetch(`/api/projects/${projectId}/tokens`).then((r) => r.json());
+export const putProviderToken = (projectId, provider, token) =>
+  siteCall(`/api/projects/${projectId}/tokens/${provider}`, 'PUT', { token });
+export const deleteProviderToken = (projectId, provider) =>
+  siteCall(`/api/projects/${projectId}/tokens/${provider}`, 'DELETE');
+
 export const createSite = (projectId, body) => siteCall(`/api/projects/${projectId}/sites`, 'POST', body);
 export const updateSite = (siteId, body) => siteCall(`/api/sites/${siteId}`, 'PATCH', body);
 export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${siteId}${force ? '?force=1' : ''}`, 'DELETE');

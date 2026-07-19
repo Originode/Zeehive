@@ -3,7 +3,7 @@ import {
   createProject, updateProject, probeRepo, getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
-  getMachines,
+  getMachines, getProviderTokens, putProviderToken, deleteProviderToken,
 } from './api.js';
 
 // PROJECT SETUP — the onboarding surface (spec §7 Phase 2.2 + the console half of everything the
@@ -150,6 +150,7 @@ function EditSections({ project, onChanged, onProject }) {
       <SitesSection project={project} run={run} busy={busy} />
       <InventorySection project={project} run={run} busy={busy} />
       <SpawnSection project={project} run={run} />
+      <TokensSection project={project} run={run} busy={busy} />
     </>
   );
 }
@@ -363,6 +364,78 @@ function InvRow({ c, run, busy }) {
         <button type="button" className="projpop-del" disabled={busy} title={`Remove ${c.name} from the inventory`}
                 onClick={() => { const n = Number(c.linked_xells); if (window.confirm(n > 0 ? `${c.name} is linked to ${n} xell(s). Force?` : `Remove ${c.name}?`)) run(() => deleteSharedContainer(c.id, n > 0)); }}>🗑</button>
       </span>
+    </div>
+  );
+}
+
+// ── agent providers: the per-project credential a CAGED zee runs on ───────────
+// One token per provider (only Claude today), stored in the meta-DB. The human does the OAuth:
+// copy the command, run it in a terminal, authorize in the browser, paste the token back. The
+// server only ever returns a masked hint — a connected token cannot be read back out of the UI.
+function TokensSection({ project, run, busy }) {
+  const [tokens, setTokens] = useState(null);
+  const [open, setOpen] = useState(null);     // provider key whose connect panel is open
+  const [paste, setPaste] = useState('');
+  const [copied, setCopied] = useState(false);
+  const load = useCallback(() => getProviderTokens(project.id).then(setTokens).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+
+  const copy = async (cmd) => {
+    try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1500); }
+    catch { /* clipboard denied — the command is visible to select anyway */ }
+  };
+  const save = (p) => wrapped(() => putProviderToken(project.id, p.provider, paste))
+    .then(() => { setPaste(''); setOpen(null); });
+  const disconnect = (p) => {
+    if (window.confirm(`Disconnect ${p.label} from ${project.name}?\n\nCaged zees for this project won't be able to authenticate until a new token is connected.`)) {
+      wrapped(() => deleteProviderToken(project.id, p.provider));
+    }
+  };
+
+  return (
+    <div className="setup-sec">
+      <h3>Agent providers <span className="pc">(the credential a caged zee spawns with — stored in the meta-DB, never echoed back)</span></h3>
+      {(tokens || []).map((p) => (
+        <div key={p.provider} className="siteed">
+          <div className="setup-row">
+            <span className="sitekey">{p.label}</span>
+            {p.connected
+              ? <span className="gate g-pass" title={p.created_at ? `connected ${new Date(p.created_at).toLocaleDateString()}` : ''}>
+                  ✓ <span className="mono">{p.token_hint}</span>
+                  {p.last_used_at ? ` · used ${new Date(p.last_used_at).toLocaleDateString()}` : ' · never used'}
+                </span>
+              : <span className="gate g-warn">△ not connected</span>}
+            <button type="button" className="ghost"
+                    onClick={() => { setOpen(open === p.provider ? null : p.provider); setPaste(''); }}>
+              {open === p.provider ? '▾ cancel' : p.connected ? '↻ replace token' : '＋ connect'}
+            </button>
+            {p.connected && (
+              <button type="button" className="projpop-del" disabled={busy}
+                      title={`Disconnect ${p.label}`} onClick={() => disconnect(p)}>🗑</button>
+            )}
+          </div>
+          {open === p.provider && (
+            <div className="setup-grid" style={{ gridTemplateColumns: '1fr' }}>
+              <label>1 · Run this in any terminal
+                <span className="setup-row">
+                  <input className="mono" readOnly value={p.command} onFocus={(e) => e.target.select()} />
+                  <button type="button" onClick={() => copy(p.command)}>{copied ? '✓ copied' : '⧉ copy'}</button>
+                </span>
+              </label>
+              <span className="pc">2 · {p.steps}</span>
+              <label>3 · Paste the token
+                <span className="setup-row">
+                  <input type="password" autoComplete="off" value={paste} placeholder="sk-ant-oat01-…"
+                         onChange={(e) => setPaste(e.target.value)}
+                         onKeyDown={(e) => { if (e.key === 'Enter' && paste.trim()) { e.preventDefault(); save(p); } }} />
+                  <button type="button" disabled={busy || !paste.trim()} onClick={() => save(p)}>Save token</button>
+                </span>
+              </label>
+            </div>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

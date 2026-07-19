@@ -25,6 +25,7 @@ import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
          probeRepo, projectReadiness, getPoolConfig, updatePoolConfig } from '../lib/projects.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
+import { listProviderTokens, setProviderToken, deleteProviderToken } from '../lib/provider-tokens.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
@@ -221,6 +222,22 @@ router.patch('/sites/:id', async (req, res) => {
 router.delete('/sites/:id', async (req, res) => {
   try { res.json(await deleteSite(req.params.id, req.query.force === '1')); }
   catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// ── provider tokens: per-project AI credentials for caged zees ────────────────
+// The read model is MASKED (hint + dates only); the full token never leaves the server —
+// only the spawn path reads it, via tokenForSpawn().
+router.get('/projects/:id/tokens', async (req, res) => {
+  try { res.json(await listProviderTokens(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.put('/projects/:id/tokens/:provider', async (req, res) => {
+  try { res.json(await setProviderToken(req.params.id, req.params.provider, req.body?.token)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/projects/:id/tokens/:provider', async (req, res) => {
+  try { res.json(await deleteProviderToken(req.params.id, req.params.provider)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // Regenerate a xell's .zeehive.env projection (spec §3.4) — e.g. after a site edit or a rename.
