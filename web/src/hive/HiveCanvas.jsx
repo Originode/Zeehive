@@ -512,6 +512,9 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   const full = size >= 52;             // the two-half card needs room; else degrade
 
+  // caged / uncaged padlock — glanceable per-hex "is this zee following protocol?"
+  drawCageBadge(ctx, cx, cy, size, x);
+
   // ── upper half ──
   const mach = machineOf(x, machines);
   if (full && mach) {
@@ -631,54 +634,93 @@ function drawFlower(ctx, centers, size, x, diff, machines) {
   });
 }
 
-// The flower's own action row — canvas-native buttons, hit-tested in onPointerUp (no DOM toolbar).
-// Returns their WORLD-space rects [{x,y,w,h,kind,label}] so the same transform used for the click
-// (toWorld) lines up. Empty for production, which has no per-xell actions.
+// Per-hex CAGE indicator — a padlock showing whether this xell's zee is STRUCTURALLY CONFINED.
+// Reads x.runtime_key: caged → closed GREEN lock (following protocol); local → OPEN RED lock (the
+// uncaged one to spot); remote → amber lock; no zee assigned yet → nothing drawn. Sits at the hex's
+// top so it's glanceable across the whole honeycomb.
+function drawCageBadge(ctx, cx, cy, size, x) {
+  if (x.is_production) return;
+  const rk = x.runtime_key;
+  if (!rk) return;                                  // no zee → no runtime to judge
+  const local = rk === 'claude-code-local';
+  const remote = rk === 'claude-code-remote';
+  const color = local ? COL.error : remote ? COL.idle : COL.working;
+  const lx = cx, ly = cy - size * 0.72;             // near the top, above the machine/chips row
+  const bw = Math.max(9, size * 0.24), bh = Math.max(7, size * 0.18);
+  const r = bw * 0.34;                               // shackle radius
+  ctx.save();
+  ctx.lineWidth = Math.max(1.3, size * 0.032);
+  ctx.strokeStyle = color;
+  ctx.lineCap = 'round';
+  // shackle — closed sits centred on the body; open (local) is tilted/lifted = unlatched
+  ctx.beginPath();
+  if (local) ctx.arc(lx - r * 0.35, ly - bh * 0.28, r, Math.PI * 0.78, Math.PI * 2.02);
+  else ctx.arc(lx, ly - bh * 0.08, r, Math.PI, Math.PI * 2);
+  ctx.stroke();
+  // body
+  ctx.beginPath();
+  ctx.roundRect(lx - bw / 2, ly, bw, bh, bw * 0.16);
+  ctx.fillStyle = withAlpha(color, 0.3);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+// One canvas button centred at (cx, cy). Font must already be set. Returns its WORLD-space rect.
+function drawPetalBtn(ctx, cx, cy, label, kind, accent, h, padX) {
+  const w = ctx.measureText(label).width + padX * 2;
+  ctx.beginPath();
+  ctx.roundRect(cx - w / 2, cy - h / 2, w, h, h / 2);
+  ctx.fillStyle = withAlpha(COL.panel, 0.96);
+  ctx.fill();
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = withAlpha(accent, 0.65);
+  ctx.stroke();
+  ctx.fillStyle = withAlpha(COL.text, 0.94);
+  ctx.fillText(label, cx, cy + 0.5);
+  return { x: cx - w / 2, y: cy - h / 2, w, h, kind };
+}
+
+// The flower's per-xell actions, drawn INSIDE the facet each verb belongs to and hit-tested in
+// onPointerUp (no DOM toolbar). Placement mirrors meaning: build in CONTAINERS(3), terminal in
+// SESSION(2), pull/push in COMMIT(5), PR in DIFF·AGE(6), mark-done in BRANCH(1). Buttons sit low in
+// their petal so the facet's own text still reads above them. Returns WORLD-space rects for hit-test.
 function drawFlowerButtons(ctx, centers, size, x) {
   if (x.is_production) return [];
   const buildable = (x.stack || []).some((c) => c.role === 'server' || c.role === 'webapp');
   const caged = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
   const showDone = ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status);
-  const specs = [];
-  if (buildable) specs.push({ kind: 'build', label: '🔨 build' });
-  specs.push({ kind: 'pull', label: '↓ pull' });
-  specs.push({ kind: 'push', label: '↑ push' });
-  specs.push({ kind: 'pr', label: 'PR' });
-  if (caged) specs.push({ kind: 'terminal', label: '⌨ terminal' });
-  if (showDone) specs.push({ kind: 'done', label: x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? 'mark done' : 'clean up') });
-
-  const h = size * 0.36;
-  const padX = size * 0.17;
-  const gap = size * 0.13;
-  const fs = Math.max(9, size * 0.16);
-  ctx.font = `600 ${fs}px 'Segoe UI', sans-serif`;
-  const widths = specs.map((s) => ctx.measureText(s.label).width + padX * 2);
-  const totalW = widths.reduce((a, b) => a + b, 0) + gap * Math.max(0, specs.length - 1);
-
-  // Centred on the flower centre, one row below the flower's lowest petal.
-  const cx0 = centers[0][0];
-  let maxY = -Infinity;
-  for (const c of centers) maxY = Math.max(maxY, c[1]);
-  const rowY = maxY + size * 0.55;
-  let bx = cx0 - totalW / 2;
-  const rects = [];
+  const R = COL.ready, D = COL.error;
+  const h = Math.max(15, size * 0.28);
+  const padX = size * 0.13;
+  const yOff = size * 0.56;                 // low in the petal, below the facet's own text
+  ctx.font = `600 ${Math.max(9, size * 0.145)}px 'Segoe UI', sans-serif`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  specs.forEach((s, i) => {
-    const w = widths[i];
-    const accent = s.kind === 'done' ? COL.error : COL.ready;
-    ctx.beginPath();
-    ctx.roundRect(bx, rowY, w, h, h / 2);
-    ctx.fillStyle = withAlpha(COL.panel, 0.95);
-    ctx.fill();
-    ctx.lineWidth = 1.2;
-    ctx.strokeStyle = withAlpha(accent, 0.6);
-    ctx.stroke();
-    ctx.fillStyle = withAlpha(COL.text, 0.92);
-    ctx.fillText(s.label, bx + w / 2, rowY + h / 2 + 0.5);
-    rects.push({ x: bx, y: rowY, w, h, kind: s.kind, label: s.label });
-    bx += w + gap;
-  });
+  const rects = [];
+  const at = (i) => centers[i];
+
+  // build → CONTAINERS petal
+  if (buildable && at(3)) rects.push(drawPetalBtn(ctx, at(3)[0], at(3)[1] + yOff, '🔨 build', 'build', R, h, padX));
+  // terminal → SESSION petal (only a caged zee has an SSH terminal)
+  if (caged && at(2)) rects.push(drawPetalBtn(ctx, at(2)[0], at(2)[1] + yOff, '⌨ terminal', 'terminal', R, h, padX));
+  // pull + push → COMMIT petal, side by side
+  if (at(5)) {
+    const [ccx, ccy] = at(5);
+    const lw = ctx.measureText('↓ pull').width + padX * 2;
+    const rw = ctx.measureText('↑ push').width + padX * 2;
+    const gap = size * 0.06;
+    const total = lw + gap + rw;
+    rects.push(drawPetalBtn(ctx, ccx - total / 2 + lw / 2, ccy + yOff, '↓ pull', 'pull', R, h, padX));
+    rects.push(drawPetalBtn(ctx, ccx + total / 2 - rw / 2, ccy + yOff, '↑ push', 'push', R, h, padX));
+  }
+  // PR → DIFF·AGE petal
+  if (at(6)) rects.push(drawPetalBtn(ctx, at(6)[0], at(6)[1] + yOff, 'PR', 'pr', R, h, padX));
+  // mark-done → BRANCH petal (the teardown verb, kept away from the git actions)
+  if (showDone && at(1)) {
+    const label = x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? '✓ mark done' : '✕ clean up');
+    rects.push(drawPetalBtn(ctx, at(1)[0], at(1)[1] + yOff, label, 'done', D, h, padX));
+  }
   return rects;
 }
 
@@ -714,6 +756,7 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     ctx.fillStyle = withAlpha(col, 0.95);
     ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
     ctx.fillText(fit(ctx, facet.lines[1], size * 1.5), cx, cy + size * 0.2);
+    drawCageBadge(ctx, cx, cy, size, x);   // caged/uncaged padlock on the flower's centre too
     return;
   }
   ctx.textBaseline = 'top';
