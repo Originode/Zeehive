@@ -437,6 +437,42 @@ a.cbox:hover { border-color: var(--accent); }
   padding: 6px 8px 2px; margin-top: 2px; border-top: 1px solid var(--line); }
 .ctxmenu button.ctxsel { color: var(--accent); font-weight: 600; }
 .ctxmenu button.ctxsel:hover { color: #fff; }
+
+/* ── decommission: the destructive container action ─────────────────────────── */
+/* production is never a candidate — it shows this instead of an action */
+.ctxmenu .ctxprotected { display: flex; align-items: center; gap: 6px; padding: 7px 8px; margin-top: 4px;
+  border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.ctxmenu .ctxbusy-note { padding: 7px 8px; margin-top: 4px; border-top: 1px solid var(--line); }
+/* the entry point item — red, sits below the build actions */
+.ctxmenu button.ctxitem-danger { color: #ff8a8a; margin-top: 4px; border-top: 1px solid var(--line);
+  border-radius: 0 0 5px 5px; }
+.ctxmenu button.ctxitem-danger:hover { background: #b3261e; color: #fff; }
+.ctxmenu button.ctxitem-danger:hover .ctxsub { color: rgba(255,255,255,.85); }
+.ctxmenu.confirming { min-width: 250px; }
+/* the second-stage confirmation panel */
+.ctxconfirm { padding: 4px 8px 8px; }
+.ctxconfirm .ctxwarn-id { padding: 2px 0 8px; }
+.ctxconfirm .ctxwarn-id > b { font-family: ui-monospace, monospace; font-size: 12px; display: block;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctxconfirm .ctxwarn-id .ctxsub { display: block; margin-top: 2px; }
+.ctxconfirm .ctxwarn-body { font-size: 12px; color: var(--text); line-height: 1.5; }
+.ctxconfirm .ctxwarn-danger { margin-top: 6px; padding: 6px 8px; border-radius: 5px; line-height: 1.45;
+  background: rgba(179,38,30,.16); border: 1px solid rgba(255,138,138,.4); color: #ffb4b4; }
+.ctxconfirm .ctxwarn-note { margin-top: 6px; font-size: 11px; color: var(--muted); line-height: 1.4; }
+.ctxconfirm .ctxwarn-type { display: block; margin-top: 8px; font-size: 11px; color: var(--muted); }
+.ctxconfirm .ctxwarn-type input { display: block; width: 100%; margin-top: 4px; box-sizing: border-box;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 5px; color: var(--text);
+  font-family: ui-monospace, monospace; font-size: 12px; padding: 5px 7px; }
+.ctxconfirm .ctxwarn-type input:focus { outline: none; border-color: #ff8a8a; }
+.ctxconfirm .ctxwarn-err { margin-top: 8px; font-size: 11px; color: #ffb4b4; line-height: 1.4; }
+.ctxconfirm-actions { display: flex; gap: 8px; margin-top: 10px; }
+.ctxconfirm-actions button { width: auto; flex: 1; justify-content: center; align-items: center;
+  border-radius: 5px; padding: 7px 10px; font-size: 12px; font-weight: 600; }
+.ctxconfirm-actions .ctxcancel { background: var(--panel); border: 1px solid var(--line); color: var(--text); }
+.ctxconfirm-actions .ctxcancel:hover { background: var(--line); color: var(--text); }
+.ctxconfirm-actions .ctxdanger { background: #b3261e; color: #fff; }
+.ctxconfirm-actions .ctxdanger:hover { background: #d13a30; color: #fff; }
+.ctxconfirm-actions .ctxdanger:disabled { background: rgba(179,38,30,.35); color: rgba(255,255,255,.5); cursor: not-allowed; }
 /* ⇄ marker on a chip whose image compiles on a different context than it runs on */
 .cbuildhost { position: absolute; bottom: 0; left: 2px; font-size: 9px; line-height: 1; opacity: .7;
   color: var(--accent); pointer-events: none; }

@@ -442,7 +442,8 @@ export default function App() {
                   onClose={() => setShowDispatch(false)}
                   onDispatched={() => { setShowDispatch(false); refresh(); }} />
       )}
-      <ContainerMenu menu={menu} onClose={() => setMenu(null)} />
+      <ContainerMenu menu={menu} onClose={() => setMenu(null)}
+                     projectName={project.name} onDecommissioned={refresh} />
     </div>
   );
 }
@@ -560,33 +561,57 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
     // Spell out exactly what is at stake BEFORE asking — a generic "cannot be undone" let a single
     // click destroy a working xell that had an uncommitted file in it.
     const unlanded = diff && (diff.ahead > 0 || diff.dirty > 0);
+    // A xell awaiting a human decision (a held landing, an open PR into it, or an in-flight ship)
+    // is NOT idle — decommissioning it throws that decision away, and a shipping xell holds prod.
+    // Treat any of these as "in use": warn hard and demand the same typed-name confirmation as
+    // unlanded work. (The reaper withdraws open ships and refuses one it is actively deploying —
+    // this stops the click before it gets there.)
+    const heldLanding = (landing || []).filter((r) => r.status === 'pending').length;
+    const openPr = (prs || []).filter((r) => r.status === 'pending').length;
+    const pendingShip = ship && ['pending', 'approved', 'shipping'].includes(ship.status) ? ship.status : null;
+    const inUse = heldLanding + openPr > 0 || !!pendingShip;
+    const inUseText = inUse
+      ? `\n\n⚠ THIS XELL IS WAITING ON A DECISION:\n` +
+        (heldLanding ? `   • ${heldLanding} landing held for approval\n` : '') +
+        (openPr ? `   • ${openPr} open PR into this xell\n` : '') +
+        (pendingShip ? `   • a production ship is ${pendingShip}${pendingShip !== 'pending' ? ' (may hold the prod lock)' : ''}\n` : '') +
+        `   Tearing it down cancels that.\n`
+      : '';
     const atStake = unlanded
       ? `\n\n⚠ THIS XELL HAS WORK THAT IS NOT ON MAIN:\n` +
         (diff.ahead > 0 ? `   • ${diff.ahead} commit(s) not landed on main\n` : '') +
         (diff.dirty > 0 ? `   • ${diff.dirty} uncommitted file(s) in the worktree\n` : '') +
         `   This work will be PERMANENTLY LOST.\n`
-      : '\n\n(Nothing unlanded — its work is already on main.)\n';
+      : (inUse ? '' : '\n\n(Nothing unlanded — its work is already on main.)\n');
     // ACTIVE = a zee is still in there; the server needs `force` to touch it. It is NOT, on its
     // own, a reason for more friction: marking done is the human's job (House rule 4), and a live
     // zee whose work is already on main loses nothing when it goes — you just restart it.
     const active = !!x.zee_id && (x.cli_active === true || ['spawning', 'online', 'working'].includes(x.zee_status));
     const ok = window.confirm(
-      `${x.task_id ? 'Mark done' : 'Clean up'} "${x.slug}"?` +
+      `${x.task_id ? 'Mark done' : 'Decommission'} "${x.slug}"?` +
       (active ? `\n\nIts zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills the agent mid-task.\n` : '') +
+      inUseText +
       atStake +
       `\nThis removes its worktree, branch, and per-xell containers, and decommissions its zee` +
       `${x.holds_prod_lock ? ' (it currently HOLDS the prod lock)' : ''}.\nThis cannot be undone.`);
     if (!ok) return;
-    // The ONE hard gate, and only where something is actually destroyed forever: unlanded work.
-    // Gate on LOSS, not on liveness — keying it to "active" made the common case (a finished zee
-    // sitting clean at the source tip) demand a typed 40-char slug to do the very thing the whole
-    // system asks you to do, while a stray click on a dirty-but-idle xell only cost one confirm.
-    if (unlanded) {
+    // The hard gate — a typed-name confirmation — fires whenever something real is at stake:
+    //   • a LIVE zee is in there (active): a claimed xell with a running agent must never go on a
+    //     single click — that exact accident (a live claimed xell reaped) is why this gate exists;
+    //   • unlanded work that would be LOST;
+    //   • a pending decision (landing/PR/ship) that would be CANCELLED.
+    // A clean, idle/pooled xell with none of these still costs only the single confirm above — the
+    // common "tidy up an unused xell" case stays one step.
+    if (unlanded || inUse || active) {
       const typed = window.prompt(
-        `"${x.slug}" has work that is NOT on main:\n` +
-        (diff.ahead > 0 ? `  • ${diff.ahead} commit(s) not landed\n` : '') +
-        (diff.dirty > 0 ? `  • ${diff.dirty} uncommitted file(s)\n` : '') +
-        `\nThis will be PERMANENTLY LOST. To confirm, type the xell name exactly:\n${x.slug}`);
+        `"${x.slug}" is not safe to remove without confirmation:\n` +
+        (active ? `  • its zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills it mid-task\n` : '') +
+        (diff?.ahead > 0 ? `  • ${diff.ahead} commit(s) not landed\n` : '') +
+        (diff?.dirty > 0 ? `  • ${diff.dirty} uncommitted file(s)\n` : '') +
+        (heldLanding ? `  • ${heldLanding} landing held for approval\n` : '') +
+        (openPr ? `  • ${openPr} open PR\n` : '') +
+        (pendingShip ? `  • a production ship is ${pendingShip}\n` : '') +
+        `\nProceeding is irreversible. To confirm, type the xell name exactly:\n${x.slug}`);
       if (typed !== x.slug) { if (typed !== null) alert('Name did not match — nothing was touched.'); return; }
     }
     try {
@@ -804,14 +829,20 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
       {!isProd && x.worktree_path && <XourceActions x={x} diff={diff} onDone={onDone} />}
 
       {/* Never gate this on task_id: a dispatched zee's xell may have no task row, and without a
-          button it can never be confirmed OR reaped — it just strands in awaiting-done forever. */}
-      {!isProd && ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status) && (
+          button it can never be confirmed OR reaped — it just strands in awaiting-done forever.
+          `ready` is included too: an idle POOLED xell nobody needs had no teardown affordance at
+          all, so a user could never decommission an unused xell — the whole point of this action.
+          Teardown routes through reapXell either way, so the pool reconciler backfills to appetite
+          exactly as it does for any other decommission. */}
+      {!isProd && ['working', 'idle', 'claimed', 'awaiting-done', 'ready'].includes(x.status) && (
         <button className={`donebtn ${x.status === 'awaiting-done' ? 'await' : ''}`} onClick={done}
                 data-testid="done-btn"
                 title={x.task_id ? 'Mark the task done — the queenzee tears this xell down'
-                                 : 'No task row on this xell — this cleans it up (tears it down) directly'}>
+                     : x.status === 'ready' ? 'Decommission this unused (pooled) xell — the queenzee tears it down; the pool refills as usual'
+                     : 'No task row on this xell — this cleans it up (tears it down) directly'}>
           {x.status === 'awaiting-done' ? '✓ Confirm done (zee reported finished)'
-            : (x.task_id ? 'Mark done' : 'Clean up xell')}
+            : x.status === 'ready' ? 'Decommission xell'
+            : (x.task_id ? 'Mark done' : 'Decommission xell')}
         </button>
       )}
     </div>

@@ -200,6 +200,19 @@ export async function buildContainer(containerId, hot = false, buildCtx) {
   return r.ok ? r.json() : Promise.reject(await r.json().catch(() => ({ error: r.statusText })));
 }
 
+// Decommission ONE container (the container context-menu action): stop + remove it, reclaim its
+// image, drop its row. The server REFUSES production (ok:false, protected:true) — surface that as
+// an error rather than treating a refusal as a teardown.
+export async function decommissionContainer(containerId, force = false) {
+  const r = await fetch(`/api/containers/${containerId}/decommission`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ force }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `decommission failed (${r.status})`);
+  if (data?.ok === false) throw new Error(data.error || 'decommission refused');
+  return data;
+}
+
 // Set WHERE a xell's images compile (both server+webapp). build_ctx='' resets to the run host.
 // Throws with an actionable message if the context is foreign and no registry is configured.
 export async function setXellBuildCtx(xellId, build_ctx) {

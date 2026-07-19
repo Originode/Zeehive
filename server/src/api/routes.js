@@ -10,7 +10,7 @@ import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, 
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
-import { checkContainers } from '../queenzee/containers.js';
+import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool } from '../lib/machines.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -425,6 +425,15 @@ router.get('/monitor/remote', async (_req, res) => res.json(await remoteAvailabl
 
 // ── container health: is each container actually running (per `docker ps`)? ───
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
+
+// ── decommission ONE container (the container context-menu action) ────────────
+// Stops + removes the actual container, reclaims its image, drops its meta row. PRODUCTION is
+// refused by decommissionContainer itself (tier='prod' or a production xell) — server-side, so a
+// direct API call can't get around the UI guard.
+router.post('/containers/:id/decommission', async (req, res) => {
+  try { res.json(await decommissionContainer(req.params.id, { force: !!req.body?.force })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 // ── machines: the hive's docker hosts as data (023) — placement, caps, build policy ──
 router.get('/machines', async (_req, res) => res.json(await listMachines()));

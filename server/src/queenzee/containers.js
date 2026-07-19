@@ -5,7 +5,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { dockerPs } from '../lib/docker.js';
+import { dockerPs, stopAndRemoveContainer, removeImage } from '../lib/docker.js';
 
 // Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
 // role } (the zeehive.* identity labels, null when the container is unlabeled) and a null map
@@ -185,6 +185,71 @@ export async function checkContainers() {
   const healthLine = `docker health: ${up} up · ${down} down · ${unknown} unknown${busy ? ` · ${busy} building (skipped)` : ''}${procs.length ? ` (incl. ${procs.length} process role(s) by URL)` : ''}${unreach.length ? ` (unreachable: ${unreach.join(', ')})` : ''}${changed ? ` · ${changed} changed` : ''}${orphans.length ? ` · ${orphans.length} ORPHANED` : ''}`;
   if (healthLine !== lastHealthLine) { lastHealthLine = healthLine; logline('containers', healthLine); }
   return { up, down, unknown, changed, building: busy, unreachable: unreach, orphans };
+}
+
+// ── decommission ONE container (the context-menu action) ─────────────────────
+//
+// Stops + removes the actual docker container, reclaims its image, then drops its meta row so the
+// dashboard, health monitor and pool reconciler all see it gone. This is the SINGLE-container
+// counterpart to the reaper (which tears down a whole xell); it uses the same docker-by-name
+// mechanics, so state stays coherent through the queenzee rather than a hand-rolled second path.
+//
+// PRODUCTION IS EXCLUDED ENTIRELY — not warned about, refused. tier='prod' covers the prod stack
+// AND the pinned prod database (which lives outside compose but is still a tier='prod' row). This
+// is a server-side guard, not just a hidden UI item: a UI-only guard is bypassed by any direct
+// API call — the same reasoning the reaper states for its active-zee guard.
+export async function decommissionContainer(id, { force = false } = {}) {
+  const c = await one(
+    `SELECT c.*, x.slug AS owner_slug, x.is_production AS owner_is_production, p.name AS project_name
+       FROM container c
+       LEFT JOIN xell x ON x.id = c.owner_xell_id
+       LEFT JOIN project p ON p.id = c.project_id
+      WHERE c.id = $1`, [id]);
+  if (!c) return { ok: false, error: 'container not found' };
+
+  // Never target production — the stack or the pinned prod db. Refuse outright.
+  if (c.tier === 'prod' || c.owner_is_production) {
+    return { ok: false, protected: true,
+      error: `${c.name} is a PRODUCTION container — it is protected and cannot be decommissioned.` };
+  }
+
+  // Mid-operation (a live build, or a db being restored/backed-up): removing it now would mangle
+  // the operation and leave the row lying about what happened. Force overrides — a wedged build
+  // that will never finish is exactly when you need to remove it — but say what is being overridden.
+  if (!force && (c.health === 'building' || c.busy_since)) {
+    return { ok: false, busy: true, name: c.name,
+      error: `${c.name} is busy (${c.health === 'building' ? 'building' : (c.busy_op || 'in an operation')}) — `
+           + 'wait for it to finish, or force to remove it anyway.' };
+  }
+
+  logline('containers', `decommissioning container ${c.name}`
+    + `${c.owner_slug ? ` (xell ${c.owner_slug})` : ''} — stopping + removing, reclaiming its image`);
+
+  // Stop + remove the real container. removeVolumes for a db so its data goes with it (a db
+  // container's whole point is its volume). Best-effort over the daemon HTTP API — a missing
+  // container (already gone) is success, and an unreachable daemon must not strand the row.
+  let docker = { skipped: true };
+  if (c.docker_ctx) {
+    docker = await stopAndRemoveContainer(c.docker_ctx, c.name, { removeVolumes: c.role === 'db' })
+      .catch((e) => ({ error: e.message }));
+    if (docker.error) {
+      logline('containers', `docker stop/remove FAILED for ${c.name}: ${docker.error} — removing the meta row anyway; the container may leak`);
+    }
+    // Reclaim its image (never force — docker refuses while anything still depends on it, which is
+    // the pre-ZEEHIVE /spin worktrees' safeguard). Also the build host on a split build.
+    for (const ctx of [...new Set([c.docker_ctx, c.build_ctx].filter(Boolean))]) {
+      if (!c.image_tag) break;
+      const img = await removeImage(ctx, c.image_tag).catch((e) => ({ removed: false, reason: e.message }));
+      if (img.removed) logline('containers', `reclaimed image ${c.image_tag} (~1.3 GB) from ${c.name}`);
+    }
+  }
+
+  // Drop the meta row — cascades its xell_uses_container junctions and db_instance rows (001/019).
+  await q(`DELETE FROM container WHERE id=$1`, [id]);
+  broadcast('container', { id, project_id: c.project_id, deleted: true });
+  logline('containers', `container ${c.name} decommissioned ✓`);
+  return { ok: true, name: c.name, role: c.role, owner_slug: c.owner_slug || null,
+           docker, orphaned: !!(docker && docker.error) };
 }
 
 export function startContainerMonitor() {

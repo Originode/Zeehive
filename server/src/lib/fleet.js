@@ -87,6 +87,7 @@ async function decorateXell(x, heads, deployed) {
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id,
             c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
             c.docker_ctx, c.build_ctx,
+            (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
             c.prod_diff, c.prod_diff_at, uc.relation, ${INSTANCES_AGG}
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1
@@ -150,6 +151,7 @@ export async function getFleet(projectId) {
     `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host_port, c.health,
             c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
             c.docker_ctx, c.build_ctx,
+            (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
             -- where a PROCESS role (docker_ctx NULL) lives: its site's context, so the machine
             -- matrix can place it in the right column instead of 'elsewhere'
             (SELECT ds.docker_ctx FROM deploy_site ds WHERE ds.id = c.site_id) AS site_docker_ctx,

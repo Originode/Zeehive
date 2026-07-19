@@ -9,8 +9,12 @@
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
 import React, { useState, useEffect } from 'react';
-import { buildContainer, getDockerContexts, setContainerBuildCtx } from './api.js';
+import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer } from './api.js';
 import { nick } from './nick.js';
+
+// Production is EXCLUDED from decommission entirely (not warned) — a prod container/db is never a
+// candidate for this action. Mirrors the server guard in decommissionContainer (tier='prod').
+export const isProdContainer = (c) => c?.tier === 'prod';
 
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
 export const isBuildable = (c) => BUILDABLE.has(c.role) && !!c.owner_xell_id;
@@ -156,15 +160,27 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
 
 // Right-click context menu for a container. Build actions only when the container is buildable
 // AND idle; a busy container shows a "please wait" note instead so it can't be mangled mid-op.
-export function ContainerMenu({ menu, onClose }) {
+// Decommission (stop + remove) is offered on every non-production container behind a second-stage
+// confirmation — production is never a candidate (it isn't even shown), matching the server guard.
+export function ContainerMenu({ menu, onClose, projectName, onDecommissioned }) {
   // Hooks must run unconditionally (before any early return). The build-host picker lists the
   // docker contexts this machine can compile on; loaded lazily the first time a buildable+idle
   // container's menu opens, then cached for the life of the menu component.
   const [ctxs, setCtxs] = useState(null);
+  // Decommission is a two-stage flow: the menu item flips to an in-menu confirmation panel (a
+  // clearly destructive button, not a default-focused OK), and a db additionally requires typing
+  // its name. Reset whenever the menu targets a different container so state can't bleed across.
+  const [confirming, setConfirming] = useState(false);
+  const [typed, setTyped] = useState('');
+  const [busyAct, setBusyAct] = useState(false);
+  const [err, setErr] = useState(null);
   const c = menu?.c;
+  const cid = c?.id;
+  useEffect(() => { setConfirming(false); setTyped(''); setBusyAct(false); setErr(null); }, [cid]);
+
   const buildable = c ? isBuildable(c) : false;
   const busy = c ? busyReason(c) : null;
-  const showPicker = !!c && buildable && !busy;
+  const showPicker = !!c && buildable && !busy && !confirming;
   useEffect(() => {
     if (!showPicker || ctxs) return;
     let live = true;
@@ -190,11 +206,67 @@ export function ContainerMenu({ menu, onClose }) {
   if (runCtx) picker.push({ name: runCtx, run: true });
   for (const k of (ctxs || [])) if (k.name && k.name !== runCtx) picker.push({ name: k.name, endpoint: k.endpoint });
 
+  // Decommission wiring. Production is never a candidate. A db needs its name typed (it deletes
+  // data); anything else just needs the destructive button pressed.
+  const prod = isProdContainer(c);
+  const isDb = c.role === 'db';
+  const canConfirm = !isDb || typed.trim() === c.name;
+  const runDecommission = async () => {
+    if (!canConfirm || busyAct) return;
+    setBusyAct(true); setErr(null);
+    try {
+      await decommissionContainer(c.id, false);
+      onDecommissioned?.();
+      onClose();
+    } catch (e) { setErr(e?.error || e?.message || String(e)); setBusyAct(false); }
+  };
+
   // No blocking scrim — App closes the menu via document-level listeners. Stop propagation so a
   // click INSIDE the menu doesn't also bubble to that closer before the item handler runs.
   return (
-    <div className="ctxmenu" style={{ left: x, top: y }} role="menu" onClick={(e) => e.stopPropagation()}>
+    <div className={`ctxmenu${confirming ? ' confirming' : ''}`} style={{ left: x, top: y }} role="menu"
+         onClick={(e) => e.stopPropagation()}>
       <div className="ctxhead">{c.name}</div>
+
+      {/* ── decommission confirmation panel (second stage) ─────────────────────── */}
+      {confirming ? (
+        <div className="ctxconfirm" data-testid="decommission-confirm">
+          <div className="ctxwarn-id">
+            <b>{c.name}</b>
+            <span className="ctxsub">
+              {(ROLE_WORD[c.role] || c.role)} · {c.tier}
+              {c.owner_slug ? <> · xell <b>{c.owner_slug}</b></> : null}
+              {projectName ? <> · {projectName}</> : null}
+            </span>
+          </div>
+          <div className="ctxwarn-body">
+            This <b>stops and removes</b> the container.
+            {isDb
+              ? <div className="ctxwarn-danger">⚠ This is a <b>DATABASE</b>. Its data is
+                  <b> permanently deleted</b> — this cannot be undone.</div>
+              : <div className="ctxwarn-note">Its built image is reclaimed. This cannot be undone
+                  (rebuild to bring it back).</div>}
+          </div>
+          {isDb && (
+            <label className="ctxwarn-type">
+              To confirm, type the container name:
+              <input autoFocus data-testid="decommission-type" value={typed}
+                     placeholder={c.name} spellCheck={false} autoComplete="off"
+                     onChange={(e) => setTyped(e.target.value)}
+                     onKeyDown={(e) => { if (e.key === 'Enter') runDecommission(); }} />
+            </label>
+          )}
+          {err && <div className="ctxwarn-err" data-testid="decommission-err">{err}</div>}
+          <div className="ctxconfirm-actions">
+            <button className="ctxcancel" onClick={() => setConfirming(false)} disabled={busyAct}>Cancel</button>
+            <button className="ctxdanger" data-testid="decommission-go" disabled={!canConfirm || busyAct}
+                    onClick={runDecommission}>
+              {busyAct ? 'Decommissioning…' : 'Decommission'}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
       {busy && <div className="ctxbusy" data-testid="ctx-busy"><span className={`cspin ${busy}`} />{busy === 'restoring' ? 'restoring from backup…' : 'building…'}</div>}
       {!busy && buildable && <button role="menuitem" onClick={() => act(false)}>🔨 Build <span className="ctxsub">full rebuild{bh?.split ? ` on ${current}` : ''}</span></button>}
       {!busy && buildable && <button role="menuitem" onClick={() => act(true)}>⚡ Hot build <span className="ctxsub">fast reload</span></button>}
@@ -212,7 +284,23 @@ export function ContainerMenu({ menu, onClose }) {
         </>
       )}
       {c.url && <a role="menuitem" href={c.url} target="_blank" rel="noopener" onClick={onClose}>↗ Open URL</a>}
-      {!busy && !buildable && !c.url && <div className="ctxempty">no actions</div>}
+
+      {/* Decommission: every non-production container. Production is excluded outright — it shows a
+          protected note instead, never an action. A busy container can't be removed mid-op. */}
+      {prod ? (
+        <div className="ctxprotected" data-testid="decommission-protected">🛡 production — protected</div>
+      ) : busy ? (
+        <div className="ctxsub ctxbusy-note">decommission unavailable while busy</div>
+      ) : (
+        <button role="menuitem" className="ctxitem-danger" data-testid="decommission-open"
+                onClick={() => { setConfirming(true); setErr(null); }}>
+          🗑 Decommission… <span className="ctxsub">{isDb ? 'stop + remove (deletes data)' : 'stop + remove'}</span>
+        </button>
+      )}
+        </>
+      )}
     </div>
   );
 }
+
+const ROLE_WORD = { db: 'database', server: 'server', webapp: 'app' };

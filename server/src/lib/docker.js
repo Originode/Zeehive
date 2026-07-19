@@ -72,6 +72,61 @@ function getJson(conn, path, timeout) {
   });
 }
 
+// A request that does NOT expect a JSON body back (stop/remove return 204/304 empty). Resolves
+// with the HTTP status so the caller can tell "done" (2xx) from "already gone" (404) from
+// "already in that state" (304). THROWS only on a transport error or an unexpected 5xx — a 404 is
+// data, not a failure (the container/image may have been removed already).
+function reqNoBody(conn, method, path, timeout) {
+  return new Promise((res, rej) => {
+    const r = http.request({ ...conn, path, method, timeout }, (resp) => {
+      let body = '';
+      resp.setEncoding('utf8');
+      resp.on('data', (d) => (body += d));
+      resp.on('end', () => {
+        if (resp.statusCode >= 500) return rej(new Error(`HTTP ${resp.statusCode}: ${body.slice(0, 200)}`));
+        res({ status: resp.statusCode, body });
+      });
+      resp.on('error', rej);
+    });
+    r.on('error', rej);
+    r.on('timeout', () => r.destroy(new Error(`timeout after ${timeout}ms`)));
+    r.end();
+  });
+}
+
+// Stop then remove ONE container, by name (docker's HTTP API accepts a name as the id). Best-effort
+// and idempotent: a 404 (already gone) is success, so this can run after a partial teardown and
+// finish it. `removeVolumes` deletes the container's ANONYMOUS volumes too — the reaper's per-xell
+// db is anonymous, so its data goes with it (that is the point of decommissioning a db container).
+// Returns { stopped, removed, alreadyGone } — never throws for a missing container.
+export async function stopAndRemoveContainer(ctx, name, { removeVolumes = false, timeout = 30000 } = {}) {
+  const conn = await resolveContext(ctx);
+  const enc = encodeURIComponent(name);
+  let stopped = false, alreadyGone = false;
+  const stop = await reqNoBody(conn, 'POST', `/containers/${enc}/stop?t=10`, timeout);
+  if (stop.status === 404) alreadyGone = true;                 // nothing to stop
+  else if (stop.status < 300 || stop.status === 304) stopped = stop.status !== 304; // 304 = already stopped
+  const del = await reqNoBody(conn, 'DELETE',
+    `/containers/${enc}?force=true&v=${removeVolumes ? 'true' : 'false'}`, timeout);
+  const removed = del.status >= 200 && del.status < 300;
+  if (del.status === 404) alreadyGone = true;
+  return { stopped, removed, alreadyGone };
+}
+
+// Remove an image by tag. NEVER force (see lib/images.js): force UNTAGS an image a container still
+// uses, and the next restart of that environment then fails "image not found". Plain remove makes
+// docker the judge — it refuses (409) while any container depends on it, which is the only
+// authority that actually knows. A 404 (already gone) is success. Best-effort: returns a verdict.
+export async function removeImage(ctx, tag, { timeout = 60000 } = {}) {
+  if (!tag) return { removed: false, reason: 'no image tag' };
+  const conn = await resolveContext(ctx);
+  const r = await reqNoBody(conn, 'DELETE', `/images/${encodeURIComponent(tag)}`, timeout);
+  if (r.status >= 200 && r.status < 300) return { removed: true };
+  if (r.status === 404) return { removed: false, reason: 'already gone' };
+  if (r.status === 409) return { removed: false, reason: 'still in use by a container' };
+  return { removed: false, reason: `HTTP ${r.status}` };
+}
+
 // Every container on a context (running or not), keyed by name:
 //   { state, xell, project, role }  — identity labels (spec §3.3), null when unlabeled.
 // THROWS if the daemon is unreachable/errors. An empty Map means a genuinely empty daemon; the
