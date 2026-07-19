@@ -217,6 +217,13 @@ export default function App() {
       body: nImg
         ? `Uploading ${nImg} image${nImg === 1 ? '' : 's'}, claiming a xell and spawning…`
         : 'Claiming a ready xell and spawning…' });
+    // YIELD before the network call. dispatchTask() runs synchronously up to its first await —
+    // JSON.stringify()-ing a multi-MB base64 screenshot blocks the main thread for that whole
+    // serialization. If we call it inside the same click-handler tick, that blocking happens
+    // BEFORE React commits the modal-close + toast, so the window appears to freeze exactly as
+    // before. Two rAFs guarantee the browser has painted the closed modal and the progress toast
+    // first; the heavy serialization then runs with the UI already updated.
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     try {
       const r = await dispatchTask(payload);
       updateToast(id, { kind: 'success', title: 'Zee dispatched', onRetry: null,
