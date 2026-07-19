@@ -131,7 +131,13 @@ export function catchUpWorktree(worktree, ref) {
   // Diverged → replay our commits onto the current tip. On conflict, ABORT and report — never
   // leave the worktree wedged mid-rebase (the next land would trip over it). We resolve trivially
   // (a clean replay) or surface the real conflict; we never fabricate a merge nobody reviewed.
-  const rb = git(worktree, ['rebase', ref], 180000);
+  // --autostash: a stray UNCOMMITTED file in the worktree (e.g. a spawn-time `mcp/server.js` mode
+  // flip that no cage verb can clean) would otherwise make git refuse the rebase outright with
+  // "cannot rebase: you have unstaged changes" — a landing wedged on drift that is not even ours.
+  // Autostash tucks it away, rebases, and restores it; --abort likewise pops the stash back, so
+  // the worktree is left exactly as we found it either way. It never touches OUR commits, only the
+  // dirty tree the rebase can't carry across.
+  const rb = git(worktree, ['rebase', '--autostash', ref], 180000);
   if (!rb.ok) {
     git(worktree, ['rebase', '--abort']);
     return { state: 'conflict', ref, base: tip, stashed, output: `${rb.out}\n${rb.err}`.trim().slice(-1200) };
