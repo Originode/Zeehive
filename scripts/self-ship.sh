@@ -25,8 +25,54 @@ PORT="${PORT:-4700}"
 
 emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$HEAD" "$2" "$ROLE"; }
 
-if [ "$MODE" = "simulate" ]; then emit true "simulate"; exit 0; fi
+# ── GAP 2: rebuild the CAGE IMAGE as part of the approved Zeehive deploy ─────────────────────────
+# New caged-zee capabilities (the `zee` CLI, cage-sshd/seed/attach scripts) ship INSIDE
+# zeehive/zee-agent (docker/zeehive/Dockerfile.zee-agent). Deploying Zeehive must rebuild that image
+# so freshly-provisioned cages carry the current code — otherwise the fleet silently stays on an old
+# image and a shipped capability never actually reaches a zee. This lives HERE, not in shipgate.js,
+# on purpose: self-ship.sh is Zeehive's OWN build_script, so the rebuild is automatically scoped to
+# the self-hosting project and CANNOT touch OmniBiz's container-build ship path (which shares
+# shipgate.js). Cages run on the `default` docker context (server/src/queenzee/intake.js: `const ctx
+# = 'default'`), so the image must exist there; CAGE_IMAGE_CTX overrides for an operator who moves
+# the fleet's daemon. Best-effort with LOUD failure: a build failure is reported on the ship card
+# (this stdout/stderr is captured into the ship_request row + streamed to the console) but does NOT
+# abort the code deploy — a running queenzee on new code with a stale cage image beats a blocked
+# ship, and the warning is anything but silent.
+CAGE_IMAGE="${CAGE_IMAGE:-zeehive/zee-agent}"
+CAGE_IMAGE_CTX="${CAGE_IMAGE_CTX:-}"   # empty = the default docker context, where cages actually run
+cage_build_cmd() {
+  local ctxargs=""
+  [ -n "$CAGE_IMAGE_CTX" ] && ctxargs="--context $CAGE_IMAGE_CTX "
+  echo "docker ${ctxargs}build -f \"$SRC/docker/zeehive/Dockerfile.zee-agent\" -t \"$CAGE_IMAGE\" \"$SRC/docker/zeehive\""
+}
+rebuild_cage_image() {
+  echo "self-ship: rebuilding cage image $CAGE_IMAGE @ $HEAD so new cages carry this code" >&2
+  local ctxargs=()
+  [ -n "$CAGE_IMAGE_CTX" ] && ctxargs=(--context "$CAGE_IMAGE_CTX")
+  if docker "${ctxargs[@]}" build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" \
+        -t "$CAGE_IMAGE" "$SRC/docker/zeehive" >&2; then
+    echo "self-ship: CAGE-IMAGE ok — $CAGE_IMAGE rebuilt at $HEAD; new cages will carry this code" >&2
+  else
+    echo "self-ship: !!! CAGE-IMAGE FAILED — could NOT rebuild $CAGE_IMAGE; the fleet stays on the OLD" >&2
+    echo "self-ship: !!! cage image and newly-provisioned cages will run STALE caged-zee code. The" >&2
+    echo "self-ship: !!! queenzee restart proceeds (code deploy is the priority); rebuild the cage" >&2
+    echo "self-ship: !!! image by hand or re-ship: $(cage_build_cmd)" >&2
+  fi
+}
+
+if [ "$MODE" = "simulate" ]; then
+  # Prove the new steps WITHOUT touching any process/daemon (Zeehive's own test path). Assert the
+  # exact cage-image command a real deploy would run, and the worktree-sync the restart would do.
+  echo "self-ship: [simulate] would rebuild cage image with: $(cage_build_cmd)" >&2
+  echo "self-ship: [simulate] would sync working tree with: bash \"$SRC/scripts/self-ship-sync.sh\" \"$SRC\" \"$REF\"" >&2
+  emit true "simulate"; exit 0
+fi
 if [ "$ROLE" = "webapp" ]; then emit true "noop-rides-with-server"; exit 0; fi
+
+# Real server ship: rebuild the cage image NOW, while this (soon-to-die) queenzee is still alive,
+# its docker context reachable, and its output still captured by the ship record. Runs before the
+# detached restart is scheduled so a cage-image failure lands on the ship card, not into the void.
+rebuild_cage_image
 
 # Detached restart helper. Grace period 3s: long enough for runShip to write 'shipped' and start
 # the lock countdown; short enough that the port frees before anyone notices. The new process
@@ -39,7 +85,15 @@ if [ "$ROLE" = "webapp" ]; then emit true "noop-rides-with-server"; exit 0; fi
 #   2. `bash` must resolve to GIT bash. A detached PowerShell inherits the SYSTEM PATH, where
 #      C:\Windows\system32\bash.exe (WSL, no distro) shadows Git bash — every provisioning script
 #      then fails with an empty error. Prepend Git's bin explicitly.
+# GAP 1: SYNC THE WORKING TREE between the kill and the start. The landing gate moved `master` with
+# update-ref (no working-tree touch), so the files on disk are still the pre-landing code; without
+# this the new process would boot STALE bytes. The order is load-bearing: kill the old server FIRST
+# (so nothing is reading the tree we are about to reset), THEN reset --hard to the approved sha, THEN
+# start. self-ship-sync.sh is defensive — it stashes any unexpected uncommitted edits under a
+# labeled stash before resetting, and only ever moves to the exact ship ref ($REF). We start the
+# server regardless of the sync's exit (`;`, not `&&`): a running queenzee on old-but-committed code
+# is recoverable; a dead one cannot even self-ship the fix.
 SRCWIN="$(echo "$SRC" | sed 's|/|\\\\|g')"
-powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('Start-Sleep 3; Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }; Start-Sleep 1; \$env:Path = \"C:\Program Files\Git\bin;\" + \$env:Path; Set-Location \"${SRCWIN}\"; npm run server')" >&2 \
+powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('Start-Sleep 3; Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }; Start-Sleep 1; \$env:Path = \"C:\Program Files\Git\bin;\" + \$env:Path; Set-Location \"${SRCWIN}\"; bash \"${SRC}/scripts/self-ship-sync.sh\" \"${SRC}\" \"${REF}\"; npm run server')" >&2 \
   && emit true "detached-restart" \
   || emit false "detach-failed"
