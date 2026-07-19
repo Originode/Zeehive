@@ -27,6 +27,15 @@ if [[ -n "${CAGE_PUBKEY:-}" ]]; then
   chmod 600 /home/zee/.ssh/authorized_keys
 fi
 
+# Pre-answer Claude Code's first-run gauntlet for the zee user so an ATTENDING human never sees
+# onboarding/theme/trust/bypass prompts. Idempotent (merges the keys, preserving whatever Claude
+# has already written) — the image bakes this too, but re-running here keeps a cage seeded even if
+# it was built from an older image. Written as root, then handed back to zee.
+if [[ -x /usr/local/bin/cage-claude-seed.mjs ]]; then
+  node /usr/local/bin/cage-claude-seed.mjs /home/zee/.claude.json || true
+  chown zee:zee /home/zee/.claude.json && chmod 600 /home/zee/.claude.json
+fi
+
 # Token for interactive SSH logins. /etc/environment is read by PAM at login, so an SSH shell
 # (which a docker-exec -e run bypasses) still comes up authenticated. 0600 root — the zee's own
 # shell can read it via the login env, but it is not world-readable in the fs.

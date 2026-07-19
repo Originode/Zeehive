@@ -27,7 +27,14 @@ COPY cage-sshd.sh /usr/local/bin/cage-sshd.sh
 # This is a synced copy of scripts/zee (the authoritative source); it lives here because the image's
 # build context is this directory. Update both if you change it.
 COPY zee /usr/local/bin/zee
-RUN chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee
+# The ATTEND path: cage-claude-seed.mjs pre-answers Claude Code's first-run gauntlet (so an
+# attending human sees ZERO onboarding/theme/trust/bypass prompts); zee-attach.sh + zee-live.mjs
+# land that human straight in the zee's live workflow, then `claude --resume` for the full session.
+COPY cage-claude-seed.mjs /usr/local/bin/cage-claude-seed.mjs
+COPY zee-live.mjs /usr/local/bin/zee-live.mjs
+COPY zee-attach.sh /usr/local/bin/zee-attach.sh
+RUN chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee \
+             /usr/local/bin/cage-claude-seed.mjs /usr/local/bin/zee-live.mjs /usr/local/bin/zee-attach.sh
 
 RUN useradd -m -s /bin/bash zee \
     && mkdir -p /work && chown zee:zee /work \
@@ -37,6 +44,11 @@ WORKDIR /work
 ENV NODE_NO_WARNINGS=1 \
     DISABLE_AUTOUPDATER=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+# Bake the answered first-run config into the zee user's home so it is present BEFORE any claude
+# launch (the headless run and the very first terminal attach both read it). cage-sshd.sh re-runs
+# the same idempotent seed at spawn as a belt-and-suspenders across future image changes.
+RUN node /usr/local/bin/cage-claude-seed.mjs /home/zee/.claude.json && chmod 600 /home/zee/.claude.json
 
 # git identity for in-cage commits; the land gate attributes the human merge
 RUN git config --global user.name "zee" \

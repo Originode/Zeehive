@@ -42,13 +42,14 @@ async function openTerminal(ws, zeeId) {
   try { port = Number(new URL(zee.viewer_url).port); } catch { return fail('bad viewer url'); }
   const { privateKey } = ensureZeehiveKeypair();
 
-  // First open starts the resumed conversation; reconnects re-attach the live tmux session. If
-  // claude exits, drop to a login shell so the pane (and the zee's box) stays reachable.
-  const sid = zee.claude_session_id;
-  const inner = sid
-    ? `claude --resume ${sid} 2>/dev/null || claude; exec bash -l`
-    : `exec bash -l`;
-  const cmd = `tmux new -A -s zee -c /work/repo '${inner}'`;
+  // First open lands the human in the zee's WORKFLOW; reconnects re-attach the live tmux session
+  // (true async — disconnect and it keeps running). zee-attach.sh (baked into the cage) does the
+  // work: while the headless zee is still working it streams the transcript live, then hands off
+  // to `claude --resume <sid>` for the full interactive session (all first-run prompts are
+  // pre-answered by cage-claude-seed.mjs, so it drops straight in). It ends in a login shell, so
+  // the pane (and the zee's box) stays reachable if claude exits.
+  const sid = (zee.claude_session_id || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — it is shell-interpolated
+  const cmd = `tmux new -A -s zee -c /work/repo 'zee-attach.sh ${sid}'`;
 
   const conn = new Client();
   conn.on('ready', () => {
