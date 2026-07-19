@@ -84,7 +84,7 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
       + 'xell is finished so they can mark it done. If you have UNLANDED work, stop and tell your '
       + 'human exactly that — do not commit or push anything from this directory.'));
   }
-  const d = worktreeDiff(xell.worktree_path, main);
+  const d = await worktreeDiff(xell.worktree_path, main);
   if (d.dirty > 0) {
     return deny(gate('sync', 'deny',
       `${d.dirty} uncommitted file(s) in your worktree. Commit them (or discard them) first — a ship `

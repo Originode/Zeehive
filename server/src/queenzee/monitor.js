@@ -24,6 +24,9 @@ async function setActive(zee, active, source) {
   return row;
 }
 
+// last time each stale claim's worktree was actually diffed (throttle below)
+const staleDiffAt = new Map();
+
 // ── stale claims: the xell leak ──────────────────────────────────────────────
 //
 // A failed dispatch strands its xell. `releaseXell` only fires on ONE path (the first-event race
@@ -87,7 +90,12 @@ async function reclaimStaleClaims() {
         + 'if it is finished, Mark done releases it.');
       continue;
     }
-    const d = worktreeDiff(x.worktree_path, src);
+    // Throttled: the diff is four git calls against a possibly-large worktree, and its answer
+    // changes on human timescales (the zee is GONE — nobody is committing). Once per 5 min per
+    // xell is plenty for a "surface it and leave it alone" report.
+    if (Date.now() - (staleDiffAt.get(x.id) || 0) < 5 * 60000) continue;
+    staleDiffAt.set(x.id, Date.now());
+    const d = await worktreeDiff(x.worktree_path, src);
     logChanged(`stale:${x.slug}`,
       `stale claim ${x.slug}: zee is gone (${d.ahead} commit(s) unlanded, ${d.dirty} dirty file(s)). `
       + 'Not touching it — resume it, or Mark done when it is finished.');

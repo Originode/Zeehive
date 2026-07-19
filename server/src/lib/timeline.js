@@ -40,7 +40,7 @@ export async function getDiffs(projectId) {
       continue;
     }
     out[x.id] = x.worktree_path && existsSync(x.worktree_path)
-      ? worktreeDiff(x.worktree_path, branch)
+      ? await worktreeDiff(x.worktree_path, branch)
       : (x.head_commit ? diffStat(project.repo_root, x.head_commit, branch) : null);
   }
   return out;
