@@ -13,6 +13,7 @@ import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
 import { pool } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
+import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
@@ -101,6 +102,9 @@ app.listen(config.port, () => {
   // this call is what marks 'shipped' (spec §6.3).
   recoverOrphanBuilds().catch((e) => console.error('[build] orphan recovery failed:', e.message));
   recoverOrphanShips().catch((e) => console.error('[ship] orphan recovery failed:', e.message));
+  // Same principle for teardowns: a xell stranded at 'tearing-down' by a mid-reap death renders
+  // on the dashboard forever (only 'retired' is filtered out) and nothing else revisits it.
+  recoverOrphanTeardowns().catch((e) => console.error('[reaper] teardown recovery failed:', e.message));
   startPool();
   startMonitor();
   startContainerMonitor();

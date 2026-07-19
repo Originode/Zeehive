@@ -15,6 +15,26 @@ import { dropCloneDb } from '../lib/xell-db.js';
 import { removeCage } from '../lib/cage.js';
 import { releaseXellShips } from './shipgate.js';
 
+// Boot recovery: a queenzee killed mid-reap (a self-ship, a crash) strands rows at
+// 'tearing-down' — worktree possibly gone, row never 'retired', and the dashboard renders
+// every non-retired xell, so the pile looks like rogues that never prune (2026-07-19: 107 of
+// them from the triple-queenzee kill). reapXell is idempotent, so just walk them the rest of
+// the way. Serial and best-effort — this is a boot janitor, not a hot path.
+export async function recoverOrphanTeardowns() {
+  const rows = await q(
+    `SELECT id, slug FROM xell WHERE status = 'tearing-down' AND NOT is_production`);
+  if (!rows.length) return { finished: 0 };
+  logline('reaper', `finishing ${rows.length} teardown(s) stranded by a previous queenzee's death`);
+  let finished = 0;
+  for (const x of rows) {
+    const r = await reapXell(x.id, 'stranded-teardown').catch((e) => ({ ok: false, error: e.message }));
+    if (r.ok) finished++;
+    else logline('reaper', `stranded teardown ${x.slug} still stuck: ${r.error}`);
+  }
+  logline('reaper', `stranded teardowns: ${finished}/${rows.length} finished`);
+  return { finished };
+}
+
 export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
   if (!xell) return { ok: false, error: 'xell not found' };
