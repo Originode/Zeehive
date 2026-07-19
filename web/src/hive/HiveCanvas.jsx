@@ -512,15 +512,29 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   const full = size >= 52;             // the two-half card needs room; else degrade
 
-  // caged / uncaged padlock — glanceable per-hex "is this zee following protocol?"
-  drawCageBadge(ctx, cx, cy, size, x);
-
   // ── upper half ──
+  // Machine line, prefixed with the cage lock (🔒 caged / 🔓 uncaged) so protocol-compliance reads
+  // at a glance. The lock is tinted (green/red/amber); the machine name stays muted, so the two are
+  // drawn as separate colour segments, centred together.
   const mach = machineOf(x, machines);
   if (full && mach) {
     ctx.font = `${Math.max(8, size * 0.14)}px 'Segoe UI', sans-serif`;
-    ctx.fillStyle = COL.muted;
-    ctx.fillText(fit(ctx, '⌂ ' + mach, w * 0.62), cx, cy - size * 0.62);
+    const lock = cageLock(x);
+    const machTxt = fit(ctx, mach, w * 0.5);
+    const y = cy - size * 0.62;
+    if (lock) {
+      const pre = lock.g + ' ';
+      const preW = ctx.measureText(pre).width;
+      const txtW = ctx.measureText(machTxt).width;
+      const x0 = cx - (preW + txtW) / 2;
+      const prev = ctx.textAlign; ctx.textAlign = 'left';
+      ctx.fillStyle = lock.c; ctx.fillText(pre, x0, y);
+      ctx.fillStyle = COL.muted; ctx.fillText(machTxt, x0 + preW, y);
+      ctx.textAlign = prev;
+    } else {
+      ctx.fillStyle = COL.muted;
+      ctx.fillText('⌂ ' + machTxt, cx, y);
+    }
   }
   const stack = ['db', 'server', 'webapp']
     .map((r) => (x.stack || []).find((s) => s.role === r))
@@ -634,36 +648,17 @@ function drawFlower(ctx, centers, size, x, diff, machines) {
   });
 }
 
-// Per-hex CAGE indicator — a padlock showing whether this xell's zee is STRUCTURALLY CONFINED.
-// Reads x.runtime_key: caged → closed GREEN lock (following protocol); local → OPEN RED lock (the
-// uncaged one to spot); remote → amber lock; no zee assigned yet → nothing drawn. Sits at the hex's
-// top so it's glanceable across the whole honeycomb.
-function drawCageBadge(ctx, cx, cy, size, x) {
-  if (x.is_production) return;
+// Per-hex CAGE indicator as a small inline lock GLYPH, shown before the machine name. The ︎
+// (VS15) forces monochrome text presentation so ctx.fillStyle actually tints it. Reads runtime_key:
+// caged → 🔒 green (confined, on-protocol); local → 🔓 red (uncaged — the one to spot); remote → 🔒
+// amber. null (no zee assigned yet) → no lock, keep the plain ⌂ machine glyph.
+function cageLock(x) {
+  if (x.is_production) return null;
   const rk = x.runtime_key;
-  if (!rk) return;                                  // no zee → no runtime to judge
-  const local = rk === 'claude-code-local';
-  const remote = rk === 'claude-code-remote';
-  const color = local ? COL.error : remote ? COL.idle : COL.working;
-  const lx = cx, ly = cy - size * 0.72;             // near the top, above the machine/chips row
-  const bw = Math.max(9, size * 0.24), bh = Math.max(7, size * 0.18);
-  const r = bw * 0.34;                               // shackle radius
-  ctx.save();
-  ctx.lineWidth = Math.max(1.3, size * 0.032);
-  ctx.strokeStyle = color;
-  ctx.lineCap = 'round';
-  // shackle — closed sits centred on the body; open (local) is tilted/lifted = unlatched
-  ctx.beginPath();
-  if (local) ctx.arc(lx - r * 0.35, ly - bh * 0.28, r, Math.PI * 0.78, Math.PI * 2.02);
-  else ctx.arc(lx, ly - bh * 0.08, r, Math.PI, Math.PI * 2);
-  ctx.stroke();
-  // body
-  ctx.beginPath();
-  ctx.roundRect(lx - bw / 2, ly, bw, bh, bw * 0.16);
-  ctx.fillStyle = withAlpha(color, 0.3);
-  ctx.fill();
-  ctx.stroke();
-  ctx.restore();
+  if (!rk) return null;
+  if (rk === 'claude-code-local') return { g: '\u{1F513}︎', c: COL.error };   // open lock
+  if (rk === 'claude-code-remote') return { g: '\u{1F512}︎', c: COL.idle };   // closed, amber
+  return { g: '\u{1F512}︎', c: COL.working };                                  // closed, green
 }
 
 // One canvas button centred at (cx, cy). Font must already be set. Returns its WORLD-space rect.
@@ -756,7 +751,6 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     ctx.fillStyle = withAlpha(col, 0.95);
     ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
     ctx.fillText(fit(ctx, facet.lines[1], size * 1.5), cx, cy + size * 0.2);
-    drawCageBadge(ctx, cx, cy, size, x);   // caged/uncaged padlock on the flower's centre too
     return;
   }
   ctx.textBaseline = 'top';
@@ -833,9 +827,23 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   }
 
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = COL.text;
   ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
-  ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy);
+  // MACHINE facet gets the cage lock prefixed to the machine name (tinted), like the compact hex.
+  const lock = facet.title === 'machine' ? cageLock(x) : null;
+  if (lock) {
+    const name = fit(ctx, facet.lines[0] || '—', size * 1.25);
+    const pre = lock.g + ' ';
+    const preW = ctx.measureText(pre).width;
+    const txtW = ctx.measureText(name).width;
+    const x0 = cx - (preW + txtW) / 2;
+    const prev = ctx.textAlign; ctx.textAlign = 'left';
+    ctx.fillStyle = lock.c; ctx.fillText(pre, x0, cy);
+    ctx.fillStyle = COL.text; ctx.fillText(name, x0 + preW, cy);
+    ctx.textAlign = prev;
+  } else {
+    ctx.fillStyle = COL.text;
+    ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy);
+  }
   if (facet.lines[1]) {
     ctx.fillStyle = COL.muted;
     ctx.font = `${Math.min(9.5, size * 0.13)}px 'Segoe UI', sans-serif`;
