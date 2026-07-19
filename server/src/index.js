@@ -11,6 +11,7 @@ import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
+import { pool } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startImageJanitor } from './lib/images.js';
@@ -52,6 +53,31 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'zeehive', ts: Date.now() }));
 app.use('/api', router);
+
+// SINGLE-QUEENZEE LOCK. Two queenzees ticking loops against one meta-DB reconcile against each
+// other — different code, different verdicts, provision/retire ping-pong, and reaps of xells the
+// other one just cut (the hazard the prod compose file documents). On 2026-07-19 THREE were
+// alive at once: self-ship's helper only kills whatever owns the API port at that moment, so a
+// queenzee that had already lost its port (an earlier restart's survivor) kept its loops running
+// for a DAY. The lock lives in the meta-DB itself — a session advisory lock on a dedicated
+// connection held for the process lifetime — so it guards exactly the resource that's in danger
+// and dies with the process (kill → connection drops → lock frees; the self-ship's 3s grace fits
+// well inside the 90s wait). A second instance waits, then exits LOUDLY instead of double-driving.
+{
+  const LOCK_KEY = 715533001; // arbitrary constant: "the queenzee of this meta-DB"
+  const client = await pool.connect(); // deliberately never released
+  const deadline = Date.now() + 90000;
+  for (;;) {
+    const r = await client.query('SELECT pg_try_advisory_lock($1) AS got', [LOCK_KEY]);
+    if (r.rows[0].got) break;
+    if (Date.now() > deadline) {
+      console.error('[zeehive] ANOTHER QUEENZEE holds the meta-DB lock — refusing to double-drive the fleet. Exiting.');
+      process.exit(1);
+    }
+    console.log('[zeehive] waiting for the previous queenzee to release the meta-DB lock…');
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+}
 
 // Schema first, serve second (spec §6.3): a self-ship replaces the process, so the restart is
 // the deploy — the new code must bring its own meta-DB schema up before anything queries it.
