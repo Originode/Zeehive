@@ -11,8 +11,9 @@
 // a mount: worktree .git files carry absolute host paths that don't resolve in Linux, and a
 // shared object store would leak the xource into the cage. The worktree's generated
 // .zeehive.env (gitignored, so absent from the bundle) is copied in separately — it carries
-// the xell's ports and DATABASE_URL. Work products stay in the container until collected
-// (exportCageDiff) — landing them on the worktree is the human-gated step.
+// the xell's ports and DATABASE_URL. Pasted prompt-attachments (also gitignored) are copied in
+// the same way, so a prompt that hands the zee an image path can actually Read it. Work products
+// stay in the container until collected (exportCageDiff) — landing them is the human-gated step.
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -174,6 +175,24 @@ export async function cloneIntoCage({ ctx, name, worktree }) {
       await dk(ctx, ['cp', envFile, `${name}:/tmp/.zeehive.env`]);
       await dk(ctx, ['exec', '-u', '0', name, 'bash', '-lc',
         'mv /tmp/.zeehive.env /work/repo/.zeehive.env && chown zee:zee /work/repo/.zeehive.env']);
+    }
+    // Pasted prompt-attachments (screenshots the human dropped into the dispatch) live under
+    // .zeehive/prompt-attachments/ on the worktree with a `*` .gitignore — so, exactly like
+    // .zeehive.env, they are absent from the HEAD bundle and must be copied in separately, or the
+    // zee's prompt hands it a path (`.zeehive/prompt-attachments/…`) that resolves to nothing in
+    // the cage. Copy the whole dir (docker cp creates the dest from the source's contents) and
+    // hand it to `zee`.
+    const attachDir = join(worktree, '.zeehive', 'prompt-attachments');
+    if (existsSync(attachDir)) {
+      // Best-effort, unlike .zeehive.env: a screenshot that fails to copy must not sink the whole
+      // cage spawn (the zee can still work without it) — same stance as saveDispatchImages.
+      try {
+        await dk(ctx, ['cp', attachDir, `${name}:/tmp/prompt-attachments`]);
+        await dk(ctx, ['exec', '-u', '0', name, 'bash', '-lc',
+          'mkdir -p /work/repo/.zeehive && rm -rf /work/repo/.zeehive/prompt-attachments '
+          + '&& mv /tmp/prompt-attachments /work/repo/.zeehive/prompt-attachments '
+          + '&& chown -R zee:zee /work/repo/.zeehive/prompt-attachments']);
+      } catch (e) { logline('cage', `${name}: could not copy prompt-attachments into cage: ${e.message}`); }
     }
   } finally {
     rmSync(tmp, { recursive: true, force: true });
