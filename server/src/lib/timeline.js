@@ -2,7 +2,7 @@
 // anchor commit (its worktree base) so the frontend can draw a connector to the card.
 import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
-import { gitLog, diffStat, worktreeDiff, worktreeHead } from './git.js';
+import { gitLog, diffStat, worktreeDiff, worktreeHead, isAncestor } from './git.js';
 import { defaultProject } from './fleet.js';
 
 // Per-xell divergence vs its tracked xource (ahead/behind + shortstat).
@@ -39,9 +39,14 @@ export async function getDiffs(projectId) {
         : null;
       continue;
     }
-    out[x.id] = x.worktree_path && existsSync(x.worktree_path)
+    const d = x.worktree_path && existsSync(x.worktree_path)
       ? await worktreeDiff(x.worktree_path, branch)
       : (x.head_commit ? diffStat(project.repo_root, x.head_commit, branch) : null);
+    // Is this xell's landed head already contained in the LIVE prod commit? If so the card should
+    // read "shipped", not "ship ready" — its work is already deployed (usually as part of a later
+    // combined ship), so offering to ship again is misleading.
+    if (d && d.head && shipped?.commit) d.in_prod = isAncestor(project.repo_root, d.head, shipped.commit);
+    out[x.id] = d;
   }
   return out;
 }

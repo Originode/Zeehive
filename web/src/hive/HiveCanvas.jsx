@@ -81,6 +81,9 @@ function shipLine(x, diff) {
   if (!diff) return null;
   if (diff.ahead > 0) return `no — ${diff.ahead} unlanded`;
   if (diff.dirty > 0) return `no — dirty`;
+  // Landed AND already contained in the live prod commit → its work is deployed. Say so instead of
+  // dangling "ship ready" forever on a xell whose commits are already in production.
+  if (diff.in_prod) return 'shipped';
   return 'ready';
 }
 

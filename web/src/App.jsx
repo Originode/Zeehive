@@ -371,7 +371,7 @@ export default function App() {
             ⇄ flip
           </button>
           <RuntimeToggle runtimes={runtimes} value={runtime}
-                         onChange={(k) => { setRuntime(k); setDefaultRuntime(k); }} />
+                         onChange={(k) => { setRuntime(k); setDefaultRuntime(k, projectId || project.id); }} />
           <span className={`conn ${conn}`}>{conn === 'live' ? '● live' : '○ ' + conn}</span>
         </div>
       </header>

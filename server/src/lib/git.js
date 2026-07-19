@@ -37,6 +37,14 @@ export function headCommit(repoRoot, branch = 'main') {
   return r.status === 0 ? r.out.trim() : null;
 }
 
+// Is commit `a` contained in `b` (an ancestor of, or equal to, b)? Used to answer "is this xell's
+// landed work already live in production" — a landed xell whose head is inside the deployed prod
+// commit is SHIPPED, not merely ship-ready. Returns false if either ref is missing/unreadable.
+export function isAncestor(repoRoot, a, b) {
+  if (!a || !b) return false;
+  return git(repoRoot, ['merge-base', '--is-ancestor', a, b]).status === 0;
+}
+
 // Is this directory REALLY the xell's worktree — bound to its branch — or a husk? A de-registered
 // worktree (no .git file: /spinon-style cleanup, a prune, a hand deletion) makes `git -C <dir>`
 // walk UP and answer for the PARENT repo. Every caller then silently operates on the XOURCE:

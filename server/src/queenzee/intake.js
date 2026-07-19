@@ -138,7 +138,9 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   }
 
   const pool = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id = $1`, [projectId]);
-  const rt = runtime ? await runtimeByKey(runtime) : await runtimeById(pool?.default_runtime_id);
+  // Caged by design (see spawnHeadless): fall back to caged, never the uncaged local SDK.
+  const rt = (runtime ? await runtimeByKey(runtime) : await runtimeById(pool?.default_runtime_id))
+    || await runtimeByKey('claude-code-caged');
   const viewer = viewerUrlFor(rt, session_id, null);
 
   // Enforce "ready ⟺ diff(0,0)" at the point of use: fast-forward the worktree onto the source
@@ -646,7 +648,12 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   }
 
   const cfgRow = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id=$1`, [pid]);
-  const rt = runtime ? await runtimeByKey(runtime) : await runtimeById(cfgRow?.default_runtime_id);
+  // CAGED BY DESIGN: a xell is structurally confined unless a human EXPLICITLY opts out. So when no
+  // runtime is named and the pool has no (or an unresolvable) default, the fallback is caged — never
+  // the uncaged local SDK. Running local is a deliberate choice (runtime='claude-code-local'), not
+  // something a missing/misconfigured default can silently land a zee on with full host access.
+  const rt = (runtime ? await runtimeByKey(runtime) : await runtimeById(cfgRow?.default_runtime_id))
+    || await runtimeByKey('claude-code-caged');
 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
   if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });

@@ -414,8 +414,13 @@ router.post('/pool/runtime', async (req, res) => {
   const key = req.body?.runtime;
   const rt = await one(`SELECT id, key, label FROM agent_runtime WHERE key=$1 AND enabled`, [key]);
   if (!rt) return res.status(400).json({ error: 'unknown/disabled runtime' });
-  const proj = req.body?.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
-  await q(`UPDATE pool_config SET default_runtime_id=$2 WHERE project_id=$1`, [proj, rt.id]);
+  // project is REQUIRED — the old "fall back to the oldest project" default meant a runtime toggle
+  // on ANY dashboard silently rewrote the FIRST project's (OmniBiz's) default instead of the one on
+  // screen. A default this load-bearing (it decides whether a zee is caged) must never be guessed.
+  const proj = req.body?.project;
+  if (!proj) return res.status(400).json({ error: 'project required' });
+  const row = await one(`UPDATE pool_config SET default_runtime_id=$2 WHERE project_id=$1 RETURNING project_id`, [proj, rt.id]);
+  if (!row) return res.status(404).json({ error: 'no pool_config for project' });
   res.json({ ok: true, default_runtime: rt.key });
 });
 

@@ -328,10 +328,12 @@ export async function setPoolTarget(target_ready, projectId) {
   return r.ok ? r.json() : null;
 }
 
-export async function setDefaultRuntime(runtime) {
+export async function setDefaultRuntime(runtime, project) {
+  // project is REQUIRED in practice: without it the server falls back to the oldest project, so
+  // toggling the runtime on the Zeehive dashboard silently rewrote OmniBiz's default instead.
   const r = await fetch('/api/pool/runtime', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ runtime }),
+    body: JSON.stringify({ runtime, project }),
   });
   return r.ok ? r.json() : null;
 }
