@@ -36,6 +36,21 @@ const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
 // compact burn formatters (mirror the dashboard's fmtTok/fmtUsd) for the per-xell burn on the flower
 const fmtTok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n || 0));
 const fmtUsd = (n) => '$' + (n >= 100 ? Math.round(n) : (n || 0).toFixed(2));
+
+// A zee is ACTIVELY WORKING when its CLI is live (cli_active) or it reports the working status.
+// The honeycomb shows that with a yellow blinking dot beside the diff; the animation loop that makes
+// it blink only runs while at least one xell is busy (see the effect in HiveCanvas).
+const isBusyZee = (x) => !x.is_production && (x.cli_active === true || x.zee_status === 'working');
+function drawBusyDot(ctx, x, y, r) {
+  const a = 0.2 + 0.8 * (0.5 + 0.5 * Math.sin(performance.now() / 300));   // blink
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = withAlpha('#ffd93b', a);
+  ctx.shadowColor = '#ffd93b'; ctx.shadowBlur = r * 1.6 * a;
+  ctx.fill();
+  ctx.restore();
+}
 const nick = (name) => {
   const s = String(name || '');
   let h = 2166136261;
@@ -324,6 +339,21 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     });
   }, [subscribeHover, draw]);
 
+  // Blink loop for the "actively working" dot — runs ONLY while at least one zee is busy, and
+  // throttles to ~9fps (a redraw of the whole honeycomb is not free). When nothing is working the
+  // loop never starts, so an idle fleet costs zero animation frames.
+  useEffect(() => {
+    const anyBusy = (xells || []).some(isBusyZee);
+    if (!anyBusy) return undefined;
+    let raf = 0, last = 0;
+    const loop = (t) => {
+      if (t - last > 110) { last = t; draw(); }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [xells, draw]);
+
   // ── sizing ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     const el = wrapRef.current;
@@ -588,11 +618,17 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     if (own && !x.is_production) {
       const y = cy + size * 0.32;
       ctx.font = `600 ${Math.max(9.5, size * 0.165)}px 'Cascadia Code', monospace`;
-      drawDiffRow(ctx, cx, y, [
+      const parts = [
         { t: `${own.files}f `, c: COL.muted },
         { t: `+${own.insertions}`, c: COL.add },
         { t: `/−${own.deletions}`, c: COL.del },
-      ]);
+      ];
+      drawDiffRow(ctx, cx, y, parts);
+      // yellow blinking "actively working" dot, just left of the diff row
+      if (isBusyZee(x)) {
+        const dw = parts.reduce((a, p) => a + ctx.measureText(p.t).width, 0);
+        drawBusyDot(ctx, cx - dw / 2 - size * 0.11, y, Math.max(2.4, size * 0.055));
+      }
     }
     // status pill
     const st = x.is_production ? 'live · protected' : x.status;
@@ -823,12 +859,18 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     const own = facet.diff?.own;
     if (own) {
       ctx.font = `600 ${Math.min(13, size * 0.175)}px 'Cascadia Code', monospace`;
-      drawDiffRow(ctx, cx, cy - size * 0.02, [
+      const parts = [
         { t: '◈ ', c: withAlpha(col, 0.95) },
         { t: `${own.files}f `, c: COL.muted },
         { t: `+${own.insertions}`, c: COL.add },
         { t: `/−${own.deletions}`, c: COL.del },
-      ]);
+      ];
+      drawDiffRow(ctx, cx, cy - size * 0.02, parts);
+      // yellow blinking "actively working" dot, just left of the diff row
+      if (isBusyZee(x)) {
+        const dw = parts.reduce((a, p) => a + ctx.measureText(p.t).width, 0);
+        drawBusyDot(ctx, cx - dw / 2 - size * 0.14, cy - size * 0.02, Math.max(3, size * 0.06));
+      }
     } else {
       ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
       ctx.fillStyle = COL.text;
