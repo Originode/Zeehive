@@ -7,7 +7,7 @@
 //      "let it go" — an unattended hold blocks every other xell. HOLD stops the clock for a human
 //      who is actively verifying.
 import React, { useState, useEffect, useRef } from 'react';
-import { decideShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
+import { decideShip, dismissShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
@@ -111,6 +111,10 @@ function ShipCard({ req, live, prodSites, onDone }) {
           <b>PRODUCTION{!pending && siteName ? ` @ ${siteName}` : ''}</b>
         </span>
         <span className="land-meta">{req.status}</span>
+        {(req.status === 'shipped' || req.status === 'failed') && (
+          <button className="drawer-close ship-dismiss" title="Dismiss this notification"
+                  onClick={async () => { await dismissShip(req.id); onDone?.(); }}>✕</button>
+        )}
       </div>
       {pending && sites.length > 1 && (
         <div className="ship-target" data-testid="ship-target">

@@ -149,6 +149,17 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   return { ok: true, request: row };
 }
 
+// "Seen it — stop showing me." View-only, like the landing equivalent: a dismissed ship still
+// shipped/failed on its own, it just stops rendering in the PRODUCTION panel (fleet.js filters
+// dismissed_at IS NULL). Never touches status.
+export async function dismissShipRequest(id, by = 'human@console') {
+  const row = await one(
+    `UPDATE ship_request SET dismissed_at=now(), dismissed_by=$2 WHERE id=$1 RETURNING *`, [id, by]);
+  if (!row) throw new Error('no such ship request');
+  broadcast('ship', row);
+  return row;
+}
+
 export async function listShipRequests(projectId, { open = true } = {}) {
   const where = open ? `AND s.status IN ('pending','approved','shipping')` : '';
   return q(

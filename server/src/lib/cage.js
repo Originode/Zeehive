@@ -82,6 +82,21 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
   });
 }
 
+// Is a caged zee ACTUALLY working right now? True iff a `claude` process is alive inside its cage.
+// This is the honest liveness signal the monitor needs: it catches both the headless run AND an
+// interactive terminal session a human drives over SSH — the latter is a claude the queenzee never
+// spawned, so its own process handle can't see it (that's why a busy caged zee read 'idle'). pgrep
+// exits 1 (→ dk rejects) when nothing matches, and a stopped/absent container rejects too; either
+// way there is no live agent, so → false. Short timeout: this runs every monitor tick.
+export async function cageZeeActive({ ctx = 'default', slug }) {
+  try {
+    await dk(ctx, ['exec', cageName(slug), 'pgrep', '-f', 'claude'], { timeoutMs: 8000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Create (or recreate) the xell's cage container on its own bridge network. Labeled so
 // dockerPs-based monitors can attribute it; NET_ADMIN only for the firewall seal. Publishes an
 // SSH port on 127.0.0.1 (the attend door — host-only; the queenzee's ssh2 bridge and a

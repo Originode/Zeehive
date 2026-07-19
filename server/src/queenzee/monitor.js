@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { listActiveAgents, remoteList, remoteStatus } from '../lib/claude-cli.js';
+import { cageZeeActive } from '../lib/cage.js';
 import { broadcast } from '../lib/events.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { worktreeDiff } from '../lib/git.js';
@@ -105,8 +106,9 @@ async function reclaimStaleClaims() {
 
 export async function monitorTick() {
   const zees = await q(
-    `SELECT z.*, r.key AS runtime_key FROM zee z
+    `SELECT z.*, r.key AS runtime_key, x.slug AS xell_slug FROM zee z
        LEFT JOIN agent_runtime r ON r.id = z.runtime_id
+       JOIN xell x ON x.id = z.xell_id
       WHERE z.status IN ('spawning','online','working','idle')`);
   // regular census of the fleet so the terminal shows continuous housekeeping
   const cen = await one(
@@ -120,8 +122,19 @@ export async function monitorTick() {
     + (freed ? ` · reclaimed ${freed} stale claim(s)` : ''));
   if (!zees.length) return { checked: 0, freed };
 
-  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote');
+  const caged = zees.filter((z) => z.runtime_key === 'claude-code-caged');
+  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote' && z.runtime_key !== 'claude-code-caged');
   const remote = zees.filter((z) => z.runtime_key === 'claude-code-remote');
+
+  // caged: the claude runs INSIDE the container, so it is NOT in the host's `claude agents --json`
+  // (which is why every caged zee used to read inactive). Probe the cage's own process list instead
+  // — this is true whether the run is the headless one we spawned or an interactive SSH session.
+  if (caged.length) {
+    await Promise.all(caged.map(async (z) => {
+      const active = await cageZeeActive({ ctx: 'default', slug: z.xell_slug }).catch(() => false);
+      await setActive(z, active, 'cage-pgrep');
+    }));
+  }
 
   // local/headless: one CLI call, cross-check session ids.
   // TRUST IT ONLY WHEN IT ANSWERED. listActiveAgents() returns {ok:false, agents:[]} on any

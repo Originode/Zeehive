@@ -416,6 +416,14 @@ export async function decideShip(id, decision, by = 'human@console', siteId = un
   return data;
 }
 
+// Hide a shipped/failed ship card's receipt (visibility only — the ship itself is unchanged).
+export async function dismissShip(id) {
+  const r = await fetch(`/api/ship/requests/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  return r.ok ? r.json() : null;
+}
+
 // Stop the auto-release countdown — for a human who is actively verifying prod.
 export async function holdProdLock(projectId, by = 'human@console') {
   const r = await fetch('/api/prod-lock/hold', {

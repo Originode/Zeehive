@@ -32,8 +32,8 @@ import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, lan
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
-import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock }
-  from '../queenzee/shipgate.js';
+import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
+  dismissShipRequest } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone,
          listProdBindRequests, decideProdBind } from '../queenzee/self.js';
@@ -131,6 +131,12 @@ router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => 
     res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console',
       { siteId: req.body?.site_id || undefined }));
   } catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// Dismiss a shipped/failed ship card's receipt (visibility only; the ship itself is unchanged).
+router.post('/ship/requests/:id/dismiss', async (req, res) => {
+  try { res.json(await dismissShipRequest(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
 });
 
 // Lock lifecycle — both HUMAN-only. Hold stops the auto-release countdown; force release takes

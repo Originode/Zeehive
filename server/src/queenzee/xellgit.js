@@ -101,12 +101,32 @@ export function catchUpWorktree(worktree, ref) {
   if (git(worktree, ['merge-base', '--is-ancestor', tip, head]).ok) {
     return { state: 'up-to-date', head, ref, base: tip };
   }
+
+  // We are about to MOVE the branch (ff or rebase), which git refuses over a dirty tree — and that
+  // refusal is what kept wedging `zee land` with "cannot rebase: you have unstaged changes", forcing
+  // the caged zee (which cannot touch the host worktree) to tell a human to `git checkout` by hand.
+  // A caged zee's real work arrives as COMMITS collected from the cage; ANY uncommitted change in
+  // the host worktree is local noise (the recurring one: a Windows exec-bit flip on mcp/server.js).
+  // So park it in a labelled stash and carry on unattended — it stays recoverable (`git stash list`)
+  // and is never lost, and the catch-up no longer needs a babysitter.
+  let stashed = false;
+  if (dirtyCount(worktree) > 0) {
+    const s = git(worktree, ['stash', 'push', '--include-untracked', '-m',
+      'zee-land: stray host-worktree changes parked before catch-up']);
+    stashed = s.ok;
+    if (!s.ok) {
+      // couldn't even stash — don't blunder into a rebase that will half-apply; report honestly.
+      return { state: 'conflict', ref, base: tip,
+        output: `worktree is dirty and could not be stashed before catch-up:\n${s.out}\n${s.err}`.trim().slice(-1200) };
+    }
+  }
+
   // Our HEAD is an ancestor of the tip → we added nothing of our own; just fast-forward to it.
   if (git(worktree, ['merge-base', '--is-ancestor', head, tip]).ok) {
     const m = git(worktree, ['merge', '--ff-only', ref]);
-    if (!m.ok) return { state: 'conflict', ref, base: tip, output: `${m.out}\n${m.err}`.trim().slice(-1200) };
+    if (!m.ok) return { state: 'conflict', ref, base: tip, stashed, output: `${m.out}\n${m.err}`.trim().slice(-1200) };
     const h = git(worktree, ['rev-parse', 'HEAD']);
-    return { state: 'fast-forwarded', head: h.out, ref, base: tip };
+    return { state: 'fast-forwarded', head: h.out, ref, base: tip, stashed };
   }
   // Diverged → replay our commits onto the current tip. On conflict, ABORT and report — never
   // leave the worktree wedged mid-rebase (the next land would trip over it). We resolve trivially
@@ -114,10 +134,10 @@ export function catchUpWorktree(worktree, ref) {
   const rb = git(worktree, ['rebase', ref], 180000);
   if (!rb.ok) {
     git(worktree, ['rebase', '--abort']);
-    return { state: 'conflict', ref, base: tip, output: `${rb.out}\n${rb.err}`.trim().slice(-1200) };
+    return { state: 'conflict', ref, base: tip, stashed, output: `${rb.out}\n${rb.err}`.trim().slice(-1200) };
   }
   const h = git(worktree, ['rev-parse', 'HEAD']);
-  return { state: 'rebased', head: h.out, ref, base: tip };
+  return { state: 'rebased', head: h.out, ref, base: tip, stashed };
 }
 
 // DB-aware wrapper: resolve the xell's worktree + xource ref, then catch that worktree up. Same
