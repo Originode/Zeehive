@@ -14,13 +14,45 @@
 // the xell's ports and DATABASE_URL. Work products stay in the container until collected
 // (exportCageDiff) — landing them on the worktree is the human-gated step.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
 import { logline } from './logbus.js';
 
 const IMAGE = 'zeehive/zee-agent';
 export const cageName = (slug) => `zee_cage_${String(slug).replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
+
+// ── SSH attend: a human reaches a caged zee's interactive claude over SSH (the dashboard's
+// ssh2→xterm terminal AND Claude Code desktop's "Add SSH host" are the same door). Inbound, so
+// the egress firewall neither blocks it nor is loosened. ────────────────────────────────────
+
+// The Zeehive keypair, one for the whole fleet, kept OUTSIDE the repo (never git). The private
+// key stays here on the queenzee's host; the public key is authorized inside every cage.
+const SSH_DIR = process.env.ZEEHIVE_SSH_DIR || resolve(homedir(), '.zeehive', 'ssh');
+const PRIV = join(SSH_DIR, 'cage_id_ed25519');
+const PUB = join(SSH_DIR, 'cage_id_ed25519.pub');
+
+export function ensureZeehiveKeypair() {
+  if (existsSync(PRIV) && existsSync(PUB)) {
+    return { privateKeyPath: PRIV, privateKey: readFileSync(PRIV), publicKey: readFileSync(PUB, 'utf8').trim() };
+  }
+  mkdirSync(SSH_DIR, { recursive: true });
+  const { utils } = createRequire(import.meta.url)('ssh2');
+  const kp = utils.generateKeyPairSync('ed25519', { comment: 'zeehive-cage' });
+  writeFileSync(PRIV, kp.private, { mode: 0o600 });
+  writeFileSync(PUB, kp.public + '\n');
+  logline('cage', `generated the Zeehive cage keypair at ${SSH_DIR}`);
+  return { privateKeyPath: PRIV, privateKey: Buffer.from(kp.private), publicKey: kp.public.trim() };
+}
+
+// Per-cage host SSH port, bound to 127.0.0.1. A pure function of the slug so it survives a
+// queenzee restart without being stored; ensureCage scans upward on a collision.
+export function cageSshPort(slug) {
+  let h = 0;
+  for (const c of String(slug)) h = (h * 31 + c.charCodeAt(0)) & 0x7fffffff;
+  return 22000 + (h % 2000);
+}
 
 // docker CLI runner. `--context` (not env) so a queenzee env leak can never re-aim a cage;
 // input is piped to stdin; onLine streams stdout lines (for the NDJSON event stream).
@@ -51,17 +83,45 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
 }
 
 // Create (or recreate) the xell's cage container on its own bridge network. Labeled so
-// dockerPs-based monitors can attribute it; NET_ADMIN only for the firewall seal.
-export async function ensureCage({ ctx, slug, xellId, network }) {
+// dockerPs-based monitors can attribute it; NET_ADMIN only for the firewall seal. Publishes an
+// SSH port on 127.0.0.1 (the attend door — host-only; the queenzee's ssh2 bridge and a
+// same-machine Claude Code desktop both reach it, nothing on the LAN does). Returns the port
+// actually bound, scanning upward if the slug-derived one is taken.
+export async function ensureCage({ ctx, slug, xellId, network, sshPort }) {
   const name = cageName(slug);
   const net = network || 'zee-cage-net';
   await dk(ctx, ['network', 'create', '--label', 'zeehive.cage=net', net]).catch((e) => {
     if (!/already exists/i.test(e.message)) throw e;
   });
   await dk(ctx, ['rm', '-f', name]).catch(() => {}); // stale cage from a prior run
-  await dk(ctx, ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
-    '--label', 'zeehive.cage=1', '--label', `zeehive.xell=${xellId || ''}`, IMAGE]);
-  return name;
+  let port = sshPort || cageSshPort(slug);
+  for (let attempt = 0; attempt < 12; attempt++, port++) {
+    try {
+      await dk(ctx, ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
+        '-p', `127.0.0.1:${port}:22`,
+        '--label', 'zeehive.cage=1', '--label', `zeehive.xell=${xellId || ''}`, IMAGE]);
+      return { name, sshPort: port };
+    } catch (e) {
+      if (/port is already allocated|address already in use|bind/i.test(e.message)) {
+        await dk(ctx, ['rm', '-f', name]).catch(() => {}); // the failed create left a husk
+        continue; // next port
+      }
+      throw e;
+    }
+  }
+  throw new Error(`could not bind an SSH port for cage ${name} (all candidates in use)`);
+}
+
+// Open the cage's SSH door: install the Zeehive public key for `zee`, drop the Claude token into
+// /etc/environment so an interactive (PAM) login shell comes up authenticated — a docker-exec -e
+// run gets the token directly, an SSH login does not — and start sshd. Root exec; the zee cannot
+// undo it. Idempotent.
+export async function openCageSsh({ ctx, name, publicKey, token }) {
+  const env = [];
+  if (publicKey) env.push('-e', `CAGE_PUBKEY=${publicKey}`);
+  if (token) env.push('-e', `CAGE_ENV=ANTHROPIC_AUTH_TOKEN=${token}`);
+  const r = await dk(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cage-sshd.sh']);
+  return r.out.trim();
 }
 
 // Bundle the worktree's HEAD (its spinoff branch) into the cage as a private clone at

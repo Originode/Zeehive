@@ -19,7 +19,8 @@ import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
-import { ensureCage, cloneIntoCage, sealCage, runZee, removeCage, cageName } from '../lib/cage.js';
+import { ensureCage, cloneIntoCage, sealCage, runZee, removeCage, cageName,
+         ensureZeehiveKeypair, openCageSsh } from '../lib/cage.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -788,11 +789,21 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // allow-list, so co-location with the xell's app tier is unnecessary (they meet over TCP).
   const ctx = 'default';
   const name = cageName(xell.slug);
+  let sshPort = null;
   try {
-    await ensureCage({ ctx, slug: xell.slug, xellId: xell.id });
+    const created = await ensureCage({ ctx, slug: xell.slug, xellId: xell.id });
+    sshPort = created.sshPort;
     await cloneIntoCage({ ctx, name, worktree: xell.worktree_path });
     const sealed = await sealCage({ ctx, name, queenzee: `host.docker.internal:${config.port}`, allowTcp });
     logline('cage', `${name}: ${sealed[sealed.length - 1]}${allowTcp.length ? ` (+${allowTcp.length} stack port(s))` : ''}`);
+    // Open the attend door: authorize the fleet key and start sshd with the token in the login
+    // env. This is what makes the dashboard terminal and desktop "Add SSH host" work — the zee's
+    // viewer_url below becomes a literal ssh:// deeplink into this cage.
+    const { publicKey } = ensureZeehiveKeypair();
+    await openCageSsh({ ctx, name, publicKey, token });
+    const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
+    await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
+    logline('cage', `${name}: attend door open — ${viewerUrl}`);
   } catch (err) {
     await removeCage({ ctx, slug: xell.slug });
     const reason = `cage build failed: ${err.message}`;

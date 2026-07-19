@@ -861,3 +861,25 @@ a.cbox:hover { border-color: var(--accent); }
   color: var(--muted); border-radius: 6px; width: 24px; height: 24px; cursor: pointer; font-size: 12px; }
 .drawer-close:hover { color: var(--down); border-color: var(--down); }
 .drawer-hint { font-size: 13px; }
+
+/* ── caged-zee terminal (ssh→tmux over a websocket) ─────────────────────────── */
+.termbtn {
+  margin-left: 6px; font-size: 11px; padding: 1px 7px; border-radius: 5px;
+  border: 1px solid var(--line); background: var(--panel2); color: var(--fg);
+  cursor: pointer; white-space: nowrap;
+}
+.termbtn:hover { border-color: var(--accent, #5b8cff); }
+.zeeterm {
+  width: min(1100px, 94vw); height: min(80vh, 760px); display: flex; flex-direction: column;
+  background: #0b0e14; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,.55);
+}
+.zeeterm-body { flex: 1; min-height: 0; padding: 6px 8px; }
+.zeeterm-foot {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border-top: 1px solid var(--line); background: var(--panel2);
+}
+.zeeterm-foot input { flex: 1; min-width: 0; }
+.tstat { font-size: 11px; padding: 0 6px; border-radius: 5px; margin-left: 8px; }
+.tstat.t-live { color: #35c46b; } .tstat.t-connecting { color: #e0a53b; }
+.tstat.t-closed, .tstat.t-error { color: #e5554e; }

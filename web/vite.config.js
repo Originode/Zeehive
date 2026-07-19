@@ -29,6 +29,7 @@ export default defineConfig({
       '/api': {
         target: process.env.ZEEHIVE_API || `http://localhost:${Number(env('PORT')) || 4700}`,
         changeOrigin: true,
+        ws: true, // the caged-zee terminal is a websocket under /api/zees/:id/terminal
       },
     },
   },

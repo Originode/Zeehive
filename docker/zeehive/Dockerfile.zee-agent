@@ -11,16 +11,23 @@
 #
 # The CLI runs as the non-root user `zee` (required for bypassPermissions inside
 # the cage) with `--bare` so nothing host-side (plugins/MCP/hooks/skills) leaks in.
+# openssh-server + tmux: a human ATTENDS a caged zee over SSH — the built-in dashboard terminal
+# (ssh2 → xterm.js) and Claude Code desktop's "Add SSH host" are the SAME inbound door. SSH is
+# inbound, so the egress-only firewall (OUTPUT DROP) neither blocks it nor is loosened by it.
+# tmux keeps the interactive session alive across disconnects (true async, come-back-whenever).
 FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git bash ca-certificates curl iptables dnsutils \
-    && rm -rf /var/lib/apt/lists/*
+      git bash ca-certificates curl iptables dnsutils openssh-server tmux \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
 RUN npm install -g @anthropic-ai/claude-code
 COPY cage-firewall.sh /usr/local/bin/cage-firewall.sh
-RUN chmod +x /usr/local/bin/cage-firewall.sh
+COPY cage-sshd.sh /usr/local/bin/cage-sshd.sh
+RUN chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh
 
 RUN useradd -m -s /bin/bash zee \
-    && mkdir -p /work && chown zee:zee /work
+    && mkdir -p /work && chown zee:zee /work \
+    && mkdir -p /home/zee/.ssh && chmod 700 /home/zee/.ssh && chown zee:zee /home/zee/.ssh
 USER zee
 WORKDIR /work
 ENV NODE_NO_WARNINGS=1 \

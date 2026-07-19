@@ -16,6 +16,7 @@ import ShipPanel, { LockBadge } from './Ship.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 import MachineMatrix from './Machines.jsx';
+import ZeeTerminal from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
 import Dispatch from './Dispatch.jsx';
 
@@ -305,6 +306,9 @@ export default function App() {
   // drawer card's. Web sessions open a tab; desktop-protocol sessions deep-link into Claude Desktop.
   const openSession = (x) => {
     if (!x?.viewer_url || x.is_production) return;
+    // A caged zee's viewer is an ssh:// terminal, not a URL a browser can open — its card
+    // carries the ⌨ terminal button instead, so ignore the generic open here.
+    if (x.viewer_kind === 'ssh-terminal') return;
     if (x.viewer_kind === 'desktop-protocol') openProtocol(x.viewer_url);
     else window.open(x.viewer_url, '_blank', 'noopener');
   };
@@ -499,6 +503,9 @@ function openProtocol(url) {
 function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
+  const [termOpen, setTermOpen] = useState(false);
+  // A caged zee is attended over SSH, not a Desktop deep-link — its viewer is a live terminal.
+  const caged = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url && !isProd;
 
   // WHERE this xell runs. Its stack is context-stamped per container; the machine is the one whose
   // docker_ctx matches the SERVER container (the stack's anchor), falling back to any stack
@@ -507,7 +514,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
   const stackCtx = (x.stack.find((c) => c.role === 'server' && c.docker_ctx)
     || x.stack.find((c) => c.docker_ctx))?.docker_ctx || null;
   const machine = stackCtx ? (machines || []).find((m) => m.docker_ctx === stackCtx) : null;
-  const clickable = !!x.viewer_url && !isProd;
+  const clickable = !!x.viewer_url && !isProd && x.viewer_kind !== 'ssh-terminal';
   // Open the session in the right surface for its runtime: a claude.ai web session opens
   // in a browser tab; a local (desktop-protocol) session deep-links into Claude Desktop.
   const open = () => {
@@ -648,7 +655,17 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
               {['stopped', 'errored'].includes(x.zee_status) && x.claude_session_id
                 && <span className="detached" data-testid="detached">detached · click to resume</span>}
             </span>
+            {/* Caged zees are attended in-browser: open a live terminal into the cage (ssh→tmux).
+                This replaces the Desktop deep-link, which can't reach a session inside a container. */}
+            {caged && (
+              <button className="termbtn" title="Open a live terminal into this caged zee"
+                      onClick={(e) => { e.stopPropagation(); setTermOpen(true); }}>⌨ terminal</button>
+            )}
           </div>
+        )}
+        {caged && termOpen && (
+          <ZeeTerminal zeeId={x.zee_id} slug={x.slug} viewerUrl={x.viewer_url}
+                       onClose={() => setTermOpen(false)} />
         )}
         {!isProd && <Row k="zee" v={working ? x.zee_name : '—'} highlight={working} testid="zee-name" />}
         {isProd

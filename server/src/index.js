@@ -14,6 +14,7 @@ import { runMigrations } from './db/migrate.js';
 import { pool } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
+import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
@@ -91,7 +92,7 @@ try {
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }
 }
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, () => {
   console.log(`[zeehive] API on http://localhost:${config.port}  (db: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);
   startPoller();
   console.log(`[queenzee] poller started (${config.pollerIntervalMs}ms)`);
@@ -115,4 +116,7 @@ app.listen(config.port, () => {
   startProdDiff();
   startDbCloneWatch();
 });
+// Browser terminal into caged zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
+// existing /api proxy (vite dev + the prod nginx bundle) with no extra port to expose.
+attachTerminalBridge(server);
 export { app };
