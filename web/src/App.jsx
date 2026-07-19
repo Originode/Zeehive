@@ -339,6 +339,11 @@ export default function App() {
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} onGeometry={fireGeom}
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+        {/* Docked to the flower pane itself — build/pull/push/PR/mark-done on the SELECTED xell,
+            without dropping down to the drawer at the bottom of the page. */}
+        {expandedXell && (
+          <FlowerToolbar x={expandedXell} diff={diffs[expandedXell.id]} onMenu={openMenu} onDone={refresh} />
+        )}
       </section>
 
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
@@ -526,6 +531,138 @@ function openProtocol(url) {
   a.remove();
 }
 
+// Build all — rebuild this xell's server + app. Reused by the drawer card's header AND the
+// flower toolbar so there is exactly one implementation of "what a build-all click does".
+function BuildAllButton({ x }) {
+  if (x.is_production || !x.stack.some(isBuildable)) return null;
+  const busy = x.stack.some(isBusy);   // don't allow a build-all while anything is building/restoring
+  return (
+    <button className="xbuild" data-testid="xell-build" disabled={busy}
+            title={busy ? 'A container is busy (building/restoring) — wait for it to finish'
+                        : "Build all — rebuild this xell's server + app (right-click for hot build)"}
+            onClick={(e) => { e.stopPropagation(); if (!busy) buildXell(x.id, false).catch(buildErr); }}
+            onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!busy) buildXell(x.id, true).catch(buildErr); }}>
+      {busy ? '⏳ busy…' : '🔨 build all'}
+    </button>
+  );
+}
+
+// Confirm-and-tear-down. Goes through the task when there is one; otherwise reaps the xell
+// directly — a xell can legitimately have no task row (a dispatched zee that reported done), and
+// gating the only teardown button on task_id stranded those forever. Extracted from the drawer
+// card so the flower toolbar's "mark done" runs the EXACT same confirm flow, not a second one that
+// could drift out of sync with what it warns about.
+async function markXellDone(x, diff, onDone, ctx = {}) {
+  // ctx = { landing, prs, ship } — the card has these in scope and passes them so the "in use"
+  // gate below can fire; the flower toolbar calls with none, which just degrades to inUse=0.
+  const { landing, prs, ship } = ctx;
+  // Teardown deletes the worktree AND the branch, so anything not landed on main dies with it.
+  // Spell out exactly what is at stake BEFORE asking — a generic "cannot be undone" let a single
+  // click destroy a working xell that had an uncommitted file in it.
+  const unlanded = diff && (diff.ahead > 0 || diff.dirty > 0);
+  // A xell awaiting a human decision (a held landing, an open PR into it, or an in-flight ship)
+  // is NOT idle — decommissioning it throws that decision away, and a shipping xell holds prod.
+  // Treat any of these as "in use": warn hard and demand the same typed-name confirmation as
+  // unlanded work. (The reaper withdraws open ships and refuses one it is actively deploying —
+  // this stops the click before it gets there.)
+  const heldLanding = (landing || []).filter((r) => r.status === 'pending').length;
+  const openPr = (prs || []).filter((r) => r.status === 'pending').length;
+  const pendingShip = ship && ['pending', 'approved', 'shipping'].includes(ship.status) ? ship.status : null;
+  const inUse = heldLanding + openPr > 0 || !!pendingShip;
+  const inUseText = inUse
+    ? `\n\n⚠ THIS XELL IS WAITING ON A DECISION:\n` +
+      (heldLanding ? `   • ${heldLanding} landing held for approval\n` : '') +
+      (openPr ? `   • ${openPr} open PR into this xell\n` : '') +
+      (pendingShip ? `   • a production ship is ${pendingShip}${pendingShip !== 'pending' ? ' (may hold the prod lock)' : ''}\n` : '') +
+      `   Tearing it down cancels that.\n`
+    : '';
+  const atStake = unlanded
+    ? `\n\n⚠ THIS XELL HAS WORK THAT IS NOT ON MAIN:\n` +
+      (diff.ahead > 0 ? `   • ${diff.ahead} commit(s) not landed on main\n` : '') +
+      (diff.dirty > 0 ? `   • ${diff.dirty} uncommitted file(s) in the worktree\n` : '') +
+      `   This work will be PERMANENTLY LOST.\n`
+    : (inUse ? '' : '\n\n(Nothing unlanded — its work is already on main.)\n');
+  // ACTIVE = a zee is still in there; the server needs `force` to touch it. It is NOT, on its own,
+  // a reason for more friction: marking done is the human's job (House rule 4), and a live zee
+  // whose work is already on main loses nothing when it goes — you just restart it.
+  const active = !!x.zee_id && (x.cli_active === true || ['spawning', 'online', 'working'].includes(x.zee_status));
+  const ok = window.confirm(
+    `${x.task_id ? 'Mark done' : 'Decommission'} "${x.slug}"?` +
+    (active ? `\n\nIts zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills the agent mid-task.\n` : '') +
+    inUseText +
+    atStake +
+    `\nThis removes its worktree, branch, and per-xell containers, and decommissions its zee` +
+    `${x.holds_prod_lock ? ' (it currently HOLDS the prod lock)' : ''}.\nThis cannot be undone.`);
+  if (!ok) return;
+  // The hard gate — a typed-name confirmation — fires whenever something real is at stake:
+  //   • a LIVE zee is in there (active): a claimed xell with a running agent must never go on a
+  //     single click — that exact accident (a live claimed xell reaped) is why this gate exists;
+  //   • unlanded work that would be LOST;
+  //   • a pending decision (landing/PR/ship) that would be CANCELLED.
+  // A clean, idle/pooled xell with none of these still costs only the single confirm above.
+  if (unlanded || inUse || active) {
+    const typed = window.prompt(
+      `"${x.slug}" is not safe to remove without confirmation:\n` +
+      (active ? `  • its zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills it mid-task\n` : '') +
+      (diff?.ahead > 0 ? `  • ${diff.ahead} commit(s) not landed\n` : '') +
+      (diff?.dirty > 0 ? `  • ${diff.dirty} uncommitted file(s)\n` : '') +
+      (heldLanding ? `  • ${heldLanding} landing held for approval\n` : '') +
+      (openPr ? `  • ${openPr} open PR\n` : '') +
+      (pendingShip ? `  • a production ship is ${pendingShip}\n` : '') +
+      `\nProceeding is irreversible. To confirm, type the xell name exactly:\n${x.slug}`);
+    if (typed !== x.slug) { if (typed !== null) alert('Name did not match — nothing was touched.'); return; }
+  }
+  try {
+    const r = x.task_id ? await markDone(x.task_id, 'mark', active) : await reapXell(x.id, 'human-cleanup', active);
+    // The xell is retired either way, but don't let a half-teardown pass as clean: if the folder
+    // survived (something still holds it open — usually the zee's own session), say so.
+    const orphan = r?.orphaned_worktree || r?.reap?.orphaned_worktree;
+    if (orphan) {
+      alert(`"${x.slug}" was retired, but its worktree could NOT be removed:\n\n${orphan}\n\n` +
+            `Something still has it open — usually that zee's session in Claude Code. ` +
+            `Close the session, then run Clean up again.`);
+    }
+    onDone();
+  } catch (err) { alert('Cleanup failed: ' + (err?.message || err)); }
+}
+
+// A compact action bar docked to the honeycomb pane itself, so Mark doesn't have to scroll down to
+// the drawer to act on the xell he already has the flower open for. It renders when a hexagon is
+// expanded and acts on THAT xell — reusing the exact same pieces as the drawer card (BuildAllButton,
+// ContainerChip per-container build, XourceActions' pull/push/PR, markXellDone) rather than a second
+// implementation that could answer differently than the card sitting right below it.
+function FlowerToolbar({ x, diff, onMenu, onDone }) {
+  if (!x || x.is_production) return null;
+  const showDone = ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status);
+  return (
+    <div className="flower-toolbar" data-testid="flower-toolbar">
+      <div className="fa-id">
+        <b className="fa-slug" title={x.slug}>{x.slug}</b>
+        <span className={`badge b-${x.status}`}>{x.status}</span>
+      </div>
+      <div className="fa-stack">
+        {['db', 'server', 'webapp'].map((role) => {
+          const c = x.stack.find((s) => s.role === role);
+          return c ? <ContainerChip key={role} c={c} onMenu={onMenu} hammer /> : null;
+        })}
+      </div>
+      <div className="fa-actions">
+        <BuildAllButton x={x} />
+        <XourceActions x={x} diff={diff} onDone={onDone} />
+        {showDone && (
+          <button className={`donebtn fa-done ${x.status === 'awaiting-done' ? 'await' : ''}`}
+                  data-testid="flower-done"
+                  onClick={() => markXellDone(x, diff, onDone)}
+                  title={x.task_id ? 'Mark the task done — the queenzee tears this xell down'
+                                   : 'No task row on this xell — this cleans it up (tears it down) directly'}>
+            {x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? 'mark done' : 'clean up')}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
@@ -552,81 +689,10 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
     : x.viewer_kind === 'desktop-protocol' ? 'Open this session in Claude Desktop'
     : 'Open this session in claude.ai';
 
-  // Confirm-and-tear-down. Goes through the task when there is one; otherwise reaps the xell
-  // directly — a xell can legitimately have no task row (a dispatched zee that reported done),
-  // and gating the only teardown button on task_id stranded those forever.
-  const done = async (e) => {
-    e.stopPropagation();
-    // Teardown deletes the worktree AND the branch, so anything not landed on main dies with it.
-    // Spell out exactly what is at stake BEFORE asking — a generic "cannot be undone" let a single
-    // click destroy a working xell that had an uncommitted file in it.
-    const unlanded = diff && (diff.ahead > 0 || diff.dirty > 0);
-    // A xell awaiting a human decision (a held landing, an open PR into it, or an in-flight ship)
-    // is NOT idle — decommissioning it throws that decision away, and a shipping xell holds prod.
-    // Treat any of these as "in use": warn hard and demand the same typed-name confirmation as
-    // unlanded work. (The reaper withdraws open ships and refuses one it is actively deploying —
-    // this stops the click before it gets there.)
-    const heldLanding = (landing || []).filter((r) => r.status === 'pending').length;
-    const openPr = (prs || []).filter((r) => r.status === 'pending').length;
-    const pendingShip = ship && ['pending', 'approved', 'shipping'].includes(ship.status) ? ship.status : null;
-    const inUse = heldLanding + openPr > 0 || !!pendingShip;
-    const inUseText = inUse
-      ? `\n\n⚠ THIS XELL IS WAITING ON A DECISION:\n` +
-        (heldLanding ? `   • ${heldLanding} landing held for approval\n` : '') +
-        (openPr ? `   • ${openPr} open PR into this xell\n` : '') +
-        (pendingShip ? `   • a production ship is ${pendingShip}${pendingShip !== 'pending' ? ' (may hold the prod lock)' : ''}\n` : '') +
-        `   Tearing it down cancels that.\n`
-      : '';
-    const atStake = unlanded
-      ? `\n\n⚠ THIS XELL HAS WORK THAT IS NOT ON MAIN:\n` +
-        (diff.ahead > 0 ? `   • ${diff.ahead} commit(s) not landed on main\n` : '') +
-        (diff.dirty > 0 ? `   • ${diff.dirty} uncommitted file(s) in the worktree\n` : '') +
-        `   This work will be PERMANENTLY LOST.\n`
-      : (inUse ? '' : '\n\n(Nothing unlanded — its work is already on main.)\n');
-    // ACTIVE = a zee is still in there; the server needs `force` to touch it. It is NOT, on its
-    // own, a reason for more friction: marking done is the human's job (House rule 4), and a live
-    // zee whose work is already on main loses nothing when it goes — you just restart it.
-    const active = !!x.zee_id && (x.cli_active === true || ['spawning', 'online', 'working'].includes(x.zee_status));
-    const ok = window.confirm(
-      `${x.task_id ? 'Mark done' : 'Decommission'} "${x.slug}"?` +
-      (active ? `\n\nIts zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills the agent mid-task.\n` : '') +
-      inUseText +
-      atStake +
-      `\nThis removes its worktree, branch, and per-xell containers, and decommissions its zee` +
-      `${x.holds_prod_lock ? ' (it currently HOLDS the prod lock)' : ''}.\nThis cannot be undone.`);
-    if (!ok) return;
-    // The hard gate — a typed-name confirmation — fires whenever something real is at stake:
-    //   • a LIVE zee is in there (active): a claimed xell with a running agent must never go on a
-    //     single click — that exact accident (a live claimed xell reaped) is why this gate exists;
-    //   • unlanded work that would be LOST;
-    //   • a pending decision (landing/PR/ship) that would be CANCELLED.
-    // A clean, idle/pooled xell with none of these still costs only the single confirm above — the
-    // common "tidy up an unused xell" case stays one step.
-    if (unlanded || inUse || active) {
-      const typed = window.prompt(
-        `"${x.slug}" is not safe to remove without confirmation:\n` +
-        (active ? `  • its zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills it mid-task\n` : '') +
-        (diff?.ahead > 0 ? `  • ${diff.ahead} commit(s) not landed\n` : '') +
-        (diff?.dirty > 0 ? `  • ${diff.dirty} uncommitted file(s)\n` : '') +
-        (heldLanding ? `  • ${heldLanding} landing held for approval\n` : '') +
-        (openPr ? `  • ${openPr} open PR\n` : '') +
-        (pendingShip ? `  • a production ship is ${pendingShip}\n` : '') +
-        `\nProceeding is irreversible. To confirm, type the xell name exactly:\n${x.slug}`);
-      if (typed !== x.slug) { if (typed !== null) alert('Name did not match — nothing was touched.'); return; }
-    }
-    try {
-      const r = x.task_id ? await markDone(x.task_id, 'mark', active) : await reapXell(x.id, 'human-cleanup', active);
-      // The xell is retired either way, but don't let a half-teardown pass as clean: if the folder
-      // survived (something still holds it open — usually the zee's own session), say so.
-      const orphan = r?.orphaned_worktree || r?.reap?.orphaned_worktree;
-      if (orphan) {
-        alert(`"${x.slug}" was retired, but its worktree could NOT be removed:\n\n${orphan}\n\n` +
-              `Something still has it open — usually that zee's session in Claude Code. ` +
-              `Close the session, then run Clean up again.`);
-      }
-      onDone();
-    } catch (err) { alert('Cleanup failed: ' + (err?.message || err)); }
-  };
+  // Confirm-and-tear-down — see markXellDone (shared with the flower toolbar). The card passes its
+  // landing/prs/ship context so the "in use" gate (a held landing / open PR / in-flight ship) can
+  // fire; the flower toolbar calls markXellDone without it and just degrades to no in-use warning.
+  const done = (e) => { e.stopPropagation(); markXellDone(x, diff, onDone, { landing, prs, ship }); };
 
   return (
     <div data-xell={x.id}
@@ -662,18 +728,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
                          projectId={projectId} onChanged={onDone} />
             </span>
           )}
-          {!isProd && x.stack.some(isBuildable) && (() => {
-            const busy = x.stack.some(isBusy);   // don't allow a build-all while anything is building/restoring
-            return (
-              <button className="xbuild" data-testid="xell-build" disabled={busy}
-                      title={busy ? 'A container is busy (building/restoring) — wait for it to finish'
-                                  : 'Build all — rebuild this xell\'s server + app (right-click for hot build)'}
-                      onClick={(e) => { e.stopPropagation(); if (!busy) buildXell(x.id, false).catch(buildErr); }}
-                      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (!busy) buildXell(x.id, true).catch(buildErr); }}>
-                {busy ? '⏳ busy…' : '🔨 build all'}
-              </button>
-            );
-          })()}
+          <BuildAllButton x={x} />
         </span>
       </div>
       {/* One row, no labels: the chip's own glyph says which role it is, so a "db"/"srv"/"web"

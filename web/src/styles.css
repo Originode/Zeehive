@@ -342,8 +342,9 @@ a.cbox:hover { border-color: var(--accent); }
 .srow { align-items: center; gap: 8px; }
 .srole { min-width: 26px; color: var(--muted); font-size: 11px; }
 
-/* diff row */
-.diff { font-family: 'Cascadia Code', monospace; font-size: 11px; }
+/* diff row — bumped from 11px: the +ins/−del counts are the numbers Mark actually scans for, and
+   at 11px they were legible only up close. */
+.diff { font-family: 'Cascadia Code', monospace; font-size: 13px; font-weight: 600; }
 .diff .dstat { color: var(--muted); }
 .diff .ins { color: var(--up); }
 .diff .del { color: var(--down); }
@@ -701,7 +702,7 @@ a.cbox:hover { border-color: var(--accent); }
 .land-what { font-size: 14px; flex: 1; min-width: 0; }
 .land-meta { color: var(--muted); font-size: 12px;
   font-family: 'Cascadia Code', 'Consolas', monospace; }
-.land-stat { color: var(--muted); font-size: 12px; margin: 6px 0 4px; }
+.land-stat { color: var(--muted); font-size: 13px; font-weight: 600; margin: 6px 0 4px; }
 .land-stat .ins { color: var(--up); }
 .land-stat .del { color: var(--error); }
 .land-commits { list-style: none; margin: 6px 0 0; padding: 0; max-height: 168px; overflow-y: auto;
@@ -863,8 +864,12 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-split.o-portrait  { flex-direction: column; }
 
 .hive-pane { min-width: 0; min-height: 0; }
-.hive-pane.honey  { flex: 1 1 0; position: relative; }
-.hive-pane.panels { flex: 1 1 0; overflow: auto; }
+/* The flower is the primary surface now that its own toolbar covers build/pull/push/PR/done —
+   give it the larger share of the pane (was an even 1:1 split, which read as empty margin around
+   the honeycomb on anything wider than a laptop). The panels pane still scrolls, so it loses
+   nothing but width. */
+.hive-pane.honey  { flex: 3 1 0; position: relative; }
+.hive-pane.panels { flex: 2 1 0; overflow: auto; }
 
 /* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The
    inner SVG is absolutely positioned and scrolls along its length (group transform) to track prod. */
@@ -891,6 +896,27 @@ a.cbox:hover { border-color: var(--accent); }
 
 /* the panels half scrolls independently; drop the old flex/rail padding assumptions */
 .hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }
+
+/* ── flower toolbar: build/pull/push/PR/mark-done docked to the honeycomb pane ───────────────────
+   Appears only while a hexagon is expanded, so it costs the flower nothing the rest of the time.
+   It sits ON the canvas (a DOM sibling painted after it), pinned to the bottom so it never covers
+   the flower itself, which the layout centres in the pane. */
+.flower-toolbar {
+  position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+  z-index: 6; max-width: calc(100% - 28px);
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  background: rgba(13,16,23,.92); border: 1px solid var(--line); border-radius: 12px;
+  padding: 8px 14px; box-shadow: 0 10px 30px rgba(0,0,0,.5); backdrop-filter: blur(6px);
+}
+.fa-id { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.fa-slug { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.fa-stack { display: flex; gap: 5px; }
+.fa-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.flower-toolbar .xact { padding: 0; border-top: none; }
+.flower-toolbar .xact-row { gap: 6px; }
+.flower-toolbar .donebtn.fa-done {
+  width: auto; border-top: none; border-radius: 6px; padding: 5px 10px; font-size: 11px;
+}
 
 .flip-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
   border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; }

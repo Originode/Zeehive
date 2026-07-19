@@ -11,6 +11,9 @@ const COL = {
 const HEALTH = { up: '#35c46b', building: '#e0a53b', down: '#e5554e', unknown: '#6b7688', starting: '#5b8cff' };
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff',
   '#e5554e', '#3bc6c0', '#d98c5f', '#7bd0e0', '#c98cff', '#8cd98c'];
+// role tint, matching the DOM chip's icon colours (Container.jsx / styles.css .cbox[data-role]) —
+// so a canvas-drawn container box reads as the same object as the real one in the machine columns.
+const ROLE_TINT = { db: '#e08a3b', server: '#9b8cff', webapp: '#5b8cff' };
 
 // The git graph now lives in its own centre-divider pane (<GraphPane>) and the connector wires in
 // an SVG overlay (<Connectors>). This canvas is purely the honeycomb: hexes + the bloom flower, on
@@ -81,6 +84,71 @@ function shipLine(x, diff) {
   return 'ready';
 }
 
+// Draw a run of differently-coloured text segments centred on `cx` at baseline `y`. `ctx.font` must
+// already be set by the caller (all segments share one font — that's what makes the widths add up).
+// Used for every colored diffstat (git convention: insertions green, deletions red) so the commit
+// hex, the diff·age facet and the compact hex's own-diff line all share one implementation.
+function drawDiffRow(ctx, cx, y, parts) {
+  const widths = parts.map((p) => ctx.measureText(p.t).width);
+  const total = widths.reduce((a, b) => a + b, 0);
+  let x0 = cx - total / 2;
+  const prevAlign = ctx.textAlign;
+  ctx.textAlign = 'left';
+  parts.forEach((p, i) => { ctx.fillStyle = p.c; ctx.fillText(p.t, x0, y); x0 += widths[i]; });
+  ctx.textAlign = prevAlign;
+}
+
+// A tiny role glyph, canvas-drawn to match the DOM chip's SVG icons (Container.jsx / styles.css) —
+// same silhouette (cylinder / rack bars / browser window), same low-opacity white stroke.
+function drawRoleIcon(ctx, role, cx, cy, s) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = Math.max(1, s * 0.13);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (role === 'db') {
+    const rx = s * 0.5, ry = s * 0.2, top = cy - s * 0.32, bot = cy + s * 0.32;
+    ctx.beginPath(); ctx.ellipse(cx, top, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - rx, top); ctx.lineTo(cx - rx, bot);
+    ctx.bezierCurveTo(cx - rx, bot + ry, cx + rx, bot + ry, cx + rx, bot);
+    ctx.lineTo(cx + rx, top);
+    ctx.stroke();
+  } else if (role === 'server') {
+    const bw = s * 1.05, bh = s * 0.38, gap = s * 0.16;
+    ctx.strokeRect(cx - bw / 2, cy - gap / 2 - bh, bw, bh);
+    ctx.strokeRect(cx - bw / 2, cy + gap / 2, bw, bh);
+  } else if (role === 'webapp') {
+    const bw = s * 1.05, bh = s * 0.85;
+    ctx.strokeRect(cx - bw / 2, cy - bh / 2, bw, bh);
+    ctx.beginPath();
+    ctx.moveTo(cx - bw / 2, cy - bh / 2 + bh * 0.3); ctx.lineTo(cx + bw / 2, cy - bh / 2 + bh * 0.3);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// The real container box — nick + type icon + health dot — rendered wherever a container needs to
+// be shown as itself rather than as a dot (the flower's CONTAINERS facet, and the compact hex's
+// upper-half stack). Mirrors ContainerChip (Container.jsx): role-tinted rounded box, icon on top,
+// nick below, health dot pinned to the top-right corner.
+function drawContainerBox(ctx, cx, cy, w, h, c) {
+  const r = Math.min(6, w * 0.18, h * 0.18);
+  ctx.beginPath();
+  ctx.roundRect(cx - w / 2, cy - h / 2, w, h, r);
+  const tint = ROLE_TINT[c.role];
+  ctx.fillStyle = tint ? withAlpha(tint, 0.18) : withAlpha('#0a0d13', 0.72);
+  ctx.fill();
+  ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(COL.line, 1); ctx.stroke();
+  drawRoleIcon(ctx, c.role, cx, cy - h * 0.16, Math.min(w, h) * 0.62);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 ${Math.max(8, h * 0.24)}px 'Cascadia Code', monospace`;
+  ctx.fillStyle = COL.text;
+  ctx.fillText(nick(c.name), cx, cy + h * 0.32);
+  ctx.beginPath(); ctx.arc(cx + w / 2 - 4, cy - h / 2 + 4, Math.max(2, h * 0.08), 0, Math.PI * 2);
+  ctx.fillStyle = c.health ? (HEALTH[c.health] || HEALTH.unknown) : withAlpha(COL.muted, 0.4);
+  ctx.fill();
+}
+
 // ── offset-grid helpers (odd rows shift right — matches layoutHoneycomb) ───────
 const cellKey = (row, col) => row + ',' + col;
 function cellCenter(row, col, size, originX, originY) {
@@ -144,8 +212,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
 
     // honeycomb WORLD layout across the whole pane (initial view = identity, so world ≈ screen
     // until the user pans/zooms). The git graph is a separate pane; nothing is reserved here.
-    const pad = 14;
-    const lay = layoutHoneycomb(list.length, w - pad * 2, h - pad * 2, { min: 24 });
+    // Kept tight on purpose — every pixel here is the flower's; pad only enough that a hex's edge
+    // stroke doesn't clip against the pane border, and let hexes grow bigger (raised `max`) when
+    // there are few enough xells that the honeycomb was previously capped well under the pane size.
+    const pad = 6;
+    const lay = layoutHoneycomb(list.length, w - pad * 2, h - pad * 2, { min: 24, max: 168, pad: 6 });
     const cellSize = lay.size;                    // gapless layout cell → the routing lattice
     // corridor gap: room for `count` traces to pass (cols in portrait, rows in landscape). Shrink the
     // drawn hex within its cell to open it, but keep enough hex to stay legible.
@@ -468,19 +539,17 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
       ctx.fillStyle = COL.sha;
       ctx.fillText(sha, cx, cy + size * 0.14);
     }
-    // own diff: "0f +0/−0"
+    // own diff: "0f +0/−0" — bumped up from the old 0.14 factor (min 8) so it reads at a glance;
+    // git convention colouring (insertions green, deletions red) via drawDiffRow.
     const own = diff?.own;
     if (own && !x.is_production) {
       const y = cy + size * 0.32;
-      ctx.font = `${Math.max(8, size * 0.14)}px 'Cascadia Code', monospace`;
-      const fPart = `${own.files}f `, aPart = `+${own.insertions}`, dPart = `/−${own.deletions}`;
-      const tw = ctx.measureText(fPart + aPart + dPart).width;
-      let tx0 = cx - tw / 2;
-      ctx.textAlign = 'left';
-      ctx.fillStyle = COL.muted; ctx.fillText(fPart, tx0, y); tx0 += ctx.measureText(fPart).width;
-      ctx.fillStyle = COL.add; ctx.fillText(aPart, tx0, y); tx0 += ctx.measureText(aPart).width;
-      ctx.fillStyle = COL.del; ctx.fillText(dPart, tx0, y);
-      ctx.textAlign = 'center';
+      ctx.font = `600 ${Math.max(9.5, size * 0.165)}px 'Cascadia Code', monospace`;
+      drawDiffRow(ctx, cx, y, [
+        { t: `${own.files}f `, c: COL.muted },
+        { t: `+${own.insertions}`, c: COL.add },
+        { t: `/−${own.deletions}`, c: COL.del },
+      ]);
     }
     // status pill
     const st = x.is_production ? 'live · protected' : x.status;
@@ -542,14 +611,11 @@ function drawFlower(ctx, centers, size, x, diff, machines) {
 function flowerFacets(x, diff, machines) {
   const src = x.remote_source || {};
   const stack = x.stack || [];
+  // real container rows (role/health/name — enough for drawContainerBox), not just a health dot.
   const cont = ['db', 'server', 'webapp'].map((r) => {
     const c = stack.find((s) => s.role === r);
-    return { r, health: c?.health || null, name: c?.name || null };
+    return { role: r, health: c?.health || null, name: c?.name || null, present: !!c };
   });
-  const sd = diff && !x.is_production
-    ? `↑${diff.ahead} ↓${diff.behind} · ${diff.files}f`
-    : (diff && x.is_production ? `↑${diff.ahead} ↓${diff.behind}` : '—');
-  const own = diff?.own ? `${diff.own.files}f +${diff.own.insertions}/−${diff.own.deletions}` : '—';
   return [
     { title: null, lines: [x.is_production ? 'PRODUCTION' : shortSlug(x.slug),
       x.is_production ? 'live · protected' : x.status] },
@@ -558,9 +624,9 @@ function flowerFacets(x, diff, machines) {
       x.zee_status === 'working' ? (x.zee_name || 'working') : (x.zee_status || '')] },
     { title: 'containers', kind: 'stack', stack: cont },
     { title: 'machine', lines: [machineOf(x, machines) || '—', x.runtime_label || ''] },
-    { title: 'commit', lines: [(x.is_production ? x.deployed_commit : x.head_commit)?.slice(0, 8) || '—',
-      `src ${sd}`] },
-    { title: 'diff · age', lines: [`◈ ${own}`, ageText(x.created_at) ? `age ${ageText(x.created_at)}` : ''] },
+    { title: 'commit', kind: 'commitdiff',
+      lines: [(x.is_production ? x.deployed_commit : x.head_commit)?.slice(0, 8) || '—'], diff },
+    { title: 'diff · age', kind: 'owndiff', diff, age: ageText(x.created_at) },
   ];
 }
 
@@ -581,22 +647,74 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   ctx.font = `600 ${Math.min(9.5, size * 0.14)}px 'Segoe UI', sans-serif`;
   ctx.fillText(String(facet.title || '').toUpperCase(), cx, cy - size * 0.5);
 
+  // CONTAINERS facet: the real container boxes (nick + type icon + health dot), not a row of dots —
+  // the same object the machine columns show below, just drawn small enough to fit the petal.
   if (facet.kind === 'stack') {
     const roles = facet.stack;
-    const gapx = size * 0.42;
-    const y = cy + size * 0.02;
-    ctx.textBaseline = 'middle';
+    const boxW = size * 0.42, boxH = size * 0.56, gapx = size * 0.46;
+    const y = cy + size * 0.08;
     roles.forEach((rr, i) => {
       const px = cx + (i - 1) * gapx;
-      ctx.beginPath(); ctx.arc(px, y - 6, 5, 0, Math.PI * 2);
-      ctx.fillStyle = rr.health ? (HEALTH[rr.health] || COL.muted) : withAlpha(COL.muted, 0.4);
-      ctx.fill();
-      ctx.fillStyle = COL.muted;
-      ctx.font = `9px 'Segoe UI', sans-serif`;
-      ctx.fillText(rr.r === 'webapp' ? 'app' : rr.r, px, y + 9);
+      if (rr.present) {
+        drawContainerBox(ctx, px, y, boxW, boxH, rr);
+      } else {
+        ctx.beginPath();
+        ctx.roundRect(px - boxW / 2, y - boxH / 2, boxW, boxH, Math.min(5, boxW * 0.18));
+        ctx.setLineDash([2, 2]);
+        ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(COL.muted, 0.5); ctx.stroke();
+        ctx.setLineDash([]);
+      }
     });
     return;
   }
+
+  // COMMIT facet: sha, then the source diff (↑ahead ↓behind · files, git-coloured +ins/−del).
+  if (facet.kind === 'commitdiff') {
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COL.text;
+    ctx.font = `600 ${Math.min(12, size * 0.16)}px 'Cascadia Code', monospace`;
+    ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy - size * 0.02);
+    const d = facet.diff;
+    if (d) {
+      ctx.font = `600 ${Math.min(12.5, size * 0.165)}px 'Cascadia Code', monospace`;
+      drawDiffRow(ctx, cx, cy + size * 0.3, [
+        { t: `↑${d.ahead} ↓${d.behind} · ${d.files}f `, c: COL.muted },
+        { t: `+${d.insertions}`, c: COL.add },
+        { t: `/−${d.deletions}`, c: COL.del },
+      ]);
+    } else {
+      ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
+      ctx.fillStyle = COL.muted;
+      ctx.fillText('src —', cx, cy + size * 0.3);
+    }
+    return;
+  }
+
+  // DIFF · AGE facet: own (uncommitted-since-checkpoint) diff, git-coloured, then the xell's age.
+  if (facet.kind === 'owndiff') {
+    ctx.textBaseline = 'middle';
+    const own = facet.diff?.own;
+    if (own) {
+      ctx.font = `600 ${Math.min(13, size * 0.175)}px 'Cascadia Code', monospace`;
+      drawDiffRow(ctx, cx, cy - size * 0.02, [
+        { t: '◈ ', c: withAlpha(col, 0.95) },
+        { t: `${own.files}f `, c: COL.muted },
+        { t: `+${own.insertions}`, c: COL.add },
+        { t: `/−${own.deletions}`, c: COL.del },
+      ]);
+    } else {
+      ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
+      ctx.fillStyle = COL.text;
+      ctx.fillText('◈ —', cx, cy - size * 0.02);
+    }
+    if (facet.age) {
+      ctx.fillStyle = COL.muted;
+      ctx.font = `${Math.min(9.5, size * 0.13)}px 'Segoe UI', sans-serif`;
+      ctx.fillText(`age ${facet.age}`, cx, cy + size * 0.3);
+    }
+    return;
+  }
+
   ctx.textBaseline = 'middle';
   ctx.fillStyle = COL.text;
   ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;
