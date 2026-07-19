@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import {
   createProject, updateProject, probeRepo, getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
@@ -25,7 +26,10 @@ export default function ProjectSetup({ project: initial, onClose, onChanged, onS
   const [contexts, setContexts] = useState([]);
   useEffect(() => { getDockerContexts().then(setContexts).catch(() => setContexts([])); }, []);
 
-  return (
+  // Portaled to <body>: rendered in place (inside the header's stacking context, z-index 2) the
+  // overlay's z-50 cannot escape its ancestor, and the honeycomb connector SVG (z-index 5, one
+  // context up) paints its wires OVER the modal. A portal makes z-50 compete at the root.
+  return createPortal(
     <div className="term-overlay" onClick={onClose}>
       <div className="setup" onClick={(e) => e.stopPropagation()}>
         <div className="term-head">
@@ -41,7 +45,8 @@ export default function ProjectSetup({ project: initial, onClose, onChanged, onS
             : <CreateForm onCreated={(p) => { setProject(p); onChanged?.(); onSelect?.(p.id); }} />}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
