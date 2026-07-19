@@ -930,6 +930,25 @@ a.cbox:hover { border-color: var(--accent); }
 .drawer-close:hover { color: var(--down); border-color: var(--down); }
 .drawer-hint { font-size: 13px; }
 
+/* ⌨ terminal button → pick in-house (browser xterm) vs deep-linked (external ssh://) */
+.term-choice-back { position: absolute; inset: 0; z-index: 20; display: flex; align-items: center;
+  justify-content: center; background: rgba(6,8,12,.6); backdrop-filter: blur(3px); }
+.term-choice { width: min(380px, 90%); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.6); display: flex;
+  flex-direction: column; gap: 10px; }
+.tc-title { font-size: 14px; color: var(--muted); margin-bottom: 2px; }
+.tc-title b { color: var(--text); }
+.tc-opt { display: flex; align-items: center; gap: 12px; text-align: left; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; cursor: pointer; color: var(--text); }
+.tc-opt:hover:not(:disabled) { border-color: var(--accent); background: rgba(91,140,255,.10); }
+.tc-opt:disabled { opacity: .45; cursor: not-allowed; }
+.tc-ico { font-size: 20px; }
+.tc-opt span > b { display: block; font-size: 13px; }
+.tc-opt span > small { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+.tc-cancel { align-self: flex-end; background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 12px; padding: 4px 6px; }
+.tc-cancel:hover { color: var(--text); }
+
 /* ── caged-zee terminal (ssh→tmux over a websocket) ─────────────────────────── */
 .termbtn {
   margin-left: 6px; font-size: 11px; padding: 1px 7px; border-radius: 5px;

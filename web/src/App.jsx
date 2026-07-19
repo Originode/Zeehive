@@ -120,6 +120,7 @@ export default function App() {
   const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
   const [termXell, setTermXell] = useState(null);  // caged-zee terminal modal, opened from the flower
+  const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
   // per-frame "geometry changed" fire so a pan/zoom re-tracks the graph and re-routes the wires
@@ -334,7 +335,7 @@ export default function App() {
   const handleFlowerAction = (kind, x, diff) => {
     if (!x || x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
-    if (kind === 'terminal') { setTermXell(x); return; }
+    if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
     if (kind === 'build') {
       if (x.stack.some(isBusy)) { alert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
@@ -388,6 +389,24 @@ export default function App() {
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The caged-zee terminal is the one piece that needs
             DOM, so it opens as a modal from the flower's ⌨ button. */}
+        {termChoice && (
+          <div className="term-choice-back" onClick={() => setTermChoice(null)}>
+            <div className="term-choice" onClick={(e) => e.stopPropagation()}>
+              <div className="tc-title">Attach to <b>{termChoice.slug}</b></div>
+              <button className="tc-opt" onClick={() => { setTermXell(termChoice); setTermChoice(null); }}>
+                <span className="tc-ico">🖥</span>
+                <span><b>In-house terminal</b><small>live xterm in the dashboard (SSH → tmux)</small></span>
+              </button>
+              <button className="tc-opt" disabled={!termChoice.viewer_url}
+                      onClick={() => { openProtocol(termChoice.viewer_url); setTermChoice(null); }}>
+                <span className="tc-ico">🔗</span>
+                <span><b>Deep-linked terminal</b>
+                  <small>{termChoice.viewer_url ? 'open ssh:// in your own terminal app' : 'no ssh url for this xell'}</small></span>
+              </button>
+              <button className="tc-cancel" onClick={() => setTermChoice(null)}>cancel</button>
+            </div>
+          </div>
+        )}
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
                        onClose={() => setTermXell(null)} />
