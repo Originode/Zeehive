@@ -33,6 +33,9 @@ function statusColor(x) {
 }
 const shortSlug = (s) => String(s || '');
 const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
+// compact burn formatters (mirror the dashboard's fmtTok/fmtUsd) for the per-xell burn on the flower
+const fmtTok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n || 0));
+const fmtUsd = (n) => '$' + (n >= 100 ? Math.round(n) : (n || 0).toFixed(2));
 const nick = (name) => {
   const s = String(name || '');
   let h = 2166136261;
@@ -779,16 +782,17 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     return;
   }
 
-  // COMMIT facet: sha, then the source diff (↑ahead ↓behind · files, git-coloured +ins/−del).
+  // COMMIT facet: sha, the source diff (↑ahead ↓behind · files, git-coloured +ins/−del), and this
+  // xell's own BURN (tokens + $ its zees have consumed). Stacked above the pull/push buttons.
   if (facet.kind === 'commitdiff') {
     ctx.textBaseline = 'middle';
     ctx.fillStyle = COL.text;
     ctx.font = `600 ${Math.min(12, size * 0.16)}px 'Cascadia Code', monospace`;
-    ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy - size * 0.02);
+    ctx.fillText(fit(ctx, facet.lines[0] || '—', size * 1.45), cx, cy - size * 0.16);
     const d = facet.diff;
     if (d) {
-      ctx.font = `600 ${Math.min(12.5, size * 0.165)}px 'Cascadia Code', monospace`;
-      drawDiffRow(ctx, cx, cy + size * 0.3, [
+      ctx.font = `600 ${Math.min(11.5, size * 0.15)}px 'Cascadia Code', monospace`;
+      drawDiffRow(ctx, cx, cy + size * 0.08, [
         { t: `↑${d.ahead} ↓${d.behind} · ${d.files}f `, c: COL.muted },
         { t: `+${d.insertions}`, c: COL.add },
         { t: `/−${d.deletions}`, c: COL.del },
@@ -796,7 +800,19 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     } else {
       ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
       ctx.fillStyle = COL.muted;
-      ctx.fillText('src —', cx, cy + size * 0.3);
+      ctx.fillText('src —', cx, cy + size * 0.08);
+    }
+    const b = x.burn;
+    ctx.font = `${Math.min(10.5, size * 0.135)}px 'Segoe UI', sans-serif`;
+    if (b && (b.tokens > 0 || b.cost > 0)) {
+      drawDiffRow(ctx, cx, cy + size * 0.32, [
+        { t: '⚡', c: COL.idle },
+        { t: ` ${fmtTok(b.tokens)} tok · `, c: COL.muted },
+        { t: fmtUsd(b.cost), c: COL.idle },
+      ]);
+    } else {
+      ctx.fillStyle = withAlpha(COL.muted, 0.6);
+      ctx.fillText('⚡ no burn yet', cx, cy + size * 0.32);
     }
     return;
   }
