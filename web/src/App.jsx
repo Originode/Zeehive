@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells } from './api.js';
+         streamFleetXells, dispatchTask } from './api.js';
 
 const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
 import HiveCanvas from './hive/HiveCanvas.jsx';
@@ -19,6 +19,7 @@ import MachineMatrix from './Machines.jsx';
 import ZeeTerminal from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
 import Dispatch from './Dispatch.jsx';
+import Toasts from './Toasts.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
 
@@ -113,6 +114,7 @@ export default function App() {
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
   const [showDispatch, setShowDispatch] = useState(false); // the "+" prompt composer
+  const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
 
   // ── honeycomb shell ──────────────────────────────────────────────────────────
@@ -197,6 +199,35 @@ export default function App() {
       setVersion((v) => v + 1);
     } catch { /* keep last */ }
   }, [projectId, loadProjects, applyFleet, restreamXells]);
+
+  // ── toast plumbing ───────────────────────────────────────────────────────────
+  const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
+  const pushToast = useCallback((t) => setToasts((ts) => [...ts, t]), []);
+  const updateToast = useCallback((id, patch) =>
+    setToasts((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t))), []);
+
+  // Fire-and-forget dispatch. The composer hands us the whole payload and closes IMMEDIATELY; the
+  // slow bits (uploading a pasted image, renaming the worktree, spawning + awaiting the zee) run
+  // here and report through a toast. A failure keeps the payload in a Retry closure, so "no ready
+  // xell available" et al. never lose the composed prompt even though the modal is already gone.
+  const runDispatch = useCallback(async (payload) => {
+    const id = `disp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const nImg = payload.images?.length || 0;
+    pushToast({ id, kind: 'progress', title: 'Dispatching a zee…',
+      body: nImg
+        ? `Uploading ${nImg} image${nImg === 1 ? '' : 's'}, claiming a xell and spawning…`
+        : 'Claiming a ready xell and spawning…' });
+    try {
+      const r = await dispatchTask(payload);
+      updateToast(id, { kind: 'success', title: 'Zee dispatched', onRetry: null,
+        body: r?.slug ? `Running in ${r.slug}.` : 'The zee is on it.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 7000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', title: 'Dispatch failed', body: e?.message || String(e),
+        onRetry: () => { dismissToast(id); runDispatch(payload); } });
+    }
+  }, [pushToast, updateToast, dismissToast, refresh]);
 
   // once: global runtimes + logs, and pick the active project (persisted → first)
   useEffect(() => {
@@ -494,8 +525,9 @@ export default function App() {
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
                   onClose={() => setShowDispatch(false)}
-                  onDispatched={() => { setShowDispatch(false); refresh(); }} />
+                  onDispatch={(payload) => { setShowDispatch(false); runDispatch(payload); }} />
       )}
+      <Toasts toasts={toasts} onDismiss={dismissToast} />
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}
                      projectName={project.name} onDecommissioned={refresh} />
     </div>

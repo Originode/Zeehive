@@ -876,6 +876,36 @@ a.cbox:hover { border-color: var(--accent); }
 .disp-submit:hover { filter: brightness(1.1); }
 .disp-submit:disabled, .disp-cancel:disabled { opacity: .5; cursor: default; }
 
+/* ── toasts: async-dispatch progress, bottom-right, above the overlay layer ────── */
+.toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: flex;
+  flex-direction: column; gap: 10px; max-width: min(380px, 92vw); pointer-events: none; }
+.toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 10px;
+  background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  border-radius: 9px; padding: 11px 12px; box-shadow: 0 8px 26px rgba(0,0,0,.42);
+  animation: toast-in .18s ease-out; }
+.toast-success { border-left-color: var(--up); }
+.toast-error   { border-left-color: var(--down); }
+.toast-progress { border-left-color: var(--accent); }
+.toast-icon { flex: 0 0 auto; width: 18px; height: 18px; display: flex; align-items: center;
+  justify-content: center; font-size: 13px; font-weight: 800; margin-top: 1px; }
+.toast-success .toast-icon { color: var(--up); }
+.toast-error   .toast-icon { color: var(--down); }
+.toast-main { flex: 1; min-width: 0; }
+.toast-title { color: var(--text); font-size: 13px; font-weight: 600; }
+.toast-body { color: var(--muted); font-size: 12px; margin-top: 2px; line-height: 1.4;
+  word-break: break-word; }
+.toast-retry { margin-top: 7px; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--text); border-radius: 6px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+.toast-retry:hover { border-color: var(--accent); }
+.toast-x { flex: 0 0 auto; background: none; border: 0; color: var(--muted); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 1px 2px; }
+.toast-x:hover { color: var(--text); }
+.toast-spin { width: 13px; height: 13px; border: 2px solid var(--line);
+  border-top-color: var(--accent); border-radius: 50%; display: inline-block;
+  animation: toast-spin .7s linear infinite; }
+@keyframes toast-spin { to { transform: rotate(360deg); } }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
 /* ── honeycomb shell: three panes, the git graph as the exact centre divider ─────
    [ honeycomb | graph | panels ]. Orientation decides the split axis (row/column);
    the graph pane always holds the middle slot while the flip (honey-a/b) swaps which

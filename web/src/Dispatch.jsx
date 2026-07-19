@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { getDispatchModes, getDispatchModels, dispatchTask } from './api.js';
+import { getDispatchModes, getDispatchModels } from './api.js';
 
 // The "+" composer. A human writes a prompt (rich text, paste-friendly, images welcome) and picks
 // the autonomy mode / model / attended flag — then SUBMIT dispatches it exactly like a /xell
@@ -9,7 +9,13 @@ import { getDispatchModes, getDispatchModels, dispatchTask } from './api.js';
 //
 // The overlay deliberately does NOT close on an outside click — a half-written prompt is real work,
 // and losing it to a stray click is worse than one extra button press. Close is ✕ / Cancel only.
-export default function Dispatch({ projectId, projectName, onClose, onDispatched }) {
+//
+// SUBMIT IS FIRE-AND-FORGET: dispatching a zee is slow (it uploads any pasted screenshot, renames
+// the worktree, then spawns and AWAITS the real zee start), and an attached image made the old
+// blocking "Dispatching…" button freeze the modal for seconds. So submit now just validates, hands
+// the whole payload up to the parent and closes at once — the parent runs the dispatch and reports
+// progress through a toast (including a Retry that reuses this exact payload if it fails).
+export default function Dispatch({ projectId, projectName, onClose, onDispatch }) {
   const editorRef = useRef(null);
   const [modes, setModes] = useState([]);
   const [models, setModels] = useState([]);
@@ -18,7 +24,6 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
   const [headless, setHeadless] = useState(true); // default headless (fire-and-forget)
   const [prodDb, setProdDb] = useState(false);    // OFF by default — LIVE production data, opt-in only
   const [images, setImages] = useState([]);       // [{ id, name, data(dataURL), size }]
-  const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const [empty, setEmpty] = useState(true);       // drives the placeholder + submit-disabled state
 
@@ -36,11 +41,11 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
   // Esc closes only when nothing is composed — so it can't silently discard a written prompt.
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key === 'Escape' && empty && !images.length && !busy) onClose();
+      if (e.key === 'Escape' && empty && !images.length) onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [empty, images.length, busy, onClose]);
+  }, [empty, images.length, onClose]);
 
   const addImage = (img) =>
     setImages((prev) => [...prev, { id: `${Date.now()}-${prev.length}`, ...img }]);
@@ -71,30 +76,23 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
     });
   };
 
-  const submit = async () => {
+  const submit = () => {
     const task = (editorRef.current?.innerText || '').trim();
     if (!task) { setErr('Write a prompt first (an image alone is not enough — the zee needs a task).'); return; }
-    setBusy(true); setErr(null);
-    try {
-      const r = await dispatchTask({
-        project: projectId,
-        task,
-        mode,
-        model,
-        headless,
-        // OPT-IN prod DATA access. The value is the full db_coupling ('db-shared-prod'), which the
-        // dispatch hands to attachXellDb → the prod db container becomes THIS xell's assigned
-        // database. Reads and writes are allowed; the prod guard HARD-BLOCKS schema changes (DDL).
-        ...(prodDb ? { db: 'db-shared-prod' } : {}),
-        images: images.map(({ name, data }) => ({ name, data })),
-      });
-      onDispatched?.(r);   // parent refreshes + closes
-    } catch (e) {
-      // Keep the composed prompt on screen — "no ready xell available" et al. are recoverable and
-      // the human should not have to retype anything.
-      setErr(e?.message || String(e));
-      setBusy(false);
-    }
+    // Hand the whole payload up and let the parent dispatch it asynchronously (progress → toast).
+    // The prompt isn't lost on failure: the parent captures this payload in the toast's Retry.
+    onDispatch?.({
+      project: projectId,
+      task,
+      mode,
+      model,
+      headless,
+      // OPT-IN prod DATA access. The value is the full db_coupling ('db-shared-prod'), which the
+      // dispatch hands to attachXellDb → the prod db container becomes THIS xell's assigned
+      // database. Reads and writes are allowed; the prod guard HARD-BLOCKS schema changes (DDL).
+      ...(prodDb ? { db: 'db-shared-prod' } : {}),
+      images: images.map(({ name, data }) => ({ name, data })),
+    });
   };
 
   const onKeyDown = (e) => {
@@ -108,7 +106,7 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
       <div className="disp" role="dialog" aria-label="Compose a prompt" data-testid="dispatch-modal">
         <div className="disp-head">
           <span className="disp-title">＋ New prompt <span className="disp-sub">→ dispatches a zee into a ready xell{projectName ? ` · ${projectName}` : ''}</span></span>
-          <button className="disp-x" onClick={onClose} disabled={busy} title="Close">✕</button>
+          <button className="disp-x" onClick={onClose} title="Close">✕</button>
         </div>
 
         <div className="disp-body">
@@ -204,9 +202,9 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatched
         </div>
 
         <div className="disp-foot">
-          <button className="disp-cancel" onClick={onClose} disabled={busy}>Cancel</button>
-          <button className="disp-submit" onClick={submit} disabled={busy} data-testid="dispatch-submit">
-            {busy ? 'Dispatching…' : 'Dispatch →'}
+          <button className="disp-cancel" onClick={onClose}>Cancel</button>
+          <button className="disp-submit" onClick={submit} data-testid="dispatch-submit">
+            Dispatch →
           </button>
         </div>
       </div>
