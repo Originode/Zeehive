@@ -19,7 +19,7 @@ import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
-import { ensureCage, cloneIntoCage, sealCage, runZee, removeCage, cageName,
+import { ensureCage, cloneIntoCage, warmCage, sealCage, runZee, removeCage, cageName,
          ensureZeehiveKeypair, openCageSsh } from '../lib/cage.js';
 import { mintXellToken } from '../lib/xell-token.js';
 
@@ -766,14 +766,18 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // (with the fix spelled out) before anything claims the xell or builds a container.
   const token = await tokenForSpawn(pid, 'claude');
 
-  // The firewall allow-list: the xell's OWN containers, wherever they run. This is how a caged
-  // zee reaches its assigned db/app tier across docker hosts while the rest of the LAN
-  // (including prod, unless prod IS its assigned stack via /xell-prod) stays unreachable.
-  const stack = await q(
-    `SELECT c.host, c.host_port FROM xell_uses_container uc
-       JOIN container c ON c.id = uc.container_id
-      WHERE uc.xell_id = $1 AND c.host IS NOT NULL AND c.host_port IS NOT NULL`, [xell.id]);
-  const allowTcp = stack.map((r) => `${r.host}:${r.host_port}`);
+  // Egress policy (simplified 2026-07-19): the container is the confinement boundary — a caged
+  // zee can't reach the host or other xells no matter what — so we DON'T lock egress down (that
+  // only broke npm/builds). We block the ONE thing that matters: the fleet's live PROD databases,
+  // which Docker's bridge NAT would otherwise expose on the LAN. A xell bound to prod
+  // (db-shared-prod) keeps its OWN prod DB reachable — that binding is a human's call.
+  const prodDbs = await q(
+    `SELECT DISTINCT host(c.host) AS host, c.host_port, c.project_id FROM container c
+      WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
+  const prodBound = xell.db_coupling === 'db-shared-prod';
+  const blockTcp = prodDbs
+    .filter((r) => !(prodBound && r.project_id === xell.project_id))
+    .map((r) => `${r.host}:${r.host_port}`);
 
   const zeeTitle = title || `xell : ${xell.slug}`;
   const zee = await one(
@@ -799,8 +803,13 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     const created = await ensureCage({ ctx, slug: xell.slug, xellId: xell.id });
     sshPort = created.sshPort;
     await cloneIntoCage({ ctx, name, worktree: xell.worktree_path });
-    const sealed = await sealCage({ ctx, name, queenzee: `host.docker.internal:${config.port}`, allowTcp });
-    logline('cage', `${name}: ${sealed[sealed.length - 1]}${allowTcp.length ? ` (+${allowTcp.length} stack port(s))` : ''}`);
+    // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
+    // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
+    logline('cage', `${name}: warming (npm ci + web build) so the zee starts ready…`);
+    const warm = await warmCage({ ctx, name });
+    logline('cage', `${name}: ${warm.warmed ? 'warmed (deps + web build ready)' : 'warm incomplete — zee will install as needed'}`);
+    const sealed = await sealCage({ ctx, name, blockTcp });
+    logline('cage', `${name}: ${sealed[sealed.length - 1]}`);
     // Open the attend door: authorize the fleet key and start sshd with the token in the login
     // env. This is what makes the dashboard terminal and desktop "Add SSH host" work — the zee's
     // viewer_url below becomes a literal ssh:// deeplink into this cage. The xell identity token

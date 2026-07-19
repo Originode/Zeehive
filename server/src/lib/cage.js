@@ -165,17 +165,33 @@ export async function cloneIntoCage({ ctx, name, worktree }) {
   }
 }
 
-// Seal the egress firewall (docker/zeehive/cage-firewall.sh, baked into the image).
-// allowTcp: the xell's OWN containers as "host:port" strings — its db/app tier, wherever
-// they run. Everything else on the LAN stays DROPped. Root exec is required for iptables;
-// the zee itself runs as `zee` and cannot undo the seal.
-export async function sealCage({ ctx, name, queenzee, allowTcp = [], allowDomains }) {
-  const env = [];
-  if (queenzee) env.push('-e', `CAGE_QUEENZEE=${queenzee}`);
-  if (allowTcp.length) env.push('-e', `CAGE_ALLOW_TCP=${allowTcp.join(' ')}`);
-  if (allowDomains) env.push('-e', `CAGE_ALLOW_DOMAINS=${allowDomains}`);
+// Apply the cage egress policy (docker/zeehive/cage-firewall.sh): default ALLOW, DROP only the
+// prod DB host:port pairs in blockTcp. The container is the real confinement boundary; this just
+// keeps the one thing that matters — the live production database — off-limits (unless the xell
+// is prod-bound, in which case the caller leaves its prod DB out of blockTcp). Root exec; the
+// zee runs as `zee` and cannot undo it.
+export async function sealCage({ ctx, name, blockTcp = [] }) {
+  const env = blockTcp.length ? ['-e', `CAGE_BLOCK_TCP=${blockTcp.join(' ')}`] : [];
   const r = await dk(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cage-firewall.sh']);
   return r.out.trim().split('\n');
+}
+
+// Provision the boring slow stuff so a FRESH zee starts working immediately instead of burning
+// its turn (and your allowance) on `npm ci`: install deps + prebuild the web bundle. The queenzee
+// drives it over docker exec, so it costs zero agent tokens. Runs with egress fully open (before
+// the prod-db block is applied). Best-effort: a slow/failed warm must NOT fail the dispatch — the
+// zee can still install what it needs.
+export async function warmCage({ ctx, name }) {
+  try {
+    const r = await dk(ctx, ['exec', name, 'bash', '-lc',
+      'cd /work/repo && (npm ci --no-audit --no-fund || npm install --no-audit --no-fund) '
+      + '&& (npm run build --workspace web >/dev/null 2>&1 || true) && echo WARM_OK'],
+      { timeoutMs: 900000 });
+    return { warmed: /WARM_OK/.test(r.out) };
+  } catch (e) {
+    logline('cage', `${name}: warm (npm/build) incomplete — the zee will install as needed: ${String(e.message).slice(0, 160)}`);
+    return { warmed: false, error: e.message };
+  }
 }
 
 // Run the zee: `claude -p` inside the cage, stream-json events out. Returns { proc, done }

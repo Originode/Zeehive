@@ -168,19 +168,19 @@ export async function decideProdBind(id, decision, by = 'human@console') {
   return done;
 }
 
-// Recompute the cage's egress allow-list from the xell's CURRENT containers (now including prod) and
-// re-run the firewall seal. Mirrors the seal in spawnCaged, just with the post-bind stack.
+// Re-seal the cage now that this xell is bound to prod: block every prod DB EXCEPT this xell's own
+// project's — that one is now reachable, which is the whole point of the bind. Mirrors spawnCaged's
+// block-list logic (default-allow egress, drop only prod DBs).
 async function resealCageForStack(xellId) {
-  const xell = await one(`SELECT slug FROM xell WHERE id=$1`, [xellId]);
-  const stack = await q(
-    `SELECT host(c.host) AS host, c.host_port FROM xell_uses_container uc JOIN container c ON c.id=uc.container_id
-      WHERE uc.xell_id=$1 AND c.host IS NOT NULL AND c.host_port IS NOT NULL`, [xellId]);
-  const allowTcp = stack.map((r) => `${r.host}:${r.host_port}`);
-  const sealed = await sealCage({
-    ctx: 'default', name: cageName(xell.slug),
-    queenzee: `host.docker.internal:${config.port}`, allowTcp,
-  });
-  return { allowTcp, tail: sealed[sealed.length - 1] || null };
+  const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
+  const prodDbs = await q(
+    `SELECT DISTINCT host(c.host) AS host, c.host_port, c.project_id FROM container c
+      WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
+  const blockTcp = prodDbs
+    .filter((r) => r.project_id !== xell.project_id) // this xell's prod DB is now allowed
+    .map((r) => `${r.host}:${r.host_port}`);
+  const sealed = await sealCage({ ctx: 'default', name: cageName(xell.slug), blockTcp });
+  return { blockTcp, tail: sealed[sealed.length - 1] || null };
 }
 
 // ── POST /api/xell/self/done — propose done (the human confirms → teardown) ─────
