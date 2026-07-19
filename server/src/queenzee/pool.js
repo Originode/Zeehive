@@ -22,14 +22,18 @@ import { logline } from '../lib/logbus.js';
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 async function reconcileProject(projectId, target) {
-  const project = await one(`SELECT main_branch FROM project WHERE id=$1`, [projectId]);
+  const project = await one(`SELECT main_branch, compose_spinoff FROM project WHERE id=$1`, [projectId]);
   const src = project?.main_branch || 'main';
 
   // 1+2. Reconcile pooled xells to the source. Only in real mode (simulate has no worktrees).
   if (MODE === 'real') {
+    // Capped per tick: each reconcile is git work. Against a normal pool (≤ a handful) the cap
+    // is invisible; against a runaway pile it keeps the tick bounded while trim drains it —
+    // an unreconciled surplus xell is fine, it is on its way out anyway.
     const pooled = await q(
       `SELECT id, slug, head_commit, worktree_path FROM xell
-         WHERE project_id=$1 AND status='ready' AND NOT is_production`, [projectId]);
+         WHERE project_id=$1 AND status='ready' AND NOT is_production
+         ORDER BY ready_at DESC NULLS LAST, created_at DESC LIMIT 25`, [projectId]);
     for (const x of pooled) {
       const { verdict, res } = await reconcileXell(x, src);
       if (verdict === 'decommission') {
@@ -46,8 +50,17 @@ async function reconcileProject(projectId, target) {
   // machine keeps ITS OWN number of ready xells for THIS project (machine_pool, 025 — a
   // high-load project pools bigger than a quiet one on the same host); legacy project-wide
   // target otherwise.
+  // Machine mode counts a project's ready xells THROUGH their owned server container
+  // (fillTrim's join on role='server' + docker_ctx). A project with no per-xell app tier
+  // (no compose_spinoff — e.g. Zeehive itself: its xells are bare worktrees) owns no such
+  // containers, so that count is ALWAYS ZERO no matter how many ready xells exist: fill
+  // provisions pool_size more every tick, trim never sees a surplus, and max_xells (counted
+  // the same way) never caps it. That is exactly how 167 ready Zeehive xells piled up by
+  // 2026-07-19 — and the per-tick reconcile sweep over all of them is what froze the API.
+  // Machine placement is meaningless for bare worktrees anyway (they live on the queenzee's
+  // host), so such projects use the legacy project-wide target, whose count has no join.
   const machines = await devMachines();
-  if (!machines.length) return fillTrim(projectId, target, null);
+  if (!machines.length || !project?.compose_spinoff) return fillTrim(projectId, target, null);
   for (const m of machines) {
     const size = await machinePoolSize(m.id, projectId);
     await fillTrim(projectId, size, m).catch((e) => console.error(`[pool] ${m.key}:`, e.message));
@@ -80,9 +93,13 @@ async function fillTrim(projectId, target, m) {
       }
     }
   } else if (ready.length > target) {
+    // Batch the trim: a reap is spawnSync-heavy (worktree + branch removal), and a large
+    // surplus (the 167-xell pile above) drained in one tick would freeze the API for minutes.
+    // Five per tick keeps the queenzee responsive; the rest go next tick.
     const surplus = ready.slice(target); // freshest kept, oldest surplus reaped
-    logline('pool', `trimming ${surplus.length} surplus ready xell(s)${m ? ` on ${m.key}` : ''}: ${surplus.map((s) => s.slug).join(', ')}`);
-    for (const s of surplus) await reapXell(s.id, 'pool-surplus')
+    const batch = surplus.slice(0, 5);
+    logline('pool', `trimming ${batch.length}/${surplus.length} surplus ready xell(s)${m ? ` on ${m.key}` : ''}: ${batch.map((s) => s.slug).join(', ')}`);
+    for (const s of batch) await reapXell(s.id, 'pool-surplus')
       .catch((e) => logline('pool', `TRIM FAILED for ${s.slug}: ${e.message} — surplus xell stays`));
   }
 }
@@ -117,7 +134,17 @@ export function startPool() {
       + 'disk, AND the reconciler that would decommission them is OFF. Do not point this at a real '
       + 'registry: run with PROVISION_MODE=real (see HANDOFF "Run it").');
   }
-  const tick = () => ensureReady().catch((e) => console.error('[pool]', e.message));
+  // Re-entrancy guard: setInterval fires on schedule whether or not the last sweep finished,
+  // so a sweep that outruns the interval (large pool, slow git) STACKS more sweeps on top —
+  // each slower than the last. That compounding is what took the API from 47s to 90s+ on
+  // 2026-07-19. One sweep at a time; a skipped tick just runs next interval.
+  let sweeping = false;
+  const tick = async () => {
+    if (sweeping) return;
+    sweeping = true;
+    try { await ensureReady(); } catch (e) { console.error('[pool]', e.message); }
+    finally { sweeping = false; }
+  };
   tick();
   return setInterval(tick, config.poolIntervalMs);
 }
