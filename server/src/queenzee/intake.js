@@ -21,6 +21,7 @@ import { logline } from '../lib/logbus.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 import { ensureCage, cloneIntoCage, sealCage, runZee, removeCage, cageName,
          ensureZeehiveKeypair, openCageSsh } from '../lib/cage.js';
+import { mintXellToken } from '../lib/xell-token.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -789,6 +790,10 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // allow-list, so co-location with the xell's app tier is unnecessary (they meet over TCP).
   const ctx = 'default';
   const name = cageName(xell.slug);
+  // The per-xell IDENTITY token: the caged zee's only credential to the queenzee's /api/xell/self/*
+  // workflow verbs (land/ship/prod/done/status). Minted here, HASH stored on the xell, PLAINTEXT
+  // injected into the cage env below — never persisted in the clear (see lib/xell-token.js).
+  const xellToken = await mintXellToken(xell.id);
   let sshPort = null;
   try {
     const created = await ensureCage({ ctx, slug: xell.slug, xellId: xell.id });
@@ -798,9 +803,10 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     logline('cage', `${name}: ${sealed[sealed.length - 1]}${allowTcp.length ? ` (+${allowTcp.length} stack port(s))` : ''}`);
     // Open the attend door: authorize the fleet key and start sshd with the token in the login
     // env. This is what makes the dashboard terminal and desktop "Add SSH host" work — the zee's
-    // viewer_url below becomes a literal ssh:// deeplink into this cage.
+    // viewer_url below becomes a literal ssh:// deeplink into this cage. The xell identity token
+    // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
-    await openCageSsh({ ctx, name, publicKey, token });
+    await openCageSsh({ ctx, name, publicKey, token, xellToken });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cage', `${name}: attend door open — ${viewerUrl}`);
@@ -827,6 +833,26 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  that is by design, not an outage.',
     '- Commit your work on your branch as you go. Your commits are collected from this container',
     '  when the job completes; nothing you do here can touch the host, other xells, or prod.',
+    '',
+    '## READ THE PROJECT MANUAL FIRST',
+    '- Before you design anything, Read `/work/repo/CLAUDE.md` (and the memory files it references).',
+    '  You run `--bare`, which may NOT auto-load it — so open it yourself with the Read tool. It, plus',
+    '  the docs it points to, is how this repo actually works; guessing instead is how zees waste a turn.',
+    '',
+    '## YOUR QUEENZEE VERBS — how a caged zee lands/ships/goes-to-prod/finishes',
+    'You are walled in: no docker, no host fs, no skills. The queenzee API is your ONLY door out, and',
+    'it is authenticated as YOU by $ZEEHIVE_XELL_TOKEN (already in your env). Every "skill" a host zee',
+    'has is ONE call here — and each one is only a REQUEST that lands on a HUMAN gate. You may know',
+    'them all; none of them lets you act unilaterally. Use the `zee` CLI (on your PATH) — do not',
+    'hand-roll curl:',
+    '  - `zee status`               → where you stand: your task, and whether a land/ship/prod/done is pending a human.',
+    '  - `zee land`                 → collect your commits out of the cage and run the gated push to main. HELD for a human.',
+    '  - `zee ship --reason "..."`  → ask to deploy to prod (add `--targets server webapp`). Refused unless already landed; a human approves; the QUEENZEE builds from main.',
+    '  - `zee prod --reason "..."`  → ASK to be bound to the prod database. Recorded only — a human confirms, then the cage is re-sealed to reach prod. Until then you cannot.',
+    '  - `zee done --summary "..."` → propose your job is done. A human confirms with "Mark done"; THAT tears the cage down. Never try to despawn yourself.',
+    'The FULL manual (every verb, its gate, the golden rules) is at `/work/repo/docs/caged-zee-manual.md` —',
+    'Read it. Each verb maps to the same landgate/shipgate/prod/done a human drives from the console;',
+    'nothing here is a bypass. Commit freely; you can only ever ASK to land, ship, bind-prod, or finish.',
   ].join('\n');
 
   let sid = null;
@@ -853,7 +879,7 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
-  const handle = runZee({ ctx, name, prompt, model, token, onEvent: feed });
+  const handle = runZee({ ctx, name, prompt, model, token, xellToken, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.

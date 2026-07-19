@@ -23,7 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g @anthropic-ai/claude-code
 COPY cage-firewall.sh /usr/local/bin/cage-firewall.sh
 COPY cage-sshd.sh /usr/local/bin/cage-sshd.sh
-RUN chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh
+# The caged zee's workflow CLI (land/ship/prod/done/status → the queenzee's /api/xell/self/* verbs).
+# This is a synced copy of scripts/zee (the authoritative source); it lives here because the image's
+# build context is this directory. Update both if you change it.
+COPY zee /usr/local/bin/zee
+RUN chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee
 
 RUN useradd -m -s /bin/bash zee \
     && mkdir -p /work && chown zee:zee /work \

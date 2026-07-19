@@ -116,10 +116,17 @@ export async function ensureCage({ ctx, slug, xellId, network, sshPort }) {
 // /etc/environment so an interactive (PAM) login shell comes up authenticated — a docker-exec -e
 // run gets the token directly, an SSH login does not — and start sshd. Root exec; the zee cannot
 // undo it. Idempotent.
-export async function openCageSsh({ ctx, name, publicKey, token }) {
+export async function openCageSsh({ ctx, name, publicKey, token, xellToken }) {
   const env = [];
   if (publicKey) env.push('-e', `CAGE_PUBKEY=${publicKey}`);
-  if (token) env.push('-e', `CAGE_ENV=ANTHROPIC_AUTH_TOKEN=${token}`);
+  // /etc/environment lines a PAM (SSH) login inherits — the Claude token so interactive `claude`
+  // comes up authenticated, AND the per-xell identity token so an attending human's `zee` CLI (and
+  // any command in the login shell) can reach the queenzee's /api/xell/self/* verbs. A docker-exec
+  // -e run gets these directly; an SSH login does not, so they must land in /etc/environment too.
+  const envLines = [];
+  if (token) envLines.push(`ANTHROPIC_AUTH_TOKEN=${token}`);
+  if (xellToken) envLines.push(`ZEEHIVE_XELL_TOKEN=${xellToken}`);
+  if (envLines.length) env.push('-e', `CAGE_ENV=${envLines.join('\n')}`);
   const r = await dk(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cage-sshd.sh']);
   return r.out.trim();
 }
@@ -179,7 +186,7 @@ export async function sealCage({ ctx, name, queenzee, allowTcp = [], allowDomain
 // from CLAUDE_CODE_OAUTH_TOKEN alone (tokenForSpawn — the project's connected token).
 // --dangerously-skip-permissions: safe HERE and only here — the cage is the permission
 // system, and the CLI requires non-root, which the image guarantees.
-export function runZee({ ctx, name, prompt, model, token, onEvent }) {
+export function runZee({ ctx, name, prompt, model, token, xellToken, onEvent }) {
   // BOTH env names, measured on claude 2.1.214 (2026-07-19): --bare skips the OAuth credential
   // chain entirely — CLAUDE_CODE_OAUTH_TOKEN alone yields "Not logged in" without one API call —
   // but honors ANTHROPIC_AUTH_TOKEN (the raw bearer header, which an sk-ant-oat01 token is).
@@ -187,6 +194,10 @@ export function runZee({ ctx, name, prompt, model, token, onEvent }) {
   const cmd = ['exec', '-i',
     '-e', `CLAUDE_CODE_OAUTH_TOKEN=${token}`,
     '-e', `ANTHROPIC_AUTH_TOKEN=${token}`,
+    // The per-xell identity token: the caged zee's `zee` CLI (and any /api/xell/self/* call) reads
+    // it to prove WHICH xell is calling. Injected alongside the Claude token — same door, and the
+    // firewall already allows the queenzee host:port.
+    ...(xellToken ? ['-e', `ZEEHIVE_XELL_TOKEN=${xellToken}`] : []),
     name, 'bash', '-lc',
     `cd /work/repo && claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions${model ? ` --model ${model}` : ''}`];
   const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...cmd];
@@ -230,6 +241,51 @@ export async function exportCageDiff({ ctx, name, toDir }) {
   const out = join(toDir, `${name}-out.bundle`);
   await dk(ctx, ['cp', `${name}:/tmp/out.bundle`, out]);
   return out;
+}
+
+// COLLECT the cage's commits onto its HOST worktree so they can be landed through the normal gate.
+// This is the missing piece for a caged zee: its work is committed INSIDE the container, but the
+// land gate pushes from the host worktree. exportCageDiff bundles the cage's branch (commits not in
+// remotes); we fetch that bundle into the worktree and fast-forward the checked-out branch to the
+// cage's HEAD. The push that follows (pushToXource) is what actually trips the land gate — this only
+// moves the commits from inside the cage to the worktree they will be pushed from.
+//
+// Best-effort by contract: a cage with no new commits (already collected, or none made) is a no-op,
+// not an error. A worktree that has DIVERGED from the cage (someone moved it) refuses rather than
+// force — the caller surfaces that to the zee.
+export async function collectCageDiffToWorktree({ ctx = 'default', slug, worktree }) {
+  if (!worktree || !existsSync(worktree)) {
+    return { collected: false, reason: `no host worktree on disk (${worktree || 'null'})` };
+  }
+  const name = cageName(slug);
+  const tmp = mkdtempSync(join(tmpdir(), 'zee-land-'));
+  const git = (args) => new Promise((resolve, reject) => {
+    const g = spawn('git', ['-C', worktree, ...args], { windowsHide: true });
+    let out = '', err = '';
+    g.stdout.on('data', (d) => (out += d.toString()));
+    g.stderr.on('data', (d) => (err += d.toString()));
+    g.on('error', reject);
+    g.on('close', (c) => (c === 0 ? resolve(out.trim()) : reject(new Error(`git ${args[0]} exited ${c}: ${err.slice(0, 300)}`))));
+  });
+  try {
+    const bundle = await exportCageDiff({ ctx, name, toDir: tmp });
+    if (!bundle) return { collected: false, reason: 'the cage has no commits beyond the worktree' };
+    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
+    // Fetch the cage branch into a private staging ref (never the checked-out branch directly), then
+    // fast-forward the worktree branch to it. --ff-only is the honesty guard: if the worktree moved
+    // since caging, we refuse instead of fabricating a merge nobody asked for.
+    await git(['fetch', bundle, `${branch}:refs/zeehive/cage-land`]);
+    const target = await git(['rev-parse', 'refs/zeehive/cage-land']);
+    let ff;
+    try { await git(['merge', '--ff-only', target]); ff = true; }
+    catch (e) { ff = false; await git(['update-ref', '-d', 'refs/zeehive/cage-land']).catch(() => {});
+      throw new Error(`the cage's commits do not fast-forward the worktree branch — it moved since caging (${e.message})`); }
+    await git(['update-ref', '-d', 'refs/zeehive/cage-land']).catch(() => {});
+    const head = await git(['rev-parse', 'HEAD']);
+    return { collected: ff, head, branch };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 export async function removeCage({ ctx, slug }) {

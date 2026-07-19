@@ -34,6 +34,9 @@ import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock }
   from '../queenzee/shipgate.js';
+import { xellForToken } from '../lib/xell-token.js';
+import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone,
+         listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -563,6 +566,64 @@ router.post('/tasks/:id/done', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// ── the CAGED zee's WORKFLOW PROTOCOL: /api/xell/self/* ───────────────────────
+//
+// A caged zee has no docker, no host fs, no skills — this authenticated surface is its ONLY door out
+// of the cage. Every verb requires `Authorization: Bearer <ZEEHIVE_XELL_TOKEN>` (minted at cage
+// spawn, injected into the cage env), resolves the CALLING xell from the token hash, and maps to an
+// existing human-gated action. An unknown/absent token is refused — a verb can only ever act on the
+// xell that presented its own token, so there is no way to reach across to another xell.
+async function resolveSelf(req, res) {
+  const auth = req.get('authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
+  if (!token) { res.status(401).json({ error: 'missing bearer token — set ZEEHIVE_XELL_TOKEN (the cage injects it)' }); return null; }
+  const xell = await xellForToken(token);
+  if (!xell) { res.status(401).json({ error: 'unknown xell token — it identifies no xell' }); return null; }
+  if (xell.status === 'retired') { res.status(409).json({ error: `${xell.slug} is retired — its worktree is gone` }); return null; }
+  return xell;
+}
+
+router.get('/xell/self/status', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfStatus(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// Collect this cage's commits and run the gated push — HELD for a human (landgate). Never moves main.
+router.post('/xell/self/land', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfLand(x)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.
+router.post('/xell/self/ship', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfShip(x, { targets: req.body?.targets || null, reason: req.body?.reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// ASK to bind this xell to the prod stack — recorded only; a human confirms, then the queenzee binds.
+router.post('/xell/self/prod-request', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfProdRequest(x, { reason: req.body?.reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Propose done — flags the xell for a human's "Mark done"; the zee never despawns itself.
+router.post('/xell/self/done', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfDone(x, { summary: req.body?.summary || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// HUMAN side of the prod-bind request (the dashboard) — list + confirm/reject. There is deliberately
+// NO zee path to confirm: binding prod is a human's decision, exactly like a landing or a ship.
+router.get('/prod-bind/requests', async (req, res) => {
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  res.json(await listProdBindRequests(req.query.project, { open: req.query.all !== '1' }));
+});
+router.post('/prod-bind/requests/:id/:decision(confirm|reject)', async (req, res) => {
+  const decision = req.params.decision === 'confirm' ? 'confirmed' : 'rejected';
+  try { res.json(await decideProdBind(req.params.id, decision, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
 });
 
 // ── AI-facing: report/propose the job is done, and query status ──────────────
