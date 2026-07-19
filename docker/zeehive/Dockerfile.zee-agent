@@ -1,0 +1,36 @@
+# ZEEHIVE zee-agent — the CAGE a headless zee runs in. One container per xell.
+#
+# Confinement is structural, not prompted: the container sees ONLY
+#   /work            — a private clone of the xell's branch (from a git bundle; no
+#                      shared object store with the xource, no host mounts)
+#   its xell network — the xell's own db/app containers resolve; nothing else routes
+#   the queenzee API — reached with a per-xell scoped token (minted at provision)
+# It gets NO docker socket, NO docker CLI, NO host filesystem, NO ~/.claude mount.
+# Auth arrives as CLAUDE_CODE_OAUTH_TOKEN (claude setup-token) or ANTHROPIC_API_KEY
+# in the environment — never as a mounted credential file.
+#
+# The CLI runs as the non-root user `zee` (required for bypassPermissions inside
+# the cage) with `--bare` so nothing host-side (plugins/MCP/hooks/skills) leaks in.
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git bash ca-certificates curl iptables dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g @anthropic-ai/claude-code
+COPY cage-firewall.sh /usr/local/bin/cage-firewall.sh
+RUN chmod +x /usr/local/bin/cage-firewall.sh
+
+RUN useradd -m -s /bin/bash zee \
+    && mkdir -p /work && chown zee:zee /work
+USER zee
+WORKDIR /work
+ENV NODE_NO_WARNINGS=1 \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+# git identity for in-cage commits; the land gate attributes the human merge
+RUN git config --global user.name "zee" \
+    && git config --global user.email "zee@zeehive.local" \
+    && git config --global init.defaultBranch main
+
+# The queenzee execs the actual run; idle keeps the cage warm between turns.
+CMD ["sleep", "infinity"]
