@@ -102,16 +102,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock   # the local daemon; TCP contexts for the rest
       - zeehive_ssh:/data/ssh
       - zeehive_backups:/backups
-    networks: [default, zee-hive-net]
+    # zee-hive-net is NOT declared in compose — the entrypoint creates and self-joins it
+    # idempotently (a compose-owned or external declaration fights pre-existing networks).
     labels:
       zeehive.project: Zeehive
       zeehive.role: server
-
-networks:
-  # The cxell network — created/owned by the queenzee (cxell.js ensureCxell), so external here:
-  # compose must join it, never create or tear it down.
-  zee-hive-net:
-    external: true
 
 volumes:
   # New-era volumes carry EXPLICIT names: compose otherwise prefixes them with the project name

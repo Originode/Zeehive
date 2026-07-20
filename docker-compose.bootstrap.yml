@@ -56,7 +56,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - zeehive_ssh:/data/ssh
       - zeehive_backups:/backups
-    networks: [default, zee-hive-net]
+    # zee-hive-net (the cxell network) is deliberately NOT declared here: the entrypoint creates
+    # and joins it idempotently — a compose-owned network would refuse any pre-existing one.
 
   web:
     image: ghcr.io/originode/zeehive-web:latest
@@ -68,11 +69,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on: [server]
-
-networks:
-  # the cxell network — explicit name so the queenzee's own idempotent `network create` and
-  # every script agree with compose about which network this is
-  zee-hive-net: { name: zee-hive-net }
 
 volumes:
   # explicit names: scripts (e.g. the self-ship sibling) mount these by bare name

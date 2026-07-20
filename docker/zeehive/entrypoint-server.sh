@@ -30,4 +30,14 @@ ensure_ctx() { # <name> <endpoint>
 ensure_ctx ugreen-nas   "${ZEEHIVE_CTX_UGREEN:-}"
 ensure_ctx mardale-prod "${ZEEHIVE_CTX_MARDALE:-}"
 
+# Join the cxell network OURSELVES instead of declaring it in compose: a compose-owned network
+# refuses to start when the name already exists without compose labels (which is exactly what
+# the queenzee's own idempotent `network create` leaves behind — seen live on the first local
+# bootstrap run). Create-if-absent + self-connect are both idempotent; hostname is this
+# container's id. Skipped silently when there's no local daemon (host-process era).
+if docker info >/dev/null 2>&1; then
+  docker network create "${ZEEHIVE_NET:-zee-hive-net}" >/dev/null 2>&1 || true
+  docker network connect "${ZEEHIVE_NET:-zee-hive-net}" "$(hostname)" >/dev/null 2>&1 || true
+fi
+
 exec node server/src/index.js
