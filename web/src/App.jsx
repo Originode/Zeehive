@@ -209,12 +209,15 @@ export default function App() {
   // dropped instead of clobbering the newly-selected project's data (fixes the switch race).
   const projectIdRef = useRef(null);
   useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
-  // Which AI providers this project can dispatch on — drives the per-provider prompt buttons.
+  // Which AI provider ACCOUNTS this project can dispatch on — drives the per-account prompt
+  // buttons. NB: read the fallback id off `fleet` (state), NOT the `project` const destructured
+  // from it further down — referencing that in this deps array is a temporal-dead-zone crash
+  // that white-screened the whole console on first render (found 2026-07-21).
   useEffect(() => {
-    const pid = projectId || project?.id;
+    const pid = projectId || fleet?.project?.id;
     if (!pid) return;
     getProviderTokens(pid).then((t) => setProviders(Array.isArray(t) ? t : [])).catch(() => setProviders([]));
-  }, [projectId, project?.id, showSetup, showDispatch]);
+  }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
   // Latest project list, read from callbacks with stable identities (e.g. selectProject) so they
   // can resolve an id → project row for the URL without re-binding on every list change.
   const projectsRef = useRef([]);
@@ -577,28 +580,32 @@ export default function App() {
         {(!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0) || !project.compose_spinoff)
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
-        {/* One prompt button per CONNECTED dispatchable provider (a Kimi zee is the same cxell
-            claude CLI aimed at Moonshot's anthropic-compatible endpoint). A connected provider
-            with no runtime yet (OpenAI) renders disabled with the reason. No AI provider at
-            all → the one honest button is "add provider", straight into Project setup. */}
+        {/* ONE PROMPT BUTTON PER CONNECTED ACCOUNT — click = compose for THAT account, no
+            second AI choice anywhere. A project can hold several accounts of one provider type
+            (two Claude subscriptions, say): each is its own button, named by its account label
+            (falling back to the provider name + token tail when several share it). Each runs
+            its VENDOR'S OWN CLI inside the cxell (claude / codex / kimi; see server
+            lib/cxell-runtimes.js). Visibility IS the token store: no accounts → the one honest
+            button is "add provider", straight into Project setup. */}
         {(() => {
-          const ai = providers.filter((p) => p.provider !== 'github');
-          const connected = ai.filter((p) => p.connected);
-          if (!connected.length) {
+          const ai = providers.filter((p) => p.provider !== 'github' && p.dispatch);
+          const buttons = ai.flatMap((p) => (p.accounts || []).map((a) => {
+            const dupes = (p.accounts || []).length > 1;
+            const name = a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label);
+            return { id: a.id, provider: p.provider, name, typeLabel: p.label };
+          }));
+          if (!buttons.length) {
             return (
               <button className="new-prompt-btn" data-testid="add-provider-btn"
-                      title="No AI provider connected — add a Claude or Kimi token to dispatch zees"
+                      title="No AI provider connected — add a Claude, Codex, or Kimi token to dispatch zees"
                       onClick={() => setShowSetup(true)}>＋ add provider</button>
             );
           }
-          return connected.map((p) => (
-            <button key={p.provider} className="new-prompt-btn" data-testid={`new-prompt-btn-${p.provider}`}
-                    disabled={!p.dispatch}
-                    title={p.dispatch
-                      ? `Compose a prompt and dispatch a ${p.label} zee into a ready xell`
-                      : `${p.label} is connected but has no zee runtime yet`}
-                    onClick={() => p.dispatch && setShowDispatch({ provider: p.provider, label: p.label })}>
-              ＋ prompt · {p.label}
+          return buttons.map((b) => (
+            <button key={b.id} className="new-prompt-btn" data-testid={`new-prompt-btn-${b.provider}`}
+                    title={`Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
+                    onClick={() => setShowDispatch({ provider: b.provider, tokenId: b.id, label: b.name })}>
+              ＋ prompt · {b.name}
             </button>
           ));
         })()}
@@ -638,6 +645,7 @@ export default function App() {
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
                   provider={showDispatch.provider || 'claude'} providerLabel={showDispatch.label}
+                  tokenId={showDispatch.tokenId || null}
                   onClose={() => setShowDispatch(false)}
                   onDispatch={(payload) => { setShowDispatch(false); runDispatch(payload); }} />
       )}

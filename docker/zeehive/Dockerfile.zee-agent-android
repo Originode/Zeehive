@@ -1,0 +1,48 @@
+# ZEEHIVE zee-agent — ANDROID variant. The slim base cxell (Dockerfile.zee-agent) carries only `adb`
+# so any zee can DRIVE a device xhip; this variant adds the JDK + Android SDK a zee needs to BUILD an
+# APK (`./gradlew assembleDebug`). It is kept SEPARATE on purpose: the SDK is multi-GB, and baking it
+# into the base would balloon every cxell (db work, web work, server work) for a capability only
+# Android projects use. An Android project points its cxell at this image via the project's
+# device.cxell_image (manifest) — spawnCxell reads it — or the global CXELL_IMAGE override.
+#
+# Build AFTER the base (this FROMs it):
+#   docker build -f docker/zeehive/Dockerfile.zee-agent          -t zeehive/zee-agent         docker/zeehive
+#   docker build -f docker/zeehive/Dockerfile.zee-agent-android  -t zeehive/zee-agent-android docker/zeehive
+FROM zeehive/zee-agent
+
+# SDK install needs root; the base ends on USER zee. Java 17 is the current Android Gradle Plugin
+# baseline; unzip/wget fetch the command-line tools.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-17-jdk-headless unzip wget \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV ANDROID_SDK_ROOT=/opt/android-sdk \
+    ANDROID_HOME=/opt/android-sdk
+# cmdline-tools is PINNED (the SDK moves; bump deliberately, like the base pins kimi). The unpacked
+# tools must sit at cmdline-tools/latest/ for sdkmanager to resolve its own path.
+ARG CMDLINE_TOOLS_VERSION=11076708
+ARG ANDROID_PLATFORM=android-34
+ARG ANDROID_BUILD_TOOLS=34.0.0
+RUN mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools" \
+    && wget -q "https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_VERSION}_latest.zip" -O /tmp/ct.zip \
+    && unzip -q /tmp/ct.zip -d "${ANDROID_SDK_ROOT}/cmdline-tools" \
+    && mv "${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools" "${ANDROID_SDK_ROOT}/cmdline-tools/latest" \
+    && rm /tmp/ct.zip
+ENV PATH="${PATH}:${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools"
+# Accept licenses non-interactively, then install the platform + build-tools an APK build needs.
+# platform-tools brings its OWN adb; the base already has one on PATH, and the SDK's is preferred
+# (PATH above puts it first) so `./gradlew` and manual adb agree on a version.
+RUN yes | sdkmanager --licenses >/dev/null 2>&1 || true \
+    && sdkmanager --install "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" >/dev/null
+# The zee runs as `zee`; it must own the SDK to write caches/licenses under it and run gradle.
+RUN chown -R zee:zee "${ANDROID_SDK_ROOT}"
+
+USER zee
+# Re-declare for the zee's login shell (ENV persists across USER, but Gradle/AGP look these up and a
+# missing ANDROID_HOME is the #1 "SDK location not found" build failure — be explicit).
+ENV ANDROID_SDK_ROOT=/opt/android-sdk \
+    ANDROID_HOME=/opt/android-sdk \
+    GRADLE_USER_HOME=/home/zee/.gradle
+WORKDIR /work
+CMD ["sleep", "infinity"]

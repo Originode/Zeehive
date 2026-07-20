@@ -22,6 +22,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
 import { setTend, tendOpen, pingWorking } from '../lib/status.js';
+import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 
 const liveZee = (xellId) => one(
   `SELECT id, name, status, model FROM zee WHERE xell_id=$1
@@ -338,6 +339,37 @@ export async function selfBuild(xell, { role = null, hot = false } = {}) {
       + 'the queenzee (this call does NOT block). To find out when it settles and whether the container is '
       + `actually serving your HEAD, run \`zee build ${role || ''} --wait\` (or --watch) in the BACKGROUND — its `
       + `exit is your nudge.${hot ? ' NOTE: --hot reused the old image, so it does NOT contain code changes.' : ''}`,
+  };
+}
+
+// ── POST /api/xell/self/device — attach / detach / status a mobile DEVICE xhip ──
+// UNLIKE land/ship/prod/done this is NOT human-gated: attaching a THROWAWAY Android emulator to run
+// your own app is the same class of act as `zee build` — building your own test target needs no
+// human. `attach` stands up (or links) a device and hands back the adb address + the exact
+// build→install→run→screenshot loop; `detach` gives it back; `status` reports the current one.
+export async function selfDevice(xell, { action = 'attach', kind = null } = {}) {
+  if (action === 'detach') {
+    const r = await detachDeviceXhip(xell.id);
+    return { ok: true, ...r, message: r.detached
+      ? `Device ${r.name} detached${r.removed ? ' and removed' : ' (physical device left running)'}.`
+      : 'No device was attached — nothing to detach.' };
+  }
+  if (action === 'status') {
+    const d = await deviceForXell(xell.id);
+    return d ? { ok: true, attached: true, device: d, loop: deviceLoop(d) }
+             : { ok: true, attached: false, message: 'No device attached. Run `zee device` to attach one.' };
+  }
+  // attach (default)
+  const r = await attachDeviceXhip(xell.id, { kind });
+  const loop = deviceLoop(r.device);
+  return {
+    ok: true, ...r, loop,
+    message: r.already
+      ? `You already have a device (${r.device.name}). Reachable at adb ${r.device.adb}${r.device.viewer_url ? `, viewer ${r.device.viewer_url}` : ''}.`
+      : `Device ATTACHED (${r.device.kind}, ${r.device.name}). Connect with \`${loop.connect}\`, then build → install → launch → screenshot. `
+        + `${r.device.kind === 'emulator' ? 'It boots Android in ~30-60s; run `adb wait-for-device` after connecting. ' : ''}`
+        + `${r.device.viewer_url ? `A human can watch the screen live at ${r.device.viewer_url}. ` : ''}`
+        + 'It is torn down with this xell.',
   };
 }
 

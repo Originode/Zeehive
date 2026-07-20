@@ -46,6 +46,7 @@ queenzee at `host.docker.internal:4700` (firewall-allowed).
 ```
 zee status                                       # where you stand
 zee build [server|webapp|all] [--hot] [--wait] [--watch]   # (re)build your OWN app tier (NOT gated)
+zee device [--detach|--status]                   # attach a MOBILE DEVICE (Android) to build apps on (NOT gated)
 zee land                                         # collect commits + gated push to main
 zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod
 zee prod --reason "…"                            # ask to be bound to the prod database
@@ -89,6 +90,25 @@ is collected — the dirty tree is not), then runs the **same queenzee build** a
 
 If your cxell diverged from the worktree (something moved underneath you), the collect refuses rather
 than force a merge, and the build is not started — resolve it, commit, and `zee build` again.
+
+### `zee device` — attach a mobile device (build apps on it)
+`POST /api/xell/self/device` `{ action?, kind? }`. For a project that supports one, this attaches a
+**mobile DEVICE xhip** — an Android emulator (or a linked physical phone) reachable over **adb** — so
+you can build your app, install it, launch it and **verify it with your eyes**. Like `zee build`, it
+is **NOT human-gated**: the device is a throwaway test target, torn down with your xell.
+
+- `zee device` attaches one (idempotent — you get the same device back if you already have one). The
+  answer carries the adb address and the exact loop; `zee device --status` shows the current device,
+  `zee device --detach` gives it back.
+- The device is **not** on your app-tier network by name — reach it at the `adb`/`serial` address in
+  the answer (already firewall-allowed). An emulator boots Android in ~30–60s: after `adb connect`,
+  run `adb wait-for-device`.
+- The loop: `adb connect <serial>` → build your APK (`./gradlew assembleDebug` in `/work/repo`; the
+  full Android SDK is present only on device-project cxell images) → `adb -s <serial> install -r
+  app.apk` → `adb -s <serial> shell am start -n <pkg>/.MainActivity` → **`adb -s <serial> exec-out
+  screencap -p > /tmp/shot.png` and Read it** to SEE your app → `adb -s <serial> logcat -d` for
+  crashes. A human can watch the emulator screen live at the `viewer_url` in the answer.
+- **Verify with your eyes.** A build that installs is not a build that works — screenshot it.
 
 ### `zee land` — land your work on main
 

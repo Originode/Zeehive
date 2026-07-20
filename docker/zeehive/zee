@@ -150,6 +150,7 @@ function usage() {
 
   zee status [--wait]                where you stand (hive status + task + pending land/ship/prod/done); --wait blocks until a landing is decided
   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]   (re)build your OWN app tier to run e2e tests (NOT gated; acts now). --wait blocks until it serves your HEAD (run in background); --watch reports without building; --hot bounces the old image (no code change)
+  zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. --clear lowers it
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); --wait blocks until decided (run in background)
@@ -218,6 +219,13 @@ switch (cmd) {
     // Ping "I am actively working" — asserts live activity the passive poller can't see for a cxell,
     // and clears any open tend. NOT gated; acts immediately.
     out(await req('POST', '/api/xell/self/working', { note: flag('note') || null }));
+    break;
+  }
+  case 'device': {
+    // Attach / --detach / --status a MOBILE DEVICE (Android) to build+install+run your app on. NOT
+    // gated (throwaway target, like `zee build`). Attach returns the adb address + the loop.
+    const action = rest.includes('--detach') ? 'detach' : rest.includes('--status') ? 'status' : 'attach';
+    out(await req('POST', '/api/xell/self/device', { action, kind: flag('kind') || null }));
     break;
   }
   case 'tend': {

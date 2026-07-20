@@ -106,7 +106,7 @@ async function reclaimStaleClaims() {
 
 export async function monitorTick() {
   const zees = await q(
-    `SELECT z.*, r.key AS runtime_key, x.slug AS xell_slug FROM zee z
+    `SELECT z.*, r.key AS runtime_key, r.driver AS runtime_driver, x.slug AS xell_slug FROM zee z
        LEFT JOIN agent_runtime r ON r.id = z.runtime_id
        JOIN xell x ON x.id = z.xell_id
       WHERE z.status IN ('spawning','online','working','idle')`);
@@ -122,13 +122,18 @@ export async function monitorTick() {
     + (freed ? ` · reclaimed ${freed} stale claim(s)` : ''));
   if (!zees.length) return { checked: 0, freed };
 
-  const cxell = zees.filter((z) => z.runtime_key === 'claude-code-cxell');
-  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote' && z.runtime_key !== 'claude-code-cxell');
+  // cxell zees are ALL 'cxell-cli' runtimes (claude, codex, kimi) — bucket by driver, not by one
+  // hardcoded key, or a codex/kimi zee lands in `local` and gets checked against the host's
+  // `claude agents --json`, where it can never appear (seen live 2026-07-21: the first codex
+  // probe read inactive within a tick).
+  const cxell = zees.filter((z) => z.runtime_driver === 'cxell-cli');
+  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote' && z.runtime_driver !== 'cxell-cli');
   const remote = zees.filter((z) => z.runtime_key === 'claude-code-remote');
 
-  // cxell: the claude runs INSIDE the container, so it is NOT in the host's `claude agents --json`
-  // (which is why every cxell zee used to read inactive). Probe the cxell's own process list instead
-  // — this is true whether the run is the headless one we spawned or an interactive SSH session.
+  // cxell: the agent CLI runs INSIDE the container, so it is NOT in the host's `claude agents
+  // --json` (which is why every cxell zee used to read inactive). Probe the cxell's own process
+  // list instead — true whether the run is the headless one we spawned or an interactive SSH
+  // session, and CLI-agnostic (the pgrep pattern covers every registered runtime's binary).
   if (cxell.length) {
     await Promise.all(cxell.map(async (z) => {
       const active = await cxellZeeActive({ ctx: 'default', slug: z.xell_slug }).catch(() => false);

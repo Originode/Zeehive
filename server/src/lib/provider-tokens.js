@@ -1,10 +1,12 @@
-// Per-project AI-provider tokens (spec: cxell zees) — the meta-DB is the credential store.
-// The full token leaves this module through ONE door: tokenForSpawn(), used when the queenzee
+// Per-project AI-provider ACCOUNTS (spec: cxell zees) — the meta-DB is the credential store.
+// Since 036 a project can hold SEVERAL accounts of one provider type (two Claude subscriptions,
+// say): each is its own row with its own label and its own prompt button in the console. The
+// full token leaves this module through ONE door: tokenForSpawn(), used when the queenzee
 // injects it into a zee-agent container's environment. Everything the console sees is masked.
 import { q, one } from '../db/pool.js';
 
-// provider registry — how to obtain a token and what a valid one looks like. UI copy lives
-// here too so the console renders new providers without a client change.
+// provider TYPE registry — how to obtain a token of each type and what a valid one looks like.
+// UI copy lives here too so the console renders new provider types without a client change.
 export const PROVIDERS = {
   claude: {
     key: 'claude',
@@ -15,24 +17,27 @@ export const PROVIDERS = {
     // sk-ant-oat01-<base64ish>; stay loose on the tail so a format tweak upstream doesn't lock us out
     valid: (t) => /^sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}$/.test(t),
   },
-  // The GPT runtime will be the literal ChatGPT Codex CLI (OPENAI_API_KEY auth) — this slot
-  // holds its key, inert until that runtime lands. sk-ant-… is explicitly rejected so a Claude
+  // The GPT runtime is the literal ChatGPT Codex CLI (`codex exec` inside the cxell,
+  // OPENAI_API_KEY auth — runtime 'codex-cxell'). sk-ant-… is explicitly rejected so a Claude
   // token pasted in the wrong slot fails loudly instead of sitting dormant.
   openai: {
     key: 'openai',
     label: 'ChatGPT Codex',
+    dispatch: true,   // codex-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://platform.openai.com/api-keys',
-    steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. Dispatch activates when the Codex CLI runtime lands.',
+    steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Codex CLI inside their cxell.',
     valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
-  // Mark's ruling (2026-07-20): NOT Kimi-via-claude-CLI shims — the Kimi runtime will be the
-  // literal Kimi Code CLI, whose dedicated CODING key comes from kimi.com/code/console (a
-  // different credential than a Moonshot Open Platform key). Inert until that runtime lands.
+  // Mark's ruling (2026-07-20): NOT Kimi-via-claude-CLI shims — the Kimi runtime is the literal
+  // Kimi Code CLI (`kimi --print` inside the cxell — runtime 'kimi-code-cxell'), whose dedicated
+  // CODING key comes from kimi.com/code/console (a different credential than a Moonshot Open
+  // Platform key).
   kimi: {
     key: 'kimi',
     label: 'Kimi Code',
+    dispatch: true,   // kimi-code-cxell runtime (lib/cxell-runtimes.js)
     command: 'https://kimi.com/code/console',
-    steps: 'Create a dedicated CODING key in the Kimi Code console (not a Moonshot platform key) and paste it below; it is stored only in the meta-DB. Dispatch activates when the Kimi Code CLI runtime lands.',
+    steps: 'Create a dedicated CODING key in the Kimi Code console (not a Moonshot platform key) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Kimi Code CLI inside their cxell.',
     valid: (t) => /^[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
   // GitHub is INBOUND-ONLY (migration 032): this token is used exclusively by clone/pull fetches
@@ -52,57 +57,108 @@ export const PROVIDERS = {
 
 const hint = (t) => `${t.slice(0, 13)}…${t.slice(-4)}`;
 
-// masked read model: which providers exist, which are connected — never the token itself
+// masked read model: every provider TYPE, each with its list of connected ACCOUNTS — never the
+// token itself. The legacy per-type fields (connected/token_hint/…) mirror the FIRST account so
+// older consumers keep working; new consumers read `accounts`.
 export async function listProviderTokens(projectId) {
   const rows = await q(
-    `SELECT provider, token_hint, created_at, last_used_at
-       FROM provider_token WHERE project_id = $1`, [projectId]);
-  const byProvider = Object.fromEntries(rows.map((r) => [r.provider, r]));
-  return Object.values(PROVIDERS).map((p) => ({
-    provider: p.key, label: p.label, command: p.command, steps: p.steps,
-    dispatch: !!p.dispatch,   // can a zee run on it? (github: no — infra credential)
-    connected: !!byProvider[p.key],
-    token_hint: byProvider[p.key]?.token_hint || null,
-    created_at: byProvider[p.key]?.created_at || null,
-    last_used_at: byProvider[p.key]?.last_used_at || null,
-  }));
+    `SELECT id, provider, label, token_hint, created_at, last_used_at
+       FROM provider_token WHERE project_id = $1 ORDER BY created_at`, [projectId]);
+  return Object.values(PROVIDERS).map((p) => {
+    const accounts = rows.filter((r) => r.provider === p.key)
+      .map(({ id, label, token_hint, created_at, last_used_at }) => ({ id, label, token_hint, created_at, last_used_at }));
+    return {
+      provider: p.key, label: p.label, command: p.command, steps: p.steps,
+      dispatch: !!p.dispatch,   // can a zee run on it? (github: no — infra credential)
+      connected: accounts.length > 0,
+      accounts,
+      token_hint: accounts[0]?.token_hint || null,
+      created_at: accounts[0]?.created_at || null,
+      last_used_at: accounts[0]?.last_used_at || null,
+    };
+  });
 }
 
-export async function setProviderToken(projectId, provider, token) {
+function validate(provider, token) {
   const p = PROVIDERS[provider];
   if (!p) throw new Error(`unknown provider "${provider}"`);
   const t = String(token || '').trim();
   if (!t) throw new Error('token is empty');
-  if (!p.valid(t)) throw new Error(`that does not look like a ${p.label} token (expected sk-ant-…)`);
-  await q(
-    `INSERT INTO provider_token (project_id, provider, token, token_hint)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (project_id, provider)
-     DO UPDATE SET token = $3, token_hint = $4, created_at = now(), last_used_at = NULL`,
-    [projectId, provider, t, hint(t)]);
+  if (!p.valid(t)) throw new Error(`that does not look like a ${p.label} token — see the steps for what to paste`);
+  return { p, t };
+}
+
+// ADD an account of this type (multiple per type allowed — that is the point since 036).
+export async function addProviderToken(projectId, provider, token, label = null) {
+  const { t } = validate(provider, token);
+  const row = await one(
+    `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
+     VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+    [projectId, provider, t, hint(t), String(label || '').trim() || null]);
+  return (await listProviderTokens(projectId)).find((r) => r.provider === provider)
+    ?? { id: row.id };
+}
+
+// Legacy PUT semantics, kept for scripts and the github panel: no account of this type → create;
+// exactly one → replace it in place; several → refuse rather than guess which to clobber.
+export async function setProviderToken(projectId, provider, token) {
+  const { t } = validate(provider, token);
+  const rows = await q(`SELECT id FROM provider_token WHERE project_id=$1 AND provider=$2`, [projectId, provider]);
+  if (rows.length > 1) throw new Error(`several ${provider} accounts are connected — add/remove specific accounts instead`);
+  if (rows.length === 1) {
+    await q(`UPDATE provider_token SET token=$2, token_hint=$3, created_at=now(), last_used_at=NULL WHERE id=$1`,
+      [rows[0].id, t, hint(t)]);
+  } else {
+    await q(`INSERT INTO provider_token (project_id, provider, token, token_hint) VALUES ($1,$2,$3,$4)`,
+      [projectId, provider, t, hint(t)]);
+  }
   return (await listProviderTokens(projectId)).find((r) => r.provider === provider);
 }
 
+// disconnect ONE account by id (scoped to the project so a stray id can't cross projects)
+export async function deleteProviderAccount(projectId, accountId) {
+  await q('DELETE FROM provider_token WHERE project_id = $1 AND id = $2', [projectId, accountId]);
+  return { ok: true };
+}
+
+// disconnect ALL accounts of a type (legacy route; the console now removes per account)
 export async function deleteProviderToken(projectId, provider) {
   await q('DELETE FROM provider_token WHERE project_id = $1 AND provider = $2', [projectId, provider]);
   return { ok: true };
 }
 
-// What a cxell spawn needs for a given AI provider: the token plus (for anthropic-compatible
-// vendors like Kimi) the base URL the claude CLI should aim at. Refuses non-dispatchable
-// providers up front — an OpenAI key has no runtime yet and must fail the dispatch cleanly.
-export async function spawnCreds(projectId, provider = 'claude') {
+// What a cxell spawn needs for a given AI provider ACCOUNT: the token plus (for a provider
+// whose CLI takes an alternate endpoint) the base URL. `tokenId` pins the exact account the
+// human's button carries; without one (CLI dispatches), the freshest account of the type is
+// used. Refuses non-dispatchable types up front — a GitHub PAT is an infra credential, not
+// something a zee can run on.
+export async function spawnCreds(projectId, provider = 'claude', { tokenId = null } = {}) {
   const p = PROVIDERS[provider];
   if (!p) throw new Error(`unknown provider "${provider}"`);
-  if (!p.dispatch) throw new Error(`no zee runtime for ${p.label} yet — dispatch on Claude or Kimi`);
-  return { provider, token: await tokenForSpawn(projectId, provider), baseUrl: p.anthropicBaseUrl || null };
+  if (!p.dispatch) throw new Error(`no zee runtime for ${p.label} — dispatch on Claude, Codex, or Kimi`);
+  const acct = await tokenForSpawn(projectId, provider, { tokenId });
+  return { provider, token: acct.token, baseUrl: p.anthropicBaseUrl || null,
+           tokenId: acct.id, accountLabel: acct.label };
 }
 
 // the one full-token read — the spawn path injecting into a cxell zee's environment
-export async function tokenForSpawn(projectId, provider = 'claude') {
-  const row = await one(
-    `UPDATE provider_token SET last_used_at = now()
-      WHERE project_id = $1 AND provider = $2 RETURNING token`, [projectId, provider]);
-  if (!row) throw new Error(`project has no ${provider} token — connect one in Project setup`);
-  return row.token;
+export async function tokenForSpawn(projectId, provider = 'claude', { tokenId = null } = {}) {
+  const row = tokenId
+    ? await one(
+        // the id is authoritative but must MATCH the claimed type — a button can't smuggle a
+        // github PAT into a zee spawn by pairing its id with provider=claude
+        `UPDATE provider_token SET last_used_at = now()
+          WHERE project_id = $1 AND id = $2 AND provider = $3 RETURNING id, label, token`,
+        [projectId, tokenId, provider])
+    : await one(
+        `UPDATE provider_token SET last_used_at = now()
+          WHERE id = (SELECT id FROM provider_token WHERE project_id = $1 AND provider = $2
+                       ORDER BY created_at DESC LIMIT 1) RETURNING id, label, token`,
+        [projectId, provider]);
+  if (!row) {
+    throw new Error(tokenId
+      ? `that ${provider} account is no longer connected — it may have been removed; reopen the composer`
+      : `project has no ${provider} token — connect one in Project setup`);
+  }
+  return row;
 }

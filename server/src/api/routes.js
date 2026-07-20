@@ -13,6 +13,7 @@ import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool } from '../lib/machines.js';
+import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell } from '../queenzee/reaper.js';
@@ -28,7 +29,8 @@ import { listProjects, createProject, updateProject, deleteProject,
 import { probeRemote } from '../lib/remote-git.js';
 import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
-import { listProviderTokens, setProviderToken, deleteProviderToken } from '../lib/provider-tokens.js';
+import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderToken,
+         deleteProviderAccount } from '../lib/provider-tokens.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
@@ -41,7 +43,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfWorking, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -284,11 +286,21 @@ router.delete('/sites/:id', async (req, res) => {
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 
-// ── provider tokens: per-project AI credentials for cxell zees ────────────────
+// ── provider accounts: per-project AI credentials for cxell zees ──────────────
 // The read model is MASKED (hint + dates only); the full token never leaves the server —
-// only the spawn path reads it, via tokenForSpawn().
+// only the spawn path reads it, via tokenForSpawn(). A project can hold SEVERAL accounts of
+// one provider type (036): POST adds one, DELETE …/account/:accountId removes one; the PUT
+// keeps its legacy replace-in-place semantics for single-account types (github, scripts).
 router.get('/projects/:id/tokens', async (req, res) => {
   try { res.json(await listProviderTokens(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/projects/:id/tokens', async (req, res) => {
+  try { res.json(await addProviderToken(req.params.id, req.body?.provider, req.body?.token, req.body?.label)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/projects/:id/tokens/account/:accountId', async (req, res) => {
+  try { res.json(await deleteProviderAccount(req.params.id, req.params.accountId)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.put('/projects/:id/tokens/:provider', async (req, res) => {
@@ -425,8 +437,9 @@ router.get('/xell/db-modes', (_req, res) =>
 router.get('/xell/modes', (_req, res) =>
   res.json(Object.entries(DISPATCH_MODES).map(([n, m]) => ({ mode: Number(n), key: m.key, permission_mode: m.permissionMode, tools: m.tools || 'all', label: m.label }))));
 
-// the models a dispatch can run (opus/sonnet/haiku); `default` marks the current ZEE_MODEL default
-router.get('/xell/models', (_req, res) => res.json(listDispatchModels()));
+// the models a dispatch can run — per PROVIDER (?provider=claude|openai|kimi), since each vendor's
+// CLI takes its own model ids; `default` marks the entry a bare dispatch would run
+router.get('/xell/models', (req, res) => res.json(listDispatchModels(req.query.provider)));
 
 // Change a zee's permission mode from the console (the mode chip on a xell card). Live-applies
 // to a headless zee we hold the handle for; otherwise recorded, with a note saying so.
@@ -510,6 +523,50 @@ router.post('/machines/:id/dev-db', async (req, res) => {
   try {
     const projectId = req.body?.project_id || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
     res.json(await provisionDevDb(projectId, req.params.id, { snapshotId: req.body?.snapshot_id || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── devices: the HUMAN side of mobile device xhips (035) ─────────────────────
+// The zee attaches its own device over the token'd /xell/self/device; these are for a human/the
+// dashboard: register a physical phone, and attach/detach a device to a named xell by id.
+router.get('/devices', async (req, res) => {
+  // Registered SHARED devices (physical) for a project — the pool a xell can link from.
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  res.json(await q(
+    `SELECT c.id, c.name, c.docker_ctx, host(c.host) AS host, c.host_port, c.url AS label, c.health,
+            (SELECT x.slug FROM xell_uses_container uc JOIN xell x ON x.id = uc.xell_id
+              WHERE uc.container_id = c.id AND x.status <> 'retired' LIMIT 1) AS in_use_by
+       FROM container c
+      WHERE c.project_id = $1 AND c.role='device' AND c.isolation='shared'
+      ORDER BY c.created_at`, [req.query.project]));
+});
+// Register a physical phone as a shared device on a can_device machine — network-adb (transport:'net',
+// give adb_port) or USB-shared (transport:'usb', give serial; adb_port defaults to the 5037 server).
+router.post('/devices', async (req, res) => {
+  const { project, machine_id, adb_port, serial, transport, name, label, host } = req.body || {};
+  if (!project || !machine_id) return res.status(400).json({ error: 'project and machine_id required' });
+  try { res.json(await registerPhysicalDevice({ projectId: project, machineId: machine_id,
+    adbPort: adb_port || null, serial: serial || null, transport: transport || 'net',
+    name: name || null, label: label || null, host: host || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Stand up the shared adb host on a machine (shares its USB-plugged phones over TCP). Background-ish
+// docker run; FIREWALL the port to the LAN (an open adb server is unauthenticated).
+router.post('/machines/:id/adb-host', async (req, res) => {
+  try { res.json(await provisionAdbHost(req.params.id, { port: req.body?.port || undefined })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// List the phones plugged into a machine's shared adb host (`adb devices` in the adb-host container).
+router.get('/machines/:id/usb-devices', async (req, res) => {
+  try { res.json(await listUsbDevices(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Attach (or ?action=detach) a device to a xell by id — the dashboard's "attach device" button.
+router.post('/xells/:id/device', async (req, res) => {
+  const action = req.body?.action || 'attach';
+  try {
+    if (action === 'detach') return res.json(await detachDeviceXhip(req.params.id));
+    res.json(await attachDeviceXhip(req.params.id, { kind: req.body?.kind || null }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -718,6 +775,13 @@ router.post('/xell/self/build', async (req, res) => {
 router.get('/xell/self/build/status', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfBuildStatus(x)); }
   catch (err) { res.status(404).json({ error: err.message }); }
+});
+// Attach / detach / status a mobile DEVICE xhip (Android). NOT human-gated — same class as build:
+// a throwaway device to run your own app. `zee device` maps here.
+router.post('/xell/self/device', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfDevice(x, { action: req.body?.action || 'attach', kind: req.body?.kind || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // HUMAN side of the prod-bind request (the dashboard) — list + confirm/reject. There is deliberately

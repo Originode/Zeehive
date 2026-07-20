@@ -25,12 +25,12 @@ const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 // there is no such thing as a machine-wide pool anymore.
 export async function listMachines(projectId = null) {
   if (!projectId) {
-    return q(`SELECT id, key, label, docker_ctx, host_ip, can_build, dev_priority, max_xells,
-                     enabled, notes, created_at
+    return q(`SELECT id, key, label, docker_ctx, host_ip, can_build, can_device, dev_priority,
+                     max_xells, enabled, notes, created_at
                 FROM machine ORDER BY dev_priority DESC, created_at`);
   }
   return q(
-    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.dev_priority,
+    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device, m.dev_priority,
             m.max_xells, m.enabled, m.notes, m.created_at,
             COALESCE(mp.pool_size, 0) AS pool_size
        FROM machine m LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
@@ -97,9 +97,9 @@ export async function createMachine(body = {}) {
   const known = await resolveContext(ctx).catch(() => null);
   if (!known) throw new Error(`docker context '${ctx}' is not configured on this machine — \`docker context ls\` doesn't know it`);
   const row = await one(
-    `INSERT INTO machine (key,label,docker_ctx,host_ip,can_build,dev_priority,max_xells,enabled,notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,true),$9) RETURNING *`,
-    [body.key, body.label || null, ctx, body.host_ip || null, !!body.can_build,
+    `INSERT INTO machine (key,label,docker_ctx,host_ip,can_build,can_device,dev_priority,max_xells,enabled,notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,true),$10) RETURNING *`,
+    [body.key, body.label || null, ctx, body.host_ip || null, !!body.can_build, !!body.can_device,
      Number(body.dev_priority) || 0, Number(body.max_xells) || 0,
      body.enabled === undefined ? null : !!body.enabled, body.notes || null]);
   // Pool is per (machine, project): a pool_size on create applies to the project the console is
@@ -108,11 +108,11 @@ export async function createMachine(body = {}) {
     await setMachinePool(row.id, body.project_id, Number(body.pool_size));
   }
   broadcast('machine', row);
-  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}, priority ${row.dev_priority}, cap ${row.max_xells})`);
+  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}${row.can_device ? ', devices' : ''}, priority ${row.dev_priority}, cap ${row.max_xells})`);
   return row;
 }
 
-const PATCHABLE = ['key', 'label', 'docker_ctx', 'host_ip', 'can_build', 'dev_priority',
+const PATCHABLE = ['key', 'label', 'docker_ctx', 'host_ip', 'can_build', 'can_device', 'dev_priority',
                    'max_xells', 'enabled', 'notes'];
 
 export async function updateMachine(id, body = {}) {
@@ -194,6 +194,15 @@ export async function defaultBuildCtxFor(machine) {
     `SELECT docker_ctx FROM machine WHERE enabled AND can_build
       ORDER BY dev_priority DESC, created_at LIMIT 1`);
   return b?.docker_ctx || null;
+}
+
+// The best host for a mobile DEVICE xhip: highest-priority enabled machine that can run an Android
+// emulator (KVM) or has a phone tethered — can_device (035). null ⇒ no device host configured; the
+// device driver turns that into an actionable "mark a machine can_device" error, never a crash-loop.
+export async function deviceCapableMachine() {
+  return one(
+    `SELECT * FROM machine WHERE enabled AND can_device
+      ORDER BY dev_priority DESC, created_at LIMIT 1`);
 }
 
 // ── per-machine dev db provisioning ───────────────────────────────────────────

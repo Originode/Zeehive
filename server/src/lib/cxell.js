@@ -1,5 +1,6 @@
-// The CXELL driver: everything the queenzee does to run a zee's claude CLI INSIDE a per-xell
-// zee-agent container (image docker/zeehive/Dockerfile.zee-agent) instead of on the host.
+// The CXELL driver: everything the queenzee does to run a zee's agent CLI (claude, codex, or
+// kimi — see cxell-runtimes.js) INSIDE a per-xell zee-agent container (image
+// docker/zeehive/Dockerfile.zee-agent) instead of on the host.
 //
 // Why: host-side confinement is prompt + regex (hooks/prod-guard.mjs admits it is not
 // adversary-proof). The cxell makes it structural — the container sees a private clone of the
@@ -21,6 +22,7 @@ import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
+import { adapterFor, CLAUDE_ADAPTER, AGENT_PROC_PATTERN } from './cxell-runtimes.js';
 
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
 // ghcr — matching the CXELL_IMAGE the self-ship scripts already honor for their rebuild.
@@ -97,15 +99,16 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
   });
 }
 
-// Is a cxell zee ACTUALLY working right now? True iff a `claude` process is alive inside its cxell.
-// This is the honest liveness signal the monitor needs: it catches both the headless run AND an
-// interactive terminal session a human drives over SSH — the latter is a claude the queenzee never
-// spawned, so its own process handle can't see it (that's why a busy cxell zee read 'idle'). pgrep
-// exits 1 (→ dk rejects) when nothing matches, and a stopped/absent container rejects too; either
-// way there is no live agent, so → false. Short timeout: this runs every monitor tick.
+// Is a cxell zee ACTUALLY working right now? True iff an agent CLI process (claude/codex/kimi —
+// whatever runtimes the adapter registry knows) is alive inside its cxell. This is the honest
+// liveness signal the monitor needs: it catches both the headless run AND an interactive terminal
+// session a human drives over SSH — the latter is an agent the queenzee never spawned, so its own
+// process handle can't see it (that's why a busy cxell zee read 'idle'). pgrep exits 1 (→ dk
+// rejects) when nothing matches, and a stopped/absent container rejects too; either way there is
+// no live agent, so → false. Short timeout: this runs every monitor tick.
 export async function cxellZeeActive({ ctx = 'default', slug }) {
   try {
-    await dk(ctx, ['exec', cxellName(slug), 'pgrep', '-f', 'claude'], { timeoutMs: 8000 });
+    await dk(ctx, ['exec', cxellName(slug), 'pgrep', '-f', AGENT_PROC_PATTERN], { timeoutMs: 8000 });
     return true;
   } catch {
     return false;
@@ -169,8 +172,9 @@ export async function cxellDiff({ ctx = 'default', slug, base }) {
 // SSH port on 127.0.0.1 (the attend door — host-only; the queenzee's ssh2 bridge and a
 // same-machine Claude Code desktop both reach it, nothing on the LAN does). Returns the port
 // actually bound, scanning upward if the slug-derived one is taken.
-export async function ensureCxell({ ctx, slug, xellId, network, sshPort }) {
+export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image }) {
   const name = cxellName(slug);
+  const img = image || IMAGE;   // per-project override (e.g. the Android SDK variant); else the base
   const net = network || 'zee-hive-net';
   await dk(ctx, ['network', 'create', '--label', 'zeehive.cxell=net', net]).catch((e) => {
     if (!/already exists/i.test(e.message)) throw e;
@@ -181,7 +185,7 @@ export async function ensureCxell({ ctx, slug, xellId, network, sshPort }) {
     try {
       await dk(ctx, ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
         '-p', `127.0.0.1:${port}:22`,
-        '--label', 'zeehive.cxell=1', '--label', `zeehive.xell=${xellId || ''}`, IMAGE]);
+        '--label', 'zeehive.cxell=1', '--label', `zeehive.xell=${xellId || ''}`, img]);
       return { name, sshPort: port };
     } catch (e) {
       if (/port is already allocated|address already in use|bind/i.test(e.message)) {
@@ -194,22 +198,24 @@ export async function ensureCxell({ ctx, slug, xellId, network, sshPort }) {
   throw new Error(`could not bind an SSH port for cxell ${name} (all candidates in use)`);
 }
 
-// Open the cxell's SSH door: install the Zeehive public key for `zee`, drop the Claude token into
-// /etc/environment so an interactive (PAM) login shell comes up authenticated — a docker-exec -e
-// run gets the token directly, an SSH login does not — and start sshd. Root exec; the zee cannot
-// undo it. Idempotent.
-export async function openCxellSsh({ ctx, name, publicKey, token, xellToken, baseUrl = null }) {
+// Open the cxell's SSH door: install the Zeehive public key for `zee`, drop the agent CLI's
+// credential env into /etc/environment so an interactive (PAM) login shell comes up authenticated
+// — a docker-exec -e run gets the env directly, an SSH login does not — and start sshd. Root
+// exec; the zee cannot undo it. Idempotent.
+export async function openCxellSsh({ ctx, name, publicKey, agentEnv = {}, xellToken, runtimeKey = null }) {
   const env = [];
   if (publicKey) env.push('-e', `CXELL_PUBKEY=${publicKey}`);
-  // /etc/environment lines a PAM (SSH) login inherits — the Claude token so interactive `claude`
-  // comes up authenticated, AND the per-xell identity token so an attending human's `zee` CLI (and
-  // any command in the login shell) can reach the queenzee's /api/xell/self/* verbs. A docker-exec
-  // -e run gets these directly; an SSH login does not, so they must land in /etc/environment too.
-  const envLines = [];
-  if (token) envLines.push(`ANTHROPIC_AUTH_TOKEN=${token}`);
-  // anthropic-compatible vendors (Kimi): the interactive claude in the cxell aims at the same
-  // base URL the headless run used, so an attending human continues on the SAME provider
-  if (baseUrl) envLines.push(`ANTHROPIC_BASE_URL=${baseUrl}`);
+  // /etc/environment lines a PAM (SSH) login inherits — the VENDOR's credential env (whatever the
+  // runtime adapter says its CLI reads: ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY, KIMI_MODEL_*…) so an
+  // attending human's interactive agent comes up authenticated on the SAME provider the headless
+  // run used, AND the per-xell identity token so that human's `zee` CLI (and any command in the
+  // login shell) can reach the queenzee's /api/xell/self/* verbs. A docker-exec -e run gets these
+  // directly; an SSH login does not, so they must land in /etc/environment too.
+  const envLines = Object.entries(agentEnv)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => `${k}=${v}`);
+  // which agent CLI owns this cxell — zee-attach.sh branches its resume/attach flow on it
+  if (runtimeKey) envLines.push(`ZEE_RUNTIME=${runtimeKey}`);
   if (xellToken) envLines.push(`ZEEHIVE_XELL_TOKEN=${xellToken}`);
   // Where the `zee` CLI finds the queenzee. Explicit (not the CLI's baked default) so a
   // containerized queenzee can re-aim every cxell by config alone (CXELL_API_BASE).
@@ -300,39 +306,35 @@ export async function warmCxell({ ctx, name }) {
   }
 }
 
-// Run the zee: `claude -p` inside the cxell, stream-json events out. Returns { proc, done }
-// where done resolves with the final `result` event (or rejects on a transport failure).
-// onEvent(obj) fires per parsed NDJSON event — init (session id), assistant turns, result.
-//
-// --bare: nothing host-side (plugins/MCP/hooks/skills) leaks into the cxell, and auth comes
-// from CLAUDE_CODE_OAUTH_TOKEN alone (tokenForSpawn — the project's connected token).
-// --dangerously-skip-permissions: safe HERE and only here — the cxell is the permission
-// system, and the CLI requires non-root, which the image guarantees.
-export function runZee({ ctx, name, prompt, model, token, xellToken, baseUrl = null, onEvent }) {
-  // BOTH env names, measured on claude 2.1.214 (2026-07-19): --bare skips the OAuth credential
-  // chain entirely — CLAUDE_CODE_OAUTH_TOKEN alone yields "Not logged in" without one API call —
-  // but honors ANTHROPIC_AUTH_TOKEN (the raw bearer header, which an sk-ant-oat01 token is).
-  // Keep the OAuth var too so a future CLI that prefers it keeps working.
+// Run the zee: the runtime adapter's CLI headless inside the cxell (claude -p / codex exec /
+// kimi --print — see cxell-runtimes.js), its output translated to the normalized event stream.
+// Returns { proc, done } where done resolves with the final `result` event (or rejects on a
+// transport failure). onEvent(obj) fires per normalized event — init (session id), assistant
+// turns, result. Bypass/auto mode inside is safe HERE and only here — the cxell is the
+// permission system, and every adapter runs its CLI's equivalent of skip-permissions.
+export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, onEvent }) {
+  const agentEnv = adapter.env({ token, baseUrl, model });
   const cmd = ['exec', '-i',
-    '-e', `CLAUDE_CODE_OAUTH_TOKEN=${token}`,
-    '-e', `ANTHROPIC_AUTH_TOKEN=${token}`,
+    ...Object.entries(agentEnv).filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .flatMap(([k, v]) => ['-e', `${k}=${v}`]),
     // The per-xell identity token: the cxell zee's `zee` CLI (and any /api/xell/self/* call) reads
-    // it to prove WHICH xell is calling. Injected alongside the Claude token — same door, and the
-    // firewall already allows the queenzee host:port.
+    // it to prove WHICH xell is calling. Injected alongside the vendor credential — same door, and
+    // the firewall already allows the queenzee host:port.
     ...(xellToken ? ['-e', `ZEEHIVE_XELL_TOKEN=${xellToken}`] : []),
-    ...(baseUrl ? ['-e', `ANTHROPIC_BASE_URL=${baseUrl}`] : []),   // Kimi et al: same CLI, different vendor
     '-e', `ZEEHIVE_API=${config.cxellApiBase}`,   // same reason as openCxellSsh's CXELL_ENV line
     name, 'bash', '-lc',
-    `cd /work/repo && claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions${model ? ` --model ${model}` : ''}`];
+    `cd /work/repo && ${adapter.execCmd({ model })}`];
   const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...cmd];
   const p = spawn('docker', full, { windowsHide: true });
   let buf = '', err = '', result = null;
-  const feed = (line) => {
-    if (!line.trim()) return;
-    let ev;
-    try { ev = JSON.parse(line); } catch { return; } // non-JSON noise (e.g. a bash warning)
+  const emit = (ev) => {
     if (ev?.type === 'result') result = ev;
     try { onEvent?.(ev); } catch (e) { logline('cxell', `onEvent threw: ${e.message}`); }
+  };
+  const parser = adapter.makeParser(emit);
+  const feed = (line) => {
+    if (!line.trim()) return;
+    try { parser.line(line); } catch (e) { logline('cxell', `${adapter.key} parser threw: ${e.message}`); }
   };
   p.stdout.on('data', (d) => {
     buf += d.toString();
@@ -344,11 +346,16 @@ export function runZee({ ctx, name, prompt, model, token, xellToken, baseUrl = n
     p.on('error', reject);
     p.on('close', (code) => {
       if (buf.trim()) feed(buf);
+      // vendor adapters synthesize an error result here when the CLI died before its own final
+      // event (e.g. a bad API key) — that's what turns an auth failure into a READABLE feed
+      // event instead of a bare transport error
+      try { parser.close(code, err.trim().split('\n').slice(-3).join(' ').slice(0, 400)); }
+      catch (e) { logline('cxell', `${adapter.key} parser close threw: ${e.message}`); }
       if (result) resolve({ code, result });
-      else reject(new Error(`cxell claude exited ${code} with no result event: ${err.slice(0, 400)}`));
+      else reject(new Error(`cxell ${adapter.bin} exited ${code} with no result event: ${err.slice(0, 400)}`));
     });
   });
-  p.stdin.write(prompt);
+  p.stdin.write(adapter.stdinPayload ? adapter.stdinPayload(prompt) : prompt);
   p.stdin.end();
   return { proc: p, done };
 }
@@ -436,24 +443,26 @@ export async function collectCxellDiffToWorktree({ ctx = 'default', slug, worktr
 // invalidate a token a `zee … --wait` poll is still holding (re-minting would 401 that poll right
 // as it should report success). Fall back to whatever the caller passes. Best-effort: a torn-down
 // or unreachable cxell rejects, and the caller just logs it.
-export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, model, token = null, xellToken = null, timeoutMs = 1200000 } = {}) {
-  let claudeTok = token, identTok = xellToken;
-  if (!claudeTok || !identTok) {
+export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, model, adapter = CLAUDE_ADAPTER, token = null, xellToken = null, timeoutMs = 1200000 } = {}) {
+  if (!adapter.resumable) throw new Error(`runtime ${adapter.key} cannot resume a headless session`);
+  let vendorTok = token, identTok = xellToken;
+  if (!vendorTok || !identTok) {
     try {
       const r = await dk(ctx, ['exec', '-u', '0', name, 'cat', '/etc/environment'], { timeoutMs: 15000 });
       const pick = (k) => (r.out.match(new RegExp(`^${k}=(.*)$`, 'm')) || [])[1]?.trim();
-      claudeTok = claudeTok || pick('ANTHROPIC_AUTH_TOKEN');
+      vendorTok = vendorTok || pick(adapter.tokenEnvKey);
       identTok = identTok || pick('ZEEHIVE_XELL_TOKEN');
     } catch { /* fall through with whatever the caller gave us */ }
   }
-  const env = [];
-  if (claudeTok) env.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${claudeTok}`, '-e', `ANTHROPIC_AUTH_TOKEN=${claudeTok}`);
+  const env = Object.entries(adapter.env({ token: vendorTok, model }))
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);
-  const sid = String(sessionId || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — it is interpolated
-  const resume = sid ? ` --resume ${sid}` : '';
+  // the adapter sanitizes the session id before interpolating it (claude/codex); kimi resumes by
+  // workdir (--continue) and ignores the id entirely
   const cmd = ['exec', '-i', ...env, name, 'bash', '-lc',
-    `cd /work/repo && claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions${resume}${model ? ` --model ${model}` : ''}`];
-  return dk(ctx, cmd, { input: prompt, timeoutMs });
+    `cd /work/repo && ${adapter.execCmd({ model, resumeSid: sessionId || '' })}`];
+  return dk(ctx, cmd, { input: adapter.stdinPayload ? adapter.stdinPayload(prompt) : prompt, timeoutMs });
 }
 
 // Run ONE command inside a cxell zee over the SAME inbound SSH door the browser terminal uses (the

@@ -14,6 +14,7 @@
 import { one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { cxellName, nudgeCxellZee, sendKeysToCxellZee } from '../lib/cxell.js';
+import { adapterFor } from '../lib/cxell-runtimes.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 
 const CONTINUE_PROMPT =
@@ -84,25 +85,30 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log } =
   try {
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
-              x.slug, x.project_id
+              x.slug, x.project_id, rt.key AS runtime_key
          FROM zee z JOIN xell x ON x.id = z.xell_id
+         LEFT JOIN agent_runtime rt ON rt.id = z.runtime_id
         WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
         ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
     if (!zee) return { nudged: false, reason: 'no cxell zee for this xell (nothing to nudge)' };
     // A LIVE cxell has an ssh-terminal viewer; a torn-down one does not.
     if (zee.viewer_kind !== 'ssh-terminal') return { nudged: false, reason: `zee is not in a live cxell (viewer_kind=${zee.viewer_kind})` };
-    if (!zee.claude_session_id) return { nudged: false, reason: 'cxell zee has no session id to resume' };
+    // The zee's own runtime dialect: claude/codex resume by session id, kimi by workdir
+    // (--continue) — so only the id-keyed runtimes refuse when no session id was captured.
+    const adapter = adapterFor(zee.runtime_key);
+    if (!adapter.resumable) return { nudged: false, reason: `runtime ${adapter.key} cannot resume a headless session` };
+    if (adapter.needsSid && !zee.claude_session_id) return { nudged: false, reason: 'cxell zee has no session id to resume' };
 
     // Fallback token only — nudgeCxellZee prefers the tokens already in the cxell's /etc/environment
     // so a running `zee … --wait` poll keeps its identity.
-    const token = await tokenForSpawn(zee.project_id, 'claude').catch(() => null);
+    const token = await tokenForSpawn(zee.project_id, adapter.provider).then((a) => a?.token).catch(() => null);
 
-    const sid = String(zee.claude_session_id).slice(0, 8);
+    const sid = String(zee.claude_session_id || 'latest').slice(0, 8);
     logline('nudge', log ? log(zee.slug, sid) : `${zee.slug}: ${why} by ${by} — resuming cxell session ${sid}`);
     // Fire and forget: the continuation turn can run for minutes; do NOT block the caller on it.
     nudgeCxellZee({
       ctx: 'default', name: cxellName(zee.slug), sessionId: zee.claude_session_id,
-      prompt, model: zee.model, token,
+      prompt, model: zee.model, adapter, token,
     })
       .then((r) => logline('nudge', `${zee.slug}: nudge session exited (code ${r?.code ?? '?'})`))
       .catch((e) => logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`));

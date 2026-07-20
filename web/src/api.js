@@ -52,8 +52,8 @@ export async function getDispatchModes() {
   const r = await fetch('/api/xell/modes');
   return r.ok ? r.json() : [];
 }
-export async function getDispatchModels() {
-  const r = await fetch('/api/xell/models');
+export async function getDispatchModels(provider = 'claude') {
+  const r = await fetch(`/api/xell/models?provider=${encodeURIComponent(provider)}`);
   return r.ok ? r.json() : [];
 }
 
@@ -149,8 +149,14 @@ export async function dismissLanding(id) {
   return data;
 }
 
-// ── provider tokens (masked — the server never returns the token itself) ──────
+// ── provider accounts (masked — the server never returns the token itself). A project can
+// hold several accounts of one provider type (e.g. two Claude subscriptions), each its own
+// row/button; add with POST, remove per-account by id. ────────────────────────
 export const getProviderTokens = (projectId) => fetch(`/api/projects/${projectId}/tokens`).then((r) => r.json());
+export const addProviderToken = (projectId, provider, token, label) =>
+  siteCall(`/api/projects/${projectId}/tokens`, 'POST', { provider, token, label: label || undefined });
+export const deleteProviderAccount = (projectId, accountId) =>
+  siteCall(`/api/projects/${projectId}/tokens/account/${accountId}`, 'DELETE');
 export const putProviderToken = (projectId, provider, token) =>
   siteCall(`/api/projects/${projectId}/tokens/${provider}`, 'PUT', { token });
 export const deleteProviderToken = (projectId, provider) =>

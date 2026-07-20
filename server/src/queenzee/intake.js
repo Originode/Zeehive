@@ -21,7 +21,9 @@ import { logline } from '../lib/logbus.js';
 import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
          ensureZeehiveKeypair, openCxellSsh } from '../lib/cxell.js';
+import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
+import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -226,7 +228,7 @@ function saveDispatchImages(worktreePath, images) {
 // per the runtime) to run the task. Human confirms in their session before this is called.
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
                                      headless = true, model, db, db_container, dump, images,
-                                     provider = 'claude' }) {
+                                     provider = 'claude', provider_token_id = null }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -271,14 +273,15 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
     if (saved.length) {
       taskText += `\n\n## Attached images\n`
         + `The human pasted ${saved.length} image(s) into this prompt. They are saved in your `
-        + `worktree — open them with the Read tool (paths are relative to your worktree root):\n`
+        + `worktree — open and read them (paths are relative to your worktree root):\n`
         + saved.map((p) => `- ${p}`).join('\n');
     }
   }
 
   const spawned = await spawnHeadless({
     projectId, xellId: targetId, task: taskText, runtime, mode, title: inherited,
-    headless: headless !== false, provider, ...(model ? { model } : {}),
+    headless: headless !== false, provider, providerTokenId: provider_token_id,
+    ...(model ? { model } : {}),
   });
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
 
@@ -416,6 +419,23 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
     targets: 'Name what you are shipping: server, webapp, or both (default both).',
   };
 
+  // A MOBILE DEVICE xhip, when this project supports one. If a device is already attached, hand the
+  // zee its adb address + the build→install→run→screenshot loop; otherwise, if the project opts in
+  // (manifest device.enabled), tell it that `zee device` will attach one on demand. Off entirely for
+  // projects with no device declared, so a web-only xell's binding is unchanged.
+  const dev = await deviceForXell(xellId);
+  const proj = await one(`SELECT manifest FROM project WHERE id=$1`, [xell.project_id]);
+  const devCfg = deviceConfig(proj);
+  const device = dev
+    ? { attached: true, ...dev, loop: deviceLoop(dev, cxell ? { buildApkHint: './gradlew assembleDebug  # in /work/repo' } : {}) }
+    : (devCfg.enabled
+      ? { attached: false, platform: 'android', kind: devCfg.kind,
+          how: 'This project can attach a mobile DEVICE (Android) so you can build, install and VISUALLY '
+             + 'verify your app on it. It is not attached yet — attach one on demand when you are ready '
+             + `to test on-device${cxell ? ' with `zee device`' : ''}. It is throwaway (torn down with this xell).`,
+          attach: cxell ? 'zee device' : null }
+      : null);
+
   return {
     status: 'claimed', // the gate: the zee may begin work ONLY when this is 'claimed'
     xell: {
@@ -427,6 +447,7 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
     containers: stack,
     build,
     db,
+    ...(device ? { device } : {}),
     ship,
     task: task || null,
     rules: [
@@ -595,7 +616,8 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
     // reconstructs the `docker exec … psql` line by hand (guessing the exact form) and never sees
     // db.note, the prod-write warning. A claiming zee gets the whole binding; a dispatched one got
     // three keys. Same handoff, same fields.
-    JSON.stringify({ xell: b.xell, containers: b.containers, db: b.db, build: b.build }, null, 2),
+    JSON.stringify({ xell: b.xell, containers: b.containers, db: b.db, build: b.build,
+                     ...(b.device ? { device: b.device } : {}) }, null, 2),
     '```',
     '',
     '## Rules',
@@ -604,7 +626,8 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
     '## How you are running (read this carefully)',
     ...running,
     '- Do the work in THIS turn. Background sub-agents can be killed when the turn ends, so do not',
-    '  put the critical path in one and wait on it — read the code yourself with Read/Glob/Grep.',
+    '  put the critical path in one and wait on it — read the code yourself with your own',
+    '  file-reading and search tools.',
     '- Explore the codebase before designing: find the existing patterns and build on them.',
     '- When the job is done, stop. A human marks it done in the ZEEHIVE dashboard — never despawn',
     '  yourself, and never touch the xource (the read-only main repo).',
@@ -623,19 +646,23 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
 // dispatch, or set ZEE_MODEL. Default is opus: a zee runs unattended with no one to catch it.
 const DEFAULT_ZEE_MODEL = process.env.ZEE_MODEL || 'opus';
 
-// The models a dispatched zee can run — the aliases the Agent SDK/CLI resolves to the current
-// Claude generation (so we never hardcode a dated model id here). The dashboard "+" composer reads
-// this for its model picker; `default` marks whatever DEFAULT_ZEE_MODEL currently is.
+// The models a dispatched zee can run — PER PROVIDER, since each vendor's CLI takes its own
+// model ids. Claude keeps the aliases the Agent SDK/CLI resolves to the current generation (so
+// we never hardcode a dated model id here); the other vendors' lists live with their adapters
+// (lib/cxell-runtimes.js providerModels — vendor dialect belongs there). The dashboard "+"
+// composer reads this for its model picker; `default` marks what a bare dispatch would run.
 const ZEE_MODELS = [
   { key: 'opus',   label: 'Opus',   note: 'most capable — best for unattended, load-bearing work' },
   { key: 'sonnet', label: 'Sonnet', note: 'fast and cheaper — good for well-scoped or simple jobs' },
   { key: 'haiku',  label: 'Haiku',  note: 'fastest and cheapest — light edits and quick tasks' },
 ];
-export function listDispatchModels() {
+export function listDispatchModels(provider = 'claude') {
+  const vendor = providerModels(provider);
+  if (vendor) return vendor;
   return ZEE_MODELS.map((m) => ({ ...m, default: m.key === DEFAULT_ZEE_MODEL }));
 }
 
-export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true, provider = 'claude' }) {
+export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true, provider = 'claude', providerTokenId = null }) {
   const m = resolveMode(mode);
   const pid = projectId || (await defaultProjectId());
   const xell = xellId
@@ -666,7 +693,30 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
       + '"failed to launch / libc" error: that is the SDK misreporting ENOENT on this cwd.');
   }
 
+  // AUTO-ATTACH a device at dispatch when the project opts in (manifest device.auto). Default is
+  // lazy — an emulator is heavy, so most projects attach on demand via `zee device`. Best-effort:
+  // a device host that's down or missing must NOT sink the dispatch (the zee can still attach later,
+  // and the failure is logged), so this never throws out.
+  try {
+    const projRow = await one(`SELECT manifest FROM project WHERE id=$1`, [pid]);
+    if (deviceConfig(projRow).auto) {
+      const d = await attachDeviceXhip(xell.id).catch((e) => ({ ok: false, error: e.message }));
+      logline('intake', d.ok
+        ? `auto-attached a device to ${xell.slug} at dispatch (${d.device?.name})`
+        : `device auto-attach skipped for ${xell.slug}: ${d.error} — the zee can \`zee device\` later`);
+    }
+  } catch (e) { logline('intake', `device auto-attach check failed for ${xell.slug}: ${e.message}`); }
+
   const cfgRow = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id=$1`, [pid]);
+  // A NON-CLAUDE provider picks its runtime by itself: an OpenAI key runs the Codex CLI, a Kimi
+  // key the Kimi Code CLI — the pool default and the runtime toggle are claude-world knobs that
+  // must not aim another vendor's credential at the claude CLI (or the host SDK).
+  const providerRtKey = runtimeKeyForProvider(provider);
+  if (providerRtKey) {
+    const rt = await runtimeByKey(providerRtKey);
+    if (!rt) throw new Error(`runtime ${providerRtKey} for provider "${provider}" is not in agent_runtime — run migrations`);
+    return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
+  }
   // CXELLD BY DESIGN: a xell is structurally confined unless a human EXPLICITLY opts out. So when no
   // runtime is named and the pool has no (or an unresolvable) default, the fallback is cxell — never
   // the uncxell local SDK. Running local is a deliberate choice (runtime='claude-code-local'), not
@@ -677,7 +727,7 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
   if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });
   // CXELLD runtime → the CLI runs INSIDE the xell's zee-agent container (structural confinement).
-  if (rt?.key === 'claude-code-cxell') return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider });
+  if (rt?.driver === 'cxell-cli') return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
 
   let sdk;
   try { sdk = await import('@anthropic-ai/claude-agent-sdk'); }
@@ -809,11 +859,17 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 // No viewer: the session JSONL lives inside the container, so claude:// cannot attach. The
 // live feed is the stream-json event stream, re-broadcast per-zee on the SSE bus as
 // 'zee-output' and narrated into the Terminal under the `zee:<slug>` scope.
-async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true, provider = 'claude' }) {
-  // Credentials FIRST — a project with no connected token for this provider must fail the
+async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true, provider = 'claude', providerTokenId = null }) {
+  // Which vendor CLI runs inside the cxell — claude, codex, or kimi (see lib/cxell-runtimes.js).
+  // Resolved before anything is claimed so an unknown runtime fails the dispatch cleanly.
+  const adapter = adapterFor(rt?.key);
+  // Credentials FIRST — a project with no connected account for this provider must fail the
   // dispatch cleanly (with the fix spelled out) before anything claims the xell or builds a
-  // container. For anthropic-compatible vendors (Kimi) baseUrl re-aims the cxell's claude CLI.
-  const { token, baseUrl } = await spawnCreds(pid, provider);
+  // container. providerTokenId pins the exact ACCOUNT whose button the human clicked (a
+  // project can hold several of one type since 036); a CLI dispatch without one gets the
+  // freshest account of the type.
+  const { token, baseUrl, accountLabel } = await spawnCreds(pid, provider, { tokenId: providerTokenId });
+  if (accountLabel) logline('intake', `dispatching on the "${accountLabel}" ${provider} account`);
 
   // Egress policy (simplified 2026-07-19): the container is the confinement boundary — a cxell
   // zee can't reach the host or other xells no matter what — so we DON'T lock egress down (that
@@ -847,9 +903,14 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // workflow verbs (land/ship/prod/done/status). Minted here, HASH stored on the xell, PLAINTEXT
   // injected into the cxell env below — never persisted in the clear (see lib/xell-token.js).
   const xellToken = await mintXellToken(xell.id);
+  // Which cxell image this xell runs. A device project that BUILDS apps declares device.cxell_image
+  // (the Android SDK variant) so its zee gets the JDK+SDK; everything else uses the slim base. Read
+  // from the project manifest, null → ensureCxell's default (CXELL_IMAGE or zeehive/zee-agent).
+  const projRow = await one(`SELECT manifest FROM project WHERE id=$1`, [pid]);
+  const cxellImage = deviceConfig(projRow).cxellImage;
   let sshPort = null;
   try {
-    const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id });
+    const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id, image: cxellImage });
     sshPort = created.sshPort;
     await cloneIntoCxell({ ctx, name, worktree: xell.worktree_path });
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
@@ -864,7 +925,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // viewer_url below becomes a literal ssh:// deeplink into this cxell. The xell identity token
     // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
-    await openCxellSsh({ ctx, name, publicKey, token, xellToken, baseUrl });
+    await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
+                         agentEnv: adapter.env({ token, baseUrl, model }) });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);
@@ -893,11 +955,11 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  when the job completes; nothing you do here can touch the host, other xells, or prod.',
     '',
     '## READ THE PROJECT MANUAL FIRST',
-    '- You run `--bare`, which does NOT auto-load project memory — so open it yourself with the Read',
-    '  tool before you design anything. Read `/work/repo/CLAUDE.md` if it exists; if not, read the',
-    '  repo\'s top-level manual/handover instead (look for CLAUDE.md, AGENTS.md, HANDOFF.md or',
-    '  README.md at /work/repo, and the memory files they reference). That, plus the docs it points',
-    '  to, is how this repo actually works; guessing instead is how a zee wastes its whole turn.',
+    '- You run headless with NO host-side config, so project memory/instructions are NOT auto-loaded',
+    '  — open the manual yourself before you design anything. Read the repo\'s top-level manual/',
+    '  handover (look for CLAUDE.md, AGENTS.md, HANDOFF.md or README.md at /work/repo, and the',
+    '  memory files they reference). That, plus the docs it points to, is how this repo actually',
+    '  works; guessing instead is how a zee wastes its whole turn.',
     '',
     '## YOUR QUEENZEE VERBS — how a cxell zee lands/ships/goes-to-prod/finishes',
     'You are walled in: no docker, no host fs, no skills. The queenzee API is your ONLY door out, and',
@@ -908,6 +970,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     'human. Use the `zee` CLI (on your PATH) — do not hand-roll curl:',
     '  - `zee status`               → where you stand: your task, and whether a land/ship/prod/done is pending a human.',
     '  - `zee build [server|webapp|all]` → (re)build your OWN app tier so you can run e2e tests against your change. NOT gated — build freely. Add --wait (background) to be told when it is serving your HEAD; --watch reports without building. COMMIT first — it builds your cxell commits.',
+    '  - `zee device [--detach|--status]` → attach a MOBILE DEVICE (Android) to build/install/run your app on. NOT gated (throwaway target). Returns the adb address + the build→install→launch→screenshot loop; a human can watch its screen in a web viewer. Only for projects that support one.',
     '  - `zee land`                 → collect your commits out of the cxell and run the gated push to main. HELD for a human.',
     '  - `zee ship --reason "..."`  → ask to deploy to prod (add `--targets server webapp`). Refused unless already landed; a human approves; the QUEENZEE builds from main.',
     '  - `zee prod --reason "..."`  → ASK to be bound to the prod database. Recorded only — a human confirms, then the cxell is re-sealed to reach prod. Until then you cannot.',
@@ -941,16 +1004,22 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
-  const handle = runZee({ ctx, name, prompt, model, token, xellToken, baseUrl, onEvent: feed });
+  const handle = runZee({ ctx, name, prompt, model, adapter, token, xellToken, baseUrl, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.
   try {
-    await Promise.race([
+    const raced = await Promise.race([
       initSeen,
       handle.done, // resolves/rejects only on exit — an early death beats a 60s silence
       new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for the cxell agent to start')), 60000)),
     ]);
+    // A vendor CLI that died on startup (bad API key, unknown model) resolves `done` with a
+    // SYNTHESIZED error result before any init event — surface that as a FAILED dispatch with
+    // the CLI's own message, not a "confirmed working" that flips to errored a second later.
+    if (!sid && raced?.result?.is_error) {
+      throw new Error(String(raced.result.result || `${adapter.bin} failed to start`).slice(0, 300));
+    }
   } catch (err) {
     await removeCxell({ ctx, slug: xell.slug });
     const reason = `cxell spawn failed: ${String(err.message).slice(0, 300)}`;

@@ -5,7 +5,7 @@ import {
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
-  getMachines, getProviderTokens, putProviderToken, deleteProviderToken,
+  getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
 } from './api.js';
 import { showConfirm } from './Dialog.jsx';
 
@@ -472,13 +472,16 @@ function InvRow({ c, run, busy }) {
 }
 
 // ── agent providers: the per-project credential a CXELLD zee runs on ───────────
-// One token per provider (only Claude today), stored in the meta-DB. The human does the OAuth:
-// copy the command, run it in a terminal, authorize in the browser, paste the token back. The
-// server only ever returns a masked hint — a connected token cannot be read back out of the UI.
+// Provider ACCOUNTS, stored in the meta-DB. A project can hold several accounts of one provider
+// type — e.g. two Claude subscriptions — each with its own label, its own prompt button in the
+// header, and its own last-used date. The human does the OAuth: copy the command, run it in a
+// terminal, authorize in the browser, paste the token back (plus an optional label naming the
+// account). The server only ever returns a masked hint — a connected token cannot be read back.
 function TokensSection({ project, run, busy }) {
   const [tokens, setTokens] = useState(null);
-  const [open, setOpen] = useState(null);     // provider key whose connect panel is open
+  const [open, setOpen] = useState(null);     // provider key whose add-account panel is open
   const [paste, setPaste] = useState('');
+  const [label, setLabel] = useState('');
   const [copied, setCopied] = useState(false);
   const load = useCallback(() => getProviderTokens(project.id).then(setTokens).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
@@ -488,36 +491,38 @@ function TokensSection({ project, run, busy }) {
     try { await navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1500); }
     catch { /* clipboard denied — the command is visible to select anyway */ }
   };
-  const save = (p) => wrapped(() => putProviderToken(project.id, p.provider, paste))
-    .then(() => { setPaste(''); setOpen(null); });
-  const disconnect = async (p) => {
-    if (await showConfirm(`Disconnect ${p.label} from ${project.name}?\n\nCxell zees for this project won't be able to authenticate until a new token is connected.`, { variant: 'danger', okLabel: 'Disconnect' })) {
-      wrapped(() => deleteProviderToken(project.id, p.provider));
+  const save = (p) => wrapped(() => addProviderToken(project.id, p.provider, paste, label))
+    .then(() => { setPaste(''); setLabel(''); setOpen(null); });
+  const disconnect = async (p, a) => {
+    const name = a.label || `${p.label} ${a.token_hint || ''}`;
+    if (await showConfirm(`Disconnect the "${name}" account from ${project.name}?\n\nIts prompt button disappears; zees dispatched on it can no longer authenticate.`, { variant: 'danger', okLabel: 'Disconnect' })) {
+      wrapped(() => deleteProviderAccount(project.id, a.id));
     }
   };
 
   return (
     <div className="setup-sec">
-      <h3>Agent providers <span className="pc">(the credential a cxell zee spawns with — stored in the meta-DB, never echoed back)</span></h3>
+      <h3>Agent providers <span className="pc">(the credential a cxell zee spawns with — stored in the meta-DB, never echoed back. Several accounts of one provider are fine: each gets its own prompt button)</span></h3>
       {(tokens || []).map((p) => (
         <div key={p.provider} className="siteed">
           <div className="setup-row">
             <span className="sitekey">{p.label}</span>
-            {p.connected
-              ? <span className="gate g-pass" title={p.created_at ? `connected ${new Date(p.created_at).toLocaleDateString()}` : ''}>
-                  ✓ <span className="mono">{p.token_hint}</span>
-                  {p.last_used_at ? ` · used ${new Date(p.last_used_at).toLocaleDateString()}` : ' · never used'}
-                </span>
-              : <span className="gate g-warn">△ not connected</span>}
+            {!p.connected && <span className="gate g-warn">△ not connected</span>}
             <button type="button" className="ghost"
-                    onClick={() => { setOpen(open === p.provider ? null : p.provider); setPaste(''); }}>
-              {open === p.provider ? '▾ cancel' : p.connected ? '↻ replace token' : '＋ connect'}
+                    onClick={() => { setOpen(open === p.provider ? null : p.provider); setPaste(''); setLabel(''); }}>
+              {open === p.provider ? '▾ cancel' : p.connected ? '＋ add another account' : '＋ connect'}
             </button>
-            {p.connected && (
-              <button type="button" className="projpop-del" disabled={busy}
-                      title={`Disconnect ${p.label}`} onClick={() => disconnect(p)}>🗑</button>
-            )}
           </div>
+          {(p.accounts || []).map((a) => (
+            <div className="setup-row" key={a.id} data-testid={`token-account-${p.provider}`}>
+              <span className="gate g-pass" title={a.created_at ? `connected ${new Date(a.created_at).toLocaleDateString()}` : ''}>
+                ✓ {a.label ? <b>{a.label} · </b> : null}<span className="mono">{a.token_hint}</span>
+                {a.last_used_at ? ` · used ${new Date(a.last_used_at).toLocaleDateString()}` : ' · never used'}
+              </span>
+              <button type="button" className="projpop-del" disabled={busy}
+                      title={`Disconnect this ${p.label} account`} onClick={() => disconnect(p, a)}>🗑</button>
+            </div>
+          ))}
           {open === p.provider && (
             <div className="setup-grid" style={{ gridTemplateColumns: '1fr' }}>
               <label>1 · Run this in any terminal
@@ -527,12 +532,15 @@ function TokensSection({ project, run, busy }) {
                 </span>
               </label>
               <span className="pc">2 · {p.steps}</span>
-              <label>3 · Paste the token
+              <label>3 · Paste the token{p.connected ? ' (a new account — existing ones stay)' : ''}
                 <span className="setup-row">
                   <input type="password" autoComplete="off" value={paste} placeholder="sk-ant-oat01-…"
                          onChange={(e) => setPaste(e.target.value)}
                          onKeyDown={(e) => { if (e.key === 'Enter' && paste.trim()) { e.preventDefault(); save(p); } }} />
-                  <button type="button" disabled={busy || !paste.trim()} onClick={() => save(p)}>Save token</button>
+                  <input value={label} placeholder="label (optional) — e.g. work / personal"
+                         onChange={(e) => setLabel(e.target.value)}
+                         onKeyDown={(e) => { if (e.key === 'Enter' && paste.trim()) { e.preventDefault(); save(p); } }} />
+                  <button type="button" disabled={busy || !paste.trim()} onClick={() => save(p)}>Save</button>
                 </span>
               </label>
             </div>

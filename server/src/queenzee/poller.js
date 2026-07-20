@@ -18,7 +18,12 @@ export function startPoller() {
       const zees = await q(
         `SELECT * FROM zee
            WHERE status IN ('spawning','online','working','idle')
-             AND claude_session_id IS NOT NULL`);
+             AND claude_session_id IS NOT NULL
+             -- cxell zees (claude/codex/kimi alike): the session lives INSIDE the container, so
+             -- the host session registry can never see it — this pass would stamp every one
+             -- 'session-gone' within a tick (seen live 2026-07-21 on a codex probe). Their
+             -- liveness check is the monitor's in-container pgrep, not host session files.
+             AND entrypoint <> 'cxell-cli'`);
       for (const zee of zees) {
         const s = byId.get(zee.claude_session_id);
         const isLive = !!(s && s.alive);

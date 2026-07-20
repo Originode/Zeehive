@@ -226,7 +226,7 @@ export async function pullProject(id, by = 'human@console') {
   if (!p.remote_url) return { pulled: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
 
   let token = null;
-  try { token = await tokenForSpawn(p.id, 'github'); } catch { /* no token = anonymous fetch (public repo) */ }
+  try { token = (await tokenForSpawn(p.id, 'github'))?.token || null; } catch { /* no token = anonymous fetch (public repo) */ }
 
   const r = await pullRemote({
     repoRoot: String(p.repo_root).replace(/\\/g, '/'),

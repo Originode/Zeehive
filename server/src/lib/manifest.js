@@ -78,6 +78,17 @@ export function parseManifest(text, { dir = null } = {}) {
       warnings.push(`tiers.${tier}.compose "${t.compose}" not found in ${dir} (different branch?)`);
     }
     for (const [role, p] of Object.entries(t.ports || {})) {
+      // A DEVICE xhip publishes two ports (adb + web viewer), so its port block is {adb_base,
+      // viewer_base}, not a single {base} like server/webapp/db. Both default in the device driver,
+      // so either may be omitted — only reject a value that is present but non-numeric.
+      if (role === 'device') {
+        for (const k of ['adb_base', 'viewer_base']) {
+          if (p?.[k] != null && !Number.isFinite(Number(p[k]))) {
+            errors.push(`tiers.${tier}.ports.device.${k} must be numeric (got ${JSON.stringify(p[k])})`);
+          }
+        }
+        continue;
+      }
       if (p == null || typeof p !== 'object' || !Number.isFinite(Number(p.base))) {
         errors.push(`tiers.${tier}.ports.${role} needs a numeric base (got ${JSON.stringify(p)})`);
       }
@@ -102,6 +113,18 @@ export function parseManifest(text, { dir = null } = {}) {
   }
   if (m.ship?.script && dir && !existsSync(resolve(dir, m.ship.script))) {
     warnings.push(`ship.script "${m.ship.script}" not found in ${dir}`);
+  }
+  // device: opt-in mobile-device xhip (035). Only `enabled` is required to turn it on; the rest
+  // default in lib/devices.js. Validated lightly — a bad kind/image shouldn't be silently ignored.
+  if (m.device != null) {
+    if (typeof m.device !== 'object') errors.push('device must be a map (e.g. { enabled: true })');
+    else {
+      if (m.device.kind != null && !['emulator', 'physical'].includes(m.device.kind)) {
+        errors.push(`device.kind must be "emulator" or "physical" (got ${JSON.stringify(m.device.kind)})`);
+      }
+      if (m.device.image != null && typeof m.device.image !== 'string') errors.push('device.image must be a string');
+      if (m.device.cxell_image != null && typeof m.device.cxell_image !== 'string') errors.push('device.cxell_image must be a string (a zee-agent image with the Android SDK)');
+    }
   }
   if (m.env?.file && typeof m.env.file !== 'string') errors.push('env.file must be a path string');
   if (m.db && (m.db.name != null && typeof m.db.name !== 'string')) errors.push('db.name must be a string');

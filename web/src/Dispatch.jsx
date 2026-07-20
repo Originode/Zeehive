@@ -15,7 +15,7 @@ import { getDispatchModes, getDispatchModels } from './api.js';
 // blocking "Dispatching…" button freeze the modal for seconds. So submit now just validates, hands
 // the whole payload up to the parent and closes at once — the parent runs the dispatch and reports
 // progress through a toast (including a Retry that reuses this exact payload if it fails).
-export default function Dispatch({ projectId, projectName, provider = 'claude', providerLabel, onClose, onDispatch }) {
+export default function Dispatch({ projectId, projectName, provider = 'claude', providerLabel, tokenId = null, onClose, onDispatch }) {
   const editorRef = useRef(null);
   const [modes, setModes] = useState([]);
   const [models, setModels] = useState([]);
@@ -29,14 +29,16 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
 
   useEffect(() => {
     getDispatchModes().then((ms) => setModes(ms)).catch(() => {});
-    getDispatchModels().then((ms) => {
+    // The model list is the PROVIDER'S — a Codex composer offers Codex model ids, a Kimi one
+    // Kimi's; claude keeps opus/sonnet/haiku. The server owns the lists (/xell/models?provider=).
+    getDispatchModels(provider).then((ms) => {
       setModels(ms);
       const def = ms.find((m) => m.default) || ms[0];
       if (def) setModel(def.key);
     }).catch(() => {});
     // focus the editor on open so the human can just start typing
     setTimeout(() => editorRef.current?.focus(), 30);
-  }, []);
+  }, [provider]);
 
   // Esc closes only when nothing is composed — so it can't silently discard a written prompt.
   useEffect(() => {
@@ -84,7 +86,10 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
     onDispatch?.({
       project: projectId,
       task,
-      provider,   // which connected AI provider's button opened this composer
+      provider,   // which AI provider TYPE's button opened this composer (picks the runtime)
+      // which exact ACCOUNT of that type — a project can hold several (e.g. two Claude
+      // subscriptions); the spawn uses precisely this one's token
+      ...(tokenId ? { provider_token_id: tokenId } : {}),
       mode,
       model,
       headless,
@@ -106,7 +111,7 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
     <div className="disp-overlay">
       <div className="disp" role="dialog" aria-label="Compose a prompt" data-testid="dispatch-modal">
         <div className="disp-head">
-          <span className="disp-title">＋ New prompt <span className="disp-sub">→ dispatches a zee into a ready xell{projectName ? ` · ${projectName}` : ''}</span></span>
+          <span className="disp-title">＋ New prompt{providerLabel ? ` · ${providerLabel}` : ''} <span className="disp-sub">→ dispatches a zee into a ready xell{projectName ? ` · ${projectName}` : ''}</span></span>
           <button className="disp-x" onClick={onClose} title="Close">✕</button>
         </div>
 
@@ -149,7 +154,7 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
             <div className="disp-field">
               <label className="disp-label">Model</label>
               <div className="disp-models" role="group" aria-label="Model">
-                {(models.length ? models : FALLBACK_MODELS).map((m) => (
+                {(models.length ? models : fallbackModels(provider)).map((m) => (
                   <button key={m.key} className={`disp-seg ${model === m.key ? 'on' : ''}`}
                           data-testid={`dispatch-model-${m.key}`}
                           title={m.note || m.label} onClick={() => setModel(m.key)}>
@@ -221,8 +226,9 @@ const FALLBACK_MODES = [
   { mode: 4, key: 'auto',   label: 'all tools, auto-accept edits' },
   { mode: 5, key: 'bypass', label: 'bypass all permission prompts (fully unattended)' },
 ];
-const FALLBACK_MODELS = [
-  { key: 'opus', label: 'Opus', default: true },
-  { key: 'sonnet', label: 'Sonnet' },
-  { key: 'haiku', label: 'Haiku' },
-];
+// Provider-aware: claude's aliases are safe to guess offline; another vendor's model ids are
+// not, so its fallback is the single honest "vendor default" entry (key '' → dispatch sends no
+// model and the vendor CLI runs its own default).
+const fallbackModels = (provider) => provider === 'claude' || !provider
+  ? [{ key: 'opus', label: 'Opus', default: true }, { key: 'sonnet', label: 'Sonnet' }, { key: 'haiku', label: 'Haiku' }]
+  : [{ key: '', label: 'default', note: "the vendor CLI's own default model", default: true }];
