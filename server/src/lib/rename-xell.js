@@ -100,7 +100,7 @@ export async function renameXellForTask(xellId, title) {
       // $5 appears as both an integer (host_port) and text (URL concat) — without explicit
       // casts Postgres refuses the statement outright ("inconsistent types deduced for
       // parameter $5"), which rolled the whole rename back AFTER the git move (2026-07-19:
-      // the first two caged dispatches each stranded a renamed worktree this way).
+      // the first two cxell dispatches each stranded a renamed worktree this way).
       await client.query(
         `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5::int,
                 url = 'http://' || COALESCE(host(host), $6) || ':' || $5::text

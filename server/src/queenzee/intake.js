@@ -19,8 +19,8 @@ import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
-import { ensureCage, cloneIntoCage, warmCage, sealCage, runZee, removeCage, cageName,
-         ensureZeehiveKeypair, openCageSsh } from '../lib/cage.js';
+import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
+         ensureZeehiveKeypair, openCxellSsh } from '../lib/cxell.js';
 import { mintXellToken } from '../lib/xell-token.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
@@ -138,9 +138,9 @@ export async function claimXell({ session_id, cwd, task, runtime, project }) {
   }
 
   const pool = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id = $1`, [projectId]);
-  // Caged by design (see spawnHeadless): fall back to caged, never the uncaged local SDK.
+  // Cxell by design (see spawnHeadless): fall back to cxell, never the uncxell local SDK.
   const rt = (runtime ? await runtimeByKey(runtime) : await runtimeById(pool?.default_runtime_id))
-    || await runtimeByKey('claude-code-caged');
+    || await runtimeByKey('claude-code-cxell');
   const viewer = viewerUrlFor(rt, session_id, null);
 
   // Enforce "ready ⟺ diff(0,0)" at the point of use: fast-forward the worktree onto the source
@@ -302,7 +302,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
 }
 
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
-async function bindingFor(xellId, zee, task, { caged = false } = {}) {
+async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
   const xell = await one(`SELECT x.*, xo.ref AS xource_ref FROM xell x JOIN xource xo ON xo.id=x.xource_id WHERE x.id=$1`, [xellId]);
   const dbid = await dbIdentity(xell.project_id);
   const rows = await q(
@@ -358,19 +358,19 @@ async function bindingFor(xellId, zee, task, { caged = false } = {}) {
   // docker/compose/spin-env.sh directly leaves the orchestrator blind (no built-commit, no hot
   // flag, no health/spinner) and can mangle a container mid-operation.
   //
-  // CAGED zees have no host filesystem, so the host `xell-build.mjs` PATH is unreachable to them —
-  // that gap is exactly why caged zees couldn't build and complained they couldn't run e2e tests.
-  // Their build door is the in-cage `zee build` CLI (→ /api/xell/self/build), which the token
-  // identifies to their xell (so no xell id in the command). It collects their cage COMMITS onto
+  // CXELLD zees have no host filesystem, so the host `xell-build.mjs` PATH is unreachable to them —
+  // that gap is exactly why cxell zees couldn't build and complained they couldn't run e2e tests.
+  // Their build door is the in-cxell `zee build` CLI (→ /api/xell/self/build), which the token
+  // identifies to their xell (so no xell id in the command). It collects their cxell COMMITS onto
   // the worktree first, then runs the SAME queenzee build. Host-side zees keep the script path.
-  const bs = caged ? 'zee build' : `node "${resolve(config.repoRoot, 'scripts', 'xell-build.mjs')}"`;
-  const buildCmd = (role) => (caged ? `${bs} ${role}` : `${bs} ${xell.id} ${role}`);
+  const bs = cxell ? 'zee build' : `node "${resolve(config.repoRoot, 'scripts', 'xell-build.mjs')}"`;
+  const buildCmd = (role) => (cxell ? `${bs} ${role}` : `${bs} ${xell.id} ${role}`);
   const build = {
-    how: caged
+    how: cxell
       ? 'Build your OWN app-tier containers with `zee build` (on your PATH). It goes through the '
         + 'queenzee, so the built commit, hot flag and health all stay truthful — do NOT run docker, '
         + 'compose or ad-hoc build scripts (you have no docker CLI, and the host build script is '
-        + 'unreachable from the cage). It collects your cage COMMITS first, so COMMIT before you build.'
+        + 'unreachable from the cxell). It collects your cxell COMMITS first, so COMMIT before you build.'
       : 'Build ONLY through the queenzee with these commands. Do NOT run docker, docker compose, '
         + 'scripts/spin-env.sh, or ad-hoc build scripts yourself.',
     all: buildCmd('all'),
@@ -383,7 +383,7 @@ async function bindingFor(xellId, zee, task, { caged = false } = {}) {
       hot: 'append --hot to bounce the container from the existing image (fast, but does NOT pick up code changes — there is no source mount)',
       wait: 'append --wait to BLOCK until the build settles and be told whether the container is '
           + 'actually serving your current HEAD (exit 0 = built, 1 = failed/timeout)',
-      ...(caged ? { watch: 'append --watch to REPORT on a build without starting one (read-only "is what runs actually my code?")' } : {}),
+      ...(cxell ? { watch: 'append --watch to REPORT on a build without starting one (read-only "is what runs actually my code?")' } : {}),
     },
     how_to_wait: 'NEVER hand-roll a wait. Do not curl your own webapp in a poll loop, do not grep '
       + 'it for your changed text, do not `sleep` and re-check: those loops guess at a condition, '
@@ -565,8 +565,8 @@ export async function setZeeMode(zeeId, permissionMode) {
 // of running headless. Without this it gets a bare task string — it doesn't know it's a zee, what
 // it owns, how to build, or that nobody can answer a question, so it researches and then stalls
 // asking "want me to continue?" into a void.
-async function briefing(xellId, zee, task, { headless = true, caged = false } = {}) {
-  const b = await bindingFor(xellId, zee, task, { caged });
+async function briefing(xellId, zee, task, { headless = true, cxell = false } = {}) {
+  const b = await bindingFor(xellId, zee, task, { cxell });
   // Be truthful about who (if anyone) can answer. A dispatched session is still a real session the
   // human can open and talk to — claiming "nobody can answer you" when they can is a lie that
   // pushes the zee to guess instead of surfacing a genuine blocker.
@@ -666,17 +666,17 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   }
 
   const cfgRow = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id=$1`, [pid]);
-  // CAGED BY DESIGN: a xell is structurally confined unless a human EXPLICITLY opts out. So when no
-  // runtime is named and the pool has no (or an unresolvable) default, the fallback is caged — never
-  // the uncaged local SDK. Running local is a deliberate choice (runtime='claude-code-local'), not
+  // CXELLD BY DESIGN: a xell is structurally confined unless a human EXPLICITLY opts out. So when no
+  // runtime is named and the pool has no (or an unresolvable) default, the fallback is cxell — never
+  // the uncxell local SDK. Running local is a deliberate choice (runtime='claude-code-local'), not
   // something a missing/misconfigured default can silently land a zee on with full host access.
   const rt = (runtime ? await runtimeByKey(runtime) : await runtimeById(cfgRow?.default_runtime_id))
-    || await runtimeByKey('claude-code-caged');
+    || await runtimeByKey('claude-code-cxell');
 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
   if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });
-  // CAGED runtime → the CLI runs INSIDE the xell's zee-agent container (structural confinement).
-  if (rt?.key === 'claude-code-caged') return spawnCaged({ pid, xell, task, rt, model, m, title, headless });
+  // CXELLD runtime → the CLI runs INSIDE the xell's zee-agent container (structural confinement).
+  if (rt?.key === 'claude-code-cxell') return spawnCxell({ pid, xell, task, rt, model, m, title, headless });
 
   let sdk;
   try { sdk = await import('@anthropic-ai/claude-agent-sdk'); }
@@ -798,22 +798,22 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
            mode: m.key, permission_mode: m.permissionMode };
 }
 
-// CAGED spawn — the zee's claude CLI runs INSIDE a per-xell zee-agent container. This is the
-// runtime that makes confinement STRUCTURAL instead of prompted: the cage sees a private clone
+// CXELLD spawn — the zee's claude CLI runs INSIDE a per-xell zee-agent container. This is the
+// runtime that makes confinement STRUCTURAL instead of prompted: the cxell sees a private clone
 // of the xell's branch, a default-DROP egress firewall (api.anthropic.com + the queenzee API +
 // its own stack's host:ports), no docker socket, no host filesystem. Because the walls are
-// real, the CLI always runs bypassPermissions inside — the cage IS the permission system, so
+// real, the CLI always runs bypassPermissions inside — the cxell IS the permission system, so
 // the dispatch mode's tool ladder is irrelevant here (there is nothing outside to protect).
 //
 // No viewer: the session JSONL lives inside the container, so claude:// cannot attach. The
 // live feed is the stream-json event stream, re-broadcast per-zee on the SSE bus as
 // 'zee-output' and narrated into the Terminal under the `zee:<slug>` scope.
-async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true }) {
+async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true }) {
   // Token FIRST — a project with no connected Claude token must fail the dispatch cleanly
   // (with the fix spelled out) before anything claims the xell or builds a container.
   const token = await tokenForSpawn(pid, 'claude');
 
-  // Egress policy (simplified 2026-07-19): the container is the confinement boundary — a caged
+  // Egress policy (simplified 2026-07-19): the container is the confinement boundary — a cxell
   // zee can't reach the host or other xells no matter what — so we DON'T lock egress down (that
   // only broke npm/builds). We block the ONE thing that matters: the fleet's live PROD databases,
   // which Docker's bridge NAT would otherwise expose on the LAN. A xell bound to prod
@@ -830,57 +830,57 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   const zee = await one(
     `INSERT INTO zee (xell_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
                       model, permission_mode, cwd, title)
-     VALUES ($1,'headless-spawn',$2,'none','spawning','headless','caged-cli',$3,'bypassPermissions',$4,$5)
+     VALUES ($1,'headless-spawn',$2,'none','spawning','headless','cxell-cli',$3,'bypassPermissions',$4,$5)
      RETURNING *`,
     [xell.id, rt?.id || null, model, '/work/repo', zeeTitle]);
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
-  logline('intake', `caging zee in ${xell.slug} — building the cage (mode requested: ${m.key}; cage always runs bypass inside)`);
+  logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
 
-  // The cage runs on the queenzee's local daemon for now — its network reach is the firewall
+  // The cxell runs on the queenzee's local daemon for now — its network reach is the firewall
   // allow-list, so co-location with the xell's app tier is unnecessary (they meet over TCP).
   const ctx = 'default';
-  const name = cageName(xell.slug);
-  // The per-xell IDENTITY token: the caged zee's only credential to the queenzee's /api/xell/self/*
+  const name = cxellName(xell.slug);
+  // The per-xell IDENTITY token: the cxell zee's only credential to the queenzee's /api/xell/self/*
   // workflow verbs (land/ship/prod/done/status). Minted here, HASH stored on the xell, PLAINTEXT
-  // injected into the cage env below — never persisted in the clear (see lib/xell-token.js).
+  // injected into the cxell env below — never persisted in the clear (see lib/xell-token.js).
   const xellToken = await mintXellToken(xell.id);
   let sshPort = null;
   try {
-    const created = await ensureCage({ ctx, slug: xell.slug, xellId: xell.id });
+    const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id });
     sshPort = created.sshPort;
-    await cloneIntoCage({ ctx, name, worktree: xell.worktree_path });
+    await cloneIntoCxell({ ctx, name, worktree: xell.worktree_path });
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
     // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
-    logline('cage', `${name}: warming (npm ci + web build) so the zee starts ready…`);
-    const warm = await warmCage({ ctx, name });
-    logline('cage', `${name}: ${warm.warmed ? 'warmed (deps + web build ready)' : 'warm incomplete — zee will install as needed'}`);
-    const sealed = await sealCage({ ctx, name, blockTcp });
-    logline('cage', `${name}: ${sealed[sealed.length - 1]}`);
+    logline('cxell', `${name}: warming (npm ci + web build) so the zee starts ready…`);
+    const warm = await warmCxell({ ctx, name });
+    logline('cxell', `${name}: ${warm.warmed ? 'warmed (deps + web build ready)' : 'warm incomplete — zee will install as needed'}`);
+    const sealed = await sealCxell({ ctx, name, blockTcp });
+    logline('cxell', `${name}: ${sealed[sealed.length - 1]}`);
     // Open the attend door: authorize the fleet key and start sshd with the token in the login
     // env. This is what makes the dashboard terminal and desktop "Add SSH host" work — the zee's
-    // viewer_url below becomes a literal ssh:// deeplink into this cage. The xell identity token
+    // viewer_url below becomes a literal ssh:// deeplink into this cxell. The xell identity token
     // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
-    await openCageSsh({ ctx, name, publicKey, token, xellToken });
+    await openCxellSsh({ ctx, name, publicKey, token, xellToken });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
-    logline('cage', `${name}: attend door open — ${viewerUrl}`);
+    logline('cxell', `${name}: attend door open — ${viewerUrl}`);
   } catch (err) {
-    await removeCage({ ctx, slug: xell.slug });
-    const reason = `cage build failed: ${err.message}`;
+    await removeCxell({ ctx, slug: xell.slug });
+    const reason = `cxell build failed: ${err.message}`;
     const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
     broadcast('zee', dead);
     await releaseXell(xell.id);
     return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
   }
 
-  // The briefing still binds the xell truthfully (containers, db, rules) — then the caged
+  // The briefing still binds the xell truthfully (containers, db, rules) — then the cxell
   // addendum corrects the parts that are host-shaped: paths and docker access.
   const prompt = [
-    await briefing(xell.id, zee, task, { headless, caged: true }),
+    await briefing(xell.id, zee, task, { headless, cxell: true }),
     '',
-    '## You are CAGED (overrides anything above that conflicts)',
+    '## You are CXELLD (overrides anything above that conflicts)',
     '- Your workspace is /work/repo — a private clone of your branch. Host paths in the binding',
     '  (worktree_path and friends) refer to the same code from the outside; ignore them.',
     '- You have NO docker CLI. Where the binding says `docker exec … psql`, connect over TCP',
@@ -897,7 +897,7 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  README.md at /work/repo, and the memory files they reference). That, plus the docs it points',
     '  to, is how this repo actually works; guessing instead is how a zee wastes its whole turn.',
     '',
-    '## YOUR QUEENZEE VERBS — how a caged zee lands/ships/goes-to-prod/finishes',
+    '## YOUR QUEENZEE VERBS — how a cxell zee lands/ships/goes-to-prod/finishes',
     'You are walled in: no docker, no host fs, no skills. The queenzee API is your ONLY door out, and',
     'it is authenticated as YOU by $ZEEHIVE_XELL_TOKEN (already in your env). Every "skill" a host zee',
     'has is ONE call here. `zee land`/`zee ship`/`zee prod`/`zee done` are each only a REQUEST that',
@@ -905,12 +905,12 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     'acts immediately, because building your OWN throwaway containers to verify your work needs no',
     'human. Use the `zee` CLI (on your PATH) — do not hand-roll curl:',
     '  - `zee status`               → where you stand: your task, and whether a land/ship/prod/done is pending a human.',
-    '  - `zee build [server|webapp|all]` → (re)build your OWN app tier so you can run e2e tests against your change. NOT gated — build freely. Add --wait (background) to be told when it is serving your HEAD; --watch reports without building. COMMIT first — it builds your cage commits.',
-    '  - `zee land`                 → collect your commits out of the cage and run the gated push to main. HELD for a human.',
+    '  - `zee build [server|webapp|all]` → (re)build your OWN app tier so you can run e2e tests against your change. NOT gated — build freely. Add --wait (background) to be told when it is serving your HEAD; --watch reports without building. COMMIT first — it builds your cxell commits.',
+    '  - `zee land`                 → collect your commits out of the cxell and run the gated push to main. HELD for a human.',
     '  - `zee ship --reason "..."`  → ask to deploy to prod (add `--targets server webapp`). Refused unless already landed; a human approves; the QUEENZEE builds from main.',
-    '  - `zee prod --reason "..."`  → ASK to be bound to the prod database. Recorded only — a human confirms, then the cage is re-sealed to reach prod. Until then you cannot.',
-    '  - `zee done --summary "..."` → propose your job is done. A human confirms with "Mark done"; THAT tears the cage down. Never try to despawn yourself.',
-    'The FULL manual (every verb, its gate, the golden rules) is at `/work/repo/docs/caged-zee-manual.md` —',
+    '  - `zee prod --reason "..."`  → ASK to be bound to the prod database. Recorded only — a human confirms, then the cxell is re-sealed to reach prod. Until then you cannot.',
+    '  - `zee done --summary "..."` → propose your job is done. A human confirms with "Mark done"; THAT tears the cxell down. Never try to despawn yourself.',
+    'The FULL manual (every verb, its gate, the golden rules) is at `/work/repo/docs/cxell-zee-manual.md` —',
     'Read it. Each verb maps to the same landgate/shipgate/prod/done a human drives from the console;',
     'nothing here is a bypass. Commit freely; you can only ever ASK to land, ship, bind-prod, or finish.',
   ].join('\n');
@@ -947,23 +947,23 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     await Promise.race([
       initSeen,
       handle.done, // resolves/rejects only on exit — an early death beats a 60s silence
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for the caged agent to start')), 60000)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for the cxell agent to start')), 60000)),
     ]);
   } catch (err) {
-    await removeCage({ ctx, slug: xell.slug });
-    const reason = `caged spawn failed: ${String(err.message).slice(0, 300)}`;
+    await removeCxell({ ctx, slug: xell.slug });
+    const reason = `cxell spawn failed: ${String(err.message).slice(0, 300)}`;
     const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
     broadcast('zee', dead);
     await releaseXell(xell.id);
     return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
   }
 
-  // Drive the rest in the background. The cage container is KEPT after the turn (idle, sealed)
-  // so its commits can be collected (lib/cage.js exportCageDiff) — the reaper owns teardown.
+  // Drive the rest in the background. The cxell container is KEPT after the turn (idle, sealed)
+  // so its commits can be collected (lib/cxell.js exportCxellDiff) — the reaper owns teardown.
   handle.done
     .then(async ({ result }) => {
-      // CAGED is the priority for the burn tracker: capture the full usage object (tokens + $),
-      // not just cost_usd. The caged CLI's final result event carries usage.{input,output,
+      // CXELLD is the priority for the burn tracker: capture the full usage object (tokens + $),
+      // not just cost_usd. The cxell CLI's final result event carries usage.{input,output,
       // cache_read_input,cache_creation_input}_tokens alongside total_cost_usd.
       const b = usageFrom(result);
       const errored = result?.is_error;
@@ -976,15 +976,15 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       const row = await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]);
       broadcast('zee', row);
       const tok = b.input + b.output + b.cacheRead + b.cacheWrite;
-      logline('intake', `caged zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})`);
+      logline('intake', `cxell zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})`);
     })
     .catch(async (err) => {
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, String(err.message).slice(0, 200)]);
-      logline('intake', `caged zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
+      logline('intake', `cxell zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
     });
 
-  return { ok: true, zee_id: zee.id, xell_id: xell.id, cage: name, session: sid,
-           mode: m.key, permission_mode: 'bypassPermissions', caged: true };
+  return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,
+           mode: m.key, permission_mode: 'bypassPermissions', cxell: true };
 }
 
 // A spawn that failed must hand the xell back — otherwise a dead zee strands it as 'claimed'.

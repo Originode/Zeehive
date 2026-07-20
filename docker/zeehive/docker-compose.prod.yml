@@ -90,10 +90,10 @@ services:
       # console onboarding remains.
       ZEEHIVE_SELF_REMOTE: https://github.com/Originode/Zeehive.git
       ZEEHIVE_GITHUB_TOKEN: ${ZEEHIVE_GITHUB_TOKEN:-}
-      ZEEHIVE_SSH_DIR: /data/ssh           # fleet cage keypair — regenerating it orphans live cages
+      ZEEHIVE_SSH_DIR: /data/ssh           # fleet cxell keypair — regenerating it orphans live cxells
       BACKUP_DIR: /backups                 # prod DB dumps
-      ZEEHIVE_CAGE_SSH: network            # SSH to cages by container name over zee-cage-net
-      CAGE_API_BASE: http://host.docker.internal:4701   # cages must call THIS instance: it
+      ZEEHIVE_CXELL_SSH: network            # SSH to cxells by container name over zee-hive-net
+      CXELL_API_BASE: http://host.docker.internal:4701   # cxells must call THIS instance: it
                                            # publishes 4701 while experimental. Cutover flips the
                                            # port mapping to 4700 — drop this line then (the code
                                            # default is host.docker.internal:4700).
@@ -102,15 +102,15 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock   # the local daemon; TCP contexts for the rest
       - zeehive_ssh:/data/ssh
       - zeehive_backups:/backups
-    networks: [default, zee-cage-net]
+    networks: [default, zee-hive-net]
     labels:
       zeehive.project: Zeehive
       zeehive.role: server
 
 networks:
-  # The cage network — created/owned by the queenzee (cage.js ensureCage), so external here:
+  # The cxell network — created/owned by the queenzee (cxell.js ensureCxell), so external here:
   # compose must join it, never create or tear it down.
-  zee-cage-net:
+  zee-hive-net:
     external: true
 
 volumes:

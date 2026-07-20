@@ -25,59 +25,59 @@ PORT="${PORT:-4700}"
 
 emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$HEAD" "$2" "$ROLE"; }
 
-# ── GAP 2: rebuild the CAGE IMAGE as part of the approved Zeehive deploy ─────────────────────────
-# New caged-zee capabilities (the `zee` CLI, cage-sshd/seed/attach scripts) ship INSIDE
+# ── GAP 2: rebuild the CXELL IMAGE as part of the approved Zeehive deploy ─────────────────────────
+# New cxell-zee capabilities (the `zee` CLI, cxell-sshd/seed/attach scripts) ship INSIDE
 # zeehive/zee-agent (docker/zeehive/Dockerfile.zee-agent). Deploying Zeehive must rebuild that image
-# so freshly-provisioned cages carry the current code — otherwise the fleet silently stays on an old
+# so freshly-provisioned cxells carry the current code — otherwise the fleet silently stays on an old
 # image and a shipped capability never actually reaches a zee. This lives HERE, not in shipgate.js,
 # on purpose: self-ship.sh is Zeehive's OWN build_script, so the rebuild is automatically scoped to
 # the self-hosting project and CANNOT touch OmniBiz's container-build ship path (which shares
-# shipgate.js). Cages run on the `default` docker context (server/src/queenzee/intake.js: `const ctx
-# = 'default'`), so the image must exist there; CAGE_IMAGE_CTX overrides for an operator who moves
+# shipgate.js). Cxells run on the `default` docker context (server/src/queenzee/intake.js: `const ctx
+# = 'default'`), so the image must exist there; CXELL_IMAGE_CTX overrides for an operator who moves
 # the fleet's daemon. Best-effort with LOUD failure: a build failure is reported on the ship card
 # (this stdout/stderr is captured into the ship_request row + streamed to the console) but does NOT
-# abort the code deploy — a running queenzee on new code with a stale cage image beats a blocked
+# abort the code deploy — a running queenzee on new code with a stale cxell image beats a blocked
 # ship, and the warning is anything but silent.
-CAGE_IMAGE="${CAGE_IMAGE:-zeehive/zee-agent}"
-CAGE_IMAGE_CTX="${CAGE_IMAGE_CTX:-}"   # empty = the default docker context, where cages actually run
-cage_build_cmd() {
+CXELL_IMAGE="${CXELL_IMAGE:-zeehive/zee-agent}"
+CXELL_IMAGE_CTX="${CXELL_IMAGE_CTX:-}"   # empty = the default docker context, where cxells actually run
+cxell_build_cmd() {
   local ctxargs=""
-  [ -n "$CAGE_IMAGE_CTX" ] && ctxargs="--context $CAGE_IMAGE_CTX "
-  echo "docker ${ctxargs}build -f \"$SRC/docker/zeehive/Dockerfile.zee-agent\" -t \"$CAGE_IMAGE\" \"$SRC/docker/zeehive\""
+  [ -n "$CXELL_IMAGE_CTX" ] && ctxargs="--context $CXELL_IMAGE_CTX "
+  echo "docker ${ctxargs}build -f \"$SRC/docker/zeehive/Dockerfile.zee-agent\" -t \"$CXELL_IMAGE\" \"$SRC/docker/zeehive\""
 }
-rebuild_cage_image() {
-  echo "self-ship: rebuilding cage image $CAGE_IMAGE @ $HEAD so new cages carry this code" >&2
+rebuild_cxell_image() {
+  echo "self-ship: rebuilding cxell image $CXELL_IMAGE @ $HEAD so new cxells carry this code" >&2
   local ctxargs=()
-  [ -n "$CAGE_IMAGE_CTX" ] && ctxargs=(--context "$CAGE_IMAGE_CTX")
+  [ -n "$CXELL_IMAGE_CTX" ] && ctxargs=(--context "$CXELL_IMAGE_CTX")
   if docker "${ctxargs[@]}" build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" \
-        -t "$CAGE_IMAGE" "$SRC/docker/zeehive" >&2; then
-    echo "self-ship: CAGE-IMAGE ok — $CAGE_IMAGE rebuilt at $HEAD; new cages will carry this code" >&2
+        -t "$CXELL_IMAGE" "$SRC/docker/zeehive" >&2; then
+    echo "self-ship: CXELL-IMAGE ok — $CXELL_IMAGE rebuilt at $HEAD; new cxells will carry this code" >&2
   else
-    echo "self-ship: !!! CAGE-IMAGE FAILED — could NOT rebuild $CAGE_IMAGE; the fleet stays on the OLD" >&2
-    echo "self-ship: !!! cage image and newly-provisioned cages will run STALE caged-zee code. The" >&2
-    echo "self-ship: !!! queenzee restart proceeds (code deploy is the priority); rebuild the cage" >&2
-    echo "self-ship: !!! image by hand or re-ship: $(cage_build_cmd)" >&2
+    echo "self-ship: !!! CXELL-IMAGE FAILED — could NOT rebuild $CXELL_IMAGE; the fleet stays on the OLD" >&2
+    echo "self-ship: !!! cxell image and newly-provisioned cxells will run STALE cxell-zee code. The" >&2
+    echo "self-ship: !!! queenzee restart proceeds (code deploy is the priority); rebuild the cxell" >&2
+    echo "self-ship: !!! image by hand or re-ship: $(cxell_build_cmd)" >&2
   fi
 }
 
 if [ "$MODE" = "simulate" ]; then
   # Prove the new steps WITHOUT touching any process/daemon (Zeehive's own test path). Mirror REAL
-  # mode exactly: only the server role rebuilds the cage image and syncs the tree (webapp rides
+  # mode exactly: only the server role rebuilds the cxell image and syncs the tree (webapp rides
   # along as a no-op restart), so only the server role asserts the commands a real deploy would run.
   if [ "$ROLE" = "server" ]; then
-    echo "self-ship: [simulate] would rebuild cage image with: $(cage_build_cmd)" >&2
+    echo "self-ship: [simulate] would rebuild cxell image with: $(cxell_build_cmd)" >&2
     echo "self-ship: [simulate] would sync working tree with: bash \"$SRC/scripts/self-ship-sync.sh\" \"$SRC\" \"$REF\"" >&2
   else
-    echo "self-ship: [simulate] role $ROLE is a no-op restart (rides with the server); no cage/sync steps" >&2
+    echo "self-ship: [simulate] role $ROLE is a no-op restart (rides with the server); no cxell/sync steps" >&2
   fi
   emit true "simulate"; exit 0
 fi
 if [ "$ROLE" = "webapp" ]; then emit true "noop-rides-with-server"; exit 0; fi
 
-# Real server ship: rebuild the cage image NOW, while this (soon-to-die) queenzee is still alive,
+# Real server ship: rebuild the cxell image NOW, while this (soon-to-die) queenzee is still alive,
 # its docker context reachable, and its output still captured by the ship record. Runs before the
-# detached restart is scheduled so a cage-image failure lands on the ship card, not into the void.
-rebuild_cage_image
+# detached restart is scheduled so a cxell-image failure lands on the ship card, not into the void.
+rebuild_cxell_image
 
 # Detached restart helper. Grace period 3s: long enough for runShip to write 'shipped' and start
 # the lock countdown; short enough that the port frees before anyone notices. The new process

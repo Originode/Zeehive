@@ -284,7 +284,7 @@ router.delete('/sites/:id', async (req, res) => {
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 
-// ── provider tokens: per-project AI credentials for caged zees ────────────────
+// ── provider tokens: per-project AI credentials for cxell zees ────────────────
 // The read model is MASKED (hint + dates only); the full token never leaves the server —
 // only the spawn path reads it, via tokenForSpawn().
 router.get('/projects/:id/tokens', async (req, res) => {
@@ -459,7 +459,7 @@ router.post('/pool/runtime', async (req, res) => {
   if (!rt) return res.status(400).json({ error: 'unknown/disabled runtime' });
   // project is REQUIRED — the old "fall back to the oldest project" default meant a runtime toggle
   // on ANY dashboard silently rewrote the FIRST project's (OmniBiz's) default instead of the one on
-  // screen. A default this load-bearing (it decides whether a zee is caged) must never be guessed.
+  // screen. A default this load-bearing (it decides whether a zee is cxell) must never be guessed.
   const proj = req.body?.project;
   if (!proj) return res.status(400).json({ error: 'project required' });
   const row = await one(`UPDATE pool_config SET default_runtime_id=$2 WHERE project_id=$1 RETURNING project_id`, [proj, rt.id]);
@@ -617,7 +617,7 @@ router.post('/xells/:id/pr', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// Nudge the xell's live caged zee for a STATUS UPDATE — the flower's "nudge" button. Best-effort:
+// Nudge the xell's live cxell zee for a STATUS UPDATE — the flower's "nudge" button. Best-effort:
 // returns { nudged:false, reason } (200) when there is no live zee to reach, so the UI can say so.
 router.post('/xells/:id/nudge', async (req, res) => {
   try { res.json(await nudgeXellForStatus(req.params.id, { by: req.body?.by || 'human@console' })); }
@@ -646,18 +646,18 @@ router.post('/tasks/:id/done', async (req, res) => {
   }
 });
 
-// ── the CAGED zee's WORKFLOW PROTOCOL: /api/xell/self/* ───────────────────────
+// ── the CXELLD zee's WORKFLOW PROTOCOL: /api/xell/self/* ───────────────────────
 //
-// A caged zee has no docker, no host fs, no skills — this authenticated surface is its ONLY door out
-// of the cage. Every verb requires `Authorization: Bearer <ZEEHIVE_XELL_TOKEN>` (minted at cage
-// spawn, injected into the cage env), resolves the CALLING xell from the token hash, and maps to an
+// A cxell zee has no docker, no host fs, no skills — this authenticated surface is its ONLY door out
+// of the cxell. Every verb requires `Authorization: Bearer <ZEEHIVE_XELL_TOKEN>` (minted at cxell
+// spawn, injected into the cxell env), resolves the CALLING xell from the token hash, and maps to an
 // existing human-gated action. An unknown/absent token is refused — a verb can only ever act on the
 // xell that presented its own token, so there is no way to reach across to another xell.
 async function resolveSelf(req, res) {
   const auth = req.get('authorization') || '';
   const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
   const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
-  if (!token) { res.status(401).json({ error: 'missing bearer token — set ZEEHIVE_XELL_TOKEN (the cage injects it)' }); return null; }
+  if (!token) { res.status(401).json({ error: 'missing bearer token — set ZEEHIVE_XELL_TOKEN (the cxell injects it)' }); return null; }
   const xell = await xellForToken(token);
   if (!xell) { res.status(401).json({ error: 'unknown xell token — it identifies no xell' }); return null; }
   if (xell.status === 'retired') { res.status(409).json({ error: `${xell.slug} is retired — its worktree is gone` }); return null; }
@@ -668,7 +668,7 @@ router.get('/xell/self/status', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfStatus(x)); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
-// Collect this cage's commits and run the gated push — HELD for a human (landgate). Never moves main.
+// Collect this cxell's commits and run the gated push — HELD for a human (landgate). Never moves main.
 router.post('/xell/self/land', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfLand(x)); }
   catch (err) { res.status(400).json({ error: err.message }); }
@@ -698,23 +698,23 @@ router.post('/xell/self/tend', async (req, res) => {
     res.json(await selfTend(x, { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
-// Ping "I am actively working" — asserts live activity the passive poller can't see for a cage, and
+// Ping "I am actively working" — asserts live activity the passive poller can't see for a cxell, and
 // clears any open tend. The hive shows occ-working.
 router.post('/xell/self/working', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfWorking(x, { note: req.body?.note || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
-// (Re)build this cage's OWN app tier so a caged zee can run e2e tests against its change. NOT
+// (Re)build this cxell's OWN app tier so a cxell zee can run e2e tests against its change. NOT
 // human-gated (building your own throwaway containers is the point of a xell) — it collects the
-// cage's commits onto the worktree, then runs the same queenzee build a host zee does.
+// cxell's commits onto the worktree, then runs the same queenzee build a host zee does.
 router.post('/xell/self/build', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const role = req.body?.role && req.body.role !== 'all' ? req.body.role : null;
     res.json(await selfBuild(x, { role, hot: !!req.body?.hot })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
-// Read-only: is the cage's stack serving its current HEAD? What `zee build --wait/--watch` polls.
+// Read-only: is the cxell's stack serving its current HEAD? What `zee build --wait/--watch` polls.
 router.get('/xell/self/build/status', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfBuildStatus(x)); }
   catch (err) { res.status(404).json({ error: err.message }); }

@@ -43,7 +43,7 @@ function fmtLine(l) {
 // Modal terminal streaming the queenzee's live activity (checks, updates, maintenance…).
 // One firehose, but filterable: the scope chips in the header toggle channels on and off, so
 // "just the ship" or "everything but the monitor" is one click, not a scroll hunt. The body is a
-// real xterm (same engine as the caged-zee terminal) — ANSI colour, native scrollback + selection.
+// real xterm (same engine as the cxell-zee terminal) — ANSI colour, native scrollback + selection.
 export default function Terminal({ logs, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);

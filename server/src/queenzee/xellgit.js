@@ -75,7 +75,7 @@ const dirtyCount = (wt) => {
 };
 
 // ── CATCH UP: replay the xell's commits onto the CURRENT xource tip ──────────
-// A caged (or host) zee commits on top of the xource AS IT WAS when it started. The xource moves
+// A cxell (or host) zee commits on top of the xource AS IT WAS when it started. The xource moves
 // while the zee works, so a straight `git push . HEAD:<ref>` is a NON-fast-forward — and the
 // landgate's update hook only ever ADVANCES a ref; a non-ff push is simply declined with nothing
 // raised. That is the fleet-burn-tracker bug: the commit diverged, no landing card appeared, yet
@@ -105,11 +105,11 @@ export function catchUpWorktree(worktree, ref) {
 
   // We are about to MOVE the branch (ff or rebase), which git refuses over a dirty tree — and that
   // refusal is what kept wedging `zee land` with "cannot rebase: you have unstaged changes", forcing
-  // the caged zee (which cannot touch the host worktree) to tell a human to `git checkout` by hand.
+  // the cxell zee (which cannot touch the host worktree) to tell a human to `git checkout` by hand.
   // First, tell git to IGNORE file-mode changes here — the recurring wedge is a Windows exec-bit flip
   // (mcp/server.js: 644 in the tree, 755 on checkout) git calls dirty forever; ignoring mode makes it
-  // vanish without a stash. Then, for any REAL remaining dirt: a caged zee's work arrives as COMMITS
-  // collected from the cage, so ANY uncommitted change in the host worktree is local noise — park it
+  // vanish without a stash. Then, for any REAL remaining dirt: a cxell zee's work arrives as COMMITS
+  // collected from the cxell, so ANY uncommitted change in the host worktree is local noise — park it
   // in a labelled stash and carry on unattended (recoverable via `git stash list`, never lost).
   git(worktree, ['config', 'core.fileMode', 'false']);
   let stashed = false;

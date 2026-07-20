@@ -691,13 +691,13 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   const full = size >= 52;             // the two-half card needs room; else degrade
 
   // ── upper half ──
-  // Machine line, prefixed with the cage lock (🔒 caged / 🔓 uncaged) so protocol-compliance reads
+  // Machine line, prefixed with the cxell lock (🔒 cxell / 🔓 uncxell) so protocol-compliance reads
   // at a glance. The lock is tinted (green/red/amber); the machine name stays muted, so the two are
   // drawn as separate colour segments, centred together.
   const mach = machineOf(x, machines);
   if (full && mach) {
     ctx.font = `${Math.max(8, size * 0.14)}px 'Segoe UI', sans-serif`;
-    const lock = cageLock(x);
+    const lock = cxellLock(x);
     const machTxt = fit(ctx, mach, w * 0.5);
     const y = cy - size * 0.62;
     if (lock) {
@@ -833,11 +833,11 @@ function drawFlower(ctx, centers, size, x, diff, machines) {
   });
 }
 
-// Per-hex CAGE indicator as a small inline lock GLYPH, shown before the machine name. The ︎
+// Per-hex CXELL indicator as a small inline lock GLYPH, shown before the machine name. The ︎
 // (VS15) forces monochrome text presentation so ctx.fillStyle actually tints it. Reads runtime_key:
-// caged → 🔒 green (confined, on-protocol); local → 🔓 red (uncaged — the one to spot); remote → 🔒
+// cxell → 🔒 green (confined, on-protocol); local → 🔓 red (uncxell — the one to spot); remote → 🔒
 // amber. null (no zee assigned yet) → no lock, keep the plain ⌂ machine glyph.
-function cageLock(x) {
+function cxellLock(x) {
   if (x.is_production) return null;
   const rk = x.runtime_key;
   if (!rk) return null;
@@ -891,7 +891,7 @@ function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
 function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];
   const buildable = (x.stack || []).some((c) => c.role === 'server' || c.role === 'webapp');
-  const caged = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
+  const cxell = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
   const st = x.hive_status;
   const showDone = true;                                          // mark-done: visible on any status
   const canLand = st ? st === 'occ-landRequest'                   // a land request reveals ⬆ land
@@ -935,11 +935,11 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
 
   // build → CONTAINERS petal
   if (buildable) row(3, [{ label: '🔨 build', kind: 'build' }]);
-  // terminal + nudge → SESSION petal (both act on the live zee; only a caged zee is reachable)
+  // terminal + nudge → SESSION petal (both act on the live zee; only a cxell zee is reachable)
   {
     const s = [];
-    if (caged) s.push({ label: '⌨ terminal', kind: 'terminal' });
-    if (caged) s.push({ label: '💬 nudge', kind: 'nudge', accent: G });
+    if (cxell) s.push({ label: '⌨ terminal', kind: 'terminal' });
+    if (cxell) s.push({ label: '💬 nudge', kind: 'nudge', accent: G });
     row(2, s);
   }
   // pull, and LAND when there is work to land → COMMIT petal
@@ -1103,8 +1103,8 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
 
   ctx.textBaseline = 'middle';
   const bodyMaxW = hexHalfWidthAt(size, size * 0.1) * 2 * 0.9;
-  // MACHINE facet gets the cage lock prefixed to the machine name (tinted), like the compact hex.
-  const lock = facet.title === 'machine' ? cageLock(x) : null;
+  // MACHINE facet gets the cxell lock prefixed to the machine name (tinted), like the compact hex.
+  const lock = facet.title === 'machine' ? cxellLock(x) : null;
   let subShift = 0;                                   // pushed down when the body wraps to two lines
   if (lock) {
     ctx.font = `${Math.min(11, size * 0.15)}px 'Segoe UI', sans-serif`;

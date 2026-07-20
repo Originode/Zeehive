@@ -1,4 +1,4 @@
--- Provider tokens: per-project AI-provider credentials for CAGED (in-container) zees, stored in
+-- Provider tokens: per-project AI-provider credentials for CXELLD (in-container) zees, stored in
 -- the meta-DB instead of a dotfile on somebody's disk. One row per (project, provider) — today
 -- the only provider is 'claude' (a long-lived OAuth token from `claude setup-token`, injected
 -- into the zee-agent container's environment at spawn; the host's ~/.claude is never mounted).

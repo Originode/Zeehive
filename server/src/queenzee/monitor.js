@@ -5,7 +5,7 @@ import { existsSync } from 'node:fs';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { listActiveAgents, remoteList, remoteStatus } from '../lib/claude-cli.js';
-import { cageZeeActive } from '../lib/cage.js';
+import { cxellZeeActive } from '../lib/cxell.js';
 import { broadcast } from '../lib/events.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { worktreeDiff } from '../lib/git.js';
@@ -122,17 +122,17 @@ export async function monitorTick() {
     + (freed ? ` · reclaimed ${freed} stale claim(s)` : ''));
   if (!zees.length) return { checked: 0, freed };
 
-  const caged = zees.filter((z) => z.runtime_key === 'claude-code-caged');
-  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote' && z.runtime_key !== 'claude-code-caged');
+  const cxell = zees.filter((z) => z.runtime_key === 'claude-code-cxell');
+  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote' && z.runtime_key !== 'claude-code-cxell');
   const remote = zees.filter((z) => z.runtime_key === 'claude-code-remote');
 
-  // caged: the claude runs INSIDE the container, so it is NOT in the host's `claude agents --json`
-  // (which is why every caged zee used to read inactive). Probe the cage's own process list instead
+  // cxell: the claude runs INSIDE the container, so it is NOT in the host's `claude agents --json`
+  // (which is why every cxell zee used to read inactive). Probe the cxell's own process list instead
   // — this is true whether the run is the headless one we spawned or an interactive SSH session.
-  if (caged.length) {
-    await Promise.all(caged.map(async (z) => {
-      const active = await cageZeeActive({ ctx: 'default', slug: z.xell_slug }).catch(() => false);
-      await setActive(z, active, 'cage-pgrep');
+  if (cxell.length) {
+    await Promise.all(cxell.map(async (z) => {
+      const active = await cxellZeeActive({ ctx: 'default', slug: z.xell_slug }).catch(() => false);
+      await setActive(z, active, 'cxell-pgrep');
     }));
   }
 

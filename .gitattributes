@@ -5,7 +5,7 @@
 
 # The `zee` CLI (and every .mjs the queenzee runs) has a `#!/usr/bin/env node` shebang. A CRLF
 # checkout turns that into `#!/usr/bin/env node\r`, so the kernel looks for an interpreter literally
-# named "node\r" and the script dies with `node\r: No such file or directory` — a caged zee then
+# named "node\r" and the script dies with `node\r: No such file or directory` — a cxell zee then
 # can't run `zee land` bare and has to work around it with `node /usr/local/bin/zee`. These are
 # scripts, executed by their shebang, and must be LF on every platform including a Windows checkout.
 scripts/zee text eol=lf

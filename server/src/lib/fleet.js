@@ -52,7 +52,7 @@ async function fetchXellRows(pid) {
             z.permission_mode, z.kind AS zee_kind,
             r.label AS runtime_label, r.key AS runtime_key,
             -- FLEET BURN (per xell): sum of what EVERY zee this xell has ever hosted consumed —
-            -- tokens + $ — not just the currently-shown zee (z above is one row). A caged xell can
+            -- tokens + $ — not just the currently-shown zee (z above is one row). A cxell xell can
             -- outlive several zees; the card figure must be the xell's whole burn. Cheap subquery on
             -- the zee(xell_id) index. NB: fleet-own consumption, NOT Anthropic account %/limits.
             (SELECT COALESCE(SUM(zb.input_tokens + zb.output_tokens

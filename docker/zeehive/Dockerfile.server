@@ -37,7 +37,7 @@ COPY hooks/ hooks/
 COPY skill/ skill/
 # The repo checks out CRLF on Windows and COPY preserves it; bash then reads `set -euo pipefail\r`
 # as an invalid option and every provisioning script dies (seen live: pool provision 2026-07-20).
-# Same normalization Dockerfile.zee-agent applies to its cage scripts.
+# Same normalization Dockerfile.zee-agent applies to its cxell scripts.
 RUN find scripts hooks -type f \( -name '*.sh' -o -name '*.mjs' -o -name 'zee' \) -exec sed -i 's/\r$//' {} +
 
 # Entrypoint creates the remote docker contexts (ugreen-nas / mardale-prod) from env, then execs

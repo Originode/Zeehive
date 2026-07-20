@@ -12,7 +12,7 @@ import { logline } from '../lib/logbus.js';
 import { resolveBash } from '../lib/bash.js';
 import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
-import { removeCage } from '../lib/cage.js';
+import { removeCxell } from '../lib/cxell.js';
 import { stopAndRemoveContainer } from '../lib/docker.js';
 import { releaseXellShips } from './shipgate.js';
 
@@ -151,11 +151,11 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   // queenzee knows the exact tags, so it does not need the worktree to clean up after itself.
   await removeXellImages(xellId, xell.slug).catch((e) => logline('reaper', `image cleanup failed for ${xell.slug}: ${e.message}`));
 
-  // the xell's zee CAGE, if a caged zee ever ran here (lib/cage.js) — it idles sealed on the
+  // the xell's zee CXELL, if a cxell zee ever ran here (lib/cxell.js) — it idles sealed on the
   // queenzee's local daemon after its turn so commits stay collectible; retirement is the point
   // of no return, so it goes too. Best-effort like the rest: a leak is visible in `docker ps`
-  // by its zeehive.cage label.
-  await removeCage({ ctx: 'default', slug: xell.slug }).catch((e) => logline('reaper', `cage cleanup failed for ${xell.slug}: ${e.message}`));
+  // by its zeehive.cxell label.
+  await removeCxell({ ctx: 'default', slug: xell.slug }).catch((e) => logline('reaper', `cxell cleanup failed for ${xell.slug}: ${e.message}`));
 
   // Physically remove owned containers the queenzee docker-ran itself (the per-xell db of a
   // process-runner xell — spec §6.1). Compose-managed ones were already purged by the despawn

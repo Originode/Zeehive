@@ -471,7 +471,7 @@ function InvRow({ c, run, busy }) {
   );
 }
 
-// ── agent providers: the per-project credential a CAGED zee runs on ───────────
+// ── agent providers: the per-project credential a CXELLD zee runs on ───────────
 // One token per provider (only Claude today), stored in the meta-DB. The human does the OAuth:
 // copy the command, run it in a terminal, authorize in the browser, paste the token back. The
 // server only ever returns a masked hint — a connected token cannot be read back out of the UI.
@@ -491,14 +491,14 @@ function TokensSection({ project, run, busy }) {
   const save = (p) => wrapped(() => putProviderToken(project.id, p.provider, paste))
     .then(() => { setPaste(''); setOpen(null); });
   const disconnect = async (p) => {
-    if (await showConfirm(`Disconnect ${p.label} from ${project.name}?\n\nCaged zees for this project won't be able to authenticate until a new token is connected.`, { variant: 'danger', okLabel: 'Disconnect' })) {
+    if (await showConfirm(`Disconnect ${p.label} from ${project.name}?\n\nCxell zees for this project won't be able to authenticate until a new token is connected.`, { variant: 'danger', okLabel: 'Disconnect' })) {
       wrapped(() => deleteProviderToken(project.id, p.provider));
     }
   };
 
   return (
     <div className="setup-sec">
-      <h3>Agent providers <span className="pc">(the credential a caged zee spawns with — stored in the meta-DB, never echoed back)</span></h3>
+      <h3>Agent providers <span className="pc">(the credential a cxell zee spawns with — stored in the meta-DB, never echoed back)</span></h3>
       {(tokens || []).map((p) => (
         <div key={p.provider} className="siteed">
           <div className="setup-row">

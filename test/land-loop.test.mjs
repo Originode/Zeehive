@@ -1,12 +1,12 @@
 // LAND-LOOP integration test — proves the three fixes against a THROWAWAY postgres + real git repos.
 //
 // Runs the REAL queenzee code paths (no mocks of the logic under test):
-//   • selfLand → collect (no-op: no cage) → catchUpToXource (REAL rebase onto moved master) →
+//   • selfLand → collect (no-op: no cxell) → catchUpToXource (REAL rebase onto moved master) →
 //     pushToXource (REAL git push through the REAL land-gate `update` hook) → honest status.
 //   • decideLandRequest → landApproved (REAL update-ref) → nudgeXellAfterLand (REAL docker-exec
 //     command, captured by a fake `docker` on PATH).
 //
-// The ONLY seams are the two things a cage genuinely provides and this box does not: `docker`
+// The ONLY seams are the two things a cxell genuinely provides and this box does not: `docker`
 // (stubbed on PATH — its argv is what we ASSERT on for the nudge) and the queenzee HTTP surface the
 // git hook curls (a 30-line server that calls the SAME checkPush the real route calls).
 import http from 'node:http';
@@ -69,12 +69,12 @@ const xell = await one(
   `INSERT INTO xell (project_id, xource_id, slug, branch, worktree_path, head_commit, status, self_token_hash)
    VALUES ($1,$2,'test-slug','spinoff/test',$3,$4,'working','deadbeefhash') RETURNING *`,
   [project.id, xource.id, wt, shaA]);
-// a LIVE CAGED zee (entrypoint caged-cli + a live ssh-terminal cage) — the only kind we nudge
+// a LIVE CXELLD zee (entrypoint cxell-cli + a live ssh-terminal cxell) — the only kind we nudge
 const SID = '11111111-2222-3333-4444-555555555555';
 await one(
   `INSERT INTO zee (xell_id, attach_mode, entrypoint, kind, viewer_kind, viewer_url,
                     claude_session_id, model, status)
-   VALUES ($1,'headless-spawn','caged-cli','headless','ssh-terminal','ssh://zee@127.0.0.1:22001',
+   VALUES ($1,'headless-spawn','cxell-cli','headless','ssh-terminal','ssh://zee@127.0.0.1:22001',
            $2,'opus','idle') RETURNING id`, [xell.id, SID]);
 
 // ── 3. install the REAL land-gate update hook, pointed at a tiny checkPush server ──
@@ -118,7 +118,7 @@ ok(row?.status === 'pending', `land_request.status is 'pending' (${row?.status})
 ok(row?.new_sha === wtHeadAfter, 'land_request.new_sha === the rebased worktree HEAD');
 ok(git(src, ['rev-parse', 'main']) === shaB, 'master did NOT move — the push is HELD, not landed');
 
-// ── 5. BUG 2: approve → master moves AND the caged zee is NUDGED ───────────────
+// ── 5. BUG 2: approve → master moves AND the cxell zee is NUDGED ───────────────
 console.log('\n── approval: land + queenzee NUDGE ──');
 const DOCKER_LOG = join(tmp, 'docker.log');
 process.env.DOCKER_LOG = DOCKER_LOG;                 // fake docker (test/_bin) logs here
@@ -130,7 +130,7 @@ ok(git(src, ['rev-parse', 'main']) === wtHeadAfter, 'master NOW moved to the app
 let log = '';
 for (let i = 0; i < 25 && !/--resume/.test(log); i++) { await sleep(120); log = existsSync(DOCKER_LOG) ? readFileSync(DOCKER_LOG, 'utf8') : ''; }
 ok(/exec/.test(log) && /--resume/.test(log), 'the queenzee ran `docker exec … claude … --resume` to re-invoke the session');
-ok(log.includes(SID), `the resume targeted THIS caged session id (${SID.slice(0, 8)}…)`);
+ok(log.includes(SID), `the resume targeted THIS cxell session id (${SID.slice(0, 8)}…)`);
 ok(/claude --bare -p/.test(log), 'the nudge runs `claude --bare -p` (headless continuation)');
 ok(/landing was APPROVED/.test(log), 'the nudge prompt tells the zee its landing landed and to continue (ship → done)');
 

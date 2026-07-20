@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// `zee` — the CAGED zee's in-cage CLI. A caged zee has no docker, no host fs and no skills; the
-// queenzee API is its only door out of the cage. This wraps the /api/xell/self/* verbs so the zee
-// (or an attending human in the cage's SSH shell) doesn't hand-roll curl.
+// `zee` — the CXELLD zee's in-cxell CLI. A cxell zee has no docker, no host fs and no skills; the
+// queenzee API is its only door out of the cxell. This wraps the /api/xell/self/* verbs so the zee
+// (or an attending human in the cxell's SSH shell) doesn't hand-roll curl.
 //
 //   zee status [--wait]
 //   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]
@@ -14,15 +14,15 @@
 //
 // --wait (on `land` and `status`) BLOCKS, polling until the landing is decided (landed/rejected/
 // stale), and exits with that verdict — its exit is your nudge, so run it in the BACKGROUND. The
-// queenzee ALSO nudges a caged zee on approval (it resumes your session); --wait is the backup.
+// queenzee ALSO nudges a cxell zee on approval (it resumes your session); --wait is the backup.
 //
-// Auth is $ZEEHIVE_XELL_TOKEN (injected into the cage env at spawn). The queenzee is reached at
+// Auth is $ZEEHIVE_XELL_TOKEN (injected into the cxell env at spawn). The queenzee is reached at
 // host.docker.internal:4700 by default (already firewall-allowed); override with $ZEEHIVE_API.
 //
 // `zee land`/`zee ship`/`zee prod`/`zee done` are each only a REQUEST that lands on a HUMAN gate —
 // they do not act unilaterally; a human approves in the ZEEHIVE console, then the queenzee does the
 // work. `zee build` is the ONE exception: it acts immediately, because building your OWN throwaway
-// app-tier containers (to run e2e tests against your change) needs no human. It collects your cage
+// app-tier containers (to run e2e tests against your change) needs no human. It collects your cxell
 // COMMITS onto the worktree first, then runs the same queenzee build a host-side zee runs, so the
 // built commit/hot flag/health all stay truthful — COMMIT before you build.
 import http from 'node:http';
@@ -65,7 +65,7 @@ async function pollLanding(secs) {
   process.exit(1);
 }
 // Poll self/build/status until no targeted container is 'building', then report whether each is UP
-// and serving THIS cage's HEAD. Bounded — a wait that can hang forever is the very thing it replaces
+// and serving THIS cxell's HEAD. Bounded — a wait that can hang forever is the very thing it replaces
 // (a zee's curl|grep loop against its own app). Exit 0 = built and serving your HEAD, 1 = failed /
 // not-your-code / timeout. Run it in the BACKGROUND: its exit is your nudge. Prints to stderr so a
 // backgrounded --wait doesn't tangle with the JSON the build POST already printed to stdout.
@@ -146,7 +146,7 @@ function out(r) {
 }
 
 function usage() {
-  console.log(`zee — caged-zee ↔ queenzee verbs (each is a REQUEST that lands on a human gate)
+  console.log(`zee — cxell-zee ↔ queenzee verbs (each is a REQUEST that lands on a human gate)
 
   zee status [--wait]                where you stand (hive status + task + pending land/ship/prod/done); --wait blocks until a landing is decided
   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]   (re)build your OWN app tier to run e2e tests (NOT gated; acts now). --wait blocks until it serves your HEAD (run in background); --watch reports without building; --hot bounces the old image (no code change)
@@ -162,7 +162,7 @@ env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (default host
 }
 
 if (!token && cmd && cmd !== 'help') {
-  console.error('no ZEEHIVE_XELL_TOKEN in the environment — this shell is not an authenticated cage.');
+  console.error('no ZEEHIVE_XELL_TOKEN in the environment — this shell is not an authenticated cxell.');
   process.exit(1);
 }
 
@@ -200,7 +200,7 @@ switch (cmd) {
     const secs = w.secs || 1200;
     // --watch: report only, start nothing (read-only "is what's running actually my code?").
     if (watch) {
-      console.error(`Watching ${role} for this cage (no build started)…`);
+      console.error(`Watching ${role} for this cxell (no build started)…`);
       await pollBuild(role, secs, { watch: true }); // exits
       break;
     }
@@ -215,7 +215,7 @@ switch (cmd) {
     break;
   }
   case 'working': {
-    // Ping "I am actively working" — asserts live activity the passive poller can't see for a cage,
+    // Ping "I am actively working" — asserts live activity the passive poller can't see for a cxell,
     // and clears any open tend. NOT gated; acts immediately.
     out(await req('POST', '/api/xell/self/working', { note: flag('note') || null }));
     break;

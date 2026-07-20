@@ -122,7 +122,7 @@ const server = app.listen(config.port, () => {
   startProdDiff();
   startDbCloneWatch();
 });
-// Browser terminal into caged zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
+// Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
 // existing /api proxy (vite dev + the prod nginx bundle) with no extra port to expose.
 attachTerminalBridge(server);
 export { app };

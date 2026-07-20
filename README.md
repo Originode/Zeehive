@@ -1,97 +1,100 @@
 # ZEEHIVE
 
-Deterministic agent-environment orchestrator.
+A deterministic agent-environment orchestrator that **runs itself**: start it against nothing,
+and it clones this repo from GitHub, onboards itself as its first project, and is ready to cut
+isolated environments for AI agents to work in.
 
-- **xource** — the source a *xell* branches from (e.g. local `main`). Read-only to xells.
-- **xell** — an isolated environment: a git worktree + its own branch + assigned
-  containers (db/server/webapp) + config. The unit the orchestrator spawns/tracks/tears down.
-- **zee** — an agent (a Claude Code session) bound to exactly one xell.
-- **queenzee** — the orchestrator. **Pure script, no AI.** It reads xell/zee *status*,
-  keeps a pool of pre-warmed empty xells, spawns/despawns deterministically, and runs
-  maintenance (prod DB backup, refresh stale xell DBs). It never reads a zee's context or
-  interprets prompts.
+## Self-start
 
-The insight: **provisioning is 100% deterministic and belongs in a script; the AI should
-only do the actual work, starting from a proven-correct environment.**
+Requirements: Docker (with compose).
+
+```sh
+git clone https://github.com/Originode/Zeehive.git
+cd Zeehive
+docker network create zee-hive-net
+docker compose -f docker/zeehive/docker-compose.prod.yml --profile experimental up -d --build meta-db server web
+```
+
+That's the whole loop. On first boot the server migrates its **own fresh meta-DB**
+(`zeehive_meta_data` volume), then **self-onboards**: it clones this repo into the `zeehive_repos`
+volume, registers it as the `Zeehive` project with a pull-only GitHub remote, installs the
+landing gate, and sets the spawn template. The console is on **http://localhost:5180**
+(API :4701).
+
+To actually dispatch an agent you need one credential: Project setup → **Tokens** → connect
+Claude (`claude setup-token`). Then raise the **pool target** and pre-warmed xells appear —
+each with its own worktree, branch, and database container. Type a task into **+ new prompt**
+and a zee goes to work in one.
+
+- Self-onboard from a fork: set `ZEEHIVE_SELF_REMOTE` (and `ZEEHIVE_GITHUB_TOKEN` for a private
+  repo — a fine-grained PAT with Contents: Read-only) in `docker/zeehive/.env`.
+- A truly fresh re-run is: delete the `zeehive_meta_data` + `zeehive_repos` volumes and
+  `up -d` again.
+
+## The vocabulary
+
+- **xource** — the source a *xell* branches from: the project's local clone and its main branch.
+  Read-only to xells. Synced from GitHub **inbound-only** (clone + fast-forward pull); nothing in
+  ZEEHIVE ever pushes to a remote — pushing is a human act.
+- **xell** — an isolated environment: a git worktree + its own branch + its own containers
+  (per-xell database, server, webapp) + generated config (`.zeehive.env`). The unit the
+  orchestrator pools, spawns, tracks, and tears down.
+- **cxell** — a *caged xell*: the locked-down container a headless zee actually works in
+  (`cxell_<slug>` on the `zee-hive-net` network). No docker socket, no host filesystem, a
+  default-deny egress firewall — the queenzee API is its only door out, and every privileged
+  verb behind that door lands on a human gate. The repo enters as a git bundle; commits leave
+  the same way. See [docs/cxell-zee-manual.md](docs/cxell-zee-manual.md).
+- **zee** — an agent (a Claude session) bound to exactly one xell, running inside its cxell.
+- **queenzee** — the orchestrator. **Pure script, no AI.** It provisions/reaps deterministically,
+  keeps the pool warm, monitors health, runs maintenance, and executes the privileged actions
+  humans approve. AI is invoked only at dispatch — never in routine loops.
+
+The insight: **provisioning is 100% deterministic and belongs in a script; the AI should only do
+the actual work, starting from a proven-correct environment — and anything irreversible needs a
+human's click.**
+
+## The gates (how nothing irreversible happens on an agent's say-so)
+
+- **Landing gate** — a zee lands work with `git push . HEAD:main` inside its xell; a git `update`
+  hook on the xource asks the queenzee, and the push is **held** until a human approves that
+  exact sha in the console. Fails closed. Installed automatically on every onboarded project.
+- **Ship gate** — production deploys are requests; a human approves, and the *queenzee* builds
+  from the landed main and deploys. A zee never holds the prod lock or runs a prod build.
+- **Prod data** — binding a xell to a production database is a per-xell human grant.
+- **Done** — a zee proposes it's finished; a human's "Mark done" is what tears the cxell down
+  (commits are collected first).
+
+## GitHub-centric, inbound-only
+
+The code lives on GitHub; every instance is born from it (self-onboard) and refreshed from it
+(the console's ff-only **Pull**). The dev cycle itself — landing, integration, prod builds —
+runs entirely on the local xource and never depends on GitHub being reachable. There is **no
+push verb anywhere in the system**: publishing local main to GitHub is a deliberate human act.
 
 ## Layout
 
 ```
-db/migrations/ 001 init · 002 monitor · 003 deploy_lock · 004 production
-               005 container_build · 006 db_backups · 007 container_restoring
-               008 async_backup_jobs
-server/        Node API + queenzee loops
-  src/
-    db/        migrate.js, seed.js, seed_demo.js (NEVER run — see House rules), pool.js
-    api/       routes.js — every HTTP route (hooks, claim, tasks, read models, SSE stream)
-    queenzee/  pool (reconciler), intake, landing, poller, monitor, containers,
-               reaper, tasks, maintenance, deploylock
-    lib/       fleet, timeline, git, sessions, session-title, claude-cli, provision,
-               project-resolve, rename-xell, build, xell-db, reveal, runtimes, names,
-               projects, logbus, events, status
-web/           React + Vite visualization (read-only)
-mcp/server.js  MCP server wrapping the API
-skill/         /xell + /xell-done Claude skills (installed copies live in ~/.claude/skills/
-               — edit BOTH or they drift)
-scripts/       provision-xell.sh, provision-xell-db.sh, despawn-xell.sh, land-xell.sh,
-               rename-xell.sh, build-container.sh, check-containers.sh, xell-*.mjs
-hooks/         settings.json hooks snippet + post-hook.sh — a TEMPLATE, not installed
+db/migrations/   schema, applied automatically at boot
+server/src/
+  api/routes.js  every HTTP route (hooks, claim, land/ship gates, self verbs, SSE stream)
+  queenzee/      the loops: pool, intake, monitor, landing pad, ship gate, reaper, maintenance
+  lib/           provision, cxell driver, remote-git (clone/pull, no push), self-onboard,
+                 projects, terminal bridge, fleet, docker, …
+web/             the console (React + Vite) — honeycomb fleet view, gates, terminals
+docker/zeehive/  Dockerfile.server (the queenzee), Dockerfile.zee-agent (the cxell image),
+                 Dockerfile.web, docker-compose.prod.yml, migration playbook (README.md)
+scripts/         provisioning/despawn/build/ship scripts + the in-cxell `zee` CLI
+docs/            deploy-topology spec, the cxell zee manual
 ```
 
-## Quick start
+## Developing ZEEHIVE with ZEEHIVE
 
-```bash
-cp .env.example .env            # edit DATABASE_URL etc.
-npm install
-docker --context ugreen-nas compose up -d db   # meta-DB `zeehive_db` at 10.1.0.18:5445
-npm run db:reset                # migrate + seed OmniBiz
-npm run server                  # API + queenzee on :4700
-npm run web                     # Vite dev server on :5180
-```
+ZEEHIVE is its own first project: work on it happens in xells like any other project. A Zeehive
+xell gets its own per-xell meta-DB container (`zeehive_db_spin_<slug>`), and the nested queenzee
+inside it runs with simulate-mode safety defaults (`zeehive.yml`) — it can never touch the real
+fleet. Landed work reaches the running instance via its **self-ship**: the approved ref is
+rebuilt and the server replaces itself, finishing the ship record on the new boot.
 
-The meta-DB lives on the `ugreen-nas` Docker context, not localhost — drop `--context` only if
-you deliberately want a throwaway local one. `docker-compose.yml` pins `name: zeehive`
-deliberately: compose otherwise derives the volume prefix from the **folder name**, so moving
-this repo would make it look for a volume that doesn't exist and quietly start an **empty** meta
-database. Do not remove that line.
-
-Mark's standard run — real provisioning, pool on, no app tier:
-
-```bash
-PROVISION_MODE=real PROVISION_APP_TIER=false POOL_ENABLED=true POLLER_ENABLED=false \
-  NODE_NO_WARNINGS=1 node server/src/index.js
-```
-
-## Observability (how status is known without trusting the agent)
-
-Two model-independent channels were designed. **Only the second is actually running:**
-
-1. **Push — harness hooks. NOT INSTALLED.** The design: `~/.claude/settings.json` posts
-   `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `Stop` / `SessionEnd` … to
-   `POST /api/hooks`, which the harness fires itself so the model can't skip them.
-   `POST /api/hooks` exists and returns 202, but `~/.claude/settings.json` has **no hooks key**,
-   so nothing ever calls it. `hooks/settings.hooks.json` is a template, not a live config.
-2. **Passive poll — the live channel.** `~/.claude/sessions/<PID>.json` (PID↔session↔cwd) joined
-   with the transcript's mtime + last `stop_reason`, gated on live PIDs. Plus the **active-session
-   monitor** (`queenzee/monitor.js`), which is where live zee state actually comes from today.
-
-`stats-cache.json` is deliberately **not** used (daily rollup, no per-session data).
-"Done" is a human decision surfaced in the web app — `Stop`=idle is necessary, not sufficient.
-
-## The landing gate (how main is protected without trusting the agent)
-
-Same principle, applied to the one irreversible thing a zee does. "Land locally: `git push .
-HEAD:main`" was only an instruction in the prompt — so a zee followed it and put work on `main`
-with nobody told. Observing that after the fact is useless: the ref has already moved.
-
-So the enforcement sits where the action happens. An `update` hook on the xource
-(`hooks/land-gate-update.sh` → `scripts/install-land-gate.sh`) fires on every push to the
-project's `main_branch`, asks `POST /api/land/check`, and **declines unless a human already
-approved that exact sha** in the console. The push becomes a *request*; the human decides; the
-zee re-runs the same push once approved. It **fails closed**, and it fires only on push — working
-on `main` directly is untouched.
-
-Machine-local: `.git/hooks` is not version-controlled and does not travel with a clone, so the
-installer must be run once per machine per project.
-
-See `C:\Users\Mark\.claude\plans\okay-so-here-is-merry-gizmo.md` for the full design.
+Legacy note: a host-process deployment mode (the pre-container era) still exists alongside the
+container mode during the migration — [docker/zeehive/README.md](docker/zeehive/README.md) is
+the authoritative playbook for what runs where and what remains before full cutover.

@@ -1,4 +1,4 @@
-// Per-project AI-provider tokens (spec: caged zees) — the meta-DB is the credential store.
+// Per-project AI-provider tokens (spec: cxell zees) — the meta-DB is the credential store.
 // The full token leaves this module through ONE door: tokenForSpawn(), used when the queenzee
 // injects it into a zee-agent container's environment. Everything the console sees is masked.
 import { q, one } from '../db/pool.js';
@@ -66,7 +66,7 @@ export async function deleteProviderToken(projectId, provider) {
   return { ok: true };
 }
 
-// the one full-token read — the spawn path injecting into a caged zee's environment
+// the one full-token read — the spawn path injecting into a cxell zee's environment
 export async function tokenForSpawn(projectId, provider = 'claude') {
   const row = await one(
     `UPDATE provider_token SET last_used_at = now()

@@ -345,10 +345,10 @@ after landing ed805cc exposed both):
   checkout to the exact approved ship sha. It is defensive: genuinely-uncommitted work is
   preserved in a labeled `git stash` first, while the *expected* update-ref delta (the tree
   matching an ancestor of the ship sha) is recognised and reset without a redundant stash.
-- **Cage-image rebuild.** New caged-zee capabilities ship inside `zeehive/zee-agent`
-  (`docker/zeehive/Dockerfile.zee-agent` — the `zee` CLI, cage-sshd/seed/attach scripts).
-  `self-ship.sh` rebuilds that image on the `default` docker context (where cages run) as
-  part of the approved ship, so new cages carry the shipped code. Best-effort with loud,
+- **Cxell-image rebuild.** New cxell-zee capabilities ship inside `zeehive/zee-agent`
+  (`docker/zeehive/Dockerfile.zee-agent` — the `zee` CLI, cxell-sshd/seed/attach scripts).
+  `self-ship.sh` rebuilds that image on the `default` docker context (where cxells run) as
+  part of the approved ship, so new cxells carry the shipped code. Best-effort with loud,
   recorded failure: a build failure is reported on the ship card but does not abort the
   code deploy. Both steps live in `self-ship.sh` (Zeehive's own `build_script`), so they are
   scoped to self-hosting and never touch OmniBiz's container-build ship path.

@@ -95,7 +95,7 @@ export async function worktreeDiff(worktree, ref = 'main') {
     // staged + unstaged but NOT untracked files — those only show in `dirty`, which counts them.)
     gitAsync(worktree, ['diff', '--shortstat', 'HEAD']),
     // The LIVE head of the branch — what the zee is actually sitting on right now. The card's sha
-    // used to render the stored head_commit (the PROVISIONING base, frozen at cage-cut), so a xell
+    // used to render the stored head_commit (the PROVISIONING base, frozen at cxell-cut), so a xell
     // that had committed/rebased/landed still showed its old fork sha and looked "behind" the tip
     // it was level with. Read it here, next to the diff, so the card can show where it truly is.
     gitAsync(worktree, ['rev-parse', 'HEAD']),
@@ -127,7 +127,7 @@ export async function worktreeDiff(worktree, ref = 'main') {
 }
 
 // How far a ref has advanced past a base commit — the commit count of `base..ref`. Used for a
-// caged zee's `behind`: its work (and HEAD) live in the cage, but the SOURCE ref only exists on the
+// cxell zee's `behind`: its work (and HEAD) live in the cxell, but the SOURCE ref only exists on the
 // host, so "how far the source moved since this branch forked" is answered here, from repo_root.
 // Async and count-only (no shortstat) so it never blocks the event loop on a big worktree. 0 on any
 // error — a missing ref reads as "not behind", which is the safe blank.

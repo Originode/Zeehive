@@ -38,9 +38,9 @@ New Project → Clone from GitHub. Staged, each step reversible:
    the `ugreen-nas`/`mardale-prod` TCP contexts from env; `DOCKER_HOST` points the `default`
    context at the mounted socket; volumes for the fleet SSH keypair (`zeehive_ssh`) and prod
    dumps (`zeehive_backups`); `REPOS_DIR=/repos` makes clones land on the repos volume;
-   `ZEEHIVE_CAGE_SSH=network` makes the queenzee SSH to cages by container name over
-   `zee-cage-net` (the human's `127.0.0.1:<port>` door is unchanged); cages get `ZEEHIVE_API`
-   injected from `CAGE_API_BASE`. Container self-ship is `scripts/self-ship-container.sh`
+   `ZEEHIVE_CXELL_SSH=network` makes the queenzee SSH to cxells by container name over
+   `zee-hive-net` (the human's `127.0.0.1:<port>` door is unchanged); cxells get `ZEEHIVE_API`
+   injected from `CXELL_API_BASE`. Container self-ship is `scripts/self-ship-container.sh`
    (sync → build → sibling `docker:cli` recreate) — selected per-site via the container row's
    `build_script`, so host and container eras coexist as data.
 3. **Parallel run** — the container (compose profile `experimental`, :4701) against the NEW
@@ -49,11 +49,11 @@ New Project → Clone from GitHub. Staged, each step reversible:
    from the old zeehive_db — the new world starts fresh (projects onboarded from GitHub, fresh
    xells), and the old instance keeps its data until it retires. The DATABASE_URL default is the
    in-compose meta-db (it can never resolve to the old zeehive_db, so the two-queenzees guard
-   holds); ZEEHIVE_DATABASE_URL still overrides for scratch experiments. Pre-create the cage
-   network once (`docker network create zee-cage-net`) — compose joins it as external. Then:
+   holds); ZEEHIVE_DATABASE_URL still overrides for scratch experiments. Pre-create the cxell
+   network once (`docker network create zee-hive-net`) — compose joins it as external. Then:
    New Project → Clone (Zeehive itself, into `/repos`), connect the claude + github tokens, set
-   the spawn template to db-isolated, dispatch a caged zee end-to-end, self-ship.
-4. **Zees stay caged** — the all-caged runtime is the endgame; credentials come from the
+   the spawn template to db-isolated, dispatch a cxell zee end-to-end, self-ship.
+4. **Zees stay cxell** — the all-cxell runtime is the endgame; credentials come from the
    meta-DB (`provider_token`), so NO `~/.claude` mount is needed for zees. Losses to design
    around: `claude://` deep links can't open Claude Desktop into a container, and host-session
    observability (sessions.js reads of `CLAUDE_HOME`) retires with host zees.

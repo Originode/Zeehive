@@ -148,7 +148,7 @@ export default function App() {
   const orientation = useOrientation();          // 'portrait' | 'landscape'
   const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
-  const [termXell, setTermXell] = useState(null);  // caged-zee terminal modal, opened from the flower
+  const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
@@ -400,7 +400,7 @@ export default function App() {
   // drawer card's. Web sessions open a tab; desktop-protocol sessions deep-link into Claude Desktop.
   const openSession = (x) => {
     if (!x?.viewer_url || x.is_production) return;
-    // A caged zee's viewer is an ssh:// terminal, not a URL a browser can open — its card
+    // A cxell zee's viewer is an ssh:// terminal, not a URL a browser can open — its card
     // carries the ⌨ terminal button instead, so ignore the generic open here.
     if (x.viewer_kind === 'ssh-terminal') return;
     if (x.viewer_kind === 'desktop-protocol') openProtocol(x.viewer_url);
@@ -486,7 +486,7 @@ export default function App() {
                     hexPosRef={hexPosRef} onGeometry={fireGeom}
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
-            and hit-tested there — no DOM toolbar. The caged-zee terminal is the one piece that needs
+            and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs
             DOM, so it opens as a modal from the flower's ⌨ button. */}
         {termChoice && (
           <div className="term-choice-back" onClick={() => setTermChoice(null)}>
@@ -806,8 +806,8 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const [termOpen, setTermOpen] = useState(false);
-  // A caged zee is attended over SSH, not a Desktop deep-link — its viewer is a live terminal.
-  const caged = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url && !isProd;
+  // A cxell zee is attended over SSH, not a Desktop deep-link — its viewer is a live terminal.
+  const cxell = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url && !isProd;
 
   // WHERE this xell runs. Its stack is context-stamped per container; the machine is the one whose
   // docker_ctx matches the SERVER container (the stack's anchor), falling back to any stack
@@ -899,15 +899,15 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
               {['stopped', 'errored'].includes(x.zee_status) && x.claude_session_id
                 && <span className="detached" data-testid="detached">detached · click to resume</span>}
             </span>
-            {/* Caged zees are attended in-browser: open a live terminal into the cage (ssh→tmux).
+            {/* Cxell zees are attended in-browser: open a live terminal into the cxell (ssh→tmux).
                 This replaces the Desktop deep-link, which can't reach a session inside a container. */}
-            {caged && (
-              <button className="termbtn" title="Open a live terminal into this caged zee"
+            {cxell && (
+              <button className="termbtn" title="Open a live terminal into this cxell zee"
                       onClick={(e) => { e.stopPropagation(); setTermOpen(true); }}>⌨ terminal</button>
             )}
           </div>
         )}
-        {caged && termOpen && (
+        {cxell && termOpen && (
           <ZeeTerminal zeeId={x.zee_id} slug={x.slug} viewerUrl={x.viewer_url}
                        onClose={() => setTermOpen(false)} />
         )}

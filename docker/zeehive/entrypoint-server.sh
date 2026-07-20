@@ -2,7 +2,7 @@
 # Entrypoint for the containerized queenzee (Dockerfile.server).
 #
 # Creates the REMOTE docker contexts before the server starts: the fleet daemons are reached by
-# `docker --context <name>` everywhere (cage.js, maintenance.js, xell-db.js, …), and a fresh
+# `docker --context <name>` everywhere (cxell.js, maintenance.js, xell-db.js, …), and a fresh
 # container has an empty ~/.docker — the host's context store doesn't travel with the image.
 # The LOCAL daemon needs no context: compose sets DOCKER_HOST=unix:///var/run/docker.sock and
 # both lib/docker.js (HTTP) and the CLI honor it for the 'default' context.

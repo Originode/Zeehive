@@ -12,11 +12,11 @@ async function seed() {
     // local viewer = the desktop-protocol deep link (same claude:// scheme the T-Keyboard
     // uses to jump Claude Desktop to a session); built per-zee from its session id at spawn.
     { key: 'claude-code-local',  label: 'Claude Code (local)',  vendor: 'anthropic', driver: 'agent-sdk',  viewer_kind: 'desktop-protocol', tmpl: 'claude://resume?session={session}', enabled: true,  sort: 100 },
-    // caged = the CLI runs INSIDE a per-xell zee-agent container (kernel-enforced confinement,
+    // cxell = the CLI runs INSIDE a per-xell zee-agent container (kernel-enforced confinement,
     // not prompt-enforced). No viewer: its session JSONL lives in the container, so claude://
     // cannot attach — output streams to the dashboard over SSE instead. (Also in 028 for
     // already-migrated DBs; seeded here for fresh ones.)
-    { key: 'claude-code-caged',  label: 'Claude Code (caged)',  vendor: 'anthropic', driver: 'caged-cli',  viewer_kind: 'none',            tmpl: null, enabled: true,  sort: 150 },
+    { key: 'claude-code-cxell',  label: 'Claude Code (cxell)',  vendor: 'anthropic', driver: 'cxell-cli',  viewer_kind: 'none',            tmpl: null, enabled: true,  sort: 150 },
     // remote viewer_url is captured LIVE from `claude remote` output at spawn (the real
     // claude.ai session URL) — no template, so a URL scheme is never fabricated.
     { key: 'claude-code-remote', label: 'Claude Code (remote)', vendor: 'anthropic', driver: 'remote-api', viewer_kind: 'web',             tmpl: null, enabled: true,  sort: 200 },

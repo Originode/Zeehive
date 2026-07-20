@@ -1,4 +1,4 @@
-# ZEEHIVE zee-agent — the CAGE a headless zee runs in. One container per xell.
+# ZEEHIVE zee-agent — the CXELL a headless zee runs in. One container per xell.
 #
 # Confinement is structural, not prompted: the container sees ONLY
 #   /work            — a private clone of the xell's branch (from a git bundle; no
@@ -10,8 +10,8 @@
 # in the environment — never as a mounted credential file.
 #
 # The CLI runs as the non-root user `zee` (required for bypassPermissions inside
-# the cage) with `--bare` so nothing host-side (plugins/MCP/hooks/skills) leaks in.
-# openssh-server + tmux: a human ATTENDS a caged zee over SSH — the built-in dashboard terminal
+# the cxell) with `--bare` so nothing host-side (plugins/MCP/hooks/skills) leaks in.
+# openssh-server + tmux: a human ATTENDS a cxell zee over SSH — the built-in dashboard terminal
 # (ssh2 → xterm.js) and Claude Code desktop's "Add SSH host" are the SAME inbound door. SSH is
 # inbound, so the egress-only firewall (OUTPUT DROP) neither blocks it nor is loosened by it.
 # tmux keeps the interactive session alive across disconnects (true async, come-back-whenever).
@@ -21,26 +21,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 RUN npm install -g @anthropic-ai/claude-code
-COPY cage-firewall.sh /usr/local/bin/cage-firewall.sh
-COPY cage-sshd.sh /usr/local/bin/cage-sshd.sh
-# The caged zee's workflow CLI (land/ship/prod/done/status → the queenzee's /api/xell/self/* verbs).
+COPY cxell-firewall.sh /usr/local/bin/cxell-firewall.sh
+COPY cxell-sshd.sh /usr/local/bin/cxell-sshd.sh
+# The cxell zee's workflow CLI (land/ship/prod/done/status → the queenzee's /api/xell/self/* verbs).
 # This is a synced copy of scripts/zee (the authoritative source); it lives here because the image's
 # build context is this directory. Update both if you change it.
 COPY zee /usr/local/bin/zee
-# The ATTEND path: cage-claude-seed.mjs pre-answers Claude Code's first-run gauntlet (so an
+# The ATTEND path: cxell-claude-seed.mjs pre-answers Claude Code's first-run gauntlet (so an
 # attending human sees ZERO onboarding/theme/trust/bypass prompts); zee-attach.sh + zee-live.mjs
 # land that human straight in the zee's live workflow, then `claude --resume` for the full session.
-COPY cage-claude-seed.mjs /usr/local/bin/cage-claude-seed.mjs
+COPY cxell-claude-seed.mjs /usr/local/bin/cxell-claude-seed.mjs
 COPY zee-live.mjs /usr/local/bin/zee-live.mjs
 COPY zee-attach.sh /usr/local/bin/zee-attach.sh
 # Belt-and-suspenders CRLF strip: .gitattributes pins these to LF, but if the build context was
 # checked out on Windows with autocrlf=true (or copied through a Windows tool) a `#!/usr/bin/env
 # node\r` shebang would make `zee` die with `node\r: No such file or directory`. Strip any trailing
 # CR from the shebang-bearing scripts BEFORE chmod so `zee` (and the .sh/.mjs helpers) run bare.
-RUN sed -i 's/\r$//' /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee \
-             /usr/local/bin/cage-claude-seed.mjs /usr/local/bin/zee-live.mjs /usr/local/bin/zee-attach.sh \
-    && chmod +x /usr/local/bin/cage-firewall.sh /usr/local/bin/cage-sshd.sh /usr/local/bin/zee \
-             /usr/local/bin/cage-claude-seed.mjs /usr/local/bin/zee-live.mjs /usr/local/bin/zee-attach.sh
+RUN sed -i 's/\r$//' /usr/local/bin/cxell-firewall.sh /usr/local/bin/cxell-sshd.sh /usr/local/bin/zee \
+             /usr/local/bin/cxell-claude-seed.mjs /usr/local/bin/zee-live.mjs /usr/local/bin/zee-attach.sh \
+    && chmod +x /usr/local/bin/cxell-firewall.sh /usr/local/bin/cxell-sshd.sh /usr/local/bin/zee \
+             /usr/local/bin/cxell-claude-seed.mjs /usr/local/bin/zee-live.mjs /usr/local/bin/zee-attach.sh
 
 RUN useradd -m -s /bin/bash zee \
     && mkdir -p /work && chown zee:zee /work \
@@ -52,19 +52,19 @@ ENV NODE_NO_WARNINGS=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 # Bake the answered first-run config into the zee user's home so it is present BEFORE any claude
-# launch (the headless run and the very first terminal attach both read it). cage-sshd.sh re-runs
+# launch (the headless run and the very first terminal attach both read it). cxell-sshd.sh re-runs
 # the same idempotent seed at spawn as a belt-and-suspenders across future image changes.
-RUN node /usr/local/bin/cage-claude-seed.mjs /home/zee/.claude.json && chmod 600 /home/zee/.claude.json
+RUN node /usr/local/bin/cxell-claude-seed.mjs /home/zee/.claude.json && chmod 600 /home/zee/.claude.json
 
-# git identity for in-cage commits; the land gate attributes the human merge
+# git identity for in-cxell commits; the land gate attributes the human merge
 RUN git config --global user.name "zee" \
     && git config --global user.email "zee@zeehive.local" \
     && git config --global init.defaultBranch main
 
 # tmux runs fullscreen (alternate buffer), so the dashboard's xterm has no scrollback of its
-# own — without mouse mode the wheel does nothing. Baked here for fresh cages; the terminal
-# bridge also sets it per-attach so pre-existing cages behave the same.
+# own — without mouse mode the wheel does nothing. Baked here for fresh cxells; the terminal
+# bridge also sets it per-attach so pre-existing cxells behave the same.
 RUN printf 'set -g mouse on\nset -g history-limit 50000\n' > /home/zee/.tmux.conf
 
-# The queenzee execs the actual run; idle keeps the cage warm between turns.
+# The queenzee execs the actual run; idle keeps the cxell warm between turns.
 CMD ["sleep", "infinity"]

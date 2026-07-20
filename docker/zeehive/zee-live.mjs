@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Render a caged zee's transcript (the session .jsonl Claude Code writes on disk, which is the
+// Render a cxell zee's transcript (the session .jsonl Claude Code writes on disk, which is the
 // same content-block stream the queenzee captures for the SSE feed) into a readable LIVE feed
 // for the dashboard terminal. zee-attach.sh pipes a `tail -f` of the running session's transcript
 // through this while the headless zee is still working, so an attending human sees the workflow —

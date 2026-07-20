@@ -1,5 +1,5 @@
-// Browser terminal for a caged zee: a websocket ↔ SSH-PTY bridge. The dashboard's xterm connects
-// to /api/zees/:id/terminal; this opens an SSH session into that zee's cage (with the fleet key),
+// Browser terminal for a cxell zee: a websocket ↔ SSH-PTY bridge. The dashboard's xterm connects
+// to /api/zees/:id/terminal; this opens an SSH session into that zee's cxell (with the fleet key),
 // requests a PTY running `tmux new -A -s zee` (attach-or-create → true async: disconnect and the
 // session keeps running), and pipes bytes both ways. Pure JS (ssh2) — no native PTY module, so it
 // behaves the same on the Windows host as anywhere.
@@ -8,7 +8,7 @@
 // {t:'r',cols,rows} resize. server→client is raw terminal bytes (straight into xterm.write).
 import { createRequire } from 'node:module';
 import { one } from '../db/pool.js';
-import { ensureZeehiveKeypair, cageSshDest } from './cage.js';
+import { ensureZeehiveKeypair, cxellSshDest } from './cxell.js';
 import { logline } from './logbus.js';
 
 const require = createRequire(import.meta.url);
@@ -35,7 +35,7 @@ async function openTerminal(ws, zeeId) {
   } catch (e) { return fail(`lookup failed: ${e.message}`); }
   if (!zee) return fail('no such zee');
   if (zee.viewer_kind !== 'ssh-terminal' || !zee.viewer_url) {
-    return fail('this zee has no SSH terminal (only caged zees do)');
+    return fail('this zee has no SSH terminal (only cxell zees do)');
   }
 
   let port;
@@ -43,15 +43,15 @@ async function openTerminal(ws, zeeId) {
   const { privateKey } = ensureZeehiveKeypair();
 
   // First open lands the human in the zee's WORKFLOW; reconnects re-attach the live tmux session
-  // (true async — disconnect and it keeps running). zee-attach.sh (baked into the cage) does the
+  // (true async — disconnect and it keeps running). zee-attach.sh (baked into the cxell) does the
   // work: while the headless zee is still working it streams the transcript live, then hands off
   // to `claude --resume <sid>` for the full interactive session (all first-run prompts are
-  // pre-answered by cage-claude-seed.mjs, so it drops straight in). It ends in a login shell, so
+  // pre-answered by cxell-claude-seed.mjs, so it drops straight in). It ends in a login shell, so
   // the pane (and the zee's box) stays reachable if claude exits.
   const sid = (zee.claude_session_id || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — it is shell-interpolated
   // `\; set -g mouse on` rides every attach: tmux runs fullscreen (alternate buffer), so the
   // browser xterm has NO scrollback of its own — without tmux mouse mode the wheel is dead air
-  // ("i cant even seem to scroll it"). Applied per-attach so cages older than the baked
+  // ("i cant even seem to scroll it"). Applied per-attach so cxells older than the baked
   // .tmux.conf get it too.
   // window-size latest: size the tmux window to the MOST RECENT client, so a lingering
   // half-closed attach from an earlier open can never clamp a fresh, bigger terminal.
@@ -80,7 +80,7 @@ async function openTerminal(ws, zeeId) {
     conn.exec(cmd, { pty: { term: 'xterm-256color', cols: lastSize.cols, rows: lastSize.rows } }, (err, s) => {
       if (err) return fail(`exec failed: ${err.message}`);
       stream = s;
-      logline('cage', `terminal attached to ${zee.slug} (${sid ? 'resume ' + sid.slice(0, 8) : 'shell'}, ${lastSize.cols}x${lastSize.rows})`);
+      logline('cxell', `terminal attached to ${zee.slug} (${sid ? 'resume ' + sid.slice(0, 8) : 'shell'}, ${lastSize.cols}x${lastSize.rows})`);
       stream.setWindow(lastSize.rows, lastSize.cols, 0, 0);   // in case the size moved between exec and now
       for (const d of earlyInput.splice(0)) stream.write(d);
       stream.on('data', (d) => send(d));
@@ -89,7 +89,7 @@ async function openTerminal(ws, zeeId) {
     });
   });
   conn.on('error', (e) => fail(`ssh error: ${e.message}`));
-  // cageSshDest: published loopback port in host mode; container name over zee-cage-net in
-  // network mode (ZEEHIVE_CAGE_SSH=network). The human's 127.0.0.1 viewer door is unchanged.
-  conn.connect({ ...cageSshDest({ slug: zee.slug, sshPort: port }), username: 'zee', privateKey, readyTimeout: 8000 });
+  // cxellSshDest: published loopback port in host mode; container name over zee-hive-net in
+  // network mode (ZEEHIVE_CXELL_SSH=network). The human's 127.0.0.1 viewer door is unchanged.
+  conn.connect({ ...cxellSshDest({ slug: zee.slug, sshPort: port }), username: 'zee', privateKey, readyTimeout: 8000 });
 }

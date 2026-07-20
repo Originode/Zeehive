@@ -132,8 +132,8 @@ export async function tendOpen(xellId) {
 }
 
 // A zee PINGS that it is actively working. Mirrors what a harness UserPromptSubmit hook would do
-// (Channel A is not installed for caged zees), so the hive can show live activity even when the
-// passive poller is blind to a cage. Reporting work also CLEARS any open tend — asking for a human
+// (Channel A is not installed for cxell zees), so the hive can show live activity even when the
+// passive poller is blind to a cxell. Reporting work also CLEARS any open tend — asking for a human
 // and then carrying on would leave a false "needs you".
 export async function pingWorking(zee, { note = null } = {}) {
   if (!zee) return { ok: false, error: 'no live zee to mark working' };

@@ -478,7 +478,7 @@ export const pullXell = (id) => xellVerb(id, 'pull');
 export const prXell = (id, note) => xellVerb(id, 'pr', { note });
 // Nudge the xell's running zee: type "status?" straight into its live interactive session over SSH
 // (not a forked headless run). Resolves { nudged, sent?, reason? } — nudged:false (not a throw)
-// means there was no live caged zee to reach.
+// means there was no live cxell zee to reach.
 export const nudgeXell = (id) => xellVerb(id, 'nudge');
 
 // File a production ship request for this xell (the operator asking on the zee's behalf). It is

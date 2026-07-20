@@ -4,9 +4,9 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 
-// A live terminal INTO a caged zee. The browser xterm talks to /api/zees/:id/terminal (a
+// A live terminal INTO a cxell zee. The browser xterm talks to /api/zees/:id/terminal (a
 // websocket), which the queenzee bridges over SSH to a PTY on `tmux new -A -s zee` inside the
-// cage — so this is the same interactive `claude` you'd get over SSH, prompt by prompt, and
+// cxell — so this is the same interactive `claude` you'd get over SSH, prompt by prompt, and
 // disconnecting leaves the session running (tmux). The SSH line below is that exact door for
 // Claude Code desktop's "Add SSH host" — the deeplink IS the SSH connection.
 export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
@@ -19,7 +19,7 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
   let sshCmd = null;
   try {
     const u = new URL(viewerUrl);
-    sshCmd = `ssh -i ~/.zeehive/ssh/cage_id_ed25519 -p ${u.port} ${u.username || 'zee'}@${u.hostname}`;
+    sshCmd = `ssh -i ~/.zeehive/ssh/cxell_id_ed25519 -p ${u.port} ${u.username || 'zee'}@${u.hostname}`;
   } catch { /* no url */ }
 
   useEffect(() => {

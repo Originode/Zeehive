@@ -38,10 +38,10 @@ export const config = {
   // era (the clone form asks for an explicit destination); the containerized queenzee sets it
   // to the repos volume (/repos) so clones land there without the human typing container paths.
   reposDir: process.env.REPOS_DIR || null,
-  // How a CAGE reaches the queenzee API. host.docker.internal:4700 works from a cage whether
+  // How a CXELL reaches the queenzee API. host.docker.internal:4700 works from a cxell whether
   // the queenzee is the host process or a container publishing 4700; override with the compose
   // service name if host publishing ever stops.
-  cageApiBase: process.env.CAGE_API_BASE || 'http://host.docker.internal:4700',
+  cxellApiBase: process.env.CXELL_API_BASE || 'http://host.docker.internal:4700',
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),
   poolIntervalMs: int(process.env.POOL_INTERVAL_MS, 15000),

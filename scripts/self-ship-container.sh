@@ -34,22 +34,22 @@ HEAD="$(git -C "$SRC" rev-parse --short "$REF" 2>/dev/null || echo unknown)"
 
 emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$2" "$3" "$ROLE"; }
 
-# Cage-image rebuild — same GAP-2 rationale and same loud-but-non-fatal stance as self-ship.sh:
-# new caged-zee capabilities ship inside zeehive/zee-agent, and a stale fleet image is a silent
-# capability loss. Cages run on the local daemon (the mounted socket).
-CAGE_IMAGE="${CAGE_IMAGE:-zeehive/zee-agent}"
-rebuild_cage_image() {
-  echo "self-ship: rebuilding cage image $CAGE_IMAGE @ $HEAD" >&2
-  if docker build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" -t "$CAGE_IMAGE" "$SRC/docker/zeehive" >&2; then
-    echo "self-ship: CAGE-IMAGE ok — new cages will carry $HEAD" >&2
+# Cxell-image rebuild — same GAP-2 rationale and same loud-but-non-fatal stance as self-ship.sh:
+# new cxell-zee capabilities ship inside zeehive/zee-agent, and a stale fleet image is a silent
+# capability loss. Cxells run on the local daemon (the mounted socket).
+CXELL_IMAGE="${CXELL_IMAGE:-zeehive/zee-agent}"
+rebuild_cxell_image() {
+  echo "self-ship: rebuilding cxell image $CXELL_IMAGE @ $HEAD" >&2
+  if docker build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" -t "$CXELL_IMAGE" "$SRC/docker/zeehive" >&2; then
+    echo "self-ship: CXELL-IMAGE ok — new cxells will carry $HEAD" >&2
   else
-    echo "self-ship: !!! CAGE-IMAGE FAILED — the fleet stays on the OLD image; rebuild by hand or re-ship" >&2
+    echo "self-ship: !!! CXELL-IMAGE FAILED — the fleet stays on the OLD image; rebuild by hand or re-ship" >&2
   fi
 }
 
 if [ "$MODE" = "simulate" ]; then
   if [ "$ROLE" = "server" ]; then
-    echo "self-ship: [simulate] would sync $SRC to $REF, rebuild $CAGE_IMAGE, compose build server," >&2
+    echo "self-ship: [simulate] would sync $SRC to $REF, rebuild $CXELL_IMAGE, compose build server," >&2
     echo "self-ship: [simulate] then detach a docker:cli sibling to 'compose up -d server'" >&2
   fi
   emit true "$HEAD" "simulate"; exit 0
@@ -69,7 +69,7 @@ if ! bash "$SRC/scripts/self-ship-sync.sh" "$SRC" "$REF" >&2; then
 fi
 HEAD="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo "$HEAD")"
 
-rebuild_cage_image
+rebuild_cxell_image
 
 # 2 — build the new server image now, output onto the ship card.
 if ! docker compose -f "$COMPOSE_FILE" build server >&2; then

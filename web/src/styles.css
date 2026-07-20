@@ -574,7 +574,7 @@ a.cbox:hover { border-color: var(--accent); }
 .term-x:hover { color: var(--text); }
 /* Fullscreen toggle (⛶ in the header) — both terminal modals. The overlay already covers the
    viewport; the modal just grows to fill it. The fit addon's ResizeObserver refits the grid
-   (and the cage terminal re-sends the PTY size) on the toggle. */
+   (and the cxell terminal re-sends the PTY size) on the toggle. */
 .term.full, .zeeterm.full { width: 100vw; height: 100vh; max-width: 100vw; max-height: 100vh; border-radius: 0; }
 .term-body { flex: 1; min-height: 0; position: relative; padding: 6px 8px; overflow: hidden; }
 .term-xterm { position: absolute; inset: 6px 8px; }
@@ -1086,7 +1086,7 @@ a.cbox:hover { border-color: var(--accent); }
   font-size: 12px; padding: 4px 6px; }
 .tc-cancel:hover { color: var(--text); }
 
-/* ── caged-zee terminal (ssh→tmux over a websocket) ─────────────────────────── */
+/* ── cxell-zee terminal (ssh→tmux over a websocket) ─────────────────────────── */
 .termbtn {
   margin-left: 6px; font-size: 11px; padding: 1px 7px; border-radius: 5px;
   border: 1px solid var(--line); background: var(--panel2); color: var(--fg);
