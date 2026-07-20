@@ -52,7 +52,16 @@ case "$(uname -s)" in
   *)
     LOG="$WT/.zeehive-$ROLE.log"
     fuser -k -n tcp "$PORT" >/dev/null 2>&1 || true
-    nohup bash -c "cd '$WT' && exec ${START} >> '$LOG' 2>&1" >/dev/null 2>&1 &
+    # THE PROJECTION MUST WIN: dotenv never overrides existing env vars, and this child inherits
+    # the QUEENZEE's own environment — its DATABASE_URL pointed every nested server at the
+    # managing meta-DB, where the parent eternally holds the single-queenzee advisory lock, so
+    # the xell's server "waited for the previous queenzee" forever and its port never answered
+    # (the entire first day of in-container process starts died on this). Unset every key the
+    # worktree's .zeehive.env owns so dotenv re-reads them from the file — including the §6.2
+    # simulate safety flags.
+    UNSET_ARGS="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*' "$WT/.zeehive.env" 2>/dev/null | sed 's/^/--unset=/' | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    nohup env $UNSET_ARGS bash -c "cd '$WT' && exec ${START} >> '$LOG' 2>&1" >/dev/null 2>&1 &
     disown 2>/dev/null || true
     ;;
 esac
