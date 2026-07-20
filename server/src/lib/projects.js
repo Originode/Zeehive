@@ -5,12 +5,16 @@
 // declared compose files / env / ports / db identity become the row's values, and the
 // parsed manifest is cached on the row (manifest_hash detects drift from the repo file).
 import { writeFileSync, existsSync, readdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, join, basename } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pool, one, q } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from './events.js';
+import { logline } from './logbus.js';
 import { cleanGitEnv } from './git.js';
+import { resolveBash } from './bash.js';
+import { probeRemote, cloneFromRemote, pullRemote } from './remote-git.js';
+import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
 import { resolveSite } from './sites.js';
 
@@ -68,10 +72,10 @@ export async function createProject(body) {
       `INSERT INTO project (name, repo_root, main_branch, docker_ctx_dev, docker_ctx_prod,
           dev_host_ip, prod_host_ip, compose_dev, compose_spinoff, compose_prod, env_file,
           port_server_base, port_web_base, port_slot_mod,
-          db_name, db_user, manifest, manifest_hash, manifest_at)
+          db_name, db_user, manifest, manifest_hash, manifest_at, remote_url)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
           COALESCE($12,3100), COALESCE($13,5200), COALESCE($14,90),
-          $15,$16,$17,$18, CASE WHEN $17::jsonb IS NULL THEN NULL ELSE now() END)
+          $15,$16,$17,$18, CASE WHEN $17::jsonb IS NULL THEN NULL ELSE now() END, $19)
        RETURNING *`,
       [name, repoRoot, mainBranch,
        body.docker_ctx_dev || null, body.docker_ctx_prod || null,
@@ -86,7 +90,8 @@ export async function createProject(body) {
        body.db_name || md.db_name || name.toLowerCase(),
        body.db_user || md.db_user || 'postgres',
        mf.found ? JSON.stringify(mf.manifest) : null,
-       mf.found ? mf.hash : null]);
+       mf.found ? mf.hash : null,
+       (body.remote_url || '').trim() || null]);
 
     await client.query(
       `INSERT INTO xource (project_id, ref, read_only) VALUES ($1,$2,true)
@@ -129,6 +134,95 @@ export async function createProject(body) {
   } finally {
     client.release();
   }
+}
+
+// ── GitHub inbound: New Project by clone, human-triggered pull ───────────────
+// GitHub is TRANSPORT, not a dependency (Mark, 2026-07-20): these two verbs only ever fetch.
+// Nothing in Zeehive pushes to the remote — Mark pushes by hand — and every other flow
+// (landing, provisioning, prod builds) keeps working with the remote unreachable.
+
+// Draft a project from a remote URL: probe → clone → the normal createProject. The clone is a
+// full ordinary clone (its origin = remote_url); the xource/sites/pool seeding is exactly the
+// folder-onboarding path, so a cloned project behaves identically from row one.
+export async function cloneProject(body = {}) {
+  const url = String(body.remote_url || '').trim();
+  if (!url) throw new Error('remote_url is required');
+  const token = String(body.token || '').trim() || null;
+
+  const name = String(body.name || '').trim()
+    || basename(url).replace(/\.git$/i, '');
+  if (!name) throw new Error('project name is required (could not derive one from the URL)');
+  const clash = await one(`SELECT id FROM project WHERE name = $1`, [name]);
+  if (clash) throw new Error(`a project named "${name}" already exists`);
+
+  const dest = String(body.dest || '').trim().replace(/\\/g, '/')
+    || (config.reposDir ? join(config.reposDir, name).replace(/\\/g, '/') : null);
+  if (!dest) throw new Error('dest (destination folder) is required — no REPOS_DIR default is configured');
+
+  // fail fast and resolve the default branch before any disk write
+  const probe = await probeRemote(url, { token });
+  if (!probe.reachable) {
+    throw new Error(probe.auth_required
+      ? 'remote requires authentication — provide a read-only GitHub token'
+      : `remote unreachable: ${probe.error}`);
+  }
+  const mainBranch = String(body.main_branch || '').trim() || probe.default_branch || 'main';
+
+  logline('projects', `cloning ${url} → ${dest} (branch ${mainBranch})`);
+  const cl = await cloneFromRemote({
+    url, dest, branch: mainBranch, token,
+    onProgress: (line) => logline('projects', `clone ${name}: ${line}`),
+  });
+  if (!cl.cloned) throw new Error(`clone failed: ${cl.reason}`);
+
+  let project;
+  try {
+    project = await createProject({ ...body, name, main_branch: mainBranch, repo_root: dest, remote_url: url });
+  } catch (err) {
+    // the clone was ours alone — remove it so a corrected retry starts clean
+    try { const { rm } = await import('node:fs/promises'); await rm(dest, { recursive: true, force: true }); } catch { /* best effort */ }
+    throw err;
+  }
+
+  if (token) await setProviderToken(project.id, 'github', token);
+
+  // Best-effort landing-gate install (machine-local hook; folder onboarding leaves this manual).
+  // A failure is a warning on the response, never a rollback — the gate can be installed later.
+  let gateWarning = null;
+  try {
+    const r = spawnSync(resolveBash(),
+      [resolve(config.repoRoot, 'scripts', 'install-land-gate.sh'), dest, project.id, mainBranch, config.apiBase],
+      { encoding: 'utf8', timeout: 30000, windowsHide: true, env: cleanGitEnv() });
+    if (r.status !== 0) gateWarning = `landing gate not installed: ${(r.stderr || r.stdout || 'unknown').trim().slice(-200)}`;
+  } catch (err) {
+    gateWarning = `landing gate not installed: ${err.message}`;
+  }
+  if (gateWarning) logline('projects', `${name}: ${gateWarning}`);
+
+  logline('projects', `cloned ${name} from ${url} (${mainBranch})`);
+  return { ...project, gate_warning: gateWarning };
+}
+
+// Fetch + ff-only merge of the recorded remote into the xource checkout. Human-triggered from
+// the console; refusals (dirty tree, divergence, wrong branch) come back as {pulled:false,
+// reason} for the refuse-with-reason UI convention.
+export async function pullProject(id, by = 'human@console') {
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  if (!p.remote_url) return { pulled: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
+
+  let token = null;
+  try { token = await tokenForSpawn(p.id, 'github'); } catch { /* no token = anonymous fetch (public repo) */ }
+
+  const r = await pullRemote({
+    repoRoot: String(p.repo_root).replace(/\\/g, '/'),
+    branch: p.main_branch, remoteUrl: p.remote_url, token,
+  });
+  if (r.state === 'fast-forwarded') {
+    logline('projects', `${by} pulled ${p.name}: origin/${p.main_branch} → ${(r.to || '').slice(0, 8)} (${r.commits} commit${r.commits === 1 ? '' : 's'})`);
+    broadcast('project', p);
+  }
+  return r;
 }
 
 // ── manifest lifecycle (spec §7 Phase 2.2–2.4) ───────────────────────────────
@@ -339,6 +433,7 @@ const PATCHABLE = [
   'db_name', 'db_user', 'ship_ref',
   'registry',   // OCI registry for split builds (compile on one docker context, run on another)
   'auto_approve_land', 'auto_approve_ship',   // operator policy: skip the human gate (default off)
+  'remote_url', // inbound-only fetch source (migration 032) — re-pointing it is safe, unlike repo_root
 ];
 
 export async function updateProject(id, body = {}) {

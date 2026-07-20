@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  createProject, updateProject, probeRepo, getReadiness, getSites, createSite, updateSite, deleteSite,
+  createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject,
+  getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, putProviderToken, deleteProviderToken,
@@ -52,12 +53,18 @@ export default function ProjectSetup({ project: initial, onClose, onChanged, onS
 }
 
 // ── create: the minimum to exist, guided by a live probe of the folder ────────
+// Two sources: an EXISTING folder on disk, or a fresh CLONE from a GitHub URL. Cloning is
+// inbound-only — the clone's origin is only ever fetched from (Pull); Zeehive never pushes.
 function CreateForm({ onCreated }) {
+  const [source, setSource] = useState('folder');   // 'folder' | 'clone'
   const [f, setF] = useState({ name: '', repo_root: '', main_branch: 'main', docker_ctx_dev: '', dev_host_ip: '', docker_ctx_prod: '', prod_host_ip: '' });
+  const [c, setC] = useState({ remote_url: '', dest: '', token: '' });
   const [probe, setProbe] = useState(null);
+  const [rprobe, setRprobe] = useState(null);       // remote probe (clone mode)
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const setc = (k) => (e) => setC({ ...c, [k]: e.target.value });
 
   const runProbe = async () => {
     if (!f.repo_root.trim()) return;
@@ -70,31 +77,69 @@ function CreateForm({ onCreated }) {
     } catch (e) { setProbe({ ok: false, error: e.message }); }
   };
 
+  const runRemoteProbe = async () => {
+    const url = c.remote_url.trim();
+    if (!url) return;
+    try {
+      const p = await probeRemote(url, c.token.trim() || undefined);
+      setRprobe(p);
+      const base = url.split('/').pop()?.replace(/\.git$/i, '') || '';
+      setF((prev) => ({
+        ...prev,
+        name: prev.name || base,
+        main_branch: p.default_branch || prev.main_branch,
+      }));
+      if (p.repos_dir && !c.dest.trim() && base) {
+        setC((prev) => ({ ...prev, dest: `${p.repos_dir.replace(/[\\/]+$/, '')}/${base}` }));
+      }
+    } catch (e) { setRprobe({ reachable: false, error: e.message }); }
+  };
+
   const submit = async (e) => {
     e.preventDefault();
     setBusy(true); setErr(null);
     try {
-      const p = await createProject({
-        name: f.name.trim(), repo_root: f.repo_root.trim(), main_branch: f.main_branch.trim() || 'main',
+      const common = {
+        name: f.name.trim(), main_branch: f.main_branch.trim() || 'main',
         docker_ctx_dev: f.docker_ctx_dev.trim() || null, dev_host_ip: f.dev_host_ip.trim() || null,
         docker_ctx_prod: f.docker_ctx_prod.trim() || null, prod_host_ip: f.prod_host_ip.trim() || null,
-      });
+      };
+      const p = source === 'clone'
+        ? await cloneProject({ ...common, remote_url: c.remote_url.trim(), dest: c.dest.trim() || null, token: c.token.trim() || null })
+        : await createProject({ ...common, repo_root: f.repo_root.trim() });
       onCreated(p);
     } catch (e2) { setErr(e2.message); } finally { setBusy(false); }
   };
 
+  const cloneReady = c.remote_url.trim() && (c.dest.trim() || rprobe?.repos_dir);
   return (
     <form className="setup-sec" onSubmit={submit}>
+      <h3>Source</h3>
+      <div className="setup-row">
+        <button type="button" className={source === 'folder' ? '' : 'ghost'} onClick={() => setSource('folder')}>Existing folder</button>
+        <button type="button" className={source === 'clone' ? '' : 'ghost'} onClick={() => setSource('clone')}>Clone from GitHub</button>
+        {source === 'clone' && <span className="pc">pull-only — Zeehive never pushes to the remote</span>}
+      </div>
       <h3>Basics</h3>
       <div className="setup-grid">
-        <label>Name<input autoFocus value={f.name} onChange={set('name')} placeholder="MyProject" /></label>
-        <label>Folder<input value={f.repo_root} onChange={set('repo_root')} onBlur={runProbe} placeholder="D:\Repos\MyProject" /></label>
+        <label>Name<input autoFocus={source === 'folder'} value={f.name} onChange={set('name')} placeholder="MyProject" /></label>
+        {source === 'folder' ? (
+          <label>Folder<input value={f.repo_root} onChange={set('repo_root')} onBlur={runProbe} placeholder="D:\Repos\MyProject" /></label>
+        ) : (
+          <>
+            <label>Repository URL<input autoFocus value={c.remote_url} onChange={setc('remote_url')} onBlur={runRemoteProbe} placeholder="https://github.com/org/repo" /></label>
+            <label>Clone into<input value={c.dest} onChange={setc('dest')} placeholder={rprobe?.repos_dir ? `${rprobe.repos_dir}/${f.name || '…'}` : 'D:\\Repos\\MyProject'} /></label>
+            <label>GitHub token <span className="pc">(read-only PAT — private repos only, stored in the meta-DB)</span>
+              <input type="password" autoComplete="off" value={c.token} onChange={setc('token')} placeholder="github_pat_… (blank for public)" /></label>
+          </>
+        )}
         <label>Main branch
           <input list="zh-branches" value={f.main_branch} onChange={set('main_branch')} />
-          <datalist id="zh-branches">{(probe?.git?.branches || []).map((b) => <option key={b} value={b} />)}</datalist>
+          <datalist id="zh-branches">{(source === 'clone' ? (rprobe?.branches || []) : (probe?.git?.branches || [])).map((b) => <option key={b} value={b} />)}</datalist>
         </label>
       </div>
-      {probe && <ProbeChips probe={probe} />}
+      {source === 'folder' && probe && <ProbeChips probe={probe} />}
+      {source === 'clone' && rprobe && <RemoteChips probe={rprobe} />}
       <h3>Deployment</h3>
       <div className="setup-grid">
         <label>Dev docker context<input list="zh-docker-ctxs" value={f.docker_ctx_dev} onChange={set('docker_ctx_dev')} placeholder="default (this machine)" /></label>
@@ -106,11 +151,34 @@ function CreateForm({ onCreated }) {
       <p className="pc">The pool starts at 0 — no xells are pre-warmed until the readiness gates pass and you raise it.</p>
       {err && <div className="projpop-err">{err}</div>}
       <div className="projpop-formbtns">
-        <button type="submit" disabled={busy || !f.name.trim() || !f.repo_root.trim()}>
-          {busy ? 'Creating…' : 'Create & configure →'}
+        <button type="submit" disabled={busy || !f.name.trim() || (source === 'folder' ? !f.repo_root.trim() : !cloneReady)}>
+          {busy ? (source === 'clone' ? 'Cloning…' : 'Creating…') : (source === 'clone' ? 'Clone & configure →' : 'Create & configure →')}
         </button>
+        {busy && source === 'clone' && <span className="pc">cloning can take a while on a big repo — progress streams to the log rail</span>}
       </div>
     </form>
+  );
+}
+
+// Remote-probe chips (clone mode): reachable / default branch / private-needs-token.
+function RemoteChips({ probe }) {
+  const chip = (ok, text, warn = false) => (
+    <span className={`gate ${ok ? 'g-pass' : warn ? 'g-warn' : 'g-fail'}`}>{ok ? '✓' : warn ? '△' : '✗'} {text}</span>);
+  if (!probe.reachable) {
+    return (
+      <div className="gates">
+        {probe.auth_required
+          ? chip(false, 'private repo — a read-only token is required', true)
+          : chip(false, `unreachable: ${probe.error || 'unknown'}`)}
+      </div>
+    );
+  }
+  return (
+    <div className="gates">
+      {chip(true, 'remote reachable')}
+      {probe.default_branch && chip(true, `default branch: ${probe.default_branch}`)}
+      {chip(probe.branches?.length > 0, `${probe.branches?.length || 0} branch(es)`)}
+    </div>
   );
 }
 
@@ -182,15 +250,31 @@ function BasicsSection({ project, run, onProject }) {
   const [f, setF] = useState({
     name: project.name, main_branch: project.main_branch || 'main', env_file: project.env_file || '.env',
     db_name: project.db_name || '', db_user: project.db_user || '', ship_ref: project.ship_ref || '',
-    registry: project.registry || '',
+    registry: project.registry || '', remote_url: project.remote_url || '',
   });
+  const [pull, setPull] = useState(null);   // last pull outcome {state, reason, commits, busy}
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = () => run(async () => {
     const p = await updateProject(project.id, {
       ...f, ship_ref: f.ship_ref.trim() || null, registry: f.registry.trim() || null,
+      remote_url: f.remote_url.trim() || null,
     });
     onProject(p);
   });
+  // Pull is fetch + fast-forward ONLY; a refusal ({pulled:false, reason}) is an answer, not an
+  // error — show the reason where the button is. Zeehive never pushes to the remote.
+  const doPull = async () => {
+    setPull({ busy: true });
+    try {
+      const r = await run(() => pullProject(project.id));
+      setPull(r);
+    } catch (e) { setPull({ state: 'error', reason: e.message }); }
+  };
+  const pullLabel = !pull ? null
+    : pull.busy ? 'pulling…'
+    : pull.state === 'up-to-date' ? '✓ up to date'
+    : pull.state === 'fast-forwarded' ? `✓ fast-forwarded (${pull.commits} commit${pull.commits === 1 ? '' : 's'})`
+    : pull.reason;
   return (
     <div className="setup-sec">
       <h3>Project</h3>
@@ -204,7 +288,20 @@ function BasicsSection({ project, run, onProject }) {
           <input value={f.ship_ref} onChange={set('ship_ref')} placeholder={`local ${f.main_branch}`} /></label>
         <label>Build registry <span className="pc">(blank = split builds off; host:port on the LAN, e.g. 10.1.0.18:5000)</span>
           <input value={f.registry} onChange={set('registry')} placeholder="none — compile on the run host" /></label>
+        <label>GitHub remote <span className="pc">(pull-only fetch source — Zeehive never pushes; Mark pushes by hand)</span>
+          <span className="setup-row">
+            <input value={f.remote_url} onChange={set('remote_url')} placeholder="https://github.com/org/repo (none)" />
+            <button type="button" disabled={!(project.remote_url || '').trim() || pull?.busy}
+                    title={`fetch + fast-forward ${project.main_branch} from the remote (refuses on divergence)`}
+                    onClick={doPull}>↓ Pull</button>
+          </span>
+        </label>
       </div>
+      {pullLabel && (
+        <div className="gates">
+          <span className={`gate ${pull.busy ? 'g-warn' : pull.pulled ? 'g-pass' : 'g-warn'}`}>{pullLabel}</span>
+        </div>
+      )}
       <div className="projpop-formbtns"><button type="button" onClick={save}>Save project</button></div>
     </div>
   );

@@ -32,6 +32,10 @@ export const config = {
   dockerConfigDir: process.env.DOCKER_CONFIG
     || resolve(process.env.USERPROFILE || process.env.HOME || '.', '.docker'),
   devHostIp: process.env.DEV_HOST_IP || '10.1.0.18',
+  // Default parent dir for repos cloned via New Project → Clone from GitHub. Unset on the host
+  // era (the clone form asks for an explicit destination); the containerized queenzee sets it
+  // to the repos volume (/repos) so clones land there without the human typing container paths.
+  reposDir: process.env.REPOS_DIR || null,
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),
   poolIntervalMs: int(process.env.POOL_INTERVAL_MS, 15000),

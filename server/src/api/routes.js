@@ -23,7 +23,10 @@ import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
-         probeRepo, projectReadiness, getPoolConfig, updatePoolConfig } from '../lib/projects.js';
+         probeRepo, projectReadiness, getPoolConfig, updatePoolConfig,
+         cloneProject, pullProject } from '../lib/projects.js';
+import { probeRemote } from '../lib/remote-git.js';
+import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { listProviderTokens, setProviderToken, deleteProviderToken } from '../lib/provider-tokens.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
@@ -229,6 +232,26 @@ router.patch('/projects/:id', async (req, res) => {
 router.delete('/projects/:id', async (req, res) => {
   try { res.json(await deleteProject(req.params.id, req.query.force === '1')); }
   catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// ── GitHub inbound (migration 032): clone in, pull in — NEVER push ────────────
+// Probe a REMOTE URL (before anything exists locally): reachable? default branch? private?
+router.post('/projects/probe-remote', async (req, res) => {
+  const probe = await probeRemote(req.body?.url, { token: req.body?.token });
+  // the create form prefills the destination when the server has a repos home configured
+  res.json({ ...probe, repos_dir: config.reposDir });
+});
+// New Project by clone: probe → git clone → the normal createProject seeding. Long request —
+// the probe fails fast and both dev-proxy and prod nginx carry long reads.
+router.post('/projects/clone', async (req, res) => {
+  try { res.json(await cloneProject(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Human-triggered pull: fetch + ff-only merge of the recorded remote into the xource checkout.
+// Refusals are {pulled:false, reason} with HTTP 200 — the console shows the reason.
+router.post('/projects/:id/pull', async (req, res) => {
+  try { res.json(await pullProject(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────

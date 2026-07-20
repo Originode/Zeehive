@@ -14,6 +14,17 @@ export const PROVIDERS = {
     // sk-ant-oat01-<base64ish>; stay loose on the tail so a format tweak upstream doesn't lock us out
     valid: (t) => /^sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}$/.test(t),
   },
+  // GitHub is INBOUND-ONLY (migration 032): this token is used exclusively by clone/pull fetches
+  // in lib/remote-git.js — nothing in Zeehive can push, so a Contents:Read-only PAT is all it
+  // should ever be granted.
+  github: {
+    key: 'github',
+    label: 'GitHub (pulls only)',
+    command: 'GitHub → Settings → Developer settings → Fine-grained tokens',
+    steps: 'Create a fine-grained personal access token scoped to this repo with Contents: READ-ONLY. Zeehive only ever fetches — it cannot and will not push. Paste it below; it is stored only in the meta-DB.',
+    // classic ghp_… or fine-grained github_pat_…; loose tails for the same reason as above
+    valid: (t) => /^(ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})$/.test(t),
+  },
 };
 
 const hint = (t) => `${t.slice(0, 13)}…${t.slice(-4)}`;

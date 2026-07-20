@@ -162,6 +162,10 @@ export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${site
 
 // ── onboarding surface: probe / readiness / inventory / spawn template / manifest ──
 export const probeRepo = (repo_root) => siteCall('/api/projects/probe', 'POST', { repo_root });
+// GitHub inbound — clone in, pull in, NEVER push (the server has no push verb at all).
+export const probeRemote = (url, token) => siteCall('/api/projects/probe-remote', 'POST', { url, token: token || undefined });
+export const cloneProject = (body) => siteCall('/api/projects/clone', 'POST', body);
+export const pullProject = (projectId) => siteCall(`/api/projects/${projectId}/pull`, 'POST', {});
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
