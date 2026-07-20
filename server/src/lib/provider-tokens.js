@@ -24,6 +24,16 @@ export const PROVIDERS = {
     steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. No zee runtime uses it yet — this slot is for the coming multi-provider dispatch.',
     valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
+  // Same story as openai: stored for the coming multi-provider dispatch, inert until a
+  // Kimi-backed runtime lands. Moonshot keys are OpenAI-shaped (sk-…), so only the sk-ant-
+  // mispaste is detectable — the slots themselves keep the keys apart.
+  kimi: {
+    key: 'kimi',
+    label: 'Kimi (Moonshot)',
+    command: 'https://platform.moonshot.ai/console/api-keys',
+    steps: 'Create an API key on the Moonshot platform (sk-…) and paste it below; it is stored only in the meta-DB. No zee runtime uses it yet — this slot is for the coming multi-provider dispatch.',
+    valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
+  },
   // GitHub is INBOUND-ONLY (migration 032): this token is used exclusively by clone/pull fetches
   // in lib/remote-git.js — nothing in Zeehive can push, so a Contents:Read-only PAT is all it
   // should ever be granted.
