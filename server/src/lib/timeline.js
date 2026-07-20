@@ -2,8 +2,17 @@
 // anchor commit (its worktree base) so the frontend can draw a connector to the card.
 import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
-import { gitLog, diffStat, worktreeDiff, worktreeHead, isAncestor } from './git.js';
+import { gitLog, diffStat, worktreeDiff, worktreeHead, isAncestor, countBehind } from './git.js';
+import { cageDiff } from './cage.js';
 import { defaultProject } from './fleet.js';
+
+// A caged zee's work lives INSIDE its cage, not in the host worktree (see cageDiff): the host
+// worktree stays frozen at the provisioning base until `zee land`, so worktreeDiff reads 0/0 for
+// every busy caged zee. cageDiff reads the real numbers over `docker exec`, which costs ~a few
+// hundred ms — too much for the raw /xell/diffs poll rate. Cache each cage's answer briefly; a
+// dashboard number that lags a work-cadence of seconds is invisible, and the exec load stays flat.
+const CAGE_DIFF_TTL_MS = 12_000;
+const cageDiffCache = new Map(); // xell id -> { at, val }
 
 // Per-xell divergence vs its tracked xource (ahead/behind + shortstat).
 //
@@ -12,14 +21,31 @@ import { defaultProject } from './fleet.js';
 // made every card show an identical number and hid the zee's actual work entirely (a zee could
 // commit, or have a dirty tree, and the card never moved). Falls back to the old base-vs-source
 // comparison only when there is no worktree on disk (simulate mode).
+//
+// CAGED zees are the exception the host worktree can't answer: their work sits in the cage clone
+// until landing, so for a xell with a live caged zee we read the diff from the cage (cageDiff) and
+// fold in `behind` from the host (how far the source moved since the fork). Anything unreachable or
+// non-caged falls through to the host-worktree path below.
 export async function getDiffs(projectId) {
   const project = projectId ? await one(`SELECT * FROM project WHERE id=$1`, [projectId]) : await defaultProject();
   if (!project) return {};
   const branch = project.main_branch || 'main';
   const xells = await q(
-    `SELECT id, head_commit, worktree_path, is_production FROM xell
+    `SELECT id, slug, head_commit, worktree_path, is_production FROM xell
        WHERE project_id=$1 AND status<>'retired'`,
     [project.id]);
+
+  // Which of these xells is being driven by a LIVE caged zee right now? (Same live-status set the
+  // monitor treats as "a zee is present".) Only these need the cage read; everything else is a
+  // host-worktree diff. slug → cage container name; head_commit → the base the cage diffs against.
+  const cagedRows = await q(
+    `SELECT DISTINCT z.xell_id FROM zee z
+       JOIN agent_runtime r ON r.id = z.runtime_id
+      WHERE r.key = 'claude-code-caged'
+        AND z.status IN ('spawning','online','working','idle')
+        AND z.xell_id = ANY($1::uuid[])`,
+    [xells.map((x) => x.id)]);
+  const caged = new Set(cagedRows.map((r) => r.xell_id));
 
   // Production is a xell, so it gets a diff too — it was excluded here, which is precisely why it
   // could drift unwatched. Its CONTENT is whatever the last successful ship deployed, and its
@@ -39,9 +65,29 @@ export async function getDiffs(projectId) {
         : null;
       continue;
     }
-    const d = x.worktree_path && existsSync(x.worktree_path)
-      ? await worktreeDiff(x.worktree_path, branch)
-      : (x.head_commit ? diffStat(project.repo_root, x.head_commit, branch) : null);
+    let d = null;
+    // Live caged zee: read the diff from the cage, where the uncollected work is. `behind` isn't
+    // visible in the cage (the source ref isn't cloned in), so it comes from the host — how far the
+    // source advanced past the provisioning base. Cached briefly to keep the exec load flat. On any
+    // cage failure (unreachable, no base) cageDiff returns null and we fall through to the host path.
+    if (caged.has(x.id) && x.head_commit) {
+      const hit = cageDiffCache.get(x.id);
+      if (hit && Date.now() - hit.at < CAGE_DIFF_TTL_MS) {
+        d = hit.val;
+      } else {
+        const cd = await cageDiff({ ctx: 'default', slug: x.slug, base: x.head_commit });
+        if (cd) {
+          const behind = await countBehind(project.repo_root, x.head_commit, branch);
+          d = { ...cd, behind };
+        }
+        cageDiffCache.set(x.id, { at: Date.now(), val: d });
+      }
+    }
+    if (!d) {
+      d = x.worktree_path && existsSync(x.worktree_path)
+        ? await worktreeDiff(x.worktree_path, branch)
+        : (x.head_commit ? diffStat(project.repo_root, x.head_commit, branch) : null);
+    }
     // Is this xell's landed head already contained in the LIVE prod commit? If so the card should
     // read "shipped", not "ship ready" — its work is already deployed (usually as part of a later
     // combined ship), so offering to ship again is misleading.

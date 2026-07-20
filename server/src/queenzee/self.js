@@ -19,6 +19,7 @@ import { landStatus } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { proposeDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
+import { buildXell, getBuildStatus } from '../lib/build.js';
 
 const liveZee = (xellId) => one(
   `SELECT id, name, status, model FROM zee WHERE xell_id=$1
@@ -241,4 +242,63 @@ async function resealCageForStack(xellId) {
 // "Mark done" in the dashboard, and THAT is what reaps the cage (collecting its commits first).
 export async function selfDone(xell, { summary = null } = {}) {
   return proposeDone({ xell_id: xell.id, note: summary });
+}
+
+// ── POST /api/xell/self/build — (re)build THIS cage's own app tier ─────────────
+// The verb a caged zee needs to run e2e tests against its OWN change. A host-side zee runs
+// scripts/xell-build.mjs; a caged zee has no host fs and no docker, so that script is unreachable —
+// this is its only door to a build. UNLIKE land/ship/prod/done it is NOT human-gated: building your
+// own throwaway containers is the whole point of a xell, so it acts immediately.
+//
+// The catch a caged zee cannot see: its commits live INSIDE the cage, but buildXell compiles from
+// the HOST worktree. So we first COLLECT the cage's committed diff onto the worktree (exactly like
+// selfLand step 1) — otherwise the build would faithfully rebuild the OLD code and the zee would
+// chase a change that never entered its container. Only COMMITTED cage work is collected (the bundle
+// is commits, never the dirty tree), so a zee must commit before it builds.
+export async function selfBuild(xell, { role = null, hot = false } = {}) {
+  if (!xell.worktree_path) return { ok: false, error: `${xell.slug} has no host worktree to build from` };
+
+  // COLLECT the cage's commits so the build includes the zee's code. A --hot bounce reuses the
+  // existing image and picks up NO code, so collecting for it is pointless — skip it. Best-effort
+  // otherwise: an already-collected worktree or an unreachable cage is a harmless no-op, but a real
+  // divergence (the worktree moved since caging) is an honest stop, exactly as landing treats it.
+  let collected = null;
+  if (!hot) {
+    try {
+      collected = await collectCageDiffToWorktree({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path });
+    } catch (e) {
+      if (/do not fast-forward/i.test(e.message)) {
+        return {
+          ok: false, status: 'needs-resolution', stage: 'collect', error: e.message,
+          message: `Could not pull your cage's commits onto the worktree to build from — it diverged since caging. `
+            + 'Nothing was built and your branch is untouched. Pull the latest into your cage, resolve, commit, '
+            + 'and `zee build` again.',
+        };
+      }
+      collected = { collected: false, warning: `cage collection skipped: ${e.message}` };
+      logline('self', `${xell.slug} build: cage collection skipped (${e.message})`);
+    }
+  }
+
+  let started;
+  try { started = await buildXell(xell.id, { hot, role }); }
+  catch (e) { return { ok: false, error: e.message, collected }; }
+
+  const roleLabel = role || 'server + webapp';
+  const from = collected?.collected ? `collected HEAD ${String(collected.head).slice(0, 8)}` : 'your worktree';
+  return {
+    ok: true, hot, role: role || 'all', collected, started,
+    message: `${hot ? 'HOT build' : 'Build'} started for ${roleLabel} from ${from} — running in the background on `
+      + 'the queenzee (this call does NOT block). To find out when it settles and whether the container is '
+      + `actually serving your HEAD, run \`zee build ${role || ''} --wait\` (or --watch) in the BACKGROUND — its `
+      + `exit is your nudge.${hot ? ' NOTE: --hot reused the old image, so it does NOT contain code changes.' : ''}`,
+  };
+}
+
+// ── GET /api/xell/self/build/status — is this cage's stack built from its HEAD? ─
+// Read-only. What `zee build --wait/--watch` polls: per-container health + serving_head, measured
+// against the worktree HEAD (the commit the last collect fast-forwarded it to). Starts no build and
+// collects nothing — safe to poll on a tight loop.
+export async function selfBuildStatus(xell) {
+  return getBuildStatus(xell.id);
 }

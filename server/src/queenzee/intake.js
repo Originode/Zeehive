@@ -302,7 +302,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
 }
 
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
-async function bindingFor(xellId, zee, task) {
+async function bindingFor(xellId, zee, task, { caged = false } = {}) {
   const xell = await one(`SELECT x.*, xo.ref AS xource_ref FROM xell x JOIN xource xo ON xo.id=x.xource_id WHERE x.id=$1`, [xellId]);
   const dbid = await dbIdentity(xell.project_id);
   const rows = await q(
@@ -357,25 +357,38 @@ async function bindingFor(xellId, zee, task) {
   // How this zee builds its own app tier — ALWAYS via the queenzee, never by hand. Running
   // docker/compose/spin-env.sh directly leaves the orchestrator blind (no built-commit, no hot
   // flag, no health/spinner) and can mangle a container mid-operation.
-  const bs = `node "${resolve(config.repoRoot, 'scripts', 'xell-build.mjs')}"`;
+  //
+  // CAGED zees have no host filesystem, so the host `xell-build.mjs` PATH is unreachable to them —
+  // that gap is exactly why caged zees couldn't build and complained they couldn't run e2e tests.
+  // Their build door is the in-cage `zee build` CLI (→ /api/xell/self/build), which the token
+  // identifies to their xell (so no xell id in the command). It collects their cage COMMITS onto
+  // the worktree first, then runs the SAME queenzee build. Host-side zees keep the script path.
+  const bs = caged ? 'zee build' : `node "${resolve(config.repoRoot, 'scripts', 'xell-build.mjs')}"`;
+  const buildCmd = (role) => (caged ? `${bs} ${role}` : `${bs} ${xell.id} ${role}`);
   const build = {
-    how: 'Build ONLY through the queenzee with these commands. Do NOT run docker, docker compose, '
-       + 'scripts/spin-env.sh, or ad-hoc build scripts yourself.',
-    all: `${bs} ${xell.id} all`,
-    server: `${bs} ${xell.id} server`,
-    webapp: `${bs} ${xell.id} webapp`,
+    how: caged
+      ? 'Build your OWN app-tier containers with `zee build` (on your PATH). It goes through the '
+        + 'queenzee, so the built commit, hot flag and health all stay truthful — do NOT run docker, '
+        + 'compose or ad-hoc build scripts (you have no docker CLI, and the host build script is '
+        + 'unreachable from the cage). It collects your cage COMMITS first, so COMMIT before you build.'
+      : 'Build ONLY through the queenzee with these commands. Do NOT run docker, docker compose, '
+        + 'scripts/spin-env.sh, or ad-hoc build scripts yourself.',
+    all: buildCmd('all'),
+    server: buildCmd('server'),
+    webapp: buildCmd('webapp'),
     hot_suffix: '--hot',
     wait_suffix: '--wait',
     semantics: {
       build: 'rebuilds the image from THIS worktree\'s code and recreates the container — use this to see your changes run',
       hot: 'append --hot to bounce the container from the existing image (fast, but does NOT pick up code changes — there is no source mount)',
       wait: 'append --wait to BLOCK until the build settles and be told whether the container is '
-          + 'actually serving your current HEAD (exit 0 = built, 1 = failed/timeout, 20min cap)',
+          + 'actually serving your current HEAD (exit 0 = built, 1 = failed/timeout)',
+      ...(caged ? { watch: 'append --watch to REPORT on a build without starting one (read-only "is what runs actually my code?")' } : {}),
     },
     how_to_wait: 'NEVER hand-roll a wait. Do not curl your own webapp in a poll loop, do not grep '
       + 'it for your changed text, do not `sleep` and re-check: those loops guess at a condition, '
       + 'and when they guess wrong they hang for 45 minutes on a build that finished long ago. '
-      + `Instead run \`${bs} ${xell.id} <role> --wait\`. The queenzee RECORDS the commit each `
+      + `Instead run \`${buildCmd('<role>')} --wait\`. The queenzee RECORDS the commit each `
       + 'container was built at, so --wait answers from fact. Run it in the BACKGROUND and its exit '
       + 'is your nudge — the harness re-invokes you the moment it finishes, so you can keep working.',
     note: 'Without --wait, builds are non-blocking and you get no completion signal at all (the '
@@ -552,8 +565,8 @@ export async function setZeeMode(zeeId, permissionMode) {
 // of running headless. Without this it gets a bare task string — it doesn't know it's a zee, what
 // it owns, how to build, or that nobody can answer a question, so it researches and then stalls
 // asking "want me to continue?" into a void.
-async function briefing(xellId, zee, task, { headless = true } = {}) {
-  const b = await bindingFor(xellId, zee, task);
+async function briefing(xellId, zee, task, { headless = true, caged = false } = {}) {
+  const b = await bindingFor(xellId, zee, task, { caged });
   // Be truthful about who (if anyone) can answer. A dispatched session is still a real session the
   // human can open and talk to — claiming "nobody can answer you" when they can is a lie that
   // pushes the zee to guess instead of surfacing a genuine blocker.
@@ -865,7 +878,7 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // The briefing still binds the xell truthfully (containers, db, rules) — then the caged
   // addendum corrects the parts that are host-shaped: paths and docker access.
   const prompt = [
-    await briefing(xell.id, zee, task, { headless }),
+    await briefing(xell.id, zee, task, { headless, caged: true }),
     '',
     '## You are CAGED (overrides anything above that conflicts)',
     '- Your workspace is /work/repo — a private clone of your branch. Host paths in the binding',
@@ -887,10 +900,12 @@ async function spawnCaged({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '## YOUR QUEENZEE VERBS — how a caged zee lands/ships/goes-to-prod/finishes',
     'You are walled in: no docker, no host fs, no skills. The queenzee API is your ONLY door out, and',
     'it is authenticated as YOU by $ZEEHIVE_XELL_TOKEN (already in your env). Every "skill" a host zee',
-    'has is ONE call here — and each one is only a REQUEST that lands on a HUMAN gate. You may know',
-    'them all; none of them lets you act unilaterally. Use the `zee` CLI (on your PATH) — do not',
-    'hand-roll curl:',
+    'has is ONE call here. `zee land`/`zee ship`/`zee prod`/`zee done` are each only a REQUEST that',
+    'lands on a HUMAN gate — none of them lets you act unilaterally. `zee build` is the exception: it',
+    'acts immediately, because building your OWN throwaway containers to verify your work needs no',
+    'human. Use the `zee` CLI (on your PATH) — do not hand-roll curl:',
     '  - `zee status`               → where you stand: your task, and whether a land/ship/prod/done is pending a human.',
+    '  - `zee build [server|webapp|all]` → (re)build your OWN app tier so you can run e2e tests against your change. NOT gated — build freely. Add --wait (background) to be told when it is serving your HEAD; --watch reports without building. COMMIT first — it builds your cage commits.',
     '  - `zee land`                 → collect your commits out of the cage and run the gated push to main. HELD for a human.',
     '  - `zee ship --reason "..."`  → ask to deploy to prod (add `--targets server webapp`). Refused unless already landed; a human approves; the QUEENZEE builds from main.',
     '  - `zee prod --reason "..."`  → ASK to be bound to the prod database. Recorded only — a human confirms, then the cage is re-sealed to reach prod. Until then you cannot.',

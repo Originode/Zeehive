@@ -36,7 +36,7 @@ import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
-import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone,
+import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
@@ -654,6 +654,20 @@ router.post('/xell/self/done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfDone(x, { summary: req.body?.summary || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// (Re)build this cage's OWN app tier so a caged zee can run e2e tests against its change. NOT
+// human-gated (building your own throwaway containers is the point of a xell) — it collects the
+// cage's commits onto the worktree, then runs the same queenzee build a host zee does.
+router.post('/xell/self/build', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const role = req.body?.role && req.body.role !== 'all' ? req.body.role : null;
+    res.json(await selfBuild(x, { role, hot: !!req.body?.hot })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Read-only: is the cage's stack serving its current HEAD? What `zee build --wait/--watch` polls.
+router.get('/xell/self/build/status', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfBuildStatus(x)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
 });
 
 // HUMAN side of the prod-bind request (the dashboard) — list + confirm/reject. There is deliberately

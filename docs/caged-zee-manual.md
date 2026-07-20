@@ -27,8 +27,8 @@ the queenzee API is the one narrow door, and the human is the lock on it.
 5. **You can only ASK** to land, ship, bind prod, or finish. You never hold the prod lock, never run
    a prod build, and never despawn yourself. Do not try to route around a gate — the gate *is* the
    system working.
-6. **Verify in your cage.** Build your app tier (through the queenzee) and exercise the real thing
-   before you call the work done. "I wrote it" is not verification.
+6. **Verify in your cage.** Build your app tier with `zee build` (through the queenzee — you have no
+   docker) and exercise the real thing before you call the work done. "I wrote it" is not verification.
 
 ## Your identity token
 
@@ -45,23 +45,52 @@ queenzee at `host.docker.internal:4700` (firewall-allowed).
 
 ```
 zee status                                       # where you stand
+zee build [server|webapp|all] [--hot] [--wait] [--watch]   # (re)build your OWN app tier (NOT gated)
 zee land                                         # collect commits + gated push to main
 zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod
 zee prod --reason "…"                            # ask to be bound to the prod database
 zee done --summary "…"                           # propose your job is done
 ```
 
-Every call prints the queenzee's JSON answer.
+Every call prints the queenzee's JSON answer. **`zee build` is the one verb that acts immediately**
+— every other verb is only a *request* a human must approve (see below).
 
 ## The verbs
 
-Each verb maps to the **same** human-gated action a host-side zee or a human in the console drives —
-this is the caged entrance to it, not a bypass.
+Every verb except `zee build` maps to the **same** human-gated action a host-side zee or a human in
+the console drives — this is the caged entrance to it, not a bypass. `zee build` is not gated: it
+builds your OWN throwaway containers, which is the whole point of a xell.
 
 ### `zee status` — orient
 `GET /api/xell/self/status`. Read model: your xell status and task, whether a landing / ship /
 prod-bind is pending a human, whether you hold the prod lock, and your containers + db binding. No
 secrets — your token never appears in the answer. Safe to call any time.
+
+### `zee build` — build your OWN app tier (to run e2e tests)
+`POST /api/xell/self/build` `{ role?, hot? }`. This is the piece a cage otherwise can't do: the host
+build script (`scripts/xell-build.mjs`) lives on a filesystem you can't see, so `zee build` is your
+only door to a build. **It is NOT human-gated** — building your own per-xell containers to verify
+your change is exactly what the xell is for, so it acts immediately.
+
+Like `zee land`, it first **collects your cage commits** onto the host worktree (only committed work
+is collected — the dirty tree is not), then runs the **same queenzee build** a host zee runs. So:
+
+- **Commit before you build.** Uncommitted cage work is not in the build.
+- `zee build` / `zee build all` builds both `server` and `webapp`; name one (`zee build webapp`) to
+  build just that role.
+- **`--wait`** (run it in the BACKGROUND) blocks until the build settles and then tells you whether
+  each container is UP and serving your HEAD — exit 0 = built and serving your code, 1 = failed /
+  not-your-code / timeout. Its exit is your nudge; keep working while it runs. NEVER hand-roll a
+  `curl | grep` poll against your own app — that is the loop that hangs zees for 45 minutes.
+- **`--watch`** reports on a build without starting one (read-only "is what's running actually my
+  code?").
+- **`--hot`** bounces the container from the existing image — fast, but it picks up **no** code
+  changes (there is no source mount), so `--wait` will correctly say it is not serving your HEAD.
+
+If your cage diverged from the worktree (something moved underneath you), the collect refuses rather
+than force a merge, and the build is not started — resolve it, commit, and `zee build` again.
+
+### `zee land` — land your work on main
 
 ### `zee land` — land your work on main
 `POST /api/xell/self/land`. This is the piece a cage otherwise can't do: your commits live *inside*

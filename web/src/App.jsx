@@ -22,6 +22,30 @@ import Dispatch from './Dispatch.jsx';
 import Toasts from './Toasts.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
+const PROJECT_PARAM = 'project';
+
+// Resolve a project from a URL token (?project=…), matched against either the id or the name
+// (case-insensitive), so a link/refresh lands on a specific project instead of "the first one".
+const findByToken = (ps, token) =>
+  token
+    ? ps.find((p) => p.id === token || p.name?.toLowerCase() === String(token).toLowerCase())
+    : null;
+
+const readProjectParam = () => {
+  try { return new URLSearchParams(window.location.search).get(PROJECT_PARAM); }
+  catch { return null; }
+};
+
+// Keep the URL in step with the selected project (its name — readable, and it survives a refresh)
+// WITHOUT adding history entries, so Back doesn't walk through every project you clicked.
+const writeProjectParam = (project) => {
+  try {
+    const url = new URL(window.location.href);
+    if (project?.name) url.searchParams.set(PROJECT_PARAM, project.name);
+    else url.searchParams.delete(PROJECT_PARAM);
+    window.history.replaceState(null, '', url);
+  } catch { /* history unavailable — non-fatal */ }
+};
 
 // Display only — the DB role is still 'webapp'. "App" is what the thing IS; "webapp" was naming
 // its delivery mechanism, which is the least interesting fact about it.
@@ -179,6 +203,10 @@ export default function App() {
   // dropped instead of clobbering the newly-selected project's data (fixes the switch race).
   const projectIdRef = useRef(null);
   useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
+  // Latest project list, read from callbacks with stable identities (e.g. selectProject) so they
+  // can resolve an id → project row for the URL without re-binding on every list change.
+  const projectsRef = useRef([]);
+  useEffect(() => { projectsRef.current = projects; }, [projects]);
   const applyFleet = useCallback((f) => {
     if (f && (!projectIdRef.current || f.project?.id === projectIdRef.current)) setFleet(f);
   }, []);
@@ -246,8 +274,13 @@ export default function App() {
     });
     getLogs().then((ls) => setLogs(ls));
     loadProjects().then((ps) => {
+      // URL param wins (a shared/refreshed link is explicit intent), then the last-used project
+      // from localStorage, and only then fall back to the first project we can see.
+      const fromUrl = findByToken(ps, readProjectParam());
       const stored = localStorage.getItem(PROJECT_KEY);
-      setProjectId(ps.find((p) => p.id === stored) ? stored : (ps[0]?.id || null));
+      const picked = fromUrl || ps.find((p) => p.id === stored) || ps[0] || null;
+      setProjectId(picked?.id || null);
+      writeProjectParam(picked);   // normalise the URL (fill it in, or fix an unknown token)
     });
   }, [loadProjects]);
 
@@ -272,6 +305,7 @@ export default function App() {
   const selectProject = useCallback((id) => {
     setProjectId(id);
     localStorage.setItem(PROJECT_KEY, id);
+    writeProjectParam(projectsRef.current.find((p) => p.id === id));
   }, []);
 
   const handleCreate = useCallback(async (body) => {
@@ -284,9 +318,11 @@ export default function App() {
     const r = await deleteProject(id, force);
     const ps = await loadProjects();
     if (id === projectId) {
-      const next = ps[0]?.id || null;
+      const nextProject = ps[0] || null;
+      const next = nextProject?.id || null;
       setProjectId(next);
       if (next) localStorage.setItem(PROJECT_KEY, next); else localStorage.removeItem(PROJECT_KEY);
+      writeProjectParam(nextProject);
     }
     return r;
   }, [loadProjects, projectId]);
