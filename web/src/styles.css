@@ -572,6 +572,10 @@ a.cbox:hover { border-color: var(--accent); }
 .term-chip.clear { color: var(--muted); }
 .term-chip:hover { border-color: var(--accent); }
 .term-x:hover { color: var(--text); }
+/* Fullscreen toggle (⛶ in the header) — both terminal modals. The overlay already covers the
+   viewport; the modal just grows to fill it. The fit addon's ResizeObserver refits the grid
+   (and the cage terminal re-sends the PTY size) on the toggle. */
+.term.full, .zeeterm.full { width: 100vw; height: 100vh; max-width: 100vw; max-height: 100vh; border-radius: 0; }
 .term-body { flex: 1; min-height: 0; position: relative; padding: 6px 8px; overflow: hidden; }
 .term-xterm { position: absolute; inset: 6px 8px; }
 .term-xterm .xterm, .term-xterm .xterm-viewport { height: 100%; }

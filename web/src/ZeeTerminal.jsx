@@ -13,6 +13,7 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
   const holder = useRef(null);
   const [status, setStatus] = useState('connecting');
   const [copied, setCopied] = useState(false);
+  const [full, setFull] = useState(false);   // maximize the modal; the ResizeObserver refits + resizes the PTY
 
   // ssh://zee@127.0.0.1:PORT → a copy-pasteable ssh command (external attach)
   let sshCmd = null;
@@ -58,10 +59,13 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
 
   return createPortal(
     <div className="term-overlay" onClick={onClose}>
-      <div className="zeeterm" onClick={(e) => e.stopPropagation()}>
+      <div className={`zeeterm${full ? ' full' : ''}`} onClick={(e) => e.stopPropagation()}>
         <div className="term-head">
           <span className="term-title">⌨ {slug} <span className={`tstat t-${status}`}>{status}</span></span>
-          <button className="term-x" onClick={onClose} title="Close">✕</button>
+          <span>
+            <button className="term-x" onClick={() => setFull(!full)} title={full ? 'Exit fullscreen' : 'Fullscreen'}>{full ? '⇲' : '⛶'}</button>
+            <button className="term-x" onClick={onClose} title="Close">✕</button>
+          </span>
         </div>
         <div className="zeeterm-body" ref={holder} />
         <div className="zeeterm-foot">

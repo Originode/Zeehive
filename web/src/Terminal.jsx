@@ -47,8 +47,14 @@ function fmtLine(l) {
 export default function Terminal({ logs, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
-  const drawn = useRef({ key: null, count: 0 });   // what the xterm currently shows: filter key + line count
+  // What the xterm currently shows: the filter key + the LAST DRAWN LOG OBJECT. Identity, not a
+  // count: the app caps the log buffer (slice(-1999)), so at cap every new line SLIDES the
+  // window while the length stays put — a count-based reconcile saw "no growth" and stopped
+  // writing entirely (the firehose froze the moment it filled). Object identity survives the
+  // slide, so "everything after the last thing I drew" stays correct.
+  const drawn = useRef({ key: null, last: null });
   const [only, setOnly] = useState(() => new Set());   // empty = show everything
+  const [full, setFull] = useState(false);
   const scopes = [...new Set(logs.map((l) => l.scope).filter(Boolean))].sort();
   const shown = only.size ? logs.filter((l) => only.has(l.scope)) : logs;
 
@@ -75,21 +81,29 @@ export default function Terminal({ logs, onClose }) {
       ro.disconnect();
       term.dispose();
       termRef.current = null;
-      drawn.current = { key: null, count: 0 };
+      drawn.current = { key: null, last: null };
     };
   }, []);
 
-  // Reconcile the xterm with the current filtered view. Same filter + appended logs → write only the
-  // new tail (a firehose must not redraw thousands of lines per tick); a filter change or a shrink →
-  // reset and repaint. xterm auto-scrolls to the bottom on write when the viewport is already there.
+  // Reconcile the xterm with the current filtered view. Same filter → write only what follows the
+  // last drawn line (found by OBJECT identity, so the capped/sliding buffer keeps appending and the
+  // scroll position holds); filter change, or the last drawn line slid out of the buffer → reset
+  // and repaint. xterm auto-scrolls on write only when the viewport is already at the bottom.
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
     const key = only.size ? [...only].sort().join('|') : '*';
     const st = drawn.current;
-    if (st.key !== key || shown.length < st.count) { term.reset(); st.key = key; st.count = 0; }
-    for (let i = st.count; i < shown.length; i++) term.writeln(fmtLine(shown[i]));
-    st.count = shown.length;
+    let start = 0;
+    if (st.key !== key) { term.reset(); st.key = key; st.last = null; }
+    if (st.last) {
+      const idx = shown.indexOf(st.last);
+      if (idx >= 0) start = idx + 1;
+      else { term.reset(); st.last = null; }   // drawn tail slid out entirely — repaint
+    }
+    for (let i = start; i < shown.length; i++) term.writeln(fmtLine(shown[i]));
+    if (shown.length) st.last = shown[shown.length - 1];
+    else st.last = null;
   }, [shown, only]);
 
   const toggle = (s) => setOnly((prev) => {
@@ -100,7 +114,7 @@ export default function Terminal({ logs, onClose }) {
 
   return (
     <div className="term-overlay" onClick={onClose}>
-      <div className="term" onClick={(e) => e.stopPropagation()}>
+      <div className={`term${full ? ' full' : ''}`} onClick={(e) => e.stopPropagation()}>
         <div className="term-head">
           <span className="term-title">▚ queenzee — live activity ({shown.length}{only.size ? ` of ${logs.length}` : ''})</span>
           <span className="term-filters">
@@ -114,6 +128,7 @@ export default function Terminal({ logs, onClose }) {
             ))}
             {only.size > 0 && <button className="term-chip clear" onClick={() => setOnly(new Set())} title="Show all scopes">all</button>}
           </span>
+          <button className="term-x" onClick={() => setFull(!full)} title={full ? 'Exit fullscreen' : 'Fullscreen'}>{full ? '⇲' : '⛶'}</button>
           <button className="term-x" onClick={onClose} title="Close">✕</button>
         </div>
         <div className="term-body">
