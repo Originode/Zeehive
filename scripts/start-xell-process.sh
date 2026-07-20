@@ -67,8 +67,10 @@ case "$(uname -s)" in
 esac
 
 # Honest ok: the URL answering is the health truth, so wait for the port to answer before
-# claiming success — up to 60s (a cold vite/npm start on this machine).
-for _ in $(seq 1 60); do
+# claiming success — up to 180s: a cold start stacks nested npm invocations plus vite's
+# first-run dependency optimization, and in-container that overran the old 60s window while
+# the process came up healthy right behind the FAILED verdict (seen live 2026-07-20).
+for _ in $(seq 1 180); do
   if curl -s -o /dev/null --max-time 2 "http://localhost:${PORT}"; then
     emit true "process-start"; exit 0
   fi
