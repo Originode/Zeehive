@@ -32,14 +32,25 @@ if [ ! -d "$WT/node_modules" ]; then
   (cd "$WT" && npm install --no-audit --no-fund) >&2 || { emit false "npm-install-failed"; exit 1; }
 fi
 
-WTWIN="$(echo "$WT" | sed 's|/|\\\\|g')"
-LOG="$WTWIN\\\\.zeehive-$ROLE.log"
-
 # Kill whatever already listens on this role's port (restart semantics), then start detached.
-powershell.exe -NoProfile -Command "Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }" >&2
-
-powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('\$env:Path = \"C:\Program Files\Git\bin;\" + \$env:Path; Set-Location \"${WTWIN}\"; ${START} *>> \"${LOG}\"')" >&2 \
-  || { emit false "detach-failed"; exit 1; }
+# Two branches for the two eras: git-bash on the Windows host (PowerShell detach — the lessons
+# in the header), plain nohup inside the Linux container (where powershell.exe famously is
+# "command not found" — seen live on the first in-container process start, 2026-07-20).
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    WTWIN="$(echo "$WT" | sed 's|/|\\\\|g')"
+    LOG="$WTWIN\\\\.zeehive-$ROLE.log"
+    powershell.exe -NoProfile -Command "Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id \$_ -Force -ErrorAction SilentlyContinue }" >&2
+    powershell.exe -NoProfile -Command "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',('\$env:Path = \"C:\Program Files\Git\bin;\" + \$env:Path; Set-Location \"${WTWIN}\"; ${START} *>> \"${LOG}\"')" >&2 \
+      || { emit false "detach-failed"; exit 1; }
+    ;;
+  *)
+    LOG="$WT/.zeehive-$ROLE.log"
+    fuser -k -n tcp "$PORT" >/dev/null 2>&1 || true
+    nohup bash -c "cd '$WT' && exec ${START} >> '$LOG' 2>&1" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    ;;
+esac
 
 # Honest ok: the URL answering is the health truth, so wait for the port to answer before
 # claiming success — up to 60s (a cold vite/npm start on this machine).

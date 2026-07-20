@@ -302,6 +302,8 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
   align-items: center; justify-content: flex-end; line-height: 1; padding-bottom: 4px;
   font-family: 'Cascadia Code', monospace; font-size: 11px; text-decoration: none; color: var(--text); }
 a.cbox { cursor: pointer; }
+/* PRODUCTION containers: gold border, same warning color as the PRODUCTION hex */
+.cbox.t-prod { border: 1px solid #c9a227; box-shadow: 0 0 5px rgba(201, 162, 39, .35); }
 a.cbox:hover { border-color: var(--accent); }
 .cnick { letter-spacing: .5px; }
 .cdot { position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--unknown); }

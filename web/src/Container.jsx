@@ -145,7 +145,9 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
     </>
   );
   const common = {
-    className: `cbox h-${c.health}${busy ? ` busy busy-${busy}` : ''}${drift ? ` d-${drift}` : ''}`,
+    // t-prod: PRODUCTION containers wear a gold border wherever a chip renders (matrix, hexes) —
+    // the same at-a-glance warning the PRODUCTION hex carries.
+    className: `cbox h-${c.health}${busy ? ` busy busy-${busy}` : ''}${drift ? ` d-${drift}` : ''}${c.tier === 'prod' ? ' t-prod' : ''}`,
     // Drives the faint role glyph behind the chip (see .cbox[data-role] in styles.css). Kept as a
     // data attribute rather than a class so it cannot collide with the health/busy/drift classes,
     // which own the chip's border and are the ones that actually mean something.
