@@ -3,6 +3,7 @@
 import { q, one } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
+import { hiveStatus, hiveLabel } from './hive-status.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -60,6 +61,19 @@ async function fetchXellRows(pid) {
                FROM zee zb WHERE zb.xell_id = x.id) AS burn_cost,
             (SELECT t.id FROM task t WHERE t.xell_id = x.id
                AND t.status IN ('assigned','working') ORDER BY t.created_at DESC LIMIT 1) AS task_id,
+            -- LIVE SIGNALS the hive status derivation needs but the row itself doesn't hold: a
+            -- land/ship request pending a human, the zee's tend (needs-attention) ping, and whether
+            -- production's shields are down (a deploy holds the prod lock). Folded into the one row
+            -- read so the honeycomb's per-xell status costs no extra round-trips (see lib/hive-status).
+            EXISTS(SELECT 1 FROM land_request lr WHERE lr.xell_id = x.id
+                     AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL) AS land_pending,
+            EXISTS(SELECT 1 FROM ship_request sr WHERE sr.xell_id = x.id
+                     AND sr.status IN ('pending','approved','shipping') AND sr.dismissed_at IS NULL) AS ship_pending,
+            (SELECT se.hook_event_name FROM session_event se
+               WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
+               ORDER BY se.ts DESC LIMIT 1) = 'tend-request' AS tend_pending,
+            EXISTS(SELECT 1 FROM deploy_lock dl2 WHERE dl2.project_id = x.project_id
+                     AND dl2.container = 'prod') AS prod_lock_active,
             dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
        FROM xell x
        LEFT JOIN deploy_lock dl ON dl.xell_id = x.id AND dl.container = 'prod'
@@ -96,6 +110,18 @@ async function decorateXell(x, heads, deployed) {
   x.stack = stack;
   // pretty-print the name column exactly like the mockup expects
   x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
+
+  // DISPLAY status for the hive hexagon (lib/hive-status): the raw lifecycle status projected onto
+  // the operator vocabulary, folding in the live gate/attention signals fetched with the row. The
+  // label ships too so the web only owns the colour map, not a second copy of the wording.
+  x.hive_status = hiveStatus(x, {
+    landPending: x.land_pending === true,
+    shipPending: x.ship_pending === true,
+    tendPending: x.tend_pending === true,
+    prodUnprotected: x.is_production && x.prod_lock_active === true,
+  });
+  x.hive_status_label = hiveLabel(x.hive_status);
+  delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;
 
   // Fleet burn for THIS xell — sum across all its zees. pg returns bigint/numeric as strings; coerce
   // to Number so the dashboard can format it (a xell's lifetime burn is well within double precision).

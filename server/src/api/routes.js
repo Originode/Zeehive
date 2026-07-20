@@ -37,7 +37,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfWorking, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -653,6 +653,20 @@ router.post('/xell/self/prod-request', async (req, res) => {
 router.post('/xell/self/done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfDone(x, { summary: req.body?.summary || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Raise (or --clear) a tend: "I need a human in the console". Opens no gate, blocks nothing — it
+// just flags the xell as needing attention (occ-tendRequest) for a human to see.
+router.post('/xell/self/tend', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfTend(x, { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Ping "I am actively working" — asserts live activity the passive poller can't see for a cage, and
+// clears any open tend. The hive shows occ-working.
+router.post('/xell/self/working', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfWorking(x, { note: req.body?.note || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // (Re)build this cage's OWN app tier so a caged zee can run e2e tests against its change. NOT

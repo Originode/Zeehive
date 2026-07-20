@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
+import { hiveColor, hiveStatusLabel } from './status.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
@@ -20,7 +21,11 @@ const ROLE_TINT = { db: '#e08a3b', server: '#9b8cff', webapp: '#5b8cff' };
 // a freely pannable/zoomable world. After each draw it publishes every hex's live client-space
 // centre+radius (via `hexPosRef` + `onGeometry`) so the overlay can anchor connectors to them.
 
+// Colour a hex by its DISPLAY status (server-derived `hive_status`, palette in hive/status.js) — the
+// single vocabulary the whole hive reads by: vac-* / occ-* (incl. the tend/land/ship/done requests) /
+// live-*. Falls back to the legacy lifecycle→colour map for a payload that predates hive_status.
 function statusColor(x) {
+  if (x.hive_status) return hiveColor(x.hive_status, COL.muted);
   if (x.is_production) return COL.prod;
   const s = x.status;
   if (s === 'working') return COL.working;
@@ -769,8 +774,8 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
         drawBusyDot(ctx, cx - row.width / 2 - size * 0.11, y, Math.max(2.4, size * 0.055));
       }
     }
-    // status pill
-    const st = x.is_production ? 'live · protected' : x.status;
+    // status pill — the DISPLAY status (occ-working / occ-tendRequest / live-protected / …)
+    const st = hiveStatusLabel(x);
     if (st) {
       ctx.font = `600 ${Math.max(7.5, size * 0.13)}px 'Segoe UI', sans-serif`;
       const pw = ctx.measureText(st).width + 12, ph = Math.max(11, size * 0.19);
@@ -797,7 +802,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     }
     ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
     ctx.fillStyle = COL.muted;
-    ctx.fillText(fit(ctx, x.is_production ? 'live' : x.status, w * 0.6), cx, cy + size * 0.34);
+    ctx.fillText(fit(ctx, hiveStatusLabel(x), w * 0.6), cx, cy + size * 0.34);
   }
   ctx.restore();   // unclip
   ctx.restore();
@@ -954,7 +959,7 @@ function flowerFacets(x, diff, machines) {
   });
   return [
     { title: null, lines: [x.is_production ? 'PRODUCTION' : shortSlug(x.slug),
-      x.is_production ? 'live · protected' : x.status] },
+      hiveStatusLabel(x)] },
     { title: 'branch', lines: [stripBranch(x.branch) || '—', `src ${src.ref || '—'}`] },
     { title: 'session', lines: [x.zee_title || (x.claude_session_id ? x.claude_session_id.slice(0, 8) : '—'),
       x.zee_status === 'working' ? (x.zee_name || 'working') : (x.zee_status || '')] },

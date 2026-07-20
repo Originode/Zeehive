@@ -106,6 +106,46 @@ async function touch(zee) {
   await q(`UPDATE zee SET last_event_at = now() WHERE id = $1`, [zee.id]);
 }
 
+// ── the zee's ATTENTION ping (tend) ────────────────────────────────────────────
+// A zee can raise "I need a human in the console" (tend) and clear it again. There is no dedicated
+// table — the shared dev schema is frozen — so it rides the append-only session_event log: the OPEN
+// state of a xell's tend is simply whether its LATEST tend event is a 'tend-request' (vs a
+// 'tend-clear'). recordEvent already writes the reason into `raw`. Cleared automatically when the
+// zee reports working again (see setTendFromWork), so a stale "needs you" can't dangle after the
+// zee moved on.
+export async function setTend(xellId, on, { reason = null, zeeId = null, source = 'self' } = {}) {
+  await recordEvent({
+    source, hook_event_name: on ? 'tend-request' : 'tend-clear',
+    zee_id: zeeId, xell_id: xellId, raw: reason ? { reason } : null,
+  });
+  broadcast('xell', { id: xellId });
+  return { xell_id: xellId, tend: !!on, reason };
+}
+
+// Is this xell's tend currently OPEN? (latest tend event is a request, not a clear)
+export async function tendOpen(xellId) {
+  const row = await one(
+    `SELECT hook_event_name FROM session_event
+       WHERE xell_id = $1 AND hook_event_name IN ('tend-request','tend-clear')
+       ORDER BY ts DESC LIMIT 1`, [xellId]);
+  return row?.hook_event_name === 'tend-request';
+}
+
+// A zee PINGS that it is actively working. Mirrors what a harness UserPromptSubmit hook would do
+// (Channel A is not installed for caged zees), so the hive can show live activity even when the
+// passive poller is blind to a cage. Reporting work also CLEARS any open tend — asking for a human
+// and then carrying on would leave a false "needs you".
+export async function pingWorking(zee, { note = null } = {}) {
+  if (!zee) return { ok: false, error: 'no live zee to mark working' };
+  await setZeeStatus(zee, 'working');
+  await recordEvent({
+    source: 'self', hook_event_name: 'working-ping',
+    zee_id: zee.id, xell_id: zee.xell_id, raw: note ? { note } : null,
+  });
+  if (await tendOpen(zee.xell_id)) await setTend(zee.xell_id, false, { zeeId: zee.id, reason: 'auto-cleared: zee reported working' });
+  return { ok: true, zee_id: zee.id, xell_id: zee.xell_id, status: 'working' };
+}
+
 // Channel B: reconcile one managed zee against the passive poller's derived state.
 export async function projectPoller(zee, live, derived) {
   if (!ACTIVE.includes(zee.status)) return;

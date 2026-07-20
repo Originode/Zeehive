@@ -955,7 +955,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
         )}
         <div className="row">
           <span className="rk">status</span>
-          <span className={`badge b-${x.status}`} data-testid="xell-status">{isProd ? 'live · protected' : x.status}</span>
+          <span className={`badge b-${x.status}`} data-testid="xell-status" title={`hive: ${x.hive_status || x.status}`}>{x.hive_status_label || (isProd ? 'live · protected' : x.status)}</span>
         </div>
         {/* FLEET BURN — what every zee this xell hosted consumed (tokens + $), summed. Compact by
             design (Σ 1.2M tok · $8.90). This is the xell's OWN spend; account-wide %/limits are not
@@ -1082,7 +1082,10 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
-    return { x, held, prs, n: held + prs };
+    // A zee's TEND ping (occ-tendRequest): it asked for a human in the console. No approve/reject —
+    // the chip just takes you to it; the zee (or you) clears the tend once handled.
+    const tend = x.hive_status === 'occ-tendRequest' ? 1 : 0;
+    return { x, held, prs, tend, n: held + prs + tend };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
@@ -1097,11 +1100,13 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <span className="ny-t">⚠ waiting on you:</span>
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
-                  title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''} — click to review`}>
+                  title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''}${(w.held || w.prs) && w.tend ? ' · ' : ''}${w.tend ? 'tend (needs a human)' : ''} — click to review`}>
             {w.x.slug}
             <span className="ny-n">{w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`}
               {w.held > 0 && w.prs > 0 && ' · '}
-              {w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`}</span>
+              {w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`}
+              {(w.held || w.prs) && w.tend > 0 && ' · '}
+              {w.tend > 0 && '🖐 tend'}</span>
           </button>
         ))}
       </div>
@@ -1109,6 +1114,10 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <div className="ny-decision">
           {landings.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
           {prs.map((r) => <PrCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
+          {open.tend > 0 && landings.length === 0 && prs.length === 0 && (
+            <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human.
+              Open its session to see why; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
+          )}
         </div>
       )}
     </section>

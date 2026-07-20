@@ -20,6 +20,8 @@ import { requestShip, shipStatus } from './shipgate.js';
 import { proposeDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
+import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
+import { setTend, tendOpen, pingWorking } from '../lib/status.js';
 
 const liveZee = (xellId) => one(
   `SELECT id, name, status, model FROM zee WHERE xell_id=$1
@@ -40,12 +42,26 @@ export async function selfStatus(xell) {
   const containers = await q(
     `SELECT c.role, c.name, c.tier, host(c.host) AS host, c.host_port FROM xell_uses_container uc
        JOIN container c ON c.id = uc.container_id WHERE uc.xell_id=$1 ORDER BY c.role`, [xell.id]);
+  const tend = await tendOpen(xell.id);
+  // The DISPLAY status the hive shows for this xell — the same derivation the dashboard renders, so
+  // a caged zee sees itself exactly as a human does (and can tell its tend/land/ship pings landed).
+  const hive = hiveStatus(
+    { ...xell, zee_status: zee?.status },
+    {
+      landPending: land ? ['pending', 'approved'].includes(land.status) : false,
+      shipPending: ship ? ['pending', 'approved', 'shipping'].includes(ship.status) : false,
+      tendPending: tend,
+      prodUnprotected: xell.is_production && !!lock,
+    },
+  );
   return {
     xell: {
       id: xell.id, slug: xell.slug, branch: xell.branch, status: xell.status,
+      hive_status: hive, hive_status_label: hiveLabel(hive),
       head_commit: xell.head_commit, db_coupling: xell.db_coupling,
       on_prod: xell.db_coupling === 'db-shared-prod',
     },
+    tend: { open: tend },
     zee: zee || null,
     task: task ? { id: task.id, status: task.status, done: task.status === 'done' } : null,
     awaiting_done: xell.status === 'awaiting-done',
@@ -242,6 +258,36 @@ async function resealCageForStack(xellId) {
 // "Mark done" in the dashboard, and THAT is what reaps the cage (collecting its commits first).
 export async function selfDone(xell, { summary = null } = {}) {
   return proposeDone({ xell_id: xell.id, note: summary });
+}
+
+// ── POST /api/xell/self/tend — raise (or clear) "I need a human in the console" ─
+// A caged zee's ping for human attention that ISN'T a land/ship/done (a question, a stuck decision,
+// a heads-up). Unlike those it opens no gate and blocks nothing — it just flags the xell so the hive
+// shows `occ-tendRequest` and the human knows to look. `--clear` (or {clear:true}) lowers it; a zee
+// that reports working again clears it automatically.
+export async function selfTend(xell, { reason = null, clear = false } = {}) {
+  const zee = await liveZee(xell.id);
+  const res = await setTend(xell.id, !clear, { reason, zeeId: zee?.id || null });
+  logline('self', `${xell.slug} ${clear ? 'CLEARED its tend' : 'raised a TEND'}${reason ? `: ${reason}` : ''}`);
+  return {
+    ok: true, ...res,
+    message: clear
+      ? 'Tend cleared — the hive no longer flags this xell for attention.'
+      : 'Tend RAISED — the hive now shows this xell as needing a human (occ-tendRequest). Nothing is '
+        + 'gated or blocked; a human will see it in the console. It clears when you `zee tend --clear` '
+        + 'or report working (`zee working`).',
+  };
+}
+
+// ── POST /api/xell/self/working — ping "I am actively working" ──────────────────
+// Channel A (harness hooks) isn't installed for caged zees, so a cage can look idle to the passive
+// poller even mid-task. This ping lets a zee assert live activity — the hive shows `occ-working` —
+// and clears any open tend.
+export async function selfWorking(xell, { note = null } = {}) {
+  const zee = await liveZee(xell.id);
+  if (!zee) return { ok: false, error: 'no live zee bound to this xell to mark working' };
+  const res = await pingWorking(zee, { note });
+  return { ok: true, ...res, message: 'Working ping recorded — the hive shows this xell as occ-working.' };
 }
 
 // ── POST /api/xell/self/build — (re)build THIS cage's own app tier ─────────────
