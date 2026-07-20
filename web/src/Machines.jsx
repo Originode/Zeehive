@@ -10,11 +10,12 @@ import React, { useState, useEffect } from 'react';
 import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
          setMachinePool, getSites, createSite } from './api.js';
+import { showAlert, showConfirm } from './Dialog.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' };
 const ROLES = ['db', 'server', 'webapp', 'other'];
 
-const fail = (what) => (e) => alert(`${what} failed: ${e?.error || e?.message || e}`);
+const fail = (what) => (e) => showAlert(`${what} failed: ${e?.error || e?.message || e}`, { variant: 'error' });
 
 export default function MachineMatrix({ machines, containers, projectId, onMenu, onChanged }) {
   const ms = machines || [];
@@ -110,15 +111,15 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
   };
 
   const provisionDb = async () => {
-    if (!confirm(`Provision ${m.key}'s own shared dev DB?\n\nThis stands up a fresh dev postgres ON ${m.key} (${m.docker_ctx}) and restores the latest prod backup into it — additive, touches nothing else. It takes a few minutes; watch the queenzee terminal.\n\nWithout it, ${m.key} cannot host dev xells.`)) return;
+    if (!(await showConfirm(`Provision ${m.key}'s own shared dev DB?\n\nThis stands up a fresh dev postgres ON ${m.key} (${m.docker_ctx}) and restores the latest prod backup into it — additive, touches nothing else. It takes a few minutes; watch the queenzee terminal.\n\nWithout it, ${m.key} cannot host dev xells.`, { okLabel: 'Provision' }))) return;
     setBusy(true);
-    try { await provisionMachineDevDb(m.id, projectId); alert(`Provisioning started on ${m.key} — the DB chip appears in this column when it's ready (watch the terminal).`); }
+    try { await provisionMachineDevDb(m.id, projectId); showAlert(`Provisioning started on ${m.key} — the DB chip appears in this column when it's ready (watch the terminal).`); }
     catch (e) { fail('Dev DB provision')(e); }
     finally { setBusy(false); }
   };
 
   const remove = async () => {
-    if (!confirm(`Remove machine "${m.key}" from the hive?\n\nOnly the row is deleted — nothing on the host is touched. Refused while containers still run there.`)) return;
+    if (!(await showConfirm(`Remove machine "${m.key}" from the hive?\n\nOnly the row is deleted — nothing on the host is touched. Refused while containers still run there.`, { variant: 'danger', okLabel: 'Remove' }))) return;
     try { await deleteMachine(m.id); onChanged?.(); } catch (e) { fail('Delete machine')(e); }
   };
 
@@ -130,10 +131,10 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
     try {
       const sites = await getSites(projectId);
       const existing = (sites || []).find((s) => s.tier === 'prod' && s.docker_ctx === m.docker_ctx);
-      if (existing) { alert(`${m.key} already hosts a production site for this project ("${existing.key}").`); return; }
+      if (existing) { showAlert(`${m.key} already hosts a production site for this project ("${existing.key}").`); return; }
       const first = !(sites || []).some((s) => s.tier === 'prod');
       const key = `prod-${m.key}`;
-      if (!confirm(`Add a PRODUCTION on ${m.key}?\n\nThis creates prod site "${key}" (${m.docker_ctx}${m.host_ip ? ` @ ${m.host_ip}` : ''}) and its production xell${first ? ', and makes it the DEFAULT ship target' : ' — ships can target it from the approve dialog'}.\n\nNothing deploys yet; this only models where production lives.`)) return;
+      if (!(await showConfirm(`Add a PRODUCTION on ${m.key}?\n\nThis creates prod site "${key}" (${m.docker_ctx}${m.host_ip ? ` @ ${m.host_ip}` : ''}) and its production xell${first ? ', and makes it the DEFAULT ship target' : ' — ships can target it from the approve dialog'}.\n\nNothing deploys yet; this only models where production lives.`, { okLabel: 'Add production' }))) return;
       await createSite(projectId, { key, tier: 'prod', docker_ctx: m.docker_ctx, host: m.host_ip || null, is_default: first });
       onChanged?.();
     } catch (e) { fail('Add production')(e); }

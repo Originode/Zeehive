@@ -113,7 +113,7 @@ function shipLine(x, diff) {
 // Draw a run of differently-coloured text segments centred on `cx` at baseline `y`. `ctx.font` must
 // already be set by the caller (all segments share one font — that's what makes the widths add up).
 // Used for every colored diffstat (git convention: insertions green, deletions red) so the commit
-// hex, the diff·age facet and the compact hex's own-diff line all share one implementation.
+// hex, the diff·age facet and the compact hex's source-diff line all share one implementation.
 function drawDiffRow(ctx, cx, y, parts) {
   const widths = parts.map((p) => ctx.measureText(p.t).width);
   const total = widths.reduce((a, b) => a + b, 0);
@@ -656,7 +656,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
 
 // ── compact hex: the two-half card ────────────────────────────────────────────
 // upper half: ⌂ machine + container chips (nick + health dot)
-// lower half: head sha · own diff · status pill · ship line
+// lower half: head sha · source diff · status pill · ship line
 function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);
@@ -757,15 +757,17 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
       ctx.fillStyle = COL.sha;
       ctx.fillText(sha, cx, cy + size * 0.14);
     }
-    // own diff: "0f +0/−0" — bumped up from the old 0.14 factor (min 8) so it reads at a glance;
-    // git convention colouring (insertions green, deletions red) via drawDiffRow.
-    const own = diff?.own;
-    if (own && !x.is_production) {
+    // diff: "↑1 ↓7 · 4f +32/−6" — the SOURCE diff (worktree vs its branch's fork off main), i.e.
+    // everything this xell would land, matching the expanded flower's COMMIT facet. NOT `diff.own`
+    // (uncommitted-since-checkpoint): zees checkpoint-commit constantly, so `own` sits at +0/−0
+    // almost always and the collapsed card looked like it never tracked any work. git convention
+    // colouring (insertions green, deletions red) via drawDiffRow.
+    if (diff && !x.is_production) {
       const y = cy + size * 0.32;
       const parts = [
-        { t: `${own.files}f `, c: COL.muted },
-        { t: `+${own.insertions}`, c: COL.add },
-        { t: `/−${own.deletions}`, c: COL.del },
+        { t: `↑${diff.ahead} ↓${diff.behind} · ${diff.files}f `, c: COL.muted },
+        { t: `+${diff.insertions}`, c: COL.add },
+        { t: `/−${diff.deletions}`, c: COL.del },
       ];
       // fill the card width (capped so it clears the sha above and the status pill below)
       const row = drawDiffFilled(ctx, cx, y, parts, { maxW: w * 0.82, minPx: 9, maxPx: size * 0.17 });

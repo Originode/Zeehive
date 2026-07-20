@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ProjectSetup from './ProjectSetup.jsx';
+import { showConfirm } from './Dialog.jsx';
 
 // The project switcher: an icon beside the "Project:" label. The popup only switches and
 // removes; adding and configuring (deploy sites, ingress, container inventory, spawn template)
@@ -23,13 +24,13 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
   }, [open]);
 
   const remove = async (p) => {
-    if (!window.confirm(`Remove project "${p.name}"?\n\nThis deletes its xells, containers, and config from ZEEHIVE (the actual repo folder is left untouched).`)) return;
+    if (!(await showConfirm(`Remove project "${p.name}"?\n\nThis deletes its xells, containers, and config from ZEEHIVE (the actual repo folder is left untouched).`, { variant: 'danger', okLabel: 'Remove' }))) return;
     setBusy(true); setErr(null);
     try {
       await onDelete(p.id, false);
     } catch (e) {
       // offer a force path if it's blocked by live zees
-      if (/live zee/.test(e.message) && window.confirm(`${e.message}.\n\nForce-remove anyway?`)) {
+      if (/live zee/.test(e.message) && await showConfirm(`${e.message}.\n\nForce-remove anyway?`, { variant: 'danger', okLabel: 'Force-remove' })) {
         try { await onDelete(p.id, true); } catch (e2) { setErr(e2.message); }
       } else { setErr(e.message); }
     } finally { setBusy(false); }

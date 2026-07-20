@@ -8,6 +8,7 @@
 //      who is actively verifying.
 import React, { useState, useEffect, useRef } from 'react';
 import { decideShip, dismissShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
+import { showAlert, showConfirm } from './Dialog.jsx';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
@@ -17,10 +18,11 @@ const short = (s) => (s ? String(s).slice(0, 8) : '—');
 // countdown release only skips a wait that was going to happen anyway, but releasing a HELD lock
 // cuts off a human who deliberately stopped the clock to verify prod.
 function confirmForceRelease(lock) {
-  return confirm(
+  return showConfirm(
     `Force-release the production lock from ${lock.xell_slug}?\n\n`
     + `${lock.held ? 'It is being HELD open by a human — someone may be verifying prod right now.\n\n' : ''}`
-    + `Prod becomes free for another xell to ship immediately.`);
+    + `Prod becomes free for another xell to ship immediately.`,
+    { variant: 'danger', okLabel: 'Force-release' });
 }
 const mmss = (ms) => {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -92,11 +94,12 @@ function ShipCard({ req, live, prodSites, onDone }) {
   const siteName = chosen?.key || req.site_key || null;
 
   const decide = async (decision) => {
-    if (decision === 'approve' && !confirm(
+    if (decision === 'approve' && !(await showConfirm(
       `Ship ${short(req.commit)} to PRODUCTION${siteName ? ` @ ${siteName}` : ''}?\n\n`
       + `The queenzee will take the prod lock and deploy it from main — this is real production.\n\n`
-      + `Requested by: ${req.xell_slug}\n${req.reason ? `Reason: ${req.reason}\n` : ''}`)) return;
-    if (decision === 'reject' && !confirm(`Reject this ship request from ${req.xell_slug}?`)) return;
+      + `Requested by: ${req.xell_slug}\n${req.reason ? `Reason: ${req.reason}\n` : ''}`,
+      { variant: 'danger', okLabel: 'Ship to prod' }))) return;
+    if (decision === 'reject' && !(await showConfirm(`Reject this ship request from ${req.xell_slug}?`, { variant: 'danger', okLabel: 'Reject' }))) return;
     setBusy(true); setErr(null);
     try { await decideShip(req.id, decision, undefined, decision === 'approve' ? siteId || undefined : undefined); onDone?.(); }
     catch (e) { setErr(e.message); }
@@ -190,7 +193,7 @@ function LockCountdown({ lock, projectId, onChanged }) {
 
   const hold = async () => {
     setBusy(true);
-    try { await holdProdLock(projectId); onChanged?.(); } catch (e) { alert(e.message); }
+    try { await holdProdLock(projectId); onChanged?.(); } catch (e) { showAlert(e.message, { variant: 'error' }); }
     finally { setBusy(false); }
   };
 
@@ -198,9 +201,9 @@ function LockCountdown({ lock, projectId, onChanged }) {
   // were "wait out the clock" or "go hunt for the padlock on the xell's card", which is the same
   // act two screens away from where it is being asked about.
   const release = async () => {
-    if (!confirmForceRelease(lock)) return;
+    if (!(await confirmForceRelease(lock))) return;
     setBusy(true);
-    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (e) { alert(e.message); }
+    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (e) { showAlert(e.message, { variant: 'error' }); }
     finally { setBusy(false); }
   };
 
@@ -264,9 +267,9 @@ export function LockBadge({ lock, projectId, onChanged }) {
 
   const release = async (e) => {
     e.stopPropagation();
-    if (!confirmForceRelease(lock)) return;
+    if (!(await confirmForceRelease(lock))) return;
     setBusy(true);
-    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (err) { alert(err.message); }
+    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (err) { showAlert(err.message, { variant: 'error' }); }
     finally { setBusy(false); }
   };
 

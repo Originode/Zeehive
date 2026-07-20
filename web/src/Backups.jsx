@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { getBackups, setBackupConfig, runBackup, revealBackup, restoreBackup } from './api.js';
+import { showConfirm } from './Dialog.jsx';
 
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -99,8 +100,8 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
   };
   const restore = async (b) => {
     if (!selTarget) { flash('Pick a target db container first'); return; }
-    if (!window.confirm(`Restore this backup into ${selTarget.name}?\n\nThis OVERWRITES that database. `
-      + `The container spins and can't be built until it finishes.`)) return;
+    if (!(await showConfirm(`Restore this backup into ${selTarget.name}?\n\nThis OVERWRITES that database. `
+      + `The container spins and can't be built until it finishes.`, { variant: 'danger', okLabel: 'Restore' }))) return;
     try { await restoreBackup(b.id, targetId); await load(); flash(`Restore started → ${selTarget.name}`); }
     catch (e) { flash(e.message || 'Restore failed'); }
   };

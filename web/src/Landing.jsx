@@ -5,6 +5,7 @@
 // it is loud and top-of-page on purpose — a held push means a zee is blocked, waiting on you.
 import React, { useState } from 'react';
 import { decideLanding } from './api.js';
+import { showConfirm } from './Dialog.jsx';
 
 const shortSha = (s) => (s ? s.slice(0, 10) : '—');
 const ago = (ts) => {
@@ -33,7 +34,7 @@ export function LandCard({ req, onDone, onDismiss }) {
 
   const decide = async (decision) => {
     if (decision === 'reject'
-      && !confirm(`Reject ${shortSha(req.new_sha)}?\n\nThis sha is refused for good — the zee cannot land it by re-pushing.`)) return;
+      && !(await showConfirm(`Reject ${shortSha(req.new_sha)}?\n\nThis sha is refused for good — the zee cannot land it by re-pushing.`, { variant: 'danger', okLabel: 'Reject' }))) return;
     setBusy(true); setErr(null);
     try {
       await decideLanding(req.id, decision);
