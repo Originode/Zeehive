@@ -33,7 +33,11 @@ export const config = {
   // endpoint from there instead of shelling out to `docker context inspect`.
   dockerConfigDir: process.env.DOCKER_CONFIG
     || resolve(process.env.USERPROFILE || process.env.HOME || '.', '.docker'),
-  devHostIp: process.env.DEV_HOST_IP || '10.1.0.18',
+  // No baked default: 10.1.0.18 was Mark's NAS, and a fresh bootstrap inherited it into every
+  // xhip URL — the health monitor then probed a FOREIGN machine (red chips for live processes,
+  // and one fake green where the NAS happened to answer the port). NULL falls through to
+  // localhost at the consumers, which is correct wherever the queenzee itself runs the probe.
+  devHostIp: process.env.DEV_HOST_IP || null,
   // Default parent dir for repos cloned via New Project → Clone from GitHub. Unset on the host
   // era (the clone form asks for an explicit destination); the containerized queenzee sets it
   // to the repos volume (/repos) so clones land there without the human typing container paths.
