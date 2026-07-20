@@ -1,0 +1,82 @@
+# ZEEHIVE — one-file bootstrap. No checkout, no build: published images only.
+#
+#   curl -fsSLO https://raw.githubusercontent.com/Originode/Zeehive/master/docker-compose.bootstrap.yml
+#   docker compose -f docker-compose.bootstrap.yml up -d
+#
+# On first boot the server migrates its own fresh meta-DB, then SELF-ONBOARDS: it clones the
+# ZEEHIVE repo from GitHub into the repos volume and registers it as its first project. Console
+# on http://localhost:5180 (API :4700). Connect a Claude token in Project setup → Tokens, raise
+# the pool target, and dispatch. Fresh restart-from-zero = delete the zeehive_meta_data and
+# zeehive_repos volumes and `up -d` again.
+#
+# Run your own fork: override ZEEHIVE_SELF_REMOTE (and ZEEHIVE_GITHUB_TOKEN for a private repo —
+# a fine-grained PAT with Contents: Read-only) in a .env file next to this one.
+name: zeehive
+services:
+  meta-db:
+    image: postgres:17-alpine
+    container_name: zeehive_meta_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zeehive
+      POSTGRES_PASSWORD: zeehive
+      POSTGRES_DB: zeehive
+    volumes:
+      - zeehive_meta_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeehive"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  server:
+    image: ghcr.io/originode/zeehive-server:latest
+    container_name: zeehive_server
+    restart: unless-stopped
+    ports: ["4700:4700"]
+    depends_on:
+      meta-db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://zeehive:zeehive@meta-db:5432/zeehive
+      DOCKER_HOST: unix:///var/run/docker.sock
+      PROVISION_MODE: real
+      REPOS_DIR: /repos
+      ZEEHIVE_SELF_REMOTE: ${ZEEHIVE_SELF_REMOTE:-https://github.com/Originode/Zeehive.git}
+      ZEEHIVE_GITHUB_TOKEN: ${ZEEHIVE_GITHUB_TOKEN:-}
+      ZEEHIVE_SSH_DIR: /data/ssh
+      BACKUP_DIR: /backups
+      # cxells (the zees' containers) are spawned from the published image and reach the
+      # queenzee by service name over zee-hive-net — no host networking assumptions, so this
+      # works the same on Docker Desktop (win/mac) and native Linux.
+      CXELL_IMAGE: ghcr.io/originode/zeehive-zee-agent:latest
+      CXELL_API_BASE: http://zeehive_server:4700
+      ZEEHIVE_CXELL_SSH: network
+    volumes:
+      - zeehive_repos:/repos
+      - /var/run/docker.sock:/var/run/docker.sock
+      - zeehive_ssh:/data/ssh
+      - zeehive_backups:/backups
+    networks: [default, zee-hive-net]
+
+  web:
+    image: ghcr.io/originode/zeehive-web:latest
+    container_name: zeehive_web
+    restart: unless-stopped
+    ports: ["5180:5180"]
+    # the bundled nginx proxies /api → host.docker.internal:4700 (the server's published port);
+    # host-gateway makes that name resolve on native Linux too
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on: [server]
+
+networks:
+  # the cxell network — explicit name so the queenzee's own idempotent `network create` and
+  # every script agree with compose about which network this is
+  zee-hive-net: { name: zee-hive-net }
+
+volumes:
+  # explicit names: scripts (e.g. the self-ship sibling) mount these by bare name
+  zeehive_meta_data: { name: zeehive_meta_data }
+  zeehive_repos: { name: zeehive_repos }
+  zeehive_ssh: { name: zeehive_ssh }
+  zeehive_backups: { name: zeehive_backups }

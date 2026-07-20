@@ -22,7 +22,9 @@ import { createRequire } from 'node:module';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
 
-const IMAGE = 'zeehive/zee-agent';
+// CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
+// ghcr — matching the CXELL_IMAGE the self-ship scripts already honor for their rebuild.
+const IMAGE = process.env.CXELL_IMAGE || 'zeehive/zee-agent';
 export const cxellName = (slug) => `cxell_${String(slug).replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
 
 // ── SSH attend: a human reaches a cxell zee's interactive claude over SSH (the dashboard's

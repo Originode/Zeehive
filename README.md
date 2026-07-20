@@ -6,20 +6,22 @@ isolated environments for AI agents to work in.
 
 ## Self-start
 
-Requirements: Docker (with compose).
+Requirements: Docker (with compose). No checkout, no build — published images:
 
 ```sh
-git clone https://github.com/Originode/Zeehive.git
-cd Zeehive
-docker network create zee-hive-net
-docker compose -f docker/zeehive/docker-compose.prod.yml --profile experimental up -d --build meta-db server web
+curl -fsSLO https://raw.githubusercontent.com/Originode/Zeehive/master/docker-compose.bootstrap.yml
+docker compose -f docker-compose.bootstrap.yml up -d
 ```
+
+(Developing ZEEHIVE itself? Clone the repo and build from source instead:
+`docker network create zee-hive-net`, then
+`docker compose -f docker/zeehive/docker-compose.prod.yml --profile experimental up -d --build meta-db server web`.)
 
 That's the whole loop. On first boot the server migrates its **own fresh meta-DB**
 (`zeehive_meta_data` volume), then **self-onboards**: it clones this repo into the `zeehive_repos`
 volume, registers it as the `Zeehive` project with a pull-only GitHub remote, installs the
 landing gate, and sets the spawn template. The console is on **http://localhost:5180**
-(API :4701).
+(API :4700; the from-source developer compose uses :4701 to coexist with a live instance).
 
 To actually dispatch an agent you need one credential: Project setup → **Tokens** → connect
 Claude (`claude setup-token`). Then raise the **pool target** and pre-warmed xells appear —
