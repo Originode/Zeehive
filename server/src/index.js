@@ -11,6 +11,7 @@ import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
+import { ensureSelfProject } from './lib/self-onboard.js';
 import { pool } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
@@ -88,6 +89,9 @@ app.use('/api', router);
 // a queenzee that stays up degraded beats one that exits (see the backstop note above).
 try {
   await runMigrations();
+  // Fresh run (zero projects) → ZEEHIVE onboards itself before anything else looks at the
+  // fleet (self-onboard.js). Loud-but-never-fatal, like the migrations above.
+  await ensureSelfProject();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }

@@ -84,6 +84,12 @@ services:
       ZEEHIVE_CTX_UGREEN: tcp://10.1.0.18:2375   # remote contexts, created by the entrypoint
       ZEEHIVE_CTX_MARDALE: tcp://10.2.0.16:2375
       REPOS_DIR: /repos                    # clone-from-GitHub destination default
+      # Self-onboard on a fresh meta-DB (lib/self-onboard.js): where ZEEHIVE clones ITSELF from.
+      # The repo is private — put ZEEHIVE_GITHUB_TOKEN in docker/zeehive/.env (gitignored) once
+      # and every fresh run self-onboards unattended; without it, boot logs the gap and the
+      # console onboarding remains.
+      ZEEHIVE_SELF_REMOTE: https://github.com/Originode/Zeehive.git
+      ZEEHIVE_GITHUB_TOKEN: ${ZEEHIVE_GITHUB_TOKEN:-}
       ZEEHIVE_SSH_DIR: /data/ssh           # fleet cage keypair — regenerating it orphans live cages
       BACKUP_DIR: /backups                 # prod DB dumps
       ZEEHIVE_CAGE_SSH: network            # SSH to cages by container name over zee-cage-net
@@ -108,8 +114,14 @@ networks:
     external: true
 
 volumes:
-  zeehive_repos:
+  # New-era volumes carry EXPLICIT names: compose otherwise prefixes them with the project name
+  # (zeehive-prod_zeehive_repos), which silently diverges from every script that mounts the bare
+  # name — the self-ship sibling would recreate the server against an EMPTY repos volume (found
+  # live 2026-07-20: a "cleanup" hit the auto-created bare-name volume while the server kept the
+  # prefixed one). zeehive_db_data keeps the prefix: it is the OLD era's meta-DB data, bound to
+  # the live zeehive_db container — renaming it would detach real data.
+  zeehive_repos: { name: zeehive_repos }
   zeehive_db_data:
-  zeehive_meta_data:
-  zeehive_ssh:
-  zeehive_backups:
+  zeehive_meta_data: { name: zeehive_meta_data }
+  zeehive_ssh: { name: zeehive_ssh }
+  zeehive_backups: { name: zeehive_backups }
