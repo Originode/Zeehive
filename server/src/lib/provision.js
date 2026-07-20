@@ -283,6 +283,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   }
 
   const client = await pool.connect();
+  let createdDbContainer = null;   // a docker-run per-xell db to tear down if the tx fails
   try {
     await client.query('BEGIN');
     const { rows: [xell] } = await client.query(
@@ -332,6 +333,44 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     await mk('server', ports.serverPort, 3000, `http://${urlHost}:${ports.serverPort}`);
     await mk('webapp', ports.webPort, 5173, url);
 
+    // Per-xell OWN database container (spec §6.1: a Zeehive xell gets its own meta-DB container,
+    // slot-ported, provisioned BY ZEEHIVE). Scoped to db-isolated coupling on a PROCESS-runner
+    // spinoff tier: a compose project's isolated db comes up with its compose stack, but a
+    // process xell has no compose — the queenzee must run the one docker-backed role itself.
+    // Identity comes from the manifest's db block (the committed dev credential); the container
+    // is named by the manifest's naming template (zeehive_db_spin_{slug}).
+    if (coupling === 'db-isolated' && (spinTier.runner || null) === 'process') {
+      const nmDb = namingFor(project, 'db', slug);
+      const mdb = project.manifest?.db || {};
+      const dbName = mdb.name || project.db_name || 'app';
+      const dbUser = mdb.user || project.db_user || 'postgres';
+      const dbPass = mdb.password || 'dev';
+      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
+      if (mode === 'real') {
+        const run = spawnSync('docker',
+          ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
+           '-p', `${dbPort}:5432`,
+           '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
+           '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
+           '--label', `zeehive.slug=${slug}`, dbImage],
+          { encoding: 'utf8', timeout: 120000, windowsHide: true, env: cleanGitEnv() });
+        if (run.status !== 0) {
+          throw new Error(`per-xell db container ${nmDb.container} failed: ${(run.stderr || '').slice(-300)}`);
+        }
+        createdDbContainer = { ctx: devCtx, name: nmDb.container };   // for cleanup if the tx dies
+      }
+      // conn_ref stays passwordless (parameters, not secrets) — emitXellEnv injects the
+      // manifest's committed dev credential for process xells.
+      const { rows: [dbc] } = await client.query(
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,owner_xell_id,site_id,health)
+         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10) RETURNING id`,
+        [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort,
+         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`,
+         xell.id, devSiteId, mode === 'real' ? 'up' : 'unknown']);
+      await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
+    }
+
     // db coupling: link the shared dev db it USES (db-shared-dev default). db-clone lives in the
     // SAME container — the clone database itself is cut lazily (at dispatch, or by the
     // schema-work watch), never for a pristine pooled xell.
@@ -357,6 +396,11 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     return { ...xell, ports, url, mode };
   } catch (err) {
     await client.query('ROLLBACK');
+    // the rollback erased the row that owned it — remove the physical container too
+    if (createdDbContainer) {
+      spawnSync('docker', ['--context', createdDbContainer.ctx, 'rm', '-f', createdDbContainer.name],
+        { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    }
     throw err;
   } finally {
     client.release();

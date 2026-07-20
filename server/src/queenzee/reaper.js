@@ -13,6 +13,7 @@ import { resolveBash } from '../lib/bash.js';
 import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
 import { removeCage } from '../lib/cage.js';
+import { stopAndRemoveContainer } from '../lib/docker.js';
 import { releaseXellShips } from './shipgate.js';
 
 // Boot recovery: a queenzee killed mid-reap (a self-ship, a crash) strands rows at
@@ -155,6 +156,17 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   // of no return, so it goes too. Best-effort like the rest: a leak is visible in `docker ps`
   // by its zeehive.cage label.
   await removeCage({ ctx: 'default', slug: xell.slug }).catch((e) => logline('reaper', `cage cleanup failed for ${xell.slug}: ${e.message}`));
+
+  // Physically remove owned containers the queenzee docker-ran itself (the per-xell db of a
+  // process-runner xell — spec §6.1). Compose-managed ones were already purged by the despawn
+  // script; stop+rm is idempotent, so hitting them again is a no-op, and prod containers are
+  // shared (owner_xell_id NULL) so they can never match. Best-effort like the rest.
+  const owned = await q(
+    `SELECT name, docker_ctx FROM container WHERE owner_xell_id=$1 AND docker_ctx IS NOT NULL`, [xellId]);
+  for (const c of owned) {
+    await stopAndRemoveContainer(c.docker_ctx, c.name, { removeVolumes: true })
+      .catch((e) => logline('reaper', `container cleanup failed for ${c.name}: ${e.message}`));
+  }
 
   // drop this xell's per-xell containers from the meta DB
   await q(`DELETE FROM container WHERE owner_xell_id = $1`, [xellId]);
