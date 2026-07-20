@@ -69,14 +69,18 @@ export default function Terminal({ logs, onClose }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(holder.current);
-    try { fit.fit(); } catch { /* holder not laid out yet — the observer below refits */ }
     termRef.current = term;
 
-    const refit = () => { try { fit.fit(); } catch { /* mid-teardown */ } };
+    const refit = () => { try { fit.fit(); } catch { /* holder not laid out yet / mid-teardown */ } };
+    refit();
+    // mount-time fit races the modal layout (same lesson as ZeeTerminal): refit next frame + settle
+    const raf = requestAnimationFrame(refit);
+    const settle = setTimeout(refit, 250);
     window.addEventListener('resize', refit);
     const ro = new ResizeObserver(refit);
     if (holder.current) ro.observe(holder.current);
     return () => {
+      cancelAnimationFrame(raf); clearTimeout(settle);
       window.removeEventListener('resize', refit);
       ro.disconnect();
       term.dispose();

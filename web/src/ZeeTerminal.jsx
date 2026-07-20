@@ -30,7 +30,8 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(holder.current);
-    fit.fit();
+    const refit = () => { try { fit.fit(); } catch { /* mid-teardown */ } };
+    refit();
     term.focus();
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -38,19 +39,31 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
     ws.binaryType = 'arraybuffer';
     const sendResize = () => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
 
-    ws.onopen = () => { setStatus('live'); sendResize(); };
+    // The mount-time fit races the modal's layout: measured too early it computes a small grid,
+    // tells tmux that PTY size, and NOTHING corrects it later (the ResizeObserver only fires on
+    // changes — the panel is already at its final size). Seen live: the terminal filled half the
+    // panel until a fullscreen toggle forced a refit. Refit on the next frame and once more after
+    // layout settles, re-sending the PTY size each time.
+    const raf = requestAnimationFrame(() => { refit(); sendResize(); });
+    const settle = setTimeout(() => { refit(); sendResize(); }, 250);
+
+    ws.onopen = () => { setStatus('live'); refit(); sendResize(); };
     ws.onmessage = (e) => term.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data));
     ws.onclose = () => setStatus('closed');
     ws.onerror = () => setStatus('error');
     term.onData((d) => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d })));
     term.onResize(sendResize);
 
-    const onWin = () => { fit.fit(); };
+    const onWin = () => { refit(); };
     window.addEventListener('resize', onWin);
-    const ro = new ResizeObserver(() => { fit.fit(); });
+    const ro = new ResizeObserver(() => { refit(); });
     if (holder.current) ro.observe(holder.current);
 
-    return () => { window.removeEventListener('resize', onWin); ro.disconnect(); try { ws.close(); } catch {} term.dispose(); };
+    return () => {
+      cancelAnimationFrame(raf); clearTimeout(settle);
+      window.removeEventListener('resize', onWin); ro.disconnect();
+      try { ws.close(); } catch {} term.dispose();
+    };
   }, [zeeId]);
 
   const copy = async () => {
