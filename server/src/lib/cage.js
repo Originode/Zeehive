@@ -98,6 +98,58 @@ export async function cageZeeActive({ ctx = 'default', slug }) {
   }
 }
 
+// The live diff of a CAGED zee's work — read from INSIDE the cage, where the work actually lives.
+// A caged zee commits and edits in its private clone at /work/repo; the HOST worktree stays frozen
+// at the provisioning base until `zee land` collects the commits (collectCageDiffToWorktree). So a
+// host-side `git diff` (worktreeDiff) reads 0/0 for a zee that is BUSY producing work — which is
+// exactly why the dashboard's diff hexagon showed 0/0 for every working caged zee. Read the numbers
+// from the cage instead.
+//
+// The cage clone is a bundle of the branch only: it carries the branch history (including `base`,
+// the provisioning commit) but NOT the source ref (`master` isn't there). So "what would land" is
+// measured against `base` — everything the zee added since it was spun up, committed OR not (a plain
+// `git diff <base>` spans working tree vs base, so uncommitted work counts too). `behind` (how far
+// the source moved since the fork) isn't knowable in the cage; the caller fills it in from the host.
+//
+// One docker exec runs every git query and prints five newline-separated fields (echo "$(...)" keeps
+// an empty shortstat as a blank line, so the field positions never shift). Returns null if the cage
+// is unreachable or `base` is unknown, so the caller can fall back to the host worktree.
+export async function cageDiff({ ctx = 'default', slug, base }) {
+  if (!base) return null;
+  const b = String(base).replace(/[^0-9a-fA-F]/g, '');
+  if (!b) return null;
+  const script = [
+    'cd /work/repo || exit 3',
+    'echo "$(git rev-parse HEAD 2>/dev/null)"',
+    `echo "$(git rev-list --count ${b}..HEAD 2>/dev/null)"`,
+    `echo "$(git diff --shortstat ${b} 2>/dev/null)"`,
+    'echo "$(git diff --shortstat HEAD 2>/dev/null)"',
+    'echo "$(git status --porcelain 2>/dev/null | wc -l)"',
+  ].join('\n');
+  let out;
+  try {
+    const r = await dk(ctx, ['exec', cageName(slug), 'bash', '-lc', script], { timeoutMs: 8000 });
+    out = r.out;
+  } catch {
+    return null;
+  }
+  const [head, ahead, src, own, dirty] = String(out).split('\n');
+  const num = (s, re) => +((s || '').match(re)?.[1] || 0);
+  return {
+    head: head?.trim() || null,
+    ahead: +String(ahead || '').trim() || 0,
+    files: num(src, /(\d+) files? changed/),
+    insertions: num(src, /(\d+) insertions?/),
+    deletions: num(src, /(\d+) deletions?/),
+    dirty: +String(dirty || '').trim() || 0,
+    own: {
+      files: num(own, /(\d+) files? changed/),
+      insertions: num(own, /(\d+) insertions?/),
+      deletions: num(own, /(\d+) deletions?/),
+    },
+  };
+}
+
 // Create (or recreate) the xell's cage container on its own bridge network. Labeled so
 // dockerPs-based monitors can attribute it; NET_ADMIN only for the firewall seal. Publishes an
 // SSH port on 127.0.0.1 (the attend door — host-only; the queenzee's ssh2 bridge and a

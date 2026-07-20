@@ -126,6 +126,17 @@ export async function worktreeDiff(worktree, ref = 'main') {
   };
 }
 
+// How far a ref has advanced past a base commit — the commit count of `base..ref`. Used for a
+// caged zee's `behind`: its work (and HEAD) live in the cage, but the SOURCE ref only exists on the
+// host, so "how far the source moved since this branch forked" is answered here, from repo_root.
+// Async and count-only (no shortstat) so it never blocks the event loop on a big worktree. 0 on any
+// error — a missing ref reads as "not behind", which is the safe blank.
+export async function countBehind(repoRoot, base, ref = 'main') {
+  if (!base) return 0;
+  const r = await gitAsync(repoRoot, ['rev-list', '--count', `${base}..${ref}`]);
+  return r.status === 0 ? (+r.out.trim() || 0) : 0;
+}
+
 // The live HEAD of a worktree — a one-shot for callers (getTimeline's anchor) that need where a
 // xell actually sits without the full diff. Null if the worktree is gone or git can't read it.
 export function worktreeHead(worktree) {
