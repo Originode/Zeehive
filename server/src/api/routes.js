@@ -29,6 +29,7 @@ import { listProviderTokens, setProviderToken, deleteProviderToken } from '../li
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
+import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
@@ -168,6 +169,18 @@ router.get('/fleet', async (req, res) => {
   } catch (err) {
     console.error('[api] /fleet failed:', err.message);
     res.status(503).json({ error: `fleet unavailable: ${err.message}` });
+  }
+});
+
+// The LANDING PAD read model on its own: landings + shipments as one chronological FIFO queue,
+// with the item currently on the pad flagged. Also rides the /fleet snapshot (fleet.landing_pad);
+// this standalone endpoint is for a client that wants just the queue. 503-not-throw like /fleet.
+router.get('/landing-pad', async (req, res) => {
+  try {
+    res.json(await buildLandingPad(req.query.project || null));
+  } catch (err) {
+    console.error('[api] /landing-pad failed:', err.message);
+    res.status(503).json({ error: `landing pad unavailable: ${err.message}` });
   }
 });
 

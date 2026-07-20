@@ -4,6 +4,7 @@ import { q, one } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
+import { buildLandingPad } from '../queenzee/landingpad.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -254,6 +255,10 @@ export async function getFleet(projectId) {
     `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id
        WHERE dl.project_id = $1 AND dl.container = 'prod'`, [pid]);
 
+  // The LANDING PAD: landings + shipments merged into one chronological FIFO queue, with the item
+  // currently on the pad (being processed) flagged so the UI can spin it.
+  const landingPad = await buildLandingPad(pid);
+
   return {
     project,
     pool,
@@ -267,6 +272,7 @@ export async function getFleet(projectId) {
     landing,
     shipping,
     prod_lock: prodLock || null,
+    landing_pad: landingPad,
   };
 }
 

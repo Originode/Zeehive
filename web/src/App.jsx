@@ -14,6 +14,7 @@ import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel, { BackupsModal } from './Backups.jsx';
 import LandingPanel, { LandCard } from './Landing.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
+import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 import MachineMatrix from './Machines.jsx';
@@ -584,6 +585,10 @@ export default function App() {
           both are decisions only a human may make, and both block a zee until made. */}
       <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock} shipLogs={shipLogs}
                  projectId={projectId || project.id} onDecided={refresh} />
+
+      {/* THE LANDING PAD — every landing + shipment in one chronological FIFO queue, with the item
+          the queenzee is processing right now spinning. A view of the runway, not a decision. */}
+      <LandingPad pad={fleet.landing_pad} />
 
       <BackupsPanel backup={fleet.backup} projectId={projectId || project.id} />
 

@@ -18,6 +18,7 @@ import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations } from './shipmigrate.js';
+import { shouldProcessNow, processPad } from './landingpad.js';
 
 // Real deploys are gated on a human anyway; SHIP_MODE=simulate exists to verify ZEEHIVE itself.
 const MODE = process.env.SHIP_MODE === 'simulate' ? 'simulate' : 'real';
@@ -213,11 +214,22 @@ export async function decideShip(id, decision, by = 'human@console', { siteId } 
 
 // ── the queenzee ships ───────────────────────────────────────────────────────
 // Takes the lock, runs each prod container's OWN build script, then starts the release countdown.
-async function runShip(shipId) {
+// Exported so the LANDING PAD driver can pull an approved ship onto the runway when it reaches the
+// head of the FIFO line (the same call decideShip and the reaper tick make).
+export async function runShip(shipId) {
   const ship = await one(`SELECT * FROM ship_request WHERE id=$1`, [shipId]);
   if (!ship || ship.status !== 'approved') return;
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [ship.xell_id]);
   const project = await one(`SELECT * FROM project WHERE id=$1`, [ship.project_id]);
+
+  // THE LANDING PAD's FIFO gate. This ship is approved, but the runway may be occupied (another
+  // ship building, a landing merging) or an EARLIER approval may be ahead in line. If so, leave it
+  // 'approved' and wait — the pad driver pulls it on when its turn comes. runShip already defers
+  // on a held prod lock; this is the same idea widened to one shared, chronological queue.
+  if ((await shouldProcessNow(ship.project_id, 'shipment', ship.id)) === 'wait') {
+    logline('ship', `${xell.slug} ship WAITING — landing pad busy or an earlier item is ahead (FIFO)`);
+    return; // stays 'approved'; the pad driver / tick retries when the runway frees
+  }
   // The site this ship targets — recorded at request time; NULL = the default (or a pre-sites
   // row), which keeps every legacy behavior including the shared 'prod' lock key.
   const site = ship.site_id ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [ship.site_id]) : null;
@@ -376,6 +388,9 @@ async function runShipBody(ship, xell, project, site, lockKey) {
     [project.id, ok ? 'awaiting-verification' : 'failed', String(AUTO_RELEASE_SEC), ship.id, lockKey]);
   if (lock) broadcast('xell', { id: xell.id });
   notifyShipDone({ project, xell, ok, request: done, seconds: AUTO_RELEASE_SEC });
+  // The runway is free — pull the next queued landing/ship onto the pad promptly (the pad tick is
+  // the backstop). Best-effort so a failure here never affects the ship's own result.
+  setImmediate(() => processPad(project.id).catch(() => {}));
 }
 
 // How much of a build's output survives on the ship_request row. The tail, not the head: the
