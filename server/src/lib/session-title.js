@@ -10,11 +10,14 @@
 // like naming a zee after a news headline it happened to fetch.
 //
 // mtime-cached so the monitor can call it every tick cheaply. null when unknown/untitled.
-import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { existsSync, readdirSync, statSync, readFileSync } from 'node:fs';
+import { config } from '../config.js';
 
-const PROJECTS = resolve(homedir(), '.claude', 'projects');
+// config.claudeHome, NOT homedir(): every other CLAUDE_HOME read honors the env override
+// (sessions.js), and a containerized queenzee reaches the host's transcripts only through a
+// mounted CLAUDE_HOME — a raw homedir() would silently read an empty in-container dir.
+const PROJECTS = resolve(config.claudeHome, 'projects');
 const cache = new Map(); // path → { mtimeMs, title }
 
 // Find <sessionId>.jsonl under any project slug dir (filename === session id).

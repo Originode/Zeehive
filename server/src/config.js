@@ -21,7 +21,9 @@ export const config = {
   port: int(process.env.PORT, 4700),
   apiBase: process.env.ZEEHIVE_API || `http://localhost:${int(process.env.PORT, 4700)}`,
   claudeHome: process.env.CLAUDE_HOME || resolve(process.env.USERPROFILE || process.env.HOME || '.', '.claude'),
-  omnibizRoot: process.env.OMNIBIZ_ROOT || 'D:\\Repos\\OmniBiz\\omnibiz',
+  // Seed-only (db/seed.js) + a last-resort reaper cwd fallback. No baked-in Windows default:
+  // the container era has no D:\ — set OMNIBIZ_ROOT in .env where it applies.
+  omnibizRoot: process.env.OMNIBIZ_ROOT || null,
   dockerCtx: process.env.SPINOFF_DOCKER_CONTEXT || 'ugreen-nas',
   // OCI registry for split builds (compile on one docker context, run on another). Global
   // fallback when a project has no registry of its own; NULL ⇒ split builds are unavailable.
@@ -36,6 +38,10 @@ export const config = {
   // era (the clone form asks for an explicit destination); the containerized queenzee sets it
   // to the repos volume (/repos) so clones land there without the human typing container paths.
   reposDir: process.env.REPOS_DIR || null,
+  // How a CAGE reaches the queenzee API. host.docker.internal:4700 works from a cage whether
+  // the queenzee is the host process or a container publishing 4700; override with the compose
+  // service name if host publishing ever stops.
+  cageApiBase: process.env.CAGE_API_BASE || 'http://host.docker.internal:4700',
   poolTargetReady: int(process.env.POOL_TARGET_READY, 3),
   pollerIntervalMs: int(process.env.POLLER_INTERVAL_MS, 4000),
   poolIntervalMs: int(process.env.POOL_INTERVAL_MS, 15000),

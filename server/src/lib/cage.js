@@ -20,6 +20,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { logline } from './logbus.js';
+import { config } from '../config.js';
 
 const IMAGE = 'zeehive/zee-agent';
 export const cageName = (slug) => `zee_cage_${String(slug).replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
@@ -194,6 +195,9 @@ export async function openCageSsh({ ctx, name, publicKey, token, xellToken }) {
   const envLines = [];
   if (token) envLines.push(`ANTHROPIC_AUTH_TOKEN=${token}`);
   if (xellToken) envLines.push(`ZEEHIVE_XELL_TOKEN=${xellToken}`);
+  // Where the `zee` CLI finds the queenzee. Explicit (not the CLI's baked default) so a
+  // containerized queenzee can re-aim every cage by config alone (CAGE_API_BASE).
+  envLines.push(`ZEEHIVE_API=${config.cageApiBase}`);
   if (envLines.length) env.push('-e', `CAGE_ENV=${envLines.join('\n')}`);
   const r = await dk(ctx, ['exec', '-u', '0', ...env, name, 'bash', '/usr/local/bin/cage-sshd.sh']);
   return r.out.trim();
@@ -300,6 +304,7 @@ export function runZee({ ctx, name, prompt, model, token, xellToken, onEvent }) 
     // it to prove WHICH xell is calling. Injected alongside the Claude token — same door, and the
     // firewall already allows the queenzee host:port.
     ...(xellToken ? ['-e', `ZEEHIVE_XELL_TOKEN=${xellToken}`] : []),
+    '-e', `ZEEHIVE_API=${config.cageApiBase}`,   // same reason as openCageSsh's CAGE_ENV line
     name, 'bash', '-lc',
     `cd /work/repo && claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions${model ? ` --model ${model}` : ''}`];
   const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...cmd];

@@ -75,6 +75,10 @@ async function seed() {
     },
     db: { name: 'omnibiz', user: 'postgres' },
   };
+  if (!config.omnibizRoot) {
+    throw new Error('OMNIBIZ_ROOT is not set — the seed needs the OmniBiz repo path (set it in .env, '
+      + 'e.g. D:\\Repos\\OmniBiz\\omnibiz on the host or /repos/OmniBiz/omnibiz in the container)');
+  }
   const project = await one(
     `INSERT INTO project (name,repo_root,main_branch,docker_ctx_dev,docker_ctx_prod,
         dev_host_ip,prod_host_ip,compose_dev,compose_spinoff,compose_prod,env_file,
