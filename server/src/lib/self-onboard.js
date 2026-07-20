@@ -97,20 +97,42 @@ async function modelOwnStack(projectId) {
     '--format', '{{.Names}}\t{{.Label "com.docker.compose.service"}}']);
   if (ls.status !== 0) throw new Error((ls.stderr || 'docker ps failed').trim().slice(-120));
 
+  // The local daemon as a first-class machine, so the console's matrix has a column for these
+  // containers instead of an 'elsewhere' orphan bucket. Harmless for the pool: process-runner
+  // projects (Zeehive itself) use the project-wide target regardless of machine rows; the
+  // machine_pool row seeds a sane per-machine default for compose projects onboarded later.
+  const machine = await one(
+    `INSERT INTO machine (key, label, docker_ctx, can_build, dev_priority, max_xells)
+     VALUES ('local', 'this machine', 'default', true, 1, 6)
+     ON CONFLICT (key) DO UPDATE SET enabled = machine.enabled RETURNING id`);
+  if (machine) {
+    await q(`INSERT INTO machine_pool (machine_id, project_id, pool_size) VALUES ($1,$2,1)
+             ON CONFLICT DO NOTHING`, [machine.id, projectId]);
+  }
+
   const site = await createSite(projectId, { key: 'local', tier: 'prod', docker_ctx: 'default', is_default: true });
+  // createSite (tier prod) just created the untouchable production xell — link the running
+  // containers to it as its stack, the same 'owns' shape the seed uses, so the PRODUCTION hex
+  // shows them instead of three empty slots.
+  const prodXell = await one(
+    `SELECT id FROM xell WHERE project_id=$1 AND slug='production' AND is_production`, [projectId]);
   for (const line of ls.stdout.split('\n').filter(Boolean)) {
     const [name, service] = line.split('\t');
     const role = SERVICE_ROLE[service];
     if (!role) continue;
-    await q(
+    const c = await one(
       `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, internal_port, conn_ref, site_id, health)
        VALUES ($1,$2,'prod','shared',$3,'default',$4,$5,$6,'up')
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT DO NOTHING RETURNING id`,
       [projectId, role, name,
        role === 'db' ? 5432 : role === 'server' ? 4700 : 5180,
        // parameters, not secrets: the meta-db by its in-network service name
        role === 'db' ? 'postgresql://zeehive@meta-db:5432/zeehive' : null,
        site.id]);
+    if (c && prodXell) {
+      await q(`INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'owns')
+               ON CONFLICT DO NOTHING`, [prodXell.id, c.id]);
+    }
   }
-  logline('boot', `self-onboard: modeled the running stack (compose project '${composeProject}') as prod site 'local'`);
+  logline('boot', `self-onboard: modeled the running stack (compose project '${composeProject}') as prod site 'local' on machine 'local'`);
 }
