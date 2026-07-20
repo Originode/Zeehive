@@ -53,22 +53,39 @@ async function openTerminal(ws, zeeId) {
   // browser xterm has NO scrollback of its own — without tmux mouse mode the wheel is dead air
   // ("i cant even seem to scroll it"). Applied per-attach so cages older than the baked
   // .tmux.conf get it too.
-  const cmd = `tmux new -A -s zee -c /work/repo 'zee-attach.sh ${sid}' \\; set -g mouse on \\; set -g history-limit 50000`;
+  // window-size latest: size the tmux window to the MOST RECENT client, so a lingering
+  // half-closed attach from an earlier open can never clamp a fresh, bigger terminal.
+  const cmd = `tmux new -A -s zee -c /work/repo 'zee-attach.sh ${sid}' \\; set -g mouse on \\; set -g history-limit 50000 \\; set -g window-size latest`;
 
   const conn = new Client();
+  // Listen for client frames from the FIRST moment. The browser sends its real size the instant
+  // the socket opens, but the SSH exec (where the stream lives) is ready only hundreds of ms
+  // later — a handler registered inside the exec callback silently DROPPED that resize, so the
+  // PTY stayed at the hardcoded guess and tmux drew a 100×30 window in a full-size panel until
+  // some later resize (e.g. the fullscreen toggle) got through. Queue what arrives early: the
+  // last size seeds the PTY allocation itself, and queued keystrokes replay once the stream is up.
+  let stream = null;
+  let lastSize = { cols: 100, rows: 30 };   // fallback only — normally overwritten before exec
+  const earlyInput = [];
+  ws.on('message', (raw) => {
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.t === 'i') { if (stream) stream.write(msg.d); else earlyInput.push(msg.d); }
+    else if (msg.t === 'r' && msg.cols && msg.rows) {
+      lastSize = { cols: msg.cols, rows: msg.rows };
+      if (stream) stream.setWindow(msg.rows, msg.cols, 0, 0);
+    }
+  });
+  ws.on('close', () => { try { stream?.close(); } catch {} conn.end(); });
   conn.on('ready', () => {
-    conn.exec(cmd, { pty: { term: 'xterm-256color', cols: 100, rows: 30 } }, (err, stream) => {
+    conn.exec(cmd, { pty: { term: 'xterm-256color', cols: lastSize.cols, rows: lastSize.rows } }, (err, s) => {
       if (err) return fail(`exec failed: ${err.message}`);
-      logline('cage', `terminal attached to ${zee.slug} (${sid ? 'resume ' + sid.slice(0, 8) : 'shell'})`);
+      stream = s;
+      logline('cage', `terminal attached to ${zee.slug} (${sid ? 'resume ' + sid.slice(0, 8) : 'shell'}, ${lastSize.cols}x${lastSize.rows})`);
+      stream.setWindow(lastSize.rows, lastSize.cols, 0, 0);   // in case the size moved between exec and now
+      for (const d of earlyInput.splice(0)) stream.write(d);
       stream.on('data', (d) => send(d));
       stream.stderr.on('data', (d) => send(d));
       stream.on('close', () => { try { ws.close(); } catch {} conn.end(); });
-      ws.on('message', (raw) => {
-        let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-        if (msg.t === 'i') stream.write(msg.d);
-        else if (msg.t === 'r' && msg.cols && msg.rows) stream.setWindow(msg.rows, msg.cols, 0, 0);
-      });
-      ws.on('close', () => { try { stream.close(); } catch {} conn.end(); });
     });
   });
   conn.on('error', (e) => fail(`ssh error: ${e.message}`));
