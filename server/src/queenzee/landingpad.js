@@ -61,6 +61,15 @@ export async function buildLandingPad(projectId) {
     (await q(`SELECT xell_id FROM deploy_lock WHERE project_id=$1 AND container='land'`, [pid]))
       .map((l) => l.xell_id));
 
+  return { ...composePad({ landings, ships, merging }), enabled: ENABLED };
+}
+
+// The PURE transform behind buildLandingPad: merge landing + ship rows, label each with its runway
+// phase, sort chronologically (FIFO), number the in-flight ones, and flag what is on the pad now /
+// next up. Split out from the DB fetch so the ordering rules can be exercised without a database
+// (server/db tiers don't run for Zeehive's own self-spinoffs). `merging` is the set of xell_ids
+// currently holding the land merge lock (a landing mid ref-move).
+export function composePad({ landings = [], ships = [], merging = new Set() }) {
   const phaseOf = (r, kind) => {
     if (r.status === 'pending') return 'awaiting-approval';
     if (kind === 'landing') {
@@ -100,7 +109,7 @@ export async function buildLandingPad(projectId) {
   if (!processing) { next = items.find((it) => it.phase === 'queued') || null; if (next) next.next = true; }
 
   const active = items.filter((it) => inFlight.has(it.phase)).length;
-  return { items, processing, next, active, enabled: ENABLED };
+  return { items, processing, next, active };
 }
 
 // ── the FIFO gate the two lanes consult ───────────────────────────────────────
