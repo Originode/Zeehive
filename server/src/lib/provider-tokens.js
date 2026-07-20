@@ -14,6 +14,16 @@ export const PROVIDERS = {
     // sk-ant-oat01-<base64ish>; stay loose on the tail so a format tweak upstream doesn't lock us out
     valid: (t) => /^sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}$/.test(t),
   },
+  // Stored for the coming multi-provider dispatch — no zee runtime consumes it yet, so
+  // connecting it is inert until an OpenAI-backed runtime lands. sk-ant-… is explicitly
+  // rejected so a Claude token pasted in the wrong slot fails loudly instead of sitting dormant.
+  openai: {
+    key: 'openai',
+    label: 'OpenAI (ChatGPT)',
+    command: 'https://platform.openai.com/api-keys',
+    steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. No zee runtime uses it yet — this slot is for the coming multi-provider dispatch.',
+    valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
+  },
   // GitHub is INBOUND-ONLY (migration 032): this token is used exclusively by clone/pull fetches
   // in lib/remote-git.js — nothing in Zeehive can push, so a Contents:Read-only PAT is all it
   // should ever be granted.
