@@ -67,7 +67,7 @@ async function nudgeCagedByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
     logline('nudge', `${zee.slug}: ${why} by ${by} — typing ${JSON.stringify(text)} into the live cage session over SSH (:${sshPort})`);
     // Fire and forget: opening SSH, starting the TUI if needed, and typing can take several seconds;
     // do NOT block the caller (the flower's button) on it.
-    sendKeysToCagedZee({ sshPort, text, sessionId: zee.claude_session_id })
+    sendKeysToCagedZee({ sshPort, slug: zee.slug, text, sessionId: zee.claude_session_id })
       .then(() => logline('nudge', `${zee.slug}: sent ${JSON.stringify(text)} to the live session`))
       .catch((e) => logline('nudge', `${zee.slug}: could not type into the cage (${String(e.message).slice(0, 160)}) — cage/session may be down; no retry`));
 

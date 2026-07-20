@@ -48,6 +48,17 @@ export function ensureZeehiveKeypair() {
   return { privateKeyPath: PRIV, privateKey: Buffer.from(kp.private), publicKey: kp.public.trim() };
 }
 
+// Where the QUEENZEE reaches a cage's sshd. Host mode (default): the published 127.0.0.1 port —
+// the queenzee IS the docker host. Network mode (ZEEHIVE_CAGE_SSH=network, the containerized
+// queenzee): by container name on 22 over zee-cage-net — a container cannot see the host's
+// loopback (seen live 2026-07-20: in-container nudge reported sent, then died in the
+// fire-and-forget SSH). The human's 127.0.0.1 viewer door is unaffected either way.
+export function cageSshDest({ slug, sshPort }) {
+  return process.env.ZEEHIVE_CAGE_SSH === 'network' && slug
+    ? { host: cageName(slug), port: 22 }
+    : { host: '127.0.0.1', port: Number(sshPort) };
+}
+
 // Per-cage host SSH port, bound to 127.0.0.1. A pure function of the slug so it survives a
 // queenzee restart without being stored; ensureCage scans upward on a collision.
 export function cageSshPort(slug) {
@@ -444,14 +455,15 @@ export async function nudgeCagedZee({ ctx = 'default', name, sessionId, prompt, 
 // of the cage — the tmux session and the live interactive claude running in it. Resolves
 // { code, out, err }; rejects on a transport failure or timeout. Pure ssh2 (like terminal-bridge),
 // so it behaves the same on the Windows host as anywhere.
-function sshExecInCage({ sshPort, cmd, timeoutMs = 20000 }) {
+function sshExecInCage({ sshPort, slug, cmd, timeoutMs = 20000 }) {
   const { privateKey } = ensureZeehiveKeypair();
   const { Client } = createRequire(import.meta.url)('ssh2');
+  const dest = cageSshDest({ slug, sshPort });
   return new Promise((resolve, reject) => {
     const conn = new Client();
     let settled = false;
     const done = (fn, arg) => { if (settled) return; settled = true; try { conn.end(); } catch {} fn(arg); };
-    const t = setTimeout(() => done(reject, new Error(`ssh to :${sshPort} timed out after ${timeoutMs}ms`)), timeoutMs);
+    const t = setTimeout(() => done(reject, new Error(`ssh to ${dest.host}:${dest.port} timed out after ${timeoutMs}ms`)), timeoutMs);
     conn.on('ready', () => {
       conn.exec(cmd, (err, stream) => {
         if (err) { clearTimeout(t); return done(reject, err); }
@@ -462,7 +474,7 @@ function sshExecInCage({ sshPort, cmd, timeoutMs = 20000 }) {
       });
     });
     conn.on('error', (e) => { clearTimeout(t); done(reject, new Error(`ssh error: ${e.message}`)); });
-    conn.connect({ host: '127.0.0.1', port: Number(sshPort), username: 'zee', privateKey, readyTimeout: 8000 });
+    conn.connect({ ...dest, username: 'zee', privateKey, readyTimeout: 8000 });
   });
 }
 
@@ -477,8 +489,8 @@ function sshExecInCage({ sshPort, cmd, timeoutMs = 20000 }) {
 // typing, so the keystrokes are not swallowed by a still-loading prompt. `-l` makes tmux send the
 // text LITERALLY (so "status?" can never be read as a key name); a separate Enter submits it.
 // Best-effort by contract — rejects if the cage/SSH is unreachable; the caller just logs it.
-export async function sendKeysToCagedZee({ sshPort, text, sessionId, session = 'zee', enter = true, timeoutMs = 30000 }) {
-  if (!sshPort) throw new Error('no SSH port for this cage');
+export async function sendKeysToCagedZee({ sshPort, slug, text, sessionId, session = 'zee', enter = true, timeoutMs = 30000 }) {
+  if (!sshPort && !slug) throw new Error('no SSH port or slug for this cage');
   const sid = String(sessionId || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — shell-interpolated
   const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;         // safe single-quote for bash
   const sh = [
@@ -490,7 +502,7 @@ export async function sendKeysToCagedZee({ sshPort, text, sessionId, session = '
     ...(enter ? ['sleep 0.2', `tmux send-keys -t ${session} Enter`] : []),
     'echo __ZEE_KEYS_SENT__',
   ].join('; ');
-  const r = await sshExecInCage({ sshPort, cmd: sh, timeoutMs });
+  const r = await sshExecInCage({ sshPort, slug, cmd: sh, timeoutMs });
   if (!/__ZEE_KEYS_SENT__/.test(r.out)) {
     throw new Error(`send-keys did not confirm (exit ${r.code}): ${(r.err || r.out || '').slice(0, 200)}`);
   }

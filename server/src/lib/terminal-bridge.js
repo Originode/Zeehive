@@ -8,7 +8,7 @@
 // {t:'r',cols,rows} resize. server→client is raw terminal bytes (straight into xterm.write).
 import { createRequire } from 'node:module';
 import { one } from '../db/pool.js';
-import { ensureZeehiveKeypair, cageName } from './cage.js';
+import { ensureZeehiveKeypair, cageSshDest } from './cage.js';
 import { logline } from './logbus.js';
 
 const require = createRequire(import.meta.url);
@@ -68,13 +68,7 @@ async function openTerminal(ws, zeeId) {
     });
   });
   conn.on('error', (e) => fail(`ssh error: ${e.message}`));
-  // Host mode (default): the cage publishes 127.0.0.1:<port>:22 on the docker host, and the
-  // queenzee IS that host. Network mode (ZEEHIVE_CAGE_SSH=network): a containerized queenzee
-  // can't see the host's loopback — it joins zee-cage-net and SSHes to the cage by container
-  // name on 22. The published loopback port stays either way (it is the HUMAN's door:
-  // viewer_url / Claude Desktop "Add SSH host" from the Windows side).
-  const dest = process.env.ZEEHIVE_CAGE_SSH === 'network'
-    ? { host: cageName(zee.slug), port: 22 }
-    : { host: '127.0.0.1', port };
-  conn.connect({ ...dest, username: 'zee', privateKey, readyTimeout: 8000 });
+  // cageSshDest: published loopback port in host mode; container name over zee-cage-net in
+  // network mode (ZEEHIVE_CAGE_SSH=network). The human's 127.0.0.1 viewer door is unchanged.
+  conn.connect({ ...cageSshDest({ slug: zee.slug, sshPort: port }), username: 'zee', privateKey, readyTimeout: 8000 });
 }
