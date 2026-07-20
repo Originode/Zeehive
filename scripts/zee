@@ -4,6 +4,7 @@
 // (or an attending human in the cage's SSH shell) doesn't hand-roll curl.
 //
 //   zee status [--wait]
+//   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]
 //   zee land [--wait]
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
@@ -16,8 +17,12 @@
 // Auth is $ZEEHIVE_XELL_TOKEN (injected into the cage env at spawn). The queenzee is reached at
 // host.docker.internal:4700 by default (already firewall-allowed); override with $ZEEHIVE_API.
 //
-// EVERY verb is only a REQUEST that lands on a HUMAN gate. `zee land`/`zee ship`/`zee prod`/`zee done`
-// do not act unilaterally — a human approves in the ZEEHIVE console, then the queenzee does the work.
+// `zee land`/`zee ship`/`zee prod`/`zee done` are each only a REQUEST that lands on a HUMAN gate —
+// they do not act unilaterally; a human approves in the ZEEHIVE console, then the queenzee does the
+// work. `zee build` is the ONE exception: it acts immediately, because building your OWN throwaway
+// app-tier containers (to run e2e tests against your change) needs no human. It collects your cage
+// COMMITS onto the worktree first, then runs the same queenzee build a host-side zee runs, so the
+// built commit/hot flag/health all stay truthful — COMMIT before you build.
 import http from 'node:http';
 import https from 'node:https';
 
@@ -55,6 +60,53 @@ async function pollLanding(secs) {
     // 'pending' / 'approved' → keep waiting (an approval lands automatically).
   }
   console.error(`\n  ✗ TIMEOUT after ${secs}s — still waiting on a human. Your work is safe on your branch.\n`);
+  process.exit(1);
+}
+// Poll self/build/status until no targeted container is 'building', then report whether each is UP
+// and serving THIS cage's HEAD. Bounded — a wait that can hang forever is the very thing it replaces
+// (a zee's curl|grep loop against its own app). Exit 0 = built and serving your HEAD, 1 = failed /
+// not-your-code / timeout. Run it in the BACKGROUND: its exit is your nudge. Prints to stderr so a
+// backgrounded --wait doesn't tangle with the JSON the build POST already printed to stdout.
+async function pollBuild(role, secs, { watch = false } = {}) {
+  const deadline = Date.now() + secs * 1000;
+  let last = '';
+  let first = true;
+  while (Date.now() < deadline) {
+    // --watch answers "is my code live?" immediately; a wait-after-build needs a beat first.
+    if (!first || !watch) await sleep(3000);
+    first = false;
+    let st;
+    try { st = (await req('GET', '/api/xell/self/build/status')).json; }
+    catch (e) { console.error(`  (status unreadable: ${e.message}) — retrying`); continue; }
+    if (!Array.isArray(st?.containers)) {
+      console.error(`\n  ✗ Cannot read build status: ${st?.error || 'unexpected response'}`); process.exit(1);
+    }
+    const want = role === 'all' ? st.containers : st.containers.filter((c) => c.role === role);
+    if (!want.length) { console.error(`\n  ✗ This xell has no ${role} container to build.`); process.exit(1); }
+    const line = want.map((c) => `${c.role}=${c.health}`).join(' ');
+    if (line !== last) { console.error(`  … ${line}`); last = line; }
+    if (want.some((c) => c.health === 'building')) continue;
+
+    // Settled. Report per container, and be explicit about WHY one isn't serving HEAD — "not your
+    // code" with no reason is what sends a zee hunting for a phantom bug.
+    console.error('');
+    let ok = true;
+    for (const c of want) {
+      if (c.health === 'up' && c.serving_head) {
+        console.error(`  ✓ ${c.role} (${c.name}) is UP and serving your HEAD ${String(st.head).slice(0, 8)}`);
+      } else if (c.health === 'up' && c.hot_build) {
+        console.error(`  ⚠ ${c.role} (${c.name}) is UP but was a --hot bounce: it re-used the old image and is NOT running your code. Rebuild without --hot.`); ok = false;
+      } else if (c.health === 'up' && c.never_built) {
+        console.error(`  ⚠ ${c.role} (${c.name}) is UP but the queenzee has never built it, so what it serves is unknown — run \`zee build\`.`); ok = false;
+      } else if (c.health === 'up') {
+        console.error(`  ⚠ ${c.role} (${c.name}) is UP but built at ${String(c.last_build_commit).slice(0, 8)}, not your HEAD ${String(st.head).slice(0, 8)} — your newest commit is not in it. Rebuild.`); ok = false;
+      } else {
+        console.error(`  ✗ ${c.role} (${c.name}) is ${String(c.health).toUpperCase()} — the build FAILED. Check the queenzee terminal (▚_) on the dashboard.`); ok = false;
+      }
+    }
+    process.exit(ok ? 0 : 1);
+  }
+  console.error(`\n  ✗ TIMEOUT after ${secs}s — still building. Something is wrong; check the dashboard.`);
   process.exit(1);
 }
 // --targets takes one-or-more values until the next --flag (or end)
@@ -95,6 +147,7 @@ function usage() {
   console.log(`zee — caged-zee ↔ queenzee verbs (each is a REQUEST that lands on a human gate)
 
   zee status [--wait]                where you stand (task + pending land/ship/prod/done); --wait blocks until a landing is decided
+  zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]   (re)build your OWN app tier to run e2e tests (NOT gated; acts now). --wait blocks until it serves your HEAD (run in background); --watch reports without building; --hot bounces the old image (no code change)
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); --wait blocks until decided (run in background)
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms)
@@ -132,6 +185,28 @@ switch (cmd) {
     if (status === 'landed') process.exit(0);
     if (!w.on) process.exit(0); // held, but not asked to wait — the queenzee will nudge on approval
     if (status === 'held') { await pollLanding(w.secs); } // exits
+    process.exit(0);
+    break;
+  }
+  case 'build': {
+    const role = rest.find((a) => ['server', 'webapp', 'all'].includes(a)) || 'all';
+    const hot = rest.includes('--hot');
+    const watch = rest.includes('--watch');
+    const w = waitFlag();
+    const secs = w.secs || 1200;
+    // --watch: report only, start nothing (read-only "is what's running actually my code?").
+    if (watch) {
+      console.error(`Watching ${role} for this cage (no build started)…`);
+      await pollBuild(role, secs, { watch: true }); // exits
+      break;
+    }
+    const r = await req('POST', '/api/xell/self/build', { role, hot });
+    console.log(JSON.stringify(r.json, null, 2));
+    if (r.code >= 400 || r.json?.ok === false) process.exit(1);
+    if (w.on) {
+      console.error(`\nWaiting up to ${secs}s for the build to settle (asking the queenzee, not guessing)…`);
+      await pollBuild(role, secs, { watch: false }); // exits
+    }
     process.exit(0);
     break;
   }
