@@ -18,7 +18,7 @@ import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
 import MachineMatrix from './Machines.jsx';
-import ZeeTerminal from './ZeeTerminal.jsx';
+import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
 import Dispatch from './Dispatch.jsx';
 import Toasts from './Toasts.jsx';
@@ -143,6 +143,7 @@ export default function App() {
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
   const [loadBackupFor, setLoadBackupFor] = useState(null); // db container to restore a backup INTO
+  const [shellFor, setShellFor] = useState(null); // container to open a docker-exec shell into
 
   // ── honeycomb shell ──────────────────────────────────────────────────────────
   const orientation = useOrientation();          // 'portrait' | 'landscape'
@@ -611,7 +612,10 @@ export default function App() {
       <Toasts toasts={toasts} onDismiss={dismissToast} />
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}
                      projectName={project.name} onDecommissioned={refresh}
-                     onLoadBackup={(c) => setLoadBackupFor(c)} />
+                     onLoadBackup={(c) => setLoadBackupFor(c)}
+                     onShell={(c) => setShellFor(c)} />
+      {/* docker-exec shell into a container, opened from its chip's context menu */}
+      {shellFor && <ContainerTerminal c={shellFor} onClose={() => setShellFor(null)} />}
       {/* Backup selector opened from a db container's "Load backup…" menu item — the same all-backups
           modal the panel uses, but pre-aimed at the container the menu was on so the picked backup
           restores straight into it. */}

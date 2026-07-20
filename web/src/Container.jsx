@@ -165,7 +165,7 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
 // AND idle; a busy container shows a "please wait" note instead so it can't be mangled mid-op.
 // Decommission (stop + remove) is offered on every non-production container behind a second-stage
 // confirmation — production is never a candidate (it isn't even shown), matching the server guard.
-export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, onLoadBackup }) {
+export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, onLoadBackup, onShell }) {
   // Hooks must run unconditionally (before any early return). The build-host picker lists the
   // docker contexts this machine can compile on; loaded lazily the first time a buildable+idle
   // container's menu opens, then cached for the life of the menu component.
@@ -287,6 +287,13 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
         </>
       )}
       {c.url && <a role="menuitem" href={c.url} target="_blank" rel="noopener" onClick={onClose}>↗ Open URL</a>}
+
+      {/* Shell: a docker-exec terminal INSIDE this container. Offered even while busy — opening a
+          shell is observation, not an operation, and mid-restore is exactly when an operator wants
+          to look. The bridge reports its own error if the container is down. */}
+      <button role="menuitem" data-testid="shell-open" onClick={() => { onShell?.(c); onClose(); }}>
+        ⌨ Shell <span className="ctxsub">terminal inside this container</span>
+      </button>
 
       {/* Load backup: db containers only, never production (you never restore OVER prod, and the
           server's target list excludes it). Opens the backup selector pre-aimed at THIS container,

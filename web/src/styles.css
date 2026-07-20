@@ -1106,6 +1106,12 @@ a.cbox:hover { border-color: var(--accent); }
   border-top: 1px solid var(--line); background: var(--panel2);
 }
 .zeeterm-foot input { flex: 1; min-width: 0; }
+/* PRODUCTION container shell: the modal wears the same gold warning its chip does (.cbox.t-prod),
+   so "you are inside prod" is visible the entire session, not just at the click. */
+.zeeterm.prod { border-color: #c9a227; box-shadow: 0 0 14px rgba(201, 162, 39, .35), 0 20px 60px rgba(0,0,0,.55); }
+.term-head.prod { border-bottom: 1px solid rgba(201, 162, 39, .55); background: rgba(201, 162, 39, .08); }
+.term-prodtag { color: #c9a227; border: 1px solid rgba(201, 162, 39, .55); border-radius: 5px;
+  padding: 0 6px; margin-left: 8px; font-size: 10px; letter-spacing: .08em; }
 .tstat { font-size: 11px; padding: 0 6px; border-radius: 5px; margin-left: 8px; }
 .tstat.t-live { color: #35c46b; } .tstat.t-connecting { color: #e0a53b; }
 .tstat.t-closed, .tstat.t-error { color: #e5554e; }
