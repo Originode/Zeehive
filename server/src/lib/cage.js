@@ -434,6 +434,64 @@ export async function nudgeCagedZee({ ctx = 'default', name, sessionId, prompt, 
   return dk(ctx, cmd, { input: prompt, timeoutMs });
 }
 
+// Run ONE command inside a caged zee over the SAME inbound SSH door the browser terminal uses (the
+// fleet key, the host-published port). This reaches what a docker-exec cannot: the human's-eye-view
+// of the cage — the tmux session and the live interactive claude running in it. Resolves
+// { code, out, err }; rejects on a transport failure or timeout. Pure ssh2 (like terminal-bridge),
+// so it behaves the same on the Windows host as anywhere.
+function sshExecInCage({ sshPort, cmd, timeoutMs = 20000 }) {
+  const { privateKey } = ensureZeehiveKeypair();
+  const { Client } = createRequire(import.meta.url)('ssh2');
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let settled = false;
+    const done = (fn, arg) => { if (settled) return; settled = true; try { conn.end(); } catch {} fn(arg); };
+    const t = setTimeout(() => done(reject, new Error(`ssh to :${sshPort} timed out after ${timeoutMs}ms`)), timeoutMs);
+    conn.on('ready', () => {
+      conn.exec(cmd, (err, stream) => {
+        if (err) { clearTimeout(t); return done(reject, err); }
+        let out = '', errOut = '';
+        stream.on('data', (d) => (out += d.toString()));
+        stream.stderr.on('data', (d) => (errOut += d.toString()));
+        stream.on('close', (code) => { clearTimeout(t); done(resolve, { code, out, err: errOut }); });
+      });
+    });
+    conn.on('error', (e) => { clearTimeout(t); done(reject, new Error(`ssh error: ${e.message}`)); });
+    conn.connect({ host: '127.0.0.1', port: Number(sshPort), username: 'zee', privateKey, readyTimeout: 8000 });
+  });
+}
+
+// TYPE literal text into a caged zee's LIVE interactive claude — the exact session a human watches
+// in the dashboard terminal — by sending keystrokes to its tmux session over SSH, as if the operator
+// typed them there. This is what a "nudge" should be: poke the running agent IN PLACE so its reply
+// lands where the operator is looking. Contrast nudgeCagedZee, which forks a SECOND `claude --resume
+// -p` whose output goes to a queenzee log nobody reads (hence "nudge does not work").
+//
+// If no interactive session is up yet, one is started with the SAME `zee-attach.sh` command the
+// terminal bridge uses (attach-or-create, detached) and we give the TUI a beat to come alive before
+// typing, so the keystrokes are not swallowed by a still-loading prompt. `-l` makes tmux send the
+// text LITERALLY (so "status?" can never be read as a key name); a separate Enter submits it.
+// Best-effort by contract — rejects if the cage/SSH is unreachable; the caller just logs it.
+export async function sendKeysToCagedZee({ sshPort, text, sessionId, session = 'zee', enter = true, timeoutMs = 30000 }) {
+  if (!sshPort) throw new Error('no SSH port for this cage');
+  const sid = String(sessionId || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — shell-interpolated
+  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;         // safe single-quote for bash
+  const sh = [
+    // Attach-or-create the interactive session; only sleep when we actually just started it, so an
+    // already-open terminal (the common case) receives the keys with no added latency.
+    `if tmux has-session -t ${session} 2>/dev/null; then :; ` +
+      `else tmux new-session -d -s ${session} -x 200 -y 50 -c /work/repo 'zee-attach.sh ${sid}'; sleep 6; fi`,
+    `tmux send-keys -t ${session} -l ${sq(text)}`,
+    ...(enter ? ['sleep 0.2', `tmux send-keys -t ${session} Enter`] : []),
+    'echo __ZEE_KEYS_SENT__',
+  ].join('; ');
+  const r = await sshExecInCage({ sshPort, cmd: sh, timeoutMs });
+  if (!/__ZEE_KEYS_SENT__/.test(r.out)) {
+    throw new Error(`send-keys did not confirm (exit ${r.code}): ${(r.err || r.out || '').slice(0, 200)}`);
+  }
+  return { sent: true, text };
+}
+
 export async function removeCage({ ctx, slug }) {
   await dk(ctx, ['rm', '-f', cageName(slug)]).catch(() => {});
 }
