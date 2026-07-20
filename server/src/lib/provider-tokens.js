@@ -15,29 +15,25 @@ export const PROVIDERS = {
     // sk-ant-oat01-<base64ish>; stay loose on the tail so a format tweak upstream doesn't lock us out
     valid: (t) => /^sk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}$/.test(t),
   },
-  // Stored for the coming multi-provider dispatch — no zee runtime consumes it yet, so
-  // connecting it is inert until an OpenAI-backed runtime lands. sk-ant-… is explicitly
-  // rejected so a Claude token pasted in the wrong slot fails loudly instead of sitting dormant.
+  // The GPT runtime will be the literal ChatGPT Codex CLI (OPENAI_API_KEY auth) — this slot
+  // holds its key, inert until that runtime lands. sk-ant-… is explicitly rejected so a Claude
+  // token pasted in the wrong slot fails loudly instead of sitting dormant.
   openai: {
     key: 'openai',
-    label: 'OpenAI (ChatGPT)',
+    label: 'ChatGPT Codex',
     command: 'https://platform.openai.com/api-keys',
-    steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. No zee runtime uses it yet — this slot is for the coming multi-provider dispatch.',
+    steps: 'Create an API key on the OpenAI platform (sk-… or sk-proj-…) and paste it below; it is stored only in the meta-DB. Dispatch activates when the Codex CLI runtime lands.',
     valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
-  // Same story as openai: stored for the coming multi-provider dispatch, inert until a
-  // Kimi-backed runtime lands. Moonshot keys are OpenAI-shaped (sk-…), so only the sk-ant-
-  // mispaste is detectable — the slots themselves keep the keys apart.
+  // Mark's ruling (2026-07-20): NOT Kimi-via-claude-CLI shims — the Kimi runtime will be the
+  // literal Kimi Code CLI, whose dedicated CODING key comes from kimi.com/code/console (a
+  // different credential than a Moonshot Open Platform key). Inert until that runtime lands.
   kimi: {
     key: 'kimi',
-    label: 'Kimi (Moonshot)',
-    // Moonshot exposes an ANTHROPIC-COMPATIBLE endpoint, so a Kimi zee is the same cxell
-    // `claude --bare` aimed at a different base URL — a real runtime today, not a placeholder.
-    dispatch: true,
-    anthropicBaseUrl: 'https://api.moonshot.ai/anthropic',
-    command: 'https://platform.moonshot.ai/console/api-keys',
-    steps: 'Create an API key on the Moonshot platform (sk-…) and paste it below; it is stored only in the meta-DB. No zee runtime uses it yet — this slot is for the coming multi-provider dispatch.',
-    valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
+    label: 'Kimi Code',
+    command: 'https://kimi.com/code/console',
+    steps: 'Create a dedicated CODING key in the Kimi Code console (not a Moonshot platform key) and paste it below; it is stored only in the meta-DB. Dispatch activates when the Kimi Code CLI runtime lands.',
+    valid: (t) => /^[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
   // GitHub is INBOUND-ONLY (migration 032): this token is used exclusively by clone/pull fetches
   // in lib/remote-git.js — nothing in Zeehive can push, so a Contents:Read-only PAT is all it
