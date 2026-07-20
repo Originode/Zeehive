@@ -14,6 +14,7 @@ import { gitLog, diffStat, cleanGitEnv } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
 import { nudgeXellAfterLand } from './nudge.js';
+import { shouldProcessNow, processPad } from './landingpad.js';
 
 const ZERO = /^0+$/;
 
@@ -226,6 +227,15 @@ async function landApproved(row, by = 'human') {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
   if (!project) return row;
 
+  // THE LANDING PAD's FIFO gate. This approval is real, but the runway may be busy (a ship building,
+  // another landing merging) or an EARLIER approval may be ahead in line. If so, leave the row
+  // 'approved' and wait our turn — the pad driver (or a later tick) picks it up when it reaches the
+  // head of the line. A lone approved item is always the head, so nothing changes for the common case.
+  if ((await shouldProcessNow(row.project_id, 'landing', row.id)) === 'wait') {
+    logline('landgate', `${row.new_sha.slice(0, 8)} QUEUED on the landing pad — waiting its turn (FIFO)`);
+    return { ...row, queued: true };
+  }
+
   const { state, tip } = ffState(project.repo_root, row.ref, row.new_sha);
 
   if (state === 'already') {
@@ -303,6 +313,9 @@ async function landApproved(row, by = 'human') {
     // Primary async-continuation: if a CAGED zee raised this, resume its session so it ships/does
     // done with no human re-invocation. Best-effort and logged (a dead cage just logs).
     nudgeXellAfterLand(row.xell_id, { by }).catch(() => {});
+    // The runway is free again — pull the next item onto the pad promptly rather than waiting for
+    // the next tick. Best-effort: the tick is the backstop.
+    setImmediate(() => processPad(row.project_id).catch(() => {}));
     return landed || row;
   }
 

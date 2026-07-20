@@ -780,6 +780,43 @@ a.cbox:hover { border-color: var(--accent); }
 .lock-hold:hover:not(:disabled) { background: rgba(53,196,107,.12); }
 .lock-hold:disabled { opacity: .5; cursor: default; }
 
+/* ── the landing pad — one chronological FIFO runway for landings + shipments ──
+   A view of the queue the queenzee works through, not a decision surface. The item on the pad
+   spins; the next one carries a quiet dot; receipts fade. */
+.pad-panel { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  padding: 12px 14px; margin: 12px 0; }
+.pad-title { color: var(--muted); font-weight: 600; font-size: 13px; letter-spacing: .02em;
+  text-transform: uppercase; margin-bottom: 8px; }
+.pad-sub { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--muted); }
+.pad-sub b { color: var(--text); font-weight: 600; }
+.pad-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.pad-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 7px;
+  background: var(--panel2); border: 1px solid transparent; font-size: 13px; }
+.pad-row.on-pad { border-color: var(--building); box-shadow: 0 0 0 1px rgba(90,150,255,.18); }
+.pad-row.next-up { border-color: var(--ready); }
+.pad-row.pad-done, .pad-row.pad-rejected, .pad-row.pad-stale { opacity: .6; }
+.pad-pos { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; color: var(--muted);
+  min-width: 26px; text-align: right; }
+.pad-ico { font-size: 15px; color: var(--accent); width: 16px; text-align: center; }
+.pad-what { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pad-what code { color: var(--accent); font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; }
+.pad-verb { color: var(--muted); }
+.pad-commits { color: var(--muted); font-size: 12px; }
+.pad-phase { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600;
+  white-space: nowrap; }
+.pad-phase.pad-await { color: var(--error); }
+.pad-phase.pad-queued { color: var(--muted); }
+.pad-phase.pad-proc { color: var(--building); }
+.pad-phase.pad-done { color: var(--ready); }
+.pad-phase.pad-failed, .pad-phase.pad-rejected { color: var(--error); }
+.pad-phase.pad-stale { color: var(--muted); }
+.pad-age { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px; color: var(--muted);
+  min-width: 30px; text-align: right; }
+.pad-spin { width: 11px; height: 11px; border: 2px solid var(--line); border-top-color: var(--building);
+  border-radius: 50%; display: inline-block; animation: toast-spin .7s linear infinite; box-sizing: border-box; }
+.pad-nextdot { width: 7px; height: 7px; border-radius: 50%; background: var(--ready); display: inline-block;
+  animation: cardflash 1.6s ease-in-out infinite; }
+
 /* Release now — amber, matching the countdown clock it short-circuits: this button does what the
    timer was already going to do, just now. Green stays reserved for HOLD (keep/protect), so the two
    choices the bar poses never wear the same colour. Not red: releasing is the DEFAULT outcome, not

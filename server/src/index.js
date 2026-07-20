@@ -16,6 +16,7 @@ import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { startLandReaper } from './queenzee/landgate.js';
+import { startLandingPad } from './queenzee/landingpad.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
 
@@ -112,6 +113,7 @@ const server = app.listen(config.port, () => {
   startMaintenance();
   startShipReaper();
   startLandReaper();
+  startLandingPad();
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();
