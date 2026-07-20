@@ -43,20 +43,25 @@ New Project → Clone from GitHub. Staged, each step reversible:
    injected from `CAGE_API_BASE`. Container self-ship is `scripts/self-ship-container.sh`
    (sync → build → sibling `docker:cli` recreate) — selected per-site via the container row's
    `build_script`, so host and container eras coexist as data.
-3. **Parallel run** — the container (compose profile `experimental`, :4701) against a THROWAWAY
-   meta-DB: two queenzees reconciling one meta-DB reap each other's xells, so the env
-   deliberately has no default `DATABASE_URL`. Pre-create the cage network once
-   (`docker network create zee-cage-net`) — compose joins it as external; normally the first
-   `ensureCage` creates it, but the server service now needs it at start. Then: New Project →
-   Clone (Zeehive itself, into `/repos`), connect the claude token, dispatch a dummy caged zee
-   end-to-end, self-ship on the throwaway instance.
+3. **Parallel run** — the container (compose profile `experimental`, :4701) against the NEW
+   ERA'S OWN meta-DB (`meta-db` service, volume `zeehive_meta_data`) — which is not a throwaway:
+   it is the database the new instance keeps forever. Decided 2026-07-20: NOTHING is migrated
+   from the old zeehive_db — the new world starts fresh (projects onboarded from GitHub, fresh
+   xells), and the old instance keeps its data until it retires. The DATABASE_URL default is the
+   in-compose meta-db (it can never resolve to the old zeehive_db, so the two-queenzees guard
+   holds); ZEEHIVE_DATABASE_URL still overrides for scratch experiments. Pre-create the cage
+   network once (`docker network create zee-cage-net`) — compose joins it as external. Then:
+   New Project → Clone (Zeehive itself, into `/repos`), connect the claude + github tokens, set
+   the spawn template to db-isolated, dispatch a caged zee end-to-end, self-ship.
 4. **Zees stay caged** — the all-caged runtime is the endgame; credentials come from the
    meta-DB (`provider_token`), so NO `~/.claude` mount is needed for zees. Losses to design
    around: `claude://` deep links can't open Claude Desktop into a container, and host-session
    observability (sessions.js reads of `CLAUDE_HOME`) retires with host zees.
-5. **Cutover** — after the zero-xell reset: host queenzee stops, container takes :4700 (drop the
-   `experimental` profile, flip the port), projects re-created via the clone flow,
-   `zeehive_server`'s row flips from process role (`docker_ctx` NULL, URL-probed) to a real
-   container row on `desktop-linux`. Host-zee code paths (local SDK spawn, `claude remote`,
-   their monitor passes, hooks/skill host surface) are disabled via `agent_runtime` first,
-   deleted in a later cleanup ship.
+5. **Cutover** — NO data migration, ever (2026-07-20): the new instance keeps its own fresh
+   meta-db; the old zeehive_db is never reused. OmniBiz stays on the OLD instance until it is
+   onboarded FRESH on the new one (GitHub clone, fresh xells); the old instance and its data are
+   left untouched until then. When the old instance retires: container takes :4700 (drop the
+   `experimental` profile, flip the port), old zeehive_db + host process stop, old worktrees/
+   containers are decommissioned at Mark's pace. Host-zee code paths (local SDK spawn, `claude
+   remote`, their monitor passes, hooks/skill host surface) are disabled via `agent_runtime`
+   first, deleted in a later cleanup ship.

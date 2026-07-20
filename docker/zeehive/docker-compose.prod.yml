@@ -40,6 +40,30 @@ services:
       zeehive.project: Zeehive
       zeehive.role: webapp
 
+  # The NEW ERA's meta-DB (decided 2026-07-20): the containerized queenzee starts from a FRESH
+  # database — nothing is ever migrated from the old zeehive_db above, which keeps serving the
+  # host-era instance until it retires. Its own named volume; 5447 on the host for humans/psql.
+  meta-db:
+    profiles: ["experimental"]
+    image: postgres:17-alpine
+    container_name: zeehive_meta_db
+    restart: unless-stopped
+    ports: ["5447:5432"]
+    environment:
+      POSTGRES_USER: zeehive
+      POSTGRES_PASSWORD: zeehive
+      POSTGRES_DB: zeehive
+    volumes:
+      - zeehive_meta_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeehive"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    labels:
+      zeehive.project: Zeehive
+      zeehive.role: db
+
   server:
     profiles: ["experimental"]
     build: { context: ../.., dockerfile: docker/zeehive/Dockerfile.server }
@@ -47,9 +71,13 @@ services:
     container_name: zeehive_server_ctr    # _ctr: never shadow the live host process's row name
     restart: unless-stopped
     ports: ["4701:4700"]                  # 4701 while experimental — the host queenzee owns 4700
+    depends_on:
+      meta-db: { condition: service_healthy }
     environment:
-      DATABASE_URL: ${ZEEHIVE_DATABASE_URL:-}   # NEVER default to the live meta-DB: two queenzees
-                                                # reconciling one meta-DB reap each other's xells
+      # Defaults to the NEW era's own meta-db (same compose network — it can never resolve to the
+      # old zeehive_db, so the two-queenzees-one-meta-DB failure class stays impossible). The
+      # ZEEHIVE_DATABASE_URL override remains for pointing a scratch instance elsewhere.
+      DATABASE_URL: ${ZEEHIVE_DATABASE_URL:-postgres://zeehive:zeehive@meta-db:5432/zeehive}
       DOCKER_HOST: unix:///var/run/docker.sock  # 'default' context = the mounted local daemon
       PROVISION_MODE: ${ZEEHIVE_CTR_PROVISION_MODE:-real}   # worktrees are real here — they live
                                                             # on the container's own /repos volume
@@ -82,5 +110,6 @@ networks:
 volumes:
   zeehive_repos:
   zeehive_db_data:
+  zeehive_meta_data:
   zeehive_ssh:
   zeehive_backups:
