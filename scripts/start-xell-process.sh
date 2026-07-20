@@ -27,9 +27,14 @@ if [ "$MODE" = "simulate" ]; then emit true "simulate"; exit 0; fi
 if [ ! -d "$WT" ]; then emit false "no-worktree"; exit 1; fi
 
 # The worktree must be able to run at all — a pooled xell may never have had npm install.
+# `npm ci` NOT `npm install`: install rewrites package-lock.json, the pool reads that as a
+# dirty worktree and decommissions the xell right after its first build — an endless
+# provision→build→reap loop (seen live on the boot instance, 2026-07-20). ci never touches
+# the lock; plain install remains the fallback for a worktree without one.
 if [ ! -d "$WT/node_modules" ]; then
-  echo "node_modules missing — npm install (first start of this worktree)" >&2
-  (cd "$WT" && npm install --no-audit --no-fund) >&2 || { emit false "npm-install-failed"; exit 1; }
+  echo "node_modules missing — npm ci (first start of this worktree)" >&2
+  (cd "$WT" && { [ -f package-lock.json ] && npm ci --no-audit --no-fund || npm install --no-audit --no-fund; }) >&2 \
+    || { emit false "npm-install-failed"; exit 1; }
 fi
 
 # Kill whatever already listens on this role's port (restart semantics), then start detached.
