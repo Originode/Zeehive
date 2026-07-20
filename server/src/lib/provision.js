@@ -353,6 +353,9 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       if (mode === 'real') {
         const run = spawnSync('docker',
           ['--context', devCtx, 'run', '-d', '--name', nmDb.container, '--restart', 'unless-stopped',
+           // on the cxell network: the queenzee container and every cxell resolve it BY NAME —
+           // the published host port below is the HUMAN's door (psql from the host)
+           '--network', 'zee-hive-net',
            '-p', `${dbPort}:5432`,
            '-e', `POSTGRES_USER=${dbUser}`, '-e', `POSTGRES_PASSWORD=${dbPass}`, '-e', `POSTGRES_DB=${dbName}`,
            '--label', `zeehive.project=${project.name}`, '--label', 'zeehive.role=db',
@@ -395,12 +398,19 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
         }
       }
       // conn_ref stays passwordless (parameters, not secrets) — emitXellEnv injects the
-      // manifest's committed dev credential for process xells.
+      // manifest's committed dev credential for process xells. The HOST in it depends on where
+      // the consumers run: a containerized queenzee's process xells and its cxells resolve the
+      // db by CONTAINER NAME over zee-hive-net (localhost:<published port> is the container's
+      // own empty loopback — seen live: the first in-container process start died on connect
+      // and its port never answered); the host era keeps the published-port form.
+      const inContainer = existsSync('/.dockerenv');
+      const connRef = inContainer
+        ? `postgresql://${dbUser}@${nmDb.container}:5432/${dbName}`
+        : `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`;
       const { rows: [dbc] } = await client.query(
         `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,owner_xell_id,site_id,health)
          VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10) RETURNING id`,
-        [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort,
-         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`,
+        [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort, connRef,
          xell.id, devSiteId, mode === 'real' ? 'up' : 'unknown']);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
     }
