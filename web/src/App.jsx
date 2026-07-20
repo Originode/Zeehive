@@ -3,7 +3,7 @@ import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markD
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell } from './api.js';
-import { showAlert } from './Dialog.jsx';
+import { showAlert, showConfirm } from './Dialog.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 import HiveCanvas from './hive/HiveCanvas.jsx';
