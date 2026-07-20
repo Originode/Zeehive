@@ -408,7 +408,7 @@ export default function App() {
 
   // The flower's canvas action buttons dispatch here (HiveCanvas onAction) — same verbs the old DOM
   // toolbar/drawer ran, with the same confirmations, so nothing changed but WHERE they are clicked.
-  const handleFlowerAction = (kind, x, diff) => {
+  const handleFlowerAction = async (kind, x, diff) => {
     if (!x || x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
@@ -421,15 +421,16 @@ export default function App() {
       return;
     }
     if (kind === 'push' || kind === 'land') {
-      if (!confirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
+      if (!(await showConfirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
-        + `Your commits stay on the branch either way.`)) return;
+        + `Your commits stay on the branch either way.`, { okLabel: 'Land' }))) return;
       pushXell(x.id).then((r) => { if (r?.landed === false) showAlert(r.reason || 'push held at the gate'); refresh(); })
         .catch((e) => showAlert('Push failed: ' + (e?.message || e), { variant: 'error' })); return;
     }
     if (kind === 'ship') {
-      if (!confirm(`Ship ${x.slug} to PRODUCTION?\n\nThis files a ship request. It is REFUSED unless the work is `
-        + `already landed on main; a human then approves it in the ship panel, and the queenzee deploys from main.`)) return;
+      if (!(await showConfirm(`Ship ${x.slug} to PRODUCTION?\n\nThis files a ship request. It is REFUSED unless the work is `
+        + `already landed on main; a human then approves it in the ship panel, and the queenzee deploys from main.`,
+        { variant: 'danger', okLabel: 'Request ship' }))) return;
       const id = `ship-${x.id}-${Date.now()}`;
       pushToast({ id, kind: 'progress', title: `Requesting ship of ${x.slug}…` });
       requestShipXell(x.id, `ship ${x.slug} from the dashboard`).then((r) => {
@@ -457,15 +458,16 @@ export default function App() {
     }
     if (kind === 'pull') {
       const dirty = diff?.dirty || 0;
-      if (!confirm(`Pull ${src} into ${x.slug}?\n\nMerges ${src} into ${x.slug}'s working tree on disk`
+      if (!(await showConfirm(`Pull ${src} into ${x.slug}?\n\nMerges ${src} into ${x.slug}'s working tree on disk`
         + `${x.zee_status === 'working' ? ' — its zee is still working in there' : ''}.`
-        + (dirty > 0 ? `\n\n⚠ ${dirty} uncommitted file(s): this will be REFUSED (commit or stash first).` : ''))) return;
+        + (dirty > 0 ? `\n\n⚠ ${dirty} uncommitted file(s): this will be REFUSED (commit or stash first).` : ''),
+        { okLabel: 'Pull' }))) return;
       pullXell(x.id).then((r) => { if (r?.merged === false) showAlert(r.reason || 'pull refused'); refresh(); })
         .catch((e) => showAlert('Pull failed: ' + (e?.message || e), { variant: 'error' })); return;
     }
     if (kind === 'pr') {
-      if (!confirm(`Raise a PR from ${x.slug} → ${src}?\n\nNothing moves now: it appears on ${src}'s card, and a `
-        + `human accepts it there.`)) return;
+      if (!(await showConfirm(`Raise a PR from ${x.slug} → ${src}?\n\nNothing moves now: it appears on ${src}'s card, and a `
+        + `human accepts it there.`, { okLabel: 'Raise PR' }))) return;
       prXell(x.id).then(refresh).catch((e) => showAlert('PR failed: ' + (e?.message || e), { variant: 'error' })); return;
     }
   };
@@ -644,7 +646,8 @@ function AutoApprove({ project, projectId, onChanged }) {
   const [busy, setBusy] = useState(false);
   const set = async (field, checked) => {
     if (field === 'auto_approve_ship' && checked
-      && !confirm('Auto-approve PRODUCTION ships?\n\nEvery ship request will deploy to prod immediately with NO human review. The queenzee still only builds landed work from main, but nobody signs off per ship.')) return;
+      && !(await showConfirm('Auto-approve PRODUCTION ships?\n\nEvery ship request will deploy to prod immediately with NO human review. The queenzee still only builds landed work from main, but nobody signs off per ship.',
+        { variant: 'danger', okLabel: 'Enable auto-approve' }))) return;
     setBusy(true);
     try { await updateProject(projectId, { [field]: checked }); onChanged?.(); }
     catch (e) { showAlert('Auto-approve change failed: ' + e.message, { variant: 'error' }); }
@@ -749,13 +752,14 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
   // a reason for more friction: marking done is the human's job (House rule 4), and a live zee
   // whose work is already on main loses nothing when it goes — you just restart it.
   const active = !!x.zee_id && (x.cli_active === true || ['spawning', 'online', 'working'].includes(x.zee_status));
-  const ok = window.confirm(
+  const ok = await showConfirm(
     `${x.task_id ? 'Mark done' : 'Decommission'} "${x.slug}"?` +
     (active ? `\n\nIts zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills the agent mid-task.\n` : '') +
     inUseText +
     atStake +
     `\nThis removes its worktree, branch, and per-xell containers, and decommissions its zee` +
-    `${x.holds_prod_lock ? ' (it currently HOLDS the prod lock)' : ''}.\nThis cannot be undone.`);
+    `${x.holds_prod_lock ? ' (it currently HOLDS the prod lock)' : ''}.\nThis cannot be undone.`,
+    { variant: 'danger', okLabel: x.task_id ? 'Mark done' : 'Decommission' });
   if (!ok) return;
   // The hard gate — a typed-name confirmation — fires whenever something real is at stake:
   //   • a LIVE zee is in there (active): a claimed xell with a running agent must never go on a
@@ -764,7 +768,7 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
   //   • a pending decision (landing/PR/ship) that would be CANCELLED.
   // A clean, idle/pooled xell with none of these still costs only the single confirm above.
   if (unlanded || inUse || active) {
-    const typed = window.prompt(
+    const typed = await showPrompt(
       `"${x.slug}" is not safe to remove without confirmation:\n` +
       (active ? `  • its zee is still ${x.zee_status}${x.cli_active ? ' (really active)' : ''} — this kills it mid-task\n` : '') +
       (diff?.ahead > 0 ? `  • ${diff.ahead} commit(s) not landed\n` : '') +
@@ -772,7 +776,8 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
       (heldLanding ? `  • ${heldLanding} landing held for approval\n` : '') +
       (openPr ? `  • ${openPr} open PR\n` : '') +
       (pendingShip ? `  • a production ship is ${pendingShip}\n` : '') +
-      `\nProceeding is irreversible. To confirm, type: done`);
+      `\nProceeding is irreversible. To confirm, type: done`,
+      { variant: 'danger', placeholder: 'type: done', okLabel: 'Confirm', title: 'Type to confirm' });
     if ((typed || '').trim().toLowerCase() !== 'done') { if (typed !== null) showAlert('Not confirmed — type "done" to proceed. Nothing was touched.'); return; }
   }
   try {
@@ -1127,11 +1132,11 @@ function PrCard({ req, onDone, onDismiss }) {
   const stat = req.stat || {};
 
   const accept = async () => {
-    if (!confirm(
+    if (!(await showConfirm(
       `Accept ${req.xell_slug}'s PR into ${(req.ref || '').replace('refs/heads/', '')}?\n\n`
       + `This fast-forwards to ${String(req.new_sha).slice(0, 10)} — the exact commit listed here. `
       + `It cannot pull in anything you haven't read: if it is no longer a fast-forward, it is `
-      + `refused rather than merged.`)) return;
+      + `refused rather than merged.`, { okLabel: 'Accept PR' }))) return;
     setBusy(true); setErr(null);
     try {
       const r = await acceptPull(req.id);
@@ -1207,36 +1212,36 @@ function XourceActions({ x, diff, onDone }) {
     finally { setBusy(null); }
   };
 
-  const push = () => {
-    if (!confirm(
+  const push = async () => {
+    if (!(await showConfirm(
       `Push ${x.slug} → ${src}?\n\n`
       + `This runs the same gated push a zee runs. Unless a human has ALREADY approved this exact `
       + `commit, the gate will HOLD it and raise it for verification — that is the expected outcome, `
-      + `not a failure.\n\nNothing is lost either way: your commits stay on the branch.`)) return;
+      + `not a failure.\n\nNothing is lost either way: your commits stay on the branch.`, { okLabel: 'Push' }))) return;
     run('push', () => pushXell(x.id));
   };
 
-  const pull = () => {
+  const pull = async () => {
     // Say whose worktree is about to move, and warn BEFORE the click rather than let the server's
     // refusal be the first time you hear about it. The server refuses dirty anyway — this is so a
     // human knows what they are aiming at, not a substitute for that check.
     const dirty = diff?.dirty || 0;
-    if (!confirm(
+    if (!(await showConfirm(
       `Pull ${src} into ${x.slug}?\n\n`
       + `This merges ${src} into ${x.slug}'s WORKING TREE on disk`
       + `${x.zee_status === 'working' ? ' — and its zee is still working in there right now' : ''}.\n`
       + (dirty > 0
         ? `\n⚠ It has ${dirty} uncommitted file(s). This will be REFUSED: merging over a dirty tree `
           + `can entangle in-progress work with the merge. Commit or stash first.\n`
-        : ''))) return;
+        : ''), { okLabel: 'Pull' }))) return;
     run('pull', () => pullXell(x.id));
   };
 
-  const pr = () => {
-    if (!confirm(
+  const pr = async () => {
+    if (!(await showConfirm(
       `Raise a PR from ${x.slug} → ${src}?\n\n`
       + `This asks ${src} to take ${x.slug}'s commits in. Nothing moves now: it appears on ${src}'s `
-      + `card, and a human accepts it there.`)) return;
+      + `card, and a human accepts it there.`, { okLabel: 'Raise PR' }))) return;
     run('pr', () => prXell(x.id));
   };
 

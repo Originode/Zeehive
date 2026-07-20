@@ -6,6 +6,7 @@ import {
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, putProviderToken, deleteProviderToken,
 } from './api.js';
+import { showConfirm } from './Dialog.jsx';
 
 // PROJECT SETUP — the onboarding surface (spec §7 Phase 2.2 + the console half of everything the
 // deploy-topology spec models). One modal, whole story: probe the folder, read/draft the manifest,
@@ -295,9 +296,9 @@ function SiteEditor({ site, run, busy }) {
       notes: f.notes.trim() || undefined,
     },
   }));
-  const del = () => {
+  const del = async () => {
     const n = Number(site.container_count);
-    if (window.confirm(n > 0 ? `Site "${site.key}" has ${n} container(s). Force-remove?` : `Remove site "${site.key}"?`)) {
+    if (await showConfirm(n > 0 ? `Site "${site.key}" has ${n} container(s). Force-remove?` : `Remove site "${site.key}"?`, { variant: 'danger', okLabel: 'Remove' })) {
       run(() => deleteSite(site.id, n > 0));
     }
   };
@@ -367,7 +368,7 @@ function InvRow({ c, run, busy }) {
         <button type="button" disabled={busy || !dirty} title="Save"
                 onClick={() => run(() => patchSharedContainer(c.id, { build_script: script.trim() || null }))}>💾</button>
         <button type="button" className="projpop-del" disabled={busy} title={`Remove ${c.name} from the inventory`}
-                onClick={() => { const n = Number(c.linked_xells); if (window.confirm(n > 0 ? `${c.name} is linked to ${n} xell(s). Force?` : `Remove ${c.name}?`)) run(() => deleteSharedContainer(c.id, n > 0)); }}>🗑</button>
+                onClick={async () => { const n = Number(c.linked_xells); if (await showConfirm(n > 0 ? `${c.name} is linked to ${n} xell(s). Force?` : `Remove ${c.name}?`, { variant: 'danger', okLabel: 'Remove' })) run(() => deleteSharedContainer(c.id, n > 0)); }}>🗑</button>
       </span>
     </div>
   );
@@ -392,8 +393,8 @@ function TokensSection({ project, run, busy }) {
   };
   const save = (p) => wrapped(() => putProviderToken(project.id, p.provider, paste))
     .then(() => { setPaste(''); setOpen(null); });
-  const disconnect = (p) => {
-    if (window.confirm(`Disconnect ${p.label} from ${project.name}?\n\nCaged zees for this project won't be able to authenticate until a new token is connected.`)) {
+  const disconnect = async (p) => {
+    if (await showConfirm(`Disconnect ${p.label} from ${project.name}?\n\nCaged zees for this project won't be able to authenticate until a new token is connected.`, { variant: 'danger', okLabel: 'Disconnect' })) {
       wrapped(() => deleteProviderToken(project.id, p.provider));
     }
   };
