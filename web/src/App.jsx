@@ -3,8 +3,9 @@ import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markD
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell } from './api.js';
+import { showAlert } from './Dialog.jsx';
 
-const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
+const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 import HiveCanvas from './hive/HiveCanvas.jsx';
 import GraphPane from './GraphPane.jsx';
 import Connectors from './Connectors.jsx';
@@ -412,7 +413,7 @@ export default function App() {
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
     if (kind === 'build') {
-      if (x.stack.some(isBusy)) { alert('A container is busy (building/restoring) — wait for it to finish.'); return; }
+      if (x.stack.some(isBusy)) { showAlert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
     }
     if (kind === 'done') {
@@ -423,8 +424,8 @@ export default function App() {
       if (!confirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
         + `Your commits stay on the branch either way.`)) return;
-      pushXell(x.id).then((r) => { if (r?.landed === false) alert(r.reason || 'push held at the gate'); refresh(); })
-        .catch((e) => alert('Push failed: ' + (e?.message || e))); return;
+      pushXell(x.id).then((r) => { if (r?.landed === false) showAlert(r.reason || 'push held at the gate'); refresh(); })
+        .catch((e) => showAlert('Push failed: ' + (e?.message || e), { variant: 'error' })); return;
     }
     if (kind === 'ship') {
       if (!confirm(`Ship ${x.slug} to PRODUCTION?\n\nThis files a ship request. It is REFUSED unless the work is `
@@ -459,13 +460,13 @@ export default function App() {
       if (!confirm(`Pull ${src} into ${x.slug}?\n\nMerges ${src} into ${x.slug}'s working tree on disk`
         + `${x.zee_status === 'working' ? ' — its zee is still working in there' : ''}.`
         + (dirty > 0 ? `\n\n⚠ ${dirty} uncommitted file(s): this will be REFUSED (commit or stash first).` : ''))) return;
-      pullXell(x.id).then((r) => { if (r?.merged === false) alert(r.reason || 'pull refused'); refresh(); })
-        .catch((e) => alert('Pull failed: ' + (e?.message || e))); return;
+      pullXell(x.id).then((r) => { if (r?.merged === false) showAlert(r.reason || 'pull refused'); refresh(); })
+        .catch((e) => showAlert('Pull failed: ' + (e?.message || e), { variant: 'error' })); return;
     }
     if (kind === 'pr') {
       if (!confirm(`Raise a PR from ${x.slug} → ${src}?\n\nNothing moves now: it appears on ${src}'s card, and a `
         + `human accepts it there.`)) return;
-      prXell(x.id).then(refresh).catch((e) => alert('PR failed: ' + (e?.message || e))); return;
+      prXell(x.id).then(refresh).catch((e) => showAlert('PR failed: ' + (e?.message || e), { variant: 'error' })); return;
     }
   };
 
@@ -646,7 +647,7 @@ function AutoApprove({ project, projectId, onChanged }) {
       && !confirm('Auto-approve PRODUCTION ships?\n\nEvery ship request will deploy to prod immediately with NO human review. The queenzee still only builds landed work from main, but nobody signs off per ship.')) return;
     setBusy(true);
     try { await updateProject(projectId, { [field]: checked }); onChanged?.(); }
-    catch (e) { alert('Auto-approve change failed: ' + e.message); }
+    catch (e) { showAlert('Auto-approve change failed: ' + e.message, { variant: 'error' }); }
     finally { setBusy(false); }
   };
   const Switch = ({ field, label, title, danger }) => (
@@ -772,7 +773,7 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
       (openPr ? `  • ${openPr} open PR\n` : '') +
       (pendingShip ? `  • a production ship is ${pendingShip}\n` : '') +
       `\nProceeding is irreversible. To confirm, type: done`);
-    if ((typed || '').trim().toLowerCase() !== 'done') { if (typed !== null) alert('Not confirmed — type "done" to proceed. Nothing was touched.'); return; }
+    if ((typed || '').trim().toLowerCase() !== 'done') { if (typed !== null) showAlert('Not confirmed — type "done" to proceed. Nothing was touched.'); return; }
   }
   try {
     const r = x.task_id ? await markDone(x.task_id, 'mark', active) : await reapXell(x.id, 'human-cleanup', active);
@@ -780,12 +781,12 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
     // survived (something still holds it open — usually the zee's own session), say so.
     const orphan = r?.orphaned_worktree || r?.reap?.orphaned_worktree;
     if (orphan) {
-      alert(`"${x.slug}" was retired, but its worktree could NOT be removed:\n\n${orphan}\n\n` +
+      showAlert(`"${x.slug}" was retired, but its worktree could NOT be removed:\n\n${orphan}\n\n` +
             `Something still has it open — usually that zee's session in Claude Code. ` +
-            `Close the session, then run Clean up again.`);
+            `Close the session, then run Clean up again.`, { variant: 'error' });
     }
     onDone();
-  } catch (err) { alert('Cleanup failed: ' + (err?.message || err)); }
+  } catch (err) { showAlert('Cleanup failed: ' + (err?.message || err), { variant: 'error' }); }
 }
 
 // (The old DOM FlowerToolbar was removed: its build/pull/push/PR/mark-done buttons are now drawn
@@ -907,7 +908,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             <div className="row"><span className="rk">worktree</span>
               <button className="wtlink" data-testid="worktree"
                       title={`${x.worktree_path}\n(click to open in Explorer)`}
-                      onClick={(e) => { e.stopPropagation(); revealWorktree(x.id).catch((err) => alert('Open failed: ' + (err?.message || err))); }}>
+                      onClick={(e) => { e.stopPropagation(); revealWorktree(x.id).catch((err) => showAlert('Open failed: ' + (err?.message || err), { variant: 'error' })); }}>
                 {base(x.worktree_path)}
               </button>
             </div>

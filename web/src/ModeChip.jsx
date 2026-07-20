@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { setZeeMode } from './api.js';
+import { showAlert } from './Dialog.jsx';
 
 // The harness's permission modes — what a running session can be switched between. Chip text is
 // terse (it sits inline in a 12px card row); the dropdown carries the full words. Tool
@@ -54,9 +55,9 @@ export default function ModeChip({ zeeId, mode }) {
     try {
       const r = await setZeeMode(zeeId, key);
       // applied:false → recorded on the zee only; tell the human what is (and isn't) real.
-      if (r?.note) alert(r.note);
+      if (r?.note) showAlert(r.note);
     } catch (err) {
-      alert('Mode change failed: ' + (err?.message || err));
+      showAlert('Mode change failed: ' + (err?.message || err), { variant: 'error' });
     } finally { setBusy(false); }
   };
 

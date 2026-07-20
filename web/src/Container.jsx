@@ -11,6 +11,7 @@
 import React, { useState, useEffect } from 'react';
 import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer } from './api.js';
 import { nick } from './nick.js';
+import { showAlert } from './Dialog.jsx';
 
 // Production is EXCLUDED from decommission entirely (not warned) — a prod container/db is never a
 // candidate for this action. Mirrors the server guard in decommissionContainer (tier='prod').
@@ -18,7 +19,7 @@ export const isProdContainer = (c) => c?.tier === 'prod';
 
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
 export const isBuildable = (c) => BUILDABLE.has(c.role) && !!c.owner_xell_id;
-const buildErr = (e) => alert('Build failed: ' + (e?.error || e?.message || e));
+const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 
 // Why a container is busy right now (null = idle): 'building' (its own health state), or a db
 // job — 'backup' (dumping the source) / 'restore' (loading a backup into it), from busy_since/op.

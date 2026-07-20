@@ -8,6 +8,7 @@
 //      who is actively verifying.
 import React, { useState, useEffect, useRef } from 'react';
 import { decideShip, dismissShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
+import { showAlert } from './Dialog.jsx';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
@@ -190,7 +191,7 @@ function LockCountdown({ lock, projectId, onChanged }) {
 
   const hold = async () => {
     setBusy(true);
-    try { await holdProdLock(projectId); onChanged?.(); } catch (e) { alert(e.message); }
+    try { await holdProdLock(projectId); onChanged?.(); } catch (e) { showAlert(e.message, { variant: 'error' }); }
     finally { setBusy(false); }
   };
 
@@ -200,7 +201,7 @@ function LockCountdown({ lock, projectId, onChanged }) {
   const release = async () => {
     if (!confirmForceRelease(lock)) return;
     setBusy(true);
-    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (e) { alert(e.message); }
+    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (e) { showAlert(e.message, { variant: 'error' }); }
     finally { setBusy(false); }
   };
 
@@ -266,7 +267,7 @@ export function LockBadge({ lock, projectId, onChanged }) {
     e.stopPropagation();
     if (!confirmForceRelease(lock)) return;
     setBusy(true);
-    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (err) { alert(err.message); }
+    try { await forceReleaseProdLock(projectId); onChanged?.(); } catch (err) { showAlert(err.message, { variant: 'error' }); }
     finally { setBusy(false); }
   };
 
