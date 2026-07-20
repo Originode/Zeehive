@@ -186,6 +186,14 @@ export async function cloneProject(body = {}) {
 
   if (token) await setProviderToken(project.id, 'github', token);
 
+  // Landing pushes into this checkout's CURRENT branch (`git push . HEAD:main`), which a
+  // non-bare repo refuses by default (receive.denyCurrentBranch=refuse — seen live: the first
+  // in-container land bounced with "work tree inconsistent"). updateInstead is what the
+  // host-era xources run, set by hand back then: an accepted push also updates the working
+  // tree, so the checkout tracks landed main. Encode it here so every clone is landing-ready.
+  spawnSync('git', ['-C', dest, 'config', 'receive.denyCurrentBranch', 'updateInstead'],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
+
   // Best-effort landing-gate install (machine-local hook; folder onboarding leaves this manual).
   // A failure is a warning on the response, never a rollback — the gate can be installed later.
   let gateWarning = null;

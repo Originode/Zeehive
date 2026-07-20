@@ -51,12 +51,18 @@ services:
       DATABASE_URL: ${ZEEHIVE_DATABASE_URL:-}   # NEVER default to the live meta-DB: two queenzees
                                                 # reconciling one meta-DB reap each other's xells
       DOCKER_HOST: unix:///var/run/docker.sock  # 'default' context = the mounted local daemon
+      PROVISION_MODE: ${ZEEHIVE_CTR_PROVISION_MODE:-real}   # worktrees are real here — they live
+                                                            # on the container's own /repos volume
       ZEEHIVE_CTX_UGREEN: tcp://10.1.0.18:2375   # remote contexts, created by the entrypoint
       ZEEHIVE_CTX_MARDALE: tcp://10.2.0.16:2375
       REPOS_DIR: /repos                    # clone-from-GitHub destination default
       ZEEHIVE_SSH_DIR: /data/ssh           # fleet cage keypair — regenerating it orphans live cages
       BACKUP_DIR: /backups                 # prod DB dumps
       ZEEHIVE_CAGE_SSH: network            # SSH to cages by container name over zee-cage-net
+      CAGE_API_BASE: http://host.docker.internal:4701   # cages must call THIS instance: it
+                                           # publishes 4701 while experimental. Cutover flips the
+                                           # port mapping to 4700 — drop this line then (the code
+                                           # default is host.docker.internal:4700).
     volumes:
       - zeehive_repos:/repos                        # the migrated project folders (Linux-native git)
       - /var/run/docker.sock:/var/run/docker.sock   # the local daemon; TCP contexts for the rest
