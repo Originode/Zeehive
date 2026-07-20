@@ -14,6 +14,9 @@ import { resolveSite } from './sites.js';
 import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
+import { dbIdentity } from './projects.js';
+
+const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* noop */ } };
 
 const ADJ = ['swift', 'calm', 'bright', 'bold', 'keen', 'lively', 'nimble', 'quiet', 'sunny', 'wise'];
 const NOUN = ['harbor', 'meadow', 'summit', 'delta', 'ember', 'grove', 'atlas', 'cove', 'ridge', 'vale'];
@@ -359,6 +362,37 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
           throw new Error(`per-xell db container ${nmDb.container} failed: ${(run.stderr || '').slice(-300)}`);
         }
         createdDbContainer = { ctx: devCtx, name: nmDb.container };   // for cleanup if the tx dies
+
+        // Start the xell's db as a COPY OF PROD, not a blank slate (Mark, 2026-07-20: "the first
+        // dev db always empty/drifted from prod" — an empty spin db breaks the promise the
+        // db-isolated label makes, and prod-shaped data is the point of an own db). Streamed
+        // live — pg_dump | psql through the docker CLI — so it needs no backup file and stays
+        // transactionally consistent; cross-context sources work the same way. Best-effort with
+        // a LOUD failure: a xell on an empty db beats no xell, but the gap must never be silent.
+        const prodDb = await one(
+          `SELECT name, docker_ctx FROM container
+            WHERE project_id=$1 AND role='db' AND tier='prod' AND isolation='shared'
+            ORDER BY (docker_ctx = $2) DESC NULLS LAST LIMIT 1`, [projectId, devCtx]);
+        if (prodDb) {
+          let up = false;
+          for (let i = 0; i < 20 && !up; i++) {
+            up = spawnSync('docker', ['--context', devCtx, 'exec', nmDb.container, 'pg_isready', '-U', dbUser],
+              { encoding: 'utf8', timeout: 10000, windowsHide: true }).status === 0;
+            if (!up) sleepSync(1000);
+          }
+          const src = await dbIdentity(projectId);
+          const srcCtx = prodDb.docker_ctx || 'default';
+          const pipe = `docker --context ${srcCtx} exec ${prodDb.name} pg_dump -U ${src.user} -d ${src.name} --no-owner --no-privileges`
+            + ` | docker --context ${devCtx} exec -i ${nmDb.container} psql -q -v ON_ERROR_STOP=0 -U ${dbUser} -d ${dbName}`;
+          const cp = up && spawnSync(resolveBash(), ['-c', pipe],
+            { encoding: 'utf8', timeout: 600000, windowsHide: true, env: cleanGitEnv() });
+          if (cp && cp.status === 0) {
+            console.log(`[provision] ${slug}: per-xell db seeded from prod (${prodDb.name} → ${nmDb.container})`);
+          } else {
+            console.error(`[provision] ${slug}: !!! per-xell db is EMPTY — prod seed failed `
+              + `(${!up ? 'db never became ready' : (cp.stderr || '').trim().slice(-200)})`);
+          }
+        }
       }
       // conn_ref stays passwordless (parameters, not secrets) — emitXellEnv injects the
       // manifest's committed dev credential for process xells.
