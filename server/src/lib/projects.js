@@ -184,7 +184,13 @@ export async function cloneProject(body = {}) {
     throw err;
   }
 
-  if (token) await setProviderToken(project.id, 'github', token);
+  // Best-effort: an unrecognized-but-working token shape must not fail the clone AFTER the
+  // project exists — the clone already proved the token works; storage is for future Pulls.
+  let tokenWarning = null;
+  if (token) {
+    try { await setProviderToken(project.id, 'github', token); }
+    catch (err) { tokenWarning = `github token not stored for future pulls: ${err.message}`; logline('projects', `${name}: ${tokenWarning}`); }
+  }
 
   // Landing pushes into this checkout's CURRENT branch (`git push . HEAD:main`), which a
   // non-bare repo refuses by default (receive.denyCurrentBranch=refuse — seen live: the first
@@ -208,7 +214,7 @@ export async function cloneProject(body = {}) {
   if (gateWarning) logline('projects', `${name}: ${gateWarning}`);
 
   logline('projects', `cloned ${name} from ${url} (${mainBranch})`);
-  return { ...project, gate_warning: gateWarning };
+  return { ...project, gate_warning: gateWarning, token_warning: tokenWarning };
 }
 
 // Fetch + ff-only merge of the recorded remote into the xource checkout. Human-triggered from

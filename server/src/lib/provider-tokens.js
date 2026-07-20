@@ -22,8 +22,10 @@ export const PROVIDERS = {
     label: 'GitHub (pulls only)',
     command: 'GitHub → Settings → Developer settings → Fine-grained tokens',
     steps: 'Create a fine-grained personal access token scoped to this repo with Contents: READ-ONLY. Zeehive only ever fetches — it cannot and will not push. Paste it below; it is stored only in the meta-DB.',
-    // classic ghp_… or fine-grained github_pat_…; loose tails for the same reason as above
-    valid: (t) => /^(ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})$/.test(t),
+    // classic ghp_…, fine-grained github_pat_…, or an OAuth/device token gho_/ghu_/ghs_ (what
+    // `gh auth token` and git-credential-manager hold — a proven-working fallback when an org's
+    // fine-grained-PAT policy fights the human); loose tails for the same reason as above
+    valid: (t) => /^(gh[opus]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,})$/.test(t),
   },
 };
 
