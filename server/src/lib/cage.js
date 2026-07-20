@@ -498,6 +498,8 @@ export async function sendKeysToCagedZee({ sshPort, slug, text, sessionId, sessi
     // already-open terminal (the common case) receives the keys with no added latency.
     `if tmux has-session -t ${session} 2>/dev/null; then :; ` +
       `else tmux new-session -d -s ${session} -x 200 -y 50 -c /work/repo 'zee-attach.sh ${sid}'; sleep 6; fi`,
+    // wheel-scroll needs tmux mouse mode (alt-screen has no xterm scrollback); idempotent
+    `tmux set -g mouse on 2>/dev/null || true`,
     `tmux send-keys -t ${session} -l ${sq(text)}`,
     ...(enter ? ['sleep 0.2', `tmux send-keys -t ${session} Enter`] : []),
     'echo __ZEE_KEYS_SENT__',

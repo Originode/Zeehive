@@ -49,7 +49,11 @@ async function openTerminal(ws, zeeId) {
   // pre-answered by cage-claude-seed.mjs, so it drops straight in). It ends in a login shell, so
   // the pane (and the zee's box) stays reachable if claude exits.
   const sid = (zee.claude_session_id || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — it is shell-interpolated
-  const cmd = `tmux new -A -s zee -c /work/repo 'zee-attach.sh ${sid}'`;
+  // `\; set -g mouse on` rides every attach: tmux runs fullscreen (alternate buffer), so the
+  // browser xterm has NO scrollback of its own — without tmux mouse mode the wheel is dead air
+  // ("i cant even seem to scroll it"). Applied per-attach so cages older than the baked
+  // .tmux.conf get it too.
+  const cmd = `tmux new -A -s zee -c /work/repo 'zee-attach.sh ${sid}' \\; set -g mouse on \\; set -g history-limit 50000`;
 
   const conn = new Client();
   conn.on('ready', () => {

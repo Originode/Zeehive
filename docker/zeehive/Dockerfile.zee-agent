@@ -61,5 +61,10 @@ RUN git config --global user.name "zee" \
     && git config --global user.email "zee@zeehive.local" \
     && git config --global init.defaultBranch main
 
+# tmux runs fullscreen (alternate buffer), so the dashboard's xterm has no scrollback of its
+# own — without mouse mode the wheel does nothing. Baked here for fresh cages; the terminal
+# bridge also sets it per-attach so pre-existing cages behave the same.
+RUN printf 'set -g mouse on\nset -g history-limit 50000\n' > /home/zee/.tmux.conf
+
 # The queenzee execs the actual run; idle keeps the cage warm between turns.
 CMD ["sleep", "infinity"]
