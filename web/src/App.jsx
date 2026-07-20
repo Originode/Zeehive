@@ -445,10 +445,10 @@ export default function App() {
     }
     if (kind === 'nudge') {
       const id = `nudge-${x.id}-${Date.now()}`;
-      pushToast({ id, kind: 'progress', title: `Nudging ${x.slug}…`, body: 'asking it for a status update' });
+      pushToast({ id, kind: 'progress', title: `Nudging ${x.slug}…`, body: 'typing “status?” into its live session' });
       nudgeXell(x.id).then((r) => {
         if (r?.nudged) updateToast(id, { kind: 'success', title: `Nudged ${x.slug}`, onRetry: null,
-          body: 'asked it for a status update on its work' });
+          body: `typed “${r.sent || 'status?'}” into its live session over SSH` });
         else updateToast(id, { kind: 'error', title: 'Nudge not delivered', onRetry: null,
           body: r?.reason || r?.error || 'no live zee to reach' });
         setTimeout(() => dismissToast(id), 6000);
