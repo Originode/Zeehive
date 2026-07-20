@@ -877,16 +877,27 @@ function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
 
 // The flower's per-xell actions, drawn INSIDE the facet each verb belongs to and hit-tested in
 // onPointerUp (no DOM toolbar). Placement mirrors meaning: build in CONTAINERS(3), terminal+nudge in
-// SESSION(2), pull(+land) in COMMIT(5), PR(+ship) in DIFF·AGE(6), mark-done in BRANCH(1). Land and
-// ship appear ONLY when the action is actually available (there is work to land / it is landed &
-// clean). Buttons sit low in their petal so the facet's own text still reads above them.
+// SESSION(2), pull(+land) in COMMIT(5), PR(+ship) in DIFF·AGE(6), mark-done in BRANCH(1).
+//
+// VISIBILITY follows the xell's DISPLAY status (hive_status), so the button a human needs shows up
+// exactly when the hive is asking them for it:
+//   • land  is revealed on a LAND REQUEST  (occ-landRequest — a zee/operator asked to push to main)
+//   • ship  is revealed on a SHIP REQUEST  (occ-shipRequest — a ship to prod is being requested)
+//   • mark-done is ALWAYS visible, regardless of status — it is the teardown verb and must never be
+//     gated behind a particular lifecycle state.
+// Older server payloads that predate hive_status fall back to the git-derived availability (land =
+// committed work ahead of main; ship = landed & clean) so the buttons still surface. Buttons sit low
+// in their petal so the facet's own text still reads above them.
 function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];
   const buildable = (x.stack || []).some((c) => c.role === 'server' || c.role === 'webapp');
   const caged = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
-  const showDone = ['working', 'idle', 'claimed', 'awaiting-done'].includes(x.status);
-  const canLand = !!diff && diff.ahead > 0;                       // has committed work to push to main
-  const canShip = shipLine(x, diff) === 'ready';                  // landed, clean, not already in prod
+  const st = x.hive_status;
+  const showDone = true;                                          // mark-done: visible on any status
+  const canLand = st ? st === 'occ-landRequest'                   // a land request reveals ⬆ land
+    : (!!diff && diff.ahead > 0);                                 // (fallback: committed work to push)
+  const canShip = st ? st === 'occ-shipRequest'                   // a ship request reveals 🚀 ship
+    : (shipLine(x, diff) === 'ready');                            // (fallback: landed, clean, not in prod)
   const R = COL.ready, D = COL.error, G = COL.working, P = COL.prod;
   const h = Math.max(15, size * 0.28);
   const padX = size * 0.13;
