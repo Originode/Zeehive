@@ -2,8 +2,9 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells, dispatchTask, nudgeXell, requestShipXell } from './api.js';
+         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens } from './api.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
+import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 import HiveCanvas from './hive/HiveCanvas.jsx';
@@ -139,7 +140,9 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
-  const [showDispatch, setShowDispatch] = useState(false); // the "+" prompt composer
+  const [showDispatch, setShowDispatch] = useState(false); // false | { provider } — the "+" prompt composer
+  const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
+  const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
   const [loadBackupFor, setLoadBackupFor] = useState(null); // db container to restore a backup INTO
@@ -206,6 +209,12 @@ export default function App() {
   // dropped instead of clobbering the newly-selected project's data (fixes the switch race).
   const projectIdRef = useRef(null);
   useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
+  // Which AI providers this project can dispatch on — drives the per-provider prompt buttons.
+  useEffect(() => {
+    const pid = projectId || project?.id;
+    if (!pid) return;
+    getProviderTokens(pid).then((t) => setProviders(Array.isArray(t) ? t : [])).catch(() => setProviders([]));
+  }, [projectId, project?.id, showSetup, showDispatch]);
   // Latest project list, read from callbacks with stable identities (e.g. selectProject) so they
   // can resolve an id → project row for the URL without re-binding on every list change.
   const projectsRef = useRef([]);
@@ -568,9 +577,31 @@ export default function App() {
         {(!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0) || !project.compose_spinoff)
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
-        <button className="new-prompt-btn" data-testid="new-prompt-btn"
-                title="Compose a prompt and dispatch a zee into a ready xell"
-                onClick={() => setShowDispatch(true)}>＋ new prompt</button>
+        {/* One prompt button per CONNECTED dispatchable provider (a Kimi zee is the same cxell
+            claude CLI aimed at Moonshot's anthropic-compatible endpoint). A connected provider
+            with no runtime yet (OpenAI) renders disabled with the reason. No AI provider at
+            all → the one honest button is "add provider", straight into Project setup. */}
+        {(() => {
+          const ai = providers.filter((p) => p.provider !== 'github');
+          const connected = ai.filter((p) => p.connected);
+          if (!connected.length) {
+            return (
+              <button className="new-prompt-btn" data-testid="add-provider-btn"
+                      title="No AI provider connected — add a Claude or Kimi token to dispatch zees"
+                      onClick={() => setShowSetup(true)}>＋ add provider</button>
+            );
+          }
+          return connected.map((p) => (
+            <button key={p.provider} className="new-prompt-btn" data-testid={`new-prompt-btn-${p.provider}`}
+                    disabled={!p.dispatch}
+                    title={p.dispatch
+                      ? `Compose a prompt and dispatch a ${p.label} zee into a ready xell`
+                      : `${p.label} is connected but has no zee runtime yet`}
+                    onClick={() => p.dispatch && setShowDispatch({ provider: p.provider, label: p.label })}>
+              ＋ prompt · {p.label}
+            </button>
+          ));
+        })()}
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
@@ -606,8 +637,12 @@ export default function App() {
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
+                  provider={showDispatch.provider || 'claude'} providerLabel={showDispatch.label}
                   onClose={() => setShowDispatch(false)}
                   onDispatch={(payload) => { setShowDispatch(false); runDispatch(payload); }} />
+      )}
+      {showSetup && (
+        <ProjectSetup project={project} onClose={() => setShowSetup(false)} onChanged={refresh} />
       )}
       <Toasts toasts={toasts} onDismiss={dismissToast} />
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}

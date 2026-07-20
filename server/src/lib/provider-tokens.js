@@ -9,6 +9,7 @@ export const PROVIDERS = {
   claude: {
     key: 'claude',
     label: 'Claude',
+    dispatch: true,   // a zee can run on this provider today
     command: 'claude setup-token',
     steps: 'Run the command in any terminal. Your browser opens — authorize, and the CLI prints a long-lived token (sk-ant-oat01-…). Paste it below; it is stored only in the meta-DB.',
     // sk-ant-oat01-<base64ish>; stay loose on the tail so a format tweak upstream doesn't lock us out
@@ -30,6 +31,10 @@ export const PROVIDERS = {
   kimi: {
     key: 'kimi',
     label: 'Kimi (Moonshot)',
+    // Moonshot exposes an ANTHROPIC-COMPATIBLE endpoint, so a Kimi zee is the same cxell
+    // `claude --bare` aimed at a different base URL — a real runtime today, not a placeholder.
+    dispatch: true,
+    anthropicBaseUrl: 'https://api.moonshot.ai/anthropic',
     command: 'https://platform.moonshot.ai/console/api-keys',
     steps: 'Create an API key on the Moonshot platform (sk-…) and paste it below; it is stored only in the meta-DB. No zee runtime uses it yet — this slot is for the coming multi-provider dispatch.',
     valid: (t) => /^sk-[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
@@ -59,6 +64,7 @@ export async function listProviderTokens(projectId) {
   const byProvider = Object.fromEntries(rows.map((r) => [r.provider, r]));
   return Object.values(PROVIDERS).map((p) => ({
     provider: p.key, label: p.label, command: p.command, steps: p.steps,
+    dispatch: !!p.dispatch,   // can a zee run on it? (github: no — infra credential)
     connected: !!byProvider[p.key],
     token_hint: byProvider[p.key]?.token_hint || null,
     created_at: byProvider[p.key]?.created_at || null,
@@ -84,6 +90,16 @@ export async function setProviderToken(projectId, provider, token) {
 export async function deleteProviderToken(projectId, provider) {
   await q('DELETE FROM provider_token WHERE project_id = $1 AND provider = $2', [projectId, provider]);
   return { ok: true };
+}
+
+// What a cxell spawn needs for a given AI provider: the token plus (for anthropic-compatible
+// vendors like Kimi) the base URL the claude CLI should aim at. Refuses non-dispatchable
+// providers up front — an OpenAI key has no runtime yet and must fail the dispatch cleanly.
+export async function spawnCreds(projectId, provider = 'claude') {
+  const p = PROVIDERS[provider];
+  if (!p) throw new Error(`unknown provider "${provider}"`);
+  if (!p.dispatch) throw new Error(`no zee runtime for ${p.label} yet — dispatch on Claude or Kimi`);
+  return { provider, token: await tokenForSpawn(projectId, provider), baseUrl: p.anthropicBaseUrl || null };
 }
 
 // the one full-token read — the spawn path injecting into a cxell zee's environment

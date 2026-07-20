@@ -15,7 +15,7 @@ import { getDispatchModes, getDispatchModels } from './api.js';
 // blocking "Dispatching…" button freeze the modal for seconds. So submit now just validates, hands
 // the whole payload up to the parent and closes at once — the parent runs the dispatch and reports
 // progress through a toast (including a Retry that reuses this exact payload if it fails).
-export default function Dispatch({ projectId, projectName, onClose, onDispatch }) {
+export default function Dispatch({ projectId, projectName, provider = 'claude', providerLabel, onClose, onDispatch }) {
   const editorRef = useRef(null);
   const [modes, setModes] = useState([]);
   const [models, setModels] = useState([]);
@@ -84,6 +84,7 @@ export default function Dispatch({ projectId, projectName, onClose, onDispatch }
     onDispatch?.({
       project: projectId,
       task,
+      provider,   // which connected AI provider's button opened this composer
       mode,
       model,
       headless,

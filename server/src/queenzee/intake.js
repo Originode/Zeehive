@@ -18,7 +18,7 @@ import { resolveProjectId } from '../lib/project-resolve.js';
 import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
-import { tokenForSpawn } from '../lib/provider-tokens.js';
+import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
          ensureZeehiveKeypair, openCxellSsh } from '../lib/cxell.js';
 import { mintXellToken } from '../lib/xell-token.js';
@@ -225,7 +225,8 @@ function saveDispatchImages(worktreePath, images) {
 // The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
 // per the runtime) to run the task. Human confirms in their session before this is called.
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
-                                     headless = true, model, db, db_container, dump, images }) {
+                                     headless = true, model, db, db_container, dump, images,
+                                     provider = 'claude' }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -277,7 +278,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
 
   const spawned = await spawnHeadless({
     projectId, xellId: targetId, task: taskText, runtime, mode, title: inherited,
-    headless: headless !== false, ...(model ? { model } : {}),
+    headless: headless !== false, provider, ...(model ? { model } : {}),
   });
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
 
@@ -634,7 +635,7 @@ export function listDispatchModels() {
   return ZEE_MODELS.map((m) => ({ ...m, default: m.key === DEFAULT_ZEE_MODEL }));
 }
 
-export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true }) {
+export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true, provider = 'claude' }) {
   const m = resolveMode(mode);
   const pid = projectId || (await defaultProjectId());
   const xell = xellId
@@ -676,7 +677,7 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
   if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });
   // CXELLD runtime → the CLI runs INSIDE the xell's zee-agent container (structural confinement).
-  if (rt?.key === 'claude-code-cxell') return spawnCxell({ pid, xell, task, rt, model, m, title, headless });
+  if (rt?.key === 'claude-code-cxell') return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider });
 
   let sdk;
   try { sdk = await import('@anthropic-ai/claude-agent-sdk'); }
@@ -808,10 +809,11 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 // No viewer: the session JSONL lives inside the container, so claude:// cannot attach. The
 // live feed is the stream-json event stream, re-broadcast per-zee on the SSE bus as
 // 'zee-output' and narrated into the Terminal under the `zee:<slug>` scope.
-async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true }) {
-  // Token FIRST — a project with no connected Claude token must fail the dispatch cleanly
-  // (with the fix spelled out) before anything claims the xell or builds a container.
-  const token = await tokenForSpawn(pid, 'claude');
+async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], title, headless = true, provider = 'claude' }) {
+  // Credentials FIRST — a project with no connected token for this provider must fail the
+  // dispatch cleanly (with the fix spelled out) before anything claims the xell or builds a
+  // container. For anthropic-compatible vendors (Kimi) baseUrl re-aims the cxell's claude CLI.
+  const { token, baseUrl } = await spawnCreds(pid, provider);
 
   // Egress policy (simplified 2026-07-19): the container is the confinement boundary — a cxell
   // zee can't reach the host or other xells no matter what — so we DON'T lock egress down (that
@@ -862,7 +864,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // viewer_url below becomes a literal ssh:// deeplink into this cxell. The xell identity token
     // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
-    await openCxellSsh({ ctx, name, publicKey, token, xellToken });
+    await openCxellSsh({ ctx, name, publicKey, token, xellToken, baseUrl });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);
@@ -939,7 +941,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
-  const handle = runZee({ ctx, name, prompt, model, token, xellToken, onEvent: feed });
+  const handle = runZee({ ctx, name, prompt, model, token, xellToken, baseUrl, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.

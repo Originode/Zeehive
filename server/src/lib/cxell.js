@@ -198,7 +198,7 @@ export async function ensureCxell({ ctx, slug, xellId, network, sshPort }) {
 // /etc/environment so an interactive (PAM) login shell comes up authenticated — a docker-exec -e
 // run gets the token directly, an SSH login does not — and start sshd. Root exec; the zee cannot
 // undo it. Idempotent.
-export async function openCxellSsh({ ctx, name, publicKey, token, xellToken }) {
+export async function openCxellSsh({ ctx, name, publicKey, token, xellToken, baseUrl = null }) {
   const env = [];
   if (publicKey) env.push('-e', `CXELL_PUBKEY=${publicKey}`);
   // /etc/environment lines a PAM (SSH) login inherits — the Claude token so interactive `claude`
@@ -207,6 +207,9 @@ export async function openCxellSsh({ ctx, name, publicKey, token, xellToken }) {
   // -e run gets these directly; an SSH login does not, so they must land in /etc/environment too.
   const envLines = [];
   if (token) envLines.push(`ANTHROPIC_AUTH_TOKEN=${token}`);
+  // anthropic-compatible vendors (Kimi): the interactive claude in the cxell aims at the same
+  // base URL the headless run used, so an attending human continues on the SAME provider
+  if (baseUrl) envLines.push(`ANTHROPIC_BASE_URL=${baseUrl}`);
   if (xellToken) envLines.push(`ZEEHIVE_XELL_TOKEN=${xellToken}`);
   // Where the `zee` CLI finds the queenzee. Explicit (not the CLI's baked default) so a
   // containerized queenzee can re-aim every cxell by config alone (CXELL_API_BASE).
@@ -305,7 +308,7 @@ export async function warmCxell({ ctx, name }) {
 // from CLAUDE_CODE_OAUTH_TOKEN alone (tokenForSpawn — the project's connected token).
 // --dangerously-skip-permissions: safe HERE and only here — the cxell is the permission
 // system, and the CLI requires non-root, which the image guarantees.
-export function runZee({ ctx, name, prompt, model, token, xellToken, onEvent }) {
+export function runZee({ ctx, name, prompt, model, token, xellToken, baseUrl = null, onEvent }) {
   // BOTH env names, measured on claude 2.1.214 (2026-07-19): --bare skips the OAuth credential
   // chain entirely — CLAUDE_CODE_OAUTH_TOKEN alone yields "Not logged in" without one API call —
   // but honors ANTHROPIC_AUTH_TOKEN (the raw bearer header, which an sk-ant-oat01 token is).
@@ -317,6 +320,7 @@ export function runZee({ ctx, name, prompt, model, token, xellToken, onEvent }) 
     // it to prove WHICH xell is calling. Injected alongside the Claude token — same door, and the
     // firewall already allows the queenzee host:port.
     ...(xellToken ? ['-e', `ZEEHIVE_XELL_TOKEN=${xellToken}`] : []),
+    ...(baseUrl ? ['-e', `ANTHROPIC_BASE_URL=${baseUrl}`] : []),   // Kimi et al: same CLI, different vendor
     '-e', `ZEEHIVE_API=${config.cxellApiBase}`,   // same reason as openCxellSsh's CXELL_ENV line
     name, 'bash', '-lc',
     `cd /work/repo && claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions${model ? ` --model ${model}` : ''}`];
