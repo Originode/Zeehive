@@ -59,17 +59,21 @@ export default function BackupsPanel({ backup, projectId }) {
 
 // ── all backups, newest first. Jobs run async: a running backup shows a spinner row, and a
 //    restoring target shows a spinner. Polls every 3s so in-flight jobs update to done. ─────
-function BackupsModal({ projectId, onClose }) {
+// initialTargetId — preselect a db container in the "restore into" picker. Passed when the modal
+// is opened from a db container's context menu ("Load backup…"), so the backup you pick restores
+// straight into THAT container rather than the default first target.
+export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
   const [backups, setBackups] = useState(null);
   const [targets, setTargets] = useState([]);
-  const [targetId, setTargetId] = useState('');
+  const [targetId, setTargetId] = useState(initialTargetId || '');
   const [msg, setMsg] = useState('');
   const flash = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2600); };
 
   const load = () => getBackups(projectId).then((d) => {
     setBackups(d.backups || []);
     setTargets(d.targets || []);
-    setTargetId((cur) => cur || (d.targets?.[0]?.id ?? ''));
+    // Prefer the caller's requested target, then whatever's already picked, then the first one.
+    setTargetId((cur) => cur || initialTargetId || (d.targets?.[0]?.id ?? ''));
   }).catch(() => {});
   useEffect(() => {
     load();

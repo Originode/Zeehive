@@ -162,7 +162,7 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
 // AND idle; a busy container shows a "please wait" note instead so it can't be mangled mid-op.
 // Decommission (stop + remove) is offered on every non-production container behind a second-stage
 // confirmation — production is never a candidate (it isn't even shown), matching the server guard.
-export function ContainerMenu({ menu, onClose, projectName, onDecommissioned }) {
+export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, onLoadBackup }) {
   // Hooks must run unconditionally (before any early return). The build-host picker lists the
   // docker contexts this machine can compile on; loaded lazily the first time a buildable+idle
   // container's menu opens, then cached for the life of the menu component.
@@ -284,6 +284,19 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned }) 
         </>
       )}
       {c.url && <a role="menuitem" href={c.url} target="_blank" rel="noopener" onClick={onClose}>↗ Open URL</a>}
+
+      {/* Load backup: db containers only, never production (you never restore OVER prod, and the
+          server's target list excludes it). Opens the backup selector pre-aimed at THIS container,
+          so the backup you pick restores straight into it. Withdrawn while busy — a db mid-restore
+          can't take another. */}
+      {isDb && !prod && (busy ? (
+        <div className="ctxsub ctxbusy-note" data-testid="load-backup-busy">load backup unavailable while busy</div>
+      ) : (
+        <button role="menuitem" data-testid="load-backup-open"
+                onClick={() => { onLoadBackup?.(c); onClose(); }}>
+          📥 Load backup… <span className="ctxsub">restore a backup into this db (overwrites data)</span>
+        </button>
+      ))}
 
       {/* Decommission: every non-production container. Production is excluded outright — it shows a
           protected note instead, never an action. A busy container can't be removed mid-op. */}

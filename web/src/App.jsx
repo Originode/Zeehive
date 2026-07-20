@@ -10,7 +10,7 @@ import GraphPane from './GraphPane.jsx';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
-import BackupsPanel from './Backups.jsx';
+import BackupsPanel, { BackupsModal } from './Backups.jsx';
 import LandingPanel, { LandCard } from './Landing.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import { nick } from './nick.js';
@@ -116,6 +116,7 @@ export default function App() {
   const [showDispatch, setShowDispatch] = useState(false); // the "+" prompt composer
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
+  const [loadBackupFor, setLoadBackupFor] = useState(null); // db container to restore a backup INTO
 
   // ── honeycomb shell ──────────────────────────────────────────────────────────
   const orientation = useOrientation();          // 'portrait' | 'landscape'
@@ -565,7 +566,15 @@ export default function App() {
       )}
       <Toasts toasts={toasts} onDismiss={dismissToast} />
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}
-                     projectName={project.name} onDecommissioned={refresh} />
+                     projectName={project.name} onDecommissioned={refresh}
+                     onLoadBackup={(c) => setLoadBackupFor(c)} />
+      {/* Backup selector opened from a db container's "Load backup…" menu item — the same all-backups
+          modal the panel uses, but pre-aimed at the container the menu was on so the picked backup
+          restores straight into it. */}
+      {loadBackupFor && (
+        <BackupsModal projectId={projectId || project.id} initialTargetId={loadBackupFor.id}
+                      onClose={() => setLoadBackupFor(null)} />
+      )}
     </div>
   );
 }
