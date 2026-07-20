@@ -60,8 +60,10 @@ export function worktreeBound(worktree, branch) {
 
 // What a ZEE has actually done. TWO different questions, so the card shows two numbers:
 //
-//   SOURCE DIFF (top-level ahead/behind/files/…) — the worktree vs the SOURCE. Everything the
-//     zee has produced, committed or not: what would land.
+//   SOURCE DIFF (top-level ahead/behind/files/…) — the worktree vs the branch's FORK POINT off the
+//     source (see the merge-base note in worktreeDiff). Everything the zee has produced, committed or
+//     not: what would land. Measured from the fork, not the source tip, so the source's own progress
+//     since the fork never leaks into the number.
 //   OWN DIFF (`own`) — the worktree vs its OWN HEAD, i.e. work it has not checkpointed yet.
 //     Zees checkpoint-commit freely on their branch, so this is the "unsaved" number: it goes
 //     to 0 on every checkpoint while the source diff keeps growing.
@@ -72,9 +74,22 @@ export function worktreeBound(worktree, branch) {
 // ASYNC (see gitAsync): every caller loops over xells, and the four git calls per xell must
 // not block the event loop. They run concurrently — independent read-only queries.
 export async function worktreeDiff(worktree, ref = 'main') {
+  // The SOURCE DIFF is measured from the FORK POINT (merge-base of the source and HEAD), not from
+  // the source TIP. Diffing the worktree straight against `ref` folds the source's own
+  // advancement-since-fork into the stat: every line the source gained after this branch left the
+  // trunk shows up as a phantom deletion the zee never made. Seen live — a xell three lines ahead of
+  // where it forked read "+78/−384", and a xell sitting exactly on the tip (a pool cell, or one whose
+  // work is already merged) read "0/0" even with real committed work. Both hid the zee's actual
+  // contribution. merge-base(ref, HEAD) is where the branch left the trunk, so diffing the worktree
+  // against it yields precisely what the branch adds — committed or not — i.e. what would land. If the
+  // branch has merged the source back in, the merge-base IS the source tip, so this still excludes the
+  // source and shows only the zee's work. Falls back to `ref` if merge-base can't resolve (unrelated
+  // histories / missing ref), which is no worse than the old behaviour.
+  const mb = await gitAsync(worktree, ['merge-base', ref, 'HEAD']);
+  const base = mb.status === 0 && mb.out.trim() ? mb.out.trim() : ref;
   const [rl, ss, st, own, hd] = await Promise.all([
     gitAsync(worktree, ['rev-list', '--left-right', '--count', `${ref}...HEAD`]),
-    gitAsync(worktree, ['diff', '--shortstat', ref]),
+    gitAsync(worktree, ['diff', '--shortstat', base]),
     gitAsync(worktree, ['status', '--porcelain']),
     // Uncommitted work: tracked changes vs its own last checkpoint. (`git diff HEAD` covers
     // staged + unstaged but NOT untracked files — those only show in `dirty`, which counts them.)
