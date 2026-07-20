@@ -25,6 +25,11 @@ SRC="${1:?usage: self-ship-container.sh <source_path> <role> <docker_ctx> <mode>
 ROLE="${2:?role}"; CTX="${3:-default}"; MODE="${4:-real}"; REF="${5:-master}"
 
 COMPOSE_FILE="$SRC/docker/zeehive/docker-compose.prod.yml"
+# The server service sits behind the `experimental` profile until cutover, and compose does NOT
+# auto-enable a profile just because the service is named on the command line — without this,
+# `build server`/`up -d server` answer "no such service". Harmless after cutover drops the
+# profile: enabling a profile no service carries is a no-op.
+export COMPOSE_PROFILES="${COMPOSE_PROFILES:-experimental}"
 HEAD="$(git -C "$SRC" rev-parse --short "$REF" 2>/dev/null || echo unknown)"
 
 emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$2" "$3" "$ROLE"; }
@@ -77,6 +82,7 @@ fi
 # $COMPOSE_FILE (an /repos/... path here) resolves identically inside the sibling. The compose
 # project name stays pinned by the file's `name:` — never pass -p.
 if docker run -d --rm \
+     -e COMPOSE_PROFILES="$COMPOSE_PROFILES" \
      -v /var/run/docker.sock:/var/run/docker.sock \
      -v zeehive_repos:/repos:ro \
      docker:cli sh -c "sleep 3; docker compose -f '$COMPOSE_FILE' up -d server" >&2; then
