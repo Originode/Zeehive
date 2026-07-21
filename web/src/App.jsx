@@ -1,5 +1,5 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import { getFleet, getRuntimes, getTimeline, getDiffs, getLogs, subscribe, markDone, setDefaultRuntime,
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens } from './api.js';
@@ -130,8 +130,6 @@ export default function App() {
   const [projectId, setProjectId] = useState(null);
   const [fleet, setFleet] = useState(null);
   const [timeline, setTimeline] = useState(null);
-  const [runtimes, setRuntimes] = useState([]);
-  const [runtime, setRuntime] = useState(null);
   const [conn, setConn] = useState('connecting');
   const [version, setVersion] = useState(0);
   const [railCollapsed, setRailCollapsed] = useState(false);
@@ -218,21 +216,6 @@ export default function App() {
     if (!pid) return;
     getProviderTokens(pid).then((t) => setProviders(Array.isArray(t) ? t : [])).catch(() => setProviders([]));
   }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
-  // The topbar runtime toggle offers ONLY runtimes whose provider has a connected account —
-  // availability IS the token store, exactly like the per-account prompt buttons in the status
-  // line. On a fresh instance (no tokens) the toggle disappears entirely and "add provider" is
-  // the one honest control. agent_runtime says `vendor` where the token store says `provider`
-  // (anthropic/claude, moonshot/kimi) — VENDOR_PROVIDER bridges the two vocabularies.
-  const availRuntimes = useMemo(() => {
-    const connected = new Set(providers.filter((p) => p.connected && p.dispatch).map((p) => p.provider));
-    return runtimes.filter((r) => connected.has(VENDOR_PROVIDER[r.vendor] || r.vendor));
-  }, [runtimes, providers]);
-  // A selection whose provider just disconnected falls to the first still-available runtime —
-  // locally only. The project DEFAULT changes when a human clicks the toggle, never as a side
-  // effect of token churn.
-  useEffect(() => {
-    if (availRuntimes.length && !availRuntimes.some((r) => r.key === runtime)) setRuntime(availRuntimes[0].key);
-  }, [availRuntimes, runtime]);
   // Latest project list, read from callbacks with stable identities (e.g. selectProject) so they
   // can resolve an id → project row for the URL without re-binding on every list change.
   const projectsRef = useRef([]);
@@ -295,13 +278,8 @@ export default function App() {
     }
   }, [pushToast, updateToast, dismissToast, refresh]);
 
-  // once: global runtimes + logs, and pick the active project (persisted → first)
+  // once: global logs, and pick the active project (persisted → first)
   useEffect(() => {
-    getRuntimes().then((rs) => {
-      const enabled = rs.filter((r) => r.enabled);
-      setRuntimes(enabled);
-      if (enabled[0]) setRuntime(enabled[0].key);
-    });
     getLogs().then((ls) => setLogs(ls));
     loadProjects().then((ps) => {
       // URL param wins (a shared/refreshed link is explicit intent), then the last-used project
@@ -564,8 +542,8 @@ export default function App() {
                   title={`Flip the honeycomb to the other side (timeline follows so merge points keep facing it). Now: ${orientation}, honeycomb ${honeySide === 'a' ? (orientation === 'portrait' ? 'top' : 'left') : (orientation === 'portrait' ? 'bottom' : 'right')}`}>
             ⇄ flip
           </button>
-          <RuntimeToggle runtimes={availRuntimes} value={runtime}
-                         onChange={(k) => { setRuntime(k); setDefaultRuntime(k, projectId || project.id); }} />
+          {/* No runtime toggle here: WHICH AI answers a prompt is decided by clicking that
+              account's own prompt button in the status line — one click, no second choice. */}
           <span className={`conn ${conn}`}>{conn === 'live' ? '● live' : '○ ' + conn}</span>
         </div>
       </header>
@@ -735,23 +713,6 @@ function AutoApprove({ project, projectId, onChanged }) {
       <Switch field="auto_approve_ship" label="ships" danger
               title="Automatically approve every production ship — code goes LIVE with no human review (still built from landed main)." />
     </span>
-  );
-}
-
-// agent_runtime.vendor → provider_token.provider: two vocabularies for the same company
-const VENDOR_PROVIDER = { anthropic: 'claude', openai: 'openai', moonshot: 'kimi' };
-
-function RuntimeToggle({ runtimes, value, onChange }) {
-  if (!runtimes.length) return null;
-  return (
-    <div className="toggle" role="group" aria-label="Agent runtime">
-      {runtimes.map((r) => (
-        <button key={r.key} className={`seg ${value === r.key ? 'on' : ''}`}
-                onClick={() => onChange(r.key)} title={r.vendor}>
-          {r.label}
-        </button>
-      ))}
-    </div>
   );
 }
 
