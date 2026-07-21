@@ -742,10 +742,21 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   }
 
   // ── middle seam: identity ── grow a short slug to fill the card width (single line — it's the seam)
+  // With a session title the seam splits in two: WHO it is (slug) rides just above WHAT it's
+  // doing (the zee's task title) — the collapsed card answers both without expanding the flower.
+  // Rows below shift down a notch to make the room; no title (ready xells, production) → the
+  // layout is exactly what it was.
+  // the dispatch convention prefixes titles with "xell : " — identity noise on a card this small
+  const zeeTitle = full && !x.is_production ? (x.zee_title || '').replace(/^xell\s*:\s*/i, '').trim() : '';
   const label = x.is_production ? '🛡 PRODUCTION' : shortSlug(x.slug);
   fillFont(ctx, label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
   ctx.fillStyle = COL.text;
-  ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * 0.06 : size * 0.2));
+  ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * (zeeTitle ? 0.14 : 0.06) : size * 0.2));
+  if (zeeTitle) {
+    ctx.font = `italic ${Math.max(7.5, size * 0.125)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.muted;
+    ctx.fillText(fit(ctx, zeeTitle, w * 0.88), cx, cy + size * 0.02);
+  }
 
   // ── lower half ──
   // Live head (diff.head, read from the worktree) over the frozen head_commit provisioning base, so
@@ -755,7 +766,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     if (sha) {
       ctx.font = `600 ${Math.max(8.5, size * 0.155)}px 'Cascadia Code', monospace`;
       ctx.fillStyle = COL.sha;
-      ctx.fillText(sha, cx, cy + size * 0.14);
+      ctx.fillText(sha, cx, cy + size * (zeeTitle ? 0.2 : 0.14));
     }
     // diff: "↑1 ↓7 · 4f +32/−6" — the SOURCE diff (worktree vs its branch's fork off main), i.e.
     // everything this xell would land, matching the expanded flower's COMMIT facet. NOT `diff.own`
@@ -763,7 +774,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     // almost always and the collapsed card looked like it never tracked any work. git convention
     // colouring (insertions green, deletions red) via drawDiffRow.
     if (diff && !x.is_production) {
-      const y = cy + size * 0.32;
+      const y = cy + size * (zeeTitle ? 0.36 : 0.32);
       const parts = [
         { t: `↑${diff.ahead} ↓${diff.behind} · ${diff.files}f `, c: COL.muted },
         { t: `+${diff.insertions}`, c: COL.add },
@@ -781,7 +792,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     if (st) {
       ctx.font = `600 ${Math.max(7.5, size * 0.13)}px 'Segoe UI', sans-serif`;
       const pw = ctx.measureText(st).width + 12, ph = Math.max(11, size * 0.19);
-      const py2 = cy + size * 0.5;
+      const py2 = cy + size * (zeeTitle ? 0.53 : 0.5);
       ctx.beginPath(); ctx.roundRect(cx - pw / 2, py2 - ph / 2, pw, ph, ph / 2);
       ctx.fillStyle = withAlpha(col, 0.22); ctx.fill();
       ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(col, 0.7); ctx.stroke();
