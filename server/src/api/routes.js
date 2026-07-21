@@ -256,6 +256,10 @@ router.post('/projects/probe-remote', async (req, res) => {
   // the create form prefills the destination when the server has a repos home configured
   res.json({ ...probe, repos_dir: config.reposDir });
 });
+// Where the queenzee's own filesystem keeps repos. The onboard form's Folder / Clone-into hints
+// speak THIS world: paths resolve on the server's filesystem, so a containerized queenzee sees
+// /repos (its volume), never the operator's D:\ — the form must not suggest otherwise.
+router.get('/projects/repos-home', (_req, res) => res.json({ repos_dir: config.reposDir }));
 // New Project by clone: probe → git clone → the normal createProject seeding. Long request —
 // the probe fails fast and both dev-proxy and prod nginx carry long reads.
 router.post('/projects/clone', async (req, res) => {

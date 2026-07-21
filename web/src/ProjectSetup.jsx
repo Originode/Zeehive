@@ -5,7 +5,7 @@ import {
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
-  getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
+  getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome,
 } from './api.js';
 import { showConfirm } from './Dialog.jsx';
 
@@ -63,6 +63,12 @@ function CreateForm({ onCreated }) {
   const [rprobe, setRprobe] = useState(null);       // remote probe (clone mode)
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  // The Folder path resolves on the QUEENZEE's filesystem, not the browser's machine — a
+  // containerized queenzee sees /repos (its volume), never the operator's D:\. Ask the server
+  // where its repos home is so the hints speak the world the path will actually be checked in.
+  const [home, setHome] = useState(null);
+  useEffect(() => { getReposHome().then((r) => setHome(r?.repos_dir || null)).catch(() => {}); }, []);
+  const homeDir = home ? home.replace(/[\\/]+$/, '') : null;
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const setc = (k) => (e) => setC({ ...c, [k]: e.target.value });
 
@@ -111,7 +117,7 @@ function CreateForm({ onCreated }) {
     } catch (e2) { setErr(e2.message); } finally { setBusy(false); }
   };
 
-  const cloneReady = c.remote_url.trim() && (c.dest.trim() || rprobe?.repos_dir);
+  const cloneReady = c.remote_url.trim() && (c.dest.trim() || rprobe?.repos_dir || homeDir);
   return (
     <form className="setup-sec" onSubmit={submit}>
       <h3>Source</h3>
@@ -124,11 +130,13 @@ function CreateForm({ onCreated }) {
       <div className="setup-grid">
         <label>Name<input autoFocus={source === 'folder'} value={f.name} onChange={set('name')} placeholder="MyProject" /></label>
         {source === 'folder' ? (
-          <label>Folder<input value={f.repo_root} onChange={set('repo_root')} onBlur={runProbe} placeholder="D:\Repos\MyProject" /></label>
+          <label>Folder <span className="pc">(a path on the queenzee's own filesystem{homeDir ? ` — this instance keeps repos under ${homeDir}` : ''})</span>
+            <input value={f.repo_root} onChange={set('repo_root')} onBlur={runProbe}
+                   placeholder={homeDir ? `${homeDir}/${f.name || 'MyProject'}` : 'D:\\Repos\\MyProject'} /></label>
         ) : (
           <>
             <label>Repository URL<input autoFocus value={c.remote_url} onChange={setc('remote_url')} onBlur={runRemoteProbe} placeholder="https://github.com/org/repo" /></label>
-            <label>Clone into<input value={c.dest} onChange={setc('dest')} placeholder={rprobe?.repos_dir ? `${rprobe.repos_dir}/${f.name || '…'}` : 'D:\\Repos\\MyProject'} /></label>
+            <label>Clone into<input value={c.dest} onChange={setc('dest')} placeholder={(rprobe?.repos_dir || homeDir) ? `${(rprobe?.repos_dir || homeDir).replace(/[\\/]+$/, '')}/${f.name || '…'}` : 'D:\\Repos\\MyProject'} /></label>
             <label>GitHub token <span className="pc">(read-only PAT — private repos only, stored in the meta-DB)</span>
               <input type="password" autoComplete="off" value={c.token} onChange={setc('token')} placeholder="github_pat_… (blank for public)" /></label>
           </>

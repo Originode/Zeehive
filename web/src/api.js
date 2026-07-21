@@ -168,6 +168,8 @@ export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${site
 
 // ── onboarding surface: probe / readiness / inventory / spawn template / manifest ──
 export const probeRepo = (repo_root) => siteCall('/api/projects/probe', 'POST', { repo_root });
+// the server's repos home (null on a host-era install) — the create form's path hints use it
+export const getReposHome = () => fetch('/api/projects/repos-home').then((r) => r.json());
 // GitHub inbound — clone in, pull in, NEVER push (the server has no push verb at all).
 export const probeRemote = (url, token) => siteCall('/api/projects/probe-remote', 'POST', { url, token: token || undefined });
 export const cloneProject = (body) => siteCall('/api/projects/clone', 'POST', body);
