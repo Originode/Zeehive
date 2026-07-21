@@ -40,6 +40,18 @@ export const PROVIDERS = {
     steps: 'Create a dedicated CODING key in the Kimi Code console (not a Moonshot platform key) and paste it below; it is stored only in the meta-DB. Dispatched zees run the Kimi Code CLI inside their cxell.',
     valid: (t) => /^[A-Za-z0-9_-]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
+  // DeepSeek ships no coding-agent CLI of its own — a DeepSeek zee runs the claude CLI against
+  // DeepSeek's OWN Anthropic-compatible endpoint (runtime 'deepseek-cxell'): the sanctioned
+  // exception to the vendor-native ruling, decided 2026-07-22 (see lib/cxell-runtimes.js).
+  deepseek: {
+    key: 'deepseek',
+    label: 'DeepSeek',
+    dispatch: true,   // deepseek-cxell runtime (lib/cxell-runtimes.js)
+    command: 'https://platform.deepseek.com/api_keys',
+    steps: 'Create an API key on the DeepSeek platform (sk-…) and paste it below; it is stored only in the meta-DB. Dispatched zees run the claude CLI against DeepSeek’s Anthropic-compatible endpoint.',
+    // sk-<alnum tail>; sk-ant-… is explicitly rejected so a Claude token in the wrong slot fails loudly
+    valid: (t) => /^sk-[A-Za-z0-9]{20,}$/.test(t) && !/^sk-ant-/.test(t),
+  },
   // GitHub is INBOUND-ONLY (migration 032): this token is used exclusively by clone/pull fetches
   // in lib/remote-git.js — nothing in Zeehive can push, so a Contents:Read-only PAT is all it
   // should ever be granted.

@@ -189,6 +189,31 @@ const ADAPTERS = {
   },
 };
 
+// ── DeepSeek — the claude CLI aimed at DeepSeek's OWN Anthropic-compatible endpoint ──────────
+// The sanctioned exception to the vendor-native ruling above (Mark, 2026-07-22): DeepSeek ships
+// NO coding-agent CLI of its own; what it ships is an Anthropic-compatible API surface
+// (api.deepseek.com/anthropic) built precisely so Claude-Code-style tooling can drive DeepSeek
+// models. That makes this the vendor's documented door, not a shim around the vendor. Everything
+// is the claude adapter (same stream-json contract, same resume mechanics); what differs is the
+// credential (a DeepSeek key on the same bearer header), the base URL, and the model — pinned
+// via ANTHROPIC_MODEL because claude aliases mean nothing here (bare dispatch runs deepseek-chat).
+ADAPTERS['deepseek-cxell'] = {
+  ...ADAPTERS['claude-code-cxell'],
+  key: 'deepseek-cxell',
+  provider: 'deepseek',
+  // no --model flag: the model rides ANTHROPIC_MODEL below (claude aliases are dropped)
+  execCmd: ({ resumeSid } = {}) =>
+    'claude --bare -p --output-format stream-json --verbose --dangerously-skip-permissions'
+    + (safeSid(resumeSid) ? ` --resume ${safeSid(resumeSid)}` : ''),
+  env: ({ token, model } = {}) => ({
+    ANTHROPIC_AUTH_TOKEN: token,
+    ANTHROPIC_BASE_URL: process.env.DEEPSEEK_ANTHROPIC_BASE_URL || 'https://api.deepseek.com/anthropic',
+    ANTHROPIC_MODEL: safeModel(vendorModel(model)) || process.env.DEEPSEEK_DEFAULT_MODEL || 'deepseek-chat',
+    // the CLI's background/fast lane must not silently ask for a claude model id either
+    ANTHROPIC_SMALL_FAST_MODEL: process.env.DEEPSEEK_DEFAULT_MODEL || 'deepseek-chat',
+  }),
+};
+
 export function adapterFor(runtimeKey) {
   const a = ADAPTERS[runtimeKey || 'claude-code-cxell'];
   if (!a) throw new Error(`no cxell runtime adapter for "${runtimeKey}" — known: ${Object.keys(ADAPTERS).join(', ')}`);
@@ -198,7 +223,7 @@ export const CLAUDE_ADAPTER = ADAPTERS['claude-code-cxell'];
 
 // Which cxell runtime a dispatch provider runs on. Claude resolves through the pool default /
 // runtime toggle as before; the other vendors have exactly one runtime — their own CLI.
-const PROVIDER_RUNTIME = { openai: 'codex-cxell', kimi: 'kimi-code-cxell' };
+const PROVIDER_RUNTIME = { openai: 'codex-cxell', kimi: 'kimi-code-cxell', deepseek: 'deepseek-cxell' };
 export const runtimeKeyForProvider = (provider) => PROVIDER_RUNTIME[provider] || null;
 
 // The "+" composer's model picker, per vendor (claude's aliases stay in intake.js — they also
@@ -223,6 +248,13 @@ const VENDOR_MODELS = {
     { key: 'k3',                        label: 'K3',              note: 'flagship' },
     { key: 'kimi-for-coding',           label: 'K2.7 Code',       note: 'standard coding model' },
     { key: 'kimi-for-coding-highspeed', label: 'K2.7 high-speed', note: 'same model, faster serving' },
+  ],
+  // DeepSeek's two stable serving names — they track generations upstream, so they can't go stale:
+  // deepseek-chat is the current V-series (non-thinking), deepseek-reasoner the thinking R-series.
+  deepseek: [
+    { key: '', label: 'DeepSeek default', note: `runs ${process.env.DEEPSEEK_DEFAULT_MODEL || 'deepseek-chat'} (override: DEEPSEEK_DEFAULT_MODEL)`, default: true },
+    { key: 'deepseek-chat',     label: 'DeepSeek Chat',     note: 'the current V-series — fast, everyday coding' },
+    { key: 'deepseek-reasoner', label: 'DeepSeek Reasoner', note: 'the thinking R-series — hard, long-horizon work' },
   ],
 };
 export const providerModels = (provider) => VENDOR_MODELS[provider] || null;
