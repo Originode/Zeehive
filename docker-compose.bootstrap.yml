@@ -11,6 +11,18 @@
 #
 # Run your own fork: override ZEEHIVE_SELF_REMOTE (and ZEEHIVE_GITHUB_TOKEN for a private repo —
 # a fine-grained PAT with Contents: Read-only) in a .env file next to this one.
+#
+# Onboard a project that lives on YOUR machine (instead of cloning it): bind-mount it into the
+# repos volume with a sibling override file, and it appears in the console's folder picker —
+#   # mount-my-project.yml
+#   services:
+#     server:
+#       volumes:
+#         - D:\Repos\MyProject:/repos/MyProject     # host path : container path
+#   docker compose -f docker-compose.bootstrap.yml -f mount-my-project.yml up -d
+# Know the tradeoffs: Docker Desktop bind mounts are much slower than the named volume for
+# git-heavy work, a Windows checkout brings CRLF along, and the queenzee's zees write that tree —
+# don't fight them from a host editor mid-run. Clone-from-GitHub remains the smoothest path.
 name: zeehive
 services:
   meta-db:
