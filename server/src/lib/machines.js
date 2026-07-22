@@ -140,7 +140,7 @@ export async function createMachine(body = {}) {
     await setMachinePriority(row.id, body.project_id, Number(body.dev_priority));
   }
   broadcast('machine', row);
-  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}${row.can_device ? ', devices' : ''}, priority ${row.dev_priority}, cap ${row.max_xells})`);
+  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}${row.can_device ? ', devices' : ''}, cap ${row.max_xells}${Number(body.dev_priority) > 0 ? `, priority ${Number(body.dev_priority)} for this project` : ''})`);
   return row;
 }
 
