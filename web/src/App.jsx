@@ -9,6 +9,7 @@ import ProjectSetup from './ProjectSetup.jsx';
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 import HiveCanvas from './hive/HiveCanvas.jsx';
 import GraphPane from './GraphPane.jsx';
+import { beginPaneReposition, readSplit } from './paneSplit.js';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
@@ -149,6 +150,10 @@ export default function App() {
   // ── honeycomb shell ──────────────────────────────────────────────────────────
   const orientation = useOrientation();          // 'portrait' | 'landscape'
   const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
+  // honey pane's fraction of the two OUTER panes' combined size — the grip in the graph pane slides
+  // this to move the centre divider (null → the CSS 3:2 default). Persisted per orientation.
+  const [split, setSplit] = useState(null);
+  useEffect(() => { setSplit(readSplit(orientation)); }, [orientation]);
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
@@ -484,7 +489,7 @@ export default function App() {
   // side is honeycomb vs panels. Connector wires bridge each xell's commit dot (graph) to its hex.
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
-      <section className="hive-pane honey">
+      <section className="hive-pane honey" style={split != null ? { flex: `${split} 1 0` } : undefined}>
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     onContainerMenu={openMenu}
@@ -520,14 +525,16 @@ export default function App() {
 
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
                  hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
-                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                 onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
+                 onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />
 
-      <section className="hive-pane panels">
+      <section className="hive-pane panels" style={split != null ? { flex: `${1 - split} 1 0` } : undefined}>
       <div className="content">
       <header className="topbar">
         <div className="proj">
@@ -538,10 +545,7 @@ export default function App() {
           <span className="k folder">Folder:</span> <span className="mono">{project.repo_root}</span>
         </div>
         <div className="right">
-          <button className="flip-btn" data-testid="flip-btn" onClick={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
-                  title={`Flip the honeycomb to the other side (timeline follows so merge points keep facing it). Now: ${orientation}, honeycomb ${honeySide === 'a' ? (orientation === 'portrait' ? 'top' : 'left') : (orientation === 'portrait' ? 'bottom' : 'right')}`}>
-            ⇄ flip
-          </button>
+          {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided by clicking that
               account's own prompt button in the status line — one click, no second choice. */}
           <span className={`conn ${conn}`}>{conn === 'live' ? '● live' : '○ ' + conn}</span>
