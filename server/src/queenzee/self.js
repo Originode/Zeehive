@@ -116,15 +116,23 @@ export async function selfLand(xell) {
   } catch (e) {
     return { ok: false, status: 'needs-resolution', stage: 'catch-up', error: e.message, collected };
   }
-  if (caughtUp.state === 'conflict' || caughtUp.state === 'no-head') {
+  if (caughtUp.state === 'conflict' || caughtUp.state === 'no-head' || caughtUp.state === 'error') {
+    const msg = caughtUp.state === 'conflict'
+      ? `Could not catch up to ${caughtUp.ref}: your commits CONFLICT with work that landed while you were `
+        + 'running. Nothing was pushed and your branch is untouched. Pull the latest into your cxell, resolve '
+        + 'the conflict, commit, and `zee land` again.'
+      : caughtUp.state === 'error'
+        // NOT a content conflict — an operational failure on the queenzee side that a zee cannot fix by
+        // editing files. Surface it plainly so nobody hunts a phantom merge conflict.
+        ? `Could not catch up to ${caughtUp.ref} — this is NOT a merge conflict but a catch-up error, so `
+          + 'there is nothing for you to resolve in the code. Nothing was pushed; your branch is untouched. '
+          + `A human should check the queenzee: ${(caughtUp.output || 'no detail').split('\n').filter(Boolean).pop()}`
+        : `Could not read HEAD in the worktree for ${xell.slug} — nothing to land.`;
     return {
       ok: false, status: 'needs-resolution', stage: 'catch-up', collected, catch_up: caughtUp,
-      conflict: caughtUp.output || null,
-      message: caughtUp.state === 'conflict'
-        ? `Could not catch up to ${caughtUp.ref}: your commits CONFLICT with work that landed while you were `
-          + 'running. Nothing was pushed and your branch is untouched. Pull the latest into your cxell, resolve '
-          + 'the conflict, commit, and `zee land` again.'
-        : `Could not read HEAD in the worktree for ${xell.slug} — nothing to land.`,
+      conflict: caughtUp.state === 'conflict' ? (caughtUp.output || null) : null,
+      error: caughtUp.state === 'error' ? (caughtUp.output || null) : undefined,
+      message: msg,
     };
   }
 
