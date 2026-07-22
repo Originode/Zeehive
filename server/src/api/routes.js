@@ -27,6 +27,7 @@ import { listProjects, createProject, updateProject, deleteProject,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
          cloneProject, pullProject } from '../lib/projects.js';
 import { probeRemote } from '../lib/remote-git.js';
+import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderToken,
@@ -263,6 +264,13 @@ router.get('/projects/repos-home', (_req, res) => res.json({ repos_dir: config.r
 // The onboard form's folder picker: browse directories on the queenzee's own filesystem
 // (listing only — names + git-repo marker; see lib/projects.js listDirs).
 router.get('/fs/dirs', (req, res) => res.json(listDirs(req.query.path || null)));
+// UI-driven host-folder mounts (containerized era): register the bind, then self-recreate via
+// a sibling docker:cli helper so the folder appears under /repos (lib/self-mount.js).
+router.get('/projects/host-mounts', (_req, res) => res.json(listHostMounts()));
+router.post('/projects/mount-host', (req, res) => {
+  try { res.json(mountHostFolder(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // New Project by clone: probe → git clone → the normal createProject seeding. Long request —
 // the probe fails fast and both dev-proxy and prod nginx carry long reads.
 router.post('/projects/clone', async (req, res) => {

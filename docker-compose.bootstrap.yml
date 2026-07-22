@@ -12,8 +12,10 @@
 # Run your own fork: override ZEEHIVE_SELF_REMOTE (and ZEEHIVE_GITHUB_TOKEN for a private repo —
 # a fine-grained PAT with Contents: Read-only) in a .env file next to this one.
 #
-# Onboard a project that lives on YOUR machine (instead of cloning it): bind-mount it into the
-# repos volume with a sibling override file, and it appears in the console's folder picker —
+# Onboard a project that lives on YOUR machine (instead of cloning it): the console does this
+# for you — Onboard → Existing folder → "mount a folder from the host machine…" (the queenzee
+# recreates its own container to take the bind; mounts persist in /repos/.zeehive-mounts.yml).
+# The manual equivalent, if you prefer to own the compose invocation —
 #   # mount-my-project.yml
 #   services:
 #     server:

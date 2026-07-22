@@ -6,6 +6,7 @@ import {
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
+  mountHostFolder,
 } from './api.js';
 import { showConfirm } from './Dialog.jsx';
 
@@ -78,6 +79,21 @@ function CreateForm({ onCreated }) {
     setF((prev) => ({ ...prev, repo_root: path, name: prev.name.trim() ? prev.name : name }));
     setBrowse(null);
     probeRepo(path).then(setProbe).catch((e) => setProbe({ ok: false, error: e.message }));
+  };
+  // Mount a folder from the HOST machine (containerized queenzee only): the server registers the
+  // bind and RECREATES ITS OWN CONTAINER to take it — the console blips offline for ~10s, then
+  // the folder is under /repos. null = collapsed; {host,name} = editing; {done} = restarting.
+  const [mount, setMount] = useState(null);
+  const [mountBusy, setMountBusy] = useState(false);
+  const [mountErr, setMountErr] = useState(null);
+  const doMount = async () => {
+    setMountBusy(true); setMountErr(null);
+    try {
+      const r = await mountHostFolder(mount.host.trim(), mount.name.trim() || undefined);
+      setF((prev) => ({ ...prev, repo_root: r.target }));
+      setMount({ done: r.target });
+    } catch (e) { setMountErr(e?.error || e?.message || String(e)); }
+    finally { setMountBusy(false); }
   };
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const setc = (k) => (e) => setC({ ...c, [k]: e.target.value });
@@ -177,6 +193,33 @@ function CreateForm({ onCreated }) {
                 </span>
               </span>
             )}
+            {/* Host-folder mount — only meaningful when the queenzee is containerized (homeDir
+                set). The server refuses with a clear message on a host-era install anyway. */}
+            {homeDir && !browse && (mount?.done ? (
+              <span className="pc" data-testid="mount-restarting">
+                ⏳ queenzee is restarting to take the mount — when the ● live pill returns, <b>{mount.done}</b> is ready to probe or browse.
+              </span>
+            ) : mount ? (
+              <span className="fsbrowse" data-testid="mount-panel">
+                <span className="pc">Mounts a folder from the <b>host machine</b> (the one running docker) into {homeDir}.
+                  The queenzee restarts (~10s) to take the bind — zees in their cxells keep running.
+                  Heads-up: a hand-run <span className="mono">docker compose up</span> that omits
+                  <span className="mono"> /repos/.zeehive-mounts.yml</span> drops UI mounts.</span>
+                <span className="setup-row">
+                  <input value={mount.host} placeholder="D:\Repos\MyProject  (host path)"
+                         onChange={(e) => setMount({ ...mount, host: e.target.value })} />
+                  <input value={mount.name} placeholder="name (default: folder name)" style={{ maxWidth: 180 }}
+                         onChange={(e) => setMount({ ...mount, name: e.target.value })} />
+                  <button type="button" disabled={mountBusy || !mount.host.trim()} data-testid="mount-go"
+                          onClick={doMount}>{mountBusy ? 'Mounting…' : '⇅ Mount & restart'}</button>
+                  <button type="button" className="ghost" onClick={() => { setMount(null); setMountErr(null); }}>cancel</button>
+                </span>
+                {mountErr && <span className="projpop-err">{mountErr}</span>}
+              </span>
+            ) : (
+              <button type="button" className="ghost" data-testid="mount-open"
+                      onClick={() => setMount({ host: '', name: '' })}>⇅ mount a folder from the host machine…</button>
+            ))}
           </label>
         ) : (
           <>
