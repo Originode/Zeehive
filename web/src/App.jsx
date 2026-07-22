@@ -291,7 +291,7 @@ export default function App() {
     pushToast({ id, kind: 'progress', title: 'Starting backup…',
       body: `Dumping ${c?.name || 'the production database'}` });
     try {
-      await runBackup(projectId || project?.id);
+      await runBackup(projectId || fleet?.project?.id);
       updateToast(id, { kind: 'success', title: 'Backup started',
         body: 'It runs in the background — watch the backups panel for its spinner.' });
       refresh();
@@ -299,7 +299,14 @@ export default function App() {
     } catch (e) {
       updateToast(id, { kind: 'error', title: 'Backup not started', body: e?.error || e?.message || String(e) });
     }
-  }, [pushToast, updateToast, dismissToast, refresh, projectId, project]);
+    // Reads `fleet?.project`, NOT the destructured `project` — and this is not a style choice.
+    // `const { project } = fleet` happens far below, after the `if (!fleet) return` early return;
+    // a dep array is evaluated on EVERY render, so naming `project` here touched it in its temporal
+    // dead zone and threw "Cannot access 'project' before initialization" on the first render. The
+    // whole console rendered blank (2026-07-22). Moving this hook below that destructure is not the
+    // fix either — it sits after an early return, and hooks must run unconditionally. `fleet` is
+    // state declared at the top of the component, so it is always safe to reference here.
+  }, [pushToast, updateToast, dismissToast, refresh, projectId, fleet]);
 
   // once: global logs, and pick the active project (persisted → first)
   useEffect(() => {
