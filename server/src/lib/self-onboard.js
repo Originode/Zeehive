@@ -146,7 +146,10 @@ async function modelOwnStack(projectId) {
        role === 'db' ? 5432 : role === 'server' ? 4700 : 5180,
        // parameters, not secrets: the meta-db by its in-network service name
        role === 'db' ? 'postgresql://zeehive@meta-db:5432/zeehive' : null,
-       site.id, buildScript, buildScript ? 'bash' : null]);
+       // build_exec is NOT NULL DEFAULT 'bash' (migration 010) — always 'bash'; it is inert
+       // when build_script is NULL (the db never ships), and passing null threw and aborted
+       // modeling the db row entirely (found 2026-07-22 on the first from-zero boot).
+       site.id, buildScript, 'bash']);
     if (c && prodXell) {
       await q(`INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'owns')
                ON CONFLICT DO NOTHING`, [prodXell.id, c.id]);
