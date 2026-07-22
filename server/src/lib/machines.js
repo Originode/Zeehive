@@ -1,6 +1,7 @@
 // Machines — the physical docker hosts of the hive, as data (migration 023). One row per docker
-// context: what the host IS (can it build?), what it should carry (pool_size / max_xells), and
-// where new dev work goes first (dev_priority). Consumed by:
+// context: what the host IS (can it build? its machine-wide max_xells cap). WHERE new dev work
+// goes first (dev_priority) and how big a warm pool it keeps (pool_size) are PER-PROJECT choices,
+// held in machine_pool (025 + 038), not on the machine row. Consumed by:
 //   provision.js  — pickDevMachine() chooses WHERE a fresh xell spawns; defaultBuildCtxFor()
 //                   chooses WHERE its images compile (the NAS runs but must not build).
 //   pool.js       — per-machine pool targets replace pool_config.target_ready once any dev
