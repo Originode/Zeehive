@@ -60,7 +60,12 @@ services:
     # nobody tests. Keep the two in lockstep.
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    depends_on: [server]
+    # NO depends_on here, deliberately — bootstrap has one because it boots the whole stack in
+    # order, but self-ship runs `up -d --no-build web` and compose acts on a service's WHOLE
+    # dependency chain. With `depends_on: [server]` the webapp ship recreated server and meta-db
+    # too: it killed the running queenzee mid-ship and left a half-created container behind
+    # (observed 2026-07-22 on the cold-boot verification). A role ship must touch ONE container.
+    # depends_on is orchestration, not identity — this is the one field the two files may differ on.
     labels:
       zeehive.project: Zeehive
       zeehive.role: webapp
