@@ -44,7 +44,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -797,6 +797,19 @@ router.post('/xell/self/done', async (req, res) => {
 router.post('/xell/self/tend', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfTend(x, { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Readiness HINT (or --clear): "this looks land/ship-ready — a human should decide". Opens no gate
+// and pushes nothing; it lights the land? / ship? prompt so a human sees the button. The zee calls
+// the REAL land/ship only when 100% certain the job is done; otherwise it hints and leaves the call.
+router.post('/xell/self/hint-land', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHint(x, 'land', { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/hint-ship', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHint(x, 'ship', { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Ping "I am actively working" — asserts live activity the passive poller can't see for a cxell, and

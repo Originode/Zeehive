@@ -131,6 +131,36 @@ export async function tendOpen(xellId) {
   return row?.hook_event_name === 'tend-request';
 }
 
+// ── the zee's READINESS HINT (hint-land / hint-ship) ────────────────────────────
+// A zee that is NOT 100% certain the job is done — so it must NOT call the real, gated `zee land`
+// / `zee ship` — but HAS reached a landable/shippable checkpoint, drops a HINT: "human, this looks
+// ready — consider it." Like tend it opens no gate and blocks nothing; unlike tend it maps to a
+// specific verb, so the hive can surface the exact button (land? / ship?) a human would click.
+// Same append-only session_event ride as tend (the dev schema is frozen): the OPEN state of a
+// hint is whether its LATEST event is a '<kind>hint-request' (vs '<kind>hint-clear'). kind is
+// 'land' or 'ship'. Cleared explicitly (`--clear`) or superseded once a real land/ship request or
+// done request outranks it in the hive-status derivation.
+const HINT_KINDS = new Set(['land', 'ship']);
+export async function setHint(xellId, kind, on, { reason = null, zeeId = null, source = 'self' } = {}) {
+  if (!HINT_KINDS.has(kind)) throw new Error(`unknown hint kind '${kind}' — use 'land' or 'ship'`);
+  await recordEvent({
+    source, hook_event_name: on ? `${kind}hint-request` : `${kind}hint-clear`,
+    zee_id: zeeId, xell_id: xellId, raw: reason ? { reason } : null,
+  });
+  broadcast('xell', { id: xellId });
+  return { xell_id: xellId, kind, hint: !!on, reason };
+}
+
+// Is this xell's <kind> hint currently OPEN? (latest hint event of that kind is a request)
+export async function hintOpen(xellId, kind) {
+  if (!HINT_KINDS.has(kind)) return false;
+  const row = await one(
+    `SELECT hook_event_name FROM session_event
+       WHERE xell_id = $1 AND hook_event_name IN ($2, $3)
+       ORDER BY ts DESC LIMIT 1`, [xellId, `${kind}hint-request`, `${kind}hint-clear`]);
+  return row?.hook_event_name === `${kind}hint-request`;
+}
+
 // A zee PINGS that it is actively working. Mirrors what a harness UserPromptSubmit hook would do
 // (Channel A is not installed for cxell zees), so the hive can show live activity even when the
 // passive poller is blind to a cxell. Reporting work also CLEARS any open tend — asking for a human

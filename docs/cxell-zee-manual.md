@@ -47,10 +47,12 @@ queenzee at `host.docker.internal:4700` (firewall-allowed).
 zee status                                       # where you stand
 zee build [server|webapp|all] [--hot] [--wait] [--watch]   # (re)build your OWN app tier (NOT gated)
 zee device [--detach|--status]                   # attach a MOBILE DEVICE (Android) to build apps on (NOT gated)
-zee land                                         # collect commits + gated push to main
-zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod
+zee land                                         # collect commits + gated push to main (ONLY when 100% certain)
+zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod   (ONLY when 100% certain)
+zee hint-land [--reason "…"] | --clear           # "looks land-ready" — light the land? button for a human, don't land
+zee hint-ship [--reason "…"] | --clear           # "looks ship-ready" — light the ship? button for a human, don't ship
 zee prod --reason "…"                            # ask to be bound to the prod database
-zee done --summary "…"                           # propose your job is done
+zee done --summary "…"                           # propose your job is done (ONLY after landed — and shipped, if shipping)
 ```
 
 Every call prints the queenzee's JSON answer. **`zee build` is the one verb that acts immediately**
@@ -111,8 +113,6 @@ is **NOT human-gated**: the device is a throwaway test target, torn down with yo
 - **Verify with your eyes.** A build that installs is not a build that works — screenshot it.
 
 ### `zee land` — land your work on main
-
-### `zee land` — land your work on main
 `POST /api/xell/self/land`. This is the piece a cxell otherwise can't do: your commits live *inside*
 the container, but landing pushes from the host worktree. So the queenzee:
 1. **collects** your commits out of the cxell (bundles your branch HEAD, fast-forwards the host
@@ -133,6 +133,18 @@ lock and builds prod itself, from the xource at main. You do not hold the lock, 
 build, you do not release anything — deliberately. `--targets` names what to rebuild (`server`,
 `webapp`, or both; default both). Land first (`zee land`), then ship.
 
+### `zee hint-land` · `zee hint-ship` — nudge a human to land/ship, without doing it
+`POST /api/xell/self/hint-land` · `.../hint-ship` `{ reason?, clear? }`. **Call the real `zee land`
+/ `zee ship` ONLY when you are 100% certain the job is done.** Any time you are less than certain —
+you have a landable checkpoint, or a state you *think* is shippable but want a human's eyes on — do
+NOT land/ship. **Hint instead.** A hint opens no gate and pushes nothing; it just lights the
+`land?` / `ship?` prompt on your hexagon (`occ-landHint` / `occ-shipHint`) so a human sees the
+land/ship **button** and makes the call. `--clear` lowers it. This is the mechanism behind the rule
+"a zee should never be left hanging": if you finish unsure, your hexagon still asks a human to act,
+instead of you either force-driving a gate or going silent. (The land/ship buttons ALSO appear on
+their own whenever your git state warrants — unlanded commits → `land`, landed+clean → `ship`; a
+hint is your explicit "I think it's time" on top of that.)
+
 ### `zee prod` — ask for the production database
 `POST /api/xell/self/prod-request` `{ reason }`. Records a **request only**. It does **not** bind:
 binding grants the prod DATABASE (live, irreversible writes), which is a human's call. A human
@@ -145,7 +157,14 @@ human to agree.
 ### `zee done` — propose you are finished
 `POST /api/xell/self/done` `{ summary }`. Flags your xell `awaiting-done`. A **human** confirms with
 "Mark done" in the dashboard, and *that* is what tears the cxell down (collecting your commits first).
-**You never despawn yourself.** When you believe the job is done, `zee done` and stop.
+**You never despawn yourself.**
+
+**Order matters: land — then ship (if shipping) — THEN done.** `awaiting-done` is a terminal state
+that *outranks* land/ship/tend/hint in the hive derivation, so proposing done early **masks your own
+`land?` button** and invites a human to tear you down with work still only on your branch. Do not
+`zee done` until your work is landed on main (and shipped, if this job ships). If you are finished
+but unsure it is landable/shippable, `zee hint-land` / `zee hint-ship` and let a human decide —
+don't reach for `zee done` to signal completion.
 
 ## What happens to your work
 

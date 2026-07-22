@@ -908,9 +908,9 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
   const st = x.hive_status;
   const showDone = true;                                          // mark-done: visible on any status
   const canLand = (!!diff && diff.ahead > 0)                      // committed work not yet on main…
-    || st === 'occ-landRequest';                                  // …or a land request already pending
+    || st === 'occ-landRequest' || st === 'occ-landHint';         // …or a land request/hint standing
   const canShip = shipLine(x, diff) === 'ready'                   // landed, clean, not in prod…
-    || st === 'occ-shipRequest';                                  // …or a ship request already pending
+    || st === 'occ-shipRequest' || st === 'occ-shipHint';         // …or a ship request/hint standing
   const R = COL.ready, D = COL.error, G = COL.working, P = COL.prod;
   const h = Math.max(15, size * 0.28);
   const padX = size * 0.13;
