@@ -30,7 +30,7 @@ const median = (a) => {
 };
 
 export default function GraphPane({ timeline, orientation, honeySide, hexPosRef, prodIds = [], subscribeGeom,
-                                   hoverRef, setHover, subscribeHover }) {
+                                   hoverRef, setHover, subscribeHover, onFlip }) {
   const groupRef = useRef(null);
   const portrait = orientation === 'portrait';
   const [, forceHover] = useReducer((x) => x + 1, 0);
@@ -206,6 +206,17 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
         </g>
       </svg>
       <span className="graph-branch" data-orient={orientation}>⎇ {timeline.branch}</span>
+      {/* flip button lives IN the middle pane, at the end opposite the ⎇ branch label (which sits at
+          the top in landscape / the left in portrait, so flip sits at the bottom / right). */}
+      {onFlip && (
+        <button className="graph-flip" data-orient={orientation} data-testid="flip-btn" onClick={onFlip}
+                title={`Flip the honeycomb to the other side (timeline follows so merge points keep facing it). Now: ${orientation}, honeycomb ${honeySide === 'a' ? (portrait ? 'top' : 'left') : (portrait ? 'bottom' : 'right')}`}
+                style={portrait
+                  ? { position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)' }
+                  : { position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)' }}>
+          ⇄ flip
+        </button>
+      )}
       {/* drag the panels-facing edge to resize; squeeze it to collapse subjects to heads only */}
       <div className={`graph-resize${compressed && !portrait ? ' compressed' : ''}`} data-orient={orientation}
            onPointerDown={onResizeDown}
@@ -213,6 +224,16 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
            style={portrait
              ? { position: 'absolute', left: 0, right: 0, height: 9, cursor: 'row-resize', [honeyLow ? 'bottom' : 'top']: 0 }
              : { position: 'absolute', top: 0, bottom: 0, width: 9, cursor: 'col-resize', [honeyLow ? 'right' : 'left']: 0 }} />
+      {/* a grippable ICON on that same panels-facing edge: drag it to reposition the whole middle
+          pane, growing one neighbour pane while shrinking the other. Squeeze to heads-only. */}
+      <button className="graph-grip" data-orient={orientation} data-testid="graph-grip"
+              onPointerDown={onResizeDown}
+              title="Drag to resize the git graph — grows/shrinks the panes on either side; squeeze it down to just the commit heads"
+              style={portrait
+                ? { position: 'absolute', left: '50%', transform: 'translateX(-50%)', cursor: 'row-resize', [honeyLow ? 'bottom' : 'top']: 2 }
+                : { position: 'absolute', top: '50%', transform: 'translateY(-50%)', cursor: 'col-resize', [honeyLow ? 'right' : 'left']: 2 }}>
+        {portrait ? '⇕' : '⇔'}
+      </button>
     </div>
   );
 }

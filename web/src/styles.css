@@ -1075,6 +1075,19 @@ a.cbox:hover { border-color: var(--accent); }
 .graph-branch[data-orient="landscape"] { top: 6px; left: 50%; transform: translateX(-50%); }
 .graph-branch[data-orient="portrait"]  { left: 8px; top: 50%; transform: translateY(-50%); }
 
+/* flip button, docked IN the graph pane at the end opposite the ⎇ branch label */
+.graph-flip { z-index: 5; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; padding: 4px 10px; font-size: 11px; line-height: 1; cursor: pointer;
+  white-space: nowrap; }
+.graph-flip:hover { color: var(--text); border-color: var(--accent); }
+
+/* draggable resize grip: a visible icon on the panels-facing edge. Dragging it repositions the
+   whole middle pane — growing one neighbour while shrinking the other, down to heads-only. */
+.graph-grip { z-index: 6; display: flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--muted); border-radius: 6px; font-size: 13px; line-height: 1; touch-action: none; }
+.graph-grip:hover, .graph-grip:active { color: var(--text); border-color: var(--accent); background: var(--panel); }
+
 /* flip: honey-a → honeycomb in the first slot, honey-b → last slot; graph stays centred (order:1) */
 .hive-split.honey-a .hive-pane.honey  { order: 0; }
 .hive-split.honey-a .hive-pane.panels { order: 2; }

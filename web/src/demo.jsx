@@ -80,7 +80,8 @@ function Demo() {
 
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
                  hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
-                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                 onFlip={() => { setHoneySide((s) => s === 'a' ? 'b' : 'a'); setVersion((v) => v + 1); }} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}

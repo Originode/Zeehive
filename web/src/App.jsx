@@ -520,7 +520,8 @@ export default function App() {
 
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
                  hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
-                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+                 hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                 onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
@@ -538,10 +539,7 @@ export default function App() {
           <span className="k folder">Folder:</span> <span className="mono">{project.repo_root}</span>
         </div>
         <div className="right">
-          <button className="flip-btn" data-testid="flip-btn" onClick={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
-                  title={`Flip the honeycomb to the other side (timeline follows so merge points keep facing it). Now: ${orientation}, honeycomb ${honeySide === 'a' ? (orientation === 'portrait' ? 'top' : 'left') : (orientation === 'portrait' ? 'bottom' : 'right')}`}>
-            ⇄ flip
-          </button>
+          {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided by clicking that
               account's own prompt button in the status line — one click, no second choice. */}
           <span className={`conn ${conn}`}>{conn === 'live' ? '● live' : '○ ' + conn}</span>
