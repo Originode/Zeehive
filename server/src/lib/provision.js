@@ -234,7 +234,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // with room under max_xells — spec: "if local priority is higher, dev xells get spawned there
   // first"); legacy otherwise: the project's default dev site → deprecated project columns →
   // global env default (see lib/sites.js).
-  const machine = machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine();
+  const machine = machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine(projectId);
   if (machineCtx && !machine) throw new Error(`no machine row for docker context '${machineCtx}'`);
   const devSite = await resolveSite(projectId, 'dev');
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;

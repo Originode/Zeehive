@@ -298,6 +298,14 @@ export async function setMachinePool(machineId, projectId, pool_size) {
   });
   return jsonOrThrow(r, 'set pool size');
 }
+// Per-project dev spawn priority on a machine — where THIS project's new xells land first.
+export async function setMachinePriority(machineId, projectId, dev_priority) {
+  const r = await fetch(`/api/machines/${machineId}/priority`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, dev_priority }),
+  });
+  return jsonOrThrow(r, 'set priority');
+}
 // Stand up the project's shared dev db ON a machine (background; restores the latest prod backup).
 export async function provisionMachineDevDb(machineId, projectId) {
   const r = await fetch(`/api/machines/${machineId}/dev-db`, {

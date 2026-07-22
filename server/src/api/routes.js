@@ -12,7 +12,8 @@ import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restore
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
-import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool } from '../lib/machines.js';
+import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
+         setMachinePriority } from '../lib/machines.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
@@ -530,6 +531,15 @@ router.put('/machines/:id/pool', async (req, res) => {
   try {
     const projectId = req.body?.project_id || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
     res.json(await setMachinePool(req.params.id, projectId, req.body?.pool_size));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Per-project dev spawn priority on a machine (machine_pool, 038) — the matrix prio knob writes
+// here. Priority is a project's placement choice, not a machine-wide habit; only max_xells (PATCHed
+// onto the machine row) is shared across projects.
+router.put('/machines/:id/priority', async (req, res) => {
+  try {
+    const projectId = req.body?.project_id || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+    res.json(await setMachinePriority(req.params.id, projectId, req.body?.dev_priority));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Stand up this project's shared dev db ON a machine (latest prod backup by default) — the
