@@ -14,8 +14,12 @@ runs as a host process, and the sanctioned path to full containerization.
 Deploy / redeploy the dashboard:
 
 ```sh
-docker --context desktop-linux compose -f docker/zeehive/docker-compose.prod.yml up -d --build web
+docker compose -f docker/zeehive/docker-compose.prod.yml up -d --build web
 ```
+
+This file and `docker-compose.bootstrap.yml` describe the SAME stack (project `zeehive`, same
+container names and ports) — bootstrap pulls published images, this one builds from the checkout.
+Change identity in one and you must change it in the other, or self-ship breaks on fresh installs.
 
 Ships through the gate use [`scripts/ship-zeehive-web.sh`](../../scripts/ship-zeehive-web.sh)
 (the `zeehive_web` row's build_script): detached worktree at the approved sha → image build on

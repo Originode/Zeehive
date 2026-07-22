@@ -15,7 +15,9 @@ docker compose -f docker-compose.bootstrap.yml up -d
 
 (Developing ZEEHIVE itself? Clone the repo and build from source instead:
 `docker network create zee-hive-net`, then
-`docker compose -f docker/zeehive/docker-compose.prod.yml --profile experimental up -d --build meta-db server web`.)
+`docker compose -f docker/zeehive/docker-compose.prod.yml up -d --build meta-db server web`.
+That file is the build-from-source twin of the bootstrap one — same project name, same container
+names, same ports — so a stack booted either way is shippable by the same scripts.)
 
 That's the whole loop. On first boot the server migrates its **own fresh meta-DB**
 (`zeehive_meta_data` volume), then **self-onboards**: it clones this repo into the `zeehive_repos`

@@ -1,13 +1,28 @@
-# ZEEHIVE production on machine 'local' (docker context desktop-linux).
+# ZEEHIVE production — the BUILD-FROM-SOURCE twin of docker-compose.bootstrap.yml.
 #
-#   docker --context desktop-linux compose -f docker/zeehive/docker-compose.prod.yml up -d --build web
+#   docker compose -f docker/zeehive/docker-compose.prod.yml up -d --build web
 #
-# web    — LIVE: the production dashboard (built bundle behind nginx, /api proxied to the
-#          queenzee). This is what http://10.1.0.15:5180 serves.
-# server — EXPERIMENTAL (profile): the containerized queenzee. Builds today; goes live only
-#          after the repo migration to the Linux side (see Dockerfile.server header). Until
-#          then the queenzee runs on the host via the self-ship pattern.
-name: zeehive-prod
+# Bootstrap PULLS published images; this file BUILDS the same stack from the checkout. They must
+# therefore describe the SAME stack: same project name, same container names, same ports, same
+# host aliases. That is not tidiness — self-ship drives THIS file (scripts/ship-zeehive-web.sh,
+# scripts/self-ship-container.sh) against containers that bootstrap created, and `container_name`
+# is a global docker namespace. When the two disagreed (`zeehive-prod` here vs `zeehive` there),
+# every ship from a bootstrap-booted queenzee died on
+#   "Conflict. The container name /zeehive_web is already in use"
+# because compose recreates containers it OWNS and refuses ones labelled for another project.
+# Found 2026-07-22 on the first from-zero boot that tried to ship: the bootstrap file was added
+# with `name: zeehive` while these scripts already targeted `zeehive-prod`, and nothing had ever
+# exercised the two together.
+#
+# The rule this file now lives by: if you change identity here (name, container_name, ports,
+# extra_hosts), change it in docker-compose.bootstrap.yml too, or ships break on fresh installs.
+#
+# Why identity fixes must land HERE and not in the scripts: the ship runs
+# `container.build_script` from /app (baked into the SERVER IMAGE, which lags master until the
+# image is republished) but reads this compose file from $SRC = project.repo_root = the checkout
+# git just landed. A fix in this file reaches a fresh `docker pull` install immediately; a fix in
+# the scripts does not reach it until the image is rebuilt and pushed.
+name: zeehive
 services:
   # The meta-DB — ZEEHIVE's single source of truth, LIVE on machine 'local' (migrated off
   # ugreen-nas 2026-07-18: every Zeehive prod container belongs on the machine its prod site
@@ -15,7 +30,10 @@ services:
   # colocating removes the network from every query). Port 5445 kept from the ugreen era so the
   # DATABASE_URL only changes host. The data lives in the zeehive_db_data volume; the old ugreen
   # container is kept STOPPED as a cold fallback of the pre-migration state.
+  # NOT part of the shippable stack — the host era's archive, kept behind a profile so an
+  # unscoped `up` in project 'zeehive' can never start it alongside the live containers.
   db:
+    profiles: ["archive"]
     image: postgres:17-alpine
     container_name: zeehive_db
     restart: unless-stopped
@@ -36,19 +54,27 @@ services:
     container_name: zeehive_web
     restart: unless-stopped
     ports: ["5180:5180"]
+    # nginx-web.conf proxies /api to host.docker.internal:4700, a name that does NOT resolve on
+    # native Linux without this alias. Bootstrap has it; when this file did not, a webapp ship
+    # recreated the container without it and took /api down on exactly the fresh-install path
+    # nobody tests. Keep the two in lockstep.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on: [server]
     labels:
       zeehive.project: Zeehive
       zeehive.role: webapp
 
   # The NEW ERA's meta-DB (decided 2026-07-20): the containerized queenzee starts from a FRESH
   # database — nothing is ever migrated from the old zeehive_db above, which keeps serving the
-  # host-era instance until it retires. Its own named volume; 5447 on the host for humans/psql.
+  # host-era instance until it retires. Its own named volume.
+  # No host port, matching bootstrap: `server` depends_on this, so ANY difference in its config
+  # would make compose recreate the database container on every server ship. `docker exec
+  # zeehive_meta_db psql -U zeehive` is the access path.
   meta-db:
-    profiles: ["experimental"]
     image: postgres:17-alpine
     container_name: zeehive_meta_db
     restart: unless-stopped
-    ports: ["5447:5432"]
     environment:
       POSTGRES_USER: zeehive
       POSTGRES_PASSWORD: zeehive
@@ -65,12 +91,16 @@ services:
       zeehive.role: db
 
   server:
-    profiles: ["experimental"]
     build: { context: ../.., dockerfile: docker/zeehive/Dockerfile.server }
     image: zeehive-server:prod
-    container_name: zeehive_server_ctr    # _ctr: never shadow the live host process's row name
+    # Identity is bootstrap's, exactly. It was `zeehive_server_ctr` on 4701 to avoid shadowing the
+    # host-era queenzee that owned 4700 — that era is over, and the mismatch was actively harmful:
+    # under one project name compose matches by SERVICE label, so a server ship would have found
+    # the running `zeehive_server` and replaced it with a differently-named container on a port
+    # the web container's nginx does not proxy to.
+    container_name: zeehive_server
     restart: unless-stopped
-    ports: ["4701:4700"]                  # 4701 while experimental — the host queenzee owns 4700
+    ports: ["4700:4700"]
     depends_on:
       meta-db: { condition: service_healthy }
     environment:
@@ -93,10 +123,11 @@ services:
       ZEEHIVE_SSH_DIR: /data/ssh           # fleet cxell keypair — regenerating it orphans live cxells
       BACKUP_DIR: /backups                 # prod DB dumps
       ZEEHIVE_CXELL_SSH: network            # SSH to cxells by container name over zee-hive-net
-      CXELL_API_BASE: http://host.docker.internal:4701   # cxells must call THIS instance: it
-                                           # publishes 4701 while experimental. Cutover flips the
-                                           # port mapping to 4700 — drop this line then (the code
-                                           # default is host.docker.internal:4700).
+      # cxells reach the queenzee by SERVICE NAME over zee-hive-net — no host-networking
+      # assumption, so this works the same on Docker Desktop and native Linux. Same value as
+      # bootstrap; see the identity rule in the header.
+      CXELL_IMAGE: ${CXELL_IMAGE:-ghcr.io/originode/zeehive-zee-agent:latest}
+      CXELL_API_BASE: http://zeehive_server:4700
     volumes:
       - zeehive_repos:/repos                        # the migrated project folders (Linux-native git)
       - /var/run/docker.sock:/var/run/docker.sock   # the local daemon; TCP contexts for the rest
