@@ -44,7 +44,12 @@ services:
       retries: 20
 
   server:
-    image: ghcr.io/originode/zeehive-server:latest
+    # Overridable so a stack that has SHIPPED itself is not silently reverted. Ships replace these
+    # containers with locally built images (zeehive-server:prod / zeehive-web:prod); re-running
+    # `up -d` here — to add an env var, say — reconciles them straight back to the published tag
+    # and undoes the deploy with no warning. If you build from source, set ZEEHIVE_SERVER_IMAGE and
+    # ZEEHIVE_WEB_IMAGE in the .env next to this file.
+    image: ${ZEEHIVE_SERVER_IMAGE:-ghcr.io/originode/zeehive-server:latest}
     container_name: zeehive_server
     restart: unless-stopped
     ports: ["4700:4700"]
@@ -74,7 +79,7 @@ services:
     # and joins it idempotently — a compose-owned network would refuse any pre-existing one.
 
   web:
-    image: ghcr.io/originode/zeehive-web:latest
+    image: ${ZEEHIVE_WEB_IMAGE:-ghcr.io/originode/zeehive-web:latest}
     container_name: zeehive_web
     restart: unless-stopped
     ports: ["5180:5180"]
