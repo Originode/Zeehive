@@ -33,11 +33,37 @@ SERVER_PORT=$((3100 + SLOT))
 WEB_PORT=$((5200 + SLOT))
 URL="http://$HOST_IP:$WEB_PORT"
 
+# PROVISIONING IS ALL-OR-NOTHING. Everything below runs under `set -e`, so ANY later failure
+# aborts the script — and until 2026-07-22 it aborted with the worktree already on disk and no
+# xell row to own it. The pool maintainer then retried on its next 15s tick, cut another one, and
+# failed again: 396 orphaned OmniBiz worktrees (~367MB each) accumulated in about three hours,
+# filled the Docker VM's disk, and wedged the whole engine. Nothing noticed, because the pool
+# only logs "provision failed" and an orphan looks like nothing at all.
+#
+# So: from the moment we create the worktree, a non-zero exit REMOVES it again. A xell that
+# failed to provision must leave the disk exactly as it found it.
+CREATED_WT=""
+cleanup_failed_provision() {
+  status=$?
+  [ $status -eq 0 ] && exit 0
+  if [ -n "$CREATED_WT" ]; then
+    echo "provision failed (exit $status) — removing the worktree it had already created: $CREATED_WT" >&2
+    git -C "$ROOT" worktree remove --force "$CREATED_WT" >/dev/null 2>&1 || true
+    rm -rf "$CREATED_WT" 2>/dev/null || true
+    git -C "$ROOT" worktree prune >/dev/null 2>&1 || true
+    # the branch was created by `worktree add -b`; it has no commits of its own worth keeping
+    git -C "$ROOT" branch -D "$BRANCH" >/dev/null 2>&1 || true
+  fi
+  exit $status
+}
+trap cleanup_failed_provision EXIT
+
 # 1) create the isolated worktree on its own branch off the LOCAL source ref (never origin)
 if [ ! -e "$WT/.git" ]; then
   git -C "$ROOT" rev-parse --verify --quiet "$SRC_REF" >/dev/null \
     || { echo "source ref '$SRC_REF' does not exist in $ROOT" >&2; exit 1; }
   git -C "$ROOT" worktree add "$WT" -b "$BRANCH" "$SRC_REF" >&2
+  CREATED_WT="$WT"   # ours to clean up if anything below fails
 fi
 HEAD="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 

@@ -71,6 +71,12 @@ services:
       # by omission. MAINTENANCE_ENABLED arms the scheduler; MODE decides real vs placeholder.
       MAINTENANCE_MODE: ${MAINTENANCE_MODE:-real}
       MAINTENANCE_ENABLED: ${MAINTENANCE_ENABLED:-true}
+      # Worktree-only provisioning by default. The app tier runs the PROJECT's own spin-env.sh,
+      # which needs the main checkout's .env — a file a fresh `git clone` never has, because it is
+      # gitignored. provision.js defaults this ON, so a containerized queenzee provisioning a
+      # cloned project failed on every attempt (2026-07-22: 396 orphaned worktrees, 139GB, engine
+      # wedged). Turn it on per-install once the project's dev tier is genuinely wired up.
+      PROVISION_APP_TIER: ${PROVISION_APP_TIER:-false}
       # cxells (the zees' containers) are spawned from the published image and reach the
       # queenzee by service name over zee-hive-net — no host networking assumptions, so this
       # works the same on Docker Desktop (win/mac) and native Linux.

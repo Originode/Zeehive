@@ -21,6 +21,30 @@ const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuf
 const ADJ = ['swift', 'calm', 'bright', 'bold', 'keen', 'lively', 'nimble', 'quiet', 'sunny', 'wise'];
 const NOUN = ['harbor', 'meadow', 'summit', 'delta', 'ember', 'grove', 'atlas', 'cove', 'ridge', 'vale'];
 
+// WHY a provision failed, in one line a human can act on.
+//
+// This used to be `stderr.slice(-500)` — the LAST 500 characters. git writes checkout progress to
+// stderr ("Updating files: 97% (3089/3184)…"), and on a big repo that progress is several
+// THOUSAND characters, so the tail was always the progress bar and the real error was always cut
+// off the front. Every failure read as `provision-xell.sh failed: ng files: 92% … done.` — which
+// looks like success. That is why 396 orphaned worktrees (139GB) and a wedged docker engine went
+// unnoticed for three hours on 2026-07-22; the actual cause was one line the log never showed:
+// "❌ /repos/omnibiz/.env not found".
+//
+// So: drop the progress meters, then prefer the LAST real line — scripts print their complaint
+// last. Fall back to the raw tail only if filtering leaves nothing.
+export function provisionFailureReason(r) {
+  const raw = `${r.stderr || ''}\n${r.stdout || ''}`;
+  const lines = raw
+    .split(/[\r\n]+/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .filter((l) => !/^(Updating files|Checking out files|Receiving objects|Resolving deltas|remote: (Counting|Compressing) objects|Cloning into|Preparing worktree)/i.test(l))
+    .filter((l) => !/^[\s.]*\d{1,3}% \(\d+\/\d+\)/.test(l));
+  if (!lines.length) return (r.stderr || '(no output)').trim().slice(-300);
+  return lines.slice(-3).join(' | ').slice(0, 600);
+}
+
 // Mirror of spin-env.sh: slot = (first 4 hex of md5(slug)) % slot_mod. Bases/mod come from the
 // project row (port_server_base/port_web_base/port_slot_mod); the numeric defaults keep the
 // OmniBiz-era values for callers that don't pass a project.
@@ -281,7 +305,7 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       env: cleanGitEnv({ SPINOFF_DOCKER_CONTEXT: devCtx, DEV_HOST_IP: devHost,
              PROVISION_APP_TIER: appTier ? 'true' : 'false' }),
     });
-    if (r.status !== 0) throw new Error(`provision-xell.sh failed: ${(r.stderr || '').slice(-500)}`);
+    if (r.status !== 0) throw new Error(`provision-xell.sh failed: ${provisionFailureReason(r)}`);
     health = appTier ? 'up' : 'down'; // worktree exists; containers only up if the app tier ran
   }
 

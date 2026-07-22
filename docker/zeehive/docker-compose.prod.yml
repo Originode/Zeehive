@@ -132,6 +132,10 @@ services:
       # backup — see 9169c1b for why that is worse than having no backup at all.
       MAINTENANCE_MODE: ${MAINTENANCE_MODE:-real}
       MAINTENANCE_ENABLED: ${MAINTENANCE_ENABLED:-true}
+      # Worktree-only provisioning — same default and same reason as docker-compose.bootstrap.yml
+      # (keep the two in step). See provision.js: the code default is ON, and that default is what
+      # produced 396 orphaned worktrees against a cloned project with no .env.
+      PROVISION_APP_TIER: ${PROVISION_APP_TIER:-false}
       ZEEHIVE_CXELL_SSH: network            # SSH to cxells by container name over zee-hive-net
       # cxells reach the queenzee by SERVICE NAME over zee-hive-net — no host-networking
       # assumption, so this works the same on Docker Desktop and native Linux. Same value as
