@@ -30,7 +30,7 @@ const median = (a) => {
 };
 
 export default function GraphPane({ timeline, orientation, honeySide, hexPosRef, prodIds = [], subscribeGeom,
-                                   hoverRef, setHover, subscribeHover, onFlip }) {
+                                   hoverRef, setHover, subscribeHover, onFlip, onReposition }) {
   const groupRef = useRef(null);
   const portrait = orientation === 'portrait';
   const [, forceHover] = useReducer((x) => x + 1, 0);
@@ -224,16 +224,19 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
            style={portrait
              ? { position: 'absolute', left: 0, right: 0, height: 9, cursor: 'row-resize', [honeyLow ? 'bottom' : 'top']: 0 }
              : { position: 'absolute', top: 0, bottom: 0, width: 9, cursor: 'col-resize', [honeyLow ? 'right' : 'left']: 0 }} />
-      {/* a grippable ICON on that same panels-facing edge: drag it to reposition the whole middle
-          pane, growing one neighbour pane while shrinking the other. Squeeze to heads-only. */}
-      <button className="graph-grip" data-orient={orientation} data-testid="graph-grip"
-              onPointerDown={onResizeDown}
-              title="Drag to resize the git graph — grows/shrinks the panes on either side; squeeze it down to just the commit heads"
-              style={portrait
-                ? { position: 'absolute', left: '50%', transform: 'translateX(-50%)', cursor: 'row-resize', [honeyLow ? 'bottom' : 'top']: 2 }
-                : { position: 'absolute', top: '50%', transform: 'translateY(-50%)', cursor: 'col-resize', [honeyLow ? 'right' : 'left']: 2 }}>
-        {portrait ? '⇕' : '⇔'}
-      </button>
+      {/* a grippable ICON at the pane's centre: drag it to SLIDE the whole middle pane along the
+          split axis. The pane keeps its own size — instead the two OUTER panes trade space (drag up
+          → top pane smaller, bottom bigger; drag left → left pane smaller). Thickness is the edge
+          strip above; this only moves the divider. */}
+      {onReposition && (
+        <button className="graph-grip" data-orient={orientation} data-testid="graph-grip"
+                onPointerDown={onReposition}
+                title="Drag to slide the graph — moves the divider so one side pane grows while the other shrinks (the graph keeps its size; drag its edge to resize that)"
+                style={{ position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)',
+                         cursor: portrait ? 'row-resize' : 'col-resize' }}>
+          {portrait ? '⇕' : '⇔'}
+        </button>
+      )}
     </div>
   );
 }
