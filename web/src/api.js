@@ -208,6 +208,17 @@ export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, on
   return () => es.close();
 }
 
+// Live clone progress for the onboard form ({name,url,phase,label,pct,overall,detail,done}).
+// Its own EventSource rather than a hook into subscribe(): the onboard modal runs before the
+// project it is creating exists, so there is no project stream for it to ride on yet.
+export function subscribeCloneProgress(onProgress) {
+  const es = new EventSource('/api/stream');
+  es.addEventListener('clone-progress', (e) => {
+    try { onProgress(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
+  });
+  return () => es.close();
+}
+
 // (Re)build a per-xell container. hot=true → fast reload (lime dot); false → full rebuild.
 // buildCtx (optional): compile on this docker context now ('' resets to the run host). Omit to
 // keep whatever build host the container already has.

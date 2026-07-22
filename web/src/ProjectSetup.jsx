@@ -6,7 +6,7 @@ import {
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
-  mountHostFolder, purgeDevXells,
+  mountHostFolder, purgeDevXells, subscribeCloneProgress,
 } from './api.js';
 import { showConfirm } from './Dialog.jsx';
 
@@ -64,6 +64,7 @@ function CreateForm({ onCreated }) {
   const [rprobe, setRprobe] = useState(null);       // remote probe (clone mode)
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
+  const [prog, setProg] = useState(null);           // live clone progress frame (clone mode)
   // The Folder path resolves on the QUEENZEE's filesystem, not the browser's machine — a
   // containerized queenzee sees /repos (its volume), never the operator's D:\. Ask the server
   // where its repos home is so the hints speak the world the path will actually be checked in.
@@ -136,7 +137,10 @@ function CreateForm({ onCreated }) {
 
   const submit = async (e) => {
     e.preventDefault();
-    setBusy(true); setErr(null);
+    setBusy(true); setErr(null); setProg(null);
+    // Listen for the server's clone frames for the duration of THIS request only. Cloning a big
+    // repo is minutes of silence otherwise, which reads as a hung dialog.
+    const stop = source === 'clone' ? subscribeCloneProgress(setProg) : null;
     try {
       const common = {
         name: f.name.trim(), main_branch: f.main_branch.trim() || 'main',
@@ -147,7 +151,7 @@ function CreateForm({ onCreated }) {
         ? await cloneProject({ ...common, remote_url: c.remote_url.trim(), dest: c.dest.trim() || null, token: c.token.trim() || null })
         : await createProject({ ...common, repo_root: f.repo_root.trim() });
       onCreated(p);
-    } catch (e2) { setErr(e2.message); } finally { setBusy(false); }
+    } catch (e2) { setErr(e2.message); } finally { stop?.(); setBusy(false); setProg(null); }
   };
 
   const cloneReady = c.remote_url.trim() && (c.dest.trim() || rprobe?.repos_dir || homeDir);
@@ -242,13 +246,34 @@ function CreateForm({ onCreated }) {
       </div>
       <p className="pc">The pool starts at 0 — no xells are pre-warmed until the readiness gates pass and you raise it.</p>
       {err && <div className="projpop-err">{err}</div>}
+      {busy && source === 'clone' && <CloneProgress prog={prog} />}
       <div className="projpop-formbtns">
         <button type="submit" disabled={busy || !f.name.trim() || (source === 'folder' ? !f.repo_root.trim() : !cloneReady)}>
           {busy ? (source === 'clone' ? 'Cloning…' : 'Creating…') : (source === 'clone' ? 'Clone & configure →' : 'Create & configure →')}
         </button>
-        {busy && source === 'clone' && <span className="pc">cloning can take a while on a big repo — progress streams to the log rail</span>}
       </div>
     </form>
+  );
+}
+
+// Live clone progress. Until the first frame arrives (probe + connect happen before git prints
+// anything) the bar is indeterminate rather than a lying 0% — the work has genuinely started, we
+// just cannot size it yet. Percentages are whole-clone, not per-phase; see CLONE_PHASES server-side.
+function CloneProgress({ prog }) {
+  const pending = !prog || prog.overall == null;
+  const pct = pending ? 0 : Math.max(0, Math.min(100, prog.overall));
+  return (
+    <div className="clone-prog">
+      <div className={`clone-prog-bar${pending ? ' indeterminate' : ''}`}>
+        <div className="clone-prog-fill" style={pending ? undefined : { width: `${pct}%` }} />
+      </div>
+      <div className="clone-prog-meta">
+        <span className="clone-prog-label">{prog?.label || 'starting clone…'}</span>
+        {prog?.detail && <span className="pc">{prog.detail}</span>}
+        {!pending && <span className="clone-prog-pct">{pct}%</span>}
+      </div>
+      <span className="pc">a big repo takes a few minutes — full git output streams to the log rail</span>
+    </div>
   );
 }
 

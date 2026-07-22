@@ -13,7 +13,7 @@ import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import { cleanGitEnv } from './git.js';
 import { resolveBash } from './bash.js';
-import { probeRemote, cloneFromRemote, pullRemote } from './remote-git.js';
+import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
 import { resolveSite } from './sites.js';
@@ -169,9 +169,25 @@ export async function cloneProject(body = {}) {
   const mainBranch = String(body.main_branch || '').trim() || probe.default_branch || 'main';
 
   logline('projects', `cloning ${url} → ${dest} (branch ${mainBranch})`);
+  // Progress rides the SSE bus so the onboard form can draw a real bar instead of a spinner that
+  // says nothing for four minutes. git emits many updates a second; only forward a frame when the
+  // whole-clone percentage actually moves, or the stream becomes the bottleneck it is reporting on.
+  let lastOverall = -1;
+  broadcast('clone-progress', { name, url, phase: 'starting', label: 'contacting remote', overall: 0, pct: 0 });
   const cl = await cloneFromRemote({
     url, dest, branch: mainBranch, token,
-    onProgress: (line) => logline('projects', `clone ${name}: ${line}`),
+    onProgress: (line) => {
+      logline('projects', `clone ${name}: ${line}`);
+      const p = parseGitProgress(line);
+      if (!p || p.overall === lastOverall) return;
+      lastOverall = p.overall;
+      broadcast('clone-progress', { name, url, ...p });
+    },
+  });
+  // Terminal frame either way — a bar left at 87% with no closing event is worse than no bar.
+  broadcast('clone-progress', {
+    name, url, phase: cl.cloned ? 'done' : 'failed', label: cl.cloned ? 'clone complete' : 'clone failed',
+    overall: cl.cloned ? 100 : lastOverall, pct: 100, done: true, error: cl.cloned ? null : cl.reason,
   });
   if (!cl.cloned) throw new Error(`clone failed: ${cl.reason}`);
 

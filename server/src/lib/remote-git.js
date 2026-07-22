@@ -54,6 +54,42 @@ function gitNet(args, { cwd, token, timeout = 120000, onStderrLine } = {}) {
   });
 }
 
+// ── clone progress, parsed ────────────────────────────────────────────────────
+// git --progress narrates four phases on stderr, each counting 0→100% on its own. A bar that
+// just mirrored the last percentage would race to 100 four times, so the phases are laid end to
+// end on ONE 0-100 scale, weighted by how long each actually takes on a big repo. Receiving is
+// the network and dominates; counting/compressing happen on GitHub's side and are over quickly.
+const CLONE_PHASES = [
+  { re: /^remote:\s*Counting objects:\s+(\d+)%/,    key: 'counting',    label: 'counting objects',   from: 0,  to: 5 },
+  { re: /^remote:\s*Compressing objects:\s+(\d+)%/, key: 'compressing', label: 'compressing',        from: 5,  to: 10 },
+  { re: /^Receiving objects:\s+(\d+)%/,             key: 'receiving',   label: 'receiving objects',  from: 10, to: 80 },
+  { re: /^Resolving deltas:\s+(\d+)%/,              key: 'resolving',   label: 'resolving deltas',   from: 80, to: 92 },
+  // "Updating files" on modern git, "Checking out files" before 2.29 — both mean checkout.
+  { re: /^(?:Updating|Checking out) files:\s+(\d+)%/, key: 'checkout',  label: 'checking out',       from: 92, to: 100 },
+];
+
+// One stderr line → {phase,label,pct,overall,detail}, or null when the line carries no percentage
+// (banners like "Cloning into '…'" and warnings stay in the log rail where they belong).
+export function parseGitProgress(line) {
+  for (const p of CLONE_PHASES) {
+    const m = p.re.exec(line);
+    if (!m) continue;
+    const pct = Math.max(0, Math.min(100, Number(m[1])));
+    // the tail git appends to receiving lines: ", 12.34 MiB | 2.11 MiB/s" — minus the ", done."
+    // it adds on the last frame of a phase, which is already said by the bar reaching the end.
+    const raw = (/,\s*([\d.]+\s*[KMGT]?i?B[^)]*)$/.exec(line) || [])[1] || null;
+    const detail = raw ? raw.replace(/,\s*done\.?\s*$/i, '').trim() : null;
+    return {
+      phase: p.key,
+      label: p.label,
+      pct,
+      overall: Math.round(p.from + ((p.to - p.from) * pct) / 100),
+      detail: detail || null,
+    };
+  }
+  return null;
+}
+
 const looksLikeAuthFailure = (err) =>
   /authentication failed|could not read Username|terminal prompts disabled|403|invalid credentials|Password authentication is not supported/i.test(err || '');
 
