@@ -21,7 +21,7 @@ import { proposeDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
-import { setTend, tendOpen, pingWorking } from '../lib/status.js';
+import { setTend, tendOpen, setHint, hintOpen, pingWorking } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 
 const liveZee = (xellId) => one(
@@ -44,14 +44,17 @@ export async function selfStatus(xell) {
     `SELECT c.role, c.name, c.tier, host(c.host) AS host, c.host_port FROM xell_uses_container uc
        JOIN container c ON c.id = uc.container_id WHERE uc.xell_id=$1 ORDER BY c.role`, [xell.id]);
   const tend = await tendOpen(xell.id);
+  const landHint = await hintOpen(xell.id, 'land');
+  const shipHint = await hintOpen(xell.id, 'ship');
   // The DISPLAY status the hive shows for this xell — the same derivation the dashboard renders, so
-  // a cxell zee sees itself exactly as a human does (and can tell its tend/land/ship pings landed).
+  // a cxell zee sees itself exactly as a human does (and can tell its tend/hint/land/ship pings landed).
   const hive = hiveStatus(
     { ...xell, zee_status: zee?.status },
     {
       landPending: land ? ['pending', 'approved'].includes(land.status) : false,
       shipPending: ship ? ['pending', 'approved', 'shipping'].includes(ship.status) : false,
       tendPending: tend,
+      landHint, shipHint,
       prodUnprotected: xell.is_production && !!lock,
     },
   );
@@ -113,15 +116,23 @@ export async function selfLand(xell) {
   } catch (e) {
     return { ok: false, status: 'needs-resolution', stage: 'catch-up', error: e.message, collected };
   }
-  if (caughtUp.state === 'conflict' || caughtUp.state === 'no-head') {
+  if (caughtUp.state === 'conflict' || caughtUp.state === 'no-head' || caughtUp.state === 'error') {
+    const msg = caughtUp.state === 'conflict'
+      ? `Could not catch up to ${caughtUp.ref}: your commits CONFLICT with work that landed while you were `
+        + 'running. Nothing was pushed and your branch is untouched. Pull the latest into your cxell, resolve '
+        + 'the conflict, commit, and `zee land` again.'
+      : caughtUp.state === 'error'
+        // NOT a content conflict — an operational failure on the queenzee side that a zee cannot fix by
+        // editing files. Surface it plainly so nobody hunts a phantom merge conflict.
+        ? `Could not catch up to ${caughtUp.ref} — this is NOT a merge conflict but a catch-up error, so `
+          + 'there is nothing for you to resolve in the code. Nothing was pushed; your branch is untouched. '
+          + `A human should check the queenzee: ${(caughtUp.output || 'no detail').split('\n').filter(Boolean).pop()}`
+        : `Could not read HEAD in the worktree for ${xell.slug} — nothing to land.`;
     return {
       ok: false, status: 'needs-resolution', stage: 'catch-up', collected, catch_up: caughtUp,
-      conflict: caughtUp.output || null,
-      message: caughtUp.state === 'conflict'
-        ? `Could not catch up to ${caughtUp.ref}: your commits CONFLICT with work that landed while you were `
-          + 'running. Nothing was pushed and your branch is untouched. Pull the latest into your cxell, resolve '
-          + 'the conflict, commit, and `zee land` again.'
-        : `Could not read HEAD in the worktree for ${xell.slug} — nothing to land.`,
+      conflict: caughtUp.state === 'conflict' ? (caughtUp.output || null) : null,
+      error: caughtUp.state === 'error' ? (caughtUp.output || null) : undefined,
+      message: msg,
     };
   }
 
@@ -277,6 +288,26 @@ export async function selfTend(xell, { reason = null, clear = false } = {}) {
       : 'Tend RAISED — the hive now shows this xell as needing a human (occ-tendRequest). Nothing is '
         + 'gated or blocked; a human will see it in the console. It clears when you `zee tend --clear` '
         + 'or report working (`zee working`).',
+  };
+}
+
+// ── POST /api/xell/self/hint-land · hint-ship — "this looks ready; a human should decide" ──────
+// The verb for the 100%-certain rule: a zee only calls the real, gated `zee land` / `zee ship` when
+// it is CERTAIN the job is done. Short of that — a landable checkpoint, a plausibly-shippable state
+// it wants eyes on — it HINTS instead. A hint opens no gate and pushes nothing; it just lights the
+// land? / ship? prompt on the hive so a human sees the button and decides. `{clear:true}` lowers it.
+export async function selfHint(xell, kind, { reason = null, clear = false } = {}) {
+  const zee = await liveZee(xell.id);
+  const res = await setHint(xell.id, kind, !clear, { reason, zeeId: zee?.id || null });
+  logline('self', `${xell.slug} ${clear ? `cleared its ${kind} hint` : `HINTED ${kind}-ready`}${reason ? `: ${reason}` : ''}`);
+  const verb = kind === 'land' ? 'land' : 'ship';
+  return {
+    ok: true, ...res,
+    message: clear
+      ? `${kind} hint cleared — the hive no longer prompts to ${verb} this xell.`
+      : `${kind} hint RAISED — the hive now shows this xell as occ-${kind}Hint (${verb}?), surfacing the `
+        + `${verb} button for a human. Nothing is gated or pushed. Call the real \`zee ${verb}\` yourself ONLY `
+        + `when you are 100% certain the job is done; otherwise leave the decision to the human's button.`,
   };
 }
 

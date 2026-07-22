@@ -13,7 +13,8 @@ import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import { cleanGitEnv } from './git.js';
 import { resolveBash } from './bash.js';
-import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress } from './remote-git.js';
+import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
+         remoteAccess, pushRemote, openPullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
 import { resolveSite } from './sites.js';
@@ -252,6 +253,62 @@ export async function pullProject(id, by = 'human@console') {
     logline('projects', `${by} pulled ${p.name}: origin/${p.main_branch} → ${(r.to || '').slice(0, 8)} (${r.commits} commit${r.commits === 1 ? '' : 's'})`);
     broadcast('project', p);
   }
+  return r;
+}
+
+// ── OUTBOUND (opt-in, human-gated): does this project's PAT carry write access? ──
+// The console asks this to decide whether to SHOW the Push / PR buttons at all. Read-only or no
+// token → both false with a reason, and the buttons stay hidden. Never throws (a probe failure is
+// an answer, not a 500): a project with no remote reports can_push/can_pr false.
+export async function githubAccess(id) {
+  const p = await one(`SELECT id, remote_url, main_branch FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  if (!p.remote_url) return { can_push: false, can_pr: false, reason: 'project has no remote_url' };
+  let token = null;
+  try { token = (await tokenForSpawn(p.id, 'github'))?.token || null; } catch { /* no token */ }
+  return remoteAccess({ url: p.remote_url, token });
+}
+
+// Push local main → the remote's same branch (fast-forward only). Human-triggered from the
+// console behind a confirm dialog. Refuses ({pushed:false, reason}) on divergence/auth exactly
+// like Pull refuses — the console shows the reason.
+export async function pushProject(id, by = 'human@console') {
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  if (!p.remote_url) return { pushed: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
+
+  const access = await githubAccess(id);
+  if (!access.can_push) return { pushed: false, state: 'refused', reason: access.reason || 'the connected GitHub token cannot push to this repo' };
+
+  let token = null;
+  try { token = (await tokenForSpawn(p.id, 'github'))?.token || null; } catch { /* handled below */ }
+
+  const r = await pushRemote({
+    repoRoot: String(p.repo_root).replace(/\\/g, '/'),
+    branch: p.main_branch, remoteUrl: p.remote_url, token,
+  });
+  if (r.pushed) logline('projects', `${by} pushed ${p.name}: local ${p.main_branch} → origin/${p.main_branch} (${(r.sha || '').slice(0, 8)}) [${r.state}]`);
+  return r;
+}
+
+// Open a PR from local main. Human-triggered; the console may pass a head branch name / title.
+export async function pullRequestProject(id, { headBranch = null, title = null, base = null } = {}, by = 'human@console') {
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  if (!p.remote_url) return { opened: false, reason: 'project has no remote_url — set one in Project setup first' };
+
+  const access = await githubAccess(id);
+  if (!access.can_pr) return { opened: false, reason: access.reason || 'the connected GitHub token cannot open PRs on this repo' };
+
+  let token = null;
+  try { token = (await tokenForSpawn(p.id, 'github'))?.token || null; } catch { /* handled below */ }
+
+  const r = await openPullRequest({
+    repoRoot: String(p.repo_root).replace(/\\/g, '/'),
+    remoteUrl: p.remote_url, token, branch: p.main_branch,
+    headBranch, title, base,
+  });
+  if (r.opened) logline('projects', `${by} opened PR on ${p.name}: ${r.head} → ${r.base}${r.number ? ` (#${r.number})` : ''} [${r.state}]`);
   return r;
 }
 

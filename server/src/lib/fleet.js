@@ -73,6 +73,14 @@ async function fetchXellRows(pid) {
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'tend-request' AS tend_pending,
+            -- readiness HINTS (zee said "this looks land/ship-ready" without calling the gated verb):
+            -- same latest-event-wins ride as tend, one per kind.
+            (SELECT se.hook_event_name FROM session_event se
+               WHERE se.xell_id = x.id AND se.hook_event_name IN ('landhint-request','landhint-clear')
+               ORDER BY se.ts DESC LIMIT 1) = 'landhint-request' AS land_hint,
+            (SELECT se.hook_event_name FROM session_event se
+               WHERE se.xell_id = x.id AND se.hook_event_name IN ('shiphint-request','shiphint-clear')
+               ORDER BY se.ts DESC LIMIT 1) = 'shiphint-request' AS ship_hint,
             EXISTS(SELECT 1 FROM deploy_lock dl2 WHERE dl2.project_id = x.project_id
                      AND dl2.container = 'prod') AS prod_lock_active,
             dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
@@ -139,10 +147,13 @@ async function decorateXell(x, heads, deployed, project) {
     landPending: x.land_pending === true,
     shipPending: x.ship_pending === true,
     tendPending: x.tend_pending === true,
+    landHint: x.land_hint === true,
+    shipHint: x.ship_hint === true,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
   delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;
+  delete x.land_hint; delete x.ship_hint;
 
   // Fleet burn for THIS xell — sum across all its zees. pg returns bigint/numeric as strings; coerce
   // to Number so the dashboard can format it (a xell's lifetime burn is well within double precision).

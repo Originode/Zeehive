@@ -23,6 +23,8 @@ export const HIVE_STATUS = {
   'occ-tendRequest':  { label: 'tend?',        group: 'occ' },
   'occ-landRequest':  { label: 'land?',        group: 'occ' },
   'occ-shipRequest':  { label: 'ship?',        group: 'occ' },
+  'occ-landHint':     { label: 'land?',        group: 'occ' },
+  'occ-shipHint':     { label: 'ship?',        group: 'occ' },
   'occ-doneRequest':  { label: 'done?',        group: 'occ' },
   'occ-done':         { label: 'done',         group: 'occ' },
   'live-protected':   { label: 'protected',    group: 'live' },
@@ -41,6 +43,7 @@ export function hiveGroup(key) { return HIVE_STATUS[key]?.group || null; }
 export function hiveStatus(x, sig = {}) {
   const {
     landPending = false, shipPending = false, tendPending = false, prodUnprotected = false,
+    landHint = false, shipHint = false,
   } = sig;
 
   // ── production ──
@@ -61,6 +64,10 @@ export function hiveStatus(x, sig = {}) {
   if (shipPending)                       return 'occ-shipRequest';
   if (landPending)                       return 'occ-landRequest';
   if (tendPending)                       return 'occ-tendRequest';
+  // Readiness HINTS rank below the real held requests and tend (those are firmer asks), but above
+  // live activity — a "this looks ready" prompt should be visible even while the zee keeps polishing.
+  if (shipHint)                          return 'occ-shipHint';
+  if (landHint)                          return 'occ-landHint';
 
   const working = x.zee_status === 'working' || x.cli_active === true || s === 'working';
   if (working)                           return 'occ-working';
