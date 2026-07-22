@@ -132,7 +132,7 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
           {!backups && <div className="term-line dim">loading…</div>}
           {backups && backups.length === 0 && <div className="term-line dim">no backups yet</div>}
           {backups && backups.map((b) => (
-            <div className={`bkrow ${b.status || 'finished'}`} key={b.id} data-testid="backup-row" data-status={b.status}>
+            <div className={`bkrow ${b.status || 'finished'} ${b.mode === 'simulate' ? 'sim' : ''}`} key={b.id} data-testid="backup-row" data-status={b.status}>
               <span className="bkstamp mono">{stampFmt(b.taken_at)}</span>
               <span className="bkago2">{ago(b.taken_at)}</span>
               {b.status === 'running' ? (
@@ -142,13 +142,20 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
               ) : (
                 <>
                   <span className="bksize">{fmtBytes(b.size_bytes)}</span>
+                  {b.mode === 'simulate' && (
+                    <span className="bksim" data-testid="backup-simulated"
+                          title="SIMULATED backup — a placeholder written by the queenzee, NOT a dump of the real database. It cannot be restored.">
+                      simulated
+                    </span>
+                  )}
                   <span className="bkpath mono" title={b.dump_path}>{b.dump_path}</span>
                   <span className="bkacts">
                     <button className="bkbtn sm" onClick={() => copy(b.dump_path)}>Copy path</button>
                     <button className="bkbtn sm" onClick={() => reveal(b.id)}>Open in Explorer</button>
                     <button className="bkbtn sm" onClick={() => restore(b)}
-                            disabled={!targets.length || targetBusy}
-                            title={!targets.length ? 'no restore target available'
+                            disabled={!targets.length || targetBusy || b.mode === 'simulate'}
+                            title={b.mode === 'simulate' ? 'a simulated backup is a placeholder, not real data — it cannot be restored'
+                              : !targets.length ? 'no restore target available'
                               : targetBusy ? 'target is busy — wait for the current restore'
                               : 'Restore this backup into the selected db container'}>
                       Restore

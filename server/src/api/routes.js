@@ -863,7 +863,7 @@ router.get('/backups', async (req, res) => {
   const cfg = await one(
     `SELECT backup_dir, backup_interval_sec, max_backups FROM pool_config WHERE project_id=$1`, [proj]);
   const backups = await q(
-    `SELECT id, dump_path, size_bytes, taken_at, source, status, error FROM db_snapshot
+    `SELECT id, dump_path, size_bytes, taken_at, source, status, error, mode FROM db_snapshot
        WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC`, [proj]);
   // db containers a backup may be restored INTO (prod excluded — never restore over production);
   // busy_since/busy_op tell the modal which target is mid-restore.

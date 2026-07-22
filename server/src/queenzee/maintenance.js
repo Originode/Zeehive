@@ -11,7 +11,7 @@
 // A backup row is created 'running' and finalized 'finished'/'failed'; the container doing the
 // work is flagged busy_since/busy_op. Both drive live spinners in the UI over SSE.
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { q, one } from '../db/pool.js';
@@ -49,6 +49,36 @@ function execAsync(cmd, args, { timeout = 600000 } = {}) {
       resolveP({ status: code, stdout: out, stderr: timedOut ? `killed at the ${Math.round(timeout / 1000)}s timeout${err ? ` · ${err}` : ''}` : err, timedOut });
     });
   });
+}
+
+// A real backup MUST be a valid pg_dump custom-format (-Fc) archive — those begin with the
+// 5-byte magic "PGDMP". Anything else means the dump never actually produced the data (an empty
+// or truncated file, a plain-text error captured to the path, a simulated placeholder), and
+// recording it as a 'finished' backup hands the operator a restore point that would WIPE a real
+// database and put ~nothing back. So a dump that isn't a real archive, or is implausibly small
+// for a database, is a FAILURE — not a tiny success. Throws with a human-readable reason.
+// (min_bytes: a genuinely empty prod DB still dumps a full TOC — a real -Fc archive is never
+// this small; a few hundred bytes means the dump body is missing.)
+const DUMP_MAGIC = 'PGDMP';
+const MIN_REAL_DUMP_BYTES = 512;
+function assertValidDump(path, size) {
+  if (size == null) throw new Error('dump file is missing after pg_dump (nothing was written)');
+  if (size < MIN_REAL_DUMP_BYTES) {
+    throw new Error(`dump is only ${size} bytes — far too small to be a real database dump `
+      + `(a valid pg_dump archive is never under ${MIN_REAL_DUMP_BYTES}B). The dump did not capture the data.`);
+  }
+  let head = '';
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(DUMP_MAGIC.length);
+    readSync(fd, buf, 0, buf.length, 0);
+    head = buf.toString('latin1');
+  } finally { if (fd !== undefined) try { closeSync(fd); } catch { /* fd gone */ } }
+  if (head !== DUMP_MAGIC) {
+    throw new Error(`dump is not a valid pg_dump custom-format archive `
+      + `(expected magic "${DUMP_MAGIC}", got ${JSON.stringify(head)}). The file is not a usable backup.`);
+  }
 }
 
 // timestamp key for the dump filename (yyyymmddhhmmss). A short random token is appended
@@ -192,6 +222,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
           + `${((cp.stderr || cp.stdout) || '(no output)').slice(-300)}`);
       }
       try { size = statSync(fullPath).size; } catch { size = null; }
+      // A backup that isn't a real, plausibly-sized pg_dump archive is DEFECTIVE — fail it
+      // loudly instead of storing a useless restore point (this is exactly the "big DB, few-byte
+      // backup" case: catch it here rather than at 3am during a restore).
+      assertValidDump(fullPath, size);
     } else {
       await wait(SIM_BACKUP_MS);   // simulate: hold 'running' briefly so the spinner is visible
       const body = `-- ZEEHIVE simulated backup of ${project.name} PRODUCTION database\n`
@@ -206,16 +240,16 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
 
   if (error) {
     try { rmSync(fullPath, { force: true }); } catch { /* partial may not exist */ }
-    const row = await one(`UPDATE db_snapshot SET status='failed', error=$2 WHERE id=$1 RETURNING *`,
-      [snap.id, String(error).slice(0, 500)]);
+    const row = await one(`UPDATE db_snapshot SET status='failed', error=$2, mode=$3 WHERE id=$1 RETURNING *`,
+      [snap.id, String(error).slice(0, 500), MODE]);
     if (dbc) await clearBusy(dbc.id);
     broadcast('task', { kind: 'db_snapshot', snap: row });
     logline('maint', `backup FAILED → ${error}`);
     return;
   }
 
-  const row = await one(`UPDATE db_snapshot SET status='finished', size_bytes=$2 WHERE id=$1 RETURNING *`,
-    [snap.id, size]);
+  const row = await one(`UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3 WHERE id=$1 RETURNING *`,
+    [snap.id, size, MODE]);
   if (dbc) await clearBusy(dbc.id);
   broadcast('task', { kind: 'db_snapshot', snap: row });
   logline('maint', `backup finished (${MODE}) → ${fullPath} (${size ?? '?'} bytes)`);
@@ -287,6 +321,11 @@ export async function restoreBackup({ snapshot, container }) {
   const snap = await one(`SELECT * FROM db_snapshot WHERE id=$1`, [snapshot]);
   if (!snap?.dump_path) throw new Error('backup not found');
   if (snap.status && snap.status !== 'finished') throw new Error('backup is not finished yet');
+  // A simulated backup is a ~150-byte placeholder, NOT the data — restoring it would overwrite a
+  // real database with nothing. Refuse it (the UI disables the button too; this is the backstop).
+  if (snap.mode === 'simulate') {
+    throw new Error('this is a SIMULATED backup (a placeholder, not real data) — it cannot be restored over a database');
+  }
   const c = await one(`SELECT * FROM container WHERE id=$1`, [container]);
   if (!c) throw new Error('container not found');
   if (c.role !== 'db') throw new Error(`target is not a db container (role=${c.role})`);
