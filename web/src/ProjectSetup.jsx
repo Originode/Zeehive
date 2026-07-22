@@ -70,15 +70,22 @@ function CreateForm({ onCreated }) {
   const [home, setHome] = useState(null);
   useEffect(() => { getReposHome().then((r) => setHome(r?.repos_dir || null)).catch(() => {}); }, []);
   const homeDir = home ? home.replace(/[\\/]+$/, '') : null;
-  // Folder picker: walks the QUEENZEE's filesystem (where the path actually resolves), one
-  // level at a time. null = closed; {path,parent,dirs,error} = the level on display.
-  const [browse, setBrowse] = useState(null);
-  const browseTo = (path) => listFsDirs(path).then(setBrowse).catch((e) => setBrowse({ ok: false, error: e.message, dirs: [] }));
+  // Folder pickers (one per path field) — FsBrowse walks the QUEENZEE's filesystem, where
+  // these paths actually resolve. Booleans just toggle the panels.
+  const [showBrowse, setShowBrowse] = useState(false);       // Folder (existing-folder mode)
+  const [showDestBrowse, setShowDestBrowse] = useState(false); // Clone into (clone mode)
   const pickFolder = (path) => {
     const name = f.name.trim() || path.split(/[\\/]/).filter(Boolean).pop() || '';
     setF((prev) => ({ ...prev, repo_root: path, name: prev.name.trim() ? prev.name : name }));
-    setBrowse(null);
+    setShowBrowse(false);
     probeRepo(path).then(setProbe).catch((e) => setProbe({ ok: false, error: e.message }));
+  };
+  // Clone-into picks a PARENT directory — the clone lands in a new folder under it, named
+  // after the repo (or whatever the human edits the suffix to).
+  const pickDest = (path) => {
+    const base = f.name.trim() || c.remote_url.trim().split('/').pop()?.replace(/\.git$/i, '') || '';
+    setC((prev) => ({ ...prev, dest: `${path.replace(/[\\/]+$/, '')}/${base}` }));
+    setShowDestBrowse(false);
   };
   // Mount a folder from the HOST machine (containerized queenzee only): the server registers the
   // bind and RECREATES ITS OWN CONTAINER to take it — the console blips offline for ~10s, then
@@ -162,40 +169,16 @@ function CreateForm({ onCreated }) {
                      placeholder={homeDir ? `${homeDir}/${f.name || 'MyProject'}` : 'D:\\Repos\\MyProject'} />
               <button type="button" className="ghost" data-testid="fs-browse"
                       title="Browse folders on the queenzee's filesystem"
-                      onClick={() => (browse ? setBrowse(null) : browseTo(f.repo_root.trim() || homeDir || ''))}>
-                {browse ? '▾ close' : '📁 browse'}
+                      onClick={() => setShowBrowse(!showBrowse)}>
+                {showBrowse ? '▾ close' : '📁 browse'}
               </button>
             </span>
-            {browse && (
-              <span className="fsbrowse" data-testid="fs-panel">
-                <span className="fsb-head">
-                  <span className="mono fsb-path">{browse.path || '—'}</span>
-                  <button type="button" onClick={() => pickFolder(browse.path)} disabled={!browse.ok}>✓ use this folder</button>
-                </span>
-                {browse.error && <span className="projpop-err">{browse.error}</span>}
-                <span className="fsb-list">
-                  {browse.parent && (
-                    <button type="button" className="fsb-dir" onClick={() => browseTo(browse.parent)}>↰ ..</button>
-                  )}
-                  {(browse.dirs || []).map((d) => {
-                    const full = `${browse.path.replace(/[\\/]+$/, '')}/${d.name}`;
-                    // a git repo is what onboarding is FOR — clicking one picks it outright;
-                    // a plain folder is a waypoint — clicking descends into it
-                    return (
-                      <button type="button" key={d.name} className={`fsb-dir${d.is_repo ? ' repo' : ''}`}
-                              title={d.is_repo ? 'a git repo — click to pick it' : 'click to enter'}
-                              onClick={() => (d.is_repo ? pickFolder(full) : browseTo(full))}>
-                        {d.is_repo ? '⎇ ' : '▸ '}{d.name}
-                      </button>
-                    );
-                  })}
-                  {browse.ok && !(browse.dirs || []).length && <span className="pc">no subfolders</span>}
-                </span>
-              </span>
+            {showBrowse && (
+              <FsBrowse start={f.repo_root.trim() || homeDir || ''} repoPicks onPick={pickFolder} />
             )}
             {/* Host-folder mount — only meaningful when the queenzee is containerized (homeDir
                 set). The server refuses with a clear message on a host-era install anyway. */}
-            {homeDir && !browse && (mount?.done ? (
+            {homeDir && !showBrowse && (mount?.done ? (
               <span className="pc" data-testid="mount-restarting">
                 ⏳ queenzee is restarting to take the mount — when the ● live pill returns, <b>{mount.done}</b> is ready to probe or browse.
               </span>
@@ -224,7 +207,20 @@ function CreateForm({ onCreated }) {
         ) : (
           <>
             <label>Repository URL<input autoFocus value={c.remote_url} onChange={setc('remote_url')} onBlur={runRemoteProbe} placeholder="https://github.com/org/repo" /></label>
-            <label>Clone into<input value={c.dest} onChange={setc('dest')} placeholder={(rprobe?.repos_dir || homeDir) ? `${(rprobe?.repos_dir || homeDir).replace(/[\\/]+$/, '')}/${f.name || '…'}` : 'D:\\Repos\\MyProject'} /></label>
+            <label>Clone into
+              <span className="setup-row">
+                <input value={c.dest} onChange={setc('dest')} placeholder={(rprobe?.repos_dir || homeDir) ? `${(rprobe?.repos_dir || homeDir).replace(/[\\/]+$/, '')}/${f.name || '…'}` : 'D:\\Repos\\MyProject'} />
+                <button type="button" className="ghost" data-testid="fs-browse-dest"
+                        title="Browse folders on the queenzee's filesystem — pick the PARENT; the clone makes its own folder"
+                        onClick={() => setShowDestBrowse(!showDestBrowse)}>
+                  {showDestBrowse ? '▾ close' : '📁 browse'}
+                </button>
+              </span>
+              {showDestBrowse && (
+                <FsBrowse start={c.dest.trim().replace(/[\\/][^\\/]*$/, '') || homeDir || ''}
+                          pickLabel="✓ clone under this folder" onPick={pickDest} />
+              )}
+            </label>
             <label>GitHub token <span className="pc">(read-only PAT — private repos only, stored in the meta-DB)</span>
               <input type="password" autoComplete="off" value={c.token} onChange={setc('token')} placeholder="github_pat_… (blank for public)" /></label>
           </>
@@ -253,6 +249,40 @@ function CreateForm({ onCreated }) {
         {busy && source === 'clone' && <span className="pc">cloning can take a while on a big repo — progress streams to the log rail</span>}
       </div>
     </form>
+  );
+}
+
+// One-level-at-a-time directory browser over the QUEENZEE's filesystem (GET /api/fs/dirs) —
+// shared by the Folder field and Clone-into. repoPicks: clicking a ⎇ git-repo row picks it
+// outright (existing-folder mode — a repo is the destination); otherwise every row navigates
+// and only the header button picks (clone mode — the pick is a PARENT directory).
+function FsBrowse({ start, onPick, repoPicks = false, pickLabel = '✓ use this folder' }) {
+  const [lvl, setLvl] = useState(null);
+  const go = (p) => listFsDirs(p).then(setLvl).catch((e) => setLvl({ ok: false, error: e.message, dirs: [] }));
+  useEffect(() => { go(start || ''); }, []);   // opens at the field's current value / repos home
+  if (!lvl) return <span className="pc">loading…</span>;
+  return (
+    <span className="fsbrowse" data-testid="fs-panel">
+      <span className="fsb-head">
+        <span className="mono fsb-path">{lvl.path || '—'}</span>
+        <button type="button" onClick={() => onPick(lvl.path)} disabled={!lvl.ok}>{pickLabel}</button>
+      </span>
+      {lvl.error && <span className="projpop-err">{lvl.error}</span>}
+      <span className="fsb-list">
+        {lvl.parent && <button type="button" className="fsb-dir" onClick={() => go(lvl.parent)}>↰ ..</button>}
+        {(lvl.dirs || []).map((d) => {
+          const full = `${lvl.path.replace(/[\\/]+$/, '')}/${d.name}`;
+          return (
+            <button type="button" key={d.name} className={`fsb-dir${d.is_repo ? ' repo' : ''}`}
+                    title={d.is_repo ? (repoPicks ? 'a git repo — click to pick it' : 'a git repo') : 'click to enter'}
+                    onClick={() => (repoPicks && d.is_repo ? onPick(full) : go(full))}>
+              {d.is_repo ? '⎇ ' : '▸ '}{d.name}
+            </button>
+          );
+        })}
+        {lvl.ok && !(lvl.dirs || []).length && <span className="pc">no subfolders</span>}
+      </span>
+    </span>
   );
 }
 
