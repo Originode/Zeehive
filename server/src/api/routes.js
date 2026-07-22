@@ -16,7 +16,7 @@ import { listMachines, createMachine, updateMachine, deleteMachine, provisionDev
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
-import { reapXell } from '../queenzee/reaper.js';
+import { reapXell, purgeDevXells } from '../queenzee/reaper.js';
 import { attachXellDb, dbAccessForCwd, DB_MODES } from '../lib/xell-db.js';
 import { attachProdStack, detachProdStack, prodStackStatus } from '../lib/xell-prod.js';
 import { remoteAvailable } from '../lib/claude-cli.js';
@@ -628,6 +628,13 @@ router.post('/xells/:id/build', async (req, res) => {
 // means no button, and nothing ever reaps them. Production is refused by reapXell itself.
 router.post('/xells/:id/reap', async (req, res) => {
   try { res.json(await reapXell(req.params.id, req.body?.reason || 'human-cleanup', { force: !!req.body?.force })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// DANGER ZONE — purge ALL non-production xells in a project, mid-work and all (project setup →
+// Danger tab, behind a typed confirmation). Prod is never a candidate (reaper excludes+refuses it).
+router.post('/projects/:id/purge-dev', async (req, res) => {
+  try { res.json(await purgeDevXells(req.params.id, { reason: req.body?.reason || 'danger-purge' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

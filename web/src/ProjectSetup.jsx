@@ -6,7 +6,7 @@ import {
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
-  mountHostFolder,
+  mountHostFolder, purgeDevXells,
 } from './api.js';
 import { showConfirm } from './Dialog.jsx';
 
@@ -334,6 +334,7 @@ const SETUP_TABS = [
   { key: 'deploy', label: 'Deploy', gates: ['dev_site', 'prod_site', 'shippable'] },
   { key: 'providers', label: 'Providers', gates: [] },
   { key: 'pool', label: 'Pool', gates: ['pool'] },
+  { key: 'danger', label: '⚠ Danger', gates: [], danger: true },
 ];
 const tabForGate = (key) => SETUP_TABS.find((t) => t.gates.includes(key))?.key || null;
 
@@ -361,7 +362,7 @@ function EditSections({ project, onChanged, onProject }) {
       <div className="setup-tabs" role="tablist">
         {SETUP_TABS.map((t) => (
           <button key={t.key} role="tab" aria-selected={tab === t.key}
-                  className={`setup-tab${tab === t.key ? ' on' : ''}`} onClick={() => setTab(t.key)}>
+                  className={`setup-tab${tab === t.key ? ' on' : ''}${t.danger ? ' danger' : ''}`} onClick={() => setTab(t.key)}>
             {t.label}
           </button>
         ))}
@@ -376,7 +377,61 @@ function EditSections({ project, onChanged, onProject }) {
       </>}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'pool' && <SpawnSection project={project} run={run} />}
+      {tab === 'danger' && <DangerSection project={project} onChanged={() => { reload(); onChanged?.(); }} />}
     </>
+  );
+}
+
+// ── Danger zone: irreversible, project-wide actions ────────────────────────────
+// Purge every non-production xell + its containers back to bare prod, mid-work and all.
+// Two-stage: a spelled-out warning, then type the project name to arm the button — the same
+// bar the container decommission uses for a db, because this is that action times N.
+function DangerSection({ project, onChanged }) {
+  const [typed, setTyped] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState(null);
+  const armed = typed.trim() === project.name;
+
+  const purge = async () => {
+    if (!armed || busy) return;
+    setBusy(true); setErr(null); setResult(null);
+    try {
+      const r = await purgeDevXells(project.id);
+      setResult(r);
+      setTyped('');
+      onChanged?.();
+    } catch (e) { setErr(e?.error || e?.message || String(e)); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="setup-sec danger-sec">
+      <h3>⚠ Danger zone <span className="pc">irreversible — production is never touched</span></h3>
+      <div className="danger-box" data-testid="danger-purge">
+        <div className="danger-title">Purge dev xells &amp; containers</div>
+        <div className="pc danger-desc">
+          Reaps <b>every non-production xell</b> in <b>{project.name}</b> — removing each one's
+          worktree, branch, and per-xell containers — <b>regardless of current work</b>. A zee
+          mid-task is killed. The live <b>production</b> stack (its hex, db, server, app) is left
+          completely alone. The ready pool refills afterward unless you also lower the pool target.
+        </div>
+        <label className="danger-arm">To confirm, type the project name <b>{project.name}</b>:
+          <input data-testid="danger-type" value={typed} placeholder={project.name}
+                 spellCheck={false} autoComplete="off" onChange={(e) => setTyped(e.target.value)}
+                 onKeyDown={(e) => { if (e.key === 'Enter') purge(); }} />
+        </label>
+        {err && <div className="projpop-err" data-testid="danger-err">{err}</div>}
+        {result && (
+          <div className="danger-result" data-testid="danger-result">
+            ✓ purged {result.reaped}/{result.total} dev xell(s){result.failed?.length ? ` — ${result.failed.length} failed` : ''}. Production intact.
+          </div>
+        )}
+        <button className="ctxdanger" data-testid="danger-go" disabled={!armed || busy} onClick={purge}>
+          {busy ? 'Purging…' : '🗑 Purge dev xells'}
+        </button>
+      </div>
+    </div>
   );
 }
 

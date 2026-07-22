@@ -130,6 +130,21 @@ body { margin: 0; background: var(--bg); color: var(--text); }
   font-size: 13px; padding: 6px 14px; cursor: pointer; margin-bottom: -1px; }
 .setup-tab:hover { color: var(--text); }
 .setup-tab.on { color: var(--text); border-bottom-color: var(--accent, #5b8cff); font-weight: 600; }
+.setup-tab.danger { color: #e5776e; margin-left: auto; }
+.setup-tab.danger.on { color: #ff8b81; border-bottom-color: #b3261e; }
+
+/* danger zone tab */
+.danger-box { border: 1px solid rgba(179,38,30,.5); border-radius: 8px; padding: 12px 14px;
+  background: rgba(179,38,30,.06); display: flex; flex-direction: column; gap: 8px; }
+.danger-title { font-weight: 600; color: #ff8b81; font-size: 14px; }
+.danger-desc { line-height: 1.45; }
+.danger-arm { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.danger-arm input { max-width: 280px; }
+.danger-result { color: var(--up, #35c46b); font-size: 12px; }
+.danger-box .ctxdanger { align-self: flex-start; background: #b3261e; color: #fff; border: 0;
+  border-radius: 6px; padding: 7px 16px; font-size: 13px; cursor: pointer; }
+.danger-box .ctxdanger:hover { background: #d13a30; }
+.danger-box .ctxdanger:disabled { background: rgba(179,38,30,.35); color: rgba(255,255,255,.5); cursor: not-allowed; }
 /* per-site editor + inventory rows */
 .siteed { border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; margin: 6px 0; }
 .siteed .ingress { margin: 6px 0 4px; }

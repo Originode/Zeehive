@@ -172,6 +172,8 @@ export const probeRepo = (repo_root) => siteCall('/api/projects/probe', 'POST', 
 export const getReposHome = () => fetch('/api/projects/repos-home').then((r) => r.json());
 // browse directories on the queenzee's own filesystem (the onboard form's folder picker)
 export const listFsDirs = (path) => fetch(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`).then((r) => r.json());
+// DANGER: purge all non-production xells in a project (project setup → Danger tab)
+export const purgeDevXells = (projectId) => siteCall(`/api/projects/${projectId}/purge-dev`, 'POST', {});
 // containerized era: mount a HOST folder into /repos (recreates the queenzee's own container)
 export const getHostMounts = () => fetch('/api/projects/host-mounts').then((r) => r.json());
 export const mountHostFolder = (host_path, name) => siteCall('/api/projects/mount-host', 'POST', { host_path, name: name || undefined });

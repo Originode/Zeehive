@@ -187,3 +187,28 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
 
   return { ok: true, reason, orphaned_worktree: orphaned ? xell.worktree_path : null, despawn, zee_id: zee?.id };
 }
+
+// DANGER ZONE — purge every non-production xell in a project, reclaiming the dev fleet back to
+// bare prod. Reaps regardless of in-flight work (force:true), so a zee mid-task is killed and its
+// worktree + branch + per-xell containers deleted. Production is never a candidate: is_production
+// rows are excluded here AND refused by reapXell, and prod's shared containers have no owner so no
+// teardown path touches them. The pool maintainer will refill READY xells afterward unless the
+// caller also drops the pool target — that is the console's job, offered alongside this.
+// Idempotent and best-effort: one xell's failure is recorded and the sweep continues.
+export async function purgeDevXells(projectId, { reason = 'danger-purge' } = {}) {
+  if (!projectId) return { ok: false, error: 'projectId required' };
+  const targets = await q(
+    `SELECT id, slug FROM xell
+       WHERE project_id = $1 AND is_production = false AND status <> 'retired'
+       ORDER BY created_at`, [projectId]);
+  logline('reaper', `DANGER purge: reaping ${targets.length} non-production xell(s) in project ${projectId} — prod is untouched`);
+  const results = [];
+  for (const x of targets) {
+    const r = await reapXell(x.id, reason, { force: true }).catch((e) => ({ ok: false, error: e.message }));
+    results.push({ slug: x.slug, ok: !!r.ok, error: r.ok ? null : r.error });
+    logline('reaper', r.ok ? `purge: reaped ${x.slug} ✓` : `purge: ${x.slug} FAILED — ${r.error}`);
+  }
+  const reaped = results.filter((r) => r.ok).length;
+  logline('reaper', `DANGER purge complete: ${reaped}/${targets.length} reaped, production intact`);
+  return { ok: true, total: targets.length, reaped, failed: results.filter((r) => !r.ok), results };
+}
