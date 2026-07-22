@@ -288,12 +288,20 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
       )}
       {c.url && <a role="menuitem" href={c.url} target="_blank" rel="noopener" onClick={onClose}>↗ Open URL</a>}
 
-      {/* Shell: a docker-exec terminal INSIDE this container. Offered even while busy — opening a
-          shell is observation, not an operation, and mid-restore is exactly when an operator wants
-          to look. The bridge reports its own error if the container is down. */}
-      <button role="menuitem" data-testid="shell-open" onClick={() => { onShell?.(c); onClose(); }}>
-        ⌨ Shell <span className="ctxsub">terminal inside this container</span>
-      </button>
+      {/* Shell: a terminal INSIDE this container. `shellable` is computed server-side (fleet.js):
+          a real container needs to be running ('up'); a PROCESS-ROLE server/webapp is always
+          shellable — its shell is the queenzee's container at the xell's worktree, which works
+          even while the process is down (exactly when you want in to debug it). A down/unbuilt
+          real container offers the honest reason instead of a broken terminal. */}
+      {c.shellable ? (
+        <button role="menuitem" data-testid="shell-open" onClick={() => { onShell?.(c); onClose(); }}>
+          ⌨ Shell <span className="ctxsub">terminal inside this container</span>
+        </button>
+      ) : (
+        <div className="ctxsub ctxbusy-note" data-testid="shell-unavailable">
+          ⌨ shell unavailable — {buildable && !c.last_build_commit ? 'build it first' : `container is ${c.health}`}
+        </div>
+      )}
 
       {/* Load backup: db containers only, never production (you never restore OVER prod, and the
           server's target list excludes it). Opens the backup selector pre-aimed at THIS container,

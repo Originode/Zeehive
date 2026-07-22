@@ -10,6 +10,7 @@
 // (straight into xterm.write).
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
 import { createRequire } from 'node:module';
 import { one } from '../db/pool.js';
 import { ensureZeehiveKeypair, cxellSshDest } from './cxell.js';
@@ -134,21 +135,55 @@ function dockerReq(conn, method, path, body, timeout = 15000) {
   });
 }
 
+// Where a container row's shell actually lands. Most rows ARE a docker container (db, and any
+// compose-built server/webapp) → exec straight into it. But a PROCESS-ROLE server/webapp (spec
+// §6.1, runner:process — Zeehive itself) has NO container of its own: start-xell-process.sh runs
+// `npm run …` as a child of the QUEENZEE, inside the queenzee's container, cwd = the xell's
+// worktree. So its shell is the queenzee's own container opened at that worktree — the exact place
+// the process and its code live. Returns { ctx, name, workingDir, banner } or { error }.
+async function resolveShellTarget(c) {
+  const ctx = c.docker_ctx || 'default';
+  if (c.role === 'db') {
+    // db rows carry LOGICAL names (omnibiz_db_dev) while the daemon runs versioned ones — the
+    // split-brain hazard xell-db.js documents. Same cached resolver, non-blocking after first hit.
+    return { ctx, name: resolveRealDbContainerCached(ctx, c.name), workingDir: null, banner: null };
+  }
+  // server/webapp: is this project's role a process runner? Read it the same way build.js does.
+  const proj = c.owner_xell_id
+    ? await one(
+        `SELECT p.manifest, x.slug, x.worktree_path
+           FROM xell x JOIN project p ON p.id = x.project_id WHERE x.id = $1`, [c.owner_xell_id])
+    : null;
+  const runner = proj?.manifest?.roles?.[c.role]?.runner
+    || proj?.manifest?.tiers?.spinoff?.runner
+    || null;
+  if (runner === 'process') {
+    if (!proj?.worktree_path) return { error: `${c.name} is a process role but its worktree is unknown — cannot open a shell` };
+    // The queenzee's own container, on the local daemon. hostname() is our container id, which
+    // docker accepts as a reference. If we're NOT containerized (host era) this 404s and the
+    // caller's message explains the process runs on the host.
+    return {
+      ctx: 'default', name: hostname(), workingDir: proj.worktree_path, selfContainer: true,
+      banner: `\x1b[2m[zeehive] ${c.role} of ${proj.slug} is a process inside the queenzee — shell opened at its worktree\x1b[0m\r\n`,
+    };
+  }
+  // a real compose-built server/webapp container — its name is already the docker name
+  return { ctx, name: c.name, workingDir: null, banner: null };
+}
+
 async function openContainerShell(ws, containerId) {
   const send = (s) => { if (ws.readyState === 1) ws.send(s); };
   const fail = (msg) => { send(`\r\n\x1b[31m[zeehive] ${msg}\x1b[0m\r\n`); try { ws.close(); } catch {} };
 
   let c;
   try {
-    c = await one(`SELECT id, name, role, tier, docker_ctx FROM container WHERE id = $1`, [containerId]);
+    c = await one(`SELECT id, name, role, tier, docker_ctx, owner_xell_id FROM container WHERE id = $1`, [containerId]);
   } catch (e) { return fail(`lookup failed: ${e.message}`); }
   if (!c) return fail('no such container');
 
-  const ctx = c.docker_ctx || 'default';
-  // db rows carry LOGICAL names (omnibiz_db_dev) while the daemon runs versioned ones
-  // (omnibiz_db_dev_gis) — the split-brain hazard xell-db.js documents. Same cached resolver,
-  // same non-blocking behavior after first sighting. Non-db names are already real.
-  const name = c.role === 'db' ? resolveRealDbContainerCached(ctx, c.name) : c.name;
+  const target = await resolveShellTarget(c);
+  if (target.error) return fail(target.error);
+  const { ctx, name, workingDir, banner } = target;
 
   let conn;
   try { conn = await resolveContext(ctx); } catch (e) { return fail(`docker context '${ctx}': ${e.message}`); }
@@ -163,12 +198,23 @@ async function openContainerShell(ws, containerId) {
     const created = await dockerReq(conn, 'POST', `/containers/${encodeURIComponent(name)}/exec`, {
       AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: true,
       Env: ['TERM=xterm-256color', `ZEEHIVE_SHELL_MARK=${mark}`],
+      ...(workingDir ? { WorkingDir: workingDir } : {}),
       // bash where the image has it (postgres, node), sh where it doesn't (alpine)
       Cmd: ['/bin/sh', '-c', 'command -v bash >/dev/null && exec bash || exec sh'],
     });
     execId = created?.Id;
     if (!execId) throw new Error('daemon returned no exec id');
-  } catch (e) { return fail(`cannot exec into ${name}: ${e.message}`); }
+  } catch (e) {
+    // A 404 here means the container is modeled but not running — a buildable server/webapp that
+    // was never built, one that died since the menu opened, or a process role on a host-era
+    // queenzee (no container to enter). Say that, not the raw docker line.
+    if (/HTTP 404/.test(e.message)) {
+      if (target.selfContainer) return fail(`this ${c.role} runs as a process on the host, not in a container — no shell to open (containerize the queenzee to get one)`);
+      return fail(`${name} is not running — nothing to shell into. `
+        + `${c.role === 'db' ? 'The database container may be down.' : 'Build this container first (the hammer on its chip), then open a shell.'}`);
+    }
+    return fail(`cannot exec into ${name}: ${e.message}`);
+  }
 
   // Reap the shell (and anything it spawned that inherited the marker, e.g. an open psql) via a
   // one-shot detached exec. -a: /proc/*/environ is NUL-separated, so grep must read it as text.
@@ -213,6 +259,7 @@ async function openContainerShell(ws, containerId) {
     sock = s;
     logline('api', `container shell attached to ${name} (${ctx}, ${lastSize.cols}x${lastSize.rows})`);
     resize();   // TTY starts at the daemon's default size — set the real one before the prompt draws
+    if (banner) send(banner);   // say when the shell is the queenzee-at-worktree, not a own container
     if (head?.length) send(head);
     for (const d of earlyInput.splice(0)) sock.write(d);
     sock.on('data', (d) => send(d));

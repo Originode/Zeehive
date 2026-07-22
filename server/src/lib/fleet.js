@@ -95,9 +95,23 @@ async function fetchXellRows(pid) {
       ORDER BY x.created_at`, [pid]);
 }
 
+// Can a browser shell open into this container row? Mirrors terminal-bridge.resolveShellTarget:
+//   • a PER-XELL process role (runner:process, owner set) has no container of its own — its shell
+//     is the queenzee at the worktree, which works even while the role is DOWN → always shellable;
+//   • everything else is a real docker container → shellable only when it's running ('up').
+// The process signal is the manifest's per-role runner (what build.js reads), spinoff-tier default
+// as fallback; db is never a process role, and a SHARED prod server/webapp is a real container.
+function containerShellable(project, c) {
+  if (c.role !== 'db' && c.owner_xell_id) {
+    const m = project?.manifest;
+    if ((m?.roles?.[c.role]?.runner || m?.tiers?.spinoff?.runner || null) === 'process') return true;
+  }
+  return c.health === 'up';
+}
+
 // Attach a xell's resolved container stack + xource/deploy heads. Mutates and returns `x`. One
 // stack query per xell — the streamable unit of work.
-async function decorateXell(x, heads, deployed) {
+async function decorateXell(x, heads, deployed, project) {
   const stack = await q(
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id,
             c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
@@ -108,6 +122,12 @@ async function decorateXell(x, heads, deployed) {
       WHERE uc.xell_id = $1
       ORDER BY CASE c.role WHEN 'db' THEN 1 WHEN 'server' THEN 2 WHEN 'webapp' THEN 3 ELSE 4 END`,
     [x.id]);
+  // Can a browser shell open into this container? (drives the chip menu's Shell item.) A PROCESS
+  // role (runner:process — Zeehive's own server/webapp) has no container of its own: its shell is
+  // the queenzee's container at the xell's worktree (terminal-bridge resolveShellTarget), which
+  // works whenever the worktree exists — even while the process is down, which is exactly when you
+  // want in to debug it. Everything else IS a docker container, so it needs to be running ('up').
+  for (const c of stack) c.shellable = containerShellable(project, c);
   x.stack = stack;
   // pretty-print the name column exactly like the mockup expects
   x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
@@ -154,7 +174,7 @@ export async function streamXells(projectId, onXell) {
   const { heads, deployed } = await fleetGitContext(project);
   const rows = await fetchXellRows(project.id);
   for (const x of rows) {
-    await decorateXell(x, heads, deployed);
+    await decorateXell(x, heads, deployed, project);
     await onXell(x);
   }
   return project;
@@ -185,6 +205,9 @@ export async function getFleet(projectId) {
             c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at, ${instancesAgg}
        FROM container c WHERE c.project_id = $1
        ORDER BY c.role, c.tier, c.name`, [pid]);
+  // Same shell-capability the xell stack carries (decorateXell) — the MATRIX renders these rows,
+  // so without it every matrix chip reads "shell unavailable" even for an up process role.
+  for (const c of containers) c.shellable = containerShellable(project, c);
   const groups = { db: [], server: [], webapp: [], other: [] };
   for (const c of containers) (groups[c.role] || groups.other).push(c);
 
@@ -195,7 +218,7 @@ export async function getFleet(projectId) {
   // xells with their resolved container stack + live zee + runtime label. Same rows + decoration
   // the streaming path emits — just collected into an array here rather than flushed one by one.
   const xells = await fetchXellRows(pid);
-  for (const x of xells) await decorateXell(x, heads, deployed);
+  for (const x of xells) await decorateXell(x, heads, deployed, project);
 
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
