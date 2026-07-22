@@ -1,6 +1,7 @@
 // Machines — the physical docker hosts of the hive, as data (migration 023). One row per docker
-// context: what the host IS (can it build?), what it should carry (pool_size / max_xells), and
-// where new dev work goes first (dev_priority). Consumed by:
+// context: what the host IS (can it build? its machine-wide max_xells cap). WHERE new dev work
+// goes first (dev_priority) and how big a warm pool it keeps (pool_size) are PER-PROJECT choices,
+// held in machine_pool (025 + 038), not on the machine row. Consumed by:
 //   provision.js  — pickDevMachine() chooses WHERE a fresh xell spawns; defaultBuildCtxFor()
 //                   chooses WHERE its images compile (the NAS runs but must not build).
 //   pool.js       — per-machine pool targets replace pool_config.target_ready once any dev
@@ -20,21 +21,23 @@ import { namingFor } from './manifest.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
-// projectId (optional) scopes pool_size to that project (machine_pool, 025) — the matrix shows
-// and edits THIS project's pool on each machine. Without it, rows carry no pool_size at all:
-// there is no such thing as a machine-wide pool anymore.
+// projectId (optional) scopes pool_size AND dev_priority to that project (machine_pool, 025+038) —
+// the matrix shows and edits THIS project's pool and spawn priority on each machine. Without it,
+// rows carry neither: there is no such thing as a machine-wide pool or priority anymore, only the
+// machine-wide max_xells cap.
 export async function listMachines(projectId = null) {
   if (!projectId) {
-    return q(`SELECT id, key, label, docker_ctx, host_ip, can_build, can_device, dev_priority,
+    return q(`SELECT id, key, label, docker_ctx, host_ip, can_build, can_device,
                      max_xells, enabled, notes, created_at
-                FROM machine ORDER BY dev_priority DESC, created_at`);
+                FROM machine ORDER BY created_at`);
   }
   return q(
-    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device, m.dev_priority,
+    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device,
             m.max_xells, m.enabled, m.notes, m.created_at,
-            COALESCE(mp.pool_size, 0) AS pool_size
+            COALESCE(mp.pool_size, 0)    AS pool_size,
+            COALESCE(mp.dev_priority, 0) AS dev_priority
        FROM machine m LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
-      ORDER BY m.dev_priority DESC, m.created_at`, [projectId]);
+      ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]);
 }
 
 // This machine's warm-pool target for ONE project. No row → 0: a project pools nowhere it
@@ -45,25 +48,51 @@ export async function machinePoolSize(machineId, projectId) {
   return r?.pool_size || 0;
 }
 
-export async function setMachinePool(machineId, projectId, poolSize) {
-  const n = Number(poolSize);
-  if (!Number.isInteger(n) || n < 0) throw new Error('pool_size must be a non-negative integer');
+// This machine's dev spawn priority for ONE project (machine_pool, 038). No row / 0 → this
+// machine is not a dev spawn target for the project at all.
+export async function machinePriority(machineId, projectId) {
+  const r = await one(
+    `SELECT dev_priority FROM machine_pool WHERE machine_id=$1 AND project_id=$2`, [machineId, projectId]);
+  return r?.dev_priority || 0;
+}
+
+// Upsert ONE column of the per-(machine, project) policy row (machine_pool) — pool_size or
+// dev_priority — leaving the other untouched (INSERT defaults it, ON CONFLICT never overwrites it).
+async function setMachinePolicyField(machineId, projectId, field, value, label) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`${field} must be a non-negative integer`);
   const m = await one(`SELECT key FROM machine WHERE id=$1`, [machineId]);
   if (!m) throw new Error('machine not found');
   const row = await one(
-    `INSERT INTO machine_pool (machine_id, project_id, pool_size) VALUES ($1,$2,$3)
-     ON CONFLICT (machine_id, project_id) DO UPDATE SET pool_size=EXCLUDED.pool_size
+    `INSERT INTO machine_pool (machine_id, project_id, ${field}) VALUES ($1,$2,$3)
+     ON CONFLICT (machine_id, project_id) DO UPDATE SET ${field}=EXCLUDED.${field}
      RETURNING *`, [machineId, projectId, n]);
   broadcast('machine', { id: machineId });
-  logline('machine', `pool on ${m.key} → ${n} for project ${String(projectId).slice(0, 8)}`);
+  logline('machine', `${label} on ${m.key} → ${n} for project ${String(projectId).slice(0, 8)}`);
   return row;
 }
 
-// Machines that may host DEV xells, best first. Empty ⇒ machine-aware placement is off and
-// everything falls back to the legacy single-dev-site behavior — a fresh install keeps working
-// with zero machine rows.
-export async function devMachines() {
-  return q(`SELECT * FROM machine WHERE enabled AND dev_priority > 0 ORDER BY dev_priority DESC, created_at`);
+export async function setMachinePool(machineId, projectId, poolSize) {
+  return setMachinePolicyField(machineId, projectId, 'pool_size', poolSize, 'pool');
+}
+
+export async function setMachinePriority(machineId, projectId, priority) {
+  return setMachinePolicyField(machineId, projectId, 'dev_priority', priority, 'dev priority');
+}
+
+// Machines that may host DEV xells FOR THIS PROJECT, best first (per-project priority, 038): a
+// machine with no machine_pool row or dev_priority 0 for the project is not a target for it, even
+// if another project spawns there. No projectId, or none configured for it ⇒ empty, and placement
+// falls back to the legacy single-dev-site behavior — a fresh install keeps working with zero rows.
+export async function devMachines(projectId) {
+  if (!projectId) return [];
+  return q(
+    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device,
+            m.max_xells, m.enabled, m.notes, m.created_at,
+            mp.dev_priority AS dev_priority, COALESCE(mp.pool_size, 0) AS pool_size
+       FROM machine m JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
+      WHERE m.enabled AND mp.dev_priority > 0
+      ORDER BY mp.dev_priority DESC, m.created_at`, [projectId]);
 }
 
 export async function machineForCtx(ctx) {
@@ -97,22 +126,28 @@ export async function createMachine(body = {}) {
   const known = await resolveContext(ctx).catch(() => null);
   if (!known) throw new Error(`docker context '${ctx}' is not configured on this machine — \`docker context ls\` doesn't know it`);
   const row = await one(
-    `INSERT INTO machine (key,label,docker_ctx,host_ip,can_build,can_device,dev_priority,max_xells,enabled,notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9,true),$10) RETURNING *`,
+    `INSERT INTO machine (key,label,docker_ctx,host_ip,can_build,can_device,max_xells,enabled,notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,true),$9) RETURNING *`,
     [body.key, body.label || null, ctx, body.host_ip || null, !!body.can_build, !!body.can_device,
-     Number(body.dev_priority) || 0, Number(body.max_xells) || 0,
+     Number(body.max_xells) || 0,
      body.enabled === undefined ? null : !!body.enabled, body.notes || null]);
-  // Pool is per (machine, project): a pool_size on create applies to the project the console is
-  // looking at — other projects start at 0 here and get their own numbers in their own views.
+  // Pool AND priority are per (machine, project): a pool_size / dev_priority on create applies to
+  // the project the console is looking at — other projects start at 0 here and set their own
+  // numbers from their own views. Only max_xells (the cap) is a machine-wide fact on the row.
   if (body.project_id && Number(body.pool_size) > 0) {
     await setMachinePool(row.id, body.project_id, Number(body.pool_size));
   }
+  if (body.project_id && Number(body.dev_priority) > 0) {
+    await setMachinePriority(row.id, body.project_id, Number(body.dev_priority));
+  }
   broadcast('machine', row);
-  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}${row.can_device ? ', devices' : ''}, priority ${row.dev_priority}, cap ${row.max_xells})`);
+  logline('machine', `machine added: ${row.key} (ctx ${row.docker_ctx}${row.can_build ? ', builds' : ', no builds'}${row.can_device ? ', devices' : ''}, cap ${row.max_xells}${Number(body.dev_priority) > 0 ? `, priority ${Number(body.dev_priority)} for this project` : ''})`);
   return row;
 }
 
-const PATCHABLE = ['key', 'label', 'docker_ctx', 'host_ip', 'can_build', 'can_device', 'dev_priority',
+// dev_priority is NOT here: it is per (machine, project) now (machine_pool, 038), set through
+// setMachinePriority, not PATCHed onto the machine row.
+const PATCHABLE = ['key', 'label', 'docker_ctx', 'host_ip', 'can_build', 'can_device',
                    'max_xells', 'enabled', 'notes'];
 
 export async function updateMachine(id, body = {}) {
@@ -163,11 +198,12 @@ export async function liveXellCount(ctx) {
   return r?.n || 0;
 }
 
-// WHERE does the next dev xell spawn? The highest-priority enabled machine that still has room.
-// Returns null when no machines are configured (legacy placement) and THROWS when machines exist
+// WHERE does the next dev xell for THIS PROJECT spawn? The highest-priority enabled machine (in
+// this project's priorities, 038) that still has room under its machine-wide cap. Returns null
+// when no machines are configured for the project (legacy placement) and THROWS when they exist
 // but every one is at its cap — "the hive is full" is an answer, not a fallback to the NAS.
-export async function pickDevMachine() {
-  const ms = await devMachines();
+export async function pickDevMachine(projectId) {
+  const ms = await devMachines(projectId);
   if (!ms.length) return null;
   for (const m of ms) {
     if ((await liveXellCount(m.docker_ctx)) < m.max_xells) return m;
@@ -185,24 +221,23 @@ export async function sharedDevDb(projectId, ctx) {
 }
 
 // WHERE do a xell's images compile when it runs on `machine`? On the machine itself when it can
-// build; otherwise on the best build-capable machine (registry handoff) — ordered by dev_priority
-// so "this PC first" holds for builds exactly like it does for spawns. null ⇒ build on the run
-// host (no capable machine, or no machines at all): the legacy behavior, never an error.
+// build; otherwise on the oldest build-capable machine (registry handoff) — build capability is a
+// machine-wide fact, so its choice no longer rides on the (now per-project) dev_priority. null ⇒
+// build on the run host (no capable machine, or no machines at all): the legacy behavior.
 export async function defaultBuildCtxFor(machine) {
   if (!machine || machine.can_build) return null;
   const b = await one(
-    `SELECT docker_ctx FROM machine WHERE enabled AND can_build
-      ORDER BY dev_priority DESC, created_at LIMIT 1`);
+    `SELECT docker_ctx FROM machine WHERE enabled AND can_build ORDER BY created_at LIMIT 1`);
   return b?.docker_ctx || null;
 }
 
-// The best host for a mobile DEVICE xhip: highest-priority enabled machine that can run an Android
-// emulator (KVM) or has a phone tethered — can_device (035). null ⇒ no device host configured; the
-// device driver turns that into an actionable "mark a machine can_device" error, never a crash-loop.
+// The best host for a mobile DEVICE xhip: an enabled machine that can run an Android emulator (KVM)
+// or has a phone tethered — can_device (035), a machine-wide capability (no per-project priority).
+// null ⇒ no device host configured; the device driver turns that into an actionable "mark a machine
+// can_device" error, never a crash-loop.
 export async function deviceCapableMachine() {
   return one(
-    `SELECT * FROM machine WHERE enabled AND can_device
-      ORDER BY dev_priority DESC, created_at LIMIT 1`);
+    `SELECT * FROM machine WHERE enabled AND can_device ORDER BY created_at LIMIT 1`);
 }
 
 // ── per-machine dev db provisioning ───────────────────────────────────────────

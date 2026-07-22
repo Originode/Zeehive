@@ -16,8 +16,18 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { cleanGitEnv, worktreeBound } from '../lib/git.js';
 
+// The catch-up creates COMMITS in the host worktree — a stash of stray worktree noise, and the
+// merge of the xource tip into the zee's branch. Those need a committer identity, and the queenzee
+// container has NONE configured. An ambient-config-dependent git therefore died with "unable to
+// auto-detect email address (got 'root@<host>')", and catchUpWorktree mislabeled that as a merge
+// CONFLICT — a phantom that blocked `zee land` for every diverged branch (2026-07-22). Attribute
+// every git action here to the queenzee itself, via `-c` so it is SELF-SUFFICIENT: it never again
+// depends on the host's git config, and the automated merges read as the queenzee's, not a stray
+// root@ or whoever last configured the box. (Harmless on read-only calls like rev-parse.)
+const QUEENZEE_IDENTITY = ['-c', 'user.name=Zeehive queenzee', '-c', 'user.email=queenzee@zeehive.local'];
+
 function git(cwd, args, timeout = 60000) {
-  const r = spawnSync('git', ['-C', cwd, ...args],
+  const r = spawnSync('git', ['-C', cwd, ...QUEENZEE_IDENTITY, ...args],
     { encoding: 'utf8', timeout, windowsHide: true, env: cleanGitEnv() });
   return { ok: r.status === 0, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 }
@@ -119,7 +129,8 @@ export function catchUpWorktree(worktree, ref) {
     stashed = s.ok;
     if (!s.ok) {
       // couldn't even stash — don't blunder into a rebase that will half-apply; report honestly.
-      return { state: 'conflict', ref, base: tip,
+      // This is an operational failure, NOT a merge conflict — say so (see mergeFailure below).
+      return { state: 'error', ref, base: tip,
         output: `worktree is dirty and could not be stashed before catch-up:\n${s.out}\n${s.err}`.trim().slice(-1200) };
     }
   }
@@ -127,7 +138,9 @@ export function catchUpWorktree(worktree, ref) {
   // Our HEAD is an ancestor of the tip → we added nothing of our own; just fast-forward to it.
   if (git(worktree, ['merge-base', '--is-ancestor', head, tip]).ok) {
     const m = git(worktree, ['merge', '--ff-only', ref]);
-    if (!m.ok) return { state: 'conflict', ref, base: tip, stashed, output: `${m.out}\n${m.err}`.trim().slice(-1200) };
+    // a ff-only merge that fails is an operational error (we already proved it's a fast-forward), not
+    // a content conflict — classify it as such so the caller doesn't tell the zee to "resolve" nothing.
+    if (!m.ok) return { ...mergeFailure(m), ref, base: tip, stashed };
     const h = git(worktree, ['rev-parse', 'HEAD']);
     return { state: 'fast-forwarded', head: h.out, ref, base: tip, stashed };
   }
@@ -141,10 +154,20 @@ export function catchUpWorktree(worktree, ref) {
   const mg = git(worktree, ['merge', '--no-ff', '--no-edit', ref, '-m', `Merge ${ref} into ${branchName}`], 180000);
   if (!mg.ok) {
     git(worktree, ['merge', '--abort']);
-    return { state: 'conflict', ref, base: tip, stashed, output: `${mg.out}\n${mg.err}`.trim().slice(-1200) };
+    return { ...mergeFailure(mg), ref, base: tip, stashed };
   }
   const h = git(worktree, ['rev-parse', 'HEAD']);
   return { state: 'merged', head: h.out, ref, base: tip, stashed };
+}
+
+// A failed `git merge` is only a real CONFLICT when git says so (unmerged paths / "Automatic merge
+// failed"). Anything else — a missing committer identity, a hook refusal, an unreadable object — is
+// an operational ERROR the zee cannot "resolve by hand", and calling it a conflict sent zees chasing
+// a phantom (2026-07-22). Split the two so each gets an honest message.
+function mergeFailure(m) {
+  const output = `${m.out}\n${m.err}`.trim();
+  const realConflict = /^CONFLICT|Automatic merge failed|fix conflicts|would be overwritten by merge/im.test(output);
+  return { state: realConflict ? 'conflict' : 'error', output: output.slice(-1200) };
 }
 
 // DB-aware wrapper: resolve the xell's worktree + xource ref, then catch that worktree up. Same
@@ -152,10 +175,12 @@ export function catchUpWorktree(worktree, ref) {
 export async function catchUpToXource(xellId) {
   const { x, ref } = await ctx(xellId);
   const res = catchUpWorktree(x.worktree_path, ref);
-  if (res.state === 'rebased' || res.state === 'fast-forwarded') {
+  if (res.state === 'rebased' || res.state === 'fast-forwarded' || res.state === 'merged') {
     logline('landgate', `${x.slug} caught up to ${ref} (${res.state} → ${String(res.head).slice(0, 8)})`);
   } else if (res.state === 'conflict') {
-    logline('landgate', `${x.slug} could NOT catch up to ${ref} — rebase conflict (aborted, worktree untouched)`);
+    logline('landgate', `${x.slug} could NOT catch up to ${ref} — merge conflict (aborted, worktree untouched)`);
+  } else if (res.state === 'error') {
+    logline('landgate', `${x.slug} could NOT catch up to ${ref} — catch-up error (not a conflict): ${String(res.output || '').split('\n').filter(Boolean).pop() || 'unknown'}`);
   }
   return { ...res, ref, slug: x.slug };
 }

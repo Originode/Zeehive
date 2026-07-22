@@ -12,7 +12,8 @@ import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restore
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
-import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool } from '../lib/machines.js';
+import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
+         setMachinePriority } from '../lib/machines.js';
 import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
@@ -25,7 +26,7 @@ import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
-         cloneProject, pullProject } from '../lib/projects.js';
+         cloneProject, pullProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
 import { probeRemote } from '../lib/remote-git.js';
 import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
@@ -44,7 +45,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -282,6 +283,28 @@ router.post('/projects/clone', async (req, res) => {
 router.post('/projects/:id/pull', async (req, res) => {
   try { res.json(await pullProject(req.params.id, req.body?.by || 'human@console')); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// ── GitHub OUTBOUND (opt-in, human-gated) — only when the PAT carries write access ────────────
+// Does this project's stored GitHub token actually let us push / open PRs? The console asks this
+// to decide whether to render the Push / PR buttons at all (read-only token → neither shows).
+router.get('/projects/:id/github-access', async (req, res) => {
+  try { res.json(await githubAccess(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Human-triggered push: local main → the remote's branch, fast-forward only. A diverged/read-only
+// remote comes back {pushed:false, reason} with HTTP 200 — the console shows the reason.
+router.post('/projects/:id/push', async (req, res) => {
+  try { res.json(await pushProject(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Human-triggered PR: push a side branch off local main and open a pull request against default.
+// Refusals are {opened:false, reason} with HTTP 200.
+router.post('/projects/:id/pr', async (req, res) => {
+  try {
+    res.json(await pullRequestProject(req.params.id,
+      { headBranch: req.body?.headBranch || null, title: req.body?.title || null, base: req.body?.base || null },
+      req.body?.by || 'human@console'));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────
@@ -532,6 +555,15 @@ router.put('/machines/:id/pool', async (req, res) => {
     res.json(await setMachinePool(req.params.id, projectId, req.body?.pool_size));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Per-project dev spawn priority on a machine (machine_pool, 038) — the matrix prio knob writes
+// here. Priority is a project's placement choice, not a machine-wide habit; only max_xells (PATCHed
+// onto the machine row) is shared across projects.
+router.put('/machines/:id/priority', async (req, res) => {
+  try {
+    const projectId = req.body?.project_id || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+    res.json(await setMachinePriority(req.params.id, projectId, req.body?.dev_priority));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Stand up this project's shared dev db ON a machine (latest prod backup by default) — the
 // prerequisite for the machine hosting dev xells. Background; watch the queenzee log.
 router.post('/machines/:id/dev-db', async (req, res) => {
@@ -775,6 +807,19 @@ router.post('/xell/self/done', async (req, res) => {
 router.post('/xell/self/tend', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfTend(x, { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Readiness HINT (or --clear): "this looks land/ship-ready — a human should decide". Opens no gate
+// and pushes nothing; it lights the land? / ship? prompt so a human sees the button. The zee calls
+// the REAL land/ship only when 100% certain the job is done; otherwise it hints and leaves the call.
+router.post('/xell/self/hint-land', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHint(x, 'land', { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/hint-ship', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHint(x, 'ship', { reason: req.body?.reason || null, clear: !!req.body?.clear })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Ping "I am actively working" — asserts live activity the passive poller can't see for a cxell, and

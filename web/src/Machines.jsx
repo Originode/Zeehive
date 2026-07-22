@@ -9,7 +9,7 @@
 import React, { useState, useEffect } from 'react';
 import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
-         setMachinePool, getSites, createSite } from './api.js';
+         setMachinePool, setMachinePriority, getSites, createSite } from './api.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' };
@@ -142,12 +142,18 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
   };
 
 
-  // pool is per (machine, PROJECT) — it writes machine_pool for the project in view, not a
-  // machine column; prio and cap are the host's own facts and PATCH the machine row.
+  // pool AND prio are per (machine, PROJECT) — they write machine_pool for the project in view,
+  // not the machine row; only cap (max_xells) is the host's own machine-wide fact and PATCHes it.
   const setPool = async (n) => {
     setBusy(true);
     try { await setMachinePool(m.id, projectId, n); onChanged?.(); }
     catch (e) { fail('Pool size')(e); }
+    finally { setBusy(false); }
+  };
+  const setPrio = async (n) => {
+    setBusy(true);
+    try { await setMachinePriority(m.id, projectId, n); onChanged?.(); }
+    catch (e) { fail('Priority')(e); }
     finally { setBusy(false); }
   };
   const num = (field, v, title, onCommit) => (
@@ -169,7 +175,7 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
         {empty && <button className="mx-del" title="Remove this machine row" onClick={remove}>✕</button>}
       </div>
       <div className="mx-knobs">
-        {num('dev_priority', m.dev_priority, 'Dev spawn priority — the highest-priority machine with room gets new dev xells first. 0 = never a dev host. (Machine-wide.)')}
+        {num('dev_priority', m.dev_priority, 'Dev spawn priority for THIS project — the highest-priority machine with room gets this project\'s new dev xells first. 0 = not a dev host for this project. Per project — one project can prefer this box while another prefers the laptop.', setPrio)}
         {num('pool_size', m.pool_size, 'How many READY (pre-warmed) xells THIS project keeps on this machine. Per project — a high-load project pools bigger here than a quiet one.', setPool)}
         {num('max_xells', m.max_xells, 'Machine-wide cap: total live dev xells here across ALL projects (ready + claimed + working).')}
         <label className={`mx-build${m.can_build ? ' on' : ''}`}
@@ -208,8 +214,8 @@ function AddMachine({ projectId, onChanged }) {
   const save = async () => {
     setBusy(true);
     try {
-      // pool_size on create is scoped to the project in view (machine_pool) — other projects
-      // start at 0 on this machine and set their own numbers from their own views.
+      // pool_size AND dev_priority on create are scoped to the project in view (machine_pool) —
+      // other projects start at 0 on this machine and set their own numbers from their own views.
       await createMachine({ ...f, key: f.key.trim() || f.docker_ctx, host_ip: f.host_ip.trim() || null,
                             project_id: projectId });
       setOpen(false);

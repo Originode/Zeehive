@@ -48,16 +48,18 @@ function usageFrom(result) {
 }
 
 async function readyXells(projectId) {
-  // Machine-priority first (023): a claim takes a ready xell from the preferred machine before
-  // any other — "if local priority is higher, dev xells get spawned there first" applies to
-  // dispatch exactly like it does to the pool fill. With no machine rows every priority is 0
-  // and this is the old freshest-first order unchanged.
+  // Machine-priority first (023, now per-project 038): a claim takes a ready xell from the
+  // machine THIS PROJECT prefers before any other — "if local priority is higher, dev xells get
+  // spawned there first" applies to dispatch exactly like it does to the pool fill. Priority is a
+  // (machine, project) fact (machine_pool), so the join carries the project through. With no
+  // machine_pool row every priority is 0 and this is the old freshest-first order unchanged.
   return q(
     `SELECT x.* FROM xell x
        LEFT JOIN container sc ON sc.owner_xell_id = x.id AND sc.role = 'server'
        LEFT JOIN machine m ON m.docker_ctx = sc.docker_ctx AND m.enabled
+       LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = x.project_id
       WHERE x.project_id = $1 AND x.status = 'ready'
-      ORDER BY COALESCE(m.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
+      ORDER BY COALESCE(mp.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
     [projectId]);
 }
 

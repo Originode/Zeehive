@@ -2,13 +2,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import {
   createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject,
+  githubAccess, pushProject, pullRequestProject,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress,
 } from './api.js';
-import { showConfirm } from './Dialog.jsx';
+import { showConfirm, showPrompt } from './Dialog.jsx';
 
 // PROJECT SETUP — the onboarding surface (spec §7 Phase 2.2 + the console half of everything the
 // deploy-topology spec models). One modal, whole story: probe the folder, read/draft the manifest,
@@ -491,7 +492,18 @@ function BasicsSection({ project, run, onProject }) {
     registry: project.registry || '', remote_url: project.remote_url || '',
   });
   const [pull, setPull] = useState(null);   // last pull outcome {state, reason, commits, busy}
+  const [out, setOut] = useState(null);      // last push/PR outcome (shares the status pill)
+  const [access, setAccess] = useState(null); // {can_push, can_pr, reason} — gates the outbound buttons
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  // Ask the server whether the stored GitHub PAT actually carries write access. Only then do the
+  // Push / PR buttons appear — a read-only (pull-only) token never sees them. Re-probe when the
+  // recorded remote changes.
+  useEffect(() => {
+    let live = true;
+    if (!(project.remote_url || '').trim()) { setAccess(null); return; }
+    githubAccess(project.id).then((a) => { if (live) setAccess(a); }).catch(() => { if (live) setAccess(null); });
+    return () => { live = false; };
+  }, [project.id, project.remote_url]);
   const save = () => run(async () => {
     const p = await updateProject(project.id, {
       ...f, ship_ref: f.ship_ref.trim() || null, registry: f.registry.trim() || null,
@@ -500,19 +512,53 @@ function BasicsSection({ project, run, onProject }) {
     onProject(p);
   });
   // Pull is fetch + fast-forward ONLY; a refusal ({pulled:false, reason}) is an answer, not an
-  // error — show the reason where the button is. Zeehive never pushes to the remote.
+  // error — show the reason where the button is.
   const doPull = async () => {
-    setPull({ busy: true });
+    setOut(null); setPull({ busy: true });
     try {
       const r = await run(() => pullProject(project.id));
       setPull(r);
     } catch (e) { setPull({ state: 'error', reason: e.message }); }
+  };
+  // Push is OUTBOUND and human-gated: confirm first, then local main → the remote (ff-only). A
+  // refusal ({pushed:false, reason}) shows in the same status pill.
+  const doPush = async () => {
+    if (!(await showConfirm(
+      `Push local ${project.main_branch} of ${project.name} to the GitHub remote?\n\n`
+      + `${project.remote_url}\n\nThis publishes your local history to the remote (fast-forward only — a `
+      + `diverged remote is refused, never force-pushed).`,
+      { title: 'Push to remote?', okLabel: 'Push' }))) return;
+    setPull(null); setOut({ busy: true, kind: 'push' });
+    try {
+      const r = await run(() => pushProject(project.id));
+      setOut({ ...r, kind: 'push' });
+    } catch (e) { setOut({ kind: 'push', reason: e.message }); }
+  };
+  // PR is OUTBOUND and human-gated: prompt for a branch name, then push a side branch + open a PR.
+  const doPR = async () => {
+    const headBranch = await showPrompt(
+      `Open a pull request from local ${project.main_branch} of ${project.name}.\n\n`
+      + `A side branch is pushed to the remote and a PR is opened against ${access?.default_branch || 'the default branch'}. `
+      + `Name the head branch (leave as-is for a generated name):`,
+      { title: 'Open a pull request?', defaultValue: `zeehive/${project.main_branch}`, okLabel: 'Open PR' });
+    if (headBranch === null) return;   // cancelled
+    setPull(null); setOut({ busy: true, kind: 'pr' });
+    try {
+      const r = await run(() => pullRequestProject(project.id, { headBranch: headBranch.trim() || undefined }));
+      setOut({ ...r, kind: 'pr' });
+    } catch (e) { setOut({ kind: 'pr', reason: e.message }); }
   };
   const pullLabel = !pull ? null
     : pull.busy ? 'pulling…'
     : pull.state === 'up-to-date' ? '✓ up to date'
     : pull.state === 'fast-forwarded' ? `✓ fast-forwarded (${pull.commits} commit${pull.commits === 1 ? '' : 's'})`
     : pull.reason;
+  const outLabel = !out ? null
+    : out.busy ? (out.kind === 'push' ? 'pushing…' : 'opening PR…')
+    : out.kind === 'push'
+      ? (out.pushed ? (out.state === 'up-to-date' ? '✓ remote already up to date' : `✓ pushed ${project.main_branch} → remote`) : (out.reason || 'push refused'))
+      : (out.opened ? `✓ PR ${out.state === 'existing' ? 'already open' : 'opened'}${out.number ? ` #${out.number}` : ''}${out.url ? ' — open on GitHub ↗' : ''}` : (out.reason || 'PR refused'));
+  const outOk = out && (out.pushed || out.opened);
   return (
     <div className="setup-sec">
       <h3>Project</h3>
@@ -526,18 +572,33 @@ function BasicsSection({ project, run, onProject }) {
           <input value={f.ship_ref} onChange={set('ship_ref')} placeholder={`local ${f.main_branch}`} /></label>
         <label>Build registry <span className="pc">(blank = split builds off; host:port on the LAN, e.g. 10.1.0.18:5000)</span>
           <input value={f.registry} onChange={set('registry')} placeholder="none — compile on the run host" /></label>
-        <label>GitHub remote <span className="pc">(pull-only fetch source — Zeehive never pushes; Mark pushes by hand)</span>
+        <label>GitHub remote <span className="pc">{access?.can_push
+            ? '(write access — Pull, or Push / open a PR; every outbound action is confirmed)'
+            : '(pull-only fetch source — connect a write-scoped PAT to enable Push / PR)'}</span>
           <span className="setup-row">
             <input value={f.remote_url} onChange={set('remote_url')} placeholder="https://github.com/org/repo (none)" />
-            <button type="button" disabled={!(project.remote_url || '').trim() || pull?.busy}
+            <button type="button" disabled={!(project.remote_url || '').trim() || pull?.busy || out?.busy}
                     title={`fetch + fast-forward ${project.main_branch} from the remote (refuses on divergence)`}
                     onClick={doPull}>↓ Pull</button>
+            {access?.can_push && (
+              <button type="button" disabled={pull?.busy || out?.busy}
+                      title={`push local ${project.main_branch} to the remote (fast-forward only) — you'll be asked to confirm`}
+                      onClick={doPush}>↑ Push</button>
+            )}
+            {access?.can_pr && (
+              <button type="button" className="ghost" disabled={pull?.busy || out?.busy}
+                      title={`push a side branch off local ${project.main_branch} and open a pull request — you'll be asked to confirm`}
+                      onClick={doPR}>⇅ PR</button>
+            )}
           </span>
         </label>
       </div>
-      {pullLabel && (
+      {(pullLabel || outLabel) && (
         <div className="gates">
-          <span className={`gate ${pull.busy ? 'g-warn' : pull.pulled ? 'g-pass' : 'g-warn'}`}>{pullLabel}</span>
+          {pullLabel && <span className={`gate ${pull.busy ? 'g-warn' : pull.pulled ? 'g-pass' : 'g-warn'}`}>{pullLabel}</span>}
+          {outLabel && (out?.url && outOk
+            ? <a className="gate g-pass" href={out.url} target="_blank" rel="noreferrer">{outLabel}</a>
+            : <span className={`gate ${out.busy ? 'g-warn' : outOk ? 'g-pass' : 'g-warn'}`}>{outLabel}</span>)}
         </div>
       )}
       <div className="projpop-formbtns"><button type="button" onClick={save}>Save project</button></div>

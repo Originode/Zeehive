@@ -155,6 +155,8 @@ function usage() {
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. --clear lowers it
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); --wait blocks until decided (run in background)
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
+  zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
+  zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms)
   zee done --summary "..."           propose done (a human confirms with "Mark done")
 
@@ -240,6 +242,14 @@ switch (cmd) {
     const reason = flag('reason'); const targets = multi('targets');
     if (!reason) { console.error('ship needs --reason "what you are shipping"'); process.exit(1); }
     out(await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) }));
+    break;
+  }
+  case 'hint-land': case 'hint-ship': {
+    // Surface the land?/ship? prompt for a human WITHOUT calling the gated land/ship. Use this
+    // whenever you are not 100% certain the job is done — leave the decision to the human's button.
+    const kind = cmd === 'hint-land' ? 'land' : 'ship';
+    const clear = rest.includes('--clear');
+    out(await req('POST', `/api/xell/self/hint-${kind}`, { reason: flag('reason') || null, clear }));
     break;
   }
   case 'prod': {

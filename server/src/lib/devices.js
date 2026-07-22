@@ -135,7 +135,7 @@ export function deviceLoop(handle, { buildApkHint = './gradlew assembleDebug' } 
   };
 }
 
-// WHERE an emulator can run: the best can_device machine (highest dev_priority). Refused with the
+// WHERE an emulator can run: the first can_device machine (a machine-wide capability). Refused with the
 // FIX when none exists, so "no device host" is an actionable message, not a crash-looping container.
 async function pickDeviceHost(preferCtx = null) {
   if (preferCtx) {

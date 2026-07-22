@@ -38,8 +38,9 @@ and a zee goes to work in one.
 ## The vocabulary
 
 - **xource** — the source a *xell* branches from: the project's local clone and its main branch.
-  Read-only to xells. Synced from GitHub **inbound-only** (clone + fast-forward pull); nothing in
-  ZEEHIVE ever pushes to a remote — pushing is a human act.
+  Read-only to xells. Synced from GitHub **inbound by default** (clone + fast-forward pull).
+  Pushing out stays a **human act**: outbound Push / open-PR only surface when the project's PAT
+  carries write access, and each one is a confirmed click in the console — never a zee's to make.
 - **xell** — an isolated environment: a git worktree + its own branch + its own containers
   (per-xell database, server, webapp) + generated config (`.zeehive.env`). The unit the
   orchestrator pools, spawns, tracks, and tears down.
@@ -68,12 +69,19 @@ human's click.**
 - **Done** — a zee proposes it's finished; a human's "Mark done" is what tears the cxell down
   (commits are collected first).
 
-## GitHub-centric, inbound-only
+## GitHub-centric, inbound by default — outbound opt-in
 
 The code lives on GitHub; every instance is born from it (self-onboard) and refreshed from it
 (the console's ff-only **Pull**). The dev cycle itself — landing, integration, prod builds —
-runs entirely on the local xource and never depends on GitHub being reachable. There is **no
-push verb anywhere in the system**: publishing local main to GitHub is a deliberate human act.
+runs entirely on the local xource and never depends on GitHub being reachable.
+
+Publishing local main *out* to GitHub is opt-in and human-gated. The console probes the
+project's stored GitHub PAT (`GET …/github-access`): only when it actually carries **write**
+access do a **Push** (local main → the remote branch, fast-forward only) and an **open-PR**
+(push a side branch + open a pull request) appear in Project setup, and each fires only from a
+human's confirmed click. A read-only (Contents: read) token — the recommended default — never
+lights those buttons, and a **zee can never reach them**: outbound lives only on the console's
+human surface, behind a `showConfirm`, exactly like every other irreversible act.
 
 ## Layout
 
