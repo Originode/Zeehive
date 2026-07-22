@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import HiveCanvas from './hive/HiveCanvas.jsx';
 import GraphPane from './GraphPane.jsx';
 import Connectors from './Connectors.jsx';
+import { beginPaneReposition } from './paneSplit.js';
 import './styles.css';
 
 // DEMO-ONLY visual harness (not shipped): the real HiveCanvas + GraphPane + Connectors wired with
@@ -52,6 +53,7 @@ function Demo() {
   const [orientation, setOrientation] = useState('landscape');
   const [honeySide, setHoneySide] = useState('a');
   const [expandedId, setExpandedId] = useState(null);
+  const [split, setSplit] = useState(null);
   const layoutRef = useRef(null);
   const hexPosRef = useRef({});
   const geomListeners = useRef(new Set());
@@ -70,7 +72,7 @@ function Demo() {
 
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
-      <section className="hive-pane honey">
+      <section className="hive-pane honey" style={split != null ? { flex: `${split} 1 0` } : undefined}>
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={machines} onOpenSession={() => {}}
                     expandedId={expandedId} onExpand={setExpandedId}
@@ -81,14 +83,15 @@ function Demo() {
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
                  hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
-                 onFlip={() => { setHoneySide((s) => s === 'a' ? 'b' : 'a'); setVersion((v) => v + 1); }} />
+                 onFlip={() => { setHoneySide((s) => s === 'a' ? 'b' : 'a'); setVersion((v) => v + 1); }}
+                 onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />
 
-      <section className="hive-pane panels">
+      <section className="hive-pane panels" style={split != null ? { flex: `${1 - split} 1 0` } : undefined}>
         <div className="content" style={{ padding: 16 }}>
           <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
             <button className="flip-btn" onClick={() => { setOrientation((o) => o === 'landscape' ? 'portrait' : 'landscape'); setVersion((v) => v + 1); }}>

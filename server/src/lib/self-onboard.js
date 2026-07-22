@@ -115,11 +115,13 @@ async function modelOwnStack(projectId) {
   // projects (Zeehive itself) use the project-wide target regardless of machine rows; the
   // machine_pool row seeds a sane per-machine default for compose projects onboarded later.
   const machine = await one(
-    `INSERT INTO machine (key, label, docker_ctx, can_build, dev_priority, max_xells)
-     VALUES ('local', 'this machine', 'default', true, 1, 6)
+    `INSERT INTO machine (key, label, docker_ctx, can_build, max_xells)
+     VALUES ('local', 'this machine', 'default', true, 6)
      ON CONFLICT (key) DO UPDATE SET enabled = machine.enabled RETURNING id`);
   if (machine) {
-    await q(`INSERT INTO machine_pool (machine_id, project_id, pool_size) VALUES ($1,$2,1)
+    // pool AND priority are per (machine, project) now (025 + 038): seed local as this project's
+    // preferred dev host with one warm xell. max_xells stays the machine-wide cap on the row above.
+    await q(`INSERT INTO machine_pool (machine_id, project_id, pool_size, dev_priority) VALUES ($1,$2,1,1)
              ON CONFLICT DO NOTHING`, [machine.id, projectId]);
   }
 

@@ -52,14 +52,16 @@ export const PROVIDERS = {
     // sk-<alnum tail>; sk-ant-… is explicitly rejected so a Claude token in the wrong slot fails loudly
     valid: (t) => /^sk-[A-Za-z0-9]{20,}$/.test(t) && !/^sk-ant-/.test(t),
   },
-  // GitHub is INBOUND-ONLY (migration 032): this token is used exclusively by clone/pull fetches
-  // in lib/remote-git.js — nothing in Zeehive can push, so a Contents:Read-only PAT is all it
-  // should ever be granted.
+  // GitHub is INBOUND BY DEFAULT (migration 032): this token drives clone/pull fetches in
+  // lib/remote-git.js. A Contents:Read-only PAT is the safe default and keeps Zeehive fetch-only.
+  // If the PAT instead carries Contents: WRITE (and, for PRs, Pull requests: write), the console's
+  // Project setup ADDITIONALLY offers a human-confirmed Push / open-PR (lib/remote-git.js
+  // remoteAccess/pushRemote/openPullRequest) — still never a zee's to trigger.
   github: {
     key: 'github',
-    label: 'GitHub (pulls only)',
+    label: 'GitHub',
     command: 'GitHub → Settings → Developer settings → Fine-grained tokens',
-    steps: 'Create a fine-grained personal access token scoped to this repo with Contents: READ-ONLY. Zeehive only ever fetches — it cannot and will not push. Paste it below; it is stored only in the meta-DB.',
+    steps: 'Create a fine-grained personal access token scoped to this repo. Contents: READ-ONLY keeps Zeehive fetch-only (the safe default). Grant Contents: WRITE (plus Pull requests: write for PRs) and Project setup gains a human-confirmed Push / open-PR button. Paste it below; it is stored only in the meta-DB.',
     // classic ghp_…, fine-grained github_pat_…, or an OAuth/device token gho_/ghu_/ghs_ (what
     // `gh auth token` and git-credential-manager hold — a proven-working fallback when an org's
     // fine-grained-PAT policy fights the human); loose tails for the same reason as above

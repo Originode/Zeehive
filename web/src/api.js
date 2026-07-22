@@ -184,10 +184,14 @@ export const purgeDevXells = (projectId) => siteCall(`/api/projects/${projectId}
 // containerized era: mount a HOST folder into /repos (recreates the queenzee's own container)
 export const getHostMounts = () => fetch('/api/projects/host-mounts').then((r) => r.json());
 export const mountHostFolder = (host_path, name) => siteCall('/api/projects/mount-host', 'POST', { host_path, name: name || undefined });
-// GitHub inbound — clone in, pull in, NEVER push (the server has no push verb at all).
+// GitHub inbound — clone in, pull in. Outbound (push / PR) is opt-in and only surfaces when the
+// project's PAT carries write access (githubAccess), and every outbound call is human-confirmed.
 export const probeRemote = (url, token) => siteCall('/api/projects/probe-remote', 'POST', { url, token: token || undefined });
 export const cloneProject = (body) => siteCall('/api/projects/clone', 'POST', body);
 export const pullProject = (projectId) => siteCall(`/api/projects/${projectId}/pull`, 'POST', {});
+export const githubAccess = (projectId) => fetch(`/api/projects/${projectId}/github-access`).then((r) => r.json());
+export const pushProject = (projectId) => siteCall(`/api/projects/${projectId}/push`, 'POST', {});
+export const pullRequestProject = (projectId, opts = {}) => siteCall(`/api/projects/${projectId}/pr`, 'POST', opts);
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
@@ -304,6 +308,14 @@ export async function setMachinePool(machineId, projectId, pool_size) {
     body: JSON.stringify({ project_id: projectId, pool_size }),
   });
   return jsonOrThrow(r, 'set pool size');
+}
+// Per-project dev spawn priority on a machine — where THIS project's new xells land first.
+export async function setMachinePriority(machineId, projectId, dev_priority) {
+  const r = await fetch(`/api/machines/${machineId}/priority`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, dev_priority }),
+  });
+  return jsonOrThrow(r, 'set priority');
 }
 // Stand up the project's shared dev db ON a machine (background; restores the latest prod backup).
 export async function provisionMachineDevDb(machineId, projectId) {

@@ -59,7 +59,7 @@ async function reconcileProject(projectId, target) {
   // 2026-07-19 — and the per-tick reconcile sweep over all of them is what froze the API.
   // Machine placement is meaningless for bare worktrees anyway (they live on the queenzee's
   // host), so such projects use the legacy project-wide target, whose count has no join.
-  const machines = await devMachines();
+  const machines = await devMachines(projectId);
   if (!machines.length || !project?.compose_spinoff) return fillTrim(projectId, target, null);
   for (const m of machines) {
     const size = await machinePoolSize(m.id, projectId);

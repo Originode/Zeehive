@@ -1,16 +1,24 @@
-// The ONLY module that talks to a git remote over the network — and it only ever READS.
+// The ONLY module that talks to a git remote over the network.
 //
-// GitHub is inbound transport (Mark, 2026-07-20): New Project can CLONE from a URL, and the
-// console's Pull fetches + fast-forwards. NOTHING HERE OR ANYWHERE MAY PUSH — Mark pushes by
-// hand. No push function exists in this module on purpose; do not add one. The dev cycle
-// (landing, integration, prod builds) works entirely on the local repo and never depends on
-// the remote being reachable.
+// GitHub is inbound transport by DEFAULT (Mark, 2026-07-20): New Project can CLONE from a URL,
+// and the console's Pull fetches + fast-forwards. That default stands — with a Contents:Read-only
+// PAT nothing here can push, and the dev cycle (landing, integration, prod builds) never depends
+// on the remote being reachable.
 //
-// Credentials: a per-project fine-grained READ-ONLY PAT from the provider_token table. It is
-// handed to git through a ONE-SHOT in-memory credential helper with the token in the child's
-// env — never in argv (visible in `ps`), never written to git config, never part of the
-// stored remote URL. The first empty `credential.helper=` clears any configured manager
-// (e.g. manager-core) so nothing prompts, caches, or overrides.
+// OUTBOUND is now OPT-IN and HUMAN-GATED (Mark, 2026-07-22): when a project's GitHub PAT actually
+// carries write access, the console MAY offer a Push (local main → the remote's branch) and/or a
+// PR (push a side branch + open a pull request). Both are surfaced only after `remoteAccess()`
+// confirms the token's scope against the GitHub API, and both fire only from a human's click in
+// the console behind a confirm dialog — a zee can never reach them, and a read-only token never
+// sees the buttons. A push is fast-forward-only (never --force): a diverged remote fails loud,
+// exactly like the ff-only Pull refuses a diverged local.
+//
+// Credentials: a per-project fine-grained PAT from the provider_token table. It is handed to git
+// through a ONE-SHOT in-memory credential helper with the token in the child's env — never in
+// argv (visible in `ps`), never written to git config, never part of the stored remote URL. The
+// first empty `credential.helper=` clears any configured manager (e.g. manager-core) so nothing
+// prompts, caches, or overrides. The same token authenticates the REST calls (access probe, PR
+// open) via an Authorization header — never logged, never returned to the client.
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
@@ -209,4 +217,176 @@ export async function pullRemote({ repoRoot, branch = 'main', remoteUrl, token }
     pulled: true, state: 'fast-forwarded', from: before, to: after,
     commits: rc.status === 0 ? (+rc.out.trim() || 0) : null,
   };
+}
+
+// ── OUTBOUND (opt-in, human-gated) — GitHub REST + push/PR ────────────────────
+// Only github.com and GitHub Enterprise https remotes get an API base; everything else returns
+// null and the outbound features simply never light up. github.com → api.github.com; an
+// enterprise host <h> → https://<h>/api/v3 (its documented REST root).
+export function parseGitHubSlug(url) {
+  const m = /^https?:\/\/([^/]+)\/([^/]+)\/(.+?)(?:\.git)?\/?$/i.exec(String(url || '').trim());
+  if (!m) return null;
+  const [, host, owner, repo] = m;
+  const h = host.toLowerCase();
+  const apiBase = (h === 'github.com' || h === 'www.github.com')
+    ? 'https://api.github.com'
+    : `https://${host}/api/v3`;
+  return { host, owner, repo, apiBase };
+}
+
+// One authenticated REST call. The token rides the Authorization header (never argv, never a log).
+// Returns {ok, status, body, error} — network failure is status 0, not a throw, so callers branch
+// instead of unwinding. 15s cap: a hung api.github.com must not wedge the single-process server.
+async function githubApi(slug, path, { token, method = 'GET', body } = {}) {
+  if (!slug) return { ok: false, status: 0, body: null, error: 'not a recognised GitHub URL' };
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 15000);
+  try {
+    const res = await fetch(`${slug.apiBase}${path}`, {
+      method,
+      signal: ctl.signal,
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'zeehive',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    let payload = null;
+    try { payload = await res.json(); } catch { /* empty/non-json body */ }
+    return { ok: res.ok, status: res.status, body: payload, error: res.ok ? null : (payload?.message || `HTTP ${res.status}`) };
+  } catch (e) {
+    return { ok: false, status: 0, body: null, error: e?.name === 'AbortError' ? 'GitHub API timed out' : String(e?.message || e) };
+  } finally { clearTimeout(t); }
+}
+
+// What can THIS token actually do to THIS repo? Reads the repo's effective `permissions` block
+// (GitHub computes it for the authenticated token), so a Contents:Read-only PAT reports can_push
+// false and the console never shows the outbound buttons. can_pr additionally needs the pull
+// requests to be openable at all — a fork/archived repo can be pushable-to yet PR-flow differs —
+// so it is gated on write AND the repo not being archived. Never throws; a probe that can't reach
+// GitHub returns can_push/can_pr false with a reason the console can show.
+export async function remoteAccess({ url, token } = {}) {
+  const slug = parseGitHubSlug(url);
+  if (!slug) return { provider: null, can_push: false, can_pr: false, reason: 'remote is not a GitHub URL — push/PR are GitHub-only' };
+  if (!token) return { provider: 'github', can_push: false, can_pr: false, reason: 'no GitHub token connected — outbound needs a PAT with write access' };
+  const r = await githubApi(slug, `/repos/${slug.owner}/${slug.repo}`, { token });
+  if (!r.ok) {
+    return { provider: 'github', can_push: false, can_pr: false,
+      reason: r.status === 401 || r.status === 403
+        ? 'the connected GitHub token is not authorised for this repo'
+        : `could not read repo permissions: ${r.error}` };
+  }
+  const perms = r.body?.permissions || {};
+  const archived = !!r.body?.archived;
+  const can_push = !!(perms.push || perms.maintain || perms.admin) && !archived;
+  return {
+    provider: 'github',
+    owner: slug.owner, repo: slug.repo,
+    default_branch: r.body?.default_branch || null,
+    archived,
+    can_push,
+    // opening a PR needs a branch pushed first, so write access is the floor; the pull-request
+    // API itself is refused loudly at open-time if a fine-grained token lacks "Pull requests: write".
+    can_pr: can_push,
+    reason: can_push ? null
+      : archived ? 'repository is archived — read-only'
+      : 'the connected GitHub token has read-only access (Contents: write is needed to push)',
+  };
+}
+
+// PUSH local <branch> to the remote's same branch. Fast-forward ONLY — no --force, ever — so a
+// remote that moved ahead is REFUSED (non-fast-forward), matching the ff-only Pull. Keeps origin
+// pointed at the credential-free remote URL (token never lands in git config), then pushes with
+// the one-shot credential helper. Refusals come back {pushed:false, reason}; the console shows it.
+export async function pushRemote({ repoRoot, branch = 'main', remoteUrl, token } = {}) {
+  if (!repoRoot || !remoteUrl) return { pushed: false, state: 'error', reason: 'repoRoot and remoteUrl are required' };
+  if (!token) return { pushed: false, state: 'error', reason: 'a GitHub token with write access is required to push' };
+  const g = (args, opts = {}) => gitNet(['-C', repoRoot, ...args], opts);
+
+  // push what the checkout has for <branch>, whatever it is checked out as — resolve the ref so a
+  // detached ship checkout can't quietly push the wrong tip.
+  const local = await g(['rev-parse', '--verify', `refs/heads/${branch}`], { timeout: 15000 });
+  if (local.status !== 0) return { pushed: false, state: 'refused', reason: `local branch '${branch}' does not exist in the checkout` };
+  const sha = local.out.trim();
+
+  const cur0 = await g(['remote', 'get-url', 'origin'], { timeout: 15000 });
+  if (cur0.status !== 0) await g(['remote', 'add', 'origin', remoteUrl], { timeout: 15000 });
+  else if (cur0.out.trim() !== remoteUrl) await g(['remote', 'set-url', 'origin', remoteUrl], { timeout: 15000 });
+
+  // no leading '+' → non-fast-forward is rejected by the remote (loud), never force-pushed.
+  const pr = await g([...credArgs(token), 'push', 'origin', `refs/heads/${branch}:refs/heads/${branch}`], { token, timeout: 5 * 60 * 1000 });
+  if (pr.status !== 0) {
+    const err = (pr.err || '').trim();
+    const nonff = /non-fast-forward|fetch first|rejected|failed to push/i.test(err);
+    return {
+      pushed: false,
+      state: looksLikeAuthFailure(err) ? 'refused-auth' : nonff ? 'refused-diverged' : 'error',
+      reason: looksLikeAuthFailure(err)
+        ? 'authentication failed — the connected GitHub token cannot write to this repo'
+        : nonff
+          ? `remote ${branch} has commits local ${branch} does not — Zeehive only fast-forwards; pull or reconcile first`
+          : `push failed: ${err.slice(-300)}`,
+    };
+  }
+  const upToDate = /up-to-date|Everything up-to-date/i.test(pr.err || '');
+  return { pushed: true, state: upToDate ? 'up-to-date' : 'pushed', branch, sha };
+}
+
+// Open a PULL REQUEST: push the local <branch> tip to a NEW head branch on the remote, then create
+// the PR against <base> (the repo default branch) via REST. The head branch is force-updatable
+// (a re-run of the same request refreshes it), but MAIN is never touched. Returns {opened, url,...}
+// or {opened:false, reason}. A fine-grained token missing "Pull requests: write" fails at the REST
+// step with GitHub's own 403 message surfaced.
+export async function openPullRequest({ repoRoot, remoteUrl, token, branch = 'main', headBranch, base, title, body } = {}) {
+  if (!repoRoot || !remoteUrl) return { opened: false, reason: 'repoRoot and remoteUrl are required' };
+  if (!token) return { opened: false, reason: 'a GitHub token with write access is required to open a PR' };
+  const slug = parseGitHubSlug(remoteUrl);
+  if (!slug) return { opened: false, reason: 'remote is not a GitHub URL — PRs are GitHub-only' };
+  const g = (args, opts = {}) => gitNet(['-C', repoRoot, ...args], opts);
+
+  const local = await g(['rev-parse', '--verify', `refs/heads/${branch}`], { timeout: 15000 });
+  if (local.status !== 0) return { opened: false, reason: `local branch '${branch}' does not exist in the checkout` };
+  const sha = local.out.trim();
+
+  // default base = the remote's default branch (from the access probe); default head name carries
+  // the short sha so repeat opens are idempotent-ish and collisions are unlikely.
+  const access = await remoteAccess({ url: remoteUrl, token });
+  const baseBranch = String(base || '').trim() || access.default_branch || branch;
+  const head = String(headBranch || '').trim() || `zeehive/${branch}-${sha.slice(0, 8)}`;
+  if (head === baseBranch) return { opened: false, reason: `head branch '${head}' equals base '${baseBranch}' — pick a different branch name` };
+
+  const cur0 = await g(['remote', 'get-url', 'origin'], { timeout: 15000 });
+  if (cur0.status !== 0) await g(['remote', 'add', 'origin', remoteUrl], { timeout: 15000 });
+  else if (cur0.out.trim() !== remoteUrl) await g(['remote', 'set-url', 'origin', remoteUrl], { timeout: 15000 });
+
+  // + on the head ref only: refresh THIS PR branch on a re-run; base/main are out of reach here.
+  const pushRes = await g([...credArgs(token), 'push', 'origin', `+refs/heads/${branch}:refs/heads/${head}`], { token, timeout: 5 * 60 * 1000 });
+  if (pushRes.status !== 0) {
+    const err = (pushRes.err || '').trim();
+    return { opened: false, reason: looksLikeAuthFailure(err)
+      ? 'authentication failed — the connected GitHub token cannot write to this repo'
+      : `could not push PR branch: ${err.slice(-300)}` };
+  }
+
+  const prTitle = String(title || '').trim() || `Zeehive: ${branch} → ${baseBranch}`;
+  const r = await githubApi(slug, `/repos/${slug.owner}/${slug.repo}/pulls`, {
+    token, method: 'POST',
+    body: { title: prTitle, head, base: baseBranch, body: String(body || 'Opened from the Zeehive console.') },
+  });
+  if (!r.ok) {
+    // a PR for this head↔base may already be open — surface that as success-ish, not an error.
+    const already = r.status === 422 && /already exists|pull request already/i.test(r.error || '');
+    if (already) {
+      const ex = await githubApi(slug, `/repos/${slug.owner}/${slug.repo}/pulls?head=${slug.owner}:${head}&base=${baseBranch}&state=open`, { token });
+      const url = ex.ok && Array.isArray(ex.body) && ex.body[0]?.html_url;
+      if (url) return { opened: true, state: 'existing', url, head, base: baseBranch, number: ex.body[0].number };
+    }
+    return { opened: false, reason: r.status === 403
+      ? 'the GitHub token cannot open pull requests here (needs "Pull requests: write")'
+      : `could not open PR: ${r.error}`, head };
+  }
+  return { opened: true, state: 'opened', url: r.body?.html_url || null, number: r.body?.number || null, head, base: baseBranch };
 }

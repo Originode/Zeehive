@@ -16,6 +16,8 @@ export const HIVE_COLORS = {
   'occ-tendRequest':  '#e26fae',
   'occ-landRequest':  '#7b9cff',
   'occ-shipRequest':  '#f2c14e',
+  'occ-landHint':     '#9db4ff',   // a hint is a softer ask than a held request — lighter tint
+  'occ-shipHint':     '#f7d98a',
   'occ-doneRequest':  '#3bc6c0',
   'occ-done':         '#8bd98c',
   'live-protected':   '#f2c14e',
@@ -34,6 +36,8 @@ export const HIVE_LABELS = {
   'occ-tendRequest':  'tend?',
   'occ-landRequest':  'land?',
   'occ-shipRequest':  'ship?',
+  'occ-landHint':     'land?',
+  'occ-shipHint':     'ship?',
   'occ-doneRequest':  'done?',
   'occ-done':         'done',
   'live-protected':   'protected',

@@ -127,6 +127,11 @@ services:
       ZEEHIVE_GITHUB_TOKEN: ${ZEEHIVE_GITHUB_TOKEN:-}
       ZEEHIVE_SSH_DIR: /data/ssh           # fleet cxell keypair — regenerating it orphans live cxells
       BACKUP_DIR: /backups                 # prod DB dumps
+      # Real backups + armed scheduler, same defaults as docker-compose.bootstrap.yml (keep the
+      # two in step). Unset means 'simulate', which records a ~150-byte placeholder as a finished
+      # backup — see 9169c1b for why that is worse than having no backup at all.
+      MAINTENANCE_MODE: ${MAINTENANCE_MODE:-real}
+      MAINTENANCE_ENABLED: ${MAINTENANCE_ENABLED:-true}
       ZEEHIVE_CXELL_SSH: network            # SSH to cxells by container name over zee-hive-net
       # cxells reach the queenzee by SERVICE NAME over zee-hive-net — no host-networking
       # assumption, so this works the same on Docker Desktop and native Linux. Same value as

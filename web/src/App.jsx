@@ -2,13 +2,14 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens } from './api.js';
+         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 import HiveCanvas from './hive/HiveCanvas.jsx';
 import GraphPane from './GraphPane.jsx';
+import { beginPaneReposition, readSplit } from './paneSplit.js';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
@@ -149,6 +150,10 @@ export default function App() {
   // ── honeycomb shell ──────────────────────────────────────────────────────────
   const orientation = useOrientation();          // 'portrait' | 'landscape'
   const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
+  // honey pane's fraction of the two OUTER panes' combined size — the grip in the graph pane slides
+  // this to move the centre divider (null → the CSS 3:2 default). Persisted per orientation.
+  const [split, setSplit] = useState(null);
+  useEffect(() => { setSplit(readSplit(orientation)); }, [orientation]);
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
@@ -277,6 +282,31 @@ export default function App() {
         onRetry: () => { dismissToast(id); runDispatch(payload); } });
     }
   }, [pushToast, updateToast, dismissToast, refresh]);
+
+  // Fire a prod backup from a db chip's "Back up now" menu item. Same async job as the backups
+  // panel's button (POST /backups/run) — a running row appears immediately and finalizes over SSE;
+  // we report start/refusal through a toast and refresh so the panel's spinner shows.
+  const runBackupNow = useCallback(async (c) => {
+    const id = `bk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    pushToast({ id, kind: 'progress', title: 'Starting backup…',
+      body: `Dumping ${c?.name || 'the production database'}` });
+    try {
+      await runBackup(projectId || fleet?.project?.id);
+      updateToast(id, { kind: 'success', title: 'Backup started',
+        body: 'It runs in the background — watch the backups panel for its spinner.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 7000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', title: 'Backup not started', body: e?.error || e?.message || String(e) });
+    }
+    // Reads `fleet?.project`, NOT the destructured `project` — and this is not a style choice.
+    // `const { project } = fleet` happens far below, after the `if (!fleet) return` early return;
+    // a dep array is evaluated on EVERY render, so naming `project` here touched it in its temporal
+    // dead zone and threw "Cannot access 'project' before initialization" on the first render. The
+    // whole console rendered blank (2026-07-22). Moving this hook below that destructure is not the
+    // fix either — it sits after an early return, and hooks must run unconditionally. `fleet` is
+    // state declared at the top of the component, so it is always safe to reference here.
+  }, [pushToast, updateToast, dismissToast, refresh, projectId, fleet]);
 
   // once: global logs, and pick the active project (persisted → first)
   useEffect(() => {
@@ -484,7 +514,7 @@ export default function App() {
   // side is honeycomb vs panels. Connector wires bridge each xell's commit dot (graph) to its hex.
   return (
     <div className={`hive-split o-${orientation} honey-${honeySide}`} ref={layoutRef}>
-      <section className="hive-pane honey">
+      <section className="hive-pane honey" style={split != null ? { flex: `${split} 1 0` } : undefined}>
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     onContainerMenu={openMenu}
@@ -521,14 +551,15 @@ export default function App() {
       <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
                  hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
-                 onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))} />
+                 onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
+                 onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />
 
-      <section className="hive-pane panels">
+      <section className="hive-pane panels" style={split != null ? { flex: `${1 - split} 1 0` } : undefined}>
       <div className="content">
       <header className="topbar">
         <div className="proj">
@@ -647,6 +678,7 @@ export default function App() {
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}
                      projectName={project.name} onDecommissioned={refresh}
                      onLoadBackup={(c) => setLoadBackupFor(c)}
+                     onBackup={runBackupNow}
                      onShell={(c) => setShellFor(c)} />
       {/* docker-exec shell into a container, opened from its chip's context menu */}
       {shellFor && <ContainerTerminal c={shellFor} onClose={() => setShellFor(null)} />}
