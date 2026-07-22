@@ -120,6 +120,16 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .gate.g-warn { color: var(--building, #e0a53b); border-color: rgba(224,165,59,.45); background: rgba(224,165,59,.10); }
 .gate.g-fail { color: var(--down, #e5554e);  border-color: rgba(229,85,78,.45);  background: rgba(229,85,78,.10); }
 .gate-ship { font-weight: 600; margin-left: auto; }
+/* clickable gates jump to the tab that fixes them */
+.gate.gate-jump { cursor: pointer; }
+.gate.gate-jump:hover { border-color: var(--accent, #5b8cff); }
+
+/* project-setup tabs — the six sections group into four concern tabs under the pinned checklist */
+.setup-tabs { display: flex; gap: 2px; margin: 10px 0 14px; border-bottom: 1px solid var(--line); }
+.setup-tab { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted);
+  font-size: 13px; padding: 6px 14px; cursor: pointer; margin-bottom: -1px; }
+.setup-tab:hover { color: var(--text); }
+.setup-tab.on { color: var(--text); border-bottom-color: var(--accent, #5b8cff); font-weight: 600; }
 /* per-site editor + inventory rows */
 .siteed { border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; margin: 6px 0; }
 .siteed .ingress { margin: 6px 0 4px; }

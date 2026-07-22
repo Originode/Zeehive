@@ -14,6 +14,7 @@
 // None of it may block boot: failure logs loudly and the console's onboarding UI remains.
 import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { one, q } from '../db/pool.js';
 import { config } from '../config.js';
@@ -87,6 +88,18 @@ export async function ensureSelfProject() {
 // labels: works whatever the containers are named (bootstrap, dev-era, an override file).
 const SERVICE_ROLE = { 'meta-db': 'db', server: 'server', web: 'webapp' };
 
+// How each prod container SHIPS. Zeehive ships ITSELF, so its scripts differ from a normal
+// project's ship-prod.sh: the server rebuilds+recreates its own container (self-ship-container.sh
+// — the paradox-resolving sibling recreate), the webapp its own image (ship-zeehive-web.sh). The
+// db is infra — never redeployed by a ship — so it has no build_script and stays off the shippable
+// gate by design. Without these the `shippable` readiness gate is red on first boot and /ooney has
+// nothing to build (found 2026-07-22: self-onboard modeled the containers but left build_script
+// NULL, so a fresh Zeehive could never ship itself).
+const SELF_SHIP_SCRIPT = {
+  server: 'scripts/self-ship-container.sh',
+  webapp: 'scripts/ship-zeehive-web.sh',
+};
+
 async function modelOwnStack(projectId) {
   const dk = (args) => spawnSync('docker', args, { encoding: 'utf8', timeout: 15000, windowsHide: true });
   const self = dk(['inspect', hostname(), '--format', '{{ index .Config.Labels "com.docker.compose.project" }}']);
@@ -120,15 +133,20 @@ async function modelOwnStack(projectId) {
     const [name, service] = line.split('\t');
     const role = SERVICE_ROLE[service];
     if (!role) continue;
+    // Absolute path to the ship script under the running checkout (config.repoRoot), so the
+    // shipgate spawns it wherever the queenzee lives; db stays NULL (infra never ships).
+    const relScript = SELF_SHIP_SCRIPT[role];
+    const buildScript = relScript ? resolve(config.repoRoot, relScript).replace(/\\/g, '/') : null;
     const c = await one(
-      `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, internal_port, conn_ref, site_id, health)
-       VALUES ($1,$2,'prod','shared',$3,'default',$4,$5,$6,'up')
-       ON CONFLICT DO NOTHING RETURNING id`,
+      `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, internal_port, conn_ref, site_id, build_script, build_exec, health)
+       VALUES ($1,$2,'prod','shared',$3,'default',$4,$5,$6,$7,$8,'up')
+       ON CONFLICT (project_id, name) DO UPDATE SET build_script = EXCLUDED.build_script, build_exec = EXCLUDED.build_exec
+       RETURNING id`,
       [projectId, role, name,
        role === 'db' ? 5432 : role === 'server' ? 4700 : 5180,
        // parameters, not secrets: the meta-db by its in-network service name
        role === 'db' ? 'postgresql://zeehive@meta-db:5432/zeehive' : null,
-       site.id]);
+       site.id, buildScript, buildScript ? 'bash' : null]);
     if (c && prodXell) {
       await q(`INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'owns')
                ON CONFLICT DO NOTHING`, [prodXell.id, c.id]);

@@ -324,11 +324,24 @@ function ProbeChips({ probe }) {
   );
 }
 
-// ── edit: the full surface ─────────────────────────────────────────────────────
+// ── edit: the full surface, split into tabs ────────────────────────────────────
+// One modal held six stacked sections — too tall to scan. They group into four tabs by concern;
+// the readiness checklist stays PINNED above the tabs (it is the whole-project verdict, and its
+// gates point AT the tabs — a red 'shippable' is fixed under Deploy, a missing token under
+// Providers). Clicking a gate jumps to the tab that owns it.
+const SETUP_TABS = [
+  { key: 'project', label: 'Project', gates: ['repo', 'main_branch', 'env', 'manifest'] },
+  { key: 'deploy', label: 'Deploy', gates: ['dev_site', 'prod_site', 'shippable'] },
+  { key: 'providers', label: 'Providers', gates: [] },
+  { key: 'pool', label: 'Pool', gates: ['pool'] },
+];
+const tabForGate = (key) => SETUP_TABS.find((t) => t.gates.includes(key))?.key || null;
+
 function EditSections({ project, onChanged, onProject }) {
   const [readiness, setReadiness] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [tab, setTab] = useState('project');
 
   const reload = useCallback(() => { getReadiness(project.id).then(setReadiness).catch(() => {}); }, [project.id]);
   useEffect(() => { reload(); }, [reload]);
@@ -343,27 +356,46 @@ function EditSections({ project, onChanged, onProject }) {
 
   return (
     <>
-      {readiness && <Readiness r={readiness} />}
+      {readiness && <Readiness r={readiness} onJump={(key) => { const t = tabForGate(key); if (t) setTab(t); }} />}
       {err && <div className="projpop-err">{err}</div>}
-      <BasicsSection project={project} run={run} onProject={onProject} />
-      <ManifestSection project={project} run={run} onProject={onProject} />
-      <SitesSection project={project} run={run} busy={busy} />
-      <InventorySection project={project} run={run} busy={busy} />
-      <SpawnSection project={project} run={run} />
-      <TokensSection project={project} run={run} busy={busy} />
+      <div className="setup-tabs" role="tablist">
+        {SETUP_TABS.map((t) => (
+          <button key={t.key} role="tab" aria-selected={tab === t.key}
+                  className={`setup-tab${tab === t.key ? ' on' : ''}`} onClick={() => setTab(t.key)}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {tab === 'project' && <>
+        <BasicsSection project={project} run={run} onProject={onProject} />
+        <ManifestSection project={project} run={run} onProject={onProject} />
+      </>}
+      {tab === 'deploy' && <>
+        <SitesSection project={project} run={run} busy={busy} />
+        <InventorySection project={project} run={run} busy={busy} />
+      </>}
+      {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
+      {tab === 'pool' && <SpawnSection project={project} run={run} />}
     </>
   );
 }
 
-function Readiness({ r }) {
+function Readiness({ r, onJump }) {
+  // gates are buttons: clicking one jumps to the tab that fixes it, so a red gate is one click
+  // from the field that clears it instead of a hunt.
   return (
     <div className="setup-sec">
       <div className="gates">
-        {r.gates.map((g) => (
-          <span key={g.key} className={`gate g-${g.level}`} title={g.detail}>
-            {g.level === 'pass' ? '✓' : g.level === 'warn' ? '△' : '✗'} {g.key}
-          </span>
-        ))}
+        {r.gates.map((g) => {
+          const target = tabForGate(g.key);
+          return (
+            <button key={g.key} type="button" className={`gate g-${g.level}${target ? ' gate-jump' : ''}`}
+                    title={target ? `${g.detail}\n\n→ ${SETUP_TABS.find((t) => t.key === target).label} tab` : g.detail}
+                    onClick={() => target && onJump?.(g.key)}>
+              {g.level === 'pass' ? '✓' : g.level === 'warn' ? '△' : '✗'} {g.key}
+            </button>
+          );
+        })}
         <span className={`gate ${r.can_ship ? 'g-pass' : 'g-fail'} gate-ship`}>
           {r.can_ship ? '⛴ can ship' : '⛴ cannot ship yet'}
         </span>
