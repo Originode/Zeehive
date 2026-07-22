@@ -61,7 +61,7 @@ function execAsync(cmd, args, { timeout = 600000 } = {}) {
 // this small; a few hundred bytes means the dump body is missing.)
 const DUMP_MAGIC = 'PGDMP';
 const MIN_REAL_DUMP_BYTES = 512;
-function assertValidDump(path, size) {
+export function assertValidDump(path, size) {
   if (size == null) throw new Error('dump file is missing after pg_dump (nothing was written)');
   if (size < MIN_REAL_DUMP_BYTES) {
     throw new Error(`dump is only ${size} bytes — far too small to be a real database dump `
