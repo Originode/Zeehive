@@ -5,7 +5,7 @@ import {
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
-  getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome,
+  getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
 } from './api.js';
 import { showConfirm } from './Dialog.jsx';
 
@@ -69,6 +69,16 @@ function CreateForm({ onCreated }) {
   const [home, setHome] = useState(null);
   useEffect(() => { getReposHome().then((r) => setHome(r?.repos_dir || null)).catch(() => {}); }, []);
   const homeDir = home ? home.replace(/[\\/]+$/, '') : null;
+  // Folder picker: walks the QUEENZEE's filesystem (where the path actually resolves), one
+  // level at a time. null = closed; {path,parent,dirs,error} = the level on display.
+  const [browse, setBrowse] = useState(null);
+  const browseTo = (path) => listFsDirs(path).then(setBrowse).catch((e) => setBrowse({ ok: false, error: e.message, dirs: [] }));
+  const pickFolder = (path) => {
+    const name = f.name.trim() || path.split(/[\\/]/).filter(Boolean).pop() || '';
+    setF((prev) => ({ ...prev, repo_root: path, name: prev.name.trim() ? prev.name : name }));
+    setBrowse(null);
+    probeRepo(path).then(setProbe).catch((e) => setProbe({ ok: false, error: e.message }));
+  };
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const setc = (k) => (e) => setC({ ...c, [k]: e.target.value });
 
@@ -131,8 +141,43 @@ function CreateForm({ onCreated }) {
         <label>Name<input autoFocus={source === 'folder'} value={f.name} onChange={set('name')} placeholder="MyProject" /></label>
         {source === 'folder' ? (
           <label>Folder <span className="pc">(a path on the queenzee's own filesystem{homeDir ? ` — this instance keeps repos under ${homeDir}` : ''})</span>
-            <input value={f.repo_root} onChange={set('repo_root')} onBlur={runProbe}
-                   placeholder={homeDir ? `${homeDir}/${f.name || 'MyProject'}` : 'D:\\Repos\\MyProject'} /></label>
+            <span className="setup-row">
+              <input value={f.repo_root} onChange={set('repo_root')} onBlur={runProbe}
+                     placeholder={homeDir ? `${homeDir}/${f.name || 'MyProject'}` : 'D:\\Repos\\MyProject'} />
+              <button type="button" className="ghost" data-testid="fs-browse"
+                      title="Browse folders on the queenzee's filesystem"
+                      onClick={() => (browse ? setBrowse(null) : browseTo(f.repo_root.trim() || homeDir || ''))}>
+                {browse ? '▾ close' : '📁 browse'}
+              </button>
+            </span>
+            {browse && (
+              <span className="fsbrowse" data-testid="fs-panel">
+                <span className="fsb-head">
+                  <span className="mono fsb-path">{browse.path || '—'}</span>
+                  <button type="button" onClick={() => pickFolder(browse.path)} disabled={!browse.ok}>✓ use this folder</button>
+                </span>
+                {browse.error && <span className="projpop-err">{browse.error}</span>}
+                <span className="fsb-list">
+                  {browse.parent && (
+                    <button type="button" className="fsb-dir" onClick={() => browseTo(browse.parent)}>↰ ..</button>
+                  )}
+                  {(browse.dirs || []).map((d) => {
+                    const full = `${browse.path.replace(/[\\/]+$/, '')}/${d.name}`;
+                    // a git repo is what onboarding is FOR — clicking one picks it outright;
+                    // a plain folder is a waypoint — clicking descends into it
+                    return (
+                      <button type="button" key={d.name} className={`fsb-dir${d.is_repo ? ' repo' : ''}`}
+                              title={d.is_repo ? 'a git repo — click to pick it' : 'click to enter'}
+                              onClick={() => (d.is_repo ? pickFolder(full) : browseTo(full))}>
+                        {d.is_repo ? '⎇ ' : '▸ '}{d.name}
+                      </button>
+                    );
+                  })}
+                  {browse.ok && !(browse.dirs || []).length && <span className="pc">no subfolders</span>}
+                </span>
+              </span>
+            )}
+          </label>
         ) : (
           <>
             <label>Repository URL<input autoFocus value={c.remote_url} onChange={setc('remote_url')} onBlur={runRemoteProbe} placeholder="https://github.com/org/repo" /></label>

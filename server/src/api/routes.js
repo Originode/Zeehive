@@ -24,7 +24,7 @@ import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
-         probeRepo, projectReadiness, getPoolConfig, updatePoolConfig,
+         probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
          cloneProject, pullProject } from '../lib/projects.js';
 import { probeRemote } from '../lib/remote-git.js';
 import { config } from '../config.js';
@@ -260,6 +260,9 @@ router.post('/projects/probe-remote', async (req, res) => {
 // speak THIS world: paths resolve on the server's filesystem, so a containerized queenzee sees
 // /repos (its volume), never the operator's D:\ — the form must not suggest otherwise.
 router.get('/projects/repos-home', (_req, res) => res.json({ repos_dir: config.reposDir }));
+// The onboard form's folder picker: browse directories on the queenzee's own filesystem
+// (listing only — names + git-repo marker; see lib/projects.js listDirs).
+router.get('/fs/dirs', (req, res) => res.json(listDirs(req.query.path || null)));
 // New Project by clone: probe → git clone → the normal createProject seeding. Long request —
 // the probe fails fast and both dev-proxy and prod nginx carry long reads.
 router.post('/projects/clone', async (req, res) => {

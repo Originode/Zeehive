@@ -5,7 +5,7 @@
 // declared compose files / env / ports / db identity become the row's values, and the
 // parsed manifest is cached on the row (manifest_hash detects drift from the repo file).
 import { writeFileSync, existsSync, readdirSync } from 'node:fs';
-import { resolve, join, basename } from 'node:path';
+import { resolve, join, basename, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pool, one, q } from '../db/pool.js';
 import { config } from '../config.js';
@@ -271,6 +271,26 @@ export async function refreshProjectManifest(id) {
   const updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, vals);
   broadcast('project', updated);
   return { ...updated, manifest_warnings: repo.warnings };
+}
+
+// ── onboarding: browse DIRECTORIES on the queenzee's own filesystem ─────────
+// The onboard form's folder picker: the Folder path resolves on THIS process's filesystem
+// (a containerized queenzee sees /repos, never the operator's desktop), so the picker walks
+// this world. Listing only — directory names plus a git-repo marker, never file contents; the
+// console already hands out shells into containers, so a read-only dir listing adds no new
+// authority. Hidden (dot) directories are skipped: nothing onboardable lives there.
+export function listDirs(startPath) {
+  const root = resolve(String(startPath || '').trim() || config.reposDir || config.repoRoot);
+  if (!existsSync(root)) return { ok: false, error: `no such folder: ${root}`, path: root, parent: null, dirs: [] };
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); }
+  catch (e) { return { ok: false, error: `cannot read ${root}: ${e.message}`, path: root, parent: null, dirs: [] }; }
+  const dirs = entries
+    .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+    .map((e) => ({ name: e.name, is_repo: existsSync(join(root, e.name, '.git')) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const parent = dirname(root);
+  return { ok: true, path: root.replace(/\\/g, '/'), parent: parent === root ? null : parent.replace(/\\/g, '/'), dirs };
 }
 
 // ── onboarding: inspect a folder BEFORE (or after) it becomes a project ─────

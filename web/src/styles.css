@@ -91,6 +91,17 @@ body { margin: 0; background: var(--bg); color: var(--text); }
   border-radius: 6px; padding: 5px 8px; font-size: 12px; min-width: 0; }
 .setup-grid input:focus, .setup-row input:focus { outline: none; border-color: var(--accent); }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
+
+/* onboard folder picker — walks the queenzee's filesystem one level at a time */
+.fsbrowse { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; padding: 8px;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; }
+.fsb-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.fsb-path { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fsb-list { display: flex; flex-direction: column; gap: 1px; max-height: 200px; overflow-y: auto; }
+.fsb-dir { text-align: left; background: none; border: 0; color: var(--text); font-size: 13px;
+  padding: 3px 6px; border-radius: 5px; cursor: pointer; }
+.fsb-dir:hover { background: rgba(91, 140, 255, .12); }
+.fsb-dir.repo { color: var(--accent, #5b8cff); }
 .setup-row input { flex: 1; }
 .setup-row button, .setup-sec .projpop-formbtns button, .setup-sec > .projpop-formbtns {
   font-size: 12px; }
