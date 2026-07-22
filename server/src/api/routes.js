@@ -25,7 +25,7 @@ import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
-         cloneProject, pullProject } from '../lib/projects.js';
+         cloneProject, pullProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
 import { probeRemote } from '../lib/remote-git.js';
 import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
@@ -282,6 +282,28 @@ router.post('/projects/clone', async (req, res) => {
 router.post('/projects/:id/pull', async (req, res) => {
   try { res.json(await pullProject(req.params.id, req.body?.by || 'human@console')); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// ── GitHub OUTBOUND (opt-in, human-gated) — only when the PAT carries write access ────────────
+// Does this project's stored GitHub token actually let us push / open PRs? The console asks this
+// to decide whether to render the Push / PR buttons at all (read-only token → neither shows).
+router.get('/projects/:id/github-access', async (req, res) => {
+  try { res.json(await githubAccess(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Human-triggered push: local main → the remote's branch, fast-forward only. A diverged/read-only
+// remote comes back {pushed:false, reason} with HTTP 200 — the console shows the reason.
+router.post('/projects/:id/push', async (req, res) => {
+  try { res.json(await pushProject(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Human-triggered PR: push a side branch off local main and open a pull request against default.
+// Refusals are {opened:false, reason} with HTTP 200.
+router.post('/projects/:id/pr', async (req, res) => {
+  try {
+    res.json(await pullRequestProject(req.params.id,
+      { headBranch: req.body?.headBranch || null, title: req.body?.title || null, base: req.body?.base || null },
+      req.body?.by || 'human@console'));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────
