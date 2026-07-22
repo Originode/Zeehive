@@ -34,6 +34,7 @@ import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderT
          deleteProviderAccount } from '../lib/provider-tokens.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
+import { discoverSite, adoptContainers } from '../lib/discovery.js';
 import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
@@ -299,6 +300,20 @@ router.patch('/sites/:id', async (req, res) => {
 router.delete('/sites/:id', async (req, res) => {
   try { res.json(await deleteSite(req.params.id, req.query.force === '1')); }
   catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// ── discover & adopt a site's running stack (generalised self-onboard) ────────
+// READ-ONLY wrt docker: GET lists what is actually running on the site's context (docker ps/
+// inspect only); POST models a human-chosen subset as that site's prod inventory and links each
+// to the production xell ('owns'). An unreachable context is reported {ok:false, error} (200), not
+// an empty list, so the console can tell "nothing to adopt" from "the daemon is dead".
+router.get('/sites/:id/discover', async (req, res) => {
+  try { res.json(await discoverSite(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+router.post('/sites/:id/adopt', async (req, res) => {
+  try { res.json(await adoptContainers(req.params.id, req.body?.containers || [])); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── provider accounts: per-project AI credentials for cxell zees ──────────────

@@ -6,9 +6,9 @@ import {
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
-  mountHostFolder, purgeDevXells, subscribeCloneProgress,
+  mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
 } from './api.js';
-import { showConfirm } from './Dialog.jsx';
+import { showConfirm, showAlert } from './Dialog.jsx';
 
 // PROJECT SETUP — the onboarding surface (spec §7 Phase 2.2 + the console half of everything the
 // deploy-topology spec models). One modal, whole story: probe the folder, read/draft the manifest,
@@ -669,13 +669,15 @@ function SiteEditor({ site, run, busy }) {
 
 function InventorySection({ project, run, busy }) {
   const [cs, setCs] = useState(null);
+  const [sites, setSites] = useState([]);
   const [add, setAdd] = useState({ name: '', role: 'server', tier: 'prod', build_script: '' });
   const load = useCallback(() => getSharedContainers(project.id).then(setCs).catch(() => {}), [project.id]);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); getSites(project.id).then((ss) => setSites(ss || [])).catch(() => {}); }, [load, project.id]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
   return (
     <div className="setup-sec">
       <h3>Container inventory <span className="pc">(shared/prod — a ship needs ≥1 prod container with a build script)</span></h3>
+      <DiscoverPanel project={project} sites={sites} busy={busy} onAdopted={load} />
       <div className="invhead setup-row"><span>name</span><span>role</span><span>tier · site</span><span>build script (shippable)</span><span /></div>
       {(cs || []).map((c) => <InvRow key={c.id} c={c} run={wrapped} busy={busy} />)}
       <div className="setup-row">
@@ -705,6 +707,131 @@ function InvRow({ c, run, busy }) {
         <button type="button" className="projpop-del" disabled={busy} title={`Remove ${c.name} from the inventory`}
                 onClick={async () => { const n = Number(c.linked_xells); if (await showConfirm(n > 0 ? `${c.name} is linked to ${n} xell(s). Force?` : `Remove ${c.name}?`, { variant: 'danger', okLabel: 'Remove' })) run(() => deleteSharedContainer(c.id, n > 0)); }}>🗑</button>
       </span>
+    </div>
+  );
+}
+
+// ── Discover on «site» — see what is really running on a prod site's docker context and adopt a
+// chosen subset as that site's production inventory, without hand-typing a single container name.
+// Read-only wrt docker (docker ps/inspect); adopt models each row (build_script stays NULL — never
+// shippable as a side effect) AND links it to the site's production xell so it shows in the hex.
+function DiscoverPanel({ project, sites, busy, onAdopted }) {
+  const prodSites = (sites || []).filter((s) => s.tier === 'prod');
+  const [siteId, setSiteId] = useState('');
+  const [result, setResult] = useState(null);   // discoverSite() response, or null
+  const [sel, setSel] = useState({});            // name -> { checked, role }
+  const [working, setWorking] = useState(false);
+
+  useEffect(() => { if (!siteId && prodSites[0]) setSiteId(prodSites[0].id); }, [prodSites.length]);
+  if (prodSites.length === 0) {
+    return <div className="pc" style={{ marginBottom: 8 }}>
+      Add a <b>prod</b> deploy site above to discover and adopt a running stack automatically.
+    </div>;
+  }
+
+  const discover = async () => {
+    setWorking(true); setResult(null); setSel({});
+    try {
+      const r = await discoverSite(siteId);
+      setResult(r);
+      if (r.ok) {
+        // Pre-check the not-yet-adopted containers, seeding each with its inferred role.
+        const next = {};
+        for (const c of r.containers) {
+          const adoptable = !(c.already_modeled && c.linked_to_prod);
+          next[c.name] = { checked: adoptable, role: c.inferred_role || '' };
+        }
+        setSel(next);
+      }
+    } catch (e) { setResult({ ok: false, error: e.message }); }
+    finally { setWorking(false); }
+  };
+
+  const adopt = async () => {
+    const containers = (result?.containers || [])
+      .filter((c) => sel[c.name]?.checked && !(c.already_modeled && c.linked_to_prod))
+      .map((c) => ({ name: c.name, role: sel[c.name].role, image_tag: c.image,
+                     compose_project: c.compose_project,
+                     host_port: c.ports?.[0]?.public || null,
+                     internal_port: c.ports?.[0]?.private || null }));
+    const bad = containers.find((c) => !['db', 'server', 'webapp', 'infra'].includes(c.role));
+    if (bad) { await showAlert(`Choose a role for "${bad.name}" before adopting.`, { variant: 'error' }); return; }
+    if (containers.length === 0) { await showAlert('Nothing selected to adopt.'); return; }
+    setWorking(true);
+    try {
+      const r = await adoptContainers(siteId, containers);
+      await onAdopted?.();
+      await discover();   // re-discover so adopted rows now show as already-modeled (idempotency, visible)
+      await showAlert(`Adopted ${r.adopted.length}, linked ${r.linked.length} to production`
+        + `${r.skipped.length ? `, ${r.skipped.length} already modeled` : ''}.`);
+    } catch (e) { await showAlert(e.message, { variant: 'error' }); }
+    finally { setWorking(false); }
+  };
+
+  const setRole = (name, role) => setSel((s) => ({ ...s, [name]: { ...s[name], role } }));
+  const toggle = (name) => setSel((s) => ({ ...s, [name]: { ...s[name], checked: !s[name]?.checked } }));
+  const disabled = busy || working;
+
+  return (
+    <div className="siteed" style={{ marginBottom: 10 }}>
+      <div className="setup-row">
+        <span className="pc">Discover running stack on</span>
+        <select value={siteId} onChange={(e) => { setSiteId(e.target.value); setResult(null); }} disabled={disabled}>
+          {prodSites.map((s) => <option key={s.id} value={s.id}>{s.key}{s.is_default ? ' ●' : ''} · {s.docker_ctx}</option>)}
+        </select>
+        <button type="button" disabled={disabled || !siteId} onClick={discover}>{working ? '…' : '🔍 Discover'}</button>
+      </div>
+
+      {result && !result.ok && (
+        <div className="pc" style={{ color: 'var(--danger, #d66)', marginTop: 6 }}>
+          ⚠ {result.error}
+        </div>
+      )}
+      {result?.ok && result.count === 0 && (
+        <div className="pc" style={{ marginTop: 6 }}>
+          Context <span className="mono">{result.docker_ctx}</span> is reachable but has no containers.
+        </div>
+      )}
+      {result?.ok && result.prod_xell_missing && (
+        <div className="pc" style={{ color: 'var(--danger, #d66)', marginTop: 6 }}>
+          ⚠ This site has no production xell yet — adopting will model the rows but cannot link them to the hex.
+        </div>
+      )}
+      {result?.ok && result.count > 0 && (
+        <div style={{ marginTop: 6 }}>
+          {result.containers.map((c) => {
+            const done = c.already_modeled && c.linked_to_prod;
+            const s = sel[c.name] || {};
+            return (
+              <div key={c.name} className="setup-row discover-row" style={{ opacity: done ? 0.55 : 1 }}>
+                <input type="checkbox" checked={!!s.checked} disabled={disabled || done} onChange={() => toggle(c.name)}
+                       title={done ? 'already adopted' : 'select to adopt'} />
+                <span className="mono" title={`${c.image || ''} · ${c.status || c.state || ''}`}>{c.name}</span>
+                <span className="pc" title="published ports">
+                  {c.compose_service ? `${c.compose_project}/${c.compose_service}` : (c.labelled ? '—' : 'unlabelled')}
+                  {c.ports?.length ? ` :${c.ports.map((p) => p.public).join(',')}` : ''}
+                </span>
+                {done
+                  ? <span className="pc" style={{ color: 'var(--ok, #6a6)' }}>adopted ✓</span>
+                  : c.already_modeled
+                    ? <><select value={s.role || ''} disabled><option>{c.modeled_as?.role}</option></select>
+                        <span className="pc">modeled — will link to prod</span></>
+                    : <>
+                        <select value={s.role || ''} disabled={disabled} onChange={(e) => setRole(c.name, e.target.value)}>
+                          <option value="">role?</option>
+                          {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                        </select>
+                        <span className="pc" title="why this role was guessed">{c.role_reason}</span>
+                      </>}
+              </div>
+            );
+          })}
+          <div className="setup-row" style={{ marginTop: 4 }}>
+            <button type="button" disabled={disabled} onClick={adopt}>＋ Adopt selected</button>
+            <span className="pc">build script stays empty — set it below to make a container shippable.</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

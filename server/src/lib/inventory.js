@@ -5,6 +5,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { resolveSite } from './sites.js';
+import { ensureProdLink } from './discovery.js';
 
 const ROLES = ['db', 'server', 'webapp', 'infra'];
 const TIERS = ['dev', 'prod'];
@@ -70,6 +71,17 @@ export async function createSharedContainer(projectId, body = {}) {
      body.host_port || null, body.internal_port || null, body.url || null, siteId,
      body.build_script || null, body.build_exec || null]);
   broadcast('container', row);
+
+  // A tier='prod' row belongs to that site's PRODUCTION xell — link it ('owns'), the same shape
+  // self-onboard and adoption use. Historically ONLY self-onboard made this link, so a hand-typed
+  // prod row modeled a container the PRODUCTION hexagon never showed (measured on the live
+  // instance: omnibiz had 11 prod rows, 0 links). Nothing keys off the link's ABSENCE — the
+  // readiness/shippable gate goes by build_script, not by hex membership — so adding it is safe.
+  // Best-effort: with no prod site/xell yet (a dev-first project) it is a silent no-op.
+  if (row.tier === 'prod') {
+    try { await ensureProdLink(row.id, { siteId: row.site_id, projectId }); }
+    catch { /* the hex link is a projection, never a reason to fail the row insert */ }
+  }
   return row;
 }
 

@@ -149,3 +149,47 @@ export async function dockerPs(ctx, timeout = 15000) {
   }
   return out;
 }
+
+// Every container on a context, in the DETAIL discovery/adoption needs: what is running, its
+// image, human status, PUBLISHED ports, compose project/service (when labeled) and any zeehive.*
+// identity labels. Same read-only `/containers/json?all=1` call as dockerPs — no `docker` CLI, no
+// write verb, nothing that could touch a production stack. THROWS on an unreachable/erroring
+// daemon so the caller can say "context unreachable" instead of an ambiguous empty list.
+export async function listContainersDetailed(ctx, timeout = 15000) {
+  const conn = await resolveContext(ctx);
+  const list = await getJson(conn, '/containers/json?all=1', timeout);
+  if (!Array.isArray(list)) throw new Error('unexpected /containers/json payload');
+  const out = [];
+  for (const c of list) {
+    const name = (c.Names?.[0] || '').replace(/^\//, '');
+    if (!name) continue;
+    const L = c.Labels || {};
+    // Published ports only (a PublicPort means it is reachable from the host); collapse the
+    // duplicate IPv4/IPv6 rows docker emits per mapping.
+    const seen = new Set();
+    const ports = [];
+    for (const p of c.Ports || []) {
+      if (p.PublicPort == null) continue;
+      const key = `${p.PublicPort}/${p.PrivatePort}/${p.Type}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      ports.push({ ip: p.IP || null, public: p.PublicPort, private: p.PrivatePort, type: p.Type });
+    }
+    const exposed = [...new Set((c.Ports || []).map((p) => p.PrivatePort).filter(Boolean))];
+    out.push({
+      name,
+      image: c.Image || null,
+      state: c.State || null,                 // running | exited | created | restarting | paused | dead
+      status: c.Status || null,               // "Up 3 hours", "Exited (0) 2 days ago"
+      ports,
+      exposed_ports: exposed,
+      compose_project: L['com.docker.compose.project'] || null,
+      compose_service: L['com.docker.compose.service'] || null,
+      zeehive_project: L['zeehive.project'] || null,
+      zeehive_xell: L['zeehive.xell'] || null,
+      zeehive_role: L['zeehive.role'] || null,
+      labels_present: Object.keys(L).length > 0,
+    });
+  }
+  return out;
+}

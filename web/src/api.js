@@ -166,6 +166,13 @@ export const createSite = (projectId, body) => siteCall(`/api/projects/${project
 export const updateSite = (siteId, body) => siteCall(`/api/sites/${siteId}`, 'PATCH', body);
 export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${siteId}${force ? '?force=1' : ''}`, 'DELETE');
 
+// ── discover & adopt a site's running stack (read-only docker; adopt models + links to prod) ──
+// discoverSite returns {ok, containers[…]} or {ok:false, error} for an unreachable context — the
+// caller MUST surface the error, not treat it as an empty stack.
+export const discoverSite = (siteId) => fetch(`/api/sites/${siteId}/discover`).then((r) => r.json());
+export const adoptContainers = (siteId, containers) =>
+  siteCall(`/api/sites/${siteId}/adopt`, 'POST', { containers });
+
 // ── onboarding surface: probe / readiness / inventory / spawn template / manifest ──
 export const probeRepo = (repo_root) => siteCall('/api/projects/probe', 'POST', { repo_root });
 // the server's repos home (null on a host-era install) — the create form's path hints use it
