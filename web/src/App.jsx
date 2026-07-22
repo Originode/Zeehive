@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens } from './api.js';
+         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
@@ -282,6 +282,24 @@ export default function App() {
         onRetry: () => { dismissToast(id); runDispatch(payload); } });
     }
   }, [pushToast, updateToast, dismissToast, refresh]);
+
+  // Fire a prod backup from a db chip's "Back up now" menu item. Same async job as the backups
+  // panel's button (POST /backups/run) — a running row appears immediately and finalizes over SSE;
+  // we report start/refusal through a toast and refresh so the panel's spinner shows.
+  const runBackupNow = useCallback(async (c) => {
+    const id = `bk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    pushToast({ id, kind: 'progress', title: 'Starting backup…',
+      body: `Dumping ${c?.name || 'the production database'}` });
+    try {
+      await runBackup(projectId || project?.id);
+      updateToast(id, { kind: 'success', title: 'Backup started',
+        body: 'It runs in the background — watch the backups panel for its spinner.' });
+      refresh();
+      setTimeout(() => dismissToast(id), 7000);
+    } catch (e) {
+      updateToast(id, { kind: 'error', title: 'Backup not started', body: e?.error || e?.message || String(e) });
+    }
+  }, [pushToast, updateToast, dismissToast, refresh, projectId, project]);
 
   // once: global logs, and pick the active project (persisted → first)
   useEffect(() => {
@@ -653,6 +671,7 @@ export default function App() {
       <ContainerMenu menu={menu} onClose={() => setMenu(null)}
                      projectName={project.name} onDecommissioned={refresh}
                      onLoadBackup={(c) => setLoadBackupFor(c)}
+                     onBackup={runBackupNow}
                      onShell={(c) => setShellFor(c)} />
       {/* docker-exec shell into a container, opened from its chip's context menu */}
       {shellFor && <ContainerTerminal c={shellFor} onClose={() => setShellFor(null)} />}

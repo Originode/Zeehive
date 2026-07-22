@@ -165,7 +165,7 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
 // AND idle; a busy container shows a "please wait" note instead so it can't be mangled mid-op.
 // Decommission (stop + remove) is offered on every non-production container behind a second-stage
 // confirmation — production is never a candidate (it isn't even shown), matching the server guard.
-export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, onLoadBackup, onShell }) {
+export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, onLoadBackup, onBackup, onShell }) {
   // Hooks must run unconditionally (before any early return). The build-host picker lists the
   // docker contexts this machine can compile on; loaded lazily the first time a buildable+idle
   // container's menu opens, then cached for the life of the menu component.
@@ -302,6 +302,21 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
           ⌨ shell unavailable — {buildable && !c.last_build_commit ? 'build it first' : `container is ${c.health}`}
         </div>
       )}
+
+      {/* Back up now: dump THIS database to a new backup. Offered only on the PRODUCTION db chip —
+          "backup" in this system means the prod snapshot the maintenance loop takes (backupProd),
+          the same job the backups panel's "＋ Back up now" fires. Withdrawn while the db is busy
+          (a dump/restore already in flight) since two dumps of one DB must not stack. This item
+          rides the shared ContainerMenu, so it appears both on the inventory matrix and on the
+          production hexagon's db chip. */}
+      {isDb && prod && (busy ? (
+        <div className="ctxsub ctxbusy-note" data-testid="backup-db-busy">backup unavailable while busy</div>
+      ) : (
+        <button role="menuitem" data-testid="backup-db-open"
+                onClick={() => { onBackup?.(c); onClose(); }}>
+          📦 Back up now <span className="ctxsub">dump this production database to a new backup</span>
+        </button>
+      ))}
 
       {/* Load backup: db containers only, never production (you never restore OVER prod, and the
           server's target list excludes it). Opens the backup selector pre-aimed at THIS container,
