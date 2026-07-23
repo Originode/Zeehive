@@ -35,6 +35,26 @@ async function recordLandedHead(project, head) {
 
 const ZERO = /^0+$/;
 
+// AFTER A LANDING LANDS, bring the xell's STORED git position in line with what actually happened.
+// The land_request row flips to 'landed', but the xell row still carries the sha it was PROVISIONED
+// at (head_commit) and last synced from (last_synced_commit) — the fork point it left long ago. So
+// the card the human just watched land keeps rendering the pre-land diff: its stored head points at
+// the old base, so a xell now level with main reads as still-ahead until something re-reads the
+// worktree. pushToXource already fixes this for the immediate-approve path (it updates both columns
+// on a successful push); the paths that move the ref WITHOUT a push from the worktree — a human
+// approval (update-ref), an already-landed reconcile, an auto-approved gate, a PR merged from the
+// inside — never did. Point both columns at the landed sha (the tip the xell's work is now part of)
+// so the xell's data matches its current diff (level, 0/0) and status, then broadcast the refreshed
+// row. Best-effort and keyed on the land_request itself, so EVERY way a landing lands ends the same.
+export async function syncXellAfterLand(xellId, landedSha) {
+  if (!xellId || !landedSha) { if (xellId) broadcast('xell', { id: xellId }); return null; }
+  const row = await one(
+    `UPDATE xell SET head_commit=$2, last_synced_commit=$2 WHERE id=$1 RETURNING *`,
+    [xellId, landedSha]).catch(() => null);
+  broadcast('xell', row || { id: xellId });
+  return row;
+}
+
 // The commits a push would ADD to main (old..new), newest first — what the human actually reviews.
 // Safe to read from the xource: xell worktrees SHARE its object store, so the zee's commits are
 // already there; the push only moves the ref. (Nothing is quarantined for a same-repo push.)
@@ -89,6 +109,8 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
     const row = await one(
       `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [approved.id]);
     broadcast('land', row);
+    // The push we are allowing moves the ref to newSha — record that as the xell's position now.
+    await syncXellAfterLand(row.xell_id, newSha);
     logline('landgate', `ALLOWED ${ref} → ${newSha.slice(0, 8)} on ${project.name} (approved by ${approved.decided_by})`);
     // The receive path is about to move the ref to newSha — keep the rollback baseline fresh so a
     // land does not leave head_commit stale (and later trip a false BACKWARD on pull).
@@ -123,6 +145,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
             decided_at=now(), decided_by='auto-approve@policy', landed_at=now()
            WHERE id=$1 RETURNING *`, [existing.id]);
       broadcast('land', row);
+      await syncXellAfterLand(row.xell_id, newSha);
       logline('landgate', `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — auto-approve policy (no human review)`);
       await recordLandedHead(project, newSha);
       return { allow: true, reason: 'auto-approved', request: row };
@@ -152,7 +175,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
       [projectId, xell?.id || null, ref, oldSha || null, newSha,
         JSON.stringify(commits), stat ? JSON.stringify(stat) : null]);
     broadcast('land', row);
-    broadcast('xell', { id: xell?.id });
+    await syncXellAfterLand(xell?.id, newSha);
     logline('landgate',
       `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
       + `${xell?.slug || 'unknown'} (auto-approve policy, no human review)`);
@@ -267,6 +290,8 @@ async function landApproved(row, by = 'human') {
       `UPDATE land_request SET status='landed', landed_at=COALESCE(landed_at, now())
          WHERE id=$1 RETURNING *`, [row.id]);
     broadcast('land', landed);
+    // Its work is on the ref now — make the xell's stored position say so (level, not still-ahead).
+    await syncXellAfterLand(row.xell_id, row.new_sha);
     logline('landgate', `${row.new_sha.slice(0, 8)} is already on ${row.ref.replace('refs/heads/', '')} — marking landed`);
     // The ref already contains this sha (landed by some other path) — reconcile the recorded head
     // to the ref's ACTUAL current tip so the rollback baseline stays truthful.
@@ -333,7 +358,9 @@ async function landApproved(row, by = 'human') {
     const landed = await one(
       `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [row.id]);
     broadcast('land', landed);
-    broadcast('xell', { id: row.xell_id });
+    // The ref just moved to include this xell's work — sync its stored head/last-synced to the landed
+    // sha so its diff reads level (0/0) instead of the frozen provisioning base it forked from.
+    await syncXellAfterLand(row.xell_id, row.new_sha);
     logline('landgate', `LANDED ${row.new_sha.slice(0, 8)} → ${row.ref.replace('refs/heads/', '')} (approved by ${row.decided_by || by})`);
     // The xource ref just advanced — re-record its head so the rollback baseline tracks the land
     // (a ff, so this contains the old head and warns about nothing). Advisory: never blocks a land.

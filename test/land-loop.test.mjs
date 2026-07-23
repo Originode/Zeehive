@@ -125,9 +125,17 @@ console.log('\n── approval: land + queenzee NUDGE ──');
 const DOCKER_LOG = join(tmp, 'docker.log');
 process.env.DOCKER_LOG = DOCKER_LOG;                 // fake docker (test/_bin) logs here
 process.env.PATH = `${join(REPO_ROOT, 'test', '_bin')}:${process.env.PATH}`;
+// snapshot the xell's STORED position before the landing — it is still the frozen provisioning base
+const xellBefore = await one(`SELECT head_commit, last_synced_commit FROM xell WHERE id=$1`, [xell.id]);
+ok(xellBefore.head_commit === shaA, `xell.head_commit is still the provisioning base A (${shaA.slice(0, 8)}) before landing`);
 const decided = await decideLandRequest(row.id, 'approved', 'human@test');
 ok(decided?.status === 'landed', `land_request → 'landed' (${decided?.status})`);
 ok(git(src, ['rev-parse', 'main']) === wtHeadAfter, 'master NOW moved to the approved sha (queenzee update-ref, no hook re-entrancy)');
+// BUG 3: after the ref moves, the queenzee brings the xell's STORED data in line with reality — its
+// work is on main now, so head_commit/last_synced_commit read the landed sha, not the frozen base.
+const xellAfter = await one(`SELECT head_commit, last_synced_commit FROM xell WHERE id=$1`, [xell.id]);
+ok(xellAfter.head_commit === wtHeadAfter, `xell.head_commit now === the landed sha (${wtHeadAfter.slice(0, 8)}), not the old base — its card reads level`);
+ok(xellAfter.last_synced_commit === wtHeadAfter, `xell.last_synced_commit now === the landed sha (${wtHeadAfter.slice(0, 8)}) — synced to what landed`);
 // the nudge is fire-and-forget — wait briefly for the fake docker to record the resume
 let log = '';
 for (let i = 0; i < 25 && !/--resume/.test(log); i++) { await sleep(120); log = existsSync(DOCKER_LOG) ? readFileSync(DOCKER_LOG, 'utf8') : ''; }
