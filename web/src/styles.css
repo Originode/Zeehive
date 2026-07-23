@@ -498,6 +498,9 @@ a.cbox:hover { border-color: var(--accent); }
   padding: 6px 8px 2px; margin-top: 2px; border-top: 1px solid var(--line); }
 .ctxmenu button.ctxsel { color: var(--accent); font-weight: 600; }
 .ctxmenu button.ctxsel:hover { color: #fff; }
+/* restore-over-prod entry: loud, because it targets live production */
+.ctxmenu button.ctxdanger-item { color: #ff8b81; }
+.ctxmenu button.ctxdanger-item:hover { background: #b3261e; color: #fff; }
 
 /* ── decommission: the destructive container action ─────────────────────────── */
 /* production is never a candidate — it shows this instead of an action */

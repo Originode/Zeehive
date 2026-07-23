@@ -318,16 +318,18 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
         </button>
       ))}
 
-      {/* Load backup: db containers only, never production (you never restore OVER prod, and the
-          server's target list excludes it). Opens the backup selector pre-aimed at THIS container,
-          so the backup you pick restores straight into it. Withdrawn while busy — a db mid-restore
-          can't take another. */}
-      {isDb && !prod && (busy ? (
+      {/* Load backup: any db container. Opens the backup selector pre-aimed at THIS container, so
+          the backup you pick restores straight into it. PRODUCTION is allowed but gated — the modal
+          makes you type the db name to confirm before it overwrites live prod. Withdrawn while busy
+          — a db mid-restore can't take another. */}
+      {isDb && (busy ? (
         <div className="ctxsub ctxbusy-note" data-testid="load-backup-busy">load backup unavailable while busy</div>
       ) : (
-        <button role="menuitem" data-testid="load-backup-open"
+        <button role="menuitem" data-testid="load-backup-open" className={prod ? 'ctxdanger-item' : ''}
                 onClick={() => { onLoadBackup?.(c); onClose(); }}>
-          📥 Load backup… <span className="ctxsub">restore a backup into this db (overwrites data)</span>
+          {prod
+            ? <>📥 Restore backup over prod… <span className="ctxsub">⚠ overwrites LIVE production — asks you to confirm</span></>
+            : <>📥 Load backup… <span className="ctxsub">restore a backup into this db (overwrites data)</span></>}
         </button>
       ))}
 
