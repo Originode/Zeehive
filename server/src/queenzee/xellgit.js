@@ -370,7 +370,13 @@ export async function acceptPullIn(requestId, by = 'human@console') {
     const row = await one(
       `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [requestId]);
     broadcast('land', row);
-    broadcast('xell', { id: req.xell_id });
+    // Its work is now on the target ref — point the xell's stored head/last-synced at the landed sha
+    // so its card reads level, not still-ahead (inlined rather than importing landgate's helper to
+    // keep this module free of a landgate → nudge → cxell → xellgit import cycle).
+    const synced = await one(
+      `UPDATE xell SET head_commit=$2, last_synced_commit=$2 WHERE id=$1 RETURNING *`,
+      [req.xell_id, req.new_sha]).catch(() => null);
+    broadcast('xell', synced || { id: req.xell_id });
     logline('landgate',
       `PR ACCEPTED by ${by}: ${xell?.slug} @ ${req.new_sha.slice(0, 8)} is on ${req.ref.replace('refs/heads/', '')}`);
   } else {
