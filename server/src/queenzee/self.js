@@ -13,8 +13,10 @@ import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { collectCxellDiffToWorktree, sealCxell, cxellName } from '../lib/cxell.js';
+import { spawnSync } from 'node:child_process';
+import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
+import { cleanGitEnv } from '../lib/git.js';
 import { landStatus } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { proposeDone } from './tasks.js';
@@ -99,27 +101,89 @@ export async function selfStatus(xell) {
 // And we REPORT THE REAL OUTCOME: `landed` (a human already approved this sha), `held` (a genuine
 // pending land_request now exists — verified), or `needs-resolution` (couldn't catch up: a real
 // conflict). Never "held" when nothing was actually raised — the fleet-burn-tracker lie.
+// The xource ref (e.g. 'master') this xell tracks — needed to deliver/merge it into the cxell.
+async function xourceRef(xellId) {
+  const row = await one(
+    `SELECT xo.ref FROM xource xo JOIN xell x ON x.xource_id = xo.id WHERE x.id=$1`, [xellId]);
+  return row?.ref || null;
+}
+const wtGit = (wt, args) => {
+  const r = spawnSync('git', ['-C', wt, args].flat(), { encoding: 'utf8', windowsHide: true, env: cleanGitEnv() });
+  return { ok: r.status === 0, out: (r.stdout || '').trim() };
+};
+// Does the worktree HEAD already contain the xource tip? If so, the push that follows is a real
+// fast-forward the land-gate can hold; if not, the zee needs to merge current main (via a cxell sync)
+// before it can land. For a LIVE cxell we NEVER merge into the worktree here (Change 1: the worktree
+// is read-only for catch-up) — we self-heal by delivering main INTO the cxell instead.
+function worktreeContainsRef(wt, ref) {
+  if (!wtGit(wt, ['rev-parse', ref]).ok) return true; // ref unreadable → nothing to catch up to
+  return wtGit(wt, ['merge-base', '--is-ancestor', ref, 'HEAD']).ok;
+}
+
 export async function selfLand(xell) {
   if (!xell.worktree_path) return { ok: false, status: 'error', error: `${xell.slug} has no host worktree to land from` };
 
+  // Is a live cxell driving this xell? If so, reconciliation happens by delivering the xource INTO
+  // the container and merging there (self-heal) — never by a behind-the-zee's-back worktree merge.
+  const live = await cxellRunning({ ctx: 'default', slug: xell.slug });
+  const ref = await xourceRef(xell.id);
+
   // 1) COLLECT — best-effort: a missing docker/cxell or an already-collected worktree is a no-op,
-  // not a failure. Only a worktree that has DIVERGED from the cxell is a real refusal.
-  let collected;
+  // not a failure. A worktree that has DIVERGED from the cxell used to be a dead end (and stranded
+  // the work); now, for a live cxell, we SELF-HEAL: sync current main into the cxell, merge there,
+  // and retry the collect. We only give up if that merge genuinely CONFLICTS.
+  let collected, healed = null;
   try {
     collected = await collectCxellDiffToWorktree({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path });
   } catch (e) {
-    if (/do not fast-forward/i.test(e.message)) return { ok: false, status: 'needs-resolution', stage: 'collect', error: e.message };
-    collected = { collected: false, warning: `cxell collection skipped: ${e.message}` };
-    logline('self', `${xell.slug} land: cxell collection skipped (${e.message})`);
+    if (/do not fast-forward/i.test(e.message)) {
+      if (!live || !ref) {
+        return { ok: false, status: 'needs-resolution', stage: 'collect', error: e.message,
+          stranded_ref: e.strandedRef || null };
+      }
+      const heal = await selfHealSync(xell, ref);
+      if (!heal.ok) return { ...heal, collected: null, stranded_ref: e.strandedRef || null };
+      healed = heal;
+      // retry the collect now that the cxell descends from current main
+      try {
+        collected = await collectCxellDiffToWorktree({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path });
+      } catch (e2) {
+        return { ok: false, status: 'needs-resolution', stage: 'collect', healed,
+          error: e2.message, stranded_ref: e2.strandedRef || e.strandedRef || null,
+          message: `Synced current ${ref} into your cxell and merged it, but the collect still does not `
+            + `fast-forward. Your commits are anchored at ${e2.strandedRef || e.strandedRef} — a human should look.` };
+      }
+    } else {
+      collected = { collected: false, warning: `cxell collection skipped: ${e.message}` };
+      logline('self', `${xell.slug} land: cxell collection skipped (${e.message})`);
+    }
   }
 
-  // 2) CATCH UP to the current xource tip so an older-based commit still fast-forwards. A rebase
-  // conflict is a real, honest stop — do NOT silently proceed to a doomed push.
+  // 1b) For a LIVE cxell whose worktree does NOT yet contain the current xource tip, the push would
+  // be a non-fast-forward the gate silently drops. Do NOT merge into the worktree behind the zee's
+  // back (Change 1) — self-heal by merging main INSIDE the cxell, then re-collect so the worktree
+  // fast-forwards onto the reconciled HEAD. (Only when we didn't already just heal above.)
+  if (live && ref && !healed && !worktreeContainsRef(xell.worktree_path, ref)) {
+    const heal = await selfHealSync(xell, ref);
+    if (!heal.ok) return { ...heal, collected };
+    healed = heal;
+    try {
+      collected = await collectCxellDiffToWorktree({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path });
+    } catch (e) {
+      return { ok: false, status: 'needs-resolution', stage: 'collect', healed, error: e.message,
+        stranded_ref: e.strandedRef || null };
+    }
+  }
+
+  // 2) CATCH UP to the current xource tip so an older-based commit still fast-forwards. For a live
+  // cxell the self-heal above already brought the worktree up to main (via the cxell), so this is a
+  // no-op 'up-to-date'; for a NON-cxell (host) xell it does the old worktree merge. A conflict here is
+  // an honest stop — do NOT silently proceed to a doomed push.
   let caughtUp;
   try {
     caughtUp = await catchUpToXource(xell.id);
   } catch (e) {
-    return { ok: false, status: 'needs-resolution', stage: 'catch-up', error: e.message, collected };
+    return { ok: false, status: 'needs-resolution', stage: 'catch-up', error: e.message, collected, healed };
   }
   if (caughtUp.state === 'conflict' || caughtUp.state === 'no-head' || caughtUp.state === 'error') {
     const msg = caughtUp.state === 'conflict'
@@ -134,7 +198,7 @@ export async function selfLand(xell) {
           + `A human should check the queenzee: ${(caughtUp.output || 'no detail').split('\n').filter(Boolean).pop()}`
         : `Could not read HEAD in the worktree for ${xell.slug} — nothing to land.`;
     return {
-      ok: false, status: 'needs-resolution', stage: 'catch-up', collected, catch_up: caughtUp,
+      ok: false, status: 'needs-resolution', stage: 'catch-up', collected, catch_up: caughtUp, healed,
       conflict: caughtUp.state === 'conflict' ? (caughtUp.output || null) : null,
       error: caughtUp.state === 'error' ? (caughtUp.output || null) : undefined,
       message: msg,
@@ -143,15 +207,16 @@ export async function selfLand(xell) {
 
   // 3) PUSH — the same gated `git push . HEAD:<ref>`. The landgate's update hook decides.
   const push = await pushToXource(xell.id, `zee@${xell.slug}`).catch((e) => ({ error: e.message }));
-  if (push.error) return { ok: false, status: 'error', stage: 'push', error: push.error, collected, catch_up: caughtUp };
+  if (push.error) return { ok: false, status: 'error', stage: 'push', error: push.error, collected, catch_up: caughtUp, healed };
 
   // 4) REPORT THE REAL OUTCOME.
   const caughtNote = (caughtUp.state === 'merged' || caughtUp.state === 'rebased' || caughtUp.state === 'fast-forwarded')
-    ? ` (after catching up to ${caughtUp.ref} — ${caughtUp.state})` : '';
+    ? ` (after catching up to ${caughtUp.ref} — ${caughtUp.state})`
+    : (healed && healed.state === 'merged' ? ` (after self-healing: merged current ${ref} into your cxell)` : '');
 
   if (push.landed) {
     return {
-      ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, request: await landStatus(xell.id),
+      ok: true, status: 'landed', landed: true, collected, catch_up: caughtUp, healed, request: await landStatus(xell.id),
       message: `LANDED on ${push.ref} @ ${String(push.head).slice(0, 8)} — a human had already approved this exact sha${caughtNote}.`,
     };
   }
@@ -162,7 +227,7 @@ export async function selfLand(xell) {
   const trulyHeld = request && request.status === 'pending' && request.new_sha === push.head;
   if (trulyHeld) {
     return {
-      ok: true, status: 'held', landed: false, collected, catch_up: caughtUp, request,
+      ok: true, status: 'held', landed: false, collected, catch_up: caughtUp, healed, request,
       message: `Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
         + `(land_request ${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote}. Your commits `
         + 'are safe on your branch; nothing lands until a human agrees. You do NOT need to re-run land: when a human '
@@ -185,6 +250,68 @@ export async function selfLand(xell) {
       : 'Push did not land and NO land_request was raised — the gate held nothing (a non-fast-forward the catch-up '
         + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.',
   };
+}
+
+// ── the SELF-HEAL primitive — deliver current main into the cxell and merge it, PURE SCRIPT ──────
+// Shared by `zee land`'s automatic recovery and by `zee sync`. It runs syncCxellWithXource (deliver +
+// merge, no model) and turns its state into a uniform result. A CLEAN merge (or already-up-to-date)
+// is { ok: true }; a genuine CONFLICT or an operational ERROR is { ok: false, status:'needs-resolution' }
+// carrying the honest message (Change 4: the zee is told WHICH kind of failure it hit, so it does not
+// hunt a phantom conflict). On conflict the merge is LEFT in the cxell for the zee to resolve in place.
+async function selfHealSync(xell, ref) {
+  const s = await syncCxellWithXource({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref });
+  if (s.state === 'merged' || s.state === 'up-to-date') return { ok: true, ...s };
+  if (s.state === 'conflict') {
+    return {
+      ok: false, status: 'needs-resolution', stage: 'sync', state: 'conflict', ref, sync: s,
+      conflict: s.output || null,
+      message: `Merging current ${ref} into your cxell hit a real CONTENT CONFLICT — this one is YOURS to resolve. `
+        + `The merge is left in progress in your cxell (/work/repo): run \`git status\`, fix the conflicted files, `
+        + `\`git add\` them and \`git commit\`, then \`zee land\` again. If you truly cannot resolve it, \`zee tend\` a human.`,
+    };
+  }
+  // operational error (delivery failed, or a non-conflict merge failure) — nothing to fix in code.
+  return {
+    ok: false, status: 'needs-resolution', stage: 'sync', state: 'error', ref, sync: s,
+    error: s.output || s.reason || null,
+    message: `Could not sync current ${ref} into your cxell — this is an OPERATIONAL error, NOT a merge conflict, `
+      + `so there is nothing for you to resolve in the code. Your commits are untouched. A human should check the `
+      + `queenzee: ${String(s.output || s.reason || 'no detail').split('\n').filter(Boolean).pop()}`,
+  };
+}
+
+// ── POST /api/xell/self/sync — pull current main into the cxell, merge, rebuild ──────────────────
+// The verb a caged zee can run AT ANY TIME to reconcile with main on its own: deliver the current
+// xource into the cxell, merge it (pure script), and — on a clean merge — kick a rebuild so the
+// running stack reflects the merged code. NOT human-gated (it only touches this xell's own cxell and
+// throwaway containers). The zee then re-verifies (its tests / `zee build --wait`). A genuine content
+// conflict is handed back for the zee to resolve; an operational error is reported as such.
+export async function selfSync(xell, { rebuild = true } = {}) {
+  if (!xell.worktree_path) return { ok: false, status: 'error', error: `${xell.slug} has no host worktree to sync from` };
+  const live = await cxellRunning({ ctx: 'default', slug: xell.slug });
+  if (!live) return { ok: false, status: 'error', error: `${xell.slug} has no live cxell to sync into — sync delivers current main INTO the container.` };
+  const ref = await xourceRef(xell.id);
+  if (!ref) return { ok: false, status: 'error', error: `cannot resolve the xource ref for ${xell.slug}` };
+
+  const heal = await selfHealSync(xell, ref);
+  if (!heal.ok) return heal;
+
+  // Clean merge (or already current). On an actual merge, collect the merged HEAD onto the worktree
+  // and rebuild so the zee's containers run the reconciled code; re-verification is the zee's to do.
+  let collected = null, built = null;
+  if (rebuild && heal.state === 'merged') {
+    try {
+      collected = await collectCxellDiffToWorktree({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path });
+    } catch (e) { collected = { collected: false, warning: e.message }; }
+    try { built = await buildXell(xell.id, { hot: false, role: null }); }
+    catch (e) { built = { error: e.message }; }
+  }
+  const note = heal.state === 'up-to-date'
+    ? `Already up to date with ${ref} — your cxell already contains the current tip; nothing to merge.`
+    : `Merged current ${ref} into your cxell cleanly (HEAD ${String(heal.head).slice(0, 8)}).`
+      + (built && !built.error ? ' A rebuild was started — run `zee build --wait` (background) to confirm it serves your HEAD, then re-run your tests.' : '')
+      + (built && built.error ? ` (rebuild could not start: ${built.error})` : '');
+  return { ok: true, status: heal.state, ref, head: heal.head || null, collected, built, message: note };
 }
 
 // ── POST /api/xell/self/ship — file a ship request (shipgate) ──────────────────

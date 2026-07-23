@@ -45,7 +45,7 @@ import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
-import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
+import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
@@ -818,6 +818,12 @@ router.get('/xell/self/status', async (req, res) => {
 // Collect this cxell's commits and run the gated push — HELD for a human (landgate). Never moves main.
 router.post('/xell/self/land', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfLand(x)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Reconcile with main ON THE ZEE'S OWN: deliver current main into the cxell, merge it (pure script),
+// rebuild. NOT gated — it touches only this xell's cxell + throwaway containers. `zee sync` maps here.
+router.post('/xell/self/sync', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfSync(x, { rebuild: req.body?.rebuild !== false })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.

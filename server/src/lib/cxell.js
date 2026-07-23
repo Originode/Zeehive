@@ -23,6 +23,7 @@ import { createRequire } from 'node:module';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
 import { adapterFor, CLAUDE_ADAPTER, AGENT_PROC_PATTERN } from './cxell-runtimes.js';
+import { classifyMergeOutput } from '../queenzee/xellgit.js';
 
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
 // ghcr — matching the CXELL_IMAGE the self-ship scripts already honor for their rebuild.
@@ -115,6 +116,147 @@ export async function cxellZeeActive({ ctx = 'default', slug }) {
   }
 }
 
+// Does this xell HAVE a live cxell container right now? (Distinct from cxellZeeActive, which asks
+// whether an AGENT PROCESS is running: a zee that just called `zee land` is BETWEEN turns, so no
+// agent is alive, yet its container is up and its uncollected work lives inside it.) This is the
+// signal `zee land` needs to choose the reconcile path: a live cxell is reconciled by delivering the
+// xource INTO it (deliverXourceIntoCxell); a xell with no cxell falls back to the host-worktree merge
+// (catchUpToXource). Any docker/container error → treat as "no cxell" and fall back.
+export async function cxellRunning({ ctx = 'default', slug }) {
+  try {
+    const r = await dk(ctx, ['inspect', '-f', '{{.State.Running}}', cxellName(slug)], { timeoutMs: 8000 });
+    return /true/i.test(r.out.trim());
+  } catch {
+    return false;
+  }
+}
+
+// ── DELIVER the xource INTO a live cxell — the mirror image of exportCxellDiff ────────────────────
+// The failure class this removes: while a cxell is LIVE, the host worktree must be READ-ONLY for
+// catch-up. The old catch-up merged the xource tip INTO the host worktree behind the zee's back
+// (catchUpWorktree), which made the cxell→worktree fast-forward impossible FOREVER — and stranded the
+// zee's commits. Instead we hand the xource tip to the container, exactly as exportCxellDiff hands the
+// cxell's commits OUT: a thin bundle, docker-cp'd in, fetched to refs/remotes/origin/main. The zee
+// (or the pure-script sync) then merges origin/main ITSELF, where it can build and test the result.
+//
+//   git bundle create <tmp>/main.bundle <ref> --not <base>   # queenzee side, thin (only what moved)
+//   docker cp <bundle> <cxell>:/tmp/main.bundle              # same door as task.bundle
+//   git fetch /tmp/main.bundle <ref>:refs/remotes/origin/main   # inside the cxell
+//
+// The bundle's boundary (`--not <base>`) must be a commit the cxell ALREADY HAS, or its fetch refuses
+// with a missing-prerequisite. The safe boundary is merge-base(<ref>, worktree HEAD): once Change 1
+// stops behind-the-zee's-back merges, the worktree HEAD is always a commit the cxell has (the collect
+// only ever fast-forwards it TO the cxell's HEAD), so their merge-base is in the cxell too. If a
+// legacy divergence still trips the thin fetch, we retry with a FULL bundle (self-contained, always
+// fetchable) so recovery never depends on the boundary being present.
+export async function deliverXourceIntoCxell({ ctx = 'default', slug, worktree, ref }) {
+  if (!worktree || !existsSync(worktree)) return { delivered: false, reason: `no host worktree on disk (${worktree || 'null'})` };
+  const name = cxellName(slug);
+  const tmp = mkdtempSync(join(tmpdir(), 'zee-deliver-'));
+  const git = (args) => new Promise((resolve, reject) => {
+    const g = spawn('git', ['-C', worktree, ...args], { windowsHide: true });
+    let out = '', err = '';
+    g.stdout.on('data', (d) => (out += d.toString()));
+    g.stderr.on('data', (d) => (err += d.toString()));
+    g.on('error', reject);
+    g.on('close', (c) => (c === 0 ? resolve(out.trim()) : reject(new Error(`git ${args.join(' ')} exited ${c}: ${err.slice(0, 300)}`))));
+  });
+  try {
+    const tip = await git(['rev-parse', ref]);
+    // merge-base(ref, worktree HEAD): a commit on the xource that the cxell also has (see above). Best
+    // effort — if it can't be read, we simply send a full bundle.
+    let base = null;
+    try { base = await git(['merge-base', ref, 'HEAD']); } catch { /* full bundle */ }
+    const bundle = join(tmp, 'main.bundle');
+    const buildThin = base && base !== tip;
+    if (buildThin) await git(['bundle', 'create', bundle, ref, '--not', base]);
+    else await git(['bundle', 'create', bundle, ref]);
+    await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`]);
+    const fetch = async () => dk(ctx, ['exec', name, 'bash', '-lc',
+      `cd /work/repo && git fetch -f /tmp/main.bundle '${ref.replace(/'/g, '')}:refs/remotes/origin/main'`], { timeoutMs: 60000 });
+    try {
+      await fetch();
+    } catch (e) {
+      // Thin fetch refused (boundary not in the cxell — a legacy divergence). Fall back to a FULL,
+      // self-contained bundle so delivery still succeeds; a stranded cxell must always be recoverable.
+      if (buildThin) {
+        await git(['bundle', 'create', bundle, ref]).catch(() => {});
+        await dk(ctx, ['cp', bundle, `${name}:/tmp/main.bundle`]);
+        await fetch();
+      } else { throw e; }
+    }
+    await dk(ctx, ['exec', '-u', '0', name, 'rm', '-f', '/tmp/main.bundle']).catch(() => {});
+    logline('cxell', `${slug}: delivered ${ref} @ ${String(tip).slice(0, 8)} into the cxell as origin/main`);
+    return { delivered: true, ref, tip };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// ── SYNC a live cxell with its xource — PURE SCRIPT, no model in the loop ─────────────────────────
+// Deliver the xource in (above), then MERGE origin/main into the cxell's branch, inside the cxell,
+// with the queenzee identity so it never depends on the container's git config. This is the whole
+// "reconcile with main on its own" mechanism: after a clean merge the cxell's HEAD descends from the
+// current xource, so the eventual cxell→worktree fast-forward succeeds and a push lands.
+//
+// The division of labour the task requires: this attempt is script-only. Its JUDGMENT call — a real
+// CONTENT conflict — is the one thing handed back to the model. We classify the merge output with the
+// SAME predicate the host-side catch-up uses (classifyMergeOutput), so a genuine conflict reads
+// 'conflict' (the zee's to resolve, in place — MERGE_HEAD is left set) and an operational failure
+// reads 'error' (nothing for the zee to fix in code). Returns { state, ... } where state is:
+//   'up-to-date' — the cxell already contains the xource tip; nothing to do.
+//   'merged'     — merged origin/main in cleanly; head is the new merge commit.
+//   'conflict'   — a genuine content conflict; the merge is LEFT in progress for the zee to resolve.
+//   'error'      — an operational failure (delivery or a non-conflict merge failure).
+const CX_IDENTITY = `-c user.name='Zeehive queenzee' -c user.email=queenzee@zeehive.local`;
+export async function syncCxellWithXource({ ctx = 'default', slug, worktree, ref }) {
+  const name = cxellName(slug);
+  let delivery;
+  try {
+    delivery = await deliverXourceIntoCxell({ ctx, slug, worktree, ref });
+  } catch (e) {
+    return { state: 'error', stage: 'deliver', output: String(e.message).slice(-1200) };
+  }
+  if (!delivery.delivered) return { state: 'error', stage: 'deliver', output: delivery.reason || 'could not deliver the xource into the cxell' };
+
+  // Already contains the tip → a merge would be a no-op; report up-to-date without touching the tree.
+  try {
+    await dk(ctx, ['exec', name, 'bash', '-lc',
+      'cd /work/repo && git merge-base --is-ancestor refs/remotes/origin/main HEAD'], { timeoutMs: 15000 });
+    const head = (await dk(ctx, ['exec', name, 'bash', '-lc', 'cd /work/repo && git rev-parse HEAD'], { timeoutMs: 15000 })).out.trim();
+    return { state: 'up-to-date', head, tip: delivery.tip, ref };
+  } catch { /* not yet an ancestor → merge it */ }
+
+  // MERGE. --no-edit so the script needs no editor; the queenzee identity so the merge commit never
+  // depends on the container's (absent) git config. On failure DO NOT abort: leaving MERGE_HEAD set
+  // is what lets the zee resolve a genuine conflict in place, then just commit. Capture the FULL merge
+  // output (2>&1) and the REAL exit code inline — git writes its "CONFLICT …/Automatic merge failed"
+  // lines to stdout, and we must classify on the whole text, not a truncated docker-error slice.
+  let out = '', code = 1;
+  try {
+    const r = await dk(ctx, ['exec', name, 'bash', '-lc',
+      `cd /work/repo && git ${CX_IDENTITY} merge --no-edit refs/remotes/origin/main 2>&1; echo "__MERGE_RC__:$?"`],
+      { timeoutMs: 180000 });
+    out = r.out;
+    code = Number((out.match(/__MERGE_RC__:(\d+)/) || [])[1] ?? 1);
+  } catch (e) {
+    code = 1; out = String(e.message);
+  }
+  if (code === 0) {
+    const head = (await dk(ctx, ['exec', name, 'bash', '-lc', 'cd /work/repo && git rev-parse HEAD'], { timeoutMs: 15000 })).out.trim();
+    logline('cxell', `${slug}: merged ${ref} into the cxell cleanly → ${String(head).slice(0, 8)}`);
+    return { state: 'merged', head, tip: delivery.tip, ref };
+  }
+  // Failed. Classify: a real content conflict is the zee's; anything else is operational.
+  const cls = classifyMergeOutput(out);
+  if (cls.state === 'error') {
+    // Not a content conflict → nothing for the zee to resolve. Abort so we don't leave a stuck merge.
+    await dk(ctx, ['exec', name, 'bash', '-lc', 'cd /work/repo && git merge --abort'], { timeoutMs: 15000 }).catch(() => {});
+  }
+  logline('cxell', `${slug}: sync merge of ${ref} → ${cls.state}`);
+  return { ...cls, tip: delivery.tip, ref };
+}
+
 // The live diff of a CXELLD zee's work — read from INSIDE the cxell, where the work actually lives.
 // A cxell zee commits and edits in its private clone at /work/repo; the HOST worktree stays frozen
 // at the provisioning base until `zee land` collects the commits (collectCxellDiffToWorktree). So a
@@ -135,10 +277,17 @@ export async function cxellDiff({ ctx = 'default', slug, base }) {
   if (!base) return null;
   const b = String(base).replace(/[^0-9a-fA-F]/g, '');
   if (!b) return null;
+  // "ahead" is the count of the zee's UNLANDED commits. Measure it against origin/main WHEN THAT REF
+  // EXISTS in the cxell (delivered by deliverXourceIntoCxell) — because commits the zee already landed
+  // are on main, so counting from the frozen provisioning base kept them showing as unlanded forever
+  // (six xells read ↑1–↑4 with every commit already on main). Fall back to the base only until the
+  // first sync delivers a live origin/main. The shortstat still measures the working diff vs base.
   const script = [
     'cd /work/repo || exit 3',
     'echo "$(git rev-parse HEAD 2>/dev/null)"',
-    `echo "$(git rev-list --count ${b}..HEAD 2>/dev/null)"`,
+    'OM="$(git rev-parse --verify -q refs/remotes/origin/main || true)"',
+    `if [ -n "$OM" ]; then echo "$(git rev-list --count refs/remotes/origin/main..HEAD 2>/dev/null)"; `
+      + `else echo "$(git rev-list --count ${b}..HEAD 2>/dev/null)"; fi`,
     `echo "$(git diff --shortstat ${b} 2>/dev/null)"`,
     'echo "$(git diff --shortstat HEAD 2>/dev/null)"',
     'echo "$(git status --porcelain 2>/dev/null | wc -l)"',
@@ -390,6 +539,25 @@ export async function collectCxellDiffToWorktree({ ctx = 'default', slug, worktr
   }
   const name = cxellName(slug);
   const tmp = mkdtempSync(join(tmpdir(), 'zee-land-'));
+  try {
+    const bundle = await exportCxellDiff({ ctx, name, toDir: tmp });
+    if (!bundle) return { collected: false, reason: 'the cxell has no commits beyond the worktree' };
+    return await reconcileBundleIntoWorktree(worktree, { bundle, slug });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// The pure-git core of the collect: fetch the cxell's bundle into a staging ref and fast-forward the
+// worktree branch onto it. Factored out of collectCxellDiffToWorktree so it can be exercised WITHOUT
+// docker (the bundle is just a file), which is how the stranding-vs-reconcile behaviour is tested.
+//
+// THE STRANDING FIX (highest-value change): a --ff-only miss used to `update-ref -d` the staging ref
+// and throw — which left the cxell's commits reachable from NO ref and NO reflog, i.e. GC-eligible.
+// That is how a xell's work got silently destroyed. Now, on a miss, we RENAME the staging ref to a
+// durable `refs/zeehive/stranded/<slug>` so the work is anchored, GC-proof and recoverable, and we
+// name that ref in the thrown error. A failure is "blocked", never "lost".
+export async function reconcileBundleIntoWorktree(worktree, { bundle, slug }) {
   const git = (args) => new Promise((resolve, reject) => {
     const g = spawn('git', ['-C', worktree, ...args], { windowsHide: true });
     let out = '', err = '';
@@ -398,38 +566,44 @@ export async function collectCxellDiffToWorktree({ ctx = 'default', slug, worktr
     g.on('error', reject);
     g.on('close', (c) => (c === 0 ? resolve(out.trim()) : reject(new Error(`git ${args[0]} exited ${c}: ${err.slice(0, 300)}`))));
   });
-  try {
-    const bundle = await exportCxellDiff({ ctx, name, toDir: tmp });
-    if (!bundle) return { collected: false, reason: 'the cxell has no commits beyond the worktree' };
-    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
-    // Fetch the cxell branch into a private staging ref (never the checked-out branch directly), then
-    // fast-forward the worktree branch to it. --ff-only is the honesty guard: if the worktree moved
-    // since caging, we refuse instead of fabricating a merge nobody asked for.
-    await git(['fetch', bundle, `${branch}:refs/zeehive/cxell-land`]);
-    const target = await git(['rev-parse', 'refs/zeehive/cxell-land']);
-    // Clear host-worktree noise the cxell zee cannot reach so the --ff-only below is not blocked
-    // with "refuses to touch <file>". On a Windows checkout mcp/server.js recurs dirty two ways: an
-    // exec-bit flip (644↔755) and CRLF↔LF normalization (git status flags it "modified" with an
-    // EMPTY content diff). Ignoring file-mode kills the first; the second only clears with a stash.
-    // So do both: ignore mode, then park any remaining dirt in a labelled stash — a cxell zee's work
-    // is its COMMITS from the cxell, so nothing UNCOMMITTED in the host worktree is ever its to lose.
-    // Both are safe and self-healing — the whole point is that `zee land` never needs a human.
-    await git(['config', 'core.fileMode', 'false']).catch(() => {});
-    const dirty = await git(['status', '--porcelain']).catch(() => '');
-    if (dirty.trim()) {
-      await git(['stash', 'push', '--include-untracked', '-m',
-        'zee-land: stray host-worktree changes parked before collect']).catch(() => {});
-    }
-    let ff;
-    try { await git(['merge', '--ff-only', target]); ff = true; }
-    catch (e) { ff = false; await git(['update-ref', '-d', 'refs/zeehive/cxell-land']).catch(() => {});
-      throw new Error(`the cxell's commits do not fast-forward the worktree branch — it moved since caging (${e.message})`); }
-    await git(['update-ref', '-d', 'refs/zeehive/cxell-land']).catch(() => {});
-    const head = await git(['rev-parse', 'HEAD']);
-    return { collected: ff, head, branch };
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
+  const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const strandedRef = `refs/zeehive/stranded/${String(slug).replace(/[^A-Za-z0-9._/-]/g, '-')}`;
+  // Fetch the cxell branch into a private staging ref (never the checked-out branch directly), then
+  // fast-forward the worktree branch to it. --ff-only is the honesty guard: if the worktree moved
+  // since caging, we refuse instead of fabricating a merge nobody asked for.
+  await git(['fetch', bundle, `${branch}:refs/zeehive/cxell-land`]);
+  const target = await git(['rev-parse', 'refs/zeehive/cxell-land']);
+  // Clear host-worktree noise the cxell zee cannot reach so the --ff-only below is not blocked
+  // with "refuses to touch <file>". On a Windows checkout mcp/server.js recurs dirty two ways: an
+  // exec-bit flip (644↔755) and CRLF↔LF normalization (git status flags it "modified" with an
+  // EMPTY content diff). Ignoring file-mode kills the first; the second only clears with a stash.
+  // So do both: ignore mode, then park any remaining dirt in a labelled stash — a cxell zee's work
+  // is its COMMITS from the cxell, so nothing UNCOMMITTED in the host worktree is ever its to lose.
+  // Both are safe and self-healing — the whole point is that `zee land` never needs a human.
+  await git(['config', 'core.fileMode', 'false']).catch(() => {});
+  const dirty = await git(['status', '--porcelain']).catch(() => '');
+  if (dirty.trim()) {
+    await git(['stash', 'push', '--include-untracked', '-m',
+      'zee-land: stray host-worktree changes parked before collect']).catch(() => {});
   }
+  try {
+    await git(['merge', '--ff-only', target]);
+  } catch (e) {
+    // ff-only MISS. NEVER strand: anchor the collected commits under a durable ref before releasing
+    // the staging ref, so the work survives GC and a human (or a later self-heal) can recover it.
+    await git(['update-ref', strandedRef, target]).catch(() => {});
+    await git(['update-ref', '-d', 'refs/zeehive/cxell-land']).catch(() => {});
+    logline('cxell', `${slug}: cxell commits do NOT fast-forward the worktree — anchored at ${strandedRef} @ ${String(target).slice(0, 8)} (NOT stranded)`);
+    const err = new Error(
+      `the cxell's commits do not fast-forward the worktree branch — it moved since caging. `
+      + `Your commits are SAFE and anchored at ${strandedRef} (${String(target).slice(0, 8)}) — nothing was lost. (${e.message})`);
+    err.strandedRef = strandedRef;
+    err.strandedHead = target;
+    throw err;
+  }
+  await git(['update-ref', '-d', 'refs/zeehive/cxell-land']).catch(() => {});
+  const head = await git(['rev-parse', 'HEAD']);
+  return { collected: true, head, branch };
 }
 
 // NUDGE a cxell zee: RESUME its claude session inside the cxell so its workflow continues with no
