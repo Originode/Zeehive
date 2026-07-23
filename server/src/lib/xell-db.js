@@ -40,15 +40,114 @@ export const DB_MODES = {
 
 // The container rows carry LOGICAL names (omnibiz_db_dev / omnibiz_db_prod) but the real daemons
 // run versioned ones (omnibiz_db_dev_gis / omnibiz_db_prod_v184). `docker exec omnibiz_db_dev`
-// hits the stale postgres:18beta1 container instead — the split-brain hazard. Resolve the actual
-// container by preferring a running versioned match over the bare name.
-export function resolveRealDbContainer(ctx, logicalName, { timeout = 15000 } = {}) {
-  const r = spawnSync('docker', ['--context', ctx, 'ps', '--format', '{{.Names}}'],
+// hits the stale postgres:18beta1 container instead — the split-brain hazard.
+//
+// STOP GUESSING NAMES — RESOLVE FROM REGISTRY IDENTITY. The old resolver took the FIRST running
+// container whose name merely STARTED WITH `${logicalName}_`. That is name-shape inference, and it
+// manufactured a live prod incident (2026-07-23): a dev clone minted as
+// `omnibiz_db_prod_dev_local_mardale_prod` is a prefix-extension of `omnibiz_db_prod`, so it
+// matched the scan; `docker ps` lists newest first, the clone was newer, and a prod ship applied
+// its migrations to a 7.7MB throwaway while reporting success. Identity now comes from things a
+// name cannot lie about:
+//   • a container that IS another registry row is never the answer for THIS row (the clone has its
+//     OWN row at tier=dev — excluding registered names alone kills this whole bug class), and
+//   • the published HOST PORT the registry records for the row (5432 → real prod; 32768 → clone),
+//     which docker reports independently of how the container is named.
+// Prefix matching survives only as a last resort for a freshly-modeled row with NO recorded port,
+// and even then only among names that are not themselves registered. Ambiguity is REFUSED, never
+// coin-flipped: for a prod migration a wrong guess is worse than a failed resolve.
+
+// Parse `docker ps --format '{{.Names}}\t{{.Ports}}'` into [{name, hostPorts:Set<number>}].
+// A ports cell looks like "0.0.0.0:5432->5432/tcp, :::5432->5432/tcp" or "32768->5432/tcp"; the
+// published host port is the number immediately before `->`.
+function parsePsPorts(stdout) {
+  return (stdout || '').split('\n').map((l) => l.trim()).filter(Boolean).map((line) => {
+    const [name = '', ports = ''] = line.split('\t');
+    const hostPorts = new Set();
+    for (const m of ports.matchAll(/(?:^|[\s,])(?:[\d.]+:|:::)?(\d+)->/g)) hostPorts.add(Number(m[1]));
+    return { name: name.trim(), hostPorts };
+  }).filter((e) => e.name);
+}
+
+// Pure decision (no I/O, exported for tests). `running` = [{name, hostPorts}] from docker ps on
+// this context; `target` = { name (logical), host_port }; `registeredElsewhere` = the names that
+// belong to a DIFFERENT registry row. Returns { name, via } or { ambiguous, candidates }.
+export function pickDbContainer(running, target, registeredElsewhere = new Set()) {
+  const logical = target.name;
+  const wantPort = target.host_port != null ? Number(target.host_port) : null;
+  // A running container that owns its own (different) registry row is by definition not the
+  // container for THIS row — exclude it before any matching. This single guard is what makes the
+  // clone unpickable when resolving prod.
+  const cand = running.filter((c) => !registeredElsewhere.has(c.name));
+
+  // 1. The logical name itself is running — unambiguously the container.
+  const exact = cand.find((c) => c.name === logical);
+  if (exact) return { name: exact.name, via: 'exact' };
+
+  // 2. Durable identity: the published host port the registry recorded for this row.
+  if (wantPort != null) {
+    const byPort = cand.filter((c) => c.hostPorts.has(wantPort));
+    if (byPort.length === 1) return { name: byPort[0].name, via: 'port' };
+    if (byPort.length > 1) return { ambiguous: true, candidates: byPort.map((c) => c.name) };
+  }
+
+  // 3. Last resort only for a row with NO recorded port: a versioned extension of the logical
+  //    name, among names not themselves registered. Never reached when a host_port is on file.
+  const versioned = cand.filter((c) => c.name !== logical && c.name.startsWith(`${logical}_`));
+  if (versioned.length === 1) return { name: versioned[0].name, via: 'prefix' };
+  if (versioned.length > 1) return { ambiguous: true, candidates: versioned.map((c) => c.name) };
+
+  // 4. Nothing matched. Fall back to the logical name (as the old resolver did on any miss). The
+  //    guard's substring match tolerates it; callers that need certainty (a prod migration) assert
+  //    the target independently before writing.
+  return { name: logical, via: 'fallback', unresolved: true };
+}
+
+// The names of every OTHER db container in the registry — the exclusion set for pickDbContainer.
+async function otherRegisteredDbNames(exceptName) {
+  const rows = await q(`SELECT name FROM container WHERE role='db'`);
+  const s = new Set(rows.map((r) => r.name));
+  s.delete(exceptName);
+  return s;
+}
+
+function dockerPsSync(ctx, timeout) {
+  const r = spawnSync('docker', ['--context', ctx, 'ps', '--format', '{{.Names}}\t{{.Ports}}'],
     { encoding: 'utf8', timeout, windowsHide: true });
-  if (r.status !== 0) return logicalName;
-  const running = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
-  const versioned = running.find((n) => n !== logicalName && n.startsWith(`${logicalName}_`));
-  return versioned || (running.includes(logicalName) ? logicalName : logicalName);
+  return r.status === 0 ? parsePsPorts(r.stdout) : null;
+}
+
+function dockerPsAsync(ctx, timeout = 30000) {
+  return new Promise((res) => {
+    let out = '', child;
+    try { child = spawn('docker', ['--context', ctx, 'ps', '--format', '{{.Names}}\t{{.Ports}}'], { windowsHide: true }); }
+    catch { return res(null); }
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, timeout);
+    child.stdout?.on('data', (d) => { out += d; });
+    child.on('error', () => { clearTimeout(t); res(null); });
+    child.on('close', (code) => { clearTimeout(t); res(code === 0 ? parsePsPorts(out) : null); });
+  });
+}
+
+// Resolve the running container for a logical db name via registry identity. Blocking (spawnSync)
+// — intended for the migration / drift / bind paths, NOT the guard hot path (use the Cached
+// variant there). Pass { row } when you already have the container row (its host_port disambiguates
+// and saves a lookup). THROWS on ambiguity: a prod migration must refuse rather than pick.
+export async function resolveRealDbContainer(ctx, logicalName, { timeout = 15000, row = null } = {}) {
+  if (!ctx || !logicalName) return logicalName;
+  const running = dockerPsSync(ctx, timeout);
+  if (!running) return logicalName;                 // docker unreachable → logical (as before)
+  const known = row || await one(
+    `SELECT host_port FROM container WHERE role='db' AND docker_ctx=$1 AND name=$2 LIMIT 1`,
+    [ctx, logicalName]);
+  const registered = await otherRegisteredDbNames(logicalName);
+  const pick = pickDbContainer(running, { name: logicalName, host_port: known?.host_port ?? null }, registered);
+  if (pick.ambiguous) {
+    throw new Error(`cannot resolve the real container for ${logicalName} on ${ctx}: `
+      + `${pick.candidates.length} candidates match and none is confirmable (${pick.candidates.join(', ')}). `
+      + 'Refusing to guess — resolve the collision or record the row\'s host_port.');
+  }
+  return pick.name;
 }
 
 // Same resolution, but safe to call on the prod-guard's hot path. The guard gives its whole
@@ -59,30 +158,35 @@ export function resolveRealDbContainer(ctx, logicalName, { timeout = 15000 } = {
 // every call where mardale answered slower than the budget, and allowed on the rare fast one —
 // a gate that FLAPS teaches a zee that the gate is noise.
 //
-// So: NEVER block on the network once a name is known. A hit is served even when stale;
-// staleness only kicks off a background refresh. Container names change only across a rebuild,
-// and even the worst stale answer — the LOGICAL name — is one the guard's substring match still
-// tolerates against a versioned container (omnibiz_db_prod is a prefix of omnibiz_db_prod_v184).
-// Only the first sighting of a (ctx, name) pair ever waits, and only up to 3s, to stay inside
-// the guard's budget.
+// So this NEVER blocks on the network. A cached hit is served even when stale; staleness only
+// kicks off a background refresh. A cache MISS returns the LOGICAL name immediately (and refreshes
+// in the background) — it no longer waits up to 3s on a cold docker ps, removing the last network
+// round-trip from the hot path entirely. The logical name is safe here: the guard's substring
+// match still tolerates it against a versioned container (omnibiz_db_prod is a prefix of
+// omnibiz_db_prod_v184), and the registry-identity refresh sharpens it to the exact name shortly
+// after. Ambiguity in the background refresh keeps the last known (or logical) name — the guard
+// never sees a thrown error.
 const nameCache = new Map();
 const NAME_TTL_MS = 5 * 60 * 1000;
+const refreshing = new Set();
 
 function refreshRealDbName(ctx, logicalName, key) {
-  let child;
-  try { child = spawn('docker', ['--context', ctx, 'ps', '--format', '{{.Names}}'], { windowsHide: true }); }
-  catch { return; }
-  let out = '';
-  const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 30000);
-  child.stdout?.on('data', (d) => { out += d; });
-  child.on('error', () => clearTimeout(t));
-  child.on('close', (code) => {
-    clearTimeout(t);
-    if (code !== 0) return;   // keep serving the last known name; retry at the next TTL expiry
-    const running = out.split('\n').map((s) => s.trim()).filter(Boolean);
-    const versioned = running.find((n) => n !== logicalName && n.startsWith(`${logicalName}_`));
-    nameCache.set(key, { name: versioned || logicalName, at: Date.now() });
-  });
+  if (refreshing.has(key)) return;
+  refreshing.add(key);
+  (async () => {
+    try {
+      const running = await dockerPsAsync(ctx);
+      if (!running) return;               // keep serving the last known name; retry at next TTL
+      const known = await one(
+        `SELECT host_port FROM container WHERE role='db' AND docker_ctx=$1 AND name=$2 LIMIT 1`,
+        [ctx, logicalName]);
+      const registered = await otherRegisteredDbNames(logicalName);
+      const pick = pickDbContainer(running, { name: logicalName, host_port: known?.host_port ?? null }, registered);
+      // Ambiguous → do not cache a guess; keep the last known / logical name.
+      if (!pick.ambiguous) nameCache.set(key, { name: pick.name, at: Date.now() });
+    } catch { /* keep serving the last known name */ }
+    finally { refreshing.delete(key); }
+  })();
 }
 
 export function resolveRealDbContainerCached(ctx, logicalName, now = Date.now()) {
@@ -96,9 +200,10 @@ export function resolveRealDbContainerCached(ctx, logicalName, now = Date.now())
     }
     return hit.name;
   }
-  const name = resolveRealDbContainer(ctx, logicalName, { timeout: 3000 });
-  nameCache.set(key, { name, at: now });
-  return name;
+  // Cold miss: NEVER block the hot path. Serve the logical name now, resolve in the background.
+  nameCache.set(key, { name: logicalName, at: now });
+  refreshRealDbName(ctx, logicalName, key);
+  return logicalName;
 }
 
 async function sharedDb(projectId, tier) {
@@ -169,7 +274,7 @@ async function ensureCloneTemplate(project, devC) {
 
   const run = (async () => {
     const ctx = devC.docker_ctx;
-    const real = resolveRealDbContainer(ctx, devC.name);
+    const real = await resolveRealDbContainer(ctx, devC.name, { row: devC });
     const have = await execPsql(ctx, real, dbid.user, `SELECT 1 FROM pg_database WHERE datname='${tpl}'`);
     const inst = await templateInstanceFor(devC.id);
     const fresh = inst?.refreshed_at && (Date.now() - new Date(inst.refreshed_at).getTime()) < TPL_MAX_AGE_MS;
@@ -217,7 +322,7 @@ async function provisionCloneDb({ project, xell }) {
 
   if (MODE === 'real') {
     const ctx = devC.docker_ctx;
-    const real = resolveRealDbContainer(ctx, devC.name);
+    const real = await resolveRealDbContainer(ctx, devC.name, { row: devC });
     const have = await execPsql(ctx, real, dbid.user, `SELECT 1 FROM pg_database WHERE datname='${dbname}'`);
     if (!(have.ok && have.out.trim() === '1')) {
       const { tpl } = await ensureCloneTemplate(project, devC);
@@ -244,7 +349,7 @@ export async function dropCloneDb(xell) {
   if (!project || !devC) return { ok: false, error: 'no project/db container to drop from' };
   if (MODE === 'real') {
     const dbid = projectDbId(project);
-    const real = resolveRealDbContainer(devC.docker_ctx, devC.name);
+    const real = await resolveRealDbContainer(devC.docker_ctx, devC.name, { row: devC });
     const r = await execPsql(devC.docker_ctx, real, dbid.user,
       `DROP DATABASE IF EXISTS "${inst.name}" WITH (FORCE)`);
     if (!r.ok) return { ok: false, error: r.err.trim().slice(-200) };
@@ -262,7 +367,7 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
   const devSite = await resolveSite(project.id, 'dev');
   const ctx = devSite?.docker_ctx || project.docker_ctx_dev;
   const devHost = devSite?.host || project.dev_host_ip;
-  const realSrc = MODE === 'real' ? resolveRealDbContainer(src?.docker_ctx || ctx, src?.name) : src?.name;
+  const realSrc = MODE === 'real' ? await resolveRealDbContainer(src?.docker_ctx || ctx, src?.name, { row: src }) : src?.name;
   const image = MODE === 'real'
     ? (spawnSync('docker', ['--context', src?.docker_ctx || ctx, 'inspect', '-f', '{{.Config.Image}}', realSrc],
         { encoding: 'utf8', timeout: 15000, windowsHide: true }).stdout || '').trim()

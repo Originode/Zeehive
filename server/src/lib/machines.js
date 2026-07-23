@@ -17,7 +17,7 @@ import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import { resolveContext } from './docker.js';
 import { resolveBash } from './bash.js';
-import { namingFor } from './manifest.js';
+import { namingFor, sanitizeName } from './manifest.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
@@ -293,8 +293,16 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   const alias = netEntry?.aliases?.[0] || 'postgres';
 
   const mkey = m.key.replace(/-/g, '_');
+  // NEVER mint the name by prefixing the PROD container's name. `${prodDb.name}_dev_${mkey}` makes
+  // a dev clone whose name is a prefix-extension of the prod name (omnibiz_db_prod →
+  // omnibiz_db_prod_dev_local_mardale_prod), and a name-shape resolver then cannot tell the clone
+  // from prod — the 2026-07-23 ship-to-clone incident. Derive a DEV sibling name from the
+  // project's OWN db identity instead (omnibiz_db_dev_<machine>), which can never be read as an
+  // extension of prod. Bootstrapping from the prod row still borrows its IMAGE (above), never its
+  // name.
+  const devLogical = `${sanitizeName(project.name)}_db_dev`;
   const name = source?.name ? `${source.name}_${mkey}`
-    : prodDb?.name ? `${prodDb.name}_dev_${mkey}`
+    : prodDb ? `${devLogical}_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
   const host = m.host_ip || project.dev_host_ip || config.devHostIp;
   const dbUser = project.db_user || config.prodDbUser || 'postgres';

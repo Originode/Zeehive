@@ -535,30 +535,44 @@ function BasicsSection({ project, run, onProject }) {
     } catch (e) { setOut({ kind: 'push', reason: e.message }); }
   };
   // PR is OUTBOUND and human-gated: prompt for a branch name, then push a side branch + open a PR.
-  const doPR = async () => {
+  // With merge=true it goes one step further and MERGES the PR on GitHub (pull-request AND merge) —
+  // a refused merge (branch protection, checks pending) still leaves the PR open to finish by hand.
+  const doPR = async (merge = false) => {
     const headBranch = await showPrompt(
-      `Open a pull request from local ${project.main_branch} of ${project.name}.\n\n`
-      + `A side branch is pushed to the remote and a PR is opened against ${access?.default_branch || 'the default branch'}. `
+      `${merge ? 'Open a pull request and MERGE it' : 'Open a pull request'} from local ${project.main_branch} of ${project.name}.\n\n`
+      + `A side branch is pushed to the remote and a PR is opened against ${access?.default_branch || 'the default branch'}`
+      + `${merge ? ', then merged into it on GitHub' : ''}. `
       + `Name the head branch (leave as-is for a generated name):`,
-      { title: 'Open a pull request?', defaultValue: `zeehive/${project.main_branch}`, okLabel: 'Open PR' });
+      { title: merge ? 'Open a pull request and merge?' : 'Open a pull request?',
+        defaultValue: `zeehive/${project.main_branch}`, okLabel: merge ? 'Open & merge' : 'Open PR' });
     if (headBranch === null) return;   // cancelled
-    setPull(null); setOut({ busy: true, kind: 'pr' });
+    setPull(null); setOut({ busy: true, kind: 'pr', merge });
     try {
-      const r = await run(() => pullRequestProject(project.id, { headBranch: headBranch.trim() || undefined }));
-      setOut({ ...r, kind: 'pr' });
-    } catch (e) { setOut({ kind: 'pr', reason: e.message }); }
+      const r = await run(() => pullRequestProject(project.id, { headBranch: headBranch.trim() || undefined, merge }));
+      setOut({ ...r, kind: 'pr', merge });
+    } catch (e) { setOut({ kind: 'pr', merge, reason: e.message }); }
   };
   const pullLabel = !pull ? null
     : pull.busy ? 'pulling…'
     : pull.state === 'up-to-date' ? '✓ up to date'
     : pull.state === 'fast-forwarded' ? `✓ fast-forwarded (${pull.commits} commit${pull.commits === 1 ? '' : 's'})`
     : pull.reason;
+  const prLabel = (o) => {
+    if (!o.opened) return o.reason || 'PR refused';
+    const opened = `✓ PR ${o.state === 'existing' ? 'already open' : 'opened'}${o.number ? ` #${o.number}` : ''}`;
+    if (!o.merge) return `${opened}${o.url ? ' — open on GitHub ↗' : ''}`;
+    // pull-request AND merge: report the merge outcome, but a refused merge still opened a PR.
+    return o.merge?.merged
+      ? `✓ PR #${o.number} merged → ${o.base}${o.merge.sha ? ` (${o.merge.sha.slice(0, 8)})` : ''}`
+      : `${opened} — merge refused: ${o.merge?.reason || 'not mergeable'}${o.url ? ' (finish on GitHub ↗)' : ''}`;
+  };
   const outLabel = !out ? null
-    : out.busy ? (out.kind === 'push' ? 'pushing…' : 'opening PR…')
+    : out.busy ? (out.kind === 'push' ? 'pushing…' : out.merge ? 'opening & merging PR…' : 'opening PR…')
     : out.kind === 'push'
       ? (out.pushed ? (out.state === 'up-to-date' ? '✓ remote already up to date' : `✓ pushed ${project.main_branch} → remote`) : (out.reason || 'push refused'))
-      : (out.opened ? `✓ PR ${out.state === 'existing' ? 'already open' : 'opened'}${out.number ? ` #${out.number}` : ''}${out.url ? ' — open on GitHub ↗' : ''}` : (out.reason || 'PR refused'));
-  const outOk = out && (out.pushed || out.opened);
+      : prLabel(out);
+  // Green only when fully done: an opened-but-not-merged "PR & merge" is a partial success (warn).
+  const outOk = out && (out.pushed || (out.opened && (!out.merge || out.merge?.merged)));
   return (
     <div className="setup-sec">
       <h3>Project</h3>
@@ -588,7 +602,12 @@ function BasicsSection({ project, run, onProject }) {
             {access?.can_pr && (
               <button type="button" className="ghost" disabled={pull?.busy || out?.busy}
                       title={`push a side branch off local ${project.main_branch} and open a pull request — you'll be asked to confirm`}
-                      onClick={doPR}>⇅ PR</button>
+                      onClick={() => doPR(false)}>⇅ PR</button>
+            )}
+            {access?.can_pr && (
+              <button type="button" className="ghost" disabled={pull?.busy || out?.busy}
+                      title={`open a pull request off local ${project.main_branch} AND merge it into ${access?.default_branch || 'the default branch'} on GitHub — you'll be asked to confirm`}
+                      onClick={() => doPR(true)}>⇅ PR &amp; merge</button>
             )}
           </span>
         </label>

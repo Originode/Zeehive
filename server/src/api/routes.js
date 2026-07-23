@@ -320,11 +320,13 @@ router.post('/projects/:id/push', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Human-triggered PR: push a side branch off local main and open a pull request against default.
-// Refusals are {opened:false, reason} with HTTP 200.
+// With merge:true it ALSO merges the PR on GitHub (pull-request AND merge) — a refused merge still
+// leaves the PR open (r.merge.reason). Refusals are {opened:false, reason} with HTTP 200.
 router.post('/projects/:id/pr', async (req, res) => {
   try {
     res.json(await pullRequestProject(req.params.id,
-      { headBranch: req.body?.headBranch || null, title: req.body?.title || null, base: req.body?.base || null },
+      { headBranch: req.body?.headBranch || null, title: req.body?.title || null, base: req.body?.base || null,
+        merge: !!req.body?.merge, mergeMethod: req.body?.mergeMethod || 'merge' },
       req.body?.by || 'human@console'));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });

@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseGitHubSlug, remoteAccess, pushRemote } from '../server/src/lib/remote-git.js';
+import { parseGitHubSlug, remoteAccess, pushRemote, mergePullRequest } from '../server/src/lib/remote-git.js';
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -101,6 +101,48 @@ console.log('pushRemote: ff push succeeds; a diverged remote is refused (never f
     r = await pushRemote({ repoRoot: work, branch: 'nope', remoteUrl: bare, token: 'ghp_dummy' });
     ok(r.pushed === false && /does not exist/.test(r.reason || ''), 'missing local branch → refused');
   } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+// ── mergePullRequest (stubbed fetch) ────────────────────────────────────────────
+console.log('mergePullRequest: merges via PUT /pulls/:n/merge; refusals surface loud, never forced');
+{
+  const realFetch = globalThis.fetch;
+  let last = null;
+  const stub = ({ ok: httpOk = true, status = 200, body = {} } = {}) => {
+    globalThis.fetch = async (url, opts) => { last = { url, opts }; return { ok: httpOk, status, json: async () => body }; };
+  };
+  const tok = 'ghp_x'.padEnd(30, 'a');
+  try {
+    stub({ body: { merged: true, sha: 'deadbeefcafe0000', message: 'Pull Request successfully merged' } });
+    let r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7, method: 'squash' });
+    ok(r.merged === true && r.state === 'merged' && r.sha === 'deadbeefcafe0000', 'success → merged with sha');
+    ok(last.opts.method === 'PUT' && /\/pulls\/7\/merge$/.test(last.url), 'calls PUT …/pulls/7/merge');
+    ok(JSON.parse(last.opts.body).merge_method === 'squash', 'honours merge_method=squash');
+
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7, method: 'bogus' });
+    ok(JSON.parse(last.opts.body).merge_method === 'merge', 'unknown method falls back to merge');
+
+    stub({ ok: false, status: 405, body: { message: 'Pull Request is not mergeable' } });
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7 });
+    ok(r.merged === false && r.state === 'not-mergeable' && /not mergeable/i.test(r.reason || ''), '405 → not-mergeable, reason shown');
+
+    stub({ ok: false, status: 409, body: { message: 'Head branch was modified' } });
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7 });
+    ok(r.merged === false && r.state === 'conflict', '409 → conflict (head moved)');
+
+    stub({ ok: false, status: 403, body: { message: 'Resource not accessible' } });
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7 });
+    ok(r.merged === false && r.state === 'refused' && /write access|branch protection/i.test(r.reason || ''), '403 → refused with reason');
+
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: null, number: 7 });
+    ok(r.merged === false && /write access/i.test(r.reason || ''), 'no token → refused before any call');
+
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: null });
+    ok(r.merged === false && /PR number/i.test(r.reason || ''), 'no PR number → refused');
+
+    r = await mergePullRequest({ remoteUrl: 'git@github.com:org/repo.git', token: tok, number: 7 });
+    ok(r.merged === false && /not a github url/i.test(r.reason || ''), 'non-GitHub URL → refused');
+  } finally { globalThis.fetch = realFetch; }
 }
 
 console.log(failures === 0 ? '\nALL GREEN' : `\n${failures} FAILURE(S)`);
