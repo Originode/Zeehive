@@ -123,22 +123,64 @@ async function ledgerFiles(project, db, sha) {
 // to the default site.
 async function prodDb(project, site = null) {
   const c = await one(
-    `SELECT name, docker_ctx FROM container
+    `SELECT name, docker_ctx, tier, host_port FROM container
       WHERE project_id=$1 AND role='db' AND tier='prod'
         AND ($2::uuid IS NULL OR site_id = $2::uuid OR (site_id IS NULL AND $3)) LIMIT 1`,
     [project.id, site?.id || null, !!site?.is_default]);
   if (!c) return null;
   return {
-    ctx: c.docker_ctx, container: resolveRealDbContainer(c.docker_ctx, c.name),
+    ctx: c.docker_ctx, container: await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }),
+    tier: c.tier, host_port: c.host_port, logical: c.name,
     // db identity is a project fact (spec Appendix A); env vars are last-resort fallback
     user: project.db_user || config.prodDbUser || 'postgres',
     name: project.db_name || config.prodDbName || 'omnibiz',
   };
 }
 
+// ASSERT THE TARGET before any write. resolveRealDbContainer maps the registry's logical prod name
+// to a running container by durable identity, but a migration is irreversible — so before we apply
+// anything we INDEPENDENTLY re-confirm the container we hold really is the registry's PRODUCTION
+// database:
+//   • the row we selected is tier='prod' (never a dev / clone row), and
+//   • docker's OWN report says that container publishes the row's host_port on this context — the
+//     same durable fact the resolver used, checked a second time against the live daemon.
+// A ship that cannot PROVE which database it is talking to must not write to it: on 2026-07-23 a
+// prod ship applied its migrations to a 7.7MB dev clone and reported success.
+export async function assertProdDbTarget(db) {
+  if (db.tier !== 'prod') {
+    return { ok: false, error: `refusing to migrate ${db.container}: the selected registry row is `
+      + `tier='${db.tier}', not 'prod'` };
+  }
+  if (db.host_port == null) {
+    return { ok: false, error: `refusing to migrate ${db.container}: the prod db row records no `
+      + 'host_port, so its identity cannot be confirmed — record it before shipping migrations' };
+  }
+  const r = spawnSync('docker', ['--context', db.ctx, 'inspect', '--format',
+    '{{json .NetworkSettings.Ports}}', db.container],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true });
+  if (r.status !== 0) {
+    return { ok: false, error: `refusing to migrate: cannot inspect ${db.container} on ${db.ctx} to `
+      + `confirm it is prod — ${(r.stderr || '').trim().split('\n').pop()?.slice(0, 160)}` };
+  }
+  const published = new Set();
+  try {
+    for (const binds of Object.values(JSON.parse(r.stdout || '{}') || {})) {
+      for (const b of (binds || [])) if (b?.HostPort) published.add(Number(b.HostPort));
+    }
+  } catch { /* leave published empty → mismatch below */ }
+  if (!published.has(Number(db.host_port))) {
+    return { ok: false, error: `refusing to migrate ${db.container}: it does not publish the prod db `
+      + `row's host_port ${db.host_port} (published: ${[...published].join(', ') || 'none'}). This is `
+      + 'NOT the registry\'s production database — aborting before any write.' };
+  }
+  return { ok: true };
+}
+
 // What would this ship apply? Called at REQUEST time so the human approves with the list in view.
 export async function pendingMigrations(project, sha, site = null) {
-  const db = await prodDb(project, site);
+  let db;
+  try { db = await prodDb(project, site); }
+  catch (e) { return { ok: false, error: e.message, pending: [] }; }
   if (!db) return { ok: false, error: 'no prod db container', pending: [] };
   try {
     const done = await ledgerFiles(project, db, sha);
@@ -175,8 +217,13 @@ async function runPending(project, db, sha, pending) {
 // Apply everything pending at `sha` to PROD, recording each success. First failure stops the
 // run — and the ship.
 export async function applyMigrations(project, sha, site = null) {
-  const db = await prodDb(project, site);
+  let db;
+  try { db = await prodDb(project, site); }
+  catch (e) { logline('shipmigrate', `migration ABORTED: ${e.message}`); return { ok: false, error: e.message, applied: [] }; }
   if (!db) return { ok: false, error: 'no prod db container', applied: [] };
+  // Prove the target IS the registry's prod database before touching it. Refuse otherwise.
+  const guard = await assertProdDbTarget(db);
+  if (!guard.ok) { logline('shipmigrate', `migration ABORTED: ${guard.error}`); return { ok: false, error: guard.error, applied: [] }; }
   const { ok, error, pending } = await pendingMigrations(project, sha, site);
   if (!ok) return { ok: false, error, applied: [] };
   return runPending(project, db, sha, pending);
@@ -223,8 +270,10 @@ export async function applyMigrationsToXell(xellId) {
     user: project.db_user || config.prodDbUser || 'postgres',
     name: clone ? clone.name : (project.db_name || config.prodDbName || 'omnibiz'),
   };
-  const db = { ctx: c.docker_ctx, container: resolveRealDbContainer(c.docker_ctx, c.name),
-               user: dbid.user, name: dbid.name };
+  let realContainer;
+  try { realContainer = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  const db = { ctx: c.docker_ctx, container: realContainer, user: dbid.user, name: dbid.name };
 
   const head = xell.worktree_path ? gitOut(xell.worktree_path, ['rev-parse', 'HEAD']) : null;
   if (!head) return { ok: false, error: 'cannot read the worktree HEAD — is the worktree still bound?', applied: [] };

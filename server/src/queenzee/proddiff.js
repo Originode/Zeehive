@@ -111,8 +111,11 @@ function diffPayload(prodFp, fp) {
 
 // Compare one db container against a prod fingerprint and persist the verdict.
 async function diffContainer(c, prodFp, dbid) {
-  const real = resolveRealDbContainer(c.docker_ctx, c.name);
-  const got = await fingerprint(c.docker_ctx, real, dbid);
+  let real;
+  try { real = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
+  catch (e) { real = null; }
+  const got = real ? await fingerprint(c.docker_ctx, real, dbid)
+                    : { error: `could not resolve the real container for ${c.name}` };
 
   const payload = got.error
     ? { ok: false, error: got.error, total: null, kinds: null }
@@ -160,7 +163,9 @@ export async function diffXellDbAgainstProd(projectId, xellId) {
   if (mine.id === prod.id) return { ok: true, same_db: true, total: 0, kinds: null };
 
   const dbid = await dbIdentity(projectId);
-  const realProd = resolveRealDbContainer(prod.docker_ctx, prod.name);
+  let realProd;
+  try { realProd = await resolveRealDbContainer(prod.docker_ctx, prod.name, { row: prod }); }
+  catch (e) { return { ok: false, error: e.message, total: null }; }
   const got = await fingerprint(prod.docker_ctx, realProd, dbid);
   if (got.error) return { ok: false, error: `prod db unreadable: ${got.error}`, total: null };
 
@@ -171,7 +176,9 @@ export async function diffXellDbAgainstProd(projectId, xellId) {
   if (xell?.db_coupling === 'db-clone') {
     const inst = await cloneInstanceFor(xellId);
     if (!inst) return { ok: false, error: 'db-clone coupling but no clone database on record — re-attach it', total: null };
-    const realMine = resolveRealDbContainer(mine.docker_ctx, mine.name);
+    let realMine;
+    try { realMine = await resolveRealDbContainer(mine.docker_ctx, mine.name, { row: mine }); }
+    catch (e) { return { ok: false, error: e.message, total: null }; }
     const own = await fingerprint(mine.docker_ctx, realMine, { ...dbid, name: inst.name });
     if (own.error) {
       const payload = { ok: false, error: own.error, total: null, kinds: null };
@@ -196,7 +203,9 @@ export async function prodDiffTick() {
     if (!prod) continue;                                  // no ruler → nothing to measure against
 
     const dbid = await dbIdentity(project_id);
-    const realProd = resolveRealDbContainer(prod.docker_ctx, prod.name);
+    let realProd;
+    try { realProd = await resolveRealDbContainer(prod.docker_ctx, prod.name, { row: prod }); }
+    catch (e) { logline('proddiff', `prod db ${prod.name} unresolvable, skipping drift check — ${e.message}`); continue; }
     const got = await fingerprint(prod.docker_ctx, realProd, dbid);
     if (got.error) {                                      // the RULER is unreadable — measure nothing
       logline('proddiff', `prod db ${prod.name} unreadable, skipping drift check — ${got.error}`);
