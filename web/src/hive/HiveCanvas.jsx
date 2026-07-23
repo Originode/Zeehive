@@ -955,6 +955,9 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
     if (cxell) s.push({ label: '💬 nudge', kind: 'nudge', accent: G });
     row(2, s);
   }
+  // message → MACHINE petal: a "proper message" composer (long text + images) for when the raw
+  // terminal is too clumsy. Sits on its own next to the session petal so it never crowds terminal+nudge.
+  if (cxell) row(4, [{ label: '📨 message', kind: 'message', accent: G }]);
   // pull, and LAND when there is work to land → COMMIT petal
   {
     const s = [{ label: '↓ pull', kind: 'pull' }];

@@ -13,7 +13,7 @@
 // cxell is unreachable.
 import { one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
-import { cxellName, nudgeCxellZee, sendKeysToCxellZee } from '../lib/cxell.js';
+import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from '../lib/cxell.js';
 import { adapterFor } from '../lib/cxell-runtimes.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 
@@ -44,6 +44,78 @@ export async function nudgeXellForStatus(xellId, { by = 'human' } = {}) {
 export async function nudgeXellAfterLand(xellId, { by = 'human' } = {}) {
   return nudgeCxell(xellId, { by, prompt: CONTINUE_PROMPT,
     why: 'landing approved', log: (slug, sid) => `${slug}: landing approved by ${by} — resuming cxell session ${sid} to continue` });
+}
+
+// SEND A COMPOSED OPERATOR MESSAGE to this xell's live cxell zee — the "proper message" path behind
+// the flower's 📨 button, for when the raw terminal is too clumsy for long text or images. Short,
+// single-line text is TYPED straight into the live interactive session (exactly like a status nudge,
+// so the zee's reply lands where the operator is looking). Anything richer — any image, or multi-line
+// / long text — is written into the cxell as real files under `.zee-inbox/<ts>/` (images verbatim, the
+// body as `message.md`), and a one-line pointer is typed in telling the zee to READ the body and VIEW
+// the attached images by path (Claude opens image files from a path). Delivery is fire-and-forget and
+// best-effort — this NEVER throws; it returns { sent, reason?/error? } so the route/UI can report.
+export async function sendMessageToXell(xellId, { text = '', images = [], by = 'human' } = {}) {
+  try {
+    const body = String(text || '').trim();
+    const imgs = (Array.isArray(images) ? images : []).filter((i) => i && i.data);
+    if (!body && !imgs.length) return { sent: false, reason: 'empty message (no text or images)' };
+
+    const zee = await one(
+      `SELECT z.id, z.claude_session_id, z.viewer_kind, z.viewer_url, x.slug
+         FROM zee z JOIN xell x ON x.id = z.xell_id
+        WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
+        ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
+    if (!zee) return { sent: false, reason: 'no cxell zee for this xell (nothing to message)' };
+    if (zee.viewer_kind !== 'ssh-terminal') return { sent: false, reason: `zee is not in a live cxell (viewer_kind=${zee.viewer_kind})` };
+    let sshPort;
+    try { sshPort = Number(new URL(zee.viewer_url).port); } catch { /* handled below */ }
+    if (!sshPort) return { sent: false, reason: 'cxell has no SSH port to reach (viewer_url missing/invalid)' };
+
+    // Rich message → hand it over as files; plain short text → type it inline.
+    const rich = imgs.length > 0 || body.includes('\n') || body.length > 300;
+    let typed = body;
+    const written = [];
+
+    if (rich) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const dir = `.zee-inbox/${ts}`;
+      for (let i = 0; i < imgs.length; i++) {
+        const b64 = String(imgs[i].data).replace(/^data:[^,]*,/, '');
+        const rel = `${dir}/image-${i + 1}${msgImageExt(imgs[i].name, imgs[i].type)}`;
+        try { written.push((await writeFileIntoCxell({ slug: zee.slug, relPath: rel, base64: b64 })).path); }
+        catch (e) { logline('message', `${zee.slug}: could not write attachment ${rel} (${String(e.message).slice(0, 120)})`); }
+      }
+      const md = ['# Operator message', `_sent ${new Date().toISOString()} by ${by}_`, '',
+        body || '(no text — see attachments)', '',
+        ...(written.length ? [`## Attachments (${written.length})`, ...written.map((p) => `- ${p}`)] : [])].join('\n');
+      let bodyPath = `${dir}/message.md`;
+      try { bodyPath = (await writeFileIntoCxell({ slug: zee.slug, relPath: bodyPath, text: md })).path; }
+      catch (e) { logline('message', `${zee.slug}: could not write message body (${String(e.message).slice(0, 120)})`); }
+      typed = `📨 New operator message — please read ${bodyPath}`
+        + (written.length ? ` and view the ${written.length} attached image(s): ${written.join(', ')}` : '')
+        + (body ? `. Summary: ${body.replace(/\s+/g, ' ').slice(0, 160)}` : '');
+    }
+
+    logline('message', `${zee.slug}: operator message by ${by} — ${rich ? `${written.length} file(s) to .zee-inbox, ` : ''}typing into live cxell session over SSH (:${sshPort})`);
+    // Fire and forget: opening SSH, resuming the TUI and typing can take several seconds.
+    sendKeysToCxellZee({ sshPort, slug: zee.slug, text: typed, sessionId: zee.claude_session_id })
+      .then(() => logline('message', `${zee.slug}: delivered operator message to the live session`))
+      .catch((e) => logline('message', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`));
+
+    return { sent: true, zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written };
+  } catch (e) {
+    logline('message', `message for xell ${String(xellId).slice(0, 8)} failed: ${String(e.message).slice(0, 160)}`);
+    return { sent: false, error: e.message };
+  }
+}
+
+// Pick a sane file extension for an attachment from its name, else its mime type, else default png.
+function msgImageExt(name = '', type = '') {
+  const m = String(name).match(/\.([A-Za-z0-9]{1,5})$/);
+  if (m) return `.${m[1].toLowerCase()}`;
+  const sub = String(type).split('/')[1];
+  if (sub) return `.${sub.replace('jpeg', 'jpg').replace('svg+xml', 'svg').replace(/[^a-z0-9]/gi, '')}`;
+  return '.png';
 }
 
 // STATUS delivery: resolve this xell's live cxell zee and TYPE `text` into the interactive session
