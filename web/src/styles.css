@@ -811,6 +811,16 @@ a.cbox:hover { border-color: var(--accent); }
   font-weight: 600; }
 .ship-approve:hover:not(:disabled) { background: rgba(229,85,78,.14); }
 .ship-approve:disabled { opacity: .5; cursor: default; }
+/* defer: a neutral "not now, keep it" — quieter than approve (red) or reject, since it decides
+   nothing irreversible; it just steps the ship out of the queue until a human resumes it. */
+.ship-defer { border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--muted); }
+.ship-defer:hover:not(:disabled) { background: rgba(255,255,255,.06); color: var(--text); }
+.ship-defer:disabled { opacity: .5; cursor: default; }
+/* a deferred card is dimmed and set aside — informational, not the loud awaiting-approval red. */
+.ship-card.deferred { border-color: var(--line); border-style: dashed; opacity: .9; }
+.ship-deferred { color: var(--muted); font-size: 12.5px; margin-top: 8px;
+  border-left: 2px solid var(--muted); padding-left: 8px; }
 .ship-card.s-shipped { border-color: var(--ready); opacity: .92; }
 .ship-card.s-failed { border-color: var(--error); }
 .ship-progress.done { color: var(--ready); }

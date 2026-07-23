@@ -68,8 +68,11 @@ async function fetchXellRows(pid) {
             -- read so the honeycomb's per-xell status costs no extra round-trips (see lib/hive-status).
             EXISTS(SELECT 1 FROM land_request lr WHERE lr.xell_id = x.id
                      AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL) AS land_pending,
+            -- deferred_at IS NULL: a ship a human DEFERRED is deliberately set aside, so it no
+            -- longer nags on the xell's hexagon as "ship awaiting a human".
             EXISTS(SELECT 1 FROM ship_request sr WHERE sr.xell_id = x.id
-                     AND sr.status IN ('pending','approved','shipping') AND sr.dismissed_at IS NULL) AS ship_pending,
+                     AND sr.status IN ('pending','approved','shipping') AND sr.dismissed_at IS NULL
+                     AND sr.deferred_at IS NULL) AS ship_pending,
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'tend-request' AS tend_pending,

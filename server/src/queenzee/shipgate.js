@@ -78,6 +78,27 @@ async function resolveShipSite(projectId, siteKey = null) {
 }
 const lockKeyFor = (site) => (site && !site.is_default ? `prod@${site.key}` : 'prod');
 
+// Resolve WHAT a ship will build: the sha at the project's ship_ref (local main by default, a
+// fetched remote ref for a remote-integration project) and the migration set pending at that sha
+// for the chosen site. Shared by requestShip (decides it once, at request time) and resumeShip (a
+// deferred ship re-decides it against the CURRENT main tip, so the combined ship carries every
+// landing made while it was set aside). Returns { commit, migrations } or throws with a reason.
+async function resolveShipCommit(project, shipSite, main) {
+  const shipRef = project.ship_ref || main;
+  if (shipRef.includes('/')) {
+    const remote = shipRef.split('/')[0];
+    const f = spawnSync('git', ['-C', project.repo_root, 'fetch', remote],
+      { encoding: 'utf8', timeout: 60000, windowsHide: true, env: cleanGitEnv() });
+    if (f.status !== 0) {
+      throw new Error(`cannot fetch ${remote} for ship_ref ${shipRef}: ${(f.stderr || '').slice(-200)}`);
+    }
+  }
+  const commit = headCommit(project.repo_root, shipRef);
+  if (!commit) throw new Error(`ship_ref "${shipRef}" does not resolve in ${project.repo_root}`);
+  const mig = await pendingMigrations(project, commit, shipSite);
+  return { commit, migrations: mig.pending || [] };
+}
+
 // ── the zee's only prod verb ─────────────────────────────────────────────────
 // skipDb: the zee scoped this ship to CODE ONLY — runShip will NOT apply pending migration/ops
 // files (recorded on the row; the human approves the scope with the click, the results show the
@@ -105,31 +126,23 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   const existing = await one(
     `SELECT * FROM ship_request WHERE project_id=$1 AND xell_id=$2
        AND status IN ('pending','approved','shipping')`, [project.id, xellId]);
-  if (existing) return { ok: true, request: existing, note: 'you already have an open ship request' };
+  if (existing) return { ok: true, request: existing,
+    note: existing.deferred_at
+      ? 'you already have a ship request — a human DEFERRED it to batch it into a combined ship; it will go when they resume it'
+      : 'you already have an open ship request' };
 
   // WHERE the ship's code comes from: local main by default (the anti-band-aid rule); a project
   // whose integration truth is remote (ship_ref like 'origin/main') gets that remote fetched
-  // FIRST so the human approves the sha that is actually current, not a stale mirror.
-  const shipRef = project.ship_ref || main;
-  if (shipRef.includes('/')) {
-    const remote = shipRef.split('/')[0];
-    const f = spawnSync('git', ['-C', project.repo_root, 'fetch', remote],
-      { encoding: 'utf8', timeout: 60000, windowsHide: true, env: cleanGitEnv() });
-    if (f.status !== 0) {
-      return { ok: false, reason: `cannot fetch ${remote} for ship_ref ${shipRef}: ${(f.stderr || '').slice(-200)}`, request: null };
-    }
-  }
-  const commit = headCommit(project.repo_root, shipRef);
-  if (!commit) return { ok: false, reason: `ship_ref "${shipRef}" does not resolve in ${project.repo_root}`, request: null };
-  // What schema rides along — decided NOW so the human approves code and migrations as one thing.
-  // Pending files are recorded EVEN when the ship skips them — the human must see exactly what a
-  // code-only ship is choosing not to run.
-  const mig = await pendingMigrations(project, commit, shipSite);
+  // FIRST so the human approves the sha that is actually current, not a stale mirror. What schema
+  // rides along is decided NOW too, so the human approves code and migrations as one thing.
+  let commit, migrations;
+  try { ({ commit, migrations } = await resolveShipCommit(project, shipSite, main)); }
+  catch (e) { return { ok: false, reason: e.message, request: null }; }
   const row = await one(
     `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id,
                                skip_migrations, db_note)
        VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10) RETURNING *`,
-    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(mig.pending || []), shipSite?.id || null,
+    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(migrations), shipSite?.id || null,
      !!skipDb, dbNote]);
   broadcast('ship', row);
 
@@ -159,6 +172,62 @@ export async function dismissShipRequest(id, by = 'human@console') {
   if (!row) throw new Error('no such ship request');
   broadcast('ship', row);
   return row;
+}
+
+// ── defer / resume: set a ship aside, then bring it back combined ─────────────
+// DEFER a pending ship: it stops nagging as "awaiting approval" and steps out of the landing-pad
+// queue, but it is NOT rejected. The request stays 'pending' (keeping the one-open-ship-per-xell
+// invariant) with deferred_at set — the "not now, keep it for a combined ship" bucket. Only a
+// pending, not-yet-deferred request can be deferred; there is no zee path to this, by design.
+export async function deferShip(id, by = 'human@console') {
+  const row = await one(
+    `UPDATE ship_request SET deferred_at=now(), deferred_by=$2
+       WHERE id=$1 AND status='pending' AND deferred_at IS NULL RETURNING *`, [id, by]);
+  if (!row) throw new Error('no such pending ship request to defer (already decided or deferred?)');
+  broadcast('ship', row);
+  logline('ship', `DEFERRED ship ${String(row.commit).slice(0, 8)} from ${by}`
+    + ' — set aside so landings can accumulate for one combined ship');
+  return row;
+}
+
+// RESUME a deferred ship: clear deferred_at so it is a live pending request again — AND re-resolve
+// it to the CURRENT main tip. That re-resolution is the whole point of deferring: while the ship
+// sat aside, other xells kept landing, so the sha (and the migration set) it was frozen at is now
+// stale. Resuming re-aims it at what main is NOW, so approving the resumed ship deploys every
+// incremental landing made since — one big shipment for many small landings.
+export async function resumeShip(id, by = 'human@console') {
+  const deferred = await one(
+    `SELECT * FROM ship_request WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL`, [id]);
+  if (!deferred) throw new Error('no such deferred ship request to resume');
+  const xell = await one(`SELECT * FROM xell WHERE id=$1`, [deferred.xell_id]);
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [deferred.project_id]);
+  const main = project.main_branch || 'main';
+  const site = deferred.site_id ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [deferred.site_id]) : null;
+
+  // The request's own work must still be on main (landings are forward-only, so a ship that was
+  // landable when deferred stays landable) — but re-check, because a resume that shipped unlanded
+  // work would be exactly the band-aid the ship gate exists to prevent.
+  const state = landedState(xell?.worktree_path, main);
+  if (!state.landed) {
+    logline('ship', `REFUSED resume of ${xell?.slug || deferred.xell_id} ship: ${state.reason}`);
+    return { ok: false, reason: state.reason, request: deferred };
+  }
+
+  let commit, migrations;
+  try { ({ commit, migrations } = await resolveShipCommit(project, site, main)); }
+  catch (e) { return { ok: false, reason: e.message, request: deferred }; }
+
+  const row = await one(
+    `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, commit=$2, migrations=$3::jsonb,
+            requested_at=now()
+       WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
+    [id, commit, JSON.stringify(migrations)]);
+  if (!row) throw new Error('ship request changed underneath the resume — reload and try again');
+  broadcast('ship', row);
+  logline('ship', `RESUMED ship for ${xell?.slug || deferred.xell_id} by ${by} @ ${String(commit).slice(0, 8)}`
+    + ` — re-aimed at the current ${main} tip (${migrations.length} pending migration(s))`);
+  notifyShipRequest({ project, xell, request: row });
+  return { ok: true, request: row };
 }
 
 export async function listShipRequests(projectId, { open = true } = {}) {

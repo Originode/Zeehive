@@ -473,6 +473,26 @@ export async function dismissShip(id) {
   return r.ok ? r.json() : null;
 }
 
+// Defer a pending ship: set it aside (not rejected) so landings can accumulate for a combined ship.
+export async function deferShip(id) {
+  const r = await fetch(`/api/ship/requests/${id}/defer`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `defer failed (${r.status})`);
+  return data;
+}
+
+// Resume a deferred ship: re-aim it at the current main tip and make it awaiting-approval again.
+export async function resumeShip(id) {
+  const r = await fetch(`/api/ship/requests/${id}/resume`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `resume failed (${r.status})`);
+  return data;
+}
+
 // Stop the auto-release countdown — for a human who is actively verifying prod.
 export async function holdProdLock(projectId, by = 'human@console') {
   const r = await fetch('/api/prod-lock/hold', {

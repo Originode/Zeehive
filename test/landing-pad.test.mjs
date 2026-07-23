@@ -48,5 +48,19 @@ ok(next && next.id === 'l1', `oldest queued (l1) flagged next-up (${next?.id})`)
 const pad3 = composePad({ landings: [landings[0]], ships: [], merging: new Set(['xa']) });
 ok(pad3.items[0].phase === 'processing', 'approved landing holding the merge lock → processing');
 
+// a DEFERRED ship (pending, but deferred_at set) is out of the runway: 'deferred' phase, no
+// position, not counted active — a human set it aside so landings can accumulate.
+const padD = composePad({
+  landings: [landings[0]],  // l1: approved landing, in-flight
+  ships: [{ id: 'sd', xell_id: 'xf', xell_slug: 'foxtrot', status: 'pending',
+            requested_at: t(5), sha: 'ffff6666', reason: 'batch me', deferred_at: t(6) }],
+  merging: new Set(),
+});
+const sd = padD.items.find((i) => i.id === 'sd');
+ok(sd.phase === 'deferred', 'deferred ship → deferred phase');
+ok(sd.position === null, 'deferred ship has no queue position');
+ok(padD.active === 1, `deferred ship not counted active (active=${padD.active})`);
+ok(padD.items.find((i) => i.id === 'l1').next === true, 'the approved landing is free to go next past a deferred ship');
+
 console.log(fail === 0 ? '\nALL PASSED ✓' : `\n${fail} FAILURE(S) ✗`);
 process.exit(fail ? 1 : 0);

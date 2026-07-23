@@ -24,6 +24,7 @@ const PHASE = {
   'awaiting-approval': { label: 'awaiting approval', cls: 'pad-await' },
   queued:              { label: 'queued',            cls: 'pad-queued' },
   processing:          { label: 'processing…',       cls: 'pad-proc' },
+  deferred:            { label: 'deferred',           cls: 'pad-stale' },
   done:                { label: 'done',               cls: 'pad-done' },
   failed:              { label: 'failed',             cls: 'pad-failed' },
   rejected:            { label: 'rejected',           cls: 'pad-rejected' },

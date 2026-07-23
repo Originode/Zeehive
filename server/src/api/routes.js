@@ -43,7 +43,7 @@ import { nudgeXellForStatus } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
-  dismissShipRequest } from '../queenzee/shipgate.js';
+  dismissShipRequest, deferShip, resumeShip } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
@@ -146,6 +146,18 @@ router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => 
 // Dismiss a shipped/failed ship card's receipt (visibility only; the ship itself is unchanged).
 router.post('/ship/requests/:id/dismiss', async (req, res) => {
   try { res.json(await dismissShipRequest(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// Defer a pending ship: set it aside (not rejected) so landings can accumulate for a combined ship.
+router.post('/ship/requests/:id/defer', async (req, res) => {
+  try { res.json(await deferShip(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// Resume a deferred ship: re-aim it at the current main tip and make it a live pending request.
+router.post('/ship/requests/:id/resume', async (req, res) => {
+  try { res.json(await resumeShip(req.params.id, req.body?.by || 'human@console')); }
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 

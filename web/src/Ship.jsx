@@ -7,7 +7,7 @@
 //      "let it go" — an unattended hold blocks every other xell. HOLD stops the clock for a human
 //      who is actively verifying.
 import React, { useState, useEffect, useRef } from 'react';
-import { decideShip, dismissShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
+import { decideShip, dismissShip, deferShip, resumeShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
@@ -81,7 +81,10 @@ function LiveBuildLog({ lines }) {
 function ShipCard({ req, live, prodSites, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
-  const pending = req.status === 'pending';
+  // A DEFERRED ship is still 'pending' server-side, but a human set it aside for a combined ship.
+  // It shows a quiet "deferred" card with Resume, not the loud approve/reject actions.
+  const deferred = req.status === 'pending' && !!req.deferred_at;
+  const pending = req.status === 'pending' && !deferred;
   // WHERE this ship deploys. One production → nothing to choose, it ships there (the recorded
   // site). More than one → a human picks in THIS dialog, defaulting to the request's recorded
   // site (the project default) — approving with a different pick re-aims the ship, and the server
@@ -106,14 +109,34 @@ function ShipCard({ req, live, prodSites, onDone }) {
     finally { setBusy(false); }
   };
 
+  // DEFER: set the ship aside without rejecting it, so other xells' landings can pile up on main
+  // and one combined ship carries them all. RESUME re-aims it at the current main tip.
+  const defer = async () => {
+    if (!(await showConfirm(
+      `Defer this ship from ${req.xell_slug}?\n\n`
+      + `It is set aside — NOT rejected — and stops asking for approval, so landings from other `
+      + `xells can accumulate on main. Resume it later to ship everything at once (it re-aims at `
+      + `the current main tip when you do).`,
+      { okLabel: 'Defer' }))) return;
+    setBusy(true); setErr(null);
+    try { await deferShip(req.id); onDone?.(); } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  const resume = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await resumeShip(req.id);
+      if (r && r.ok === false) setErr(r.reason || 'could not resume'); else onDone?.();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
   return (
-    <div className={`ship-card s-${req.status}`}>
+    <div className={`ship-card s-${req.status}${deferred ? ' deferred' : ''}`}>
       <div className="land-head">
         <span className="land-what">
           <b>{req.xell_slug}</b> wants to ship <b>{short(req.commit)}</b> to{' '}
           <b>PRODUCTION{!pending && siteName ? ` @ ${siteName}` : ''}</b>
         </span>
-        <span className="land-meta">{req.status}</span>
+        <span className="land-meta">{deferred ? 'deferred' : req.status}</span>
         {(req.status === 'shipped' || req.status === 'failed') && (
           <button className="drawer-close ship-dismiss" title="Dismiss this notification"
                   onClick={async () => { await dismissShip(req.id); onDone?.(); }}>✕</button>
@@ -163,13 +186,32 @@ function ShipCard({ req, live, prodSites, onDone }) {
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
       {req.status === 'shipped' && <div className="ship-progress done">★ LIVE — shipped {req.finished_at ? `at ${new Date(req.finished_at).toLocaleTimeString()}` : ''}</div>}
       {req.status === 'failed' && <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>}
+      {deferred && (
+        <div className="ship-deferred" data-testid="ship-deferred">
+          ⏸ deferred{req.deferred_by ? ` by ${req.deferred_by}` : ''} — set aside so other xells' landings
+          collect on main. Resume to ship the combined result (it re-aims at the current main tip).
+        </div>
+      )}
       <ShipResults results={req.containers} />
       {err && <div className="land-err">{err}</div>}
       {pending && (
         <div className="land-actions">
           <button className="land-reject" disabled={busy} onClick={() => decide('reject')}>Reject</button>
+          {/* Defer: not now — keep it, let landings accumulate, ship once (see deferShip). */}
+          <button className="ship-defer" data-testid="ship-defer" disabled={busy} onClick={defer}
+                  title="Set aside without rejecting — resume later for one combined ship">
+            Defer
+          </button>
           <button className="ship-approve" disabled={busy} onClick={() => decide('approve')}>
             {busy ? '…' : 'Approve → ship to prod'}
+          </button>
+        </div>
+      )}
+      {deferred && (
+        <div className="land-actions">
+          <button className="land-reject" disabled={busy} onClick={() => decide('reject')}>Reject</button>
+          <button className="ship-approve" data-testid="ship-resume" disabled={busy} onClick={resume}>
+            {busy ? '…' : 'Resume → awaiting approval'}
           </button>
         </div>
       )}
@@ -244,13 +286,18 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
     return () => { live = false; };
   }, [projectId, open.length]);
   if (!open.length && !prodLock) return null;
-  const pending = open.filter((s) => s.status === 'pending').length;
+  // Deferred ships are still 'pending' server-side but a human set them aside, so they do NOT count
+  // toward the loud "awaiting your approval" alarm — they render as quiet deferred cards.
+  const pending = open.filter((s) => s.status === 'pending' && !s.deferred_at).length;
+  const deferred = open.filter((s) => s.status === 'pending' && s.deferred_at).length;
   return (
     <section className={`ship-panel${pending ? ' urgent' : ''}`}>
       <div className="ship-title">
         {pending
           ? `⚠ ${pending} PRODUCTION ship${pending === 1 ? '' : 's'} awaiting your approval`
-          : '⇪ production'}
+          : deferred
+            ? `⏸ ${deferred} ship${deferred === 1 ? '' : 's'} deferred — resume for one combined ship`
+            : '⇪ production'}
       </div>
       <LockCountdown lock={prodLock} projectId={projectId} onChanged={onDecided} />
       {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} prodSites={prodSites} onDone={onDecided} />)}

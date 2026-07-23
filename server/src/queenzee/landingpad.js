@@ -47,7 +47,7 @@ export async function buildLandingPad(projectId) {
 
   const ships = await q(
     `SELECT s.id, s.xell_id, x.slug AS xell_slug, s.status, s.requested_at, s.decided_at,
-            s.finished_at, s.commit AS sha, s.reason
+            s.finished_at, s.commit AS sha, s.reason, s.deferred_at
        FROM ship_request s JOIN xell x ON x.id = s.xell_id
       WHERE s.project_id = $1 AND s.dismissed_at IS NULL
         AND (s.status IN ('pending','approved','shipping')
@@ -71,6 +71,9 @@ export async function buildLandingPad(projectId) {
 // currently holding the land merge lock (a landing mid ref-move).
 export function composePad({ landings = [], ships = [], merging = new Set() }) {
   const phaseOf = (r, kind) => {
+    // A DEFERRED ship is pending but set aside — it is out of the runway queue (no position, no
+    // spinner), waiting for a human to resume it, so it never counts as awaiting-approval work.
+    if (r.deferred_at) return 'deferred';
     if (r.status === 'pending') return 'awaiting-approval';
     if (kind === 'landing') {
       if (r.status === 'approved') return merging.has(r.xell_id) ? 'processing' : 'queued';
