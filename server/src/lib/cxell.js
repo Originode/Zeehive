@@ -700,6 +700,28 @@ export async function sendKeysToCxellZee({ sshPort, slug, text, sessionId, sessi
   return { sent: true, text };
 }
 
+// WRITE a file INTO a live cxell's /work/repo — the delivery path for an operator's rich message
+// (image attachments + a long-text body handed over as real files the zee can open, rather than
+// mashed through the terminal). The write runs as the container's DEFAULT user — the same user the
+// repo is cloned as — so whatever lands is readable by the zee. base64 payloads are decoded in the
+// container; text payloads are written verbatim. The relative path is confined to the repo (leading
+// slashes and any `..`/`.` segments are stripped) so a message can never escape /work/repo. Rejects
+// on a docker/transport failure; the caller decides whether that is fatal.
+export async function writeFileIntoCxell({ ctx = 'default', slug, relPath, base64 = null, text = null, timeoutMs = 30000 }) {
+  const name = cxellName(slug);
+  const safe = String(relPath).replace(/\\/g, '/').split('/')
+    .filter((seg) => seg && seg !== '.' && seg !== '..').join('/');
+  if (!safe) throw new Error('empty target path');
+  const full = `/work/repo/${safe}`;
+  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const dir = full.replace(/\/[^/]*$/, '');
+  const decode = base64 != null;
+  const cmd = ['exec', '-i', name, 'bash', '-lc',
+    `mkdir -p ${sq(dir)} && ${decode ? 'base64 -d' : 'cat'} > ${sq(full)}`];
+  await dk(ctx, cmd, { input: decode ? String(base64) : String(text ?? ''), timeoutMs });
+  return { path: full, rel: safe };
+}
+
 export async function removeCxell({ ctx, slug }) {
   await dk(ctx, ['rm', '-f', cxellName(slug)]).catch(() => {});
   // pre-rename containers (zee_cage_<slug>) from the old-vocabulary era — idempotent, so this

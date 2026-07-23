@@ -3,6 +3,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup } from './api.js';
+import MessageComposer from './MessageComposer.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
@@ -156,6 +157,7 @@ export default function App() {
   useEffect(() => { setSplit(readSplit(orientation)); }, [orientation]);
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
+  const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
@@ -449,6 +451,7 @@ export default function App() {
     if (!x || x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
+    if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
     if (kind === 'build') {
       if (x.stack.some(isBusy)) { showAlert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
@@ -545,6 +548,13 @@ export default function App() {
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
                        onClose={() => setTermXell(null)} />
+        )}
+        {msgXell && (
+          <MessageComposer xell={msgXell} onClose={() => setMsgXell(null)}
+                           onSent={(r) => { const id = `msg-${msgXell.id}-${Date.now()}`;
+                             pushToast({ id, kind: 'success', title: `Message sent to ${msgXell.slug}`, onRetry: null,
+                               body: r?.attachments?.length ? `${r.attachments.length} attachment(s) delivered to its .zee-inbox` : 'typed into its live session' });
+                             setTimeout(() => dismissToast(id), 6000); }} />
         )}
       </section>
 

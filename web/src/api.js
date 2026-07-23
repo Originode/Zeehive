@@ -558,6 +558,14 @@ export const prXell = (id, note) => xellVerb(id, 'pr', { note });
 // means there was no live cxell zee to reach.
 export const nudgeXell = (id) => xellVerb(id, 'nudge');
 
+// Send a composed operator message — long text and/or image attachments ([{ name, type, data }],
+// data being a base64 / data-URL string) — to the xell's live cxell zee. Images and long text are
+// handed over as files in the cxell's .zee-inbox with a pointer typed into the live session; short
+// text is typed inline. Resolves { sent, attachments?, reason? } — sent:false (not a throw) means
+// there was no live cxell zee to reach.
+export const sendXellMessage = (id, { text, images } = {}) =>
+  xellVerb(id, 'message', { text: text || '', images: images || [] });
+
 // File a production ship request for this xell (the operator asking on the zee's behalf). It is
 // REFUSED server-side unless the work is already landed on main; a human then approves it in the
 // ship panel (or auto-approve does). Returns { ok, request?, reason? }.

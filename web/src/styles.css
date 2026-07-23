@@ -1201,3 +1201,39 @@ a.cbox:hover { border-color: var(--accent); }
 .tstat { font-size: 11px; padding: 0 6px; border-radius: 5px; margin-left: 8px; }
 .tstat.t-live { color: #35c46b; } .tstat.t-connecting { color: #e0a53b; }
 .tstat.t-closed, .tstat.t-error { color: #e5554e; }
+
+/* ── message composer (long text + images → a xell's live cxell zee) ─────────── */
+.msg-back { position: absolute; inset: 0; z-index: 22; display: flex; align-items: center;
+  justify-content: center; background: rgba(6,8,12,.6); backdrop-filter: blur(3px); }
+.msg-modal { width: min(560px, 92%); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.6); display: flex;
+  flex-direction: column; gap: 10px; }
+.msg-head { display: flex; align-items: center; }
+.msg-title { font-size: 14px; color: var(--muted); }
+.msg-title b { color: var(--text); }
+.msg-x { margin-left: auto; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; }
+.msg-x:hover { color: var(--text); }
+.msg-sub { font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+.msg-sub code { background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.msg-ta { min-height: 140px; resize: vertical; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 10px; color: var(--text); padding: 10px 12px; font-size: 13px; line-height: 1.5;
+  font-family: 'Segoe UI', sans-serif; }
+.msg-ta:focus { outline: none; border-color: var(--accent); }
+.msg-ta.dragging { border-color: var(--accent); background: rgba(91,140,255,.08); }
+.msg-thumbs { display: flex; flex-wrap: wrap; gap: 8px; }
+.msg-thumb { position: relative; width: 72px; height: 72px; border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--line); background: var(--panel2); }
+.msg-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.msg-thumb-x { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%;
+  border: none; background: rgba(6,8,12,.75); color: #fff; cursor: pointer; font-size: 10px; line-height: 1; }
+.msg-thumb-x:hover { background: var(--down, #e5554e); }
+.msg-err { font-size: 12px; color: var(--down, #e5554e); }
+.msg-foot { display: flex; align-items: center; gap: 12px; }
+.msg-attach { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; color: var(--text);
+  padding: 7px 12px; cursor: pointer; font-size: 12.5px; }
+.msg-attach:hover { border-color: var(--accent); }
+.msg-hint { font-size: 11px; color: var(--muted); }
+.msg-send { margin-left: auto; background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  border-radius: 8px; padding: 8px 18px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.msg-send:disabled { opacity: .45; cursor: not-allowed; }
+.msg-send:hover:not(:disabled) { filter: brightness(1.08); }

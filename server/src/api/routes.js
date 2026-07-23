@@ -39,7 +39,7 @@ import { discoverSite, adoptContainers } from '../lib/discovery.js';
 import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
-import { nudgeXellForStatus } from '../queenzee/nudge.js';
+import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
@@ -770,6 +770,16 @@ router.post('/xells/:id/pr', async (req, res) => {
 // returns { nudged:false, reason } (200) when there is no live zee to reach, so the UI can say so.
 router.post('/xells/:id/nudge', async (req, res) => {
   try { res.json(await nudgeXellForStatus(req.params.id, { by: req.body?.by || 'human@console' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Send a COMPOSED message — long text and/or image attachments — to this xell's live cxell zee, for
+// when the raw terminal is too clumsy. Images and long/multi-line text are handed to the zee as real
+// files under its .zee-inbox and a pointer is typed into the live session; short text is typed inline.
+// Body: { text, images: [{ name, type, data }], by }. Returns { sent, attachments?, reason?/error? }.
+router.post('/xells/:id/message', async (req, res) => {
+  try { res.json(await sendMessageToXell(req.params.id, {
+    text: req.body?.text || '', images: req.body?.images || [], by: req.body?.by || 'human@console' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
