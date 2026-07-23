@@ -14,7 +14,7 @@ import { logline } from './logbus.js';
 import { cleanGitEnv, headCommit, isAncestor } from './git.js';
 import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
-         remoteAccess, pushRemote, openPullRequest } from './remote-git.js';
+         remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
 import { resolveSite } from './sites.js';
@@ -325,8 +325,12 @@ export async function pushProject(id, by = 'human@console') {
   return r;
 }
 
-// Open a PR from local main. Human-triggered; the console may pass a head branch name / title.
-export async function pullRequestProject(id, { headBranch = null, title = null, base = null } = {}, by = 'human@console') {
+// Open a PR from local main — and, when `merge` is set, MERGE it too (pull-request AND merge).
+// Human-triggered; the console may pass a head branch name / title, a merge flag and a merge method
+// ('merge' | 'squash' | 'rebase'). The merge is a separate GitHub call after the PR is opened, so a
+// refused merge (branch protection, not-yet-mergeable) still leaves an OPEN PR the human can finish
+// by hand — the outcome is reported as r.merge = {merged, state, reason}.
+export async function pullRequestProject(id, { headBranch = null, title = null, base = null, merge = false, mergeMethod = 'merge' } = {}, by = 'human@console') {
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { opened: false, reason: 'project has no remote_url — set one in Project setup first' };
@@ -343,6 +347,13 @@ export async function pullRequestProject(id, { headBranch = null, title = null, 
     headBranch, title, base,
   });
   if (r.opened) logline('projects', `${by} opened PR on ${p.name}: ${r.head} → ${r.base}${r.number ? ` (#${r.number})` : ''} [${r.state}]`);
+
+  if (merge && r.opened && r.number) {
+    const m = await mergePullRequest({ remoteUrl: p.remote_url, token, number: r.number, method: mergeMethod, title });
+    r.merge = m;
+    if (m.merged) logline('projects', `${by} merged PR #${r.number} on ${p.name} → ${r.base} (${m.method}, ${(m.sha || '').slice(0, 8)})`);
+    else logline('projects', `${by} opened PR #${r.number} on ${p.name} but merge was refused: ${m.reason}`);
+  }
   return r;
 }
 
