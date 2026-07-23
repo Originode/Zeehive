@@ -123,57 +123,123 @@ async function ledgerFiles(project, db, sha) {
 // to the default site.
 async function prodDb(project, site = null) {
   const c = await one(
-    `SELECT name, docker_ctx, tier, host_port FROM container
+    `SELECT name, docker_ctx, tier, host_port, conn_ref FROM container
       WHERE project_id=$1 AND role='db' AND tier='prod'
         AND ($2::uuid IS NULL OR site_id = $2::uuid OR (site_id IS NULL AND $3)) LIMIT 1`,
     [project.id, site?.id || null, !!site?.is_default]);
   if (!c) return null;
   return {
     ctx: c.docker_ctx, container: await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }),
-    tier: c.tier, host_port: c.host_port, logical: c.name,
+    tier: c.tier, host_port: c.host_port, conn_ref: c.conn_ref, logical: c.name,
     // db identity is a project fact (spec Appendix A); env vars are last-resort fallback
     user: project.db_user || config.prodDbUser || 'postgres',
     name: project.db_name || config.prodDbName || 'omnibiz',
   };
 }
 
-// ASSERT THE TARGET before any write. resolveRealDbContainer maps the registry's logical prod name
-// to a running container by durable identity, but a migration is irreversible — so before we apply
-// anything we INDEPENDENTLY re-confirm the container we hold really is the registry's PRODUCTION
-// database:
+// The network host a conn_ref names — `postgresql://zeehive@meta-db:5432/zeehive` → `meta-db`.
+// Only a DNS-style host counts: an IP, `localhost`, or the literal `null` some legacy rows carry
+// is not an identity docker can confirm. Exported so the pure decision can be unit-tested.
+export function connRefAlias(connRef) {
+  try {
+    const h = new URL(connRef).hostname;
+    return /^[a-z][a-z0-9_.-]*$/i.test(h) && h !== 'null' && h !== 'localhost' ? h : null;
+  } catch { return null; }
+}
+
+// Which ADDRESS the registry recorded for this row, and how docker must confirm it — PURE.
+// A published host_port where the row has one; otherwise the network alias its conn_ref names,
+// where the database publishes NOTHING and is reachable only on a docker network. A row carrying
+// NEITHER is unaddressed and proves nothing.
+//   → { mode: 'port', port }  |  { mode: 'alias', alias }  |  { mode: 'none' }
+export function prodDbAddress(db) {
+  if (db.host_port != null) return { mode: 'port', port: Number(db.host_port) };
+  const alias = connRefAlias(db.conn_ref);
+  return alias ? { mode: 'alias', alias } : { mode: 'none' };
+}
+
+// The docker inspect --format template for an address mode. Alias needs the network membership;
+// a published port needs the port bindings.
+function inspectFormatFor(mode) {
+  return mode === 'alias' ? '{{json .NetworkSettings.Networks}}' : '{{json .NetworkSettings.Ports}}';
+}
+
+// PURE DECISION over (row-handle, docker-inspect-result) — the same shape pickDbContainer uses:
+// no I/O, exported for tests. `inspect` mirrors a spawnSync result: { status, stdout, stderr }
+// (pass null when we deliberately skipped the daemon because the pre-conditions already fail).
+//
+// resolveRealDbContainer maps the registry's logical prod name to a running container by durable
+// identity, but a migration is irreversible — so before we apply anything we INDEPENDENTLY
+// re-confirm the container we hold really is the registry's PRODUCTION database:
 //   • the row we selected is tier='prod' (never a dev / clone row), and
-//   • docker's OWN report says that container publishes the row's host_port on this context — the
-//     same durable fact the resolver used, checked a second time against the live daemon.
-// A ship that cannot PROVE which database it is talking to must not write to it: on 2026-07-23 a
-// prod ship applied its migrations to a 7.7MB dev clone and reported success.
-export async function assertProdDbTarget(db) {
+//   • docker's OWN report says that container carries the ADDRESS the registry recorded for the
+//     row — the published host_port where the row has one (omnibiz prod: 10.2.0.16:5432), or the
+//     network alias its conn_ref names where the database publishes NOTHING and is reachable only
+//     on a docker network (Zeehive's own meta db answers to `meta-db` on zeehive_default, and its
+//     Ports map is {"5432/tcp": null} by design).
+// A row carrying NEITHER address is refused: an unaddressed row proves nothing. And recording a
+// port the container does not publish, to get past this guard, re-creates precisely the hazard it
+// exists to stop — a stranger binding that port later would read as "this is prod".
+// On 2026-07-23 a prod ship applied its migrations to a 7.7MB dev clone and reported success.
+export function decideProdDbTarget(db, inspect) {
   if (db.tier !== 'prod') {
     return { ok: false, error: `refusing to migrate ${db.container}: the selected registry row is `
       + `tier='${db.tier}', not 'prod'` };
   }
-  if (db.host_port == null) {
-    return { ok: false, error: `refusing to migrate ${db.container}: the prod db row records no `
-      + 'host_port, so its identity cannot be confirmed — record it before shipping migrations' };
+
+  const addr = prodDbAddress(db);
+  if (addr.mode === 'none') {
+    return { ok: false, error: `refusing to migrate ${db.container}: the prod db row records neither `
+      + 'a host_port nor a network host in conn_ref, so its identity cannot be confirmed — record '
+      + 'one before shipping migrations' };
   }
-  const r = spawnSync('docker', ['--context', db.ctx, 'inspect', '--format',
-    '{{json .NetworkSettings.Ports}}', db.container],
-    { encoding: 'utf8', timeout: 15000, windowsHide: true });
-  if (r.status !== 0) {
+
+  if (!inspect || inspect.status !== 0) {
+    const tail = (inspect?.stderr || inspect?.error?.message || '').trim().split('\n').pop();
     return { ok: false, error: `refusing to migrate: cannot inspect ${db.container} on ${db.ctx} to `
-      + `confirm it is prod — ${(r.stderr || '').trim().split('\n').pop()?.slice(0, 160)}` };
+      + `confirm it is prod — ${(tail || '').slice(0, 160)}` };
   }
-  const published = new Set();
-  try {
-    for (const binds of Object.values(JSON.parse(r.stdout || '{}') || {})) {
-      for (const b of (binds || [])) if (b?.HostPort) published.add(Number(b.HostPort));
+
+  let seen;
+  try { seen = JSON.parse(inspect.stdout || '{}') || {}; } catch { seen = {}; }
+
+  if (addr.mode === 'alias') {
+    const names = new Set();
+    for (const net of Object.values(seen)) {
+      for (const n of [...(net?.Aliases || []), ...(net?.DNSNames || [])]) names.add(n);
     }
-  } catch { /* leave published empty → mismatch below */ }
-  if (!published.has(Number(db.host_port))) {
+    if (!names.has(addr.alias)) {
+      return { ok: false, error: `refusing to migrate ${db.container}: it does not answer to the prod `
+        + `db row's network name '${addr.alias}' (aliases: ${[...names].join(', ') || 'none'}). This is `
+        + 'NOT the registry\'s production database — aborting before any write.' };
+    }
+    return { ok: true };
+  }
+
+  const published = new Set();
+  for (const binds of Object.values(seen)) {
+    for (const b of (binds || [])) if (b?.HostPort) published.add(Number(b.HostPort));
+  }
+  if (!published.has(addr.port)) {
     return { ok: false, error: `refusing to migrate ${db.container}: it does not publish the prod db `
       + `row's host_port ${db.host_port} (published: ${[...published].join(', ') || 'none'}). This is `
       + 'NOT the registry\'s production database — aborting before any write.' };
   }
   return { ok: true };
+}
+
+// ASSERT THE TARGET before any write. Thin I/O wrapper over decideProdDbTarget: pick the inspect
+// format the address mode needs, run docker (skipping the daemon call entirely when the row already
+// fails on tier or carries no address — those refusals need no daemon), and let the pure decider
+// judge. See decideProdDbTarget for the full rationale.
+export async function assertProdDbTarget(db) {
+  const addr = prodDbAddress(db);
+  const inspect = (db.tier === 'prod' && addr.mode !== 'none')
+    ? spawnSync('docker', ['--context', db.ctx, 'inspect', '--format',
+      inspectFormatFor(addr.mode), db.container],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true })
+    : null;
+  return decideProdDbTarget(db, inspect);
 }
 
 // What would this ship apply? Called at REQUEST time so the human approves with the list in view.

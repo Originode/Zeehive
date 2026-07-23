@@ -101,6 +101,26 @@ try {
   a = await assertProdDbTarget({ ...dbHandle, tier: 'dev' });
   ok(a.ok === false && /tier='dev'/.test(a.error), 'ABORTS when the selected row is not tier=prod');
 
+  // Zeehive's own prod meta db: host_port NULL, identity is the conn_ref network alias. This runs
+  // the REAL spawnSync wrapper — proving assertProdDbTarget requests the Networks format and reads
+  // .NetworkSettings.Networks[*].Aliases, not just the port path. (The fake docker inspect returns
+  // whatever we stash for the container, regardless of --format.)
+  const meta = { ctx, container: `zt${tag}_meta_db`, tier: 'prod', host_port: null,
+    conn_ref: 'postgresql://zeehive@meta-db:5432/zeehive' };
+  setState({ inspect: { [meta.container]: { zeehive_default: { Aliases: [meta.container, 'meta-db'] } } } });
+  ok((await assertProdDbTarget(meta)).ok === true, 'passes when the container answers to the conn_ref alias (meta-db)');
+
+  setState({ inspect: { [meta.container]: { zeehive_default: { Aliases: [meta.container] } } } });
+  a = await assertProdDbTarget(meta);
+  ok(a.ok === false && /does not answer to the prod db row's network name 'meta-db'/.test(a.error),
+     'ABORTS when the container lacks the meta-db alias (wrong container)');
+
+  // docker inspect exits non-zero → REFUSED, and the message names the container AND the context.
+  setState({ inspect: {} });   // fake docker exits 1 with "No such object: <name>"
+  a = await assertProdDbTarget(meta);
+  ok(a.ok === false && a.error.includes(meta.container) && a.error.includes(ctx) && /cannot inspect/.test(a.error),
+     'ABORTS naming the container and context when docker inspect fails');
+
   // ── 5. applyMigrations aborts BEFORE writing when the target is not prod ─────────────────────────
   console.log('applyMigrations: aborts before any write on a mismatched target');
   const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
