@@ -395,3 +395,39 @@ export async function openPullRequest({ repoRoot, remoteUrl, token, branch = 'ma
   }
   return { opened: true, state: 'opened', url: r.body?.html_url || null, number: r.body?.number || null, head, base: baseBranch };
 }
+
+// MERGE a pull request on the remote (GitHub REST `PUT /pulls/{number}/merge`). Human-gated, exactly
+// like open — a read-only PAT (or branch protection the token can't satisfy) is refused LOUDLY as
+// {merged:false, reason}, never forced. `method` is GitHub's merge strategy: 'merge' (default),
+// 'squash' or 'rebase'. A PR that isn't mergeable yet (GitHub still computing, or a conflict) comes
+// back 405 → {state:'not-mergeable'}; a head that moved since we read it comes back 409 →
+// {state:'conflict'}. Nothing here touches the local checkout — the merge happens entirely on GitHub.
+export async function mergePullRequest({ remoteUrl, token, number, method = 'merge', title, message } = {}) {
+  if (!remoteUrl || !number) return { merged: false, state: 'error', reason: 'remoteUrl and a PR number are required to merge' };
+  if (!token) return { merged: false, state: 'error', reason: 'a GitHub token with write access is required to merge' };
+  const slug = parseGitHubSlug(remoteUrl);
+  if (!slug) return { merged: false, state: 'error', reason: 'remote is not a GitHub URL — PRs are GitHub-only' };
+  const merge_method = new Set(['merge', 'squash', 'rebase']).has(method) ? method : 'merge';
+
+  const r = await githubApi(slug, `/repos/${slug.owner}/${slug.repo}/pulls/${number}/merge`, {
+    token, method: 'PUT',
+    body: {
+      merge_method,
+      ...(title ? { commit_title: String(title) } : {}),
+      ...(message ? { commit_message: String(message) } : {}),
+    },
+  });
+  if (!r.ok) {
+    // 405 = "not mergeable" (conflict / checks / mergeability still computing); 409 = head moved.
+    const state = r.status === 405 ? 'not-mergeable' : r.status === 409 ? 'conflict' : r.status === 403 ? 'refused' : 'error';
+    return {
+      merged: false, number, state,
+      reason: state === 'not-mergeable' ? `pull request #${number} is not mergeable yet: ${r.error}`
+        : state === 'conflict' ? `PR #${number} head moved since it was read — re-open and retry: ${r.error}`
+        : state === 'refused' ? 'the GitHub token cannot merge here (needs write access; branch protection may require a review/checks)'
+        : `could not merge PR #${number}: ${r.error}`,
+    };
+  }
+  // GitHub returns {merged:true, sha, message} on success.
+  return { merged: !!r.body?.merged, number, state: 'merged', sha: r.body?.sha || null, method: merge_method };
+}
