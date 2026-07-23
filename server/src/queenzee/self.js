@@ -52,7 +52,9 @@ export async function selfStatus(xell) {
     { ...xell, zee_status: zee?.status },
     {
       landPending: land ? ['pending', 'approved'].includes(land.status) : false,
-      shipPending: ship ? ['pending', 'approved', 'shipping'].includes(ship.status) : false,
+      // A DEFERRED ship (pending, but a human set it aside for a combined ship) is not "awaiting a
+      // human" — it matches how fleet.js derives the hive status, so the zee sees itself as a human does.
+      shipPending: ship ? (['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at) : false,
       tendPending: tend,
       landHint, shipHint,
       prodUnprotected: xell.is_production && !!lock,
@@ -74,7 +76,10 @@ export async function selfStatus(xell) {
       : null,
     ship: ship
       ? { status: ship.status, commit: ship.commit, decided_by: ship.decided_by,
-          pending: ['pending', 'approved', 'shipping'].includes(ship.status) }
+          // deferred: a human set this ship aside to batch it into one combined ship; it is NOT
+          // rejected and NOT awaiting approval — it goes when they resume it.
+          deferred: !!ship.deferred_at,
+          pending: ['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at }
       : null,
     prod_bind: prodBind
       ? { id: prodBind.id, status: prodBind.status, pending: prodBind.status === 'pending' }
