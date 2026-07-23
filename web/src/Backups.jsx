@@ -148,6 +148,7 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
                       simulated
                     </span>
                   )}
+                  {b.dest_ctx && <span className="bkdest" title={`on docker context ${b.dest_ctx}`}>{b.dest_ctx}</span>}
                   <span className="bkpath mono" title={b.dump_path}>{b.dump_path}</span>
                   <span className="bkacts">
                     <button className="bkbtn sm" onClick={() => copy(b.dump_path)}>Copy path</button>
@@ -185,6 +186,7 @@ function BackupSettings({ backup, projectId, onClose }) {
   const cfg = backup?.config || {};
   const init = splitInterval(cfg.backup_interval_sec ?? 86400);
   const [dir, setDir] = useState(cfg.backup_dir || '');
+  const [ctx, setCtx] = useState(cfg.backup_ctx || '');
   const [ival, setIval] = useState(init.value);
   const [unit, setUnit] = useState(init.unit);
   const [maxB, setMaxB] = useState(cfg.max_backups ?? 14);
@@ -198,6 +200,7 @@ function BackupSettings({ backup, projectId, onClose }) {
       await setBackupConfig({
         project: projectId,
         backup_dir: dir.trim() || null,
+        backup_ctx: ctx.trim() || null,
         backup_interval_sec: Math.round(Number(ival) * mult),
         max_backups: Number(maxB),
       });
@@ -213,9 +216,18 @@ function BackupSettings({ backup, projectId, onClose }) {
           <button className="term-x" onClick={onClose} title="Close">✕</button>
         </div>
         <div className="bkcfg-body">
+          <label>Destination (docker context)
+            <input value={ctx} placeholder="(blank: this host — e.g. ugreen-nas for the NAS)"
+                   onChange={(e) => setCtx(e.target.value)} spellCheck={false} data-testid="backup-ctx" />
+            <span className="bkhint">a docker context whose host owns the location below (no SMB
+              credentials needed). Blank = write to this host. Verified reachable on Save — an
+              unreachable context is refused, never silently written locally.</span>
+          </label>
           <label>Backup location
             <input value={dir} placeholder="(default: <repo>/db_backups)"
                    onChange={(e) => setDir(e.target.value)} spellCheck={false} />
+            <span className="bkhint">a directory ON the destination host
+              (e.g. /volume3/maki/Backups/Omnibiz/db)</span>
           </label>
           <label>Backup interval
             <span className="bkival">

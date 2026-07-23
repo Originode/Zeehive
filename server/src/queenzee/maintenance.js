@@ -19,6 +19,7 @@ import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { resolveSite } from '../lib/sites.js';
+import { listContainersDetailed } from '../lib/docker.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -51,17 +52,79 @@ function execAsync(cmd, args, { timeout = 600000 } = {}) {
   });
 }
 
+// STREAM one process's stdout straight into another's stdin, so a 1.2 GB dump never lands on the
+// queenzee host. This replaces the old "pg_dump to the container's /tmp, then docker cp to the
+// host" — over the mardale link that copy leg alone was ~10 minutes for 1.2 GB, and it also
+// stranded ~870 MB in the container's writable layer on every failed copy. Here the src's stdout
+// (the dump) flows through the queenzee only as bytes-in-transit into the dst's stdin (which
+// writes it to the destination host's bind mount). Resolves with BOTH child statuses + the dst's
+// captured stdout (used to read back the written size) and stderr from either side. Never rejects.
+function execPipe(a, b, { timeout = 1800000 } = {}) {
+  return new Promise((resolveP) => {
+    let dstOut = '', srcErr = '', dstErr = '', timedOut = false, srcDone = false, dstDone = false;
+    let srcStatus = null, dstStatus = null, src, dst;
+    const finish = () => {
+      if (!srcDone || !dstDone) return;
+      clearTimeout(timer);
+      resolveP({ srcStatus, dstStatus, dstStdout: dstOut, srcStderr: srcErr, dstStderr: dstErr, timedOut });
+    };
+    try {
+      src = spawn(a.cmd, a.args, { windowsHide: true });
+      dst = spawn(b.cmd, b.args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    } catch (e) {
+      return resolveP({ srcStatus: -1, dstStatus: -1, dstStdout: '', srcStderr: String(e?.message || e), dstStderr: '', timedOut });
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { src.kill('SIGKILL'); } catch { /* gone */ }
+      try { dst.kill('SIGKILL'); } catch { /* gone */ }
+    }, timeout);
+    src.stdout.pipe(dst.stdin);
+    // if pg_dump dies, tear down the writer so it can't finalize a truncated file as "ok"
+    src.stdout.on('error', () => { try { dst.stdin.destroy(); } catch { /* gone */ } });
+    dst.stdin.on('error', () => { /* dst exited early; src close will surface the real status */ });
+    src.stderr?.on('data', (d) => { srcErr += d; });
+    dst.stdout?.on('data', (d) => { dstOut += d; });
+    dst.stderr?.on('data', (d) => { dstErr += d; });
+    src.on('error', (e) => { srcErr += String(e?.message || e); srcStatus = srcStatus ?? -1; srcDone = true; finish(); });
+    dst.on('error', (e) => { dstErr += String(e?.message || e); dstStatus = dstStatus ?? -1; dstDone = true; finish(); });
+    src.on('close', (code) => { srcStatus = code; srcDone = true; finish(); });
+    dst.on('close', (code) => { dstStatus = code; dstDone = true; finish(); });
+  });
+}
+
 // A real backup MUST be a valid pg_dump custom-format (-Fc) archive — those begin with the
 // 5-byte magic "PGDMP". Anything else means the dump never actually produced the data (an empty
 // or truncated file, a plain-text error captured to the path, a simulated placeholder), and
 // recording it as a 'finished' backup hands the operator a restore point that would WIPE a real
-// database and put ~nothing back. So a dump that isn't a real archive, or is implausibly small
-// for a database, is a FAILURE — not a tiny success. Throws with a human-readable reason.
-// (min_bytes: a genuinely empty prod DB still dumps a full TOC — a real -Fc archive is never
-// this small; a few hundred bytes means the dump body is missing.)
+// database and put ~nothing back.
+//
+// But "is it a valid archive?" is NOT enough — that is precisely how regression 2 slipped through.
+// The 7,643-byte dump of the WRONG database (a dev clone with only the zeehive_migrations ledger)
+// IS a valid PGDMP archive; it just contains an empty database. An absolute byte floor calibrated
+// for TRUNCATED files (512 B) waves it through. Restoring it with `pg_restore --clean --if-exists`
+// would DROP production's objects and put a ledger table back. So the guard now checks two more
+// things the archive-magic never could:
+//   • RELATIVE SIZE — a valid backup of the same prod DB does not lose ~all of its bytes overnight.
+//     Compared against the last good backup; a collapse past MIN_SIZE_RATIO fails loudly.
+//   • CONTENT — the dump's TOC must actually contain application tables (not ONLY the migration
+//     ledger), and must not have lost a schema the last good backup had. This is what catches
+//     "valid archive of the wrong/empty database" that size and magic alone cannot.
 const DUMP_MAGIC = 'PGDMP';
+// Truncation floor only — a real -Fc archive is never smaller than a full TOC. The wrong-database
+// case is caught by the relative + content guards below, NOT by this.
 const MIN_REAL_DUMP_BYTES = 512;
-export function assertValidDump(path, size) {
+// A backup that lost more than this fraction of the last good backup's size is treated as a
+// collapse (regression 2 was 1.2 GB → 7.6 KB, a 99.9994% drop). 0.5 tolerates ordinary variation
+// and even a halving of the database, while still catching any gross wrong-DB/empty dump.
+const MIN_SIZE_RATIO = 0.5;
+// Tables that a NON-empty application dump must contain MORE than — a dump whose only table is a
+// migration ledger is an empty database wearing a valid archive's clothes (regression 2 exactly).
+const LEDGER_TABLES = new Set(['zeehive_migrations', 'schema_migrations']);
+
+// Fast local pre-check: the file exists, is not truncation-tiny, and starts with PGDMP. Kept for
+// the local-destination path where the file is on the queenzee host's own filesystem. Throws.
+export function assertDumpMagic(path, size) {
   if (size == null) throw new Error('dump file is missing after pg_dump (nothing was written)');
   if (size < MIN_REAL_DUMP_BYTES) {
     throw new Error(`dump is only ${size} bytes — far too small to be a real database dump `
@@ -81,25 +144,185 @@ export function assertValidDump(path, size) {
   }
 }
 
+// RELATIVE SIZE guard. prevSize = size_bytes of the most recent successful backup for this same
+// project (null when there is no predecessor). A first-ever backup cannot be compared, so we say
+// so out loud (returned note) and lean entirely on the content guard rather than skipping silently.
+export function assertDumpSize(size, prevSize) {
+  if (size == null) throw new Error('dump size is unknown after the backup ran (nothing was written)');
+  if (size < MIN_REAL_DUMP_BYTES) {
+    throw new Error(`dump is only ${size} bytes — far too small to be a real database dump. The dump did not capture the data.`);
+  }
+  if (prevSize == null || prevSize <= 0) {
+    return { compared: false, note: 'no previous successful backup to compare size against — relying on the content check' };
+  }
+  const floor = Math.floor(prevSize * MIN_SIZE_RATIO);
+  if (size < floor) {
+    const pct = (100 * (1 - size / prevSize)).toFixed(size / prevSize < 0.001 ? 4 : 1);
+    throw new Error(`dump is ${size} bytes but the last good backup was ${prevSize} bytes — a ${pct}% collapse `
+      + `(below the ${Math.round(MIN_SIZE_RATIO * 100)}% floor). A real backup of the same database does not shrink this much; `
+      + `this almost certainly dumped the WRONG or an EMPTY database. Refusing to record it.`);
+  }
+  return { compared: true, note: null };
+}
+
+// Parse `pg_restore --list` text into a compact summary. Each data-bearing line looks like:
+//   "215; 1259 16805 TABLE core invoices postgres"
+//   "3012; 0 16805 TABLE DATA core invoices postgres"
+// We collect the schema+table for TABLE / TABLE DATA / SEQUENCE / VIEW / MATERIALIZED VIEW rows.
+export function parseDumpToc(listText) {
+  const schemas = new Set();
+  const tables = [];      // [{ schema, name }] for TABLE rows only
+  let entryCount = 0;
+  for (const raw of String(listText || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith(';')) continue;   // ';' lines are the header/comment block
+    // strip the "dumpId; catalogOid oid " prefix, keep the "DESC schema name owner" tail
+    const m = /^\d+;\s+\d+\s+\d+\s+(.*)$/.exec(line);
+    if (!m) continue;
+    entryCount++;
+    const rest = m[1];
+    const desc = /^(TABLE DATA|MATERIALIZED VIEW|TABLE|SEQUENCE|VIEW|INDEX|CONSTRAINT|TYPE|FUNCTION|SCHEMA|DEFAULT|FK CONSTRAINT|TRIGGER)\b/.exec(rest);
+    if (!desc) continue;
+    const kind = desc[1];
+    const tail = rest.slice(kind.length).trim().split(/\s+/);
+    if (kind === 'SCHEMA') { if (tail[0]) schemas.add(tail[0]); continue; }
+    const schema = tail[0];
+    const name = tail[1];
+    if (schema) schemas.add(schema);
+    if (kind === 'TABLE' && schema && name) tables.push({ schema, name });
+  }
+  return { schemas: [...schemas], tables, tableCount: tables.length, entryCount };
+}
+
+// CONTENT guard. toc = parseDumpToc(...) of the dump actually written. prevSummary = the
+// toc_summary jsonb recorded for the last good backup (null when none/legacy).
+//  • absolute: the dump must contain at least one application table that is NOT a migration ledger.
+//    A TOC whose only table is zeehive_migrations is an empty database (regression 2 exactly).
+//  • relative: every schema the last good backup had must still be present. Losing `core`
+//    overnight means the wrong database, not a legitimate change.
+export function assertDumpContent(toc, prevSummary) {
+  const appTables = (toc.tables || []).filter((t) => !LEDGER_TABLES.has(t.name));
+  if (appTables.length === 0) {
+    const only = (toc.tables || []).map((t) => `${t.schema}.${t.name}`).join(', ') || '(no tables at all)';
+    throw new Error(`dump contains no application tables — only ${only}. `
+      + `This is an EMPTY database (its whole TOC is ${toc.entryCount} entr${toc.entryCount === 1 ? 'y' : 'ies'}): `
+      + `almost certainly the WRONG container was dumped. Restoring it would WIPE the real database. Refusing to record it.`);
+  }
+  const prevSchemas = Array.isArray(prevSummary?.schemas) ? prevSummary.schemas : null;
+  if (prevSchemas && prevSchemas.length) {
+    const now = new Set(toc.schemas || []);
+    const missing = prevSchemas.filter((s) => !now.has(s));
+    if (missing.length) {
+      throw new Error(`dump is missing schema(s) [${missing.join(', ')}] that the last good backup contained. `
+        + `A backup does not lose whole schemas between runs — this is the wrong database. Refusing to record it.`);
+    }
+  }
+  return { appTableCount: appTables.length, comparedSchemas: !!(prevSchemas && prevSchemas.length) };
+}
+
 // timestamp key for the dump filename (yyyymmddhhmmss). A short random token is appended
 // separately to guarantee a unique filename even for two backups in the same second.
 function stamp() { return new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14); }
 
-// the folder new dumps go into: per-project override, else the server default (<repo>/db_backups)
+// the folder new dumps go into: per-project override, else the server default (<repo>/db_backups).
+// This is a path ON THE DESTINATION CONTEXT'S HOST (backup_ctx) when one is set — e.g.
+// /volume3/maki/Backups/Omnibiz/db on ugreen-nas.
 function backupDirFor(pool) {
   const d = pool?.backup_dir && String(pool.backup_dir).trim();
   return d || config.backupDir;
 }
 
-// Resolve the modeled container name (omnibiz_db_prod) to the actually-running container on a
-// context — deploys give it a versioned suffix (omnibiz_db_prod_v184), same convention the
-// health monitor's matchState uses. `docker ps` (no -a) lists only running containers.
-async function resolveRunningContainer(ctx, modeledName) {
-  const r = await execAsync('docker', ['--context', ctx, 'ps', '--format', '{{.Names}}'], { timeout: 30000 });
-  if (r.status !== 0) return null;
-  const names = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
-  if (names.includes(modeledName)) return modeledName;
-  return names.find((n) => n.startsWith(modeledName + '_')) || null;
+// A tiny image the destination context uses to WRITE the streamed bytes to its bind mount, and to
+// prune/read files there. `alpine` is ~5 MB and universally pullable.
+const STREAM_IMAGE = process.env.BACKUP_STREAM_IMAGE || 'alpine';
+// The image used to run `pg_restore --list` on the WRITTEN dump for the content check. We prefer
+// the SOURCE db container's own image (guaranteed to read an archive it produced), falling back to
+// a stock postgres so a private source tag that the destination can't pull still validates.
+const PG_TOOLS_IMAGE = process.env.BACKUP_TOOLS_IMAGE || 'postgres:17-alpine';
+
+// Join a dir + filename with '/'. The destination path lives on ANOTHER host (often Linux/NAS);
+// node's path.resolve would rewrite it against the queenzee's own OS/cwd. For a local dump we do
+// want resolve() (it is a real path on this host); for a remote one we keep it POSIX and literal.
+const posixJoin = (dir, file) => `${String(dir).replace(/[/\\]+$/, '')}/${file}`;
+
+// Delete a single file inside `dir` on a remote context via a throwaway container (used to clear a
+// truncated partial after a failed stream, and to prune on retention). Never throws.
+async function removeRemoteFile(ctx, dir, file) {
+  try {
+    await execAsync('docker',
+      ['--context', ctx, 'run', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'rm', '-f', `/out/${file}`],
+      { timeout: 120000 });
+  } catch { /* best effort */ }
+}
+
+// Resolve a REGISTRY container ROW to the actually-running container on its context — WITHOUT
+// trusting name shape.
+//
+// The old code did `names.find((n) => n.startsWith(modeledName + '_'))` and took the FIRST match
+// `docker ps` returned (newest-first). That is regression 2: two containers matched
+// `omnibiz_db_prod_` — the real prod db `omnibiz_db_prod_v184` (port 5432, has schema `core`) and
+// a dev clone `omnibiz_db_prod_dev_local_mardale_prod` (port 32768, empty). The clone was newer,
+// so it won, and the queenzee cheerfully dumped an empty database over the real one's history.
+// "stop with the hard coded naming" — Mark. The registry row already distinguishes them by
+// IDENTITY (docker_ctx + host_port + tier); we resolve from that, and use the versioned name only
+// as a tie-breaker, never as the discriminator.
+//
+// This is the SAME bug the concurrent xell calm-summit-65c3fb is centralizing in lib/xell-db.js.
+// If a registry-based resolver has landed there by merge time, import and use it and delete this;
+// until then this fixes it locally the same way (identity, not shape). — reconcile the two.
+//
+// pickContainer is the PURE decision (list of running containers + the row) so it is unit-testable
+// without a docker daemon. Returns { name } or { error }.
+export function pickContainer(running, row) {
+  const list = (running || []).filter((c) => (c.state ? c.state === 'running' : true));
+  const name = row?.name;
+  const port = row?.host_port ?? null;
+  const nameMatch = (c) => c.name === name || (name && c.name.startsWith(name + '_'));
+
+  if (port != null) {
+    // Identity: exactly one container publishes the modeled host port on this daemon (a host port
+    // is unique per daemon). This is what tells omnibiz_db_prod_v184 (5432) from the clone (32768).
+    const byPort = list.filter((c) => (c.ports || []).some((p) => p.public === port));
+    if (byPort.length === 1) return { name: byPort[0].name };
+    if (byPort.length > 1) {
+      // more than one publishes it (shouldn't happen on one daemon) — prefer the name-shaped one
+      const shaped = byPort.find(nameMatch);
+      if (shaped) return { name: shaped.name };
+      return { error: `multiple running containers publish host port ${port} (${byPort.map((c) => c.name).join(', ')}) — cannot identify the modeled container '${name}'` };
+    }
+    // NOTHING on this context publishes the modeled port → the modeled container is not running as
+    // configured. Do NOT fall back to a name-prefix guess: that is exactly how the wrong container
+    // got picked. Fail loudly with what we looked for.
+    return { error: `no running container on this context publishes the modeled host port ${port} for '${name}' `
+      + `(running: ${list.map((c) => c.name).join(', ') || 'none'})` };
+  }
+
+  // No host_port recorded on the row — fall back to name, but require an UNAMBIGUOUS match rather
+  // than blindly taking the first (the original defect). An exact name wins; else a single
+  // versioned match; more than one is a refusal, not a coin toss.
+  const exact = list.find((c) => c.name === name);
+  if (exact) return { name: exact.name };
+  const versioned = list.filter((c) => name && c.name.startsWith(name + '_'));
+  if (versioned.length === 1) return { name: versioned[0].name };
+  if (versioned.length > 1) {
+    return { error: `several running containers match '${name}_*' (${versioned.map((c) => c.name).join(', ')}) and no host_port is recorded to tell them apart — refusing to guess` };
+  }
+  return { error: `container '${name}' is not running on this context (running: ${list.map((c) => c.name).join(', ') || 'none'})` };
+}
+
+// Async wrapper: read the live container list off the row's context (over the docker HTTP API — no
+// CLI, same read the health monitor uses) and apply pickContainer. Returns { name, image } of the
+// resolved running container. THROWS on an unreachable context or an unresolvable row — a backup
+// must FAIL, never fall through to some other container or to a local volume.
+async function resolveRunningContainer(row) {
+  const ctx = row?.docker_ctx;
+  let list;
+  try { list = await listContainersDetailed(ctx); }
+  catch (e) { throw new Error(`context '${ctx}' unreachable while resolving '${row?.name}': ${e.message}`); }
+  const picked = pickContainer(list, row);
+  if (picked.error) throw new Error(picked.error);
+  const hit = list.find((c) => c.name === picked.name);
+  return { name: picked.name, image: hit?.image || null };
 }
 
 // Flag a container busy (op = 'backup' | 'restore') or clear it, and tell the UI so it can spin
@@ -167,71 +390,130 @@ export async function backupProd(projectId) {
       + '(pg_dump locks every table for its duration). It runs automatically once prod is released.');
   }
 
-  const pool = await one(`SELECT backup_dir, max_backups FROM pool_config WHERE project_id=$1`, [projectId]);
+  const pool = await one(`SELECT backup_dir, backup_ctx, max_backups FROM pool_config WHERE project_id=$1`, [projectId]);
   const dir = backupDirFor(pool);
+  const destCtx = (pool?.backup_ctx && String(pool.backup_ctx).trim()) || null;   // NULL ⇒ local host
   const file = `${project.name.toLowerCase()}_prod_${stamp()}_${randomBytes(3).toString('hex')}.dump`;
-  const fullPath = resolve(dir, file);
-  mkdirSync(dir, { recursive: true });
+  // dump_path is the path ON THE DESTINATION: a real host path locally, a POSIX path on the NAS.
+  const fullPath = destCtx ? posixJoin(dir, file) : resolve(dir, file);
+  if (!destCtx) mkdirSync(dir, { recursive: true });   // remote: the bind mount creates the dir
 
   // the PRODUCTION db container to dump (modeled; resolved to its live versioned name in the job)
   const dbc = await one(
-    `SELECT id, name, docker_ctx FROM container
+    `SELECT id, name, docker_ctx, host_port, tier FROM container
        WHERE project_id=$1 AND role='db' AND tier='prod' AND isolation='shared'
        ORDER BY created_at LIMIT 1`, [projectId]);
   const dbName = project.db_name || config.prodDbName || project.name.toLowerCase();
   const dbUser = project.db_user || config.prodDbUser;
 
+  // dest_ctx recorded up front so the UI shows WHERE this dump is going while it runs, and so a
+  // restore/prune can always find it. dump_path alone is ambiguous across hosts now.
   const snap = await one(
-    `INSERT INTO db_snapshot (project_id, source, dump_path, status) VALUES ($1,'prod',$2,'running') RETURNING *`,
-    [projectId, fullPath]);
+    `INSERT INTO db_snapshot (project_id, source, dump_path, dest_ctx, status) VALUES ($1,'prod',$2,$3,'running') RETURNING *`,
+    [projectId, fullPath, destCtx]);
   if (dbc) await setBusy(dbc.id, 'backup');
   broadcast('task', { kind: 'db_snapshot', snap });
-  logline('maint', `backup started (${MODE}) → ${fullPath}`);
+  logline('maint', `backup started (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath}`);
 
   // fire-and-forget: the heavy work runs async; the caller gets the running row now
-  runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file, keep: pool?.max_backups ?? DEFAULT_MAX_BACKUPS })
+  runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, keep: pool?.max_backups ?? DEFAULT_MAX_BACKUPS })
     .catch((e) => console.error('[backup]', e.message));
   return snap;
 }
 
-async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file, keep }) {
-  let size = null, error = null;
+async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, keep }) {
+  let size = null, error = null, tocText = null, tocSummary = null;
   try {
     if (MODE === 'real') {
       if (!dbc?.name) throw new Error('no production db container modeled for this project');
-      const ctx = dbc.docker_ctx || (await resolveSite(project.id, 'prod'))?.docker_ctx || project.docker_ctx_prod;
-      const container = await resolveRunningContainer(ctx, dbc.name);
-      if (!container) throw new Error(`prod db container '${dbc.name}' not running on context '${ctx}'`);
-      const remoteTmp = `/tmp/${file}`;
-      const dump = await execAsync('docker',
-        ['--context', ctx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName, '-f', remoteTmp],
-        { timeout: 1200000 });
-      if (dump.status !== 0) {
-        throw new Error(`pg_dump of ${container}/${dbName} failed (exit ${dump.status}): `
-          + `${((dump.stderr || dump.stdout) || '(no output)').slice(-300)}`);
+      const srcCtx = dbc.docker_ctx || (await resolveSite(project.id, 'prod'))?.docker_ctx || project.docker_ctx_prod;
+      // Resolve the source container by IDENTITY (ctx + host_port), never name shape (regression 2).
+      const src = await resolveRunningContainer({ ...dbc, docker_ctx: srcCtx });
+      const container = src.name;
+
+      if (destCtx) {
+        // ── NETWORK destination: STREAM src → dst, never staging the dump on the queenzee host ──
+        // pg_dump writes to stdout; a throwaway container on the destination context reads stdin
+        // and writes it to the bind-mounted backup dir, then prints the byte count it wrote.
+        const writer = `cat > '/out/${file}' && wc -c < '/out/${file}'`;
+        const piped = await execPipe(
+          { cmd: 'docker', args: ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName] },
+          { cmd: 'docker', args: ['--context', destCtx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'sh', '-c', writer] },
+          { timeout: 1800000 });
+        if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
+          await removeRemoteFile(destCtx, dir, file);   // never leave a truncated partial behind
+          const why = piped.timedOut ? 'timed out' : `pg_dump exit ${piped.srcStatus}, writer exit ${piped.dstStatus}`;
+          throw new Error(`streamed backup of ${container}/${dbName} → [${destCtx}] failed (${why}): `
+            + `${((piped.srcStderr || piped.dstStderr) || '(no output)').slice(-300)}`);
+        }
+        size = parseInt(String(piped.dstStdout).trim(), 10);
+        if (!Number.isFinite(size)) throw new Error(`destination did not report a written size (got ${JSON.stringify(String(piped.dstStdout).slice(0, 80))})`);
+        // Content/magic check: run pg_restore --list on the WRITTEN file, on the destination host
+        // (local disk read there — the TOC is tiny and comes back over the wire, not the 1.2 GB).
+        const toolsImage = src.image || PG_TOOLS_IMAGE;
+        const list = await execAsync('docker',
+          ['--context', destCtx, 'run', '--rm', '-v', `${dir}:/out`, toolsImage, 'pg_restore', '--list', `/out/${file}`],
+          { timeout: 600000 });
+        if (list.status !== 0) {
+          await removeRemoteFile(destCtx, dir, file);
+          throw new Error(`the written dump is not a readable pg_dump archive (pg_restore --list exit ${list.status}): `
+            + `${((list.stderr || list.stdout) || '(no output)').slice(-300)}`);
+        }
+        tocText = list.stdout;
+      } else {
+        // ── LOCAL destination (backup_ctx NULL): today's behavior — dump to the container's /tmp,
+        //    list it there, copy to the host volume, then rm whatever happened. ──
+        const remoteTmp = `/tmp/${file}`;
+        const dump = await execAsync('docker',
+          ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName, '-f', remoteTmp],
+          { timeout: 1200000 });
+        if (dump.status !== 0) {
+          await execAsync('docker', ['--context', srcCtx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
+          throw new Error(`pg_dump of ${container}/${dbName} failed (exit ${dump.status}): `
+            + `${((dump.stderr || dump.stdout) || '(no output)').slice(-300)}`);
+        }
+        // TOC while the file is still in the container (its own pg_restore reads its own dump).
+        const list = await execAsync('docker',
+          ['--context', srcCtx, 'exec', container, 'pg_restore', '--list', remoteTmp], { timeout: 300000 });
+        const cp = await execAsync('docker', ['--context', srcCtx, 'cp', `${container}:${remoteTmp}`, fullPath], { timeout: 1200000 });
+        // rm the in-container dump WHATEVER the cp did — the rm used to run only after a good cp,
+        // so every failed copy leaked ~870MB into the container's writable layer (16 dumps / 13GB
+        // found in prod's /tmp on 2026-07-17, overlay at 86%).
+        await execAsync('docker', ['--context', srcCtx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
+        if (cp.status !== 0) {
+          throw new Error(`docker cp failed (exit ${cp.status}): `
+            + `${((cp.stderr || cp.stdout) || '(no output)').slice(-300)}`);
+        }
+        try { size = statSync(fullPath).size; } catch { size = null; }
+        assertDumpMagic(fullPath, size);
+        if (list.status !== 0) {
+          throw new Error(`pg_restore --list of the dump failed (exit ${list.status}) — the file is not a usable archive: `
+            + `${((list.stderr || list.stdout) || '(no output)').slice(-300)}`);
+        }
+        tocText = list.stdout;
       }
-      const cp = await execAsync('docker', ['--context', ctx, 'cp', `${container}:${remoteTmp}`, fullPath], { timeout: 1200000 });
-      // rm the in-container dump WHATEVER the cp did — the rm used to run only after a good cp,
-      // so every failed copy leaked ~870MB into the container's writable layer (16 dumps / 13GB
-      // found in prod's /tmp on 2026-07-17, overlay at 86%).
-      await execAsync('docker', ['--context', ctx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
-      if (cp.status !== 0) {
-        // stderr AND stdout: a day of "docker cp failed: " with the real complaint discarded is
-        // a day of debugging the wrong thing. exit -1 = the child errored/was killed (timeout).
-        throw new Error(`docker cp failed (exit ${cp.status}): `
-          + `${((cp.stderr || cp.stdout) || '(no output)').slice(-300)}`);
-      }
-      try { size = statSync(fullPath).size; } catch { size = null; }
-      // A backup that isn't a real, plausibly-sized pg_dump archive is DEFECTIVE — fail it
-      // loudly instead of storing a useless restore point (this is exactly the "big DB, few-byte
-      // backup" case: catch it here rather than at 3am during a restore).
-      assertValidDump(fullPath, size);
+
+      // ── validation common to both destinations ──────────────────────────────
+      // Compare against the last GOOD backup of this project: a catastrophic size collapse and a
+      // dump that lost the schemas/tables the last one had are BOTH refused (regression 3). This
+      // is what turns "valid archive of the wrong/empty database" into a loud FAILURE.
+      const prev = await one(
+        `SELECT size_bytes, toc_summary FROM db_snapshot
+           WHERE project_id=$1 AND source='prod' AND status='finished' AND mode='real' AND id<>$2
+           ORDER BY taken_at DESC LIMIT 1`, [snap.project_id, snap.id]);
+      const sizeVerdict = assertDumpSize(size, prev?.size_bytes ?? null);
+      const toc = parseDumpToc(tocText);
+      const contentVerdict = assertDumpContent(toc, prev?.toc_summary ?? null);
+      tocSummary = { schemas: toc.schemas, table_count: toc.tableCount };
+      logline('maint', `backup validated → ${size} bytes, ${toc.tableCount} table(s), schemas [${toc.schemas.join(', ')}]`
+        + `${sizeVerdict.compared ? '' : ` · ${sizeVerdict.note}`}${contentVerdict.comparedSchemas ? ' · schema-continuity ok' : ''}`);
     } else {
       await wait(SIM_BACKUP_MS);   // simulate: hold 'running' briefly so the spinner is visible
       const body = `-- ZEEHIVE simulated backup of ${project.name} PRODUCTION database\n`
         + `-- target: ${dbc?.name || '(prod db container)'} / db=${dbName} user=${dbUser}\n`
+        + `-- destination: ${destCtx ? `[${destCtx}] ` : '(local) '}${fullPath}\n`
         + `-- taken ${new Date().toISOString()}\n`;
-      writeFileSync(fullPath, body);
+      if (!destCtx) writeFileSync(fullPath, body);   // remote sim: nothing to write here
       size = Buffer.byteLength(body);
     }
   } catch (e) {
@@ -239,7 +521,9 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
   }
 
   if (error) {
-    try { rmSync(fullPath, { force: true }); } catch { /* partial may not exist */ }
+    // Clean up whatever partial exists on whichever host it would be on.
+    if (destCtx) { await removeRemoteFile(destCtx, dir, file); }
+    else { try { rmSync(fullPath, { force: true }); } catch { /* partial may not exist */ } }
     const row = await one(`UPDATE db_snapshot SET status='failed', error=$2, mode=$3 WHERE id=$1 RETURNING *`,
       [snap.id, String(error).slice(0, 500), MODE]);
     if (dbc) await clearBusy(dbc.id);
@@ -248,11 +532,11 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
     return;
   }
 
-  const row = await one(`UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3 WHERE id=$1 RETURNING *`,
-    [snap.id, size, MODE]);
+  const row = await one(`UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3, toc_summary=$4 WHERE id=$1 RETURNING *`,
+    [snap.id, size, MODE, tocSummary ? JSON.stringify(tocSummary) : null]);
   if (dbc) await clearBusy(dbc.id);
   broadcast('task', { kind: 'db_snapshot', snap: row });
-  logline('maint', `backup finished (${MODE}) → ${fullPath} (${size ?? '?'} bytes)`);
+  logline('maint', `backup finished (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath} (${size ?? '?'} bytes)`);
   await housekeepBackups(snap.project_id, keep);
 }
 
@@ -260,11 +544,20 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, fullPath, file
 // (running/failed rows are never counted or pruned here.)
 export async function housekeepBackups(projectId, keep = DEFAULT_MAX_BACKUPS) {
   const extra = await q(
-    `SELECT id, dump_path FROM db_snapshot
+    `SELECT id, dump_path, dest_ctx FROM db_snapshot
        WHERE project_id=$1 AND source='prod' AND status='finished'
        ORDER BY taken_at DESC OFFSET $2`, [projectId, Math.max(0, keep)]);
   for (const s of extra) {
-    if (s.dump_path) { try { rmSync(s.dump_path, { force: true }); } catch { /* file may be gone */ } }
+    // Prune on the SAME host the dump lives on — deleting the local path for a NAS dump would
+    // delete nothing (and quietly grow the NAS forever); this is regression 1's mirror image.
+    if (s.dump_path) {
+      if (s.dest_ctx) {
+        const i = Math.max(s.dump_path.lastIndexOf('/'), s.dump_path.lastIndexOf('\\'));
+        await removeRemoteFile(s.dest_ctx, s.dump_path.slice(0, i), s.dump_path.slice(i + 1));
+      } else {
+        try { rmSync(s.dump_path, { force: true }); } catch { /* file may be gone */ }
+      }
+    }
     await q(`DELETE FROM db_snapshot WHERE id=$1`, [s.id]);
   }
   if (extra.length) {
@@ -276,7 +569,7 @@ export async function housekeepBackups(projectId, keep = DEFAULT_MAX_BACKUPS) {
 
 // Update a project's backup settings (folder / interval / retention), then apply housekeeping
 // immediately so lowering max_backups takes effect at once.
-export async function setBackupConfig({ project, backup_dir, backup_interval_sec, max_backups }) {
+export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_interval_sec, max_backups }) {
   const proj = project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
   if (!proj) throw new Error('no project');
   const interval = Number(backup_interval_sec);
@@ -284,16 +577,26 @@ export async function setBackupConfig({ project, backup_dir, backup_interval_sec
   if (!Number.isInteger(interval) || interval < 60) throw new Error('backup_interval_sec must be an integer ≥ 60');
   if (!Number.isInteger(maxB) || maxB < 1 || maxB > 1000) throw new Error('max_backups must be an integer 1–1000');
   const dir = backup_dir && String(backup_dir).trim() ? String(backup_dir).trim() : null;
+  const ctx = backup_ctx && String(backup_ctx).trim() ? String(backup_ctx).trim() : null;
+  // A network destination is a docker CONTEXT + a directory on that context's host. A context
+  // with no directory has nowhere to write — refuse it up front rather than at 3am mid-backup.
+  if (ctx && !dir) throw new Error('a backup context needs a backup location (the directory on that context\'s host to write dumps into)');
+  // Prove the context is REACHABLE now, so a typo/dead host is caught at Save — not discovered
+  // four days later as a silent local fallback (regression 1). NULL context skips this (local).
+  if (ctx) {
+    try { await listContainersDetailed(ctx, 8000); }
+    catch (e) { throw new Error(`backup context '${ctx}' is not reachable: ${e.message}. Fix the context or clear it to back up locally.`); }
+  }
 
   const row = await one(
-    `UPDATE pool_config SET backup_dir=$2, backup_interval_sec=$3, max_backups=$4
+    `UPDATE pool_config SET backup_dir=$2, backup_ctx=$3, backup_interval_sec=$4, max_backups=$5
        WHERE project_id=$1
-       RETURNING backup_dir, backup_interval_sec, max_backups`,
-    [proj, dir, interval, maxB]);
+       RETURNING backup_dir, backup_ctx, backup_interval_sec, max_backups`,
+    [proj, dir, ctx, interval, maxB]);
   if (!row) throw new Error('no pool_config for project');
 
   broadcast('project', { id: proj, backup: row });
-  logline('maint', `backup config → dir=${row.backup_dir || '(default)'} every ${row.backup_interval_sec}s keep ${row.max_backups}`);
+  logline('maint', `backup config → ${row.backup_ctx ? `[${row.backup_ctx}] ` : ''}dir=${row.backup_dir || '(default)'} every ${row.backup_interval_sec}s keep ${row.max_backups}`);
   await housekeepBackups(proj, row.max_backups);
   return row;
 }
@@ -337,7 +640,7 @@ export async function restoreBackup({ snapshot, container }) {
   const dbUser = proj?.db_user || config.prodDbUser;
 
   await setBusy(c.id, 'restore');
-  logline('maint', `restore started → ${c.name} from ${snap.dump_path} (${MODE})`);
+  logline('maint', `restore started → ${c.name} from ${snap.dest_ctx ? `[${snap.dest_ctx}] ` : ''}${snap.dump_path} (${MODE})`);
   runRestoreJob({ snap, c, dbName, dbUser }).catch((e) => console.error('[restore]', e.message));
   return { ok: true, status: 'started', container: c.name };
 }
@@ -346,16 +649,32 @@ async function runRestoreJob({ snap, c, dbName, dbUser }) {
   try {
     if (MODE === 'real') {
       const ctx = c.docker_ctx;
-      const target = await resolveRunningContainer(ctx, c.name);
-      if (!target) throw new Error(`db container '${c.name}' not running on context '${ctx}'`);
-      const remoteTmp = `/tmp/restore_${randomBytes(3).toString('hex')}.dump`;
-      const cp = await execAsync('docker', ['--context', ctx, 'cp', resolve(snap.dump_path), `${target}:${remoteTmp}`], { timeout: 1200000 });
-      if (cp.status !== 0) throw new Error(`docker cp into ${target} failed: ${(cp.stderr || '').slice(-300)}`);
-      const rest = await execAsync('docker',
-        ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName, remoteTmp],
-        { timeout: 1800000 });
-      await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000 });
-      if (rest.status !== 0) throw new Error(`pg_restore into ${target}/${dbName} failed: ${(rest.stderr || '').slice(-300)}`);
+      const t = await resolveRunningContainer({ ...c });   // identity resolution (ctx + host_port)
+      const target = t.name;
+      if (snap.dest_ctx) {
+        // The dump lives on ANOTHER host (the NAS). Stream it straight into the target's pg_restore
+        // stdin — same "never stage 1.2 GB on the queenzee host" principle as the backup. A reader
+        // container on the destination cats the file; pg_restore reads the archive from stdin.
+        const i = Math.max(snap.dump_path.lastIndexOf('/'), snap.dump_path.lastIndexOf('\\'));
+        const dir = snap.dump_path.slice(0, i), file = snap.dump_path.slice(i + 1);
+        const piped = await execPipe(
+          { cmd: 'docker', args: ['--context', snap.dest_ctx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'cat', `/out/${file}`] },
+          { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName] },
+          { timeout: 1800000 });
+        if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
+          throw new Error(`streamed restore into ${target}/${dbName} from [${snap.dest_ctx}] failed `
+            + `(reader exit ${piped.srcStatus}, pg_restore exit ${piped.dstStatus}): ${((piped.dstStderr || piped.srcStderr) || '').slice(-300)}`);
+        }
+      } else {
+        const remoteTmp = `/tmp/restore_${randomBytes(3).toString('hex')}.dump`;
+        const cp = await execAsync('docker', ['--context', ctx, 'cp', resolve(snap.dump_path), `${target}:${remoteTmp}`], { timeout: 1200000 });
+        if (cp.status !== 0) throw new Error(`docker cp into ${target} failed: ${(cp.stderr || '').slice(-300)}`);
+        const rest = await execAsync('docker',
+          ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName, remoteTmp],
+          { timeout: 1800000 });
+        await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000 });
+        if (rest.status !== 0) throw new Error(`pg_restore into ${target}/${dbName} failed: ${(rest.stderr || '').slice(-300)}`);
+      }
     } else {
       await wait(SIM_RESTORE_MS);   // simulate: hold the busy state briefly so the spinner is visible
     }
@@ -372,8 +691,16 @@ async function runRestoreJob({ snap, c, dbName, dbUser }) {
 export async function reconcileInterruptedJobs() {
   const snaps = await q(
     `UPDATE db_snapshot SET status='failed', error=COALESCE(error,'interrupted by server restart')
-       WHERE status='running' RETURNING id, dump_path`);
-  for (const s of snaps) { if (s.dump_path) { try { rmSync(s.dump_path, { force: true }); } catch { /* gone */ } } }
+       WHERE status='running' RETURNING id, dump_path, dest_ctx`);
+  for (const s of snaps) {
+    if (!s.dump_path) continue;
+    if (s.dest_ctx) {
+      const i = Math.max(s.dump_path.lastIndexOf('/'), s.dump_path.lastIndexOf('\\'));
+      await removeRemoteFile(s.dest_ctx, s.dump_path.slice(0, i), s.dump_path.slice(i + 1));
+    } else {
+      try { rmSync(s.dump_path, { force: true }); } catch { /* gone */ }
+    }
+  }
   const cons = await q(`UPDATE container SET busy_since=NULL, busy_op=NULL WHERE busy_since IS NOT NULL RETURNING id`);
   if (snaps.length || cons.length) {
     logline('maint', `startup: cleared ${snaps.length} interrupted backup(s) + ${cons.length} busy container(s)`);

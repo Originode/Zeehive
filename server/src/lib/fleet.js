@@ -260,6 +260,7 @@ export async function getFleet(projectId) {
   const backup = {
     config: {
       backup_dir: pool?.backup_dir ?? null,
+      backup_ctx: pool?.backup_ctx ?? null,
       backup_interval_sec: pool?.backup_interval_sec ?? 86400,
       max_backups: pool?.max_backups ?? 14,
     },

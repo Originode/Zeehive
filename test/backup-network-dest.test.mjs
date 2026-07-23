@@ -1,0 +1,134 @@
+// Backups: registry-identity container resolution (regression 2), the meaningful dump guard
+// (regression 3), and the network-destination config guard (regression 1 + requirement 7).
+//
+// Runs the REAL lib (server/src/queenzee/maintenance.js) against this xell's isolated postgres.
+// What it CANNOT do in a cxell: reach a real docker DAEMON via the CLI (there is none here). So
+// the docker-facing transfer is proven separately (test/nas-write-proof.mjs, which uses the HTTP
+// API). Here we prove the DECISIONS — which container, is this dump real, is this destination
+// usable — which is where all three regressions actually lived.
+process.env.MAINTENANCE_MODE = process.env.MAINTENANCE_MODE || 'simulate';
+
+const { q, one, pool } = await import('../server/src/db/pool.js');
+const m = await import('../server/src/queenzee/maintenance.js');
+
+let failures = 0;
+const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
+const threw = async (fn, re, msg) => {
+  try { await fn(); ok(false, `${msg} (did NOT throw)`); }
+  catch (e) { ok(re.test(e.message), `${msg} — threw: ${e.message.slice(0, 110)}`); }
+};
+
+// The EXACT old resolver, verbatim from git history, to prove it picks the wrong container.
+const oldResolve = (names, modeledName) => {
+  if (names.includes(modeledName)) return modeledName;
+  return names.find((n) => n.startsWith(modeledName + '_')) || null;
+};
+
+try {
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n── REGRESSION 2: the wrong (empty) database was dumped ──');
+  // The live situation: on the mardale-prod context two containers share the omnibiz_db_prod_
+  // prefix. docker ps lists NEWEST first, so the dev clone leads.
+  const psNewestFirst = ['omnibiz_db_prod_dev_local_mardale_prod', 'omnibiz_db_prod_v184'];
+  ok(oldResolve(psNewestFirst, 'omnibiz_db_prod') === 'omnibiz_db_prod_dev_local_mardale_prod',
+    'OLD resolver picks the dev clone (7.7 MB, no core schema) — the bug, reproduced from ps order');
+
+  // The registry row carries identity the name shape cannot: the prod db publishes 5432.
+  const running = [
+    { name: 'omnibiz_db_prod_dev_local_mardale_prod', state: 'running', ports: [{ public: 32768 }] },
+    { name: 'omnibiz_db_prod_v184', state: 'running', ports: [{ public: 5432 }] },
+  ];
+  const prodRow = { name: 'omnibiz_db_prod', host_port: 5432, tier: 'prod', docker_ctx: 'mardale-prod' };
+  const picked = m.pickContainer(running, prodRow);
+  ok(picked.name === 'omnibiz_db_prod_v184' && !picked.error,
+    'NEW pickContainer picks omnibiz_db_prod_v184 by host_port 5432 — the REAL prod db');
+
+  const cloneRow = { name: 'omnibiz_db_prod_dev_local_mardale_prod', host_port: 32768, docker_ctx: 'mardale-prod' };
+  ok(m.pickContainer(running, cloneRow).name === 'omnibiz_db_prod_dev_local_mardale_prod',
+    'the clone row (port 32768) still resolves to the clone — identity, not name shape');
+
+  console.log('\n── the versioned case the heuristic existed for still works ──');
+  // Only the real prod running, no clone: omnibiz_db_prod → omnibiz_db_prod_v184.
+  ok(m.pickContainer([{ name: 'omnibiz_db_prod_v184', state: 'running', ports: [{ public: 5432 }] }], prodRow).name
+    === 'omnibiz_db_prod_v184', 'omnibiz_db_prod → omnibiz_db_prod_v184 by port');
+  // Same, with NO host_port recorded: fall back to a UNIQUE name-shape match (not the first guess).
+  ok(m.pickContainer([{ name: 'omnibiz_db_prod_v184', state: 'running', ports: [] }],
+    { name: 'omnibiz_db_prod', host_port: null }).name === 'omnibiz_db_prod_v184',
+    'null host_port → single versioned match still resolves');
+
+  console.log('\n── it now REFUSES rather than guessing (no silent wrong pick) ──');
+  ok(/no running container/.test(m.pickContainer(running, { name: 'omnibiz_db_prod', host_port: 9999 }).error || ''),
+    'a modeled port that nothing publishes → error, not a name-prefix fallback');
+  const ambiguous = m.pickContainer([
+    { name: 'omnibiz_db_prod_v184', state: 'running', ports: [] },
+    { name: 'omnibiz_db_prod_dev_local_mardale_prod', state: 'running', ports: [] },
+  ], { name: 'omnibiz_db_prod', host_port: null });
+  ok(/refusing to guess/.test(ambiguous.error || ''),
+    'two name matches + no port to disambiguate → refuses (this WAS the coin-toss bug)');
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n── REGRESSION 3: a valid archive of the WRONG database must FAIL ──');
+  const GB = 1_227_790_090;   // the last real omnibiz dump
+  const KB = 7_643;           // the empty ledger-only dump that slipped through
+  threw(() => m.assertDumpSize(KB, GB), /collapse/,
+    '7,643 B against a 1.2 GB predecessor → FAILS on the size collapse');
+  ok(m.assertDumpSize(GB + 5_000_000, GB).compared === true, 'normal growth passes the size guard');
+  ok(m.assertDumpSize(Math.floor(GB * 0.8), GB).compared === true, 'an ordinary 20% shrink still passes');
+  ok(m.assertDumpSize(GB, null).compared === false, 'first-ever backup: no baseline, handled explicitly (not skipped silently)');
+
+  // The 7 KB dump's actual TOC: only the migration ledger, nothing else.
+  const emptyToc = `;\n; Archive created at 2026-07-23\n;\n215; 1259 16390 TABLE public zeehive_migrations postgres\n3001; 0 16390 TABLE DATA public zeehive_migrations postgres\n`;
+  const realToc = `;\n;\n210; 1259 16805 TABLE core invoices postgres\n2999; 0 16805 TABLE DATA core invoices postgres\n211; 1259 16820 TABLE core customers postgres\n9; 2615 16 SCHEMA - core postgres\n`;
+  const emptyParsed = m.parseDumpToc(emptyToc);
+  const realParsed = m.parseDumpToc(realToc);
+  ok(emptyParsed.tables.length === 1 && emptyParsed.tables[0].name === 'zeehive_migrations',
+    'parseDumpToc: empty dump = only zeehive_migrations');
+  ok(realParsed.schemas.includes('core') && realParsed.tables.length === 2,
+    'parseDumpToc: real dump = schema core + application tables');
+  threw(() => m.assertDumpContent(emptyParsed, null), /no application tables|EMPTY/,
+    'content guard: ledger-only dump → FAILS ("this is an EMPTY database")');
+  ok(m.assertDumpContent(realParsed, null).appTableCount === 2, 'content guard: real dump passes');
+  threw(() => m.assertDumpContent({ schemas: ['public'], tables: [{ schema: 'public', name: 'invoices' }], entryCount: 2 },
+    { schemas: ['core', 'public'] }), /missing schema/,
+    'content guard: a dump that LOST schema core vs the last good backup → FAILS');
+
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log('\n── REGRESSION 1 / requirement 7: destination config is honest ──');
+  const projId = (await one(
+    `INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'main') RETURNING id`,
+    [`zt-bkcfg-${Date.now()}`, '/tmp/zt-bkcfg'])).id;
+  await q(`INSERT INTO pool_config (project_id) VALUES ($1)`, [projId]);
+
+  await threw(() => m.setBackupConfig({ project: projId, backup_ctx: 'ugreen-nas', backup_dir: null,
+    backup_interval_sec: 86400, max_backups: 14 }), /needs a backup location/,
+    'a context with no directory is refused up front');
+  await threw(() => m.setBackupConfig({ project: projId, backup_ctx: 'no-such-context-xyz',
+    backup_dir: '/volume3/maki/Backups/Omnibiz/db', backup_interval_sec: 86400, max_backups: 14 }),
+    /not reachable/, 'an UNREACHABLE context is refused (no silent local fallback — regression 1)');
+
+  // local (no ctx) still saves, and stores backup_ctx NULL
+  const local = await m.setBackupConfig({ project: projId, backup_dir: '/tmp/zt-local', backup_ctx: null,
+    backup_interval_sec: 86400, max_backups: 7 });
+  ok(local.backup_ctx == null && local.backup_dir === '/tmp/zt-local', 'local destination saves (backup_ctx NULL)');
+
+  console.log('\n── requirement 5: retention deletes the right ROWS regardless of destination ──');
+  // 3 finished remote snapshots; keep 1 → 2 pruned. (remote file removal is best-effort docker;
+  // here we assert the bookkeeping — rows removed, count returned — which is what drives the UI.)
+  for (let i = 0; i < 3; i++) {
+    await q(`INSERT INTO db_snapshot (project_id, source, dump_path, dest_ctx, size_bytes, status, mode, taken_at)
+             VALUES ($1,'prod',$2,'ugreen-nas',$3,'finished','real', now() - ($4||' min')::interval)`,
+      [projId, `/volume3/maki/Backups/Omnibiz/db/x${i}.dump`, 1000 + i, i]);
+  }
+  const pruned = await m.housekeepBackups(projId, 1);
+  ok(pruned === 2, 'housekeep prunes 2 of 3 remote snapshots (keep 1)');
+  const left = await q(`SELECT id FROM db_snapshot WHERE project_id=$1 AND status='finished'`, [projId]);
+  ok(left.length === 1, 'exactly one remote snapshot row remains');
+
+  await q(`DELETE FROM db_snapshot WHERE project_id=$1`, [projId]);
+  await q(`DELETE FROM pool_config WHERE project_id=$1`, [projId]);
+  await q(`DELETE FROM project WHERE id=$1`, [projId]);
+} finally {
+  await pool.end().catch(() => {});
+}
+console.log(`\n${failures === 0 ? 'ALL PASSED ✓' : `${failures} FAILURE(S) ✗`}`);
+process.exit(failures === 0 ? 0 : 1);

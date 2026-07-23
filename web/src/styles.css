@@ -667,6 +667,8 @@ a.cbox:hover { border-color: var(--accent); }
 .bkrow.sim { grid-template-columns: auto auto auto auto 1fr auto; }
 .bksim { justify-self: start; color: #d9a441; border: 1px solid #d9a441; border-radius: 6px;
   padding: 1px 7px; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+.bkdest { justify-self: start; color: #5aa9d9; border: 1px solid #5aa9d9; border-radius: 6px;
+  padding: 1px 7px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; }
 .bkpath { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bkacts { display: flex; gap: 6px; }
 .bkbtn { background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 7px;
