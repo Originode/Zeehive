@@ -473,6 +473,18 @@ export async function dismissShip(id) {
   return r.ok ? r.json() : null;
 }
 
+// Force-release the prod lock for this ship's site, then approve+ship it — one atomic step for the
+// "production is locked, but send this one now" decision. siteId (optional) aims/re-aims the ship.
+export async function unlockAndShip(id, siteId = undefined) {
+  const r = await fetch(`/api/ship/requests/${id}/unlock-and-ship`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(siteId ? { site_id: siteId } : {}),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `unlock & ship failed (${r.status})`);
+  return data;
+}
+
 // Defer a pending ship: set it aside (not rejected) so landings can accumulate for a combined ship.
 export async function deferShip(id) {
   const r = await fetch(`/api/ship/requests/${id}/defer`, {

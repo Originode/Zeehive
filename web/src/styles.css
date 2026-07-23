@@ -821,6 +821,11 @@ a.cbox:hover { border-color: var(--accent); }
 .ship-card.deferred { border-color: var(--line); border-style: dashed; opacity: .9; }
 .ship-deferred { color: var(--muted); font-size: 12.5px; margin-top: 8px;
   border-left: 2px solid var(--muted); padding-left: 8px; }
+/* prod is locked: why the plain approve is greyed out, and the unlock-&-ship escape hatch. */
+.ship-locked-note { color: var(--building); font-size: 12.5px; margin-top: 8px;
+  border-left: 2px solid var(--building); padding-left: 8px; }
+.unlock-ship { border-color: var(--building) !important; color: var(--building) !important; }
+.unlock-ship:hover:not(:disabled) { background: rgba(210,153,34,.14); }
 .ship-card.s-shipped { border-color: var(--ready); opacity: .92; }
 .ship-card.s-failed { border-color: var(--error); }
 .ship-progress.done { color: var(--ready); }

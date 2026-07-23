@@ -7,7 +7,7 @@
 //      "let it go" — an unattended hold blocks every other xell. HOLD stops the clock for a human
 //      who is actively verifying.
 import React, { useState, useEffect, useRef } from 'react';
-import { decideShip, dismissShip, deferShip, resumeShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
+import { decideShip, dismissShip, deferShip, resumeShip, unlockAndShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
@@ -78,7 +78,7 @@ function LiveBuildLog({ lines }) {
   );
 }
 
-function ShipCard({ req, live, prodSites, onDone }) {
+function ShipCard({ req, live, prodSites, prodLock, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   // A DEFERRED ship is still 'pending' server-side, but a human set it aside for a combined ship.
@@ -95,6 +95,12 @@ function ShipCard({ req, live, prodSites, onDone }) {
   useEffect(() => { setSiteId(defaultSiteId); }, [defaultSiteId]);
   const chosen = sites.find((s) => s.id === siteId) || null;
   const siteName = chosen?.key || req.site_key || null;
+  // Is PRODUCTION locked for the site THIS ship targets? A ship takes the prod lock keyed to its
+  // site ('prod' for the default, 'prod@<key>' otherwise); while that lock is held by someone else
+  // (a prior ship's verification countdown, or a hold) this ship cannot be approved — it would only
+  // queue behind the holder. So approving is disabled, and "Unlock & ship" is offered instead.
+  const shipLockKey = chosen && chosen.is_default === false ? `prod@${chosen.key}` : 'prod';
+  const prodLocked = !!prodLock && prodLock.container === shipLockKey;
 
   const decide = async (decision) => {
     if (decision === 'approve' && !(await showConfirm(
@@ -127,6 +133,20 @@ function ShipCard({ req, live, prodSites, onDone }) {
       const r = await resumeShip(req.id);
       if (r && r.ok === false) setErr(r.reason || 'could not resume'); else onDone?.();
     } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  // UNLOCK & SHIP: production is locked by someone else, but this ship should go now — force-release
+  // that lock and approve+ship in one step. Loud confirm, because it can cut off a human mid-verify.
+  const unlockShip = async () => {
+    if (!(await showConfirm(
+      `Production is locked by ${prodLock?.xell_slug || 'another xell'}${prodLock?.held ? ' (held open)' : ''}.\n\n`
+      + `Force-release that lock and ship ${short(req.commit)}${siteName ? ` @ ${siteName}` : ''} to PRODUCTION now?\n\n`
+      + `Whoever holds prod loses it immediately — if they are mid-verification, that is cut off. The `
+      + `queenzee then deploys this from main — real production.`,
+      { variant: 'danger', okLabel: 'Unlock & ship' }))) return;
+    setBusy(true); setErr(null);
+    try { await unlockAndShip(req.id, siteId || undefined); onDone?.(); }
+    catch (e) { setErr(e.message); } finally { setBusy(false); }
   };
 
   return (
@@ -194,6 +214,13 @@ function ShipCard({ req, live, prodSites, onDone }) {
       )}
       <ShipResults results={req.containers} />
       {err && <div className="land-err">{err}</div>}
+      {pending && prodLocked && (
+        <div className="ship-locked-note" data-testid="ship-locked-note">
+          🔒 production is locked by <b>{prodLock.xell_slug}</b>
+          {prodLock.held ? ' (held open)' : ''} — approving is disabled until it releases. Use
+          “Unlock &amp; ship” to take prod now.
+        </div>
+      )}
       {pending && (
         <div className="land-actions">
           <button className="land-reject" disabled={busy} onClick={() => decide('reject')}>Reject</button>
@@ -202,9 +229,24 @@ function ShipCard({ req, live, prodSites, onDone }) {
                   title="Set aside without rejecting — resume later for one combined ship">
             Defer
           </button>
-          <button className="ship-approve" disabled={busy} onClick={() => decide('approve')}>
-            {busy ? '…' : 'Approve → ship to prod'}
-          </button>
+          {prodLocked ? (
+            // Prod is locked — the plain approve would only queue behind the holder, so disable it
+            // and offer the deliberate "release the lock, then ship this" action instead.
+            <>
+              <button className="ship-approve" disabled data-testid="ship-approve-locked"
+                      title={`Production is locked by ${prodLock.xell_slug} — release it first, or use Unlock & ship`}>
+                Approve → ship to prod
+              </button>
+              <button className="ship-approve unlock-ship" data-testid="ship-unlock"
+                      disabled={busy} onClick={unlockShip}>
+                {busy ? '…' : '🔓 Unlock & ship'}
+              </button>
+            </>
+          ) : (
+            <button className="ship-approve" disabled={busy} onClick={() => decide('approve')}>
+              {busy ? '…' : 'Approve → ship to prod'}
+            </button>
+          )}
         </div>
       )}
       {deferred && (
@@ -300,7 +342,8 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
             : '⇪ production'}
       </div>
       <LockCountdown lock={prodLock} projectId={projectId} onChanged={onDecided} />
-      {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} prodSites={prodSites} onDone={onDecided} />)}
+      {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} prodSites={prodSites}
+                                 prodLock={prodLock} onDone={onDecided} />)}
     </section>
   );
 }

@@ -43,7 +43,7 @@ import { nudgeXellForStatus } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
-  dismissShipRequest, deferShip, resumeShip } from '../queenzee/shipgate.js';
+  dismissShipRequest, deferShip, resumeShip, unlockAndShip } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
@@ -140,6 +140,15 @@ router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => 
   try {
     res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console',
       { siteId: req.body?.site_id || undefined }));
+  } catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// Force-release the prod lock for this ship's site, then approve+ship it — the "prod is locked, but
+// send this one now" decision, done as one atomic step so nothing queues into the freed lock first.
+router.post('/ship/requests/:id/unlock-and-ship', async (req, res) => {
+  try {
+    res.json(await unlockAndShip(req.params.id,
+      { siteId: req.body?.site_id || null, by: req.body?.by || 'human@console' }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
 

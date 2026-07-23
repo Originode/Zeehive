@@ -281,6 +281,37 @@ export async function decideShip(id, decision, by = 'human@console', { siteId } 
   return row;
 }
 
+// ── unlock & ship: force prod free, then ship this one ────────────────────────
+// A pending ship cannot be approved while production is LOCKED — a prior ship is holding its
+// verification countdown (or a human held it open), and approving would only queue behind it. This
+// is the human deciding THIS ship should go now regardless: it force-releases the lock on this
+// ship's target site and then approves it in one step, so the queenzee takes the freed lock and
+// deploys. Folding the two acts ("Release now", then "Approve") into one also closes the window
+// between them where a queued ship could grab the lock first. HUMAN-only, like every ship decision.
+export async function unlockAndShip(id, { siteId = null, by = 'human@console' } = {}) {
+  const ship = await one(`SELECT * FROM ship_request WHERE id=$1 AND status='pending'`, [id]);
+  if (!ship) throw new Error('no such pending ship request (already decided?)');
+  if (ship.deferred_at) throw new Error('this ship is deferred — resume it before shipping');
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [ship.project_id]);
+  // Which site this ship will hit — the human's re-aim (siteId) wins, else the recorded site, else
+  // the project default. The lock we must free is the one keyed to THAT site.
+  const site = (siteId && siteId !== ship.site_id)
+    ? await one(`SELECT * FROM deploy_site WHERE id=$1 AND project_id=$2 AND tier='prod'`, [siteId, project.id])
+    : (ship.site_id ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [ship.site_id])
+                    : await resolveShipSite(project.id, null));
+  const lockKey = lockKeyFor(site);
+  const held = await one(`SELECT * FROM deploy_lock WHERE project_id=$1 AND container=$2`, [project.id, lockKey]);
+  if (held) {
+    await q(`DELETE FROM deploy_lock WHERE id=$1`, [held.id]);
+    broadcast('xell', { id: held.xell_id });
+    broadcast('ship', { id: held.ship_id });
+    logline('lock', `${lockKey} lock FORCE-RELEASED by ${by} — unlock & ship ${String(ship.commit).slice(0, 8)}`);
+  }
+  // Approve → runShip takes the (now free) lock and deploys. Pass the re-aim through so the ship
+  // hits (and re-resolves its migrations for) the site the human chose.
+  return decideShip(id, 'approved', by, { siteId: siteId || undefined });
+}
+
 // ── the queenzee ships ───────────────────────────────────────────────────────
 // Takes the lock, runs each prod container's OWN build script, then starts the release countdown.
 // Exported so the LANDING PAD driver can pull an approved ship onto the runway when it reaches the
