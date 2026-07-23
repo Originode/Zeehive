@@ -10,6 +10,10 @@ process.env.MAINTENANCE_MODE = process.env.MAINTENANCE_MODE || 'simulate';
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const m = await import('../server/src/queenzee/maintenance.js');
+// maintenance now RESOLVES containers through the SHARED registry-identity decision that
+// calm-summit-65c3fb centralized in lib/xell-db.js (reconciled, not a parallel copy). Prove the
+// regression-2 scenario against that shared decision — the same one maintenance calls internally.
+const { pickDbContainer } = await import('../server/src/lib/xell-db.js');
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -33,38 +37,48 @@ try {
   ok(oldResolve(psNewestFirst, 'omnibiz_db_prod') === 'omnibiz_db_prod_dev_local_mardale_prod',
     'OLD resolver picks the dev clone (7.7 MB, no core schema) — the bug, reproduced from ps order');
 
-  // The registry row carries identity the name shape cannot: the prod db publishes 5432.
+  // The registry row carries identity the name shape cannot: the prod db publishes 5432. The
+  // shared decision takes running = [{name, hostPorts:Set}] + {name, host_port} + the exclusion
+  // set of names that belong to OTHER registry rows (the clone is one).
   const running = [
-    { name: 'omnibiz_db_prod_dev_local_mardale_prod', state: 'running', ports: [{ public: 32768 }] },
-    { name: 'omnibiz_db_prod_v184', state: 'running', ports: [{ public: 5432 }] },
+    { name: 'omnibiz_db_prod_dev_local_mardale_prod', hostPorts: new Set([32768]) },
+    { name: 'omnibiz_db_prod_v184', hostPorts: new Set([5432]) },
   ];
-  const prodRow = { name: 'omnibiz_db_prod', host_port: 5432, tier: 'prod', docker_ctx: 'mardale-prod' };
-  const picked = m.pickContainer(running, prodRow);
-  ok(picked.name === 'omnibiz_db_prod_v184' && !picked.error,
-    'NEW pickContainer picks omnibiz_db_prod_v184 by host_port 5432 — the REAL prod db');
+  const otherDbNames = new Set(['omnibiz_db_prod_dev_local_mardale_prod']);   // the clone owns its own row
+  const picked = pickDbContainer(running, { name: 'omnibiz_db_prod', host_port: 5432 }, otherDbNames);
+  ok(picked.name === 'omnibiz_db_prod_v184' && !picked.ambiguous && !picked.unresolved,
+    `shared pickDbContainer picks omnibiz_db_prod_v184 by host_port 5432 — the REAL prod db (via=${picked.via})`);
 
-  const cloneRow = { name: 'omnibiz_db_prod_dev_local_mardale_prod', host_port: 32768, docker_ctx: 'mardale-prod' };
-  ok(m.pickContainer(running, cloneRow).name === 'omnibiz_db_prod_dev_local_mardale_prod',
+  ok(pickDbContainer(running, { name: 'omnibiz_db_prod_dev_local_mardale_prod', host_port: 32768 }).name
+    === 'omnibiz_db_prod_dev_local_mardale_prod',
     'the clone row (port 32768) still resolves to the clone — identity, not name shape');
 
   console.log('\n── the versioned case the heuristic existed for still works ──');
-  // Only the real prod running, no clone: omnibiz_db_prod → omnibiz_db_prod_v184.
-  ok(m.pickContainer([{ name: 'omnibiz_db_prod_v184', state: 'running', ports: [{ public: 5432 }] }], prodRow).name
-    === 'omnibiz_db_prod_v184', 'omnibiz_db_prod → omnibiz_db_prod_v184 by port');
+  // Only the real prod running, no clone: omnibiz_db_prod → omnibiz_db_prod_v184 by port.
+  ok(pickDbContainer([{ name: 'omnibiz_db_prod_v184', hostPorts: new Set([5432]) }],
+    { name: 'omnibiz_db_prod', host_port: 5432 }).name === 'omnibiz_db_prod_v184',
+    'omnibiz_db_prod → omnibiz_db_prod_v184 by port');
   // Same, with NO host_port recorded: fall back to a UNIQUE name-shape match (not the first guess).
-  ok(m.pickContainer([{ name: 'omnibiz_db_prod_v184', state: 'running', ports: [] }],
+  ok(pickDbContainer([{ name: 'omnibiz_db_prod_v184', hostPorts: new Set() }],
     { name: 'omnibiz_db_prod', host_port: null }).name === 'omnibiz_db_prod_v184',
     'null host_port → single versioned match still resolves');
 
-  console.log('\n── it now REFUSES rather than guessing (no silent wrong pick) ──');
-  ok(/no running container/.test(m.pickContainer(running, { name: 'omnibiz_db_prod', host_port: 9999 }).error || ''),
-    'a modeled port that nothing publishes → error, not a name-prefix fallback');
-  const ambiguous = m.pickContainer([
-    { name: 'omnibiz_db_prod_v184', state: 'running', ports: [] },
-    { name: 'omnibiz_db_prod_dev_local_mardale_prod', state: 'running', ports: [] },
+  console.log('\n── it now REFUSES/flags rather than guessing (maintenance turns these into a FAIL) ──');
+  // When the ONLY running container is a sibling row (the clone), it is excluded and nothing is
+  // left to pick → unresolved:true (the shared decision returns the logical name, flagged). This
+  // is the case where the old code would have prefix-matched the clone and dumped it; maintenance
+  // now treats unresolved as a hard FAILURE — it refuses to back up a database it can't identify.
+  const onlyClone = pickDbContainer(
+    [{ name: 'omnibiz_db_prod_dev_local_mardale_prod', hostPorts: new Set([32768]) }],
+    { name: 'omnibiz_db_prod', host_port: 5432 }, otherDbNames);
+  ok(onlyClone.unresolved === true,
+    'only the sibling clone is running → unresolved (excluded, not dumped); maintenance FAILS the backup');
+  const ambiguous = pickDbContainer([
+    { name: 'omnibiz_db_prod_v184', hostPorts: new Set() },
+    { name: 'omnibiz_db_prod_dev_local_mardale_prod', hostPorts: new Set() },
   ], { name: 'omnibiz_db_prod', host_port: null });
-  ok(/refusing to guess/.test(ambiguous.error || ''),
-    'two name matches + no port to disambiguate → refuses (this WAS the coin-toss bug)');
+  ok(ambiguous.ambiguous === true,
+    'two name matches + no port to disambiguate → ambiguous (maintenance FAILS rather than coin-toss)');
 
   // ─────────────────────────────────────────────────────────────────────────
   console.log('\n── REGRESSION 3: a valid archive of the WRONG database must FAIL ──');

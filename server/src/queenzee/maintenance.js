@@ -20,6 +20,7 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { resolveSite } from '../lib/sites.js';
 import { listContainersDetailed } from '../lib/docker.js';
+import { pickDbContainer } from '../lib/xell-db.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -263,66 +264,46 @@ async function removeRemoteFile(ctx, dir, file) {
 // `omnibiz_db_prod_` — the real prod db `omnibiz_db_prod_v184` (port 5432, has schema `core`) and
 // a dev clone `omnibiz_db_prod_dev_local_mardale_prod` (port 32768, empty). The clone was newer,
 // so it won, and the queenzee cheerfully dumped an empty database over the real one's history.
-// "stop with the hard coded naming" — Mark. The registry row already distinguishes them by
-// IDENTITY (docker_ctx + host_port + tier); we resolve from that, and use the versioned name only
-// as a tie-breaker, never as the discriminator.
+// "stop with the hard coded naming" — Mark.
 //
-// This is the SAME bug the concurrent xell calm-summit-65c3fb is centralizing in lib/xell-db.js.
-// If a registry-based resolver has landed there by merge time, import and use it and delete this;
-// until then this fixes it locally the same way (identity, not shape). — reconcile the two.
+// RECONCILED with calm-summit-65c3fb: that xell centralized the identity-based DECISION in
+// lib/xell-db.js as `pickDbContainer(running, {name, host_port}, registeredElsewhere)` — which
+// resolves by the row's published host port (5432 → real prod, 32768 → clone) and excludes any
+// running container that is itself another registry row. We IMPORT and use that shared decision
+// rather than keep a second copy (my brief: "if a central resolver exists by merge time, import
+// and use it"). What stays local here is only the async, CLI-free PLUMBING maintenance needs: we
+// read the live container list over the docker HTTP API (listContainersDetailed — same read the
+// health monitor uses, keeps the event loop free, and is what let this be unit-tested with no
+// daemon), and — unlike the guard's tolerant caller — we treat `ambiguous` OR `unresolved` as a
+// hard FAILURE. A backup that cannot positively identify its container must stop, never fall back
+// to a logical/first-guess name (that fallback IS regression 2).
 //
-// pickContainer is the PURE decision (list of running containers + the row) so it is unit-testable
-// without a docker daemon. Returns { name } or { error }.
-export function pickContainer(running, row) {
-  const list = (running || []).filter((c) => (c.state ? c.state === 'running' : true));
-  const name = row?.name;
-  const port = row?.host_port ?? null;
-  const nameMatch = (c) => c.name === name || (name && c.name.startsWith(name + '_'));
-
-  if (port != null) {
-    // Identity: exactly one container publishes the modeled host port on this daemon (a host port
-    // is unique per daemon). This is what tells omnibiz_db_prod_v184 (5432) from the clone (32768).
-    const byPort = list.filter((c) => (c.ports || []).some((p) => p.public === port));
-    if (byPort.length === 1) return { name: byPort[0].name };
-    if (byPort.length > 1) {
-      // more than one publishes it (shouldn't happen on one daemon) — prefer the name-shaped one
-      const shaped = byPort.find(nameMatch);
-      if (shaped) return { name: shaped.name };
-      return { error: `multiple running containers publish host port ${port} (${byPort.map((c) => c.name).join(', ')}) — cannot identify the modeled container '${name}'` };
-    }
-    // NOTHING on this context publishes the modeled port → the modeled container is not running as
-    // configured. Do NOT fall back to a name-prefix guess: that is exactly how the wrong container
-    // got picked. Fail loudly with what we looked for.
-    return { error: `no running container on this context publishes the modeled host port ${port} for '${name}' `
-      + `(running: ${list.map((c) => c.name).join(', ') || 'none'})` };
-  }
-
-  // No host_port recorded on the row — fall back to name, but require an UNAMBIGUOUS match rather
-  // than blindly taking the first (the original defect). An exact name wins; else a single
-  // versioned match; more than one is a refusal, not a coin toss.
-  const exact = list.find((c) => c.name === name);
-  if (exact) return { name: exact.name };
-  const versioned = list.filter((c) => name && c.name.startsWith(name + '_'));
-  if (versioned.length === 1) return { name: versioned[0].name };
-  if (versioned.length > 1) {
-    return { error: `several running containers match '${name}_*' (${versioned.map((c) => c.name).join(', ')}) and no host_port is recorded to tell them apart — refusing to guess` };
-  }
-  return { error: `container '${name}' is not running on this context (running: ${list.map((c) => c.name).join(', ') || 'none'})` };
-}
-
-// Async wrapper: read the live container list off the row's context (over the docker HTTP API — no
-// CLI, same read the health monitor uses) and apply pickContainer. Returns { name, image } of the
-// resolved running container. THROWS on an unreachable context or an unresolvable row — a backup
-// must FAIL, never fall through to some other container or to a local volume.
+// Returns { name, image } of the resolved running container. THROWS on an unreachable context or
+// an unconfirmable row — a backup must FAIL, never fall through to some other container/volume.
 async function resolveRunningContainer(row) {
   const ctx = row?.docker_ctx;
   let list;
   try { list = await listContainersDetailed(ctx); }
   catch (e) { throw new Error(`context '${ctx}' unreachable while resolving '${row?.name}': ${e.message}`); }
-  const picked = pickContainer(list, row);
-  if (picked.error) throw new Error(picked.error);
-  const hit = list.find((c) => c.name === picked.name);
-  return { name: picked.name, image: hit?.image || null };
+  // Adapt listContainersDetailed → pickDbContainer's shape: running only, published host ports.
+  const running = list
+    .filter((c) => c.state === 'running')
+    .map((c) => ({ name: c.name, hostPorts: new Set((c.ports || []).map((p) => p.public).filter((n) => n != null)) }));
+  // Exclusion set: the names of every OTHER db container in the registry — so a sibling row's
+  // container (the dev clone) can never be picked for this one, exactly as the shared resolver does.
+  const others = await q(`SELECT name FROM container WHERE role='db' AND name <> $1`, [row?.name]);
+  const registeredElsewhere = new Set(others.map((r) => r.name));
+  const pick = pickDbContainer(running, { name: row?.name, host_port: row?.host_port ?? null }, registeredElsewhere);
+  if (pick.ambiguous) {
+    throw new Error(`cannot identify the container for '${row?.name}' on '${ctx}': ${pick.candidates.length} candidates `
+      + `(${pick.candidates.join(', ')}) and none is confirmable. Refusing to guess — record the row's host_port.`);
+  }
+  if (pick.unresolved) {
+    throw new Error(`'${row?.name}' is not running on '${ctx}' as configured (host_port ${row?.host_port ?? 'none'}). `
+      + `Running db-ish containers: ${running.map((c) => c.name).join(', ') || 'none'}. Refusing to back up a database I cannot positively identify.`);
+  }
+  const hit = list.find((c) => c.name === pick.name);
+  return { name: pick.name, image: hit?.image || null };
 }
 
 // Flag a container busy (op = 'backup' | 'restore') or clear it, and tell the UI so it can spin
