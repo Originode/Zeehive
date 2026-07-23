@@ -256,6 +256,20 @@ async function removeRemoteFile(ctx, dir, file) {
   } catch { /* best effort */ }
 }
 
+// Remove a dump's FILE on whichever host it actually lives on: a remote dest_ctx via a throwaway
+// container, else the local path. Never throws — a file that is already gone is fine; the row is
+// removed either way. Shared by retention housekeeping, single-backup delete, and interrupted-job
+// cleanup so all three prune the RIGHT host (deleting the local path for a NAS dump = regression 1).
+async function removeDumpFile(snap) {
+  if (!snap?.dump_path) return;
+  if (snap.dest_ctx) {
+    const i = Math.max(snap.dump_path.lastIndexOf('/'), snap.dump_path.lastIndexOf('\\'));
+    await removeRemoteFile(snap.dest_ctx, snap.dump_path.slice(0, i), snap.dump_path.slice(i + 1));
+  } else {
+    try { rmSync(snap.dump_path, { force: true }); } catch { /* file may be gone */ }
+  }
+}
+
 // Resolve a REGISTRY container ROW to the actually-running container on its context — WITHOUT
 // trusting name shape.
 //
@@ -531,14 +545,7 @@ export async function housekeepBackups(projectId, keep = DEFAULT_MAX_BACKUPS) {
   for (const s of extra) {
     // Prune on the SAME host the dump lives on — deleting the local path for a NAS dump would
     // delete nothing (and quietly grow the NAS forever); this is regression 1's mirror image.
-    if (s.dump_path) {
-      if (s.dest_ctx) {
-        const i = Math.max(s.dump_path.lastIndexOf('/'), s.dump_path.lastIndexOf('\\'));
-        await removeRemoteFile(s.dest_ctx, s.dump_path.slice(0, i), s.dump_path.slice(i + 1));
-      } else {
-        try { rmSync(s.dump_path, { force: true }); } catch { /* file may be gone */ }
-      }
-    }
+    await removeDumpFile(s);
     await q(`DELETE FROM db_snapshot WHERE id=$1`, [s.id]);
   }
   if (extra.length) {
@@ -546,6 +553,24 @@ export async function housekeepBackups(projectId, keep = DEFAULT_MAX_BACKUPS) {
     logline('maint', `housekeeping removed ${extra.length} old backup(s) (keep ${keep})`);
   }
   return extra.length;
+}
+
+// Delete ONE backup on demand (the trash button in the backups modal), independent of retention:
+// remove its dump file on whichever host it lives on, then its row. Refuses a still-running backup
+// — that dump is mid-write, and "delete" is not "cancel"; wait for it to finish (or fail) first. A
+// finished OR failed row is fine to drop (a failed one may have left a partial file — clean it up).
+export async function deleteBackup(snapshotId) {
+  const snap = await one(
+    `SELECT id, project_id, dump_path, dest_ctx, status FROM db_snapshot WHERE id=$1`, [snapshotId]);
+  if (!snap) throw new Error('backup not found');
+  if (snap.status === 'running') {
+    throw new Error('this backup is still running — wait for it to finish before deleting it');
+  }
+  await removeDumpFile(snap);
+  await q(`DELETE FROM db_snapshot WHERE id=$1`, [snap.id]);
+  broadcast('task', { kind: 'db_snapshot_deleted', id: snap.id, project_id: snap.project_id });
+  logline('maint', `backup deleted → ${snap.dest_ctx ? `[${snap.dest_ctx}] ` : ''}${snap.dump_path || '(no file)'}`);
+  return { ok: true, id: snap.id };
 }
 
 // Update a project's backup settings (folder / interval / retention), then apply housekeeping
@@ -600,8 +625,10 @@ export async function revealBackup(snapshotId) {
 
 // ── RESTORE ───────────────────────────────────────────────────────────────────
 // Kick off an async restore of a backup INTO a db container. Flags the container busy and returns
-// immediately; the copy + pg_restore run in the background (runRestoreJob). Never targets prod.
-export async function restoreBackup({ snapshot, container }) {
+// immediately; the copy + pg_restore run in the background (runRestoreJob). Restoring over the
+// PRODUCTION database is allowed but GATED: `confirmProd` must be set (the console makes the human
+// type the prod db name), and prod must not be mid-ship / bound to a live zee.
+export async function restoreBackup({ snapshot, container, confirmProd = false }) {
   const snap = await one(`SELECT * FROM db_snapshot WHERE id=$1`, [snapshot]);
   if (!snap?.dump_path) throw new Error('backup not found');
   if (snap.status && snap.status !== 'finished') throw new Error('backup is not finished yet');
@@ -613,7 +640,19 @@ export async function restoreBackup({ snapshot, container }) {
   const c = await one(`SELECT * FROM container WHERE id=$1`, [container]);
   if (!c) throw new Error('container not found');
   if (c.role !== 'db') throw new Error(`target is not a db container (role=${c.role})`);
-  if (c.tier === 'prod') throw new Error('refusing to restore over the PRODUCTION database');
+  // Restoring OVER production overwrites live data — irreversible. Two backstops behind the UI's
+  // typed confirmation: the caller MUST pass confirmProd, and prod must be free (the same window
+  // that blocks a backup — a ship deploying, or a live zee bound to prod — would be clobbered).
+  if (c.tier === 'prod') {
+    if (!confirmProd) {
+      throw new Error('restoring over the PRODUCTION database requires explicit human confirmation');
+    }
+    const busy = await prodBusyReason(c.project_id);
+    if (busy) {
+      throw new Error(`refusing to restore over prod: ${busy} — a restore would clobber live prod work. `
+        + 'Try again once prod is released.');
+    }
+  }
   if (c.busy_since) throw new Error('this container is busy (a backup/restore is already running)');
 
   const proj = await one(`SELECT name, db_name, db_user FROM project WHERE id=$1`, [c.project_id]);

@@ -8,7 +8,7 @@ import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
-import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup } from '../queenzee/maintenance.js';
+import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
@@ -964,11 +964,14 @@ router.get('/backups', async (req, res) => {
   const backups = await q(
     `SELECT id, dump_path, dest_ctx, size_bytes, taken_at, source, status, error, mode FROM db_snapshot
        WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC`, [proj]);
-  // db containers a backup may be restored INTO (prod excluded — never restore over production);
-  // busy_since/busy_op tell the modal which target is mid-restore.
+  // db containers a backup may be restored INTO. Non-prod targets plus the SHARED prod db, flagged
+  // is_prod so the modal marks it and demands typed confirmation. Ordered so prod sorts LAST — the
+  // modal preselects targets[0], and prod must never be the default restore target. busy_since/
+  // busy_op tell the modal which target is mid-restore.
   const targets = await q(
-    `SELECT id, name, tier, busy_since, busy_op FROM container
-       WHERE project_id=$1 AND role='db' AND tier <> 'prod' ORDER BY tier, name`, [proj]);
+    `SELECT id, name, tier, busy_since, busy_op, (tier='prod') AS is_prod FROM container
+       WHERE project_id=$1 AND role='db' AND (tier <> 'prod' OR isolation='shared')
+       ORDER BY (tier='prod'), tier, name`, [proj]);
   res.json({ config: cfg, backups, targets });
 });
 router.post('/backups/config', async (req, res) => {
@@ -984,10 +987,19 @@ router.post('/backups/:id/reveal', async (req, res) => {
   try { res.json(await revealBackup(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
-// restore a backup INTO a db container (spins that container until done)
-router.post('/backups/:id/restore', async (req, res) => {
-  try { res.json(await restoreBackup({ snapshot: req.params.id, container: req.body?.container })); }
+// delete ONE backup (file + row); refuses a still-running backup.
+router.delete('/backups/:id', async (req, res) => {
+  try { res.json(await deleteBackup(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// restore a backup INTO a db container (spins that container until done). confirm_prod gates a
+// restore over the PRODUCTION database — the human typed the prod db name to set it.
+router.post('/backups/:id/restore', async (req, res) => {
+  try {
+    res.json(await restoreBackup({
+      snapshot: req.params.id, container: req.body?.container, confirmProd: !!req.body?.confirm_prod,
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── live stream (SSE) ─────────────────────────────────────────────────────────

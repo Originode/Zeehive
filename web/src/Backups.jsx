@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { getBackups, setBackupConfig, runBackup, revealBackup, restoreBackup } from './api.js';
-import { showConfirm } from './Dialog.jsx';
+import { getBackups, setBackupConfig, runBackup, revealBackup, restoreBackup, deleteBackup } from './api.js';
+import { showConfirm, showPrompt } from './Dialog.jsx';
 
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -100,10 +100,30 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
   };
   const restore = async (b) => {
     if (!selTarget) { flash('Pick a target db container first'); return; }
-    if (!(await showConfirm(`Restore this backup into ${selTarget.name}?\n\nThis OVERWRITES that database. `
-      + `The container spins and can't be built until it finishes.`, { variant: 'danger', okLabel: 'Restore' }))) return;
-    try { await restoreBackup(b.id, targetId); await load(); flash(`Restore started → ${selTarget.name}`); }
+    let confirmProd = false;
+    if (selTarget.is_prod) {
+      // Restoring over LIVE production is irreversible — make the human type the db name, not just
+      // click OK. The typed name both proves intent and sets the confirm_prod flag the server needs.
+      const typed = await showPrompt(
+        `⚠ RESTORE OVER PRODUCTION\n\nThis OVERWRITES the LIVE production database "${selTarget.name}" with `
+        + `this backup. It cannot be undone. Type the database name to confirm:`,
+        { variant: 'danger', okLabel: 'Restore over prod', placeholder: selTarget.name });
+      if (typed == null) return;                                   // cancelled
+      if (typed.trim() !== selTarget.name) { flash('Name did not match — restore cancelled'); return; }
+      confirmProd = true;
+    } else if (!(await showConfirm(`Restore this backup into ${selTarget.name}?\n\nThis OVERWRITES that database. `
+      + `The container spins and can't be built until it finishes.`, { variant: 'danger', okLabel: 'Restore' }))) {
+      return;
+    }
+    try { await restoreBackup(b.id, targetId, confirmProd); await load(); flash(`Restore started → ${selTarget.name}`); }
     catch (e) { flash(e.message || 'Restore failed'); }
+  };
+  const del = async (b) => {
+    if (!(await showConfirm(`Delete this backup?\n\n${stampFmt(b.taken_at)}\n\n`
+      + `This removes the dump file and its record. It cannot be undone.`,
+      { variant: 'danger', okLabel: 'Delete' }))) return;
+    try { await deleteBackup(b.id); await load(); flash('Backup deleted'); }
+    catch (e) { flash(e.message || 'Delete failed'); }
   };
 
   return (
@@ -114,11 +134,19 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
           <div className="bkhead-actions">
             {msg && <span className="bkmsg">{msg}</span>}
             {targets.length > 0 && (
-              <label className="bkrestore-into" title="Restoring a backup writes it into this db container (prod is never a target)">
+              <label className={`bkrestore-into ${selTarget?.is_prod ? 'prod' : ''}`}
+                     title="Restoring a backup writes it into this db container. Choosing PRODUCTION overwrites live prod — it asks you to type the db name to confirm.">
                 restore into
-                <select value={targetId} onChange={(e) => setTargetId(e.target.value)}>
-                  {targets.map((t) => <option key={t.id} value={t.id}>{t.name}{t.busy_since ? ' (busy)' : ''}</option>)}
+                <select value={targetId} onChange={(e) => setTargetId(e.target.value)} data-testid="restore-target">
+                  {targets.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name}{t.is_prod ? ' ⚠ PRODUCTION' : ''}{t.busy_since ? ' (busy)' : ''}
+                    </option>
+                  ))}
                 </select>
+                {selTarget?.is_prod && (
+                  <span className="bkprod-warn" title="This target is LIVE production — a restore overwrites it">⚠ live prod</span>
+                )}
                 {targetBusy && <span className="bkrestoring"><span className="cspin restore" />restoring…</span>}
               </label>
             )}
@@ -138,7 +166,13 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
               {b.status === 'running' ? (
                 <span className="bkjob" data-testid="backup-row-running"><span className="cspin backup" />backing up…</span>
               ) : b.status === 'failed' ? (
-                <span className="bkjob failed" title={b.error || 'backup failed'}>✕ failed</span>
+                <>
+                  <span className="bkjob failed" title={b.error || 'backup failed'}>✕ failed</span>
+                  <span className="bkacts">
+                    <button className="bkbtn sm danger" onClick={() => del(b)}
+                            title="Delete this failed backup (removes any partial file and its record)">Delete</button>
+                  </span>
+                </>
               ) : (
                 <>
                   <span className="bksize">{fmtBytes(b.size_bytes)}</span>
@@ -161,6 +195,8 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
                               : 'Restore this backup into the selected db container'}>
                       Restore
                     </button>
+                    <button className="bkbtn sm danger" onClick={() => del(b)}
+                            title="Delete this backup (removes the dump file and its record)">Delete</button>
                   </span>
                 </>
               )}

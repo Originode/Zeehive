@@ -677,6 +677,7 @@ a.cbox:hover { border-color: var(--accent); }
 .bkbtn:disabled { opacity: .5; cursor: not-allowed; }
 .bkbtn.sm { background: var(--panel2); color: var(--muted); border-color: var(--line); padding: 4px 9px; }
 .bkbtn.sm:hover:not(:disabled) { color: var(--text); border-color: var(--accent); filter: none; }
+.bkbtn.sm.danger:hover:not(:disabled) { color: #ff8b81; border-color: #b3261e; }
 
 /* backup settings modal */
 .bkcfg { width: min(440px, 92vw); background: var(--panel); border: 1px solid var(--line);
@@ -724,13 +725,17 @@ a.cbox:hover { border-color: var(--accent); }
 .bkrunning .cspin, .bkrestoring .cspin, .bkjob .cspin, .bkbtn .cspin { position: static; }
 .bkjob { color: #3bc6c0; font-size: 12px; }
 .bkjob.failed { color: var(--down); }
-.bkrow.running, .bkrow.failed { grid-template-columns: auto auto 1fr; }
-.bkrow.running { opacity: .9; }
+.bkrow.running { grid-template-columns: auto auto 1fr; opacity: .9; }
+.bkrow.failed { grid-template-columns: auto auto 1fr auto; }
 
 /* "restore into <db container>" selector in the backups modal header */
 .bkrestore-into { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 .bkrestore-into select { background: var(--bg); border: 1px solid var(--line); color: var(--text);
   border-radius: 6px; padding: 4px 6px; font-size: 12px; font-family: 'Cascadia Code', monospace; }
+/* a PRODUCTION target selected in "restore into" — loud, because it overwrites live prod */
+.bkrestore-into.prod select { border-color: #b3261e; color: #ff8b81; }
+.bkprod-warn { color: #ff8b81; border: 1px solid #b3261e; border-radius: 6px; padding: 1px 7px;
+  font-size: 10px; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
 
 /* ── landing gate — a push to main held for human verification ────────────────
    Loud on purpose: a held landing blocks a zee until a human decides. Uses --error

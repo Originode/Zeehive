@@ -423,12 +423,23 @@ export async function revealBackup(id) {
 }
 
 // Restore a backup into a db container (that container spins until the restore finishes).
-export async function restoreBackup(id, container) {
+// confirmProd must be true to restore over the PRODUCTION database (the UI collects a typed
+// confirmation first) — the server refuses a prod target otherwise.
+export async function restoreBackup(id, container, confirmProd = false) {
   const r = await fetch(`/api/backups/${id}/restore`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ container }),
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ container, confirm_prod: !!confirmProd }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `restore failed (${r.status})`);
+  return data;
+}
+
+// Delete a single backup (removes the dump file and its row). Refused while it is still running.
+export async function deleteBackup(id) {
+  const r = await fetch(`/api/backups/${id}`, { method: 'DELETE' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `delete failed (${r.status})`);
   return data;
 }
 
