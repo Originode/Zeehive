@@ -10,11 +10,28 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { gitLog, diffStat, cleanGitEnv } from '../lib/git.js';
+import { gitLog, diffStat, cleanGitEnv, headCommit } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
 import { nudgeXellAfterLand } from './nudge.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
+import { recordXourceHead } from '../lib/projects.js';
+
+// LANDING IS THE MOST COMMON WAY THE XOURCE HEAD MOVES — far more often than a pull. So the
+// moment a landing advances the ref we must re-record xource.head_commit, or the rollback
+// baseline (populated at onboarding / on pull) goes stale the instant anyone lands: the
+// ancestry tripwire would then fire FALSE positives against an old commit. A land is always a
+// fast-forward, so the new head contains the old one and recordXourceHead() naturally does NOT
+// warn. Advisory only: it must never break a landing, so it is wrapped and any failure is a
+// no-op. `ref` here is the plain branch name (what the xource row keys on), not `refs/heads/*`.
+async function recordLandedHead(project, head) {
+  if (!project || !head) return;
+  try {
+    await recordXourceHead(project, project.main_branch, head);
+  } catch (e) {
+    logline('landgate', `note: could not record xource head after land: ${e.message}`);
+  }
+}
 
 const ZERO = /^0+$/;
 
@@ -73,6 +90,9 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
       `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [approved.id]);
     broadcast('land', row);
     logline('landgate', `ALLOWED ${ref} → ${newSha.slice(0, 8)} on ${project.name} (approved by ${approved.decided_by})`);
+    // The receive path is about to move the ref to newSha — keep the rollback baseline fresh so a
+    // land does not leave head_commit stale (and later trip a false BACKWARD on pull).
+    await recordLandedHead(project, newSha);
     return { allow: true, reason: 'approved', request: row };
   }
 
@@ -104,6 +124,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
            WHERE id=$1 RETURNING *`, [existing.id]);
       broadcast('land', row);
       logline('landgate', `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — auto-approve policy (no human review)`);
+      await recordLandedHead(project, newSha);
       return { allow: true, reason: 'auto-approved', request: row };
     }
     const row = await one(
@@ -135,6 +156,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
     logline('landgate',
       `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
       + `${xell?.slug || 'unknown'} (auto-approve policy, no human review)`);
+    await recordLandedHead(project, newSha);
     return { allow: true, reason: 'auto-approved', request: row };
   }
 
@@ -246,6 +268,9 @@ async function landApproved(row, by = 'human') {
          WHERE id=$1 RETURNING *`, [row.id]);
     broadcast('land', landed);
     logline('landgate', `${row.new_sha.slice(0, 8)} is already on ${row.ref.replace('refs/heads/', '')} — marking landed`);
+    // The ref already contains this sha (landed by some other path) — reconcile the recorded head
+    // to the ref's ACTUAL current tip so the rollback baseline stays truthful.
+    await recordLandedHead(project, headCommit(project.repo_root, project.main_branch));
     // A cxell zee that raised this landing is waiting to continue — resume its session (best-effort).
     nudgeXellAfterLand(row.xell_id, { by }).catch(() => {});
     return landed || row;
@@ -310,6 +335,9 @@ async function landApproved(row, by = 'human') {
     broadcast('land', landed);
     broadcast('xell', { id: row.xell_id });
     logline('landgate', `LANDED ${row.new_sha.slice(0, 8)} → ${row.ref.replace('refs/heads/', '')} (approved by ${row.decided_by || by})`);
+    // The xource ref just advanced — re-record its head so the rollback baseline tracks the land
+    // (a ff, so this contains the old head and warns about nothing). Advisory: never blocks a land.
+    await recordLandedHead(project, row.new_sha);
     // Primary async-continuation: if a CXELLD zee raised this, resume its session so it ships/does
     // done with no human re-invocation. Best-effort and logged (a dead cxell just logs).
     nudgeXellAfterLand(row.xell_id, { by }).catch(() => {});

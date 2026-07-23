@@ -178,8 +178,13 @@ export async function pullRemote({ repoRoot, branch = 'main', remoteUrl, token }
     return { pulled: false, state: 'refused', reason: `checkout is on '${current || 'unknown'}', not '${branch}' — pull only fast-forwards the checked-out main` };
   }
 
-  // dirty tree → refuse (same stance as pullFromXource: never merge over uncommitted work)
-  const st = await g(['status', '--porcelain'], { timeout: 30000 });
+  // dirty tree → refuse (same stance as pullFromXource: never merge over uncommitted work).
+  // TRACKED changes only: a xource carries its xells' worktrees at .claude/worktrees/, which is
+  // untracked and never goes away, so counting untracked files refused every pull on a project
+  // that had ever been provisioned (seen live on OmniBiz: "1 uncommitted change(s)" forever).
+  // Untracked files are not at risk here — a fast-forward cannot silently clobber one, and git
+  // itself aborts the merge if it would need to write over an untracked path.
+  const st = await g(['status', '--porcelain', '--untracked-files=no'], { timeout: 30000 });
   const dirty = st.status === 0 ? st.out.split('\n').filter(Boolean).length : -1;
   if (dirty !== 0) {
     return { pulled: false, state: 'refused', reason: dirty > 0 ? `${dirty} uncommitted change(s) in the checkout — commit or stash first` : 'could not read working-tree status' };

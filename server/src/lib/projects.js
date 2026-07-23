@@ -11,7 +11,7 @@ import { pool, one, q } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
-import { cleanGitEnv } from './git.js';
+import { cleanGitEnv, headCommit, isAncestor } from './git.js';
 import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
          remoteAccess, pushRemote, openPullRequest } from './remote-git.js';
@@ -94,10 +94,15 @@ export async function createProject(body) {
        mf.found ? mf.hash : null,
        (body.remote_url || '').trim() || null]);
 
+    // Record the xource's head AT ONBOARDING. This is the baseline the rollback tripwire
+    // reads: a remote that later moves BACKWARD (force-push, restored-from-stale-backup)
+    // leaves the checkout on a commit that no longer contains this one, and that is only
+    // detectable if we wrote down where we started. Null when repo_root is not a readable
+    // git repo yet — the column is advisory, never a gate on onboarding.
     await client.query(
-      `INSERT INTO xource (project_id, ref, read_only) VALUES ($1,$2,true)
-       ON CONFLICT (project_id, ref) DO NOTHING`,
-      [project.id, mainBranch]);
+      `INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+       ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
+      [project.id, mainBranch, headCommit(repoRoot, mainBranch)]);
 
     // Deploy sites are the real "where" (spec §5); the columns above stay as deprecated
     // fallback. Every project gets a dev site ('default' = this machine's daemon when unset);
@@ -234,6 +239,30 @@ export async function cloneProject(body = {}) {
   return { ...project, gate_warning: gateWarning, token_warning: tokenWarning };
 }
 
+// Write down where the xource ref now points, and check it did not move BACKWARD. A remote
+// that regresses (force-push, restore-from-stale-backup, a re-clone of a rolled-back remote)
+// leaves the checkout on a commit that no longer CONTAINS the head we last recorded — and
+// nothing else in the system notices, because every xell dutifully branches from the new tip.
+// That is exactly how OmniBiz lost six days of work in July 2026: the remote went back from
+// 90a7548b to 0265998f and the containerized xource was cloned from the regressed remote.
+// Returns a regression descriptor when the ref moved backward, else null.
+export async function recordXourceHead(project, ref, head) {
+  if (!head) return null;
+  const prev = await one(`SELECT head_commit FROM xource WHERE project_id=$1 AND ref=$2`, [project.id, ref]);
+  const was = prev?.head_commit || null;
+  const regressed = !!was && was !== head && !isAncestor(project.repo_root, was, head);
+
+  await q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+           ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = EXCLUDED.head_commit`,
+          [project.id, ref, head]);
+
+  if (regressed) {
+    logline('projects', `WARNING ${project.name}: xource ${ref} moved BACKWARD — recorded ${was.slice(0, 8)} is not contained in ${head.slice(0, 8)}; work may have been dropped`);
+    return { regressed: true, was, now: head };
+  }
+  return null;
+}
+
 // Fetch + ff-only merge of the recorded remote into the xource checkout. Human-triggered from
 // the console; refusals (dirty tree, divergence, wrong branch) come back as {pulled:false,
 // reason} for the refuse-with-reason UI convention.
@@ -249,11 +278,16 @@ export async function pullProject(id, by = 'human@console') {
     repoRoot: String(p.repo_root).replace(/\\/g, '/'),
     branch: p.main_branch, remoteUrl: p.remote_url, token,
   });
+  // Record the head on any successful read of the ref — including 'up-to-date', which is where
+  // a first-ever population lands for a project onboarded before head_commit was tracked.
+  let regression = null;
+  if (r.pulled) regression = await recordXourceHead(p, p.main_branch, r.to || headCommit(p.repo_root, p.main_branch));
+
   if (r.state === 'fast-forwarded') {
     logline('projects', `${by} pulled ${p.name}: origin/${p.main_branch} → ${(r.to || '').slice(0, 8)} (${r.commits} commit${r.commits === 1 ? '' : 's'})`);
     broadcast('project', p);
   }
-  return r;
+  return regression ? { ...r, ...regression } : r;
 }
 
 // ── OUTBOUND (opt-in, human-gated): does this project's PAT carry write access? ──
@@ -561,8 +595,9 @@ export async function updateProject(id, body = {}) {
   const updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
   // A changed main branch needs its xource row, or the pool can't provision from it.
   if (body.main_branch && body.main_branch !== project.main_branch) {
-    await q(`INSERT INTO xource (project_id, ref, read_only) VALUES ($1,$2,true)
-             ON CONFLICT (project_id, ref) DO NOTHING`, [id, updated.main_branch]);
+    await q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+             ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
+            [id, updated.main_branch, headCommit(updated.repo_root, updated.main_branch)]);
   }
   broadcast('project', updated);
   return updated;
