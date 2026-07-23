@@ -31,6 +31,15 @@
 set -uo pipefail
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY 2>/dev/null || true
 
+# Drive the compose build through BuildKit, explicitly — do not depend on a daemon default.
+# Compose v2 uses buildx (installed in the queenzee image at
+# /usr/local/libexec/docker/cli-plugins/docker-buildx) when this is set; against a REMOTE context
+# that uses the daemon-embedded BuildKit of that context (mardale-prod has it), so `RUN --mount`,
+# `--secret`, `--ssh` and `# syntax=` directives work. Without it, compose falls back to the legacy
+# builder and any BuildKit Dockerfile feature fails at build time.
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+
 SRC="${1:?usage: ship-prod.sh <source_path> <role> <docker_ctx> <mode> [build_ref]}"
 ROLE="${2:?missing role}"
 CTX="${3:?missing docker context}"
