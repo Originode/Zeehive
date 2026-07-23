@@ -106,9 +106,11 @@ const land = await selfLand(xell);
 console.log('  selfLand →', JSON.stringify({ ok: land.ok, status: land.status, catch_up: land.catch_up?.state,
   request_status: land.request?.status, request_new_sha: land.request?.new_sha?.slice(0, 8) }));
 ok(land.status === 'held', `status is 'held' (was: ${land.status})`);
-ok(land.catch_up?.state === 'rebased', `catch-up REBASED the zee commit onto current master (state=${land.catch_up?.state})`);
+// catch-up MERGES current master into the diverged branch (kept as a merge, not a rebase, so the
+// branch survives as its own lane on the graph — see catchUpWorktree's rationale in xellgit.js).
+ok(land.catch_up?.state === 'merged', `catch-up MERGED current master into the zee branch (state=${land.catch_up?.state})`);
 const wtHeadAfter = git(wt, ['rev-parse', 'HEAD']);
-ok(wtHeadAfter !== shaZ, `worktree HEAD is a NEW sha after rebase (${wtHeadAfter.slice(0, 8)}, was ${shaZ.slice(0, 8)})`);
+ok(wtHeadAfter !== shaZ, `worktree HEAD is a NEW sha after the catch-up merge (${wtHeadAfter.slice(0, 8)}, was ${shaZ.slice(0, 8)})`);
 ok(spawnSync('git', ['-C', wt, 'merge-base', '--is-ancestor', shaB, wtHeadAfter]).status === 0,
   'the rebased HEAD now FAST-FORWARDS master (B is its ancestor) — the push can land cleanly');
 // the REAL land_request row exists, pending, for exactly the pushed sha

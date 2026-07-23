@@ -163,11 +163,17 @@ export function catchUpWorktree(worktree, ref) {
 // A failed `git merge` is only a real CONFLICT when git says so (unmerged paths / "Automatic merge
 // failed"). Anything else — a missing committer identity, a hook refusal, an unreadable object — is
 // an operational ERROR the zee cannot "resolve by hand", and calling it a conflict sent zees chasing
-// a phantom (2026-07-22). Split the two so each gets an honest message.
+// a phantom (2026-07-22). Split the two so each gets an honest message. Exported because the SAME
+// distinction has to reach a CAGED zee: its self-heal merge (of the xource into the cxell) runs
+// inside the container over docker exec, and cxell.js classifies that merge's output with this exact
+// predicate so a caged zee is told "conflict — yours to resolve" vs "operational error — not yours".
+export function classifyMergeOutput(output) {
+  const text = String(output || '').trim();
+  const realConflict = /^CONFLICT|Automatic merge failed|fix conflicts|would be overwritten by merge/im.test(text);
+  return { state: realConflict ? 'conflict' : 'error', output: text.slice(-1200) };
+}
 function mergeFailure(m) {
-  const output = `${m.out}\n${m.err}`.trim();
-  const realConflict = /^CONFLICT|Automatic merge failed|fix conflicts|would be overwritten by merge/im.test(output);
-  return { state: realConflict ? 'conflict' : 'error', output: output.slice(-1200) };
+  return classifyMergeOutput(`${m.out}\n${m.err}`);
 }
 
 // DB-aware wrapper: resolve the xell's worktree + xource ref, then catch that worktree up. Same

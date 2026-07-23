@@ -7,6 +7,7 @@
 //   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]
 //   zee working [--note "what you are doing"]
 //   zee tend --reason "why you need a human"   |   zee tend --clear
+//   zee sync [--no-rebuild]
 //   zee land [--wait]
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
@@ -153,7 +154,8 @@ function usage() {
   zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. --clear lowers it
-  zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); --wait blocks until decided (run in background)
+  zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
+  zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
@@ -215,6 +217,15 @@ switch (cmd) {
       await pollBuild(role, secs, { watch: false }); // exits
     }
     process.exit(0);
+    break;
+  }
+  case 'sync': {
+    // Reconcile with main on your own: deliver current main INTO your cxell, merge it (pure script),
+    // and rebuild your app tier. NOT gated. On a genuine content conflict the merge is left in your
+    // cxell for YOU to resolve (git status → fix → add → commit), then `zee land`.
+    const r = await req('POST', '/api/xell/self/sync', { rebuild: !rest.includes('--no-rebuild') });
+    console.log(JSON.stringify(r.json, null, 2));
+    process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
     break;
   }
   case 'working': {
