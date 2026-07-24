@@ -233,12 +233,14 @@ export async function resumeShip(id, by = 'human@console') {
 // ── bundle: ship every DEFERRED ship as ONE combined deploy ───────────────────
 // Resuming deferred ships one at a time and approving each is N prod deploys of (identically) the
 // current main tip — the very "a deploy per commit" noise that deferring set out to avoid. Bundle
-// is the human's "ship all of these together" click: per prod SITE (a build cannot target two
-// sites at once), it elects ONE deferred ship as the CARRIER, re-aims it at the current main tip
-// and approves it, and FOLDS every other deferred ship for that site into it — those riders stay
-// set aside (out of the pad and the alarm) and share the carrier's single verdict when its one
-// deploy finishes (see the fold-in in runShipBody). Their landed work is already in the main tip
-// the carrier builds, so one build genuinely ships them all. HUMAN-only, like every ship decision.
+// is the human's "gather all of these into one" click: per prod SITE (a build cannot target two
+// sites at once), it elects ONE deferred ship as the CARRIER, re-aims it at the current main tip,
+// and FOLDS every other deferred ship for that site into it — those riders stay set aside (out of
+// the pad and the alarm) and share the carrier's single verdict when its one deploy finishes (see
+// the fold-in in runShipBody). Like "Resume" but for all at once: the carrier becomes a normal
+// awaiting-approval ship, so the human still approves that ONE click before prod — nothing here
+// deploys on its own. Its landed work plus every rider's is already in the main tip it builds, so
+// one build genuinely ships them all. HUMAN-only, like every ship decision.
 export async function bundleDeferredShips(projectId, { by = 'human@console' } = {}) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
   if (!project) throw new Error('unknown project');
