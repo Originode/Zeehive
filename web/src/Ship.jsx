@@ -363,10 +363,11 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
   );
 }
 
-// One click that ships every deferred request as ONE combined deploy (per prod site): the queenzee
-// elects a carrier, re-aims it at the current main tip, approves it, and folds the rest to ride it.
-// This is the payoff of deferring — many small landings pile up on main, then ONE ship carries them
-// all, instead of resuming each into its own prod deploy.
+// One click that gathers every deferred request into ONE combined deploy (per prod site): the
+// queenzee elects a carrier, re-aims it at the current main tip, and folds the rest to ride it —
+// like "Resume", but for all of them at once. The carrier lands as a normal awaiting-approval ship
+// (the human still approves that one loud click before prod). This is the payoff of deferring —
+// many small landings pile up on main, then ONE ship carries them all, not a deploy per commit.
 function BundleBar({ count, projectId, onDone }) {
   const [busy, setBusy] = useState(false);
   const bundle = async () => {
