@@ -841,6 +841,18 @@ a.cbox:hover { border-color: var(--accent); }
 .ship-card.deferred { border-color: var(--line); border-style: dashed; opacity: .9; }
 .ship-deferred { color: var(--muted); font-size: 12.5px; margin-top: 8px;
   border-left: 2px solid var(--muted); padding-left: 8px; }
+/* bundle bar: one click ships every deferred request as ONE combined deploy instead of N. */
+.ship-bundle-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--panel2); border: 1px dashed var(--line); border-radius: 8px;
+  padding: 8px 12px; margin: 8px 0; font-size: 12.5px; color: var(--muted); }
+.ship-bundle-bar b { color: var(--text); }
+.ship-bundle-btn { margin-left: auto; border-radius: 8px; padding: 5px 12px; font-size: 12.5px;
+  cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text); }
+.ship-bundle-btn:hover:not(:disabled) { background: rgba(255,255,255,.06); border-color: var(--muted); }
+.ship-bundle-btn:disabled { opacity: .5; cursor: default; }
+/* a folded rider: informational, riding a carrier's single deploy — no actions of its own. */
+.ship-deferred.bundled { border-left-color: var(--building); color: var(--building); }
+
 /* prod is locked: why the plain approve is greyed out, and the unlock-&-ship escape hatch. */
 .ship-locked-note { color: var(--building); font-size: 12.5px; margin-top: 8px;
   border-left: 2px solid var(--building); padding-left: 8px; }

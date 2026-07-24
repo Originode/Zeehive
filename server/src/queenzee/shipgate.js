@@ -230,6 +230,122 @@ export async function resumeShip(id, by = 'human@console') {
   return { ok: true, request: row };
 }
 
+// ── bundle: ship every DEFERRED ship as ONE combined deploy ───────────────────
+// Resuming deferred ships one at a time and approving each is N prod deploys of (identically) the
+// current main tip — the very "a deploy per commit" noise that deferring set out to avoid. Bundle
+// is the human's "ship all of these together" click: per prod SITE (a build cannot target two
+// sites at once), it elects ONE deferred ship as the CARRIER, re-aims it at the current main tip
+// and approves it, and FOLDS every other deferred ship for that site into it — those riders stay
+// set aside (out of the pad and the alarm) and share the carrier's single verdict when its one
+// deploy finishes (see the fold-in in runShipBody). Their landed work is already in the main tip
+// the carrier builds, so one build genuinely ships them all. HUMAN-only, like every ship decision.
+export async function bundleDeferredShips(projectId, { by = 'human@console' } = {}) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+  if (!project) throw new Error('unknown project');
+  const main = project.main_branch || 'main';
+  const deferred = await q(
+    `SELECT s.*, x.worktree_path, x.slug AS xell_slug FROM ship_request s
+       JOIN xell x ON x.id = s.xell_id
+      WHERE s.project_id=$1 AND s.status='pending' AND s.deferred_at IS NOT NULL
+        AND s.dismissed_at IS NULL AND s.bundled_into IS NULL
+      ORDER BY s.deferred_at ASC`, [projectId]);
+  if (!deferred.length) return { ok: false, reason: 'no deferred ship requests to bundle' };
+
+  // Group by target site (null = the project default). One deploy per site — a single build cannot
+  // produce two sites' images — so each distinct site gets its OWN carrier that folds that site's
+  // members. Most projects have one prod site, so this is usually a single group.
+  const groups = new Map();
+  for (const s of deferred) {
+    const k = s.site_id || 'default';
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(s);
+  }
+
+  const bundles = [];
+  const skipped = [];
+  for (const members of groups.values()) {
+    // Every rider's work must still be on main — forward-only landings keep a deferred ship
+    // landable, but re-check: a bundle that shipped unlanded work would be exactly the band-aid the
+    // ship gate exists to forbid. An unlanded one is dropped from the bundle (stays deferred).
+    const landed = [];
+    for (const m of members) {
+      const st = landedState(m.worktree_path, main);
+      if (st.landed) landed.push(m); else skipped.push({ slug: m.xell_slug, reason: st.reason });
+    }
+    if (!landed.length) continue;
+
+    const site = landed[0].site_id
+      ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [landed[0].site_id])
+      : await resolveShipSite(projectId, null);
+    let commit, migrations;
+    try { ({ commit, migrations } = await resolveShipCommit(project, site, main)); }
+    catch (e) { skipped.push({ slug: `site ${site?.key || 'default'}`, reason: e.message }); continue; }
+
+    const [carrier, ...riders] = landed;
+    const slugs = landed.map((m) => m.xell_slug);
+    const reason = `bundled ship of ${landed.length} deferred request(s): ${slugs.join(', ')}`;
+    // Carrier: un-defer and re-aim at the current main tip, but leave it PENDING — bundling mirrors
+    // "Resume", not "Approve". The carrier becomes a normal awaiting-approval ship showing the
+    // combined commit + migration set; the human still approves THAT before anything reaches prod
+    // (the single most consequential click stays a click). Its one build carries every listed
+    // xell's landed work, because they all resolve to this same main tip.
+    const c = await one(
+      `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, bundled_into=NULL,
+              commit=$2, migrations=$3::jsonb, requested_at=now(), reason=$4
+         WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
+      [carrier.id, commit, JSON.stringify(migrations), reason]);
+    if (!c) { skipped.push({ slug: carrier.xell_slug, reason: 'changed underneath the bundle' }); continue; }
+    broadcast('ship', c);
+
+    // Fold the riders into the carrier: they stay set aside (still pending + deferred, so the pad
+    // never picks them up on their own and they raise no alarm) with bundled_into pointing at the
+    // carrier. When the carrier is approved and its one deploy finishes, every rider is resolved to
+    // its verdict (see resolveBundleRiders in runShipBody).
+    let folded = [];
+    if (riders.length) {
+      folded = await q(
+        `UPDATE ship_request SET bundled_into=$2
+           WHERE id = ANY($1) AND status='pending' AND deferred_at IS NOT NULL RETURNING id`,
+        [riders.map((m) => m.id), c.id]);
+      for (const f of folded) broadcast('ship', { id: f.id });
+    }
+    logline('ship', `BUNDLED ${landed.length} deferred ship(s) → carrier ${String(commit).slice(0, 8)}`
+      + ` for site ${site?.key || 'default'} by ${by} (${slugs.join(', ')}) — awaiting approval`);
+    notifyShipRequest({ project, xell: { slug: carrier.xell_slug }, request: c });
+    bundles.push({ carrier: c.id, site: site?.key || null, count: landed.length, commit });
+  }
+
+  if (!bundles.length) {
+    return { ok: false, skipped,
+      reason: skipped.map((s) => `${s.slug}: ${s.reason}`).join('; ') || 'nothing bundlable' };
+  }
+  return { ok: true, bundles, skipped };
+}
+
+// Resolve every rider folded into a finished carrier to that carrier's ONE verdict. Their landed
+// work is in the main tip the carrier built, so a shipped carrier ships them and a failed carrier
+// fails them — from the single real deploy, no rider ever builds on its own. Shared by the normal
+// success/fail path and the crash path so a carrier that dies mid-run still frees its riders.
+async function resolveBundleRiders(carrierId, ok, commit) {
+  const riders = await q(
+    `UPDATE ship_request
+        SET status=$2, finished_at=now(), deferred_at=NULL, deferred_by=NULL,
+            decided_at=COALESCE(decided_at, now()), decided_by=COALESCE(decided_by, 'bundle@queenzee'),
+            containers=$3::jsonb, error=$4
+      WHERE bundled_into=$1 AND status='pending' RETURNING *`,
+    [carrierId, ok ? 'shipped' : 'failed',
+      JSON.stringify([{ role: 'bundle', ok, method: 'bundled',
+        log: `rode a bundled ship built from main @ ${String(commit).slice(0, 8)} — this xell's landed `
+          + `work is included in that single deploy` }]),
+      ok ? null : `bundle carrier ${String(commit).slice(0, 8)} failed`]);
+  for (const r of riders) broadcast('ship', r);
+  if (riders.length) {
+    logline('ship', `bundle: ${riders.length} folded ship(s) resolved → ${ok ? 'shipped' : 'failed'}`
+      + ` with carrier ${String(commit).slice(0, 8)}`);
+  }
+  return riders.length;
+}
+
 export async function listShipRequests(projectId, { open = true } = {}) {
   const where = open ? `AND s.status IN ('pending','approved','shipping')` : '';
   return q(
@@ -277,6 +393,13 @@ export async function decideShip(id, decision, by = 'human@console', { siteId } 
   broadcast('ship', row);
   logline('ship', `${decision.toUpperCase()} ship ${String(row.commit).slice(0, 8)} by ${by}`
     + (retarget ? ` → site ${retarget.site.key} (re-aimed at approval)` : ''));
+  // A rejected BUNDLE carrier must not strand its riders pointing at it — free them back to
+  // plain-deferred so a human can resume or re-bundle them.
+  if (decision === 'rejected') {
+    const freed = await q(`UPDATE ship_request SET bundled_into=NULL WHERE bundled_into=$1 RETURNING id`, [row.id]);
+    for (const f of freed) broadcast('ship', { id: f.id });
+    if (freed.length) logline('ship', `bundle carrier rejected — freed ${freed.length} rider(s) back to deferred`);
+  }
   if (decision === 'approved') runShip(row.id).catch((e) => console.error('[ship] run failed:', e.message));
   return row;
 }
@@ -372,6 +495,8 @@ export async function runShip(shipId) {
         `UPDATE deploy_lock SET phase='failed', auto_release_at=COALESCE(auto_release_at, now() + ($2 || ' seconds')::interval)
           WHERE ship_id=$1 AND held=false`, [ship.id, String(AUTO_RELEASE_SEC)]);
       broadcast('xell', { id: xell.id });
+      // A crashed carrier fails its riders too — never leave them stranded pointing at a dead ship.
+      await resolveBundleRiders(ship.id, false, ship.commit).catch(() => {});
       logline('ship', `ship ${String(ship.commit).slice(0, 8)} CRASHED mid-run — marked failed, ${lockKey} countdown started: ${e.message}`);
     } catch { /* the DB is what failed — the tick() stranded sweep is the backstop */ }
   } finally {
@@ -480,6 +605,9 @@ async function runShipBody(ship, xell, project, site, lockKey) {
   logline('ship', ok
     ? `SHIPPED ${String(ship.commit).slice(0, 8)} to prod from ${xell.slug} (${MODE})`
     : `ship FAILED for ${xell.slug}: ${done.error}`);
+
+  // If this ship was a BUNDLE carrier, resolve its riders now — one deploy, one verdict for all.
+  await resolveBundleRiders(ship.id, ok, ship.commit);
 
   // Countdown starts either way: a failed ship must not sit on prod forever either.
   const lock = await one(
@@ -651,6 +779,8 @@ async function recoverStrandedShip(ship, why) {
       allUp ? null : `${why}; targets not verifiably up — re-request`]);
   if (!done) return;   // someone else landed it between our SELECT and now — nothing to recover
   broadcast('ship', done);
+  // A recovered carrier resolves its riders to the same verdict — they never outlive their carrier.
+  await resolveBundleRiders(ship.id, done.status === 'shipped', ship.commit).catch(() => {});
   logline('ship', `recovered stranded ship ${String(ship.commit).slice(0, 8)} → ${done.status}`
     + (allUp ? ' (health check passed — the self-ship pattern)' : ` (${done.error})`));
   // start the countdown on its lock if the dying process never did
@@ -680,6 +810,11 @@ export async function releaseXellShips(xellId, by = 'reaper@done') {
   for (const s of closed) {
     broadcast('ship', s);
     logline('ship', `ship request ${String(s.commit).slice(0, 8)} withdrawn — its xell was marked done`);
+    // If a withdrawn ship was a BUNDLE carrier, free its riders back to plain-deferred (bundled_into
+    // NULL) so a human can re-bundle or resume them — they must not point at a rejected carrier.
+    const freed = await q(
+      `UPDATE ship_request SET bundled_into=NULL WHERE bundled_into=$1 RETURNING id`, [s.id]);
+    for (const f of freed) broadcast('ship', { id: f.id });
   }
   // Stranded 'shipping' rows complete from evidence, exactly like boot recovery.
   const stranded = await q(`SELECT * FROM ship_request WHERE xell_id=$1 AND status='shipping'`, [xellId]);

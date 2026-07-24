@@ -516,6 +516,18 @@ export async function resumeShip(id) {
   return data;
 }
 
+// Bundle every DEFERRED ship into ONE combined deploy (per prod site): a carrier is re-aimed at the
+// current main tip and approved, and the rest ride its single build. Returns { ok, bundles, skipped }.
+export async function bundleDeferredShips(projectId) {
+  const r = await fetch('/api/ship/bundle-deferred', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ project: projectId }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `bundle failed (${r.status})`);
+  return data;
+}
+
 // Stop the auto-release countdown — for a human who is actively verifying prod.
 export async function holdProdLock(projectId, by = 'human@console') {
   const r = await fetch('/api/prod-lock/hold', {

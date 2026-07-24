@@ -43,7 +43,7 @@ import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
-  dismissShipRequest, deferShip, resumeShip, unlockAndShip } from '../queenzee/shipgate.js';
+  dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
@@ -167,6 +167,15 @@ router.post('/ship/requests/:id/defer', async (req, res) => {
 // Resume a deferred ship: re-aim it at the current main tip and make it a live pending request.
 router.post('/ship/requests/:id/resume', async (req, res) => {
   try { res.json(await resumeShip(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// Bundle every DEFERRED ship into ONE combined deploy (per prod site) — the "ship all of these
+// together" click. A carrier is re-aimed at the current main tip and approved; the rest ride it.
+router.post('/ship/bundle-deferred', async (req, res) => {
+  const projectId = req.body?.project || req.query.project;
+  if (!projectId) return res.status(400).json({ error: 'project is required' });
+  try { res.json(await bundleDeferredShips(projectId, { by: req.body?.by || 'human@console' })); }
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 

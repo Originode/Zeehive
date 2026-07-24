@@ -7,7 +7,7 @@
 //      "let it go" — an unattended hold blocks every other xell. HOLD stops the clock for a human
 //      who is actively verifying.
 import React, { useState, useEffect, useRef } from 'react';
-import { decideShip, dismissShip, deferShip, resumeShip, unlockAndShip, holdProdLock, forceReleaseProdLock, getSites } from './api.js';
+import { decideShip, dismissShip, deferShip, resumeShip, unlockAndShip, holdProdLock, forceReleaseProdLock, getSites, bundleDeferredShips } from './api.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
@@ -84,6 +84,9 @@ function ShipCard({ req, live, prodSites, prodLock, onDone }) {
   // A DEFERRED ship is still 'pending' server-side, but a human set it aside for a combined ship.
   // It shows a quiet "deferred" card with Resume, not the loud approve/reject actions.
   const deferred = req.status === 'pending' && !!req.deferred_at;
+  // A folded RIDER: still a set-aside pending ship, but bundled into a carrier — it does not act on
+  // its own (no Resume/Reject); it waits for the carrier's one deploy and shares its verdict.
+  const bundledRider = deferred && !!req.bundled_into;
   const pending = req.status === 'pending' && !deferred;
   // WHERE this ship deploys. One production → nothing to choose, it ships there (the recorded
   // site). More than one → a human picks in THIS dialog, defaulting to the request's recorded
@@ -206,10 +209,16 @@ function ShipCard({ req, live, prodSites, prodLock, onDone }) {
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
       {req.status === 'shipped' && <div className="ship-progress done">★ LIVE — shipped {req.finished_at ? `at ${new Date(req.finished_at).toLocaleTimeString()}` : ''}</div>}
       {req.status === 'failed' && <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>}
-      {deferred && (
+      {deferred && !bundledRider && (
         <div className="ship-deferred" data-testid="ship-deferred">
           ⏸ deferred{req.deferred_by ? ` by ${req.deferred_by}` : ''} — set aside so other xells' landings
           collect on main. Resume to ship the combined result (it re-aims at the current main tip).
+        </div>
+      )}
+      {bundledRider && (
+        <div className="ship-deferred bundled" data-testid="ship-bundled-rider">
+          🧺 bundled — riding one combined deploy. This xell's landed work is in the main tip the
+          bundle builds, so it ships (or fails) with the carrier, without a build of its own.
         </div>
       )}
       <ShipResults results={req.containers} />
@@ -249,7 +258,7 @@ function ShipCard({ req, live, prodSites, prodLock, onDone }) {
           )}
         </div>
       )}
-      {deferred && (
+      {deferred && !bundledRider && (
         <div className="land-actions">
           <button className="land-reject" disabled={busy} onClick={() => decide('reject')}>Reject</button>
           <button className="ship-approve" data-testid="ship-resume" disabled={busy} onClick={resume}>
@@ -332,19 +341,61 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
   // toward the loud "awaiting your approval" alarm — they render as quiet deferred cards.
   const pending = open.filter((s) => s.status === 'pending' && !s.deferred_at).length;
   const deferred = open.filter((s) => s.status === 'pending' && s.deferred_at).length;
+  // The set-aside ships a bundle would act on: deferred, and not already folded into a carrier.
+  // Two or more is where "ship them all as one deploy" beats resuming each (which is a deploy each).
+  const bundleable = open.filter((s) => s.status === 'pending' && s.deferred_at && !s.bundled_into).length;
   return (
     <section className={`ship-panel${pending ? ' urgent' : ''}`}>
       <div className="ship-title">
         {pending
           ? `⚠ ${pending} PRODUCTION ship${pending === 1 ? '' : 's'} awaiting your approval`
           : deferred
-            ? `⏸ ${deferred} ship${deferred === 1 ? '' : 's'} deferred — resume for one combined ship`
+            ? `⏸ ${deferred} ship${deferred === 1 ? '' : 's'} deferred — bundle them into one combined ship`
             : '⇪ production'}
       </div>
       <LockCountdown lock={prodLock} projectId={projectId} onChanged={onDecided} />
+      {bundleable >= 2 && (
+        <BundleBar count={bundleable} projectId={projectId} onDone={onDecided} />
+      )}
       {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} prodSites={prodSites}
                                  prodLock={prodLock} onDone={onDecided} />)}
     </section>
+  );
+}
+
+// One click that ships every deferred request as ONE combined deploy (per prod site): the queenzee
+// elects a carrier, re-aims it at the current main tip, approves it, and folds the rest to ride it.
+// This is the payoff of deferring — many small landings pile up on main, then ONE ship carries them
+// all, instead of resuming each into its own prod deploy.
+function BundleBar({ count, projectId, onDone }) {
+  const [busy, setBusy] = useState(false);
+  const bundle = async () => {
+    if (!(await showConfirm(
+      `Bundle all ${count} deferred ships into one combined production deploy?\n\n`
+      + `The queenzee picks one as the carrier, re-aims it at the current main tip and ships it — `
+      + `the rest ride that single build (their landed work is already in main). This still needs `
+      + `your approval on the carrier before it deploys.`,
+      { okLabel: 'Bundle & queue' }))) return;
+    setBusy(true);
+    try {
+      const r = await bundleDeferredShips(projectId);
+      if (r && r.ok === false) showAlert(r.reason || 'nothing to bundle', { variant: 'error' });
+      else if (r?.skipped?.length) {
+        showAlert(`Bundled ${r.bundles?.length || 0} deploy(s). Left out: `
+          + r.skipped.map((s) => `${s.slug} (${s.reason})`).join('; '), { variant: 'info' });
+      }
+      onDone?.();
+    } catch (e) { showAlert(e.message, { variant: 'error' }); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div className="ship-bundle-bar" data-testid="ship-bundle-bar">
+      🧺 <b>{count}</b> deferred ships can go as one — bundle them into a single production deploy
+      instead of {count} separate ones.
+      <button className="ship-bundle-btn" data-testid="ship-bundle" disabled={busy} onClick={bundle}>
+        {busy ? '…' : `Bundle all ${count} into one ship`}
+      </button>
+    </div>
   );
 }
 
