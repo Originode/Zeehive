@@ -78,7 +78,7 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
   return new Promise((resolve, reject) => {
     const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...args];
     const p = spawn('docker', full, { windowsHide: true });
-    let out = '', err = '', buf = '';
+    let out = '', err = '', buf = '', stdinErr = null;
     const t = timeoutMs ? setTimeout(() => { p.kill(); reject(new Error(`docker ${args[0]} timed out after ${timeoutMs}ms`)); }, timeoutMs) : null;
     p.stdout.on('data', (d) => {
       const s = d.toString();
@@ -92,11 +92,25 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
     p.on('close', (code) => {
       if (t) clearTimeout(t);
       if (onLine && buf.trim()) onLine(buf);
+      // A stdin write that broke before the payload was fully delivered (e.g. EPIPE when the
+      // container's reader closed early) means the bytes are TRUNCATED — even if the child then
+      // exits 0 (base64 -d / cat happily decode a partial stream). Surfacing this is what stops a
+      // half-written image attachment from being reported as a clean success. See writeFileIntoCxell.
+      if (stdinErr) { reject(new Error(`docker ${args.slice(0, 2).join(' ')} stdin write failed: ${stdinErr.code || stdinErr.message} — payload likely truncated`)); return; }
       if (code === 0) resolve({ code, out, err });
       else reject(new Error(`docker ${args.slice(0, 2).join(' ')} exited ${code}: ${(err || out).slice(0, 400)}`));
     });
-    if (input !== undefined) { p.stdin.write(input); }
-    p.stdin.end();
+    if (input !== undefined) {
+      // Catch stdin errors (EPIPE etc.) rather than letting them bubble to an UNCAUGHT exception:
+      // a multi-megabyte base64 attachment piped to `docker exec -i` is exactly when a mid-write
+      // pipe break happens. `.end(input)` writes the whole buffer and only closes stdin once it has
+      // flushed — so the container reader gets every byte on the happy path, and a genuine break is
+      // recorded in stdinErr and turned into a rejection on close (above).
+      p.stdin.on('error', (e) => { stdinErr = e; });
+      p.stdin.end(input);
+    } else {
+      p.stdin.end();
+    }
   });
 }
 

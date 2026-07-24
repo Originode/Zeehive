@@ -54,5 +54,27 @@ console.log('\n── writeFileIntoCxell: the target stays inside the repo ─�
   ok(threw, 'a path that is ENTIRELY traversal (../..) is refused rather than writing repo root');
 }
 
+// ── 4. a big attachment whose stdin pipe breaks mid-write → REJECTS, not false-success ──
+// The bug behind "message works for text, attaching an image fails": a multi-MB base64 piped to
+// `docker exec -i` can hit EPIPE if the reader closes early. The old dk swallowed the write, let the
+// EPIPE become an UNCAUGHT exception, and still resolved code 0 — so a truncated/empty image was
+// reported as delivered. dk must now (a) never throw uncaught, (b) reject when the payload was cut.
+console.log('\n── writeFileIntoCxell: a broken stdin pipe is surfaced, never a silent truncation ──');
+{
+  let sawUncaught = null;
+  const onUncaught = (e) => { sawUncaught = e; };
+  process.on('uncaughtException', onUncaught);
+  process.env.DOCKER_FAKE_EARLY_CLOSE = '1';
+  const bigB64 = Buffer.alloc(4 * 1024 * 1024, 0x41).toString('base64'); // ~5.5MB of base64
+  let rejected = false, rejMsg = '';
+  try { await writeFileIntoCxell({ slug: 'keen-harbor', relPath: '.zee-inbox/2026/big.png', base64: bigB64 }); }
+  catch (e) { rejected = true; rejMsg = e.message; }
+  delete process.env.DOCKER_FAKE_EARLY_CLOSE;
+  await new Promise((r) => setTimeout(r, 50)); // let any stray async error surface
+  process.removeListener('uncaughtException', onUncaught);
+  ok(rejected, `a truncated attachment write REJECTS rather than reporting success (${rejMsg.slice(0, 60)})`);
+  ok(!sawUncaught, `an EPIPE on the attachment stdin never becomes an UNCAUGHT exception${sawUncaught ? ` (saw ${sawUncaught.code || sawUncaught.message})` : ''}`);
+}
+
 console.log(`\n${failures === 0 ? 'ALL PASSED ✓' : `${failures} FAILURE(S) ✗`}`);
 process.exit(failures === 0 ? 0 : 1);

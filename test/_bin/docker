@@ -6,6 +6,13 @@ LOG="${DOCKER_LOG:-/tmp/fake-docker.log}"
 {
   echo "=== docker $* ==="
 } >> "$LOG"
+# EARLY-CLOSE simulation: read only a few bytes then exit WITHOUT draining stdin, so a large
+# payload write hits a closing pipe (EPIPE) mid-stream — the exact failure a multi-MB image
+# attachment can trigger against `docker exec -i`. Lets the message test prove dk surfaces it.
+if [ "${DOCKER_FAKE_EARLY_CLOSE:-}" = "1" ] && [ ! -t 0 ]; then
+  head -c 16 >/dev/null 2>&1 || true
+  exit 0
+fi
 # read stdin (the resume prompt) if any, record it
 if [ ! -t 0 ]; then
   IN="$(cat)"

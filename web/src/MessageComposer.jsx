@@ -68,7 +68,11 @@ export default function MessageComposer({ xell, onClose, onSent }) {
     setBusy(true); setErr(null);
     try {
       const r = await sendXellMessage(xell.id, { text, images });
-      if (r?.sent) { onSent?.(r); onClose?.(); }
+      if (r?.sent && !r?.failed?.length) { onSent?.(r); onClose?.(); }
+      else if (r?.sent) {
+        // delivered, but some attachments could not be handed over — keep the composer open and say so
+        setErr(`Sent, but ${r.failed.length} image(s) failed to attach: ${r.failed.join(', ')}`); setBusy(false);
+      }
       else { setErr(r?.reason || r?.error || 'no live cxell zee to reach'); setBusy(false); }
     } catch (e) { setErr(e?.message || String(e)); setBusy(false); }
   };

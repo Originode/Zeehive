@@ -76,6 +76,7 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
     let typed = body;
     const written = [];
 
+    const failed = [];
     if (rich) {
       const ts = new Date().toISOString().replace(/[:.]/g, '-');
       const dir = `.zee-inbox/${ts}`;
@@ -83,11 +84,18 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
         const b64 = String(imgs[i].data).replace(/^data:[^,]*,/, '');
         const rel = `${dir}/image-${i + 1}${msgImageExt(imgs[i].name, imgs[i].type)}`;
         try { written.push((await writeFileIntoCxell({ slug: zee.slug, relPath: rel, base64: b64 })).path); }
-        catch (e) { logline('message', `${zee.slug}: could not write attachment ${rel} (${String(e.message).slice(0, 120)})`); }
+        catch (e) { failed.push(imgs[i].name || rel); logline('message', `${zee.slug}: could not write attachment ${rel} (${String(e.message).slice(0, 120)})`); }
+      }
+      // Every attachment failed to land — don't type a pointer to files that aren't there and don't
+      // report a clean send. The operator needs to know the images did NOT reach the zee (this is the
+      // "attach image fails silently" case: writes threw, yet the UI showed success).
+      if (imgs.length && !written.length) {
+        return { sent: false, reason: `could not deliver ${imgs.length} image attachment(s) into the cxell — ${failed.join(', ')}`, failed };
       }
       const md = ['# Operator message', `_sent ${new Date().toISOString()} by ${by}_`, '',
         body || '(no text — see attachments)', '',
-        ...(written.length ? [`## Attachments (${written.length})`, ...written.map((p) => `- ${p}`)] : [])].join('\n');
+        ...(written.length ? [`## Attachments (${written.length})`, ...written.map((p) => `- ${p}`)] : []),
+        ...(failed.length ? ['', `> ⚠ ${failed.length} attachment(s) could not be delivered: ${failed.join(', ')}`] : [])].join('\n');
       let bodyPath = `${dir}/message.md`;
       try { bodyPath = (await writeFileIntoCxell({ slug: zee.slug, relPath: bodyPath, text: md })).path; }
       catch (e) { logline('message', `${zee.slug}: could not write message body (${String(e.message).slice(0, 120)})`); }
@@ -102,7 +110,7 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
       .then(() => logline('message', `${zee.slug}: delivered operator message to the live session`))
       .catch((e) => logline('message', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`));
 
-    return { sent: true, zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written };
+    return { sent: true, zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written, ...(failed.length ? { failed } : {}) };
   } catch (e) {
     logline('message', `message for xell ${String(xellId).slice(0, 8)} failed: ${String(e.message).slice(0, 160)}`);
     return { sent: false, error: e.message };
