@@ -263,6 +263,7 @@ export async function getFleet(projectId) {
       backup_ctx: pool?.backup_ctx ?? null,
       backup_interval_sec: pool?.backup_interval_sec ?? 86400,
       max_backups: pool?.max_backups ?? 14,
+      backup_tables: pool?.backup_tables ?? null,   // null/[] ⇒ full-database backups (the default)
     },
     last: lastBackup,
     count: backupCount?.n ?? 0,

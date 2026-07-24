@@ -26,6 +26,73 @@ function fmtBytes(n) {
   return `${v.toFixed(1)} ${u[i]}`;
 }
 
+// A plain-identifier table name: schema.table (or bare table). Mirrors the server's validator so the
+// UI rejects the same bad input up front instead of round-tripping to a 400.
+const TABLE_RE = /^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$/;
+
+// ── reusable table picker ─────────────────────────────────────────────────────
+// value/onChange is an array of 'schema.table' strings. EMPTY ⇒ "everything" (whole database) — the
+// default, shown prominently so a partial selection is never a surprise. `available` is the universe
+// to tick (from a backup's TOC); a free-text add covers tables not in that list (or when there's no
+// backup yet to enumerate).
+function TableSelect({ available = [], value, onChange, allLabel = 'the whole database' }) {
+  const [filter, setFilter] = useState('');
+  const [entry, setEntry] = useState('');
+  const sel = new Set(value);
+  const universe = [...new Set([...(available || []), ...value])].sort();
+  const shown = universe.filter((t) => t.toLowerCase().includes(filter.trim().toLowerCase()));
+  const toggle = (t) => { const n = new Set(sel); n.has(t) ? n.delete(t) : n.add(t); onChange([...n].sort()); };
+  const addEntry = () => {
+    const t = entry.trim();
+    if (!t) return;
+    if (!TABLE_RE.test(t)) return;                 // ignore invalid — the input shows the rule
+    if (!sel.has(t)) onChange([...value, t].sort());
+    setEntry('');
+  };
+  const entryBad = entry.trim() && !TABLE_RE.test(entry.trim());
+
+  return (
+    <div className="tblsel" data-testid="table-select">
+      <div className="tblsel-top">
+        <span className={`tblsel-mode ${value.length ? 'scoped' : 'all'}`}>
+          {value.length ? `${value.length} table(s) selected` : `all tables — ${allLabel}`}
+        </span>
+        {value.length > 0 && (
+          <button type="button" className="bkbtn sm" onClick={() => onChange([])}
+                  title="Clear the selection — back up / restore everything">Select all (clear)</button>
+        )}
+      </div>
+      {universe.length > 8 && (
+        <input className="tblsel-filter" value={filter} placeholder="filter tables…"
+               onChange={(e) => setFilter(e.target.value)} spellCheck={false} />
+      )}
+      <div className="tblsel-list">
+        {shown.length === 0 && (
+          <div className="tblsel-empty dim">
+            {universe.length === 0
+              ? 'no table list yet — add tables below, or take a full backup first to enumerate them'
+              : 'no tables match the filter'}
+          </div>
+        )}
+        {shown.map((t) => (
+          <label key={t} className="tblsel-row" title={t}>
+            <input type="checkbox" checked={sel.has(t)} onChange={() => toggle(t)} />
+            <span className="mono">{t}</span>
+          </label>
+        ))}
+      </div>
+      <div className="tblsel-add">
+        <input value={entry} placeholder="add schema.table" spellCheck={false}
+               className={entryBad ? 'bad' : ''}
+               onChange={(e) => setEntry(e.target.value)}
+               onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addEntry(); } }} />
+        <button type="button" className="bkbtn sm" onClick={addEntry} disabled={!entry.trim() || entryBad}>Add</button>
+        {entryBad && <span className="tblsel-warn">plain identifiers only (schema.table)</span>}
+      </div>
+    </div>
+  );
+}
+
 // ── the panel (sits above the container inventory) ────────────────────────────
 export default function BackupsPanel({ backup, projectId }) {
   const [showList, setShowList] = useState(false);
@@ -67,6 +134,8 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
   const [backups, setBackups] = useState(null);
   const [targets, setTargets] = useState([]);
   const [targetId, setTargetId] = useState(initialTargetId || '');
+  const [picks, setPicks] = useState({});    // { [backupId]: ['schema.table', …] } — [] ⇒ whole dump
+  const [openPick, setOpenPick] = useState(null);   // which backup row's table picker is expanded
   const [msg, setMsg] = useState('');
   const flash = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2600); };
 
@@ -100,22 +169,24 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
   };
   const restore = async (b) => {
     if (!selTarget) { flash('Pick a target db container first'); return; }
+    const pick = picks[b.id] || [];                                // [] ⇒ restore the whole dump
+    const scope = pick.length ? `only ${pick.length} selected table(s)` : 'the whole database';
     let confirmProd = false;
     if (selTarget.is_prod) {
       // Restoring over LIVE production is irreversible — make the human type the db name, not just
       // click OK. The typed name both proves intent and sets the confirm_prod flag the server needs.
       const typed = await showPrompt(
-        `⚠ RESTORE OVER PRODUCTION\n\nThis OVERWRITES the LIVE production database "${selTarget.name}" with `
+        `⚠ RESTORE OVER PRODUCTION\n\nThis OVERWRITES ${scope} in the LIVE production database "${selTarget.name}" with `
         + `this backup. It cannot be undone. Type the database name to confirm:`,
         { variant: 'danger', okLabel: 'Restore over prod', placeholder: selTarget.name });
       if (typed == null) return;                                   // cancelled
       if (typed.trim() !== selTarget.name) { flash('Name did not match — restore cancelled'); return; }
       confirmProd = true;
-    } else if (!(await showConfirm(`Restore this backup into ${selTarget.name}?\n\nThis OVERWRITES that database. `
+    } else if (!(await showConfirm(`Restore ${scope} into ${selTarget.name}?\n\nThis OVERWRITES ${pick.length ? 'those tables in ' : ''}that database. `
       + `The container spins and can't be built until it finishes.`, { variant: 'danger', okLabel: 'Restore' }))) {
       return;
     }
-    try { await restoreBackup(b.id, targetId, confirmProd); await load(); flash(`Restore started → ${selTarget.name}`); }
+    try { await restoreBackup(b.id, targetId, confirmProd, pick.length ? pick : null); await load(); flash(`Restore started → ${selTarget.name}`); }
     catch (e) { flash(e.message || 'Restore failed'); }
   };
   const del = async (b) => {
@@ -183,10 +254,18 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
                     </span>
                   )}
                   {b.dest_ctx && <span className="bkdest" title={`on docker context ${b.dest_ctx}`}>{b.dest_ctx}</span>}
+                  {Array.isArray(b.tables) && <span className="bkscoped" title={`this backup captured only: ${b.tables.join(', ')}`}>scoped · {b.tables.length} table(s)</span>}
                   <span className="bkpath mono" title={b.dump_path}>{b.dump_path}</span>
                   <span className="bkacts">
                     <button className="bkbtn sm" onClick={() => copy(b.dump_path)}>Copy path</button>
                     <button className="bkbtn sm" onClick={() => reveal(b.id)}>Open in Explorer</button>
+                    {b.mode !== 'simulate' && (
+                      <button className={`bkbtn sm ${(picks[b.id]?.length) ? 'active' : ''}`} data-testid="restore-tables-toggle"
+                              onClick={() => setOpenPick((o) => (o === b.id ? null : b.id))}
+                              title="Choose which tables to restore out of this backup (default: all)">
+                        Tables: {picks[b.id]?.length ? `${picks[b.id].length}` : 'all'} ▾
+                      </button>
+                    )}
                     <button className="bkbtn sm" onClick={() => restore(b)}
                             disabled={!targets.length || targetBusy || b.mode === 'simulate'}
                             title={b.mode === 'simulate' ? 'a simulated backup is a placeholder, not real data — it cannot be restored'
@@ -199,6 +278,13 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
                             title="Delete this backup (removes the dump file and its record)">Delete</button>
                   </span>
                 </>
+              )}
+              {openPick === b.id && b.status !== 'running' && b.status !== 'failed' && (
+                <div className="bkrow-pick">
+                  <TableSelect available={b.toc_tables || b.tables || []} value={picks[b.id] || []}
+                               onChange={(v) => setPicks((p) => ({ ...p, [b.id]: v }))}
+                               allLabel="everything in this dump" />
+                </div>
               )}
             </div>
           ))}
@@ -226,8 +312,18 @@ function BackupSettings({ backup, projectId, onClose }) {
   const [ival, setIval] = useState(init.value);
   const [unit, setUnit] = useState(init.unit);
   const [maxB, setMaxB] = useState(cfg.max_backups ?? 14);
+  const [tables, setTables] = useState(Array.isArray(cfg.backup_tables) ? cfg.backup_tables : []);
+  const [universe, setUniverse] = useState([]);   // tables to tick, from the most recent full backup
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
+
+  // Enumerate tables from the newest backup that recorded a TOC, so the operator ticks real names.
+  useEffect(() => {
+    getBackups(projectId).then((d) => {
+      const withToc = (d.backups || []).find((b) => Array.isArray(b.toc_tables) && b.toc_tables.length);
+      if (withToc) setUniverse(withToc.toc_tables);
+    }).catch(() => {});
+  }, [projectId]);
 
   const save = async () => {
     setSaving(true); setErr('');
@@ -239,6 +335,7 @@ function BackupSettings({ backup, projectId, onClose }) {
         backup_ctx: ctx.trim() || null,
         backup_interval_sec: Math.round(Number(ival) * mult),
         max_backups: Number(maxB),
+        backup_tables: tables.length ? tables : null,
       });
       onClose();
     } catch (e) { setErr(e.message); setSaving(false); }
@@ -276,6 +373,12 @@ function BackupSettings({ backup, projectId, onClose }) {
           <label>Max backups kept
             <input type="number" min="1" max="1000" value={maxB} onChange={(e) => setMaxB(e.target.value)} />
             <span className="bkhint">older backups beyond this are deleted by housekeeping</span>
+          </label>
+          <label>Tables to back up
+            <TableSelect available={universe} value={tables} onChange={setTables} allLabel="the whole database" />
+            <span className="bkhint">applies to scheduled AND manual backups. Leave empty to dump the
+              whole database (the default). A scoped selection dumps ONLY these tables — smaller, faster,
+              but a partial restore of it can't reconstruct the tables you left out.</span>
           </label>
           {err && <div className="bkerr">{err}</div>}
         </div>

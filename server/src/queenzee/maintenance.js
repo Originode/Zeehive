@@ -170,7 +170,13 @@ export function assertDumpSize(size, prevSize) {
 // Parse `pg_restore --list` text into a compact summary. Each data-bearing line looks like:
 //   "215; 1259 16805 TABLE core invoices postgres"
 //   "3012; 0 16805 TABLE DATA core invoices postgres"
-// We collect the schema+table for TABLE / TABLE DATA / SEQUENCE / VIEW / MATERIALIZED VIEW rows.
+//   "5; 2615 16800 SCHEMA - core postgres"          ← namespace field is '-', the NAME is the schema
+//   "217; 0 0 SEQUENCE OWNED BY core invoices_id_seq postgres"   ← COMPOUND descriptor
+// We collect the schema+table for TABLE rows, and the schema set from every entry that carries one.
+// COMPOUND descriptors matter: "SEQUENCE OWNED BY", "SEQUENCE SET" and "MATERIALIZED VIEW DATA" put a
+// sub-keyword where the schema token would otherwise be. Matching only the short prefix ("SEQUENCE")
+// left "OWNED"/"SET"/"DATA" (and, from SCHEMA rows, "-") as bogus schema names — harmless to the
+// counts but poisonous to a table/schema PICKER built from this, so the longer forms are matched first.
 export function parseDumpToc(listText) {
   const schemas = new Set();
   const tables = [];      // [{ schema, name }] for TABLE rows only
@@ -183,17 +189,71 @@ export function parseDumpToc(listText) {
     if (!m) continue;
     entryCount++;
     const rest = m[1];
-    const desc = /^(TABLE DATA|MATERIALIZED VIEW|TABLE|SEQUENCE|VIEW|INDEX|CONSTRAINT|TYPE|FUNCTION|SCHEMA|DEFAULT|FK CONSTRAINT|TRIGGER)\b/.exec(rest);
+    // Longer compound descriptors FIRST so "SEQUENCE OWNED BY" doesn't degrade to "SEQUENCE".
+    const desc = /^(TABLE DATA|MATERIALIZED VIEW DATA|MATERIALIZED VIEW|SEQUENCE OWNED BY|SEQUENCE SET|TABLE|SEQUENCE|VIEW|INDEX|CONSTRAINT|TYPE|FUNCTION|SCHEMA|DEFAULT|FK CONSTRAINT|TRIGGER)\b/.exec(rest);
     if (!desc) continue;
     const kind = desc[1];
     const tail = rest.slice(kind.length).trim().split(/\s+/);
-    if (kind === 'SCHEMA') { if (tail[0]) schemas.add(tail[0]); continue; }
+    // A SCHEMA entry's namespace column is '-'; the schema's own name is the NEXT token.
+    if (kind === 'SCHEMA') { if (tail[1]) schemas.add(tail[1]); continue; }
     const schema = tail[0];
     const name = tail[1];
-    if (schema) schemas.add(schema);
+    if (schema && schema !== '-') schemas.add(schema);
     if (kind === 'TABLE' && schema && name) tables.push({ schema, name });
   }
   return { schemas: [...schemas], tables, tableCount: tables.length, entryCount };
+}
+
+// ── table-selection arg builders (pure; unit-tested without a database) ─────────
+// A selection is an array of 'schema.table' strings. Empty/absent ⇒ [] ⇒ operate on the WHOLE
+// database (the default). Callers validate the strings first (validTableSelection below); these just
+// shape the argv. Values are passed as discrete argv to `docker exec` (never a shell string), so
+// there is no shell to inject into — the validator's job is to reject pg_dump PATTERN metacharacters
+// (?, *, etc.) that would silently widen the selection.
+export function dumpTableArgs(tables) {
+  if (!Array.isArray(tables)) return [];
+  // pg_dump -t accepts a schema-qualified pattern directly (core.location), so one flag per table.
+  return tables.filter((t) => typeof t === 'string' && t.trim()).flatMap((t) => ['-t', t.trim()]);
+}
+// pg_restore -t matches by table NAME only; schema is restricted with -n (the two are AND-ed). So we
+// emit -n for each distinct schema and -t for each table name. Caveat, noted for the caller: selecting
+// two same-named tables in different schemas widens to their cross product — rare, and safe (it only
+// restores MORE of the archive the operator already trusts), never wrong data.
+export function restoreTableArgs(tables) {
+  if (!Array.isArray(tables)) return [];
+  const clean = tables.filter((t) => typeof t === 'string' && t.trim()).map((t) => t.trim());
+  if (!clean.length) return [];
+  const schemas = new Set(); const names = [];
+  for (const t of clean) {
+    const dot = t.indexOf('.');
+    if (dot > 0) { schemas.add(t.slice(0, dot)); names.push(t.slice(dot + 1)); }
+    else names.push(t);
+  }
+  const args = [];
+  for (const s of schemas) args.push('-n', s);
+  for (const n of names) args.push('-t', n);
+  return args;
+}
+// Validate + normalise a table selection from the API. Returns a clean array (possibly empty ⇒ full
+// database) or throws with a precise reason. Identifiers only: letters/digits/underscore/$, an
+// optional single schema qualifier. No wildcards, quotes, whitespace or shell/pattern metacharacters.
+const TABLE_IDENT = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+export function validTableSelection(input, label = 'tables') {
+  if (input == null) return [];
+  if (!Array.isArray(input)) throw new Error(`${label} must be an array of "schema.table" strings`);
+  const out = [];
+  for (const raw of input) {
+    if (typeof raw !== 'string') throw new Error(`${label}: every entry must be a string`);
+    const t = raw.trim();
+    if (!t) continue;
+    const parts = t.split('.');
+    if (parts.length > 2 || !parts.every((p) => TABLE_IDENT.test(p))) {
+      throw new Error(`${label}: "${raw}" is not a valid table name — use schema.table with plain `
+        + `identifiers (letters, digits, _ , $), no wildcards or quoting`);
+    }
+    out.push(t);
+  }
+  return [...new Set(out)];
 }
 
 // CONTENT guard. toc = parseDumpToc(...) of the dump actually written. prevSummary = the
@@ -386,7 +446,9 @@ export async function backupProd(projectId) {
       + '(pg_dump locks every table for its duration). It runs automatically once prod is released.');
   }
 
-  const pool = await one(`SELECT backup_dir, backup_ctx, max_backups FROM pool_config WHERE project_id=$1`, [projectId]);
+  const pool = await one(`SELECT backup_dir, backup_ctx, max_backups, backup_tables FROM pool_config WHERE project_id=$1`, [projectId]);
+  // The configured default table selection. Empty ⇒ full-database dump (today's behaviour).
+  const tables = validTableSelection(pool?.backup_tables, 'backup_tables');
   const dir = backupDirFor(pool);
   const destCtx = (pool?.backup_ctx && String(pool.backup_ctx).trim()) || null;   // NULL ⇒ local host
   const file = `${project.name.toLowerCase()}_prod_${stamp()}_${randomBytes(3).toString('hex')}.dump`;
@@ -405,20 +467,25 @@ export async function backupProd(projectId) {
   // dest_ctx recorded up front so the UI shows WHERE this dump is going while it runs, and so a
   // restore/prune can always find it. dump_path alone is ambiguous across hosts now.
   const snap = await one(
-    `INSERT INTO db_snapshot (project_id, source, dump_path, dest_ctx, status) VALUES ($1,'prod',$2,$3,'running') RETURNING *`,
-    [projectId, fullPath, destCtx]);
+    `INSERT INTO db_snapshot (project_id, source, dump_path, dest_ctx, status, tables)
+       VALUES ($1,'prod',$2,$3,'running',$4) RETURNING *`,
+    [projectId, fullPath, destCtx, tables.length ? JSON.stringify(tables) : null]);
   if (dbc) await setBusy(dbc.id, 'backup');
   broadcast('task', { kind: 'db_snapshot', snap });
-  logline('maint', `backup started (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath}`);
+  logline('maint', `backup started (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath}`
+    + `${tables.length ? ` · SCOPED to ${tables.length} table(s): ${tables.join(', ')}` : ''}`);
 
   // fire-and-forget: the heavy work runs async; the caller gets the running row now
-  runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, keep: pool?.max_backups ?? DEFAULT_MAX_BACKUPS })
+  runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, tables,
+    keep: pool?.max_backups ?? DEFAULT_MAX_BACKUPS })
     .catch((e) => console.error('[backup]', e.message));
   return snap;
 }
 
-async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, keep }) {
+async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, tables = [], keep }) {
   let size = null, error = null, tocText = null, tocSummary = null;
+  const scoped = Array.isArray(tables) && tables.length > 0;   // a partial, table-scoped dump
+  const tArgs = dumpTableArgs(tables);                          // [] for a full-database dump
   try {
     if (MODE === 'real') {
       if (!dbc?.name) throw new Error('no production db container modeled for this project');
@@ -433,7 +500,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         // and writes it to the bind-mounted backup dir, then prints the byte count it wrote.
         const writer = `cat > '/out/${file}' && wc -c < '/out/${file}'`;
         const piped = await execPipe(
-          { cmd: 'docker', args: ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName] },
+          { cmd: 'docker', args: ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName] },
           { cmd: 'docker', args: ['--context', destCtx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'sh', '-c', writer] },
           { timeout: 1800000 });
         if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
@@ -461,7 +528,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         //    list it there, copy to the host volume, then rm whatever happened. ──
         const remoteTmp = `/tmp/${file}`;
         const dump = await execAsync('docker',
-          ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName, '-f', remoteTmp],
+          ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName, '-f', remoteTmp],
           { timeout: 1200000 });
         if (dump.status !== 0) {
           await execAsync('docker', ['--context', srcCtx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
@@ -490,19 +557,36 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       }
 
       // ── validation common to both destinations ──────────────────────────────
-      // Compare against the last GOOD backup of this project: a catastrophic size collapse and a
-      // dump that lost the schemas/tables the last one had are BOTH refused (regression 3). This
-      // is what turns "valid archive of the wrong/empty database" into a loud FAILURE.
-      const prev = await one(
-        `SELECT size_bytes, toc_summary FROM db_snapshot
-           WHERE project_id=$1 AND source='prod' AND status='finished' AND mode='real' AND id<>$2
-           ORDER BY taken_at DESC LIMIT 1`, [snap.project_id, snap.id]);
-      const sizeVerdict = assertDumpSize(size, prev?.size_bytes ?? null);
       const toc = parseDumpToc(tocText);
-      const contentVerdict = assertDumpContent(toc, prev?.toc_summary ?? null);
-      tocSummary = { schemas: toc.schemas, table_count: toc.tableCount };
-      logline('maint', `backup validated → ${size} bytes, ${toc.tableCount} table(s), schemas [${toc.schemas.join(', ')}]`
-        + `${sizeVerdict.compared ? '' : ` · ${sizeVerdict.note}`}${contentVerdict.comparedSchemas ? ' · schema-continuity ok' : ''}`);
+      // The full-database table list this dump captured, as 'schema.table' strings — feeds the
+      // restore picker (exactly what can be restored) and, for a scoped dump, records the selection.
+      const tocTables = toc.tables.map((t) => `${t.schema}.${t.name}`);
+      tocSummary = { schemas: toc.schemas, table_count: toc.tableCount, tables: tocTables, scoped };
+      if (scoped) {
+        // A SCOPED dump is smaller and has fewer schemas than a full one BY DESIGN. The size-collapse
+        // and schema-continuity guards compare against full backups, so they would falsely reject it —
+        // skip them. The floor check (a scoped dump must still capture at least one of its tables)
+        // stands in: an empty archive means the selection matched nothing.
+        if (toc.tableCount === 0) {
+          throw new Error(`scoped backup captured no tables — the selection [${tables.join(', ')}] `
+            + `matched nothing in ${dbName}. Nothing was written. Check the table names.`);
+        }
+        logline('maint', `scoped backup validated → ${size} bytes, ${toc.tableCount} of ${tables.length} selected table(s): [${tocTables.join(', ')}]`);
+      } else {
+        // Compare against the last GOOD FULL backup of this project (never a scoped one — that would
+        // compare a whole DB against a handful of tables): a catastrophic size collapse and a dump
+        // that lost the schemas/tables the last one had are BOTH refused (regression 3). This is what
+        // turns "valid archive of the wrong/empty database" into a loud FAILURE.
+        const prev = await one(
+          `SELECT size_bytes, toc_summary FROM db_snapshot
+             WHERE project_id=$1 AND source='prod' AND status='finished' AND mode='real' AND id<>$2
+               AND tables IS NULL
+             ORDER BY taken_at DESC LIMIT 1`, [snap.project_id, snap.id]);
+        const sizeVerdict = assertDumpSize(size, prev?.size_bytes ?? null);
+        const contentVerdict = assertDumpContent(toc, prev?.toc_summary ?? null);
+        logline('maint', `backup validated → ${size} bytes, ${toc.tableCount} table(s), schemas [${toc.schemas.join(', ')}]`
+          + `${sizeVerdict.compared ? '' : ` · ${sizeVerdict.note}`}${contentVerdict.comparedSchemas ? ' · schema-continuity ok' : ''}`);
+      }
     } else {
       await wait(SIM_BACKUP_MS);   // simulate: hold 'running' briefly so the spinner is visible
       const body = `-- ZEEHIVE simulated backup of ${project.name} PRODUCTION database\n`
@@ -576,13 +660,15 @@ export async function deleteBackup(snapshotId) {
 
 // Update a project's backup settings (folder / interval / retention), then apply housekeeping
 // immediately so lowering max_backups takes effect at once.
-export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_interval_sec, max_backups }) {
+export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables }) {
   const proj = project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
   if (!proj) throw new Error('no project');
   const interval = Number(backup_interval_sec);
   const maxB = Number(max_backups);
   if (!Number.isInteger(interval) || interval < 60) throw new Error('backup_interval_sec must be an integer ≥ 60');
   if (!Number.isInteger(maxB) || maxB < 1 || maxB > 1000) throw new Error('max_backups must be an integer 1–1000');
+  // The default table selection for this project's backups. [] ⇒ full-database dump (stored as NULL).
+  const tables = validTableSelection(backup_tables, 'backup_tables');
   const dir = backup_dir && String(backup_dir).trim() ? String(backup_dir).trim() : null;
   const ctx = backup_ctx && String(backup_ctx).trim() ? String(backup_ctx).trim() : null;
   // A network destination is a docker CONTEXT + a directory on that context's host. A context
@@ -596,14 +682,15 @@ export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_
   }
 
   const row = await one(
-    `UPDATE pool_config SET backup_dir=$2, backup_ctx=$3, backup_interval_sec=$4, max_backups=$5
+    `UPDATE pool_config SET backup_dir=$2, backup_ctx=$3, backup_interval_sec=$4, max_backups=$5, backup_tables=$6
        WHERE project_id=$1
-       RETURNING backup_dir, backup_ctx, backup_interval_sec, max_backups`,
-    [proj, dir, ctx, interval, maxB]);
+       RETURNING backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables`,
+    [proj, dir, ctx, interval, maxB, tables.length ? JSON.stringify(tables) : null]);
   if (!row) throw new Error('no pool_config for project');
 
   broadcast('project', { id: proj, backup: row });
-  logline('maint', `backup config → ${row.backup_ctx ? `[${row.backup_ctx}] ` : ''}dir=${row.backup_dir || '(default)'} every ${row.backup_interval_sec}s keep ${row.max_backups}`);
+  logline('maint', `backup config → ${row.backup_ctx ? `[${row.backup_ctx}] ` : ''}dir=${row.backup_dir || '(default)'} every ${row.backup_interval_sec}s keep ${row.max_backups}`
+    + `${tables.length ? ` · scoped to ${tables.length} table(s)` : ' · full database'}`);
   await housekeepBackups(proj, row.max_backups);
   return row;
 }
@@ -629,10 +716,23 @@ export async function revealBackup(snapshotId) {
 // immediately; the copy + pg_restore run in the background (runRestoreJob). Restoring over the
 // PRODUCTION database is allowed but GATED: `confirmProd` must be set (the console makes the human
 // type the prod db name), and prod must not be mid-ship / bound to a live zee.
-export async function restoreBackup({ snapshot, container, confirmProd = false }) {
+export async function restoreBackup({ snapshot, container, confirmProd = false, tables = null }) {
   const snap = await one(`SELECT * FROM db_snapshot WHERE id=$1`, [snapshot]);
   if (!snap?.dump_path) throw new Error('backup not found');
   if (snap.status && snap.status !== 'finished') throw new Error('backup is not finished yet');
+  // Optional per-restore table selection: restore ONLY these tables out of the archive. Empty/absent
+  // ⇒ restore the whole dump (today's behaviour). Validated the same way the backup selection is.
+  const pick = validTableSelection(tables, 'tables');
+  // The archive can only yield what it captured. A scoped dump records its tables; refuse a pick that
+  // asks for a table the dump does not contain rather than silently restoring nothing for it.
+  const have = Array.isArray(snap.toc_summary?.tables) ? new Set(snap.toc_summary.tables) : null;
+  if (pick.length && have) {
+    const missing = pick.filter((t) => !have.has(t));
+    if (missing.length === pick.length) {
+      throw new Error(`none of the selected table(s) [${pick.join(', ')}] are in this backup `
+        + `(it contains ${have.size} table(s)). Pick from the tables this dump captured.`);
+    }
+  }
   // A simulated backup is a ~150-byte placeholder, NOT the data — restoring it would overwrite a
   // real database with nothing. Refuse it (the UI disables the button too; this is the backstop).
   if (snap.mode === 'simulate') {
@@ -661,13 +761,15 @@ export async function restoreBackup({ snapshot, container, confirmProd = false }
   const dbUser = proj?.db_user || config.prodDbUser;
 
   await setBusy(c.id, 'restore');
-  logline('maint', `restore started → ${c.name} from ${snap.dest_ctx ? `[${snap.dest_ctx}] ` : ''}${snap.dump_path} (${MODE})`);
-  runRestoreJob({ snap, c, dbName, dbUser }).catch((e) => console.error('[restore]', e.message));
+  logline('maint', `restore started → ${c.name} from ${snap.dest_ctx ? `[${snap.dest_ctx}] ` : ''}${snap.dump_path} (${MODE})`
+    + `${pick.length ? ` · ONLY ${pick.length} table(s): ${pick.join(', ')}` : ''}`);
+  runRestoreJob({ snap, c, dbName, dbUser, tables: pick }).catch((e) => console.error('[restore]', e.message));
   return { ok: true, status: 'started', container: c.name };
 }
 
-async function runRestoreJob({ snap, c, dbName, dbUser }) {
+async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
   let restored = false;
+  const tArgs = restoreTableArgs(tables);   // [] ⇒ restore the whole archive
   try {
     if (MODE === 'real') {
       const ctx = c.docker_ctx;
@@ -681,7 +783,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser }) {
         const dir = snap.dump_path.slice(0, i), file = snap.dump_path.slice(i + 1);
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', snap.dest_ctx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'cat', `/out/${file}`] },
-          { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName] },
+          { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...tArgs, '-d', dbName] },
           { timeout: 1800000 });
         if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
           throw new Error(`streamed restore into ${target}/${dbName} from [${snap.dest_ctx}] failed `
@@ -692,7 +794,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser }) {
         const cp = await execAsync('docker', ['--context', ctx, 'cp', resolve(snap.dump_path), `${target}:${remoteTmp}`], { timeout: 1200000 });
         if (cp.status !== 0) throw new Error(`docker cp into ${target} failed: ${(cp.stderr || '').slice(-300)}`);
         const rest = await execAsync('docker',
-          ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName, remoteTmp],
+          ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...tArgs, '-d', dbName, remoteTmp],
           { timeout: 1800000 });
         await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000 });
         if (rest.status !== 0) throw new Error(`pg_restore into ${target}/${dbName} failed: ${(rest.stderr || '').slice(-300)}`);

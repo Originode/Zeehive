@@ -438,10 +438,12 @@ export async function revealBackup(id) {
 // Restore a backup into a db container (that container spins until the restore finishes).
 // confirmProd must be true to restore over the PRODUCTION database (the UI collects a typed
 // confirmation first) — the server refuses a prod target otherwise.
-export async function restoreBackup(id, container, confirmProd = false) {
+// tables — optional array of 'schema.table' strings to restore ONLY those out of the archive.
+// null/omitted ⇒ restore the whole dump.
+export async function restoreBackup(id, container, confirmProd = false, tables = null) {
   const r = await fetch(`/api/backups/${id}/restore`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ container, confirm_prod: !!confirmProd }),
+    body: JSON.stringify({ container, confirm_prod: !!confirmProd, tables }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `restore failed (${r.status})`);

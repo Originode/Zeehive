@@ -712,6 +712,33 @@ a.cbox:hover { border-color: var(--accent); }
 .bkcfg-btns button.ghost { background: var(--panel2); color: var(--muted); }
 .bkcfg-btns button:disabled { opacity: .5; cursor: not-allowed; }
 
+/* scoped-backup badge + per-row restore table picker */
+.bkscoped { justify-self: start; color: #b58bd9; border: 1px solid #b58bd9; border-radius: 6px;
+  padding: 1px 7px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; }
+.bkbtn.sm.active { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--panel2)); }
+.bkrow-pick { grid-column: 1 / -1; margin: 6px 2px 2px; }
+
+/* reusable table picker (backup settings + restore) */
+.tblsel { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 8px;
+  display: flex; flex-direction: column; gap: 7px; }
+.tblsel-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tblsel-mode { font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+.tblsel-mode.all { color: var(--muted); }
+.tblsel-mode.scoped { color: #b58bd9; }
+.tblsel-filter { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 5px 8px; font-size: 12px; font-family: 'Cascadia Code', monospace; }
+.tblsel-list { max-height: 190px; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; }
+.tblsel-row { display: flex; align-items: center; gap: 7px; padding: 2px 4px; border-radius: 5px;
+  color: var(--text); font-size: 12px; cursor: pointer; }
+.tblsel-row:hover { background: var(--panel2); }
+.tblsel-row input { width: auto; }
+.tblsel-empty { padding: 8px 4px; font-size: 11px; font-family: 'Segoe UI', sans-serif; }
+.tblsel-add { display: flex; align-items: center; gap: 6px; }
+.tblsel-add input { flex: 1; background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 5px 8px; font-size: 12px; font-family: 'Cascadia Code', monospace; }
+.tblsel-add input.bad { border-color: var(--down); }
+.tblsel-warn { color: var(--down); font-size: 10px; font-family: 'Segoe UI', sans-serif; }
+
 /* ── busy container spinner (building / backing up / restoring) ── */
 @keyframes cspin { to { transform: rotate(360deg); } }
 /* replaces the health dot while busy: amber ring = building, teal = backup, blue = restore.

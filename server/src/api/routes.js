@@ -979,9 +979,13 @@ router.post('/maintenance/refresh', async (req, res) => {
 router.get('/backups', async (req, res) => {
   const proj = req.query.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
   const cfg = await one(
-    `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups FROM pool_config WHERE project_id=$1`, [proj]);
+    `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables FROM pool_config WHERE project_id=$1`, [proj]);
+  // tables = this dump's scoped selection (null = full db). toc_summary->tables = every table the
+  // archive contains, so the restore picker offers exactly what can be restored out of THIS backup.
   const backups = await q(
-    `SELECT id, dump_path, dest_ctx, size_bytes, taken_at, source, status, error, mode FROM db_snapshot
+    `SELECT id, dump_path, dest_ctx, size_bytes, taken_at, source, status, error, mode, tables,
+            toc_summary->'tables' AS toc_tables
+       FROM db_snapshot
        WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC`, [proj]);
   // db containers a backup may be restored INTO. Non-prod targets plus the SHARED prod db, flagged
   // is_prod so the modal marks it and demands typed confirmation. Ordered so prod sorts LAST — the
@@ -1017,6 +1021,7 @@ router.post('/backups/:id/restore', async (req, res) => {
   try {
     res.json(await restoreBackup({
       snapshot: req.params.id, container: req.body?.container, confirmProd: !!req.body?.confirm_prod,
+      tables: req.body?.tables ?? null,
     }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
