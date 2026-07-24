@@ -34,25 +34,55 @@ const CONCURRENCY = 3;     // db containers probed at once; the NAS is not a dat
 const NOISE_SCHEMAS = ["'pg_catalog'", "'information_schema'", "'tiger'", "'tiger_data'",
                        "'topology'", "'ogr_system_tables'"].join(',');
 
-// Extension-owned functions are engine noise too (~1400 of them from postgis alone) and are
-// implied by the extension set, not by anyone's migration. pg_depend deptype='e' marks them.
+// Extension-owned objects are engine noise, implied by the extension set and not by anyone's
+// migration. pg_depend deptype='e' marks them. This is NOT only ~1400 functions from postgis: an
+// extension also owns TABLES (postgis's public.spatial_ref_sys, ~8k rows of SRIDs; h3's lookup
+// tables; tiger's), their COLUMNS, and any TRIGGERS it installs. The catalog probes below deliberately
+// never compared functions, so those were already out — but the table/column/trigger probes filtered
+// by SCHEMA NAME ALONE, so an extension table sitting in a real application schema (public.spatial_ref_sys
+// is the classic one) slipped straight through and was scored as drift. The prod postgis build and the
+// dev/NAS build install their extensions differently (the NAS image pre-loads postgis_topology + the
+// tiger geocoder; a "18-3.6-h3" build carries h3 tables prod's does not), so those extension tables
+// legitimately differ host-to-host and produced PHANTOM "missing"/"extra" every tick — including on a
+// database freshly and faithfully restored from a prod dump, where an operator rightly expects ZERO
+// drift. `NOT_EXT_*` below re-applies the deptype='e' rule the comment above always claimed, this time
+// to relations and triggers as well, so only what a MIGRATION owns is measured.
+//
 // zeehive_migrations is the ship's own ledger (shipmigrate.js) — it lives ONLY in prod, by
 // design, so comparing it is comparing the ruler's serial number instead of what it measures.
 // Unexcluded, the migration system's own bookkeeping tripped the parity gate it exists to serve,
 // for every xell, forever: a chicken-and-egg a zee correctly diagnosed from the outside on day one.
 const LEDGER_TABLE = `'zeehive_migrations'`;
-const Q = {
+
+// Anti-join to pg_depend: TRUE when the relation (schema.name) is NOT a member of any extension.
+// Correlates to information_schema's table_schema/table_name text columns. classid pins the
+// dependent object to pg_class so we only ever match relations, never a same-named object of
+// another catalog. This is the exact marker CREATE EXTENSION leaves and pg_dump reads to decide an
+// object is the extension's to recreate — never the app's to migrate.
+const NOT_EXT_REL = `NOT EXISTS (
+    SELECT 1 FROM pg_depend d
+      JOIN pg_class ec ON ec.oid = d.objid
+      JOIN pg_namespace en ON en.oid = ec.relnamespace
+     WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'e'
+       AND en.nspname = table_schema AND ec.relname = table_name)`;
+export const Q = {
   table: `SELECT table_schema||'.'||table_name FROM information_schema.tables
            WHERE table_schema NOT IN (${NOISE_SCHEMAS}) AND table_type='BASE TABLE'
-             AND table_name <> ${LEDGER_TABLE}`,
+             AND table_name <> ${LEDGER_TABLE} AND ${NOT_EXT_REL}`,
   column: `SELECT table_schema||'.'||table_name||'.'||column_name||':'||data_type
              FROM information_schema.columns WHERE table_schema NOT IN (${NOISE_SCHEMAS})
-             AND table_name <> ${LEDGER_TABLE}`,
+             AND table_name <> ${LEDGER_TABLE} AND ${NOT_EXT_REL}`,
+  // Exclude a trigger when EITHER its table is extension-owned OR the trigger itself is (an
+  // extension can install triggers on an app table). Same deptype='e' rule, keyed on the two oids
+  // already in scope here (c = the table, t = the trigger).
   trigger: `SELECT n.nspname||'.'||c.relname||'.'||t.tgname
               FROM pg_trigger t
               JOIN pg_class c ON c.oid=t.tgrelid
               JOIN pg_namespace n ON n.oid=c.relnamespace
-             WHERE NOT t.tgisinternal AND n.nspname NOT IN (${NOISE_SCHEMAS})`,
+             WHERE NOT t.tgisinternal AND n.nspname NOT IN (${NOISE_SCHEMAS})
+               AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.deptype='e'
+                    AND ((d.classid='pg_class'::regclass   AND d.objid=c.oid)
+                      OR (d.classid='pg_trigger'::regclass AND d.objid=t.oid)))`,
 };
 
 // Non-blocking docker exec → stdout. Never rejects: resolves {ok,out} so one unreachable container
