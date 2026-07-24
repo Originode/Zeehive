@@ -193,6 +193,49 @@ export async function diffXellDbAgainstProd(projectId, xellId) {
   return diffContainer(mine, got.fp, dbid);
 }
 
+// On-demand diff of ONE db container against prod — what the chip's "Check diff" context-menu item
+// fires, and what a finished restore calls to refresh its own verdict. Measures NOW and persists the
+// same payload shape the tick records (diffContainer broadcasts, so the chip repaints live). This
+// judges the container's PRIMARY database — exactly what its prod_diff chip describes.
+export async function diffOneContainerAgainstProd(containerId) {
+  const c = await one(`SELECT * FROM container WHERE id=$1 AND role='db'`, [containerId]);
+  if (!c) return { ok: false, error: 'no such db container', total: null };
+  // Prod is the ruler: it is measured against nothing and keeps prod_diff NULL.
+  if (c.tier === 'prod') return { ok: true, same_db: true, total: 0, kinds: null };
+
+  const prod = await one(
+    `SELECT * FROM container WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [c.project_id]);
+  if (!prod) return { ok: false, error: 'no prod db container to measure against', total: null };
+  if (prod.id === c.id) return { ok: true, same_db: true, total: 0, kinds: null };
+
+  const dbid = await dbIdentity(c.project_id);
+  let realProd;
+  try { realProd = await resolveRealDbContainer(prod.docker_ctx, prod.name, { row: prod }); }
+  catch (e) { return { ok: false, error: e.message, total: null }; }
+  const got = await fingerprint(prod.docker_ctx, realProd, dbid);
+  if (got.error) return { ok: false, error: `prod db unreadable: ${got.error}`, total: null };
+
+  return diffContainer(c, got.fp, dbid);
+}
+
+// A restore loads a NEW catalog into a db container, so its prod_diff chip is instantly stale — it
+// still describes the pre-restore schema. The 10-minute tick would eventually correct it (and while
+// the restore ran it deliberately SKIPPED this container), but until then the chip lies. Called off
+// the restore's completion — after busy is cleared, so the tick's skip no longer applies — this
+// re-measures the affected database(s) at once, so the drift colour is truthful the moment the
+// spinner stops. Restoring PROD is special: prod is the ruler, so a new prod catalog re-bases every
+// other db's verdict — re-run the whole tick rather than just this one container.
+export async function refreshProdDiffAfterRestore(containerId) {
+  const c = await one(`SELECT id, name, tier FROM container WHERE id=$1 AND role='db'`, [containerId]);
+  if (!c) return { ok: false, error: 'no such db container' };
+  if (c.tier === 'prod') {
+    logline('proddiff', `prod db ${c.name} was restored — re-checking drift for every db against the new prod`);
+    return prodDiffTick();
+  }
+  logline('proddiff', `${c.name} was restored — re-checking its schema drift against prod`);
+  return diffOneContainerAgainstProd(containerId);
+}
+
 export async function prodDiffTick() {
   const projects = await q(`SELECT DISTINCT project_id FROM container WHERE role='db'`);
   let checked = 0, drifted = 0;

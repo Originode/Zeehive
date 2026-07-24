@@ -254,6 +254,19 @@ export async function decommissionContainer(containerId, force = false) {
   return data;
 }
 
+// Check ONE db container's schema drift against PRODUCTION on demand (the chip's "Check diff" menu
+// item). The server measures it NOW, persists the verdict, and broadcasts the container update — so
+// the chip's drift mark repaints over SSE — and returns the payload { ok, total, kinds, same_db,
+// error } so the caller can pop a one-line summary.
+export async function checkContainerDiff(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/check-diff`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `check diff failed (${r.status})`);
+  return data;
+}
+
 // Set WHERE a xell's images compile (both server+webapp). build_ctx='' resets to the run host.
 // Throws with an actionable message if the context is foreign and no registry is configured.
 export async function setXellBuildCtx(xellId, build_ctx) {

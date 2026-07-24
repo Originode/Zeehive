@@ -10,6 +10,7 @@ import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, 
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
+import { diffOneContainerAgainstProd } from '../queenzee/proddiff.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
@@ -571,6 +572,15 @@ router.get('/monitor/remote', async (_req, res) => res.json(await remoteAvailabl
 
 // ── container health: is each container actually running (per `docker ps`)? ───
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
+
+// On-demand schema-drift check of ONE db container against PRODUCTION (the "Check diff" context-menu
+// item on a db chip). Same read-only catalog comparison the 10-min drift tick runs, but measured NOW
+// and for just this container: it persists the verdict and broadcasts the container update, so the
+// chip's drift mark + tooltip repaint live. Returns the payload so the caller can surface a summary.
+router.post('/containers/:id/check-diff', async (req, res) => {
+  try { res.json(await diffOneContainerAgainstProd(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 // ── decommission ONE container (the container context-menu action) ────────────
 // Stops + removes the actual container, reclaims its image, drops its meta row. PRODUCTION is

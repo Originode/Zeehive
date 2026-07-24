@@ -9,7 +9,7 @@
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
 import React, { useState, useEffect } from 'react';
-import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer } from './api.js';
+import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff } from './api.js';
 import { nick } from './nick.js';
 import { showAlert } from './Dialog.jsx';
 
@@ -186,9 +186,12 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   const [typed, setTyped] = useState('');
   const [busyAct, setBusyAct] = useState(false);
   const [err, setErr] = useState(null);
+  // "Check diff" fires an on-demand drift check against prod; guard against a double-click while the
+  // catalog comparison is in flight. Reset (with the rest) whenever the menu retargets a container.
+  const [diffing, setDiffing] = useState(false);
   const c = menu?.c;
   const cid = c?.id;
-  useEffect(() => { setConfirming(false); setTyped(''); setBusyAct(false); setErr(null); }, [cid]);
+  useEffect(() => { setConfirming(false); setTyped(''); setBusyAct(false); setErr(null); setDiffing(false); }, [cid]);
 
   const buildable = c ? isBuildable(c) : false;
   const busy = c ? busyReason(c) : null;
@@ -231,6 +234,31 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
       onDecommissioned?.();
       onClose();
     } catch (e) { setErr(e?.error || e?.message || String(e)); setBusyAct(false); }
+  };
+
+  // Check this db's schema against production NOW. The server persists the verdict and broadcasts the
+  // container, so the chip's drift mark repaints over SSE; we also pop a one-line summary. The full
+  // per-object breakdown already lives in the chip's tooltip, so we don't reproduce it here.
+  const runCheckDiff = async () => {
+    if (diffing) return;
+    setDiffing(true);
+    try {
+      const r = await checkContainerDiff(c.id);
+      onClose();
+      if (r?.same_db) { showAlert(`${c.name} IS the production database — there is nothing to diff.`); return; }
+      if (r?.ok === false) {
+        showAlert(`Could not diff ${c.name} against production:\n\n${r.error || 'unknown error'}`, { variant: 'error' });
+        return;
+      }
+      const total = r?.total || 0;
+      showAlert(total === 0
+        ? `✓ ${c.name} — schema matches production.`
+        : `⚠ ${c.name} has DRIFTED from production — ${total} difference(s).\n\nHover the chip for the per-object breakdown.`,
+        { variant: total === 0 ? 'info' : 'error' });
+    } catch (e) {
+      setDiffing(false);
+      showAlert('Check diff failed: ' + (e?.error || e?.message || e), { variant: 'error' });
+    }
   };
 
   // No blocking scrim — App closes the menu via document-level listeners. Stop propagation so a
@@ -339,6 +367,20 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
           {prod
             ? <>📥 Restore backup over prod… <span className="ctxsub">⚠ overwrites LIVE production — asks you to confirm</span></>
             : <>📥 Load backup… <span className="ctxsub">restore a backup into this db (overwrites data)</span></>}
+        </button>
+      ))}
+
+      {/* Check diff: on every NON-production db chip (matrix + xell hexagon share this menu, so it
+          appears in both). Measures this db's schema against production on demand and repaints the
+          chip's drift mark, rather than waiting up to 10 minutes for the background tick — handy the
+          moment a restore lands or a migration runs. Prod is the ruler (measured against nothing), so
+          it never carries this item. Withdrawn while busy: a mid-restore reading is stale by definition. */}
+      {isDb && !prod && (busy ? (
+        <div className="ctxsub ctxbusy-note" data-testid="check-diff-busy">diff unavailable while busy</div>
+      ) : (
+        <button role="menuitem" data-testid="check-diff-open" disabled={diffing} onClick={runCheckDiff}>
+          🔍 {diffing ? 'Checking diff…' : 'Check diff'}
+          <span className="ctxsub">compare this db's schema against production now</span>
         </button>
       ))}
 

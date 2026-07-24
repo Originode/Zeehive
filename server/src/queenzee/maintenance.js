@@ -21,6 +21,7 @@ import { logline } from '../lib/logbus.js';
 import { resolveSite } from '../lib/sites.js';
 import { listContainersDetailed } from '../lib/docker.js';
 import { pickDbContainer } from '../lib/xell-db.js';
+import { refreshProdDiffAfterRestore } from './proddiff.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -666,6 +667,7 @@ export async function restoreBackup({ snapshot, container, confirmProd = false }
 }
 
 async function runRestoreJob({ snap, c, dbName, dbUser }) {
+  let restored = false;
   try {
     if (MODE === 'real') {
       const ctx = c.docker_ctx;
@@ -699,10 +701,19 @@ async function runRestoreJob({ snap, c, dbName, dbUser }) {
       await wait(SIM_RESTORE_MS);   // simulate: hold the busy state briefly so the spinner is visible
     }
     logline('maint', `restore finished → ${c.name}`);
+    restored = true;
   } catch (e) {
     logline('maint', `restore FAILED → ${c.name}: ${e.message}`);
   } finally {
     await clearBusy(c.id);
+  }
+  // The catalog just changed under this db, so its prod_diff chip is stale. Re-measure it against
+  // prod now that busy is cleared (the drift tick skips a mid-restore container, so it would not
+  // have refreshed this on its own for up to 10 minutes). Best-effort and fire-and-forget: a failed
+  // diff must never turn a SUCCESSFUL restore into a failure, and the human need not wait on it.
+  if (restored) {
+    refreshProdDiffAfterRestore(c.id)
+      .catch((e) => logline('proddiff', `post-restore drift refresh for ${c.name} failed: ${e.message}`));
   }
 }
 
