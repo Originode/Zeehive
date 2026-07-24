@@ -126,10 +126,19 @@ export function ContainerChip({ c, onMenu, hammer = false }) {
     ? <span className={`cspin ${busy}`} data-testid="cspin" aria-label={busy} />
     : <span className={`cdot ${c.health}${c.health === 'up' && c.hot_build ? ' hot' : ''}`} />;
 
+  // A PRODUCTION chip carries the same at-a-glance shield the PRODUCTION hex/menu wear (🛡). The
+  // gold border alone is easy to miss (health/drift override the border-color, and drift's amber is
+  // a near-twin of prod gold) — the shield in the free top-LEFT corner is unmistakable and survives
+  // even when a busy state repaints the ring. Non-interactive: it's a badge, not a control.
+  const prod = isProdContainer(c);
+
   const inner = (
     <>
       <span className="cnick">{nick(c.name)}</span>
       {indicator}
+      {prod && (
+        <span className="cprod" data-testid="cprod" aria-label="production" title="production">🛡</span>
+      )}
       {drift && drift !== 'sync' && (
         <span className={`cdrift ${drift}`} data-testid="cdrift"
               aria-label={drift === 'drift' ? 'schema drifted from prod' : 'prod diff failed'} />

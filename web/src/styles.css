@@ -355,8 +355,18 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
   align-items: center; justify-content: flex-end; line-height: 1; padding-bottom: 4px;
   font-family: 'Cascadia Code', monospace; font-size: 11px; text-decoration: none; color: var(--text); }
 a.cbox { cursor: pointer; }
-/* PRODUCTION containers: gold border, same warning color as the PRODUCTION hex */
-.cbox.t-prod { border: 1px solid #c9a227; box-shadow: 0 0 5px rgba(201, 162, 39, .35); }
+/* PRODUCTION containers: a gold ring + glow, same warning colour (#f2c14e) as the PRODUCTION hex
+   and the 🛡 shield the chip now carries top-left. The ring is a box-shadow, NOT the 1px border:
+   health (.h-up) and drift (.d-drift) both override border-COLOUR later in the cascade, so a border
+   alone silently vanishes on a healthy or drifted prod chip. The inset+outset shadow paints a crisp
+   gold frame that no later border-color rule can erase — so a prod chip reads gold at a glance
+   regardless of its health, and its gold can't be mistaken for drift's lone amber border. */
+.cbox.t-prod { border-color: #f2c14e;
+  box-shadow: 0 0 0 2px #f2c14e, inset 0 0 0 1px rgba(242,193,78,.25), 0 0 7px rgba(242,193,78,.5); }
+/* The gold shield badge — top-LEFT is the only free corner (health=top-right, hammer=bottom-right,
+   drift=bottom-left). Small, glowing, and click-through so it never eats the chip's link/menu. */
+.cprod { position: absolute; top: 0; left: 1px; font-size: 9px; line-height: 1; pointer-events: none;
+  filter: drop-shadow(0 0 2px rgba(242,193,78,.7)); }
 a.cbox:hover { border-color: var(--accent); }
 .cnick { letter-spacing: .5px; }
 .cdot { position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--unknown); }
