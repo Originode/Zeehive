@@ -10,6 +10,7 @@
 // work is already landed. That is what stops band-aid deploys: a zee building prod from its own
 // worktree puts code live that main doesn't have, and the next rebuild silently reverts it.
 import { spawn, spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
@@ -18,6 +19,7 @@ import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations } from './shipmigrate.js';
+import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
 
 // Real deploys are gated on a human anyway; SHIP_MODE=simulate exists to verify ZEEHIVE itself.
@@ -563,6 +565,29 @@ async function runShipBody(ship, xell, project, site, lockKey) {
     ok = false;
     results.push({ error: 'no prod container has a build_script configured — nothing to ship' });
   }
+
+  // Materialize the prod environment from the meta-DB onto the xource's .env — the file
+  // ship-prod.sh reads (<source_path>/.env) — so the meta-DB is the source of truth and the on-disk
+  // file a projection (migration 043). SAFE BY CONSTRUCTION: an EMPTY prod environment is skipped,
+  // leaving the existing .env untouched, so ships behave exactly as before until a human fills the
+  // environment in the console. Only in real mode (simulate writes nothing, deploys nothing) and
+  // never fatal — a materialize failure falls back to the on-disk .env, which is today's behaviour.
+  if (ok && MODE === 'real') {
+    try {
+      const mat = await materializeEnvFile(project.id, 'prod', join(project.repo_root, '.env'));
+      if (mat.written) {
+        logline('ship', `prod .env written from meta-DB environment "${mat.environment}" (${mat.count} vars`
+          + `${mat.backup ? `, prior file backed up → ${mat.backup}` : ''})`);
+      } else {
+        logline('ship', `prod .env NOT rewritten — ${mat.reason}`);
+      }
+      results.push({ role: 'environment', ok: true, ...mat });
+    } catch (e) {
+      logline('ship', `prod .env materialize FAILED (continuing with the on-disk .env): ${e.message}`);
+      results.push({ role: 'environment', ok: true, skipped: true, reason: `materialize error: ${e.message}` });
+    }
+  }
+
   for (const c of cs) {
     if (!ok) break;   // a failed migration means NO container builds — old code, old schema, intact
     // ship.commit is the sha the HUMAN approved. Passing it (rather than letting the script say
