@@ -1285,15 +1285,11 @@ a.cbox:hover { border-color: var(--accent); }
 .fx-code { margin: 0; padding: 8px 10px; font-family: 'Cascadia Code', monospace; font-size: 12px;
   color: #c9d3e0; white-space: pre; }
 
-/* ── terminal right-click menu (replaces the browser page menu over the xterm) ── */
-.term-ctx { position: fixed; z-index: 60; min-width: 160px; background: #10141c;
-  border: 1px solid var(--line); border-radius: 8px; padding: 4px; box-shadow: 0 12px 34px rgba(0,0,0,.55);
-  display: flex; flex-direction: column; }
-.term-ctx button { text-align: left; background: none; border: 0; color: var(--text); cursor: pointer;
-  padding: 5px 10px; border-radius: 6px; font-size: 12px; }
-.term-ctx button:hover:not(:disabled) { background: var(--accent); color: #0a0d12; }
-.term-ctx button:disabled { opacity: .35; cursor: default; }
-.term-ctx-sep { height: 1px; background: var(--line); margin: 4px 2px; }
+/* ── "show file" path box in the explorer ── */
+.fx-go { display: flex; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.fx-goin { flex: 1; min-width: 0; background: #0b0e14; border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 2px 8px; font-family: 'Cascadia Code', monospace; font-size: 11px; }
+.fx-goin:focus { outline: none; border-color: var(--accent); }
 .term-x.on { color: var(--accent); }
 
 .zeeterm-foot {

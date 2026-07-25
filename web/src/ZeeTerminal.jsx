@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -28,21 +28,10 @@ function pathFromSelection(sel) {
 export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
-  const wsRef = useRef(null);
   const [status, setStatus] = useState('connecting');
   const [full, setFull] = useState(false);   // maximize the modal; the ResizeObserver refits + resizes the PTY
   const [showFx, setShowFx] = useState(false);       // file-explorer panel open?
   const [fxOpenPath, setFxOpenPath] = useState(null); // { path } — a "show file" request into the explorer
-  // Our own right-click menu. xterm leaves the browser's default context menu to fire on the
-  // terminal, which pops the PAGE menu (Back/Reload/Inspect) over the terminal and clobbers the
-  // native selection-copy you'd expect there. We suppress it and draw a terminal-aware one.
-  const [menu, setMenu] = useState(null);            // { x, y, sel }
-
-  // Send a chunk of input to the PTY exactly as a keystroke would (used by Paste).
-  const sendInput = useCallback((d) => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'i', d }));
-  }, []);
 
   useEffect(() => {
     const term = new Terminal({
@@ -59,7 +48,6 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}${wsPath}`);
-    wsRef.current = ws;
     ws.binaryType = 'arraybuffer';
     const sendResize = () => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
 
@@ -87,40 +75,39 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
       cancelAnimationFrame(raf); clearTimeout(settle);
       window.removeEventListener('resize', onWin); ro.disconnect();
       try { ws.close(); } catch {} term.dispose();
-      termRef.current = null; wsRef.current = null;
+      termRef.current = null;
     };
   }, [wsPath]);
 
-  // Right-click on the terminal → our own menu, never the browser's page menu.
-  const onContextMenu = (e) => {
-    e.preventDefault();
-    const sel = termRef.current?.getSelection?.() || '';
-    setMenu({ x: e.clientX, y: e.clientY, sel });
+  // The right-click CONFLICT fix: xterm forwards mouse events to the terminal app (tmux mouse mode
+  // is on for scroll), but the browser ALSO pops its page menu (Back/Reload/Inspect) on top — that
+  // is the clash. Just suppress the browser menu so the right-click belongs to the terminal; we do
+  // NOT draw a replacement menu. (To make a browser-side highlight you can copy, hold Shift while
+  // dragging — that bypasses tmux's mouse capture; Ctrl/Cmd+Shift+C then copies it.)
+  const onContextMenu = (e) => e.preventDefault();
+
+  // "Show file": read whatever path is selected in the terminal (a Shift+drag selection) and open
+  // it in the explorer. A header button, not a context-menu entry — no new menu over the xterm.
+  const showFileFromSelection = () => {
+    const p = pathFromSelection(termRef.current?.getSelection?.() || '');
+    setShowFx(true);
+    if (p) setFxOpenPath({ path: p });
   };
-  const closeMenu = () => setMenu(null);
-  const doCopy = async () => { try { await navigator.clipboard.writeText(menu.sel); } catch { /* denied */ } closeMenu(); };
-  const doPaste = async () => {
-    try { const t = await navigator.clipboard.readText(); if (t) sendInput(t); } catch { /* denied */ }
-    closeMenu(); termRef.current?.focus();
-  };
-  const doSelectAll = () => { termRef.current?.selectAll?.(); closeMenu(); };
-  const doShowFile = () => {
-    const p = pathFromSelection(menu.sel);
-    if (p) { setShowFx(true); setFxOpenPath({ path: p }); }
-    closeMenu();
-  };
-  const selPath = menu ? pathFromSelection(menu.sel) : null;
 
   return createPortal(
     <div className="term-overlay" onClick={onClose}>
       <div className={`zeeterm${full ? ' full' : ''}${prod ? ' prod' : ''}${showFx ? ' hasfx' : ''}`}
-           onClick={(e) => { e.stopPropagation(); if (menu) closeMenu(); }}>
+           onClick={(e) => e.stopPropagation()}>
         <div className={`term-head${prod ? ' prod' : ''}`}>
           <span className="term-title">⌨ {title}
             {prod && <span className="term-prodtag" data-testid="term-prodtag">PRODUCTION</span>}
             <span className={`tstat t-${status}`}>{status}</span>
           </span>
           <span>
+            {explorerZeeId && (
+              <button className="term-x" data-testid="fx-showfile" onClick={showFileFromSelection}
+                      title="Show the file selected in the terminal (Shift+drag to select its path)">📄</button>
+            )}
             {explorerZeeId && (
               <button className={`term-x${showFx ? ' on' : ''}`} data-testid="fx-toggle"
                       onClick={() => setShowFx((v) => !v)}
@@ -139,21 +126,6 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
         </div>
         {foot}
       </div>
-      {menu && createPortal(
-        <div className="term-ctx" style={{ left: menu.x, top: menu.y }}
-             onClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
-          <button disabled={!menu.sel} onClick={doCopy}>Copy</button>
-          <button onClick={doPaste}>Paste</button>
-          <button onClick={doSelectAll}>Select all</button>
-          {explorerZeeId && <div className="term-ctx-sep" />}
-          {explorerZeeId && (
-            <button disabled={!selPath} onClick={doShowFile} title={selPath ? `Open ${selPath} in the explorer` : 'Select a file path first'}>
-              {selPath ? `Show file: ${selPath}` : 'Show file (select a path)'}
-            </button>
-          )}
-        </div>,
-        document.body
-      )}
     </div>,
     document.body
   );
