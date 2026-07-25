@@ -106,6 +106,23 @@ try {
     { schemas: ['core', 'public'] }), /missing schema/,
     'content guard: a dump that LOST schema core vs the last good backup → FAILS');
 
+  // REGRESSION: a legacy ruler recorded by the PRE-FIX parseDumpToc has bogus "schema" tokens
+  // ('-', 'OWNED', 'SET', 'DATA' from SCHEMA/SEQUENCE OWNED BY/SEQUENCE SET/MATERIALIZED VIEW DATA
+  // rows). The fixed parser emits none of them, so without artifact-stripping the continuity check
+  // rejected EVERY full backup as "missing schema(s) [-, OWNED, SET, DATA]" — db backups failing again.
+  ok(m.assertDumpContent(realParsed,
+    { schemas: ['core', '-', 'OWNED', 'SET', 'DATA'], table_count: 2 }).comparedSchemas === true,
+    'content guard: a CLEAN dump vs a legacy polluted ruler → PASSES (artifacts stripped)');
+  // …but a genuine loss hiding among the artifacts is still caught (only the real schema is missed).
+  threw(() => m.assertDumpContent(realParsed,
+    { schemas: ['core', 'audit', '-', 'OWNED'], table_count: 3 }), /missing schema\(s\) \[audit\]/,
+    'content guard: real schema loss beside legacy artifacts → still FAILS on the real one only');
+  // A post-fix ruler carries tables[]; schemas are derived from it (exact), loss still caught.
+  threw(() => m.assertDumpContent(realParsed,
+    { schemas: ['core', 'audit'], tables: ['core.invoices', 'audit.log'] }),
+    /missing schema\(s\) \[audit\]/,
+    'content guard: tables[]-based ruler that lost schema audit → FAILS');
+
   // ─────────────────────────────────────────────────────────────────────────
   console.log('\n── REGRESSION 1 / requirement 7: destination config is honest ──');
   const projId = (await one(
