@@ -256,6 +256,33 @@ export function validTableSelection(input, label = 'tables') {
   return [...new Set(out)];
 }
 
+// Bogus "schema" tokens a PRE-FIX parseDumpToc could record into a backup's toc_summary.schemas.
+// The old parser mistook the sub-keyword of a COMPOUND TOC descriptor for a schema name — 'OWNED'
+// (SEQUENCE OWNED BY), 'SET' (SEQUENCE SET), 'DATA' (MATERIALIZED VIEW DATA) — and kept the '-'
+// namespace placeholder of SCHEMA rows. The fixed parser no longer emits any of these, so a CLEAN
+// new dump looks like it "lost" them and the continuity check below would reject EVERY full backup
+// ("dump is missing schema(s) [-, OWNED, SET, DATA]"): backups failing again. They were never real
+// schemas, so strip them from a recorded ruler before comparing. ('BY' was never emitted — the old
+// parser matched the short 'SEQUENCE' prefix, leaving tail[0]='OWNED'/'SET' — but include it for
+// safety.) These uppercase words as a real Postgres schema name are astronomically unlikely; even
+// then, dropping one only makes the *continuity* check more lenient (never falsely PASS — the
+// absolute app-table and size guards still stand).
+const LEGACY_TOC_SCHEMA_ARTIFACTS = new Set(['-', 'OWNED', 'BY', 'SET', 'DATA']);
+
+// The real schema set a recorded backup captured. Prefer deriving it from the ruler's TABLE list
+// (always real 'schema.table' names — exact, and what post-fix backups record); fall back to its
+// recorded schema list with the legacy-parser artifacts above stripped (pre-fix rulers have no
+// tables[] field). Returns [] when the ruler carries neither.
+function rulerSchemas(prevSummary) {
+  if (Array.isArray(prevSummary?.tables) && prevSummary.tables.length) {
+    return [...new Set(prevSummary.tables.map((t) => String(t).split('.')[0]).filter(Boolean))];
+  }
+  if (Array.isArray(prevSummary?.schemas)) {
+    return prevSummary.schemas.filter((s) => !LEGACY_TOC_SCHEMA_ARTIFACTS.has(s));
+  }
+  return [];
+}
+
 // CONTENT guard. toc = parseDumpToc(...) of the dump actually written. prevSummary = the
 // toc_summary jsonb recorded for the last good backup (null when none/legacy).
 //  • absolute: the dump must contain at least one application table that is NOT a migration ledger.
@@ -270,8 +297,8 @@ export function assertDumpContent(toc, prevSummary) {
       + `This is an EMPTY database (its whole TOC is ${toc.entryCount} entr${toc.entryCount === 1 ? 'y' : 'ies'}): `
       + `almost certainly the WRONG container was dumped. Restoring it would WIPE the real database. Refusing to record it.`);
   }
-  const prevSchemas = Array.isArray(prevSummary?.schemas) ? prevSummary.schemas : null;
-  if (prevSchemas && prevSchemas.length) {
+  const prevSchemas = rulerSchemas(prevSummary);
+  if (prevSchemas.length) {
     const now = new Set(toc.schemas || []);
     const missing = prevSchemas.filter((s) => !now.has(s));
     if (missing.length) {
@@ -279,7 +306,7 @@ export function assertDumpContent(toc, prevSummary) {
         + `A backup does not lose whole schemas between runs — this is the wrong database. Refusing to record it.`);
     }
   }
-  return { appTableCount: appTables.length, comparedSchemas: !!(prevSchemas && prevSchemas.length) };
+  return { appTableCount: appTables.length, comparedSchemas: prevSchemas.length > 0 };
 }
 
 // timestamp key for the dump filename (yyyymmddhhmmss). A short random token is appended
