@@ -1245,8 +1245,31 @@ a.cbox:hover { border-color: var(--accent); }
 }
 /* body is now a row: [file explorer] | [xterm]. Without the explorer the terminal fills it, so a
    container/prod shell (no explorer) looks exactly as before. */
-.zeeterm-main { flex: 1; min-height: 0; display: flex; }
+.zeeterm-main { flex: 1; min-height: 0; display: flex; position: relative; }
 .zeeterm-body { flex: 1; min-width: 0; min-height: 0; padding: 6px 8px; }
+
+/* ── in-app clipboard tray: a floating panel over the terminal so it needs no xterm refit. Holds
+   captured selections as REAL page text — copyable even where the OS clipboard is blocked. ── */
+.term-clip { position: absolute; right: 10px; bottom: 10px; width: min(420px, 70%); z-index: 5;
+  background: #10141c; border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  box-shadow: 0 12px 34px rgba(0,0,0,.55); display: flex; flex-direction: column; }
+.term-clip .tc-head { display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 10px; background: var(--panel2); border-bottom: 1px solid var(--line); }
+.tc-title { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text); }
+.tc-flash { color: #35c46b; font-style: normal; font-size: 11px; margin-left: 8px; }
+.tc-text { width: 100%; box-sizing: border-box; height: 96px; resize: vertical; border: 0;
+  background: #0b0e14; color: #c9d3e0; padding: 8px 10px; font-family: 'Cascadia Code', monospace;
+  font-size: 12px; outline: none; }
+.tc-actions { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--line);
+  background: var(--panel2); }
+.tc-actions button { background: #0b0e14; border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.tc-actions button:hover:not(:disabled) { border-color: var(--accent); }
+.tc-actions button:disabled { opacity: .4; cursor: default; }
+/* a dot on the 📋 button when the clipboard has content but the tray is closed */
+.term-x.dot { position: relative; }
+.term-x.dot::after { content: ''; position: absolute; top: 2px; right: 2px; width: 6px; height: 6px;
+  border-radius: 50%; background: var(--accent); }
 
 /* ── file explorer panel (rides the zee terminal) ── */
 .fx { width: 300px; min-width: 300px; display: flex; flex-direction: column;

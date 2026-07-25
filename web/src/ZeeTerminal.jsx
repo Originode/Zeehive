@@ -34,15 +34,41 @@ const PATH_RE = /(?:\.{0,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+(?::\d+(?::\
 export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
+  const wsRef = useRef(null);
+  const clipTaRef = useRef(null);
   const reqN = useRef(0);
   const [status, setStatus] = useState('connecting');
   const [full, setFull] = useState(false);   // maximize the modal; the ResizeObserver refits + resizes the PTY
   const [showFx, setShowFx] = useState(false);       // file-explorer panel open?
   const [fxReq, setFxReq] = useState(null);          // { path, n } — a "show file" request into the explorer
+  const [clip, setClip] = useState('');              // the IN-APP clipboard: last selection captured here
+  const [clipOpen, setClipOpen] = useState(false);   // the clipboard tray visible?
+  const [flash, setFlash] = useState('');
 
   // Open a path in the explorer (opening the panel if needed). The bumping `n` makes every request
   // distinct so clicking the SAME path again re-opens it (identity, not value, drives the effect).
   const openInExplorer = (p) => { if (!p) return; setShowFx(true); setFxReq({ path: p, n: ++reqN.current }); };
+
+  // Send text to the PTY as if typed (the clipboard tray's Paste→terminal).
+  const sendInput = (d) => { const ws = wsRef.current; if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'i', d })); };
+
+  // OS-clipboard write, best-effort: the async API where allowed (secure ctx / localhost), else a
+  // throwaway textarea + execCommand for an insecure http origin. Never throws.
+  const clipApi = (t) => { try { return navigator.clipboard?.writeText(t); } catch { return null; } };
+  const execCopy = (t) => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta); termRef.current?.focus();
+    } catch { /* nothing more we can do */ }
+  };
+  const toOsClipboard = (t) => { const p = clipApi(t); if (p && p.catch) p.catch(() => execCopy(t)); else if (!p) execCopy(t); };
+
+  // Capture a selection into the IN-APP clipboard (the web-ui clipboard the operator asked for): it
+  // lives in the page as real, selectable text — reliable even where the OS clipboard is blocked
+  // (remote http origin, iframe). We ALSO mirror to the OS clipboard when that's allowed.
+  const capture = (t) => { if (!t) return; setClip(t); setClipOpen(true); toOsClipboard(t); };
 
   useEffect(() => {
     const term = new Terminal({
@@ -59,6 +85,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}${wsPath}`);
+    wsRef.current = ws;
     ws.binaryType = 'arraybuffer';
     const sendResize = () => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
 
@@ -79,23 +106,11 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 
     // CLIPBOARD. xterm renders to a canvas, so a highlight is xterm's OWN selection, not a browser
     // text selection — the browser's copy has nothing to grab (reported: "Ctrl+Shift+C doesn't
-    // work, I can't copy"). So wire it explicitly:
-    //  • copy-on-select — the moment a selection exists (Shift+drag, since tmux mouse mode owns a
-    //    plain drag), push it to the system clipboard. This is the no-shortcut path that just works.
-    // clipboard API where it exists (secure context incl. localhost); best-effort, never throws.
-    const clipApi = (t) => { try { return navigator.clipboard?.writeText(t); } catch { return null; } };
-    // legacy fallback for an insecure context (console opened on a bare IP over http, where
-    // navigator.clipboard is undefined): a throwaway textarea + execCommand('copy'). It steals
-    // focus for an instant, so it is used ONLY on the explicit shortcut, not on copy-on-select.
-    const execCopy = (t) => {
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
-        document.body.appendChild(ta); ta.focus(); ta.select();
-        document.execCommand('copy'); document.body.removeChild(ta); term.focus();
-      } catch { /* nothing more we can do */ }
-    };
-    term.onSelectionChange(() => { const s = term.getSelection(); if (s) clipApi(s); });
+    // work, I can't copy"). And the OS clipboard is itself unreachable on a remote http origin. So:
+    //  • copy-on-select CAPTURES the selection into the IN-APP clipboard tray (real page text the
+    //    operator can always read/copy) and mirrors to the OS clipboard where allowed. Shift+drag,
+    //    since tmux mouse mode owns a plain drag.
+    term.onSelectionChange(() => { const s = term.getSelection(); if (s) capture(s); });
     //  • explicit shortcuts as a fallback: Ctrl+Shift+C / Cmd+C copy the selection; Ctrl+Shift+V /
     //    Cmd+V paste into the PTY. We swallow these so they don't reach the shell (plain Ctrl+C stays
     //    SIGINT — we never touch it). attachCustomKeyEventHandler returning false blocks the key.
@@ -103,12 +118,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
       if (e.type !== 'keydown') return true;
       const combo = (e.ctrlKey && e.shiftKey) || e.metaKey;   // Linux/Win: Ctrl+Shift+_, mac: Cmd+_
       if (!combo) return true;
-      if (e.code === 'KeyC' && term.hasSelection()) {
-        const s = term.getSelection();
-        const p = clipApi(s);
-        if (p && p.catch) p.catch(() => execCopy(s)); else if (!p) execCopy(s);
-        return false;
-      }
+      if (e.code === 'KeyC' && term.hasSelection()) { capture(term.getSelection()); return false; }
       if (e.code === 'KeyV') {
         try { navigator.clipboard?.readText().then((t) => t && ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d: t }))); } catch { /* denied */ }
         return false;
@@ -154,15 +164,25 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
       window.removeEventListener('resize', onWin); ro.disconnect();
       try { linkDisp?.dispose(); } catch {}
       try { ws.close(); } catch {} term.dispose();
-      termRef.current = null;
+      termRef.current = null; wsRef.current = null;
     };
   }, [wsPath]);
+
+  // ── clipboard tray actions ──
+  const flashMsg = (m) => { setFlash(m); setTimeout(() => setFlash(''), 1200); };
+  const copyClipOut = () => {
+    // select the tray textarea (so a manual Ctrl+C always works) AND try the OS clipboard.
+    clipTaRef.current?.focus(); clipTaRef.current?.select();
+    toOsClipboard(clip); flashMsg('copied');
+  };
+  const pasteClipToTerm = () => { if (clip) { sendInput(clip); termRef.current?.focus(); flashMsg('pasted → terminal'); } };
+  const clearClip = () => { setClip(''); setFlash(''); };
 
   // The right-click CONFLICT fix: xterm forwards mouse events to the terminal app (tmux mouse mode
   // is on for scroll), but the browser ALSO pops its page menu (Back/Reload/Inspect) on top — that
   // is the clash. Just suppress the browser menu so the right-click belongs to the terminal; we do
   // NOT draw a replacement menu. (Because tmux mouse mode owns a plain drag, hold Shift while
-  // dragging to make a selection — the copy-on-select handler above puts it on the clipboard.)
+  // dragging to make a selection — it is captured into the 📋 clipboard tray.)
   const onContextMenu = (e) => e.preventDefault();
 
   // "Show file" from the header button: read whatever path is selected in the terminal (a Shift+drag
@@ -183,6 +203,9 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
             <span className={`tstat t-${status}`}>{status}</span>
           </span>
           <span>
+            <button className={`term-x${clipOpen ? ' on' : ''}${clip && !clipOpen ? ' dot' : ''}`} data-testid="clip-toggle"
+                    onClick={() => setClipOpen((v) => !v)}
+                    title="Clipboard — selections you Shift+drag land here (works even when the OS clipboard is blocked)">📋</button>
             {explorerZeeId && (
               <button className="term-x" data-testid="fx-showfile" onClick={showFileFromSelection}
                       title="Show file — click a path in the output, or Shift+drag to select one, then this">📄</button>
@@ -202,6 +225,22 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
                           onClose={() => setShowFx(false)} />
           )}
           <div className="zeeterm-body" ref={holder} onContextMenu={onContextMenu} />
+          {clipOpen && (
+            <div className="term-clip" data-testid="term-clip" onClick={(e) => e.stopPropagation()}>
+              <div className="tc-head">
+                <span className="tc-title">📋 clipboard{flash && <em className="tc-flash">{flash}</em>}</span>
+                <button className="fx-x" title="Hide" onClick={() => setClipOpen(false)}>✕</button>
+              </div>
+              <textarea ref={clipTaRef} className="tc-text" value={clip} readOnly
+                        placeholder="Shift+drag in the terminal to capture text here…"
+                        onFocus={(e) => e.target.select()} />
+              <div className="tc-actions">
+                <button disabled={!clip} onClick={copyClipOut} title="Select the text and copy to the OS clipboard">⧉ copy</button>
+                <button disabled={!clip} onClick={pasteClipToTerm} title="Type this back into the terminal">⇥ paste → terminal</button>
+                <button disabled={!clip} onClick={clearClip} title="Clear">clear</button>
+              </div>
+            </div>
+          )}
         </div>
         {foot}
       </div>
@@ -233,8 +272,8 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
     <div className="zeeterm-foot">
       {/* Copy is non-obvious: tmux mouse mode owns a plain drag, so a browser selection needs Shift.
           Surface it so nobody has to guess (reported: "I can't copy text"). */}
-      <span className="pc kbd-hint" title="A plain drag scrolls/goes to the app; Shift+drag makes a copyable selection">
-        <b>Shift+drag</b> to select &amp; copy · click a <b>path</b> to open it
+      <span className="pc kbd-hint" title="A plain drag goes to the app; Shift+drag makes a selection, captured into the 📋 clipboard tray">
+        <b>Shift+drag</b> → 📋 clipboard · click a <b>path</b> to open it
       </span>
       <input className="mono" readOnly value={sshCmd || ''} onFocus={(e) => e.target.select()} />
       <button type="button" onClick={copy}>{copied ? '✓ copied' : '⧉ copy'}</button>
