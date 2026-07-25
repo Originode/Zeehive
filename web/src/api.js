@@ -178,6 +178,9 @@ export const deleteEnvVar = (envId, name) => siteCall(`/api/environments/${envId
 export const importEnv = (envId, text, is_secret = true) => siteCall(`/api/environments/${envId}/import`, 'POST', { text, is_secret });
 export const exportEnv = (envId) => siteCall(`/api/environments/${envId}/export`, 'GET');
 export const lintEnv = (envId) => fetch(`/api/environments/${envId}/lint`).then((r) => r.json());
+// Extract a xell's CURRENT environment (its live .zeehive.env, else the resolved meta-DB env) as
+// full .env text — the "pull out what this xell is running with" reveal.
+export const extractXellEnv = (xellId) => siteCall(`/api/xells/${xellId}/env/export`, 'GET');
 
 // ── discover & adopt a site's running stack (read-only docker; adopt models + links to prod) ──
 // discoverSite returns {ok, containers[…]} or {ok:false, error} for an unreachable context — the

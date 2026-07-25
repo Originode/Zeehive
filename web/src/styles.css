@@ -438,6 +438,15 @@ a.cbox:hover { border-color: var(--accent); }
 .machinechip { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: default;
   font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
 
+/* WHICH environment the xell is loaded with (migration 043). Same quiet chip language, but this one
+   IS an action — click to extract the xell's current .env — so it gets a pointer + hover lift. Prod
+   env tints warm (it carries live secrets); an empty env (∅) reads dim: dormant, nothing merged. */
+.envchip { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: pointer;
+  font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+.envchip:hover { color: var(--fg); border-color: var(--muted); }
+.envchip.env-prod { color: #c8863c; border-color: #7a5a2e; }
+.envchip.env-empty { opacity: .55; font-style: italic; }
+
 /* terminal button + modal */
 /* container build affordances */
 /* unbuilt buildable container → hammer INSIDE the box, in the bottom-right so it never

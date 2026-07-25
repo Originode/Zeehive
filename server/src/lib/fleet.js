@@ -51,6 +51,11 @@ async function fetchXellRows(pid) {
             z.cost_usd, z.attach_mode, z.cli_active, z.monitor_source, z.last_monitor_at,
             z.permission_mode, z.kind AS zee_kind,
             r.label AS runtime_label, r.key AS runtime_key,
+            -- RESOLVED ENVIRONMENT (migration 043): which env this xell is loaded with, by the same
+            -- rule lib/environments.js uses — an explicit pin, else the default env of the computed
+            -- tier (prod for a live-prod / production xell, else dev). env_var_count surfaces the
+            -- empty case (an empty env adds nothing to .zeehive.env — the safe, dormant state).
+            env.env_key, env.env_tier, env.env_pinned, env.env_var_count,
             -- FLEET BURN (per xell): sum of what EVERY zee this xell has ever hosted consumed —
             -- tokens + $ — not just the currently-shown zee (z above is one row). A cxell xell can
             -- outlive several zees; the card figure must be the xell's whole burn. Cheap subquery on
@@ -102,6 +107,20 @@ async function fetchXellRows(pid) {
           LIMIT 1
        ) z ON true
        LEFT JOIN agent_runtime r ON r.id = z.runtime_id
+       -- resolved environment: the pin if set, else the default env of the computed tier
+       LEFT JOIN LATERAL (
+         SELECT e.id AS env_id, e.key AS env_key, e.tier AS env_tier,
+                (x.environment_id IS NOT NULL) AS env_pinned,
+                (SELECT count(*) FROM environment_var ev WHERE ev.environment_id = e.id) AS env_var_count
+           FROM environment e
+          WHERE e.project_id = x.project_id
+            AND ((x.environment_id IS NOT NULL AND e.id = x.environment_id)
+              OR (x.environment_id IS NULL AND e.is_default
+                  AND e.tier = CASE WHEN x.is_production OR x.db_coupling = 'db-shared-prod'
+                                    THEN 'prod' ELSE 'dev' END))
+          ORDER BY (e.id = x.environment_id) DESC
+          LIMIT 1
+       ) env ON true
       WHERE x.project_id = $1 AND x.status <> 'retired'
       ORDER BY x.created_at`, [pid]);
 }

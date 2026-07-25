@@ -37,7 +37,7 @@ import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderT
          deleteProviderAccount } from '../lib/provider-tokens.js';
 import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
          listVars, setVar, deleteVar, importEnv, exportEnv, lintEnv, diffEnvironments,
-         resolvedEnvView, setXellEnvironment } from '../lib/environments.js';
+         resolvedEnvView, setXellEnvironment, extractXellEnv } from '../lib/environments.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { discoverSite, adoptContainers } from '../lib/discovery.js';
@@ -471,6 +471,12 @@ router.get('/xells/:id/env/resolved', async (req, res) => {
 router.post('/xells/:id/environment', async (req, res) => {
   try { res.json(await setXellEnvironment(req.params.id, req.body?.environment_id || null)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Extract a xell's CURRENT environment as full .env text (human reveal) — its own .zeehive.env if
+// present, else the resolved meta-DB environment. This is the "pull out what this xell is running".
+router.get('/xells/:id/env/export', async (req, res) => {
+  try { res.json(await extractXellEnv(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
 });
 
 // ── project manifest: the repo's zeehive.yml vs the stored cache (spec §3.1) ─
@@ -997,6 +1003,12 @@ router.post('/xell/self/working', async (req, res) => {
 // cxell's own .zeehive.env). Read-only, token-scoped. `zee env` maps here.
 router.get('/xell/self/env', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await resolvedEnvView(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// Extract THIS xell's current environment as full .env text — `zee env --export`. Full values, but
+// a zee only ever sees its OWN env (token-scoped), which it already holds in its .zeehive.env file.
+router.get('/xell/self/env/export', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await extractXellEnv(x.id)); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
