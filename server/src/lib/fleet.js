@@ -117,7 +117,7 @@ async function fetchXellRows(pid) {
             AND ((x.environment_id IS NOT NULL AND e.id = x.environment_id)
               OR (x.environment_id IS NULL AND e.is_default
                   AND e.tier = CASE WHEN x.is_production OR x.db_coupling = 'db-shared-prod'
-                                    THEN 'prod' ELSE 'dev' END))
+                                    THEN 'prod'::container_tier ELSE 'dev'::container_tier END))
           ORDER BY (e.id = x.environment_id) DESC
           LIMIT 1
        ) env ON true
