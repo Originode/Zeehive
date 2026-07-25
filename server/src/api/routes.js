@@ -8,7 +8,7 @@ import { recentLogs } from '../lib/logbus.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
-import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup } from '../queenzee/maintenance.js';
+import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { diffOneContainerAgainstProd } from '../queenzee/proddiff.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
@@ -579,6 +579,16 @@ router.post('/containers/check', async (_req, res) => res.json(await checkContai
 // chip's drift mark + tooltip repaint live. Returns the payload so the caller can surface a summary.
 router.post('/containers/:id/check-diff', async (req, res) => {
   try { res.json(await diffOneContainerAgainstProd(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── duplicate PRODUCTION into this dev db (the "Duplicate prod" context-menu action) ──
+// A prod backup + restore FUSED: streams a fresh pg_dump of production straight into pg_restore on
+// this db, so it becomes an exact copy of live prod in one go. duplicateProdInto enforces the guards
+// server-side — a prod target is refused (that's the gated restore-over-prod flow) and prod must be
+// free — so a direct API call can't get around them.
+router.post('/containers/:id/duplicate-prod', async (req, res) => {
+  try { res.json(await duplicateProdInto({ container: req.params.id })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

@@ -9,9 +9,9 @@
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
 import React, { useState, useEffect } from 'react';
-import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff } from './api.js';
+import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, duplicateProd } from './api.js';
 import { nick } from './nick.js';
-import { showAlert } from './Dialog.jsx';
+import { showAlert, showConfirm } from './Dialog.jsx';
 
 // Production is EXCLUDED from decommission entirely (not warned) — a prod container/db is never a
 // candidate for this action. Mirrors the server guard in decommissionContainer (tier='prod').
@@ -189,9 +189,12 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   // "Check diff" fires an on-demand drift check against prod; guard against a double-click while the
   // catalog comparison is in flight. Reset (with the rest) whenever the menu retargets a container.
   const [diffing, setDiffing] = useState(false);
+  // "Duplicate prod" streams a fresh prod dump into THIS dev db (backup + restore in one). Guard the
+  // in-flight window so a double-click can't fire two overwrites. Reset when the menu retargets.
+  const [dupPending, setDupPending] = useState(false);
   const c = menu?.c;
   const cid = c?.id;
-  useEffect(() => { setConfirming(false); setTyped(''); setBusyAct(false); setErr(null); setDiffing(false); }, [cid]);
+  useEffect(() => { setConfirming(false); setTyped(''); setBusyAct(false); setErr(null); setDiffing(false); setDupPending(false); }, [cid]);
 
   const buildable = c ? isBuildable(c) : false;
   const busy = c ? busyReason(c) : null;
@@ -258,6 +261,29 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
     } catch (e) {
       setDiffing(false);
       showAlert('Check diff failed: ' + (e?.error || e?.message || e), { variant: 'error' });
+    }
+  };
+
+  // Duplicate PRODUCTION into this dev db: a fresh prod backup + restore fused into one action, so
+  // the db becomes an exact copy of live prod. It OVERWRITES everything here, so it asks first (a
+  // destructive confirm, like the backups panel's restore). The container itself is captured up
+  // front because confirming closes the menu underneath the modal.
+  const runDuplicateProd = async () => {
+    if (dupPending) return;
+    const tgt = c;
+    const okd = await showConfirm(
+      `Duplicate PRODUCTION into ${tgt.name}?\n\n`
+      + `This takes a fresh dump of LIVE production and restores it here — OVERWRITING everything `
+      + `currently in this database. It cannot be undone.`,
+      { okLabel: 'Duplicate prod', cancelLabel: 'Cancel', variant: 'error' });
+    if (!okd) return;
+    setDupPending(true);
+    try {
+      await duplicateProd(tgt.id);
+      onClose();
+    } catch (e) {
+      setDupPending(false);
+      showAlert('Duplicate prod failed: ' + (e?.error || e?.message || e), { variant: 'error' });
     }
   };
 
@@ -367,6 +393,21 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
           {prod
             ? <>📥 Restore backup over prod… <span className="ctxsub">⚠ overwrites LIVE production — asks you to confirm</span></>
             : <>📥 Load backup… <span className="ctxsub">restore a backup into this db (overwrites data)</span></>}
+        </button>
+      ))}
+
+      {/* Duplicate prod: on every NON-production db chip (matrix + xell hexagon share this menu).
+          One click makes this db an exact copy of LIVE production — a fresh prod dump streamed
+          straight into a restore here (backup + restore fused). It overwrites this db, so it's a
+          danger item and asks to confirm first. Withdrawn while busy — a mid-restore db can't take
+          another overwrite. Prod is the SOURCE, never a target, so it never carries this item. */}
+      {isDb && !prod && (busy ? (
+        <div className="ctxsub ctxbusy-note" data-testid="duplicate-prod-busy">duplicate prod unavailable while busy</div>
+      ) : (
+        <button role="menuitem" data-testid="duplicate-prod-open" className="ctxdanger-item"
+                disabled={dupPending} onClick={runDuplicateProd}>
+          🐝 {dupPending ? 'Duplicating prod…' : 'Duplicate prod'}
+          <span className="ctxsub">copy LIVE production into this db (backup + restore in one · overwrites data)</span>
         </button>
       ))}
 

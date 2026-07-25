@@ -267,6 +267,19 @@ export async function checkContainerDiff(containerId) {
   return data;
 }
 
+// Duplicate PRODUCTION into a dev db container (the chip's "Duplicate prod" menu item): a prod
+// backup + restore fused into one action, so the db becomes an exact copy of live production. The
+// server streams pg_dump(prod) → pg_restore(this db) and the container spins until it finishes.
+// The server REFUSES a prod target and while prod is in use — surface that refusal as an error.
+export async function duplicateProd(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/duplicate-prod`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `duplicate prod failed (${r.status})`);
+  return data;
+}
+
 // Set WHERE a xell's images compile (both server+webapp). build_ctx='' resets to the run host.
 // Throws with an actionable message if the context is foreign and no registry is configured.
 export async function setXellBuildCtx(xellId, build_ctx) {

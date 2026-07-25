@@ -819,6 +819,105 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
   }
 }
 
+// ── DUPLICATE PROD → a dev db (backup + restore, fused into one action) ─────────
+// Make a dev database an exact copy of LIVE PRODUCTION in one go — what you'd otherwise do by
+// taking a fresh prod backup and then restoring it here, done as a single streamed pipe:
+//   pg_dump (prod) → pg_restore (dev)
+// with NO dump file staged on any host (the dump is only bytes-in-transit through the queenzee,
+// exactly like the network backup/restore path). A dev db is a throwaway copy; a KEPT artifact is
+// what the backups panel is for, so this deliberately writes no db_snapshot row. Same guards as a
+// prod backup — prod must be FREE (a pg_dump holds ACCESS SHARE on every table for its whole
+// duration, so it must not contend with a live ship/hotfix) — and it REFUSES to target production
+// itself (overwriting prod is the gated "Restore backup over prod" flow, never this).
+export async function duplicateProdInto({ container }) {
+  const c = await one(`SELECT * FROM container WHERE id=$1`, [container]);
+  if (!c) throw new Error('container not found');
+  if (c.role !== 'db') throw new Error(`target is not a db container (role=${c.role})`);
+  if (c.tier === 'prod') {
+    throw new Error('the target IS production — duplicate copies prod INTO another db, never over prod itself');
+  }
+  if (c.busy_since) throw new Error('this container is busy (a backup/restore is already running)');
+
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [c.project_id]);
+  if (!project) throw new Error('no project');
+
+  // The PRODUCTION db container to dump (modeled; resolved to its live versioned name in the job).
+  const prodDbc = await one(
+    `SELECT id, name, docker_ctx, host_port, tier, busy_since FROM container
+       WHERE project_id=$1 AND role='db' AND tier='prod' AND isolation='shared'
+       ORDER BY created_at LIMIT 1`, [c.project_id]);
+  if (!prodDbc && MODE === 'real') {
+    throw new Error('no production db container is modeled for this project — nothing to duplicate from');
+  }
+  if (prodDbc && prodDbc.id === c.id) {
+    throw new Error('source and target are the same database — that IS production, nothing to duplicate');
+  }
+  if (prodDbc?.busy_since) throw new Error('the production database is busy (a backup/restore is already running)');
+
+  // Don't dump prod while it's mid-ship or bound to a live zee — the same window that blocks a
+  // scheduled backup. A dump would contend with live prod work.
+  const busy = await prodBusyReason(c.project_id);
+  if (busy) {
+    throw new Error(`prod duplicate refused: ${busy} — a dump would contend with live prod work `
+      + '(pg_dump locks every table for its duration). Try again once prod is released.');
+  }
+
+  // Prod and its dev copies share the project's db name/user (same database, different servers).
+  const dbName = project.db_name || config.prodDbName || project.name.toLowerCase();
+  const dbUser = project.db_user || config.prodDbUser;
+
+  // Both endpoints spin while the copy runs: prod is being READ (busy_op='backup'), the target is
+  // being OVERWRITTEN (busy_op='restore'). The chips spin and lock out builds for the duration, and
+  // flagging prod busy serializes this against a concurrent scheduled backup of the same database.
+  await setBusy(c.id, 'restore');
+  if (prodDbc) await setBusy(prodDbc.id, 'backup');
+  logline('maint', `duplicate prod → ${c.name} (${MODE})`);
+  runDuplicateJob({ project, prodDbc, target: c, dbName, dbUser })
+    .catch((e) => console.error('[duplicate]', e.message));
+  return { ok: true, status: 'started', container: c.name };
+}
+
+async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
+  let restored = false;
+  try {
+    if (MODE === 'real') {
+      // Resolve BOTH endpoints by IDENTITY (ctx + host_port), never name shape — the same rule the
+      // backup/restore jobs follow, so a dev clone can never be mistaken for real prod (regression 2).
+      const srcCtx = prodDbc.docker_ctx || (await resolveSite(project.id, 'prod'))?.docker_ctx || project.docker_ctx_prod;
+      const src = await resolveRunningContainer({ ...prodDbc, docker_ctx: srcCtx });
+      const dstCtx = target.docker_ctx;
+      const dst = await resolveRunningContainer({ ...target });
+      // Stream pg_dump (prod) straight into pg_restore (dev). --clean --if-exists --no-owner mirror
+      // the restore job: drop-and-recreate every object, ignore prod's role grants on the dev server.
+      const piped = await execPipe(
+        { cmd: 'docker', args: ['--context', srcCtx, 'exec', src.name, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName] },
+        { cmd: 'docker', args: ['--context', dstCtx, 'exec', '-i', dst.name, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName] },
+        { timeout: 1800000 });
+      if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
+        const why = piped.timedOut ? 'timed out' : `pg_dump exit ${piped.srcStatus}, pg_restore exit ${piped.dstStatus}`;
+        throw new Error(`duplicate prod → ${target.name} failed (${why}): `
+          + `${((piped.dstStderr || piped.srcStderr) || '(no output)').slice(-300)}`);
+      }
+    } else {
+      await wait(SIM_RESTORE_MS);   // simulate: hold the busy state so the spinner is visible
+    }
+    logline('maint', `duplicate finished → ${target.name}`);
+    restored = true;
+  } catch (e) {
+    logline('maint', `duplicate FAILED → ${target.name}: ${e.message}`);
+  } finally {
+    await clearBusy(target.id);
+    if (prodDbc) await clearBusy(prodDbc.id);
+  }
+  // The target's catalog just changed — its prod_diff chip is stale. Re-measure now that busy is
+  // cleared (a fresh copy of prod SHOULD read as in-sync). Best-effort and fire-and-forget: a failed
+  // diff must never turn a SUCCESSFUL duplicate into a failure.
+  if (restored) {
+    refreshProdDiffAfterRestore(target.id)
+      .catch((e) => logline('proddiff', `post-duplicate drift refresh for ${target.name} failed: ${e.message}`));
+  }
+}
+
 // On startup no job from a previous process can still be running: mark any 'running' backup failed
 // (drop its partial file) and clear every busy container, so nothing is stuck spinning forever.
 export async function reconcileInterruptedJobs() {
