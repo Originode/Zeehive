@@ -9,7 +9,7 @@
 // wins; else a live-prod (db-shared-prod) or is_production xell gets the default PROD environment;
 // else the default DEV one. Spinoff/dev xells therefore get dev env, prod xells get prod env, and a
 // xell handed the live prod db is loaded with the production environment.
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pool, q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
@@ -293,6 +293,35 @@ export async function resolveEnvironmentFor(xell) {
   return one(
     `SELECT * FROM environment WHERE project_id=$1 AND tier=$2 AND is_default LIMIT 1`,
     [xell.project_id, tier]);
+}
+
+// Full-value door #2 (deploy): write a project's default environment for `tier` to an on-disk .env,
+// making the meta-DB the source and the file a projection — the same inversion .zeehive.env already
+// is, now for the prod deploy (ship-prod.sh reads <source>/.env). SAFE BY REFUSAL: an empty
+// environment is NEVER written over an existing file — that would blank prod's secrets, so a project
+// that hasn't filled its prod environment keeps shipping exactly as before. The current file is
+// backed up first. Returns {written,…} or {skipped, reason}.
+export async function materializeEnvFile(projectId, tier, destPath) {
+  const env = await one(
+    `SELECT * FROM environment WHERE project_id=$1 AND tier=$2 AND is_default LIMIT 1`, [projectId, tier]);
+  if (!env) return { skipped: true, reason: `no default ${tier} environment configured` };
+  const vars = await q(
+    `SELECT name, value FROM environment_var WHERE environment_id=$1 ORDER BY name`, [env.id]);
+  if (!vars.length) {
+    return { skipped: true, environment: env.key,
+      reason: `${tier} environment "${env.key}" is empty — on-disk ${destPath} left as the source of truth` };
+  }
+  const body = [
+    `# GENERATED from the ZEEHIVE meta-DB (environment: ${env.key}). Edit it in the console, not here.`,
+    ...vars.map((v) => `${v.name}=${v.value}`), '',
+  ].join('\n');
+  let backup = null;
+  if (existsSync(destPath)) {
+    backup = `${destPath}.zeehive-bak`;
+    try { copyFileSync(destPath, backup); } catch { backup = null; }
+  }
+  writeFileSync(destPath, body);
+  return { written: true, path: destPath, backup, count: vars.length, environment: env.key };
 }
 
 // The full-value door #1: the resolved environment's vars for emitXellEnv to write into the xell's
