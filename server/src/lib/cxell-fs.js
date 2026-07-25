@@ -56,7 +56,14 @@ function withConn(dest, fn) {
   });
 }
 
-function execCapture(conn, cmd, maxBytes = 3_000_000) {
+// Run a SCRIPT in the cxell. Critical: ssh2's exec hands the command to the zee's LOGIN shell,
+// which parses it before our /bin/sh ever runs — so any `$var` or quote in a naively-wrapped
+// command is expanded/mangled by that outer shell (seen live: `[ ! -d "$p" ]` had `$p` eaten by
+// the outer bash, leaving `[ ! -d "" ]`, so EVERY path came back "not a directory"). Ship the
+// whole script base64-encoded and decode→pipe it into sh: the outer shell then only ever sees
+// `echo <b64> | base64 -d | /bin/sh`, which has no metacharacters to misinterpret.
+function execCapture(conn, script, maxBytes = 3_000_000) {
+  const cmd = `echo ${Buffer.from(script, 'utf8').toString('base64')} | base64 -d | /bin/sh`;
   return new Promise((resolve, reject) => {
     conn.exec(cmd, (err, stream) => {
       if (err) return reject(err);
@@ -142,7 +149,7 @@ export async function listCxellDir(zeeId, path) {
   const dir = resolveCxellPath(path);
   const dest = await zeeSshDest(zeeId);
   const script = buildListScript(dir);
-  const { buf, stderr, code } = await withConn(dest, (c) => execCapture(c, `/bin/sh -c ${JSON.stringify(script)}`));
+  const { buf, stderr, code } = await withConn(dest, (c) => execCapture(c, script));
   if (code === 4 || /__NOTDIR__/.test(stderr)) throw Object.assign(new Error(`not a directory: ${dir}`), { status: 400 });
   if (code && code !== 0 && !buf.length) throw new Error(stderr.trim() || `list failed (exit ${code})`);
   return parseListOutput(buf, dir);
@@ -153,7 +160,7 @@ export async function readCxellFile(zeeId, path, maxBytes = 512_000) {
   const file = resolveCxellPath(path);
   const dest = await zeeSshDest(zeeId);
   const script = buildReadScript(file, maxBytes);
-  const { buf, stderr, code, truncated } = await withConn(dest, (c) => execCapture(c, `/bin/sh -c ${JSON.stringify(script)}`, maxBytes + 4096));
+  const { buf, stderr, code, truncated } = await withConn(dest, (c) => execCapture(c, script, maxBytes + 4096));
   if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
   if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
   return parseReadResult(buf, stderr, file, truncated);
