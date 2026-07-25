@@ -198,10 +198,25 @@ Integration caveats for (B), recorded honestly:
   Zeehive's "surface drift, never guess" ethos); if none exists, Hermes is self-hosted (`~/.hermes/`)
   so the session store can be written directly. Bridge config (base url, auth, append mode) lives in
   `harnesses/hermes/HARNESS.yml`, versioned with the harness.
-- **Two-way is out of scope for (B).** "Chat with the zee *from* Hermes's web UI" would open an
-  *inbound* control path into the cxell (a Hermes user-message posted as a prompt into the zee's
-  session). That is a new, gated surface — a later, opt-in bridge mode, never a side effect of the
-  display mirror.
+- **Two-way (human replies from Hermes's web UI) — feasible, as an opt-in bridge mode.** The
+  *inbound delivery machinery already exists and is in daily use*: the dashboard's 📨 button calls
+  `sendMessageToXell()` (`queenzee/nudge.js`, `POST /xells/:id/message`), which resolves the xell's
+  live cxell zee and **types the message straight into its live session over SSH**; rich content
+  (images, long/multi-line text) is written into the cxell as real files under `.zee-inbox/<ts>/`
+  with a typed pointer to read/view them. The zee receives it *inside its own cxell* — the human
+  never touches the zee's files, nothing leaves the cage. So a Hermes reply is just: Hermes user
+  message → (its `X-Hermes-Session-Key`, which we set to the xell slug) → the same
+  `sendMessageToXell(xellId, …)` the console already uses. No new delivery path.
+  Two guards make it opt-in rather than automatic:
+  - **It is an inbound control surface into the cxell.** The bridge endpoint Hermes POSTs to must be
+    **authenticated** (a per-xell/per-harness bridge secret) and scoped to that one xell — same
+    posture as every other queenzee door.
+  - **Best-effort, live-zee-only.** `sendMessageToXell` returns `{sent:false, reason}` when there is
+    no live cxell zee (torn down, or between one-shot turns). Hermes must **surface that state**, not
+    silently drop the message.
+
+  Direction of travel: **outbound display mirror is the default (B); the inbound reply channel is a
+  flag on the same bridge** (`bridge.inbound: true` in `HARNESS.yml`), off until you turn it on.
 
 > Domain note: the badge asset link points at `hermes-agent.org`; the authoritative docs/API live at
 > `hermes-agent.nousresearch.com` (repo `NousResearch/hermes-agent`), with a mirror at
@@ -241,6 +256,10 @@ If you want, the next proposal can spec the orchestrator against that xource-tre
    stay in its cxell. B is a one-way, outbound, display-only mirror; the zee never leaves its cage. ✔
 7. **Avatar placement → one badge at the junction** (upstream of the fan-out), because the xell
    hexagons are already crowded. ✔
+8. **Two-way (human replies from the Hermes web UI) → yes, opt-in.** Reuses the existing
+   `sendMessageToXell()` inbound path (the 📨 button / `POST /xells/:id/message`), keyed by the
+   Hermes session key = xell slug. Off by default (`bridge.inbound`), authenticated + xell-scoped
+   when on; the zee stays in its cxell. ✔
 
 ### Everything above is decided; no open questions remain. Implementation gated on your go-ahead.
 
