@@ -19,6 +19,7 @@ export default function FileExplorer({ zeeId, openPath, onClose }) {
   const [error, setError] = useState(null);
   const [file, setFile] = useState(null);        // open file viewer: { path, content, size, binary, truncated }
   const [fileErr, setFileErr] = useState(null);
+  const [go, setGo] = useState('');              // the "show file" path box — paste a path a zee named
 
   const load = useCallback(async (path) => {
     setLoading(true); setError(null);
@@ -33,19 +34,17 @@ export default function FileExplorer({ zeeId, openPath, onClose }) {
     catch (e) { setFileErr(e.message || String(e)); setFile({ path, content: '' }); }
   }, [zeeId]);
 
+  // Show a path a zee named: a dir → navigate into it, anything else → open it in the viewer.
+  const show = useCallback(async (path) => {
+    if (!path) return;
+    try { const d = await listCxellDir(zeeId, path); setDir(d); setFile(null); }
+    catch { openFile(path); }
+  }, [zeeId, openFile]);
+
   useEffect(() => { load(null); }, [load]);
 
-  // A "show file" request from the terminal: figure out whether it's a dir or file by trying to
-  // list it; if that fails, treat it as a file and open the viewer.
-  useEffect(() => {
-    if (!openPath) return;
-    let cancelled = false;
-    (async () => {
-      try { const d = await listCxellDir(zeeId, openPath); if (!cancelled) { setDir(d); setFile(null); } }
-      catch { if (!cancelled) openFile(openPath); }
-    })();
-    return () => { cancelled = true; };
-  }, [openPath, zeeId, openFile]);
+  // A "show file" request from the terminal (the 📄 button / a selected path) flows in via openPath.
+  useEffect(() => { if (openPath) show(openPath); }, [openPath, show]);
 
   const onEntry = (e) => {
     const next = `${dir.path === '/' ? '' : dir.path}/${e.name}`;
@@ -67,6 +66,13 @@ export default function FileExplorer({ zeeId, openPath, onClose }) {
         <span className="fx-cwd">{dir ? dir.path : '…'}</span>
         <button className="fx-crumb" onClick={() => load(dir?.path)} title="Refresh">⟳</button>
       </div>
+      {/* Paste a path a zee named in the terminal and open it directly — the reliable, no-selection
+          way to "show a file the zee presented". */}
+      <form className="fx-go" onSubmit={(e) => { e.preventDefault(); show(go.trim()); }}>
+        <input className="fx-goin" value={go} onChange={(e) => setGo(e.target.value)}
+               placeholder="show file — paste a path…" spellCheck={false} />
+        <button className="fx-crumb" type="submit" disabled={!go.trim()} title="Show this file">→</button>
+      </form>
 
       {file ? (
         <div className="fx-file">
