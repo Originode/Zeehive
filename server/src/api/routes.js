@@ -34,6 +34,9 @@ import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderToken,
          deleteProviderAccount } from '../lib/provider-tokens.js';
+import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
+         listVars, setVar, deleteVar, importEnv, exportEnv, lintEnv, diffEnvironments,
+         resolvedEnvView, setXellEnvironment } from '../lib/environments.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { discoverSite, adoptContainers } from '../lib/discovery.js';
@@ -401,6 +404,71 @@ router.delete('/projects/:id/tokens/:provider', async (req, res) => {
 // Regenerate a xell's .zeehive.env projection (spec §3.4) — e.g. after a site edit or a rename.
 router.post('/xells/:id/env', async (req, res) => {
   try { res.json(await emitXellEnv(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── environments: the meta-DB source of truth for the untracked .env (migration 043) ─────────
+// Read models are MASKED (secret values never returned — only a hint); the full value leaves the
+// server through emitXellEnv (into a xell's own .zeehive.env) and the human export below. Mirrors
+// the provider-tokens + sites route shapes.
+router.get('/projects/:id/environments', async (req, res) => {
+  try { res.json(await listEnvironments(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/projects/:id/environments', async (req, res) => {
+  try { res.json(await createEnvironment(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.get('/environments/diff', async (req, res) => {
+  try { res.json(await diffEnvironments(req.query.a, req.query.b)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.patch('/environments/:id', async (req, res) => {
+  try { res.json(await updateEnvironment(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/environments/:id', async (req, res) => {
+  try { res.json(await deleteEnvironment(req.params.id, req.query.force === '1')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+router.get('/environments/:id/vars', async (req, res) => {
+  try { res.json(await listVars(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+router.put('/environments/:id/vars/:name', async (req, res) => {
+  try { res.json(await setVar(req.params.id, req.params.name, { value: req.body?.value, is_secret: req.body?.is_secret })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/environments/:id/vars/:name', async (req, res) => {
+  try { res.json(await deleteVar(req.params.id, req.params.name)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Bulk import a pasted .env blob (the migration path off on-disk files).
+router.post('/environments/:id/import', async (req, res) => {
+  try { res.json(await importEnv(req.params.id, req.body?.text, { is_secret: req.body?.is_secret !== false })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Human reveal: the full .env text (the second full-value door).
+router.get('/environments/:id/export', async (req, res) => {
+  try { res.json(await exportEnv(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+// Coverage check against the repo's .env.example — surfaces missing/extra keys before a ship.
+router.get('/environments/:id/lint', async (req, res) => {
+  try { res.json(await lintEnv(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+
+// Which environment a xell resolves to (masked var names, never values) + pin/unpin it.
+router.get('/xells/:id/env/resolved', async (req, res) => {
+  try {
+    const xell = await one(`SELECT * FROM xell WHERE id=$1`, [req.params.id]);
+    if (!xell) return res.status(404).json({ error: 'xell not found' });
+    res.json(await resolvedEnvView(xell));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xells/:id/environment', async (req, res) => {
+  try { res.json(await setXellEnvironment(req.params.id, req.body?.environment_id || null)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -912,6 +980,13 @@ router.post('/xell/self/working', async (req, res) => {
     res.json(await selfWorking(x, { note: req.body?.note || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Which environment this xell is loaded with (masked — var NAMES only; the values live in the
+// cxell's own .zeehive.env). Read-only, token-scoped. `zee env` maps here.
+router.get('/xell/self/env', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await resolvedEnvView(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // (Re)build this cxell's OWN app tier so a cxell zee can run e2e tests against its change. NOT
 // human-gated (building your own throwaway containers is the point of a xell) — it collects the
 // cxell's commits onto the worktree, then runs the same queenzee build a host zee does.

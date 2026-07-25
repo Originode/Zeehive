@@ -21,6 +21,7 @@ import { landStatus } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { proposeDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
+import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
 import { setTend, tendOpen, setHint, hintOpen, pingWorking } from '../lib/status.js';
@@ -374,6 +375,10 @@ export async function decideProdBind(id, decision, by = 'human@console') {
   // that isn't running (a purely-host xell, or a torn-down cxell) simply has no firewall to re-seal —
   // best-effort, recorded either way.
   const reseal = await resealCxellForStack(row.xell_id).catch((e) => ({ error: e.message }));
+  // The xell now holds the live prod db → it must be loaded with the PRODUCTION environment. The
+  // xell's db_coupling just became 'db-shared-prod', so resolveEnvironmentFor now picks the prod
+  // env; re-emit .zeehive.env to swap dev secrets for prod ones (migration 043). Best-effort.
+  await emitXellEnv(row.xell_id).catch((e) => logline('xell-prod', `${bind.xell}: .zeehive.env not re-emitted with prod env — ${e.message}`));
   const done = await one(
     `UPDATE prod_bind_request SET result=$2::jsonb WHERE id=$1 RETURNING *`,
     [id, JSON.stringify({ bind, reseal })]);

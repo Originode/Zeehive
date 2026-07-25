@@ -15,6 +15,7 @@ import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
 import { dbIdentity } from './projects.js';
+import { resolveEnvironmentFor, fullVarsFor } from './environments.js';
 
 const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* noop */ } };
 
@@ -152,6 +153,29 @@ export async function emitXellEnv(xellId) {
         + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
     }
     lines.push(`DATABASE_URL=${dbUrl}`);
+  }
+
+  // Environment vars — the meta-DB source of truth for the untracked .env (migration 043).
+  // Resolved by tier: a live-prod (db-shared-prod) or is_production xell gets the project's default
+  // PROD environment, else the default DEV one; an explicit xell.environment_id overrides. Merged
+  // AFTER the per-xell truth above (ports/DATABASE_URL/site/slug) and BEFORE the manifest safety
+  // defaults below, and it can never override either: any name already emitted (or declared in
+  // spin.env) is skipped, so an environment can't redirect DATABASE_URL past the §6.2 guard nor
+  // undo BUILD_MODE=simulate. Best-effort — a projection failure must not sink provisioning.
+  try {
+    const env = await resolveEnvironmentFor(xell);
+    const envVars = await fullVarsFor(env?.id);
+    if (env && envVars.length) {
+      const reserved = new Set(lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]));
+      for (const k of Object.keys(spin.env || {})) reserved.add(k);
+      lines.push(`# —— environment: ${env.key} (${env.tier}) — ${envVars.length} var(s) from the meta-DB ——`);
+      for (const { name, value } of envVars) {
+        if (reserved.has(name)) continue;   // never fight per-xell wiring or the manifest defaults
+        lines.push(`${name}=${value}`);
+      }
+    }
+  } catch (e) {
+    console.error(`[provision] ${xell.slug}: environment merge skipped — ${e.message}`);
   }
 
   // Manifest-declared extra env for spinoffs — for Zeehive itself these are the §6.2 safety
