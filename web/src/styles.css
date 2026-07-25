@@ -1297,6 +1297,8 @@ a.cbox:hover { border-color: var(--accent); }
   border-top: 1px solid var(--line); background: var(--panel2);
 }
 .zeeterm-foot input { flex: 1; min-width: 0; }
+.zeeterm-foot .kbd-hint { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.zeeterm-foot .kbd-hint b { color: var(--text); font-weight: 600; }
 /* PRODUCTION container shell: the modal wears the same gold warning its chip does (.cbox.t-prod),
    so "you are inside prod" is visible the entire session, not just at the click. */
 .zeeterm.prod { border-color: #c9a227; box-shadow: 0 0 14px rgba(201, 162, 39, .35), 0 20px 60px rgba(0,0,0,.55); }

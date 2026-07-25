@@ -231,7 +231,11 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
 
   const foot = (
     <div className="zeeterm-foot">
-      <span className="pc">Attach from Claude Code desktop or a shell (same box, tmux-persisted):</span>
+      {/* Copy is non-obvious: tmux mouse mode owns a plain drag, so a browser selection needs Shift.
+          Surface it so nobody has to guess (reported: "I can't copy text"). */}
+      <span className="pc kbd-hint" title="A plain drag scrolls/goes to the app; Shift+drag makes a copyable selection">
+        <b>Shift+drag</b> to select &amp; copy · click a <b>path</b> to open it
+      </span>
       <input className="mono" readOnly value={sshCmd || ''} onFocus={(e) => e.target.select()} />
       <button type="button" onClick={copy}>{copied ? '✓ copied' : '⧉ copy'}</button>
     </div>
