@@ -75,12 +75,13 @@ function execCapture(conn, cmd, maxBytes = 3_000_000) {
 // (spaces, quotes, $(...)) can inject into the command we run in the cxell.
 const b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
 
-// List a directory: dirs first, then files, each with a byte size. One `test`+loop in the remote
-// shell keeps it to a single exec; NUL-separated stat output survives odd filenames.
-export async function listCxellDir(zeeId, path) {
-  const dir = resolveCxellPath(path);
-  const dest = await zeeSshDest(zeeId);
-  const script =
+// ── the remote commands + their parsers, factored out so a test can run the EXACT script against a
+// real shell + temp dir (no ssh, no DB) and prove the parse round-trips. Sentinels (__NOTDIR__ …)
+// distinguish "path is wrong" from "shell broke" without a second round-trip. ──────────────────────
+
+// List a directory: dirs first, then files, each with a byte size, one tab-separated line each.
+export function buildListScript(dir) {
+  return (
     `p=$(printf %s '${b64(dir)}' | base64 -d); ` +
     `if [ ! -d "$p" ]; then echo "__NOTDIR__" >&2; exit 4; fi; ` +
     `cd "$p" || exit 5; ` +
@@ -89,10 +90,11 @@ export async function listCxellDir(zeeId, path) {
     `  case "$f" in .|..) continue;; esac; ` +
     `  if [ -d "$f" ]; then t=d; s=0; else t=f; s=$(stat -c %s "$f" 2>/dev/null || echo 0); fi; ` +
     `  printf '%s\\t%s\\t%s\\n' "$t" "$s" "$f"; ` +
-    `done`;
-  const { buf, stderr, code } = await withConn(dest, (c) => execCapture(c, `/bin/sh -c ${JSON.stringify(script)}`));
-  if (code === 4 || /__NOTDIR__/.test(stderr)) throw Object.assign(new Error(`not a directory: ${dir}`), { status: 400 });
-  if (code && code !== 0 && !buf.length) throw new Error(stderr.trim() || `list failed (exit ${code})`);
+    `done`);
+}
+
+// Turn the tab-separated `type<TAB>size<TAB>name` lines into sorted {name,type,size} entries.
+export function parseListOutput(buf, dir) {
   const entries = [];
   for (const line of buf.toString('utf8').split('\n')) {
     if (!line) continue;
@@ -109,20 +111,20 @@ export async function listCxellDir(zeeId, path) {
   return { path: dir, parent, root: CXELL_ROOT, entries };
 }
 
-// Read a text file. Caps the read, and refuses obvious binaries (a NUL byte in the head) so the
-// viewer never tries to paint a megabyte of gibberish.
-export async function readCxellFile(zeeId, path, maxBytes = 512_000) {
-  const file = resolveCxellPath(path);
-  const dest = await zeeSshDest(zeeId);
-  const script =
+// Read a text file, capped. Emits the true size on stderr so we can flag truncation even though
+// stdout is clipped by `head`.
+export function buildReadScript(file, maxBytes) {
+  return (
     `p=$(printf %s '${b64(file)}' | base64 -d); ` +
     `if [ -d "$p" ]; then echo "__ISDIR__" >&2; exit 6; fi; ` +
     `if [ ! -f "$p" ]; then echo "__NOFILE__" >&2; exit 7; fi; ` +
     `sz=$(stat -c %s "$p" 2>/dev/null || echo 0); echo "__SIZE__ $sz" >&2; ` +
-    `head -c ${maxBytes} -- "$p"`;
-  const { buf, stderr, code, truncated } = await withConn(dest, (c) => execCapture(c, `/bin/sh -c ${JSON.stringify(script)}`, maxBytes + 4096));
-  if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
-  if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
+    `head -c ${maxBytes} -- "$p"`);
+}
+
+// Shape the read result: refuse obvious binaries (a NUL byte in the head) so the viewer never
+// tries to paint a megabyte of gibberish.
+export function parseReadResult(buf, stderr, file, truncated = false) {
   const sizeMatch = stderr.match(/__SIZE__ (\d+)/);
   const size = sizeMatch ? Number(sizeMatch[1]) : buf.length;
   const isBinary = buf.subarray(0, 8000).includes(0);
@@ -133,4 +135,26 @@ export async function readCxellFile(zeeId, path, maxBytes = 512_000) {
     truncated: truncated || (size > buf.length),
     content: isBinary ? '' : buf.toString('utf8'),
   };
+}
+
+// List a directory inside the cxell (one short-lived ssh exec).
+export async function listCxellDir(zeeId, path) {
+  const dir = resolveCxellPath(path);
+  const dest = await zeeSshDest(zeeId);
+  const script = buildListScript(dir);
+  const { buf, stderr, code } = await withConn(dest, (c) => execCapture(c, `/bin/sh -c ${JSON.stringify(script)}`));
+  if (code === 4 || /__NOTDIR__/.test(stderr)) throw Object.assign(new Error(`not a directory: ${dir}`), { status: 400 });
+  if (code && code !== 0 && !buf.length) throw new Error(stderr.trim() || `list failed (exit ${code})`);
+  return parseListOutput(buf, dir);
+}
+
+// Read a text file inside the cxell.
+export async function readCxellFile(zeeId, path, maxBytes = 512_000) {
+  const file = resolveCxellPath(path);
+  const dest = await zeeSshDest(zeeId);
+  const script = buildReadScript(file, maxBytes);
+  const { buf, stderr, code, truncated } = await withConn(dest, (c) => execCapture(c, `/bin/sh -c ${JSON.stringify(script)}`, maxBytes + 4096));
+  if (code === 6 || /__ISDIR__/.test(stderr)) throw Object.assign(new Error(`${file} is a directory`), { status: 400 });
+  if (code === 7 || /__NOFILE__/.test(stderr)) throw Object.assign(new Error(`no such file: ${file}`), { status: 404 });
+  return parseReadResult(buf, stderr, file, truncated);
 }
