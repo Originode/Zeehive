@@ -166,7 +166,14 @@ export async function emitXellEnv(xellId) {
     const env = await resolveEnvironmentFor(xell);
     const envVars = await fullVarsFor(env?.id);
     if (env && envVars.length) {
-      const reserved = new Set(lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]));
+      // Reserve, UNCONDITIONALLY, the structural keys emitXellEnv owns — not just the ones already
+      // emitted. A db-less xell emits no DATABASE_URL line, so a dynamic-only reserve would let an
+      // environment introduce its own DATABASE_URL and slip past the §6.2 guard; these names are
+      // never an environment's to set, present in the file or not.
+      const reserved = new Set([
+        'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', serverEnv, webEnv,
+        ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
+      ]);
       for (const k of Object.keys(spin.env || {})) reserved.add(k);
       lines.push(`# —— environment: ${env.key} (${env.tier}) — ${envVars.length} var(s) from the meta-DB ——`);
       for (const { name, value } of envVars) {
