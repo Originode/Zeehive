@@ -5,6 +5,7 @@ import { projectHook } from '../lib/status.js';
 import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
+import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
@@ -540,6 +541,18 @@ router.get('/logs', async (req, res) => res.json(recentLogs(Number(req.query.n) 
 
 router.get('/zees/:id/events', async (req, res) =>
   res.json(await q(`SELECT * FROM session_event WHERE zee_id = $1 ORDER BY ts DESC LIMIT 200`, [req.params.id])));
+
+// ── cxell file explorer (read-only) — the panel that rides alongside the zee terminal ──
+// List a directory inside the cxell, and read a text file the zee "presented" in the terminal.
+// Same ssh2 door as the terminal bridge; no write path (a watcher sees, it does not edit).
+router.get('/zees/:id/fs', async (req, res) => {
+  try { res.json(await listCxellDir(req.params.id, req.query.path)); }
+  catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
+router.get('/zees/:id/file', async (req, res) => {
+  try { res.json(await readCxellFile(req.params.id, req.query.path)); }
+  catch (err) { res.status(err.status || 400).json({ error: err.message }); }
+});
 
 // ── /xell skill → claim a ready xell, but ONLY if the session is inside its worktree ──
 router.post('/xell/claim', async (req, res) => {

@@ -653,3 +653,19 @@ export async function acceptPull(requestId) {
   if (!r.ok) throw new Error(data?.error || 'accept failed');
   return data;
 }
+
+// ── cxell file explorer: read-only view into a zee's worktree (rides the terminal modal) ──
+export async function listCxellDir(zeeId, path) {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : '';
+  const r = await fetch(`/api/zees/${zeeId}/fs${qs}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `list failed (${r.status})`);
+  return data;
+}
+
+export async function readCxellFile(zeeId, path) {
+  const r = await fetch(`/api/zees/${zeeId}/file?path=${encodeURIComponent(path)}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `read failed (${r.status})`);
+  return data;
+}

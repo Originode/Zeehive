@@ -1,8 +1,21 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+import FileExplorer from './FileExplorer.jsx';
+
+// A path-ish token a zee tends to "present" in the terminal: web/src/App.jsx, ./server/x.js,
+// /work/repo/…, package.json. Used to offer "show file" on a right-click selection and to strip a
+// pasted selection down to the path (trailing :line:col, punctuation, surrounding quotes).
+function pathFromSelection(sel) {
+  const s = (sel || '').trim().replace(/^['"`]|['"`]$/g, '').split(/\s+/)[0] || '';
+  const cleaned = s.replace(/[:,)\].]+$/, '').replace(/:\d+(:\d+)?$/, '');
+  if (!cleaned) return null;
+  // looks like a path: has a slash, or a bare filename with an extension
+  if (cleaned.includes('/') || /^[\w.-]+\.[A-Za-z0-9]+$/.test(cleaned)) return cleaned;
+  return null;
+}
 
 // One live-terminal modal, two doors (same wire protocol on both — {t:'i'} keystrokes and
 // {t:'r'} resizes up, raw bytes down):
@@ -10,16 +23,33 @@ import '@xterm/xterm/css/xterm.css';
 //   ContainerTerminal → /api/containers/:id/terminal (docker exec shell in ANY container)
 // TerminalModal is the shared body: xterm + fit + the resize/refit choreography, fullscreen,
 // and the status pill. The flavors differ only in title, footer, and prod styling.
-export function TerminalModal({ wsPath, title, prod = false, foot = null, onClose }) {
+// `explorerZeeId` (cxell zees only) lights up the 📁 file-explorer panel and the "show file"
+// entry in the right-click menu.
+export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, onClose }) {
   const holder = useRef(null);
+  const termRef = useRef(null);
+  const wsRef = useRef(null);
   const [status, setStatus] = useState('connecting');
   const [full, setFull] = useState(false);   // maximize the modal; the ResizeObserver refits + resizes the PTY
+  const [showFx, setShowFx] = useState(false);       // file-explorer panel open?
+  const [fxOpenPath, setFxOpenPath] = useState(null); // { path } — a "show file" request into the explorer
+  // Our own right-click menu. xterm leaves the browser's default context menu to fire on the
+  // terminal, which pops the PAGE menu (Back/Reload/Inspect) over the terminal and clobbers the
+  // native selection-copy you'd expect there. We suppress it and draw a terminal-aware one.
+  const [menu, setMenu] = useState(null);            // { x, y, sel }
+
+  // Send a chunk of input to the PTY exactly as a keystroke would (used by Paste).
+  const sendInput = useCallback((d) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'i', d }));
+  }, []);
 
   useEffect(() => {
     const term = new Terminal({
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 13,
       theme: { background: '#0b0e14' }, cursorBlink: true, scrollback: 5000,
     });
+    termRef.current = term;
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(holder.current);
@@ -29,6 +59,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, onClos
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}${wsPath}`);
+    wsRef.current = ws;
     ws.binaryType = 'arraybuffer';
     const sendResize = () => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
 
@@ -56,25 +87,73 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, onClos
       cancelAnimationFrame(raf); clearTimeout(settle);
       window.removeEventListener('resize', onWin); ro.disconnect();
       try { ws.close(); } catch {} term.dispose();
+      termRef.current = null; wsRef.current = null;
     };
   }, [wsPath]);
 
+  // Right-click on the terminal → our own menu, never the browser's page menu.
+  const onContextMenu = (e) => {
+    e.preventDefault();
+    const sel = termRef.current?.getSelection?.() || '';
+    setMenu({ x: e.clientX, y: e.clientY, sel });
+  };
+  const closeMenu = () => setMenu(null);
+  const doCopy = async () => { try { await navigator.clipboard.writeText(menu.sel); } catch { /* denied */ } closeMenu(); };
+  const doPaste = async () => {
+    try { const t = await navigator.clipboard.readText(); if (t) sendInput(t); } catch { /* denied */ }
+    closeMenu(); termRef.current?.focus();
+  };
+  const doSelectAll = () => { termRef.current?.selectAll?.(); closeMenu(); };
+  const doShowFile = () => {
+    const p = pathFromSelection(menu.sel);
+    if (p) { setShowFx(true); setFxOpenPath({ path: p }); }
+    closeMenu();
+  };
+  const selPath = menu ? pathFromSelection(menu.sel) : null;
+
   return createPortal(
     <div className="term-overlay" onClick={onClose}>
-      <div className={`zeeterm${full ? ' full' : ''}${prod ? ' prod' : ''}`} onClick={(e) => e.stopPropagation()}>
+      <div className={`zeeterm${full ? ' full' : ''}${prod ? ' prod' : ''}${showFx ? ' hasfx' : ''}`}
+           onClick={(e) => { e.stopPropagation(); if (menu) closeMenu(); }}>
         <div className={`term-head${prod ? ' prod' : ''}`}>
           <span className="term-title">⌨ {title}
             {prod && <span className="term-prodtag" data-testid="term-prodtag">PRODUCTION</span>}
             <span className={`tstat t-${status}`}>{status}</span>
           </span>
           <span>
+            {explorerZeeId && (
+              <button className={`term-x${showFx ? ' on' : ''}`} data-testid="fx-toggle"
+                      onClick={() => setShowFx((v) => !v)}
+                      title={showFx ? 'Hide file explorer' : 'Show file explorer'}>📁</button>
+            )}
             <button className="term-x" onClick={() => setFull(!full)} title={full ? 'Exit fullscreen' : 'Fullscreen'}>{full ? '⇲' : '⛶'}</button>
             <button className="term-x" onClick={onClose} title="Close">✕</button>
           </span>
         </div>
-        <div className="zeeterm-body" ref={holder} />
+        <div className="zeeterm-main">
+          {explorerZeeId && showFx && (
+            <FileExplorer zeeId={explorerZeeId} openPath={fxOpenPath?.path}
+                          onClose={() => setShowFx(false)} />
+          )}
+          <div className="zeeterm-body" ref={holder} onContextMenu={onContextMenu} />
+        </div>
         {foot}
       </div>
+      {menu && createPortal(
+        <div className="term-ctx" style={{ left: menu.x, top: menu.y }}
+             onClick={(e) => e.stopPropagation()} onContextMenu={(e) => e.preventDefault()}>
+          <button disabled={!menu.sel} onClick={doCopy}>Copy</button>
+          <button onClick={doPaste}>Paste</button>
+          <button onClick={doSelectAll}>Select all</button>
+          {explorerZeeId && <div className="term-ctx-sep" />}
+          {explorerZeeId && (
+            <button disabled={!selPath} onClick={doShowFile} title={selPath ? `Open ${selPath} in the explorer` : 'Select a file path first'}>
+              {selPath ? `Show file: ${selPath}` : 'Show file (select a path)'}
+            </button>
+          )}
+        </div>,
+        document.body
+      )}
     </div>,
     document.body
   );
@@ -107,7 +186,8 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
     </div>
   );
 
-  return <TerminalModal wsPath={`/api/zees/${zeeId}/terminal`} title={slug} foot={foot} onClose={onClose} />;
+  return <TerminalModal wsPath={`/api/zees/${zeeId}/terminal`} title={slug} foot={foot}
+                        explorerZeeId={zeeId} onClose={onClose} />;
 }
 
 // A shell inside a fleet container, opened from the chip's context menu. The bridge runs a
