@@ -128,10 +128,11 @@ it — the same way the schema, not a rule, is what stops a xell tracking its ow
   hexagon. One shared inbound segment from the graph reaches the harness; from the harness the wire
   fans out to each consuming xell. The maze router (`hive/maze.js`) already threads corridors between
   hexes — the harness is just an intermediate routing waypoint on the path.
-- **Rendered as an AVATAR BADGE, not a hex cell.** Where prod and xells are hexagons, a harness is a
-  circular **avatar** (its `avatar.svg`) sitting on the wire junction — visually "a persona the xells
-  wear," distinct from the honeycomb's work-cells. A small count badge ("×N") shows how many xells it
-  harnesses. Hovering it highlights exactly its consumers' wires (the hover plumbing in
+- **Rendered as ONE AVATAR BADGE at the junction, not a hex cell.** Where prod and xells are
+  hexagons, a harness is a single circular **avatar** (its `avatar.svg`) placed at the **junction
+  where the graph feeds it and its consumer wires fan out** — one badge upstream of the fan-out, not
+  one per wire (the xell hexagons are already crowded). A small count badge ("×N") shows how many
+  xells it harnesses. Hovering it highlights exactly its consumers' wires (the hover plumbing in
   `Connectors.jsx`/`GraphPane.jsx` already supports per-id highlight).
 - **No ship/land affordance.** A harness node carries none of the land?/ship? buttons a xell/prod
   hexagon does — it is a guide, not a work-cell (§7 of the manual: only the zee lands/ships).
@@ -171,33 +172,40 @@ runs/streaming/cancellation/session-continuity, **spec-native streaming** of `fu
 session ids: `X-Hermes-Session-Id` (transcript-scoped, rotates on `/new`) and **`X-Hermes-Session-Key`
 — a *stable* per-channel identifier** for long-term memory. That stable key is our anchor.
 
-A harness declares a **bridge** in `HARNESS.yml`; two ways to wire it, not mutually exclusive:
+**Chosen: (B) — mirror the transcript, keep the zee in its cxell.** The deciding factor is *file
+access*. A zee has the project files only because it **runs inside its cxell** — `/work/repo` (a
+private clone of its branch), its own db/app containers, the firewall, its identity token. Its file
+I/O is done by its own tools *in that cage*.
 
-- **(A) Hermes AS the runtime backend (cleanest — Hermes owns the transcript).** Register a
-  `hermes` `agent_runtime` (OpenAI-compatible driver, reusing the codex/OpenAI adapter path and the
-  `ANTHROPIC_BASE_URL`-style base-url override already present). A xell on the hermes harness runs its
-  zee against Hermes's endpoint, passing `X-Hermes-Session-Key = <xell.slug>` (stable for the xell's
-  life). The conversation *is* a native Hermes session, so it shows up in Hermes's Web UI Chat + logs
-  with no mirroring. Set the harness's `viewer_url_template` → the Hermes Web UI thread URL for that
-  key; `viewerUrlFor()` stamps `zee.viewer_url`, so the console viewer opens the Hermes conversation.
-- **(B) Mirror the normalized stream into Hermes (keep the current runtime).** Zeehive already
-  normalizes every provider's stream to one shape on the SSE `zee-output` bus (`logbus`/`events`). A
-  harness bridge POSTs those events to Hermes's `/v1/runs` keyed by `X-Hermes-Session-Key = slug`, and
-  again stamps `viewer_url` to the Hermes thread. The zee still runs on Claude/whatever; Hermes gets a
-  faithful mirror.
+- **Why NOT (A) — Hermes as the runtime backend.** Hermes is itself an agent (its own tools, memory,
+  data in `~/.hermes/`). Pointing the cxell at Hermes as a backend means *Hermes* runs the agentic
+  turn — and **Hermes has no access to the xell's `/work/repo`**. That either strands the agent from
+  the project files or nests two agent loops. So (A) breaks the very thing the cxell exists to give
+  the zee. Rejected.
+- **(B) keeps the execution boundary fixed.** The zee still runs on Claude/Codex/etc. **inside its
+  cxell** with full, unchanged file access. The bridge is **one-way, outbound, transcript-only**:
+  Zeehive already normalizes every provider's stream to one shape on the SSE `zee-output` bus
+  (`logbus`/`events`); the harness bridge relays those events into a Hermes thread keyed by
+  `X-Hermes-Session-Key = <xell.slug>` (stable for the xell's life). It stamps the harness's
+  `viewer_url_template` → the Hermes Web UI thread onto `zee.viewer_url` (via `viewerUrlFor()`), so the
+  console viewer opens the conversation in Hermes. **Hermes receives a display copy — never the files,
+  never write-back into the cxell.**
 
-At attach, the bridge **calls Hermes's discovery endpoint first** to confirm the instance supports
-runs/streaming/session-continuity before wiring — matching Zeehive's "surface drift, never guess"
-ethos. Bridge config (base url, auth, which mode) lives in `harnesses/hermes/HARNESS.yml`, so it is
-versioned with the harness.
+Integration caveats for (B), recorded honestly:
+- Hermes's API is *execution*-oriented, so the mirror must **append to a thread for DISPLAY without
+  triggering Hermes to generate its own turn.** At attach the bridge **calls Hermes's discovery
+  endpoint first** to learn which append/display path the running instance supports (matching
+  Zeehive's "surface drift, never guess" ethos); if none exists, Hermes is self-hosted (`~/.hermes/`)
+  so the session store can be written directly. Bridge config (base url, auth, append mode) lives in
+  `harnesses/hermes/HARNESS.yml`, versioned with the harness.
+- **Two-way is out of scope for (B).** "Chat with the zee *from* Hermes's web UI" would open an
+  *inbound* control path into the cxell (a Hermes user-message posted as a prompt into the zee's
+  session). That is a new, gated surface — a later, opt-in bridge mode, never a side effect of the
+  display mirror.
 
 > Domain note: the badge asset link points at `hermes-agent.org`; the authoritative docs/API live at
 > `hermes-agent.nousresearch.com` (repo `NousResearch/hermes-agent`), with a mirror at
 > `hermesagent.org.cn`. Worth pinning the exact instance URL in `HARNESS.yml` at wiring time.
-
-**Recommendation:** start with **(A)** — least moving parts, and the conversation is genuinely a
-Hermes session rather than a copy. **(B)** is the fallback for harnesses whose backend we don't want
-to swap.
 
 ## 8. Note on orchestrators (the parallel counterpart — provisions, not this feature)
 
@@ -228,13 +236,13 @@ If you want, the next proposal can spec the orchestrator against that xource-tre
 5. **A harness never ships/lands** — guide only; the **zee** ships/lands. **Rendered as an avatar
    badge**, not a hex. Hermes avatar sourced from the provided SVG, vendored to
    `harnesses/hermes/avatar.svg`. **Zee↔Hermes web-UI conversations** → feasible via §7. ✔
+6. **Hermes bridge → (B), mirror the transcript** (§7). Rejected (A) because it would run the agentic
+   turn *on Hermes*, which has no access to the xell's `/work/repo` — file access requires the zee to
+   stay in its cxell. B is a one-way, outbound, display-only mirror; the zee never leaves its cage. ✔
+7. **Avatar placement → one badge at the junction** (upstream of the fan-out), because the xell
+   hexagons are already crowded. ✔
 
-### Remaining questions for you
-- **A vs B for the Hermes bridge** (§7) — run zees *on* Hermes (A, recommended) or *mirror* into it
-  (B)? A changes which model actually answers; B keeps Claude/etc. and copies the transcript.
-- **Avatar placement** — does the harness avatar sit at the single junction where the graph feeds it
-  (one badge upstream of the fan-out), or ride *on each* consumer wire? One upstream badge reads
-  cleanest; per-wire badges make "this xell wears Hermes" unmissable at each hexagon.
+### Everything above is decided; no open questions remain. Implementation gated on your go-ahead.
 
 ### Phased plan (each phase independently landable)
 1. **Schema + `core`.** `harness` table, `xell.harness_id`, `pool_config.default_harness_id`, seed the
