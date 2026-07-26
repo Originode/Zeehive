@@ -101,6 +101,8 @@ export async function getDiffs(projectId) {
 const COLORS = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff', '#e5554e', '#3bc6c0'];
 // production's gold — matches its hexagon (COL.prod in HiveCanvas) so its ring + wire read as prod.
 const PROD_COLOR = '#f2c14e';
+// harness wires read as a distinct family (cooler, avatar-badge palette) — not xell, not prod.
+const HARNESS_COLORS = ['#5b8cff', '#9b8cff', '#3bc6c0', '#7bd0e0'];
 
 export async function getTimeline(projectId, n = 250) {
   const project = projectId ? await one(`SELECT * FROM project WHERE id=$1`, [projectId]) : await defaultProject();
@@ -121,7 +123,7 @@ export async function getTimeline(projectId, n = 250) {
        ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [project.id]);
 
   const xells = await q(
-    `SELECT id, slug, branch, head_commit, status, worktree_path
+    `SELECT id, slug, branch, head_commit, status, worktree_path, harness_id
        FROM xell WHERE project_id=$1 AND status<>'retired' AND NOT is_production
        ORDER BY created_at`, [project.id]);
 
@@ -135,10 +137,31 @@ export async function getTimeline(projectId, n = 250) {
       : x.head_commit && known.has(x.head_commit) ? x.head_commit
       : allCommits[0]?.hash;
     return {
-      id: x.id, slug: x.slug, branch: x.branch, status: x.status,
+      id: x.id, slug: x.slug, branch: x.branch, status: x.status, harness_id: x.harness_id,
       worktree_path: x.worktree_path, base_commit: base, head: live, color: COLORS[i % COLORS.length],
     };
   });
+
+  // HARNESSES in play — any enabled harness assigned to ≥1 live xell above. Each is a graph node,
+  // anchored to its folder's last-touch commit (head_commit) the way prod anchors to the shipped
+  // commit; the frontend renders it as ONE avatar badge at the junction and routes its consumers'
+  // wires through it IN SERIES (docs §5). consumer_ids lists the anchored xells that wear it.
+  const assignedHarnessIds = [...new Set(anchored.map((a) => a.harness_id).filter(Boolean))];
+  let harnesses = [];
+  if (assignedHarnessIds.length) {
+    const hrows = await q(
+      `SELECT id, key, label, avatar_path, head_commit, bundle->>'summary' AS summary
+         FROM harness WHERE id = ANY($1::uuid[]) AND enabled`, [assignedHarnessIds]);
+    harnesses = hrows.map((h, i) => {
+      const hbase = h.head_commit && known.has(h.head_commit) ? h.head_commit : allCommits[0]?.hash;
+      const consumers = anchored.filter((a) => a.harness_id === h.id).map((a) => a.id);
+      return {
+        id: h.id, key: h.key, label: h.label, summary: h.summary,
+        avatar_url: h.avatar_path ? `/api/harnesses/${h.key}/avatar` : null,
+        base_commit: hbase, consumer_ids: consumers, color: HARNESS_COLORS[i % HARNESS_COLORS.length],
+      };
+    });
+  }
 
   // Production is a xell too, and the graph SCROLLS to keep its dot across from the prod hexagon —
   // but it can only do that if prod has a dot, so it must be in this list. It is anchored to the
@@ -167,11 +190,11 @@ export async function getTimeline(projectId, n = 250) {
   // branch touches, so it is just noise pushing the interesting rows off the top. Keep one commit of
   // padding past the fork so the oldest branch's dot isn't flush against the bottom edge.
   let cut = 0;
-  for (const a of anchors) { const r = rowOf.get(a.base_commit); if (r != null && r > cut) cut = r; }
+  for (const a of [...anchors, ...harnesses]) { const r = rowOf.get(a.base_commit); if (r != null && r > cut) cut = r; }
   // A small floor so a project whose branches all fork near the tip still draws a usable spine
   // instead of two lonely rows; the deepest fork wins whenever it is deeper than the floor.
   const depth = Math.max(cut + 2, Math.min(allCommits.length, 12));
   const commits = allCommits.slice(0, Math.min(allCommits.length, depth));
 
-  return { branch, repo_root: project.repo_root, commits, xells: anchors };
+  return { branch, repo_root: project.repo_root, commits, xells: anchors, harnesses };
 }

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { getDispatchModes, getDispatchModels } from './api.js';
+import { getDispatchModes, getDispatchModels, getHarnesses } from './api.js';
 
 // The "+" composer. A human writes a prompt (rich text, paste-friendly, images welcome) and picks
 // the autonomy mode / model / attended flag — then SUBMIT dispatches it exactly like a /xell
@@ -19,6 +19,9 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
   const editorRef = useRef(null);
   const [modes, setModes] = useState([]);
   const [models, setModels] = useState([]);
+  const [harnesses, setHarnesses] = useState([]);
+  // undefined = use the project default (omit); '' = core only (send null); 'hermes' = that harness.
+  const [harness, setHarness] = useState(undefined);
   const [mode, setMode] = useState(5);            // default 5 = bypass (fully unattended)
   const [model, setModel] = useState('opus');     // overwritten by the server's default once loaded
   const [headless, setHeadless] = useState(true); // default headless (fire-and-forget)
@@ -36,6 +39,9 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
       const def = ms.find((m) => m.default) || ms[0];
       if (def) setModel(def.key);
     }).catch(() => {});
+    // Harnesses are non-core, enabled config layers; core is always-on and implicit, so the picker
+    // only offers the extras (plus a "core only" = none).
+    getHarnesses().then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     // focus the editor on open so the human can just start typing
     setTimeout(() => editorRef.current?.focus(), 30);
   }, [provider]);
@@ -97,6 +103,9 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
       // dispatch hands to attachXellDb → the prod db container becomes THIS xell's assigned
       // database. Reads and writes are allowed; the prod guard HARD-BLOCKS schema changes (DDL).
       ...(prodDb ? { db: 'db-shared-prod' } : {}),
+      // the config layer this zee wears (persona/skills). undefined → omit (project default); ''
+      // → core only (null); a key → that harness.
+      ...(harness !== undefined ? { harness: harness || null } : {}),
       images: images.map(({ name, data }) => ({ name, data })),
     });
   };
@@ -163,6 +172,31 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
                 ))}
               </div>
             </div>
+
+            {harnesses.length > 0 && (
+              <div className="disp-field">
+                <label className="disp-label">Harness</label>
+                <div className="disp-models" role="group" aria-label="Harness">
+                  <button className={`disp-seg ${harness === undefined ? 'on' : ''}`}
+                          data-testid="dispatch-harness-default"
+                          title="Use this project's default harness" onClick={() => setHarness(undefined)}>
+                    Default
+                  </button>
+                  <button className={`disp-seg ${harness === '' ? 'on' : ''}`}
+                          data-testid="dispatch-harness-none"
+                          title="Core only — the manual + binding rules, no persona/skills layer" onClick={() => setHarness('')}>
+                    Core only
+                  </button>
+                  {harnesses.map((h) => (
+                    <button key={h.key} className={`disp-seg ${harness === h.key ? 'on' : ''}`}
+                            data-testid={`dispatch-harness-${h.key}`}
+                            title={h.summary || h.label} onClick={() => setHarness(h.key)}>
+                      {h.label}{h.skill_count ? ` ·${h.skill_count}` : ''}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="disp-field">
               <label className="disp-label">Supervision</label>

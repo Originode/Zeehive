@@ -1,5 +1,7 @@
 // All HTTP routes: hooks sink, read models, SSE stream, xell claim, task intake.
 import { Router } from 'express';
+import { resolve, sep } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { projectHook } from '../lib/status.js';
 import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.js';
@@ -593,6 +595,19 @@ router.post('/xells/:id/db', async (req, res) => {
 router.get('/harnesses', async (_req, res) => {
   try { res.json(await listHarnesses()); }
   catch (err) { res.status(503).json({ error: err.message }); }
+});
+// The harness avatar badge (SVG). Resolved from the harness row's avatar_path under the repo root,
+// path-guarded so a crafted key can't escape harnesses/. 404 when a harness has no avatar.
+router.get('/harnesses/:key/avatar', async (req, res) => {
+  try {
+    const h = await one(`SELECT avatar_path FROM harness WHERE key=$1`, [req.params.key]);
+    if (!h?.avatar_path) return res.status(404).end();
+    const abs = resolve(config.repoRoot, h.avatar_path);
+    if (!abs.startsWith(resolve(config.repoRoot, 'harnesses') + sep) || !existsSync(abs)) return res.status(404).end();
+    res.type(abs.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.send(readFileSync(abs));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 router.post('/xells/:id/harness', async (req, res) => {
   try { res.json(await assignHarness(req.params.id, req.body?.harness ?? req.body?.key ?? null)); }

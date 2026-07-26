@@ -51,6 +51,8 @@ async function fetchXellRows(pid) {
             z.cost_usd, z.attach_mode, z.cli_active, z.monitor_source, z.last_monitor_at,
             z.permission_mode, z.kind AS zee_kind,
             r.label AS runtime_label, r.key AS runtime_key,
+            -- the harness this xell wears (config layer — persona/skills), NULL = core only
+            hn.key AS harness_key, hn.label AS harness_label,
             -- RESOLVED ENVIRONMENT (migration 043): which env this xell is loaded with, by the same
             -- rule lib/environments.js uses — an explicit pin, else the default env of the computed
             -- tier (prod for a live-prod / production xell, else dev). env_var_count surfaces the
@@ -94,6 +96,7 @@ async function fetchXellRows(pid) {
             dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
        FROM xell x
        LEFT JOIN deploy_lock dl ON dl.xell_id = x.id AND dl.container = 'prod'
+       LEFT JOIN harness hn ON hn.id = x.harness_id
        JOIN xource xo ON xo.id = x.xource_id
        -- The xell's zee, PREFERRING a living one but falling back to the most recent dead one.
        -- The old join took only living zees, so a session whose PROCESS died (app closed, laptop

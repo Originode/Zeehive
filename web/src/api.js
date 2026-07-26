@@ -56,6 +56,19 @@ export async function getDispatchModels(provider = 'claude') {
   const r = await fetch(`/api/xell/models?provider=${encodeURIComponent(provider)}`);
   return r.ok ? r.json() : [];
 }
+// Harnesses — the system-wide config layers (persona/skills) a xell can wear. Listed for the
+// composer picker + the switch-harness control on a xell card.
+export async function getHarnesses() {
+  const r = await fetch('/api/harnesses');
+  return r.ok ? r.json() : [];
+}
+// Assign/switch a xell's harness (a human action). `harness` is a key/id, or null to clear to core.
+export async function assignXellHarness(xellId, harness) {
+  const r = await fetch(`/api/xells/${xellId}/harness`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ harness }),
+  });
+  return r.ok ? r.json() : Promise.reject(new Error((await r.json().catch(() => ({}))).error || 'assign failed'));
+}
 
 // Dispatch a human-composed prompt EXACTLY like a /xell dispatch: the queenzee claims a ready xell
 // for this project and spawns a zee into its worktree with the task (and any pasted images).

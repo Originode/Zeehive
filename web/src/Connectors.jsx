@@ -16,6 +16,7 @@ const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
 //     vertex nearest the dot, so it never crosses a hexagon and every segment runs along a hex side.
 export default function Connectors({ timeline, layoutRef, version, hexPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom, hoverRef, subscribeHover }) {
   const [paths, setPaths] = useState([]);
+  const [harnessNodes, setHarnessNodes] = useState([]);   // avatar badges + their inbound wire
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [, forceHover] = useReducer((x) => x + 1, 0);
   useEffect(() => (subscribeHover ? subscribeHover(forceHover) : undefined), [subscribeHover]);
@@ -57,6 +58,30 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     // ≈cellSize from the centre, is still forward) — so no lattice vertex ever sits behind the dots.
     const forward = (cx, cy) => (perpOf(cx, cy) - spine) * fwd >= cellSize;
 
+    // HARNESS NODES (docs §5): one avatar badge per harness at a JUNCTION upstream of its consumers'
+    // fan-out — placed forward of the spine (out of the graph, before the honeycomb), aligned along
+    // the axis with the mean of its consumer hexes. Consumer wires route THROUGH it (in series). The
+    // badge's own inbound wire runs from the harness's commit dot in the graph to the badge.
+    const alongOf = (px, py) => (portrait ? px : py);   // the axis the spine runs along
+    const setAlong = (along, perp) => (portrait ? { x: along, y: perp } : { x: perp, y: along });
+    const consumerHarness = new Map();     // consumer xellId → harness node
+    const hNodes = [];
+    for (const h of (timeline.harnesses || [])) {
+      const hexes = (h.consumer_ids || []).map((id) => realHexes.find((r) => r.id === id)).filter(Boolean);
+      if (!hexes.length) continue;
+      const alongMean = mean(hexes.map((r) => alongOf(r.cx, r.cy)));
+      const perp = spine + fwd * cellSize * 1.7;        // forward of the dots, in the corridor gap
+      const pos = setAlong(alongMean, perp);
+      // inbound: the harness's own commit dot (its base_commit) → the badge
+      const hd = cont.querySelector(`[data-commit="${h.base_commit}"][data-dot]`);
+      let inbound = null;
+      if (hd) { const n = hd.getBoundingClientRect(); inbound = { x: (n.left + n.right) / 2 - cr.left, y: (n.top + n.bottom) / 2 - cr.top }; }
+      const node = { id: h.id, key: h.key, label: h.label, avatar_url: h.avatar_url, color: h.color,
+        count: hexes.length, x: pos.x, y: pos.y, inbound };
+      hNodes.push(node);
+      for (const id of h.consumer_ids || []) consumerHarness.set(id, node);
+    }
+
     // "infinite maze": tile invisible cells across the dots→honeycomb bbox, but only on the honeycomb
     // side of the spine, so a wire threads corridors through the gap without ever going backward.
     const xs = realHexes.map((h) => h.cx).concat(dots.map((d) => d.dx));
@@ -97,7 +122,10 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
         const maze = offsetPolyline(r.pts, off);           // channel-offset corridor path
         const e0 = maze[0];                                // offset entry point
         const corner = portrait ? [dd.dx, e0[1]] : [e0[0], dd.dy];  // ⟂ off the spine, then 90° turn
-        const poly = [[dd.dx, dd.dy], corner, ...maze];
+        // A harnessed xell's wire runs IN SERIES through its harness badge: dot → badge → maze → hex,
+        // so the shared config layer is visible on every consumer's line.
+        const hn = consumerHarness.get(dd.id);
+        const poly = hn ? [[dd.dx, dd.dy], [hn.x, hn.y], ...maze] : [[dd.dx, dd.dy], corner, ...maze];
         d = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
         ex = maze[maze.length - 1][0]; ey = maze[maze.length - 1][1];
       } else {
@@ -107,6 +135,7 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
         dim: expandedId && expandedId !== r.id });
     }
     setPaths(items);
+    setHarnessNodes(hNodes);
   }, [timeline, layoutRef, hexPosRef, orientation, honeySide, expandedId, prodIds.join(',')]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   useLayoutEffect(() => { measure(); }, [measure, version]);
@@ -154,6 +183,30 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
         </g>
         );
       })}
+      {/* HARNESS BADGES — one avatar per harness at the junction its consumer wires pass through,
+          plus a dashed inbound wire from the harness's own commit dot in the graph (the trace goes
+          to the harness first, then through it to the xells). Rendered last so it sits above wires. */}
+      {harnessNodes.map((h) => (
+        <g key={`h-${h.id}`}>
+          {h.inbound && (
+            <path d={`M ${h.inbound.x.toFixed(1)} ${h.inbound.y.toFixed(1)} L ${h.x.toFixed(1)} ${h.y.toFixed(1)}`}
+                  fill="none" stroke={h.color} strokeWidth="1.6" strokeDasharray="4 3" opacity="0.8" />
+          )}
+          <circle cx={h.x} cy={h.y} r="15" fill="var(--bg)" stroke={h.color} strokeWidth="2" />
+          {h.avatar_url
+            ? <image href={h.avatar_url} x={h.x - 12} y={h.y - 12} width="24" height="24"
+                     clipPath="inset(0 round 12px)">
+                <title>{h.label} — harness ({h.count})</title>
+              </image>
+            : <text x={h.x} y={h.y + 4} textAnchor="middle" fontSize="11" fill={h.color}>{h.label?.[0] || 'H'}</text>}
+          {h.count > 1 && (
+            <g>
+              <circle cx={h.x + 12} cy={h.y - 12} r="7" fill={h.color} stroke="var(--bg)" strokeWidth="1.5" />
+              <text x={h.x + 12} y={h.y - 8.5} textAnchor="middle" fontSize="9" fill="var(--bg)" fontWeight="700">{h.count}</text>
+            </g>
+          )}
+        </g>
+      ))}
     </svg>
   );
 }
