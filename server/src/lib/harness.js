@@ -33,7 +33,7 @@ const RESERVED_LAW_KEYS = new Set([
 // Keys a harness bundle MAY define (everything else is ignored with a warning).
 const ALLOWED_KEYS = new Set([
   'version', 'label', 'summary', 'description', 'personality', 'voice',
-  'skills', 'memory', 'tools', 'avatar', 'bridge',
+  'skills', 'memory', 'tools', 'avatar', 'bridge', 'parent', 'glyph',
 ]);
 
 const hashOf = (text) => createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -117,24 +117,40 @@ export function loadHarnessDir(dir) {
     if (existsSync(p)) { bundle.personality = readFileSync(p, 'utf8').trim(); files.push(`${dir}/${bundle.personality}`); }
   }
 
-  // skills: each declared skill folder, or every folder under skills/
+  // skills: an entry may be INLINE ({name, when/description, body}) in the manifest, or a NAME that
+  // resolves to a skills/<name>/SKILL.md folder. With no declared list, every folder under skills/.
   const skillsRoot = join(abs, 'skills');
-  const declared = Array.isArray(bundle.skills) ? bundle.skills.map((s) => (typeof s === 'string' ? s : s?.name)).filter(Boolean) : null;
   const skills = [];
-  if (existsSync(skillsRoot) && statSync(skillsRoot).isDirectory()) {
-    const names = declared || readdirSync(skillsRoot).filter((n) => statSync(join(skillsRoot, n)).isDirectory());
-    for (const n of names) {
-      const s = readSkill(join(skillsRoot, n), n);
-      if (s) { skills.push(s); files.push(s.path); }
+  const fromFolder = (n) => {
+    if (!existsSync(skillsRoot)) return;
+    const s = readSkill(join(skillsRoot, n), n);
+    if (s) { skills.push(s); files.push(s.path); }
+  };
+  if (Array.isArray(bundle.skills)) {
+    for (const entry of bundle.skills) {
+      if (entry && typeof entry === 'object' && (entry.body || entry.when || entry.description)) {
+        skills.push({ name: String(entry.name || 'skill'), when: String(entry.when || entry.description || ''), body: String(entry.body || '') });
+      } else {
+        const n = typeof entry === 'string' ? entry : entry?.name;
+        if (n) fromFolder(n);
+      }
     }
+  } else if (existsSync(skillsRoot) && statSync(skillsRoot).isDirectory()) {
+    for (const n of readdirSync(skillsRoot).filter((x) => statSync(join(skillsRoot, x)).isDirectory())) fromFolder(n);
   }
   bundle.skills = skills;
 
-  // memory files → inline text (a small curated set; large files are the harness author's problem)
+  // memory files → inline text. A path resolves against the harness folder first, then the REPO ROOT
+  // (containment-guarded) — so a harness like Zee Base can incorporate docs/cxell-zee-manual.md live,
+  // no copy, no drift.
   if (Array.isArray(bundle.memory)) {
     bundle.memory = bundle.memory.map((rel) => {
-      const p = join(abs, rel);
-      if (existsSync(p)) { files.push(`${dir}/${rel}`); return { path: rel, text: readFileSync(p, 'utf8').trim() }; }
+      const local = join(abs, rel);
+      const rooted = resolve(config.repoRoot, rel);
+      let p = null;
+      if (existsSync(local)) p = local;
+      else if (rooted.startsWith(config.repoRoot) && existsSync(rooted)) p = rooted;
+      if (p) { files.push(p.replace(config.repoRoot + '/', '')); return { path: rel, text: readFileSync(p, 'utf8').trim() }; }
       return { path: rel, text: null, missing: true };
     });
   }
@@ -162,9 +178,15 @@ export async function refreshHarnesses() {
       continue;   // bundle unchanged
     }
     const avatar = existsSync(resolve(config.repoRoot, h.dir, 'avatar.svg')) ? `${h.dir}/avatar.svg` : null;
-    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=COALESCE($5, avatar_path), label=COALESCE($6, label) WHERE id=$1`,
-      [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null]);
-    logline('harness', `${h.key}: refreshed (${bundle.skills?.length || 0} skill(s), hash ${hash})`);
+    // resolve a declared `parent:` key → parent_id (the trigger blocks cycles). Missing parent → null.
+    let parentId = null;
+    if (bundle.parent) {
+      const p = await one(`SELECT id FROM harness WHERE key=$1`, [bundle.parent]);
+      if (p) parentId = p.id; else logline('harness', `${h.key}: parent "${bundle.parent}" not found — ignored`);
+    }
+    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=COALESCE($5, avatar_path), label=COALESCE($6, label), parent_id=$7 WHERE id=$1`,
+      [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null, parentId]);
+    logline('harness', `${h.key}: refreshed (${bundle.skills?.length || 0} skill(s), ${bundle.parent ? `parent ${bundle.parent}, ` : ''}hash ${hash})`);
   }
 }
 
@@ -257,6 +279,17 @@ export async function updateHarness(key, patch = {}) {
   if ('memory' in patch) bundle.memory = normalizeMemory(patch.memory);
   const label = 'label' in patch ? (String(patch.label || '').trim() || h.label) : h.label;
   const enabled = 'enabled' in patch ? !!patch.enabled : h.enabled;
+  // parent: resolve a key → parent_id ('' / null clears). The trigger blocks cycles/self-parent.
+  if ('parent' in patch) {
+    let pid = null;
+    if (patch.parent) {
+      if (patch.parent === key) throw new Error('a harness cannot inherit itself');
+      const p = await one(`SELECT id FROM harness WHERE key=$1`, [patch.parent]);
+      if (!p) throw new Error(`no parent harness "${patch.parent}"`);
+      pid = p.id;
+    }
+    await q(`UPDATE harness SET parent_id=$2 WHERE key=$1`, [key, pid]);
+  }
   // detach from any file backing so refreshHarnesses can't overwrite this edit
   await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5, dir=NULL WHERE key=$1`,
     [key, JSON.stringify(bundle), label, enabled, hashOf(JSON.stringify(bundle))]);
@@ -278,46 +311,71 @@ export async function getHarnessFull(key) {
   const h = await one(`SELECT * FROM harness WHERE key=$1`, [key]);
   if (!h) throw new Error(`no harness "${key}"`);
   const b = typeof h.bundle === 'string' ? JSON.parse(h.bundle) : (h.bundle || {});
+  const parent = h.parent_id ? (await one(`SELECT key FROM harness WHERE id=$1`, [h.parent_id]))?.key || null : null;
   return {
     key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core, file_backed: !!h.dir,
-    glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
+    parent, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
   };
 }
 
-// Build the HARNESS-LAYER text block for a briefing (personality + skills-as-text + memory). This is
-// the provider-neutral prompt-injection path (docs §6.2) — it works for every runtime today. Real
-// SKILL.md file-loading (Claude) is layered on top of this by the cxell materializer, not instead of
-// it. Returns '' when there is no assigned harness (core alone adds no new TEXT — its content is the
-// manual + rules, already in the briefing).
-export function harnessLayerText(harness) {
-  if (!harness || !harness.bundle) return '';
-  const b = typeof harness.bundle === 'string' ? JSON.parse(harness.bundle) : harness.bundle;
-  const out = [];
-  out.push(`## Your harness: ${harness.label}${b.summary ? ` — ${b.summary}` : ''}`);
-  out.push(`You are wearing the **${harness.label}** harness — a shared persona/skill set the queenzee`);
-  out.push('assigned to this xell. It ADDS to, and never overrides, the law above (the manual + your');
-  out.push('binding rules on how you interact with zeehive/queenzee remain authoritative).');
-  if (b.personality) { out.push('', '### Personality / voice', b.personality.trim()); }
-  if (Array.isArray(b.skills) && b.skills.length) {
-    out.push('', `### Your skills (${b.skills.length}) — use them when they fit`);
-    for (const s of b.skills) {
-      out.push('', `#### ${s.name}`, `_When:_ ${s.when}`, '', (s.body || '').trim());
-    }
+// Resolve a harness's INHERITANCE CHAIN (root → … → leaf) by walking parent_id, and MERGE it into one
+// effective persona: personality concatenated with attribution, skills + memory unioned, glyph/summary
+// from the nearest that sets them (leaf wins). The core law layer is applied separately, always on top.
+export async function effectiveHarness(leafRow) {
+  if (!leafRow) return null;
+  const chain = [];
+  let cur = leafRow, hops = 0;
+  while (cur && hops++ < 32) {
+    chain.unshift(cur);                                   // root first
+    if (!cur.parent_id) break;
+    cur = await one(`SELECT * FROM harness WHERE id=$1 AND enabled`, [cur.parent_id]);
   }
-  if (Array.isArray(b.memory) && b.memory.length) {
+  const merged = { label: leafRow.label, glyph: null, summary: null, personality: '', skills: [], memory: [], chain: chain.map((c) => c.label) };
+  const bundleOf = (r) => (typeof r.bundle === 'string' ? JSON.parse(r.bundle) : (r.bundle || {}));
+  for (const row of chain) {
+    const b = bundleOf(row);
+    if (b.glyph) merged.glyph = b.glyph;
+    if (b.summary) merged.summary = b.summary;
+    if (b.personality && b.personality.trim()) {
+      merged.personality += (merged.personality ? '\n\n' : '')
+        + (chain.length > 1 ? `— from ${row.label}:\n` : '') + b.personality.trim();
+    }
+    if (Array.isArray(b.skills)) merged.skills.push(...b.skills.filter((s) => s && s.name));
+    if (Array.isArray(b.memory)) merged.memory.push(...b.memory.filter((m) => m && m.text));
+  }
+  return merged;
+}
+
+// Build the HARNESS-LAYER text block for a briefing from an EFFECTIVE (merged) harness — personality
+// + skills-as-text + memory. Provider-neutral prompt-injection (docs §6.2); SKILL.md files (Claude)
+// layer on top via the cxell materializer. Returns '' when there is no assigned harness (the core law
+// layer adds no new TEXT here — the manual + rules are already in the briefing).
+export function harnessLayerText(eff) {
+  if (!eff) return '';
+  const out = [];
+  const inherits = (eff.chain || []).filter((l) => l !== eff.label);
+  out.push(`## Your harness: ${eff.label}${eff.summary ? ` — ${eff.summary}` : ''}`);
+  out.push(`You are wearing the **${eff.label}** harness — the persona/skill set the queenzee assigned`);
+  out.push(`to this xell${inherits.length ? ` (inheriting: ${inherits.join(' → ')})` : ''}. It ADDS to, and never`);
+  out.push('overrides, the law above (the manual + your binding rules on interacting with zeehive/queenzee).');
+  if (eff.personality) { out.push('', '### Personality / voice', eff.personality.trim()); }
+  if (eff.skills.length) {
+    out.push('', `### Your skills (${eff.skills.length}) — use them when they fit`);
+    for (const s of eff.skills) out.push('', `#### ${s.name}`, `_When:_ ${s.when}`, '', (s.body || '').trim());
+  }
+  if (eff.memory.length) {
     out.push('', '### Harness memory');
-    for (const mem of b.memory) if (mem.text) out.push('', `_(${mem.path})_`, mem.text.trim());
+    for (const mem of eff.memory) if (mem.text) out.push('', `_(${mem.path})_`, mem.text.trim());
   }
   return out.join('\n').trim();
 }
 
-// The SKILL.md files a harness wants materialized into a cxell (Claude path). Provider adapters that
-// have no SKILL.md loader skip this and rely on harnessLayerText instead.
-export function harnessSkillFiles(harness) {
-  if (!harness) return [];
-  const b = typeof harness.bundle === 'string' ? JSON.parse(harness.bundle) : (harness.bundle || {});
-  return (b.skills || []).filter((s) => s.body).map((s) => ({
+// The SKILL.md files an effective harness wants materialized into a cxell (Claude path). Adapters
+// with no SKILL.md loader skip this and rely on harnessLayerText instead.
+export function harnessSkillFiles(eff) {
+  if (!eff) return [];
+  return (eff.skills || []).filter((s) => s.body).map((s) => ({
     relPath: `.claude/skills/${String(s.name).toLowerCase().replace(/[^a-z0-9]+/g, '-')}/SKILL.md`,
     text: `---\nname: ${s.name}\ndescription: ${String(s.when).replace(/\n/g, ' ')}\n---\n\n${s.body}\n`,
   }));

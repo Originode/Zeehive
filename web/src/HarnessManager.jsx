@@ -5,7 +5,7 @@ import { getHarnesses, getHarnessFull, createHarness, updateHarness, deleteHarne
 // layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
 // law harness is not shown here (it is not editable). This is a DB-owned surface: create/edit/delete
 // applies live, no land/ship.
-const blank = () => ({ label: '', glyph: '', summary: '', personality: '', skills: [], memory: [], enabled: true, file_backed: false });
+const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, skills: [], memory: [], enabled: true, file_backed: false });
 
 export default function HarnessManager({ onClose }) {
   const [list, setList] = useState([]);
@@ -93,6 +93,17 @@ export default function HarnessManager({ onClose }) {
                   </div>
                 </div>
                 {form.file_backed && <div className="disp-hint">Defined in the repo (harnesses/…). Saving here detaches it to dashboard ownership.</div>}
+
+                <div className="disp-field">
+                  <label className="disp-label">Inherits (parent harness)</label>
+                  <select className="disp-input" value={form.parent || ''} onChange={(e) => set('parent', e.target.value || null)}>
+                    <option value="">— none (root) —</option>
+                    {list.filter((h) => h.key !== sel).map((h) => (
+                      <option key={h.key} value={h.key}>{h.label}</option>
+                    ))}
+                  </select>
+                  <div className="disp-hint">This harness merges its parent's persona, skills &amp; memory (root → this), then the law applies on top.</div>
+                </div>
 
                 <div className="disp-field">
                   <label className="disp-label">Summary</label>

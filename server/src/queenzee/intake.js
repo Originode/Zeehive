@@ -24,7 +24,7 @@ import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell,
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
-import { harnessForXell, harnessLayerText, harnessSkillFiles, harnessBridge, assignHarness, defaultHarnessId } from '../lib/harness.js';
+import { harnessForXell, effectiveHarness, harnessLayerText, harnessSkillFiles, harnessBridge, assignHarness, defaultHarnessId } from '../lib/harness.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
@@ -612,7 +612,8 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
   // "how you are running") and ABOVE the task — the fixed precedence in docs §4. core adds no new
   // TEXT (its content is the manual + rules, already here), so an unharnessed xell is unchanged.
   const harness = await harnessForXell(xellId);
-  const harnessBlock = harnessLayerText(harness);
+  const eff = harness ? await effectiveHarness(harness) : null;   // merge the parent inheritance chain
+  const harnessBlock = harnessLayerText(eff);
   // Be truthful about who (if anyone) can answer. A dispatched session is still a real session the
   // human can open and talk to — claiming "nobody can answer you" when they can is a lie that
   // pushes the zee to guess instead of surfacing a genuine blocker.
@@ -935,9 +936,10 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // from the project manifest, null → ensureCxell's default (CXELL_IMAGE or zeehive/zee-agent).
   const projRow = await one(`SELECT manifest FROM project WHERE id=$1`, [pid]);
   const cxellImage = deviceConfig(projRow).cxellImage;
-  // The harness assigned to this xell (NULL → core only). Drives the skill-file materialization
-  // below and the "your skills come from your harness" line in the prompt.
-  const harness = await harnessForXell(xell.id);
+  // The harness assigned to this xell (NULL → core only), merged with its inheritance chain. Drives
+  // the skill-file materialization below and the "your skills come from your harness" line.
+  const harnessRow = await harnessForXell(xell.id);
+  const harness = harnessRow ? await effectiveHarness(harnessRow) : null;
   let sshPort = null;
   try {
     const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id, image: cxellImage });
@@ -1081,8 +1083,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // relay this zee's normalized transcript to its web UI (Hermes). Best-effort — the zee stays in
   // its cxell (full file access); Hermes gets a display copy. Never blocks or fails the spawn.
   try {
-    const bridge = harnessBridge(harness);
-    if (bridge) await registerHarnessBridge({ xellId: xell.id, zeeId: zee.id, slug: xell.slug, harnessLabel: harness?.label, bridge });
+    const bridge = harnessBridge(harnessRow);
+    if (bridge) await registerHarnessBridge({ xellId: xell.id, zeeId: zee.id, slug: xell.slug, harnessLabel: harnessRow?.label, bridge });
   } catch (e) { logline('bridge', `${xell.slug}: bridge register failed (${String(e.message).slice(0, 80)})`); }
 
   // Drive the rest in the background. The cxell container is KEPT after the turn (idle, sealed)
