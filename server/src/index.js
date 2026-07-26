@@ -12,6 +12,7 @@ import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
+import { refreshHarnesses } from './lib/harness.js';
 import { pool } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
@@ -92,6 +93,9 @@ try {
   // Fresh run (zero projects) → ZEEHIVE onboards itself before anything else looks at the
   // fleet (self-onboard.js). Loud-but-never-fatal, like the migrations above.
   await ensureSelfProject();
+  // Reconcile each harness row with its files under harnesses/<key>/ (parsed, hashed projection —
+  // same as the manifest). Loud-but-never-fatal: a broken harness keeps its last good bundle.
+  await refreshHarnesses();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }

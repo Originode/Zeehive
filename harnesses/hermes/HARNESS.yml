@@ -1,0 +1,23 @@
+version: 1
+label: Hermes
+summary: The messenger — crisp delivery, clean handoffs, decisive status.
+
+# Persona is in PERSONALITY.md (auto-detected). Skills are the folders under skills/.
+skills:
+  - handoff-note
+  - concise-status
+
+# Bridge to the Hermes web UI (docs/harness-proposal.md §7). Mode B: an outbound, transcript-only
+# mirror — the zee stays in its cxell (full file access); Hermes receives a DISPLAY copy keyed by the
+# xell slug. Two-way (human replies from the Hermes web UI) is the opt-in `inbound` flag, off here.
+bridge:
+  kind: hermes
+  mode: mirror                 # outbound transcript mirror (never runs the agent turn on Hermes)
+  inbound: false               # human→zee replies via sendMessageToXell; opt-in, authenticated when on
+  # Hermes exposes an OpenAI-compatible API + a Web UI. Pin the EXACT instance at wiring time —
+  # the badge asset came from hermes-agent.org; the authoritative API/docs live at
+  # hermes-agent.nousresearch.com (repo NousResearch/hermes-agent).
+  base_url: "http://localhost:8787"
+  session_key: slug            # X-Hermes-Session-Key = the xell slug (stable per xell, threads memory)
+  viewer_url_template: "{base_url}/ui/thread/{session_key}"
+  append_path: "/v1/runs"      # display-append path confirmed via Hermes's discovery endpoint at attach

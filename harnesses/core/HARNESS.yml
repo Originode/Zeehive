@@ -1,0 +1,9 @@
+version: 1
+label: Core (law)
+summary: >
+  The cxell-zee manual + the binding rules. Always present on every xell, non-overridable —
+  the law layer for how a zee interacts with zeehive/queenzee (land/ship/prod/done, the gates).
+# NOTE: core is is_law_core. Its TEXT is assembled in code (bindingFor()/spawnCxell() in
+# server/src/queenzee/intake.js) from docs/cxell-zee-manual.md + the binding rules, so
+# refreshHarnesses() SKIPS this folder. This file exists only to document the layer; a harness may
+# add guidance beneath it but can never redefine a reserved LAW key (enforced in lib/harness.js).
