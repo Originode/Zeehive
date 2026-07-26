@@ -2,7 +2,8 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup } from './api.js';
+         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
+         extractXellEnv } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
@@ -452,6 +453,15 @@ export default function App() {
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
     if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
+    if (kind === 'env') {                                    // extract this xell's CURRENT environment
+      try {
+        const r = await extractXellEnv(x.id);
+        await showAlert(
+          <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
+          { title: `${x.slug} — current environment${r.source === 'zeehive-env' ? ' (.zeehive.env on disk)' : r.environment ? ` (resolved: ${r.environment})` : ''}` });
+      } catch (e) { showAlert('Extract failed: ' + (e?.message || e), { variant: 'error' }); }
+      return;
+    }
     if (kind === 'build') {
       if (x.stack.some(isBusy)) { showAlert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
@@ -918,6 +928,26 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
                   ? `machine ${machine.key}${machine.label ? ` (${machine.label})` : ''} — ${machine.docker_ctx}@${machine.host_ip || '?'}`
                   : `machine context ${stackCtx}`}>
             ⌂ {machine ? machine.key : stackCtx}
+          </span>
+        )}
+        {x.env_key && (
+          <span className={`envchip env-${x.env_tier}${Number(x.env_var_count) === 0 ? ' env-empty' : ''}`}
+                data-testid="env-chip"
+                title={`Environment: ${x.env_key} (${x.env_tier})`
+                  + (x.env_pinned ? ' — pinned to this xell' : ` — default for ${x.env_tier} xells`)
+                  + `\n${x.env_var_count} var(s) from the meta-DB`
+                  + (Number(x.env_var_count) === 0 ? ' (empty → nothing added to .zeehive.env; xell runs as before)' : '')
+                  + `\n\nClick to extract this xell's current .env`}
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  try {
+                    const r = await extractXellEnv(x.id);
+                    await showAlert(
+                      <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
+                      { title: `${x.slug} — current environment${r.source === 'zeehive-env' ? ' (.zeehive.env)' : r.environment ? ` (resolved: ${r.environment})` : ''}` });
+                  } catch (err) { showAlert('Extract failed: ' + (err?.message || err), { variant: 'error' }); }
+                }}>
+            ❖ {x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}
           </span>
         )}
         <span className="cardtop-right">

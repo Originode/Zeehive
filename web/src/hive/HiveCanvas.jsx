@@ -698,7 +698,10 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   if (full && mach) {
     ctx.font = `${Math.max(8, size * 0.14)}px 'Segoe UI', sans-serif`;
     const lock = cxellLock(x);
-    const machTxt = fit(ctx, mach, w * 0.5);
+    // Ride the machine line with the resolved environment (❖ key; ∅ = empty → nothing merged), so
+    // "which env is this xell loaded with" reads at a glance. fit() truncates, never overflows.
+    const envSuffix = x.env_key ? ` · ❖${x.env_key}${Number(x.env_var_count) === 0 ? '∅' : ''}` : '';
+    const machTxt = fit(ctx, mach + envSuffix, w * 0.5);
     const y = cy - size * 0.62;
     if (lock) {
       const pre = lock.g + ' ';
@@ -955,9 +958,13 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
     if (cxell) s.push({ label: '💬 nudge', kind: 'nudge', accent: G });
     row(2, s);
   }
-  // message → MACHINE petal: a "proper message" composer (long text + images) for when the raw
-  // terminal is too clumsy. Sits on its own next to the session petal so it never crowds terminal+nudge.
-  if (cxell) row(4, [{ label: '📨 message', kind: 'message', accent: G }]);
+  // env extract (+ message) → MACHINE petal. '❖ env' pulls out the xell's CURRENT environment
+  // (its .zeehive.env); message is the long-text/image composer, only for a reachable cxell zee.
+  {
+    const s = [{ label: '❖ env', kind: 'env' }];
+    if (cxell) s.push({ label: '📨 message', kind: 'message', accent: G });
+    row(4, s);
+  }
   // pull, and LAND when there is work to land → COMMIT petal
   {
     const s = [{ label: '↓ pull', kind: 'pull' }];
@@ -993,7 +1000,8 @@ function flowerFacets(x, diff, machines) {
     { title: 'session', lines: [x.zee_title || (x.claude_session_id ? x.claude_session_id.slice(0, 8) : '—'),
       x.zee_status === 'working' ? (x.zee_name || 'working') : (x.zee_status || '')] },
     { title: 'containers', kind: 'stack', stack: cont },
-    { title: 'machine', lines: [machineOf(x, machines) || '—', x.runtime_label || ''] },
+    { title: 'machine', lines: [machineOf(x, machines) || '—',
+      x.env_key ? `❖ ${x.env_key}${Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}` : (x.runtime_label || '')] },
     { title: 'commit', kind: 'commitdiff',
       lines: [(x.is_production ? x.deployed_commit : (diff?.head || x.head_commit))?.slice(0, 8) || '—'], diff },
     { title: 'diff · age', kind: 'owndiff', diff, age: ageText(x.created_at) },

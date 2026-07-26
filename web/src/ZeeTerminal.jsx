@@ -6,8 +6,8 @@ import '@xterm/xterm/css/xterm.css';
 import FileExplorer from './FileExplorer.jsx';
 
 // A path-ish token a zee tends to "present" in the terminal: web/src/App.jsx, ./server/x.js,
-// /work/repo/…, package.json. Used to offer "show file" on a right-click selection and to strip a
-// pasted selection down to the path (trailing :line:col, punctuation, surrounding quotes).
+// /work/repo/…, package.json. Used to offer "show file" on a selection and to strip a pasted
+// selection down to the path (trailing :line:col, punctuation, surrounding quotes).
 function pathFromSelection(sel) {
   const s = (sel || '').trim().replace(/^['"`]|['"`]$/g, '').split(/\s+/)[0] || '';
   const cleaned = s.replace(/[:,)\].]+$/, '').replace(/:\d+(:\d+)?$/, '');
@@ -16,6 +16,12 @@ function pathFromSelection(sel) {
   if (cleaned.includes('/') || /^[\w.-]+\.[A-Za-z0-9]+$/.test(cleaned)) return cleaned;
   return null;
 }
+
+// Path tokens to make CLICKABLE in terminal output. Two shapes: (1) a multi-segment path (has a
+// slash) with an optional leading ./ or /, and an optional :line:col; (2) a bare filename with a
+// known code/text extension. Kept deliberately conservative so ordinary prose ("Node.js", "e.g.")
+// doesn't turn into a sea of links.
+const PATH_RE = /(?:\.{0,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+(?::\d+(?::\d+)?)?|\b[A-Za-z0-9_-]+\.(?:jsx?|tsx?|mjs|cjs|json|css|md|py|sh|ya?ml|html?|sql|txt|toml|ini|env|lock)\b/g;
 
 // One live-terminal modal, two doors (same wire protocol on both — {t:'i'} keystrokes and
 // {t:'r'} resizes up, raw bytes down):
@@ -28,10 +34,41 @@ function pathFromSelection(sel) {
 export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
+  const wsRef = useRef(null);
+  const clipTaRef = useRef(null);
+  const reqN = useRef(0);
   const [status, setStatus] = useState('connecting');
   const [full, setFull] = useState(false);   // maximize the modal; the ResizeObserver refits + resizes the PTY
   const [showFx, setShowFx] = useState(false);       // file-explorer panel open?
-  const [fxOpenPath, setFxOpenPath] = useState(null); // { path } — a "show file" request into the explorer
+  const [fxReq, setFxReq] = useState(null);          // { path, n } — a "show file" request into the explorer
+  const [clip, setClip] = useState('');              // the IN-APP clipboard: last selection captured here
+  const [clipOpen, setClipOpen] = useState(false);   // the clipboard tray visible?
+  const [flash, setFlash] = useState('');
+
+  // Open a path in the explorer (opening the panel if needed). The bumping `n` makes every request
+  // distinct so clicking the SAME path again re-opens it (identity, not value, drives the effect).
+  const openInExplorer = (p) => { if (!p) return; setShowFx(true); setFxReq({ path: p, n: ++reqN.current }); };
+
+  // Send text to the PTY as if typed (the clipboard tray's Paste→terminal).
+  const sendInput = (d) => { const ws = wsRef.current; if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'i', d })); };
+
+  // OS-clipboard write, best-effort: the async API where allowed (secure ctx / localhost), else a
+  // throwaway textarea + execCommand for an insecure http origin. Never throws.
+  const clipApi = (t) => { try { return navigator.clipboard?.writeText(t); } catch { return null; } };
+  const execCopy = (t) => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta); termRef.current?.focus();
+    } catch { /* nothing more we can do */ }
+  };
+  const toOsClipboard = (t) => { const p = clipApi(t); if (p && p.catch) p.catch(() => execCopy(t)); else if (!p) execCopy(t); };
+
+  // Capture a selection into the IN-APP clipboard (the web-ui clipboard the operator asked for): it
+  // lives in the page as real, selectable text — reliable even where the OS clipboard is blocked
+  // (remote http origin, iframe). We ALSO mirror to the OS clipboard when that's allowed.
+  const capture = (t) => { if (!t) return; setClip(t); setClipOpen(true); toOsClipboard(t); };
 
   useEffect(() => {
     const term = new Terminal({
@@ -48,6 +85,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}${wsPath}`);
+    wsRef.current = ws;
     ws.binaryType = 'arraybuffer';
     const sendResize = () => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
 
@@ -66,6 +104,56 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
     term.onData((d) => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d })));
     term.onResize(sendResize);
 
+    // CLIPBOARD. xterm renders to a canvas, so a highlight is xterm's OWN selection, not a browser
+    // text selection — the browser's copy has nothing to grab (reported: "Ctrl+Shift+C doesn't
+    // work, I can't copy"). And the OS clipboard is itself unreachable on a remote http origin. So:
+    //  • copy-on-select CAPTURES the selection into the IN-APP clipboard tray (real page text the
+    //    operator can always read/copy) and mirrors to the OS clipboard where allowed. Shift+drag,
+    //    since tmux mouse mode owns a plain drag.
+    term.onSelectionChange(() => { const s = term.getSelection(); if (s) capture(s); });
+    //  • explicit shortcuts as a fallback: Ctrl+Shift+C / Cmd+C copy the selection; Ctrl+Shift+V /
+    //    Cmd+V paste into the PTY. We swallow these so they don't reach the shell (plain Ctrl+C stays
+    //    SIGINT — we never touch it). attachCustomKeyEventHandler returning false blocks the key.
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true;
+      const combo = (e.ctrlKey && e.shiftKey) || e.metaKey;   // Linux/Win: Ctrl+Shift+_, mac: Cmd+_
+      if (!combo) return true;
+      if (e.code === 'KeyC' && term.hasSelection()) { capture(term.getSelection()); return false; }
+      if (e.code === 'KeyV') {
+        try { navigator.clipboard?.readText().then((t) => t && ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d: t }))); } catch { /* denied */ }
+        return false;
+      }
+      return true;
+    });
+
+    // CLICKABLE PATHS. A zee constantly names files it touched ("edited web/src/App.jsx"); make
+    // those clickable so the human opens them in the explorer with ZERO copy-paste. A custom link
+    // provider scans each rendered line for path-shaped tokens and, on click, opens the file. Only
+    // for terminals that HAVE an explorer (a cxell zee); a container shell gets no file links.
+    let linkDisp = null;
+    if (explorerZeeId) {
+      linkDisp = term.registerLinkProvider({
+        provideLinks(y, cb) {
+          const line = term.buffer.active.getLine(y - 1);
+          if (!line) return cb(undefined);
+          const text = line.translateToString(true);
+          const links = [];
+          PATH_RE.lastIndex = 0;
+          let m;
+          while ((m = PATH_RE.exec(text)) !== null) {
+            const raw = m[0];
+            const x = m.index + 1;   // xterm buffer x is 1-based
+            links.push({
+              text: raw,
+              range: { start: { x, y }, end: { x: x + raw.length - 1, y } },
+              activate: (_e, t) => openInExplorer(t.replace(/:\d+(?::\d+)?$/, '')),
+            });
+          }
+          cb(links.length ? links : undefined);
+        },
+      });
+    }
+
     const onWin = () => { refit(); };
     window.addEventListener('resize', onWin);
     const ro = new ResizeObserver(() => { refit(); });
@@ -74,24 +162,35 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
     return () => {
       cancelAnimationFrame(raf); clearTimeout(settle);
       window.removeEventListener('resize', onWin); ro.disconnect();
+      try { linkDisp?.dispose(); } catch {}
       try { ws.close(); } catch {} term.dispose();
-      termRef.current = null;
+      termRef.current = null; wsRef.current = null;
     };
   }, [wsPath]);
+
+  // ── clipboard tray actions ──
+  const flashMsg = (m) => { setFlash(m); setTimeout(() => setFlash(''), 1200); };
+  const copyClipOut = () => {
+    // select the tray textarea (so a manual Ctrl+C always works) AND try the OS clipboard.
+    clipTaRef.current?.focus(); clipTaRef.current?.select();
+    toOsClipboard(clip); flashMsg('copied');
+  };
+  const pasteClipToTerm = () => { if (clip) { sendInput(clip); termRef.current?.focus(); flashMsg('pasted → terminal'); } };
+  const clearClip = () => { setClip(''); setFlash(''); };
 
   // The right-click CONFLICT fix: xterm forwards mouse events to the terminal app (tmux mouse mode
   // is on for scroll), but the browser ALSO pops its page menu (Back/Reload/Inspect) on top — that
   // is the clash. Just suppress the browser menu so the right-click belongs to the terminal; we do
-  // NOT draw a replacement menu. (To make a browser-side highlight you can copy, hold Shift while
-  // dragging — that bypasses tmux's mouse capture; Ctrl/Cmd+Shift+C then copies it.)
+  // NOT draw a replacement menu. (Because tmux mouse mode owns a plain drag, hold Shift while
+  // dragging to make a selection — it is captured into the 📋 clipboard tray.)
   const onContextMenu = (e) => e.preventDefault();
 
-  // "Show file": read whatever path is selected in the terminal (a Shift+drag selection) and open
-  // it in the explorer. A header button, not a context-menu entry — no new menu over the xterm.
+  // "Show file" from the header button: read whatever path is selected in the terminal (a Shift+drag
+  // selection) and open it. The primary path is now just CLICKING a link in the output; this covers
+  // the case where a path isn't on its own token (e.g. selected across words).
   const showFileFromSelection = () => {
     const p = pathFromSelection(termRef.current?.getSelection?.() || '');
-    setShowFx(true);
-    if (p) setFxOpenPath({ path: p });
+    if (p) openInExplorer(p); else setShowFx(true);
   };
 
   return createPortal(
@@ -104,9 +203,12 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
             <span className={`tstat t-${status}`}>{status}</span>
           </span>
           <span>
+            <button className={`term-x${clipOpen ? ' on' : ''}${clip && !clipOpen ? ' dot' : ''}`} data-testid="clip-toggle"
+                    onClick={() => setClipOpen((v) => !v)}
+                    title="Clipboard — selections you Shift+drag land here (works even when the OS clipboard is blocked)">📋</button>
             {explorerZeeId && (
               <button className="term-x" data-testid="fx-showfile" onClick={showFileFromSelection}
-                      title="Show the file selected in the terminal (Shift+drag to select its path)">📄</button>
+                      title="Show file — click a path in the output, or Shift+drag to select one, then this">📄</button>
             )}
             {explorerZeeId && (
               <button className={`term-x${showFx ? ' on' : ''}`} data-testid="fx-toggle"
@@ -119,10 +221,26 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
         </div>
         <div className="zeeterm-main">
           {explorerZeeId && showFx && (
-            <FileExplorer zeeId={explorerZeeId} openPath={fxOpenPath?.path}
+            <FileExplorer zeeId={explorerZeeId} openReq={fxReq}
                           onClose={() => setShowFx(false)} />
           )}
           <div className="zeeterm-body" ref={holder} onContextMenu={onContextMenu} />
+          {clipOpen && (
+            <div className="term-clip" data-testid="term-clip" onClick={(e) => e.stopPropagation()}>
+              <div className="tc-head">
+                <span className="tc-title">📋 clipboard{flash && <em className="tc-flash">{flash}</em>}</span>
+                <button className="fx-x" title="Hide" onClick={() => setClipOpen(false)}>✕</button>
+              </div>
+              <textarea ref={clipTaRef} className="tc-text" value={clip} readOnly
+                        placeholder="Shift+drag in the terminal to capture text here…"
+                        onFocus={(e) => e.target.select()} />
+              <div className="tc-actions">
+                <button disabled={!clip} onClick={copyClipOut} title="Select the text and copy to the OS clipboard">⧉ copy</button>
+                <button disabled={!clip} onClick={pasteClipToTerm} title="Type this back into the terminal">⇥ paste → terminal</button>
+                <button disabled={!clip} onClick={clearClip} title="Clear">clear</button>
+              </div>
+            </div>
+          )}
         </div>
         {foot}
       </div>
@@ -152,7 +270,11 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
 
   const foot = (
     <div className="zeeterm-foot">
-      <span className="pc">Attach from Claude Code desktop or a shell (same box, tmux-persisted):</span>
+      {/* Copy is non-obvious: tmux mouse mode owns a plain drag, so a browser selection needs Shift.
+          Surface it so nobody has to guess (reported: "I can't copy text"). */}
+      <span className="pc kbd-hint" title="A plain drag goes to the app; Shift+drag makes a selection, captured into the 📋 clipboard tray">
+        <b>Shift+drag</b> → 📋 clipboard · click a <b>path</b> to open it
+      </span>
       <input className="mono" readOnly value={sshCmd || ''} onFocus={(e) => e.target.select()} />
       <button type="button" onClick={copy}>{copied ? '✓ copied' : '⧉ copy'}</button>
     </div>
