@@ -166,6 +166,22 @@ export const createSite = (projectId, body) => siteCall(`/api/projects/${project
 export const updateSite = (siteId, body) => siteCall(`/api/sites/${siteId}`, 'PATCH', body);
 export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${siteId}${force ? '?force=1' : ''}`, 'DELETE');
 
+// ── environments (masked — the server never returns a secret value, only a hint). The meta-DB
+// source of truth for the untracked .env; resolved onto a xell by tier (lib/environments.js). ──
+export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
+export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);
+export const updateEnvironment = (envId, body) => siteCall(`/api/environments/${envId}`, 'PATCH', body);
+export const deleteEnvironment = (envId, force = false) => siteCall(`/api/environments/${envId}${force ? '?force=1' : ''}`, 'DELETE');
+export const getEnvVars = (envId) => siteCall(`/api/environments/${envId}/vars`, 'GET');
+export const setEnvVar = (envId, name, value, is_secret) => siteCall(`/api/environments/${envId}/vars/${encodeURIComponent(name)}`, 'PUT', { value, is_secret });
+export const deleteEnvVar = (envId, name) => siteCall(`/api/environments/${envId}/vars/${encodeURIComponent(name)}`, 'DELETE');
+export const importEnv = (envId, text, is_secret = true) => siteCall(`/api/environments/${envId}/import`, 'POST', { text, is_secret });
+export const exportEnv = (envId) => siteCall(`/api/environments/${envId}/export`, 'GET');
+export const lintEnv = (envId) => fetch(`/api/environments/${envId}/lint`).then((r) => r.json());
+// Extract a xell's CURRENT environment (its live .zeehive.env, else the resolved meta-DB env) as
+// full .env text — the "pull out what this xell is running with" reveal.
+export const extractXellEnv = (xellId) => siteCall(`/api/xells/${xellId}/env/export`, 'GET');
+
 // ── discover & adopt a site's running stack (read-only docker; adopt models + links to prod) ──
 // discoverSite returns {ok, containers[…]} or {ok:false, error} for an unreachable context — the
 // caller MUST surface the error, not treat it as an empty stack.
@@ -638,5 +654,21 @@ export async function acceptPull(requestId) {
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data?.error || 'accept failed');
+  return data;
+}
+
+// ── cxell file explorer: read-only view into a zee's worktree (rides the terminal modal) ──
+export async function listCxellDir(zeeId, path) {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : '';
+  const r = await fetch(`/api/zees/${zeeId}/fs${qs}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `list failed (${r.status})`);
+  return data;
+}
+
+export async function readCxellFile(zeeId, path) {
+  const r = await fetch(`/api/zees/${zeeId}/file?path=${encodeURIComponent(path)}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `read failed (${r.status})`);
   return data;
 }

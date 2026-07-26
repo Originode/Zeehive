@@ -8,6 +8,8 @@ import {
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
+  getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
+  getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -358,6 +360,7 @@ function ProbeChips({ probe }) {
 const SETUP_TABS = [
   { key: 'project', label: 'Project', gates: ['repo', 'main_branch', 'env', 'manifest'] },
   { key: 'deploy', label: 'Deploy', gates: ['dev_site', 'prod_site', 'shippable'] },
+  { key: 'env', label: 'Environments', gates: [] },
   { key: 'providers', label: 'Providers', gates: [] },
   { key: 'pool', label: 'Pool', gates: ['pool'] },
   { key: 'danger', label: '⚠ Danger', gates: [], danger: true },
@@ -401,6 +404,7 @@ function EditSections({ project, onChanged, onProject }) {
         <SitesSection project={project} run={run} busy={busy} />
         <InventorySection project={project} run={run} busy={busy} />
       </>}
+      {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'pool' && <SpawnSection project={project} run={run} />}
       {tab === 'danger' && <DangerSection project={project} onChanged={() => { reload(); onChanged?.(); }} />}
@@ -741,6 +745,137 @@ function SiteEditor({ site, run, busy }) {
           <label>Ingress container <span className="pc">(the tunnel/proxy/wg container, if in docker)</span>
             <input value={f.provider_container} onChange={set('provider_container')} placeholder="cloudflare_tunnel" /></label>
           <label>Notes<input value={f.notes} onChange={set('notes')} placeholder="e.g. WebRTC media needs TURN — doesn't traverse the tunnel" /></label>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Environments: the meta-DB source of truth for the untracked .env ────────────
+// A project holds named environments (dev / prod / staging …); each is a set of KEY=value vars
+// stored in the meta-DB, masked here (a secret's value is never returned — only a hint). A xell is
+// loaded with one by TIER: a live-prod / production xell gets the default prod env, a dev/spinoff
+// xell the default dev env — merged into its .zeehive.env by emitXellEnv.
+function EnvironmentsSection({ project, run, busy }) {
+  const [envs, setEnvs] = useState(null);
+  const [add, setAdd] = useState({ key: '', tier: 'dev', label: '' });
+  const load = useCallback(() => getEnvironments(project.id).then(setEnvs).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  const dupTier = (envs || []).some((e) => e.tier === add.tier);
+  return (
+    <div className="setup-sec">
+      <h3>Environments <span className="pc">(the meta-DB source of truth for the untracked <code>.env</code> — a xell is loaded with one by tier)</span></h3>
+      {(envs || []).map((e) => <EnvironmentEditor key={e.id} env={e} run={wrapped} busy={busy} />)}
+      {envs && envs.length === 0 && <div className="pc">No environments yet — every project starts with a default <b>dev</b> and <b>prod</b>; add more (e.g. <i>staging</i>) below.</div>}
+      <div className="setup-row">
+        <select value={add.tier} onChange={(e) => setAdd({ ...add, tier: e.target.value })}
+                title="dev serves dev/spinoff xells; prod serves production xells and any xell bound to the live prod db">
+          <option value="dev">dev</option><option value="prod">prod</option>
+        </select>
+        <input value={add.key} placeholder="key (e.g. staging)" onChange={(e) => setAdd({ ...add, key: e.target.value })} />
+        <input value={add.label} placeholder="label (optional)" onChange={(e) => setAdd({ ...add, label: e.target.value })} />
+        <button type="button" disabled={busy || !add.key.trim()}
+                onClick={() => wrapped(() => createEnvironment(project.id, {
+                  key: add.key.trim(), tier: add.tier, label: add.label.trim() || null,
+                  // first environment of a tier becomes that tier's default automatically
+                  is_default: !dupTier,
+                })).then(() => setAdd({ key: '', tier: 'dev', label: '' }))}>＋ Add environment</button>
+      </div>
+    </div>
+  );
+}
+
+function EnvironmentEditor({ env, run, busy }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState(null);      // { environment, vars: [{name, is_secret, value|value_hint, length}] }
+  const [add, setAdd] = useState({ name: '', value: '', is_secret: true });
+  const [blob, setBlob] = useState('');
+  const [lint, setLint] = useState(null);
+  const loadVars = useCallback(() => getEnvVars(env.id).then(setData).catch(() => {}), [env.id]);
+  useEffect(() => { if (open && !data) loadVars(); }, [open, data, loadVars]);
+  const wrapped = (fn) => run(async () => { await fn(); await loadVars(); });
+
+  const del = async () => {
+    const pinned = Number(env.pinned_xells);
+    const msg = env.is_default
+      ? `"${env.key}" is the default ${env.tier} environment — ${env.tier}/spinoff xells resolve to it. Force-remove?`
+      : pinned > 0 ? `${pinned} xell(s) are pinned to "${env.key}" — they'll fall back to the tier default. Remove?`
+      : `Remove environment "${env.key}"?`;
+    if (await showConfirm(msg, { variant: 'danger', okLabel: 'Remove' })) run(() => deleteEnvironment(env.id, env.is_default));
+  };
+  const reveal = async () => {
+    const r = await exportEnv(env.id);
+    await showAlert(
+      <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
+      { title: `${env.key} (${env.tier}) — ${r.count} var(s), full values` });
+  };
+  const runLint = async () => { try { setLint(await lintEnv(env.id)); } catch (e) { setLint({ ok: false, reason: e.message }); } };
+  const addVar = () => {
+    if (!add.name.trim()) return;
+    wrapped(() => setEnvVar(env.id, add.name.trim(), add.value, add.is_secret))
+      .then(() => setAdd({ name: '', value: '', is_secret: true }));
+  };
+  const doImport = () => {
+    if (!blob.trim()) return;
+    wrapped(() => importEnv(env.id, blob)).then(() => setBlob(''));
+  };
+
+  return (
+    <div className="siteed">
+      <div className="setup-row">
+        <span className={`sitetier t-${env.tier}`}>{env.tier}</span>
+        <span className="sitekey">{env.key}{env.is_default ? ' ●' : ''}</span>
+        <span className="pc">{env.var_count} var{Number(env.var_count) === 1 ? '' : 's'}{Number(env.pinned_xells) > 0 ? ` · ${env.pinned_xells} pinned` : ''}</span>
+        <button type="button" className="ghost" onClick={() => setOpen(!open)}>{open ? '▾' : '▸'} vars</button>
+        <button type="button" className="ghost" disabled={busy} onClick={reveal} title="Reveal the full .env (secrets included)">⤓ export</button>
+        <button type="button" className="ghost" disabled={busy} onClick={runLint} title="Check coverage vs the repo's .env.example">✓ lint</button>
+        {!env.is_default && <button type="button" className="ghost" disabled={busy}
+          onClick={() => run(() => updateEnvironment(env.id, { is_default: true }))}>make default</button>}
+        <button type="button" className="projpop-del" disabled={busy} title={`Remove ${env.key}`} onClick={del}>🗑</button>
+      </div>
+      {lint && (
+        <div className="pc" style={{ marginLeft: 4 }}>
+          {lint.ok
+            ? <>vs <code>{lint.example}</code>: {lint.missing.length ? <span className="g-fail">missing {lint.missing.join(', ')}</span> : <span className="g-pass">all {lint.expected} keys present</span>}{lint.extra.length ? <> · extra {lint.extra.join(', ')}</> : null}</>
+            : <>lint: {lint.reason}</>}
+        </div>
+      )}
+      {open && (
+        <div className="ingress" style={{ paddingLeft: 8 }}>
+          {(data?.vars || []).map((v) => (
+            <div className="setup-row" key={v.name}>
+              <span className="mono" style={{ minWidth: 160 }}>{v.name}</span>
+              {v.is_secret
+                ? <span className="mono pc" title={`secret · ${v.length} chars`}>{v.value_hint}</span>
+                : <span className="mono">{v.value}</span>}
+              <span className="pc">{v.is_secret ? '🔒 secret' : 'plain'}</span>
+              <button type="button" className="ghost" disabled={busy} title="Replace value"
+                onClick={async () => {
+                  const nv = await showPrompt(`New value for ${v.name}`, { placeholder: v.is_secret ? 'new secret value' : 'new value' });
+                  if (nv !== null) wrapped(() => setEnvVar(env.id, v.name, nv, v.is_secret));
+                }}>edit</button>
+              <button type="button" className="projpop-del" disabled={busy} title={`Delete ${v.name}`}
+                onClick={() => wrapped(() => deleteEnvVar(env.id, v.name))}>🗑</button>
+            </div>
+          ))}
+          {data && data.vars.length === 0 && <div className="pc">No vars yet — add one, or paste a whole <code>.env</code> below.</div>}
+          <div className="setup-row">
+            <input value={add.name} placeholder="NAME" spellCheck={false}
+                   onChange={(e) => setAdd({ ...add, name: e.target.value })} />
+            <input value={add.value} placeholder="value" type={add.is_secret ? 'password' : 'text'} autoComplete="off"
+                   onChange={(e) => setAdd({ ...add, value: e.target.value })}
+                   onKeyDown={(e) => { if (e.key === 'Enter') addVar(); }} />
+            <label className="pc" title="secrets are masked in the console; plain vars (ports, flags) show in full">
+              <input type="checkbox" checked={add.is_secret} onChange={(e) => setAdd({ ...add, is_secret: e.target.checked })} /> secret</label>
+            <button type="button" disabled={busy || !add.name.trim()} onClick={addVar}>＋ Add var</button>
+          </div>
+          <div className="setup-row" style={{ alignItems: 'flex-start' }}>
+            <textarea value={blob} placeholder={'Paste a .env to bulk-import\nKEY=value per line'} rows={3}
+                      spellCheck={false} style={{ flex: 1, fontFamily: 'monospace', fontSize: 12 }}
+                      onChange={(e) => setBlob(e.target.value)} />
+            <button type="button" disabled={busy || !blob.trim()} onClick={doImport} title="Parse KEY=value lines; each imported as a secret">⇪ Import .env</button>
+          </div>
         </div>
       )}
     </div>

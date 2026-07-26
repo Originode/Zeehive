@@ -438,6 +438,15 @@ a.cbox:hover { border-color: var(--accent); }
 .machinechip { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: default;
   font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
 
+/* WHICH environment the xell is loaded with (migration 043). Same quiet chip language, but this one
+   IS an action — click to extract the xell's current .env — so it gets a pointer + hover lift. Prod
+   env tints warm (it carries live secrets); an empty env (∅) reads dim: dormant, nothing merged. */
+.envchip { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: pointer;
+  font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+.envchip:hover { color: var(--fg); border-color: var(--muted); }
+.envchip.env-prod { color: #c8863c; border-color: #7a5a2e; }
+.envchip.env-empty { opacity: .55; font-style: italic; }
+
 /* terminal button + modal */
 /* container build affordances */
 /* unbuilt buildable container → hammer INSIDE the box, in the bottom-right so it never
@@ -1243,12 +1252,87 @@ a.cbox:hover { border-color: var(--accent); }
   background: #0b0e14; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
   box-shadow: 0 20px 60px rgba(0,0,0,.55);
 }
-.zeeterm-body { flex: 1; min-height: 0; padding: 6px 8px; }
+/* body is now a row: [file explorer] | [xterm]. Without the explorer the terminal fills it, so a
+   container/prod shell (no explorer) looks exactly as before. */
+.zeeterm-main { flex: 1; min-height: 0; display: flex; position: relative; }
+.zeeterm-body { flex: 1; min-width: 0; min-height: 0; padding: 6px 8px; }
+
+/* ── in-app clipboard tray: a floating panel over the terminal so it needs no xterm refit. Holds
+   captured selections as REAL page text — copyable even where the OS clipboard is blocked. ── */
+.term-clip { position: absolute; right: 10px; bottom: 10px; width: min(420px, 70%); z-index: 5;
+  background: #10141c; border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  box-shadow: 0 12px 34px rgba(0,0,0,.55); display: flex; flex-direction: column; }
+.term-clip .tc-head { display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 10px; background: var(--panel2); border-bottom: 1px solid var(--line); }
+/* scoped to .term-clip: `.tc-title` is ALSO the terminal-choice dialog's title (above) — an
+   unscoped redefinition here silently restyled that dialog. */
+.term-clip .tc-title { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text); }
+.tc-flash { color: #35c46b; font-style: normal; font-size: 11px; margin-left: 8px; }
+.tc-text { width: 100%; box-sizing: border-box; height: 96px; resize: vertical; border: 0;
+  background: #0b0e14; color: #c9d3e0; padding: 8px 10px; font-family: 'Cascadia Code', monospace;
+  font-size: 12px; outline: none; }
+.tc-actions { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--line);
+  background: var(--panel2); }
+.tc-actions button { background: #0b0e14; border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.tc-actions button:hover:not(:disabled) { border-color: var(--accent); }
+.tc-actions button:disabled { opacity: .4; cursor: default; }
+/* a dot on the 📋 button when the clipboard has content but the tray is closed */
+.term-x.dot { position: relative; }
+.term-x.dot::after { content: ''; position: absolute; top: 2px; right: 2px; width: 6px; height: 6px;
+  border-radius: 50%; background: var(--accent); }
+
+/* ── file explorer panel (rides the zee terminal) ── */
+.fx { width: 300px; min-width: 300px; display: flex; flex-direction: column;
+  border-right: 1px solid var(--line); background: #0a0d12; overflow: hidden; }
+.zeeterm.full .fx { width: 360px; min-width: 360px; }
+.fx-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px;
+  border-bottom: 1px solid var(--line); background: var(--panel2); }
+.fx-title { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text); }
+.fx-x { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 13px; }
+.fx-x:hover { color: var(--text); }
+.fx-path { display: flex; align-items: center; gap: 4px; padding: 4px 8px;
+  border-bottom: 1px solid var(--line); font-size: 11px; }
+.fx-crumb { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 6px; padding: 1px 6px; cursor: pointer; font-size: 12px; line-height: 1.4; }
+.fx-crumb:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.fx-crumb:disabled { opacity: .3; cursor: default; }
+.fx-cwd { flex: 1; min-width: 0; color: var(--muted); font-family: 'Cascadia Code', monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.fx-list, .fx-file { flex: 1; min-height: 0; overflow: auto; }
+.fx-row { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+  background: none; border: 0; color: var(--text); cursor: pointer; padding: 3px 10px;
+  font-family: 'Cascadia Code', monospace; font-size: 12px; }
+.fx-row:hover { background: rgba(255,255,255,.05); }
+.fx-ic { color: var(--muted); width: 12px; text-align: center; }
+.fx-dir .fx-nm { color: #79c0ff; }
+.fx-nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fx-sz { color: var(--muted); font-size: 11px; }
+.fx-empty, .fx-err { padding: 10px; color: var(--muted); font-size: 12px;
+  font-family: 'Cascadia Code', monospace; }
+.fx-err { color: #e5554e; white-space: pre-wrap; }
+.fx-fhead { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+  border-bottom: 1px solid var(--line); background: var(--panel2); position: sticky; top: 0; }
+.fx-fname { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
+  flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fx-fmeta { color: var(--muted); font-size: 11px; }
+.fx-code { margin: 0; padding: 8px 10px; font-family: 'Cascadia Code', monospace; font-size: 12px;
+  color: #c9d3e0; white-space: pre; }
+
+/* ── "show file" path box in the explorer ── */
+.fx-go { display: flex; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+.fx-goin { flex: 1; min-width: 0; background: #0b0e14; border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 2px 8px; font-family: 'Cascadia Code', monospace; font-size: 11px; }
+.fx-goin:focus { outline: none; border-color: var(--accent); }
+.term-x.on { color: var(--accent); }
+
 .zeeterm-foot {
   display: flex; align-items: center; gap: 8px; padding: 8px 10px;
   border-top: 1px solid var(--line); background: var(--panel2);
 }
 .zeeterm-foot input { flex: 1; min-width: 0; }
+.zeeterm-foot .kbd-hint { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.zeeterm-foot .kbd-hint b { color: var(--text); font-weight: 600; }
 /* PRODUCTION container shell: the modal wears the same gold warning its chip does (.cbox.t-prod),
    so "you are inside prod" is visible the entire session, not just at the click. */
 .zeeterm.prod { border-color: #c9a227; box-shadow: 0 0 14px rgba(201, 162, 39, .35), 0 20px 60px rgba(0,0,0,.55); }
