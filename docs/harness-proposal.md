@@ -1,7 +1,35 @@
 # Proposal: Harnesses — shared, system-wide config layers for xells
 
-Status: **PROPOSAL — awaiting review.** Nothing here is built yet. Revision 2 folds in the review
-decisions (see §9).
+Status: **IMPLEMENTED** (all four phases). The design below is unchanged; this section maps it to code.
+
+## Implementation map
+- **Schema** — `db/migrations/044_harness.sql`: `harness` table (global, no project_id), `xell.harness_id`,
+  `pool_config.default_harness_id`, `task.req_harness_id`, the undeletable `core` law harness + a
+  `harness_guard()` trigger, and a seeded `hermes` row.
+- **Library** — `server/src/lib/harness.js`: parse/validate `HARNESS.yml` (rejects reserved LAW keys),
+  load a harness folder, `refreshHarnesses()` (boot reconcile, like the manifest), resolve/assign,
+  `harnessLayerText()` (prompt injection), `harnessSkillFiles()` (Claude SKILL.md materialization),
+  `harnessBridge()`. Boot hook in `server/src/index.js`.
+- **Injection** — `server/src/queenzee/intake.js`: `briefing()` layers the harness BELOW the law and
+  ABOVE the task; `spawnCxell()` materializes SKILL.md files + adjusts the "no skills" line;
+  `dispatchXell()` takes `--harness` and applies the project default.
+- **Trace/UI** — `server/src/lib/timeline.js` (`harnesses[]` + `harness_id` on xells), avatar route in
+  `routes.js`, `web/src/Connectors.jsx` (series routing through the avatar badge at the junction, with
+  consumer count + dashed inbound wire), `web/src/Dispatch.jsx` harness picker, `web/src/fleet.js` card
+  field, `web/src/api.js` helpers.
+- **Files** — `harnesses/core/`, `harnesses/hermes/` (HARNESS.yml, PERSONALITY.md, two skills,
+  placeholder `avatar.svg` — swap in the official brand asset).
+- **Hermes bridge** — `server/src/lib/harness-bridge.js`: mode-B outbound transcript mirror
+  (`X-Hermes-Session-Key` = slug) + opt-in, token-gated inbound reply via the existing
+  `sendMessageToXell` path (`POST /api/harness-bridge/:slug/message`).
+
+Verified in this xell: migration applies, folder parse + law-key rejection, `/api/harnesses` +
+assign/switch, timeline `harnesses[]`, avatar route (+404 guard), fleet field, `vite build`, and the
+bridge (dry-run mirror + inbound fail-closed/allow gating). The design decisions are in §9.
+
+---
+
+*(Original proposal follows — unchanged.)* Revision 2 folds in the review decisions (see §9).
 
 ## 1. What you asked for (restated)
 
