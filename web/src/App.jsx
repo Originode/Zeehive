@@ -96,6 +96,17 @@ function useStreamedXells(projectId) {
   const [xells, setXells] = useState([]);
   const mapRef = useRef(new Map());
   const acRef = useRef(null);
+  // FORCE-CLEAR on switch, synchronously. The effect below also resets, but effects run AFTER the
+  // render that already saw the new projectId — so for one frame the grid would still hold the
+  // PREVIOUS project's hexes (the lingering remnants). Reset-on-prop-change during render (React's
+  // documented pattern) drops them before paint, so a switch never flashes the old project.
+  const [prevPid, setPrevPid] = useState(projectId);
+  if (projectId !== prevPid) {
+    setPrevPid(projectId);
+    mapRef.current = new Map();
+    acRef.current?.abort();
+    setXells([]);
+  }
   const runStream = useCallback(async () => {
     acRef.current?.abort();
     const ac = new AbortController();
@@ -404,7 +415,14 @@ export default function App() {
   // invisible. Ask whether a card exists, not whether an id does.
   // The honeycomb's xells come from the lazy NDJSON stream (hexagons appear as data arrives); fall
   // back to the fleet snapshot if the stream hasn't produced anything yet (e.g. it errored).
-  const gridXells = streamedXells.length ? streamedXells : (fleet.xells || []);
+  // FORCE-CLEAR on switch: during a project switch the stream is reset to empty while the OLD
+  // project's fleet snapshot still sits in state (applyFleet won't overwrite it until the NEW
+  // project's snapshot arrives). Falling back to that stale fleet paints the previous project's
+  // xells on the canvas — the "remnants that linger". So only use the fleet fallback when it
+  // actually belongs to the selected project; otherwise show nothing until the new data lands.
+  const fleetMatchesSelection = !projectId || fleet.project?.id === projectId;
+  const gridXells = streamedXells.length ? streamedXells
+    : (fleetMatchesSelection ? (fleet.xells || []) : []);
   const carded = new Set(gridXells.map((x) => x.id));
   const landingByXell = {};
   const prsByRef = {};

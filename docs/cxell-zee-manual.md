@@ -47,6 +47,7 @@ queenzee at `host.docker.internal:4700` (firewall-allowed).
 zee status                                       # where you stand
 zee build [server|webapp|all] [--hot] [--wait] [--watch]   # (re)build your OWN app tier (NOT gated)
 zee device [--detach|--status]                   # attach a MOBILE DEVICE (Android) to build apps on (NOT gated)
+zee db-catchup [--restore]                        # roll your OWN db (clone/isolated) forward to prod's schema (NOT gated)
 zee land                                         # collect commits + gated push to main (ONLY when 100% certain)
 zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod   (ONLY when 100% certain)
 zee hint-land [--reason "…"] | --clear           # "looks land-ready" — light the land? button for a human, don't land

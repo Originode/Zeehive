@@ -409,6 +409,13 @@ async function provisionIsolatedDb({ project, xell, snapshot }) {
     [project.id, name, image || null, ctx, devHost, port, conn,
      xell.id, devSite?.id || null, MODE === 'real' ? 'up' : 'down']);
   broadcast('container', row);
+  // Record WHICH snapshot this db was restored from, so a later `zee db-catchup` can anchor its
+  // baseline on the snapshot's taken_at even when the (table-scoped) dump carried no migration ledger.
+  if (snapshot?.id) {
+    await q(
+      `INSERT INTO db_refresh (xell_id, snapshot_id, method, started_at, finished_at, status)
+       VALUES ($1,$2,'pg_restore',now(),now(),'finished')`, [xell.id, snapshot.id]);
+  }
   return row;
 }
 

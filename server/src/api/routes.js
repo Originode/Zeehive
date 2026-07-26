@@ -50,12 +50,12 @@ import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
-import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
+import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -636,6 +636,13 @@ router.post('/xells/:id/db/migrate', async (req, res) => {
   try { res.json(await applyMigrationsToXell(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Roll the xell's OWN database FORWARD to prod's current schema: apply the prod-ledger migrations it
+// does not yet reflect (clone/isolated only). Closes the pre-fork gap `db/migrate` cannot — a stale
+// prod-dump restore. Reads prod read-only; never writes prod. See docs/schema-catchup-plan.md.
+router.post('/xells/:id/db/catchup', async (req, res) => {
+  try { res.json(await catchUpXellToProd(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Asked by the prod-guard hook (hooks/prod-guard.mjs) when a command in a xell worktree touches
 // prod: is the prod DB THIS xell's assigned database? A hotfix/data xell dispatched with
 // `--db shared-prod` is entitled to its own database; a feature xell is not. The hook cannot know this
@@ -995,6 +1002,14 @@ router.post('/xell/self/land', async (req, res) => {
 // rebuild. NOT gated — it touches only this xell's cxell + throwaway containers. `zee sync` maps here.
 router.post('/xell/self/sync', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfSync(x, { rebuild: req.body?.rebuild !== false })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Catch this cxell's OWN db up to prod's current schema (clone/isolated). NOT gated — it writes only
+// this xell's throwaway db and reads prod read-only, exactly the class of `zee build`. `--restore`
+// (isolated only) rebuilds from the latest full prod snapshot instead of rolling forward.
+router.post('/xell/self/catchup', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfCatchup(x, { restore: !!req.body?.restore })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.

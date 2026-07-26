@@ -32,6 +32,8 @@ import { logline } from '../lib/logbus.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { resolveRealDbContainer } from '../lib/xell-db.js';
 import { cloneInstanceFor } from '../lib/db-instances.js';
+import { catchupDelta } from './catchup-delta.js';
+import { diffXellDbAgainstProd } from './proddiff.js';
 
 // Schema dir first in sort order (m < o) — DDL lands before the data that may depend on it.
 export const SCHEMA_DIR = 'server/sql/migrations';
@@ -357,4 +359,175 @@ export async function applyMigrationsToXell(xellId) {
   } catch (e) {
     return { ok: false, error: e.message, applied: [] };
   }
+}
+
+// ── CATCH UP TO PROD — roll a xell's OWN db FORWARD to prod's current schema ──────────────────────
+//
+// The gap applyMigrationsToXell (above) cannot close: it baselines at the branch FORK POINT, i.e. it
+// assumes everything main carried at fork is already in the db. That is false for a STALE seed — a
+// db-isolated restored from a three-week-old prod dump is missing every migration prod shipped since,
+// and forward-apply baselines those away instead of running them. proddiff MEASURES that gap
+// (`missing` = "prod has it, this db does not"); this closes it, forward, without discarding the
+// zee's work — the same runPending loop the prod ship uses. See docs/schema-catchup-plan.md.
+//
+// The ledger IS prod's forward history: prod's zeehive_migrations lists exactly what prod ran, and
+// every one of those files is on main (prod builds from main). So "catch up" = apply, to my db, the
+// prod-ledger files my db does not yet reflect, in filename order, each in its own transaction,
+// ledgered. NEVER touches prod (reads it read-only, after assertProdDbTarget) — writes only my db.
+
+// My db's OWN ledger → Set<filename> (dir: markers excluded), or null if it has no ledger table.
+async function ownLedgerFiles(db) {
+  const r = await psql(db, ['-tA', '-c', `SELECT filename FROM ${LEDGER}`]);
+  if (r.ok) {
+    return new Set(r.out.split('\n').map((s) => s.trim())
+      .filter((f) => f && !f.startsWith('dir:')));
+  }
+  if (/does not exist/i.test(r.err)) return null;
+  throw new Error(`own ledger unreadable: ${r.err.trim().slice(0, 200)}`);
+}
+
+// PROD's ledger, READ-ONLY → the migrations prod actually RAN (baseline=false, no dir markers), as
+// [{ filename, sha, applied_at }]. An absent ledger means prod has shipped no migration → nothing to
+// catch up to.
+async function prodRunMigrations(prodHandle) {
+  const r = await psql(prodHandle, ['-tAF', '\x1f', '-c',
+    `SELECT filename, sha, applied_at FROM ${LEDGER} WHERE baseline = false ORDER BY filename`]);
+  if (!r.ok) {
+    if (/does not exist/i.test(r.err)) return [];
+    throw new Error(`prod ledger unreadable: ${r.err.trim().slice(0, 200)}`);
+  }
+  return r.out.split('\n').map((s) => s.trim()).filter(Boolean).map((line) => {
+    const [filename, sha, applied_at] = line.split('\x1f');
+    return { filename, sha: sha || null, applied_at };
+  }).filter((x) => x.filename && !x.filename.startsWith('dir:'));
+}
+
+// The taken_at of the snapshot a db-isolated xell was restored from — recorded as a db_refresh row by
+// provisionIsolatedDb. Only needed for the fallback (an isolated db whose dump did NOT carry the
+// ledger table); when the dump carried it, ownLedgerFiles is exact and this is never consulted.
+async function snapshotTakenAtFor(xellId) {
+  const r = await one(
+    `SELECT s.taken_at FROM db_refresh r JOIN db_snapshot s ON s.id = r.snapshot_id
+      WHERE r.xell_id=$1 AND r.snapshot_id IS NOT NULL
+      ORDER BY r.started_at DESC NULLS LAST LIMIT 1`, [xellId]);
+  return r?.taken_at || null;
+}
+
+export async function catchUpXellToProd(xellId) {
+  const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
+  if (!xell) return { ok: false, error: 'unknown xell', applied: [] };
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+
+  // Guards — mirror applyMigrationsToXell. Prod is already prod; the shared dev db is frozen.
+  if (xell.db_coupling === 'db-shared-prod') {
+    return { ok: false, applied: [], error: 'your database IS live production — it already carries the '
+      + 'prod schema; migrations reach prod only through an approved ship (`zee ship`), never a catch-up.' };
+  }
+  const clone = xell.db_coupling === 'db-clone' ? await cloneInstanceFor(xellId) : null;
+  if (xell.db_coupling === 'db-shared-dev' || (xell.db_coupling === 'db-clone' && !clone)) {
+    return { ok: false, applied: [], error: 'your database is the SHARED dev db — its schema is frozen, '
+      + 'so it is not caught up in place. Attach your own clone first '
+      + `(POST /api/xells/${xellId}/db {"coupling":"db-clone"}, or dispatch with --db clone), then catch up.` };
+  }
+
+  // Resolve MY OWN db handle (clone instance name, or the isolated container).
+  const c = await one(
+    `SELECT c.* FROM container c JOIN xell_uses_container uc ON uc.container_id=c.id
+      WHERE uc.xell_id=$1 AND c.role='db' LIMIT 1`, [xellId]);
+  if (!c) return { ok: false, error: 'this xell has no database container linked', applied: [] };
+  const dbid = {
+    user: project.db_user || config.prodDbUser || 'postgres',
+    name: clone ? clone.name : (project.db_name || config.prodDbName || 'omnibiz'),
+  };
+  let realMine;
+  try { realMine = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  const myDb = { ctx: c.docker_ctx, container: realMine, user: dbid.user, name: dbid.name };
+
+  // Read PROD's ledger — but PROVE the handle really is prod first (we import files FROM it; the same
+  // guard that stopped a ship migrating a 7.7MB clone stops us reading the wrong "prod").
+  let prodHandle;
+  try { prodHandle = await prodDb(project); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  if (!prodHandle) return { ok: false, error: 'no prod db container to catch up to', applied: [] };
+  const guard = await assertProdDbTarget(prodHandle);
+  if (!guard.ok) return { ok: false, error: `refusing to read the prod ledger: ${guard.error}`, applied: [] };
+
+  let prodRun;
+  try { prodRun = await prodRunMigrations(prodHandle); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  if (!prodRun.length) {
+    return { ok: true, applied: [], pending: [], database: myDb.name,
+      note: 'prod has run no ledgered migrations — there is nothing to catch up to.' };
+  }
+
+  // Baseline: what does MY db already reflect? Pick the delta accordingly (pure — catchup-delta.js).
+  let own;
+  try { own = await ownLedgerFiles(myDb); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+
+  const main = project.main_branch || 'main';
+  const mainSha = gitOut(project.repo_root, ['rev-parse', main]) || main;
+  let d, baselineNote;
+
+  if (own) {
+    // The exact primary path: my db carries a ledger (isolated-from-full-dump has prod's, frozen at
+    // dump time; a re-catch-up has last run's). Set-diff against prod's current ledger.
+    d = catchupDelta(prodRun, { mode: 'ledger', done: own });
+    baselineNote = "my db's own migration ledger";
+  } else if (clone) {
+    // A clone with no ledger yet: baseline at the branch fork point (dev ≈ main at fork), then apply
+    // prod-ledger files after it. Create+baseline the ledger so runPending can ledger and future
+    // catch-ups are cheap. Best-effort: the clone came from dev, so residual drift is reported below.
+    const head = xell.worktree_path ? gitOut(xell.worktree_path, ['rev-parse', 'HEAD']) : null;
+    const base = (head && gitOut(project.repo_root, ['merge-base', main, head])) || head || mainSha;
+    const forkFiles = new Set(listMigrationFiles(project.repo_root, base) || []);
+    d = catchupDelta(prodRun, { mode: 'clone', baselineDone: forkFiles });
+    baselineNote = 'the branch fork point (clone had no ledger yet)';
+    try { await ledgerFiles(project, myDb, base); }
+    catch (e) { return { ok: false, error: `could not baseline the clone ledger: ${e.message}`, applied: [] }; }
+  } else {
+    // db-isolated whose dump did NOT carry the ledger (table-scoped, migration 042). Anchor on the
+    // source snapshot's taken_at; without it a safe forward delta cannot be computed — recommend a
+    // full re-restore rather than guess.
+    const takenAt = await snapshotTakenAtFor(xellId);
+    if (!takenAt) {
+      return { ok: false, applied: [], recommend_restore: true,
+        error: 'your isolated db carries no migration ledger (its dump was table-scoped or predates the '
+          + 'ledger) and no source snapshot is on record, so a safe forward delta cannot be computed. '
+          + 'Rebuild from the latest full prod snapshot: `zee db-catchup --restore`.' };
+    }
+    d = catchupDelta(prodRun, { mode: 'isolated', takenAt });
+    baselineNote = `the source snapshot's taken_at (${takenAt})`;
+    const create = await psql(myDb, ['-c',
+      `CREATE TABLE IF NOT EXISTS ${LEDGER} (filename text PRIMARY KEY, sha text,
+         applied_at timestamptz NOT NULL DEFAULT now(), baseline boolean NOT NULL DEFAULT false)`]);
+    if (!create.ok) return { ok: false, error: `could not create the isolated ledger: ${create.err.trim().slice(-200)}`, applied: [] };
+    const before = prodRun.filter((r) => new Date(r.applied_at).getTime() <= new Date(takenAt).getTime())
+      .map((r) => r.filename);
+    await insertBaseline(myDb, [...before, ...MIG_DIRS.map(dirMarker)], mainSha);
+  }
+
+  if (!d.delta.length) {
+    return { ok: true, applied: [], pending: [], database: myDb.name, baseline: baselineNote,
+      note: `nothing to catch up — your schema already reflects every migration prod has run (measured by ${baselineNote}).` };
+  }
+
+  // Apply the delta from the xource's main tip: every migration prod ran is a file on main, so main
+  // tip carries them all (runPending reads `${sha}:${file}`, one transaction each, stopping at the
+  // first failure and ledgering each success in MY db).
+  const pending = d.delta.map((x) => x.filename);
+  logline('shipmigrate', `${xell.slug}: catching ${myDb.name} up to prod — ${pending.length} migration(s) `
+    + `prod has run that it lacks (baseline: ${baselineNote})`);
+  const r = await runPending(project, myDb, mainSha, pending);
+
+  // Verify: re-measure drift against prod so the chip is truthful and residual `missing` surfaces.
+  let residual = null;
+  try { const diff = await diffXellDbAgainstProd(project.id, xellId); if (diff && diff.ok) residual = diff.total; }
+  catch { /* verification is best-effort — a caught-up db is still caught up if the diff can't run */ }
+
+  return {
+    ...r, pending, database: myDb.name, baseline: baselineNote, residual_missing: residual,
+    recommend_restore: !!(r.ok && residual != null && residual > 0 && xell.db_coupling === 'db-isolated'),
+  };
 }

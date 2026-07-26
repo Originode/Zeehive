@@ -2,9 +2,12 @@ import React, { useState, useRef, useEffect } from 'react';
 import ProjectSetup from './ProjectSetup.jsx';
 import { showConfirm } from './Dialog.jsx';
 
-// The project switcher: an icon beside the "Project:" label. The popup only switches and
-// removes; adding and configuring (deploy sites, ingress, container inventory, spawn template)
-// live in the full ProjectSetup modal — a popup can't hold an onboarding surface.
+// Two separate controls beside the "Project:" label:
+//   ⇄  switch icon → the popup that PICKS / removes / onboards a project (switching only).
+//   ⚙  settings cog → opens ProjectSetup for the CURRENT project directly (no popup, no pencil).
+// They used to be one ⚙ button whose popup buried "configure" behind a per-row pencil, so reaching
+// settings meant cog-then-pencil. Adding/configuring (deploy sites, ingress, container inventory,
+// spawn template) still live in the full ProjectSetup modal — a popup can't hold that surface.
 export default function ProjectMenu({ projects, currentId, onSelect, onCreate, onDelete, onChanged }) {
   const [open, setOpen] = useState(false);
   const [setup, setSetup] = useState(null);   // false=closed, null-project=create, project=edit
@@ -38,10 +41,16 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
 
   const openSetup = (project) => { setSetup(project); setShowSetup(true); setOpen(false); };
 
+  const current = projects.find((p) => p.id === currentId) || null;
+
   return (
     <span className="projmenu" ref={ref}>
-      <button className="projmenu-btn" title="Switch, add, or configure a project"
+      <button className="projmenu-btn" title="Switch project"
               aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        ⇄
+      </button>
+      <button className="projmenu-btn" title={current ? `Settings — ${current.name}` : 'Project settings'}
+              aria-label="Project settings" disabled={!current} onClick={() => openSetup(current)}>
         ⚙
       </button>
       {open && (
