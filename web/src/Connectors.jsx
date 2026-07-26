@@ -73,7 +73,7 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
       const hd = cont.querySelector(`[data-commit="${h.base_commit}"][data-dot]`);
       let inbound = null;
       if (hd) { const n = hd.getBoundingClientRect(); inbound = { x: (n.left + n.right) / 2 - cr.left, y: (n.top + n.bottom) / 2 - cr.top }; }
-      const node = { id: h.id, color: h.color, x: hx, y: hy, inbound };
+      const node = { id: h.id, color: h.color, x: hx, y: hy, inbound, consumer_ids: h.consumer_ids || [] };
       hNodes.push(node);
       for (const id of h.consumer_ids || []) consumerHarness.set(id, node);
     }
@@ -183,6 +183,13 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
 
   const hov = hoverRef ? hoverRef.current : { id: null, commit: null };
   const hoverActive = !!(hov.id || hov.commit);
+  // which xell(s) are focused (hovered/expanded) → a harness inbound wire lights up when a focused
+  // xell wears it, and dims with the rest otherwise (mirrors the badge dim/highlight on the canvas).
+  const focusedX = new Set();
+  if (expandedId) focusedX.add(expandedId);
+  if (hov.id) focusedX.add(hov.id);
+  if (hov.commit) for (const t of (timeline?.xells || [])) if (t.base_commit === hov.commit) focusedX.add(t.id);
+  const anyFocus = focusedX.size > 0;
   const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit);
 
   return (
@@ -205,11 +212,16 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
           its cell in the honeycomb (the trace goes to the harness FIRST, then the consumer wires above
           route through that same cell to the xells). The avatar badge itself is drawn on the canvas
           at the cell centre (HiveCanvas), so here we draw only the wire. */}
-      {harnessNodes.map((h) => (h.inboundD ? (
-        <path key={`h-${h.id}`} d={h.inboundD}
-              fill="none" stroke={h.color} strokeWidth="1.8" strokeDasharray="4 3" opacity="0.85"
-              strokeLinejoin="round" strokeLinecap="round" />
-      ) : null))}
+      {harnessNodes.map((h) => {
+        if (!h.inboundD) return null;
+        const hi = (h.consumer_ids || []).some((id) => focusedX.has(id));
+        const opacity = anyFocus ? (hi ? 0.95 : 0.1) : 0.85;
+        return (
+          <path key={`h-${h.id}`} d={h.inboundD}
+                fill="none" stroke={h.color} strokeWidth={hi ? 2.6 : 1.8} strokeDasharray="4 3" opacity={opacity}
+                strokeLinejoin="round" strokeLinecap="round" />
+        );
+      })}
     </svg>
   );
 }

@@ -470,11 +470,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         }
         return img;
       };
+      // which xell(s) are focused right now (hovered or expanded) → a harness badge lights up when a
+      // focused xell WEARS it, and dims with everything else when the focus is on a xell that doesn't.
+      const focusedIds = new Set();
+      if (expandedId) focusedIds.add(expandedId);
+      if (H.id) focusedIds.add(H.id);
+      if (H.commit) for (const t of (timeline?.xells || [])) if (t.base_commit === H.commit) focusedIds.add(t.id);
+      const anyFocus = focusedIds.size > 0;
       for (const h of harnesses) {
         const [row, col] = nextFree();
         const [cx, cy] = cellCenter(row, col, cellSize, originX, originY);
         harnessCells.push({ id: h.id, cx, cy, size: drawSize, cell: cellSize, color: h.color });
-        drawHarnessBadge(ctx, cx, cy, drawSize, h, getImg(h.avatar_url));
+        const hi = (h.consumer_ids || []).some((id) => focusedIds.has(id));
+        drawHarnessBadge(ctx, cx, cy, drawSize, h, getImg(h.avatar_url), { hi, dim: anyFocus && !hi });
       }
     }
 
@@ -881,17 +889,23 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
 // draws a faint dashed hex seat with a circular AVATAR at its centre, its label + consumer count
 // below. The avatar image is a preloaded <img> drawn to canvas (reliable, unlike an SVG <image>);
 // a lettermark is the fallback while it loads or if it fails.
-function drawHarnessBadge(ctx, cx, cy, size, h, img) {
+function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false } = {}) {
   const col = h.color || '#5b8cff';
   const ay = cy - size * 0.06;                 // avatar centre, nudged up to leave room for the label
   const r = size * 0.42;
   ctx.save();
+  if (dim) ctx.globalAlpha = 0.28;             // dim with the rest when the focus is on a non-consumer
   // faint dashed hex seat — this cell is part of the grid, but clearly not a work-cell
   hexPath(ctx, cx, cy, size);
-  ctx.fillStyle = withAlpha(col, 0.08);
+  ctx.fillStyle = withAlpha(col, hi ? 0.16 : 0.08);
   ctx.fill();
-  ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha(col, 0.5);
+  ctx.lineWidth = hi ? 2 : 1.2; ctx.strokeStyle = withAlpha(col, hi ? 0.9 : 0.5);
   ctx.setLineDash([4, 3]); ctx.stroke(); ctx.setLineDash([]);
+  // highlight halo when a focused xell wears this harness
+  if (hi) {
+    ctx.beginPath(); ctx.arc(cx, ay, r + 4, 0, Math.PI * 2);
+    ctx.lineWidth = 2.5; ctx.strokeStyle = COL.text; ctx.stroke();
+  }
   // avatar disc
   ctx.beginPath(); ctx.arc(cx, ay, r, 0, Math.PI * 2);
   ctx.fillStyle = COL.bg; ctx.fill();
