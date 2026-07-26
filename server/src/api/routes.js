@@ -11,6 +11,7 @@ import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness } from '../lib/harness.js';
+import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
@@ -612,6 +613,21 @@ router.get('/harnesses/:key/avatar', async (req, res) => {
 router.post('/xells/:id/harness', async (req, res) => {
   try { res.json(await assignHarness(req.params.id, req.body?.harness ?? req.body?.key ?? null)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// INBOUND bridge (docs §7): a human replies to the zee FROM the harness's web UI (Hermes). Addressed
+// by the session key = xell SLUG. Opt-in + authenticated + xell-scoped: refused unless the harness
+// set bridge.inbound AND the caller presents the shared HARNESS_BRIDGE_TOKEN. It reuses the SAME
+// sendMessageToXell path as the 📨 button — the zee stays in its cxell; nothing new reaches in.
+router.post('/harness-bridge/:slug/message', async (req, res) => {
+  try {
+    const b = bridgeBySlug(req.params.slug);
+    if (!b) return res.status(404).json({ sent: false, reason: 'no live bridged zee for that session key' });
+    const gate = bridgeInboundConfig(b.xellId);
+    if (!gate.allowed) return res.status(403).json({ sent: false, reason: gate.reason });
+    const auth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (auth !== process.env.HARNESS_BRIDGE_TOKEN) return res.status(401).json({ sent: false, reason: 'bad bridge token' });
+    res.json(await sendMessageToXell(b.xellId, { text: req.body?.text || '', images: req.body?.images || [], by: `hermes:${req.body?.by || 'web-ui'}` }));
+  } catch (err) { res.status(500).json({ sent: false, error: err.message }); }
 });
 // Apply the xell's pending server/sql/migrations + ops files (at ITS branch head) to ITS OWN
 // database (clone/isolated only — shared dev is schema-frozen, prod only ships). This is how a

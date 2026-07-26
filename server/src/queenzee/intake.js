@@ -24,7 +24,8 @@ import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell,
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
-import { harnessForXell, harnessLayerText, harnessSkillFiles, assignHarness, defaultHarnessId } from '../lib/harness.js';
+import { harnessForXell, harnessLayerText, harnessSkillFiles, harnessBridge, assignHarness, defaultHarnessId } from '../lib/harness.js';
+import { registerHarnessBridge } from '../lib/harness-bridge.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -1069,6 +1070,14 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     await releaseXell(xell.id);
     return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
   }
+
+  // Start the harness conversation bridge (docs §7): if the assigned harness declares a mirror,
+  // relay this zee's normalized transcript to its web UI (Hermes). Best-effort — the zee stays in
+  // its cxell (full file access); Hermes gets a display copy. Never blocks or fails the spawn.
+  try {
+    const bridge = harnessBridge(harness);
+    if (bridge) await registerHarnessBridge({ xellId: xell.id, zeeId: zee.id, slug: xell.slug, harnessLabel: harness?.label, bridge });
+  } catch (e) { logline('bridge', `${xell.slug}: bridge register failed (${String(e.message).slice(0, 80)})`); }
 
   // Drive the rest in the background. The cxell container is KEPT after the turn (idle, sealed)
   // so its commits can be collected (lib/cxell.js exportCxellDiff) — the reaper owns teardown.

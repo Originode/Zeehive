@@ -13,6 +13,7 @@ import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
 import { refreshHarnesses } from './lib/harness.js';
+import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
@@ -125,6 +126,7 @@ const server = app.listen(config.port, () => {
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();
+  startHarnessBridge();
 });
 // Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
 // existing /api proxy (vite dev + the prod nginx bundle) with no extra port to expose.
