@@ -2,7 +2,8 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup } from './api.js';
+         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
+         extractXellEnv } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
@@ -95,6 +96,17 @@ function useStreamedXells(projectId) {
   const [xells, setXells] = useState([]);
   const mapRef = useRef(new Map());
   const acRef = useRef(null);
+  // FORCE-CLEAR on switch, synchronously. The effect below also resets, but effects run AFTER the
+  // render that already saw the new projectId — so for one frame the grid would still hold the
+  // PREVIOUS project's hexes (the lingering remnants). Reset-on-prop-change during render (React's
+  // documented pattern) drops them before paint, so a switch never flashes the old project.
+  const [prevPid, setPrevPid] = useState(projectId);
+  if (projectId !== prevPid) {
+    setPrevPid(projectId);
+    mapRef.current = new Map();
+    acRef.current?.abort();
+    setXells([]);
+  }
   const runStream = useCallback(async () => {
     acRef.current?.abort();
     const ac = new AbortController();
@@ -403,7 +415,14 @@ export default function App() {
   // invisible. Ask whether a card exists, not whether an id does.
   // The honeycomb's xells come from the lazy NDJSON stream (hexagons appear as data arrives); fall
   // back to the fleet snapshot if the stream hasn't produced anything yet (e.g. it errored).
-  const gridXells = streamedXells.length ? streamedXells : (fleet.xells || []);
+  // FORCE-CLEAR on switch: during a project switch the stream is reset to empty while the OLD
+  // project's fleet snapshot still sits in state (applyFleet won't overwrite it until the NEW
+  // project's snapshot arrives). Falling back to that stale fleet paints the previous project's
+  // xells on the canvas — the "remnants that linger". So only use the fleet fallback when it
+  // actually belongs to the selected project; otherwise show nothing until the new data lands.
+  const fleetMatchesSelection = !projectId || fleet.project?.id === projectId;
+  const gridXells = streamedXells.length ? streamedXells
+    : (fleetMatchesSelection ? (fleet.xells || []) : []);
   const carded = new Set(gridXells.map((x) => x.id));
   const landingByXell = {};
   const prsByRef = {};
@@ -452,6 +471,15 @@ export default function App() {
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
     if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
+    if (kind === 'env') {                                    // extract this xell's CURRENT environment
+      try {
+        const r = await extractXellEnv(x.id);
+        await showAlert(
+          <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
+          { title: `${x.slug} — current environment${r.source === 'zeehive-env' ? ' (.zeehive.env on disk)' : r.environment ? ` (resolved: ${r.environment})` : ''}` });
+      } catch (e) { showAlert('Extract failed: ' + (e?.message || e), { variant: 'error' }); }
+      return;
+    }
     if (kind === 'build') {
       if (x.stack.some(isBusy)) { showAlert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
@@ -918,6 +946,26 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
                   ? `machine ${machine.key}${machine.label ? ` (${machine.label})` : ''} — ${machine.docker_ctx}@${machine.host_ip || '?'}`
                   : `machine context ${stackCtx}`}>
             ⌂ {machine ? machine.key : stackCtx}
+          </span>
+        )}
+        {x.env_key && (
+          <span className={`envchip env-${x.env_tier}${Number(x.env_var_count) === 0 ? ' env-empty' : ''}`}
+                data-testid="env-chip"
+                title={`Environment: ${x.env_key} (${x.env_tier})`
+                  + (x.env_pinned ? ' — pinned to this xell' : ` — default for ${x.env_tier} xells`)
+                  + `\n${x.env_var_count} var(s) from the meta-DB`
+                  + (Number(x.env_var_count) === 0 ? ' (empty → nothing added to .zeehive.env; xell runs as before)' : '')
+                  + `\n\nClick to extract this xell's current .env`}
+                onClick={async (e) => {
+                  e.stopPropagation();
+                  try {
+                    const r = await extractXellEnv(x.id);
+                    await showAlert(
+                      <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
+                      { title: `${x.slug} — current environment${r.source === 'zeehive-env' ? ' (.zeehive.env)' : r.environment ? ` (resolved: ${r.environment})` : ''}` });
+                  } catch (err) { showAlert('Extract failed: ' + (err?.message || err), { variant: 'error' }); }
+                }}>
+            ❖ {x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}
           </span>
         )}
         <span className="cardtop-right">

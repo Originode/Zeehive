@@ -37,7 +37,7 @@ import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderT
          deleteProviderAccount } from '../lib/provider-tokens.js';
 import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
          listVars, setVar, deleteVar, importEnv, exportEnv, lintEnv, diffEnvironments,
-         resolvedEnvView, setXellEnvironment } from '../lib/environments.js';
+         resolvedEnvView, setXellEnvironment, extractXellEnv } from '../lib/environments.js';
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { discoverSite, adoptContainers } from '../lib/discovery.js';
@@ -46,12 +46,12 @@ import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
-import { applyMigrationsToXell } from '../queenzee/shipmigrate.js';
+import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfDevice, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -472,6 +472,12 @@ router.post('/xells/:id/environment', async (req, res) => {
   try { res.json(await setXellEnvironment(req.params.id, req.body?.environment_id || null)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Extract a xell's CURRENT environment as full .env text (human reveal) — its own .zeehive.env if
+// present, else the resolved meta-DB environment. This is the "pull out what this xell is running".
+router.get('/xells/:id/env/export', async (req, res) => {
+  try { res.json(await extractXellEnv(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
 
 // ── project manifest: the repo's zeehive.yml vs the stored cache (spec §3.1) ─
 router.get('/projects/:id/manifest', async (req, res) => {
@@ -585,6 +591,13 @@ router.post('/xells/:id/db', async (req, res) => {
 // zee TESTS a migration before landing it; the same files ride the ship to prod.
 router.post('/xells/:id/db/migrate', async (req, res) => {
   try { res.json(await applyMigrationsToXell(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Roll the xell's OWN database FORWARD to prod's current schema: apply the prod-ledger migrations it
+// does not yet reflect (clone/isolated only). Closes the pre-fork gap `db/migrate` cannot — a stale
+// prod-dump restore. Reads prod read-only; never writes prod. See docs/schema-catchup-plan.md.
+router.post('/xells/:id/db/catchup', async (req, res) => {
+  try { res.json(await catchUpXellToProd(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Asked by the prod-guard hook (hooks/prod-guard.mjs) when a command in a xell worktree touches
@@ -948,6 +961,14 @@ router.post('/xell/self/sync', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfSync(x, { rebuild: req.body?.rebuild !== false })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Catch this cxell's OWN db up to prod's current schema (clone/isolated). NOT gated — it writes only
+// this xell's throwaway db and reads prod read-only, exactly the class of `zee build`. `--restore`
+// (isolated only) rebuilds from the latest full prod snapshot instead of rolling forward.
+router.post('/xell/self/catchup', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfCatchup(x, { restore: !!req.body?.restore })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.
 router.post('/xell/self/ship', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
@@ -997,6 +1018,12 @@ router.post('/xell/self/working', async (req, res) => {
 // cxell's own .zeehive.env). Read-only, token-scoped. `zee env` maps here.
 router.get('/xell/self/env', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await resolvedEnvView(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// Extract THIS xell's current environment as full .env text — `zee env --export`. Full values, but
+// a zee only ever sees its OWN env (token-scoped), which it already holds in its .zeehive.env file.
+router.get('/xell/self/env/export', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await extractXellEnv(x.id)); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 

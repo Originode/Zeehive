@@ -50,6 +50,7 @@ zee env                                           # which environment this xell 
 zee build [server|webapp|all] [--hot] [--wait] [--watch]   # (re)build your OWN app tier (NOT gated)
 zee device [--detach|--status]                   # attach a MOBILE DEVICE (Android) to build apps on (NOT gated)
 zee sync [--no-rebuild]                          # CATCH UP / rebase: merge current main INTO your cxell (NOT gated)
+zee db-catchup [--restore]                        # roll your OWN db (clone/isolated) forward to prod's schema (NOT gated)
 zee tend --reason "…" | --clear                  # raise/lower "I need a human in the console"
 zee land                                         # collect commits + gated push to main (ONLY when 100% certain)
 zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod   (ONLY when 100% certain)
@@ -142,6 +143,21 @@ human-gated**: it touches only your own cxell + throwaway containers.
 - `--no-rebuild` merges without rebuilding the app tier.
 - `zee land` runs this for you automatically if main moved since your cage was cut — but reach for
   `zee sync` the moment you are asked to rebase or catch up your branch.
+
+### `zee db-catchup` — catch your database up to prod's schema
+`POST /api/xell/self/catchup` `{ restore? }`. The **database** counterpart of `zee sync`: where
+`zee sync` rolls your *code* forward to current main, `zee db-catchup` rolls your **own** database
+forward to **prod's current schema**. Your db is a throwaway clone (or an isolated db), so this is
+**NOT human-gated** — it writes only your db and reads prod read-only.
+
+- Default: apply the **prod-ledger migrations your db doesn't yet reflect** — a forward schema
+  catch-up that preserves your db's contents.
+- `--restore` (isolated dbs only): rebuild from the **latest full prod snapshot** instead — exact
+  schema *and* data, but it **DISCARDS your db's current contents**. Use it when the ledger can't
+  close the gap (the failure message will say so).
+
+Reach for it when your migrations/tests need prod's live schema, or after prod schema moved under a
+long-running xell — the same "catch up" instinct as `zee sync`, one layer down.
 
 ### `zee land` — land your work on main
 `POST /api/xell/self/land`. This is the piece a cxell otherwise can't do: your commits live *inside*

@@ -21,6 +21,9 @@ import { landStatus } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { proposeDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
+import { catchUpXellToProd } from './shipmigrate.js';
+import { attachXellDb } from '../lib/xell-db.js';
+import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
@@ -313,6 +316,58 @@ export async function selfSync(xell, { rebuild = true } = {}) {
       + (built && !built.error ? ' A rebuild was started — run `zee build --wait` (background) to confirm it serves your HEAD, then re-run your tests.' : '')
       + (built && built.error ? ` (rebuild could not start: ${built.error})` : '');
   return { ok: true, status: heal.state, ref, head: heal.head || null, collected, built, message: note };
+}
+
+// ── POST /api/xell/self/catchup — roll THIS cxell's own db up to prod's schema ──
+// The verb a schema-work zee runs BEFORE writing migrations: bring its own db (clone/isolated)
+// forward to prod's CURRENT schema so its new migration builds on prod's real state and the /ooney
+// gate's green condition ("my catalog = prod + my pending migrations") is reachable. NOT human-gated
+// — like `zee build` it writes only this xell's throwaway db (and reads prod read-only). `restore`
+// (isolated only) rebuilds from the latest full prod snapshot instead of rolling migrations forward:
+// exact schema AND data, but it DISCARDS the zee's db work, so it is opt-in.
+export async function selfCatchup(xell, { restore = false } = {}) {
+  if (restore) {
+    if (xell.db_coupling !== 'db-isolated') {
+      return { ok: false, error: `--restore rebuilds an isolated db from a prod snapshot, but this xell is `
+        + `'${xell.db_coupling}'. For a clone, re-attach a fresh one (\`--db clone\`); for shared dev/prod there `
+        + 'is nothing to restore. Run \`zee db-catchup\` (no --restore) to roll migrations forward instead.' };
+    }
+    let attached;
+    try { attached = await attachXellDb(xell.id, { coupling: 'db-isolated', dump: 'latest' }); }
+    catch (e) { return { ok: false, error: `re-restore failed: ${e.message}` }; }
+    let residual = null;
+    try { const diff = await diffXellDbAgainstProd(xell.project_id, xell.id); if (diff?.ok) residual = diff.total; }
+    catch { /* best-effort */ }
+    return {
+      ok: true, restored: true, ...attached, residual_missing: residual,
+      message: `Re-restored your isolated db from the latest full prod snapshot (${attached.restored_from || 'unknown'}) — `
+        + `schema AND data are now at that snapshot${residual === 0 ? ', with zero schema drift from prod' : residual != null ? `, ${residual} object(s) still differ from prod` : ''}. `
+        + 'Your previous db contents were replaced. The container was re-provisioned, so REBUILD your app tier '
+        + '(`zee build --wait`, background) to pick up the new DATABASE_URL before you re-verify.',
+    };
+  }
+
+  const r = await catchUpXellToProd(xell.id);
+  if (r.ok === false) {
+    return { ...r, message: r.recommend_restore
+      ? `${r.error} (You can do that now: \`zee db-catchup --restore\`.)`
+      : r.error };
+  }
+  const applied = r.applied || [];
+  const tail = r.residual_missing === 0
+    ? ' Your schema now matches prod (0 drift).'
+    : r.residual_missing > 0
+      ? ` ${r.residual_missing} object(s) STILL differ from prod after the roll-forward`
+        + (r.recommend_restore ? ' — the ledger could not close the gap; \`zee db-catchup --restore\` rebuilds from the latest full prod snapshot.' : '.')
+      : '';
+  return {
+    ok: true, ...r,
+    message: applied.length
+      ? `Caught ${r.database} up to prod — applied ${applied.length} migration(s) prod had run that your db lacked `
+        + `(baseline: ${r.baseline}):\n    ${applied.join('\n    ')}\n  Now \`zee db-migrate\` to apply your OWN branch `
+        + `migrations on top, then re-verify.${tail}`
+      : `${r.note || 'Nothing to catch up.'}${tail}`,
+  };
 }
 
 // ── POST /api/xell/self/ship — file a ship request (shipgate) ──────────────────

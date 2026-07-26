@@ -333,6 +333,27 @@ export async function fullVarsFor(environmentId) {
     `SELECT name, value FROM environment_var WHERE environment_id=$1 ORDER BY name`, [environmentId]);
 }
 
+// EXTRACT a xell's CURRENT environment — the full text a human can copy out. Ground truth is the
+// xell's own .zeehive.env on disk (what it is ACTUALLY running with — ports + DATABASE_URL + the
+// merged env vars); if that file is absent (a pooled xell never emitted, or a torn-down worktree)
+// it falls back to the resolved environment's .env text from the meta-DB. Full values — this is a
+// human reveal door, like exportEnv. Returns { source, text, path?, environment? }.
+export async function extractXellEnv(xellId) {
+  const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
+  if (!xell) throw new Error('xell not found');
+  if (xell.worktree_path) {
+    const path = resolve(xell.worktree_path.replace(/\\/g, '/'), '.zeehive.env');
+    if (existsSync(path)) {
+      return { source: 'zeehive-env', path, slug: xell.slug, text: readFileSync(path, 'utf8') };
+    }
+  }
+  // No on-disk projection — hand back what it WOULD resolve to from the meta-DB.
+  const env = await resolveEnvironmentFor(xell);
+  if (!env) return { source: 'none', slug: xell.slug, text: '', note: 'no .zeehive.env on disk and no environment resolves for this xell' };
+  const dump = await exportEnv(env.id);
+  return { source: 'resolved', slug: xell.slug, environment: env.key, tier: env.tier, text: dump.text, note: 'no .zeehive.env on disk — showing the resolved meta-DB environment' };
+}
+
 // Masked view of what a xell resolves to — for the console badge and the `zee env` self verb. Shows
 // the environment identity and the var NAMES (values stay in .zeehive.env), never secret values.
 export async function resolvedEnvView(xell) {
