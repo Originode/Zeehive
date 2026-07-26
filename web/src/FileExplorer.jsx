@@ -5,15 +5,15 @@ import { listCxellDir, readCxellFile } from './api.js';
 // worktree over the same ssh door the terminal uses, and opens a text file in a viewer so a human
 // can SEE what a zee is talking about ("edited web/src/App.jsx") without leaving the terminal.
 //
-// `openPath` is a controlled request from the terminal's right-click "show file" — when it changes
-// the explorer navigates to (a dir) or opens (a file) that path. It reports the current directory
-// up via onDir so the parent can seed "show file" with the right folder.
+// `openReq` ({ path, n }) is a "show file" request from the terminal — a CLICKED path link in the
+// output, the 📄 button, or the path box below. On each new request the explorer navigates to (a
+// dir) or opens (a file) that path; the bumping `n` lets a repeat request on the same path re-open.
 
 const ICON = { dir: '▸', file: '·' };
 const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} K` : `${(n / 1048576).toFixed(1)} M`);
 const baseName = (p) => (p || '').replace(/\/+$/, '').split('/').pop() || '/';
 
-export default function FileExplorer({ zeeId, openPath, onClose }) {
+export default function FileExplorer({ zeeId, openReq, onClose }) {
   const [dir, setDir] = useState(null);          // { path, parent, root, entries }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -43,8 +43,9 @@ export default function FileExplorer({ zeeId, openPath, onClose }) {
 
   useEffect(() => { load(null); }, [load]);
 
-  // A "show file" request from the terminal (the 📄 button / a selected path) flows in via openPath.
-  useEffect(() => { if (openPath) show(openPath); }, [openPath, show]);
+  // A "show file" request from the terminal (a clicked path link, or the 📄 button) flows in via
+  // openReq. The bumping openReq.n makes a repeat click on the same path re-open it.
+  useEffect(() => { if (openReq?.path) show(openReq.path); }, [openReq, show]);
 
   const onEntry = (e) => {
     const next = `${dir.path === '/' ? '' : dir.path}/${e.name}`;
