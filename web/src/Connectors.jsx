@@ -95,14 +95,36 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
       .filter((c) => forward(c.cx, c.cy) && insideHoney(c.cx, c.cy));
     const graph = buildHexGraph(realHexes.concat(virtual));
 
-    // pass 1: pathfind every wire (prod included) through the corridor maze
+    // Each harness's INBOUND wire (its commit dot → its cell) threads the same corridor maze as every
+    // other wire, so it reads as one of the family. Compute its lattice path now that the graph exists.
+    for (const node of hNodes) {
+      if (!node.inbound) { node.inboundD = null; continue; }
+      const entry = nearestNode(graph, node.inbound.x, node.inbound.y);
+      const midKey = nearestNode(graph, node.x, node.y);
+      const pts = (entry && midKey) ? shortestPath(graph, entry, midKey) : null;
+      const poly = (pts && pts.length > 1)
+        ? [[node.inbound.x, node.inbound.y], ...pts.map((p) => [p.x, p.y]), [node.x, node.y]]
+        : [[node.inbound.x, node.inbound.y], [node.x, node.y]];   // fallback: straight if no maze path
+      node.inboundD = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
+    }
+
+    // pass 1: pathfind every wire (prod included) through the corridor maze. A harnessed consumer's
+    // wire is forced THROUGH its harness cell — two maze legs (dot→cell, cell→hex) spliced — so it
+    // still threads corridors like the rest instead of cutting a straight line across the honeycomb.
     const routed = [];
     for (const dd of dots) {
       const verts = graph.vertsById.get(dd.id);
       if (!verts) continue;
       const target = nearestVertex(verts, dd.dx, dd.dy);   // hex vertex nearest the commit head
       const entryKey = nearestNode(graph, dd.dx, dd.dy);
-      const path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
+      const hn = consumerHarness.get(dd.id);
+      let path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
+      if (hn && entryKey) {
+        const midKey = nearestNode(graph, hn.x, hn.y);
+        const l1 = shortestPath(graph, entryKey, midKey);
+        const l2 = shortestPath(graph, midKey, target.key);
+        if (l1 && l2 && l1.length && l2.length) path = [...l1, ...l2.slice(1)];   // splice at the cell
+      }
       routed.push({ id: dd.id, color: dd.color, dot: dd, target, pts: path });
     }
 
@@ -113,14 +135,10 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
     for (const r of routed) {
       const { dot: dd, target } = r;
       let d, ex = target.x, ey = target.y;
-      const hn = consumerHarness.get(dd.id);
-      if (hn) {
-        // A harnessed xell's wire runs IN SERIES through its harness cell: commit dot → harness cell
-        // centre → the xell's hex. Two clean legs, so the shared config layer is on every consumer's
-        // line and the wire visibly passes through the badge seated in the grid.
-        d = `M ${f1(dd.dx)} ${f1(dd.dy)} L ${f1(hn.x)} ${f1(hn.y)} L ${f1(target.x)} ${f1(target.y)}`;
-        ex = target.x; ey = target.y;
-      } else if (r.pts && r.pts.length > 1) {
+      // All wires — harnessed or not — render through the corridor maze. A harnessed consumer's
+      // r.pts was already spliced through its harness cell in pass 1, so it threads the honeycomb
+      // like the rest instead of a straight diagonal.
+      if (r.pts && r.pts.length > 1) {
         const off = lanes.get(r.id) || r.pts.slice(1).map(() => [0, 0]);
         const maze = offsetPolyline(r.pts, off);           // channel-offset corridor path
         const e0 = maze[0];                                // offset entry point
@@ -187,10 +205,10 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
           its cell in the honeycomb (the trace goes to the harness FIRST, then the consumer wires above
           route through that same cell to the xells). The avatar badge itself is drawn on the canvas
           at the cell centre (HiveCanvas), so here we draw only the wire. */}
-      {harnessNodes.map((h) => (h.inbound ? (
-        <path key={`h-${h.id}`}
-              d={`M ${h.inbound.x.toFixed(1)} ${h.inbound.y.toFixed(1)} L ${h.x.toFixed(1)} ${h.y.toFixed(1)}`}
-              fill="none" stroke={h.color} strokeWidth="1.8" strokeDasharray="4 3" opacity="0.85" />
+      {harnessNodes.map((h) => (h.inboundD ? (
+        <path key={`h-${h.id}`} d={h.inboundD}
+              fill="none" stroke={h.color} strokeWidth="1.8" strokeDasharray="4 3" opacity="0.85"
+              strokeLinejoin="round" strokeLinecap="round" />
       ) : null))}
     </svg>
   );
