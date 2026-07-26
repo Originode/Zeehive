@@ -88,9 +88,12 @@ function relay(xellId, r, ev) {
   }
   inFlight.add(xellId);
   const body = JSON.stringify({ session_key: sessionKey, source: 'zeehive', event: ev });
+  // base_url is the Hermes API SERVER (API_SERVER_PORT), Bearer-authed with API_SERVER_KEY — NOT the
+  // web-UI port. The auth token rides every mirror POST.
+  const headers = { 'content-type': 'application/json', 'X-Hermes-Session-Key': sessionKey };
+  if (bridge.auth_token) headers.authorization = `Bearer ${bridge.auth_token}`;
   fetch(`${bridge.base_url.replace(/\/$/, '')}${bridge.append_path || '/v1/runs'}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'X-Hermes-Session-Key': sessionKey },
+    method: 'POST', headers, redirect: 'manual',
     body, signal: AbortSignal.timeout(6000),
   }).then((res) => {
     if (!res.ok && !r.warned) { logline('bridge', `${slug}: Hermes mirror HTTP ${res.status} (will keep trying)`); r.warned = true; }

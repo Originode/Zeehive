@@ -79,9 +79,17 @@ export default function HarnessBridge({ onClose }) {
               </p>
 
               <div className="disp-field">
-                <label className="disp-label">Hermes base URL</label>
-                <input className="disp-input" type="text" placeholder="http://your-hermes-host:port"
+                <label className="disp-label">Hermes API URL (base_url)</label>
+                <input className="disp-input" type="text" placeholder="http://localhost:8642"
                        value={cfg.base_url || ''} onChange={(e) => set('base_url', e.target.value)} />
+                <div className="disp-hint">The <b>API server</b> port (<code>API_SERVER_PORT</code>, default 8642) — <b>not</b> the web-UI port. The bridge POSTs the mirror here.</div>
+              </div>
+
+              <div className="disp-field">
+                <label className="disp-label">API key (API_SERVER_KEY)</label>
+                <input className="disp-input" type="password" placeholder="Bearer token for the Hermes API server"
+                       autoComplete="off" value={cfg.auth_token || ''} onChange={(e) => set('auth_token', e.target.value)} />
+                <div className="disp-hint">Sent as <code>Authorization: Bearer …</code>. Required — the Hermes API server has full toolset access, so it refuses unauthenticated calls. Stored server-side (never in the repo).</div>
               </div>
 
               <div className="disp-field">
@@ -102,10 +110,10 @@ export default function HarnessBridge({ onClose }) {
               </div>
 
               <div className="disp-field">
-                <label className="disp-label">Thread URL template</label>
-                <input className="disp-input" type="text" placeholder="{base_url}/ui/thread/{session_key}"
+                <label className="disp-label">Web-UI thread URL</label>
+                <input className="disp-input" type="text" placeholder="http://localhost:8787/ui/thread/{session_key}"
                        value={cfg.viewer_url_template || ''} onChange={(e) => set('viewer_url_template', e.target.value)} />
-                <div className="disp-hint">Where a zee’s conversation opens in the Hermes web UI. <code>{'{session_key}'}</code> = the xell slug.</div>
+                <div className="disp-hint">The <b>web-UI</b> port (browser login) where a human opens the conversation — a different port from the API. <code>{'{session_key}'}</code> = the xell slug.</div>
               </div>
 
               <div className="disp-field">

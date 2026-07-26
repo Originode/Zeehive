@@ -277,7 +277,7 @@ export async function getBridge(key) {
 
 // Persist an operator edit to the live bridge connection (only known keys; the file block stays the
 // default underneath). Does NOT ship — it is live config, applied to the next dispatched zee.
-const BRIDGE_KEYS = ['base_url', 'enabled', 'inbound', 'session_key', 'append_path', 'viewer_url_template', 'mode'];
+const BRIDGE_KEYS = ['base_url', 'enabled', 'inbound', 'session_key', 'append_path', 'viewer_url_template', 'mode', 'auth_token'];
 export async function setBridge(key, patch = {}) {
   const h = await one(`SELECT bridge_override FROM harness WHERE key=$1`, [key]);
   if (!h) throw new Error(`no harness "${key}"`);
@@ -300,12 +300,28 @@ export async function probeBridge(key) {
   const cfg = harnessBridge(h) || {};
   const stamp = (p) => q(`UPDATE harness SET bridge_probe=$2 WHERE key=$1`, [key, JSON.stringify(p)]).then(() => p);
   if (!cfg.base_url) return stamp({ ok: false, at: new Date().toISOString(), detail: 'no base_url configured — set the Hermes instance URL first' });
-  const url = `${String(cfg.base_url).replace(/\/$/, '')}/v1/discovery`;
+  const url = `${String(cfg.base_url).replace(/\/$/, '')}/v1/models`;
+  const headers = cfg.auth_token ? { authorization: `Bearer ${cfg.auth_token}` } : {};
   try {
-    const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(6000) });
+    // redirect:'manual' is load-bearing — Node's fetch FOLLOWS redirects by default, so a
+    // login-gated instance would follow the 302 into its login PAGE and return 200, falsely reading
+    // as "reachable". We must SEE the 3xx to report "auth required / wrong port" honestly.
+    const res = await fetch(url, { method: 'GET', redirect: 'manual', headers, signal: AbortSignal.timeout(6000) });
+    const loc = res.headers.get('location') || '';
+    if (res.status >= 300 && res.status < 400) {
+      const toLogin = /login/i.test(loc);
+      return stamp({ ok: false, status: res.status, url, at: new Date().toISOString(),
+        detail: toLogin
+          ? `redirected to login (${loc}) — this port wants a web login, so it is the Hermes WEB UI, not the API server. Point base_url at the API server's API_SERVER_PORT (Bearer auth), not the UI port.`
+          : `redirect to ${loc}` });
+    }
+    if (res.status === 401 || res.status === 403) {
+      return stamp({ ok: false, status: res.status, url, at: new Date().toISOString(),
+        detail: cfg.auth_token ? 'auth rejected — the API key was not accepted (check API_SERVER_KEY matches)' : 'auth required — set the API key (API_SERVER_KEY) in the auth token field' });
+    }
     const body = await res.text().catch(() => '');
     return stamp({ ok: res.ok, status: res.status, url, at: new Date().toISOString(),
-      detail: res.ok ? (body.slice(0, 400) || 'reachable (empty body)') : `HTTP ${res.status} — ${body.slice(0, 200)}` });
+      detail: res.ok ? `authenticated ✓ (${body.slice(0, 200) || 'ok'})` : `HTTP ${res.status} — ${body.slice(0, 160)}` });
   } catch (e) {
     return stamp({ ok: false, url, at: new Date().toISOString(), detail: `unreachable: ${String(e.message).slice(0, 200)}` });
   }
