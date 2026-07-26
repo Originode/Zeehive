@@ -7,11 +7,16 @@
 // INPUT
 //   prodLedger : [{ filename, sha, applied_at }]  — the baseline=false rows of prod's zeehive_migrations,
 //                i.e. every migration prod has actually RUN (never the baselined pre-ledger history).
-//   opts.mode  : 'isolated' | 'clone'
-//     isolated → opts.takenAt : the db_snapshot.taken_at the isolated db was restored from. Every prod
-//                migration applied AT/BEFORE taken_at is in the dump by construction; only those applied
-//                AFTER it are the delta. Robust even for a table-scoped dump that never carried the
-//                ledger table itself — it reasons about TIME, not about what the dump contained.
+//   opts.mode  : 'ledger' | 'isolated' | 'clone'
+//     ledger   → opts.done : Set<filename> the target db ALREADY reflects, read from its OWN
+//                zeehive_migrations table. This is the EXACT primary path: a db-isolated restored from
+//                a full prod dump carries prod's ledger frozen at dump time, so the set-diff against
+//                prod's current ledger is precisely the migrations prod ran afterwards. Also the path a
+//                clone/isolated takes on its SECOND catch-up (the first one created the ledger).
+//     isolated → opts.takenAt : the db_snapshot.taken_at the isolated db was restored from, used only
+//                when the db has NO ledger (a table-scoped dump that dropped zeehive_migrations). Every
+//                prod migration applied AT/BEFORE taken_at is in the dump by construction; only those
+//                applied AFTER it are the delta. Reasons about TIME, not about what the dump contained.
 //     clone    → opts.baselineDone : Set<filename> already reflected in the clone (from ledgerFiles at
 //                merge-base(main, HEAD)); delta = prod files NOT in that set.
 //
@@ -31,6 +36,13 @@ function orderDedupe(rows) {
 
 export function catchupDelta(prodLedger, opts = {}) {
   const ledger = Array.isArray(prodLedger) ? prodLedger.filter((r) => r && r.filename) : [];
+
+  if (opts.mode === 'ledger') {
+    const done = opts.done instanceof Set ? opts.done : new Set(opts.done || []);
+    return { delta: orderDedupe(ledger.filter((r) => !done.has(r.filename))),
+      skipped: ledger.filter((r) => done.has(r.filename)).map((r) => r.filename).sort(),
+      reason: 'ledger-set-diff' };
+  }
 
   if (opts.mode === 'isolated') {
     const t = opts.takenAt != null ? new Date(opts.takenAt).getTime() : NaN;

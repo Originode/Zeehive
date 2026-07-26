@@ -1,7 +1,12 @@
 # Plan: let a zee catch its own DB schema up to production
 
-Status: **design / plan** (2026-07-25). Scoped and grounded against the live code — every file and
-function named below exists today. Nothing here is built yet; this is the "how".
+Status: **IMPLEMENTED** (2026-07-26; design 2026-07-25). Phases 1–2 are built and unit-tested; see
+§9 for what shipped. The design below is the "how", kept as the rationale of record.
+
+Built: `server/src/queenzee/catchup-delta.js` (pure delta, `test/catchup-delta.test.mjs`),
+`shipmigrate.js › catchUpXellToProd()`, `POST /api/xells/:id/db/catchup`,
+`self.js › selfCatchup()` + `POST /api/xell/self/catchup`, `zee db-catchup [--restore]`,
+`scripts/xell-db-catchup.mjs`, and a `db_refresh` snapshot link recorded by `provisionIsolatedDb`.
 
 ---
 
@@ -221,14 +226,23 @@ a test.
 
 ## 9. Phasing
 
-1. **Phase 1 — engine + verbs.** `catchupDelta()` (+ test, done here), `catchUpXellToProd()`,
+1. **Phase 1 — engine + verbs. ✅ DONE.** `catchupDelta()` (+ test), `catchUpXellToProd()`,
    `POST /api/xells/:id/db/catchup`, `selfCatchup` + `POST /api/xell/self/catchup`, `zee db-catchup`,
-   `scripts/xell-db-catchup.mjs`. Exact for `db-isolated`; best-effort schema for `db-clone`.
-2. **Phase 2 — verify + fallback.** Post-run `diffXellDbAgainstProd`; `zee db-catchup --restore`; auto
-   recommendation when residual `missing` remains; optional chained forward-apply of branch files.
-3. **Phase 3 — surface + document.** proddiff chip "Catch up to prod" action; a line in
-   `docs/cxell-zee-manual.md` and the dispatch binding so a schema-work zee is told to `zee db-catchup`
-   before it starts writing migrations.
+   `scripts/xell-db-catchup.mjs`. Exact for `db-isolated` (ledger set-diff, or snapshot `taken_at`
+   fallback); best-effort schema for `db-clone` (fork-point baseline).
+2. **Phase 2 — verify + fallback. ✅ DONE.** Post-run `diffXellDbAgainstProd` (`residual_missing` in
+   the result); `zee db-catchup --restore`; auto `recommend_restore` when residual `missing` remains;
+   the CLI message nudges the follow-up `zee db-migrate` for branch files.
+3. **Phase 3 — surface + document.** ✅ `docs/cxell-zee-manual.md` verb added. ⏳ Still to do: a
+   proddiff-chip "Catch up to prod" action in the console (`web/src/`), and a line in the dispatch
+   binding so a schema-work zee is told to `zee db-catchup` before writing migrations.
+
+**Implementation note (baseline, refined during build).** The plan led with snapshot `taken_at` for
+`db-isolated`; the build makes the db's **own ledger** the primary signal, because a full prod dump
+carries prod's `zeehive_migrations` *inside it*, frozen at dump time — so a set-diff against prod's
+current ledger is exact and needs nothing external. `taken_at` (via a new `db_refresh` link) is the
+**fallback** for a table-scoped dump that dropped the ledger table; if neither is available, catch-up
+refuses and recommends `--restore` rather than guess.
 
 ## 10. How to verify end-to-end (needs prod; not reachable from an isolated cxell)
 

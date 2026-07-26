@@ -49,7 +49,21 @@ test('de-dupes and keeps a file with no sha (caller falls back to main-tip)', ()
   assert.equal(r.delta[0].filename, '20260301_c.sql');
 });
 
+test('ledger: delta = prod ledger minus what my db already ledgered (the exact primary path)', () => {
+  // isolated-from-full-dump carries prod's ledger frozen at dump time; prod ran c afterwards.
+  const mine = new Set(['20260101_a.sql', '20260201_b.sql']);
+  const r = catchupDelta(led, { mode: 'ledger', done: mine });
+  assert.equal(r.reason, 'ledger-set-diff');
+  assert.deepEqual(r.delta.map((d) => d.filename), ['20260301_c.sql']);
+});
+
+test('ledger: my db already has everything → nothing to catch up', () => {
+  const mine = new Set(led.map((r) => r.filename));
+  assert.equal(catchupDelta(led, { mode: 'ledger', done: mine }).delta.length, 0);
+});
+
 test('empty prod ledger → nothing to catch up, any mode', () => {
+  assert.equal(catchupDelta([], { mode: 'ledger', done: new Set() }).delta.length, 0);
   assert.equal(catchupDelta([], { mode: 'isolated', takenAt: '2026-01-01' }).delta.length, 0);
   assert.equal(catchupDelta([], { mode: 'clone', baselineDone: new Set() }).delta.length, 0);
 });
