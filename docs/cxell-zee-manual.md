@@ -45,9 +45,13 @@ queenzee at `host.docker.internal:4700` (firewall-allowed).
 
 ```
 zee status                                       # where you stand
+zee working [--note "…"]                         # ping "I am actively working" (NOT gated)
+zee env                                           # which environment this xell resolved to — var NAMES only (read-only)
 zee build [server|webapp|all] [--hot] [--wait] [--watch]   # (re)build your OWN app tier (NOT gated)
 zee device [--detach|--status]                   # attach a MOBILE DEVICE (Android) to build apps on (NOT gated)
+zee sync [--no-rebuild]                          # CATCH UP / rebase: merge current main INTO your cxell (NOT gated)
 zee db-catchup [--restore]                        # roll your OWN db (clone/isolated) forward to prod's schema (NOT gated)
+zee tend --reason "…" | --clear                  # raise/lower "I need a human in the console"
 zee land                                         # collect commits + gated push to main (ONLY when 100% certain)
 zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod   (ONLY when 100% certain)
 zee hint-land [--reason "…"] | --clear           # "looks land-ready" — light the land? button for a human, don't land
@@ -69,6 +73,13 @@ builds your OWN throwaway containers, which is the whole point of a xell.
 `GET /api/xell/self/status`. Read model: your xell status and task, whether a landing / ship /
 prod-bind is pending a human, whether you hold the prod lock, and your containers + db binding. No
 secrets — your token never appears in the answer. Safe to call any time.
+
+### `zee working` · `zee env` — small non-gated helpers
+`POST /api/xell/self/working` `{ note? }` pings **"I am actively working"** — it asserts live
+activity the passive poller can't observe inside a cxell, and clears any open `tend`. `--note "what
+you are doing"` rides along. `GET /api/xell/self/env` (`zee env`) reports **which environment** this
+xell resolved to: the variable **NAMES** from the meta-DB set merged into `/work/repo/.zeehive.env`
+(the values stay in the file, never echoed). Both are read-only/ping and open no gate.
 
 ### `zee build` — build your OWN app tier (to run e2e tests)
 `POST /api/xell/self/build` `{ role?, hot? }`. This is the piece a cxell otherwise can't do: the host
@@ -113,6 +124,41 @@ is **NOT human-gated**: the device is a throwaway test target, torn down with yo
   crashes. A human can watch the emulator screen live at the `viewer_url` in the answer.
 - **Verify with your eyes.** A build that installs is not a build that works — screenshot it.
 
+### `zee sync` — catch up / rebase your branch onto current main
+`POST /api/xell/self/sync` `{ rebuild? }`. **This is how you "rebase" or "catch up your code".** Your
+cxell was seeded from a bundle of your branch ALONE — current `main`/`master` is not a ref in here,
+and `origin` points at a bundle that was consumed at clone time, so `git fetch` / `git rebase main`
+inside the cage cannot work. `zee sync` is the supported path: the queenzee (which CAN see the
+xource) delivers current main INTO your cage as `refs/remotes/origin/main`, then **merges** it into
+your branch — in the cage, with the queenzee identity — and rebuilds your app tier. It is **NOT
+human-gated**: it touches only your own cxell + throwaway containers.
+
+- **It is a merge, not a `git rebase` — deliberately.** Landing fast-forwards the host worktree up to
+  your cxell HEAD, which only works while your provisioning base stays in history; a rebase would
+  rewrite it away and strand your work. After a clean sync your HEAD descends from current main and
+  lands cleanly.
+- **Clean** → merged, keep working. **Genuine content conflict** → the merge is LEFT in progress
+  (`MERGE_HEAD` set) for YOU to resolve in `/work/repo` (edit, `git add`, `git commit`), then `zee
+  land`. **Operational failure** (not a conflict) → reported, nothing for you to fix in code.
+- `--no-rebuild` merges without rebuilding the app tier.
+- `zee land` runs this for you automatically if main moved since your cage was cut — but reach for
+  `zee sync` the moment you are asked to rebase or catch up your branch.
+
+### `zee db-catchup` — catch your database up to prod's schema
+`POST /api/xell/self/catchup` `{ restore? }`. The **database** counterpart of `zee sync`: where
+`zee sync` rolls your *code* forward to current main, `zee db-catchup` rolls your **own** database
+forward to **prod's current schema**. Your db is a throwaway clone (or an isolated db), so this is
+**NOT human-gated** — it writes only your db and reads prod read-only.
+
+- Default: apply the **prod-ledger migrations your db doesn't yet reflect** — a forward schema
+  catch-up that preserves your db's contents.
+- `--restore` (isolated dbs only): rebuild from the **latest full prod snapshot** instead — exact
+  schema *and* data, but it **DISCARDS your db's current contents**. Use it when the ledger can't
+  close the gap (the failure message will say so).
+
+Reach for it when your migrations/tests need prod's live schema, or after prod schema moved under a
+long-running xell — the same "catch up" instinct as `zee sync`, one layer down.
+
 ### `zee land` — land your work on main
 `POST /api/xell/self/land`. This is the piece a cxell otherwise can't do: your commits live *inside*
 the container, but landing pushes from the host worktree. So the queenzee:
@@ -145,6 +191,13 @@ land/ship **button** and makes the call. `--clear` lowers it. This is the mechan
 instead of you either force-driving a gate or going silent. (The land/ship buttons ALSO appear on
 their own whenever your git state warrants — unlanded commits → `land`, landed+clean → `ship`; a
 hint is your explicit "I think it's time" on top of that.)
+
+### `zee tend` — raise "I need a human"
+`POST /api/xell/self/tend` `{ reason?, clear? }`. Flags **"I need a human in the console"** on your
+hexagon with `--reason "why"`. It opens no gate and blocks nothing — it is a signal, not a request
+for a specific action (use `hint-land`/`hint-ship` when what you want is a land/ship button). `zee
+tend --clear` lowers it, and any `zee working` clears it too. Use it when you are genuinely stuck on
+something only a human can unblock — not as a substitute for deciding and proceeding.
 
 ### `zee prod` — ask for the production database
 `POST /api/xell/self/prod-request` `{ reason }`. Records a **request only**. It does **not** bind:
