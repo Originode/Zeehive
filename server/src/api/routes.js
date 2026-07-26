@@ -8,6 +8,7 @@ import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
+import { listHarnesses, assignHarness } from '../lib/harness.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
@@ -584,6 +585,17 @@ router.post('/xell/dispatch', async (req, res) => {
 // db-clone cuts the xell its own database inside the shared dev postgres (seconds, template copy).
 router.post('/xells/:id/db', async (req, res) => {
   try { res.json(await attachXellDb(req.params.id, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Harnesses (system-wide config layers). List the enabled ones for the picker; assign/switch a
+// xell's harness (a HUMAN action — a harness decides config, never a landing target, so it is
+// mutable; { harness: <key|id|null> }, null clears back to core-only).
+router.get('/harnesses', async (_req, res) => {
+  try { res.json(await listHarnesses()); }
+  catch (err) { res.status(503).json({ error: err.message }); }
+});
+router.post('/xells/:id/harness', async (req, res) => {
+  try { res.json(await assignHarness(req.params.id, req.body?.harness ?? req.body?.key ?? null)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Apply the xell's pending server/sql/migrations + ops files (at ITS branch head) to ITS OWN

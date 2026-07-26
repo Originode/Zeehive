@@ -154,8 +154,13 @@ export async function refreshHarnesses() {
     const { bundle, hash, errors, warnings } = loadHarnessDir(h.dir);
     if (!bundle) { logline('harness', `${h.key}: INVALID (${errors.join('; ')}) — keeping last good bundle`); continue; }
     for (const w of warnings) logline('harness', `${h.key}: ${w}`);
-    if (hash === h.bundle_hash) continue;   // unchanged
+    // The anchor commit is reconciled every refresh even when the bundle content is unchanged — the
+    // folder's last-touch commit moves as OTHER commits land, and the timeline anchors the node here.
     const head = dirHeadCommit(config.repoRoot, h.dir);
+    if (hash === h.bundle_hash) {
+      if (head && head !== h.head_commit) await q(`UPDATE harness SET head_commit=$2 WHERE id=$1`, [h.id, head]);
+      continue;   // bundle unchanged
+    }
     const avatar = existsSync(resolve(config.repoRoot, h.dir, 'avatar.svg')) ? `${h.dir}/avatar.svg` : null;
     await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=COALESCE($5, avatar_path), label=COALESCE($6, label) WHERE id=$1`,
       [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null]);

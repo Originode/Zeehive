@@ -20,10 +20,11 @@ import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
-         ensureZeehiveKeypair, openCxellSsh } from '../lib/cxell.js';
+         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell } from '../lib/cxell.js';
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
+import { harnessForXell, harnessLayerText, harnessSkillFiles, assignHarness, defaultHarnessId } from '../lib/harness.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -229,7 +230,7 @@ function saveDispatchImages(worktreePath, images) {
 // The queenzee spawns a zee INTO a ready xell's worktree (headless locally, or `claude remote`
 // per the runtime) to run the task. Human confirms in their session before this is called.
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
-                                     headless = true, model, db, db_container, dump, images,
+                                     headless = true, model, db, db_container, dump, images, harness,
                                      provider = 'claude', provider_token_id = null }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
@@ -263,6 +264,21 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // now or the zee spends its turn on the wrong data.
   if (targetId && (db || db_container || dump)) {
     await attachXellDb(targetId, { coupling: db, container: db_container, dump });
+  }
+
+  // Assign the harness BEFORE the zee starts, so its persona/skills are in the very first briefing.
+  // Explicit --harness wins; otherwise a pooled xell with no harness inherits the project default
+  // (pool_config.default_harness_id), exactly like the runtime/db-coupling defaults.
+  if (targetId) {
+    if (harness !== undefined) {
+      await assignHarness(targetId, harness);
+    } else {
+      const cur = await one(`SELECT harness_id FROM xell WHERE id=$1`, [targetId]);
+      if (!cur?.harness_id) {
+        const def = await defaultHarnessId(projectId);
+        if (def) await assignHarness(targetId, def);
+      }
+    }
   }
 
   // Pasted images: save them into the (possibly just-renamed) target worktree and append a
@@ -591,6 +607,11 @@ export async function setZeeMode(zeeId, permissionMode) {
 // asking "want me to continue?" into a void.
 async function briefing(xellId, zee, task, { headless = true, cxell = false } = {}) {
   const b = await bindingFor(xellId, zee, task, { cxell });
+  // The assigned harness (NULL → core only). Its layer text is injected BELOW the law (rules +
+  // "how you are running") and ABOVE the task — the fixed precedence in docs §4. core adds no new
+  // TEXT (its content is the manual + rules, already here), so an unharnessed xell is unchanged.
+  const harness = await harnessForXell(xellId);
+  const harnessBlock = harnessLayerText(harness);
   // Be truthful about who (if anyone) can answer. A dispatched session is still a real session the
   // human can open and talk to — claiming "nobody can answer you" when they can is a lie that
   // pushes the zee to guess instead of surfacing a genuine blocker.
@@ -619,6 +640,7 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
     // db.note, the prod-write warning. A claiming zee gets the whole binding; a dispatched one got
     // three keys. Same handoff, same fields.
     JSON.stringify({ xell: b.xell, containers: b.containers, db: b.db, build: b.build,
+                     ...(harness ? { harness: { key: harness.key, label: harness.label } } : {}),
                      ...(b.device ? { device: b.device } : {}) }, null, 2),
     '```',
     '',
@@ -633,6 +655,8 @@ async function briefing(xellId, zee, task, { headless = true, cxell = false } = 
     '- Explore the codebase before designing: find the existing patterns and build on them.',
     '- When the job is done, stop. A human marks it done in the ZEEHIVE dashboard — never despawn',
     '  yourself, and never touch the xource (the read-only main repo).',
+    // HARNESS LAYER — the assigned persona/skills, below the law above and above the task below.
+    ...(harnessBlock ? ['', harnessBlock] : []),
     '',
     '## Your task',
     task,
@@ -910,11 +934,22 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // from the project manifest, null → ensureCxell's default (CXELL_IMAGE or zeehive/zee-agent).
   const projRow = await one(`SELECT manifest FROM project WHERE id=$1`, [pid]);
   const cxellImage = deviceConfig(projRow).cxellImage;
+  // The harness assigned to this xell (NULL → core only). Drives the skill-file materialization
+  // below and the "your skills come from your harness" line in the prompt.
+  const harness = await harnessForXell(xell.id);
   let sshPort = null;
   try {
     const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id, image: cxellImage });
     sshPort = created.sshPort;
     await cloneIntoCxell({ ctx, name, worktree: xell.worktree_path });
+    // Materialize the assigned harness's SKILL.md files into the cxell (docs §6.2, the Claude
+    // file-loading path — complements the prompt-injected skill text the briefing already carries).
+    // Best-effort and logged: a harness with no skills, or a write that fails, must never sink the
+    // cage build (the zee still has the skills as briefing text either way).
+    for (const f of harnessSkillFiles(harness)) {
+      try { await writeFileIntoCxell({ ctx, slug: xell.slug, relPath: f.relPath, text: f.text }); }
+      catch (e) { logline('cxell', `${name}: could not write harness skill ${f.relPath} (${String(e.message).slice(0, 100)})`); }
+    }
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
     // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
     logline('cxell', `${name}: warming (npm ci + web build) so the zee starts ready…`);
@@ -964,7 +999,11 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  works; guessing instead is how a zee wastes its whole turn.',
     '',
     '## YOUR QUEENZEE VERBS — how a cxell zee lands/ships/goes-to-prod/finishes',
-    'You are walled in: no docker, no host fs, no skills. The queenzee API is your ONLY door out, and',
+    harness && harnessSkillFiles(harness).length
+      ? `You are walled in: no docker, no host fs. Your skills come from your ${harness.label} harness `
+        + '(above) — both as guidance in this briefing and as SKILL.md files in .claude/skills/. The '
+        + 'queenzee API is your ONLY door out, and'
+      : 'You are walled in: no docker, no host fs, no skills. The queenzee API is your ONLY door out, and',
     'it is authenticated as YOU by $ZEEHIVE_XELL_TOKEN (already in your env). Every "skill" a host zee',
     'has is ONE call here. `zee land`/`zee ship`/`zee prod`/`zee done` are each only a REQUEST that',
     'lands on a HUMAN gate — none of them lets you act unilaterally. `zee build` is the exception: it',
