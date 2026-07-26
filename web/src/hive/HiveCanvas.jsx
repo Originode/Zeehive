@@ -316,11 +316,13 @@ function cellNeighbors(row, col) {
 const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
-                                    expandedId, onExpand, hexPosRef, onGeometry, onAction, onContainerMenu,
+                                    expandedId, onExpand, hexPosRef, harnessPosRef, onGeometry, onAction, onContainerMenu,
                                     hoverRef, setHover, subscribeHover }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], flower: null, buttons: null, containers: null });
+  const imgCacheRef = useRef(new Map());   // avatar_url → HTMLImageElement (harness badge art)
+  const drawRef = useRef(() => {});        // latest draw(), so an image onload can trigger a redraw
   const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
   const dragRef = useRef(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -437,6 +439,45 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       geomRef.current.containers = flowerContainerRects(centers, cellSize, expanded);
     }
 
+    // HARNESSES sit in the honeycomb grid too — each takes its own hexagon CELL (docs §5: the badge
+    // is locked to a hex centre, "as if it were a xell in the grid"), reserved AFTER the xells so it
+    // never collides with one. The avatar is drawn on the CANVAS (reliable drawImage of a preloaded
+    // SVG) rather than an SVG <image> that browsers fail to load; <Connectors> routes the consumer
+    // wires through this centre.
+    const harnesses = timeline?.harnesses || [];
+    const harnessCells = [];
+    if (harnesses.length) {
+      const cols = Math.max(1, lay.cols);
+      const occupied = new Set(Object.values(cells).map(([r, c]) => cellKey(r, c)));
+      for (const k of reserved) occupied.add(k);
+      let hr = 0, hc = 0;
+      const nextFree = () => {
+        for (;;) {
+          const k = cellKey(hr, hc);
+          const out = [hr, hc];
+          hc++; if (hc >= cols) { hc = 0; hr++; }
+          if (!occupied.has(k)) { occupied.add(k); return out; }
+        }
+      };
+      const getImg = (url) => {
+        if (!url) return null;
+        let img = imgCacheRef.current.get(url);
+        if (!img) {
+          img = new Image();
+          img.onload = () => requestAnimationFrame(() => drawRef.current && drawRef.current());
+          img.src = url;
+          imgCacheRef.current.set(url, img);
+        }
+        return img;
+      };
+      for (const h of harnesses) {
+        const [row, col] = nextFree();
+        const [cx, cy] = cellCenter(row, col, cellSize, originX, originY);
+        harnessCells.push({ id: h.id, cx, cy, size: drawSize, cell: cellSize, color: h.color });
+        drawHarnessBadge(ctx, cx, cy, drawSize, h, getImg(h.avatar_url));
+      }
+    }
+
     // publish each hex's live CLIENT-space geometry so <Connectors> can route its wires here and
     // re-route on pan/zoom. `size` is the full CELL radius (the gapless routing lattice); `draw` is
     // the shrunk drawn radius (the visible hex the corridors run between).
@@ -449,12 +490,23 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       }
       hexPosRef.current = pos;
     }
+    // publish harness cell centres separately (NOT into hexPosRef — that would make the wire maze
+    // treat a harness as a routing hex). <Connectors> reads this to anchor the badge's wires.
+    if (harnessPosRef) {
+      const r = canvas.getBoundingClientRect();
+      const hp = {};
+      for (const hb of harnessCells) {
+        hp[hb.id] = { x: r.left + v.k * hb.cx + v.x, y: r.top + v.k * hb.cy + v.y,
+          size: hb.cell * v.k, draw: hb.size * v.k, color: hb.color };
+      }
+      harnessPosRef.current = hp;
+    }
     onGeometry && onGeometry();
     // honeySide is a dep so a flip (which moves this pane on screen) re-runs draw and republishes the
     // hexes' fresh client-space positions — otherwise <Connectors> would trace to their old spots.
   }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, expanded, machines, hexPosRef, onGeometry, baseOf]);
 
-  useLayoutEffect(() => { draw(); }, [draw]);
+  useLayoutEffect(() => { drawRef.current = draw; draw(); }, [draw]);
 
   // redraw the canvas when the shared hover changes (hover is read from a ref, not a draw dep)
   useEffect(() => {
@@ -821,6 +873,51 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     ctx.fillText(fit(ctx, hiveStatusLabel(x), w * 0.6), cx, cy + size * 0.34);
   }
   ctx.restore();   // unclip
+  ctx.restore();
+}
+
+// ── harness badge: an avatar seated in its own honeycomb cell (docs §5) ───────
+// A harness reads as "a persona worn by xells", not a work-cell — so instead of the two-half card it
+// draws a faint dashed hex seat with a circular AVATAR at its centre, its label + consumer count
+// below. The avatar image is a preloaded <img> drawn to canvas (reliable, unlike an SVG <image>);
+// a lettermark is the fallback while it loads or if it fails.
+function drawHarnessBadge(ctx, cx, cy, size, h, img) {
+  const col = h.color || '#5b8cff';
+  const ay = cy - size * 0.06;                 // avatar centre, nudged up to leave room for the label
+  const r = size * 0.42;
+  ctx.save();
+  // faint dashed hex seat — this cell is part of the grid, but clearly not a work-cell
+  hexPath(ctx, cx, cy, size);
+  ctx.fillStyle = withAlpha(col, 0.08);
+  ctx.fill();
+  ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha(col, 0.5);
+  ctx.setLineDash([4, 3]); ctx.stroke(); ctx.setLineDash([]);
+  // avatar disc
+  ctx.beginPath(); ctx.arc(cx, ay, r, 0, Math.PI * 2);
+  ctx.fillStyle = COL.bg; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = col; ctx.stroke();
+  if (img && img.complete && img.naturalWidth) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, ay, r - 2, 0, Math.PI * 2); ctx.clip();
+    ctx.drawImage(img, cx - (r - 2), ay - (r - 2), (r - 2) * 2, (r - 2) * 2);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = col;
+    ctx.font = `700 ${r}px 'Segoe UI', sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(String(h.label || 'H')[0], cx, ay);
+  }
+  // label + consumer count
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 ${Math.max(9, size * 0.16)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = COL.text;
+  ctx.fillText(fit(ctx, h.label || '', hexWidth(size) * 0.82), cx, cy + size * 0.5);
+  const n = (h.consumer_ids || []).length;
+  if (n) {
+    ctx.font = `600 ${Math.max(8, size * 0.13)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.muted;
+    ctx.fillText(`×${n}`, cx, cy + size * 0.68);
+  }
   ctx.restore();
 }
 

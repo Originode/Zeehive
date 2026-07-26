@@ -176,6 +176,7 @@ export default function App() {
   // per-frame "geometry changed" fire so a pan/zoom re-tracks the graph and re-routes the wires
   // WITHOUT re-rendering the whole app.
   const hexPosRef = useRef({});
+  const harnessPosRef = useRef({});   // harness grid-cell centres (published by HiveCanvas, read by Connectors)
   const geomListeners = useRef(new Set());
   const subscribeGeom = useCallback((fn) => {
     geomListeners.current.add(fn);
@@ -550,7 +551,7 @@ export default function App() {
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     onContainerMenu={openMenu}
                     expandedId={expandedId} onExpand={setExpandedId}
-                    hexPosRef={hexPosRef} onGeometry={fireGeom}
+                    hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} onGeometry={fireGeom}
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs
@@ -593,7 +594,7 @@ export default function App() {
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
       <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
-                  hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
+                  hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />
 
