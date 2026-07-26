@@ -3,24 +3,11 @@ label: Hermes
 summary: The messenger — crisp delivery, clean handoffs, decisive status.
 
 # Persona is in PERSONALITY.md (auto-detected). Skills are the folders under skills/.
+glyph: "☰"
 skills:
   - handoff-note
   - concise-status
 
-# Bridge to the Hermes web UI (docs/harness-proposal.md §7). Mode B: an outbound, transcript-only
-# mirror — the zee stays in its cxell (full file access); Hermes receives a DISPLAY copy keyed by the
-# xell slug. Two-way (human replies from the Hermes web UI) is the opt-in `inbound` flag, off here.
-bridge:
-  kind: hermes
-  mode: mirror                 # outbound transcript mirror (never runs the agent turn on Hermes)
-  inbound: false               # human→zee replies via sendMessageToXell; opt-in, authenticated when on
-  # Hermes runs its OpenAI-compatible API SERVER and its WEB UI on DIFFERENT ports:
-  #   • base_url  → the API server (API_SERVER_PORT, default 8642), Bearer-authed with API_SERVER_KEY.
-  #     The bridge POSTs the transcript mirror here. Set the key in the ⚙ Harnesses UI (auth_token),
-  #     not in this file — it is a secret and lives in the DB (bridge_override), never the repo.
-  #   • viewer_url_template → the WEB UI (default 8787, browser login) where a human OPENS the thread.
-  # These are set live from the dashboard; the values here are just sensible defaults.
-  base_url: "http://localhost:8642"
-  session_key: slug            # X-Hermes-Session-Key = the xell slug (stable per xell, threads memory)
-  viewer_url_template: "http://localhost:8787/ui/thread/{session_key}"
-  append_path: "/v1/runs"      # OpenAI-compatible run endpoint on the API server
+# NOTE: Hermes here is now just an EXAMPLE persona (personality + two skills) — the external web-UI
+# "bridge" was scratched in favour of authoring custom harnesses in the dashboard (⚙ Harnesses).
+# The AI always runs on Zeehive; a harness only decides the zee's persona/skills/memory.

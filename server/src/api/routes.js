@@ -10,7 +10,8 @@ import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
-import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge } from '../lib/harness.js';
+import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
+         createHarness, updateHarness, deleteHarness, getHarnessFull } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
@@ -596,6 +597,23 @@ router.post('/xells/:id/db', async (req, res) => {
 router.get('/harnesses', async (_req, res) => {
   try { res.json(await listHarnesses()); }
   catch (err) { res.status(503).json({ error: err.message }); }
+});
+// Harness authoring (unlimited DB-owned personas — persona/skills/memory, created from the dashboard).
+router.post('/harnesses', async (req, res) => {
+  try { res.json(await createHarness(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.get('/harnesses/:key/full', async (req, res) => {
+  try { res.json(await getHarnessFull(req.params.key)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+router.put('/harnesses/:key', async (req, res) => {
+  try { res.json(await updateHarness(req.params.key, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/harnesses/:key', async (req, res) => {
+  try { res.json(await deleteHarness(req.params.key)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 // The harness avatar badge (SVG). Resolved from the harness row's avatar_path under the repo root,
 // path-guarded so a crafted key can't escape harnesses/. 404 when a harness has no avatar.

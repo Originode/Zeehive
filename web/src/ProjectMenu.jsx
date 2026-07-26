@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ProjectSetup from './ProjectSetup.jsx';
-import HarnessBridge from './HarnessBridge.jsx';
+import HarnessManager from './HarnessManager.jsx';
 import { showConfirm } from './Dialog.jsx';
 
 // Two separate controls beside the "Project:" label:
@@ -75,15 +75,15 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
           </ul>
           {err && <div className="projpop-err">{err}</div>}
           <button className="projpop-add" onClick={() => openSetup(null)}>＋ Onboard a project</button>
-          {/* Harnesses are system-wide (not per-project), so their setup lives here, not in ProjectSetup. */}
-          <button className="projpop-add" onClick={() => { setShowHarness(true); setOpen(false); }}>⚙ Harnesses — web-UI bridge</button>
+          {/* Harnesses are system-wide (not per-project), so their manager lives here, not in ProjectSetup. */}
+          <button className="projpop-add" onClick={() => { setShowHarness(true); setOpen(false); }}>⚙ Harnesses — personas</button>
         </div>
       )}
       {showSetup && (
         <ProjectSetup project={setup} onClose={() => setShowSetup(false)}
                       onChanged={onChanged} onSelect={onSelect} />
       )}
-      {showHarness && <HarnessBridge onClose={() => setShowHarness(false)} />}
+      {showHarness && <HarnessManager onClose={() => setShowHarness(false)} />}
     </span>
   );
 }

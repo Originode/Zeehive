@@ -69,13 +69,12 @@ export async function assignXellHarness(xellId, harness) {
   });
   return r.ok ? r.json() : Promise.reject(new Error((await r.json().catch(() => ({}))).error || 'assign failed'));
 }
-// Harness → external web-UI bridge (Hermes) setup: read config + last probe, save an edit, or TEST
-// the connection (a real discovery-endpoint probe from the queenzee).
-export const getHarnessBridge = (key) => fetch(`/api/harnesses/${key}/bridge`).then((r) => (r.ok ? r.json() : Promise.reject(new Error('load failed'))));
-export const saveHarnessBridge = (key, body) => fetch(`/api/harnesses/${key}/bridge`, {
-  method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-}).then((r) => (r.ok ? r.json() : Promise.reject(new Error('save failed'))));
-export const testHarnessBridge = (key) => fetch(`/api/harnesses/${key}/bridge/test`, { method: 'POST' }).then((r) => r.json());
+// Harness authoring — unlimited DB-owned personas (persona/skills/memory).
+const jorreject = async (r, msg) => (r.ok ? r.json() : Promise.reject(new Error((await r.json().catch(() => ({}))).error || msg)));
+export const createHarness = (body) => fetch('/api/harnesses', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => jorreject(r, 'create failed'));
+export const getHarnessFull = (key) => fetch(`/api/harnesses/${key}/full`).then((r) => jorreject(r, 'load failed'));
+export const updateHarness = (key, body) => fetch(`/api/harnesses/${key}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => jorreject(r, 'save failed'));
+export const deleteHarness = (key) => fetch(`/api/harnesses/${key}`, { method: 'DELETE' }).then((r) => r.json());
 
 // Dispatch a human-composed prompt EXACTLY like a /xell dispatch: the queenzee claims a ready xell
 // for this project and spawns a zee into its worktree with the task (and any pasted images).

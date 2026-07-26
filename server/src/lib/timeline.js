@@ -150,13 +150,13 @@ export async function getTimeline(projectId, n = 250) {
   let harnesses = [];
   if (assignedHarnessIds.length) {
     const hrows = await q(
-      `SELECT id, key, label, avatar_path, head_commit, bundle->>'summary' AS summary
+      `SELECT id, key, label, avatar_path, head_commit, bundle->>'summary' AS summary, bundle->>'glyph' AS glyph
          FROM harness WHERE id = ANY($1::uuid[]) AND enabled`, [assignedHarnessIds]);
     harnesses = hrows.map((h, i) => {
       const hbase = h.head_commit && known.has(h.head_commit) ? h.head_commit : allCommits[0]?.hash;
       const consumers = anchored.filter((a) => a.harness_id === h.id).map((a) => a.id);
       return {
-        id: h.id, key: h.key, label: h.label, summary: h.summary,
+        id: h.id, key: h.key, label: h.label, summary: h.summary, glyph: h.glyph,
         avatar_url: h.avatar_path ? `/api/harnesses/${h.key}/avatar` : null,
         base_commit: hbase, consumer_ids: consumers, color: HARNESS_COLORS[i % HARNESS_COLORS.length],
       };

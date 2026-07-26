@@ -901,6 +901,11 @@ function drawHarnessBadge(ctx, cx, cy, size, h, img) {
     ctx.beginPath(); ctx.arc(cx, ay, r - 2, 0, Math.PI * 2); ctx.clip();
     ctx.drawImage(img, cx - (r - 2), ay - (r - 2), (r - 2) * 2, (r - 2) * 2);
     ctx.restore();
+  } else if (h.glyph) {
+    // authored persona badge: its chosen glyph (emoji/char) — no image needed
+    ctx.font = `${r * 1.1}px 'Segoe UI Emoji', 'Segoe UI', sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(String(h.glyph), cx, ay + r * 0.04);
   } else {
     ctx.fillStyle = col;
     ctx.font = `700 ${r}px 'Segoe UI', sans-serif`;

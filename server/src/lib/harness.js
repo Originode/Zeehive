@@ -205,14 +205,84 @@ export async function assignHarness(xellId, keyOrId) {
 // List enabled harnesses for the picker/UI (core last — it is implicit/always-on).
 export async function listHarnesses() {
   const rows = await q(
-    `SELECT id, key, label, is_law_core, enabled, avatar_path, head_commit,
-            (bundle->'skills') AS skills, bundle->>'summary' AS summary
+    `SELECT id, key, label, is_law_core, enabled, avatar_path, head_commit, dir,
+            (bundle->'skills') AS skills, bundle->>'summary' AS summary, bundle->>'glyph' AS glyph
        FROM harness WHERE enabled ORDER BY is_law_core, key`);
   return rows.map((h) => ({
     id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core,
-    avatar_path: h.avatar_path, head_commit: h.head_commit, summary: h.summary,
+    avatar_path: h.avatar_path, head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
+    file_backed: !!h.dir,
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
   }));
+}
+
+// ── harness authoring (DB-owned personas — unlimited, created from the dashboard) ────────────────
+// A harness is a PERSONA an AI assumes as a zee: personality + skills + memory. The `core` law
+// harness is off-limits. File-backed harnesses (a `dir`) are repo-managed; EDITING one detaches it
+// to DB ownership (dir → NULL) so refreshHarnesses can no longer clobber the operator's edits.
+const slugKey = (s) => String(s || '').toLowerCase().trim()
+  .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'harness';
+
+function normalizeSkills(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map((s) => ({ name: String(s?.name || '').slice(0, 60), when: String(s?.when || '').slice(0, 400), body: String(s?.body || '') }))
+    .filter((s) => s.name);
+}
+function normalizeMemory(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map((m) => ({ path: String(m?.path || m?.name || 'note').slice(0, 80), text: String(m?.text || '') }))
+    .filter((m) => m.text);
+}
+
+export async function createHarness({ key, label, glyph } = {}) {
+  const k = slugKey(key || label);
+  if (k === 'core') throw new Error('"core" is reserved for the law harness');
+  if (await one(`SELECT id FROM harness WHERE key=$1`, [k])) throw new Error(`a harness "${k}" already exists`);
+  const bundle = { label: label || k, ...(glyph ? { glyph: String(glyph).slice(0, 4) } : {}) };
+  await one(`INSERT INTO harness (key,label,bundle,enabled,is_law_core) VALUES ($1,$2,$3,true,false) RETURNING id`,
+    [k, label || k, JSON.stringify(bundle)]);
+  logline('harness', `created harness "${k}"`);
+  return getHarnessFull(k);
+}
+
+export async function updateHarness(key, patch = {}) {
+  const h = await one(`SELECT * FROM harness WHERE key=$1`, [key]);
+  if (!h) throw new Error(`no harness "${key}"`);
+  if (h.is_law_core) throw new Error('the core (law) harness is not editable');
+  const bundle = (typeof h.bundle === 'string' ? JSON.parse(h.bundle) : h.bundle) || {};
+  if ('personality' in patch) bundle.personality = String(patch.personality || '');
+  if ('summary' in patch) bundle.summary = String(patch.summary || '').slice(0, 200);
+  if ('glyph' in patch) bundle.glyph = String(patch.glyph || '').slice(0, 4);
+  if ('skills' in patch) bundle.skills = normalizeSkills(patch.skills);
+  if ('memory' in patch) bundle.memory = normalizeMemory(patch.memory);
+  const label = 'label' in patch ? (String(patch.label || '').trim() || h.label) : h.label;
+  const enabled = 'enabled' in patch ? !!patch.enabled : h.enabled;
+  // detach from any file backing so refreshHarnesses can't overwrite this edit
+  await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5, dir=NULL WHERE key=$1`,
+    [key, JSON.stringify(bundle), label, enabled, hashOf(JSON.stringify(bundle))]);
+  logline('harness', `updated harness "${key}" (${(bundle.skills || []).length} skill(s), ${(bundle.memory || []).length} memory)`);
+  return getHarnessFull(key);
+}
+
+export async function deleteHarness(key) {
+  const h = await one(`SELECT is_law_core FROM harness WHERE key=$1`, [key]);
+  if (!h) return { deleted: false };
+  if (h.is_law_core) throw new Error('the core (law) harness cannot be deleted');
+  await q(`DELETE FROM harness WHERE key=$1`, [key]);   // xell.harness_id is ON DELETE SET NULL
+  logline('harness', `deleted harness "${key}"`);
+  return { deleted: true };
+}
+
+// The full editable persona for the authoring UI.
+export async function getHarnessFull(key) {
+  const h = await one(`SELECT * FROM harness WHERE key=$1`, [key]);
+  if (!h) throw new Error(`no harness "${key}"`);
+  const b = typeof h.bundle === 'string' ? JSON.parse(h.bundle) : (h.bundle || {});
+  return {
+    key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core, file_backed: !!h.dir,
+    glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
+    skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
+  };
 }
 
 // Build the HARNESS-LAYER text block for a briefing (personality + skills-as-text + memory). This is
