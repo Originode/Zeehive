@@ -1058,6 +1058,16 @@ a.cbox:hover { border-color: var(--accent); }
 .disp-submit:hover { filter: brightness(1.1); }
 .disp-submit:disabled, .disp-cancel:disabled { opacity: .5; cursor: default; }
 
+/* harness web-UI bridge setup */
+.disp-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }
+.disp-input { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 7px; padding: 7px 10px; font-size: 13px; font-family: 'Cascadia Code', monospace; width: 100%; }
+.disp-input:focus { outline: none; border-color: var(--accent); }
+.disp-testrow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bridge-probe { font-size: 12px; font-weight: 600; }
+.bridge-probe.ok { color: var(--add, #35c46b); }
+.bridge-probe.bad { color: var(--del, #e5554e); }
+
 /* ── toasts: async-dispatch progress, bottom-right, above the overlay layer ────── */
 .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: flex;
   flex-direction: column; gap: 10px; max-width: min(380px, 92vw); pointer-events: none; }

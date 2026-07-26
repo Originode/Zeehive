@@ -10,7 +10,7 @@ import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
-import { listHarnesses, assignHarness } from '../lib/harness.js';
+import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
@@ -612,6 +612,20 @@ router.get('/harnesses/:key/avatar', async (req, res) => {
 });
 router.post('/xells/:id/harness', async (req, res) => {
   try { res.json(await assignHarness(req.params.id, req.body?.harness ?? req.body?.key ?? null)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Harness BRIDGE setup surface (docs §7): read/edit the live connection to a harness's external web
+// UI (Hermes), and TEST it (real discovery-endpoint probe). Config is applied live — no land/ship.
+router.get('/harnesses/:key/bridge', async (req, res) => {
+  try { res.json(await getBridge(req.params.key)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+router.put('/harnesses/:key/bridge', async (req, res) => {
+  try { res.json(await setBridge(req.params.key, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/harnesses/:key/bridge/test', async (req, res) => {
+  try { res.json(await probeBridge(req.params.key)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // INBOUND bridge (docs §7): a human replies to the zee FROM the harness's web UI (Hermes). Addressed

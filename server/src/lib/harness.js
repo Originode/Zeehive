@@ -253,10 +253,60 @@ export function harnessSkillFiles(harness) {
   }));
 }
 
-// The bridge config for a harness (docs §7) — outbound transcript mirror + optional inbound reply.
-// Returns null when the harness declares none.
+// The EFFECTIVE bridge config for a harness (docs §7) — the HARNESS.yml `bridge:` block (file
+// default) with the operator's live DB override (migration 045) layered on top, so a dashboard edit
+// wins over the file without a land/ship. Returns null when neither declares a bridge.
 export function harnessBridge(harness) {
   if (!harness) return null;
   const b = typeof harness.bundle === 'string' ? JSON.parse(harness.bundle) : (harness.bundle || {});
-  return b.bridge || null;
+  const file = b.bridge || null;
+  const ov = harness.bridge_override
+    ? (typeof harness.bridge_override === 'string' ? JSON.parse(harness.bridge_override) : harness.bridge_override)
+    : null;
+  if (!file && !ov) return null;
+  return { ...(file || {}), ...(ov || {}) };
+}
+
+// ── bridge setup surface (dashboard) ─────────────────────────────────────────
+// Read the effective bridge config + the last probe result for the setup UI.
+export async function getBridge(key) {
+  const h = await one(`SELECT * FROM harness WHERE key=$1`, [key]);
+  if (!h) throw new Error(`no harness "${key}"`);
+  return { key: h.key, label: h.label, config: harnessBridge(h) || {}, probe: h.bridge_probe || null };
+}
+
+// Persist an operator edit to the live bridge connection (only known keys; the file block stays the
+// default underneath). Does NOT ship — it is live config, applied to the next dispatched zee.
+const BRIDGE_KEYS = ['base_url', 'enabled', 'inbound', 'session_key', 'append_path', 'viewer_url_template', 'mode'];
+export async function setBridge(key, patch = {}) {
+  const h = await one(`SELECT bridge_override FROM harness WHERE key=$1`, [key]);
+  if (!h) throw new Error(`no harness "${key}"`);
+  const cur = h.bridge_override
+    ? (typeof h.bridge_override === 'string' ? JSON.parse(h.bridge_override) : h.bridge_override)
+    : {};
+  const next = { ...cur };
+  for (const k of BRIDGE_KEYS) if (k in patch) next[k] = patch[k];
+  await q(`UPDATE harness SET bridge_override=$2 WHERE key=$1`, [key, JSON.stringify(next)]);
+  logline('harness', `${key}: bridge config updated (base_url=${next.base_url || '—'}, enabled=${!!next.enabled}, inbound=${!!next.inbound})`);
+  return getBridge(key);
+}
+
+// TEST CONNECTION — actually probe the configured Hermes instance's discovery endpoint and record
+// the result. This is the honest "did Hermes answer?" check (real network round-trip from the
+// queenzee), the thing that turns "wired" into "verified against a live instance".
+export async function probeBridge(key) {
+  const h = await one(`SELECT * FROM harness WHERE key=$1`, [key]);
+  if (!h) throw new Error(`no harness "${key}"`);
+  const cfg = harnessBridge(h) || {};
+  const stamp = (p) => q(`UPDATE harness SET bridge_probe=$2 WHERE key=$1`, [key, JSON.stringify(p)]).then(() => p);
+  if (!cfg.base_url) return stamp({ ok: false, at: new Date().toISOString(), detail: 'no base_url configured — set the Hermes instance URL first' });
+  const url = `${String(cfg.base_url).replace(/\/$/, '')}/v1/discovery`;
+  try {
+    const res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(6000) });
+    const body = await res.text().catch(() => '');
+    return stamp({ ok: res.ok, status: res.status, url, at: new Date().toISOString(),
+      detail: res.ok ? (body.slice(0, 400) || 'reachable (empty body)') : `HTTP ${res.status} — ${body.slice(0, 200)}` });
+  } catch (e) {
+    return stamp({ ok: false, url, at: new Date().toISOString(), detail: `unreachable: ${String(e.message).slice(0, 200)}` });
+  }
 }
