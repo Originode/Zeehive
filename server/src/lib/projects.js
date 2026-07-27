@@ -506,8 +506,11 @@ export async function projectReadiness(id) {
 // ── the dev spawn template: what a NEW xell gets by default ─────────────────
 export async function getPoolConfig(projectId) {
   return one(
-    `SELECT pc.*, r.key AS runtime_key, r.label AS runtime_label
-       FROM pool_config pc LEFT JOIN agent_runtime r ON r.id = pc.default_runtime_id
+    `SELECT pc.*, r.key AS runtime_key, r.label AS runtime_label,
+            h.key AS harness_key, h.label AS harness_label
+       FROM pool_config pc
+       LEFT JOIN agent_runtime r ON r.id = pc.default_runtime_id
+       LEFT JOIN harness h ON h.id = pc.default_harness_id
       WHERE pc.project_id=$1`, [projectId]);
 }
 
@@ -554,6 +557,22 @@ export async function updatePoolConfig(projectId, body = {}) {
     if (!r) throw new Error(`no enabled runtime keyed "${body.default_runtime_key}"`);
     vals.push(r.id);
     sets.push(`default_runtime_id = $${vals.length}`);
+  }
+  // Default harness: the persona a BARE dispatch attaches (intake reads pool_config.default_harness_id
+  // when --harness is omitted and the pooled xell has none). A key names a harness; '' / 'none' /
+  // 'core-only' clears it back to core-only (the law layer, always on). The core (law) harness is not
+  // a selectable default — every xell already gets it.
+  if (body.default_harness_key !== undefined) {
+    const key = String(body.default_harness_key || '').trim().toLowerCase();
+    if (!key || key === 'none' || key === 'core-only') {
+      vals.push(null);
+      sets.push(`default_harness_id = $${vals.length}`);
+    } else {
+      const h = await one(`SELECT id FROM harness WHERE key=$1 AND enabled AND NOT is_law_core`, [key]);
+      if (!h) throw new Error(`no enabled harness keyed "${key}"`);
+      vals.push(h.id);
+      sets.push(`default_harness_id = $${vals.length}`);
+    }
   }
   if (!sets.length) return pc;
   const row = await one(`UPDATE pool_config SET ${sets.join(', ')} WHERE project_id=$1 RETURNING *`, vals);

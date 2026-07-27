@@ -5,7 +5,7 @@ import {
   githubAccess, pushProject, pullRequestProject,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
-  deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
+  deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes, getHarnesses,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
   getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
@@ -1134,10 +1134,13 @@ function TokensSection({ project, run, busy }) {
 function SpawnSection({ project, run }) {
   const [pc, setPc] = useState(null);
   const [runtimes, setRuntimes] = useState([]);
+  const [harnesses, setHarnesses] = useState([]);
   const [ctxs, setCtxs] = useState([]);
   useEffect(() => {
     getPoolConfig(project.id).then(setPc).catch(() => {});
     getRuntimes().then(setRuntimes).catch(() => {});
+    // Non-core, enabled harnesses only — core is the always-on law layer, never a selectable default.
+    getHarnesses().then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     getDockerContexts().then(setCtxs).catch(() => {});
   }, [project.id]);
   if (!pc) return null;
@@ -1157,6 +1160,11 @@ function SpawnSection({ project, run }) {
         <label>Default runtime
           <select value={pc.runtime_key || ''} onChange={(e) => save({ default_runtime_key: e.target.value })}>
             {runtimes.filter((r) => r.enabled !== false).map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
+          </select></label>
+        <label>Default harness <span className="pc">(persona a bare dispatch wears)</span>
+          <select value={pc.harness_key || ''} onChange={(e) => save({ default_harness_key: e.target.value })}>
+            <option value="">core only (no persona)</option>
+            {harnesses.map((h) => <option key={h.key} value={h.key}>{h.label}</option>)}
           </select></label>
         <label>Compile on <span className="pc">(build host for new xells{project.registry ? '' : ' — set a Build registry to enable'})</span>
           <select value={pc.default_build_ctx || ''} onChange={(e) => save({ default_build_ctx: e.target.value })}
