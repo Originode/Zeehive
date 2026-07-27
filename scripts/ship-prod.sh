@@ -142,12 +142,21 @@ PLAN="$(dc up -d --no-deps --dry-run "$SVC" 2>&1)" || {
   printf '%s\n' "$PLAN" >&2; emit false plan-failed; exit 1; }
 printf '%s\n' "$PLAN" >&2
 
-if printf '%s\n' "$PLAN" | grep -qiE '^[[:space:]]*Container[[:space:]]+[^[:space:]]*(db|postgres|pgdata|redis|synapse|livekit|mosquitto|caddy|element|tunnel)'; then
+# The infra keyword must be a DELIMITED name component, not a raw substring. Container names are
+# `_`/`-`-separated (project_service_suffix), and on a RECREATE `docker compose up` first renames
+# the retiring copy to `<12-hex-id>_<name>` — e.g. `20c1ce8e9dbb_omnibiz_webapp_prod`. That hex
+# prefix can contain "db" (…e9dbb…), so a raw substring match flags the app recreating its OWN
+# container as "infrastructure" and aborts every real ship. Anchoring each keyword to a leading
+# `_`/`-` boundary (and a trailing delimiter/space/EOL) pins the match to a genuine service
+# component: `omnibiz_db_prod_v184` still trips it; a recreate hex hash does not. Do NOT loosen
+# this back to a substring match.
+INFRA_RE='Container[[:space:]]+[^[:space:]]*[_-](db|postgres|pgdata|redis|synapse|livekit|mosquitto|caddy|element|tunnel)([_-]|[[:space:]]|$)'
+if printf '%s\n' "$PLAN" | grep -qiE "$INFRA_RE"; then
   echo "" >&2
   echo "  REFUSING TO SHIP: the plan for '$SVC' touches infrastructure, not just the app." >&2
   echo "  A ship deploys CODE. It must never create or recreate the database." >&2
   echo "  Offending plan lines:" >&2
-  printf '%s\n' "$PLAN" | grep -iE '^[[:space:]]*Container[[:space:]]+[^[:space:]]*(db|postgres|redis|synapse|livekit|mosquitto|caddy|element|tunnel)' | sed 's/^/    /' >&2
+  printf '%s\n' "$PLAN" | grep -iE "$INFRA_RE" | sed 's/^/    /' >&2
   echo "  Likely cause: a depends_on edge from '$SVC' into infra. Fix the compose file or this" >&2
   echo "  script's scoping — do NOT relax this check." >&2
   emit false plan-touches-infra; exit 1
