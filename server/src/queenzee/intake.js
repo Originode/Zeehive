@@ -1051,7 +1051,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  - `zee tend --reason "…"`    → raise "I need a human in the console" (blocks nothing, opens no gate); `zee tend --clear` (or any `zee working`) lowers it.',
     '  - `zee prod --reason "..."`  → ASK to be bound to the prod database. Recorded only — a human confirms, then the cxell is re-sealed to reach prod. Until then you cannot.',
     '  - `zee done --summary "..."` → propose your job is done. A human confirms with "Mark done"; THAT tears the cxell down. Never try to despawn yourself.',
-    'The FULL manual (every verb, its gate, the golden rules) is at `/work/repo/docs/cxell-zee-manual.md` —',
+    'The FULL manual (every verb, its gate, the golden rules) is delivered by your HARNESS — if you wear one',
+    'that inherits Zee Base it is a file in your xell at `.zeehive/harness/memory/cxell-zee-manual.md`. Read it. —',
     'Read it. Each verb maps to the same landgate/shipgate/prod/done a human drives from the console;',
     'nothing here is a bypass. Commit freely; you can only ever ASK to land, ship, bind-prod, or finish.',
   ].join('\n');

@@ -12,7 +12,7 @@ import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
-import { refreshHarnesses, ensureZeeBaseManual } from './lib/harness.js';
+import { refreshHarnesses } from './lib/harness.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
@@ -97,8 +97,6 @@ try {
   // Reconcile each harness row with its files under harnesses/<key>/ (parsed, hashed projection —
   // same as the manifest). Loud-but-never-fatal: a broken harness keeps its last good bundle.
   await refreshHarnesses();
-  // Ingest the cxell manual into Zee Base's meta-DB memory (harness-gated, not a repo file).
-  await ensureZeeBaseManual();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }

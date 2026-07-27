@@ -190,24 +190,10 @@ export async function refreshHarnesses() {
   }
 }
 
-// INGEST the cxell manual INTO the meta DB as Zee Base's OWNED memory (not a live repo-file ref, so
-// it is harness-gated: only zees wearing a harness that inherits Zee Base get it, injected as a file
-// into their xell). Reads docs/cxell-zee-manual.md once at boot as the source, stores the text on the
-// harness row (harness.bundle.memory), and keeps it fresh if the source changes. Idempotent.
-export async function ensureZeeBaseManual() {
-  const zb = await one(`SELECT * FROM harness WHERE key='zee-base'`);
-  if (!zb) return;
-  const src = resolve(config.repoRoot, 'docs', 'cxell-zee-manual.md');
-  if (!existsSync(src)) { logline('harness', 'zee-base: manual source not found — leaving memory as-is'); return; }
-  const text = readFileSync(src, 'utf8').trim();
-  const bundle = (typeof zb.bundle === 'string' ? JSON.parse(zb.bundle) : zb.bundle) || {};
-  const existing = (bundle.memory || []).find((m) => /cxell-zee-manual/i.test(m.path || ''));
-  if (existing && existing.text === text) return;               // already current
-  bundle.memory = [{ path: 'cxell-zee-manual.md', text }, ...(bundle.memory || []).filter((m) => !/cxell-zee-manual/i.test(m.path || ''))];
-  const j = JSON.stringify(bundle);
-  await q(`UPDATE harness SET bundle=$1, bundle_hash=$2 WHERE key='zee-base'`, [j, hashOf(j)]);
-  logline('harness', `zee-base: cxell manual ingested into the meta DB (${text.length} chars)`);
-}
+// NOTE: the cxell manual now lives INSIDE the meta DB — seeded directly into Zee Base's
+// harness.bundle.memory by migration 047, and Zee Base is DB-owned (dir=NULL) so refreshHarnesses
+// never touches it. There is no boot-time file ingest (that depended on a repo file and was fragile);
+// the manual is editable in the manager and injected into a xell only via harness assignment.
 
 // ── resolution + assembly (used by the briefing) ─────────────────────────────
 export async function coreHarness() {

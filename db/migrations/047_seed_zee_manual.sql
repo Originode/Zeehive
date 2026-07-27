@@ -1,4 +1,20 @@
-# The cxell-zee manual
+-- SEED the cxell-zee manual INTO the meta DB, and make Zee Base FULLY DB-OWNED.
+--
+-- Per the design the manual must live in the meta DB and reach a xell only via harness injection —
+-- not as a repo doc any zee can read. This writes the full manual into harness.bundle.memory AND
+-- sets dir=NULL so refreshHarnesses() (which reads harnesses/<key>/) never touches or clobbers it.
+-- The manager (DB-owned, editable) + this seed are the source of truth; docs/cxell-zee-manual.md and
+-- the harnesses/zee-base/ folder are removed.
+UPDATE harness SET
+  dir = NULL,
+  label = 'Zee Base',
+  bundle = jsonb_build_object(
+    'label', 'Zee Base',
+    'glyph', '🐝',
+    'summary', 'The foundation every zee stands on — the cxell-zee manual, carried as memory.',
+    'memory', jsonb_build_array(jsonb_build_object(
+      'path', 'cxell-zee-manual.md',
+      'text', $ZEEMAN$# The cxell-zee manual
 
 You are a **cxell zee**: an autonomous agent running `claude --bare` *inside* a per-xell container
 (the "cxell"). This document is authoritative — it is what your briefing points you to.
@@ -225,3 +241,6 @@ don't reach for `zee done` to signal completion.
 Your commits are collected from the cxell when the job completes (or when you `zee land`). Nothing you
 do in the cxell can touch the host, other xells, or prod directly — every privileged step is a request
 that a human approves and the queenzee performs. That is why you can be handed every verb safely.
+$ZEEMAN$))
+  )
+ WHERE key='zee-base';
