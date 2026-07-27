@@ -1,10 +1,9 @@
 version: 1
 label: Zee Base
 glyph: "🐝"
-summary: The foundation every zee stands on — the cxell-zee manual, fully incorporated.
+summary: The foundation every zee stands on — the cxell-zee manual, carried as memory.
 
-# The full cxell-zee manual is incorporated as this harness's memory. loadHarnessDir resolves a
-# memory path against the harness folder first, then the repo root — so this reads the LIVE manual
-# (no copy, no drift). Every harness that inherits Zee Base carries the manual with it.
-memory:
-  - docs/cxell-zee-manual.md
+# The cxell manual is NOT referenced from a repo file here (a repo file is readable by every zee).
+# It is INGESTED into the meta DB as this harness's memory by ensureZeeBaseManual() at boot, so it is
+# harness-gated: only a zee wearing a harness that inherits Zee Base gets it, injected as a file into
+# its xell on assignment/dispatch. This folder only carries the persona/label/glyph.
