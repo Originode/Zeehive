@@ -21,7 +21,7 @@ import { checkContainers, decommissionContainer } from '../queenzee/containers.j
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
          setMachinePriority } from '../lib/machines.js';
-import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices } from '../lib/devices.js';
+import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell, purgeDevXells } from '../queenzee/reaper.js';
@@ -844,9 +844,15 @@ router.post('/machines/:id/adb-host', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // List the phones plugged into a machine's shared adb host (`adb devices` in the adb-host container).
+// ?register=1&project=<id> AUTO-REGISTERS every ready serial as a shared USB device row (item #3).
 router.get('/machines/:id/usb-devices', async (req, res) => {
-  try { res.json(await listUsbDevices(req.params.id)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try {
+    if (req.query.register === '1' || req.query.register === 'true') {
+      if (!req.query.project) return res.status(400).json({ error: 'project required to auto-register discovered devices' });
+      return res.json(await discoverUsbDevices(req.params.id, { projectId: req.query.project }));
+    }
+    res.json(await listUsbDevices(req.params.id));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Attach (or ?action=detach) a device to a xell by id — the dashboard's "attach device" button.
 router.post('/xells/:id/device', async (req, res) => {

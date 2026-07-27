@@ -9,16 +9,21 @@
 import React, { useState, useEffect } from 'react';
 import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
-         setMachinePool, setMachinePriority, getSites, createSite } from './api.js';
-import { showAlert, showConfirm } from './Dialog.jsx';
+         setMachinePool, setMachinePriority, getSites, createSite,
+         registerDevice, provisionAdbHost, getUsbDevices } from './api.js';
+import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 
-const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' };
-const ROLES = ['db', 'server', 'webapp', 'other'];
+const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', device: 'Device', other: 'Other' };
+const BASE_ROLES = ['db', 'server', 'webapp', 'other'];
 
 const fail = (what) => (e) => showAlert(`${what} failed: ${e?.error || e?.message || e}`, { variant: 'error' });
 
 export default function MachineMatrix({ machines, containers, projectId, onMenu, onChanged }) {
   const ms = machines || [];
+  // The device row is opt-in: shown only when this project actually uses devices (a device chip
+  // exists, or a machine is marked can_device), so ordinary projects keep a 4-row matrix.
+  const usesDevices = (containers.device || []).length > 0 || ms.some((m) => m.can_device);
+  const ROLES = usesDevices ? ['db', 'server', 'webapp', 'device', 'other'] : BASE_ROLES;
   const all = ROLES.flatMap((r) => (containers[r] || []).map((c) => ({ ...c, _role: r })));
 
   // Where a container lives, for column placement: its own run context — or, for a PROCESS role
@@ -185,7 +190,17 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
                  onChange={(e) => patch({ can_build: e.target.checked })} />
           🔨
         </label>
+        {/* can_device (035): this host can run Android emulators (needs a Linux host with /dev/kvm)
+            or tether physical phones. A xell's device xhip is REFUSED on a machine that lacks it. */}
+        <label className={`mx-build mx-device${m.can_device ? ' on' : ''}`} data-testid={`mx-candevice-${m.key}`}
+               title={m.can_device ? 'Device host — can run Android emulators (needs /dev/kvm) and/or share tethered phones over adb. Device xhips can attach here.'
+                                   : 'NOT a device host — emulators need a Linux host with /dev/kvm. Tick to allow device xhips (emulators + tethered phones) here.'}>
+          <input type="checkbox" checked={!!m.can_device} disabled={busy}
+                 onChange={(e) => patch({ can_device: e.target.checked })} />
+          📱
+        </label>
       </div>
+      {m.can_device && <DevicePanel m={m} projectId={projectId} />}
       {m.dev_priority > 0 && !hasDevDb && (
         <button className={`mx-devdb${devDbElsewhere ? '' : ' quiet'}`} data-testid={`mx-devdb-${m.key}`}
                 disabled={busy} onClick={provisionDb}
@@ -199,12 +214,64 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
   );
 }
 
+// Device host controls (035), shown under a can_device machine's header. Three actions over the new
+// routes: stand up the shared adb-host (so its USB-plugged phones are reachable over TCP), discover +
+// auto-register those phones, and register a phone by hand (network-adb or a specific USB serial).
+function DevicePanel({ m, projectId }) {
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
+  const run = (what, fn) => async () => {
+    setBusy(true);
+    try { return await fn(); }
+    catch (e) { fail(what)(e); }
+    finally { setBusy(false); }
+  };
+
+  const adbHost = run('adb-host', async () => {
+    if (!(await showConfirm(`Stand up the shared adb-host on ${m.key}?\n\n`
+      + `This runs one container on ${m.key} that shares its USB-plugged phones over TCP (adb server on :5037).\n\n`
+      + `⚠ An open adb server is UNAUTHENTICATED root on every attached phone — it MUST be firewalled to the trusted LAN.`,
+      { okLabel: 'Provision adb-host' }))) return;
+    const r = await provisionAdbHost(m.id);
+    showAlert(`adb-host up on ${m.key}: ${r.name}\n\nList devices:  ${r.list}\n\n⚠ Firewall ${r.adb_server} to the trusted LAN.`);
+  });
+
+  const discover = run('USB discovery', async () => {
+    const r = await getUsbDevices(m.id, { register: true, projectId });
+    const reg = (r.registered || []).map((d) => d.serial).join(', ') || 'none';
+    const skip = (r.skipped || []).map((d) => `${d.serial} (${d.reason})`).join('\n  ') || 'none';
+    showAlert(`USB discovery on ${m.key}:\n\nregistered: ${reg}\nskipped:\n  ${skip}`);
+  });
+
+  const registerNet = run('register device', async () => {
+    const port = await showPrompt(`Register a NETWORK device on ${m.key}\n\nThe phone's adb-over-tcp port (from \`adb tcpip <port>\` on the handset). Its host defaults to ${m.host_ip || m.docker_ctx}.`,
+      { placeholder: '5555', okLabel: 'Register' });
+    if (!port) return;
+    const r = await registerDevice({ project: projectId, machine_id: m.id, transport: 'net', adb_port: Number(port) });
+    showAlert(`Registered ${r.device?.name}\n\nconnect:  ${r.device?.connect}`);
+  });
+
+  return (
+    <div className="mx-devpanel" data-testid={`mx-devpanel-${m.key}`}>
+      <button className="mx-devbtn" disabled={busy} onClick={() => setOpen((o) => !o)}
+              title="Device host actions — adb-host, USB discovery, register a phone">📱 devices ▾</button>
+      {open && (
+        <div className="mx-devactions">
+          <button disabled={busy} onClick={adbHost} title="Run the shared adb-host container (shares USB phones over TCP)">adb-host</button>
+          <button disabled={busy} onClick={discover} title="Scan the adb-host and auto-register every ready USB phone as a device">discover USB</button>
+          <button disabled={busy} onClick={registerNet} title="Register a phone reachable over network adb (adb tcpip)">＋ net device</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // "+ machine": register another docker host. The context list comes from docker itself, so the
 // choice is always a context this queenzee can actually reach.
 function AddMachine({ projectId, onChanged }) {
   const [open, setOpen] = useState(false);
   const [ctxs, setCtxs] = useState(null);
-  const [f, setF] = useState({ key: '', docker_ctx: '', host_ip: '', can_build: false, dev_priority: 0, pool_size: 0, max_xells: 0 });
+  const [f, setF] = useState({ key: '', docker_ctx: '', host_ip: '', can_build: false, can_device: false, dev_priority: 0, pool_size: 0, max_xells: 0 });
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     if (!open || ctxs) return;
@@ -219,7 +286,7 @@ function AddMachine({ projectId, onChanged }) {
       await createMachine({ ...f, key: f.key.trim() || f.docker_ctx, host_ip: f.host_ip.trim() || null,
                             project_id: projectId });
       setOpen(false);
-      setF({ key: '', docker_ctx: '', host_ip: '', can_build: false, dev_priority: 0, pool_size: 0, max_xells: 0 });
+      setF({ key: '', docker_ctx: '', host_ip: '', can_build: false, can_device: false, dev_priority: 0, pool_size: 0, max_xells: 0 });
       onChanged?.();
     } catch (e) { fail('Add machine')(e); }
     finally { setBusy(false); }
@@ -242,6 +309,7 @@ function AddMachine({ projectId, onChanged }) {
       <label>pool<input type="number" min="0" value={f.pool_size} onChange={(e) => setF({ ...f, pool_size: Number(e.target.value) })} /></label>
       <label>cap<input type="number" min="0" value={f.max_xells} onChange={(e) => setF({ ...f, max_xells: Number(e.target.value) })} /></label>
       <label className="mx-cb"><input type="checkbox" checked={f.can_build} onChange={(e) => setF({ ...f, can_build: e.target.checked })} />🔨 builds</label>
+      <label className="mx-cb"><input type="checkbox" checked={f.can_device} onChange={(e) => setF({ ...f, can_device: e.target.checked })} />📱 devices</label>
       <button disabled={busy || !f.docker_ctx} onClick={save}>Add</button>
       <button className="mx-cancel" onClick={() => setOpen(false)}>✕</button>
     </div>

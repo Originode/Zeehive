@@ -1,0 +1,11 @@
+-- Device boot readiness (035 follow-up): a docker 'running' emulator is NOT yet installable — the
+-- Android system inside takes ~30–60s to finish booting after the container starts. The health
+-- monitor used to map docker-running → 'up' for every role, so a device chip went green the instant
+-- the container ran, inviting a zee to `adb install` into a device that would refuse it.
+--
+-- 'booting' is the honest in-between: the container runs, but adb/getprop sys.boot_completed says the
+-- OS is not up yet. The container health monitor sets it for a per-xell emulator whose adb readiness
+-- probe reports not-booted, and promotes it to 'up' only once boot_completed=1 — so 'up' means
+-- installable. Role-agnostic in the schema (it is just another container_health value); only the
+-- device probe ever produces it today.
+ALTER TYPE container_health ADD VALUE IF NOT EXISTS 'booting';

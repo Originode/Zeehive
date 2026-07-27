@@ -319,6 +319,25 @@ export async function registerPhysicalDevice({ projectId, machineId, adbPort = n
   return { ok: true, device: deviceHandle({ ...row, host_addr: hostAddr }) };
 }
 
+// ── BOOT READINESS (item #2) ────────────────────────────────────────────────────────────────────
+// A docker-'running' emulator is not the same as a BOOTED, installable Android device: the AVD inside
+// takes ~30–60s to finish booting. This probes the real thing — `adb shell getprop sys.boot_completed`
+// INSIDE the emulator container (budtmo/docker-android ships adb + the emulator on one host, so we
+// exec locally rather than reach in over TCP). The container health monitor calls this for a running
+// per-xell emulator to decide 'up' (booted) vs 'booting' (running, not yet installable).
+//   'booted'  → boot_completed=1: the device will accept `adb install`.
+//   'booting' → the container runs but the OS is not up yet.
+//   'unknown' → we could NOT tell (simulate, no ctx, or the exec failed) — the caller MUST NOT trap a
+//               device in 'booting' on an inconclusive probe; treat unknown as "trust docker running".
+export async function deviceBootState(container) {
+  if (MODE !== 'real' || !container?.docker_ctx || !container?.name) return 'unknown';
+  const r = spawnSync('docker',
+    ['--context', container.docker_ctx, 'exec', container.name, 'adb', 'shell', 'getprop', 'sys.boot_completed'],
+    { encoding: 'utf8', timeout: 12000, windowsHide: true });
+  if (r.status !== 0) return 'unknown';
+  return (r.stdout || '').trim() === '1' ? 'booted' : 'booting';
+}
+
 // ── SHARING USB DEVICES: the adb-host container ─────────────────────────────────────────────────
 // A phone plugged into a machine over USB is visible ONLY to that machine's local adb server. To
 // SHARE it with cxells (which run on the queenzee's daemon, and with other machines), we run ONE
@@ -372,4 +391,31 @@ export async function listUsbDevices(machineId) {
     .map((l) => l.trim()).filter(Boolean)
     .map((l) => { const [serial, state] = l.split(/\s+/); return { serial, state: state || 'unknown' }; });
   return { ok: true, machine: m.key, devices };
+}
+
+// ── USB AUTO-DISCOVERY (item #3) ────────────────────────────────────────────────────────────────
+// Enumerate a machine's USB-plugged phones (listUsbDevices) and REGISTER every ready one as a shared
+// USB device row for `project`, so a human doesn't hand-type each serial. Idempotent: registerPhysical
+// upserts on (project, name) and the name is derived from the serial, so re-running just refreshes.
+// Only serials in adb state 'device' are registered — an 'unauthorized'/'offline' phone isn't usable
+// yet (accept the RSA prompt on the handset first), so we report it as skipped instead of registering
+// a dead row. Returns what it found, what it added, and what it skipped and why.
+export async function discoverUsbDevices(machineId, { projectId }) {
+  if (!projectId) throw new Error('projectId required to auto-register discovered devices');
+  const listed = await listUsbDevices(machineId);
+  if (!listed.ok) return { ...listed, registered: [], skipped: [] };
+  const registered = [];
+  const skipped = [];
+  for (const d of listed.devices) {
+    if (d.state !== 'device') { skipped.push({ ...d, reason: `adb state '${d.state}' (not ready — authorize it on the handset)` }); continue; }
+    try {
+      const r = await registerPhysicalDevice({ projectId, machineId, transport: 'usb', serial: d.serial });
+      registered.push({ serial: d.serial, name: r.device?.name || null });
+    } catch (err) {
+      skipped.push({ ...d, reason: err.message });
+    }
+  }
+  logline('device', `USB discovery on ${listed.machine}: ${registered.length} registered, ${skipped.length} skipped `
+    + `(of ${listed.devices.length} attached)`);
+  return { ok: true, machine: listed.machine, devices: listed.devices, registered, skipped };
 }

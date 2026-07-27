@@ -3,7 +3,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
-         extractXellEnv } from './api.js';
+         extractXellEnv, attachXellDevice, detachXellDevice } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
@@ -817,6 +817,51 @@ function BuildAllButton({ x }) {
   );
 }
 
+// The device xhip slot on a xell card (035). Renders the attached device's chip when there is one,
+// with a detach control; otherwise, for a device-enabled project, a faint "＋📱 device" affordance
+// that attaches one (emulator or the project's physical default). Absent entirely for a project that
+// does not opt into devices AND has none attached, so ordinary stacks stay three chips wide.
+function DeviceSlot({ x, onMenu, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const device = (x.stack || []).find((s) => s.role === 'device');
+  if (!device && !x.device_enabled) return null;
+
+  const attach = async (e) => {
+    e.stopPropagation();
+    setBusy(true);
+    try { await attachXellDevice(x.id); onChanged?.(); }
+    catch (err) { showAlert('Attach device failed: ' + (err?.error || err?.message || err), { variant: 'error' }); }
+    finally { setBusy(false); }
+  };
+  const detach = async (e) => {
+    e.stopPropagation();
+    if (!(await showConfirm(`Detach the device from ${x.slug}?\n\n`
+      + (device.name?.includes('phys') ? 'The shared physical device is only UNLINKED — the phone is untouched.'
+         : 'The per-xell emulator is stopped and removed.'), { okLabel: 'Detach' }))) return;
+    setBusy(true);
+    try { await detachXellDevice(x.id); onChanged?.(); }
+    catch (err) { showAlert('Detach device failed: ' + (err?.error || err?.message || err), { variant: 'error' }); }
+    finally { setBusy(false); }
+  };
+
+  if (device) {
+    return (
+      <span className="devslot" onClick={(e) => e.stopPropagation()}>
+        <ContainerChip c={device} onMenu={onMenu} />
+        <button className="devdetach" data-testid={`device-detach-${x.slug}`} disabled={busy}
+                title="Detach this device from the xell" onClick={detach}>✕</button>
+      </span>
+    );
+  }
+  return (
+    <button className="cbox empty devattach" data-role="device" data-testid={`device-attach-${x.slug}`}
+            disabled={busy} onClick={attach}
+            title={`Attach a ${x.device_kind === 'physical' ? 'physical' : 'emulator'} device to ${x.slug} — build, install and screenshot your app on it`}>
+      {busy ? '…' : '＋📱'}
+    </button>
+  );
+}
+
 // Confirm-and-tear-down. Goes through the task when there is one; otherwise reaps the xell
 // directly — a xell can legitimately have no task row (a dispatched zee that reported done), and
 // gating the only teardown button on task_id stranded those forever. Extracted from the drawer
@@ -999,6 +1044,11 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             ? <ContainerChip key={role} c={c} onMenu={onMenu} hammer />
             : <span key={role} className="cbox empty" data-role={role} title={`no ${role} container`}>—</span>;
         })}
+        {/* Device xhip (035): a mobile device the zee builds/installs/screenshots on. Shown only for
+            a device-enabled project (or whenever one is actually attached) so non-device projects
+            stay a clean three-chip stack. The chip is a real container chip (health/viewer URL); the
+            control attaches/detaches it to THIS xell. */}
+        <DeviceSlot x={x} onMenu={onMenu} onChanged={onDone} />
       </div>
       <div className="meta">
         {!isProd && (

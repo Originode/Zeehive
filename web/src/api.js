@@ -386,6 +386,53 @@ export async function provisionMachineDevDb(machineId, projectId) {
   return jsonOrThrow(r, 'provision dev db');
 }
 
+// ── device xhips (035): mobile devices as a container role ────────────────────
+// The registered SHARED (physical) devices for a project — the pool a xell links from.
+export async function getDevices(projectId) {
+  const r = await fetch(`/api/devices?project=${encodeURIComponent(projectId)}`);
+  return jsonOrThrow(r, 'list devices');
+}
+// Register a physical phone as a shared device on a can_device machine. transport 'net' (give
+// adb_port) or 'usb' (give serial; adb_port defaults to the shared 5037 adb-server).
+export async function registerDevice(body) {
+  const r = await fetch('/api/devices', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  return jsonOrThrow(r, 'register device');
+}
+// Stand up the shared adb-host on a machine (shares its USB-plugged phones over TCP :5037).
+export async function provisionAdbHost(machineId, port) {
+  const r = await fetch(`/api/machines/${machineId}/adb-host`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(port ? { port } : {}),
+  });
+  return jsonOrThrow(r, 'provision adb-host');
+}
+// The phones plugged into a machine's shared adb host (`adb devices` in the adb-host container).
+// ?register=1 auto-registers every discovered serial as a shared USB device row (item #3).
+export async function getUsbDevices(machineId, { register = false, projectId = null } = {}) {
+  const qs = register ? `?register=1${projectId ? `&project=${encodeURIComponent(projectId)}` : ''}` : '';
+  const r = await fetch(`/api/machines/${machineId}/usb-devices${qs}`);
+  return jsonOrThrow(r, 'list usb devices');
+}
+// Attach a device to a named xell by id (the dashboard's "attach device"). kind overrides the
+// project's manifest default (emulator | physical).
+export async function attachXellDevice(xellId, kind = null) {
+  const r = await fetch(`/api/xells/${xellId}/device`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(kind ? { kind } : {}),
+  });
+  return jsonOrThrow(r, 'attach device');
+}
+// Detach (emulator: stop+remove; physical: unlink) the device attached to a xell.
+export async function detachXellDevice(xellId) {
+  const r = await fetch(`/api/xells/${xellId}/device`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'detach' }),
+  });
+  return jsonOrThrow(r, 'detach device');
+}
+
 // Build every buildable (server + webapp) container of a xell.
 export async function buildXell(xellId, hot = false) {
   const r = await fetch(`/api/xells/${xellId}/build`, {

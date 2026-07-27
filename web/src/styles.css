@@ -374,6 +374,10 @@ a.cbox:hover { border-color: var(--accent); }
 .cdot.up { background: var(--up); box-shadow: 0 0 4px var(--up); }
 .cdot.down, .cdot.purged { background: var(--down); }
 .cdot.building { background: var(--building); }
+/* A device emulator that is running but still booting Android — not yet installable. Amber, and
+   pulsing so it reads as "in progress" rather than a settled state (035/048 boot readiness). */
+.cdot.booting { background: var(--building); box-shadow: 0 0 4px var(--building); animation: dotpulse 1.1s ease-in-out infinite; }
+@keyframes dotpulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 .cbox.empty { color: var(--muted); border-style: dashed; }
 
 /* ── what KIND of thing this chip is: glyph + tint ──────────────────────────
@@ -387,8 +391,12 @@ a.cbox:hover { border-color: var(--accent); }
    Glyph opacity is baked into the SVG: a CSS `opacity` would fade the name too.
    Nothing for `other`/infra — a grab-bag (caddy, synapse, redis, livekit…) with
    no single honest icon, and a wrong glyph is worse than none. */
-.cbox[data-role="db"], .cbox[data-role="server"], .cbox[data-role="webapp"] {
+.cbox[data-role="db"], .cbox[data-role="server"], .cbox[data-role="webapp"], .cbox[data-role="device"] {
   background-repeat: no-repeat; background-position: center 3px; background-size: 14px 14px;
+}
+.cbox[data-role="device"] {
+  background-color: rgba(53, 196, 107, .16);   /* green — the device tier */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='1.8' opacity='0.55'%3E%3Crect x='7' y='2.5' width='10' height='19' rx='2'/%3E%3Cpath d='M10.5 19h3' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 .cbox[data-role="db"] {
   background-color: rgba(224, 138, 59, .18);   /* orange */
@@ -605,6 +613,24 @@ a.cbox:hover { border-color: var(--accent); }
 /* bootstrap state — the project's FIRST dev db: an offer, not an alarm */
 .mx-devdb.quiet { background: none; color: var(--muted); border: 1px dashed var(--line); }
 .mx-devdb.quiet:hover:not(:disabled) { color: var(--text); border-color: var(--accent); background: none; }
+/* device host (035): the 📱 capability toggle + the actions panel under a can_device header */
+.mx-device.on { color: #6fe39a; }
+.mx-devpanel { margin-top: 5px; }
+.mx-devbtn { font-size: 11px; background: rgba(53,196,107,.12); color: #9fe8bd;
+  border: 1px solid rgba(53,196,107,.5); border-radius: 5px; padding: 2px 7px; cursor: pointer; }
+.mx-devbtn:hover:not(:disabled) { background: rgba(53,196,107,.25); }
+.mx-devactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.mx-devactions button { font-size: 10px; background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; cursor: pointer; }
+.mx-devactions button:hover:not(:disabled) { border-color: #6fe39a; }
+/* device slot on a xell card: the attached device chip + its detach ✕, or the attach affordance */
+.devslot { position: relative; display: inline-flex; align-items: center; }
+.devdetach { position: absolute; top: -5px; right: -5px; width: 14px; height: 14px; line-height: 12px;
+  font-size: 9px; text-align: center; border-radius: 50%; border: 1px solid var(--line);
+  background: var(--panel2); color: var(--muted); cursor: pointer; padding: 0; }
+.devdetach:hover:not(:disabled) { color: #ff9a8a; border-color: #d9553b; }
+.devattach { cursor: pointer; font-size: 11px; }
+.devattach:hover:not(:disabled) { border-style: solid; border-color: #6fe39a; color: #9fe8bd; }
 .mx-role { align-self: center; }
 .mx-cell { min-height: 26px; }
 .mx-add { align-self: start; justify-self: start; background: var(--panel2); border: 1px dashed var(--line);

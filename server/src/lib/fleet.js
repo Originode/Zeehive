@@ -5,6 +5,7 @@ import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
+import { deviceConfig } from './devices.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -162,6 +163,12 @@ async function decorateXell(x, heads, deployed, project) {
   // want in to debug it. Everything else IS a docker container, so it needs to be running ('up').
   for (const c of stack) c.shellable = containerShellable(project, c);
   x.stack = stack;
+  // Does THIS project support device xhips (manifest device.enabled)? Drives whether the card shows
+  // the attach-device affordance. device_kind is the project's default shape (emulator|physical), so
+  // the card can label the button without re-reading the manifest. A real prod xell never gets one.
+  const dcfg = deviceConfig(project);
+  x.device_enabled = !x.is_production && dcfg.enabled;
+  x.device_kind = dcfg.kind;
   // pretty-print the name column exactly like the mockup expects
   x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
 
@@ -244,7 +251,7 @@ export async function getFleet(projectId) {
   // Same shell-capability the xell stack carries (decorateXell) — the MATRIX renders these rows,
   // so without it every matrix chip reads "shell unavailable" even for an up process role.
   for (const c of containers) c.shellable = containerShellable(project, c);
-  const groups = { db: [], server: [], webapp: [], other: [] };
+  const groups = { db: [], server: [], webapp: [], device: [], other: [] };
   for (const c of containers) (groups[c.role] || groups.other).push(c);
 
   // The hive's machines with THIS project's pool sizes (machine_pool, 025) — the matrix renders

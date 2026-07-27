@@ -426,8 +426,15 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
       ))}
 
       {/* Decommission: every non-production container. Production is excluded outright — it shows a
-          protected note instead, never an action. A busy container can't be removed mid-op. */}
-      {prod ? (
+          protected note instead, never an action. A busy container can't be removed mid-op. A DEVICE
+          is never decommissioned from here — decommission deletes the row, which for a SHARED physical
+          device would destroy the registration. Detach it from its xell card instead (emulator: stop
+          + remove; physical: unlink), so a shared phone is never lost by a stray right-click. */}
+      {c.role === 'device' ? (
+        <div className="ctxsub ctxbusy-note" data-testid="device-detach-note">
+          📱 device — detach it from the xell card (✕), not here
+        </div>
+      ) : prod ? (
         <div className="ctxprotected" data-testid="decommission-protected">🛡 production — protected</div>
       ) : busy ? (
         <div className="ctxsub ctxbusy-note">decommission unavailable while busy</div>
