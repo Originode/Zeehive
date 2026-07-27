@@ -627,6 +627,7 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-adblist { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; font-size: 10px; }
 .mx-adberr { color: #ffb4a2; }
 .mx-adbempty { color: var(--muted); }
+.mx-adbnote { margin-top: 2px; color: var(--muted); opacity: .85; line-height: 1.35; }
 .mx-adbrow { display: flex; align-items: center; gap: 6px; }
 .mx-adbstate { width: 6px; height: 6px; border-radius: 50%; background: var(--unknown); flex: none; }
 .mx-adbstate.s-device { background: var(--up); }

@@ -293,7 +293,10 @@ function DevicePanel({ m, projectId }) {
               {adb.error
                 ? <div className="mx-adberr">{adb.error}</div>
                 : adb.devices.length === 0
-                  ? <div className="mx-adbempty">{`no adb devices seen${adb.source ? ` (via ${adb.source})` : ''} — \`adb connect <ip:port>\` a phone, or provision the adb-host for USB`}</div>
+                  ? <div className="mx-adbempty">
+                      <b>{`no adb devices seen${adb.source ? ` (via ${adb.source})` : ''}`}</b>
+                      {adb.note ? <div className="mx-adbnote">{adb.note}</div> : null}
+                    </div>
                   : adb.devices.map((d) => (
                       <div className="mx-adbrow" key={d.serial} data-testid={`adb-${d.serial}`}>
                         <span className={`mx-adbstate s-${d.state}`} title={`adb state: ${d.state}`} />

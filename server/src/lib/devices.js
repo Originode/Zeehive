@@ -442,7 +442,19 @@ export async function listAdbDevices(machineId, { projectId = null } = {}) {
     }
     return { ...d, kind, registered };
   });
-  return { ok: true, machine: m.key, source, devices };
+  // WHERE this ran matters, and an empty list is usually a location mismatch, not a fault: `adb
+  // devices` here reads the adb server ON THE SERVER'S HOST (source='host-adb') or inside the machine's
+  // adb-host container ('adb-host') — NOT the operator's laptop. A phone plugged into a Windows/Mac
+  // workstation is on THAT box's adb server; Windows does not share USB into WSL/Docker (needs
+  // usbipd-win), and a remote/prod server is a different machine on a different network. So say so, and
+  // point at the path that always works for a network phone: register it by its ip:port directly.
+  const note = source === 'adb-host'
+    ? `read from the shared adb-host container on ${m.key}.`
+    : `read from the adb server on the SERVER host (no adb-host container on ${m.key}). A phone plugged `
+      + `into your workstation is on ITS adb server, not this one — Windows/Mac don't share USB into `
+      + `WSL/Docker/a remote server. For a network (wifi/tcp) phone, skip this and register its ip:port `
+      + `with "＋ net device"; for USB on a can_device host, provision the adb-host there first.`;
+  return { ok: true, machine: m.key, source, devices, note };
 }
 
 // ── USB AUTO-DISCOVERY (item #3) ────────────────────────────────────────────────────────────────
