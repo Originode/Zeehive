@@ -129,7 +129,10 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
         const maze = offsetPolyline(r.pts, off);           // channel-offset corridor path
         // pin the shared through-vertex to the harness badge CENTRE so every consumer's trace visibly
         // runs THROUGH the hexagon (and parallel consumers converge there — reading as one junction).
-        if (r.harnessAt != null && r.harnessCenter && maze[r.harnessAt]) maze[r.harnessAt] = r.harnessCenter;
+        // Interior vertices only — never move the entry lead-in or the xell endpoint.
+        if (r.harnessAt != null && r.harnessCenter && r.harnessAt > 0 && r.harnessAt < maze.length - 1) {
+          maze[r.harnessAt] = r.harnessCenter;
+        }
         const e0 = maze[0];                                // offset entry point
         const corner = portrait ? [dd.dx, e0[1]] : [e0[0], dd.dy];  // ⟂ off the spine, then 90° turn
         const poly = [[dd.dx, dd.dy], corner, ...maze];
