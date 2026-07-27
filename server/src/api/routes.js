@@ -9,7 +9,7 @@ import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
-import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels } from '../queenzee/intake.js';
+import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
@@ -629,8 +629,12 @@ router.get('/harnesses/:key/avatar', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 router.post('/xells/:id/harness', async (req, res) => {
-  try { res.json(await assignHarness(req.params.id, req.body?.harness ?? req.body?.key ?? null)); }
-  catch (err) { res.status(400).json({ error: err.message }); }
+  try {
+    const r = await assignHarness(req.params.id, req.body?.harness ?? req.body?.key ?? null);
+    // inject the (new) harness's files into a live cxell zee so a switch takes effect without a rebuild
+    const inj = await reinjectHarnessIntoXell(req.params.id);
+    res.json({ ...r, injected: inj });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Harness BRIDGE setup surface (docs §7): read/edit the live connection to a harness's external web
 // UI (Hermes), and TEST it (real discovery-endpoint probe). Config is applied live — no land/ship.

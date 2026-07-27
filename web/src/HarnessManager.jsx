@@ -5,7 +5,20 @@ import { getHarnesses, getHarnessFull, createHarness, updateHarness, deleteHarne
 // layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
 // law harness is not shown here (it is not editable). This is a DB-owned surface: create/edit/delete
 // applies live, no land/ship.
-const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, skills: [], memory: [], enabled: true, file_backed: false });
+const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, skills: [], memory: [], enabled: true, file_backed: false, inherited: { skills: [], memory: [], chain: [] } });
+
+// order the flat harness list into a parent→child tree (depth for indentation)
+function treeRows(list) {
+  const byParent = {};
+  for (const h of list) (byParent[h.parent || ''] = byParent[h.parent || ''] || []).push(h);
+  const rows = [];
+  const walk = (pk, depth) => { for (const h of (byParent[pk] || [])) { rows.push({ h, depth }); walk(h.key, depth + 1); } };
+  walk('', 0);
+  // any orphan whose parent isn't in the list (disabled/removed) still shows at root
+  const seen = new Set(rows.map((r) => r.h.key));
+  for (const h of list) if (!seen.has(h.key)) rows.push({ h, depth: 0 });
+  return rows;
+}
 
 export default function HarnessManager({ onClose }) {
   const [list, setList] = useState([]);
@@ -68,8 +81,10 @@ export default function HarnessManager({ onClose }) {
         </div>
         <div className="hm-body">
           <aside className="hm-list">
-            {list.map((h) => (
-              <button key={h.key} className={`hm-item ${sel === h.key ? 'on' : ''}`} onClick={() => open(h.key)}>
+            {treeRows(list).map(({ h, depth }) => (
+              <button key={h.key} className={`hm-item ${sel === h.key ? 'on' : ''}`} onClick={() => open(h.key)}
+                      style={{ marginLeft: depth * 14 }} title={depth ? `inherits ${h.parent}` : ''}>
+                {depth > 0 && <span className="hm-branch">↳</span>}
                 <span className="hm-glyph">{h.glyph || (h.label || '?')[0]}</span>
                 <span className="hm-name">{h.label}</span>
                 <span className="hm-meta">{h.skill_count}★{h.file_backed ? ' · repo' : ''}</span>
@@ -144,6 +159,19 @@ export default function HarnessManager({ onClose }) {
                   ))}
                   <button className="hm-add" onClick={addMem}>＋ Add memory</button>
                 </div>
+
+                {form.inherited && (form.inherited.skills.length > 0 || form.inherited.memory.length > 0) && (
+                  <div className="disp-field">
+                    <label className="disp-label">Inherited — from {form.inherited.chain.join(' → ') || 'parent'}</label>
+                    {form.inherited.skills.map((s, i) => (
+                      <div key={`is${i}`} className="hm-inh">★ <b>{s.name}</b> <span className="disp-hint">— {s.when}</span></div>
+                    ))}
+                    {form.inherited.memory.map((m, i) => (
+                      <div key={`im${i}`} className="hm-inh">🧠 <b>{m.path}</b> <span className="disp-hint">({(m.text || '').length.toLocaleString()} chars)</span></div>
+                    ))}
+                    <div className="disp-hint">Read-only — carried from the parent chain (e.g. the cxell manual from Zee Base). Edit it on the parent.</div>
+                  </div>
+                )}
 
                 <div className="disp-field">
                   <label className="disp-label">Enabled</label>

@@ -190,6 +190,25 @@ export async function refreshHarnesses() {
   }
 }
 
+// INGEST the cxell manual INTO the meta DB as Zee Base's OWNED memory (not a live repo-file ref, so
+// it is harness-gated: only zees wearing a harness that inherits Zee Base get it, injected as a file
+// into their xell). Reads docs/cxell-zee-manual.md once at boot as the source, stores the text on the
+// harness row (harness.bundle.memory), and keeps it fresh if the source changes. Idempotent.
+export async function ensureZeeBaseManual() {
+  const zb = await one(`SELECT * FROM harness WHERE key='zee-base'`);
+  if (!zb) return;
+  const src = resolve(config.repoRoot, 'docs', 'cxell-zee-manual.md');
+  if (!existsSync(src)) { logline('harness', 'zee-base: manual source not found — leaving memory as-is'); return; }
+  const text = readFileSync(src, 'utf8').trim();
+  const bundle = (typeof zb.bundle === 'string' ? JSON.parse(zb.bundle) : zb.bundle) || {};
+  const existing = (bundle.memory || []).find((m) => /cxell-zee-manual/i.test(m.path || ''));
+  if (existing && existing.text === text) return;               // already current
+  bundle.memory = [{ path: 'cxell-zee-manual.md', text }, ...(bundle.memory || []).filter((m) => !/cxell-zee-manual/i.test(m.path || ''))];
+  const j = JSON.stringify(bundle);
+  await q(`UPDATE harness SET bundle=$1, bundle_hash=$2 WHERE key='zee-base'`, [j, hashOf(j)]);
+  logline('harness', `zee-base: cxell manual ingested into the meta DB (${text.length} chars)`);
+}
+
 // ── resolution + assembly (used by the briefing) ─────────────────────────────
 export async function coreHarness() {
   return one(`SELECT * FROM harness WHERE is_law_core LIMIT 1`);
@@ -227,11 +246,13 @@ export async function assignHarness(xellId, keyOrId) {
 // List enabled harnesses for the picker/UI (core last — it is implicit/always-on).
 export async function listHarnesses() {
   const rows = await q(
-    `SELECT id, key, label, is_law_core, enabled, avatar_path, head_commit, dir,
-            (bundle->'skills') AS skills, bundle->>'summary' AS summary, bundle->>'glyph' AS glyph
-       FROM harness WHERE enabled ORDER BY is_law_core, key`);
+    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.avatar_path, h.head_commit, h.dir,
+            (h.bundle->'skills') AS skills, h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
+            p.key AS parent
+       FROM harness h LEFT JOIN harness p ON p.id = h.parent_id
+      WHERE h.enabled ORDER BY h.is_law_core, h.key`);
   return rows.map((h) => ({
-    id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core,
+    id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core, parent: h.parent,
     avatar_path: h.avatar_path, head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
     file_backed: !!h.dir,
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
@@ -312,11 +333,42 @@ export async function getHarnessFull(key) {
   if (!h) throw new Error(`no harness "${key}"`);
   const b = typeof h.bundle === 'string' ? JSON.parse(h.bundle) : (h.bundle || {});
   const parent = h.parent_id ? (await one(`SELECT key FROM harness WHERE id=$1`, [h.parent_id]))?.key || null : null;
+  // inherited = the merged parent chain (so the editor can SHOW what this harness gets from its
+  // parents — e.g. the cxell manual carried by Zee Base — even though it is not this row's OWN memory)
+  let inherited = { skills: [], memory: [], chain: [] };
+  if (h.parent_id) {
+    const eff = await effectiveHarness(await one(`SELECT * FROM harness WHERE id=$1`, [h.parent_id]));
+    if (eff) inherited = { skills: eff.skills, memory: eff.memory, chain: eff.chain };
+  }
   return {
     key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core, file_backed: !!h.dir,
     parent, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
+    inherited,
   };
+}
+
+// The FILES an effective harness materializes into a xell (docs §6) — its persona, skills, and
+// memory (incl. the cxell manual carried by Zee Base). Injected into the cxell at dispatch AND when a
+// harness is (re)assigned to a live zee, so the persona is real files in the workspace, not just
+// prompt text. Skills also load as Claude SKILL.md; persona + memory land under .zeehive/harness/.
+const fileSafe = (s) => String(s || 'note').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'note';
+export function harnessFiles(eff) {
+  if (!eff) return [];
+  const files = [];
+  if (eff.personality && eff.personality.trim()) {
+    files.push({ relPath: '.zeehive/harness/PERSONA.md', text: `# ${eff.label} — persona\n\n${eff.personality.trim()}\n` });
+  }
+  for (const s of eff.skills || []) {
+    if (!s.body) continue;
+    files.push({ relPath: `.claude/skills/${fileSafe(s.name)}/SKILL.md`, text: `---\nname: ${s.name}\ndescription: ${String(s.when).replace(/\n/g, ' ')}\n---\n\n${s.body}\n` });
+  }
+  for (const m of eff.memory || []) {
+    if (!m.text) continue;
+    const base = fileSafe(String(m.path).split('/').pop() || 'memory').replace(/\.md$/, '') + '.md';
+    files.push({ relPath: `.zeehive/harness/memory/${base}`, text: m.text });
+  }
+  return files;
 }
 
 // Resolve a harness's INHERITANCE CHAIN (root → … → leaf) by walking parent_id, and MERGE it into one

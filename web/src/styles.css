@@ -1077,6 +1077,8 @@ a.cbox:hover { border-color: var(--accent); }
   background: var(--panel2); border: 1px solid transparent; color: var(--text); cursor: pointer; text-align: left; }
 .hm-item:hover { border-color: var(--line); }
 .hm-item.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel2)); }
+.hm-branch { color: var(--muted); font-size: 12px; margin-right: -2px; }
+.hm-inh { font-size: 12px; color: var(--text); padding: 3px 0; }
 .hm-glyph { font-size: 15px; width: 20px; text-align: center; }
 .hm-name { flex: 1; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hm-meta { font-size: 10px; color: var(--muted); }
