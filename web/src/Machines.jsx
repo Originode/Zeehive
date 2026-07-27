@@ -244,10 +244,17 @@ function DevicePanel({ m, projectId }) {
   });
 
   const registerNet = run('register device', async () => {
-    const port = await showPrompt(`Register a NETWORK device on ${m.key}\n\nThe phone's adb-over-tcp port (from \`adb tcpip <port>\` on the handset). Its host defaults to ${m.host_ip || m.docker_ctx}.`,
-      { placeholder: '5555', okLabel: 'Register' });
-    if (!port) return;
-    const r = await registerDevice({ project: projectId, machine_id: m.id, transport: 'net', adb_port: Number(port) });
+    // The phone's OWN adb-over-tcp address, host:port (from `adb connect <ip>:<port>` on the handset).
+    // A wifi-adb phone lives at its own IP — NOT the machine's — so we ask for the full address and
+    // default the host to the machine's IP only when the operator gives a bare port.
+    const addr = await showPrompt(`Register a NETWORK device on ${m.key}\n\nThe phone's adb address — host:port (e.g. 10.1.6.205:42005), as you'd \`adb connect\` it. A bare port defaults the host to ${m.host_ip || m.docker_ctx}.`,
+      { placeholder: '10.1.6.205:42005', okLabel: 'Register' });
+    if (!addr) return;
+    const [a, b] = String(addr).trim().split(':');
+    const host = b ? a : null;                 // "ip:port" → host a; bare "port" → default host
+    const port = Number(b || a);
+    if (!Number.isInteger(port) || port <= 0) { showAlert('Enter a valid host:port (or a bare port).', { variant: 'error' }); return; }
+    const r = await registerDevice({ project: projectId, machine_id: m.id, transport: 'net', adb_port: port, host });
     showAlert(`Registered ${r.device?.name}\n\nconnect:  ${r.device?.connect}`);
   });
 
