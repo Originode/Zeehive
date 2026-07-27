@@ -193,8 +193,14 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
   const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit);
 
   return (
+    // zIndex:1 keeps the trace-line overlay a LOW decorative layer: above the honeycomb canvas
+    // (which is z-auto inside the honey pane, so the wires still thread the cells) but beneath every
+    // dialog and UI surface. Anything positioned (the in-honey terminal-choice/message-composer
+    // overlays, all the fixed modals, panel chrome) therefore renders ON TOP of the wires, never
+    // buried by them. Do NOT raise this above the dialog layer, and do NOT lift the honey PANE
+    // above it — a pane-level z-index makes the pane a stacking context that covers the modals.
     <svg className="connectors" width={size.w} height={size.h}
-         style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', zIndex: 5 }}>
+         style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', zIndex: 1 }}>
       {paths.map((p) => {
         const hovered = isHov(p);
         const opacity = p.dim ? 0.12 : (hoverActive ? (hovered ? 1 : 0.1) : 0.92);
