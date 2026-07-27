@@ -320,7 +320,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
                                     hoverRef, setHover, subscribeHover }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
-  const geomRef = useRef({ hexes: [], flower: null, buttons: null, containers: null });
+  const geomRef = useRef({ hexes: [], harnesses: [], flower: null, buttons: null, containers: null });
   const imgCacheRef = useRef(new Map());   // avatar_url → HTMLImageElement (harness badge art)
   const drawRef = useRef(() => {});        // latest draw(), so an image onload can trigger a redraw
   const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
@@ -407,10 +407,14 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     });
     const hexById = {}; for (const hx of hexes) hexById[hx.id] = hx;
 
-    // hover highlight: a hovered hex OR a hovered commit dot lights up the matching hex(es)
-    const H = hoverRef ? hoverRef.current : { id: null, commit: null };
-    const hoverActive = !!(H.id || H.commit);
-    const isHov = (id) => id === H.id || (!!H.commit && baseOf(id) === H.commit);
+    // hover highlight: a hovered hex, a hovered commit dot, OR a hovered harness badge lights up the
+    // matching hex(es). Hovering a harness highlights every xell that wears it (its consumers) —
+    // the reverse of a xell hover highlighting the harness it wears.
+    const H = hoverRef ? hoverRef.current : { id: null, commit: null, harness: null };
+    const hovHarness = H.harness ? (timeline?.harnesses || []).find((h) => h.id === H.harness) : null;
+    const hovHarnessConsumers = new Set(hovHarness?.consumer_ids || []);
+    const hoverActive = !!(H.id || H.commit || H.harness);
+    const isHov = (id) => id === H.id || (!!H.commit && baseOf(id) === H.commit) || hovHarnessConsumers.has(id);
 
     // honeycomb + flower, on the pan/zoom world transform
     ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
@@ -470,21 +474,26 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         }
         return img;
       };
-      // which xell(s) are focused right now (hovered or expanded) → a harness badge lights up when a
-      // focused xell WEARS it, and dims with everything else when the focus is on a xell that doesn't.
+      // which xell(s) are focused right now (hovered/expanded, OR the consumers of a hovered harness)
+      // → a harness badge lights up when a focused xell WEARS it, and dims with everything else when
+      // the focus is on a xell that doesn't.
       const focusedIds = new Set();
       if (expandedId) focusedIds.add(expandedId);
       if (H.id) focusedIds.add(H.id);
       if (H.commit) for (const t of (timeline?.xells || [])) if (t.base_commit === H.commit) focusedIds.add(t.id);
-      const anyFocus = focusedIds.size > 0;
+      for (const id of hovHarnessConsumers) focusedIds.add(id);
+      const anyFocus = focusedIds.size > 0 || !!H.harness;
       for (const h of harnesses) {
         const [row, col] = nextFree();
         const [cx, cy] = cellCenter(row, col, cellSize, originX, originY);
         harnessCells.push({ id: h.id, cx, cy, size: drawSize, cell: cellSize, color: h.color });
-        const hi = (h.consumer_ids || []).some((id) => focusedIds.has(id));
+        // a harness badge is hi when it is the one being hovered, or a focused xell wears it
+        const hi = h.id === H.harness || (h.consumer_ids || []).some((id) => focusedIds.has(id));
         drawHarnessBadge(ctx, cx, cy, drawSize, h, getImg(h.avatar_url), { hi, dim: anyFocus && !hi });
       }
     }
+    // record harness cells (drawn radius) so a hover/click can hit-test them like a hex
+    geomRef.current.harnesses = harnessCells;
 
     // publish each hex's live CLIENT-space geometry so <Connectors> can route its wires here and
     // re-route on pan/zoom. `size` is the full CELL radius (the gapless routing lattice); `draw` is
@@ -560,6 +569,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     for (const hx of geomRef.current.hexes) if (pointInHex(wx, wy, hx.cx, hx.cy, hx.size)) return hx;
     return null;
   }, []);
+  const hitHarness = useCallback((wx, wy) => {
+    for (const hb of geomRef.current.harnesses || []) if (pointInHex(wx, wy, hb.cx, hb.cy, hb.size)) return hb;
+    return null;
+  }, []);
   const hitFlower = useCallback((wx, wy) => {
     const f = geomRef.current.flower;
     if (!f) return null;
@@ -616,9 +629,15 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       emitHover({ id: null, commit: null });
     } else {
       const hx = hitHex(wx, wy);
-      const id = hx?.id || null;
-      emitHover({ id, commit: null });   // a hex is ONE xell → key on id, so only this hex lights up
-      cursor = hx ? 'pointer' : 'default';
+      if (hx) {
+        emitHover({ id: hx.id, commit: null, harness: null });   // a hex is ONE xell → key on id
+        cursor = 'pointer';
+      } else {
+        // no hex under the cursor → a harness badge lights up its consumer xells (reverse highlight)
+        const hb = hitHarness(wx, wy);
+        emitHover({ id: null, commit: null, harness: hb?.id || null });
+        cursor = hb ? 'pointer' : 'default';
+      }
     }
     canvasRef.current.style.cursor = cursor;
   };

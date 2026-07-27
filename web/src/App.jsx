@@ -186,13 +186,16 @@ export default function App() {
     geomListeners.current.forEach((fn) => { try { fn(); } catch { /* listener detached mid-fire */ } });
   }, []);
   // shared hover: hovering a hex or a commit dot highlights the hex, its wire, and its dot together.
+  // `harness` is the third focus target — hovering a harness badge lights up every xell that wears
+  // it (and its through-traces), the mirror of a xell hover lighting up the harness it wears.
   // A ref + subscription (not state) so a hover doesn't re-render the whole app.
-  const hoverRef = useRef({ id: null, commit: null });
+  const hoverRef = useRef({ id: null, commit: null, harness: null });
   const hoverListeners = useRef(new Set());
   const setHover = useCallback((h) => {
+    const n = { id: h.id ?? null, commit: h.commit ?? null, harness: h.harness ?? null };
     const c = hoverRef.current;
-    if (c.id === h.id && c.commit === h.commit) return;
-    hoverRef.current = h;
+    if (c.id === n.id && c.commit === n.commit && c.harness === n.harness) return;
+    hoverRef.current = n;
     hoverListeners.current.forEach((fn) => { try { fn(); } catch { /* detached */ } });
   }, []);
   const subscribeHover = useCallback((fn) => {

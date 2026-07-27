@@ -165,9 +165,20 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
     return `M${pt(fA, fC)} C${pt(fA + ROW * 0.5, fC)} ${pt(fA + ROW * 0.4, tC)} ${pt(fA + ROW, tC)} L${pt(tA, tC)}`;
   };
 
-  // which commit is highlighted: a hovered dot, or the commit a hovered hex/wire sits on
-  const hov = hoverRef ? hoverRef.current : { id: null, commit: null };
-  const hovCommit = hov.commit || (hov.id ? (timeline.xells || []).find((t) => t.id === hov.id)?.base_commit : null);
+  // which commit(s) are highlighted: a hovered dot, the commit a hovered hex/wire sits on, or — when a
+  // harness badge is hovered — the base commits of every xell that wears it (its through-traces all
+  // originate from those dots, so they light up together).
+  const hov = hoverRef ? hoverRef.current : { id: null, commit: null, harness: null };
+  const hovCommits = new Set();
+  if (hov.commit) hovCommits.add(hov.commit);
+  if (hov.id) { const b = (timeline.xells || []).find((t) => t.id === hov.id)?.base_commit; if (b) hovCommits.add(b); }
+  if (hov.harness) {
+    const h = (timeline.harnesses || []).find((hh) => hh.id === hov.harness);
+    for (const id of h?.consumer_ids || []) {
+      const b = (timeline.xells || []).find((t) => t.id === id)?.base_commit;
+      if (b) hovCommits.add(b);
+    }
+  }
 
   return (
     <div className="graph-pane" data-orient={orientation} style={paneStyle}>
@@ -183,7 +194,7 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
             const isMerge = c.parents.length > 1;
             const ring = anchors[c.hash]?.[0];
             const [lx, ly] = P(alongOf(row), labelRaw);
-            const hovered = hovCommit === c.hash;
+            const hovered = hovCommits.has(c.hash);
             const subj = c.subject || '';
             const shownSubj = subj.length > msgChars ? subj.slice(0, Math.max(0, msgChars - 1)) + '…' : subj;
             return (

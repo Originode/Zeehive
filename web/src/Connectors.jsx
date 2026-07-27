@@ -16,7 +16,6 @@ const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
 //     vertex nearest the dot, so it never crosses a hexagon and every segment runs along a hex side.
 export default function Connectors({ timeline, layoutRef, version, hexPosRef, harnessPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom, hoverRef, subscribeHover }) {
   const [paths, setPaths] = useState([]);
-  const [harnessNodes, setHarnessNodes] = useState([]);   // avatar badges + their inbound wire
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [, forceHover] = useReducer((x) => x + 1, 0);
   useEffect(() => (subscribeHover ? subscribeHover(forceHover) : undefined), [subscribeHover]);
@@ -60,21 +59,15 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
 
     // HARNESS NODES (docs §5): each harness occupies its own honeycomb CELL (published by HiveCanvas
     // in harnessPosRef — the badge is drawn on the canvas there, at the hex centre). Here we only
-    // route WIRES: each consumer's wire runs IN SERIES through the harness cell, and the harness's own
-    // inbound wire runs from its commit dot in the graph to the cell. Anchored to the grid, not a
-    // floating junction — so it stays "as if it were a xell in the grid".
+    // record each cell centre so a consumer's wire can be routed IN SERIES through it: the trace is
+    // ONE continuous line commit-dot → harness hexagon → xell. There is no separate harness inbound
+    // wire — that used to draw a SECOND trace to the same junction; the through-routing IS the inbound.
     const harnessPos = (harnessPosRef && harnessPosRef.current) || {};
-    const consumerHarness = new Map();     // consumer xellId → harness node
-    const hNodes = [];
+    const consumerHarness = new Map();     // consumer xellId → harness cell centre {x,y}
     for (const h of (timeline.harnesses || [])) {
       const hp = harnessPos[h.id];
       if (!hp) continue;                   // HiveCanvas hasn't published this harness's cell yet
-      const hx = hp.x - cr.left, hy = hp.y - cr.top;   // cont-relative, like the dots/hexes
-      const hd = cont.querySelector(`[data-commit="${h.base_commit}"][data-dot]`);
-      let inbound = null;
-      if (hd) { const n = hd.getBoundingClientRect(); inbound = { x: (n.left + n.right) / 2 - cr.left, y: (n.top + n.bottom) / 2 - cr.top }; }
-      const node = { id: h.id, color: h.color, x: hx, y: hy, inbound, consumer_ids: h.consumer_ids || [] };
-      hNodes.push(node);
+      const node = { id: h.id, color: h.color, x: hp.x - cr.left, y: hp.y - cr.top };
       for (const id of h.consumer_ids || []) consumerHarness.set(id, node);
     }
 
@@ -95,22 +88,10 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
       .filter((c) => forward(c.cx, c.cy) && insideHoney(c.cx, c.cy));
     const graph = buildHexGraph(realHexes.concat(virtual));
 
-    // Each harness's INBOUND wire (its commit dot → its cell) threads the same corridor maze as every
-    // other wire, so it reads as one of the family. Compute its lattice path now that the graph exists.
-    for (const node of hNodes) {
-      if (!node.inbound) { node.inboundD = null; continue; }
-      const entry = nearestNode(graph, node.inbound.x, node.inbound.y);
-      const midKey = nearestNode(graph, node.x, node.y);
-      const pts = (entry && midKey) ? shortestPath(graph, entry, midKey) : null;
-      const poly = (pts && pts.length > 1)
-        ? [[node.inbound.x, node.inbound.y], ...pts.map((p) => [p.x, p.y]), [node.x, node.y]]
-        : [[node.inbound.x, node.inbound.y], [node.x, node.y]];   // fallback: straight if no maze path
-      node.inboundD = 'M ' + poly.map((p) => `${f1(p[0])} ${f1(p[1])}`).join(' L ');
-    }
-
     // pass 1: pathfind every wire (prod included) through the corridor maze. A harnessed consumer's
     // wire is forced THROUGH its harness cell — two maze legs (dot→cell, cell→hex) spliced — so it
-    // still threads corridors like the rest instead of cutting a straight line across the honeycomb.
+    // reads as ONE continuous series: commit-dot → harness hexagon → xell (docs §5), instead of the
+    // old pair of a xell wire plus a separate harness inbound wire.
     const routed = [];
     for (const dd of dots) {
       const verts = graph.vertsById.get(dd.id);
@@ -119,13 +100,18 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
       const entryKey = nearestNode(graph, dd.dx, dd.dy);
       const hn = consumerHarness.get(dd.id);
       let path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
+      let harnessAt = null, harnessCenter = null;
       if (hn && entryKey) {
         const midKey = nearestNode(graph, hn.x, hn.y);
         const l1 = shortestPath(graph, entryKey, midKey);
         const l2 = shortestPath(graph, midKey, target.key);
-        if (l1 && l2 && l1.length && l2.length) path = [...l1, ...l2.slice(1)];   // splice at the cell
+        if (l1 && l2 && l1.length && l2.length) {
+          path = [...l1, ...l2.slice(1)];   // splice at the cell
+          harnessAt = l1.length - 1;        // index of the shared harness vertex in the joined path…
+          harnessCenter = [hn.x, hn.y];     // …pinned to the badge centre so the trace runs THROUGH it
+        }
       }
-      routed.push({ id: dd.id, color: dd.color, dot: dd, target, pts: path });
+      routed.push({ id: dd.id, color: dd.color, dot: dd, target, pts: path, harnessAt, harnessCenter });
     }
 
     // pass 2: where wires share a corridor, split them into parallel channels
@@ -141,6 +127,9 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
       if (r.pts && r.pts.length > 1) {
         const off = lanes.get(r.id) || r.pts.slice(1).map(() => [0, 0]);
         const maze = offsetPolyline(r.pts, off);           // channel-offset corridor path
+        // pin the shared through-vertex to the harness badge CENTRE so every consumer's trace visibly
+        // runs THROUGH the hexagon (and parallel consumers converge there — reading as one junction).
+        if (r.harnessAt != null && r.harnessCenter && maze[r.harnessAt]) maze[r.harnessAt] = r.harnessCenter;
         const e0 = maze[0];                                // offset entry point
         const corner = portrait ? [dd.dx, e0[1]] : [e0[0], dd.dy];  // ⟂ off the spine, then 90° turn
         const poly = [[dd.dx, dd.dy], corner, ...maze];
@@ -153,7 +142,6 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
         dim: expandedId && expandedId !== r.id });
     }
     setPaths(items);
-    setHarnessNodes(hNodes);
   }, [timeline, layoutRef, hexPosRef, orientation, honeySide, expandedId, prodIds.join(',')]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   useLayoutEffect(() => { measure(); }, [measure, version]);
@@ -181,16 +169,13 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
     };
   }, [measure, layoutRef]);
 
-  const hov = hoverRef ? hoverRef.current : { id: null, commit: null };
-  const hoverActive = !!(hov.id || hov.commit);
-  // which xell(s) are focused (hovered/expanded) → a harness inbound wire lights up when a focused
-  // xell wears it, and dims with the rest otherwise (mirrors the badge dim/highlight on the canvas).
-  const focusedX = new Set();
-  if (expandedId) focusedX.add(expandedId);
-  if (hov.id) focusedX.add(hov.id);
-  if (hov.commit) for (const t of (timeline?.xells || [])) if (t.base_commit === hov.commit) focusedX.add(t.id);
-  const anyFocus = focusedX.size > 0;
-  const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit);
+  const hov = hoverRef ? hoverRef.current : { id: null, commit: null, harness: null };
+  // hovering a harness badge focuses every xell that wears it (its consumers) — so their
+  // through-traces light up together, the mirror of a xell hover lighting its harness.
+  const hovHarness = hov.harness ? (timeline?.harnesses || []).find((h) => h.id === hov.harness) : null;
+  const hovConsumers = new Set(hovHarness?.consumer_ids || []);
+  const hoverActive = !!(hov.id || hov.commit || hov.harness);
+  const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit) || hovConsumers.has(p.id);
 
   return (
     // zIndex:1 keeps the trace-line overlay a LOW decorative layer: above the honeycomb canvas
@@ -212,20 +197,6 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
           <rect x={p.x2 - 3.5} y={p.y2 - 3.5} width="7" height="7" rx="1.5"
                 fill={p.color} stroke="var(--bg)" strokeWidth="1.5" />
         </g>
-        );
-      })}
-      {/* HARNESS inbound wires — the dashed trace from each harness's own commit dot in the graph to
-          its cell in the honeycomb (the trace goes to the harness FIRST, then the consumer wires above
-          route through that same cell to the xells). The avatar badge itself is drawn on the canvas
-          at the cell centre (HiveCanvas), so here we draw only the wire. */}
-      {harnessNodes.map((h) => {
-        if (!h.inboundD) return null;
-        const hi = (h.consumer_ids || []).some((id) => focusedX.has(id));
-        const opacity = anyFocus ? (hi ? 0.95 : 0.1) : 0.85;
-        return (
-          <path key={`h-${h.id}`} d={h.inboundD}
-                fill="none" stroke={h.color} strokeWidth={hi ? 2.6 : 1.8} strokeDasharray="4 3" opacity={opacity}
-                strokeLinejoin="round" strokeLinecap="round" />
         );
       })}
     </svg>
