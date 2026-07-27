@@ -393,6 +393,58 @@ export async function listUsbDevices(machineId) {
   return { ok: true, machine: m.key, devices };
 }
 
+// List the adb devices a MACHINE can see, tagged and annotated for the dashboard's "list adb devices"
+// action (a Register button per device). Two sources, tried in order:
+//   1. the machine's shared adb-host container (USB-plugged phones) — `docker exec … adb devices`;
+//   2. if none runs, the queenzee host's OWN adb server — where a `adb connect <ip:port>` network
+//      device lives (e.g. a wifi-adb phone).
+// Each entry is tagged net|usb by its serial shape (a `host:port` serial is a network device; a bare
+// serial is USB) and marked `registered` when a shared device row already covers it for `projectId`,
+// so the UI shows Register only for the ones not yet added.
+export async function listAdbDevices(machineId, { projectId = null } = {}) {
+  const m = await one(`SELECT * FROM machine WHERE id=$1`, [machineId]);
+  if (!m) throw new Error('machine not found');
+  if (MODE !== 'real') return { ok: true, machine: m.key, source: 'simulate', devices: [] };
+
+  const containerName = `zeehive_adbhost_${m.key.replace(/-/g, '_')}`;
+  let source = 'adb-host';
+  let r = spawnSync('docker', ['--context', m.docker_ctx, 'exec', containerName, 'adb', 'devices'],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true });
+  if (r.status !== 0) {
+    // No adb-host container — read the queenzee host's own adb server, which is where a network
+    // `adb connect`ed phone shows up. A network address is globally routable, so a device seen here
+    // is still valid to register against this machine; a USB serial would be host-specific.
+    source = 'host-adb';
+    r = spawnSync('adb', ['devices'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    if (r.status !== 0) {
+      return { ok: false, machine: m.key, devices: [],
+        error: `no adb-host container on ${m.key}, and \`adb devices\` is unavailable on the queenzee host `
+             + `(${(r.stderr || r.error?.message || 'adb not found').toString().slice(-160)}). Provision an `
+             + `adb-host for USB phones, or install adb and \`adb connect <ip:port>\` a network phone on the host first.` };
+    }
+  }
+  const parsed = (r.stdout || '').split('\n').slice(1)   // drop the "List of devices attached" header
+    .map((l) => l.trim()).filter(Boolean)
+    .map((l) => { const [serial, state] = l.split(/\s+/); return { serial, state: state || 'unknown' }; });
+
+  const existing = projectId
+    ? await q(`SELECT host(host) AS host, host_port, conn_ref FROM container
+                WHERE project_id=$1 AND role='device' AND isolation='shared'`, [projectId])
+    : [];
+  const devices = parsed.map((d) => {
+    const kind = d.serial.includes(':') ? 'net' : 'usb';
+    let registered = false;
+    if (kind === 'net') {
+      const [host, port] = d.serial.split(':');
+      registered = existing.some((e) => e.host === host && String(e.host_port) === String(port));
+    } else {
+      registered = existing.some((e) => e.conn_ref === `usb:${d.serial}`);
+    }
+    return { ...d, kind, registered };
+  });
+  return { ok: true, machine: m.key, source, devices };
+}
+
 // ── USB AUTO-DISCOVERY (item #3) ────────────────────────────────────────────────────────────────
 // Enumerate a machine's USB-plugged phones (listUsbDevices) and REGISTER every ready one as a shared
 // USB device row for `project`, so a human doesn't hand-type each serial. Idempotent: registerPhysical

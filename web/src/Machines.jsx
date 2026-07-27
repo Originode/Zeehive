@@ -10,7 +10,7 @@ import React, { useState, useEffect } from 'react';
 import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
          setMachinePool, setMachinePriority, getSites, createSite,
-         registerDevice, provisionAdbHost, getUsbDevices } from './api.js';
+         registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', device: 'Device', other: 'Other' };
@@ -220,12 +220,30 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
 function DevicePanel({ m, projectId }) {
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(false);
+  // The adb devices this machine can currently see (null = not listed yet), refreshed after any
+  // register so a just-added phone flips to "registered ✓" in place.
+  const [adb, setAdb] = useState(null);
   const run = (what, fn) => async () => {
     setBusy(true);
     try { return await fn(); }
     catch (e) { fail(what)(e); }
     finally { setBusy(false); }
   };
+
+  const listAdb = run('list adb devices', async () => {
+    const r = await getAdbDevices(m.id, projectId);
+    if (r.ok === false) { setAdb({ error: r.error, devices: [] }); return; }
+    setAdb(r);
+  });
+
+  // Register ONE listed adb device — transport inferred from its serial (host:port → net; bare → usb).
+  const registerOne = (d) => run('register device', async () => {
+    const body = d.kind === 'net'
+      ? { project: projectId, machine_id: m.id, transport: 'net', host: d.serial.split(':')[0], adb_port: Number(d.serial.split(':')[1]) }
+      : { project: projectId, machine_id: m.id, transport: 'usb', serial: d.serial };
+    await registerDevice(body);
+    await listAdb();   // refresh so it now reads as registered
+  })();
 
   const adbHost = run('adb-host', async () => {
     if (!(await showConfirm(`Stand up the shared adb-host on ${m.key}?\n\n`
@@ -263,11 +281,33 @@ function DevicePanel({ m, projectId }) {
       <button className="mx-devbtn" disabled={busy} onClick={() => setOpen((o) => !o)}
               title="Device host actions — adb-host, USB discovery, register a phone">📱 devices ▾</button>
       {open && (
-        <div className="mx-devactions">
-          <button disabled={busy} onClick={adbHost} title="Run the shared adb-host container (shares USB phones over TCP)">adb-host</button>
-          <button disabled={busy} onClick={discover} title="Scan the adb-host and auto-register every ready USB phone as a device">discover USB</button>
-          <button disabled={busy} onClick={registerNet} title="Register a phone reachable over network adb (adb tcpip)">＋ net device</button>
-        </div>
+        <>
+          <div className="mx-devactions">
+            <button disabled={busy} onClick={listAdb} title="Run `adb devices` on this machine and list what it sees">list adb devices</button>
+            <button disabled={busy} onClick={adbHost} title="Run the shared adb-host container (shares USB phones over TCP)">adb-host</button>
+            <button disabled={busy} onClick={discover} title="Scan the adb-host and auto-register every ready USB phone as a device">discover USB</button>
+            <button disabled={busy} onClick={registerNet} title="Register a phone reachable over network adb (adb tcpip)">＋ net device</button>
+          </div>
+          {adb && (
+            <div className="mx-adblist" data-testid={`mx-adblist-${m.key}`}>
+              {adb.error
+                ? <div className="mx-adberr">{adb.error}</div>
+                : adb.devices.length === 0
+                  ? <div className="mx-adbempty">{`no adb devices seen${adb.source ? ` (via ${adb.source})` : ''} — \`adb connect <ip:port>\` a phone, or provision the adb-host for USB`}</div>
+                  : adb.devices.map((d) => (
+                      <div className="mx-adbrow" key={d.serial} data-testid={`adb-${d.serial}`}>
+                        <span className={`mx-adbstate s-${d.state}`} title={`adb state: ${d.state}`} />
+                        <span className="mx-adbserial" title={`${d.kind} · ${d.state}`}>{d.serial}</span>
+                        <span className="mx-adbkind">{d.kind}</span>
+                        {d.registered
+                          ? <span className="mx-adbreg" title="already a registered device for this project">registered ✓</span>
+                          : <button className="mx-adbadd" disabled={busy} onClick={() => registerOne(d)}
+                                    title={`Register this ${d.kind === 'net' ? 'network' : 'USB'} device`}>＋ register</button>}
+                      </div>
+                    ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );

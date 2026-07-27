@@ -415,6 +415,12 @@ export async function getUsbDevices(machineId, { register = false, projectId = n
   const r = await fetch(`/api/machines/${machineId}/usb-devices${qs}`);
   return jsonOrThrow(r, 'list usb devices');
 }
+// List the adb devices a machine can see (USB via its adb-host, else the host's network-connected
+// phones), each tagged net|usb and marked whether it's already registered for the project.
+export async function getAdbDevices(machineId, projectId = null) {
+  const r = await fetch(`/api/machines/${machineId}/adb-devices${projectId ? `?project=${encodeURIComponent(projectId)}` : ''}`);
+  return jsonOrThrow(r, 'list adb devices');
+}
 // Attach a device to a named xell by id (the dashboard's "attach device"). kind overrides the
 // project's manifest default (emulator | physical).
 export async function attachXellDevice(xellId, kind = null) {

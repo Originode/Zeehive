@@ -21,7 +21,7 @@ import { checkContainers, decommissionContainer } from '../queenzee/containers.j
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
          setMachinePriority } from '../lib/machines.js';
-import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices } from '../lib/devices.js';
+import { attachDeviceXhip, detachDeviceXhip, registerPhysicalDevice, provisionAdbHost, listUsbDevices, discoverUsbDevices, listAdbDevices } from '../lib/devices.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { revealXellWorktree } from '../lib/reveal.js';
 import { reapXell, purgeDevXells } from '../queenzee/reaper.js';
@@ -853,6 +853,13 @@ router.get('/machines/:id/usb-devices', async (req, res) => {
     }
     res.json(await listUsbDevices(req.params.id));
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// List the adb devices a machine can SEE (adb-host container's USB phones, else the host adb server's
+// network-connected phones), each tagged net|usb and marked whether it's already registered for the
+// project — the dashboard's "list adb devices" action with a Register button per device.
+router.get('/machines/:id/adb-devices', async (req, res) => {
+  try { res.json(await listAdbDevices(req.params.id, { projectId: req.query.project || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Attach (or ?action=detach) a device to a xell by id — the dashboard's "attach device" button.
 router.post('/xells/:id/device', async (req, res) => {

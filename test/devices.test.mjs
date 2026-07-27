@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 
-const { deviceConfig, deviceLoop, registerPhysicalDevice, discoverUsbDevices, deviceBootState } =
+const { deviceConfig, deviceLoop, registerPhysicalDevice, discoverUsbDevices, deviceBootState, listAdbDevices } =
   await import('../server/src/lib/devices.js');
 
 // ── deviceConfig: the manifest device block → resolved config (pure) ──────────────────────────────
@@ -102,4 +102,10 @@ test('register + discover against the isolated DB', { skip: hasDb ? false : 'no 
   assert.equal(disc.ok, true);
   assert.deepEqual(disc.registered, []);
   assert.deepEqual(disc.skipped, []);
+
+  // listAdbDevices: simulate short-circuits to an empty listing (no adb/docker side effects)
+  const listed = await listAdbDevices(machId, { projectId: projId });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.source, 'simulate');
+  assert.deepEqual(listed.devices, []);
 });

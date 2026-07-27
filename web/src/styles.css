@@ -623,6 +623,20 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-devactions button { font-size: 10px; background: var(--panel2); color: var(--text);
   border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; cursor: pointer; }
 .mx-devactions button:hover:not(:disabled) { border-color: #6fe39a; }
+/* the `adb devices` listing under the panel — one row per device with a per-device register button */
+.mx-adblist { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; font-size: 10px; }
+.mx-adberr { color: #ffb4a2; }
+.mx-adbempty { color: var(--muted); }
+.mx-adbrow { display: flex; align-items: center; gap: 6px; }
+.mx-adbstate { width: 6px; height: 6px; border-radius: 50%; background: var(--unknown); flex: none; }
+.mx-adbstate.s-device { background: var(--up); }
+.mx-adbstate.s-offline, .mx-adbstate.s-unauthorized { background: var(--building); }
+.mx-adbserial { font-family: var(--mono, monospace); color: var(--text); }
+.mx-adbkind { color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.mx-adbreg { color: #6fe39a; margin-left: auto; }
+.mx-adbadd { margin-left: auto; background: rgba(53,196,107,.14); color: #9fe8bd;
+  border: 1px solid rgba(53,196,107,.5); border-radius: 5px; padding: 1px 6px; cursor: pointer; }
+.mx-adbadd:hover:not(:disabled) { background: rgba(53,196,107,.28); }
 /* device slot on a xell card: the attached device chip + its detach ✕, or the attach affordance */
 .devslot { position: relative; display: inline-flex; align-items: center; }
 .devdetach { position: absolute; top: -5px; right: -5px; width: 14px; height: 14px; line-height: 12px;
