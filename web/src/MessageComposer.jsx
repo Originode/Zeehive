@@ -19,8 +19,8 @@ function readFileAsDataUrl(file) {
   });
 }
 
-export default function MessageComposer({ xell, onClose, onSent }) {
-  const [text, setText] = useState('');
+export default function MessageComposer({ xell, onClose, onSent, initialText = '' }) {
+  const [text, setText] = useState(initialText);
   const [images, setImages] = useState([]);   // [{ name, type, data, size }]
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -28,7 +28,14 @@ export default function MessageComposer({ xell, onClose, onSent }) {
   const taRef = useRef(null);
   const fileRef = useRef(null);
 
-  useEffect(() => { taRef.current?.focus(); }, []);
+  // Focus on open. When the composer is pre-filled (e.g. forwarding ship/land error logs), park the
+  // cursor at the TOP so the human can type a note above the pasted output instead of at its tail.
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.focus();
+    if (initialText) { ta.setSelectionRange(0, 0); ta.scrollTop = 0; }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose?.(); };
     window.addEventListener('keydown', onKey);

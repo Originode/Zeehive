@@ -9,6 +9,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { decideShip, dismissShip, deferShip, resumeShip, unlockAndShip, holdProdLock, forceReleaseProdLock, getSites, bundleDeferredShips } from './api.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
+import { shipFailureReport, shipHasFailureOutput } from './shipFailure.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
@@ -78,7 +79,7 @@ function LiveBuildLog({ lines }) {
   );
 }
 
-function ShipCard({ req, live, prodSites, prodLock, onDone }) {
+function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   // A DEFERRED ship is still 'pending' server-side, but a human set it aside for a combined ship.
@@ -209,6 +210,19 @@ function ShipCard({ req, live, prodSites, prodLock, onDone }) {
       {req.status === 'approved' && <div className="ship-progress">✓ approved — queenzee is taking the prod lock…</div>}
       {req.status === 'shipped' && <div className="ship-progress done">★ LIVE — shipped {req.finished_at ? `at ${new Date(req.finished_at).toLocaleTimeString()}` : ''}</div>}
       {req.status === 'failed' && <div className="land-err">✗ ship FAILED{req.error ? `: ${req.error}` : ''}</div>}
+      {/* A ship built by the queenzee and failed — hand the zee the exact build output so it can
+          fix and re-ship, instead of the operator copy-pasting logs into the message composer by
+          hand. Opens the same 📨 composer, pre-filled with the failure report; the human can add a
+          note and send. Needs a xell to reach (retired/orphaned ships have no live zee). */}
+      {shipHasFailureOutput(req) && req.xell_id && onForwardToZee && (
+        <div className="ship-forward-row">
+          <button className="ship-forward" data-testid="ship-forward"
+                  onClick={() => onForwardToZee({ id: req.xell_id, slug: req.xell_slug }, shipFailureReport(req))}
+                  title="Open a message to this xell's zee pre-filled with the ship's build output">
+            📨 Forward build output to {req.xell_slug || 'the zee'}
+          </button>
+        </div>
+      )}
       {deferred && !bundledRider && (
         <div className="ship-deferred" data-testid="ship-deferred">
           ⏸ deferred{req.deferred_by ? ` by ${req.deferred_by}` : ''} — set aside so other xells' landings
@@ -324,7 +338,7 @@ function LockCountdown({ lock, projectId, onChanged }) {
   );
 }
 
-export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onDecided }) {
+export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onDecided, onForwardToZee }) {
   const open = shipping || [];
   // The project's prod sites — the approve dialog's target choices. Loaded once per project and
   // only while something is actually open (no ships → no fetch).
@@ -358,7 +372,7 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
         <BundleBar count={bundleable} projectId={projectId} onDone={onDecided} />
       )}
       {open.map((s) => <ShipCard key={s.id} req={s} live={shipLogs?.[s.id]} prodSites={prodSites}
-                                 prodLock={prodLock} onDone={onDecided} />)}
+                                 prodLock={prodLock} onDone={onDecided} onForwardToZee={onForwardToZee} />)}
     </section>
   );
 }

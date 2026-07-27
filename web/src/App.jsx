@@ -582,7 +582,7 @@ export default function App() {
                        onClose={() => setTermXell(null)} />
         )}
         {msgXell && (
-          <MessageComposer xell={msgXell} onClose={() => setMsgXell(null)}
+          <MessageComposer xell={msgXell} initialText={msgXell.initialText || ''} onClose={() => setMsgXell(null)}
                            onSent={(r) => { const id = `msg-${msgXell.id}-${Date.now()}`;
                              pushToast({ id, kind: 'success', title: `Message sent to ${msgXell.slug}`, onRetry: null,
                                body: r?.attachments?.length ? `${r.attachments.length} attachment(s) delivered to its .zee-inbox` : 'typed into its live session' });
@@ -687,7 +687,8 @@ export default function App() {
       {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
           both are decisions only a human may make, and both block a zee until made. */}
       <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock} shipLogs={shipLogs}
-                 projectId={projectId || project.id} onDecided={refresh} />
+                 projectId={projectId || project.id} onDecided={refresh}
+                 onForwardToZee={(xell, text) => setMsgXell({ ...xell, initialText: text })} />
 
       {/* THE LANDING PAD — every landing + shipment in one chronological FIFO queue, with the item
           the queenzee is processing right now spinning. A view of the runway, not a decision. */}

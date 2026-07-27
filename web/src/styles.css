@@ -897,6 +897,12 @@ a.cbox:hover { border-color: var(--accent); }
 .unlock-ship:hover:not(:disabled) { background: rgba(210,153,34,.14); }
 .ship-card.s-shipped { border-color: var(--ready); opacity: .92; }
 .ship-card.s-failed { border-color: var(--error); }
+/* forward-to-zee: a failed ship's build output → the zee's message inbox, one click. Sits just
+   under the failure line; quiet (this is a helpful escape hatch, not a decision), but reachable. */
+.ship-forward-row { margin-top: 8px; }
+.ship-forward { border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.ship-forward:hover:not(:disabled) { background: rgba(255,255,255,.06); border-color: var(--muted); }
 .ship-progress.done { color: var(--ready); }
 .ship-results { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
 .ship-step { font-size: 12.5px; }
