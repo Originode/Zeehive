@@ -1173,7 +1173,13 @@ a.cbox:hover { border-color: var(--accent); }
    give it the larger share of the pane (was an even 1:1 split, which read as empty margin around
    the honeycomb on anything wider than a laptop). The panels pane still scrolls, so it loses
    nothing but width. */
-.hive-pane.honey  { flex: 3 1 0; position: relative; }
+/* z-index: lift the whole honeycomb pane ABOVE the connector trace-line overlay (the <Connectors>
+   SVG is a later-DOM sibling of this pane at z-index 5, drawn across the entire hive-split). Without
+   this the wires paint OVER the honeycomb's own content — the compact hex cards, the expanded flower,
+   the harness badges, and the pop-over dialogs that live in this pane (terminal-choice, message
+   composer) all got crossed out by the lines. The canvas is transparent between cells (clearRect),
+   so the wires still thread the open corridors; they just no longer bury the cards/dialogs. */
+.hive-pane.honey  { flex: 3 1 0; position: relative; z-index: 6; }
 .hive-pane.panels { flex: 2 1 0; overflow: auto; }
 
 /* graph divider: fixed cross-size (set inline by GraphPane), centred, bordered both sides. The
