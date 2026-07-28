@@ -269,12 +269,20 @@ Tests: `test/prod-seed-gate.test.mjs` (DB integration: refusals, approve→run, 
 real-mode refusal, receipts, and the fleet read model) and `test/prod-asks-console.test.mjs`
 (static: hive-status ↔ web palette lockstep, App renders the cards, NeedsYouBar counts the asks).
 
-## MANAGER ZEES — the fleet's middle layer (052/053)
+## MANAGER ZEES — the fleet's middle layer (052/053/054)
 
 Added 2026-07-28. Every zee was a worker and every decision above a worker was a human's — fine for a
 handful of xells, useless once "which of these twelve needs me?" is itself a job. A **manager zee** is
 a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manager-zees.md](docs/manager-zees.md).
 
+- **TYPE and HARNESS are two axes (054).** `xell.zee_type` (worker|manager) is what the queenzee
+  lets a zee do; a HARNESS declares the type it is for (`harness.zee_type`, from `zee_type:` in
+  HARNESS.yml) and a xell may only wear one of its own type — because a harness IS that type's
+  manual. Enforced by triggers from both directions: no mismatched assign, no retyping a xell out
+  from under its harness, no retyping a harness while it is worn, no cross-type inheritance (a
+  manager harness parented on Zee Base would teach it `zee land`). `GET /api/harnesses?zee_type=…`
+  is what every picker asks for; the harness manager has a **For zee type** selector.
+  ⚠ 054 RENAMED `xell.role` → `xell.zee_type` (role already means db/server/webapp on container).
 - **It gains fleet reach**: `zee dispatch` (every worker it spawns is stamped `manager_xell_id`),
   `zee zees` (the crew read model), `zee say` (typed into the worker's LIVE session, same SSH
   send-keys path as the console's 📨), `zee inbox`, `zee suggest-done`.

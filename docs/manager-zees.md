@@ -7,10 +7,35 @@ one human watches a handful of xells; it stops working the moment the hive is bi
 "which of these twelve needs me?" is itself a job. A **manager zee** is that job, given to an agent —
 without giving it any of the powers the gates exist to withhold.
 
+## Two axes: TYPE and HARNESS
+
+They are not the same thing, and 054 stops them contradicting each other:
+
+- **TYPE** (`xell.zee_type`: `worker` | `manager`) is what the QUEENZEE will and will not let this
+  zee do — the refusals below. It is decided when the xell is created and it is structural.
+- **HARNESS** is the persona, skills and MANUAL a zee wears. Each harness **declares the type it is
+  for** (`harness.zee_type`, from `zee_type:` in its `HARNESS.yml`), and a xell may only wear a
+  harness of its own type. `any` is reserved for the law layer (`core`), which every zee gets.
+
+Why the pairing must be enforced rather than trusted: a harness IS the manual for a type's verbs and
+refusals. Hand the manager harness to a worker and you have taught it `zee dispatch`,
+`zee suggest-done` and "you hold production read-only" — four doors it does not have — while removing
+the one it does (landing). It would spend its turn hammering on refusals. So:
+
+- the DB refuses the assignment (`xell_harness_type_guard`), from either direction — you cannot
+  assign a mismatched harness, and you cannot retype a xell out from under the harness it wears;
+- a harness cannot be **retyped** while a zee of the other type wears it, and cannot **inherit**
+  across types (a manager harness parented on Zee Base would silently merge the worker manual — and
+  `zee land` — into a manager's briefing);
+- `assignHarness` refuses first with a sentence, so the console shows a reason, not a stack trace;
+- every picker asks for the list it is allowed to offer (`GET /api/harnesses?zee_type=…`): the
+  composer and the project-default picker show worker personas only; the harness manager shows all
+  of them, with a **For zee type** selector when you author one.
+
 ## The shape
 
-A manager is an ordinary xell (`xell.role = 'manager'`) with its own cxell, its own hexagon and its
-own token. What changes is the trade:
+A manager is an ordinary xell (`xell.zee_type = 'manager'`) with its own cxell, its own hexagon and
+its own token. What changes is the trade:
 
 | It GAINS (fleet reach) | It LOSES (repo reach) |
 |---|---|
@@ -41,6 +66,8 @@ only in a prompt is a rule that lasts until the first clever workaround:
   there is no fallback to the owner credential. The reaper drops the role with the xell.
 - **One level deep.** The 052 guard trigger refuses a manager with a manager, a worker reporting to
   a worker, anything managing itself, and production being (or having) a manager.
+- **Type and manual cannot drift apart.** See the two-axis section above: a manager always wears a
+  manager harness, a worker never does, and neither can be switched to make it otherwise.
 - **Managers are added by humans only.** `zee dispatch` refuses `role=manager` and refuses to hand a
   worker the manager harness or a database of the dispatcher's choosing. A manager that could mint
   managers is a fleet that grows sideways with nobody's consent.
@@ -89,8 +116,10 @@ name the crew they belong to. With no managers in the fleet the layout is exactl
 
 ## Files
 
-- `db/migrations/052_manager_zee.sql` — role, `manager_xell_id`, `zee_message`, `done_suggestion`,
-  `db-prod-readonly`, `prod_ro_dsn`, the guard trigger, the manager harness row.
+- `db/migrations/052_manager_zee.sql` — the type column, `manager_xell_id`, `zee_message`,
+  `done_suggestion`, `db-prod-readonly`, `prod_ro_dsn`, the guard trigger, the manager harness row.
+- `db/migrations/054_zee_type.sql` — renames `xell.role` → `xell.zee_type`, adds `harness.zee_type`,
+  and the two triggers that keep type and harness in agreement.
 - `db/migrations/053_manual_manager_crew.sql` — teaches the DB-owned worker manual the crew verbs and
   the reflection stage.
 - `server/src/lib/managers.js` — the domain (crew, messages, done suggestions).
