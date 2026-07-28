@@ -223,6 +223,25 @@ function drawDiffFilled(ctx, cx, cy, parts, { maxW, minPx, maxPx, weight = 600, 
   return { y: y1, width: ctx.measureText(headTxt).width, wrapped: true };
 }
 
+// The "this stat is a link" affordance: a hairline under the drawn diffstat plus a small muted
+// caption. The flower's two diff petals open the DIFF VIEWER when clicked, and on a canvas there is
+// no cursor:pointer to discover by hovering half a pixel — so the affordance has to be drawn.
+function drawStatLink(ctx, cx, row, caption) {
+  const y = row.y + Math.max(6, row.width * 0.02);
+  ctx.save();
+  ctx.strokeStyle = withAlpha(COL.muted, 0.45);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - row.width / 2, y);
+  ctx.lineTo(cx + row.width / 2, y);
+  ctx.stroke();
+  ctx.fillStyle = withAlpha(COL.muted, 0.75);
+  ctx.font = "9px 'Segoe UI', sans-serif";
+  ctx.textAlign = 'center';
+  ctx.fillText(caption, cx, y + 7);
+  ctx.restore();
+}
+
 // A tiny role glyph, canvas-drawn to match the DOM chip's SVG icons (Container.jsx / styles.css) —
 // same silhouette (cylinder / rack bars / browser window), same low-opacity white stroke.
 function drawRoleIcon(ctx, role, cx, cy, s) {
@@ -637,7 +656,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (expandedId) {
       const b = hitButton(wx, wy);
       const f = hitFlower(wx, wy);
-      cursor = b || (f && f.cell === 0 && f.openable) ? 'pointer'
+      cursor = b || (f && ((f.cell === 0 && f.openable) || DIFF_PETAL[f.cell])) ? 'pointer'
         : hitContainer(wx, wy) ? 'context-menu' : 'default';   // right-click hint on an icon
       emitHover({ id: null, commit: null });
     } else {
@@ -673,6 +692,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         if (f.cell === 0 && f.openable) {
           const x = (xells || []).find((xx) => xx.id === f.id);
           if (x) onOpenSession?.(x);
+        } else if (DIFF_PETAL[f.cell]) {
+          // The two DIFF petals (commit/source stat, own stat) open the diff viewer — clicking the
+          // numbers is how you read the lines they count, here exactly as on the card.
+          const x = (xells || []).find((xx) => xx.id === f.id);
+          if (x) onAction?.(DIFF_PETAL[f.cell], x, diffs?.[f.id]);
         }
         return;                                              // petal clicks keep the flower open
       }
@@ -1140,6 +1164,11 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
   return rects;
 }
 
+// Which PETAL is which diffstat — the two facets whose numbers open the DIFF VIEWER when clicked.
+// A petal's index IS its facet index (drawFlower maps centers[i] → flowerFacets()[i]), so this must
+// move with the facet order in flowerFacets: 5 = 'commit' (source diff), 6 = 'diff · age' (own diff).
+const DIFF_PETAL = { 5: 'srcdiff', 6: 'owndiff' };
+
 function flowerFacets(x, diff, machines) {
   const src = x.remote_source || {};
   const stack = x.stack || [];
@@ -1223,11 +1252,15 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
     const d = facet.diff;
     if (d) {
       const dW = hexHalfWidthAt(size, size * 0.08) * 2 * 0.9;
-      drawDiffFilled(ctx, cx, cy + size * 0.08, [
+      const row = drawDiffFilled(ctx, cx, cy + size * 0.08, [
         { t: `↑${d.ahead} ↓${d.behind} · ${d.files}f `, c: COL.muted },
         { t: `+${d.insertions}`, c: COL.add },
         { t: `/−${d.deletions}`, c: COL.del },
       ], { maxW: dW, minPx: 9, maxPx: size * 0.2 });
+      // The stat is CLICKABLE (onPointerUp dispatches 'srcdiff' → the diff viewer), so it is drawn
+      // like a link: underlined, with a one-word affordance. A number nobody knows they can click
+      // is the same as a number they cannot.
+      drawStatLink(ctx, cx, row, 'read the diff');
     } else {
       ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
       ctx.fillStyle = COL.muted;
@@ -1268,6 +1301,8 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
       if (isBusyZee(x)) {
         drawBusyDot(ctx, cx - row.width / 2 - size * 0.14, row.y, Math.max(3, size * 0.06));
       }
+      // clickable, exactly like the source stat above → 'owndiff' (see onPointerUp)
+      drawStatLink(ctx, cx, { ...row, y: row.wrapped ? row.y + size * 0.2 : row.y }, 'read the diff');
     } else {
       fillFont(ctx, '◈ —', hexHalfWidthAt(size, 0) * 2 * 0.9, 9, size * 0.3,
         (px) => `${px}px 'Segoe UI', sans-serif`);

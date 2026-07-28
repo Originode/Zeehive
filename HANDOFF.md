@@ -148,6 +148,20 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
     uncommitted) — everything the zee has produced; what would land.
   - **diff** = worktree vs its OWN HEAD (`own`) — work not yet checkpointed. Drops to 0 on every
     checkpoint while source diff persists. `●N` = dirty files incl. untracked.
+- **Every one of those diffstats is CLICKABLE** (added 2026-07-28, `web/src/DiffViewer.jsx` +
+  `server/src/lib/diffview.js`): the numbers open the **patch** they are counting. A landing was
+  the case that mattered — you were asked to approve a push with only a commit list and a line
+  count to go on, and the actual change lived in a terminal on the host that the console user does
+  not have. Clickable in four places: the xell card's two stats, the hive flower's two diff petals
+  (drawn underlined — a canvas has no cursor to discover), a held **landing**, and a **PR** card.
+  - `GET /api/xells/:id/diff?kind=source|own` · `GET /api/land/requests/:id/diff` — read-only.
+  - A landing/PR is read at exactly `old_sha..new_sha` in the xource (the range being approved).
+    A live xell is read from the same place its STAT came from — the **cxell** for a cxelld zee
+    (where the work is until it lands), else the worktree — so viewer and card cannot disagree.
+  - **Untracked files are synthesised in**: `git diff` cannot see a file git was never told about,
+    and "the zee just wrote five new files and hasn't committed" is exactly when this is opened.
+  - Capped three ways (whole payload / per file / file count) and every cap is *reported* on the
+    card, never silently applied. Test: `node test/diff-viewer.test.mjs`.
 - **Installed for OmniBiz only.** `.git/hooks` is machine-local and not version-controlled, so it
   does NOT travel with a clone — re-run the installer per machine, and after any `main_branch`
   change (the protected ref is baked in). Zeehive's own repo is NOT gated yet.

@@ -6,6 +6,7 @@ import { q, one } from '../db/pool.js';
 import { projectHook } from '../lib/status.js';
 import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
+import { xellPatch, landRequestPatch } from '../lib/diffview.js';
 import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
@@ -549,6 +550,20 @@ router.get('/git/timeline', async (req, res) => {
   res.json(t);
 });
 router.get('/xell/diffs', async (req, res) => res.json(await getDiffs(req.query.project || null)));
+
+// ── the DIFF VIEWER: the patch behind a diffstat ──────────────────────────────
+// /xell/diffs answers "how much" (the numbers on every card, hexagon and land card). These two
+// answer "what": the actual lines, read from wherever that stat was measured (the cxell for a
+// cxelld zee, else the worktree; the xource for a landing's old..new range). Read-only.
+router.get('/xells/:id/diff', async (req, res) => {
+  try { res.json(await xellPatch(req.params.id, { kind: req.query.kind === 'own' ? 'own' : 'source' })); }
+  catch (err) { res.status(404).json({ ok: false, error: err.message }); }
+});
+// A landing AND a PR are both land_request rows, so one route serves both gate cards.
+router.get('/land/requests/:id/diff', async (req, res) => {
+  try { res.json(await landRequestPatch(req.params.id)); }
+  catch (err) { res.status(404).json({ ok: false, error: err.message }); }
+});
 
 // queenzee activity log (the terminal modal)
 router.get('/logs', async (req, res) => res.json(recentLogs(Number(req.query.n) || 200)));
