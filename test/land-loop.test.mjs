@@ -60,6 +60,11 @@ const nonFF = spawnSync('git', ['-C', wt, 'merge-base', '--is-ancestor', shaB, s
 ok(nonFF, 'confirmed: master (B) is NOT an ancestor of the zee commit (Z) — the divergence the bug hit');
 
 // ── 2. seed the throwaway DB ──────────────────────────────────────────────────
+// project.name is UNIQUE and this test leaves its row behind (there is no teardown — the rows are
+// harmless and the fixtures are readable after a failure). So clear the PREVIOUS run's project
+// first: without this the suite passes exactly once per fresh database and fails on every re-run
+// with `Key (name)=(landtest) already exists`, which reads as a regression in whatever changed.
+await q(`DELETE FROM project WHERE name='landtest'`);
 const project = await one(
   `INSERT INTO project (name, repo_root, main_branch, auto_approve_land)
    VALUES ('landtest', $1, 'main', false) RETURNING *`, [src]);
