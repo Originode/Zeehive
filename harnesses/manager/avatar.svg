@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Manager Zee harness">
+  <!-- A manager hexagon with three satellites: the crew seated around it, which is exactly how the
+       honeycomb lays a manager's workers out (adjacent cells). -->
+  <circle cx="32" cy="32" r="30" fill="#1c2333" stroke="#e0a53b" stroke-width="2"/>
+  <path d="M32 16 L42 22 L42 34 L32 40 L22 34 L22 22 Z" fill="none" stroke="#e0a53b" stroke-width="3"
+        stroke-linejoin="round"/>
+  <circle cx="32" cy="28" r="4" fill="#e0a53b"/>
+  <circle cx="16" cy="46" r="5" fill="none" stroke="#5b8cff" stroke-width="3"/>
+  <circle cx="32" cy="50" r="5" fill="none" stroke="#5b8cff" stroke-width="3"/>
+  <circle cx="48" cy="46" r="5" fill="none" stroke="#5b8cff" stroke-width="3"/>
+  <path d="M27 38 L18 42 M32 40 L32 45 M37 38 L46 42" stroke="#8b97a8" stroke-width="2" stroke-linecap="round"/>
+</svg>

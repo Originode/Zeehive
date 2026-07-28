@@ -1,0 +1,14 @@
+version: 1
+label: Manager Zee
+summary: Coordinates a crew of worker zees — dispatches, monitors, converses, suggests done. Writes no code, lands nothing.
+glyph: "⬢"
+
+# The manager's manual is a manual OF ITS OWN — deliberately NOT the worker's. A manager has verbs a
+# worker does not (dispatch/zees/say/inbox/suggest-done) and refusals a worker does not (land, PR,
+# any push to the xource), so inheriting the worker law layer would teach it doors it does not have.
+# That is also why this harness declares no `parent:`.
+memory:
+  - memory/manager-zee-manual.md
+
+skills:
+  - dispatch-brief

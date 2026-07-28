@@ -56,7 +56,8 @@ zee land                                         # collect commits + gated push 
 zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod   (ONLY when 100% certain)
 zee hint-land [--reason "…"] | --clear           # "looks land-ready" — light the land? button for a human, don't land
 zee hint-ship [--reason "…"] | --clear           # "looks ship-ready" — light the ship? button for a human, don't ship
-zee prod --reason "…"                            # ask to be bound to the prod database
+zee prod --reason "…"                            # ask to be bound to the prod database (the WHOLE live db)
+zee seed --file <seed.sql> --reason "…"          # ask a human to approve a LANDED seed file; the QUEENZEE runs it on PROD
 zee done --summary "…"                           # propose your job is done (ONLY after landed — and shipped, if shipping)
 ```
 
@@ -187,7 +188,9 @@ you have a landable checkpoint, or a state you *think* is shippable but want a h
 NOT land/ship. **Hint instead.** A hint opens no gate and pushes nothing; it just lights the
 `land?` / `ship?` prompt on your hexagon (`occ-landHint` / `occ-shipHint`) so a human sees the
 land/ship **button** and makes the call. `--clear` lowers it. This is the mechanism behind the rule
-"a zee should never be left hanging": if you finish unsure, your hexagon still asks a human to act,
+"a zee should never be left hanging" — which now holds for the prod-DATA asks as well: `prod?` and
+`seed?` are hexagon states with buttons, not log lines.
+If you finish unsure, your hexagon still asks a human to act,
 instead of you either force-driving a gate or going silent. (The land/ship buttons ALSO appear on
 their own whenever your git state warrants — unlanded commits → `land`, landed+clean → `ship`; a
 hint is your explicit "I think it's time" on top of that.)
@@ -207,6 +210,39 @@ cxell firewall** so you can reach the prod db. Until confirmed, your cxell physi
 prod. This grants prod DATA, not prod code — deploying code stays the ship gate (`zee ship`). Once
 bound, reads are free; before any write or migration, state exactly what it will change and get a
 human to agree.
+
+**Prefer `zee seed` when all you need is ROWS in production.** Binding hands you the entire live
+database for what is usually one file; a seed request hands that one file to the queenzee instead,
+and a human gets to read the SQL before it runs. Ask for the bind when the job genuinely IS the
+data — an investigation, a one-off repair whose shape you cannot know in advance.
+
+**And your ask is VISIBLE now.** It used to land in the queenzee log and nowhere else, so a zee
+could ask for production and simply never be answered. Today the request lights `prod?`
+(`occ-prodRequest`) on your hexagon and renders on your card in the console's "waiting on you"
+line, with **Reject** and **Bind to PROD** on it — the same treatment a held landing gets. So:
+ask once, say what you need it for, and KEEP WORKING on everything that does not depend on it.
+`zee status` carries the answer as `prod_bind` (`pending` → `confirmed`/`rejected`); on confirm
+your db_coupling becomes `db-shared-prod` and the cxell is re-sealed so prod is reachable at all.
+A rejection is a normal answer, not a failure — usually it means the job was really `zee seed`.
+
+### `zee seed` — have the queenzee SEED production for you
+`POST /api/xell/self/seed-request` `{ file | files, reason }`. The **narrow** prod-data verb, and the
+one to reach for when a shipment is not usable until rows exist in production (reference data, a
+lookup the new screen reads, the first row of a new feature). You name **landed** `*.sql` file(s)
+under `server/sql/seeds/`, a human reads the exact SQL in the console, and the **QUEENZEE** runs it
+against the production database. You never hold prod, never run psql, and cannot approve your own ask.
+
+- **Land it first.** The queenzee reads the file FROM main (`git show <main-tip>:<file>`), never from
+  your worktree — the same anti-band-aid rule as a ship. An unlanded seed is refused, with the reason.
+- **Only `server/sql/seeds/*.sql`.** That whitelist is what keeps "approve" from ever meaning "run any
+  file in the repo on production".
+- **Write it IDEMPOTENT** (`ON CONFLICT DO NOTHING` / `WHERE NOT EXISTS`). Seeds are deliberately NOT
+  ledgered — unlike a migration, a seed may legitimately be re-run — so re-running must be harmless.
+  The console shows a human every prior run of the same file before they approve a repeat.
+- `zee seed --status` reports where your request got to; the outcome (per file) lands on it, and
+  `zee status` carries it as `prod_seed`. Your hexagon shows `seed?` until a human decides.
+- A deploy in flight owns production: an approved seed FAILS loudly rather than writing data
+  underneath a half-swapped container. Ask again once the ship finishes.
 
 ### `zee done` — propose you are finished
 `POST /api/xell/self/done` `{ summary }`. Flags your xell `awaiting-done`. A **human** confirms with
