@@ -1047,6 +1047,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     logline('cxell', cli.installed
       ? `${name}: zee CLI refreshed from the queenzee's ${cli.src} (never older than this API)`
       : `${name}: zee CLI NOT refreshed (${cli.reason}) — running the image's baked copy`);
+    // The image's own verdict, read BEFORE the refresh overwrote the evidence. Say it plainly on
+    // the spawn line too: a stale fleet image is invisible from inside the cage once the CLI is
+    // refreshed, and the last time it went unnoticed it cost two zees a forensics detour.
+    if (cli.staleImage) {
+      logline('cxell', `${name}: !!! this cxell booted from a STALE zeehive/zee-agent image — rebuild it `
+        + '(the last self-ship that should have done so did not); only the `zee` CLI was repaired at spawn');
+    }
     // INJECT the assigned harness's files into the cxell (docs §6): its persona (.zeehive/harness/
     // PERSONA.md), its SKILL.md files (.claude/skills/…, Claude-loadable), and its MEMORY — including
     // the cxell manual carried by Zee Base — under .zeehive/harness/memory/. This is why the manual is
