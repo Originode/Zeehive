@@ -161,7 +161,8 @@ function usage() {
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
-  zee prod --reason "..."            ASK to be bound to the prod database (a human confirms)
+  zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
+  zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
   zee done --summary "..."           propose done (a human confirms with "Mark done")
 
 env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (default host.docker.internal:4700)`);
@@ -286,6 +287,21 @@ switch (cmd) {
     const reason = flag('reason');
     if (!reason) { console.error('prod needs --reason "why you need the prod database"'); process.exit(1); }
     out(await req('POST', '/api/xell/self/prod-request', { reason }));
+    break;
+  }
+  case 'seed': {
+    // ASK the queenzee to run LANDED seed file(s) against PRODUCTION. The narrow prod-DATA verb:
+    // where `zee prod` hands you the whole live database, this hands ONE reviewed .sql file to the
+    // queenzee, which runs it for you. Refused unless the file is on main — a seed runs FROM main,
+    // never from your worktree. `--status` reports where your request got to.
+    if (rest.includes('--status')) { out(await req('GET', '/api/xell/self/seed-request')); break; }
+    const files = multi('file') || multi('files');
+    const reason = flag('reason');
+    if (!files) { console.error('seed needs --file server/sql/seeds/<name>.sql (repeatable), or --status'); process.exit(1); }
+    if (!reason) { console.error('seed needs --reason "what this seeds into production and why"'); process.exit(1); }
+    const r = await req('POST', '/api/xell/self/seed-request', { files, reason });
+    console.log(JSON.stringify(r.json, null, 2));
+    process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
     break;
   }
   case 'done': {

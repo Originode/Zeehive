@@ -57,7 +57,10 @@ export function listMigrationFiles(repoRoot, sha, dirs = MIG_DIRS) {
 
 // `db` = the prodDb() handle: {ctx, container, user, name} — identity comes from the PROJECT
 // row (db_name/db_user), never from a global.
-function psql(db, args, input = null, timeout = 120000) {
+// EXPORTED for the prod SEED gate (queenzee/seedgate.js), which runs approved seed files against
+// the same production database through the same one door: one psql implementation, one set of
+// timeout/ON_ERROR_STOP semantics, so a seed can never quietly get looser rules than a migration.
+export function psql(db, args, input = null, timeout = 120000) {
   return new Promise((resolve) => {
     const child = spawn('docker', ['--context', db.ctx, 'exec', '-i', db.container,
       'psql', '-U', db.user, '-d', db.name,
@@ -123,7 +126,10 @@ async function ledgerFiles(project, db, sha) {
 // `site` scopes to ONE prod site's database (spec §5.2 — the ledger is per-database, so per-site
 // parity falls out naturally). NULL = default/legacy behavior; NULL-site container rows belong
 // to the default site.
-async function prodDb(project, site = null) {
+// EXPORTED (as prodDbHandle) for the seed gate: resolving WHICH container is this project's
+// production database — versioned name and all — is subtle enough that a second copy of it is how
+// you end up seeding a dev clone. One resolver, one answer.
+export async function prodDb(project, site = null) {
   const c = await one(
     `SELECT name, docker_ctx, tier, host_port, conn_ref FROM container
       WHERE project_id=$1 AND role='db' AND tier='prod'

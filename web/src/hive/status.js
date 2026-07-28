@@ -31,6 +31,8 @@ export const HIVE_COLORS = {
   'occ-landHint':     '#ef8f6a',   // soft red-orange — land looks ready (a softer ask)
   'occ-shipHint':     '#f2a06a',   // soft orange — ship looks ready
   'live-protected':   '#f0913b',   // orange — production, shields up
+  'occ-seedRequest':  '#e0563f',   // red-orange — a zee asked the queenzee to write DATA to prod
+  'occ-prodRequest':  '#d9455f',   // crimson — a zee asked to be handed the LIVE prod database
   'occ-landRequest':  '#e5554e',   // red — a landing is held (main is being touched)
   'occ-shipRequest':  '#ef5a3c',   // red-orange — a ship is held (prod is being touched)
   'live-unprotected': '#e5554e',   // red — prod shields down / a deploy is touching it
@@ -52,6 +54,8 @@ export const HIVE_HEAT = {
   'occ-landHint':     0.80,
   'occ-shipHint':     0.82,
   'live-protected':   0.86,
+  'occ-seedRequest':  1.00,
+  'occ-prodRequest':  1.00,
   'occ-landRequest':  1.00,
   'occ-shipRequest':  1.00,
   'live-unprotected': 1.00,
@@ -70,6 +74,8 @@ export const HIVE_LABELS = {
   'occ-tendRequest':  'tend?',
   'occ-landRequest':  'land?',
   'occ-shipRequest':  'ship?',
+  'occ-prodRequest':  'prod?',
+  'occ-seedRequest':  'seed?',
   'occ-landHint':     'land?',
   'occ-shipHint':     'ship?',
   'occ-doneRequest':  'done?',

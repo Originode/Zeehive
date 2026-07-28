@@ -1465,3 +1465,22 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 8px; padding: 8px 18px; cursor: pointer; font-size: 13px; font-weight: 600; }
 .msg-send:disabled { opacity: .45; cursor: not-allowed; }
 .msg-send:hover:not(:disabled) { filter: brightness(1.08); }
+
+/* ── PROD-DATA asks (ProdData.jsx): "give me the production database" / "seed production" ──
+   They reuse the landing card's chrome — same shape, same buttons, so a human reads them the same
+   way — with a crimson left edge that says the thing being touched is PRODUCTION DATA, not main. */
+.land-card.prod-ask { border-left: 3px solid #d9455f; }
+.land-card.prod-ask.seed { border-left-color: #e0563f; }
+.prod-ask-reason { font-size: 12.5px; color: var(--text); margin-top: 6px; font-style: italic; }
+.prod-ask-note { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.45; }
+.prod-ask-note.warn { color: #e0a53b; }
+.seed-sql-toggle { margin-top: 8px; font-size: 11.5px; }
+.seed-sql {
+  margin: 6px 0 0; padding: 8px; max-height: 260px; overflow: auto;
+  background: var(--bg, #14171d); border: 1px solid var(--line); border-radius: 6px;
+  font-family: monospace; font-size: 11.5px; white-space: pre-wrap; color: var(--text);
+}
+.land-panel.prod-panel { border-color: #d9455f; }
+.land-panel.prod-panel .land-title { color: #d9455f; }
+.land-panel.prod-panel.settled { border-color: var(--up); }
+.land-panel.prod-panel.settled .land-title { color: var(--up); }

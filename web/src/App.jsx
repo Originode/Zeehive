@@ -17,6 +17,7 @@ import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel, { BackupsModal } from './Backups.jsx';
 import LandingPanel, { LandCard } from './Landing.jsx';
+import ProdAsksPanel, { ProdBindCard, SeedCard } from './ProdData.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
@@ -401,6 +402,14 @@ export default function App() {
   // ASKED, which is a different card entirely — that is the point of a PR.
   const shipByXell = {};
   for (const s of fleet.shipping || []) shipByXell[s.xell_id] ||= s;
+  // The PROD-DATA asks (a zee asking for the production database, or for a landed seed file to be
+  // run on production) live on the card of the xell that asked — the same reasoning as landings:
+  // "wise-grove wants prod" is information about wise-grove, and it is decided next to that xell's
+  // own diff and status. Before this they had no console surface at all.
+  const prodBindByXell = {};
+  for (const r of fleet.prod_bind || []) (prodBindByXell[r.xell_id] ||= []).push(r);
+  const seedByXell = {};
+  for (const r of fleet.prod_seed || []) (seedByXell[r.xell_id] ||= []).push(r);
 
   // Dismissed notifications, by request id. The server records the dismissal (dismissed_at on the
   // row) so it survives reloads and SSE refreshes — receipts used to pop back on every refresh
@@ -680,9 +689,18 @@ export default function App() {
       {/* THE BAR — the one thing on the page that can't wait for you to scroll: a zee blocked on a
           human. A pointer, not a copy; clicking a chip expands that xell's flower + action drawer. */}
       <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
+                   prodBindByXell={prodBindByXell} seedByXell={seedByXell}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} />
+
+      {/* PRODUCTION DATA — a zee asking for the live prod database, or for a landed seed file to be
+          run on it, plus the receipt of every seed that ran. Live asks render on their xell's chip
+          above; this carries the ones with no chip (reaped xell) and the finished receipts. */}
+      <ProdAsksPanel bind={(fleet.prod_bind || []).filter((r) => !carded.has(r.xell_id))}
+                     seeds={(fleet.prod_seed || []).filter((r) => !carded.has(r.xell_id)
+                       || ['seeded', 'failed'].includes(r.status))}
+                     onDecided={refresh} />
 
       {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
           both are decisions only a human may make, and both block a zee until made. */}
@@ -1258,14 +1276,20 @@ function shipState(x, diff, prodLock, ship) {
 // EXPANDS that xell's flower (highlighting it on the canvas) AND drops its decision card(s) — the
 // held landing / open PR, with the Approve/Reject buttons — inline right below the bar, so the
 // judgement is made next to its own commits without hunting for a card at the bottom of the page.
-function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible }) {
+function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
+                       prodBindByXell = {}, seedByXell = {} }) {
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
     // A zee's TEND ping (occ-tendRequest): it asked for a human in the console. No approve/reject —
     // the chip just takes you to it; the zee (or you) clears the tend once handled.
     const tend = x.hive_status === 'occ-tendRequest' ? 1 : 0;
-    return { x, held, prs, tend, n: held + prs + tend };
+    // PROD DATA: "bind me to the production database" / "run this landed seed file on production".
+    // These are held gates exactly like a landing — the zee cannot proceed until a human answers —
+    // so they belong in the one line that says who is waiting on you.
+    const bind = (prodBindByXell[x.id] || []).filter((r) => r.status === 'pending').length;
+    const seed = (seedByXell[x.id] || []).filter((r) => r.status === 'pending').length;
+    return { x, held, prs, tend, bind, seed, n: held + prs + tend + bind + seed };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
@@ -1273,6 +1297,8 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
   const open = waiting.find((w) => w.x.id === expandedId);
   const landings = open ? visible(landingByXell[open.x.id]).filter((r) => r.status === 'pending') : [];
   const prs = open ? visible(prsFor(open.x)).filter((r) => r.status === 'pending') : [];
+  const binds = open ? (prodBindByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
+  const seeds = open ? (seedByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
 
   return (
     <section className="needsyou">
@@ -1280,13 +1306,15 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <span className="ny-t">⚠ waiting on you:</span>
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
-                  title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''}${(w.held || w.prs) && w.tend ? ' · ' : ''}${w.tend ? 'tend (needs a human)' : ''} — click to review`}>
+                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.tend && 'tend (needs a human)'].filter(Boolean).join(' · ')} — click to review`}>
             {w.x.slug}
-            <span className="ny-n">{w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`}
-              {w.held > 0 && w.prs > 0 && ' · '}
-              {w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`}
-              {(w.held || w.prs) && w.tend > 0 && ' · '}
-              {w.tend > 0 && '🖐 tend'}</span>
+            <span className="ny-n">{[
+              w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`,
+              w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`,
+              w.bind > 0 && '⚠ wants PROD DB',
+              w.seed > 0 && `⚠ seed prod (${w.seed})`,
+              w.tend > 0 && '🖐 tend',
+            ].filter(Boolean).join(' · ')}</span>
           </button>
         ))}
       </div>
@@ -1294,7 +1322,9 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <div className="ny-decision">
           {landings.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
           {prs.map((r) => <PrCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
-          {open.tend > 0 && landings.length === 0 && prs.length === 0 && (
+          {binds.map((r) => <ProdBindCard key={r.id} req={r} onDone={onDecided} />)}
+          {seeds.map((r) => <SeedCard key={r.id} req={r} onDone={onDecided} />)}
+          {open.tend > 0 && landings.length === 0 && prs.length === 0 && binds.length === 0 && seeds.length === 0 && (
             <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human.
               Open its session to see why; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
           )}

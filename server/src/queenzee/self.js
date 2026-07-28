@@ -19,6 +19,8 @@ import { pushToXource, catchUpToXource } from './xellgit.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { landStatus } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
+import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
+import { notifyProdBindRequest } from '../lib/notify.js';
 import { proposeDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
 import { catchUpXellToProd } from './shipmigrate.js';
@@ -45,6 +47,7 @@ export async function selfStatus(xell) {
   const prodBind = await one(
     `SELECT id, status, reason, requested_at, decided_at, decided_by FROM prod_bind_request
        WHERE xell_id=$1 ORDER BY requested_at DESC LIMIT 1`, [xell.id]);
+  const seed = await seedStatusFor(xell.id);
   const lock = await one(`SELECT container, phase FROM deploy_lock WHERE xell_id=$1`, [xell.id]);
   const containers = await q(
     `SELECT c.role, c.name, c.tier, host(c.host) AS host, c.host_port FROM xell_uses_container uc
@@ -63,6 +66,10 @@ export async function selfStatus(xell) {
       shipPending: ship ? (['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at) : false,
       tendPending: tend,
       landHint, shipHint,
+      // The two PROD-DATA asks, so a cxell zee sees its own `prod?` / `seed?` hexagon exactly as a
+      // human does — and can tell that its request actually reached the console.
+      prodBindPending: prodBind ? prodBind.status === 'pending' : false,
+      seedPending: seed ? ['pending', 'approved', 'running'].includes(seed.status) : false,
       prodUnprotected: xell.is_production && !!lock,
     },
   );
@@ -89,6 +96,13 @@ export async function selfStatus(xell) {
       : null,
     prod_bind: prodBind
       ? { id: prodBind.id, status: prodBind.status, pending: prodBind.status === 'pending' }
+      : null,
+    // The narrow prod-DATA ask: a landed seed file the queenzee runs on production once a human
+    // approves. `seeded`/`failed` carry the outcome, so `zee status` is enough to know it happened.
+    prod_seed: seed
+      ? { id: seed.id, status: seed.status, files: seed.files || [], commit: seed.commit,
+          decided_by: seed.decided_by, error: seed.result?.error || null,
+          pending: ['pending', 'approved', 'running'].includes(seed.status) }
       : null,
     holds_prod_lock: !!lock, prod_lock_phase: lock?.phase || null,
     containers,
@@ -394,12 +408,41 @@ export async function selfProdRequest(xell, { reason = null } = {}) {
   broadcast('prod-bind', row);
   broadcast('xell', { id: xell.id });
   logline('xell-prod', `${xell.slug} REQUESTED a prod bind — awaiting human confirmation${reason ? `: ${reason}` : ''}`);
+  // Reach the human OFF-SCREEN too. A prod-bind request blocks the zee exactly like a held landing
+  // does — it sat in the queenzee log only, so a zee could ask and simply never be answered.
+  const project = await one(`SELECT id, name FROM project WHERE id=$1`, [xell.project_id]);
+  notifyProdBindRequest({ project: project || { name: 'project' }, xell, request: row });
   return {
     ok: true, request: row,
-    message: 'Prod-bind REQUESTED — a human must CONFIRM it in the ZEEHIVE console. Until then your cxell '
-      + 'physically cannot reach prod (the firewall stays sealed). This grants the prod DATABASE only, not '
-      + 'prod code — shipping code stays the ship gate (`zee ship`).',
+    message: 'Prod-bind REQUESTED — a human must CONFIRM it in the ZEEHIVE console (your hexagon now shows '
+      + '`prod?` with the buttons on it). Until then your cxell physically cannot reach prod (the firewall '
+      + 'stays sealed). This grants the prod DATABASE only, not prod code — shipping code stays the ship '
+      + 'gate (`zee ship`). If all you need is rows in prod, `zee seed` is the narrower ask: the QUEENZEE '
+      + 'runs a landed seed file for you and you never hold prod at all.',
   };
+}
+
+// ── POST /api/xell/self/seed-request — ASK the queenzee to seed PRODUCTION ─────
+// The narrow counterpart to prod-request: some shipments are not usable until rows exist in prod
+// (reference data, a lookup the new screen reads). Binding the whole xell to the live database for
+// that is a sledgehammer — this asks a human to approve ONE landed .sql file under server/sql/seeds/,
+// which the QUEENZEE then runs against production. The zee never touches prod. See seedgate.js.
+export async function selfSeedRequest(xell, { files = [], reason = null, site = null } = {}) {
+  const zee = await liveZee(xell.id);
+  const r = await requestProdSeed({ xellId: xell.id, zeeId: zee?.id || null, files, reason, site });
+  broadcast('xell', { id: xell.id });
+  return r;
+}
+
+// Read-only: where did my seed request get to? (`zee seed --status`)
+export async function selfSeedStatus(xell) {
+  const row = await seedStatusFor(xell.id);
+  if (!row) {
+    return { ok: true, request: null,
+      note: `no seed request on record. Write an IDEMPOTENT ${SEED_DIR}/<name>.sql, land it, then `
+        + '`zee seed --file <name>.sql --reason "..."`.' };
+  }
+  return { ok: true, request: row };
 }
 
 // ── HUMAN side: confirm/reject a prod-bind request (no zee path to this) ────────

@@ -81,6 +81,15 @@ async function fetchXellRows(pid) {
             EXISTS(SELECT 1 FROM ship_request sr WHERE sr.xell_id = x.id
                      AND sr.status IN ('pending','approved','shipping') AND sr.dismissed_at IS NULL
                      AND sr.deferred_at IS NULL) AS ship_pending,
+            -- The two PROD-DATA asks a zee can only REQUEST: a bind to the live production database
+            -- (prod_bind_request, 029) and a queenzee-run seed of production (prod_seed_request,
+            -- 049). Both are held gates awaiting a human, so both light the hexagon — without this
+            -- a zee could ask and never be answered: the request existed only in the queenzee log.
+            EXISTS(SELECT 1 FROM prod_bind_request pbr WHERE pbr.xell_id = x.id
+                     AND pbr.status = 'pending') AS prod_bind_pending,
+            EXISTS(SELECT 1 FROM prod_seed_request psr WHERE psr.xell_id = x.id
+                     AND psr.status IN ('pending','approved','running')
+                     AND psr.dismissed_at IS NULL) AS seed_pending,
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'tend-request' AS tend_pending,
@@ -181,11 +190,14 @@ async function decorateXell(x, heads, deployed, project) {
     tendPending: x.tend_pending === true,
     landHint: x.land_hint === true,
     shipHint: x.ship_hint === true,
+    prodBindPending: x.prod_bind_pending === true,
+    seedPending: x.seed_pending === true,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
   delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;
   delete x.land_hint; delete x.ship_hint;
+  delete x.prod_bind_pending; delete x.seed_pending;
 
   // Fleet burn for THIS xell — sum across all its zees. pg returns bigint/numeric as strings; coerce
   // to Number so the dashboard can format it (a xell's lifetime burn is well within double precision).
@@ -323,6 +335,24 @@ export async function getFleet(projectId) {
     `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id
        WHERE dl.project_id = $1 AND dl.container = 'prod'`, [pid]);
 
+  // PROD-DATA asks awaiting a human: a zee asking to be BOUND to the live production database, and
+  // a zee asking the queenzee to run a landed SEED file against production. Both render on the
+  // asking xell's card (App.jsx → ProdData.jsx). Recently-decided seeds ride along for 15 minutes,
+  // like ships, so the receipt of what just ran on prod does not vanish before it can be read.
+  const prodBind = await q(
+    `SELECT pbr.*, x.slug AS xell_slug FROM prod_bind_request pbr
+       LEFT JOIN xell x ON x.id = pbr.xell_id
+      WHERE pbr.project_id = $1 AND pbr.status = 'pending'
+      ORDER BY pbr.requested_at DESC`, [pid]);
+  const prodSeed = await q(
+    `SELECT psr.*, x.slug AS live_xell_slug FROM prod_seed_request psr
+       LEFT JOIN xell x ON x.id = psr.xell_id
+      WHERE psr.project_id = $1 AND psr.dismissed_at IS NULL
+        AND (psr.status IN ('pending','approved','running')
+         OR (psr.status IN ('seeded','failed')
+             AND COALESCE(psr.finished_at, psr.decided_at) > now() - interval '15 minutes'))
+      ORDER BY psr.requested_at DESC`, [pid]);
+
   // The LANDING PAD: landings + shipments merged into one chronological FIFO queue, with the item
   // currently on the pad (being processed) flagged so the UI can spin it.
   const landingPad = await buildLandingPad(pid);
@@ -339,6 +369,8 @@ export async function getFleet(projectId) {
     fleet_burn: fleetBurn,
     landing,
     shipping,
+    prod_bind: prodBind,
+    prod_seed: prodSeed,
     prod_lock: prodLock || null,
     landing_pad: landingPad,
   };

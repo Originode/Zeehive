@@ -56,7 +56,10 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
+         selfSeedRequest, selfSeedStatus } from '../queenzee/self.js';
+import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
+         requestProdSeed } from '../queenzee/seedgate.js';
 
 export const router = Router();
 
@@ -1073,6 +1076,21 @@ router.post('/xell/self/prod-request', async (req, res) => {
     res.json(await selfProdRequest(x, { reason: req.body?.reason || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// ASK the queenzee to SEED production: name landed .sql file(s) under server/sql/seeds/ and a human
+// approves them in the console; the QUEENZEE then runs them against the prod db. The narrow version
+// of a prod bind — a zee that only needs rows in prod never has to hold the production database.
+router.post('/xell/self/seed-request', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const files = b.files || (b.file ? [b.file] : []);
+    res.json(await selfSeedRequest(x, { files, reason: b.reason || null, site: b.site || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Read-only: where did my seed request get to? (`zee seed --status`)
+router.get('/xell/self/seed-request', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfSeedStatus(x)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Propose done — flags the xell for a human's "Mark done"; the zee never despawns itself.
 router.post('/xell/self/done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
@@ -1151,6 +1169,39 @@ router.post('/prod-bind/requests/:id/:decision(confirm|reject)', async (req, res
   const decision = req.params.decision === 'confirm' ? 'confirmed' : 'rejected';
   try { res.json(await decideProdBind(req.params.id, decision, req.body?.by || 'human@console')); }
   catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// HUMAN side of the prod SEED request (queenzee/seedgate.js) — list, read the exact SQL, approve
+// (which RUNS it on production), reject, dismiss. Same shape as the ship gate and, like it, there is
+// deliberately NO zee path to approve: a zee may only ask.
+router.get('/prod-seed/requests', async (req, res) => {
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  res.json(await listProdSeedRequests(req.query.project, { open: req.query.all !== '1' }));
+});
+// The SQL a human is being asked to approve, read at the request's own sha — what is shown is
+// byte-for-byte what will run.
+router.get('/prod-seed/requests/:id/sql', async (req, res) => {
+  try { res.json(await seedRequestSql(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+router.post('/prod-seed/requests/:id/:decision(approve|reject)', async (req, res) => {
+  const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
+  try { res.json(await decideProdSeed(req.params.id, decision, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+router.post('/prod-seed/requests/:id/dismiss', async (req, res) => {
+  try { res.json(await dismissSeedRequest(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+// A HUMAN filing a seed request on a zee's behalf (the operator's own "seed prod from this xell"),
+// mirroring POST /api/xells/:id/ship. Still only a REQUEST — it lands in the same pending queue and
+// someone still approves it, so nothing here is a shortcut to writing production.
+router.post('/xells/:id/seed', async (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json(await requestProdSeed({ xellId: req.params.id, files: b.files || (b.file ? [b.file] : []),
+      reason: b.reason || null, site: b.site || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── AI-facing: report/propose the job is done, and query status ──────────────
