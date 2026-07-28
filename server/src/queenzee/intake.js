@@ -27,6 +27,7 @@ import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
 import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harnessBridge, assignHarness, defaultHarnessId } from '../lib/harness.js';
 import { bindManagerToProdReadonly } from '../lib/manager-spawn.js';
+import { connectCxellToProdNetwork } from '../lib/prod-readonly.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 
@@ -1088,6 +1089,14 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   try {
     const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id, image: cxellImage });
     sshPort = created.sshPort;
+    // A MANAGER holds production READ-ONLY, and where the prod db publishes no host:port its DSN is
+    // built on a docker NETWORK ALIAS. ensureCxell just put this cage on zee-hive-net and nothing
+    // else, so the alias would not resolve — join the prod db's network here, for THIS cxell only
+    // (lib/prod-readonly.js; a no-op for every other coupling and for a published host:port). It
+    // fails the cage build rather than leave a manager holding a DSN that cannot connect.
+    const prodNet = await connectCxellToProdNetwork({ xellId: xell.id, cxellName: name, cxellCtx: ctx });
+    if (prodNet.error) throw new Error(`prod read-only reach: ${prodNet.error}`);
+    if (prodNet.joined) logline('cxell', `${name}: joined ${prodNet.network} for the read-only prod db ('${prodNet.alias}')`);
     await cloneIntoCxell({ ctx, name, worktree: xell.worktree_path });
     // Refresh the in-cxell `zee` CLI from the QUEENZEE's own scripts/zee, over the copy baked into
     // the zee-agent image. Defence in depth against image staleness: a fleet on an old image would
