@@ -34,24 +34,22 @@ HEAD="$(git -C "$SRC" rev-parse --short "$REF" 2>/dev/null || echo unknown)"
 
 emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$2" "$3" "$ROLE"; }
 
-# Cxell-image rebuild — same GAP-2 rationale and same loud-but-non-fatal stance as self-ship.sh:
-# new cxell-zee capabilities ship inside zeehive/zee-agent, and a stale fleet image is a silent
-# capability loss. Cxells run on the local daemon (the mounted socket).
-CXELL_IMAGE="${CXELL_IMAGE:-zeehive/zee-agent}"
-rebuild_cxell_image() {
-  echo "self-ship: rebuilding cxell image $CXELL_IMAGE @ $HEAD" >&2
-  # Context = repo ROOT: the image bakes the authoritative scripts/zee (see Dockerfile.zee-agent).
-  if docker build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" -t "$CXELL_IMAGE" "$SRC" >&2; then
-    echo "self-ship: CXELL-IMAGE ok — new cxells will carry $HEAD" >&2
-  else
-    echo "self-ship: !!! CXELL-IMAGE FAILED — the fleet stays on the OLD image; rebuild by hand or re-ship" >&2
-  fi
-}
+# Cxell-image rebuild — the SAME implementation self-ship.sh uses (scripts/lib/cxell-image.sh); it
+# used to be a second copy here and the two had drifted. New cxell-zee capabilities ship inside
+# zeehive/zee-agent, and a stale fleet image is a silent capability loss, so a failed rebuild fails
+# the ship (CXELL_IMAGE_REQUIRED=0 is the escape hatch). Cxells run on the local daemon (the
+# mounted socket). This variant already syncs the tree before building, so the shared function's
+# ship-ref context is equivalent here — and identical in behaviour, which is the point of sharing it.
+. "$SRC/scripts/lib/cxell-image.sh"
 
 if [ "$MODE" = "simulate" ]; then
   if [ "$ROLE" = "server" ]; then
     echo "self-ship: [simulate] would sync $SRC to $REF, rebuild $CXELL_IMAGE, compose build server," >&2
     echo "self-ship: [simulate] then detach a docker:cli sibling to 'compose up -d server'" >&2
+    echo "self-ship: [simulate] would rebuild cxell image with: $(cxell_build_cmd)" >&2
+    echo "self-ship: [simulate] a cxell-image failure would $(cxell_image_required \
+            && echo 'FAIL THE SHIP (CXELL_IMAGE_REQUIRED=0 to override)' \
+            || echo 'be reported but NOT fail the ship (escape hatch CXELL_IMAGE_REQUIRED=0 is set)')" >&2
   fi
   emit true "$HEAD" "simulate"; exit 0
 fi
@@ -70,7 +68,17 @@ if ! bash "$SRC/scripts/self-ship-sync.sh" "$SRC" "$REF" >&2; then
 fi
 HEAD="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo "$HEAD")"
 
-rebuild_cxell_image
+# Fatal by default, exactly like the host variant: this runs BEFORE the server image build and
+# before anything is swapped, so aborting here leaves the running queenzee and prod untouched.
+if ! rebuild_cxell_image; then
+  if cxell_image_required; then
+    echo "self-ship: !!! ABORTING THE SHIP — nothing has been swapped; the queenzee keeps running the" >&2
+    echo "self-ship: !!! previous image. Fix the cxell image (or re-ship with CXELL_IMAGE_REQUIRED=0" >&2
+    echo "self-ship: !!! to accept a knowingly stale fleet image), then approve the ship again." >&2
+    emit false "$HEAD" "cxell-image-failed"; exit 1
+  fi
+  echo "self-ship: CXELL_IMAGE_REQUIRED=0 — proceeding with a KNOWINGLY STALE cxell image." >&2
+fi
 
 # 2 — build the new server image now, output onto the ship card.
 if ! docker compose -f "$COMPOSE_FILE" build server >&2; then
