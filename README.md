@@ -50,6 +50,11 @@ and a zee goes to work in one.
   verb behind that door lands on a human gate. The repo enters as a git bundle; commits leave
   the same way. See [docs/cxell-zee-manual.md](docs/cxell-zee-manual.md).
 - **zee** — an agent (a Claude session) bound to exactly one xell, running inside its cxell.
+- **manager zee** — a zee whose job is running OTHER zees: it dispatches workers, talks to them in
+  real time, reads their post-ship reflections, and suggests when one is done (a human confirms).
+  It holds the production database **read-only** (its own SELECT-only postgres role) and has **zero
+  push/PR access to the xource** — it writes no code and lands none. Humans add them, unlimited;
+  a manager can never mint another. See [docs/manager-zees.md](docs/manager-zees.md).
 - **queenzee** — the orchestrator. **Pure script, no AI.** It provisions/reaps deterministically,
   keeps the pool warm, monitors health, runs maintenance, and executes the privileged actions
   humans approve. AI is invoked only at dispatch — never in routine loops.
@@ -67,7 +72,8 @@ human's click.**
   from the landed main and deploys. A zee never holds the prod lock or runs a prod build.
 - **Prod data** — binding a xell to a production database is a per-xell human grant.
 - **Done** — a zee proposes it's finished; a human's "Mark done" is what tears the cxell down
-  (commits are collected first).
+  (commits are collected first). A **manager zee** may only *suggest* that another xell is done —
+  the same human click, with a typed confirmation, is still what ends it.
 
 ## GitHub-centric, inbound by default — outbound opt-in
 

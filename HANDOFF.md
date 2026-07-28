@@ -255,6 +255,46 @@ Tests: `test/prod-seed-gate.test.mjs` (DB integration: refusals, approve→run, 
 real-mode refusal, receipts, and the fleet read model) and `test/prod-asks-console.test.mjs`
 (static: hive-status ↔ web palette lockstep, App renders the cards, NeedsYouBar counts the asks).
 
+## MANAGER ZEES — the fleet's middle layer (052/053)
+
+Added 2026-07-28. Every zee was a worker and every decision above a worker was a human's — fine for a
+handful of xells, useless once "which of these twelve needs me?" is itself a job. A **manager zee** is
+a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manager-zees.md](docs/manager-zees.md).
+
+- **It gains fleet reach**: `zee dispatch` (every worker it spawns is stamped `manager_xell_id`),
+  `zee zees` (the crew read model), `zee say` (typed into the worker's LIVE session, same SSH
+  send-keys path as the console's 📨), `zee inbox`, `zee suggest-done`.
+- **It loses repo reach — structurally, in three independent places.** `landgate.checkPush` declines a
+  manager's push and raises **NO land_request** (nothing for a human to approve); `xellgit.ctx()` —
+  the single door every git write verb passes through — throws; `zee land` refuses with the reason
+  and the alternative. A manager writes no code: it dispatches a worker, and the worker lands.
+- **Production is READ-ONLY**: its own `zee_ro_<slug>` role, `CONNECT`+`SELECT`,
+  `default_transaction_read_only=on`, no CREATE, minted by `lib/prod-readonly.js` and dropped by the
+  reaper. `db_coupling='db-prod-readonly'` (052). **Fails closed** — if the role can't be minted the
+  bind fails; there is no fallback to the owner credential. `PRODRO_MODE=simulate` (inherits
+  `SHIP_MODE`) mints nothing. ⚠ Like the first prod ship and the first seed, **the real CREATE ROLE
+  has never run against a live prod db** — read it before the first real manager on prod.
+- **Shipping is NOT blocked.** Holding prod data is no reason to withhold the ship gate; `zee ship` is
+  unchanged (landed-only, human-approved, queenzee-run).
+- **`zee prod` is refused for a manager** — escalating your own access is not an agent's ask.
+- **Humans add managers, unlimited** (`POST /api/managers`, the "⬢ + manager zee" button). `zee
+  dispatch` refuses `role=manager`, the manager harness on a worker, and any db choice at all.
+- **Done suggestions**: `done_suggestion` (052) → `occ-doneSuggest` (`done?`) on the TARGET's hexagon,
+  a card in "waiting on you", a typed **DONE** confirmation, then the same `markTaskDone`/reap the
+  console's own button runs. No `/xell/self/` route decides one.
+- **The REFLECTION stage**: on a successful ship, `shipgate` re-invokes the shipping zee
+  (`nudge.nudgeXellForReflection`) to review what went live and report improvements/errors/follow-ups
+  to its manager (`zee report --kind reflection`) — or to the console when it has no manager.
+- **The loophole rule cuts both ways.** The manager manual forbids dispatching a worker with reach
+  beyond its own xell; the WORKER manual (053) tells workers to REFUSE such an instruction and
+  `zee tend` it. Neither side polices itself.
+- **Honeycomb**: `seatXells()` (web/src/hive/HiveCanvas.jsx) seats a crew in the free cells nearest
+  its manager, ring by ring. No managers → byte-for-byte the old layout.
+- Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
+  messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
+  over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
+  the target xell went `retired`.
+
 ## Hotfix / data-manipulation xells (prod DATA is not prod CODE)
 
 **Read the MCP tools or the API.** Container names, bindings, couplings and status are DATA: they
