@@ -148,7 +148,7 @@ const totals = (files) => files.reduce((a, f) => ({
   files: a.files + 1, insertions: a.insertions + f.insertions, deletions: a.deletions + f.deletions,
 }), { files: 0, insertions: 0, deletions: 0 });
 
-function payload(base, { source, base_ref, head_ref, label, text, capped, extra = [], note = null }) {
+function payload({ source, base_ref, head_ref, label, text, capped, extra = [], note = null }) {
   const { files, files_total, truncated } = splitPatch(text);
   const all = [...files, ...extra].slice(0, MAX_FILES);
   return {
@@ -156,7 +156,6 @@ function payload(base, { source, base_ref, head_ref, label, text, capped, extra 
     files: all, files_total: files_total + extra.length,
     truncated: truncated || capped || all.length < files_total + extra.length,
     stat: totals(all), note,
-    ...base,
   };
 }
 
@@ -217,7 +216,7 @@ export async function rangePatch(repoRoot, oldSha, newSha, { label = null } = {}
     return { ok: false, error: (r.err || 'git diff failed').trim().split('\n')[0],
              base: from, head, source: 'repo' };
   }
-  return payload({}, { source: 'repo', base_ref: from, head_ref: head, label, text: r.out, capped: r.capped });
+  return payload({ source: 'repo', base_ref: from, head_ref: head, label, text: r.out, capped: r.capped });
 }
 
 // The patch behind a LANDING (or a PR — both are land_request rows): old_sha..new_sha in the xource.
@@ -280,7 +279,7 @@ export async function xellPatch(xellId, { kind = 'source' } = {}) {
     const p = await cxellPatch({ ctx: 'default', slug: x.slug, base: x.head_commit, kind: want,
                                  maxBytes: MAX_PATCH_BYTES }).catch(() => null);
     if (p) {
-      return { ...meta, ...payload({}, {
+      return { ...meta, ...payload({
         source: 'cxell',
         base_ref: want === 'own' ? p.head || 'HEAD' : x.head_commit,
         head_ref: p.head || null,
@@ -305,7 +304,7 @@ export async function xellPatch(xellId, { kind = 'source' } = {}) {
     if (r.status !== 0) return { ...meta, ok: false, error: (r.err || 'git diff failed').trim().split('\n')[0] };
     const hd = await gitOut(x.worktree_path, ['rev-parse', 'HEAD'], { maxBytes: 200 });
     const extra = await untrackedFiles(x.worktree_path);
-    return { ...meta, ...payload({}, {
+    return { ...meta, ...payload({
       source: 'worktree', base_ref: base, head_ref: hd.status === 0 ? hd.out.trim() : null,
       label: `${x.slug} · worktree${want === 'own' ? ' · uncommitted' : ''}`,
       text: r.out, capped: r.capped, extra,
