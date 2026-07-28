@@ -352,6 +352,17 @@ after landing ed805cc exposed both):
   recorded failure: a build failure is reported on the ship card but does not abort the
   code deploy. Both steps live in `self-ship.sh` (Zeehive's own `build_script`), so they are
   scoped to self-hosting and never touch OmniBiz's container-build ship path.
+  The image builds from the **repo-root context** (`docker build -f
+  docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent .`), like `Dockerfile.server` and
+  `Dockerfile.web`, because it bakes the authoritative **`scripts/zee`**. There is deliberately
+  no second copy of the CLI under `docker/` to hand-sync: one existed, drifted, and stranded a
+  manager zee whose crew verbs the baked CLI had never seen (`test/cxell-cli-drift.test.mjs`
+  fails if a duplicate is reintroduced or a build path's context stops matching the Dockerfile).
+- **CLI refresh at spawn.** Defence in depth for the same failure: `installZeeCliIntoCxell()`
+  (`server/src/lib/cxell.js`, called from `spawnCxell`) `docker cp`s the queenzee's **own**
+  current `scripts/zee` over `/usr/local/bin/zee` in every cxell it creates, so a fleet running
+  a stale `zee-agent` image can never hand a zee a CLI older than the queenzee that defines its
+  API. Best-effort with a loud queenzee log — the baked copy remains if it fails.
 
 ## 7. Implementation plan (ZEEHIVE side)
 

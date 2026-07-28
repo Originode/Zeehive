@@ -40,7 +40,8 @@ emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$2"
 CXELL_IMAGE="${CXELL_IMAGE:-zeehive/zee-agent}"
 rebuild_cxell_image() {
   echo "self-ship: rebuilding cxell image $CXELL_IMAGE @ $HEAD" >&2
-  if docker build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" -t "$CXELL_IMAGE" "$SRC/docker/zeehive" >&2; then
+  # Context = repo ROOT: the image bakes the authoritative scripts/zee (see Dockerfile.zee-agent).
+  if docker build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" -t "$CXELL_IMAGE" "$SRC" >&2; then
     echo "self-ship: CXELL-IMAGE ok — new cxells will carry $HEAD" >&2
   else
     echo "self-ship: !!! CXELL-IMAGE FAILED — the fleet stays on the OLD image; rebuild by hand or re-ship" >&2

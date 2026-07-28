@@ -8,6 +8,7 @@
 # named "node\r" and the script dies with `node\r: No such file or directory` — a cxell zee then
 # can't run `zee land` bare and has to work around it with `node /usr/local/bin/zee`. These are
 # scripts, executed by their shebang, and must be LF on every platform including a Windows checkout.
+# scripts/zee is the ONE copy of the cxell CLI (the zee-agent image COPYs it from the repo-root
+# build context; there is deliberately no docker/zeehive/zee duplicate any more).
 scripts/zee text eol=lf
-docker/zeehive/zee text eol=lf
 *.mjs text eol=lf

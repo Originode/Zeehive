@@ -101,7 +101,9 @@ server/src/
 web/             the console (React + Vite) — honeycomb fleet view, gates, terminals
 docker/zeehive/  Dockerfile.server (the queenzee), Dockerfile.zee-agent (the cxell image),
                  Dockerfile.web, docker-compose.prod.yml, migration playbook (README.md)
-scripts/         provisioning/despawn/build/ship scripts + the in-cxell `zee` CLI
+scripts/         provisioning/despawn/build/ship scripts + `zee`, the ONE copy of the in-cxell
+                 CLI (the zee-agent image COPYs it from the repo-root build context; the
+                 queenzee also installs it into each cxell at spawn — never a second copy)
 docs/            deploy-topology spec, the cxell zee manual
 ```
 

@@ -1,5 +1,15 @@
 # ZEEHIVE zee-agent — the CXELL a headless zee runs in. One container per xell.
 #
+# BUILD CONTEXT IS THE REPO ROOT (like Dockerfile.server / Dockerfile.web):
+#   docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent .
+# It has to be, because the image bakes the AUTHORITATIVE `scripts/zee` CLI — and a
+# docker/zeehive context cannot COPY out of scripts/. That used to be "solved" by keeping a
+# hand-synced duplicate at docker/zeehive/zee with a comment saying "update both"; the duplicate
+# then missed the crew verbs (zees/dispatch/say/report/inbox/suggest-done) for every cxell in the
+# fleet — a manager zee in a cage could not dispatch at all. A comment is not a mechanism. One
+# file, one COPY, and the root .dockerignore keeps the context lean.
+# NOTE: every COPY source below is therefore REPO-ROOT-relative (docker/zeehive/… , scripts/…).
+#
 # Confinement is structural, not prompted: the container sees ONLY
 #   /work            — a private clone of the xell's branch (from a git bundle; no
 #                      shared object store with the xource, no host mounts)
@@ -41,18 +51,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # kimi-code is PINNED (young CLI, moving fast — bump deliberately, not on every rebuild);
 # claude/codex track latest like the image always has for claude.
 RUN npm install -g @anthropic-ai/claude-code @openai/codex @moonshot-ai/kimi-code@0.28.1
-COPY cxell-firewall.sh /usr/local/bin/cxell-firewall.sh
-COPY cxell-sshd.sh /usr/local/bin/cxell-sshd.sh
-# The cxell zee's workflow CLI (land/ship/prod/done/status → the queenzee's /api/xell/self/* verbs).
-# This is a synced copy of scripts/zee (the authoritative source); it lives here because the image's
-# build context is this directory. Update both if you change it.
-COPY zee /usr/local/bin/zee
+COPY docker/zeehive/cxell-firewall.sh /usr/local/bin/cxell-firewall.sh
+COPY docker/zeehive/cxell-sshd.sh /usr/local/bin/cxell-sshd.sh
+# The cxell zee's workflow CLI (land/ship/prod/done/status/crew → the queenzee's /api/xell/self/*
+# verbs), copied straight from the ONE authoritative source, scripts/zee. No duplicate to sync.
+# Belt-and-braces: the queenzee ALSO docker-cp's its own current scripts/zee into every cxell at
+# spawn (server/src/lib/cxell.js: installZeeCliIntoCxell), so a fleet still running an older
+# zee-agent image can never hand a zee a CLI older than the queenzee that defines its API.
+COPY scripts/zee /usr/local/bin/zee
 # The ATTEND path: cxell-claude-seed.mjs pre-answers Claude Code's first-run gauntlet (so an
 # attending human sees ZERO onboarding/theme/trust/bypass prompts); zee-attach.sh + zee-live.mjs
 # land that human straight in the zee's live workflow, then `claude --resume` for the full session.
-COPY cxell-claude-seed.mjs /usr/local/bin/cxell-claude-seed.mjs
-COPY zee-live.mjs /usr/local/bin/zee-live.mjs
-COPY zee-attach.sh /usr/local/bin/zee-attach.sh
+COPY docker/zeehive/cxell-claude-seed.mjs /usr/local/bin/cxell-claude-seed.mjs
+COPY docker/zeehive/zee-live.mjs /usr/local/bin/zee-live.mjs
+COPY docker/zeehive/zee-attach.sh /usr/local/bin/zee-attach.sh
 # Belt-and-suspenders CRLF strip: .gitattributes pins these to LF, but if the build context was
 # checked out on Windows with autocrlf=true (or copied through a Windows tool) a `#!/usr/bin/env
 # node\r` shebang would make `zee` die with `node\r: No such file or directory`. Strip any trailing

@@ -40,17 +40,20 @@ emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$HE
 # ship, and the warning is anything but silent.
 CXELL_IMAGE="${CXELL_IMAGE:-zeehive/zee-agent}"
 CXELL_IMAGE_CTX="${CXELL_IMAGE_CTX:-}"   # empty = the default docker context, where cxells actually run
+# The build CONTEXT is the repo ROOT (not docker/zeehive): the image bakes the authoritative
+# scripts/zee, which a docker/zeehive context cannot reach. Same shape as Dockerfile.server /
+# Dockerfile.web, and the root .dockerignore keeps the context lean.
 cxell_build_cmd() {
   local ctxargs=""
   [ -n "$CXELL_IMAGE_CTX" ] && ctxargs="--context $CXELL_IMAGE_CTX "
-  echo "docker ${ctxargs}build -f \"$SRC/docker/zeehive/Dockerfile.zee-agent\" -t \"$CXELL_IMAGE\" \"$SRC/docker/zeehive\""
+  echo "docker ${ctxargs}build -f \"$SRC/docker/zeehive/Dockerfile.zee-agent\" -t \"$CXELL_IMAGE\" \"$SRC\""
 }
 rebuild_cxell_image() {
   echo "self-ship: rebuilding cxell image $CXELL_IMAGE @ $HEAD so new cxells carry this code" >&2
   local ctxargs=()
   [ -n "$CXELL_IMAGE_CTX" ] && ctxargs=(--context "$CXELL_IMAGE_CTX")
   if docker "${ctxargs[@]}" build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" \
-        -t "$CXELL_IMAGE" "$SRC/docker/zeehive" >&2; then
+        -t "$CXELL_IMAGE" "$SRC" >&2; then
     echo "self-ship: CXELL-IMAGE ok — $CXELL_IMAGE rebuilt at $HEAD; new cxells will carry this code" >&2
   else
     echo "self-ship: !!! CXELL-IMAGE FAILED — could NOT rebuild $CXELL_IMAGE; the fleet stays on the OLD" >&2

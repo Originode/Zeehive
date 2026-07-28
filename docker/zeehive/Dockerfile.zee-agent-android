@@ -5,9 +5,10 @@
 # Android projects use. An Android project points its cxell at this image via the project's
 # device.cxell_image (manifest) — spawnCxell reads it — or the global CXELL_IMAGE override.
 #
-# Build AFTER the base (this FROMs it):
-#   docker build -f docker/zeehive/Dockerfile.zee-agent          -t zeehive/zee-agent         docker/zeehive
-#   docker build -f docker/zeehive/Dockerfile.zee-agent-android  -t zeehive/zee-agent-android docker/zeehive
+# Build AFTER the base (this FROMs it). Both build from the REPO ROOT context — the base bakes the
+# authoritative scripts/zee, so its context cannot be docker/zeehive:
+#   docker build -f docker/zeehive/Dockerfile.zee-agent          -t zeehive/zee-agent         .
+#   docker build -f docker/zeehive/Dockerfile.zee-agent-android  -t zeehive/zee-agent-android .
 FROM zeehive/zee-agent
 
 # SDK install needs root; the base ends on USER zee. Java 17 is the current Android Gradle Plugin
