@@ -19,6 +19,8 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
   const editorRef = useRef(null);
   const [modes, setModes] = useState([]);
   const [models, setModels] = useState([]);
+  // The composer dispatches WORKER zees (a manager is added with the "+ manager zee" button, which
+  // binds prod read-only and hands it the manager manual), so it only ever offers worker harnesses.
   const [harnesses, setHarnesses] = useState([]);
   // undefined = use the project default (omit); '' = core only (send null); 'hermes' = that harness.
   const [harness, setHarness] = useState(undefined);
@@ -41,7 +43,7 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
     }).catch(() => {});
     // Harnesses are non-core, enabled config layers; core is always-on and implicit, so the picker
     // only offers the extras (plus a "core only" = none).
-    getHarnesses().then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
+    getHarnesses('worker').then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     // focus the editor on open so the human can just start typing
     setTimeout(() => editorRef.current?.focus(), 30);
   }, [provider]);

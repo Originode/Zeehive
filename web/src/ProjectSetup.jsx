@@ -1140,7 +1140,9 @@ function SpawnSection({ project, run }) {
     getPoolConfig(project.id).then(setPc).catch(() => {});
     getRuntimes().then(setRuntimes).catch(() => {});
     // Non-core, enabled harnesses only — core is the always-on law layer, never a selectable default.
-    getHarnesses().then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
+    // The project DEFAULT harness is what a bare dispatch attaches to a pooled xell — always a
+    // worker. A manager gets its harness when a human adds it, so manager personas are not offered.
+    getHarnesses('worker').then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     getDockerContexts().then(setCtxs).catch(() => {});
   }, [project.id]);
   if (!pc) return null;

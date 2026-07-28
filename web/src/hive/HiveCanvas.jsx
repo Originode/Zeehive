@@ -389,7 +389,7 @@ export function seatXells(list, cols, { reserved = new Set(), pinned = {} } = {}
 
   for (const [id, rc] of Object.entries(pinned)) if (rc) place(id, rc);
 
-  const managers = list.filter((x) => x.role === 'manager');
+  const managers = list.filter((x) => x.zee_type === 'manager');
   for (const m of managers) {
     if (!cells[m.id]) place(m.id, nextFree());
     const [mr, mc] = cells[m.id];
@@ -855,7 +855,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   }
   // A MANAGER zee's hexagon is double-walled: it runs a crew (seated in the cells around it) and
   // holds production read-only, so it should be identifiable before you read a single word on it.
-  if (x.role === 'manager') {
+  if (x.zee_type === 'manager') {
     hexPath(ctx, cx, cy, size + 2.5);
     ctx.lineWidth = 2; ctx.strokeStyle = withAlpha(COL.prod, hover ? 0.95 : 0.7); ctx.stroke();
   }
@@ -934,7 +934,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   // the dispatch convention prefixes titles with "xell : " — identity noise on a card this small
   const ownTitle = full && !x.is_production ? (x.zee_title || '').replace(/^xell\s*:\s*/i, '').trim() : '';
   const zeeTitle = !full || x.is_production ? ''
-    : x.role === 'manager' ? 'manager zee — runs a crew, reads prod'
+    : x.zee_type === 'manager' ? 'manager zee — runs a crew, reads prod'
     // a managed worker names its crew ahead of its task: the cluster around a double-walled hex
     // should not be a coincidence you have to infer
     : x.manager_slug ? `↳${x.manager_slug}${ownTitle ? ` · ${ownTitle}` : ''}`
@@ -942,7 +942,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   // A manager is named as one on the seam, and a managed worker names the crew it belongs to — the
   // hexagons around a double-walled hex should not be a coincidence you have to infer.
   const label = x.is_production ? '🛡 PRODUCTION'
-    : x.role === 'manager' ? `⬢ ${shortSlug(x.slug)}` : shortSlug(x.slug);
+    : x.zee_type === 'manager' ? `⬢ ${shortSlug(x.slug)}` : shortSlug(x.slug);
   fillFont(ctx, label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
   ctx.fillStyle = COL.text;
   ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * (zeeTitle ? 0.14 : 0.06) : size * 0.2));

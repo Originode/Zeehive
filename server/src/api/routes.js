@@ -616,8 +616,11 @@ router.post('/xells/:id/db', async (req, res) => {
 // Harnesses (system-wide config layers). List the enabled ones for the picker; assign/switch a
 // xell's harness (a HUMAN action — a harness decides config, never a landing target, so it is
 // mutable; { harness: <key|id|null> }, null clears back to core-only).
-router.get('/harnesses', async (_req, res) => {
-  try { res.json(await listHarnesses()); }
+// `?zee_type=worker|manager` narrows the list to the harnesses a xell of that TYPE may wear (054) —
+// what every picker should ask for, so an operator is never offered a choice the assign would refuse.
+// Unfiltered still returns everything (the harness manager edits them all).
+router.get('/harnesses', async (req, res) => {
+  try { res.json(await listHarnesses({ zeeType: req.query.zee_type || null })); }
   catch (err) { res.status(503).json({ error: err.message }); }
 });
 // Harness authoring (unlimited DB-owned personas — persona/skills/memory, created from the dashboard).

@@ -34,7 +34,34 @@ const RESERVED_LAW_KEYS = new Set([
 const ALLOWED_KEYS = new Set([
   'version', 'label', 'summary', 'description', 'personality', 'voice',
   'skills', 'memory', 'tools', 'avatar', 'bridge', 'parent', 'glyph',
+  // Which ZEE TYPE this harness is for (054). A harness carries the MANUAL for a type's verbs and
+  // refusals, so wearing the wrong one briefs an agent for doors it does not have. `zee_type:` in
+  // HARNESS.yml (or `type:`) declares it; the pairing is enforced in the DB.
+  'zee_type', 'type',
 ]);
+
+// Every type a XELL can be, and every type a HARNESS can declare. 'any' is the law layer (core),
+// which applies to every zee whatever its type.
+export const ZEE_TYPES = ['worker', 'manager'];
+export const HARNESS_TYPES = ['worker', 'manager', 'any'];
+export function normalizeZeeType(v, fallback = 'worker') {
+  const t = String(v || '').trim().toLowerCase();
+  return HARNESS_TYPES.includes(t) ? t : fallback;
+}
+
+// PURE: may a xell of `zeeType` wear a harness declared for `harnessType`? One rule in one place, so
+// the DB trigger, the assign path, dispatch and every console picker agree on the same answer.
+export function harnessFitsType(harnessType, zeeType) {
+  const h = normalizeZeeType(harnessType, 'worker');
+  return h === 'any' || h === normalizeZeeType(zeeType, 'worker');
+}
+export function typeMismatchReason(harness, zeeType) {
+  return `harness "${harness.key}" is for ${harness.zee_type} zees, but this xell is a `
+    + `${normalizeZeeType(zeeType)} zee. A harness carries the manual for a type's verbs and refusals `
+    + "(a manager's teaches dispatch/say/suggest-done; a worker's teaches landing), so the wrong one "
+    + "briefs an agent for doors it does not have. Pick a harness of the right type, or change the "
+    + "xell's type.";
+}
 
 const hashOf = (text) => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
@@ -164,7 +191,7 @@ export function loadHarnessDir(dir) {
 // anchor commit + avatar. Loud on validation errors (a broken harness stays with its LAST good
 // bundle rather than a half-parsed one), quiet when unchanged.
 export async function refreshHarnesses() {
-  const rows = await q(`SELECT id, key, dir, bundle_hash, is_law_core FROM harness WHERE dir IS NOT NULL`);
+  const rows = await q(`SELECT id, key, dir, bundle_hash, is_law_core, zee_type FROM harness WHERE dir IS NOT NULL`);
   for (const h of rows) {
     if (h.is_law_core) continue;   // core's text is code-assembled; nothing to read from a folder
     const { bundle, hash, errors, warnings } = loadHarnessDir(h.dir);
@@ -184,8 +211,12 @@ export async function refreshHarnesses() {
       const p = await one(`SELECT id FROM harness WHERE key=$1`, [bundle.parent]);
       if (p) parentId = p.id; else logline('harness', `${h.key}: parent "${bundle.parent}" not found — ignored`);
     }
-    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=COALESCE($5, avatar_path), label=COALESCE($6, label), parent_id=$7 WHERE id=$1`,
-      [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null, parentId]);
+    // The folder's declared type is authoritative for a file-backed harness, exactly like its skills
+    // and memory. The DB trigger still refuses a retype that would strand a xell already wearing it,
+    // so a bad edit fails loudly instead of silently re-pointing a live manager at a worker manual.
+    const declared = normalizeZeeType(bundle.zee_type ?? bundle.type, h.zee_type || 'worker');
+    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=COALESCE($5, avatar_path), label=COALESCE($6, label), parent_id=$7, zee_type=$8 WHERE id=$1`,
+      [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null, parentId, declared]);
     logline('harness', `${h.key}: refreshed (${bundle.skills?.length || 0} skill(s), ${bundle.parent ? `parent ${bundle.parent}, ` : ''}hash ${hash})`);
   }
 }
@@ -208,9 +239,14 @@ export async function harnessForXell(xellId) {
 }
 
 // The default harness a bare dispatch attaches for a project (pool_config.default_harness_id).
-export async function defaultHarnessId(projectId) {
+export async function defaultHarnessId(projectId, { zeeType = 'worker' } = {}) {
   const r = await one(`SELECT default_harness_id FROM pool_config WHERE project_id=$1`, [projectId]);
-  return r?.default_harness_id || null;
+  if (!r?.default_harness_id) return null;
+  // The project default is a WORKER default by construction — it is what a bare dispatch attaches.
+  // Never hand it to a manager: that would strip the manual its verbs come from, and the assign
+  // would be refused anyway. A manager with no explicit harness gets the manager one instead.
+  const h = await one(`SELECT zee_type FROM harness WHERE id=$1`, [r.default_harness_id]);
+  return harnessFitsType(h?.zee_type, zeeType) ? r.default_harness_id : null;
 }
 
 // Resolve a harness key OR id to its row (for --harness / API assign). NULL/'none' → null (core only).
@@ -224,21 +260,31 @@ export async function resolveHarness(keyOrId) {
 // never a landing target). Returns { harness }.
 export async function assignHarness(xellId, keyOrId) {
   const h = await resolveHarness(keyOrId);
+  // TYPE FIRST (054): a harness is only assignable to a xell of its own type. The DB trigger is the
+  // real wall; this check exists so the caller gets a sentence explaining WHY, rather than a raw
+  // postgres exception the console would have to render as gibberish.
+  if (h) {
+    const x = await one(`SELECT zee_type FROM xell WHERE id=$1`, [xellId]);
+    if (!harnessFitsType(h.zee_type, x?.zee_type)) throw new Error(typeMismatchReason(h, x?.zee_type));
+  }
   await one(`UPDATE xell SET harness_id=$2 WHERE id=$1 RETURNING id`, [xellId, h?.id || null]);
   logline('harness', `xell ${String(xellId).slice(0, 8)} → harness ${h?.key || '(core only)'}`);
   return { harness: h ? { id: h.id, key: h.key, label: h.label } : null };
 }
 
 // List enabled harnesses for the picker/UI (core last — it is implicit/always-on).
-export async function listHarnesses() {
+export async function listHarnesses({ zeeType = null } = {}) {
   const rows = await q(
-    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.avatar_path, h.head_commit, h.dir,
+    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.avatar_path, h.head_commit, h.dir, h.zee_type,
             (h.bundle->'skills') AS skills, h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
             p.key AS parent
        FROM harness h LEFT JOIN harness p ON p.id = h.parent_id
       WHERE h.enabled ORDER BY h.is_law_core, h.key`);
-  return rows.map((h) => ({
+  // `zeeType` narrows the list to what a xell of that type may actually WEAR — what every picker
+  // must offer, so an operator is never shown a choice the assign path would then refuse.
+  return rows.filter((h) => !zeeType || harnessFitsType(h.zee_type, zeeType)).map((h) => ({
     id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core, parent: h.parent,
+    zee_type: h.zee_type,
     avatar_path: h.avatar_path, head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
     file_backed: !!h.dir,
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
@@ -263,14 +309,17 @@ function normalizeMemory(arr) {
     .filter((m) => m.text);
 }
 
-export async function createHarness({ key, label, glyph } = {}) {
+export async function createHarness({ key, label, glyph, zee_type } = {}) {
   const k = slugKey(key || label);
   if (k === 'core') throw new Error('"core" is reserved for the law harness');
   if (await one(`SELECT id FROM harness WHERE key=$1`, [k])) throw new Error(`a harness "${k}" already exists`);
-  const bundle = { label: label || k, ...(glyph ? { glyph: String(glyph).slice(0, 4) } : {}) };
-  await one(`INSERT INTO harness (key,label,bundle,enabled,is_law_core) VALUES ($1,$2,$3,true,false) RETURNING id`,
-    [k, label || k, JSON.stringify(bundle)]);
-  logline('harness', `created harness "${k}"`);
+  // Which TYPE of zee this persona is for. Worker is the default — the overwhelming majority, and
+  // the safe one: a manager harness handed to a worker teaches verbs the worker does not have.
+  const type = normalizeZeeType(zee_type, 'worker');
+  const bundle = { label: label || k, zee_type: type, ...(glyph ? { glyph: String(glyph).slice(0, 4) } : {}) };
+  await one(`INSERT INTO harness (key,label,bundle,enabled,is_law_core,zee_type) VALUES ($1,$2,$3,true,false,$4) RETURNING id`,
+    [k, label || k, JSON.stringify(bundle), type]);
+  logline('harness', `created ${type} harness "${k}"`);
   return getHarnessFull(k);
 }
 
@@ -286,6 +335,13 @@ export async function updateHarness(key, patch = {}) {
   if ('memory' in patch) bundle.memory = normalizeMemory(patch.memory);
   const label = 'label' in patch ? (String(patch.label || '').trim() || h.label) : h.label;
   const enabled = 'enabled' in patch ? !!patch.enabled : h.enabled;
+  // Retyping is allowed only while no xell of the other type is wearing it — the DB trigger decides
+  // and its message names the xells that block it, so an operator is told what to move first.
+  const type = 'zee_type' in patch ? normalizeZeeType(patch.zee_type, h.zee_type) : h.zee_type;
+  if (type !== h.zee_type) {
+    bundle.zee_type = type;
+    await q(`UPDATE harness SET zee_type=$2 WHERE key=$1`, [key, type]);
+  }
   // parent: resolve a key → parent_id ('' / null clears). The trigger blocks cycles/self-parent.
   if ('parent' in patch) {
     let pid = null;
@@ -328,7 +384,7 @@ export async function getHarnessFull(key) {
   }
   return {
     key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core, file_backed: !!h.dir,
-    parent, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
+    parent, zee_type: h.zee_type, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
     inherited,
   };

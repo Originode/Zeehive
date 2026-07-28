@@ -95,7 +95,7 @@ export async function selfStatus(xell) {
       id: xell.id, slug: xell.slug, branch: xell.branch, status: xell.status,
       hive_status: hive, hive_status_label: hiveLabel(hive),
       head_commit: xell.head_commit, db_coupling: xell.db_coupling,
-      role: xell.role || 'worker',
+      zee_type: xell.zee_type || 'worker',
       on_prod: xell.db_coupling === 'db-shared-prod',
       // Production, readable but not writable — the manager's binding. Named separately from
       // `on_prod` so nothing downstream mistakes a reader for a writer.
@@ -731,7 +731,7 @@ export async function selfCrew(xell) {
 // would make the new worker MORE than a worker — the loophole surface, closed structurally so the
 // manager's manual rule ("never dispatch a worker to reach beyond its own xell") is backed by code:
 //   • no db choice at all → a worker can never be handed production by its manager;
-//   • no role/manager escalation → only a HUMAN adds a manager zee;
+//   • no type/manager escalation → only a HUMAN adds a manager zee;
 //   • no manager harness on a worker → it cannot be handed the manager's verbs.
 export async function selfDispatch(xell, { task = null, model = null, mode = null, harness = null,
                                            title = null, runtime = null } = {}) {
@@ -740,10 +740,18 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   const text = String(task || '').trim();
   if (!text) return { ok: false, error: 'dispatch needs --task "…" — the brief the worker will work from' };
 
-  if (harness && String(harness).toLowerCase() === 'manager') {
-    return { ok: false, status: 'refused', error:
-      'a manager may not dispatch another MANAGER — managers are added by a human, in the console. '
-      + 'Dispatch a worker instead (omit --harness, or name a worker harness).' };
+  // A worker gets a WORKER harness — checked by TYPE, not by key, so renaming or adding a manager
+  // persona cannot open a side door. (The assign path and the DB would refuse it too; refusing here
+  // means the manager gets told why instead of watching a dispatch fail.)
+  if (harness) {
+    const { resolveHarness, normalizeZeeType } = await import('../lib/harness.js');
+    const h = await resolveHarness(harness).catch(() => null);
+    if (h && normalizeZeeType(h.zee_type) === 'manager') {
+      return { ok: false, status: 'refused', error:
+        `"${h.key}" is a MANAGER harness, and a manager may not dispatch another manager — managers `
+        + 'are added by a human, in the console. Dispatch a worker instead (omit --harness, or name a '
+        + 'worker harness).' };
+    }
   }
 
   // The brief the worker actually receives: its own task, plus who it reports to and how to reach
@@ -878,7 +886,7 @@ export async function selfSuggestDone(xell, { to = null, reason = null } = {}) {
 function requireManager(xell, verb) {
   if (isManager(xell)) return null;
   return { ok: false, status: 'refused', error:
-    `\`zee ${verb}\` is a MANAGER verb and this xell's role is '${xell.role || 'worker'}'. Workers do their own `
+    `\`zee ${verb}\` is a MANAGER verb and this xell's type is '${xell.zee_type || 'worker'}'. Workers do their own `
     + 'job in their own xell; dispatching, monitoring and closing out other zees belongs to a manager '
     + '(a human adds those in the console). You CAN talk to your manager, if you have one: `zee report '
     + '--message "…"` and `zee inbox`.' };

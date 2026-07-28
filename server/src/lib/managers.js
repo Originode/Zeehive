@@ -1,6 +1,6 @@
 // MANAGER ZEES — the fleet's middle layer.
 //
-// A manager zee is an ordinary xell (`xell.role='manager'`) whose zee coordinates OTHER zees instead
+// A manager zee is an ordinary xell (`xell.zee_type='manager'`) whose zee coordinates OTHER zees instead
 // of writing code. Everything it can do is still a queenzee verb behind the same walls; what changes
 // is WHICH verbs, and that split is the whole design:
 //
@@ -25,7 +25,7 @@ import { hiveStatus, hiveLabel } from './hive-status.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
 
 // ── who is what ──────────────────────────────────────────────────────────────
-export const isManager = (xell) => xell?.role === 'manager';
+export const isManager = (xell) => xell?.zee_type === 'manager';
 
 // The single sentence every refusal shares. Written once so the manager reads the SAME explanation
 // wherever it hits the wall — a manager that gets three different stories about why it cannot push

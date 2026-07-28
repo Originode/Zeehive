@@ -66,7 +66,7 @@ async function ctx(xellId) {
   // no code and lands none — it dispatches a worker, and the worker lands its own work. (Read-only
   // verbs that a human might still want on a manager's branch go through their own paths; this ctx
   // is the write door.)
-  if (x.role === 'manager') {
+  if (x.zee_type === 'manager') {
     throw new Error(`${x.slug} is a MANAGER xell: zero push/PR access to the xource. A manager writes no `
       + 'code and lands none — dispatch a worker to make the change, and it lands its own work.');
   }
