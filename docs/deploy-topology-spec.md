@@ -372,12 +372,24 @@ after landing ed805cc exposed both):
   A failed rebuild emits `{"ok":false,"method":"cxell-image-failed"}`, which `shipgate.js` records
   as a **failed** ship with the `!!!` block as `ship_request.error` — visible on the card without
   reading a build log. In the host variant this decision happens *before* the detached restart is
-  scheduled, so an abort leaves nothing half-applied. **`CXELL_IMAGE_REQUIRED=0`** is the escape
-  hatch: the failure is reported just as loudly but does not fail the ship, for an operator who
-  knowingly accepts a stale fleet image. The stance is deliberate — a queenzee on new code with a
-  silently stale fleet image is exactly the outcome nobody can detect, and it cost two zees a
-  forensics detour to find once. `test/cxell-cli-drift.test.mjs` covers all of it (duplicate CLI,
-  both context shapes, `.dockerignore` exclusions, the fatality contract, the spawn-time check).
+  scheduled, so an abort leaves nothing half-applied. The stance is deliberate — a queenzee on new
+  code with a silently stale fleet image is exactly the outcome nobody can detect, and it cost two
+  zees a forensics detour to find once. `test/cxell-cli-drift.test.mjs` covers all of it (duplicate
+  CLI, both context shapes, `.dockerignore` exclusions, the fatality contract, the spawn-time check).
+- **The guard's release valve is a PER-SHIP human decision, not a process setting.** A fatal guard
+  needs an override reachable *in the moment*; the first version's only override was
+  `CXELL_IMAGE_REQUIRED=0` in the queenzee's own environment — a `.env` edit plus a restart, which
+  is itself a deploy, exactly when someone is mid-incident. So the override rides the ship request
+  (`ship_request.allow_stale_cxell_image`, migration 055), like `skip_migrations` before it:
+  the console shows **"ship anyway if the cxell image can't be rebuilt"** on a pending card (off by
+  default), `decideShip`/`unlockAndShip` record the choice with `decided_by`, and `runShip` passes
+  `CXELL_IMAGE_REQUIRED=0` to that one build **explicitly** rather than relying on `cleanGitEnv()`
+  inheriting the orchestrator's env. Afterwards the card says the ship was approved *with* the
+  override, so the audit trail shows a human chose it. The process-env form still works untouched,
+  as the operator-level escape for a queenzee that cannot reach a docker daemon at all — and the two
+  are kept distinct: an operator-level setting is never recorded as a human's per-ship choice.
+  Covered by `test/ship-cxell-image-override.test.mjs` (default fatal, the flag reaching the child's
+  env, the recorded choice, reject never setting it, and the operator escape still passing through).
 - **CLI refresh at spawn.** Defence in depth for the same failure: `installZeeCliIntoCxell()`
   (`server/src/lib/cxell.js`, called from `spawnCxell`) `docker cp`s the queenzee's **own**
   current `scripts/zee` over `/usr/local/bin/zee` in every cxell it creates, so a fleet running

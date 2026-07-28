@@ -594,6 +594,11 @@ a.cbox:hover { border-color: var(--accent); }
 /* db scope + zee drift assessment on a ship card — part of what the approve click covers */
 .ship-dbscope { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 .ship-dbnote { margin: 3px 0 0; font-size: 12px; color: var(--muted); font-style: italic; }
+/* The cxell-image guard's release valve: quiet until ticked, then it says what it costs. */
+.ship-stale-override { display: block; margin: 5px 0 0; font-size: 12px; color: var(--muted); cursor: pointer; }
+.ship-stale-override input { vertical-align: -1px; margin-right: 2px; }
+.ship-stale-warn { color: #ffcf9e; }
+.ship-stale-chosen { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 /* deploy-target picker on a pending ship card */
 .ship-target { display: flex; align-items: center; gap: 7px; margin: 6px 0 2px; font-size: 13px; }
 .ship-target .k { color: var(--muted); }

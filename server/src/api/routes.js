@@ -156,8 +156,11 @@ router.get('/ship/status', async (req, res) => {
 router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => {
   const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
   try {
+    // allow_stale_cxell_image: the human's explicit "ship anyway with a stale cxell image" — a
+    // per-ship release valve for the fatal cxell-image guard, recorded on the request (055).
     res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console',
-      { siteId: req.body?.site_id || undefined }));
+      { siteId: req.body?.site_id || undefined,
+        allowStaleCxellImage: !!req.body?.allow_stale_cxell_image }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
 
@@ -166,7 +169,8 @@ router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => 
 router.post('/ship/requests/:id/unlock-and-ship', async (req, res) => {
   try {
     res.json(await unlockAndShip(req.params.id,
-      { siteId: req.body?.site_id || null, by: req.body?.by || 'human@console' }));
+      { siteId: req.body?.site_id || null, by: req.body?.by || 'human@console',
+        allowStaleCxellImage: !!req.body?.allow_stale_cxell_image }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
 
