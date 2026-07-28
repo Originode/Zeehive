@@ -61,6 +61,15 @@ async function ctx(xellId) {
        FROM xell x JOIN xource xo ON xo.id = x.xource_id WHERE x.id=$1`, [xellId]);
   if (!x) throw new Error('unknown xell');
   if (x.is_production) throw new Error('production does not push, pull or raise PRs — it is shipped to');
+  // A MANAGER xell has ZERO push/PR access to the xource. Refused here, in the one place every git
+  // verb passes through, so no route, script or future caller can reach around it: a manager writes
+  // no code and lands none — it dispatches a worker, and the worker lands its own work. (Read-only
+  // verbs that a human might still want on a manager's branch go through their own paths; this ctx
+  // is the write door.)
+  if (x.role === 'manager') {
+    throw new Error(`${x.slug} is a MANAGER xell: zero push/PR access to the xource. A manager writes no `
+      + 'code and lands none — dispatch a worker to make the change, and it lands its own work.');
+  }
   const project = await one(`SELECT * FROM project WHERE id=$1`, [x.project_id]);
   const parent = x.xource_xell_id
     ? await one(`SELECT id, slug, worktree_path FROM xell WHERE id=$1`, [x.xource_xell_id])

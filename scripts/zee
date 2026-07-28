@@ -165,6 +165,17 @@ function usage() {
   zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
   zee done --summary "..."           propose done (a human confirms with "Mark done")
 
+ crew (a zee that has a manager, or IS one):
+  zee report --message "..." [--kind reflection]   send your MANAGER a note (a question, a blocker, or your post-ship REFLECTION). The one reach outside your xell a worker is meant to have
+  zee inbox [--all]                  read what other zees sent you (reading marks them read); --all shows the history
+
+ MANAGER-only (refused for a worker, with an explanation):
+  zee zees                           YOUR CREW: every worker you dispatched — hive status, what it waits on, its last message
+  zee dispatch --task "..." [--model m] [--mode 1..5] [--harness key] [--title "..."]   spawn a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness
+  zee say --to <slug> --message "..."   type a message straight into that worker's LIVE session
+  zee suggest-done --to <slug> --reason "..."   ask a HUMAN to mark that worker done (they confirm; that is what reaps it)
+  NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — dispatch a worker instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused.
+
 env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (default host.docker.internal:4700)`);
   process.exit(cmd ? 1 : 0);
 }
@@ -302,6 +313,67 @@ switch (cmd) {
     const r = await req('POST', '/api/xell/self/seed-request', { files, reason });
     console.log(JSON.stringify(r.json, null, 2));
     process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'zees': {
+    // YOUR CREW (manager only). Read this before interrupting anyone: a worker showing occ-working
+    // is working, and 'waiting_on_human' is the list that actually needs you.
+    const r = await req('GET', '/api/xell/self/zees');
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    console.log(`crew of ${j.manager?.slug || '?'} — ${j.count} worker(s)`);
+    for (const c of j.crew || []) {
+      console.log(`  ${c.slug.padEnd(28)} ${String(c.hive_status_label).padEnd(10)} ${c.working ? 'working' : (c.zee_status || '—')}`);
+      if (c.task) console.log(`      task: ${c.task}`);
+      if (c.waiting_on_human?.length) console.log(`      ⚠ waiting: ${c.waiting_on_human.join('; ')}`);
+      if (c.last_message) console.log(`      last message: ${c.last_message.replace(/\s+/g, ' ').slice(0, 120)}`);
+    }
+    if (j.message) console.log(`\n${j.message}`);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'dispatch': {
+    // Spawn a WORKER that reports to you. Brief it properly — it gets ONE briefing and then works
+    // alone (your dispatch-brief skill is the shape to use).
+    const task = flag('task');
+    if (!task) { console.error('dispatch needs --task "the brief the worker works from"'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/dispatch', {
+      task, model: flag('model') || null, mode: flag('mode') || null,
+      harness: flag('harness') || null, title: flag('title') || null,
+    }));
+    break;
+  }
+  case 'say': {
+    const to = flag('to'); const message = flag('message');
+    if (!to || !message) { console.error('say needs --to <worker-slug> and --message "…"'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/say', { to, message }));
+    break;
+  }
+  case 'report': {
+    // Your note to your MANAGER — including the post-ship reflection (--kind reflection).
+    const message = flag('message');
+    if (!message) { console.error('report needs --message "what you want your manager to know"'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/report', { message, kind: flag('kind') || 'report' }));
+    break;
+  }
+  case 'inbox': {
+    const r = await req('GET', `/api/xell/self/inbox${rest.includes('--all') ? '?all=1' : ''}`);
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    for (const m of j.messages || []) {
+      console.log(`— ${m.at} ${m.kind.toUpperCase()} from ${m.from || '?'}`);
+      console.log(m.body);
+      console.log('');
+    }
+    if (j.message) console.log(j.message);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'suggest-done': {
+    const to = flag('to');
+    if (!to) { console.error('suggest-done needs --to <worker-slug> (and --reason "why it is finished")'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/suggest-done', { to, reason: flag('reason') || null }));
     break;
   }
   case 'done': {

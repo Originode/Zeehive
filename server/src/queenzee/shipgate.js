@@ -21,6 +21,7 @@ import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations } from './shipmigrate.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
+import { nudgeXellForReflection } from './nudge.js';
 
 // Real deploys are gated on a human anyway; SHIP_MODE=simulate exists to verify ZEEHIVE itself.
 const MODE = process.env.SHIP_MODE === 'simulate' ? 'simulate' : 'real';
@@ -643,6 +644,15 @@ async function runShipBody(ship, xell, project, site, lockKey) {
     [project.id, ok ? 'awaiting-verification' : 'failed', String(AUTO_RELEASE_SEC), ship.id, lockKey]);
   if (lock) broadcast('xell', { id: xell.id });
   notifyShipDone({ project, xell, ok, request: done, seconds: AUTO_RELEASE_SEC });
+  // THE REFLECTION STAGE. A successful ship is the moment the zee knows the most about its own
+  // change, and until now that knowledge died with the cxell. Re-invoke it to review what went live
+  // and report improvements/errors to its MANAGER (or, with no manager, to the console). Opens no
+  // gate, blocks nothing, and a torn-down cxell just logs — so it can never affect the ship itself.
+  if (ok) {
+    setImmediate(() => nudgeXellForReflection(xell.id, { commit: ship.commit })
+      .then((r) => { if (!r?.nudged) logline('ship', `${xell.slug}: no reflection pass — ${r?.reason || r?.error || 'no live cxell'}`); })
+      .catch(() => {}));
+  }
   // The runway is free — pull the next queued landing/ship onto the pad promptly (the pad tick is
   // the backstop). Best-effort so a failure here never affects the ship's own result.
   setImmediate(() => processPad(project.id).catch(() => {}));
