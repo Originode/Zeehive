@@ -1,24 +1,33 @@
-// CXELL-CLI-DRIFT test — the class of bug that stranded a manager zee in its cage:
-// `zee dispatch` answered "unknown command: dispatch" in EVERY cxell, because the CLI baked into
-// zeehive/zee-agent was a hand-synced DUPLICATE (docker/zeehive/zee) that had never seen the commit
-// which added the crew verbs to the authoritative scripts/zee. The server side was fine; the code
-// simply never reached the cage. A comment in the Dockerfile ("Update both if you change it") was
-// the only thing holding it together, and it failed on the first change that mattered.
+// CXELL-CLI-DRIFT test — the class of bug that stranded a manager zee in its cage, and the class
+// that then hid the fix from production for a whole ship.
 //
-// So this test asserts the MECHANISM, not the fix:
+// Act one: `zee dispatch` answered "unknown command: dispatch" in EVERY cxell, because the CLI
+// baked into zeehive/zee-agent was a hand-synced DUPLICATE (docker/zeehive/zee) that had never seen
+// the commit adding the crew verbs to the authoritative scripts/zee. The server side was fine; the
+// code simply never reached the cage. A Dockerfile comment ("Update both if you change it") was the
+// only thing holding it together, and it failed on the first change that mattered.
+//
+// Act two: the fix shipped and STILL did not reach the cage. The host self-ship rebuilt the image
+// from the working tree, which the landing gate leaves at PRE-LANDING code (it moves the ref with
+// update-ref), so every layer hit cache and the "rebuild" produced a byte-identical image — while
+// the ship card said success. Two zees found it by comparing baked-file mtimes across two cages.
+//
+// So this test asserts the MECHANISM at every hop the code takes to reach a running zee:
 //   a) there is exactly ONE copy of the CLI, and Dockerfile.zee-agent COPYs the authoritative one
 //      (re-introducing a duplicate anywhere under docker/ fails here);
-//   b) every COPY source in that Dockerfile resolves on disk relative to the context the build
-//      paths ACTUALLY pass (parsed out of scripts/self-ship.sh, scripts/self-ship-container.sh and
-//      the publish-images workflow) — so changing the context in one place and not the other, or
-//      forgetting a path prefix, is caught before the image stops building;
+//   b) the two build paths can each actually satisfy every COPY — the SHIP path (a `git archive`
+//      of the ship ref piped into `docker build -`, implemented once and shared) and the CI/manual
+//      path (a repo-root directory context, where .dockerignore applies and must not exclude a
+//      COPY source);
+//  b2) a failed cxell-image rebuild FAILS THE SHIP rather than being whispered into a log;
 //   c) usage-vs-implementation inside scripts/zee: every advertised verb has a `case`, and every
 //      case is advertised — the same drift one level in;
-//   d) the spawn path installs the queenzee's own CLI into each cxell (the belt to the Dockerfile's
-//      braces), with the right source, destination, root ownership and CR strip.
+//   d) the spawn path installs the queenzee's own CLI into each cxell, and SAYS SO when the image
+//      it booted from is stale (the check that would have caught act two).
 //
-// Pure static/unit assertions: no DB, no docker, no network.
+// Static + unit assertions plus one real `git archive`: no DB, no docker, no network.
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,6 +39,8 @@ const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`)
 
 const DOCKERFILE = 'docker/zeehive/Dockerfile.zee-agent';
 const CLI = 'scripts/zee';
+const IMAGE_LIB = 'scripts/lib/cxell-image.sh';
+const SHIP_SCRIPTS = ['scripts/self-ship.sh', 'scripts/self-ship-container.sh'];
 const dockerfile = read(DOCKERFILE);
 const cli = read(CLI);
 
@@ -68,58 +79,130 @@ const gaPins = read('.gitattributes').split('\n').filter((l) => l.trim() && !l.t
 ok(!gaPins.some((l) => l.startsWith('docker/zeehive/zee')),
    '.gitattributes no longer PINS the deleted duplicate (a comment about it is fine)');
 
-// ── (b) every COPY source resolves under the context the build paths actually pass ────────────
-console.log('\n── the Dockerfile and every build path agree on the context ──');
-// self-ship.sh / self-ship-container.sh: take every non-comment line that runs (or echoes) a
-// `docker build -f …Dockerfile.zee-agent`, join one level of line continuation, unescape the shell
-// quoting (simulate mode spells the command out with \" escapes) and read docker's LAST positional
-// token — which is the build CONTEXT.
-function contextsFrom(rel) {
-  const text = read(rel).replace(/\\\n\s*/g, ' ');
-  const out = [];
-  for (const line of text.split('\n')) {
-    if (line.trim().startsWith('#')) continue;                       // prose, not a build
-    if (!/build .*-f [^\n]*Dockerfile\.zee-agent/.test(line)) continue;
-    let l = line.trim();
-    if (l.startsWith('echo "') && l.endsWith('"')) l = l.slice(6, -1);  // unwrap the simulate echo
-    l = l.replace(/\\"/g, '"').replace(/>&2.*$/, '');                     // unescape, drop redirection
-    const toks = [...l.matchAll(/"([^"]*)"/g)].map((m) => m[1]).filter(Boolean);
-    if (toks.length) out.push(toks[toks.length - 1]);
-  }
-  return out;
+// ── (b) the two build paths, and what each one actually feeds docker ──────────────────────────
+//
+// Two shapes, deliberately:
+//   * the SHIP path (scripts/lib/cxell-image.sh, sourced by both self-ship variants) pipes a
+//     `git archive <ship-sha>` tar into `docker build -`. It CANNOT read the working tree — which
+//     on a host ship is still pre-landing code, the defect that made a "successful" rebuild rebuild
+//     nothing. .dockerignore does not apply to a stdin context and does not need to: a git archive
+//     carries exactly the tracked files.
+//   * the CI/manual path (publish-images.yml, the android variant's documented commands) passes the
+//     repo ROOT as a directory context, where .dockerignore very much does apply.
+console.log('\n── the ship path: one shared implementation, context = the SHIP REF ──');
+const imageLib = read(IMAGE_LIB);
+
+// No second copy of the rebuild logic: exactly ONE file may run a docker build of the cxell image.
+// (a `docker compose build server` in the container variant builds the QUEENZEE image, not the
+// cxell image — the marker for this one is the zee-agent Dockerfile or the CXELL_IMAGE tag.)
+const builders = [...SHIP_SCRIPTS, IMAGE_LIB].filter((rel) => read(rel).split('\n').some((l) =>
+  !l.trim().startsWith('#') && !/^\s*echo/.test(l.trim())
+  && /\bdocker\b[^\n]*\bbuild\b/.test(l) && /Dockerfile\.zee-agent|CXELL_IMAGE/.test(l)));
+ok(builders.length === 1 && builders[0] === IMAGE_LIB,
+   `exactly one file implements the cxell-image build — ${IMAGE_LIB} (found: ${builders.join(', ') || 'none'})`);
+for (const rel of SHIP_SCRIPTS) {
+  ok(/^\s*(?:\.|source)\s+"[^\n]*lib\/cxell-image\.sh"/m.test(read(rel)),
+     `${rel} SOURCES the shared implementation instead of carrying its own copy`);
+  ok(read(rel).includes('rebuild_cxell_image'), `${rel} calls rebuild_cxell_image`);
 }
-const shipPaths = ['scripts/self-ship.sh', 'scripts/self-ship-container.sh'];
-const contexts = [];
-for (const rel of shipPaths) {
-  const found = contextsFrom(rel);
-  ok(found.length > 0, `${rel} spells out a build context for the cxell image (${found.length} site(s))`);
-  for (const c of found) {
-    // Both scripts express the context relative to $SRC (the repo root of the checkout being shipped).
-    ok(c === '$SRC', `${rel}: context is the repo ROOT ("$SRC"), not a subdirectory (got "${c}")`);
-    contexts.push({ where: rel, dir: '.' });
-  }
+// The context must come from the ship ref, never from the working tree.
+ok(/git -C "\$SRC" archive/.test(imageLib), 'the context is materialized with `git archive` from the ship ref');
+ok(/docker[^\n]*build[^\n]*-f "\$CXELL_IMAGE_DOCKERFILE"[^\n]*-t "\$CXELL_IMAGE" -/.test(imageLib),
+   'and fed to `docker build -` (a stdin tar), so it cannot pick up the working tree');
+ok(!/^[^#\n]*docker[^\n]*build[^\n]*"\$SRC"/m.test(imageLib),
+   'the working tree ($SRC) is never passed as a build context any more');
+ok(/rev-parse --verify "\$\{REF\}\^\{commit\}"/.test(imageLib),
+   'the ship ref is resolved to a sha up front (never a moving ref)');
+ok(/cat-file -e "\$\{sha\}:\$\{CXELL_IMAGE_DOCKERFILE\}"/.test(imageLib),
+   'and the Dockerfile is checked AT THAT SHA, not on disk (the disk is the wrong tree here)');
+
+// THE REAL CHECK, executed: does a git archive of HEAD actually carry everything the Dockerfile
+// COPYs? That archive IS the ship context, byte for byte — so this assertion is the mechanism.
+const tarList = execFileSync('sh', ['-c', 'git archive --format=tar HEAD | tar -t'],
+  { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 26 }).split('\n').filter(Boolean);
+const tarSet = new Set(tarList.map((l) => l.replace(/\/$/, '')));
+ok(tarSet.has(DOCKERFILE), `the ship context contains ${DOCKERFILE} itself (-f resolves inside a stdin context)`);
+const notInArchive = copies.filter((c) => !tarSet.has(c.src));
+ok(notInArchive.length === 0,
+   `the ship context contains every COPY source (${notInArchive.map((c) => c.src).join(', ') || `all ${copies.length} present`})`);
+ok(!tarList.some((l) => l.startsWith('node_modules/') || l.startsWith('.git/')),
+   'and none of the junk .dockerignore used to exclude (untracked → never in a git archive)');
+
+console.log('\n── the CI/manual path: a directory context, where .dockerignore applies ──');
+// A .dockerignore matcher with docker's semantics: a leading ! is an exception, LAST match wins,
+// ** spans directories, * does not. Unit-tested below against synthetic patterns first, so the real
+// assertion means something instead of silently matching nothing.
+const DSTAR = '';
+function ignoreRegex(pattern) {
+  let s = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  s = s.replace(/\*\*/g, DSTAR).replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]');
+  s = s.split(`${DSTAR}/`).join('(?:.*/)?').split(DSTAR).join('.*');
+  return new RegExp(`^${s}(?:/.*)?$`);
 }
+function dockerignoreExcludes(path, lines) {
+  let excluded = false;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const neg = line.startsWith('!');
+    const pat = (neg ? line.slice(1) : line).replace(/^\.\//, '').replace(/\/$/, '');
+    if (ignoreRegex(pat).test(path)) excluded = !neg;    // last match wins
+  }
+  return excluded;
+}
+ok(dockerignoreExcludes('node_modules/x/y.js', ['node_modules']), 'matcher: a bare dir pattern excludes its contents');
+ok(dockerignoreExcludes('web/a/node_modules/x', ['**/node_modules']), 'matcher: **/ spans directories');
+ok(dockerignoreExcludes('build.log', ['*.log']) && !dockerignoreExcludes('build.txt', ['*.log']),
+   'matcher: * globs within a segment');
+ok(!dockerignoreExcludes('scripts/zee', ['scripts/*.sh']), 'matcher: * does not cross a segment boundary');
+ok(dockerignoreExcludes('scripts/zee', ['scripts']),
+   'matcher: the regression case — ignoring scripts/ would silently hide the CLI from the image');
+ok(!dockerignoreExcludes('scripts/zee', ['scripts', '!scripts/zee']), 'matcher: a later ! exception wins');
+// the real assertion: nothing the Dockerfile COPYs may be excluded from a root-context build
+const ignoreLines = existsSync(join(ROOT, '.dockerignore')) ? read('.dockerignore').split('\n') : [];
+ok(ignoreLines.length > 0, '.dockerignore exists (a root context without it uploads the world)');
+const ignored = copies.filter((c) => dockerignoreExcludes(c.src, ignoreLines));
+ok(ignored.length === 0,
+   `.dockerignore excludes NONE of the COPY sources (${ignored.map((c) => c.src).join(', ') || `all ${copies.length} survive`})`);
+ok(!dockerignoreExcludes(DOCKERFILE, ignoreLines), 'and it does not exclude the Dockerfile itself');
+
 // the publish-images workflow's matrix entry for the zee-agent image
 const wf = read('.github/workflows/publish-images.yml');
 const entry = wf.split(/- image:/).find((b) => b.includes('Dockerfile.zee-agent') && !b.includes('zee-agent-android'));
 ok(!!entry, 'publish-images.yml has a zee-agent matrix entry');
 const wfCtx = entry?.match(/context:\s*(\S+)/)?.[1];
 ok(wfCtx === '.', `the workflow builds it from the repo root (context: ${wfCtx})`);
-contexts.push({ where: '.github/workflows/publish-images.yml', dir: wfCtx || '.' });
-
-// The heart of it: every COPY source must exist relative to EVERY context a build path passes.
-for (const { where, dir } of contexts) {
-  const base = resolve(ROOT, dir);
-  const missing = copies.filter((c) => !existsSync(resolve(base, c.src)));
-  ok(missing.length === 0,
-     `${where}: every COPY source in ${DOCKERFILE} resolves under its context (${missing.map((m) => m.src).join(', ') || 'all present'})`);
-}
+const missingOnDisk = copies.filter((c) => !existsSync(resolve(ROOT, wfCtx || '.', c.src)));
+ok(missingOnDisk.length === 0,
+   `every COPY source resolves under the workflow's context (${missingOnDisk.map((m) => m.src).join(', ') || 'all present'})`);
 // And the android variant, which FROMs the base, must document the SAME context.
 const android = read('docker/zeehive/Dockerfile.zee-agent-android');
 const androidCmds = [...android.matchAll(/docker build -f (\S+)\s+-t\s+(\S+)\s+(\S+)/g)];
 ok(androidCmds.length === 2, 'the android variant documents both build commands');
 ok(androidCmds.every((m) => m[3] === '.'),
    'and both are documented with the repo-root context (they would not build otherwise)');
+
+// ── (b2) a failed rebuild must FAIL THE SHIP, not be whispered into a log ─────────────────────
+console.log('\n── a failed cxell-image rebuild fails the ship (escape hatch: CXELL_IMAGE_REQUIRED=0) ──');
+ok(/cxell_image_required\(\)\s*{\s*\[\s*"\$\{CXELL_IMAGE_REQUIRED:-1\}"\s*!=\s*"0"\s*\]/.test(imageLib),
+   'fatal is the DEFAULT (CXELL_IMAGE_REQUIRED unset → the rebuild is required)');
+for (const rel of SHIP_SCRIPTS) {
+  const text = read(rel);
+  ok(/if\s*!\s*rebuild_cxell_image;\s*then/.test(text), `${rel} branches on the rebuild's exit status`);
+  ok(/cxell_image_required/.test(text), `${rel} consults the escape hatch before deciding`);
+  ok(/emit false[^\n]*cxell-image-failed/.test(text), `${rel} emits ok:false with method=cxell-image-failed`);
+}
+// shipgate turns that JSON into a FAILED ship — assert the contract the scripts rely on.
+const shipgate = read('server/src/queenzee/shipgate.js');
+ok(/json\.ok\s*!==\s*false/.test(shipgate),
+   'shipgate marks a build failed when the script emits ok:false (the contract the scripts rely on)');
+ok(/ok \? 'shipped' : 'failed'/.test(shipgate), 'and writes that verdict onto the ship_request row a human reads');
+// the host variant must decide BEFORE scheduling the restart — otherwise "fatal" still half-ships
+const hostShip = read('scripts/self-ship.sh');
+ok(hostShip.indexOf('if ! rebuild_cxell_image') < hostShip.indexOf('powershell.exe'),
+   'the host variant decides the image BEFORE it schedules the detached restart (nothing half-applied)');
+ok(/CXELL_IMAGE_REQUIRED/.test(read('docs/deploy-topology-spec.md')),
+   'and the escape hatch is documented in the deploy spec, not just in the script');
 
 // ── (c) usage text vs implemented cases, inside scripts/zee ───────────────────────────────────
 console.log('\n── scripts/zee: every advertised verb is implemented, and vice versa ──');
@@ -167,11 +250,28 @@ ok(intake.includes('await installZeeCliIntoCxell('), 'and calls it on the spawn 
 const around = intake.slice(intake.indexOf('await cloneIntoCxell('), intake.indexOf('await warmCxell('));
 ok(around.includes('await installZeeCliIntoCxell('), 'right after the repo is cloned in, before the zee runs');
 ok(/logline\('cxell',[\s\S]{0,300}?zee CLI/.test(intake), 'and logs the outcome to the queenzee log (loud, not silent)');
-const lib = read('server/src/lib/cxell.js');
-const fn = lib.slice(lib.indexOf('export async function installZeeCliIntoCxell'));
-ok(/try\s*{/.test(fn.slice(0, 900)) && /catch/.test(fn.slice(0, 1400)),
+const cxellLib = read('server/src/lib/cxell.js');
+const fn = cxellLib.slice(cxellLib.indexOf('export async function installZeeCliIntoCxell'));
+ok(/try\s*{/.test(fn.slice(0, 1800)) && /catch/.test(fn.slice(0, 2400)),
    'the install is best-effort (a failed refresh must not sink a cxell spawn)');
-ok(/logline\('cxell'[^]*?!!!/.test(fn.slice(0, 1600)), 'but a failure is logged LOUDLY (!!!), like the self-ship cxell-image rebuild');
+ok(/logline\('cxell'[^]*?!!!/.test(fn.slice(0, 2400)), 'but a failure is logged LOUDLY (!!!), like the self-ship cxell-image rebuild');
+
+// ── (d2) …and it NOTICES when the image it booted from is stale ──────────────────────────────
+// The check that act two needed and did not have. It must read the baked CLI BEFORE the install
+// overwrites it — otherwise it is comparing the file against itself and can never report staleness.
+console.log('\n── spawn detects a STALE zee-agent image (the act-two check) ──');
+ok(/sha256sum/.test(cxellLib) && /createHash\('sha256'\)/.test(cxellLib),
+   'it compares the baked CLI to the queenzee\'s own scripts/zee by sha256');
+const preamble = fn.slice(0, fn.indexOf('for (const args of zeeCliInstallCommands'));
+ok(/bakedZeeCliSha\(/.test(preamble),
+   'the baked sha is read BEFORE the install overwrites it (afterwards the evidence is gone)');
+ok(/staleImage/.test(preamble) && /!!! STALE CXELL IMAGE/.test(preamble),
+   'a mismatch is logged loudly as a STALE CXELL IMAGE');
+ok(/CLI ONLY|CLI only/.test(preamble),
+   'and says plainly that the refresh repairs the CLI ONLY — the other baked files stay stale');
+ok(/cli\.staleImage/.test(intake), 'intake surfaces the verdict on the spawn line too');
+ok(/catch\s*{\s*return null;?\s*}/.test(cxellLib.slice(cxellLib.indexOf('async function bakedZeeCliSha'))),
+   'an unreadable baked copy is "unknown", never an error (the check can never sink a spawn)');
 
 console.log(failures ? `\n${failures} FAILED` : '\nall good');
 process.exit(failures ? 1 : 0);

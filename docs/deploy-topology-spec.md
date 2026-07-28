@@ -352,12 +352,32 @@ after landing ed805cc exposed both):
   recorded failure: a build failure is reported on the ship card but does not abort the
   code deploy. Both steps live in `self-ship.sh` (Zeehive's own `build_script`), so they are
   scoped to self-hosting and never touch OmniBiz's container-build ship path.
-  The image builds from the **repo-root context** (`docker build -f
-  docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent .`), like `Dockerfile.server` and
-  `Dockerfile.web`, because it bakes the authoritative **`scripts/zee`**. There is deliberately
-  no second copy of the CLI under `docker/` to hand-sync: one existed, drifted, and stranded a
-  manager zee whose crew verbs the baked CLI had never seen (`test/cxell-cli-drift.test.mjs`
-  fails if a duplicate is reintroduced or a build path's context stops matching the Dockerfile).
+  The image bakes the authoritative **`scripts/zee`**, so its context is the repo ROOT — for CI and
+  by hand that is `docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent .`
+  (like `Dockerfile.server`/`Dockerfile.web`, with `.dockerignore` keeping it lean). There is
+  deliberately no second copy of the CLI under `docker/` to hand-sync: one existed, drifted, and
+  stranded a manager zee whose crew verbs the baked CLI had never seen.
+- **The ship rebuild builds from the SHIP REF, not the working tree** — and a failure now **fails
+  the ship**. Both were defects, both measured on the `cad07a8` ship (2026-07-28):
+  the host `self-ship.sh` must rebuild *before* `self-ship-sync.sh` (the tree may only be reset
+  after the old server is killed), and the landing gate advances the branch with `git update-ref`,
+  which does not touch the working tree — so `docker build … "$SRC"` built **pre-landing** code,
+  hit cache on every layer, and produced a byte-identical image while the ship card said success.
+  A cxell cut after that ship carried baked files stamped identically, to the nanosecond, to one
+  cut before it. So the context is now materialized from the ship ref itself —
+  `git archive <sha> | docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent -`
+  — which cannot read the working tree (a stdin tar context also bypasses `.dockerignore`, which
+  is fine: a git archive carries exactly the tracked files). The implementation lives ONCE, in
+  **`scripts/lib/cxell-image.sh`**, sourced by both `self-ship.sh` and `self-ship-container.sh`.
+  A failed rebuild emits `{"ok":false,"method":"cxell-image-failed"}`, which `shipgate.js` records
+  as a **failed** ship with the `!!!` block as `ship_request.error` — visible on the card without
+  reading a build log. In the host variant this decision happens *before* the detached restart is
+  scheduled, so an abort leaves nothing half-applied. **`CXELL_IMAGE_REQUIRED=0`** is the escape
+  hatch: the failure is reported just as loudly but does not fail the ship, for an operator who
+  knowingly accepts a stale fleet image. The stance is deliberate — a queenzee on new code with a
+  silently stale fleet image is exactly the outcome nobody can detect, and it cost two zees a
+  forensics detour to find once. `test/cxell-cli-drift.test.mjs` covers all of it (duplicate CLI,
+  both context shapes, `.dockerignore` exclusions, the fatality contract, the spawn-time check).
 - **CLI refresh at spawn.** Defence in depth for the same failure: `installZeeCliIntoCxell()`
   (`server/src/lib/cxell.js`, called from `spawnCxell`) `docker cp`s the queenzee's **own**
   current `scripts/zee` over `/usr/local/bin/zee` in every cxell it creates, so a fleet running
