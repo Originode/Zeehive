@@ -2,13 +2,13 @@
 //
 // There is no cap and no pool for managers: add as many as you can afford to run. But only a human
 // may add one. A manager that could mint managers is a fleet that grows sideways with nobody's
-// consent, so `zee dispatch` refuses the role outright (queenzee/self.js) and this path is reachable
+// consent, so `zee dispatch` refuses the type outright (queenzee/self.js) and this path is reachable
 // only from the console (POST /api/managers) or an operator's CLI.
 //
 // What "adding" actually does, in order:
 //   1. take a ready xell (provisioning one on demand if the pool is dry) — a manager is a real xell
 //      with a real hexagon, not a special case floating outside the honeycomb;
-//   2. stamp role='manager' (the 052 guard then forbids it being managed, and the landgate/xellgit
+//   2. stamp zee_type='manager' (the 052 guard then forbids it being managed, and landgate/xellgit
 //      refuse its pushes forever after);
 //   3. bind it to production READ-ONLY: its OWN postgres role, granted SELECT and nothing else;
 //   4. cage a zee in it wearing the MANAGER harness (its own manual).
@@ -57,20 +57,20 @@ export async function bindManagerToProdReadonly(xellId) {
   return { ...db, readonly: true, role: reader.role, mode: reader.mode, address: reader.address };
 }
 
-// Create a manager zee. Everything after the role stamp is the ordinary dispatch path, so a manager
+// Create a manager zee. Everything after the type stamp is the ordinary dispatch path, so a manager
 // is observed, built, nudged and reaped exactly like any other xell.
 export async function createManagerZee({ project, cwd, task, title, model, mode, runtime, harness,
                                          provider = 'claude', provider_token_id = null } = {}) {
   const brief = String(task || '').trim() || DEFAULT_MANAGER_BRIEF;
   const { dispatchXell } = await import('../queenzee/intake.js');
   const out = await dispatchXell({
-    task: brief, project, cwd, title: title || 'manager zee', role: 'manager',
+    task: brief, project, cwd, title: title || 'manager zee', zee_type: 'manager',
     harness: harness || 'manager',
     ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
     provider, provider_token_id,
   });
   logline('crew', `MANAGER zee added on ${out.slug} — production is readable (read-only), pushing is not`);
-  return { ...out, role: 'manager' };
+  return { ...out, zee_type: 'manager' };
 }
 
 // What a manager is told when a human adds one without typing a brief. Deliberately a JOB, not a

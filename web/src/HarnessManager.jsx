@@ -5,7 +5,7 @@ import { getHarnesses, getHarnessFull, createHarness, updateHarness, deleteHarne
 // layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
 // law harness is not shown here (it is not editable). This is a DB-owned surface: create/edit/delete
 // applies live, no land/ship.
-const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, skills: [], memory: [], enabled: true, file_backed: false, inherited: { skills: [], memory: [], chain: [] } });
+const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, zee_type: 'worker', skills: [], memory: [], enabled: true, file_backed: false, inherited: { skills: [], memory: [], chain: [] } });
 
 // order the flat harness list into a parent→child tree (depth for indentation)
 function treeRows(list) {
@@ -55,7 +55,9 @@ export default function HarnessManager({ onClose }) {
     try {
       if (sel === '') {
         if (!form.label.trim()) throw new Error('give the harness a name');
-        const created = await createHarness({ label: form.label, glyph: form.glyph });
+        // The TYPE rides the create, not just the follow-up update: a manager persona that is born a
+        // worker and retyped a moment later would be refused the instant anything already wore it.
+        const created = await createHarness({ label: form.label, glyph: form.glyph, zee_type: form.zee_type || 'worker' });
         await updateHarness(created.key, form);
         await refresh(); open(created.key);
       } else {
@@ -87,7 +89,9 @@ export default function HarnessManager({ onClose }) {
                 {depth > 0 && <span className="hm-branch">↳</span>}
                 <span className="hm-glyph">{h.glyph || (h.label || '?')[0]}</span>
                 <span className="hm-name">{h.label}</span>
-                <span className="hm-meta">{h.skill_count}★{h.file_backed ? ' · repo' : ''}</span>
+                <span className="hm-meta">
+                  {h.zee_type === 'manager' ? '⬢ mgr · ' : ''}{h.skill_count}★{h.file_backed ? ' · repo' : ''}
+                </span>
               </button>
             ))}
             <button className="hm-new" onClick={startNew}>＋ New harness</button>
@@ -109,11 +113,40 @@ export default function HarnessManager({ onClose }) {
                 </div>
                 {form.file_backed && <div className="disp-hint">Defined in the repo (harnesses/…). Saving here detaches it to dashboard ownership.</div>}
 
+                {/* WHICH ZEE TYPE this persona is for. A harness carries the MANUAL for a type's
+                    verbs and refusals, so a xell may only wear one of its own type — a manager
+                    persona describes dispatch/say/suggest-done and says landing is refused, which is
+                    nonsense (and a trap) for a worker. Retyping is refused while a zee of the other
+                    type is wearing it; the server says which ones. */}
+                <div className="disp-field">
+                  <label className="disp-label">For zee type</label>
+                  <div className="disp-models" role="group" aria-label="Zee type">
+                    {['worker', 'manager'].map((t) => (
+                      <button key={t} className={`disp-seg ${(form.zee_type || 'worker') === t ? 'on' : ''}`}
+                              data-testid={`harness-type-${t}`}
+                              title={t === 'manager'
+                                ? 'A MANAGER zee: dispatches and monitors a crew, holds production read-only, cannot push to the xource.'
+                                : 'A WORKER zee: does the job in its own xell and lands its own work.'}
+                              onClick={() => { set('zee_type', t); if (form.parent) set('parent', null); }}>
+                        {t === 'manager' ? '⬢ manager' : 'worker'}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="disp-hint">
+                    Only a xell of this type can wear this harness. A worker picker will not offer a
+                    manager persona, and assigning one is refused.
+                  </div>
+                </div>
+
                 <div className="disp-field">
                   <label className="disp-label">Inherits (parent harness)</label>
                   <select className="disp-input" value={form.parent || ''} onChange={(e) => set('parent', e.target.value || null)}>
                     <option value="">— none (root) —</option>
-                    {list.filter((h) => h.key !== sel).map((h) => (
+                    {/* Only same-type parents: inheriting across types would merge the other type's
+                        manual into this briefing (a manager parented on Zee Base would be taught
+                        `zee land`, the one verb it is refused). The DB refuses it too. */}
+                    {list.filter((h) => h.key !== sel
+                                     && (h.zee_type || 'worker') === (form.zee_type || 'worker')).map((h) => (
                       <option key={h.key} value={h.key}>{h.label}</option>
                     ))}
                   </select>

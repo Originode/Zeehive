@@ -75,7 +75,7 @@ function pushedCommits(repoRoot, oldSha, newSha, limit = 50) {
 // informational — an unmatched push is still gated, it just shows as "unknown" in the console.
 async function resolveXell(projectId, repoRoot, newSha) {
   const xells = await q(
-    `SELECT id, slug, branch, role FROM xell
+    `SELECT id, slug, branch, zee_type FROM xell
        WHERE project_id = $1 AND status <> 'retired' AND is_production = false`, [projectId]);
   for (const x of xells) {
     const r = spawnSync('git', ['-C', repoRoot, 'merge-base', '--is-ancestor', newSha, x.branch],
@@ -103,7 +103,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
   // the workers land their own work. (Resolved from the pushed sha the same way the request below
   // resolves it — a push we cannot attribute is not treated as a manager's.)
   const pusher = await resolveXell(projectId, project.repo_root, newSha);
-  if (pusher?.role === 'manager') {
+  if (pusher?.zee_type === 'manager') {
     logline('landgate',
       `DECLINED ${ref} → ${String(newSha).slice(0, 8)} on ${project.name} — ${pusher.slug} is a MANAGER xell `
       + '(zero push access to the xource; nothing was raised for a human to approve)');

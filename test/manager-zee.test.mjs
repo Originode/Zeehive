@@ -77,7 +77,7 @@ try {
        VALUES ($1,$2,$3,$4,$5,'working',false ${extra ? `, '${extra.split('=')[1]}'` : ''}) RETURNING *`,
     [PID, ids.xource, slug, branch, wt])).rows[0];
 
-  const mgr = await mkXell('mgr', 'spinoff/mgr', mgrWt, "role=manager");
+  const mgr = await mkXell('mgr', 'spinoff/mgr', mgrWt, "zee_type=manager");
   const w1 = await mkXell('w1', 'spinoff/w1', w1Wt);
   const w2 = await mkXell('w2', 'spinoff/w2', w2Wt);
   await client.query(`UPDATE xell SET manager_xell_id=$1 WHERE id IN ($2,$3)`, [mgr.id, w1.id, w2.id]);
@@ -98,7 +98,7 @@ try {
     catch (e) { ok(/manager|itself|production/i.test(e.message), `${what} is refused by the DB (${e.message.split('\n')[0].slice(0, 70)})`); }
   };
   await refuses(`UPDATE xell SET manager_xell_id=$1 WHERE id=$1`, [mgr.id], 'a xell managing itself');
-  await refuses(`UPDATE xell SET role='manager' WHERE id=$1`, [w1.id], 'a MANAGED xell becoming a manager');
+  await refuses(`UPDATE xell SET zee_type='manager' WHERE id=$1`, [w1.id], 'a MANAGED xell becoming a manager');
   await refuses(`UPDATE xell SET manager_xell_id=$1 WHERE id=$2`, [w1.id, w2.id], 'a worker reporting to a WORKER');
   ok(true, 'a manager may hold a crew (the rows above were created)');
 
@@ -226,10 +226,68 @@ try {
     ok(manual.text.includes(must), `the manual states: ${must}`);
   }
   ok(!h.bundle.parent, 'it does NOT inherit the worker manual (a manager has different doors)');
+  ok((h.bundle.zee_type || h.bundle.type) === 'manager', 'the folder DECLARES the zee type it is for');
+
+  // ── 9. TYPE vs HARNESS: the two axes, and the rule between them ──────────
+  const H = await import('../server/src/lib/harness.js');
+  ok(H.harnessFitsType('worker', 'worker') && H.harnessFitsType('manager', 'manager'),
+     'a harness fits a xell of its own type');
+  ok(!H.harnessFitsType('manager', 'worker') && !H.harnessFitsType('worker', 'manager'),
+     'and never one of the other type');
+  ok(H.harnessFitsType('any', 'worker') && H.harnessFitsType('any', 'manager'),
+     "the law layer ('any') fits both — it is the manual every zee gets");
+
+  const offered = await H.listHarnesses({ zeeType: 'worker' });
+  ok(!offered.some((x) => x.key === 'manager'), 'a WORKER picker is never offered the manager harness');
+  ok(offered.some((x) => x.zee_type === 'worker'), 'but it is offered the worker ones');
+  const mgrOffered = await H.listHarnesses({ zeeType: 'manager' });
+  ok(mgrOffered.some((x) => x.key === 'manager') && !mgrOffered.some((x) => x.zee_type === 'worker'),
+     'and a MANAGER picker is offered manager harnesses only');
+
+  // assigning across types is refused — with a sentence, not a postgres exception
+  const mgrHarness = await client.query(`SELECT id FROM harness WHERE key='manager'`);
+  const wrong = await H.assignHarness(w2.id, 'manager').catch((e) => e);
+  ok(wrong instanceof Error && /is for manager zees/.test(wrong.message),
+     `assigning a manager harness to a WORKER is refused: "${String(wrong.message).slice(0, 60)}…"`);
+  const wrong2 = await H.assignHarness(mgr.id, 'zee-base').catch((e) => e);
+  ok(wrong2 instanceof Error && /is for worker zees/.test(wrong2.message),
+     'and a worker harness on a MANAGER is refused too');
+  const right = await H.assignHarness(mgr.id, 'manager');
+  ok(right.harness?.key === 'manager', 'the manager harness assigns to a manager xell');
+
+  // the DB is the wall, not the assign path: a direct UPDATE is refused as well
+  try {
+    await client.query(`UPDATE xell SET harness_id=$2 WHERE id=$1`, [w2.id, mgrHarness.rows[0].id]);
+    ok(false, 'a direct UPDATE bypassing the assign path is refused by the DB');
+  } catch (e) {
+    ok(/is for manager zees/.test(e.message), 'a direct UPDATE bypassing the assign path is refused by the DB');
+  }
+  // and a xell wearing a harness cannot be retyped out from under it
+  try {
+    await client.query(`UPDATE xell SET zee_type='worker' WHERE id=$1`, [mgr.id]);
+    ok(false, 'a manager wearing the manager harness cannot be flipped to worker');
+  } catch (e) {
+    ok(/is for manager zees/.test(e.message), 'a manager wearing the manager harness cannot be flipped to worker');
+  }
+  // nor can the harness be retyped while worn
+  try {
+    await client.query(`UPDATE harness SET zee_type='worker' WHERE key='manager'`);
+    ok(false, 'the harness cannot be retyped while a manager wears it');
+  } catch (e) {
+    ok(/cannot retype harness/.test(e.message), `the harness cannot be retyped while a manager wears it`);
+  }
+  // cross-type INHERITANCE is the quiet version of the same bug — also refused
+  try {
+    await client.query(`UPDATE harness SET parent_id=(SELECT id FROM harness WHERE key='zee-base') WHERE key='manager'`);
+    ok(false, 'a manager harness cannot inherit a worker harness');
+  } catch (e) {
+    ok(/only inherit within its own/.test(e.message), 'a manager harness cannot inherit a worker harness (it would merge the worker manual in)');
+  }
+  await H.assignHarness(mgr.id, null);   // leave it clean for the teardown
 
   // ── the briefing a manager is actually given ─────────────────────────────
   const intake = await import('node:fs').then((fs) => fs.readFileSync('server/src/queenzee/intake.js', 'utf8'));
-  ok(/You are a MANAGER zee: you coordinate other zees/.test(intake), 'the binding RULES name the manager role');
+  ok(/You are a MANAGER zee: you coordinate other zees/.test(intake), 'the binding RULES name the manager type');
   ok(/NEVER dispatch a worker in a way that gives it reach beyond its own xell/.test(intake),
      'the binding RULES carry the anti-loophole law');
   ok(/SHIPPING is NOT blocked for you/.test(intake), 'the binding RULES say shipping is not blocked');
@@ -264,10 +322,10 @@ try {
     // eslint-disable-next-line no-new-func
     const seatXells = new Function(mod)();
 
-    const mgrA = { id: 'A', role: 'manager' }, mgrB = { id: 'B', role: 'manager' };
-    const crewA = [1, 2, 3, 4].map((n) => ({ id: `a${n}`, role: 'worker', manager_xell_id: 'A' }));
-    const crewB = [1, 2].map((n) => ({ id: `b${n}`, role: 'worker', manager_xell_id: 'B' }));
-    const loners = [1, 2, 3].map((n) => ({ id: `x${n}`, role: 'worker' }));
+    const mgrA = { id: 'A', zee_type: 'manager' }, mgrB = { id: 'B', zee_type: 'manager' };
+    const crewA = [1, 2, 3, 4].map((n) => ({ id: `a${n}`, zee_type: 'worker', manager_xell_id: 'A' }));
+    const crewB = [1, 2].map((n) => ({ id: `b${n}`, zee_type: 'worker', manager_xell_id: 'B' }));
+    const loners = [1, 2, 3].map((n) => ({ id: `x${n}`, zee_type: 'worker' }));
     const list = [...loners.slice(0, 1), mgrA, ...crewB, mgrB, ...crewA, ...loners.slice(1)];
     const cells = seatXells(list, 5);
 
@@ -291,7 +349,7 @@ try {
     ok(crewB.every((w) => dist(cells[w.id], cells.A) > 1), "and not around the other manager");
 
     // the no-managers case must be byte-for-byte the old reading-order layout
-    const plain = [1, 2, 3, 4, 5, 6, 7].map((n) => ({ id: String(n), role: 'worker' }));
+    const plain = [1, 2, 3, 4, 5, 6, 7].map((n) => ({ id: String(n), zee_type: 'worker' }));
     const flat = seatXells(plain, 3);
     ok(plain.every((x, i) => flat[x.id][0] === Math.floor(i / 3) && flat[x.id][1] === i % 3),
        'with no managers the seating is exactly the old row-major reading order');

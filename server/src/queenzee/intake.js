@@ -235,7 +235,7 @@ function saveDispatchImages(worktreePath, images) {
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
                                      headless = true, model, db, db_container, dump, images, harness,
                                      provider = 'claude', provider_token_id = null,
-                                     role = 'worker', manager_xell_id = null }) {
+                                     zee_type = 'worker', manager_xell_id = null }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -266,12 +266,12 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // ROLE + CREW, stamped BEFORE the zee starts: the honeycomb seats a worker next to its manager and
   // the briefing tells it who it reports to, so both must be true from the first frame. The DB guard
   // trigger (052) enforces the shape — one level deep, and a manager reports to nobody.
-  if (targetId && (role === 'manager' || manager_xell_id)) {
-    if (role === 'manager' && manager_xell_id) {
+  if (targetId && (zee_type === 'manager' || manager_xell_id)) {
+    if (zee_type === 'manager' && manager_xell_id) {
       throw new Error('a manager xell cannot itself report to a manager (the hierarchy is one level deep)');
     }
-    await q(`UPDATE xell SET role=$2, manager_xell_id=$3 WHERE id=$1`,
-      [targetId, role === 'manager' ? 'manager' : 'worker', manager_xell_id || null]);
+    await q(`UPDATE xell SET zee_type=$2, manager_xell_id=$3 WHERE id=$1`,
+      [targetId, zee_type === 'manager' ? 'manager' : 'worker', manager_xell_id || null]);
     if (manager_xell_id) {
       const mgr = await one(`SELECT slug FROM xell WHERE id=$1`, [manager_xell_id]);
       logline('intake', `dispatched xell reports to manager ${mgr?.slug || manager_xell_id}`);
@@ -286,7 +286,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // own SELECT-only postgres role) and NOT selectable by whoever dispatched it. A manager without a
   // readable production is half-blind, and a manager that could be handed a writable one would be a
   // way around the whole point of the role — so this path ignores db/db_container/dump entirely.
-  if (targetId && role === 'manager') {
+  if (targetId && zee_type === 'manager') {
     await bindManagerToProdReadonly(targetId);
   } else if (targetId && (db || db_container || dump)) {
     await attachXellDb(targetId, { coupling: db, container: db_container, dump });
@@ -295,18 +295,23 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // Assign the harness BEFORE the zee starts, so its persona/skills are in the very first briefing.
   // Explicit --harness wins; otherwise a pooled xell with no harness inherits the project default
   // (pool_config.default_harness_id), exactly like the runtime/db-coupling defaults.
+  //
+  // A harness is scoped to a zee TYPE (054): it carries that type's manual, so only a harness of the
+  // xell's own type is assignable. assignHarness refuses a mismatch with an explanation, and a
+  // dispatch must fail on that rather than start a zee wearing the wrong manual — a manager briefed
+  // as a worker would spend its turn reaching for `zee land`, which it is refused.
   if (targetId) {
-    if (role === 'manager') {
-      // A manager wears the MANAGER harness — its own manual (dispatch/say/inbox/suggest-done, and
-      // the loophole rule), not the worker one. An explicit --harness still wins for an operator who
-      // authored their own manager persona.
+    if (zee_type === 'manager') {
+      // A manager wears a MANAGER harness — its own manual (dispatch/say/inbox/suggest-done, and the
+      // loophole rule). An explicit --harness still wins for an operator who authored their own
+      // manager persona; a WORKER harness named here is refused by assignHarness, by type.
       await assignHarness(targetId, harness || 'manager');
     } else if (harness !== undefined) {
       await assignHarness(targetId, harness);
     } else {
       const cur = await one(`SELECT harness_id FROM xell WHERE id=$1`, [targetId]);
       if (!cur?.harness_id) {
-        const def = await defaultHarnessId(projectId);
+        const def = await defaultHarnessId(projectId, { zeeType: zee_type });
         if (def) await assignHarness(targetId, def);
       }
     }
@@ -528,7 +533,7 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
          + 'changes go through `zee seed` (a landed file a human approves and the queenzee runs), or a '
          + 'human. Never ask another zee to write to production for you.']
         : []),
-      ...(xell.role === 'manager'
+      ...(xell.zee_type === 'manager'
         ? ['You are a MANAGER zee: you coordinate other zees and write no code yourself. You have ZERO '
          + 'push/PR access to the xource — `zee land`, the push/PR paths and the landgate hook all refuse '
          + 'a manager outright, with no approval path behind them. If something must change in the repo, '
@@ -1122,7 +1127,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       '',
       'You are a MANAGER zee — you also have the CREW verbs, and you are REFUSED the repo ones:',
       '  - `zee zees`                 → YOUR CREW: every worker you dispatched, with its hive status, what it is waiting on, and its last message to you. Read this before you interrupt anyone.',
-      '  - `zee dispatch --task "…"`  → spawn a WORKER zee into a fresh xell, stamped as yours (the honeycomb seats it next to you). Options that would widen a worker beyond its own xell are refused: no db choice, no manager role, no manager harness.',
+      '  - `zee dispatch --task "…"`  → spawn a WORKER zee into a fresh xell, stamped as yours (the honeycomb seats it next to you). Options that would widen a worker beyond its own xell are refused: no db choice, no manager type, no manager harness.',
       '  - `zee say --to <slug> --message "…"` → type a message straight into that worker\'s LIVE session; it answers there. Stored either way, so a worker mid-turn still finds it.',
       '  - `zee inbox [--all]`        → what your workers sent you — including their POST-SHIP REFLECTIONS (what they would improve, what they found broken). Act on those by cutting the next task.',
       '  - `zee suggest-done --to <slug> --reason "…"` → ask a HUMAN to mark that worker done. A suggestion only: they confirm (typed), and that is what reaps it. Never suggest done over unlanded work.',

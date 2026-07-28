@@ -58,8 +58,12 @@ export async function getDispatchModels(provider = 'claude') {
 }
 // Harnesses — the system-wide config layers (persona/skills) a xell can wear. Listed for the
 // composer picker + the switch-harness control on a xell card.
-export async function getHarnesses() {
-  const r = await fetch('/api/harnesses');
+//
+// `zeeType` narrows the list to what a xell of that TYPE may actually wear (054): a harness carries
+// its type's manual, so offering a manager persona in a worker picker would only produce a refusal
+// at assign time. Omit it in the harness MANAGER, which edits every persona regardless of type.
+export async function getHarnesses(zeeType = null) {
+  const r = await fetch(`/api/harnesses${zeeType ? `?zee_type=${encodeURIComponent(zeeType)}` : ''}`);
   return r.ok ? r.json() : [];
 }
 // Assign/switch a xell's harness (a human action). `harness` is a key/id, or null to clear to core.
