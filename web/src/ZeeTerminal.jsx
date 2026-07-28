@@ -29,8 +29,8 @@ const PATH_RE = /(?:\.{0,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+(?::\d+(?::\
 //   ContainerTerminal → /api/containers/:id/terminal (docker exec shell in ANY container)
 // TerminalModal is the shared body: xterm + fit + the resize/refit choreography, fullscreen,
 // and the status pill. The flavors differ only in title, footer, and prod styling.
-// `explorerZeeId` (cxell zees only) lights up the 📁 file-explorer panel and the "show file"
-// entry in the right-click menu.
+// `explorerZeeId` (cxell zees only) lights up the single 📁 file-explorer button (toggles the panel;
+// with a path-shaped selection it opens that file instead).
 export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
@@ -185,12 +185,20 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   // dragging to make a selection — it is captured into the 📋 clipboard tray.)
   const onContextMenu = (e) => e.preventDefault();
 
-  // "Show file" from the header button: read whatever path is selected in the terminal (a Shift+drag
-  // selection) and open it. The primary path is now just CLICKING a link in the output; this covers
-  // the case where a path isn't on its own token (e.g. selected across words).
-  const showFileFromSelection = () => {
-    const p = pathFromSelection(termRef.current?.getSelection?.() || '');
-    if (p) openInExplorer(p); else setShowFx(true);
+  // ONE explorer button (there used to be two — 📄 "show file" and 📁 "toggle explorer" — which is
+  // the same door twice: 📄 with nothing selected just opened the panel, and the panel has its own
+  // path box). So 📁 does both: a Shift+drag selection that LOOKS like a path opens that file (and
+  // the panel with it); otherwise it plain toggles the panel. The selection is cleared after it is
+  // consumed, so the very next click toggles instead of re-opening the same file.
+  const toggleExplorer = () => {
+    const term = termRef.current;
+    const p = pathFromSelection(term?.getSelection?.() || '');
+    if (p) {
+      openInExplorer(p);
+      try { term?.clearSelection?.(); } catch { /* terminal torn down */ }
+      return;
+    }
+    setShowFx((v) => !v);
   };
 
   return createPortal(
@@ -207,13 +215,10 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
                     onClick={() => setClipOpen((v) => !v)}
                     title="Clipboard — selections you Shift+drag land here (works even when the OS clipboard is blocked)">📋</button>
             {explorerZeeId && (
-              <button className="term-x" data-testid="fx-showfile" onClick={showFileFromSelection}
-                      title="Show file — click a path in the output, or Shift+drag to select one, then this">📄</button>
-            )}
-            {explorerZeeId && (
               <button className={`term-x${showFx ? ' on' : ''}`} data-testid="fx-toggle"
-                      onClick={() => setShowFx((v) => !v)}
-                      title={showFx ? 'Hide file explorer' : 'Show file explorer'}>📁</button>
+                      onClick={toggleExplorer}
+                      title={showFx ? 'Hide file explorer (Shift+drag a path first to open that file)'
+                                    : 'File explorer — Shift+drag a path (or click one in the output) to open that file'}>📁</button>
             )}
             <button className="term-x" onClick={() => setFull(!full)} title={full ? 'Exit fullscreen' : 'Fullscreen'}>{full ? '⇲' : '⛶'}</button>
             <button className="term-x" onClick={onClose} title="Close">✕</button>

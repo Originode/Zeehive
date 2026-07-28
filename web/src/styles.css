@@ -1485,6 +1485,107 @@ a.cbox:hover { border-color: var(--accent); }
 .land-panel.prod-panel.settled { border-color: var(--up); }
 .land-panel.prod-panel.settled .land-title { color: var(--up); }
 
+/* ── the DIFF VIEWER ────────────────────────────────────────────────────────────
+   Every diffstat in the console is now a LINK to the lines it counts (DiffViewer.jsx).
+   `.difflink` is the shared affordance: the stat keeps its exact typography (it is still
+   the number you were reading) and only gains an underline + a hover tint, so nothing
+   moves on the card — it just becomes obviously clickable. */
+.difflink { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit;
+  cursor: pointer; text-align: left; display: inline-flex; align-items: baseline; gap: 6px;
+  border-bottom: 1px dashed transparent; }
+.difflink:hover:not(:disabled) { border-bottom-color: var(--accent); }
+.difflink:disabled { cursor: default; color: var(--muted); }
+.difflink-hint { color: var(--muted); font-size: 11px; font-weight: 500; opacity: .55;
+  font-family: 'Segoe UI', sans-serif; }
+.difflink:hover .difflink-hint { opacity: 1; color: var(--accent); }
+button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; }
+
+.dv-overlay { position: fixed; inset: 0; z-index: 95; display: flex; align-items: center;
+  justify-content: center; padding: 4vh 3vw; background: rgba(4,6,10,.66);
+  backdrop-filter: blur(3px); animation: dlg-fade .14s ease-out; }
+.dv { display: flex; flex-direction: column; width: min(1400px, 96vw); height: min(92vh, 1000px);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+.dv-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel2); flex: 0 0 auto; }
+.dv-title { font-size: 14px; font-weight: 700; color: var(--text); }
+.dv-sub { font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.dv-spacer { flex: 1 1 auto; }
+.dv-stat { font-family: 'Cascadia Code', monospace; font-size: 12.5px; color: var(--muted); }
+.dv-stat .ins { color: var(--up); } .dv-stat .del { color: var(--down); }
+.dv-toggle { background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 6px; padding: 3px 9px; font-size: 11.5px; cursor: pointer; }
+.dv-toggle:hover { color: var(--text); border-color: var(--accent); }
+.dv-x { background: none; border: 0; color: var(--muted); font-size: 15px; cursor: pointer;
+  padding: 0 4px; }
+.dv-x:hover { color: var(--text); }
+.dv-meta { padding: 6px 14px; font-size: 11.5px; color: var(--muted);
+  border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+.dv-meta code { font-family: 'Cascadia Code', monospace; color: var(--accent); }
+.dv-note-inline { color: var(--building); }
+.dv-empty { padding: 28px 16px; color: var(--muted); font-size: 13px; text-align: center; }
+.dv-empty.err { color: var(--down); }
+
+.dv-split { display: flex; min-height: 0; flex: 1 1 auto; }
+.dv-rail { flex: 0 0 260px; border-right: 1px solid var(--line); overflow-y: auto;
+  background: var(--bg); padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+.dv-filter { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  color: var(--text); font-size: 12px; padding: 5px 8px; margin-bottom: 6px; outline: none; }
+.dv-filter:focus { border-color: var(--accent); }
+.dv-railitem { display: flex; align-items: center; gap: 6px; background: none; border: 0;
+  color: var(--text); font-size: 11.5px; padding: 3px 5px; border-radius: 5px; cursor: pointer;
+  text-align: left; width: 100%; }
+.dv-railitem:hover { background: var(--panel2); }
+.dv-railpath { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; direction: rtl; }
+.dv-railnums { font-family: 'Cascadia Code', monospace; font-size: 10.5px; flex: 0 0 auto; }
+.dv-railnums .ins { color: var(--up); } .dv-railnums .del { color: var(--down); }
+.dv-dot { width: 7px; height: 7px; border-radius: 2px; flex: 0 0 auto; background: var(--muted); }
+.dv-dot.s-added, .dv-dot.s-untracked { background: var(--up); }
+.dv-dot.s-deleted { background: var(--down); }
+.dv-dot.s-modified { background: var(--building); }
+.dv-dot.s-renamed, .dv-dot.s-copied { background: var(--accent); }
+
+.dv-files { flex: 1 1 auto; min-width: 0; overflow: auto; background: var(--bg); }
+.dv-file { border-bottom: 1px solid var(--line); }
+.dv-file-head { display: flex; align-items: center; gap: 8px; width: 100%; background: var(--panel2);
+  border: 0; border-bottom: 1px solid var(--line); color: var(--text); cursor: pointer;
+  padding: 6px 10px; font-size: 12px; position: sticky; top: 0; z-index: 1; text-align: left; }
+.dv-file-head:hover { background: var(--panel); }
+.dv-caret { color: var(--muted); flex: 0 0 auto; }
+.dv-status { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; flex: 0 0 auto; }
+.dv-status.s-added, .dv-status.s-untracked { color: var(--up); border-color: var(--up); }
+.dv-status.s-deleted { color: var(--down); border-color: var(--down); }
+.dv-status.s-renamed, .dv-status.s-copied { color: var(--accent); border-color: var(--accent); }
+.dv-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: 'Cascadia Code', monospace; }
+.dv-oldpath { color: var(--muted); }
+.dv-nums { font-family: 'Cascadia Code', monospace; font-size: 11.5px; flex: 0 0 auto; color: var(--muted); }
+.dv-nums .ins { color: var(--up); } .dv-nums .del { color: var(--down); }
+
+.dv-body { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; line-height: 1.45; }
+.dv-row { display: flex; white-space: pre; }
+.dv-body.wrap .dv-row { white-space: pre-wrap; }
+.dv-ln { flex: 0 0 52px; text-align: right; padding-right: 8px; color: var(--unknown);
+  user-select: none; font-size: 11px; }
+.dv-sign { flex: 0 0 14px; text-align: center; color: var(--muted); user-select: none; }
+.dv-code { flex: 1 1 auto; min-width: 0; padding-right: 12px; }
+.dv-body.wrap .dv-code { word-break: break-word; }
+.dv-row.r-add { background: rgba(53,196,107,.10); }
+.dv-row.r-add .dv-code, .dv-row.r-add .dv-sign { color: #9be3b6; }
+.dv-row.r-del { background: rgba(229,85,78,.10); }
+.dv-row.r-del .dv-code, .dv-row.r-del .dv-sign { color: #f0a9a5; }
+.dv-row.r-hunk { background: var(--panel2); color: var(--accent); }
+.dv-row.r-hunk .dv-code { color: var(--accent); }
+.dv-row.r-meta .dv-code { color: var(--muted); font-style: italic; }
+.dv-note { padding: 8px 12px; color: var(--muted); font-size: 12px; }
+.dv-note.warn { color: var(--building); }
+.dv-more { display: block; width: 100%; background: var(--panel2); border: 0; border-top: 1px solid var(--line);
+  color: var(--accent); font-size: 12px; padding: 7px; cursor: pointer; }
+.dv-more:hover { background: var(--panel); }
+
 /* ── MANAGER ZEES ───────────────────────────────────────────────────────────
    The "+ manager zee" button sits with the prompt buttons but reads differently on purpose: adding
    a manager is not dispatching a task, it is adding a layer to the fleet — an outlined (not filled)
