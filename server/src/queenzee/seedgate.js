@@ -103,6 +103,21 @@ export async function priorRuns(projectId, files) {
   }));
 }
 
+// IS PRODUCTION ALREADY RUNNING THE CODE THIS SEED BELONGS TO? A seed usually rides BEHIND a ship
+// ("some shipments require seeding the database"), and seeding rows for a table prod does not have
+// yet just fails — noisily, but it wastes an approval. So the answer travels with the request and
+// renders on the card, as information rather than a rule: there are legitimate seeds that precede a
+// ship, and a gate that guessed at the order would block them.
+//   { shipped: <sha|null>, contains: true|false|null }   null = nothing shipped / cannot tell
+export async function shipState(project, commit) {
+  const last = await one(
+    `SELECT commit FROM ship_request WHERE project_id=$1 AND status='shipped'
+      ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [project.id]);
+  if (!last?.commit || !commit) return { shipped: last?.commit || null, contains: null };
+  const r = gitOk(project.repo_root, ['merge-base', '--is-ancestor', commit, last.commit]);
+  return { shipped: last.commit, contains: r.status === 0 ? true : r.status === 1 ? false : null };
+}
+
 // ── the zee's verb: ASK to seed production ───────────────────────────────────
 // Records a request only. Refused (loudly, with the reason the zee can act on) when the named
 // files are not on main — because the queenzee runs them FROM main, so an unlanded seed is not
@@ -170,11 +185,16 @@ export async function requestProdSeed({ xellId, zeeId = null, files = [], reason
   broadcast('seed', row);
   broadcast('xell', { id: xellId });
   const prior = await priorRuns(project.id, wanted);
+  const ship = await shipState(project, commit);
   logline('seed', `HELD seed request from ${xell.slug} @ ${commit.slice(0, 8)} — ${wanted.length} file(s): `
     + `${wanted.map((f) => f.replace(`${SEED_DIR}/`, '')).join(', ')}${prior.length ? ` (⚠ ${prior.length} prior run(s) of these files)` : ''}`);
   notifySeedRequest({ project, xell, request: row });
   return {
-    ok: true, request: row, prior,
+    ok: true, request: row, prior, ship,
+    note: ship.contains === false
+      ? 'NB: production is not yet running this commit — if these rows depend on a table this ship has '
+        + 'not delivered, the seed will fail. Ship first, then have the seed approved.'
+      : undefined,
     message: 'Prod seed REQUESTED — a human must approve it in the ZEEHIVE console, and then the '
       + 'QUEENZEE runs the SQL against production (you never touch prod). Seeds are NOT ledgered: '
       + 'write them idempotent (ON CONFLICT DO NOTHING / WHERE NOT EXISTS) so a re-run is harmless.',
@@ -210,7 +230,9 @@ export async function seedRequestSql(id) {
   const files = (row.files || []).map((f) => ({
     file: f, sql: seedFileAt(project.repo_root, row.commit, f),
   }));
-  return { id: row.id, commit: row.commit, files, prior: await priorRuns(row.project_id, row.files || []) };
+  return { id: row.id, commit: row.commit, files,
+    prior: await priorRuns(row.project_id, row.files || []),
+    ship: await shipState(project, row.commit) };
 }
 
 // "Seen it — stop showing me." View-only, like the landing/ship equivalents: it never changes what

@@ -166,6 +166,19 @@ try {
      `a real run whose target cannot be PROVEN to be production refuses: "${(refused.result?.error || '').slice(0, 70)}…"`);
   process.env.SEED_MODE = 'simulate';
 
+  // ── 9b. "is prod already running this code?" rides with the request ──
+  // A seed usually follows a ship. The answer is reported, never enforced: a seed that precedes its
+  // ship is legitimate, so this is a warning on the card, not a refusal.
+  const { shipState } = await import('../server/src/queenzee/seedgate.js');
+  const noShip = await shipState({ id: PID, repo_root: repo }, head);
+  ok(noShip.shipped === null && noShip.contains === null, 'nothing shipped yet → "cannot tell", not a refusal');
+  await client.query(
+    `INSERT INTO ship_request (project_id, xell_id, commit, reason, targets, status, finished_at,
+                               decided_at, decided_by)
+       VALUES ($1,$2,$3,'code','{server}','shipped', now(), now(), 'test@seed')`, [PID, xellId, head]);
+  const shipped = await shipState({ id: PID, repo_root: repo }, head);
+  ok(shipped.contains === true, 'once the seed\'s commit is shipped, the card says prod is running it');
+
   // ── 10. THE CONSOLE SEES IT. The whole reason `zee prod` was a dead end for so long is that the
   // request existed only in the queenzee log: no hexagon status, no card, no panel. So assert the
   // read model a human actually looks at — the fleet payload — carries both asks. ──

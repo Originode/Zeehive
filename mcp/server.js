@@ -118,6 +118,22 @@ server.tool('zeehive_ship_status',
   { xell_id: z.string() },
   async ({ xell_id }) => asText(await call('GET', `/api/ship/status?xell=${encodeURIComponent(xell_id)}`)));
 
+server.tool('zeehive_seed_request',
+  'ASK a human to approve SEEDING PRODUCTION: name landed *.sql file(s) under server/sql/seeds/ and, '
+  + 'on approval, the QUEENZEE runs them against the production database. You never touch prod. Use '
+  + 'this when a shipment is not usable until rows exist in prod (reference data, a lookup the new '
+  + 'screen reads) — it is the NARROW alternative to being bound to the live database. REFUSED unless '
+  + 'the files are already on main (the queenzee reads them from main, not from your worktree), and '
+  + 'they must be IDEMPOTENT: seeds are not ledgered, so a re-run must be harmless.',
+  {
+    xell_id: z.string().describe('your xell id'),
+    files: z.array(z.string()).describe('seed file(s), e.g. server/sql/seeds/2026-07-28-lookups.sql '
+      + '(a bare name is resolved into that directory)'),
+    reason: z.string().optional().describe('what this seeds into production, and why it belongs there'),
+  },
+  async ({ xell_id, files, reason }) =>
+    asText(await call('POST', `/api/xells/${encodeURIComponent(xell_id)}/seed`, { files, reason })));
+
 server.tool('zeehive_prod_lock_status',
   'Who holds the production deploy lock right now? (Read-only. You can never take or release it.)', {},
   async () => asText(await call('GET', '/api/prod-lock')));

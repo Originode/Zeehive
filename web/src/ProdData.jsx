@@ -157,6 +157,15 @@ export function SeedCard({ req, onDone, onDismiss }) {
           )}
         </>
       )}
+      {/* Is prod already running the code these rows belong to? Information, not a rule — a seed
+          that precedes its ship is legitimate; a seed that depends on a table the ship has not
+          delivered yet will simply fail, and this is the warning that saves you the approval. */}
+      {pending && sql?.ship?.contains === false && (
+        <div className="prod-ask-note warn">
+          ⚠ production is not yet running this commit (last shipped {String(sql.ship.shipped || '').slice(0, 8)}).
+          If these rows need a table this ship has not delivered, ship first — the seed will fail otherwise.
+        </div>
+      )}
       {sql?.prior?.length > 0 && pending && (
         <div className="prod-ask-note warn">
           ⚠ already run on this production: {sql.prior.map((p) => `${p.files.map(base).join(', ')} `
