@@ -99,6 +99,26 @@ export async function getDiffs(projectId) {
   return r.ok ? r.json() : {};
 }
 
+// ── the DIFF VIEWER's two reads (the patch behind a diffstat) ─────────────────
+// getDiffs above answers "how much" for every xell; these answer "what" for one. Both return the
+// server's payload as-is INCLUDING its refusals ({ ok: false, error }) — a diff that cannot be read
+// (no worktree, a gc'd sha, an unreachable cxell) is an answer the viewer shows, not an exception.
+export async function getXellPatch(xellId, kind = 'source') {
+  const r = await fetch(`/api/xells/${xellId}/diff?kind=${encodeURIComponent(kind)}`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok && d.error) return { ok: false, ...d };
+  if (!r.ok) throw new Error(`diff ${r.status}`);
+  return d;
+}
+
+export async function getLandPatch(requestId) {
+  const r = await fetch(`/api/land/requests/${requestId}/diff`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok && d.error) return { ok: false, ...d };
+  if (!r.ok) throw new Error(`diff ${r.status}`);
+  return d;
+}
+
 export async function getLogs(n = 200) {
   const r = await fetch(`/api/logs?n=${n}`);
   return r.ok ? r.json() : [];

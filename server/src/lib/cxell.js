@@ -330,6 +330,45 @@ export async function cxellDiff({ ctx = 'default', slug, base }) {
   };
 }
 
+// The PATCH behind cxellDiff's numbers — the same read, one level deeper, for the console's diff
+// viewer. cxellDiff answers "how much", this answers "what": the actual lines, read from inside the
+// cage where a cxell zee's work lives until it lands.
+//
+//   kind 'source' → `git diff <base>`: everything the zee added since it was spun up, committed or
+//                   not (a plain diff against a commit spans the working tree, so uncommitted counts).
+//   kind 'own'    → `git diff HEAD`: only what is not checkpointed yet.
+//
+// Untracked files are appended as `--no-index` patches: `git diff` cannot see a file git has never
+// been told about, and a zee that has just written five new files and not committed is exactly when
+// a human opens this. The whole pipeline is capped with `head -c` INSIDE the container, so a runaway
+// diff never crosses the docker boundary; the cap is reported, not hidden. Returns null when the
+// cxell is unreachable (the caller then falls back to the host worktree), never throws.
+export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source', maxBytes = 4_000_000 }) {
+  const b = String(base || '').replace(/[^0-9a-fA-F]/g, '');
+  const target = kind === 'own' ? 'HEAD' : b;
+  if (!target) return null;
+  const name = cxellName(slug);
+  const body = [
+    'cd /work/repo || exit 3',
+    `git --no-pager diff --no-color -M ${target}`,
+    "git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do "
+      + 'git --no-pager diff --no-color --no-index -- /dev/null "$f"; done',
+  ].join('; ');
+  let out, head = null;
+  try {
+    const r = await dk(ctx, ['exec', name, 'bash', '-lc',
+      `{ ${body}; } 2>/dev/null | head -c ${Number(maxBytes) || 4_000_000}`], { timeoutMs: 30000 });
+    out = r.out;
+    const h = await dk(ctx, ['exec', name, 'bash', '-lc', 'cd /work/repo && git rev-parse HEAD'],
+      { timeoutMs: 8000 }).catch(() => null);
+    head = h ? h.out.trim() : null;
+  } catch {
+    return null;
+  }
+  const text = String(out || '');
+  return { text, head, capped: text.length >= (Number(maxBytes) || 4_000_000) };
+}
+
 // Create (or recreate) the xell's cxell container on its own bridge network. Labeled so
 // dockerPs-based monitors can attribute it; NET_ADMIN only for the firewall seal. Publishes an
 // SSH port on 127.0.0.1 (the attend door — host-only; the queenzee's ssh2 bridge and a

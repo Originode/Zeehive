@@ -6,6 +6,7 @@
 import React, { useState } from 'react';
 import { decideLanding } from './api.js';
 import { showConfirm } from './Dialog.jsx';
+import { showDiff } from './DiffViewer.jsx';
 
 const shortSha = (s) => (s ? s.slice(0, 10) : '—');
 const ago = (ts) => {
@@ -80,10 +81,21 @@ export function LandCard({ req, onDone, onDismiss }) {
             {req.attempts > 1 && <> · <span title="pushes seen for this sha">{req.attempts} attempts</span></>}
           </div>
 
-          <div className="land-stat">
+          {/* The diffstat is the BUTTON now. You are being asked to let this reach main; the
+              commit subjects say what the zee meant, and this says what it actually wrote. It
+              opens the patch for exactly old_sha..new_sha — the range being approved. */}
+          <button className="land-stat difflink" data-testid="land-diff"
+                  title="Read the diff — the exact lines this push would add to main"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    showDiff({ kind: 'land', landId: req.id,
+                      title: `${req.xell_slug || 'unknown xell'} → ${(req.ref || '').replace('refs/heads/', '')}`,
+                      subtitle: `${shortSha(req.old_sha)} → ${shortSha(req.new_sha)} · ${commits.length} commit${commits.length === 1 ? '' : 's'}` });
+                  }}>
             {commits.length} commit{commits.length === 1 ? '' : 's'}
             {stat.files != null && <> · {stat.files}f <span className="ins">+{stat.insertions}</span>/<span className="del">−{stat.deletions}</span></>}
-          </div>
+            <span className="difflink-hint">view diff</span>
+          </button>
 
           <ul className="land-commits">
             {commits.slice(0, 12).map((c) => (

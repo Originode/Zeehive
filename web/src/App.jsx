@@ -6,6 +6,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          extractXellEnv, attachXellDevice, detachXellDevice } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
+import { showDiff } from './DiffViewer.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
@@ -480,7 +481,20 @@ export default function App() {
   // The flower's canvas action buttons dispatch here (HiveCanvas onAction) — same verbs the old DOM
   // toolbar/drawer ran, with the same confirmations, so nothing changed but WHERE they are clicked.
   const handleFlowerAction = async (kind, x, diff) => {
-    if (!x || x.is_production) return;
+    if (!x) return;
+    // READ-ONLY, so it comes BEFORE the production guard: the flower's two diffstat petals open the
+    // diff viewer, and "what has production drifted to?" is a question worth answering on prod too.
+    if (kind === 'srcdiff' || kind === 'owndiff') {
+      const own = kind === 'owndiff';
+      if (own && x.is_production) return;                    // prod has no working tree
+      showDiff({ kind: 'xell', xellId: x.id, diffKind: own ? 'own' : 'source',
+        title: `${x.slug} · ${own ? 'uncommitted' : 'source diff'}`,
+        subtitle: own ? 'work since its own last checkpoint — not yet committed'
+          : x.is_production ? 'what is deployed vs the origin mirror'
+          : 'everything this xell adds over its fork point — what would land' });
+      return;
+    }
+    if (x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
     if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
@@ -1120,16 +1134,27 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             nothing recorded the hand-deploys that predate the ship gate — that is honest, not a
             placeholder: the system does not know what prod is running. */}
         <div className="row"><span className="rk">source diff</span>
-          <span className="diff" data-testid="source-diff"
+          {/* CLICKABLE: the numbers open the patch they are counting (DiffViewer). For a cxelld
+              zee the server reads it from inside the cxell, which is the only place that work
+              exists before it lands — the same source the stat itself came from. */}
+          <button className="diff difflink" data-testid="source-diff" disabled={!diff}
                 title={diff
                   ? (isProd
-                    ? `Deployed is ${diff.ahead} commit(s) ahead of origin · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs origin`
-                    : `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted work)`)
-                  : (isProd ? 'No ship has landed yet, so nothing recorded what production is running' : '')}>
+                    ? `Deployed is ${diff.ahead} commit(s) ahead of origin · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs origin\n\nClick to read the diff.`
+                    : `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted work)\n\nClick to read the diff.`)
+                  : (isProd ? 'No ship has landed yet, so nothing recorded what production is running' : '')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!diff) return;
+                  showDiff({ kind: 'xell', xellId: x.id, diffKind: 'source',
+                    title: `${x.slug} · source diff`,
+                    subtitle: isProd ? 'what is deployed vs the origin mirror'
+                                     : 'everything this xell adds over its fork point — what would land' });
+                }}>
             {diff
               ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span></>
               : '—'}
-          </span>
+          </button>
         </div>
         {/* For prod: the commit it is SERVING. For a work xell: the commit it was provisioned at. */}
         <Row k="commit" mono testid="commit-head"
@@ -1140,15 +1165,22 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             drops to 0 every time the zee checkpoints. ●N counts dirty files incl. untracked. */}
         {!isProd && (
           <div className="row"><span className="rk">diff</span>
-            <span className="diff" data-testid="diff"
+            <button className="diff difflink" data-testid="diff" disabled={!diff?.own}
                   title={diff?.own
-                    ? `Uncommitted: ${diff.own.files} file(s), +${diff.own.insertions}/−${diff.own.deletions} vs its own last checkpoint (HEAD)${diff.dirty ? `\n${diff.dirty} dirty file(s) in the worktree (incl. untracked)` : '\nnothing uncommitted — all work is checkpointed'}`
-                    : ''}>
+                    ? `Uncommitted: ${diff.own.files} file(s), +${diff.own.insertions}/−${diff.own.deletions} vs its own last checkpoint (HEAD)${diff.dirty ? `\n${diff.dirty} dirty file(s) in the worktree (incl. untracked)` : '\nnothing uncommitted — all work is checkpointed'}\n\nClick to read the diff.`
+                    : ''}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!diff?.own) return;
+                    showDiff({ kind: 'xell', xellId: x.id, diffKind: 'own',
+                      title: `${x.slug} · uncommitted`,
+                      subtitle: 'work since its own last checkpoint — not yet committed' });
+                  }}>
               {diff?.own
                 ? <><span className="dstat">{diff.own.files}f <span className="ins">+{diff.own.insertions}</span>/<span className="del">−{diff.own.deletions}</span></span>
                     {diff.dirty > 0 && <span className="dirty" data-testid="dirty" title={`${diff.dirty} dirty file(s) incl. untracked`}> ●{diff.dirty}</span>}</>
                 : '—'}
-            </span>
+            </button>
           </div>
         )}
         <div className="row">
@@ -1380,10 +1412,19 @@ function PrCard({ req, onDone, onDismiss }) {
       ) : (
         <>
           <div className="land-meta">{String(req.new_sha).slice(0, 10)}</div>
-          <div className="land-stat">
+          {/* Same as a held landing: the stat opens the patch you are being asked to accept. */}
+          <button className="land-stat difflink" data-testid="pr-diff"
+                  title="Read the diff — the exact lines this PR would bring in"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    showDiff({ kind: 'land', landId: req.id,
+                      title: `${req.xell_slug || 'a xell'} → ${(req.ref || '').replace('refs/heads/', '')}`,
+                      subtitle: `PR · ${String(req.new_sha).slice(0, 10)} · ${commits.length} commit${commits.length === 1 ? '' : 's'}` });
+                  }}>
             {commits.length} commit{commits.length === 1 ? '' : 's'}
             {stat.files != null && <> · {stat.files}f <span className="ins">+{stat.insertions}</span>/<span className="del">−{stat.deletions}</span></>}
-          </div>
+            <span className="difflink-hint">view diff</span>
+          </button>
           <ul className="land-commits">
             {commits.slice(0, 8).map((c) => (
               <li key={c.short}><code>{c.short}</code> {c.subject} <span className="land-author">{c.author}</span></li>
