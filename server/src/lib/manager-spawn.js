@@ -30,6 +30,18 @@ export async function bindManagerToProdReadonly(xellId) {
   if (!xell) throw new Error('xell not found');
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
 
+  // A project with NO production registered has nothing to read — and that must not make managers
+  // impossible there (reading prod is a manager's capability, not its definition). Skip the bind
+  // loudly; the manager keeps every other verb. This is the ONLY tolerated absence: if a prod db
+  // DOES exist and the reader cannot be minted, we fail closed below.
+  const prodDb = await one(
+    `SELECT id FROM container WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [project.id]);
+  if (!prodDb) {
+    logline('prod-ro', `${xell.slug}: no production database registered for ${project.name} — the manager `
+      + 'is created WITHOUT prod access (nothing to read). Register prod and re-add it to give it one.');
+    return { readonly: true, bound: false, reason: 'no prod db registered for this project' };
+  }
+
   // Mint the reader FIRST: if production cannot hand out a SELECT-only role, we must not leave the
   // xell pointing at the prod container at all.
   const reader = await mintProdReader(xell, project);

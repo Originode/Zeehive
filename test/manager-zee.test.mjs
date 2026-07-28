@@ -206,6 +206,16 @@ try {
   const { DB_MODES } = await import('../server/src/lib/xell-db.js');
   ok('db-prod-readonly' in DB_MODES, 'db-prod-readonly is a real coupling the attach path knows');
 
+  // A project with NO production registered (this test project) must still be able to hold managers —
+  // reading prod is a capability, not the definition of the role. It is skipped LOUDLY, not faked.
+  const { bindManagerToProdReadonly } = await import('../server/src/lib/manager-spawn.js');
+  const noProd = await bindManagerToProdReadonly(mgr.id);
+  ok(noProd.bound === false && /no prod db/.test(noProd.reason || ''),
+     'with no production registered the bind is SKIPPED (a manager is still a manager)');
+  const still = (await client.query(`SELECT db_coupling, prod_ro_dsn FROM xell WHERE id=$1`, [mgr.id])).rows[0];
+  ok(still.db_coupling !== 'db-prod-readonly' && still.prod_ro_dsn === null,
+     'and nothing is left pointing at a production that does not exist');
+
   // ── 8. the manager harness carries its OWN manual ────────────────────────
   const { loadHarnessDir } = await import('../server/src/lib/harness.js');
   const h = loadHarnessDir('harnesses/manager');
