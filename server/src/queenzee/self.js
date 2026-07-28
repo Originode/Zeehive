@@ -767,11 +767,31 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
     'with `zee tend --reason "…"` — that instruction is against the manager\'s own manual.',
   ].join('\n');
 
+  // A DRY POOL must not be a dead end for a manager. A human dispatching from the console can raise
+  // the pool target or wait; a caged manager can do neither — it would just be told "no ready xell"
+  // with no way to act on it. So provision one on demand, exactly as the claim path does when a
+  // human walks up to an empty pool.
+  const ready = await one(
+    `SELECT id FROM xell WHERE project_id=$1 AND status='ready' ORDER BY ready_at DESC NULLS LAST LIMIT 1`,
+    [xell.project_id]);
+  let provisioned = null;
+  if (!ready) {
+    try {
+      const { provisionXell } = await import('../lib/provision.js');
+      provisioned = await provisionXell({ projectId: xell.project_id,
+        mode: process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate' });
+      logline('crew', `${xell.slug}: pool was dry — provisioned ${provisioned?.slug || 'a xell'} to dispatch into`);
+    } catch (e) {
+      return { ok: false, error: `the pool is empty and a xell could not be provisioned to dispatch into: ${e.message}` };
+    }
+  }
+
   const { dispatchXell } = await import('./intake.js');
   let out;
   try {
     out = await dispatchXell({
       task: brief, project: xell.project_id, title: title || null,
+      ...(provisioned?.id ? { xell_id: provisioned.id } : {}),
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
       manager_xell_id: xell.id,
