@@ -222,7 +222,11 @@ export async function rangePatch(repoRoot, oldSha, newSha, { label = null } = {}
 
 // The patch behind a LANDING (or a PR — both are land_request rows): old_sha..new_sha in the xource.
 export async function landRequestPatch(id) {
-  const row = await one(`SELECT * FROM land_request WHERE id=$1`, [id]);
+  // xell_slug is a JOIN in the console's list model, not a column — read it the same way here so
+  // the viewer's title says WHO is landing rather than "a xell".
+  const row = await one(
+    `SELECT lr.*, x.slug AS xell_slug FROM land_request lr
+       LEFT JOIN xell x ON x.id = lr.xell_id WHERE lr.id=$1`, [id]);
   if (!row) throw new Error('no such land request');
   const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
   if (!project) throw new Error('the land request has no project');
