@@ -1484,3 +1484,13 @@ a.cbox:hover { border-color: var(--accent); }
 .land-panel.prod-panel .land-title { color: #d9455f; }
 .land-panel.prod-panel.settled { border-color: var(--up); }
 .land-panel.prod-panel.settled .land-title { color: var(--up); }
+
+/* ── MANAGER ZEES ───────────────────────────────────────────────────────────
+   The "+ manager zee" button sits with the prompt buttons but reads differently on purpose: adding
+   a manager is not dispatching a task, it is adding a layer to the fleet — an outlined (not filled)
+   button in production's orange, the same hue its double-walled hexagon carries in the honeycomb. */
+.mgr-add { margin-left: 12px; background: transparent; border: 1px solid var(--prod, #f0913b);
+  color: var(--prod, #f0913b); font-size: 12px; font-weight: 600; padding: 3px 11px;
+  border-radius: 6px; cursor: pointer; }
+.mgr-add:hover:not(:disabled) { background: rgba(240,145,59,.14); }
+.mgr-add:disabled { opacity: .55; cursor: default; }

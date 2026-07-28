@@ -18,6 +18,7 @@ import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel, { BackupsModal } from './Backups.jsx';
 import LandingPanel, { LandCard } from './Landing.jsx';
 import ProdAsksPanel, { ProdBindCard, SeedCard } from './ProdData.jsx';
+import { AddManagerButton, DoneSuggestionCard } from './Manager.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
@@ -410,6 +411,10 @@ export default function App() {
   for (const r of fleet.prod_bind || []) (prodBindByXell[r.xell_id] ||= []).push(r);
   const seedByXell = {};
   for (const r of fleet.prod_seed || []) (seedByXell[r.xell_id] ||= []).push(r);
+  // A MANAGER zee's open "this xell is finished" suggestions, keyed by the xell they are ABOUT —
+  // they render on that xell's chip, because that is the xell the decision reaps.
+  const doneSuggestByXell = {};
+  for (const r of fleet.done_suggestions || []) (doneSuggestByXell[r.target_xell_id] ||= []).push(r);
 
   // Dismissed notifications, by request id. The server records the dismissal (dismissed_at on the
   // row) so it survives reloads and SSE refreshes — receipts used to pop back on every refresh
@@ -682,6 +687,11 @@ export default function App() {
             </button>
           ));
         })()}
+        {/* ADD A MANAGER ZEE — unlimited, and only from here: a manager coordinates workers, holds
+            production READ-ONLY and cannot push to the xource, and `zee dispatch` refuses the role
+            so managers can never mint managers. Sits beside the prompt buttons because it is the
+            same act one level up: starting an agent. */}
+        <AddManagerButton projectId={projectId || project.id} onAdded={refresh} />
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
@@ -690,6 +700,7 @@ export default function App() {
           human. A pointer, not a copy; clicking a chip expands that xell's flower + action drawer. */}
       <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
                    prodBindByXell={prodBindByXell} seedByXell={seedByXell}
+                   doneSuggestByXell={doneSuggestByXell}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
       <LandingPanel landing={orphanLandings} onDecided={refresh} />
@@ -1277,7 +1288,7 @@ function shipState(x, diff, prodLock, ship) {
 // held landing / open PR, with the Approve/Reject buttons — inline right below the bar, so the
 // judgement is made next to its own commits without hunting for a card at the bottom of the page.
 function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
-                       prodBindByXell = {}, seedByXell = {} }) {
+                       prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {} }) {
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
@@ -1289,7 +1300,10 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
     // so they belong in the one line that says who is waiting on you.
     const bind = (prodBindByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const seed = (seedByXell[x.id] || []).filter((r) => r.status === 'pending').length;
-    return { x, held, prs, tend, bind, seed, n: held + prs + tend + bind + seed };
+    // A manager suggested this xell is done. It is a real decision waiting on a human — and the only
+    // one raised by another AGENT, so if it were not counted here nobody would ever answer it.
+    const doneSug = (doneSuggestByXell[x.id] || []).filter((r) => r.status === 'pending').length;
+    return { x, held, prs, tend, bind, seed, doneSug, n: held + prs + tend + bind + seed + doneSug };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
@@ -1299,6 +1313,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
   const prs = open ? visible(prsFor(open.x)).filter((r) => r.status === 'pending') : [];
   const binds = open ? (prodBindByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
   const seeds = open ? (seedByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
+  const doneSugs = open ? (doneSuggestByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
 
   return (
     <section className="needsyou">
@@ -1313,6 +1328,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
               w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`,
               w.bind > 0 && '⚠ wants PROD DB',
               w.seed > 0 && `⚠ seed prod (${w.seed})`,
+              w.doneSug > 0 && '⬢ manager says done',
               w.tend > 0 && '🖐 tend',
             ].filter(Boolean).join(' · ')}</span>
           </button>
@@ -1324,7 +1340,9 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
           {prs.map((r) => <PrCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
           {binds.map((r) => <ProdBindCard key={r.id} req={r} onDone={onDecided} />)}
           {seeds.map((r) => <SeedCard key={r.id} req={r} onDone={onDecided} />)}
-          {open.tend > 0 && landings.length === 0 && prs.length === 0 && binds.length === 0 && seeds.length === 0 && (
+          {doneSugs.map((r) => <DoneSuggestionCard key={r.id} req={r} onDone={onDecided} />)}
+          {open.tend > 0 && landings.length === 0 && prs.length === 0 && binds.length === 0
+            && seeds.length === 0 && doneSugs.length === 0 && (
             <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human.
               Open its session to see why; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
           )}

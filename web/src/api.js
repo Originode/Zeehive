@@ -790,3 +790,42 @@ export async function dismissSeed(id) {
   });
   return r.ok ? r.json() : null;
 }
+
+// ── MANAGER ZEES ─────────────────────────────────────────────────────────────
+// Adding a manager is a HUMAN act and there is no limit on how many you add — but only from here
+// (a zee's dispatch verb refuses the role, so managers can never mint managers).
+export async function addManagerZee(body = {}) {
+  const r = await fetch('/api/managers', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `could not add a manager zee (${r.status})`);
+  return data;
+}
+
+// A manager's crew (its dispatched workers, with live status).
+export async function fetchCrew(xellId) {
+  const r = await fetch(`/api/xells/${xellId}/crew`);
+  const data = await r.json().catch(() => ([]));
+  if (!r.ok) throw new Error(data.error || `crew unavailable (${r.status})`);
+  return data;
+}
+
+// DONE SUGGESTIONS — a manager proposed a xell is finished; approving MARKS IT DONE and reaps the
+// cxell, so the console asks for a typed confirmation before calling this.
+export async function decideDoneSuggestion(id, decision, by = 'human@console', force = false) {
+  const r = await fetch(`/api/done-suggestions/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by, force }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+export async function dismissDoneSuggestion(id, by = 'human@console') {
+  const r = await fetch(`/api/done-suggestions/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
+  return data;
+}

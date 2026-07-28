@@ -27,6 +27,7 @@ export const HIVE_COLORS = {
   'vac-dirty':        '#cd9a4a',   // dull amber — needs queenzee housekeeping
   'occ-idle':         '#e0a53b',   // amber — a zee gone quiet
   'occ-tendRequest':  '#f2c518',   // yellow — "I need a human"
+  'occ-doneSuggest':  '#3bb0c6',   // cyan — a MANAGER zee suggested this xell is finished (a human confirms)
   // ── hot: something irreversible is being touched ────────────────────────────
   'occ-landHint':     '#ef8f6a',   // soft red-orange — land looks ready (a softer ask)
   'occ-shipHint':     '#f2a06a',   // soft orange — ship looks ready
@@ -51,6 +52,7 @@ export const HIVE_HEAT = {
   'vac-dirty':        0.58,
   'occ-idle':         0.62,
   'occ-tendRequest':  0.72,
+  'occ-doneSuggest':  0.30,
   'occ-landHint':     0.80,
   'occ-shipHint':     0.82,
   'live-protected':   0.86,
@@ -79,6 +81,7 @@ export const HIVE_LABELS = {
   'occ-landHint':     'land?',
   'occ-shipHint':     'ship?',
   'occ-doneRequest':  'done?',
+  'occ-doneSuggest':  'done?',
   'occ-done':         'done',
   'live-protected':   'protected',
   'live-unprotected': 'unprotected',

@@ -321,6 +321,77 @@ function cellNeighbors(row, col) {
   ];
 }
 
+// Cells around (row,col) in RINGS, nearest first — a breadth-first walk of the offset lattice out to
+// `radius` hops. This is what lets a manager's crew be seated AROUND it: ring 1 is its six touching
+// neighbours, ring 2 the twelve beyond, and so on, so a crew stays a visually contiguous cluster
+// however large it grows.
+function cellsAround(row, col, radius = 4) {
+  const seen = new Set([cellKey(row, col)]);
+  const out = [];
+  let frontier = [[row, col]];
+  for (let hop = 0; hop < radius; hop++) {
+    const next = [];
+    for (const [r, c] of frontier) {
+      for (const [nr, nc] of cellNeighbors(r, c)) {
+        const k = cellKey(nr, nc);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        next.push([nr, nc]);
+        out.push([nr, nc]);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+// ── SEATING: a manager's crew sits NEXT TO IT ─────────────────────────────────
+// The honeycomb used to lay xells out in pure reading order, which scatters a manager's workers
+// across the grid and makes "who belongs to whom" unreadable — the one relationship the hive now
+// has. So seating happens in two passes: every MANAGER takes the next free cell and its crew fills
+// the free cells nearest to it (ring by ring); everyone else then fills what is left, in reading
+// order. With no managers in the fleet this is byte-for-byte the old layout.
+//
+// `pinned` keeps a cell for a xell whose position is already decided (the expanded flower), and
+// `reserved` blocks the cells the flower's petals consume. Pure, so it can be unit-tested.
+export function seatXells(list, cols, { reserved = new Set(), pinned = {} } = {}) {
+  const cells = {};
+  const taken = new Set(reserved);
+  const place = (id, rc) => { cells[id] = rc; taken.add(cellKey(rc[0], rc[1])); };
+  const free = (r, c) => r >= 0 && c >= 0 && c < cols && !taken.has(cellKey(r, c));
+  let scan = 0;
+  const nextFree = () => {
+    for (;;) {
+      const row = Math.floor(scan / cols), col = scan % cols;
+      scan++;
+      if (free(row, col)) return [row, col];
+    }
+  };
+
+  for (const [id, rc] of Object.entries(pinned)) if (rc) place(id, rc);
+
+  const managers = list.filter((x) => x.role === 'manager');
+  for (const m of managers) {
+    if (!cells[m.id]) place(m.id, nextFree());
+    const [mr, mc] = cells[m.id];
+    const crew = list.filter((w) => w.manager_xell_id === m.id && !cells[w.id]);
+    if (!crew.length) continue;
+    const ring = cellsAround(mr, mc, Math.max(2, Math.ceil(Math.sqrt(crew.length)) + 1));
+    let i = 0;
+    for (const w of crew) {
+      let seat = null;
+      while (i < ring.length && !seat) {
+        const [r, c] = ring[i++];
+        if (free(r, c)) seat = [r, c];
+      }
+      place(w.id, seat || nextFree());   // a crew bigger than the room around it spills into the grid
+    }
+  }
+
+  for (const x of list) if (!cells[x.id]) place(x.id, nextFree());
+  return cells;
+}
+
 // Connector wires thread the corridors BETWEEN hexes, so the honeycomb is drawn spaced: each hex is
 // shrunk inside its (gapless) layout cell to open a gap wide enough for the traces that must pass —
 // sized by the grid dimension a wire fans across (columns in portrait, rows in landscape). The
@@ -383,35 +454,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     const gap = count * WIRE_PITCH;
     const drawSize = Math.max(cellSize * 0.5, cellSize - gap / SQRT3);   // shrink to open the gap
     const originX = pad, originY = pad;
-    // base cell per xell (row-major, exactly layoutHoneycomb's shape)
-    const baseCells = {};
-    list.forEach((x, i) => {
-      const c = lay.cells[i] || { row: 0, col: i };
-      baseCells[x.id] = [c.row, c.col];
-    });
-    // flower reflow: expanded keeps its cell, its 6 neighbours are consumed; everyone else takes
-    // the next free cell in reading order (rows extend as needed — the canvas pans).
-    const cells = {};
+    // SEATING (see seatXells): managers first, each with its crew in the free cells nearest to it,
+    // then everyone else in reading order. Two passes because the flower's petals consume cells:
+    // seat once to learn where the expanded xell sits, then re-seat with its six neighbours reserved
+    // and its own cell pinned, so the bloom opens exactly where the hexagon already was.
+    const cols = Math.max(1, lay.cols);
+    const baseCells = seatXells(list, cols);
     const reserved = new Set();
+    let cells = baseCells;
     if (expanded && baseCells[expanded.id]) {
       const [er, ec] = baseCells[expanded.id];
-      cells[expanded.id] = [er, ec];
       reserved.add(cellKey(er, ec));
       for (const [nr, nc] of cellNeighbors(er, ec)) reserved.add(cellKey(nr, nc));
-    }
-    {
-      const cols = Math.max(1, lay.cols);
-      let row = 0, col = 0;
-      const nextFree = () => {
-        for (;;) {
-          const k = cellKey(row, col);
-          const taken = reserved.has(k) || Object.values(cells).some(([r2, c2]) => r2 === row && c2 === col);
-          const out = [row, col];
-          col++; if (col >= cols) { col = 0; row++; }
-          if (!taken) return out;
-        }
-      };
-      for (const x of list) { if (!cells[x.id]) cells[x.id] = nextFree(); }
+      cells = seatXells(list, cols, { reserved, pinned: { [expanded.id]: [er, ec] } });
     }
     const hexes = list.map((x) => {
       const [row, col] = cells[x.id];
@@ -774,6 +829,12 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     hexPath(ctx, cx, cy, size - 3);
     ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
   }
+  // A MANAGER zee's hexagon is double-walled: it runs a crew (seated in the cells around it) and
+  // holds production read-only, so it should be identifiable before you read a single word on it.
+  if (x.role === 'manager') {
+    hexPath(ctx, cx, cy, size + 2.5);
+    ctx.lineWidth = 2; ctx.strokeStyle = withAlpha(COL.prod, hover ? 0.95 : 0.7); ctx.stroke();
+  }
   ctx.save();
   hexPath(ctx, cx, cy, size - 2);
   ctx.clip();
@@ -847,8 +908,17 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   // Rows below shift down a notch to make the room; no title (ready xells, production) → the
   // layout is exactly what it was.
   // the dispatch convention prefixes titles with "xell : " — identity noise on a card this small
-  const zeeTitle = full && !x.is_production ? (x.zee_title || '').replace(/^xell\s*:\s*/i, '').trim() : '';
-  const label = x.is_production ? '🛡 PRODUCTION' : shortSlug(x.slug);
+  const ownTitle = full && !x.is_production ? (x.zee_title || '').replace(/^xell\s*:\s*/i, '').trim() : '';
+  const zeeTitle = !full || x.is_production ? ''
+    : x.role === 'manager' ? 'manager zee — runs a crew, reads prod'
+    // a managed worker names its crew ahead of its task: the cluster around a double-walled hex
+    // should not be a coincidence you have to infer
+    : x.manager_slug ? `↳${x.manager_slug}${ownTitle ? ` · ${ownTitle}` : ''}`
+    : ownTitle;
+  // A manager is named as one on the seam, and a managed worker names the crew it belongs to — the
+  // hexagons around a double-walled hex should not be a coincidence you have to infer.
+  const label = x.is_production ? '🛡 PRODUCTION'
+    : x.role === 'manager' ? `⬢ ${shortSlug(x.slug)}` : shortSlug(x.slug);
   fillFont(ctx, label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
   ctx.fillStyle = COL.text;
   ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * (zeeTitle ? 0.14 : 0.06) : size * 0.2));
