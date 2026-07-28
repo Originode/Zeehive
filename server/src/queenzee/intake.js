@@ -20,7 +20,8 @@ import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
-         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell } from '../lib/cxell.js';
+         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell,
+         installZeeCliIntoCxell } from '../lib/cxell.js';
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
@@ -1038,6 +1039,14 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id, image: cxellImage });
     sshPort = created.sshPort;
     await cloneIntoCxell({ ctx, name, worktree: xell.worktree_path });
+    // Refresh the in-cxell `zee` CLI from the QUEENZEE's own scripts/zee, over the copy baked into
+    // the zee-agent image. Defence in depth against image staleness: a fleet on an old image would
+    // otherwise hand this zee a CLI older than the API it is calling (that is how the crew verbs
+    // came out as "unknown command: dispatch" in every cage). Best-effort, loudly logged.
+    const cli = await installZeeCliIntoCxell({ ctx, name });
+    logline('cxell', cli.installed
+      ? `${name}: zee CLI refreshed from the queenzee's ${cli.src} (never older than this API)`
+      : `${name}: zee CLI NOT refreshed (${cli.reason}) — running the image's baked copy`);
     // INJECT the assigned harness's files into the cxell (docs §6): its persona (.zeehive/harness/
     // PERSONA.md), its SKILL.md files (.claude/skills/…, Claude-loadable), and its MEMORY — including
     // the cxell manual carried by Zee Base — under .zeehive/harness/memory/. This is why the manual is

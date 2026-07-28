@@ -400,6 +400,57 @@ export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image }
   throw new Error(`could not bind an SSH port for cxell ${name} (all candidates in use)`);
 }
 
+// ── The cxell CLI, refreshed from the QUEENZEE's own copy at spawn ───────────────────────────
+//
+// The `zee` CLI is baked into the zee-agent image (COPY scripts/zee), but an image is a snapshot:
+// a fleet still running last month's zee-agent hands every new cxell a CLI OLDER than the queenzee
+// that defines its API, and nothing says so until a zee is stranded. That is exactly how the crew
+// verbs (zees/dispatch/say/report/inbox/suggest-done) shipped server-side and answered "unknown
+// command: dispatch" in every cage — a manager zee that could not dispatch.
+//
+// So the queenzee installs ITS OWN scripts/zee over the baked one in every cxell it creates. The
+// queenzee always runs out of the Zeehive repo (config.repoRoot — the same resolution
+// provision.js/machines.js use for their scripts, and Dockerfile.server COPYs scripts/ into the
+// image), so the copy it holds is by construction the one that matches its API surface.
+export const ZEE_CLI_DEST = '/usr/local/bin/zee';
+// The path the queenzee installs FROM. Exported so a test can assert it is the authoritative CLI.
+export const zeeCliSourcePath = () => resolve(config.repoRoot, 'scripts', 'zee');
+
+// The exact docker argv sequence installZeeCliIntoCxell runs — pure, so it is assertable without a
+// daemon. `docker cp` lands the file as root; the exec then strips any trailing CR (a Windows
+// checkout would otherwise leave `#!/usr/bin/env node\r`, which dies as `node\r: No such file or
+// directory` — the same belt-and-braces the Dockerfile applies), chmods it executable and pins
+// root ownership so the zee cannot rewrite its own CLI.
+export function zeeCliInstallCommands({ name, src = zeeCliSourcePath() }) {
+  return [
+    ['cp', src, `${name}:/tmp/zee.cli`],
+    ['exec', '-u', '0', name, 'bash', '-lc',
+      `sed -i 's/\\r$//' /tmp/zee.cli && install -o root -g root -m 0755 /tmp/zee.cli ${ZEE_CLI_DEST} && rm -f /tmp/zee.cli`],
+  ];
+}
+
+// Install (idempotently — it is an overwrite) the queenzee's current `zee` CLI into the cxell.
+// Best-effort with a LOUD log, the same stance as the prompt-attachments copy above and the
+// cxell-image rebuild in self-ship.sh: the baked CLI is still there, so a failed refresh must not
+// sink a cxell spawn — but it must never be silent, because "silent" is this bug's whole story.
+export async function installZeeCliIntoCxell({ ctx = 'default', name }) {
+  const src = zeeCliSourcePath();
+  if (!existsSync(src)) {
+    logline('cxell', `${name}: !!! could not refresh the zee CLI — ${src} is missing from the queenzee's `
+      + 'repo; the cxell keeps the CLI baked into its image, which may be OLDER than this queenzee');
+    return { installed: false, reason: 'source-missing', src };
+  }
+  try {
+    for (const args of zeeCliInstallCommands({ name, src })) await dk(ctx, args);
+    return { installed: true, src };
+  } catch (e) {
+    logline('cxell', `${name}: !!! could not refresh the zee CLI from ${src} (${String(e.message).slice(0, 200)}) — `
+      + 'the cxell falls back to the CLI baked into its image, which may be OLDER than this queenzee '
+      + 'and may refuse verbs the API supports. Rebuild zeehive/zee-agent.');
+    return { installed: false, reason: 'exec-failed', src, error: e.message };
+  }
+}
+
 // Open the cxell's SSH door: install the Zeehive public key for `zee`, drop the agent CLI's
 // credential env into /etc/environment so an interactive (PAM) login shell comes up authenticated
 // — a docker-exec -e run gets the env directly, an SSH login does not — and start sshd. Root
