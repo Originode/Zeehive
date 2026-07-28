@@ -16,13 +16,22 @@
 # inbound, so the egress-only firewall (OUTPUT DROP) neither blocks it nor is loosened by it.
 # tmux keeps the interactive session alive across disconnects (true async, come-back-whenever).
 FROM node:22-bookworm-slim
-# adb (android-tools-adb, ~5 MB): the ONE tool a zee needs to drive a DEVICE xhip — connect over
-# network adb, install an APK, launch it, screencap, logcat. The heavier JDK+Android SDK to BUILD an
-# APK is deliberately NOT here (it would balloon the base image for every zee); an Android project
-# uses a zee-agent image VARIANT with the SDK via the CXELL_IMAGE override. Building the app tier and
-# talking to the device are separate concerns, so the slim cxell only carries the client.
+# adb: the ONE tool a zee needs to drive a DEVICE xhip — connect over network adb, install an APK,
+# launch it, screencap, logcat. It must be CURRENT platform-tools, NOT Debian's `android-tools-adb`:
+# that package ships adb 29.0.6 (2019), which predates Android 11 WIRELESS DEBUGGING — it has no
+# `adb pair` and can't do the TLS `adb connect`, so against a modern phone on a dynamic TLS port it
+# just times out to `offline` (diagnosed live, 2026-07-28: a wireless-debug device at :42005 was
+# unreachable from adb 29, reachable from a current one). The slim base's whole purpose is to DRIVE a
+# device, so it carries an adb new enough to. Pinned like the -android variant's SDK; bump deliberately.
+# The heavier JDK+Android SDK to BUILD an APK stays out of the base — an Android project uses the
+# zee-agent-android VARIANT via the CXELL_IMAGE override for that.
+ARG PLATFORM_TOOLS_VERSION=r35.0.2
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git bash ca-certificates curl iptables dnsutils openssh-server tmux android-tools-adb \
+      git bash ca-certificates curl unzip iptables dnsutils openssh-server tmux \
+    && curl -fsSL "https://dl.google.com/android/repository/platform-tools_${PLATFORM_TOOLS_VERSION}-linux.zip" -o /tmp/pt.zip \
+    && unzip -q /tmp/pt.zip -d /opt \
+    && ln -sf /opt/platform-tools/adb /usr/local/bin/adb \
+    && rm -f /tmp/pt.zip \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 # ALL vendor-native agent CLIs bake into the one image — which one runs is decided per dispatch
