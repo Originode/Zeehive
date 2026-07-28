@@ -108,4 +108,14 @@ test('register + discover against the isolated DB', { skip: hasDb ? false : 'no 
   assert.equal(listed.ok, true);
   assert.equal(listed.source, 'simulate');
   assert.deepEqual(listed.devices, []);
+
+  // decommission a SHARED physical device removes only the registration row — there is no container
+  // to stop, so docker is skipped (not a failed/orphaned stop) and the phone is untouched.
+  const { decommissionContainer } = await import('../server/src/queenzee/containers.js');
+  const dev = await registerPhysicalDevice({ projectId: projId, machineId: machId, transport: 'net', host: '10.0.0.5', adbPort: 5555 });
+  const dec = await decommissionContainer(dev.device.id, { force: false });
+  assert.equal(dec.ok, true);
+  assert.equal(dec.docker?.skipped, true);   // physical device: no container, docker step skipped
+  assert.equal(dec.orphaned, false);
+  assert.equal(await one(`SELECT id FROM container WHERE id=$1`, [dev.device.id]), null);
 });

@@ -231,14 +231,21 @@ export async function decommissionContainer(id, { force = false } = {}) {
            + 'wait for it to finish, or force to remove it anyway.' };
   }
 
-  logline('containers', `decommissioning container ${c.name}`
-    + `${c.owner_slug ? ` (xell ${c.owner_slug})` : ''} — stopping + removing, reclaiming its image`);
+  // A SHARED device (035) is a real phone modeled as a row — there is NO container to stop and no
+  // image to reclaim, so removing it just drops the registration (the phone is untouched). A per-xell
+  // emulator, by contrast, IS a real container and goes through the normal stop+remove below.
+  const physicalDevice = c.role === 'device' && c.isolation === 'shared';
+
+  logline('containers', physicalDevice
+    ? `decommissioning device registration ${c.name} — removing the row (the physical phone is untouched)`
+    : `decommissioning container ${c.name}`
+      + `${c.owner_slug ? ` (xell ${c.owner_slug})` : ''} — stopping + removing, reclaiming its image`);
 
   // Stop + remove the real container. removeVolumes for a db so its data goes with it (a db
   // container's whole point is its volume). Best-effort over the daemon HTTP API — a missing
   // container (already gone) is success, and an unreachable daemon must not strand the row.
   let docker = { skipped: true };
-  if (c.docker_ctx) {
+  if (c.docker_ctx && !physicalDevice) {
     docker = await stopAndRemoveContainer(c.docker_ctx, c.name, { removeVolumes: c.role === 'db' })
       .catch((e) => ({ error: e.message }));
     if (docker.error) {

@@ -228,6 +228,12 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   // data); anything else just needs the destructive button pressed.
   const prod = isProdContainer(c);
   const isDb = c.role === 'db';
+  // A device chip decommissions too (035). Distinguish the two shapes so the wording is honest:
+  // a per-xell EMULATOR is a real container (stop + remove); a SHARED physical device is just a
+  // registration row (removing it leaves the phone untouched). isolation is authoritative; relation
+  // ('uses' = a linked shared device) is the fallback for chips that don't carry isolation.
+  const isDevice = c.role === 'device';
+  const devicePhysical = isDevice && (c.isolation === 'shared' || c.relation === 'uses');
   const canConfirm = !isDb || typed.trim() === c.name;
   const runDecommission = async () => {
     if (!canConfirm || busyAct) return;
@@ -306,12 +312,22 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
             </span>
           </div>
           <div className="ctxwarn-body">
-            This <b>stops and removes</b> the container.
+            {devicePhysical
+              ? <>This <b>removes the device registration</b>.</>
+              : isDevice
+                ? <>This <b>stops and removes</b> the emulator.</>
+                : <>This <b>stops and removes</b> the container.</>}
             {isDb
               ? <div className="ctxwarn-danger">⚠ This is a <b>DATABASE</b>. Its data is
                   <b> permanently deleted</b> — this cannot be undone.</div>
-              : <div className="ctxwarn-note">Its built image is reclaimed. This cannot be undone
-                  (rebuild to bring it back).</div>}
+              : devicePhysical
+                ? <div className="ctxwarn-note">The physical phone is <b>untouched</b> — only Zeehive's
+                    registration is removed. Any xell using it is unlinked. Re-register it anytime.</div>
+                : isDevice
+                  ? <div className="ctxwarn-note">The emulator container is torn down. This cannot be
+                      undone (attach a new device to bring one back).</div>
+                  : <div className="ctxwarn-note">Its built image is reclaimed. This cannot be undone
+                      (rebuild to bring it back).</div>}
           </div>
           {isDb && (
             <label className="ctxwarn-type">
@@ -425,23 +441,22 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
         </button>
       ))}
 
-      {/* Decommission: every non-production container. Production is excluded outright — it shows a
-          protected note instead, never an action. A busy container can't be removed mid-op. A DEVICE
-          is never decommissioned from here — decommission deletes the row, which for a SHARED physical
-          device would destroy the registration. Detach it from its xell card instead (emulator: stop
-          + remove; physical: unlink), so a shared phone is never lost by a stray right-click. */}
-      {c.role === 'device' ? (
-        <div className="ctxsub ctxbusy-note" data-testid="device-detach-note">
-          📱 device — detach it from the xell card (✕), not here
-        </div>
-      ) : prod ? (
+      {/* Decommission: every non-production container, DEVICES included (035). Production is excluded
+          outright — protected note, never an action. A busy container can't be removed mid-op. The
+          sub-label tells the truth per kind: a db deletes data, a shared physical device removes only
+          its registration (phone untouched), an emulator/anything-else stops + removes the container.
+          For a device this is the pool-level "remove it entirely" — distinct from the xell card's ✕,
+          which only DETACHES (an emulator is torn down, a shared phone merely unlinked). */}
+      {prod ? (
         <div className="ctxprotected" data-testid="decommission-protected">🛡 production — protected</div>
       ) : busy ? (
         <div className="ctxsub ctxbusy-note">decommission unavailable while busy</div>
       ) : (
         <button role="menuitem" className="ctxitem-danger" data-testid="decommission-open"
                 onClick={() => { setConfirming(true); setErr(null); }}>
-          🗑 Decommission… <span className="ctxsub">{isDb ? 'stop + remove (deletes data)' : 'stop + remove'}</span>
+          🗑 Decommission… <span className="ctxsub">{isDb ? 'stop + remove (deletes data)'
+            : devicePhysical ? 'remove this device registration (phone untouched)'
+            : isDevice ? 'stop + remove the emulator' : 'stop + remove'}</span>
         </button>
       )}
         </>
@@ -450,4 +465,4 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   );
 }
 
-const ROLE_WORD = { db: 'database', server: 'server', webapp: 'app' };
+const ROLE_WORD = { db: 'database', server: 'server', webapp: 'app', device: 'device' };
