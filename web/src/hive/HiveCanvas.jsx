@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
-import { hiveColor, hiveStatusLabel } from './status.js';
+import { hiveColor, hiveStatusLabel, hiveHeat } from './status.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
   bg: '#0d1017', panel: '#161b24', line: '#2a3242', text: '#e6ebf2', muted: '#8b97a8',
   working: '#35c46b', idle: '#e0a53b', ready: '#5b8cff', claimed: '#9b8cff',
-  awaiting: '#e0a53b', spawning: '#5b8cff', error: '#e5554e', prod: '#f2c14e',
+  awaiting: '#e0a53b', spawning: '#5b8cff', error: '#e5554e', prod: '#f0913b',
   sha: '#e0a53b', add: '#35c46b', del: '#e5554e',
 };
 const HEALTH = { up: '#35c46b', building: '#e0a53b', down: '#e5554e', unknown: '#6b7688', starting: '#5b8cff' };
@@ -35,6 +35,19 @@ function statusColor(x) {
   if (s === 'awaiting-done') return COL.awaiting;
   if (['errored', 'error', 'stopped'].includes(x.zee_status)) return COL.error;
   return COL.muted;
+}
+// Background wash alphas for a hex, modulated by its status HEAT (hive/status.js hiveHeat): a COLD
+// xell (violet/blue — provisioning/ready) sits darker (a fainter wash) and a HOT one (orange/red —
+// production / a held land or ship) glows brighter, so activity/urgency reads off the fill before the
+// hue. Returns {top,bot} gradient alphas; `hover` lifts both a notch. The flower centre passes a
+// higher base so the focused bloom stays vivid at every heat.
+function heatWash(x, hover, base = 0) {
+  const heat = x?.hive_status ? hiveHeat(x.hive_status) : 0.4;
+  const lift = hover ? 0.04 : 0;
+  return {
+    top: base + lift + 0.12 + heat * 0.22,
+    bot: base + lift + 0.04 + heat * 0.12,
+  };
 }
 const shortSlug = (s) => String(s || '');
 const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
@@ -432,7 +445,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       const [er, ec] = cells[expanded.id];
       const centers = [cellCenter(er, ec, cellSize, originX, originY),
         ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, cellSize, originX, originY))];
-      drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines);
+      drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines, tById[expanded.id]?.color || null);
       geomRef.current.flower = { centers, size: cellSize, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
       // Per-xell ACTIONS drawn straight onto the flower (no DOM toolbar): a hit-tested button row
@@ -739,14 +752,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
 function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);
+  // The commit head reads in the SAME colour the git graph traces this xell with — its connector
+  // wire and the ring around its base-commit dot are drawn in hx.color (the timeline's per-xell
+  // colour), so painting the head sha that colour ties the hexagon to its line in the graph.
+  const shaCol = hx.color || COL.sha;
   const w = hexWidth(size);
   ctx.save();
   if (dim) ctx.globalAlpha = 0.3;
 
   hexPath(ctx, cx, cy, size);
   const g = ctx.createLinearGradient(cx, cy - size, cx, cy + size);
-  g.addColorStop(0, withAlpha(col, hover ? 0.30 : 0.18));
-  g.addColorStop(1, withAlpha(col, hover ? 0.16 : 0.08));
+  const wash = heatWash(x, hover);
+  g.addColorStop(0, withAlpha(col, wash.top));
+  g.addColorStop(1, withAlpha(col, wash.bot));
   ctx.fillStyle = g;
   ctx.fill();
   ctx.lineWidth = hover ? 2.4 : 1.4;
@@ -847,7 +865,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   if (full) {
     if (sha) {
       ctx.font = `600 ${Math.max(8.5, size * 0.155)}px 'Cascadia Code', monospace`;
-      ctx.fillStyle = COL.sha;
+      ctx.fillStyle = shaCol;
       ctx.fillText(sha, cx, cy + size * (zeeTitle ? 0.2 : 0.14));
     }
     // diff: "↑1 ↓7 · 4f +32/−6" — the SOURCE diff (worktree vs its branch's fork off main), i.e.
@@ -892,7 +910,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     // mid sizes: sha + status only
     if (sha) {
       ctx.font = `600 ${Math.max(8, size * 0.17)}px 'Cascadia Code', monospace`;
-      ctx.fillStyle = COL.sha;
+      ctx.fillStyle = shaCol;
       ctx.fillText(sha, cx, cy + size * 0.08);
     }
     ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
@@ -960,16 +978,18 @@ function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false }
 }
 
 // ── the flower: rendered ON the grid cells it consumes (no overlay) ───────────
-function drawFlower(ctx, centers, size, x, diff, machines) {
+function drawFlower(ctx, centers, size, x, diff, machines, traceColor) {
   const col = statusColor(x);
   const petals = flowerFacets(x, diff, machines);
+  // the focused bloom stays vivid, but still darker when cold / brighter when hot (base lifts it)
+  const wash = heatWash(x, false, 0.14);
   centers.forEach(([hx, hy], i) => {
     const facet = petals[i];
     const isCenter = i === 0;
     ctx.save();
     hexPath(ctx, hx, hy, size - 1.5);
     const g = ctx.createLinearGradient(hx, hy - size, hx, hy + size);
-    if (isCenter) { g.addColorStop(0, withAlpha(col, 0.42)); g.addColorStop(1, withAlpha(col, 0.16)); }
+    if (isCenter) { g.addColorStop(0, withAlpha(col, wash.top)); g.addColorStop(1, withAlpha(col, wash.bot)); }
     else { g.addColorStop(0, withAlpha(COL.panel, 1)); g.addColorStop(1, withAlpha(COL.bg, 1)); }
     ctx.fillStyle = g;
     ctx.fill();
@@ -977,7 +997,7 @@ function drawFlower(ctx, centers, size, x, diff, machines) {
     ctx.strokeStyle = isCenter ? col : withAlpha(col, 0.45);
     ctx.stroke();
     ctx.clip();
-    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x);
+    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x, traceColor);
     ctx.restore();
   });
 }
@@ -1143,7 +1163,7 @@ function flowerFacets(x, diff, machines) {
   ];
 }
 
-function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
+function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
   ctx.textAlign = 'center';
   if (isCenter) {
     ctx.textBaseline = 'middle';
@@ -1191,7 +1211,9 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   // xell's own BURN (tokens + $ its zees have consumed). Stacked above the pull/push buttons.
   if (facet.kind === 'commitdiff') {
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = COL.text;
+    // the head sha reads in the git graph's trace colour for this xell (its wire + commit-dot ring),
+    // tying the bloom to its line in the graph the same way the compact hex does.
+    ctx.fillStyle = traceColor || COL.text;
     // sha grows to fill the petal width (this facet is crowded with the burn line + pull/push
     // buttons below, so it stays single-line — width-fill only, no wrap).
     const shaW = hexHalfWidthAt(size, size * 0.16) * 2 * 0.9;

@@ -40,7 +40,7 @@ const xells = NAMES.map((slug, i) => ({
 const timeline = {
   branch: 'master', commits,
   xells: xells.map((x, i) => ({ id: x.id, base_commit: BASES[i],
-    color: i < 2 ? '#f2c14e' : LANE[i % LANE.length] })),
+    color: i < 2 ? '#f0913b' : LANE[i % LANE.length] })),
 };
 const diffs = Object.fromEntries(xells.map((x, i) => {
   const baseRow = commits.findIndex((c) => c.hash === BASES[i]);

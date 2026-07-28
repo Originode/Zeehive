@@ -2,27 +2,61 @@
 // The server computes `x.hive_status` (the key) and `x.hive_status_label` (the pill text) — so this
 // file only owns the palette. Keep the keys in lockstep with hive-status.js.
 //
-//   vac-*   vacant pool xell (blue = pooled/idle, amber = needs housekeeping)
-//   occ-*   a zee is on it (green = live work; the *Request keys are tinted by URGENCY so a human
-//           scanning the hive spots what needs them — pink tend, gold ship, teal done…)
-//   live-*  production (gold shield = protected; red = shields down / a deploy is touching it)
+// The palette is a TEMPERATURE scale keyed to how HOT (active / urgent / irreversible) a xell is, so
+// a human scanning the hive reads urgency straight off the colour, coldest → hottest:
+//
+//   violet  provisioning   — being born, no activity yet (coldest)
+//   blue    ready/claimed  — pooled or just taken, nothing happening
+//   green   working        — live work, healthy
+//   yellow  needs attention — idle / tend / dirty: a human should look
+//   orange  production      — live, shields up
+//   red     land / ship / unprotected — main or prod is being TOUCHED (hottest)
+//
+// The `occ-*Hint`/`occ-*Request` keys stay within their family (a hint is a softer ask than a held
+// request, so it is a lighter tint of the same hue). `hiveHeat` below exposes the same ordering as a
+// 0..1 scalar so the canvas can also darken cold hexes and brighten hot ones.
 export const HIVE_COLORS = {
-  'vac-provisioning': '#5b8cff',
-  'vac-ready':        '#5b8cff',
-  'vac-dirty':        '#d98c5f',
-  'occ-claimed':      '#9b8cff',
-  'occ-working':      '#35c46b',
-  'occ-idle':         '#e0a53b',
-  'occ-tendRequest':  '#e26fae',
-  'occ-landRequest':  '#7b9cff',
-  'occ-shipRequest':  '#f2c14e',
-  'occ-landHint':     '#9db4ff',   // a hint is a softer ask than a held request — lighter tint
-  'occ-shipHint':     '#f7d98a',
-  'occ-doneRequest':  '#3bc6c0',
-  'occ-done':         '#8bd98c',
-  'live-protected':   '#f2c14e',
-  'live-unprotected': '#e5554e',
+  // ── cold ──────────────────────────────────────────────────────────────────
+  'vac-provisioning': '#8b5cf6',   // violet — coldest: no zee, still being provisioned
+  'occ-claimed':      '#7c83f5',   // blue-violet — a zee took it but isn't working yet
+  'vac-ready':        '#5b8cff',   // blue — pooled, idle, ready to claim
+  'occ-doneRequest':  '#3bc6c0',   // teal — winding down (done proposed)
+  'occ-done':         '#6fcf97',   // cool green — reaping
+  'occ-working':      '#35c46b',   // green — live work
+  // ── warm: needs a human's eyes ──────────────────────────────────────────────
+  'vac-dirty':        '#cd9a4a',   // dull amber — needs queenzee housekeeping
+  'occ-idle':         '#e0a53b',   // amber — a zee gone quiet
+  'occ-tendRequest':  '#f2c518',   // yellow — "I need a human"
+  // ── hot: something irreversible is being touched ────────────────────────────
+  'occ-landHint':     '#ef8f6a',   // soft red-orange — land looks ready (a softer ask)
+  'occ-shipHint':     '#f2a06a',   // soft orange — ship looks ready
+  'live-protected':   '#f0913b',   // orange — production, shields up
+  'occ-landRequest':  '#e5554e',   // red — a landing is held (main is being touched)
+  'occ-shipRequest':  '#ef5a3c',   // red-orange — a ship is held (prod is being touched)
+  'live-unprotected': '#e5554e',   // red — prod shields down / a deploy is touching it
 };
+
+// The same cold→hot ordering as a 0..1 heat scalar. The canvas reads this to keep the palette's
+// promise physically: a COLD hex sits darker (a fainter wash of its colour) and a HOT one glows
+// brighter — so "no activity" recedes and "being touched" jumps out even before you read the hue.
+export const HIVE_HEAT = {
+  'vac-provisioning': 0.00,
+  'occ-claimed':      0.12,
+  'vac-ready':        0.20,
+  'occ-doneRequest':  0.26,
+  'occ-done':         0.28,
+  'occ-working':      0.40,
+  'vac-dirty':        0.58,
+  'occ-idle':         0.62,
+  'occ-tendRequest':  0.72,
+  'occ-landHint':     0.80,
+  'occ-shipHint':     0.82,
+  'live-protected':   0.86,
+  'occ-landRequest':  1.00,
+  'occ-shipRequest':  1.00,
+  'live-unprotected': 1.00,
+};
+export function hiveHeat(key) { return key in HIVE_HEAT ? HIVE_HEAT[key] : 0.4; }
 
 // Fallback labels, in case an older server payload lacks hive_status_label. Server-supplied
 // `hive_status_label` is preferred wherever a xell row is in hand.
