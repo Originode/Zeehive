@@ -52,6 +52,12 @@ function usageFrom(result) {
   };
 }
 
+// A xell's TYPE, normalized. Deliberately stricter than harness.js's normalizeZeeType (which also
+// admits 'any', a HARNESS-only value): a xell is a manager or it is a worker, and anything
+// unrecognized reads as worker — which, on a manager xell, the downgrade guard then refuses rather
+// than acts on. Pure, so the dispatch decision is the same one a test can make.
+export const asZeeType = (v) => (String(v || '').trim().toLowerCase() === 'manager' ? 'manager' : 'worker');
+
 async function readyXells(projectId) {
   // Machine-priority first (023, now per-project 038): a claim takes a ready xell from the
   // machine THIS PROJECT prefers before any other — "if local priority is higher, dev xells get
@@ -236,7 +242,10 @@ function saveDispatchImages(worktreePath, images) {
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
                                      headless = true, model, db, db_container, dump, images, harness,
                                      provider = 'claude', provider_token_id = null,
-                                     zee_type = 'worker', manager_xell_id = null }) {
+                                     // NULL, not 'worker': "the caller said nothing" and "the caller
+                                     // said worker" are different inputs, and the old default made
+                                     // them indistinguishable. See the effective-type block below.
+                                     zee_type = null, manager_xell_id = null }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -258,6 +267,39 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // cryptic pooled slug, which is the whole thing the rename exists to fix.
   const targetId = xell_id || (await readyXells(projectId))[0]?.id || null;
 
+  // ── ONE EFFECTIVE TYPE, resolved BEFORE anything downstream reads it ─────────────────────────
+  // Everything below (the crew stamp, the database branch, the harness branch) is a consequence of
+  // "is this a manager or a worker?", and that question is about the TARGET XELL — not about what a
+  // caller happened to leave unset. The ordinary console dispatch route sends no zee_type at all
+  // (routes.js carries it only in the harness-list query; only POST /api/managers sends one), so
+  // with a `= 'worker'` default every re-dispatch into an existing MANAGER arrived claiming to be a
+  // worker. It then assigned the project's default WORKER harness — which 054's pairing correctly
+  // refused ("harness … is for worker zees, but this xell is a manager zee"), the refusal an
+  // operator hit in the console. Worse where it did NOT refuse: the prod read-only bind was skipped
+  // and the else-branch would have attached a non-prod db, silently taking a manager off production.
+  //
+  // So: the explicit parameter when a caller gives one, else the xell's own current type.
+  const targetRow = targetId ? await one(`SELECT zee_type, harness_id, slug FROM xell WHERE id=$1`, [targetId]) : null;
+  const currentType = asZeeType(targetRow?.zee_type);
+  const askedType = zee_type == null || zee_type === '' ? null : asZeeType(zee_type);
+  // A bare re-dispatch must never DOWNGRADE a manager, and an explicit one must not half-convert it
+  // (strip it off production, hand it a worker manual, while the DB row still says manager). There
+  // is no downgrade verb in this system, so say so and name the one path that does set a type.
+  if (askedType === 'worker' && currentType === 'manager') {
+    throw new Error(
+      `xell ${targetRow?.slug || targetId} is a MANAGER zee, and this dispatch asked for zee_type='worker'. `
+      + 'Dispatch does not convert a xell\'s type: doing it would strip the manager off production '
+      + 'read-only and hand it a worker manual while its crew, its landgate refusal and its DB row all '
+      + 'still say manager. There is no downgrade verb — a manager is CREATED by a human (POST '
+      + '/api/managers, the console\'s "⬢ + manager zee" button) and ENDED by marking it done. To '
+      + 're-task this manager, dispatch WITHOUT zee_type; to run a worker, dispatch into another xell.');
+  }
+  const effectiveType = askedType || currentType;
+  // A TYPE CHANGE invalidates the harness in the same breath: a harness IS that type's manual, and
+  // 054's trigger fires on the zee_type UPDATE itself — so promoting a xell that already wears a
+  // worker harness would fail at the trigger before the harness branch below could ever fix it.
+  const retyping = !!targetId && effectiveType !== currentType;
+
   // Now that we know the job, give the worktree a human-trackable name — BEFORE spawning, so the
   // zee's cwd is the final path and Claude Code's sidebar (which names a worktree by its folder)
   // shows something findable instead of "calm-summit-403da6". Best-effort: if it can't rename
@@ -267,12 +309,20 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // ROLE + CREW, stamped BEFORE the zee starts: the honeycomb seats a worker next to its manager and
   // the briefing tells it who it reports to, so both must be true from the first frame. The DB guard
   // trigger (052) enforces the shape — one level deep, and a manager reports to nobody.
-  if (targetId && (zee_type === 'manager' || manager_xell_id)) {
-    if (zee_type === 'manager' && manager_xell_id) {
-      throw new Error('a manager xell cannot itself report to a manager (the hierarchy is one level deep)');
+  if (targetId && (effectiveType === 'manager' || manager_xell_id || retyping)) {
+    if (effectiveType === 'manager' && manager_xell_id) {
+      // Two different mistakes reach here; say which one it is. Asking for a manager that reports to
+      // a manager is a hierarchy error. INHERITING manager (the target xell already is one) means a
+      // crew dispatch landed on a manager xell — which used to be "fixed" by silently stamping it
+      // worker, i.e. by downgrading a manager off production without telling anybody.
+      throw new Error(askedType === 'manager'
+        ? 'a manager xell cannot itself report to a manager (the hierarchy is one level deep)'
+        : `xell ${targetRow?.slug || targetId} is already a MANAGER zee, so a worker cannot be `
+          + 'dispatched into it — that would downgrade a manager off production read-only. Dispatch '
+          + 'into a different (worker) xell; if the pool is dry, provision one first.');
     }
-    await q(`UPDATE xell SET zee_type=$2, manager_xell_id=$3 WHERE id=$1`,
-      [targetId, zee_type === 'manager' ? 'manager' : 'worker', manager_xell_id || null]);
+    await q(`UPDATE xell SET zee_type=$2, manager_xell_id=$3${retyping ? ', harness_id=NULL' : ''} WHERE id=$1`,
+      [targetId, effectiveType, manager_xell_id || null]);
     if (manager_xell_id) {
       const mgr = await one(`SELECT slug FROM xell WHERE id=$1`, [manager_xell_id]);
       logline('intake', `dispatched xell reports to manager ${mgr?.slug || manager_xell_id}`);
@@ -287,7 +337,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // own SELECT-only postgres role) and NOT selectable by whoever dispatched it. A manager without a
   // readable production is half-blind, and a manager that could be handed a writable one would be a
   // way around the whole point of the role — so this path ignores db/db_container/dump entirely.
-  if (targetId && zee_type === 'manager') {
+  if (targetId && effectiveType === 'manager') {
     await bindManagerToProdReadonly(targetId);
   } else if (targetId && (db || db_container || dump)) {
     await attachXellDb(targetId, { coupling: db, container: db_container, dump });
@@ -302,7 +352,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // dispatch must fail on that rather than start a zee wearing the wrong manual — a manager briefed
   // as a worker would spend its turn reaching for `zee land`, which it is refused.
   if (targetId) {
-    if (zee_type === 'manager') {
+    if (effectiveType === 'manager') {
       // A manager wears a MANAGER harness — its own manual (dispatch/say/inbox/suggest-done, and the
       // loophole rule). An explicit --harness still wins for an operator who authored their own
       // manager persona; a WORKER harness named here is refused by assignHarness, by type.
@@ -312,7 +362,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
     } else {
       const cur = await one(`SELECT harness_id FROM xell WHERE id=$1`, [targetId]);
       if (!cur?.harness_id) {
-        const def = await defaultHarnessId(projectId, { zeeType: zee_type });
+        const def = await defaultHarnessId(projectId, { zeeType: effectiveType });
         if (def) await assignHarness(targetId, def);
       }
     }
