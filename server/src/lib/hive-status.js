@@ -28,6 +28,10 @@ export const HIVE_STATUS = {
   // seed file against production on the zee's behalf (the narrow version of the same need).
   'occ-prodRequest':  { label: 'prod?',        group: 'occ' },
   'occ-seedRequest':  { label: 'seed?',        group: 'occ' },
+  // A MANAGER zee suggested THIS xell is finished. It is a held decision like the others — a human
+  // confirms (with a typed confirmation) and that confirmation is what reaps the cxell — but it was
+  // raised by another agent rather than by this xell's own zee, hence its own key.
+  'occ-doneSuggest':  { label: 'done?',        group: 'occ' },
   'occ-landHint':     { label: 'land?',        group: 'occ' },
   'occ-shipHint':     { label: 'ship?',        group: 'occ' },
   'occ-doneRequest':  { label: 'done?',        group: 'occ' },
@@ -49,6 +53,7 @@ export function hiveStatus(x, sig = {}) {
   const {
     landPending = false, shipPending = false, tendPending = false, prodUnprotected = false,
     landHint = false, shipHint = false, prodBindPending = false, seedPending = false,
+    doneSuggested = false,
   } = sig;
 
   // ── production ──
@@ -75,6 +80,9 @@ export function hiveStatus(x, sig = {}) {
   if (seedPending)                       return 'occ-seedRequest';
   if (prodBindPending)                   return 'occ-prodRequest';
   if (tendPending)                       return 'occ-tendRequest';
+  // A manager's "this one looks finished" — a real decision waiting on a human, below the gates that
+  // BLOCK the zee (it keeps working meanwhile) and above the readiness hints.
+  if (doneSuggested)                     return 'occ-doneSuggest';
   // Readiness HINTS rank below the real held requests and tend (those are firmer asks), but above
   // live activity — a "this looks ready" prompt should be visible even while the zee keeps polishing.
   if (shipHint)                          return 'occ-shipHint';

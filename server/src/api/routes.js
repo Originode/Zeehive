@@ -57,7 +57,11 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
-         selfSeedRequest, selfSeedStatus } from '../queenzee/self.js';
+         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
+         selfSuggestDone } from '../queenzee/self.js';
+import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
+         crewFor } from '../lib/managers.js';
+import { createManagerZee } from '../lib/manager-spawn.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
 
@@ -1157,6 +1161,88 @@ router.post('/xell/self/device', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfDevice(x, { action: req.body?.action || 'attach', kind: req.body?.kind || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── MANAGER-ZEE verbs (crew): dispatch · monitor · converse · suggest-done ─────
+// Same authentication and the same shape as every other self verb — the CALLER is resolved from its
+// own token, so a manager can only ever reach ITS OWN crew and a worker only its own manager. The
+// manager half is refused for a worker (with an explanation, not a 404); `report`/`inbox` are open to
+// every zee, because talking to your manager is the one reach outside its xell a worker is meant to
+// have.
+router.get('/xell/self/zees', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfCrew(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/dispatch', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfDispatch(x, req.body || {}));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/say', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfSay(x, { to: req.body?.to, message: req.body?.message, kind: req.body?.kind || 'directive' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/report', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfReport(x, { message: req.body?.message, kind: req.body?.kind || 'report' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.get('/xell/self/inbox', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfInbox(x, { all: req.query.all === '1' })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/suggest-done', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfSuggestDone(x, { to: req.body?.to, reason: req.body?.reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── HUMAN side of the manager layer ───────────────────────────────────────────
+// Adding a manager zee is a HUMAN act (unlimited — add as many as you can afford to run): the
+// queenzee provisions/claims a xell, stamps it role='manager', binds it to production READ-ONLY (its
+// own SELECT-only postgres role) and cages a zee in it wearing the manager harness.
+router.post('/managers', async (req, res) => {
+  try { res.json(await createManagerZee(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message, detail: err.detail || null }); }
+});
+// A manager's crew, for the console.
+router.get('/xells/:id/crew', async (req, res) => {
+  try { res.json(await crewFor(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// DONE SUGGESTIONS — a manager proposed a xell is finished; a human decides. Approving MARKS THE
+// TASK DONE and reaps the cxell (the console asks for a typed confirmation first), so this is the
+// same class of irreversible act as a landing: no zee path to the decision, ever.
+router.get('/done-suggestions', async (req, res) => {
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  try { res.json(await listDoneSuggestions(req.query.project, { open: req.query.all !== '1' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/done-suggestions/:id/:decision(approve|reject)', async (req, res) => {
+  const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
+  try {
+    res.json(await decideDoneSuggestion(req.params.id, decision, req.body?.by || 'human@console',
+      { force: req.body?.force === true }));
+  } catch (err) { res.status(409).json({ error: err.message }); }
+});
+router.post('/done-suggestions/:id/dismiss', async (req, res) => {
+  try { res.json(await dismissDoneSuggestion(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// An operator filing a done suggestion on a manager's behalf (still only a suggestion — it lands on
+// the same human gate, which is the point: this cannot become a shortcut to marking things done).
+router.post('/xells/:id/suggest-done', async (req, res) => {
+  try {
+    const target = await one(`SELECT * FROM xell WHERE id=$1`, [req.params.id]);
+    if (!target) return res.status(404).json({ error: 'no such xell' });
+    const manager = target.manager_xell_id
+      ? await one(`SELECT * FROM xell WHERE id=$1`, [target.manager_xell_id]) : null;
+    if (!manager) return res.status(409).json({ error: 'that xell has no manager to suggest on behalf of' });
+    res.json(await suggestDone({ manager, target, reason: req.body?.reason || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // HUMAN side of the prod-bind request (the dashboard) — list + confirm/reject. There is deliberately

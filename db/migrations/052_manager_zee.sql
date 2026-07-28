@@ -76,6 +76,14 @@ COMMENT ON COLUMN xell.manager_xell_id IS
 -- per PG12+ semantics nothing in this file may USE the value.
 ALTER TYPE db_coupling ADD VALUE IF NOT EXISTS 'db-prod-readonly';
 
+-- The read-only connection string minted for THIS xell (its own `zee_ro_<slug>` role on the prod
+-- database, granted SELECT and nothing else). Per-xell rather than one shared reader so a manager's
+-- queries are attributable in pg_stat_activity and its access is revocable on its own — the reaper
+-- drops the role with the xell. NULL for every other xell, which is all of them by default.
+ALTER TABLE xell ADD COLUMN IF NOT EXISTS prod_ro_dsn text;
+COMMENT ON COLUMN xell.prod_ro_dsn IS
+  'Read-only production DSN minted for this (manager) xell — its own SELECT-only role. Written to .zeehive.env as DATABASE_URL for a db-prod-readonly xell.';
+
 -- ── zee ↔ zee messages (manager ⇄ worker), and the worker's post-ship REFLECTION ──
 -- A message is DELIVERED into the recipient's live cxell session (nudge.js sendMessageToXell) AND
 -- stored here, so it survives a cxell that was asleep, a zee that has been re-spawned, and a human

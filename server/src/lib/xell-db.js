@@ -35,6 +35,7 @@ export const DB_MODES = {
   'db-shared-dev': 'the shared dev database (default) — other xells share it; its SCHEMA is frozen (write migrations instead)',
   'db-clone': 'its OWN database inside the shared dev postgres, cloned in seconds from a maintained template — for xells doing schema/migration work',
   'db-shared-prod': 'the LIVE PRODUCTION database — writes are real and irreversible',
+  'db-prod-readonly': 'the LIVE PRODUCTION database, READ-ONLY — a per-xell postgres role granted SELECT and nothing else (manager zees)',
   'db-isolated': 'its own postgres container, restored from a dump (e.g. the latest prod backup)',
 };
 
@@ -505,10 +506,13 @@ export async function dbAccessForCwd(cwd) {
       : null,
     db_containers: dbNames,
     docker_ctx: db?.docker_ctx || null,
-    // Only a xell a human deliberately pointed at prod may touch prod data.
-    allowed: xell.db_coupling === 'db-shared-prod' && !!db && db.tier === 'prod',
-    reason: xell.db_coupling === 'db-shared-prod'
-      ? (db ? null : 'db-shared-prod but no db container attached')
+    // Only a xell a human deliberately pointed at prod may touch prod data. A MANAGER holds it
+    // READ-ONLY ('db-prod-readonly'): reading production is its whole purpose, so it is allowed here
+    // and flagged readonly — and postgres refuses its writes regardless of what any hook decides.
+    allowed: ['db-shared-prod', 'db-prod-readonly'].includes(xell.db_coupling) && !!db && db.tier === 'prod',
+    readonly: xell.db_coupling === 'db-prod-readonly',
+    reason: ['db-shared-prod', 'db-prod-readonly'].includes(xell.db_coupling)
+      ? (db ? null : `${xell.db_coupling} but no db container attached`)
       : `this xell's database is '${xell.db_coupling}', not prod — and it does not hold the prod `
         + 'deploy lock (the lock holder may exec against the prod db during its verification window)',
   };
@@ -536,7 +540,11 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
     target = await one(`SELECT * FROM container WHERE role='db' AND (name=$1 OR id::text=$1)`, [String(container)]);
     if (!target) throw new Error(`no db container matching "${container}"`);
     mode = target.tier === 'prod' ? 'db-shared-prod' : (target.tier === 'dev' ? 'db-shared-dev' : mode || 'db-shared-dev');
-  } else if (mode === 'db-shared-prod') {
+  } else if (mode === 'db-shared-prod' || mode === 'db-prod-readonly') {
+    // Same container, different CREDENTIAL. 'db-prod-readonly' links the live prod db exactly like a
+    // full bind does — what differs is the DSN the xell is handed (lib/prod-readonly.js mints a
+    // SELECT-only role for it), so every reader of the binding still sees "this xell's database IS
+    // production" and postgres itself is what refuses the writes.
     target = await sharedDb(project.id, 'prod');
     if (!target) throw new Error('no prod db container registered for this project');
   } else if (mode === 'db-clone') {
