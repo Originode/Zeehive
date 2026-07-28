@@ -35,8 +35,10 @@ import { prodDb, psql, assertProdDbTarget } from './shipmigrate.js';
 // whitelist is what keeps "run this file on prod" from meaning "run ANY file in the repo on prod".
 export const SEED_DIR = 'server/sql/seeds';
 // Real runs are gated on a human anyway; SEED_MODE=simulate exists to verify ZEEHIVE itself
-// end-to-end without a production database in the loop (mirrors SHIP_MODE).
-const MODE = process.env.SEED_MODE === 'simulate' ? 'simulate' : 'real';
+// end-to-end without a production database in the loop (mirrors SHIP_MODE). Read per call, not
+// once at import: a test that flips the mode mid-run must get the mode it set, and nothing here is
+// hot enough for one env read to matter.
+const seedMode = () => (process.env.SEED_MODE === 'simulate' ? 'simulate' : 'real');
 const OPEN = ['pending', 'approved', 'running'];
 
 const gitOk = (repoRoot, args) => spawnSync('git', ['-C', repoRoot, ...args],
@@ -255,7 +257,7 @@ export async function runSeed(id) {
     logline('seed', `seed FAILED for ${row.xell_slug || row.xell_id}: ${error}`);
     const done = await one(
       `UPDATE prod_seed_request SET status='failed', finished_at=now(), result=$2::jsonb
-         WHERE id=$1 RETURNING *`, [id, JSON.stringify({ ok: false, error, applied, mode: MODE })]);
+         WHERE id=$1 RETURNING *`, [id, JSON.stringify({ ok: false, error, applied, mode: seedMode() })]);
     broadcast('seed', done);
     broadcast('xell', { id: row.xell_id });
     return done;
@@ -276,13 +278,13 @@ export async function runSeed(id) {
   catch (e) { return fail(e.message); }
   if (!db) return fail('no prod db container in the inventory for this project/site');
 
-  if (MODE === 'simulate') {
+  if (seedMode() === 'simulate') {
     const applied = (row.files || []).map((f) => ({ file: f, ok: true, simulated: true }));
     logline('seed', `[simulate] would run ${applied.length} seed file(s) on ${db.container}/${db.name}`);
     const done = await one(
       `UPDATE prod_seed_request SET status='seeded', finished_at=now(), result=$2::jsonb
          WHERE id=$1 RETURNING *`,
-      [id, JSON.stringify({ ok: true, applied, mode: MODE, database: `${db.container}/${db.name}` })]);
+      [id, JSON.stringify({ ok: true, applied, mode: seedMode(), database: `${db.container}/${db.name}` })]);
     broadcast('seed', done);
     broadcast('xell', { id: row.xell_id });
     return done;
@@ -311,7 +313,7 @@ export async function runSeed(id) {
   const done = await one(
     `UPDATE prod_seed_request SET status='seeded', finished_at=now(), result=$2::jsonb
        WHERE id=$1 RETURNING *`,
-    [id, JSON.stringify({ ok: true, applied, mode: MODE, database: `${db.container}/${db.name}` })]);
+    [id, JSON.stringify({ ok: true, applied, mode: seedMode(), database: `${db.container}/${db.name}` })]);
   broadcast('seed', done);
   broadcast('xell', { id: row.xell_id });
   logline('seed', `SEEDED production for ${row.xell_slug || row.xell_id} — ${applied.length} file(s) on `
