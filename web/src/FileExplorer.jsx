@@ -6,7 +6,7 @@ import { listCxellDir, readCxellFile } from './api.js';
 // can SEE what a zee is talking about ("edited web/src/App.jsx") without leaving the terminal.
 //
 // `openReq` ({ path, n }) is a "show file" request from the terminal — a CLICKED path link in the
-// output, the 📄 button, or the path box below. On each new request the explorer navigates to (a
+// output, the 📁 button with a path selected, or the path box below. On each new request the explorer navigates to (a
 // dir) or opens (a file) that path; the bumping `n` lets a repeat request on the same path re-open.
 
 const ICON = { dir: '▸', file: '·' };
@@ -43,7 +43,7 @@ export default function FileExplorer({ zeeId, openReq, onClose }) {
 
   useEffect(() => { load(null); }, [load]);
 
-  // A "show file" request from the terminal (a clicked path link, or the 📄 button) flows in via
+  // A "show file" request from the terminal (a clicked path link, or 📁 with a path selected) flows in via
   // openReq. The bumping openReq.n makes a repeat click on the same path re-open it.
   useEffect(() => { if (openReq?.path) show(openReq.path); }, [openReq, show]);
 
