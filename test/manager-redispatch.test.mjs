@@ -191,6 +191,48 @@ try {
   ok(w2.zee_type === 'manager' && w2.harness_key === 'manager' && w2.db_coupling === 'db-prod-readonly',
      'the worker xell became a manager, wearing the manager harness, on production read-only');
 
+  // ── 6. an UNNAMED worker dispatch is never handed a ready MANAGER xell ────────────────────
+  // The console composer sends no xell_id: it takes "the freshest ready xell". A manager whose zee
+  // died or whose work landed goes back to 'ready' WITH its prod binding and manager harness, so
+  // that pick used to land on it — which is how the operator's refusal happened without anyone
+  // naming a manager. Excluding it is the only answer that is neither a downgrade nor a dead end.
+  console.log('an unnamed WORKER dispatch skips a ready manager xell');
+  await client.query(`UPDATE xell SET status='ready', ready_at=now() WHERE id IN ($1,$2)`, [mgrA.id, mgrB.id]);
+  // wrk is now a manager (case 5 promoted it); park it so the ONLY non-manager ready xell is new.
+  await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [wrk.id]);
+  const wt2 = mkWt('spare-worker-dd44ee', 'spinoff/spare-worker-dd44ee');
+  const spare = await mkXell('spare-worker-dd44ee', wt2, 'worker', null);
+  await client.query(`UPDATE xell SET ready_at = now() - interval '1 hour' WHERE id=$1`, [spare.id]);
+
+  const r6 = await dispatch({ project: PID, task: 'plain worker work', title: 'spare worker' });
+  ok(!r6.threw || SPAWN_STAGE.test(r6.error), `no refusal before the spawn [${r6.threw ? r6.error.slice(0, 110) : 'no throw'}]`);
+  const picked = await readXell(spare.id);
+  ok(picked.harness_key === workerH.key,
+     'it took the OLDER plain worker xell, not either of the two fresher ready MANAGER xells');
+  const untouchedA = await readXell(mgrA.id);
+  const untouchedB = await readXell(mgrB.id);
+  ok(untouchedA.status === 'ready' && untouchedB.status === 'ready',
+     'and both manager xells were left alone (still ready, not claimed by a worker dispatch)');
+  ok(untouchedA.db_coupling === 'db-prod-readonly' && untouchedB.db_coupling === 'db-prod-readonly',
+     'their production read-only binding is intact — nothing was downgraded to take a spare xell');
+
+  // ── 7. with ONLY manager xells ready, the pool is dry for a worker — it does not "make do" ──
+  console.log('only manager xells ready → a worker dispatch reports an EMPTY pool, it does not take one');
+  await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [spare.id]);
+  await client.query(`UPDATE xell SET status='ready' WHERE id IN ($1,$2)`, [mgrA.id, mgrB.id]);
+  const r7 = await dispatch({ project: PID, task: 'nowhere to go' });
+  ok(r7.threw && /no ready xell available/i.test(r7.error),
+     `the pool reads as DRY, so the reconciler provisions a real one [${(r7.error || '').slice(0, 90)}]`);
+  const a7 = await readXell(mgrA.id);
+  ok(a7.zee_type === 'manager' && a7.status === 'ready' && a7.db_coupling === 'db-prod-readonly',
+     'and the ready manager is untouched rather than conscripted');
+
+  // ── 8. …but an explicit MANAGER dispatch still draws from every ready xell ───
+  console.log('an explicit MANAGER dispatch may still take a ready manager xell');
+  const r8 = await dispatch({ project: PID, task: 'add a manager', zee_type: 'manager', harness: 'manager' });
+  ok(r8.threw && SPAWN_STAGE.test(r8.error) && !/no ready xell available/i.test(r8.error),
+     `it FOUND a target (only the spawn failed) [${(r8.error || '').slice(0, 90)}]`);
+
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
   console.error('TEST ERROR:', e);

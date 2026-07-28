@@ -59,7 +59,20 @@ function usageFrom(result) {
 // than acts on. Pure, so the dispatch decision is the same one a test can make.
 export const asZeeType = (v) => (String(v || '').trim().toLowerCase() === 'manager' ? 'manager' : 'worker');
 
-async function readyXells(projectId) {
+// `zeeType: 'worker'` EXCLUDES manager xells from the pool this pick draws from.
+//
+// A ready MANAGER xell is an anomaly, not a spare: a manager is created claimed and runs until it
+// is reaped, so it only reaches 'ready' when its zee died or its work landed — with its prod
+// read-only binding, its crew and its manager harness all still live. Handing that to a worker
+// dispatch is wrong in every case, and it used to be "handled" by silently stamping it worker
+// (downgrading a manager off production), and after the type fix by a refusal the operator can do
+// nothing about. Neither is an answer; not picking it is. Excluding it also reads correctly to the
+// pool reconciler, which sees one fewer ready xell and provisions a real one.
+//
+// A MANAGER dispatch (POST /api/managers) passes zeeType 'manager' and draws from everything: it is
+// going to stamp the type anyway, and a ready manager xell is the ideal target for it.
+// zeeType null keeps the unfiltered list — that is the claim path, which matches an exact cwd.
+async function readyXells(projectId, { zeeType = null } = {}) {
   // Machine-priority first (023, now per-project 038): a claim takes a ready xell from the
   // machine THIS PROJECT prefers before any other — "if local priority is higher, dev xells get
   // spawned there first" applies to dispatch exactly like it does to the pool fill. Priority is a
@@ -71,8 +84,9 @@ async function readyXells(projectId) {
        LEFT JOIN machine m ON m.docker_ctx = sc.docker_ctx AND m.enabled
        LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = x.project_id
       WHERE x.project_id = $1 AND x.status = 'ready'
+        AND ($2::text IS DISTINCT FROM 'worker' OR COALESCE(x.zee_type, 'worker') <> 'manager')
       ORDER BY COALESCE(mp.dev_priority, 0) DESC, x.ready_at DESC NULLS LAST, x.created_at DESC`,
-    [projectId]);
+    [projectId, zeeType]);
 }
 
 // The ready xell the caller is physically STANDING IN (cwd === its worktree), or null.
@@ -263,10 +277,21 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   const from = title || titleFromTask(task) || (session_id ? sessionTitle(session_id) : null);
   const inherited = from ? `xell : ${from}` : null;
 
+  // What TYPE did the caller ask for? Purely a function of the parameter, so it is known before we
+  // pick anything — which is what lets the pick itself be type-aware. A bare dispatch (the console's
+  // payload) asks for nothing and means WORKER; only POST /api/managers says 'manager'.
+  const askedType = zee_type == null || zee_type === '' ? null : asZeeType(zee_type);
+
   // Resolve the target xell UP FRONT. If the caller didn't name one we must still pick it here,
   // not inside spawnHeadless — otherwise the rename below is skipped and the xell keeps its
   // cryptic pooled slug, which is the whole thing the rename exists to fix.
-  const targetId = xell_id || (await readyXells(projectId))[0]?.id || null;
+  //
+  // An explicit xell_id is authoritative (a human named that xell on purpose — the type block below
+  // then does the right thing with it). An UNNAMED worker dispatch must not be handed a ready
+  // MANAGER xell by accident: see readyXells.
+  const targetId = xell_id
+    || (await readyXells(projectId, { zeeType: askedType || 'worker' }))[0]?.id
+    || null;
 
   // ── ONE EFFECTIVE TYPE, resolved BEFORE anything downstream reads it ─────────────────────────
   // Everything below (the crew stamp, the database branch, the harness branch) is a consequence of
@@ -282,7 +307,6 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // So: the explicit parameter when a caller gives one, else the xell's own current type.
   const targetRow = targetId ? await one(`SELECT zee_type, harness_id, slug FROM xell WHERE id=$1`, [targetId]) : null;
   const currentType = asZeeType(targetRow?.zee_type);
-  const askedType = zee_type == null || zee_type === '' ? null : asZeeType(zee_type);
   // A bare re-dispatch must never DOWNGRADE a manager, and an explicit one must not half-convert it
   // (strip it off production, hand it a worker manual, while the DB row still says manager). There
   // is no downgrade verb in this system, so say so and name the one path that does set a type.
@@ -387,6 +411,9 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   const spawned = await spawnHeadless({
     projectId, xellId: targetId, task: taskText, runtime, mode, title: inherited,
     headless: headless !== false, provider, providerTokenId: provider_token_id,
+    // Only reached when targetId is null (the pool was dry at the pick above) — carry the same
+    // intent down so the fallback cannot grab a xell this dispatch just declined to take.
+    zeeType: effectiveType,
     ...(model ? { model } : {}),
   });
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
@@ -833,15 +860,19 @@ export function listDispatchModels(provider = 'claude') {
   return ZEE_MODELS.map((m) => ({ ...m, default: m.key === DEFAULT_ZEE_MODEL }));
 }
 
-export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true, provider = 'claude', providerTokenId = null }) {
+// `zeeType` is only consulted when no xellId is named — it is the intent behind the FALLBACK pick,
+// and it defaults to 'worker' because every caller that reaches here without a xell (a queued task
+// in tasks.js, a dispatch whose pool was dry) is spawning a worker. Without it the dispatch path's
+// type-aware pick would be undone one function later by an unfiltered "take the freshest ready".
+export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true, provider = 'claude', providerTokenId = null, zeeType = 'worker' }) {
   const m = resolveMode(mode);
   const pid = projectId || (await defaultProjectId());
   const xell = xellId
     ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId])
-    // No xell named → take the freshest ready one. (readyXellForCwd matches a caller's cwd to a
-    // worktree and takes the ready ARRAY — passing projectId here silently matched nothing, so
-    // every dispatch without an explicit xell_id died with "no ready xell available".)
-    : (await readyXells(pid))[0];
+    // No xell named → take the freshest ready one OF THE RIGHT TYPE. (readyXellForCwd matches a
+    // caller's cwd to a worktree and takes the ready ARRAY — passing projectId here silently matched
+    // nothing, so every dispatch without an explicit xell_id died with "no ready xell available".)
+    : (await readyXells(pid, { zeeType }))[0];
   if (!xell) throw new Error('no ready xell available for headless spawn');
   if (!task) throw new Error('task (prompt) required for headless spawn');
 
@@ -1047,6 +1078,17 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // only broke npm/builds). We block the ONE thing that matters: the fleet's live PROD databases,
   // which Docker's bridge NAT would otherwise expose on the LAN. A xell bound to prod
   // (db-shared-prod) keeps its OWN prod DB reachable — that binding is a human's call.
+  //
+  // ⚠ THIS LIST IS host:port PAIRS ONLY, so a prod db registered ALIAS-ONLY (no host/host_port,
+  // reachable only by its docker network name — see lib/prod-readonly.js decideReaderAddress) is
+  // NOT in it. That is currently harmless, but only because TWO conditions hold together:
+  //   (a) an alias-only row publishes no host port, so there is no bridge-NAT path for a rule to
+  //       block in the first place — the thing this list exists to close does not exist for it; AND
+  //   (b) the ONLY container joined to that db's docker network is the prod-read-only MANAGER's
+  //       cage, joined deliberately by connectCxellToProdNetwork() and only for db-prod-readonly.
+  // If EITHER stops holding — a host_port is added to an alias-registered row, or anything else is
+  // joined to that network — the row belongs in blockTcp for every project except its own
+  // prod-bound one, and this query must stop filtering on host/host_port to find it.
   const prodDbs = await q(
     `SELECT DISTINCT host(c.host) AS host, c.host_port, c.project_id FROM container c
       WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
