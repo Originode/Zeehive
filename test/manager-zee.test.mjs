@@ -20,7 +20,7 @@
 //
 // Everything it creates is torn down in a finally, whatever happens.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
@@ -223,6 +223,77 @@ try {
   ok(/NEVER dispatch a worker in a way that gives it reach beyond its own xell/.test(intake),
      'the binding RULES carry the anti-loophole law');
   ok(/SHIPPING is NOT blocked for you/.test(intake), 'the binding RULES say shipping is not blocked');
+  // ── 9. the honeycomb SEATS a crew next to its manager ───────────────────
+  // The layout lives in a .jsx module (React imports, no DOM here), so the seating functions are
+  // lifted OUT of the real source text and run — testing what actually ships rather than a copy.
+  {
+    const src = readFileSync('web/src/hive/HiveCanvas.jsx', 'utf8');
+    const grab = (name, kind = 'function') => {
+      const start = src.indexOf(`${kind} ${name}(`);
+      if (start < 0) throw new Error(`${name} not found in HiveCanvas.jsx`);
+      // Skip the PARAMETER list before hunting the body brace — seatXells destructures its options
+      // (`{ reserved, pinned } = {}`), so "the first { after the name" is a parameter, not the body.
+      let i = src.indexOf('(', start), pdepth = 0;
+      for (; i < src.length; i++) {
+        if (src[i] === '(') pdepth++;
+        else if (src[i] === ')' && --pdepth === 0) { i++; break; }
+      }
+      i = src.indexOf('{', i);
+      let depth = 0;
+      for (; i < src.length; i++) {
+        if (src[i] === '{') depth++;
+        else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
+      }
+      throw new Error(`could not bracket-match ${name}`);
+    };
+    const mod = [
+      "const cellKey = (row, col) => row + ',' + col;",
+      grab('cellNeighbors'), grab('cellsAround'), grab('seatXells', 'export function').replace('export ', ''),
+      'return seatXells;',
+    ].join('\n');
+    // eslint-disable-next-line no-new-func
+    const seatXells = new Function(mod)();
+
+    const mgrA = { id: 'A', role: 'manager' }, mgrB = { id: 'B', role: 'manager' };
+    const crewA = [1, 2, 3, 4].map((n) => ({ id: `a${n}`, role: 'worker', manager_xell_id: 'A' }));
+    const crewB = [1, 2].map((n) => ({ id: `b${n}`, role: 'worker', manager_xell_id: 'B' }));
+    const loners = [1, 2, 3].map((n) => ({ id: `x${n}`, role: 'worker' }));
+    const list = [...loners.slice(0, 1), mgrA, ...crewB, mgrB, ...crewA, ...loners.slice(1)];
+    const cells = seatXells(list, 5);
+
+    const dist = (p1, p2) => {                       // odd-r offset → cube distance
+      const cube = ([r, c]) => { const x = c - (r - (r & 1)) / 2; return [x, r, -x - r]; };
+      const [ax, ay, az] = cube(p1), [bx, by, bz] = cube(p2);
+      return Math.max(Math.abs(ax - bx), Math.abs(ay - by), Math.abs(az - bz));
+    };
+    const seats = Object.values(cells).map((c) => c.join(','));
+    ok(new Set(seats).size === list.length, 'every xell gets its own cell (no two share a hexagon)');
+    ok(crewA.every((w) => dist(cells[w.id], cells.A) <= 2),
+       "a manager's whole crew is seated within two rings of it");
+    // At the grid's CORNER only two of the six neighbour cells exist, so the rest of the crew
+    // correctly spills to the next ring. Away from the edge, a crew of four should all touch it.
+    const mid = seatXells(list, 5, { pinned: { A: [2, 2] } });
+    ok(crewA.every((w) => dist(mid[w.id], mid.A) === 1),
+       'seated away from the edge, a crew of four are all DIRECT neighbours of their manager');
+    ok(crewA.filter((w) => dist(cells[w.id], cells.A) === 1).length === 2,
+       'at the grid corner it fills the two neighbour cells that exist and spills to the next ring');
+    ok(crewB.every((w) => dist(cells[w.id], cells.B) === 1), "a second manager's crew clusters around IT, not A");
+    ok(crewB.every((w) => dist(cells[w.id], cells.A) > 1), "and not around the other manager");
+
+    // the no-managers case must be byte-for-byte the old reading-order layout
+    const plain = [1, 2, 3, 4, 5, 6, 7].map((n) => ({ id: String(n), role: 'worker' }));
+    const flat = seatXells(plain, 3);
+    ok(plain.every((x, i) => flat[x.id][0] === Math.floor(i / 3) && flat[x.id][1] === i % 3),
+       'with no managers the seating is exactly the old row-major reading order');
+
+    // the flower's petals are respected: a pinned/reserved cell is never handed to someone else
+    const reserved = new Set(['0,1', '1,1']);
+    const withFlower = seatXells(plain, 3, { reserved, pinned: { 1: [0, 0] } });
+    ok(withFlower['1'].join(',') === '0,0', 'a pinned xell keeps its cell (the expanded flower)');
+    ok(!Object.entries(withFlower).some(([id, c]) => id !== '1' && reserved.has(c.join(','))),
+       'nobody is seated on a reserved (petal) cell');
+  }
+
 } finally {
   await cleanup({ files: true });
   await client.end().catch(() => {});
