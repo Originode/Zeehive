@@ -26,6 +26,57 @@ const CONTINUE_PROMPT =
   + '  3. When you are satisfied the whole job is complete, run `zee done --summary "…"`.\n'
   + 'Do NOT try to re-run `zee land` for the work that just landed; it is done. Pick the next step and act.';
 
+// THE REFLECTION STAGE — what a worker does AFTER its work is live in production.
+//
+// A ship used to be the end of a zee's story: the containers swapped, the card went quiet, and
+// everything the zee learned on the way — the workaround it had to leave in, the test it could not
+// write, the bug it saw in passing — died with the cxell. The one moment a worker knows the most
+// about a change is right after it ships, and nobody was asking.
+//
+// So the queenzee re-invokes the shipping zee with a REFLECTION prompt: review what actually shipped
+// and report improvements and errors to its MANAGER (`zee report --kind reflection`), which lands in
+// the manager's inbox and is delivered into its live session. A worker with no manager still writes
+// the reflection — it is recorded for the humans in the console instead of being lost.
+//
+// It is a prompt, not a gate: it opens nothing, blocks nothing, and a dead cxell simply logs.
+const REFLECT_PROMPT = (commit, managerSlug) => [
+  `Your work SHIPPED to production${commit ? ` (${String(commit).slice(0, 8)})` : ''}. Before you stop, do the REFLECTION pass —`,
+  'this is a required stage, and it is the most valuable thing you will write today, because right now',
+  'you know more about this change than anyone else ever will.',
+  '',
+  'Review what actually shipped (your diff, what you had to work around, what you could not verify), then',
+  'report — honestly, specifically, no reassurance:',
+  '  1. IMPROVEMENTS — what should be done better next time, in this code or in how the job was set up.',
+  '  2. ERRORS / RISKS — anything you know is wrong, fragile, or unverified in what just went live,',
+  '     including things outside your task that you noticed on the way. Say it even if it is your own',
+  '     mistake: an unreported flaw in production is far more expensive than an admitted one.',
+  '  3. FOLLOW-UPS — the concrete next tasks you would cut, in priority order.',
+  '',
+  managerSlug
+    ? `Send it with \`zee report --kind reflection --message "…"\` — it goes to your MANAGER (${managerSlug}),`
+      + ' who decides what becomes the next task. Keep it under ~25 lines and lead with anything broken.'
+    : 'Send it with `zee report --kind reflection --message "…"`. You have no manager zee, so it is recorded'
+      + ' for the humans in the console. Keep it under ~25 lines and lead with anything broken.',
+  '',
+  'If you find something genuinely broken in production, ALSO raise it now: `zee tend --reason "…"`.',
+  'Do not deploy, do not touch prod, and do not start fixing it in this xell without being asked —',
+  'reflect, report, and let a human or your manager decide what happens next.',
+].join('\n');
+
+// Ask the zee that just shipped to reflect. Called by the ship gate on a SUCCESSFUL ship only —
+// there is nothing to reflect on when nothing went live (a failed ship is a build problem the human
+// is already looking at). Best-effort, never throws: a ship must never fail because a cxell is gone.
+export async function nudgeXellForReflection(xellId, { commit = null, by = 'queenzee' } = {}) {
+  const mgr = await one(
+    `SELECT m.slug FROM xell x JOIN xell m ON m.id = x.manager_xell_id WHERE x.id=$1`, [xellId])
+    .catch(() => null);
+  return nudgeCxell(xellId, {
+    by, prompt: REFLECT_PROMPT(commit, mgr?.slug || null), why: 'post-ship reflection',
+    log: (slug, sid) => `${slug}: shipped — resuming cxell session ${sid} for the REFLECTION pass`
+      + `${mgr?.slug ? ` (reports to ${mgr.slug})` : ''}`,
+  });
+}
+
 // An OPERATOR-initiated nudge: poke the running zee for a status update, WITHOUT changing anything.
 // The word the operator wants the agent to actually SEE, typed into the live session as-is.
 const STATUS_KEYS = 'status?';

@@ -99,6 +99,26 @@ export async function getDiffs(projectId) {
   return r.ok ? r.json() : {};
 }
 
+// ── the DIFF VIEWER's two reads (the patch behind a diffstat) ─────────────────
+// getDiffs above answers "how much" for every xell; these answer "what" for one. Both return the
+// server's payload as-is INCLUDING its refusals ({ ok: false, error }) — a diff that cannot be read
+// (no worktree, a gc'd sha, an unreachable cxell) is an answer the viewer shows, not an exception.
+export async function getXellPatch(xellId, kind = 'source') {
+  const r = await fetch(`/api/xells/${xellId}/diff?kind=${encodeURIComponent(kind)}`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok && d.error) return { ok: false, ...d };
+  if (!r.ok) throw new Error(`diff ${r.status}`);
+  return d;
+}
+
+export async function getLandPatch(requestId) {
+  const r = await fetch(`/api/land/requests/${requestId}/diff`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok && d.error) return { ok: false, ...d };
+  if (!r.ok) throw new Error(`diff ${r.status}`);
+  return d;
+}
+
 export async function getLogs(n = 200) {
   const r = await fetch(`/api/logs?n=${n}`);
   return r.ok ? r.json() : [];
@@ -742,5 +762,90 @@ export async function readCxellFile(zeeId, path) {
   const r = await fetch(`/api/zees/${zeeId}/file?path=${encodeURIComponent(path)}`);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data?.error || `read failed (${r.status})`);
+  return data;
+}
+
+// ── PROD-DATA asks: the two things a zee may only REQUEST about production DATA ──
+// Both are decided here, by a human, and performed by the queenzee — never by the zee.
+//
+//   prod BIND  → the xell's assigned database BECOMES live production (lib/xell-prod.js). The big
+//                one: live, irreversible writes, and (for a cxell) the firewall is re-sealed so the
+//                cxell can reach prod at all.
+//   prod SEED  → the queenzee runs LANDED .sql file(s) from server/sql/seeds/ against production
+//                (queenzee/seedgate.js). The narrow one: one reviewed file, no prod access granted.
+
+// Confirm/reject a zee's request to be bound to the production stack.
+export async function decideProdBind(id, decision, by = 'human@console') {
+  const r = await fetch(`/api/prod-bind/requests/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+
+// The exact SQL a seed request will run, read at ITS sha — what you approve is what runs.
+// Also returns `prior`: every earlier run of the same file(s) on this production.
+export async function seedRequestSql(id) {
+  const r = await fetch(`/api/prod-seed/requests/${id}/sql`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `could not read the seed SQL (${r.status})`);
+  return data;
+}
+
+// Approve (→ the queenzee RUNS it on production and returns the finished row) or reject a seed.
+export async function decideProdSeed(id, decision, by = 'human@console') {
+  const r = await fetch(`/api/prod-seed/requests/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+
+// Hide a finished seed's receipt (visibility only — what ran on prod is unchanged).
+export async function dismissSeed(id) {
+  const r = await fetch(`/api/prod-seed/requests/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  return r.ok ? r.json() : null;
+}
+
+// ── MANAGER ZEES ─────────────────────────────────────────────────────────────
+// Adding a manager is a HUMAN act and there is no limit on how many you add — but only from here
+// (a zee's dispatch verb refuses the role, so managers can never mint managers).
+export async function addManagerZee(body = {}) {
+  const r = await fetch('/api/managers', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `could not add a manager zee (${r.status})`);
+  return data;
+}
+
+// A manager's crew (its dispatched workers, with live status).
+export async function fetchCrew(xellId) {
+  const r = await fetch(`/api/xells/${xellId}/crew`);
+  const data = await r.json().catch(() => ([]));
+  if (!r.ok) throw new Error(data.error || `crew unavailable (${r.status})`);
+  return data;
+}
+
+// DONE SUGGESTIONS — a manager proposed a xell is finished; approving MARKS IT DONE and reaps the
+// cxell, so the console asks for a typed confirmation before calling this.
+export async function decideDoneSuggestion(id, decision, by = 'human@console', force = false) {
+  const r = await fetch(`/api/done-suggestions/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by, force }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+export async function dismissDoneSuggestion(id, by = 'human@console') {
+  const r = await fetch(`/api/done-suggestions/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
   return data;
 }

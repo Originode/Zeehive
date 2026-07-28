@@ -75,7 +75,7 @@ function pushedCommits(repoRoot, oldSha, newSha, limit = 50) {
 // informational — an unmatched push is still gated, it just shows as "unknown" in the console.
 async function resolveXell(projectId, repoRoot, newSha) {
   const xells = await q(
-    `SELECT id, slug, branch FROM xell
+    `SELECT id, slug, branch, role FROM xell
        WHERE project_id = $1 AND status <> 'retired' AND is_production = false`, [projectId]);
   for (const x of xells) {
     const r = spawnSync('git', ['-C', repoRoot, 'merge-base', '--is-ancestor', newSha, x.branch],
@@ -95,6 +95,19 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
   if (!newSha || ZERO.test(newSha)) {
     logline('landgate', `DECLINED deletion of ${ref} on ${project.name}`);
     return { allow: false, reason: 'deletion-refused', request: null };
+  }
+
+  // A MANAGER zee has ZERO push access to the xource, and this is where that is made true rather
+  // than asked for: the push is declined and NO land_request is raised, so there is no card, no
+  // approval and no path a persuasive agent could talk a human down. A manager coordinates workers;
+  // the workers land their own work. (Resolved from the pushed sha the same way the request below
+  // resolves it — a push we cannot attribute is not treated as a manager's.)
+  const pusher = await resolveXell(projectId, project.repo_root, newSha);
+  if (pusher?.role === 'manager') {
+    logline('landgate',
+      `DECLINED ${ref} → ${String(newSha).slice(0, 8)} on ${project.name} — ${pusher.slug} is a MANAGER xell `
+      + '(zero push access to the xource; nothing was raised for a human to approve)');
+    return { allow: false, reason: 'manager-no-push', request: null };
   }
 
   const approved = await one(
@@ -157,7 +170,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
   }
 
   const commits = pushedCommits(project.repo_root, oldSha, newSha);
-  const xell = await resolveXell(projectId, project.repo_root, newSha);
+  const xell = pusher;   // resolved once, above (the manager check needed it first)
 
   // Store what a human reviewing a LANDING needs: how much lands, not divergence. diffStat's
   // ahead/behind are relative to a base and read backwards here (its `behind` is the count of

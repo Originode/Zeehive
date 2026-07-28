@@ -6,6 +6,7 @@ import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { deviceConfig } from './devices.js';
+import { listDoneSuggestions } from './managers.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -81,6 +82,15 @@ async function fetchXellRows(pid) {
             EXISTS(SELECT 1 FROM ship_request sr WHERE sr.xell_id = x.id
                      AND sr.status IN ('pending','approved','shipping') AND sr.dismissed_at IS NULL
                      AND sr.deferred_at IS NULL) AS ship_pending,
+            -- The two PROD-DATA asks a zee can only REQUEST: a bind to the live production database
+            -- (prod_bind_request, 029) and a queenzee-run seed of production (prod_seed_request,
+            -- 049). Both are held gates awaiting a human, so both light the hexagon — without this
+            -- a zee could ask and never be answered: the request existed only in the queenzee log.
+            EXISTS(SELECT 1 FROM prod_bind_request pbr WHERE pbr.xell_id = x.id
+                     AND pbr.status = 'pending') AS prod_bind_pending,
+            EXISTS(SELECT 1 FROM prod_seed_request psr WHERE psr.xell_id = x.id
+                     AND psr.status IN ('pending','approved','running')
+                     AND psr.dismissed_at IS NULL) AS seed_pending,
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'tend-request' AS tend_pending,
@@ -92,6 +102,13 @@ async function fetchXellRows(pid) {
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('shiphint-request','shiphint-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'shiphint-request' AS ship_hint,
+            -- A MANAGER zee suggested this xell is finished: a held decision, raised by another
+            -- agent rather than by this xell's own zee, and it must be visible or a manager's
+            -- suggestion is as invisible as the prod-bind ask used to be.
+            EXISTS(SELECT 1 FROM done_suggestion ds WHERE ds.target_xell_id = x.id
+                     AND ds.status = 'pending' AND ds.dismissed_at IS NULL) AS done_suggested,
+            -- the manager this xell reports to (its slug, for the card/hexagon)
+            (SELECT mx.slug FROM xell mx WHERE mx.id = x.manager_xell_id) AS manager_slug,
             EXISTS(SELECT 1 FROM deploy_lock dl2 WHERE dl2.project_id = x.project_id
                      AND dl2.container = 'prod') AS prod_lock_active,
             dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
@@ -181,11 +198,16 @@ async function decorateXell(x, heads, deployed, project) {
     tendPending: x.tend_pending === true,
     landHint: x.land_hint === true,
     shipHint: x.ship_hint === true,
+    prodBindPending: x.prod_bind_pending === true,
+    seedPending: x.seed_pending === true,
+    doneSuggested: x.done_suggested === true,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
   delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;
   delete x.land_hint; delete x.ship_hint;
+  delete x.prod_bind_pending; delete x.seed_pending;
+  // done_suggested stays on the row (not deleted): the console renders the decision card from it.
 
   // Fleet burn for THIS xell — sum across all its zees. pg returns bigint/numeric as strings; coerce
   // to Number so the dashboard can format it (a xell's lifetime burn is well within double precision).
@@ -323,9 +345,31 @@ export async function getFleet(projectId) {
     `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id
        WHERE dl.project_id = $1 AND dl.container = 'prod'`, [pid]);
 
+  // PROD-DATA asks awaiting a human: a zee asking to be BOUND to the live production database, and
+  // a zee asking the queenzee to run a landed SEED file against production. Both render on the
+  // asking xell's card (App.jsx → ProdData.jsx). Recently-decided seeds ride along for 15 minutes,
+  // like ships, so the receipt of what just ran on prod does not vanish before it can be read.
+  const prodBind = await q(
+    `SELECT pbr.*, x.slug AS xell_slug FROM prod_bind_request pbr
+       LEFT JOIN xell x ON x.id = pbr.xell_id
+      WHERE pbr.project_id = $1 AND pbr.status = 'pending'
+      ORDER BY pbr.requested_at DESC`, [pid]);
+  const prodSeed = await q(
+    `SELECT psr.*, x.slug AS live_xell_slug FROM prod_seed_request psr
+       LEFT JOIN xell x ON x.id = psr.xell_id
+      WHERE psr.project_id = $1 AND psr.dismissed_at IS NULL
+        AND (psr.status IN ('pending','approved','running')
+         OR (psr.status IN ('seeded','failed')
+             AND COALESCE(psr.finished_at, psr.decided_at) > now() - interval '15 minutes'))
+      ORDER BY psr.requested_at DESC`, [pid]);
+
   // The LANDING PAD: landings + shipments merged into one chronological FIFO queue, with the item
   // currently on the pad (being processed) flagged so the UI can spin it.
   const landingPad = await buildLandingPad(pid);
+
+  // A manager zee's open "this xell is finished" suggestions. Same altitude as the prod-data asks:
+  // a decision only a human may make, on a xell that keeps working until they make it.
+  const doneSuggestions = await listDoneSuggestions(pid, { open: true });
 
   return {
     project,
@@ -339,8 +383,11 @@ export async function getFleet(projectId) {
     fleet_burn: fleetBurn,
     landing,
     shipping,
+    prod_bind: prodBind,
+    prod_seed: prodSeed,
     prod_lock: prodLock || null,
     landing_pad: landingPad,
+    done_suggestions: doneSuggestions,
   };
 }
 

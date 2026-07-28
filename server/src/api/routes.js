@@ -6,6 +6,7 @@ import { q, one } from '../db/pool.js';
 import { projectHook } from '../lib/status.js';
 import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
+import { xellPatch, landRequestPatch } from '../lib/diffview.js';
 import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
@@ -56,7 +57,14 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind } from '../queenzee/self.js';
+         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
+         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
+         selfSuggestDone } from '../queenzee/self.js';
+import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
+         crewFor } from '../lib/managers.js';
+import { createManagerZee } from '../lib/manager-spawn.js';
+import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
+         requestProdSeed } from '../queenzee/seedgate.js';
 
 export const router = Router();
 
@@ -546,6 +554,20 @@ router.get('/git/timeline', async (req, res) => {
   res.json(t);
 });
 router.get('/xell/diffs', async (req, res) => res.json(await getDiffs(req.query.project || null)));
+
+// ── the DIFF VIEWER: the patch behind a diffstat ──────────────────────────────
+// /xell/diffs answers "how much" (the numbers on every card, hexagon and land card). These two
+// answer "what": the actual lines, read from wherever that stat was measured (the cxell for a
+// cxelld zee, else the worktree; the xource for a landing's old..new range). Read-only.
+router.get('/xells/:id/diff', async (req, res) => {
+  try { res.json(await xellPatch(req.params.id, { kind: req.query.kind === 'own' ? 'own' : 'source' })); }
+  catch (err) { res.status(404).json({ ok: false, error: err.message }); }
+});
+// A landing AND a PR are both land_request rows, so one route serves both gate cards.
+router.get('/land/requests/:id/diff', async (req, res) => {
+  try { res.json(await landRequestPatch(req.params.id)); }
+  catch (err) { res.status(404).json({ ok: false, error: err.message }); }
+});
 
 // queenzee activity log (the terminal modal)
 router.get('/logs', async (req, res) => res.json(recentLogs(Number(req.query.n) || 200)));
@@ -1073,6 +1095,21 @@ router.post('/xell/self/prod-request', async (req, res) => {
     res.json(await selfProdRequest(x, { reason: req.body?.reason || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// ASK the queenzee to SEED production: name landed .sql file(s) under server/sql/seeds/ and a human
+// approves them in the console; the QUEENZEE then runs them against the prod db. The narrow version
+// of a prod bind — a zee that only needs rows in prod never has to hold the production database.
+router.post('/xell/self/seed-request', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    const files = b.files || (b.file ? [b.file] : []);
+    res.json(await selfSeedRequest(x, { files, reason: b.reason || null, site: b.site || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Read-only: where did my seed request get to? (`zee seed --status`)
+router.get('/xell/self/seed-request', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfSeedStatus(x)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Propose done — flags the xell for a human's "Mark done"; the zee never despawns itself.
 router.post('/xell/self/done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
@@ -1141,6 +1178,88 @@ router.post('/xell/self/device', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── MANAGER-ZEE verbs (crew): dispatch · monitor · converse · suggest-done ─────
+// Same authentication and the same shape as every other self verb — the CALLER is resolved from its
+// own token, so a manager can only ever reach ITS OWN crew and a worker only its own manager. The
+// manager half is refused for a worker (with an explanation, not a 404); `report`/`inbox` are open to
+// every zee, because talking to your manager is the one reach outside its xell a worker is meant to
+// have.
+router.get('/xell/self/zees', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfCrew(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/dispatch', async (req, res) => {
+  try {
+    const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfDispatch(x, req.body || {}));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/say', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfSay(x, { to: req.body?.to, message: req.body?.message, kind: req.body?.kind || 'directive' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/xell/self/report', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfReport(x, { message: req.body?.message, kind: req.body?.kind || 'report' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.get('/xell/self/inbox', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfInbox(x, { all: req.query.all === '1' })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/suggest-done', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfSuggestDone(x, { to: req.body?.to, reason: req.body?.reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── HUMAN side of the manager layer ───────────────────────────────────────────
+// Adding a manager zee is a HUMAN act (unlimited — add as many as you can afford to run): the
+// queenzee provisions/claims a xell, stamps it role='manager', binds it to production READ-ONLY (its
+// own SELECT-only postgres role) and cages a zee in it wearing the manager harness.
+router.post('/managers', async (req, res) => {
+  try { res.json(await createManagerZee(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message, detail: err.detail || null }); }
+});
+// A manager's crew, for the console.
+router.get('/xells/:id/crew', async (req, res) => {
+  try { res.json(await crewFor(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// DONE SUGGESTIONS — a manager proposed a xell is finished; a human decides. Approving MARKS THE
+// TASK DONE and reaps the cxell (the console asks for a typed confirmation first), so this is the
+// same class of irreversible act as a landing: no zee path to the decision, ever.
+router.get('/done-suggestions', async (req, res) => {
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  try { res.json(await listDoneSuggestions(req.query.project, { open: req.query.all !== '1' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/done-suggestions/:id/:decision(approve|reject)', async (req, res) => {
+  const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
+  try {
+    res.json(await decideDoneSuggestion(req.params.id, decision, req.body?.by || 'human@console',
+      { force: req.body?.force === true }));
+  } catch (err) { res.status(409).json({ error: err.message }); }
+});
+router.post('/done-suggestions/:id/dismiss', async (req, res) => {
+  try { res.json(await dismissDoneSuggestion(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// An operator filing a done suggestion on a manager's behalf (still only a suggestion — it lands on
+// the same human gate, which is the point: this cannot become a shortcut to marking things done).
+router.post('/xells/:id/suggest-done', async (req, res) => {
+  try {
+    const target = await one(`SELECT * FROM xell WHERE id=$1`, [req.params.id]);
+    if (!target) return res.status(404).json({ error: 'no such xell' });
+    const manager = target.manager_xell_id
+      ? await one(`SELECT * FROM xell WHERE id=$1`, [target.manager_xell_id]) : null;
+    if (!manager) return res.status(409).json({ error: 'that xell has no manager to suggest on behalf of' });
+    res.json(await suggestDone({ manager, target, reason: req.body?.reason || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
 // HUMAN side of the prod-bind request (the dashboard) — list + confirm/reject. There is deliberately
 // NO zee path to confirm: binding prod is a human's decision, exactly like a landing or a ship.
 router.get('/prod-bind/requests', async (req, res) => {
@@ -1151,6 +1270,39 @@ router.post('/prod-bind/requests/:id/:decision(confirm|reject)', async (req, res
   const decision = req.params.decision === 'confirm' ? 'confirmed' : 'rejected';
   try { res.json(await decideProdBind(req.params.id, decision, req.body?.by || 'human@console')); }
   catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// HUMAN side of the prod SEED request (queenzee/seedgate.js) — list, read the exact SQL, approve
+// (which RUNS it on production), reject, dismiss. Same shape as the ship gate and, like it, there is
+// deliberately NO zee path to approve: a zee may only ask.
+router.get('/prod-seed/requests', async (req, res) => {
+  if (!req.query.project) return res.status(400).json({ error: 'project required' });
+  res.json(await listProdSeedRequests(req.query.project, { open: req.query.all !== '1' }));
+});
+// The SQL a human is being asked to approve, read at the request's own sha — what is shown is
+// byte-for-byte what will run.
+router.get('/prod-seed/requests/:id/sql', async (req, res) => {
+  try { res.json(await seedRequestSql(req.params.id)); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+router.post('/prod-seed/requests/:id/:decision(approve|reject)', async (req, res) => {
+  const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
+  try { res.json(await decideProdSeed(req.params.id, decision, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+router.post('/prod-seed/requests/:id/dismiss', async (req, res) => {
+  try { res.json(await dismissSeedRequest(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(404).json({ error: err.message }); }
+});
+// A HUMAN filing a seed request on a zee's behalf (the operator's own "seed prod from this xell"),
+// mirroring POST /api/xells/:id/ship. Still only a REQUEST — it lands in the same pending queue and
+// someone still approves it, so nothing here is a shortcut to writing production.
+router.post('/xells/:id/seed', async (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json(await requestProdSeed({ xellId: req.params.id, files: b.files || (b.file ? [b.file] : []),
+      reason: b.reason || null, site: b.site || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── AI-facing: report/propose the job is done, and query status ──────────────

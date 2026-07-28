@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
-import { hiveColor, hiveStatusLabel } from './status.js';
+import { hiveColor, hiveStatusLabel, hiveHeat } from './status.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
   bg: '#0d1017', panel: '#161b24', line: '#2a3242', text: '#e6ebf2', muted: '#8b97a8',
   working: '#35c46b', idle: '#e0a53b', ready: '#5b8cff', claimed: '#9b8cff',
-  awaiting: '#e0a53b', spawning: '#5b8cff', error: '#e5554e', prod: '#f2c14e',
+  awaiting: '#e0a53b', spawning: '#5b8cff', error: '#e5554e', prod: '#f0913b',
   sha: '#e0a53b', add: '#35c46b', del: '#e5554e',
 };
 const HEALTH = { up: '#35c46b', building: '#e0a53b', down: '#e5554e', unknown: '#6b7688', starting: '#5b8cff' };
@@ -35,6 +35,19 @@ function statusColor(x) {
   if (s === 'awaiting-done') return COL.awaiting;
   if (['errored', 'error', 'stopped'].includes(x.zee_status)) return COL.error;
   return COL.muted;
+}
+// Background wash alphas for a hex, modulated by its status HEAT (hive/status.js hiveHeat): a COLD
+// xell (violet/blue — provisioning/ready) sits darker (a fainter wash) and a HOT one (orange/red —
+// production / a held land or ship) glows brighter, so activity/urgency reads off the fill before the
+// hue. Returns {top,bot} gradient alphas; `hover` lifts both a notch. The flower centre passes a
+// higher base so the focused bloom stays vivid at every heat.
+function heatWash(x, hover, base = 0) {
+  const heat = x?.hive_status ? hiveHeat(x.hive_status) : 0.4;
+  const lift = hover ? 0.04 : 0;
+  return {
+    top: base + lift + 0.12 + heat * 0.22,
+    bot: base + lift + 0.04 + heat * 0.12,
+  };
 }
 const shortSlug = (s) => String(s || '');
 const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
@@ -210,6 +223,25 @@ function drawDiffFilled(ctx, cx, cy, parts, { maxW, minPx, maxPx, weight = 600, 
   return { y: y1, width: ctx.measureText(headTxt).width, wrapped: true };
 }
 
+// The "this stat is a link" affordance: a hairline under the drawn diffstat plus a small muted
+// caption. The flower's two diff petals open the DIFF VIEWER when clicked, and on a canvas there is
+// no cursor:pointer to discover by hovering half a pixel — so the affordance has to be drawn.
+function drawStatLink(ctx, cx, row, caption) {
+  const y = row.y + Math.max(6, row.width * 0.02);
+  ctx.save();
+  ctx.strokeStyle = withAlpha(COL.muted, 0.45);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - row.width / 2, y);
+  ctx.lineTo(cx + row.width / 2, y);
+  ctx.stroke();
+  ctx.fillStyle = withAlpha(COL.muted, 0.75);
+  ctx.font = "9px 'Segoe UI', sans-serif";
+  ctx.textAlign = 'center';
+  ctx.fillText(caption, cx, y + 7);
+  ctx.restore();
+}
+
 // A tiny role glyph, canvas-drawn to match the DOM chip's SVG icons (Container.jsx / styles.css) —
 // same silhouette (cylinder / rack bars / browser window), same low-opacity white stroke.
 function drawRoleIcon(ctx, role, cx, cy, s) {
@@ -308,6 +340,77 @@ function cellNeighbors(row, col) {
   ];
 }
 
+// Cells around (row,col) in RINGS, nearest first — a breadth-first walk of the offset lattice out to
+// `radius` hops. This is what lets a manager's crew be seated AROUND it: ring 1 is its six touching
+// neighbours, ring 2 the twelve beyond, and so on, so a crew stays a visually contiguous cluster
+// however large it grows.
+function cellsAround(row, col, radius = 4) {
+  const seen = new Set([cellKey(row, col)]);
+  const out = [];
+  let frontier = [[row, col]];
+  for (let hop = 0; hop < radius; hop++) {
+    const next = [];
+    for (const [r, c] of frontier) {
+      for (const [nr, nc] of cellNeighbors(r, c)) {
+        const k = cellKey(nr, nc);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        next.push([nr, nc]);
+        out.push([nr, nc]);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+// ── SEATING: a manager's crew sits NEXT TO IT ─────────────────────────────────
+// The honeycomb used to lay xells out in pure reading order, which scatters a manager's workers
+// across the grid and makes "who belongs to whom" unreadable — the one relationship the hive now
+// has. So seating happens in two passes: every MANAGER takes the next free cell and its crew fills
+// the free cells nearest to it (ring by ring); everyone else then fills what is left, in reading
+// order. With no managers in the fleet this is byte-for-byte the old layout.
+//
+// `pinned` keeps a cell for a xell whose position is already decided (the expanded flower), and
+// `reserved` blocks the cells the flower's petals consume. Pure, so it can be unit-tested.
+export function seatXells(list, cols, { reserved = new Set(), pinned = {} } = {}) {
+  const cells = {};
+  const taken = new Set(reserved);
+  const place = (id, rc) => { cells[id] = rc; taken.add(cellKey(rc[0], rc[1])); };
+  const free = (r, c) => r >= 0 && c >= 0 && c < cols && !taken.has(cellKey(r, c));
+  let scan = 0;
+  const nextFree = () => {
+    for (;;) {
+      const row = Math.floor(scan / cols), col = scan % cols;
+      scan++;
+      if (free(row, col)) return [row, col];
+    }
+  };
+
+  for (const [id, rc] of Object.entries(pinned)) if (rc) place(id, rc);
+
+  const managers = list.filter((x) => x.role === 'manager');
+  for (const m of managers) {
+    if (!cells[m.id]) place(m.id, nextFree());
+    const [mr, mc] = cells[m.id];
+    const crew = list.filter((w) => w.manager_xell_id === m.id && !cells[w.id]);
+    if (!crew.length) continue;
+    const ring = cellsAround(mr, mc, Math.max(2, Math.ceil(Math.sqrt(crew.length)) + 1));
+    let i = 0;
+    for (const w of crew) {
+      let seat = null;
+      while (i < ring.length && !seat) {
+        const [r, c] = ring[i++];
+        if (free(r, c)) seat = [r, c];
+      }
+      place(w.id, seat || nextFree());   // a crew bigger than the room around it spills into the grid
+    }
+  }
+
+  for (const x of list) if (!cells[x.id]) place(x.id, nextFree());
+  return cells;
+}
+
 // Connector wires thread the corridors BETWEEN hexes, so the honeycomb is drawn spaced: each hex is
 // shrunk inside its (gapless) layout cell to open a gap wide enough for the traces that must pass —
 // sized by the grid dimension a wire fans across (columns in portrait, rows in landscape). The
@@ -370,35 +473,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     const gap = count * WIRE_PITCH;
     const drawSize = Math.max(cellSize * 0.5, cellSize - gap / SQRT3);   // shrink to open the gap
     const originX = pad, originY = pad;
-    // base cell per xell (row-major, exactly layoutHoneycomb's shape)
-    const baseCells = {};
-    list.forEach((x, i) => {
-      const c = lay.cells[i] || { row: 0, col: i };
-      baseCells[x.id] = [c.row, c.col];
-    });
-    // flower reflow: expanded keeps its cell, its 6 neighbours are consumed; everyone else takes
-    // the next free cell in reading order (rows extend as needed — the canvas pans).
-    const cells = {};
+    // SEATING (see seatXells): managers first, each with its crew in the free cells nearest to it,
+    // then everyone else in reading order. Two passes because the flower's petals consume cells:
+    // seat once to learn where the expanded xell sits, then re-seat with its six neighbours reserved
+    // and its own cell pinned, so the bloom opens exactly where the hexagon already was.
+    const cols = Math.max(1, lay.cols);
+    const baseCells = seatXells(list, cols);
     const reserved = new Set();
+    let cells = baseCells;
     if (expanded && baseCells[expanded.id]) {
       const [er, ec] = baseCells[expanded.id];
-      cells[expanded.id] = [er, ec];
       reserved.add(cellKey(er, ec));
       for (const [nr, nc] of cellNeighbors(er, ec)) reserved.add(cellKey(nr, nc));
-    }
-    {
-      const cols = Math.max(1, lay.cols);
-      let row = 0, col = 0;
-      const nextFree = () => {
-        for (;;) {
-          const k = cellKey(row, col);
-          const taken = reserved.has(k) || Object.values(cells).some(([r2, c2]) => r2 === row && c2 === col);
-          const out = [row, col];
-          col++; if (col >= cols) { col = 0; row++; }
-          if (!taken) return out;
-        }
-      };
-      for (const x of list) { if (!cells[x.id]) cells[x.id] = nextFree(); }
+      cells = seatXells(list, cols, { reserved, pinned: { [expanded.id]: [er, ec] } });
     }
     const hexes = list.map((x) => {
       const [row, col] = cells[x.id];
@@ -432,7 +519,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       const [er, ec] = cells[expanded.id];
       const centers = [cellCenter(er, ec, cellSize, originX, originY),
         ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, cellSize, originX, originY))];
-      drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines);
+      drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines, tById[expanded.id]?.color || null);
       geomRef.current.flower = { centers, size: cellSize, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
       // Per-xell ACTIONS drawn straight onto the flower (no DOM toolbar): a hit-tested button row
@@ -624,7 +711,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (expandedId) {
       const b = hitButton(wx, wy);
       const f = hitFlower(wx, wy);
-      cursor = b || (f && f.cell === 0 && f.openable) ? 'pointer'
+      cursor = b || (f && ((f.cell === 0 && f.openable) || DIFF_PETAL[f.cell])) ? 'pointer'
         : hitContainer(wx, wy) ? 'context-menu' : 'default';   // right-click hint on an icon
       emitHover({ id: null, commit: null });
     } else {
@@ -660,6 +747,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         if (f.cell === 0 && f.openable) {
           const x = (xells || []).find((xx) => xx.id === f.id);
           if (x) onOpenSession?.(x);
+        } else if (DIFF_PETAL[f.cell]) {
+          // The two DIFF petals (commit/source stat, own stat) open the diff viewer — clicking the
+          // numbers is how you read the lines they count, here exactly as on the card.
+          const x = (xells || []).find((xx) => xx.id === f.id);
+          if (x) onAction?.(DIFF_PETAL[f.cell], x, diffs?.[f.id]);
         }
         return;                                              // petal clicks keep the flower open
       }
@@ -739,14 +831,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
 function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);
+  // The commit head reads in the SAME colour the git graph traces this xell with — its connector
+  // wire and the ring around its base-commit dot are drawn in hx.color (the timeline's per-xell
+  // colour), so painting the head sha that colour ties the hexagon to its line in the graph.
+  const shaCol = hx.color || COL.sha;
   const w = hexWidth(size);
   ctx.save();
   if (dim) ctx.globalAlpha = 0.3;
 
   hexPath(ctx, cx, cy, size);
   const g = ctx.createLinearGradient(cx, cy - size, cx, cy + size);
-  g.addColorStop(0, withAlpha(col, hover ? 0.30 : 0.18));
-  g.addColorStop(1, withAlpha(col, hover ? 0.16 : 0.08));
+  const wash = heatWash(x, hover);
+  g.addColorStop(0, withAlpha(col, wash.top));
+  g.addColorStop(1, withAlpha(col, wash.bot));
   ctx.fillStyle = g;
   ctx.fill();
   ctx.lineWidth = hover ? 2.4 : 1.4;
@@ -755,6 +852,12 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   if (hx.color) {
     hexPath(ctx, cx, cy, size - 3);
     ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
+  }
+  // A MANAGER zee's hexagon is double-walled: it runs a crew (seated in the cells around it) and
+  // holds production read-only, so it should be identifiable before you read a single word on it.
+  if (x.role === 'manager') {
+    hexPath(ctx, cx, cy, size + 2.5);
+    ctx.lineWidth = 2; ctx.strokeStyle = withAlpha(COL.prod, hover ? 0.95 : 0.7); ctx.stroke();
   }
   ctx.save();
   hexPath(ctx, cx, cy, size - 2);
@@ -829,8 +932,17 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   // Rows below shift down a notch to make the room; no title (ready xells, production) → the
   // layout is exactly what it was.
   // the dispatch convention prefixes titles with "xell : " — identity noise on a card this small
-  const zeeTitle = full && !x.is_production ? (x.zee_title || '').replace(/^xell\s*:\s*/i, '').trim() : '';
-  const label = x.is_production ? '🛡 PRODUCTION' : shortSlug(x.slug);
+  const ownTitle = full && !x.is_production ? (x.zee_title || '').replace(/^xell\s*:\s*/i, '').trim() : '';
+  const zeeTitle = !full || x.is_production ? ''
+    : x.role === 'manager' ? 'manager zee — runs a crew, reads prod'
+    // a managed worker names its crew ahead of its task: the cluster around a double-walled hex
+    // should not be a coincidence you have to infer
+    : x.manager_slug ? `↳${x.manager_slug}${ownTitle ? ` · ${ownTitle}` : ''}`
+    : ownTitle;
+  // A manager is named as one on the seam, and a managed worker names the crew it belongs to — the
+  // hexagons around a double-walled hex should not be a coincidence you have to infer.
+  const label = x.is_production ? '🛡 PRODUCTION'
+    : x.role === 'manager' ? `⬢ ${shortSlug(x.slug)}` : shortSlug(x.slug);
   fillFont(ctx, label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
   ctx.fillStyle = COL.text;
   ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * (zeeTitle ? 0.14 : 0.06) : size * 0.2));
@@ -847,7 +959,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   if (full) {
     if (sha) {
       ctx.font = `600 ${Math.max(8.5, size * 0.155)}px 'Cascadia Code', monospace`;
-      ctx.fillStyle = COL.sha;
+      ctx.fillStyle = shaCol;
       ctx.fillText(sha, cx, cy + size * (zeeTitle ? 0.2 : 0.14));
     }
     // diff: "↑1 ↓7 · 4f +32/−6" — the SOURCE diff (worktree vs its branch's fork off main), i.e.
@@ -892,7 +1004,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     // mid sizes: sha + status only
     if (sha) {
       ctx.font = `600 ${Math.max(8, size * 0.17)}px 'Cascadia Code', monospace`;
-      ctx.fillStyle = COL.sha;
+      ctx.fillStyle = shaCol;
       ctx.fillText(sha, cx, cy + size * 0.08);
     }
     ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
@@ -960,16 +1072,18 @@ function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false }
 }
 
 // ── the flower: rendered ON the grid cells it consumes (no overlay) ───────────
-function drawFlower(ctx, centers, size, x, diff, machines) {
+function drawFlower(ctx, centers, size, x, diff, machines, traceColor) {
   const col = statusColor(x);
   const petals = flowerFacets(x, diff, machines);
+  // the focused bloom stays vivid, but still darker when cold / brighter when hot (base lifts it)
+  const wash = heatWash(x, false, 0.14);
   centers.forEach(([hx, hy], i) => {
     const facet = petals[i];
     const isCenter = i === 0;
     ctx.save();
     hexPath(ctx, hx, hy, size - 1.5);
     const g = ctx.createLinearGradient(hx, hy - size, hx, hy + size);
-    if (isCenter) { g.addColorStop(0, withAlpha(col, 0.42)); g.addColorStop(1, withAlpha(col, 0.16)); }
+    if (isCenter) { g.addColorStop(0, withAlpha(col, wash.top)); g.addColorStop(1, withAlpha(col, wash.bot)); }
     else { g.addColorStop(0, withAlpha(COL.panel, 1)); g.addColorStop(1, withAlpha(COL.bg, 1)); }
     ctx.fillStyle = g;
     ctx.fill();
@@ -977,7 +1091,7 @@ function drawFlower(ctx, centers, size, x, diff, machines) {
     ctx.strokeStyle = isCenter ? col : withAlpha(col, 0.45);
     ctx.stroke();
     ctx.clip();
-    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x);
+    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x, traceColor);
     ctx.restore();
   });
 }
@@ -1120,6 +1234,11 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
   return rects;
 }
 
+// Which PETAL is which diffstat — the two facets whose numbers open the DIFF VIEWER when clicked.
+// A petal's index IS its facet index (drawFlower maps centers[i] → flowerFacets()[i]), so this must
+// move with the facet order in flowerFacets: 5 = 'commit' (source diff), 6 = 'diff · age' (own diff).
+const DIFF_PETAL = { 5: 'srcdiff', 6: 'owndiff' };
+
 function flowerFacets(x, diff, machines) {
   const src = x.remote_source || {};
   const stack = x.stack || [];
@@ -1143,7 +1262,7 @@ function flowerFacets(x, diff, machines) {
   ];
 }
 
-function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
+function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
   ctx.textAlign = 'center';
   if (isCenter) {
     ctx.textBaseline = 'middle';
@@ -1191,7 +1310,9 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
   // xell's own BURN (tokens + $ its zees have consumed). Stacked above the pull/push buttons.
   if (facet.kind === 'commitdiff') {
     ctx.textBaseline = 'middle';
-    ctx.fillStyle = COL.text;
+    // the head sha reads in the git graph's trace colour for this xell (its wire + commit-dot ring),
+    // tying the bloom to its line in the graph the same way the compact hex does.
+    ctx.fillStyle = traceColor || COL.text;
     // sha grows to fill the petal width (this facet is crowded with the burn line + pull/push
     // buttons below, so it stays single-line — width-fill only, no wrap).
     const shaW = hexHalfWidthAt(size, size * 0.16) * 2 * 0.9;
@@ -1201,11 +1322,15 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
     const d = facet.diff;
     if (d) {
       const dW = hexHalfWidthAt(size, size * 0.08) * 2 * 0.9;
-      drawDiffFilled(ctx, cx, cy + size * 0.08, [
+      const row = drawDiffFilled(ctx, cx, cy + size * 0.08, [
         { t: `↑${d.ahead} ↓${d.behind} · ${d.files}f `, c: COL.muted },
         { t: `+${d.insertions}`, c: COL.add },
         { t: `/−${d.deletions}`, c: COL.del },
       ], { maxW: dW, minPx: 9, maxPx: size * 0.2 });
+      // The stat is CLICKABLE (onPointerUp dispatches 'srcdiff' → the diff viewer), so it is drawn
+      // like a link: underlined, with a one-word affordance. A number nobody knows they can click
+      // is the same as a number they cannot.
+      drawStatLink(ctx, cx, row, 'read the diff');
     } else {
       ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
       ctx.fillStyle = COL.muted;
@@ -1246,6 +1371,8 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x) {
       if (isBusyZee(x)) {
         drawBusyDot(ctx, cx - row.width / 2 - size * 0.14, row.y, Math.max(3, size * 0.06));
       }
+      // clickable, exactly like the source stat above → 'owndiff' (see onPointerUp)
+      drawStatLink(ctx, cx, { ...row, y: row.wrapped ? row.y + size * 0.2 : row.y }, 'read the diff');
     } else {
       fillFont(ctx, '◈ —', hexHalfWidthAt(size, 0) * 2 * 0.9, 9, size * 0.3,
         (px) => `${px}px 'Segoe UI', sans-serif`);

@@ -99,8 +99,10 @@ export async function getDiffs(projectId) {
 
 // stable, distinct connector colors per xell
 const COLORS = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff', '#e5554e', '#3bc6c0'];
-// production's gold — matches its hexagon (COL.prod in HiveCanvas) so its ring + wire read as prod.
-const PROD_COLOR = '#f2c14e';
+// production's orange — matches its hexagon (COL.prod / live-protected in HiveCanvas) so its ring +
+// wire read as prod. Orange is the hive's "production" temperature: hotter than working green, cooler
+// than a held land/ship red.
+const PROD_COLOR = '#f0913b';
 // harness wires read as a distinct family (cooler, avatar-badge palette) — not xell, not prod.
 const HARNESS_COLORS = ['#5b8cff', '#9b8cff', '#3bc6c0', '#7bd0e0'];
 

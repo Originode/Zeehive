@@ -93,7 +93,16 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
       `DELETE FROM xell_uses_container uc USING container c
         WHERE uc.container_id = c.id AND uc.xell_id = $1 AND c.tier = 'prod'`, [xellId]);
     // Drop the coupling too, so a half-torn-down row can never answer the prod guard with "yes".
-    await q(`UPDATE xell SET db_coupling='db-shared-dev' WHERE id=$1 AND db_coupling='db-shared-prod'`, [xellId]);
+    await q(`UPDATE xell SET db_coupling='db-shared-dev' WHERE id=$1
+               AND db_coupling IN ('db-shared-prod','db-prod-readonly')`, [xellId]);
+    // A MANAGER held prod through its OWN read-only postgres role. Give it back: a credential that
+    // outlives the agent it was minted for is a credential nobody owns. Best-effort — an unreachable
+    // database must not wedge a teardown, and the role is inert once its DSN is gone with the cxell.
+    if (xell.db_coupling === 'db-prod-readonly' || xell.prod_ro_dsn) {
+      const { dropProdReader } = await import('../lib/prod-readonly.js');
+      const r = await dropProdReader(xell);
+      logline('reaper', `${xell.slug}: read-only prod role ${r.role || ''} ${r.dropped ? 'DROPPED' : `not dropped (${r.reason || r.error || '—'})`}`);
+    }
     logline('reaper',
       `${xell.slug} was bound to PRODUCTION — DISCONNECTED ${prodLinks.map((c) => c.name).join(', ')} `
       + '(released, NOT deleted) before teardown. Production is untouched.');

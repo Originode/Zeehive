@@ -119,6 +119,12 @@ export async function emitXellEnv(xellId) {
       } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
     }
   }
+  // A MANAGER xell holds production READ-ONLY: its DATABASE_URL is the SELECT-only DSN the queenzee
+  // minted for it (lib/prod-readonly.js), never the prod owner's connection string. Emitted here
+  // because a cxell zee has no docker and reaches postgres over TCP — without this line it holds a
+  // binding it cannot use. The role itself is what makes this safe to hand over.
+  if (!dbUrl && xell.db_coupling === 'db-prod-readonly' && xell.prod_ro_dsn) dbUrl = xell.prod_ro_dsn;
+
   // db-shared-dev on a PROCESS-runner project: the xell's server is a bare process, so unlike a
   // compose stack there is no network alias handing it a database — the projection must carry
   // the shared dev db's conn_ref outright. Scoped to process runners so compose projects keep

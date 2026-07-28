@@ -516,7 +516,9 @@ export async function getPoolConfig(projectId) {
 
 const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
                         'refresh_interval_sec', 'default_build_ctx'];
-const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod'];
+// Every coupling a xell can hold. The two prod ones are listed so a bad value still gets the honest
+// "must be one of" error, then refused individually below as DEFAULTS (prod access is per-xell).
+const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod', 'db-prod-readonly'];
 
 export async function updatePoolConfig(projectId, body = {}) {
   const pc = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [projectId]);
@@ -526,6 +528,13 @@ export async function updatePoolConfig(projectId, body = {}) {
   }
   if (body.default_db_coupling === 'db-shared-prod') {
     throw new Error('db-shared-prod cannot be a DEFAULT — prod data access is per-xell and human-granted (/xell-prod)');
+  }
+  // Read-only prod is still PROD, and it belongs to exactly one kind of xell (a manager, bound when
+  // a human adds one). As a project default it would silently point every pooled worker at the live
+  // database — the same reason db-shared-prod is refused above, one notch quieter.
+  if (body.default_db_coupling === 'db-prod-readonly') {
+    throw new Error('db-prod-readonly cannot be a DEFAULT — it is the MANAGER binding, minted per xell '
+      + 'when a human adds a manager zee (its own SELECT-only postgres role)');
   }
   // Default compile host: normalize empty → NULL (compile on the run host), and refuse a foreign
   // context unless the project can hand the image over (a registry). Same rule as a per-xell knob,

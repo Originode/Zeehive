@@ -44,16 +44,20 @@ out an OmniBiz worktree to a session standing in this repo).
 ```
 db/migrations/*.sql      001 init · 002 monitor · 003 deploy_lock · 004 production
                          005 container_build · 006 db_backups · 007 container_restoring
-                         008 async_backup_jobs · 009 land_gate
+                         008 async_backup_jobs · 009 land_gate · … · 049 prod_seed
+                         (the list stopped being maintained around 009 — read the FOLDER; it is
+                          forward-only and filename-ordered, so the newest number is the truth)
 server/src/
   db/        migrate.js, seed.js, seed_demo.js  ← seed_demo is DEAD to us (see House rules)
   api/routes.js          all HTTP routes
   queenzee/  pool (reconciler), intake (claim+dispatch), landing, poller, monitor, containers,
-             reaper, tasks, maintenance, deploylock
+             reaper, tasks, maintenance, deploylock, shipgate + shipmigrate (code+schema to prod),
+             seedgate (DATA to prod: an approved seed file the queenzee runs), self (cxell verbs)
   lib/       fleet, timeline, git, sessions, session-title, claude-cli, provision, project-resolve,
              rename-xell, build, xell-db, reveal, runtimes, names, projects, logbus, events, status
 web/src/     App.jsx, Container.jsx (reusable chip), GitRail.jsx, Connectors.jsx, Backups.jsx,
-             ProjectMenu.jsx, Terminal.jsx (queenzee log modal), nick.js, api.js, styles.css
+             ProjectMenu.jsx, Terminal.jsx (queenzee log modal), nick.js, api.js, styles.css,
+             Landing.jsx / Ship.jsx / ProdData.jsx — the three human GATES (main · prod code · prod data)
 mcp/server.js            MCP server wrapping the API
 skill/xell, skill/xell-done   source of the slash-command skills (installed copies live in
                               ~/.claude/skills/ — edit BOTH or they drift)
@@ -144,6 +148,20 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
     uncommitted) — everything the zee has produced; what would land.
   - **diff** = worktree vs its OWN HEAD (`own`) — work not yet checkpointed. Drops to 0 on every
     checkpoint while source diff persists. `●N` = dirty files incl. untracked.
+- **Every one of those diffstats is CLICKABLE** (added 2026-07-28, `web/src/DiffViewer.jsx` +
+  `server/src/lib/diffview.js`): the numbers open the **patch** they are counting. A landing was
+  the case that mattered — you were asked to approve a push with only a commit list and a line
+  count to go on, and the actual change lived in a terminal on the host that the console user does
+  not have. Clickable in four places: the xell card's two stats, the hive flower's two diff petals
+  (drawn underlined — a canvas has no cursor to discover), a held **landing**, and a **PR** card.
+  - `GET /api/xells/:id/diff?kind=source|own` · `GET /api/land/requests/:id/diff` — read-only.
+  - A landing/PR is read at exactly `old_sha..new_sha` in the xource (the range being approved).
+    A live xell is read from the same place its STAT came from — the **cxell** for a cxelld zee
+    (where the work is until it lands), else the worktree — so viewer and card cannot disagree.
+  - **Untracked files are synthesised in**: `git diff` cannot see a file git was never told about,
+    and "the zee just wrote five new files and hasn't committed" is exactly when this is opened.
+  - Capped three ways (whole payload / per file / file count) and every cap is *reported* on the
+    card, never silently applied. Test: `node test/diff-viewer.test.mjs`.
 - **Installed for OmniBiz only.** `.git/hooks` is machine-local and not version-controlled, so it
   does NOT travel with a clone — re-run the installer per machine, and after any `main_branch`
   change (the protected ref is baked in). Zeehive's own repo is NOT gated yet.
@@ -202,6 +220,95 @@ prod, absent from main, silently reverted by the next rebuild from main.
   hover → 🔓, click → confirm → force release. Reaper tick: 5s; it also starts any approved ship
   that was waiting for prod to free up.
 
+## Prod DATA asks: `zee seed` (new) and the prod-bind request that nobody could see
+
+Added 2026-07-28. Code reaching prod has had a gate since the ship flow; **data** reaching prod had
+half of one. Two concrete holes, one fix each:
+
+- **`zee prod` was a dead end.** It wrote a `prod_bind_request` row (029) and logged a line — and
+  **nothing in the console ever rendered it**: no hive status, no card, no panel, no ping. A zee
+  could ask for production and simply never be answered. Now: `occ-prodRequest` (`prod?`) on the
+  hexagon, the request on the asking xell's chip in the "waiting on you" bar with
+  **Reject / Bind to PROD** (typed `BIND` confirmation — it hands a running agent the live db), a
+  `ProdAsksPanel` for asks whose xell is gone, and a T-Keyboard ping. `fleet.prod_bind` carries it.
+- **A shipment that needs ROWS in prod had only that sledgehammer.** `server/sql/ops/` rides the
+  ship (014), but it is decided *before* the containers rebuild and only for files already in the
+  approved commit; seeding that must happen *after* the new code is live, or that is only discovered
+  once prod serves it, had no path except binding the whole database. So: **`zee seed`**.
+
+**`zee seed --file server/sql/seeds/<name>.sql --reason "…"`** (`prod_seed_request`, migration 049;
+`queenzee/seedgate.js`) is the ship gate's division of labour applied to data:
+
+- zee **asks**, naming files that are **already on main**; human **approves**, with the exact SQL
+  (read at the request's own sha) in view; **queenzee runs it** against the production database.
+  The zee never touches prod and cannot approve its own ask. `POST /api/xell/self/seed-request`.
+- **Only `server/sql/seeds/*.sql`** — the whitelist is what stops "approve" ever meaning "run any
+  file in the repo on prod". `normalizeSeedPath` accepts shorthands (`x.sql`, `seeds/x.sql`) and
+  refuses everything outside, including traversal.
+- **Unlanded → refused**, because the queenzee reads the file with `git show <main-tip>:<file>`.
+  Same anti-band-aid rule as a ship, and it makes "what ran on prod" always readable in the repo.
+- **Not ledgered, deliberately** — a migration runs once, a seed is legitimately re-runnable. The
+  contract is idempotent SQL, and the console surfaces **every prior run of the same file** so a
+  repeat is a decision rather than a surprise (`priorRuns`).
+- Before writing anything it re-proves the target with `assertProdDbTarget` (the same guard that
+  stopped a ship migrating a 7.7 MB dev clone), and it **refuses while the prod lock is held** —
+  a seed must not write data underneath a half-swapped container. Each file runs in its own
+  transaction; the first failure stops the run and lands on the row as `failed` + reason.
+- **`SEED_MODE=simulate`** runs nothing and records `mode: simulate` (mirrors `SHIP_MODE`) — how
+  `test/prod-seed-gate.test.mjs` exercises the whole path against a throwaway project.
+  ⚠ Like the first prod ship, **the real psql has never run against a live prod db** — everything
+  around it is verified, and it reuses shipmigrate's `psql`/`prodDb`, but read it before the first
+  real seed.
+- Receipts **outlive the xell** (`xell_id ON DELETE SET NULL` + a stamped `xell_slug`): a record of
+  something that touched production does not get reaped with a throwaway worktree.
+- Hive: `occ-seedRequest` (`seed?`). Human API: `GET /api/prod-seed/requests`,
+  `…/:id/sql`, `…/:id/(approve|reject)`, `…/:id/dismiss`, plus `POST /api/xells/:id/seed` for an
+  operator filing one on a zee's behalf (still only a request).
+
+Tests: `test/prod-seed-gate.test.mjs` (DB integration: refusals, approve→run, lock-held failure,
+real-mode refusal, receipts, and the fleet read model) and `test/prod-asks-console.test.mjs`
+(static: hive-status ↔ web palette lockstep, App renders the cards, NeedsYouBar counts the asks).
+
+## MANAGER ZEES — the fleet's middle layer (052/053)
+
+Added 2026-07-28. Every zee was a worker and every decision above a worker was a human's — fine for a
+handful of xells, useless once "which of these twelve needs me?" is itself a job. A **manager zee** is
+a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manager-zees.md](docs/manager-zees.md).
+
+- **It gains fleet reach**: `zee dispatch` (every worker it spawns is stamped `manager_xell_id`),
+  `zee zees` (the crew read model), `zee say` (typed into the worker's LIVE session, same SSH
+  send-keys path as the console's 📨), `zee inbox`, `zee suggest-done`.
+- **It loses repo reach — structurally, in three independent places.** `landgate.checkPush` declines a
+  manager's push and raises **NO land_request** (nothing for a human to approve); `xellgit.ctx()` —
+  the single door every git write verb passes through — throws; `zee land` refuses with the reason
+  and the alternative. A manager writes no code: it dispatches a worker, and the worker lands.
+- **Production is READ-ONLY**: its own `zee_ro_<slug>` role, `CONNECT`+`SELECT`,
+  `default_transaction_read_only=on`, no CREATE, minted by `lib/prod-readonly.js` and dropped by the
+  reaper. `db_coupling='db-prod-readonly'` (052). **Fails closed** — if the role can't be minted the
+  bind fails; there is no fallback to the owner credential. `PRODRO_MODE=simulate` (inherits
+  `SHIP_MODE`) mints nothing. ⚠ Like the first prod ship and the first seed, **the real CREATE ROLE
+  has never run against a live prod db** — read it before the first real manager on prod.
+- **Shipping is NOT blocked.** Holding prod data is no reason to withhold the ship gate; `zee ship` is
+  unchanged (landed-only, human-approved, queenzee-run).
+- **`zee prod` is refused for a manager** — escalating your own access is not an agent's ask.
+- **Humans add managers, unlimited** (`POST /api/managers`, the "⬢ + manager zee" button). `zee
+  dispatch` refuses `role=manager`, the manager harness on a worker, and any db choice at all.
+- **Done suggestions**: `done_suggestion` (052) → `occ-doneSuggest` (`done?`) on the TARGET's hexagon,
+  a card in "waiting on you", a typed **DONE** confirmation, then the same `markTaskDone`/reap the
+  console's own button runs. No `/xell/self/` route decides one.
+- **The REFLECTION stage**: on a successful ship, `shipgate` re-invokes the shipping zee
+  (`nudge.nudgeXellForReflection`) to review what went live and report improvements/errors/follow-ups
+  to its manager (`zee report --kind reflection`) — or to the console when it has no manager.
+- **The loophole rule cuts both ways.** The manager manual forbids dispatching a worker with reach
+  beyond its own xell; the WORKER manual (053) tells workers to REFUSE such an instruction and
+  `zee tend` it. Neither side polices itself.
+- **Honeycomb**: `seatXells()` (web/src/hive/HiveCanvas.jsx) seats a crew in the free cells nearest
+  its manager, ring by ring. No managers → byte-for-byte the old layout.
+- Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
+  messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
+  over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
+  the target xell went `retired`.
+
 ## Hotfix / data-manipulation xells (prod DATA is not prod CODE)
 
 **Read the MCP tools or the API.** Container names, bindings, couplings and status are DATA: they
@@ -211,7 +318,11 @@ an exited husk for weeks.
 
 A xell dispatched with **`--db shared-prod`** has `db_coupling='db-shared-prod'`: the live production
 database IS its assigned container. Querying it is the job, not a violation — "use ONLY your
-assigned containers" is *satisfied*, because a human deliberately gave it that one.
+assigned containers" is *satisfied*, because a human deliberately gave it that one. A LIVE xell can
+be re-pointed the same way after the fact (`lib/xell-prod.js`), and a zee can now **ask** for that
+(`zee prod` → `prod_bind_request`) and actually be answered — see the section above. Before reaching
+for a bind, check whether the job is really "rows into prod": that is `zee seed`, and it costs the
+zee no prod access at all.
 
 ⚠ The flag value is **`shared-prod`**, not `prod`. Dispatch prefixes it with `db-`
 (`xell-dispatch.mjs`), so `--db prod` → `db-prod`, which is not a mode. This doc and the prod

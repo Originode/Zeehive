@@ -36,6 +36,26 @@ export function notifyShipDone({ project, xell, ok, seconds }) {
     ok ? 'green' : 'red');
 }
 
+// A zee wants the queenzee to run SQL against the PRODUCTION database (seed data a shipment needs).
+// Same urgency class as a ship: prod is about to be written to, and the zee is blocked until a human
+// reads the SQL and decides.
+export function notifySeedRequest({ project, xell, request }) {
+  const n = (request?.files || []).length;
+  ping('SEED prod?',
+    `${xell?.slug || 'a zee'} -> ${project.name} PROD: ${n} seed file(s) need your OK`,
+    'red');
+}
+
+// A zee is asking to be BOUND to the production database (prod DATA, live and irreversible). It
+// cannot bind itself and cannot reach prod until a human confirms — so nothing happens until this
+// reaches someone.
+export function notifyProdBindRequest({ project, xell, request }) {
+  ping('PROD BIND?',
+    `${xell?.slug || 'a zee'} wants ${project.name} PROD DB (live data)`
+    + `${request?.reason ? `: ${String(request.reason).slice(0, 60)}` : ''}`,
+    'red');
+}
+
 // A push to main is being held for verification.
 export function notifyLandRequest({ project, xell, commits, request }) {
   const who = xell?.slug || 'unknown xell';
