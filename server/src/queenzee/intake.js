@@ -25,9 +25,10 @@ import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell,
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
-import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harnessBridge, assignHarness, defaultHarnessId } from '../lib/harness.js';
-import { bindManagerToProdReadonly } from '../lib/manager-spawn.js';
-import { connectCxellToProdNetwork } from '../lib/prod-readonly.js';
+import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harnessBridge, assignHarness, defaultHarnessId,
+         resolveHarness, harnessFitsType, typeMismatchReason } from '../lib/harness.js';
+import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
+import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 
@@ -58,6 +59,22 @@ function usageFrom(result) {
 // unrecognized reads as worker — which, on a manager xell, the downgrade guard then refuses rather
 // than acts on. Pure, so the dispatch decision is the same one a test can make.
 export const asZeeType = (v) => (String(v || '').trim().toLowerCase() === 'manager' ? 'manager' : 'worker');
+
+// WHICH harness a xell of `effectiveType` ends up wearing on this dispatch — the same choice the
+// harness branch in dispatchXell makes, resolved to an id so a RETYPE can write zee_type and
+// harness_id in one statement (see there for why that matters). Refuses a mismatched explicit pick
+// with assignHarness's own sentence, so the caller is told WHY rather than getting a raw trigger
+// exception. Returns null for "core only".
+async function harnessIdForType({ projectId, targetId, effectiveType, harness }) {
+  const want = effectiveType === 'manager'
+    ? (harness || 'manager')
+    : (harness !== undefined ? harness : await defaultHarnessId(projectId, { zeeType: effectiveType }));
+  if (!want) return null;
+  const h = await resolveHarness(want);
+  if (!h) return null;
+  if (!harnessFitsType(h.zee_type, effectiveType)) throw new Error(typeMismatchReason(h, effectiveType));
+  return h.id;
+}
 
 // `zeeType: 'worker'` EXCLUDES manager xells from the pool this pick draws from.
 //
@@ -346,8 +363,17 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
           + 'dispatched into it — that would downgrade a manager off production read-only. Dispatch '
           + 'into a different (worker) xell; if the pool is dry, provision one first.');
     }
-    await q(`UPDATE xell SET zee_type=$2, manager_xell_id=$3${retyping ? ', harness_id=NULL' : ''} WHERE id=$1`,
-      [targetId, effectiveType, manager_xell_id || null]);
+    // TYPE AND HARNESS MOVE IN ONE STATEMENT on a retype. Clearing harness_id first and assigning
+    // the new one afterwards left a window: anything that threw in between (the bind to production
+    // is right there, and it talks to a real cluster) stranded the xell wearing NOTHING — no manual
+    // at all, which is worse than the mismatched one it started with. 054's trigger compares
+    // NEW.harness_id against NEW.zee_type, both from the same row version, so writing them together
+    // is consistent by construction and needs no transaction. The harness branch below re-asserts the
+    // same value, which is a no-op; it stays the single place that OWNS the choice.
+    const retypeHarnessId = retyping ? await harnessIdForType({ projectId, targetId, effectiveType, harness }) : null;
+    await q(`UPDATE xell SET zee_type=$2, manager_xell_id=$3${retyping ? ', harness_id=$4' : ''} WHERE id=$1`,
+      retyping ? [targetId, effectiveType, manager_xell_id || null, retypeHarnessId]
+               : [targetId, effectiveType, manager_xell_id || null]);
     if (manager_xell_id) {
       const mgr = await one(`SELECT slug FROM xell WHERE id=$1`, [manager_xell_id]);
       logline('intake', `dispatched xell reports to manager ${mgr?.slug || manager_xell_id}`);
@@ -363,6 +389,25 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // readable production is half-blind, and a manager that could be handed a writable one would be a
   // way around the whole point of the role — so this path ignores db/db_container/dump entirely.
   if (targetId && effectiveType === 'manager') {
+    // SAY IT OUT LOUD when this is a RE-mint. Resolving the type from the target xell means an
+    // ORDINARY console re-task of an existing manager now reaches this bind — and in PRODRO_MODE=real
+    // the bind runs `CREATE/ALTER ROLE … PASSWORD` against the LIVE production database and ROTATES
+    // the DSN, invalidating the one the previous cage was handed. That is the right behaviour (the
+    // re-mint is also what re-applies GRANTs as the schema moves), but per HANDOFF that SQL has never
+    // run against a live prod db, and it must not be something an operator discovers afterwards from
+    // a changed password. So it is announced BEFORE it happens, on the queenzee log the console
+    // renders, naming the role. No gate is added here — gating a production write is a policy call
+    // for a human, not something this path should decide on its own.
+    if (!retyping) {
+      const prior = await one(`SELECT slug, prod_ro_dsn FROM xell WHERE id=$1`, [targetId]);
+      if (prior?.prod_ro_dsn) {
+        logline('prod-ro', `RE-DISPATCH into the existing manager ${prior.slug}: about to RE-MINT its `
+          + `production reader ${roRoleName(prior.slug)}${PRODRO_MODE === 'real'
+            ? ' — this runs CREATE/ALTER ROLE on the LIVE production database and ROTATES its password,'
+              + ' so the DSN the previous cage held stops working'
+            : ' (PRODRO_MODE=simulate — nothing runs on production)'}`);
+      }
+    }
     await bindManagerToProdReadonly(targetId);
   } else if (targetId && (db || db_container || dump)) {
     await attachXellDb(targetId, { coupling: db, container: db_container, dump });
@@ -408,14 +453,28 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
     }
   }
 
-  const spawned = await spawnHeadless({
-    projectId, xellId: targetId, task: taskText, runtime, mode, title: inherited,
-    headless: headless !== false, provider, providerTokenId: provider_token_id,
-    // Only reached when targetId is null (the pool was dry at the pick above) — carry the same
-    // intent down so the fallback cannot grab a xell this dispatch just declined to take.
-    zeeType: effectiveType,
-    ...(model ? { model } : {}),
-  });
+  // The prod read-only bind above is the only step of this dispatch that writes to a REAL cluster,
+  // and the spawn can still fail after it — before the cage-build try/catch is even reached, since
+  // spawnCreds() runs first and a project with no connected account throws right there. That left a
+  // ready, zee-less xell pointing at production holding a live `zee_ro_<slug>` role. Compensate and
+  // re-throw: the caller still gets the real error, and nothing is left on production for an agent
+  // that never started. (spawnCxell compensates the same way for a failure inside the cage build.)
+  let spawned;
+  try {
+    spawned = await spawnHeadless({
+      projectId, xellId: targetId, task: taskText, runtime, mode, title: inherited,
+      headless: headless !== false, provider, providerTokenId: provider_token_id,
+      // Only reached when targetId is null (the pool was dry at the pick above) — carry the same
+      // intent down so the fallback cannot grab a xell this dispatch just declined to take.
+      zeeType: effectiveType,
+      ...(model ? { model } : {}),
+    });
+  } catch (err) {
+    if (targetId && effectiveType === 'manager') {
+      await unbindManagerFromProdReadonly(targetId, `the dispatch failed before the zee started: ${err.message}`);
+    }
+    throw err;
+  }
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
 
   // Report only what actually happened — spawnHeadless/spawnRemote await the real start.
@@ -1136,7 +1195,11 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // else, so the alias would not resolve — join the prod db's network here, for THIS cxell only
     // (lib/prod-readonly.js; a no-op for every other coupling and for a published host:port). It
     // fails the cage build rather than leave a manager holding a DSN that cannot connect.
-    const prodNet = await connectCxellToProdNetwork({ xellId: xell.id, cxellName: name, cxellCtx: ctx });
+    // dbCoupling is passed EXPLICITLY so the 99% case (every non-manager dispatch in the fleet)
+    // returns on a string comparison — no query, no docker, nothing that can throw. This call sits
+    // on the universal spawn path; it must be free for everyone it does not concern.
+    const prodNet = await connectCxellToProdNetwork({ xellId: xell.id, dbCoupling: xell.db_coupling,
+                                                     cxellName: name, cxellCtx: ctx });
     if (prodNet.error) throw new Error(`prod read-only reach: ${prodNet.error}`);
     if (prodNet.joined) logline('cxell', `${name}: joined ${prodNet.network} for the read-only prod db ('${prodNet.alias}')`);
     await cloneIntoCxell({ ctx, name, worktree: xell.worktree_path });
@@ -1176,6 +1239,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);
   } catch (err) {
     await removeCxell({ ctx, slug: xell.slug });
+    // COMPENSATE the prod read-only bind. It happened BEFORE this function was even called (in
+    // dispatchXell), it minted a real `zee_ro_<slug>` role on a real production cluster, and until
+    // now nothing here undid it — the role and the `db-prod-readonly` coupling both survived a failed
+    // cage build, waiting on a teardown that only comes when the xell is reaped. releaseXell puts the
+    // xell back in the pool a moment later, so without this a POOLED, zee-less xell sits pointing at
+    // production holding a live credential. Best-effort and never throws (lib/manager-spawn.js).
+    await unbindManagerFromProdReadonly(xell.id, 'the cage build failed');
     const reason = `cxell build failed: ${err.message}`;
     const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
     broadcast('zee', dead);

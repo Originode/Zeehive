@@ -132,12 +132,28 @@ try {
     try { const out = await dispatchXell(body); return { threw: false, out }; }
     catch (e) { return { threw: true, error: e.message }; }
   };
+  // The prod read-only BIND happens mid-dispatch, and every dispatch in this throwaway project
+  // fails at the spawn (no provider account) — which now correctly triggers the compensating UNBIND,
+  // so the xell row afterwards cannot tell "bound then undone" from "never bound". Read the queenzee
+  // log instead: it is the same ring the console renders, and it records both halves in order.
+  const { recentLogs } = await import('../server/src/lib/logbus.js');
+  let logMark = recentLogs(2000).length;
+  const sinceDispatch = () => recentLogs(2000).slice(logMark).map((l) => l.msg);
+  const markLogs = () => { logMark = recentLogs(2000).length; };
+  const boundThenUndone = (slug) => {
+    const lines = sinceDispatch();
+    return {
+      bound: lines.some((m) => m.startsWith(slug + ' bound to PRODUCTION READ-ONLY')),
+      undone: lines.some((m) => m.startsWith(slug + ': UNBOUND from production read-only')),
+    };
+  };
   const readXell = async (id) => (await client.query(
     `SELECT x.*, h.key AS harness_key FROM xell x LEFT JOIN harness h ON h.id=x.harness_id WHERE x.id=$1`,
     [id])).rows[0];
 
   // ── 1. a BARE re-dispatch into a manager xell (no zee_type — what the console sends) ─────
   console.log('bare re-dispatch into a manager xell (the console\'s payload)');
+  markLogs();
   const r1 = await dispatch({ xell_id: mgrA.id, project: PID, task: 'retask me', title: 'retask me' });
   ok(!(r1.threw && /is for worker zees/.test(r1.error)),
      `NOT refused by the harness pairing [${r1.threw ? r1.error.slice(0, 110) : 'no throw'}]`);
@@ -146,31 +162,37 @@ try {
   const a1 = await readXell(mgrA.id);
   ok(a1.zee_type === 'manager', `it is STILL a manager (zee_type=${a1.zee_type})`);
   ok(a1.harness_key === 'manager', `it wears the MANAGER harness, not the project's worker default (${a1.harness_key})`);
-  ok(a1.db_coupling === 'db-prod-readonly', `it is still bound to production READ-ONLY (${a1.db_coupling})`);
-  ok(typeof a1.prod_ro_dsn === 'string' && a1.prod_ro_dsn.startsWith('postgresql://zee_ro_'),
-     'and it holds a read-only DSN minted for its own role');
+  const t1 = boundThenUndone('retask-me-aa11bb');
+  ok(t1.bound, 'it IS bound to production READ-ONLY (its own zee_ro_ role) — the branch a bare re-dispatch used to skip');
+  ok(t1.undone && a1.db_coupling !== 'db-prod-readonly',
+     `…and because THIS dispatch then failed at the spawn, the bind is compensated rather than left on production (${a1.db_coupling})`);
 
   // ── 2. a manager that ALREADY wears the manager harness ─────────────────────
   // Here the old code never tripped the harness refusal (a xell with a harness keeps it), so the bug
   // was silent: the prod read-only bind was skipped and the manager came back off production.
   console.log('bare re-dispatch into a manager that already wears its harness');
+  markLogs();
   const r2 = await dispatch({ xell_id: mgrB.id, project: PID, task: 'retask two', title: 'retask two' });
   ok(!r2.threw || SPAWN_STAGE.test(r2.error), `no refusal before the spawn [${r2.threw ? r2.error.slice(0, 110) : 'no throw'}]`);
   const b1 = await readXell(mgrB.id);
   ok(b1.zee_type === 'manager' && b1.harness_key === 'manager', 'type and harness are untouched');
-  ok(b1.db_coupling === 'db-prod-readonly' && !!b1.prod_ro_dsn,
-     `production read-only is (re-)bound, not silently stripped (${b1.db_coupling})`);
+  const t2 = boundThenUndone('retask-two-bb22cc');
+  ok(t2.bound, 'production read-only is (re-)bound, not silently stripped — the SILENT half of this bug');
+  ok(t2.undone, 'and undone again when the spawn fails, so nothing is left on the cluster');
 
   // ── 3. an EXPLICIT worker downgrade is REFUSED, and says what does change a type ──────────
   console.log('explicit zee_type=worker on a manager xell');
+  markLogs();
   const r3 = await dispatch({ xell_id: mgrB.id, project: PID, task: 'downgrade me', title: 'retask two',
                               zee_type: 'worker' });
   ok(r3.threw, 'refused');
   ok(/manager/i.test(r3.error || '') && /\/api\/managers/.test(r3.error || ''),
      `the refusal names the real verb that changes a type [${(r3.error || '').slice(0, 160)}]`);
   const b2 = await readXell(mgrB.id);
-  ok(b2.zee_type === 'manager' && b2.harness_key === 'manager' && b2.db_coupling === 'db-prod-readonly',
-     'and NOTHING was half-converted (type, harness and db binding all intact)');
+  ok(b2.zee_type === 'manager' && b2.harness_key === 'manager',
+     'and NOTHING was half-converted — it is still a manager wearing the manager manual');
+  ok(!sinceDispatch().some((m) => /retask-two-bb22cc.*(bound to PRODUCTION|UNBOUND)/.test(m)),
+     'a refused dispatch touches production not at all — no bind, and nothing to compensate');
 
   // ── 4. a plain worker dispatch is completely unchanged ───────────────────────
   console.log('an ordinary worker dispatch still behaves exactly as before');
@@ -184,12 +206,14 @@ try {
 
   // ── 5. explicitly promoting is still possible (createManagerZee's own payload) ───────────
   console.log('an explicit zee_type=manager still promotes (POST /api/managers\'s own payload)');
+  markLogs();
   const r5 = await dispatch({ xell_id: wrk.id, project: PID, task: 'be a manager', title: 'plain worker',
                               zee_type: 'manager', harness: 'manager' });
   ok(!r5.threw || SPAWN_STAGE.test(r5.error), `no refusal before the spawn [${r5.threw ? r5.error.slice(0, 110) : 'no throw'}]`);
   const w2 = await readXell(wrk.id);
-  ok(w2.zee_type === 'manager' && w2.harness_key === 'manager' && w2.db_coupling === 'db-prod-readonly',
-     'the worker xell became a manager, wearing the manager harness, on production read-only');
+  ok(w2.zee_type === 'manager' && w2.harness_key === 'manager',
+     'the worker xell became a manager, wearing the manager harness');
+  ok(boundThenUndone('plain-worker-cc33dd').bound, 'and was put on production read-only');
 
   // ── 6. an UNNAMED worker dispatch is never handed a ready MANAGER xell ────────────────────
   // The console composer sends no xell_id: it takes "the freshest ready xell". A manager whose zee
@@ -204,6 +228,12 @@ try {
   const spare = await mkXell('spare-worker-dd44ee', wt2, 'worker', null);
   await client.query(`UPDATE xell SET ready_at = now() - interval '1 hour' WHERE id=$1`, [spare.id]);
 
+  // "Untouched" is now a COMPARISON, not an absolute: sections 1-2 legitimately unbound these two
+  // (their dispatches failed at the spawn and the bind was compensated). What must hold here is that
+  // an unnamed WORKER dispatch changes nothing about them at all.
+  const beforeA = (await readXell(mgrA.id)).db_coupling;
+  const beforeB = (await readXell(mgrB.id)).db_coupling;
+  markLogs();
   const r6 = await dispatch({ project: PID, task: 'plain worker work', title: 'spare worker' });
   ok(!r6.threw || SPAWN_STAGE.test(r6.error), `no refusal before the spawn [${r6.threw ? r6.error.slice(0, 110) : 'no throw'}]`);
   const picked = await readXell(spare.id);
@@ -213,18 +243,22 @@ try {
   const untouchedB = await readXell(mgrB.id);
   ok(untouchedA.status === 'ready' && untouchedB.status === 'ready',
      'and both manager xells were left alone (still ready, not claimed by a worker dispatch)');
-  ok(untouchedA.db_coupling === 'db-prod-readonly' && untouchedB.db_coupling === 'db-prod-readonly',
-     'their production read-only binding is intact — nothing was downgraded to take a spare xell');
+  ok(untouchedA.db_coupling === beforeA && untouchedB.db_coupling === beforeB,
+     `their db binding is exactly as it was — nothing was downgraded to take a spare xell (${beforeA}/${beforeB})`);
+  ok(!sinceDispatch().some((m) => /retask-(me|two)-\w+.*(bound to PRODUCTION|UNBOUND)/.test(m)),
+     'and production was not touched on their behalf at all');
 
   // ── 7. with ONLY manager xells ready, the pool is dry for a worker — it does not "make do" ──
   console.log('only manager xells ready → a worker dispatch reports an EMPTY pool, it does not take one');
   await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [spare.id]);
   await client.query(`UPDATE xell SET status='ready' WHERE id IN ($1,$2)`, [mgrA.id, mgrB.id]);
+  const beforeA7 = (await readXell(mgrA.id)).db_coupling;
+  markLogs();
   const r7 = await dispatch({ project: PID, task: 'nowhere to go' });
   ok(r7.threw && /no ready xell available/i.test(r7.error),
      `the pool reads as DRY, so the reconciler provisions a real one [${(r7.error || '').slice(0, 90)}]`);
   const a7 = await readXell(mgrA.id);
-  ok(a7.zee_type === 'manager' && a7.status === 'ready' && a7.db_coupling === 'db-prod-readonly',
+  ok(a7.zee_type === 'manager' && a7.status === 'ready' && a7.db_coupling === beforeA7,
      'and the ready manager is untouched rather than conscripted');
 
   // ── 8. …but an explicit MANAGER dispatch still draws from every ready xell ───
@@ -232,6 +266,101 @@ try {
   const r8 = await dispatch({ project: PID, task: 'add a manager', zee_type: 'manager', harness: 'manager' });
   ok(r8.threw && SPAWN_STAGE.test(r8.error) && !/no ready xell available/i.test(r8.error),
      `it FOUND a target (only the spawn failed) [${(r8.error || '').slice(0, 90)}]`);
+
+  // ── 9. A FAILED DISPATCH LEAVES NOTHING ON PRODUCTION ────────────────────────────────────────
+  // bindManagerToProdReadonly mints a real `zee_ro_<slug>` role on a real cluster and re-points the
+  // xell at prod — and the spawn after it can still fail (in this throwaway project it always does:
+  // no provider account is connected, so spawnCreds throws before the cage-build try/catch is even
+  // reached). Nothing used to undo that: a READY, zee-less xell was left pointing at production
+  // holding a live credential, waiting on a teardown that only comes when the xell is reaped.
+  console.log('a dispatch that fails after the prod bind UNBINDS it again');
+  // A BYSTANDER: a manager bound to prod read-only directly (not through a dispatch), so nothing in
+  // this section is dispatching into it. The compensation must be scoped to the failing dispatch's
+  // OWN target — a manager minding its own business must not lose production because another
+  // dispatch failed.
+  const { bindManagerToProdReadonly } = await import('../server/src/lib/manager-spawn.js');
+  const bystander = await mkXell('bystander-aa99zz', mkWt('bystander-aa99zz', 'spinoff/bystander-aa99zz'),
+                                 'manager', mgrH.id);
+  await bindManagerToProdReadonly(bystander.id);
+  const bBefore = await readXell(bystander.id);
+  ok(bBefore.db_coupling === 'db-prod-readonly' && !!bBefore.prod_ro_dsn, 'fixture: the bystander holds prod read-only');
+
+  const victimWt = mkWt('victim-dd44ee', 'spinoff/victim-dd44ee');
+  const victim = await mkXell('victim-dd44ee', victimWt, 'worker', null);
+  const r9 = await dispatch({ xell_id: victim.id, project: PID, task: 'be a manager', title: 'victim',
+                              zee_type: 'manager', harness: 'manager' });
+  ok(r9.threw && SPAWN_STAGE.test(r9.error), `the spawn failed, as it must here [${(r9.error || '').slice(0, 80)}]`);
+  const v9 = await readXell(victim.id);
+  ok(v9.db_coupling !== 'db-prod-readonly',
+     `the xell is NOT left pointing at production (${v9.db_coupling})`);
+  ok(!v9.prod_ro_dsn, 'and holds no production DSN — the reader was dropped, not left for the reaper');
+  ok(v9.zee_type === 'manager' && v9.harness_key === 'manager',
+     'what it IS (a manager, wearing the manager manual) is untouched — only the prod credential is undone');
+
+  // The compensation must be surgical: it undoes THIS dispatch's bind, and nothing else's.
+  const b9 = await readXell(bystander.id);
+  ok(b9.db_coupling === 'db-prod-readonly' && !!b9.prod_ro_dsn,
+     "a DIFFERENT manager's binding is untouched by the failure");
+
+  // ── 10. the universal spawn path is FREE for every xell this does not concern ────────────────
+  // connectCxellToProdNetwork() runs on every cxell dispatch in the fleet. When the caller already
+  // knows the coupling it must decide on a string comparison — no query, no docker, nothing that can
+  // throw — or an unrelated dispatch can be sunk by manager code.
+  console.log('connectCxellToProdNetwork short-circuits before any query for a non-manager xell');
+  const { connectCxellToProdNetwork } = await import('../server/src/lib/prod-readonly.js');
+  // POISONED id: `SELECT … WHERE id='not-a-uuid'` raises `invalid input syntax for type uuid`. So a
+  // clean answer here PROVES no query was made — it is not an assertion about the answer, it is an
+  // assertion about the path. Every non-manager dispatch in the fleet rides this.
+  const call = async (args) => {
+    try { return { out: await connectCxellToProdNetwork(args) }; }
+    catch (e) { return { threw: true, error: e.message }; }
+  };
+  const cheap = await call({ xellId: 'not-a-uuid', dbCoupling: 'db-shared-dev', cxellName: 'cxell_x' });
+  ok(!cheap.threw && cheap.out?.required === false && !cheap.out?.error,
+     `a known non-prod-readonly coupling answers WITHOUT reading the xell row [${cheap.error || 'no query'}]`);
+  const cheap2 = await call({ xellId: 'not-a-uuid', dbCoupling: 'db-clone', cxellName: 'cxell_x' });
+  ok(!cheap2.threw && cheap2.out?.required === false, 'same for db-clone — the guard is the coupling, not the row');
+  const cheap3 = await call({ xellId: 'not-a-uuid', dbCoupling: 'db-isolated', cxellName: 'cxell_x' });
+  ok(!cheap3.threw && cheap3.out?.required === false, 'same for db-isolated (this xell\'s own coupling)');
+  // With NO hint it must still never throw THROUGH a cage build — it fails closed as a returned
+  // refusal, because a xell it cannot rule out may genuinely be a manager.
+  const blind = await call({ xellId: 'not-a-uuid', cxellName: 'cxell_x' });
+  ok(!blind.threw, 'with no coupling hint an unexpected failure is RETURNED, never thrown mid-cage-build');
+  ok(blind.out?.required === true && !!blind.out?.error,
+     `and it fails CLOSED, since a xell it could not read might be a manager [${(blind.out?.error || '').slice(0, 70)}]`);
+  // A prod-read-only xell with the hint still does the real work (it is not short-circuited away).
+  const real = await call({ xellId: bystander.id, dbCoupling: 'db-prod-readonly', cxellName: 'cxell_x' });
+  ok(!real.threw && real.out?.required === false && /publishes 10\.9\.9\.9:5432/.test(real.out?.reason || ''),
+     `a real manager IS resolved — this project's prod db publishes a port, so no join is needed [${real.out?.reason || real.out?.error}]`);
+
+  // ── 11. a RETYPE writes type and harness together (no window wearing nothing) ────────────────
+  // 054's trigger compares NEW.harness_id with NEW.zee_type in the same row version, so the two can
+  // and must move in one statement. Clearing first and assigning after left a xell wearing NO manual
+  // at all if anything in between threw — and the prod bind is in between.
+  console.log('a retype never leaves the xell wearing nothing');
+  const swapWt = mkWt('swap-ee55ff', 'spinoff/swap-ee55ff');
+  const swap = await mkXell('swap-ee55ff', swapWt, 'worker', workerH.id);
+  const r11 = await dispatch({ xell_id: swap.id, project: PID, task: 'promote', title: 'swap',
+                               zee_type: 'manager', harness: 'manager' });
+  ok(r11.threw && SPAWN_STAGE.test(r11.error), 'the dispatch got past the retype and died at the spawn');
+  const s11 = await readXell(swap.id);
+  ok(s11.zee_type === 'manager' && s11.harness_key === 'manager',
+     `it wears the MANAGER manual, never nothing (${s11.harness_key})`);
+  // The failure mode this replaces: the old code cleared harness_id, then the prod bind ran, then
+  // assignHarness. Assert the invariant directly — a manager xell always wears a manager harness.
+  for (const x of [await readXell(mgrA.id), await readXell(mgrB.id), s11, v9]) {
+    ok(x.zee_type !== 'manager' || x.harness_key === 'manager',
+       `invariant: manager xell ${x.slug} wears a manager harness (${x.harness_key})`);
+  }
+  // An explicit MISMATCHED harness on a retype is refused with the sentence, not a raw trigger error.
+  const swap2 = await mkXell('swap2-ff66aa', mkWt('swap2-ff66aa', 'spinoff/swap2-ff66aa'), 'worker', null);
+  const r11b = await dispatch({ xell_id: swap2.id, project: PID, task: 'promote badly', title: 'swap2',
+                                zee_type: 'manager', harness: workerH.key });
+  ok(r11b.threw && /is for worker zees/.test(r11b.error || '') && !/RAISE|plpgsql|syntax/i.test(r11b.error || ''),
+     `refused with the explanation, not a postgres exception [${(r11b.error || '').slice(0, 90)}]`);
+  const s11b = await readXell(swap2.id);
+  ok(s11b.zee_type === 'worker' && !s11b.harness_key,
+     'and the xell is not half-converted — it is still exactly what it was');
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {

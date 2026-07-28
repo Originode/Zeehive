@@ -201,10 +201,33 @@ export async function mintProdReader(xell, project) {
 // is network REACH: docker network membership is per-network, not per-container, so the manager's
 // cxell can see whatever else sits on that network. That is the cost of an alias-addressed prod db,
 // and it is why a published host:port (which needs no join) stays the preferred registration.
-export async function connectCxellToProdNetwork({ xellId, cxellName, cxellCtx = CXELL_CTX }) {
+export const PROD_RO_COUPLING = 'db-prod-readonly';
+
+export async function connectCxellToProdNetwork({ xellId, dbCoupling, cxellName, cxellCtx = CXELL_CTX }) {
+  // ── THE UNIVERSAL-PATH GUARD, before ANY query ────────────────────────────────────────────────
+  // This is called for EVERY cxell dispatch in the fleet, and only a prod-read-only xell has any
+  // business here. When the caller already holds the coupling (spawnCxell does — it is on the xell
+  // row it is spawning into) decide from that and touch nothing: no SELECT, no docker, no throw. A
+  // dispatch that has nothing to do with managers must not be able to fail on this code at all.
+  if (dbCoupling !== undefined && dbCoupling !== PROD_RO_COUPLING) {
+    return { required: false, joined: false, reason: 'not a prod read-only xell' };
+  }
+  try {
+    return await resolveAndJoinProdNetwork({ xellId, cxellName, cxellCtx });
+  } catch (e) {
+    // We only get here for a xell we could NOT rule out as prod-read-only, so failing closed is the
+    // correct answer: the caller aborts the cage build rather than start a manager whose DSN may not
+    // resolve. An unexpected throw becomes that same refusal instead of an exception thrown through
+    // the middle of a cage build.
+    return { required: true, joined: false,
+      error: `could not establish prod read-only network reach: ${e.message}` };
+  }
+}
+
+async function resolveAndJoinProdNetwork({ xellId, cxellName, cxellCtx }) {
   const xell = xellId ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId]) : null;
   if (!xell) return { required: false, joined: false, reason: 'no xell' };
-  if (xell.db_coupling !== 'db-prod-readonly') {
+  if (xell.db_coupling !== PROD_RO_COUPLING) {
     return { required: false, joined: false, reason: 'not a prod read-only xell' };
   }
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
@@ -267,6 +290,10 @@ export async function dropProdReader(xell) {
     const role = roRoleName(xell.slug);
     if (PRODRO_MODE === 'simulate') {
       logline('prod-ro', `SIMULATE: would drop read-only role ${role}`);
+      // Clear the stored DSN even in simulate. The ROLE is cluster state and simulate skips it, but
+      // xell.prod_ro_dsn is OUR row — leaving it set means the xell still reports a production
+      // credential it is no longer meant to hold, in the one mode the whole path is exercised in.
+      if (xell.id) await q(`UPDATE xell SET prod_ro_dsn=NULL WHERE id=$1`, [xell.id]);
       return { dropped: true, role, mode: 'simulate' };
     }
     const db = await prodDb(project);
