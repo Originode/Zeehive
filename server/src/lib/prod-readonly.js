@@ -20,9 +20,10 @@
 // fallback to the owner credential, because "read-only access, except when provisioning hiccups"
 // is not read-only access.
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
-import { psql, prodDb, assertProdDbTarget } from '../queenzee/shipmigrate.js';
+import { psql, prodDb, assertProdDbTarget, prodDbAddress, connRefAlias } from '../queenzee/shipmigrate.js';
 
 export const PRODRO_MODE = (process.env.PRODRO_MODE || process.env.SHIP_MODE || 'real') === 'simulate'
   ? 'simulate' : 'real';
@@ -70,19 +71,98 @@ export function readonlyDsn({ host, port, role, password, dbName }) {
   return `postgresql://${role}:${encodeURIComponent(password)}@${host}:${port}/${dbName}`;
 }
 
+// ── WHICH ADDRESS a manager's cxell dials ────────────────────────────────────────────────────────
+//
+// There are TWO shapes of registered production database in this codebase, and shipmigrate has
+// modelled both since the ship gate: one that PUBLISHES a host:port, and one that publishes nothing
+// and is reachable only by its docker NETWORK ALIAS (Zeehive's own meta db — Ports is
+// {"5432/tcp": null} by design). This path used to know only the first, so an alias-only prod db
+// made `add a manager zee` impossible. prodDbAddress() is the one resolver; we reuse it rather than
+// writing a second one that can disagree with the guard that decides whether a write may happen.
+
+// The docker context a cxell runs on. spawnCxell pins 'default' (the queenzee IS the docker host),
+// and a docker network on ANOTHER daemon cannot resolve from it — so the reachability rule below and
+// the network join agree on exactly one constant.
+export const CXELL_CTX = 'default';
+
+// The port an alias-addressed conn_ref names. `postgresql://z@meta-db:5445/z` → 5445; a URL with no
+// port → 5432, which is libpq's own default and therefore the one the DSN would use anyway.
+export function connRefPort(connRef) {
+  try { const p = new URL(connRef).port; return p ? Number(p) : 5432; } catch { return 5432; }
+}
+
+// PURE: which of a container's docker networks answer to `alias`. Reads the same
+// .NetworkSettings.Networks shape decideProdDbTarget already parses (Aliases + DNSNames).
+export function networksCarryingAlias(networks, alias) {
+  const out = [];
+  for (const [net, cfg] of Object.entries(networks || {})) {
+    const names = [...(cfg?.Aliases || []), ...(cfg?.DNSNames || [])];
+    if (alias && names.includes(alias)) out.push(net);
+  }
+  return out;
+}
+
+// PURE DECISION: the host:port a manager's read-only DSN should carry, or a refusal that says where
+// the missing address goes. `db` is prodDb()'s handle, `row` the raw container row (it alone carries
+// the inet `host` column). No I/O, exported so the whole decision is table-testable.
+//
+//   → { ok: true, mode: 'port',  host, port }              — published; nothing else to arrange
+//   → { ok: true, mode: 'alias', host, port, ctx }         — a docker network name; the cxell must
+//                                                            JOIN that network (see below)
+//   → { ok: false, error }                                 — FAILS CLOSED, and says what to fill in
+export function decideReaderAddress({ db, row, project, cxellCtx = CXELL_CTX }) {
+  const addr = prodDbAddress(db);
+  // A published host:port is today's behaviour, byte for byte — but only when the row actually
+  // carries the HOST too. A host_port with an empty host used to build `postgresql://null:5432/…`.
+  if (addr.mode === 'port' && row?.host) {
+    return { ok: true, mode: 'port', host: row.host, port: addr.port };
+  }
+
+  const alias = connRefAlias(db?.conn_ref ?? row?.conn_ref);
+  if (alias) {
+    // An alias DSN is only TRUE if the cxell can resolve it, and a docker network lives on one
+    // daemon. Refuse rather than hand a manager a DSN that cannot connect.
+    const dbCtx = db?.ctx || CXELL_CTX;
+    if (dbCtx !== cxellCtx) {
+      return { ok: false, error:
+        `the production database for project "${project?.name || '?'}" (container row "${row?.name || db?.logical}") `
+        + `publishes no host:port and is reachable only by the docker network name '${alias}' on context `
+        + `'${dbCtx}' — but a cxell runs on '${cxellCtx}', and a docker network on another daemon cannot `
+        + 'resolve from it. Publish an address on that container row (container.host + container.host_port), '
+        + `or register the prod db on the '${cxellCtx}' context, then re-add the manager.` };
+    }
+    return { ok: true, mode: 'alias', host: alias, port: connRefPort(db?.conn_ref ?? row?.conn_ref), ctx: dbCtx };
+  }
+
+  return { ok: false, error:
+    `the production database for project "${project?.name || '?'}" records no address a cxell can dial. `
+    + `Fill it in on the container row "${row?.name || db?.logical}" (role='db', tier='prod'): either `
+    + 'container.host + container.host_port (the published address, e.g. 10.2.0.16 and 5432), or '
+    + "container.conn_ref as a URL whose HOST is the docker network name the database answers to "
+    + '(postgresql://<user>@<network-alias>:5432/<db>). Then re-add the manager — the bind fails '
+    + 'closed until then, because a DSN nothing can connect to is worse than a refusal.' };
+}
+
 // Mint (or re-mint) THIS xell's read-only prod reader and return its DSN. Throws on failure —
 // callers must let that propagate: a failed mint means NO prod access, not degraded access.
 export async function mintProdReader(xell, project) {
   const db = await prodDb(project);
   if (!db) throw new Error('no prod db container registered for this project');
+
+  // ADDRESS FIRST, before anything is written on a real cluster: if the DSN we could hand this
+  // manager is not one its cxell can dial, there is no point creating a role for it. Pure decision,
+  // no I/O — and the ONE resolver (prodDbAddress) the ship/seed guards already use.
+  const row = await one(
+    `SELECT c.name, c.docker_ctx, host(c.host) AS host, c.host_port, c.conn_ref FROM container c
+      WHERE c.project_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [project.id]);
+  const addr = decideReaderAddress({ db, row, project });
+  if (!addr.ok) throw new Error(addr.error);
+
   // The same identity proof a prod migration/seed makes before it writes. We only ever SELECT with
   // the resulting role, but CREATE ROLE is a real write on a real cluster — prove which one it is.
   const target = await assertProdDbTarget(db);
   if (target?.ok === false) throw new Error(target.error);
 
-  const row = await one(
-    `SELECT c.name, c.docker_ctx, host(c.host) AS host, c.host_port, c.conn_ref FROM container c
-      WHERE c.project_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [project.id]);
   const role = roRoleName(xell.slug);
   const password = randomBytes(24).toString('base64url');
   const sql = readonlyRoleSql(role, password, db.name, db.user);
@@ -95,14 +175,86 @@ export async function mintProdReader(xell, project) {
     logline('prod-ro', `created/refreshed read-only role ${role} on ${db.container} (${db.name}) — SELECT only`);
   }
 
-  const dsn = readonlyDsn({ host: row?.host, port: row?.host_port, role, password, dbName: db.name });
-  if (!dsn) {
-    throw new Error('the prod db row publishes no host:port, so a cxell cannot reach it over TCP — '
-      + 'record the address on the container before binding a manager to prod');
-  }
-  await q(`UPDATE xell SET prod_ro_dsn=$2 WHERE id=$1`, [xell.id, dsn]);
+  const dsn = readonlyDsn({ host: addr.host, port: addr.port, role, password, dbName: db.name });
+  // Belt and braces: decideReaderAddress already refused every unaddressed shape, so reaching here
+  // with no DSN would be a bug in this file — never a manager quietly bound to nothing.
+  if (!dsn) throw new Error(`could not build a read-only DSN from the ${addr.mode} address of ${db.container}`);
+  if (xell.id) await q(`UPDATE xell SET prod_ro_dsn=$2 WHERE id=$1`, [xell.id, dsn]);
   return { role, dsn, mode: PRODRO_MODE, container: db.container, database: db.name,
-           address: `${row.host}:${row.host_port}` };
+           address: `${addr.host}:${addr.port}`, address_mode: addr.mode };
+}
+
+// ── MAKING AN ALIAS ADDRESS ACTUALLY REACHABLE ──────────────────────────────────────────────────
+//
+// ensureCxell() puts every cxell on `zee-hive-net` and nothing else, so a docker network ALIAS does
+// not resolve in there — a DSN built on one would be a lie. This connects THIS ONE cxell (the
+// manager's, and only when it holds db-prod-readonly) to the network the prod db answers on, so the
+// alias resolves for exactly the container that is supposed to read production.
+//
+// Deliberately narrow, and it must stay that way:
+//   • ONLY a db-prod-readonly xell. An ordinary worker cxell is never joined to a prod network.
+//   • ONLY when the address really is an alias — a published host:port needs no join at all.
+//   • ONE network (the first that answers to the alias), never "all of them".
+//   • FAILS CLOSED: the caller aborts the cage build on `error`, because a manager holding a DSN it
+//     cannot connect to is worse than a manager that was never created.
+// It grants no write of any kind — the credential is still the SELECT-only role. What it DOES widen
+// is network REACH: docker network membership is per-network, not per-container, so the manager's
+// cxell can see whatever else sits on that network. That is the cost of an alias-addressed prod db,
+// and it is why a published host:port (which needs no join) stays the preferred registration.
+export async function connectCxellToProdNetwork({ xellId, cxellName, cxellCtx = CXELL_CTX }) {
+  const xell = xellId ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId]) : null;
+  if (!xell) return { required: false, joined: false, reason: 'no xell' };
+  if (xell.db_coupling !== 'db-prod-readonly') {
+    return { required: false, joined: false, reason: 'not a prod read-only xell' };
+  }
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  const db = project ? await prodDb(project).catch(() => null) : null;
+  // No production registered at all is the ONE tolerated absence (manager-spawn.js says so): the
+  // manager exists, it just has nothing to read.
+  if (!db) return { required: false, joined: false, reason: 'no prod db registered' };
+  const row = await one(
+    `SELECT c.name, c.docker_ctx, host(c.host) AS host, c.host_port, c.conn_ref FROM container c
+      WHERE c.project_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [project.id]);
+
+  const addr = decideReaderAddress({ db, row, project, cxellCtx });
+  if (!addr.ok) return { required: true, joined: false, error: addr.error };
+  if (addr.mode !== 'alias') {
+    return { required: false, joined: false, reason: `prod db publishes ${addr.host}:${addr.port} — no network join needed` };
+  }
+  if (PRODRO_MODE === 'simulate') {
+    logline('prod-ro', `SIMULATE: would connect ${cxellName} to the docker network carrying '${addr.host}'`);
+    return { required: true, joined: false, simulated: true, alias: addr.host };
+  }
+
+  const insp = spawnSync('docker', [...(db.ctx && db.ctx !== 'default' ? ['--context', db.ctx] : []),
+    'inspect', '--format', '{{json .NetworkSettings.Networks}}', db.container],
+    { encoding: 'utf8', timeout: 15000, windowsHide: true });
+  if (insp.status !== 0) {
+    return { required: true, joined: false, error:
+      `cannot inspect ${db.container} on ${db.ctx} to find the docker network its name '${addr.host}' `
+      + `lives on — ${(insp.stderr || insp.error?.message || '').trim().split('\n').pop()?.slice(0, 160)}` };
+  }
+  let nets = {};
+  try { nets = JSON.parse(insp.stdout || '{}') || {}; } catch { nets = {}; }
+  const carrying = networksCarryingAlias(nets, addr.host);
+  if (!carrying.length) {
+    return { required: true, joined: false, error:
+      `${db.container} is on no docker network that answers to '${addr.host}' (networks: `
+      + `${Object.keys(nets).join(', ') || 'none'}) — the prod db row's conn_ref names a host this `
+      + 'container does not have, so a manager cxell could never reach it.' };
+  }
+  const net = carrying[0];
+  const con = spawnSync('docker', [...(db.ctx && db.ctx !== 'default' ? ['--context', db.ctx] : []),
+    'network', 'connect', net, cxellName], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+  const already = /already exists in network|endpoint with name .* already exists/i.test(con.stderr || '');
+  if (con.status !== 0 && !already) {
+    return { required: true, joined: false, error:
+      `could not connect ${cxellName} to docker network ${net} (where the prod db answers to `
+      + `'${addr.host}') — ${(con.stderr || con.error?.message || '').trim().split('\n').pop()?.slice(0, 160)}` };
+  }
+  logline('prod-ro', `${cxellName}: joined docker network ${net} so the read-only prod DSN's host `
+    + `'${addr.host}' resolves — this cxell only`);
+  return { required: true, joined: true, network: net, alias: addr.host, networks: carrying };
 }
 
 // Give the access back. Called by the reaper when a manager xell is torn down: a role that outlives

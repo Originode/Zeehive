@@ -64,6 +64,21 @@ only in a prompt is a rule that lasts until the first clever workaround:
   and `REVOKE CREATE ON SCHEMA public` (`lib/prod-readonly.js`). Writes are refused by the server,
   not by the agent's restraint. It **fails closed**: if the role cannot be minted, the bind fails —
   there is no fallback to the owner credential. The reaper drops the role with the xell.
+  - **Which ADDRESS the DSN carries** is `decideReaderAddress()` (pure, table-tested), and it reuses
+    shipmigrate's **`prodDbAddress()`** rather than a second resolver that could disagree with the
+    guard deciding whether a write may happen. A prod db that **publishes a host:port** yields that;
+    one registered **alias-only** (publishes nothing, reachable only on a docker network — Zeehive's
+    own meta db) yields a DSN on the **network alias**, port from the `conn_ref` URL. A row carrying
+    **neither** is still refused, now naming the project, the container row and the exact columns to
+    fill. (Until 2026-07-28 the mint read `host`/`host_port` only, so an alias-only production made
+    "add a manager zee" impossible — it SELECTed `conn_ref` in the same query and never used it.)
+  - An alias is only true if the cage can **resolve** it. `ensureCxell()` puts every cxell on
+    `zee-hive-net` and nothing else, so `connectCxellToProdNetwork()` joins **that one cxell** (only
+    `db-prod-readonly`, only one network) to the prod db's network at cage build, and **fails the
+    cage build** rather than hand a manager a DSN that cannot connect. An alias on **another docker
+    context** is refused outright: a network on another daemon can never resolve from a cxell, which
+    runs on the queenzee's own. Prefer registering a published `host`/`host_port` — it needs no join,
+    and docker network membership is per-network, not per-container.
 - **One level deep.** The 052 guard trigger refuses a manager with a manager, a worker reporting to
   a worker, anything managing itself, and production being (or having) a manager.
 - **Type and manual cannot drift apart.** See the two-axis section above: a manager always wears a
