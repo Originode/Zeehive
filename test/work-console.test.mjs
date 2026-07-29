@@ -218,7 +218,8 @@ const smoke = async () => {
         const Tickets = require('./Tickets.jsx').default;
         const Gantt = require('./Gantt.jsx').default;
         const Drawer = require('./WorkItemDrawer.jsx').default;
-        module.exports = { React, renderToString, Board, Tickets, Gantt, Drawer };
+        const DeployZee = require('./DeployZee.jsx').default;
+        module.exports = { React, renderToString, Board, Tickets, Gantt, Drawer, DeployZee };
       `,
       resolveDir: resolve(here, '..', 'web/src/work'),
       loader: 'js',
@@ -237,6 +238,17 @@ const smoke = async () => {
     renderToString(React.createElement(screens.Tickets, { projectId: 'p', statuses, kinds: ['bug'] })),
     renderToString(React.createElement(screens.Gantt, { projectId: 'p', rootId: null })),
     renderToString(React.createElement(screens.Drawer, { itemId: 'i', projectId: 'p', statuses })),
+    // The drawer's first frame has no data yet, so the zee seam is rendered directly — BOTH states,
+    // because "nobody is on it" and "a zee is on it" are different code paths and the empty one is
+    // the one a human meets first.
+    renderToString(React.createElement(screens.DeployZee, {
+      item: { id: 'i', title: 'an item', xell_id: null }, zee: null, events: [],
+    })),
+    renderToString(React.createElement(screens.DeployZee, {
+      item: { id: 'i', title: 'an item', xell_id: 'x' },
+      zee: { slug: 'lively-meadow', hive_status: 'occ-working', hive_status_label: 'working' },
+      events: [{ kind: 'assigned', detail: { xell_slug: 'lively-meadow' } }],
+    })),
   ].join('');
   return html;
 };
@@ -250,6 +262,8 @@ try {
   for (const id of ['work-tickets', 'work-gantt', 'work-drawer']) {
     ok(html.includes(id), `the rendered markup carries ${id}`);
   }
+  ok(/deploy a worker/.test(html), 'an unassigned item offers "deploy a worker" on its first frame');
+  ok(/lively-meadow/.test(html), 'an assigned item renders its zee chip');
 } catch (e) {
   ok(false, `a screen threw while rendering — ${String(e.message).split('\n')[0]}`);
 }
