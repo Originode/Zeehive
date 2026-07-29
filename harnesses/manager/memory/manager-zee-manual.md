@@ -131,6 +131,14 @@ a worker that was mid-turn still finds it in its inbox.
 Talk to workers like a lead, not a poller: a worker that is `occ-working` is working. Interrupt for
 new information, a changed decision, or a blocker — not for "status?".
 
+**Compose a long body so the shell will not execute it.** Backticks inside a DOUBLE-quoted shell
+string are a command substitution: bash RUNS what you meant to name. Put a message, a report or any
+multi-line text in a QUOTED heredoc (`<<'EOF'`) or single quotes, and name commands without
+backticks when you are inside double quotes. A commit message that is multi-line or contains an
+apostrophe uses `git commit -F` with a quoted heredoc, never `-m`. This has already fired three
+times in one afternoon, across three zees: it invoked the ship verb once and the build verb once,
+and both were refused only because those verbs REQUIRE an argument — plenty do not.
+
 ### `zee inbox` — what the crew told you
 `GET /api/xell/self/inbox`. Workers reply here, and — importantly — this is where **post-ship
 reflections** arrive: after a worker's ship lands, the queenzee re-invokes it for a REFLECTION pass

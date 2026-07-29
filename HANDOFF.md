@@ -464,6 +464,22 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
   ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
   rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
+- **Compose a long body the shell will not execute** (2026-07-29, ticket #21 — migration 079).
+  Three incidents in one afternoon across three zees: backticks inside a DOUBLE-quoted shell string
+  are a command substitution, so composing a report body that way RUNS what it meant to name (it
+  invoked the ship verb once and the build verb once), and an apostrophe inside a single-quoted
+  `git commit -m` closes the quote early. The note teaches the quoted heredoc / single quotes, and
+  `git commit -F` for anything multi-line or apostrophe-bearing — with the REASON, which is the part
+  that makes it stick: **those two invocations were refused only because those verbs require an
+  argument, and `zee land` does not.** Whether a gated verb should refuse a bare invocation is
+  ticket #17 and a human's call; 079 is documentation only.
+  It also shows the SPLIT every manual edit has to respect: `zee-base` is DB-owned (`dir IS NULL`),
+  so its manual is patched by migration through 076's `harness_memory_put` in 077's anchored/guarded
+  shape; the MANAGER manual is FILE-backed (`harnesses/manager/`, reloaded from the folder at every
+  boot), so its copy of the note is a repo file edit — a DB write there is overwritten on the next
+  boot. Verified on a VIRGIN database (created empty, migrated from scratch: 81 migrations, the note
+  present, both `zee-base` memory files intact) and re-applied past the ledger as a byte-identical
+  no-op. Suite 77/0 on both the virgin and the in-place database.
 - **Notify a manager about a ticket: proved it ARRIVES, and made it ask first** (2026-07-29,
   ticket #16). The feature itself (the derived `TKT-<n>-<4hex>` code, the live-manager picker, the
   notify route through the existing `sendMessageToXell` door) landed separately; two things it was
