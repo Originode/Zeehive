@@ -52,8 +52,14 @@ try {
   ok(fns.some((f) => f.proname === 'harness_memory_put'),
      'harness_memory_put() exists (if this fails your db is behind the ledger — npm run db:migrate)');
   ok(fns.some((f) => f.proname === 'harness_memory_get'), 'harness_memory_get() exists beside it');
-  ok(fns.every((f) => f.comment && /BY PATH/i.test(f.comment)),
+  ok(fns.length === 2 && fns.every((f) => f.comment && /BY PATH/i.test(f.comment)),
      'both are COMMENTed with the rule, so the next author finds it from psql');
+  if (fns.length < 2) {
+    // Stop here rather than crash 30 assertions deep on "function does not exist": a database behind
+    // the ledger is not a failing helper, and the difference must be readable in the first line.
+    console.log('\n  → this database is BEHIND the migration ledger (076 is not applied). Run:  npm run db:migrate');
+    throw new Error('harness_memory_put() is not in this database');
+  }
 
   // ── 1. append, then append again: siblings accumulate, nothing is lost ──
   console.log('\n── APPEND when the path is absent ──');

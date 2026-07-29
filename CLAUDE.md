@@ -130,6 +130,12 @@ docs/            specs and rationale (see the doc map)
    the next rebuild, and one of those sent zees at an exited husk for weeks.
 8. **What a zee is told is versioned like code.** The manual, the briefing and the CLI usage must
    move together (`test/cxell-cli-drift.test.mjs` fails the build if they drift).
+9. **A migration edits harness memory BY PATH, through the helper.** `harness_memory_put(harness_key,
+   path, text)` (076) replaces the entry when present, appends when absent, keeps every sibling;
+   `harness_memory_get` reads one back for an anchored edit. Never hand-roll
+   `jsonb_set(bundle,'{memory}', …)`: six migrations rebuilt that array from `memory->0` and deleted
+   a memory file out of the LIVE meta-DB — invisible on a fresh database, which is every cxell's.
+   `test/harness-memory-migrations.test.mjs` fails anything newer that tries.
 
 ## 6. Doc map — which file answers what
 
