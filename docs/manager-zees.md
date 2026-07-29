@@ -49,6 +49,35 @@ the ship gate: a ship is still refused unless the work is landed, still approved
 still performed by the queenzee from main. A manager is often the right agent to ask for one — it is
 the one holding the whole picture.
 
+## How a manager READS in the console (2026-07-29)
+
+A manager's hexagon is not a work-cell, and is no longer drawn as one. The honeycomb's worker card is
+built around git — a head sha, a source diffstat, pull/land/PR — and every one of those describes
+work a manager is structurally refused. So `web/src/hive/HiveCanvas.jsx` draws it in the **harness
+badge's** visual language instead (`drawManagerHex`, beside `drawHarnessBadge`; both seat their
+persona with the same `drawAvatarDisc`):
+
+- a **dashed** seat — the badge's "part of the grid, but not a work-cell" tell — inside the
+  prod-orange double wall that says "this one holds production";
+- the **persona disc** of the harness it wears (its avatar art, else its glyph, else ⬢);
+- `⬢ slug` on the seam over `manager · ⬡ N crew`, and the crew's **activity** (`N working · N
+  waiting`) where a worker's diffstat sits — a manager's work is its crew;
+- the same hive status pill every hexagon carries, and `🛡 read-only` where a worker's ship line is;
+- **no head sha and no diffstat, anywhere on it.**
+
+Its bloom keeps the five facets it owns (identity, branch, session, containers, machine) and swaps
+the two git ones: petal 5 is **CREW** (one status-coloured dot per worker, the colour of that
+worker's own hexagon) and petal 6 is **PROD · AGE**. Clicking either opens nothing — `diffPetal()`
+returns null for a manager, so a petal that no longer shows a diff can never open the diff viewer.
+The buttons follow the same rule (`petalVerbs`, pure and unit-tested): **pull, land and PR are
+absent** — offering them would offer a human three clicks that can only return the refusal above —
+while build, terminal, nudge, env, message, done and **ship** remain.
+
+`test/manager-hexagon.test.mjs` holds that shape: it transforms the real JSX with esbuild, imports
+it, and PAINTS the hexagon at each size against a recording 2D context, asserting what actually
+landed on the canvas (and that nothing resembling a sha or a diffstat did). `web/demo.html` seats a
+manager and its crew in the mock hive so it can be looked at without a live fleet.
+
 ## Why the refusals are structural
 
 Every limit here is enforced somewhere a persuasive agent cannot reach, because a rule that lives

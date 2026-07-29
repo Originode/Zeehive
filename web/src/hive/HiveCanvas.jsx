@@ -1217,9 +1217,11 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     ctx.fillText(st, cx, py + 0.5);
     // where a worker's ship line sits: what this manager holds in production
     if (card.prodShort) {
+      // the hex has tapered to ~60% of its width down here — ask the geometry, don't guess a fraction
+      const room = hexHalfWidthAt(size, size * 0.7) * 2 * 0.9;
       ctx.font = `${Math.max(7.5, size * 0.125)}px 'Segoe UI', sans-serif`;
       ctx.fillStyle = COL.prod;
-      ctx.fillText(fit(ctx, card.prodShort, w * 0.5), cx, cy + size * 0.7);
+      ctx.fillText(fit(ctx, card.prodShort, room), cx, cy + size * 0.7);
     }
   } else if (!full) {
     ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
