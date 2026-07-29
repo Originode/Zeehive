@@ -165,6 +165,7 @@ docs/            specs and rationale (see the doc map)
 | the role-specialised worker personas (Scout, Builder, Reviewer, …) | [docs/dev-crew.md](docs/dev-crew.md) |
 | the manager harness that runs that crew | [docs/dev-crew-lead.md](docs/dev-crew-lead.md) |
 | how a zee's db catches up to prod's schema | [docs/schema-catchup-plan.md](docs/schema-catchup-plan.md) |
+| a db chip says DRIFTED and you need to know why | [docs/schema-drift-triage.md](docs/schema-drift-triage.md) |
 | projects, manifests, deploy sites | [docs/deploy-topology-spec.md](docs/deploy-topology-spec.md) |
 | what runs where in production, and the cutover | [docker/zeehive/README.md](docker/zeehive/README.md) |
 | **why** a gate is shaped the way it is; traps already paid for | [HANDOFF.md](HANDOFF.md) — **history, not instructions** |

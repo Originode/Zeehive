@@ -8,6 +8,9 @@ const COL = {
   working: '#35c46b', idle: '#e0a53b', ready: '#5b8cff', claimed: '#9b8cff',
   awaiting: '#e0a53b', spawning: '#5b8cff', error: '#e5554e', prod: '#f0913b',
   sha: '#e0a53b', add: '#35c46b', del: '#e5554e',
+  // the manager↔crew RELATION mark: a pale steel that is in NO status palette (hive/status.js), so a
+  // marked cell can never be misread as having taken on a status of its own
+  rel: '#c8d3e8',
 };
 const HEALTH = { up: '#35c46b', building: '#e0a53b', down: '#e5554e', unknown: '#6b7688', starting: '#5b8cff' };
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff',
@@ -71,6 +74,70 @@ export const isManagerXell = (x) => x?.zee_type === 'manager';
 // payload, because the manager hexagon needs its art.
 export const wearersOf = (h) => h?.wearer_ids || h?.consumer_ids || [];   // old payloads: wearers = consumers
 export const badgedHarnesses = (harnesses = []) => (harnesses || []).filter((h) => (h?.consumer_ids || []).length > 0);
+
+// ── a manager and its CREW: the one real grouping in the honeycomb ────────────
+// seatXells already sits a manager's crew in the cells NEAREST to it, so the relationship was half
+// expressed by layout and not at all by interaction: hovering a manager told you nothing about which
+// of the cells around it were actually its own. These three pure helpers are that answer, and they
+// cost no request — `xell.manager_xell_id` already rides on the fleet payload the console polls.
+//
+// LIVE crew only, by the SAME rule the work tracker resolves a live zee with (server/src/lib/
+// work-items.js LIVE_XELL_STATUSES): 'retired' is gone and 'husk'/'error' are VACANT (lib/
+// hive-status.js classes both as vac-dirty), so no zee occupies any of them. A reaped worker lighting
+// up as though it were still there draws a crew that does not exist — worse than no highlight.
+const DEAD_XELL_STATUSES = ['retired', 'husk', 'error'];
+export const isLiveXell = (x) => !!x && !DEAD_XELL_STATUSES.includes(String(x.status || ''));
+
+// manager id → its LIVE crew, and worker id → the manager it reports to (only when that manager is
+// itself live — a husk manager cannot be "who this one reports to"). A dead manager's own hover still
+// gets a crew list: the manager row is vacant, but the workers it dispatched are real and running.
+export function crewLinks(xells = []) {
+  const byId = new Map();
+  for (const x of xells || []) if (x?.id) byId.set(x.id, x);
+  const crewOf = {};
+  const managerOf = {};
+  for (const x of xells || []) {
+    const mid = x?.manager_xell_id;
+    if (!mid || !isLiveXell(x)) continue;
+    (crewOf[mid] ||= []).push(x);
+    if (isLiveXell(byId.get(mid))) managerOf[x.id] = mid;
+  }
+  return { crewOf, managerOf };
+}
+
+// Who is RELATED to the focused (hovered or selected) xell, and HOW → Map(id → 'crew' | 'manager').
+// ONE hop, deliberately: a manager marks its crew, and a worker marks the manager it reports to
+// ("who does this one report to" is the same question asked backwards). A worker does NOT mark its
+// SIBLINGS — they are not related to it, they merely share a boss, and lighting five cells from one
+// worker's hover reads as a selection sweep rather than an answer.
+export function relatedTo(xells = [], focusId, links = null) {
+  const rel = new Map();
+  if (!focusId) return rel;
+  const focus = (xells || []).find((x) => x?.id === focusId);
+  if (!focus) return rel;
+  const l = links || crewLinks(xells);
+  if (isManagerXell(focus)) for (const w of l.crewOf[focusId] || []) rel.set(w.id, 'crew');
+  const mid = l.managerOf[focusId];
+  if (mid && mid !== focusId) rel.set(mid, 'manager');
+  return rel;
+}
+
+// A hex DIMS when the focus is elsewhere — but a RELATED hex never dims, and that is the whole
+// highlight: the focus lights its own group and the rest of the fleet recedes behind it. Pure, so the
+// decision the draw loop makes is testable without a canvas.
+export const hexDim = ({ hexId, expandedId = null, hovered = false, hoverActive = false, related = null }) =>
+  !related && ((!!expandedId && expandedId !== hexId) || (hoverActive && !hovered));
+
+// The WORD a relation mark carries. This codebase's rule is that the word is the signal and colour is
+// only reinforcement — a highlight that exists as a hue alone fails for anyone who cannot separate
+// those hues — so every relation mark says which relation it is, in words, and the long form names
+// the other end of it when there is room for it.
+export function relationTag(kind, otherSlug = null) {
+  const other = String(otherSlug || '').trim();
+  if (kind === 'crew') return { kind, glyph: '⬡', word: 'crew', long: other ? `crew of ${other}` : 'crew' };
+  if (kind === 'manager') return { kind, glyph: '⬢', word: 'manager', long: other ? `manager of ${other}` : 'manager' };
+  return null;
+}
 
 // What a manager's hexagon says, as data (pure — unit-tested; the drawing below only paints it).
 export function managerCard(x, crew = []) {
@@ -548,8 +615,9 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // crew, not as a work-cell. The avatar loader is shared with the harness badges below (one image
     // cache; a load triggers one redraw).
     const harnesses = timeline?.harnesses || [];
-    const crewOf = {};
-    for (const x of list) if (x.manager_xell_id) (crewOf[x.manager_xell_id] ||= []).push(x);
+    // LIVE crew only, both ways (crewLinks): a reaped/husk worker is counted by nobody and lights up
+    // for nobody — the same rule the work tracker resolves a live zee with.
+    const { crewOf, managerOf } = crewLinks(list);
     // WEARS it (wearer_ids), not "is a consumer of" it: a manager is a wearer but never a consumer,
     // because its hexagon IS the badge — the persona disc below is exactly the art this looks up.
     // Falling back to consumer_ids keeps an older payload (and the demo fixture) rendering.
@@ -576,19 +644,30 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     const hoverActive = !!(H.id || H.commit || H.harness);
     const isHov = (id) => id === H.id || (!!H.commit && baseOf(id) === H.commit) || hovHarnessConsumers.has(id);
 
+    // THE CREW HIGHLIGHT (ticket #24): the focused xell is the hovered hex, or — with nothing hovered
+    // — the SELECTED (bloomed) one, so a manager's crew stays marked while its flower is open. Its
+    // live crew (or, hovering a worker, the manager it reports to) is marked as RELATED: never
+    // dimmed, and drawn with the dashed tie-ring + the word, which is nothing selection uses.
+    const focusId = H.id || expandedId || null;
+    const related = relatedTo(list, focusId, { crewOf, managerOf });
+    const focus = focusId ? list.find((x) => x.id === focusId) : null;
+    const relColor = focusId ? (tById[focusId]?.color || null) : null;
+
     // honeycomb + flower, on the pan/zoom world transform
     ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
     geomRef.current.hexes = hexes;
     for (const hx of hexes) {
       if (expanded && hx.id === expanded.id) continue;     // the flower draws it
       const hovered = isHov(hx.id);
-      const dim = (expandedId && expandedId !== hx.id) || (hoverActive && !hovered);
+      const rel = related.get(hx.id) || null;
+      const dim = hexDim({ hexId: hx.id, expandedId, hovered, hoverActive, related: rel });
+      const relArgs = { related: rel, relatedTo: rel ? focus?.slug || null : null, relColor };
       if (isManagerXell(hx.x)) {
         const h = harnessOf(hx.id);
         drawManagerHex(ctx, hx, { hover: hovered, dim, crew: crewOf[hx.id] || [],
-          harness: h, img: getImg(h?.avatar_url) });
+          harness: h, img: getImg(h?.avatar_url), ...relArgs });
       } else {
-        drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines });
+        drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines, ...relArgs });
       }
     }
     geomRef.current.flower = null;
@@ -897,12 +976,77 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
 }
 
 
+// ── the RELATION mark: "related to the focus", never "also selected" ──────────
+// The manager is the thing selected; a crew member was chosen by nobody. So this mark deliberately
+// borrows NONE of selection's language — no lifted wash, no thickened status stroke, no bloom — and is
+// instead a DASHED tie-ring just outside the seat plus the WORD for the relation. That is two
+// independent signals of which only one is colour: the dash pattern says "attached to something else"
+// and the word says which relation it is, so the highlight still lands for a reader who cannot
+// separate the hues (this file's rule: the word is the signal, colour reinforces).
+//
+// `color` is the FOCUS's own trace colour where the timeline has one — the same colour its wire and
+// its commit dot are drawn in — so the mark reads as "belongs to that line", not as a new status.
+export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color = null, gap = 3, tagY = -0.62 } = {}) {
+  const tag = relationTag(kind, slug);
+  if (!tag) return null;
+  const col = color || COL.rel;
+  ctx.save();
+  hexPath(ctx, cx, cy, size + gap);
+  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = withAlpha(col, 0.95);
+  ctx.setLineDash([2, 4]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // The word rides an opaque pill INSIDE the seat (never outside it — a label in the corridor would be
+  // read as belonging to the wires). `tagY` is a PREFERENCE ORDER of rows, in fractions of the radius:
+  // a pointy-top hex narrows fast toward its vertex, so the roomiest row is not always the one that
+  // covers least, and the caller lists the rows it would rather give up in order. The first row where
+  // the whole word fits wins. A hex too small to read the card's own text keeps the dashed ring alone
+  // — still a signal that is not a colour.
+  let shown = null;
+  if (size >= 30) {
+    const pad = 10, nomPx = Math.max(7, size * 0.12);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const font = (px) => `600 ${px}px 'Segoe UI', sans-serif`;
+    const widthAt = (t, px) => { ctx.font = font(px); return ctx.measureText(t).width; };
+    const long = `${tag.glyph} ${tag.long}`, short = `${tag.glyph} ${tag.word}`;
+    let at = null;
+    for (const ty of (Array.isArray(tagY) ? tagY : [tagY])) {
+      const room = Math.max(0, hexHalfWidthAt(size, Math.abs(size * ty)) * 2 * 0.94 - pad);
+      // The long form (which names the other end) if it fits, else the bare relation, else the bare
+      // relation SHRUNK to fit. Never an ellipsis: the word IS the signal here and "⬢ manag…" is not a
+      // word — if it cannot be read whole even at the floor size, this row is not the row.
+      if (widthAt(long, nomPx) <= room) shown = long;
+      else if (widthAt(short, nomPx) <= room) shown = short;
+      else {
+        fillFont(ctx, short, room, 6.5, nomPx, font);
+        shown = ctx.measureText(short).width <= room ? short : null;
+      }
+      if (shown) { at = cy + size * ty; break; }
+    }
+    if (!shown) { ctx.restore(); return { word: null, kind: tag.kind }; }
+    const pw = ctx.measureText(shown).width + pad, ph = Math.max(10, size * 0.17);
+    ctx.beginPath();
+    ctx.roundRect(cx - pw / 2, at - ph / 2, pw, ph, ph / 2);
+    ctx.fillStyle = withAlpha('#0a0d13', 0.86);
+    ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(col, 0.85);
+    ctx.setLineDash([2, 3]); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = col;
+    ctx.fillText(shown, cx, at + 0.5);
+  }
+  ctx.restore();
+  return { word: shown, kind: tag.kind };
+}
+
 // ── compact hex: the two-half card ────────────────────────────────────────────
 // upper half: ⌂ machine + container chips (nick + health dot)
 // lower half: head sha · source diff · status pill · ship line
 // This is the WORKER (and production) card — it is built around the git state, so a MANAGER never
 // reaches it: drawManagerHex draws that one instead (no sha, no diffstat, a persona and its crew).
-function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
+// exported for the same reason drawManagerHex is: the crew highlight is a DRAWN state (there is no DOM
+// per cell), so the only honest way to assert it is to run this against a recording 2D context
+export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = null, relatedTo = null, relColor = null }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);
   // The commit head reads in the SAME colour the git graph traces this xell with — its connector
@@ -927,6 +1071,12 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     hexPath(ctx, cx, cy, size - 3);
     ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
   }
+  // the manager↔crew relation mark, painted LAST (over the card, outside the clip) so its word is not
+  // buried under the row it overlays — see drawRelationMark
+  const mark = () => (related
+    ? drawRelationMark(ctx, cx, cy, size, { kind: related, slug: relatedTo, color: relColor })
+    : null);
+
   ctx.save();
   hexPath(ctx, cx, cy, size - 2);
   ctx.clip();
@@ -934,7 +1084,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   if (size < 30) {                     // tiny: just the status dot
     ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.22), 0, Math.PI * 2);
     ctx.fillStyle = col; ctx.fill();
-    ctx.restore(); ctx.restore(); return;
+    ctx.restore(); mark(); ctx.restore(); return;
   }
 
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -1076,6 +1226,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
     ctx.fillText(fit(ctx, hiveStatusLabel(x), w * 0.6), cx, cy + size * 0.34);
   }
   ctx.restore();   // unclip
+  mark();
   ctx.restore();
 }
 
@@ -1169,7 +1320,8 @@ function drawAvatarDisc(ctx, cx, cy, r, col, { img, glyph, letter } = {}) {
 // the two things a manager can never act on: its head sha and its diffstat. In their place: the crew
 // it runs (count, and how many are working / waiting on a human) and its read-only hold on prod. The
 // prod-orange outer wall stays — that ring is the "this one holds production" tell.
-export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null, img = null }) {
+export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null, img = null,
+                                          related = null, relatedTo = null, relColor = null }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);                 // its hive status still colours it — a manager idles too
   const card = managerCard(x, crew);
@@ -1197,6 +1349,14 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
   }
 
+  // its relation mark sits OUTSIDE the prod wall (gap 6, not 3) so the two dashed rings stay two rings,
+  // and its word prefers the strip ABOVE the persona disc — only falling onto the disc's top edge on a
+  // hex too narrow up there to read the word whole (a manager IS its avatar; cover it last)
+  const mark = () => (related
+    ? drawRelationMark(ctx, cx, cy, size, { kind: related, slug: relatedTo, color: relColor,
+                                            gap: 6, tagY: [-0.78, -0.62] })
+    : null);
+
   ctx.save();
   hexPath(ctx, cx, cy, size - 2);
   ctx.clip();
@@ -1206,7 +1366,7 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.24), 0, Math.PI * 2);
     ctx.fillStyle = col; ctx.fill();
     ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha(COL.prod, 0.9); ctx.stroke();
-    ctx.restore(); ctx.restore(); return;
+    ctx.restore(); mark(); ctx.restore(); return;
   }
 
   const full = size >= 52;
@@ -1280,6 +1440,7 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     ctx.fillText(fit(ctx, `⬡ ×${card.count} · ${st}`, w * 0.7), cx, cy + size * 0.38);
   }
   ctx.restore();   // unclip
+  mark();
   ctx.restore();
 }
 
