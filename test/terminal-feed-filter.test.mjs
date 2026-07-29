@@ -72,21 +72,21 @@ ok(/return;/.test(onmsg) && onmsg.indexOf('return;') < onmsg.indexOf('term.write
 ok(/catch\s*{/.test(onmsg), 'a malformed control frame cannot kill the terminal');
 
 // ── the buttons ───────────────────────────────────────────────────────────────────────────────
+// (their LEGIBILITY — the "can't tell if it's pressed" defect — is pinned by
+//  test/terminal-feed-chips.test.mjs, which renders the real component in both states.)
 console.log('\n── the ✱ / ⚒ buttons in the terminal header ──');
 const head = jsx.slice(jsx.indexOf('<div className={`term-head'), jsx.indexOf('<div className="zeeterm-main"'));
-ok(head.includes('data-testid="feed-thinking"'), 'the header has a ✱ thinking button');
-ok(head.includes('data-testid="feed-moves"'), 'and a ⚒ moves button');
-ok(head.includes('✱ thinking') && head.includes('⚒ moves'), 'labelled with the glyphs the feed itself uses');
-ok(/setFeedFlag\('thinking'\)/.test(head) && /setFeedFlag\('moves'\)/.test(head), 'both wired to setFeedFlag');
-ok(/\{explorerZeeId && \(\s*<span className="term-filters"/.test(head),
-   'shown only on the ZEE door (a container shell has no feed to filter)');
-ok(/feed\.thinking \? '' : ' off'/.test(head) && /feed\.moves \? '' : ' off'/.test(head),
-   'each chip renders its own state (lit = shown, .off = hidden) — the same idiom as the queenzee log chips');
-ok(/feed\.live === false \? ' idle' : ''/.test(head),
-   'and says when no feed is streaming, instead of pretending the click did something');
-ok(head.includes('title={feedTitle('), 'both carry a tooltip explaining what they do');
+ok(/\{explorerZeeId && <FeedChips feed=\{feed\} onToggle=\{setFeedFlag\} \/>\}/.test(head),
+   'the header renders FeedChips on the ZEE door only (a container shell has no feed to filter)');
+const chips = read('web/src/FeedChips.jsx');
+ok(chips.includes('data-testid={`feed-${key}`}'), 'the chips are individually addressable');
+ok(chips.includes("chip('thinking', '✱'") && chips.includes("chip('moves', '⚒'"),
+   'a ✱ thinking chip and a ⚒ moves chip, labelled with the glyphs the feed itself uses');
+ok(/onToggle\(key\)/.test(chips), 'both wired back to the terminal through onToggle');
+ok(!/import .*css|@xterm/.test(chips),
+   'and the component stays side-effect free, so a test can render it (that is how the legibility bug is now caught)');
 
-const fn = jsx.slice(jsx.indexOf('const setFeedFlag'), jsx.indexOf('const feedTitle'));
+const fn = jsx.slice(jsx.indexOf('const setFeedFlag'), jsx.indexOf('const toggleExplorer'));
 ok(/t: 'v'/.test(fn), "the toggle sends a {t:'v'} view frame");
 ok(!/t: 'i'/.test(fn) && !/sendInput\(/.test(fn),
    'and NEVER a keystroke — the pane belongs to the interactive session once the turn ends');

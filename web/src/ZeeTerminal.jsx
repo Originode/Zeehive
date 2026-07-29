@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import FileExplorer from './FileExplorer.jsx';
+import FeedChips from './FeedChips.jsx';
 
 // A path-ish token a zee tends to "present" in the terminal: web/src/App.jsx, ./server/x.js,
 // /work/repo/…, package.json. Used to offer "show file" on a selection and to strip a pasted
@@ -223,10 +224,6 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'v', thinking: next.thinking, moves: next.moves }));
     termRef.current?.focus();
   };
-  const feedTitle = (on, what) =>
-    `${on ? 'Hide' : 'Show'} ${what} in the zee's live feed`
-    + (feed.live === false ? ' — no feed is streaming right now, so this is the view the next one starts in' : ' (the feed redraws)');
-
   const toggleExplorer = () => {
     const term = termRef.current;
     const p = pathFromSelection(term?.getSelection?.() || '');
@@ -248,16 +245,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
             <span className={`tstat t-${status}`}>{status}</span>
           </span>
           {/* Only the zee door has a feed to filter — a container shell is just a shell. */}
-          {explorerZeeId && (
-            <span className="term-filters" data-testid="feed-filters">
-              <button className={`term-chip${feed.thinking ? '' : ' off'}${feed.live === false ? ' idle' : ''}`}
-                      data-testid="feed-thinking" onClick={() => setFeedFlag('thinking')}
-                      title={feedTitle(feed.thinking, "the zee's thinking (the ✱ lines)")}>✱ thinking</button>
-              <button className={`term-chip${feed.moves ? '' : ' off'}${feed.live === false ? ' idle' : ''}`}
-                      data-testid="feed-moves" onClick={() => setFeedFlag('moves')}
-                      title={feedTitle(feed.moves, 'the detailed moves — every ⚒ tool call and its ↳ result')}>⚒ moves</button>
-            </span>
-          )}
+          {explorerZeeId && <FeedChips feed={feed} onToggle={setFeedFlag} />}
           <span>
             <button className={`term-x${clipOpen ? ' on' : ''}${clip && !clipOpen ? ' dot' : ''}`} data-testid="clip-toggle"
                     onClick={() => setClipOpen((v) => !v)}

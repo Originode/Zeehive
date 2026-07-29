@@ -1438,11 +1438,30 @@ a.cbox:hover { border-color: var(--accent); }
 .term-x.on { color: var(--accent); }
 
 /* ── live-feed chips in the zee terminal header (✱ thinking · ⚒ moves) ──
-   Same chip idiom as the queenzee log's scope filters (.term-chip/.off): lit = shown, dimmed =
-   hidden. `.idle` says the cage has no feed streaming right now, so the click sets the view the
-   NEXT feed opens in rather than repainting something — dashed, not disabled (it still records). */
-.zeeterm .term-filters { flex: 0 0 auto; margin-left: auto; }
-.term-chip.idle { border-style: dashed; }
+   These first shipped as bare .term-chips and came straight back as "it's too difficult to see if
+   the buttons are pressed or not" — correct: .term-chip carries no COLOUR (the queenzee-log chips
+   it was copied from always pass an inline per-scope colour), so they inherited the default button
+   colour on a dark panel, and the only state signal was one opacity step.
+   So the state is carried three independent ways — the WORD (shown/hidden), the colour, and a
+   strike through a hidden label — and the word alone is enough on a bad screen. */
+.feedchips { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+.feedchip { display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  font-family: 'Cascadia Code', monospace; font-size: 11px; line-height: 1.7;
+  padding: 0 3px 0 7px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--panel2); color: var(--muted); }
+.feedchip:hover { border-color: var(--accent); }
+.feedchip .fc-state { font-size: 10px; letter-spacing: .04em; padding: 0 6px; border-radius: 8px;
+  border: 1px solid transparent; }
+/* SHOWN: accent throughout, with the state word reversed out — reads as "lit / pressed in". */
+.feedchip.on { color: var(--accent); border-color: var(--accent); background: rgba(91, 140, 255, .14); }
+.feedchip.on .fc-state { background: var(--accent); color: #0d1017; }
+/* HIDDEN: muted, flat, the label struck through — legible as "off" with no colour at all. */
+.feedchip.off { color: var(--muted); background: transparent; }
+.feedchip.off .fc-label { text-decoration: line-through; text-decoration-thickness: 1px; }
+.feedchip.off .fc-state { border-color: var(--line); }
+/* No feed streaming: said in words, because otherwise a click lands on nothing visible. */
+.fc-idle { font-size: 10px; color: var(--muted); border: 1px dashed var(--line);
+  border-radius: 8px; padding: 0 6px; }
 
 .zeeterm-foot {
   display: flex; align-items: center; gap: 8px; padding: 8px 10px;
