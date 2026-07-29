@@ -47,6 +47,12 @@ New Project → Clone from GitHub. Staged, each step reversible:
    injected from `CXELL_API_BASE`. Container self-ship is `scripts/self-ship-container.sh`
    (sync → build → sibling `docker:cli` recreate) — selected per-site via the container row's
    `build_script`, so host and container eras coexist as data.
+   ⚠ **Harness FILES are not in the image** (and must not be): `harnesses/<key>/` is read from the
+   ZEEHIVE PROJECT's clone (`project.repo_root`, i.e. `/repos/Zeehive`), which is why the Zeehive
+   project must be onboarded and the repos volume readable before a manager zee gets its manual.
+   Boot logs `[harness] <key>: FOLDER MISSING …` and `GET /api/harnesses` carries
+   `files_missing`/`bundle_empty` when it is not (fixed 2026-07-29 — before that it was silent and
+   every file-backed harness was empty in the deployed queenzee).
 3. **Parallel run** — the container (compose profile `experimental`, :4701) against the NEW
    ERA'S OWN meta-DB (`meta-db` service, volume `zeehive_meta_data`) — which is not a throwaway:
    it is the database the new instance keeps forever. Decided 2026-07-20: NOTHING is migrated

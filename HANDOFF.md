@@ -347,6 +347,28 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   payload — the manager hexagon reads its art from it — but `badgedHarnesses()` seats no cell for it
   and `Connectors` routes no wire. Workers are unchanged (in both lists).
   Test: `node test/harness-manager-cell.test.mjs`.
+- **A file-backed harness lives in the ZEEHIVE PROJECT's repo, not in the server image**
+  (2026-07-29, ticket #1 — "manager zee has no manual at all"). `harness.dir` ('harnesses/manager')
+  is relative to `project.repo_root` (the clone self-onboard registers), NOT to `config.repoRoot`,
+  which is only where the running server's code sits. On a checkout they are the same folder — which
+  is why every test passed while the DEPLOYED queenzee shipped manager zees with an EMPTY harness:
+  `Dockerfile.server` copies `server/ scripts/ db/ hooks/ skill/` and deliberately **not**
+  `harnesses/` (one copy of the files, in the repo the DB row projects — same reasoning as the single
+  copy of `scripts/zee`), so `/app` had no harness folders and `refreshHarnesses()` kept the empty
+  seed bundle. `GET /api/harnesses/manager/full` returned `""` for persona, summary, glyph, and no
+  skills or memory at all. Fixed in `lib/harness.js`: ONE resolution (`harnessRoots()` /
+  `harnessBase()` — project repo roots first, self project first, `config.repoRoot` always last and
+  never absent) shared by `loadHarnessDir()`, its hash re-read, `dirHeadCommit()`, the avatar
+  (`harnessAvatarFile()`, which `GET /api/harnesses/:key/avatar` now calls) and the read models. A
+  root only wins if the folder is actually there, so a stale `repo_root` falls through instead of
+  blanking a harness. **Do NOT "fix" this by COPYing `harnesses/` into the image** — a second copy
+  drifts from the repo the row claims to project.
+  And it is no longer SILENT: an unreadable folder still keeps its last good bundle, but logs
+  `FOLDER MISSING` (queenzee log + stdout) naming the key, the roots searched and how many live
+  xells wear it, and `GET /api/harnesses` / `…/full` carry `files_missing` + `bundle_empty` so a
+  harness that briefs a zee with nothing is visible instead of looking healthy.
+  Test: `node test/harness-repo-root.test.mjs` (reproduces the container: a `config.repoRoot` with
+  no `harnesses/` + a project `repo_root` that has them).
 - Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
   messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
   over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
