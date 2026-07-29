@@ -264,6 +264,15 @@ try {
   ok((await S.selfHarnessUpdate(mgr, newKey, { parent: 'dev-base' })).harness.parent === 'dev-base',
      'and so is any global WORKER harness — that is the whole point of the verb');
 
+  // disabling: it leaves every list (they are all `WHERE enabled`), so the answer has to say where it went
+  const off = await S.selfHarnessUpdate(mgr, newKey, { enabled: false });
+  ok(off.ok === true && /DISABLED/.test(off.message) && /--enabled on/.test(off.message),
+     'disabling a persona says it has left the list and how to revive it (it is not deleted)');
+  ok(!(await S.selfHarnessList(mgr)).harnesses.some((h) => h.key === newKey),
+     'and it really is gone from the list');
+  ok((await S.selfHarnessGet(mgr, newKey)).ok === true, 'while still readable by name');
+  ok((await S.selfHarnessUpdate(mgr, newKey, { enabled: true })).harness.enabled === true, 'and revivable');
+
   // deleting one a live xell is wearing
   refused(await S.selfHarnessDelete(mgr, newKey), new RegExp(w1.slug),
           'deleting a harness a LIVE xell is wearing is refused, and names the xell');

@@ -1609,7 +1609,11 @@ export async function selfHarnessUpdate(xell, key, body = {}) {
   return {
     ok: true, harness: managerHarnessView(saved), scope: 'project',
     message: `Saved "${saved.key}". Every LIVE zee wearing it (or inheriting it) has had its persona `
-      + 'files rewritten — an edit reaches the crew that is already running, not only the next dispatch.',
+      + 'files rewritten — an edit reaches the crew that is already running, not only the next dispatch.'
+      // A disabled harness drops out of every list (they are all `WHERE enabled`), so say where it went
+      // rather than let a manager conclude it was deleted.
+      + (saved.enabled ? '' : ` NOTE: it is DISABLED, so it no longer shows in \`zee harness\` and no new `
+        + `dispatch can attach it. Read or revive it by name: \`zee harness ${saved.key} --enabled on\`.`),
   };
 }
 
