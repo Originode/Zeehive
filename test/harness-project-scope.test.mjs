@@ -25,7 +25,11 @@
 //
 // No agents are spawned and no containers are touched. Everything it creates is removed in a finally.
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { transformSync } from 'esbuild';
 
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
@@ -47,7 +51,18 @@ const P2 = { name: `zt-hscope-b-${tag}` };      // somebody else's project
 const keys = { mine: `zt-own-${tag}`, theirs: `zt-other-${tag}`, global: `zt-global-${tag}`,
                mgr: `zt-mgrpersona-${tag}` };
 
+// The console components are .jsx, so compile them to a temp .mjs and import that — same trick as
+// harness-authoring-ui. The build files are removed in the finally with everything else.
+const compiled = [];
+function compile(rel, name) {
+  const file = join(dirname(rel), `.${name}.test-build.mjs`);
+  writeFileSync(file, transformSync(readFileSync(rel, 'utf8'), { loader: 'jsx', format: 'esm', jsx: 'transform' }).code);
+  compiled.push(file);
+  return `file://${process.cwd()}/${file}`;
+}
+
 async function cleanup() {
+  for (const f of compiled) rmSync(f, { force: true });
   for (const k of Object.values(keys)) await q(`DELETE FROM harness WHERE key=$1`, [k]).catch(() => {});
   await q(`DELETE FROM harness WHERE key LIKE $1`, [`zt-new-${tag}%`]).catch(() => {});
   for (const p of [P1, P2]) if (p.id) await q(`DELETE FROM project WHERE id=$1`, [p.id]).catch(() => {});
@@ -316,6 +331,40 @@ try {
   const cli = readFileSync('scripts/zee', 'utf8');
   ok(/case 'harness':/.test(cli) && /zee harness/.test(cli),
      'the cxell CLI carries the verb (usage + case — cxell-cli-drift holds them together)');
+
+  // ── the CONSOLE: it SAYS the scope, and offers no other project's persona ───
+  // The real components, compiled and rendered (the trick harness-authoring-ui/harness-empty-visible
+  // use), because "the picker does not offer it" is a rendering claim.
+  console.log('\n── the console shows scope, and offers no other project\'s harness ──');
+  const HM = await import(compile('web/src/HarnessManager.jsx', 'hmscope'));
+  const mineRow = renderToStaticMarkup(React.createElement(HM.HarnessRow,
+    { h: { key: keys.mine, label: 'ZT Mine', scope: 'project', project_name: P1.name, skill_count: 1, zee_type: 'worker' } }));
+  ok(mineRow.includes(P1.name) && /harness-scope-/.test(mineRow),
+     "a project-scoped row in the (unfiltered) harness manager names the project that owns it");
+  const globalRow = renderToStaticMarkup(React.createElement(HM.HarnessRow,
+    { h: { key: 'zee-base', label: 'Zee Base', scope: 'global', project_name: null, skill_count: 2, zee_type: 'worker' } }));
+  ok(!/harness-scope-/.test(globalRow), 'and a system-wide row carries no scope chip — global is the default, not a label');
+
+  const catalogue = [
+    { key: 'zee-base', label: 'Zee Base', zee_type: 'worker', project_id: null, scope: 'global' },
+    { key: 'manager', label: 'Manager', zee_type: 'manager', project_id: null, scope: 'global' },
+    { key: keys.mine, label: 'Mine', zee_type: 'worker', project_id: P1.id, scope: 'project' },
+    { key: keys.theirs, label: 'Theirs', zee_type: 'worker', project_id: 'other-project', scope: 'project' },
+  ];
+  const offered = HM.parentOptions(catalogue, { key: newKey, zee_type: 'worker', project_id: P1.id }).map((h) => h.key);
+  ok(offered.includes('zee-base') && offered.includes(keys.mine),
+     `the parent picker offers the global and own-project worker harnesses (${offered.join(', ')})`);
+  ok(!offered.includes(keys.theirs), "and NEVER another project's — the save and the DB would refuse it");
+  ok(!offered.includes('manager'), 'nor a manager persona (054, unchanged)');
+
+  const disp = readFileSync('web/src/Dispatch.jsx', 'utf8');
+  const setup = readFileSync('web/src/ProjectSetup.jsx', 'utf8');
+  ok(/getHarnesses\(manager \? 'manager' : 'worker', projectId\)/.test(disp),
+     'the dispatch composer asks for ITS PROJECT\'S list, so a foreign persona is never a button');
+  ok(/getHarnesses\('worker', project\.id\)/.test(setup),
+     "and so does the spawn template's default-harness picker");
+  ok(/scope === 'project'/.test(disp) && /scope === 'project'/.test(setup),
+     'and both mark a project-scoped persona as one');
 } finally {
   await cleanup();
   await pool.end().catch(() => {});

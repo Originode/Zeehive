@@ -61,9 +61,14 @@ export async function getDispatchModels(provider = 'claude') {
 //
 // `zeeType` narrows the list to what a xell of that TYPE may actually wear (054): a harness carries
 // its type's manual, so offering a manager persona in a worker picker would only produce a refusal
-// at assign time. Omit it in the harness MANAGER, which edits every persona regardless of type.
-export async function getHarnesses(zeeType = null) {
-  const r = await fetch(`/api/harnesses${zeeType ? `?zee_type=${encodeURIComponent(zeeType)}` : ''}`);
+// at assign time. `projectId` narrows it the same way on the SCOPE axis (084): the system-wide
+// harnesses PLUS that project's own, and never another project's — so every picker bound to a project
+// must pass it, or it offers a choice the assign path (and the DB) would then refuse. Omit both in the
+// harness MANAGER, which edits every persona and says which scope each one is.
+export async function getHarnesses(zeeType = null, projectId = null) {
+  const qs = [zeeType ? `zee_type=${encodeURIComponent(zeeType)}` : null,
+              projectId ? `project=${encodeURIComponent(projectId)}` : null].filter(Boolean).join('&');
+  const r = await fetch(`/api/harnesses${qs ? `?${qs}` : ''}`);
   return r.ok ? r.json() : [];
 }
 // Assign/switch a xell's harness (a human action). `harness` is a key/id, or null to clear to core.

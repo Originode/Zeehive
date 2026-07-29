@@ -1273,6 +1273,10 @@ a.cbox:hover { border-color: var(--accent); }
    with a blank persona unnoticed. The chip's WORDS are the signal (see web/src/harnessHealth.js);
    these rules are reinforcement, never the only cue. */
 .hm-warn { font-size: 10px; font-weight: 700; color: var(--del, #e5554e); white-space: nowrap; }
+/* SCOPE chip on a harness row (084): a project-scoped persona must not look like a shared one. */
+.hm-scope { font-size: 10px; color: var(--muted); border: 1px solid var(--line, #333); border-radius: 3px;
+            padding: 0 3px; margin-left: 4px; white-space: nowrap; max-width: 90px; overflow: hidden;
+            text-overflow: ellipsis; }
 .hm-item.hm-hollow { border-color: rgba(229,85,78,.45); background: rgba(229,85,78,.08); }
 .hm-item.hm-hollow .hm-name { color: #ff9a94; }
 .hm-empty { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; border-radius: 8px;
