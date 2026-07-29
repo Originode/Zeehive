@@ -95,6 +95,14 @@ ok(!leaked.length, `Gantt.jsx hardcodes no status key${leaked.length ? ` (found:
 ok(/statuses \|\| \[\]\)\.find\(\(s\) => s\.key === key\)\?\.terminal|\.terminal/.test(gcode),
    '"overdue" asks the vocabulary whether the status is terminal — a finished item cannot be late');
 
+// ── 4b. the two rules the audit added ──
+ok(/dragged\.current/.test(gcode) && /if \(!dragged\.current\) return;/.test(gcode),
+   'a gesture that never MOVED cannot write (belt one against the click-reschedules-it defect)');
+ok(/shiftBy/.test(scale) && !/snapDate/.test(scale),
+   'the drag quantises the MOVEMENT (shiftBy); the absolute-date snap that caused the defect is gone');
+ok(/MAX_SPAN_DAYS/.test(scale) && /clamped/.test(gcode),
+   'the window is capped by a NAMED constant and the chart announces the cap');
+
 // ── 5. dialogs, drawer, live ──
 ok(/import\s*\{[^}]*showConfirm[^}]*\}\s*from\s*['"]\.\.\/Dialog\.jsx['"]/.test(gantt),
    'removing a dependency asks through Dialog.jsx (showConfirm), imported where it is called');
@@ -134,10 +142,37 @@ const D = (y, m, d) => new Date(y, m - 1, d);
   ok(ts.barSpan(D(2026, 7, 20), null, w.start, 10).open === true, 'a row with no due date draws open-ended, not guessed');
   ok(ts.barSpan(null, null, w.start, 10) === null, 'a row with no dates at all draws NO bar');
 }
-// the snap, per zoom
-ok(ts.dayKey(ts.snapDate(D(2026, 7, 29), 'day')) === '2026-07-29', 'day zoom snaps to the day');
-ok(ts.snapDate(D(2026, 7, 29), 'week').getDay() === 1, 'week zoom snaps to a Monday');
-ok(ts.dayKey(ts.snapDate(D(2026, 7, 29), 'month')) === '2026-08-01', 'month zoom snaps to the nearest 1st');
+// ── THE ZERO-MOVEMENT RULE — the defect this feature shipped with, pinned at every zoom ──────
+// A bar starting on a Wednesday used to snap to Monday even when the delta was ZERO, so a plain
+// CLICK on a bar (the commonest gesture on the tab) silently rescheduled it and then opened the
+// drawer showing the moved dates as if a human had set them. dragDates now quantises the MOVEMENT,
+// so a 0px gesture is an exact identity — asserted for every zoom × every mode × three bar shapes,
+// because "it is fine at day zoom" was exactly how it hid.
+{
+  let bad = [];
+  for (const zoom of ['day', 'week', 'month']) {
+    for (const mode of [ts.MOVE, ts.START, ts.END]) {
+      for (const [s0, e0] of [[D(2026, 7, 22), D(2026, 7, 24)],   // mid-week, mid-month
+                              [D(2026, 1, 31), D(2026, 3, 15)],   // a month-end start
+                              [D(2026, 7, 20), D(2026, 7, 20)]]) { // a one-day bar
+        const r = ts.dragDates({ mode, start: s0, end: e0 }, 0, zoom);
+        if (r.starts_on !== ts.dayKey(s0) || r.due_on !== ts.dayKey(e0)) bad.push(`${zoom}/${mode} ${ts.dayKey(s0)}→${r.starts_on}`);
+      }
+    }
+  }
+  ok(!bad.length, `a 0px gesture returns the ORIGINAL dates at every zoom and mode${bad.length ? ` — ${bad.join(', ')}` : ' (27 combinations)'}`);
+}
+// and a drag SHORTER than the zoom's unit is likewise a no-op, rather than a jump to the grid
+ok(ts.dragDates({ mode: ts.MOVE, start: D(2026, 7, 22), end: D(2026, 7, 24) }, 3, 'week').starts_on === '2026-07-22',
+   'a 3-day drag at WEEK zoom does not move the bar (under half a unit)');
+ok(ts.dragDates({ mode: ts.MOVE, start: D(2026, 7, 22), end: D(2026, 7, 24) }, 4, 'week').starts_on === '2026-07-29',
+   'a 4-day drag at week zoom moves it exactly ONE week, keeping its weekday');
+ok(ts.dragDates({ mode: ts.MOVE, start: D(2026, 7, 22), end: D(2026, 7, 24) }, 10, 'month').starts_on === '2026-07-22',
+   'a 10-day drag at MONTH zoom does not move the bar');
+ok(ts.dragDates({ mode: ts.MOVE, start: D(2026, 7, 22), end: D(2026, 7, 24) }, 20, 'month').starts_on === '2026-08-22',
+   'a 20-day drag at month zoom moves it exactly one month, keeping its day-of-month');
+ok(ts.dayKey(ts.addMonthsKeepingDay(D(2026, 1, 31), 1)) === '2026-02-28',
+   'a month shift out of a long month is clamped into the short one (Jan 31 → Feb 28), never overflowed');
 // THE DRAG — the gesture as arithmetic, so the ghost and the PATCH cannot disagree.
 {
   const g = { mode: ts.MOVE, start: D(2026, 7, 20), end: D(2026, 7, 24) };
@@ -153,6 +188,41 @@ ok(ts.dayKey(ts.snapDate(D(2026, 7, 29), 'month')) === '2026-08-01', 'month zoom
   const inside = ts.dragDates({ ...g, mode: ts.END }, -30, 'day');
   ok(inside.due_on === '2026-07-20', 'an edge dragged past the other one stops there — a bar is never inside out');
   ok(ts.daysAt(95, 30) === 3, 'a pixel delta becomes a WHOLE number of days');
+}
+// ── THE CLAMP — one accepted-but-absurd date used to ask for three million DOM nodes ─────────
+{
+  const p1 = (x) => { const m = /^(\d{1,4})-(\d{2})-(\d{2})/.exec(x); return new Date(+m[1], +m[2] - 1, +m[3]); };
+  const wild = ts.windowFor([p1('0001-01-01'), p1('9999-12-31')], { today: D(2026, 7, 29), zoom: 'day' });
+  ok(wild.days <= ts.MAX_SPAN_DAYS + 31, `an 8000-year span is clamped to ${wild.days} days (cap ${ts.MAX_SPAN_DAYS})`);
+  ok(wild.clamped && wild.clamped.requested > 2000000, 'and the clamp REPORTS what it refused to draw, so the UI can say so');
+  ok(ts.diffDays(wild.start, D(2026, 7, 29)) >= 0 && ts.diffDays(D(2026, 7, 29), wild.end) > 0,
+     'the clamped window still contains TODAY — the work a human is doing is what they need to see');
+  const typo = ts.windowFor([p1('2026-07-20'), p1('2206-08-01')], { today: D(2026, 7, 29), zoom: 'day' });
+  ok(typo.clamped && typo.days <= ts.MAX_SPAN_DAYS + 31, 'a mistyped year (2206 for 2026) clamps too — the realistic case');
+  const b = ts.bands(wild.start, wild.end, 'day', 30);
+  ok(b.minor.length + b.weekends.length < 1600, `the clamped axis is ${b.minor.length + b.weekends.length} nodes, not millions`);
+  const direct = ts.bands(new Date(1, 0, 1), new Date(9999, 11, 31), 'day', 30);
+  ok(direct.minor.length <= ts.MAX_SPAN_DAYS, 'and bands() caps itself even when handed an unclamped window directly (belt + braces)');
+  ok(ts.windowFor([D(2026, 7, 20), D(2026, 8, 5)], { today: D(2026, 7, 29), zoom: 'day' }).clamped === null,
+     'an ordinary plan is NOT clamped and says so');
+}
+// a bar reaching past the clamped window is CUT, not laid into the scroller at 657,000px
+{
+  ok(ts.clampSpan({ x: -50, w: 657490 }, 1000).w === 1000, 'a bar wider than the canvas is cut to it');
+  const cut = ts.clampSpan({ x: -50, w: 657490 }, 1000);
+  ok(cut.cutLeft && cut.cutRight, 'and marked on both ends, so a human sees it continues');
+  ok(ts.clampSpan({ x: 5000, w: 100 }, 1000) === null,
+     'a bar entirely outside the window draws NOTHING — the row keeps its name and the clamp notice counts it');
+  ok(ts.clampSpan({ x: 20, w: 50 }, 1000).cutRight === false, 'an ordinary bar is untouched');
+  ok(ts.clampSpan(null, 1000) === null, 'and an undated row is still no bar at all');
+}
+// an INVERTED row (due before start — the API accepts it) spans the contradiction, it does not hide
+{
+  const w = ts.windowFor([D(2026, 7, 20), D(2026, 8, 10)], { today: D(2026, 7, 29), zoom: 'day' });
+  const inv = ts.barSpan(D(2026, 8, 10), D(2026, 7, 20), w.start, 30);
+  ok(inv.inverted === true, 'an inverted row is FLAGGED');
+  ok(inv.w === 22 * 30, `and drawn across both dates (${inv.w}px = 22 days), not collapsed to the 6px minimum`);
+  ok(ts.barSpan(D(2026, 7, 20), D(2026, 7, 20), w.start, 30).inverted === false, 'an honest one-day bar is not');
 }
 // the axis
 {
@@ -202,7 +272,7 @@ const render = async () => {
         const React = require('react');
         const { renderToString } = require('react-dom/server');
         const G = require('./Gantt.jsx');
-        module.exports = { React, renderToString, Gantt: G.default, GanttChart: G.GanttChart, crumbOf: G.crumbOf };
+        module.exports = { React, renderToString, Gantt: G.default, GanttChart: G.GanttChart, crumbOf: G.crumbOf, hiddenTitle: G.hiddenTitle };
       `,
       resolveDir: resolve(here, '..', 'web/src/work'),
       loader: 'js',
@@ -214,7 +284,7 @@ const render = async () => {
 };
 
 try {
-  const { React, renderToString, Gantt, GanttChart, crumbOf } = await render();
+  const { React, renderToString, Gantt, GanttChart, crumbOf, hiddenTitle } = await render();
   globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '{"rows":[]}' });
   const el = (C, props) => React.createElement(C, props);
   const today = D(2026, 7, 29);
@@ -249,6 +319,63 @@ try {
 
   ok(crumbOf(ROWS[3], new Map(ROWS.map((r) => [r.id, r]))).join(' › ') === 'Project › Activity',
      'the tooltip breadcrumb is built from the rows already in hand — no second request');
+
+  // ── the four UI fixes, rendered ───────────────────────────────────────────────────────────
+  const R = (o) => ({ parent_id: null, depth: 0, kind: 'task', status: serverKeys[0], progress: 0,
+                      rolled_progress: 0, deps: [], unscheduled: false, ...o });
+  const count = (h, re) => (h.match(re) || []).length;
+
+  // a PARENT that states its OWN dates may be dragged (it used to have no handles and no explanation)
+  {
+    const h = renderToString(el(GanttChart, { today, statuses, rows: [
+      R({ id: 'a', kind: 'activity', title: 'own dates', starts_on: '2026-07-20', due_on: '2026-08-05',
+          computed_start: '2026-07-20', computed_end: '2026-08-05' }),
+      R({ id: 'k', parent_id: 'a', depth: 1, title: 'child', starts_on: '2026-07-22', due_on: '2026-07-24',
+          computed_start: '2026-07-22', computed_end: '2026-07-24' }),
+      R({ id: 'b', kind: 'activity', title: 'rolled up', computed_start: '2026-07-20', computed_end: '2026-08-05' }),
+      R({ id: 'c', parent_id: 'b', depth: 1, title: 'child2', starts_on: '2026-07-20', due_on: '2026-08-05',
+          computed_start: '2026-07-20', computed_end: '2026-08-05' }),
+    ] }));
+    ok(count(h, /work-ghandle/g) === 6, `a parent with its OWN dates gets drag handles; one with only rolled-up dates does not (${count(h, /work-ghandle/g) / 2} of 4 rows draggable)`);
+    ok(count(h, /class="work-gsum/g) === 2, 'both parents still draw as summary BRACKETS — draggability is about ownership, not shape');
+  }
+  // an undrawable dependency SAYS something
+  {
+    const h = renderToString(el(GanttChart, { today, statuses, unscheduledCount: 1, rows: [
+      R({ id: 'u', title: 'undated blocker', computed_start: null, computed_end: null, unscheduled: true }),
+      R({ id: 'b', title: 'blocked', starts_on: '2026-08-01', due_on: '2026-08-05',
+          computed_start: '2026-08-01', computed_end: '2026-08-05', deps: ['u'] }),
+      R({ id: 'c', title: 'blocked from outside', starts_on: '2026-08-01', due_on: '2026-08-05',
+          computed_start: '2026-08-01', computed_end: '2026-08-05', deps: ['gone'] }),
+    ] }));
+    ok(count(h, /work-gdepx/g) === 2, `each undrawable dependency is marked on the successor (${count(h, /work-gdepx/g)} of 2)`);
+    ok(/has no dates yet/.test(h) && /outside the scope/.test(h), 'and the marker says WHY it cannot be drawn');
+    ok(hiddenTitle([{ title: 'x', why: 'has no dates yet' }]).startsWith('waits for 1 item'),
+       'the marker and the tooltip describe it with the SAME sentence (one function)');
+  }
+  // an inverted row is painted as inverted
+  {
+    const h = renderToString(el(GanttChart, { today, statuses, rows: [
+      R({ id: 'i', title: 'inverted', starts_on: '2026-08-10', due_on: '2026-07-20',
+          computed_start: '2026-08-10', computed_end: '2026-07-20' })] }));
+    ok(/work-gbar[^"]*inverted/.test(h), 'an inverted row carries the inverted class');
+    const m = /data-gbar="i"[^>]*style="left:([\d.]+)px;width:([\d.]+)px"/.exec(h);
+    ok(m && Number(m[2]) > 6, `and spans the contradiction (${m ? m[2] : '?'}px), instead of the 6px stub that hid it`);
+  }
+  // the clamp is ANNOUNCED, not silent
+  {
+    const h = renderToString(el(GanttChart, { today, statuses, rows: [
+      R({ id: 'w', title: 'typo', starts_on: '2026-07-20', due_on: '2206-08-01',
+          computed_start: '2026-07-20', computed_end: '2206-08-01' })] }));
+    ok(/work-gclamp/.test(h), 'a plan too long to draw shows the clamp notice');
+    const widest = Math.max(...[...h.matchAll(/data-gbar="[^"]*"[^>]*style="left:[\d.]+px;width:([\d.]+)px"/g)].map((m) => Number(m[1])));
+    ok(widest <= 40000, `and no bar is laid into the scroller wider than the canvas (widest ${widest}px, not 657,490)`);
+    ok(/work-gcut/.test(h), 'the cut end is marked, so the bar does not pretend to end there');
+    ok(/mistyped year/.test(h) && /days/.test(h), 'and tells the human what to do about it');
+    ok(count(h, /work-gmin/g) < 1600, `while the axis stays at ${count(h, /work-gmin/g)} cells`);
+    ok(!/work-gclamp/.test(renderToString(el(GanttChart, { rows: ROWS, statuses, today }))),
+       'an ordinary plan shows no notice');
+  }
 } catch (e) {
   ok(false, `the timeline threw while rendering — ${String(e.message).split('\n')[0]}`);
 }

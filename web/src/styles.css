@@ -1970,6 +1970,19 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-garrow.on .work-garrow-hit { pointer-events: stroke; }
 .work-garrow-drawing { fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 4 3; }
 
+/* the clamp notice, an undrawable dependency, and a row whose dates contradict each other —
+   three things the chart used to pass over in silence */
+.work-gclamp { border: 1px solid var(--building); border-radius: 8px; padding: 6px 10px;
+  margin-bottom: 8px; line-height: 1.5; }
+.work-gcut { position: absolute; top: 0; bottom: 0; width: 4px; background: var(--building); z-index: 3; }
+.work-gcut.l { left: 0; border-radius: 4px 0 0 4px; } .work-gcut.r { right: 0; border-radius: 0 4px 4px 0; }
+.work-gdepx { position: absolute; top: 50%; transform: translateY(-50%); color: var(--building);
+  font-size: 13px; font-style: normal; z-index: 3; cursor: help; }
+.work-gbar.inverted, .work-gsum.inverted { outline: 1px dashed var(--down); outline-offset: 1px; }
+.work-gbar.inverted .work-gfill-bg, .work-gsum.inverted .work-gfill-bg { opacity: .5;
+  background-image: repeating-linear-gradient(45deg, var(--down) 0 3px, transparent 3px 7px); }
+.work-gbar.inverted .work-gfill, .work-gsum.inverted .work-gfill { display: none; }
+
 .work-gtip { position: fixed; z-index: 90; max-width: 280px; background: var(--panel2);
   border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font-size: 12px;
   box-shadow: 0 10px 26px rgba(0,0,0,.55); pointer-events: none; display: flex; flex-direction: column; gap: 3px; }

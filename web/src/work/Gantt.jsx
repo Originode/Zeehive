@@ -6,7 +6,7 @@ import {
 } from './workApi.js';
 import { Breadcrumb, ErrLine, KindGlyph, StatusDot, ZeeChip, parseDay, statusLabel } from './bits.jsx';
 import {
-  END, LINK, MOVE, START, ZOOMS, bands, barSpan, dayKey, daysAt, diffDays, dragDates,
+  END, LINK, MOVE, START, ZOOMS, bands, barSpan, clampSpan, dayKey, daysAt, diffDays, dragDates,
   scheduleWindow, startOfDay, windowFor, xOf, zoomOf,
 } from './timescale.js';
 import WorkItemDrawer from './WorkItemDrawer.jsx';
@@ -29,10 +29,12 @@ import WorkItemDrawer from './WorkItemDrawer.jsx';
 //    under the chart with an explicit "schedule" action, and that action is the only place in the
 //    console that proposes dates (today → today + estimate, or one day when there is no estimate).
 //
-// 3. A SUMMARY ROW IS A BRACKET, NOT A BAR — and it cannot be dragged. A parent's dates are its
-//    children's; dragging it would write dates that contradict the tree underneath. So a row is
-//    draggable only when it carries BOTH of its OWN dates, and the tooltip says so rather than
-//    leaving a human to discover a dead handle.
+// 3. A SUMMARY ROW IS A BRACKET, NOT A BAR — because a parent's dates are usually its CHILDREN'S,
+//    and a solid bar over rolled-up dates reads like a commitment nobody made. What decides
+//    DRAGGABILITY is not the shape but the ownership: a row can be dragged exactly when it carries
+//    BOTH of its own dates (a parent that states its own span may be dragged, and the server keeps
+//    those dates — its children keep theirs). A row whose dates are only computed has no handles,
+//    and the tooltip SAYS why rather than leaving a human to discover a dead bar.
 //
 // 4. THE COLOURS COME FROM ONE PLACE: the `.work-st-<key>` rules in the fenced WORK TRACKER
 //    section of `web/src/styles.css` — the very rules that paint the board's status dots, and the
@@ -223,11 +225,13 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
   const geom = useMemo(() => {
     const m = new Map();
     visible.forEach((r, i) => {
-      const span = barSpan(parseDay(r.computed_start), parseDay(r.computed_end), win.start, px);
+      // Clamped to the canvas: see clampSpan. A bar that reaches past the window is drawn to the
+      // edge and marked, and one entirely outside it draws nothing — the clamp notice counts it.
+      const span = clampSpan(barSpan(parseDay(r.computed_start), parseDay(r.computed_end), win.start, px), width);
       m.set(r.id, { i, top: i * ROW, span });
     });
     return m;
-  }, [visible, win, px]);
+  }, [visible, win, px, width]);
 
   // Park the viewport on today the first time there is something to look at (and again on a zoom
   // change, which otherwise leaves a human staring at an empty stretch of ruler).
@@ -292,26 +296,62 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
         if (target && target !== g.id) onLink?.(target, g.id);   // the bar you dropped ON depends on the one you dragged FROM
         return;
       }
+      // TWO BELTS against the defect this shipped with: a gesture that never moved cannot write
+      // (this line), and dragDates quantises the MOVEMENT rather than the resulting date, so a 0px
+      // drag is an identity at every zoom (timescale.js rule 3). Either alone would have been
+      // enough; both, because "a click silently rescheduled the item" is the worst kind of bug —
+      // it looks like the human did it.
+      if (!dragged.current) return;
       const next = dragDates(g, daysAt(e.clientX - g.x0, px), zoom);
       if (next.starts_on === dayKey(g.start) && next.due_on === dayKey(g.end)) return;
       onReschedule?.(g.id, next);
     };
-    // Escape cancels the gesture — in the CAPTURE phase so it answers here and does not also reach
-    // the console's own window listener and close the whole overlay mid-drag.
+    // Escape cancels the WRITE — in the CAPTURE phase so it answers here and does not also reach
+    // the console's own window listener and close the whole overlay mid-drag. It deliberately does
+    // NOT tear the gesture down: `active` is what keeps these listeners alive, so clearing it here
+    // removed the pointerup handler before it could run, and the flag that swallows the post-drag
+    // click was then never cleared — the NEXT click on any bar was eaten. Every gesture now ends in
+    // exactly one place (`up`), cancelled or not.
     const key = (e) => {
-      if (e.key !== 'Escape') return;
+      if (e.key !== 'Escape' || !gesture.current) return;
       e.stopPropagation();
-      gesture.current = null; setActive(null); setGhost(null);
+      gesture.current = null;
+      setGhost(null);
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);   // a cancelled pointer must not strand the gesture
     window.addEventListener('keydown', key, true);
     return () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
       window.removeEventListener('keydown', key, true);
     };
   }, [active, px, zoom, onLink, onReschedule]);
+
+  // A dependency whose predecessor has no bar cannot be drawn — and silence reads as "that
+  // dependency was deleted". So every undrawable edge is collected WITH ITS REASON and marked on
+  // the successor's bar, where a human is already looking.
+  const hiddenDeps = useMemo(() => {
+    const m = new Map();
+    for (const r of visible) {
+      const miss = [];
+      for (const depId of r.deps || []) {
+        if (geom.get(depId)?.span) continue;
+        const known = byId.get(depId);
+        miss.push({
+          id: depId,
+          title: known?.title || null,
+          why: !known ? 'outside the scope you are looking at'
+            : (known.unscheduled || !known.computed_start ? 'has no dates yet'
+              : 'inside a collapsed parent'),
+        });
+      }
+      if (miss.length) m.set(r.id, miss);
+    }
+    return m;
+  }, [visible, geom, byId]);
 
   const arrows = useMemo(() => {
     const out = [];
@@ -326,6 +366,14 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
     }
     return out;
   }, [visible, geom, byId]);
+
+  // Rows the clamped window cannot show. Counting them is the difference between "we are hiding
+  // something" and "there is nothing there".
+  const outside = useMemo(() => (win.clamped ? dated.filter((r) => {
+    const s = parseDay(r.computed_start) || parseDay(r.computed_end);
+    const e = parseDay(r.computed_end) || parseDay(r.computed_start);
+    return diffDays(win.start, e) < 0 || diffDays(s, win.end) < 0;
+  }).length : 0), [win, dated]);
 
   const rowsH = Math.max(ROW, visible.length * ROW);
   const empty = !rows.length;
@@ -363,6 +411,15 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
         </div>
       )}
 
+      {win.clamped && (
+        <div className="work-warn work-gclamp" role="status">
+          ⚠ these dates span {win.clamped.requested.toLocaleString()} days
+          (≈{Math.max(1, Math.round(win.clamped.requested / 365.25)).toLocaleString()} years) — far more
+          than a timeline can draw, so this window shows {win.clamped.shown.toLocaleString()} days
+          from {win.clamped.from}{outside > 0 ? `, and ${outside} row(s) fall outside it` : ''}.
+          That is almost always a mistyped year: open the row and check its dates.
+        </div>
+      )}
       {!empty && !nothingDated && (
         <div className="work-gscroll" ref={scroller}>
           <div className="work-gsheet" style={{ width: LEFT + width }}>
@@ -403,7 +460,7 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
                 const pct = Math.max(0, Math.min(100, Number(r.rolled_progress ?? r.progress) || 0));
                 const gh = ghost && ghost.id === r.id && ghost.mode !== LINK ? ghost : null;
                 const span = gh
-                  ? barSpan(parseDay(gh.starts_on), parseDay(gh.due_on), win.start, px)
+                  ? clampSpan(barSpan(parseDay(gh.starts_on), parseDay(gh.due_on), win.start, px), width)
                   : g?.span;
                 const hot = focus === r.id || ghost?.id === r.id || ghost?.target === r.id;
                 return (
@@ -424,10 +481,11 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
                     <div className="work-gtrack" style={{ width }}>
                       {span && (
                         <div className={`${summary ? 'work-gsum' : 'work-gbar'}${late ? ' over' : ''}`
-                                        + `${own ? '' : ' rolled'}${gh ? ' ghosting' : ''}${hot ? ' hot' : ''}`}
+                                        + `${own ? '' : ' rolled'}${gh ? ' ghosting' : ''}${hot ? ' hot' : ''}`
+                                        + `${span.inverted ? ' inverted' : ''}`}
                              data-gbar={r.id} data-testid="work-gbar"
                              style={{ left: span.x, width: span.w }}
-                             onPointerDown={(e) => { if (own && !summary) begin(e, r, MOVE); }}
+                             onPointerDown={(e) => { if (own) begin(e, r, MOVE); }}
                              onClick={() => { if (!dragged.current) onOpen?.(r.id); }}
                              onMouseEnter={(e) => setTip({ row: r, x: e.clientX, y: e.clientY })}
                              onMouseLeave={() => setTip(null)}>
@@ -439,7 +497,7 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
                           <span className={`work-gfill work-st-${r.status || 'unknown'}`} style={{ width: `${pct}%` }} />
                           {summary && <><i className={`work-gcap l work-st-${r.status || 'unknown'}`} />
                                         <i className={`work-gcap r work-st-${r.status || 'unknown'}`} /></>}
-                          {own && !summary && (
+                          {own && (
                             <>
                               <i className="work-ghandle l" title="drag to change the start"
                                  onPointerDown={(e) => begin(e, r, START)} />
@@ -450,7 +508,13 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
                             </>
                           )}
                           {span.open && <i className="work-gopen" title="no due date — this end is open" />}
+                          {span.cutLeft && <i className="work-gcut l" title="it starts before this window" />}
+                          {span.cutRight && <i className="work-gcut r" title="it continues past this window" />}
                         </div>
+                      )}
+                      {span && hiddenDeps.has(r.id) && (
+                        <i className="work-gdepx" style={{ left: Math.max(0, span.x - 14) }}
+                           title={hiddenTitle(hiddenDeps.get(r.id))}>⋯</i>
                       )}
                     </div>
                   </div>
@@ -490,6 +554,7 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
       {tip && !ghost && (
         <Tip row={tip.row} x={tip.x} y={tip.y} statuses={statuses} zee={zees?.get?.(tip.row.id)}
              crumb={crumbOf(tip.row, byId)} summary={(kidsOf.get(tip.row.id) || []).length > 0}
+             hidden={hiddenDeps.get(tip.row.id)} inverted={geom.get(tip.row.id)?.span?.inverted}
              today={t0} terminal={isTerminal(tip.row.status)} />
       )}
 
@@ -547,7 +612,7 @@ function arrowPath(from, to) {
 
 // The tooltip. It says what the bar is, WHEN it is, who is on it, and — when the bar cannot be
 // dragged — why, because a dead handle with no explanation is the worst kind of UI.
-function Tip({ row, x, y, statuses, zee, crumb, summary, today, terminal }) {
+function Tip({ row, x, y, statuses, zee, crumb, summary, hidden, inverted, today, terminal }) {
   const own = !!(row.starts_on && row.due_on);
   const end = row.computed_end;
   const late = !!end && diffDays(today, end) < 0 && !terminal;
@@ -566,6 +631,10 @@ function Tip({ row, x, y, statuses, zee, crumb, summary, today, terminal }) {
       {zee ? <ZeeChip zee={zee} /> : (
         <div className="work-gtip-d">{row.assignee ? `assignee: ${row.assignee}` : 'nobody on it'}</div>
       )}
+      {inverted && (
+        <div className="work-gtip-w">the due date is BEFORE the start date — this bar spans the
+          contradiction rather than hiding it. Fix the dates in the item drawer.</div>
+      )}
       {!own && (
         <div className="work-gtip-w">
           {summary
@@ -573,8 +642,22 @@ function Tip({ row, x, y, statuses, zee, crumb, summary, today, terminal }) {
             : 'this row has only one of its two dates — set both in the item drawer to drag it'}
         </div>
       )}
+      {own && summary && (
+        <div className="work-gtip-d">its own dates, so it can be dragged — the children keep theirs</div>
+      )}
+      {!!hidden?.length && (
+        <div className="work-gtip-w">{hiddenTitle(hidden)}</div>
+      )}
     </div>
   );
+}
+
+// What an undrawable dependency says for itself. Named once so the marker's tooltip and the item
+// tooltip cannot describe the same edge two different ways.
+export function hiddenTitle(miss) {
+  const list = (miss || []).map((m) => `“${m.title || 'an item'}” (${m.why})`);
+  if (!list.length) return '';
+  return `waits for ${list.length} item(s) this chart cannot draw: ${list.join(', ')}`;
 }
 
 // The ancestor titles, from the rows we already have (the gantt is tree-ordered and includes every
