@@ -165,7 +165,7 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
     landing per zee** — withdraw the previous one *before* landing again. `zee land` now names the
     older open requests it just superseded, and `zee status` carries `landing.open`, so the zee sees
     its own stack instead of a human discovering it. Test: `node test/land-withdraw.test.mjs`.
-- **ONE RUNWAY PER REF — the rest fly a HOLDING PATTERN** (2026-07-29, 066–067). One open landing per
+- **ONE RUNWAY PER REF — the rest fly a HOLDING PATTERN** (2026-07-29, 067–068). One open landing per
   zee was only half the problem: two *different* zees finishing together both pushed, so a human got
   TWO cards for one ref. Approving either moved the ref, and the other could never fast-forward — it
   was swept `stale` and its zee sent back to `zee sync`. A human was asked to decide something that
@@ -176,7 +176,7 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
   - When the runway frees (**landed, rejected, withdrawn or stale — all four**), `clearRunway()`
     calls the next holder: a session resume (`nudge.js → CLEARED_PROMPT`) naming `zee sync` then
     `zee land`. Clearance is a NUDGE, never an approval — the zee re-pushes and *that* raises the card.
-  - **The human gate did not move**, and 067 is where that is made true rather than promised: a
+  - **The human gate did not move**, and 068 is where that is made true rather than promised: a
     trigger refuses `holding → approved/landed` outright (any code path, any hand-run UPDATE), a
     holding row cannot carry a decider/`landed_at`, PRs cannot enter the pattern, and one live
     holding row per sha. 009's `land_decided_has_decider` is *widened* the way 062 did for

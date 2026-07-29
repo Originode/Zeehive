@@ -88,7 +88,7 @@ export async function nudgeXellForStaleLanding(xellId, { sha = null, ref = null,
 // CLEARED FOR LANDING — the third message in this loop, and the one that makes a QUEUE possible.
 //
 // When a zee pushes while another xell's landing is still open on the ref, its push is not raised as
-// a second card: it enters the holding pattern (066). That is only humane if somebody calls it back.
+// a second card: it enters the holding pattern (067). That is only humane if somebody calls it back.
 // A cxell zee's turn ends at `zee land`, so a holder that is never told the runway freed is a zee
 // that waits forever on a card that was never on a human's screen.
 //

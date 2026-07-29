@@ -63,7 +63,7 @@ if (statusOnly) {
 if (withdraw) {
   const cur = json(await req('GET', `/api/land/status?xell=${encodeURIComponent(x.id)}`));
   if (!cur?.id) { console.log('Nothing to withdraw — this xell has no land request on record.'); process.exit(0); }
-  // A HOLDING request is un-askable too (066): it is this zee's own ask and nobody has decided it,
+  // A HOLDING request is un-askable too (067): it is this zee's own ask and nobody has decided it,
   // so leaving the pattern is the zee's to do. A CLEARED one has already left it.
   if (cur.status !== 'pending' && !(cur.status === 'holding' && !cur.cleared)) {
     console.log(`Nothing to withdraw — the latest land request is '${cur.status}', not pending.`);
@@ -89,7 +89,7 @@ if (r0.landed) {
   process.exit(0);
 }
 
-// THE HOLDING PATTERN (066) — the push was queued, not held for a human. One runway per ref: while
+// THE HOLDING PATTERN (067) — the push was queued, not held for a human. One runway per ref: while
 // another xell's landing is open on main, a second card would be a card that can never land (the
 // first approval moves the ref and the second sha stops fast-forwarding). So we print the POSITION
 // and exit — there is nothing to poll for, and waiting here would burn the full timeout on a

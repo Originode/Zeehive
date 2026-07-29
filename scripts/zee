@@ -48,7 +48,7 @@ function waitFlag() {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// THE HOLDING PATTERN (066). Another xell's landing is open on this ref, so the gate queued this
+// THE HOLDING PATTERN (067). Another xell's landing is open on this ref, so the gate queued this
 // push instead of raising a second card — one runway, one card, no races. There is NOTHING to wait
 // for here: no human has been asked, and the clearance arrives as a nudge (the queenzee resumes the
 // session). So both waiters PRINT THE POSITION AND STOP rather than burn their timeout on a card

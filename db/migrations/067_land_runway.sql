@@ -22,5 +22,5 @@
 --
 -- ALONE IN THIS FILE ON PURPOSE: postgres refuses to USE a new enum value in the same transaction
 -- that adds it, and the migration runner wraps each file in one (the 061/062 precedent). The
--- columns, checks and indexes that reference 'holding' therefore live in 067.
+-- columns, checks and indexes that reference 'holding' therefore live in 068.
 ALTER TYPE land_status ADD VALUE IF NOT EXISTS 'holding';

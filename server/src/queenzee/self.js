@@ -121,7 +121,7 @@ export async function selfStatus(xell) {
       ? { status: land.status, new_sha: land.new_sha, decided_by: land.decided_by, pending: land.status === 'pending',
           // A zee's own retraction (`zee land --withdraw`) — terminal, and NOT a human decision.
           withdrawn: land.status === 'withdrawn',
-          // THE HOLDING PATTERN (066). Not a card and not a decision: another xell's landing is open
+          // THE HOLDING PATTERN (067). Not a card and not a decision: another xell's landing is open
           // on this ref, so this push is queued with a POSITION and its zee is nudged when the runway
           // clears. `cleared` means that call already came — the recovery is `zee sync`, `zee land`.
           ...(land.status === 'holding'
@@ -383,7 +383,7 @@ export async function selfLand(xell) {
 // pulling it back is not an agent's call — the answer to "it must not land after all" is `zee tend`.
 export async function selfWithdrawLand(xell, { reason = null, request = null } = {}) {
   const open = await openLandRequests(xell.id);
-  // A landing that is HOLDING (066) is un-askable too: it is this zee's own ask, nobody has decided
+  // A landing that is HOLDING (067) is un-askable too: it is this zee's own ask, nobody has decided
   // it, and a zee that no longer means it should be able to leave the pattern rather than be called
   // for a runway it does not want. It is kept separate from `open` on purpose — a holding request is
   // not a card in front of a human, so it must never be counted as one.

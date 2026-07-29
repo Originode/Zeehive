@@ -1,5 +1,5 @@
 -- The HOLDING PATTERN's own columns, and the impossibilities that keep it from ever becoming a
--- second way onto main (see 066 for the why).
+-- second way onto main (see 067 for the why).
 --
 -- A holding row is an ASK THAT IS NOT YET A QUESTION: recorded, positioned, and waiting for the
 -- tower. It is deliberately absent from every open read model — the console's landing list, the

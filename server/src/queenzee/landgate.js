@@ -143,7 +143,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
   const auto = !!project.auto_approve_land;
 
   // No approval → this push is a REQUEST. Upsert so a retrying zee bumps attempts instead of
-  // filling the console with duplicate cards for the same sha — and, since 066, so a zee re-pushing
+  // filling the console with duplicate cards for the same sha — and, since 067, so a zee re-pushing
   // while it HOLDS keeps its one place in line instead of taking a second.
   const existing = await one(
     `SELECT * FROM land_request
