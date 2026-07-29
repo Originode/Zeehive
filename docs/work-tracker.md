@@ -6,6 +6,10 @@ and `060_work_item_schedule_sanity.sql`,
 routes in `server/src/api/routes.js`, test `test/work-tracker.test.mjs`.
 Parts 2–4 hang zee-assignment and the console (kanban + gantt) off exactly this contract.
 
+**The VERBS — assignment, deploy, the board that moves itself, and the three cxell verbs — are
+documented next door in [work-tracker-verbs.md](work-tracker-verbs.md).** This file is the nouns:
+the schema, the read models and the policies everything else must not misread.
+
 ## Why this exists
 
 Everything in the ZEEHIVE meta-schema records **which agents are running**: xells, zees,
@@ -662,6 +666,8 @@ verbs, the SSE payload shape, and the proof that migration 059 and the manager h
 same words. If 058 is not applied to the target database it **skips loudly** rather than passing.
 
 ## What parts 2–4 need to know
+
+(How they actually used it, and what they built on top: [work-tracker-verbs.md](work-tracker-verbs.md).)
 
 - **`work_item.xell_id`** is the zee currently on an item — read models resolve it only while
   the xell is LIVE (see policy 4); **`assignee`** is free text for when a
