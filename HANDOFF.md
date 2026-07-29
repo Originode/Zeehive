@@ -313,6 +313,14 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   `zee tend` it. Neither side polices itself.
 - **Honeycomb**: `seatXells()` (web/src/hive/HiveCanvas.jsx) seats a crew in the free cells nearest
   its manager, ring by ring. No managers → byte-for-byte the old layout.
+- **A manager's harness takes NO cell of its own** (2026-07-29). The manager hexagon is already drawn
+  in the harness badge's language (dashed seat + the same persona disc), so seating its harness beside
+  it drew the same avatar twice. `getTimeline()` now emits two lists per harness: `wearer_ids`
+  (everyone wearing it, managers included → persona art, `×N`, hover) and `consumer_ids` (wearers
+  MINUS managers → the grid cell + the series wire). A harness worn by managers only is still in the
+  payload — the manager hexagon reads its art from it — but `badgedHarnesses()` seats no cell for it
+  and `Connectors` routes no wire. Workers are unchanged (in both lists).
+  Test: `node test/harness-manager-cell.test.mjs`.
 - Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
   messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
   over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
