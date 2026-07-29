@@ -71,7 +71,14 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     finally { setLoading(false); }
   }, [projectId, rootId]);
 
-  useEffect(() => { setLoading(true); load(); }, [load, reloadKey]);
+  // A live refetch must never yank the board out from under a drag in progress: the SSE stream can
+  // fire mid-gesture (another zee moved something), and re-rendering the columns then would drop
+  // the card the human is holding. So a reload arriving during a drag is DEFERRED to the drop.
+  const pendingReload = useRef(false);
+  useEffect(() => {
+    if (dragRef.current) { pendingReload.current = true; return; }
+    setLoading(true); load();
+  }, [load, reloadKey]);
 
   // Columns = the vocabulary, in its own order, filled from the board payload.
   const columns = useMemo(() => {
@@ -148,7 +155,10 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     e.dataTransfer.effectAllowed = 'move';
     try { e.dataTransfer.setData('text/plain', card.id); } catch { /* some browsers refuse on dragstart */ }
   };
-  const endDrag = () => { dragRef.current = null; setDragId(null); setDropAt(null); };
+  const endDrag = () => {
+    dragRef.current = null; setDragId(null); setDropAt(null);
+    if (pendingReload.current) { pendingReload.current = false; load(); }
+  };
 
   const onDrop = (e, key, index) => {
     e.preventDefault();
