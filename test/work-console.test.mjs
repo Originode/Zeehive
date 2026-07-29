@@ -191,5 +191,12 @@ ok(!/parent_id/.test(boardMove), 'a board drag patches status/sort_order only �
 ok(/ref/.test(read('web/src/work/Tickets.jsx')),
    'the breakdown editor nests with the API\'s backwards-resolving `ref` handles (one atomic call)');
 
+// ── two defects found by auditing the landed code, pinned so they cannot come back ──
+ok(/halfOf/.test(board) && /onDragOver=\{\(e\) => allow\(e, col\.key, halfOf/.test(board),
+   'a CARD is itself a drop target (upper half = before it) — not just the 6px gap between cards');
+ok(/dlg-overlay/.test(read('web/src/work/WorkConsole.jsx')),
+   'Escape while a Dialog is open answers the dialog only — it does not also close the console');
+ok(/THE ZEE SEAM/.test(drawer), 'the drawer keeps a named seam for part 3\'s assign-a-zee control');
+
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);

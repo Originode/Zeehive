@@ -33,6 +33,19 @@ export function KindGlyph({ kind, className = '' }) {
 export const statusLabel = (statuses, key) =>
   (statuses || []).find((s) => s.key === key)?.label || key || '—';
 
+// The statuses a ROW may actually move to: its own server-generated `next_statuses` plus where it
+// already is, in the vocabulary's order. Both a work item and a TICKET carry the field, and both
+// pickers must use it — a dropdown built from the whole vocabulary offers 'working' on a done item
+// and then hands the human a 409 for taking the option it just gave them.
+export function legalNext(row, statuses) {
+  const vocab = [...(statuses || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const allowed = Array.isArray(row?.next_statuses) && row.next_statuses.length
+    ? new Set([...row.next_statuses, row.status])
+    : null;
+  const list = allowed ? vocab.filter((s) => allowed.has(s.key)) : vocab;
+  return list.length ? list : vocab;         // an unknown current status must not empty the picker
+}
+
 export function StatusDot({ status, statuses, className = '' }) {
   return (
     <span className={`work-dot work-st-${status || 'unknown'} ${className}`}

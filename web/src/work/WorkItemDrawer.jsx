@@ -3,7 +3,7 @@ import { showConfirm } from '../Dialog.jsx';
 import {
   addDep, createWorkItem, deleteWorkItem, getWorkItem, listWorkItems, patchWorkItem, removeDep,
 } from './workApi.js';
-import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, ZeeChip, statusLabel, toInputDate } from './bits.jsx';
+import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, ZeeChip, legalNext, statusLabel, toInputDate } from './bits.jsx';
 
 // WORK TRACKER — the ITEM DRAWER: everything about one work item, and every edit you can make to it.
 //
@@ -199,7 +199,16 @@ export default function WorkItemDrawer({ itemId, projectId, statuses, onClose, o
                 <b>{progress}%</b>
               </span>
             </Field>
-            {data?.zee && <Field label="zee"><ZeeChip zee={data.zee} /></Field>}
+            {/* ── THE ZEE SEAM (part 3 slots its control in HERE) ──────────────────────────────
+                Rendered even when nothing is on the item, so the empty state is a place rather
+                than an absence: `xell_id` is the zee currently working this item, and part 3's
+                "assign / deploy a zee" control belongs in this Field, beside the chip that shows
+                who is already on it. It has everything it needs in scope — `item` (id, title,
+                status, ticket_id), `data.zee`, and `onChanged`/`load` to refresh the drawer and
+                the board after a deploy. Nothing else in this file needs to move. */}
+            <Field label="zee">
+              {data?.zee ? <ZeeChip zee={data.zee} /> : <span className="work-muted">— nobody on it —</span>}
+            </Field>
             {data?.ticket && (
               <Field label="ticket">
                 <span className="work-tktlink">#{data.ticket.number} {data.ticket.title}</span>
@@ -348,24 +357,6 @@ function detailText(ev) {
   return Object.entries(d)
     .map(([k, v]) => (Array.isArray(v) ? `${k}: ${v.join(', ')}` : `${k}: ${String(v).slice(0, 40)}`))
     .join(' · ');
-}
-
-// This item's legal next statuses (server-generated) plus the one it is in, in the vocabulary's
-// order, as {key,label} — so the picker shows words a human reads, not enum keys.
-function legalNext(item, statuses) {
-  const vocab = [...(statuses || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-  const allowed = Array.isArray(item.next_statuses) && item.next_statuses.length
-    ? new Set([...item.next_statuses, item.status])
-    : null;
-  const list = allowed ? vocab.filter((s) => allowed.has(s.key)) : vocab;
-  return list.length ? list : vocab;
-}
-
-const WHEN = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-function fmtWhen(ts) {
-  if (!ts) return '';
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? String(ts) : WHEN.format(d);
 }
 
 // `tree=1` may come back nested (children arrays) or flat; the drawer only wants a flat list of

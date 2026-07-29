@@ -188,6 +188,8 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
                        onDragOver={(e) => allow(e, col.key, i)} onDrop={(e) => onDrop(e, col.key, i)} />
                   <Card card={card} statuses={statuses} dragging={dragId === card.id}
                         onDragStart={(e) => onDragStart(e, card, col.key)} onDragEnd={endDrag}
+                        onDragOver={(e) => allow(e, col.key, halfOf(e, i))}
+                        onDrop={(e) => onDrop(e, col.key, halfOf(e, i))}
                         onOpen={() => onOpen?.(card.id)} />
                 </React.Fragment>
               ))}
@@ -212,13 +214,23 @@ function Gap({ on, last, onDragOver, onDrop }) {
   );
 }
 
-function Card({ card, statuses, dragging, onDragStart, onDragEnd, onOpen }) {
+// WHICH SIDE of a card the pointer is on — above its middle means "insert before me", below means
+// "after me". Without this the only drop targets were the 6px gaps BETWEEN cards, and a drop on a
+// card itself bubbled to the column and silently sent it to the bottom: the commonest aim in the
+// whole board ("put this one just here") was the one that missed.
+const halfOf = (e, index) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  return e.clientY < r.top + r.height / 2 ? index : index + 1;
+};
+
+function Card({ card, statuses, dragging, onDragStart, onDragEnd, onDragOver, onDrop, onOpen }) {
   // The board is the plan; the hive is the fact. Advisory only — see the header.
   const drift = card.live_status && card.live_status !== card.status ? card.live_status : null;
   return (
     <article className={`work-card${dragging ? ' dragging' : ''}`} draggable
              data-testid="work-card" data-item={card.id}
              onDragStart={onDragStart} onDragEnd={onDragEnd}
+             onDragOver={onDragOver} onDrop={onDrop}
              onClick={onOpen}
              onKeyDown={(e) => { if (e.key === 'Enter') onOpen?.(); }}
              tabIndex={0} role="button">

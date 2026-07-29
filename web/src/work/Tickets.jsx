@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   addComment, breakdownTicket, createTicket, getTicket, listTickets, patchTicket,
 } from './workApi.js';
-import { Breadcrumb, ErrLine, KindGlyph, Pips, StatusDot, statusLabel } from './bits.jsx';
+import { Breadcrumb, ErrLine, KindGlyph, Pips, StatusDot, legalNext, statusLabel } from './bits.jsx';
 
 // WORK TRACKER — TICKETS: the intake side of the tracker.
 //
@@ -44,6 +44,9 @@ export default function Tickets({ projectId, statuses, kinds = [], onOpenItem, r
     <div className="work-tickets" data-testid="work-tickets">
       <div className="work-filters">
         <select className="work-in" value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}>
+          {/* A FILTER offers the WHOLE vocabulary on purpose — you may look for work in any status,
+              including one nothing is in. Legal-transition filtering belongs on the pickers that
+              WRITE a status, not on the one that reads. */}
           <option value="">any status</option>
           {[...(statuses || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
             .map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
@@ -206,8 +209,11 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
                   try { await patchTicket(id, { status: e.target.value }); await load(); onChanged?.(); }
                   catch (x) { setErr(x); } finally { setBusy(false); }
                 }}>
-          {[...(statuses || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-            .map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          {/* A ticket carries `next_statuses` exactly like a work item does, so the picker that
+              WRITES its status gets the same rule as the drawer's: offer only what the server will
+              accept. Offering the whole vocabulary here was my own inconsistency — it handed a
+              human an option and then answered it with a 409. */}
+          {legalNext(t, statuses).map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
         </select>
         <button className="work-x" onClick={onClose} title="close">✕</button>
       </header>

@@ -93,6 +93,11 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
       if (openItem) return;         // the drawer handles its own Escape
+      // …and so does Dialog.jsx, which is a SINGLETON portalled outside this tree: the "+ activity"
+      // quick-add opens a showPrompt, and one Escape used to answer the prompt AND close the whole
+      // console behind it — you cancelled a title and lost the board. The dialog owns the key while
+      // it is up, so this asks the DOM whether one is open rather than duplicating its queue state.
+      if (document.querySelector('.dlg-overlay')) return;
       onClose?.();
     };
     window.addEventListener('keydown', onKey);
