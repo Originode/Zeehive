@@ -2033,3 +2033,5 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
    makes it unusable in practice. */
 .work-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .work-nrow:focus-within { background: var(--panel2); }
+.work-btn.danger { border-color: var(--down); color: var(--down); }
+.work-btn.danger:hover:not(:disabled) { background: rgba(229,85,78,.14); }

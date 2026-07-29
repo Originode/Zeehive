@@ -306,5 +306,21 @@ ok(placement(kcol, 'c', 2 - 1).at === 1, 'Alt+Up moves a card exactly one slot u
 ok(placement(kcol, 'a', 0 + 2).sortOrder === 2.5 && placement(kcol, 'c', 2 - 1).sortOrder === 1.5,
    'and both write a midpoint, exactly as the equivalent drag would');
 
+// ── the one place this console could corrupt a plan ───────────────────────────────────────────
+// /breakdown is ADDITIVE: pressing it twice creates a SECOND overlapping tree under one ticket, and
+// nothing afterwards can say which is current. So the button may never be ambiguous about it.
+const tickets = read('web/src/work/Tickets.jsx');
+ok(/doReplace/.test(tickets) && /doAdd/.test(tickets),
+   'a ticket that already has items offers ADD and REPLACE as separate, named actions');
+ok(/replace the plan/i.test(tickets) && /add \${parsed\.items\.length} to the \${items\.length}/.test(tickets),
+   'each button states what it will do, with the counts, before it is pressed');
+ok(/xell_id/.test(tickets),
+   'replace refuses while a zee is on an item being deleted (deleting live work is not a plan edit)');
+ok(/not one \n?\s*\+ ?'transaction|are not one/.test(tickets),
+   'the replace confirmation admits the delete is not atomic with the create');
+// A response with no JSON body must still say something a human can act on.
+ok(/bareStatus/.test(read('web/src/work/workApi.js')),
+   'an answer with no {error} body becomes a sentence, not a bare status code');
+
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);

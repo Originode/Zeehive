@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { showAlert, showConfirm } from '../Dialog.jsx';
 import {
-  addComment, breakdownTicket, createTicket, getTicket, listTickets, patchTicket,
+  addComment, breakdownTicket, createTicket, deleteWorkItem, getTicket, listTickets, patchTicket,
 } from './workApi.js';
 import { Breadcrumb, ErrLine, KindGlyph, Pips, StatusDot, legalNext, statusLabel } from './bits.jsx';
 
@@ -185,8 +186,26 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
     finally { setBusy(false); }
   };
 
-  const doBreakdown = async () => {
-    if (!parsed.items.length) return;
+  // BREAKING A TICKET DOWN TWICE IS THE ONE PLACE THIS CONSOLE CAN CORRUPT A PLAN.
+  //
+  // `POST /breakdown` is ADDITIVE by design — a ticket legitimately grows work as it is understood,
+  // and the server will not guess which existing items an author meant to keep. That is right for
+  // the API and wrong for a button, because a human who edits their plan text and presses the same
+  // button again means "this is the plan", not "append a near-duplicate of it". Doing that silently
+  // leaves two overlapping trees under one ticket and no way to tell which is current — a data
+  // problem in production, not a polish item.
+  //
+  // So once a ticket HAS items the single button becomes two, each saying exactly what it will do:
+  //   ADD      — the API's own behaviour, named out loud, with the existing count in the label.
+  //   REPLACE  — delete the linked items first, then create the new plan.
+  //
+  // REPLACE IS A COMPOSITE THE SERVER NEVER SEES AS ONE OPERATION, so the console owns its safety:
+  //   • it refuses outright when a zee is on any of the items being deleted — deleting work someone
+  //     is doing is destructive well beyond a plan, and unassigning first is the human's call;
+  //   • its confirmation names the exact number going and the number arriving, and says plainly that
+  //     the delete happens FIRST and is not atomic with the create;
+  //   • it stops at the first refusal and leaves the rest alone rather than half-clearing a plan.
+  const runBreakdown = async () => {
     setBusy(true);
     try {
       await breakdownTicket(id, breakdownPayload(parsed.items));
@@ -194,6 +213,54 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
       await load(); onChanged?.();
     } catch (e) { setErr(e); }
     finally { setBusy(false); }
+  };
+
+  const doAdd = async () => {
+    if (!parsed.items.length) return;
+    if (items.length) {
+      const ok = await showConfirm(
+        `Add ${parsed.items.length} item(s) to the plan on #${t.number}?\n\n`
+        + `This ticket already has ${items.length}. They stay exactly as they are and the new items `
+        + 'are added beside them — this does NOT replace the existing plan.',
+        { okLabel: `Add ${parsed.items.length}` });
+      if (!ok) return;
+    }
+    await runBreakdown();
+  };
+
+  const doReplace = async () => {
+    if (!parsed.items.length || !items.length) return;
+    const busyItems = items.filter((i) => i.xell_id);
+    if (busyItems.length) {
+      await showAlert(
+        `Cannot replace this plan: a zee is on ${busyItems.length} of its items `
+        + `(${busyItems.map((i) => i.title).join(', ')}).\n\n`
+        + 'Replacing deletes those items, and deleting work a zee is doing is not something to do '
+        + 'behind its back. Unassign them first, then replace.',
+        { variant: 'error', title: 'Somebody is working on this plan' });
+      return;
+    }
+    const ok = await showConfirm(
+      `Replace the plan on #${t.number}?\n\n`
+      + `This DELETES the ${items.length} existing item(s) and everything beneath them, then creates `
+      + `the ${parsed.items.length} above.\n\nThe delete happens FIRST and the two steps are not one `
+      + 'transaction: if the create then fails, the old plan is already gone. Nothing here can be undone.',
+      { okLabel: 'Replace the plan', variant: 'danger' });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      for (const it of items) {
+        // A parent takes its descendants with it, so an item already gone is not an error here.
+        try { await deleteWorkItem(it.id); }
+        catch (e) { if (!/no such work item/i.test(e.message)) throw e; }
+      }
+      await load();
+    } catch (e) {
+      setErr(e); setBusy(false);
+      return;                       // stop at the first real refusal — a half-cleared plan is worse
+    }
+    setBusy(false);
+    await runBreakdown();
   };
 
   if (!t) return <div className="work-tdetail"><div className="work-empty">{err ? '' : 'loading…'}<ErrLine err={err} /></div></div>;
@@ -260,18 +327,24 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
                 ))}
                 {!parsed.items.length && <div className="work-none">type a line above</div>}
                 {parsed.warnings.map((w, i) => <div key={i} className="work-warn">⚠ {w}</div>)}
-                {/* Breaking a ticket down twice ADDS a second plan — the API is additive on
-                    purpose (a ticket legitimately grows work as it is understood) and it does not
-                    reconcile. Said out loud here, because the button does not look additive. */}
+                {/* The state a human must know BEFORE choosing a button, not after pressing one. */}
                 {items.length > 0 && (
-                  <div className="work-warn">⚠ this ticket already has {items.length} item(s) —
-                    a breakdown ADDS to the plan, it does not replace it</div>
+                  <div className="work-warn">⚠ this ticket already has {items.length} item(s).
+                    “Add” keeps them; “Replace” deletes them first. Nothing here happens silently.</div>
                 )}
               </div>
               <div className="work-composer-foot">
                 <button className="work-btn" onClick={() => { setBreaking(false); setPlan(''); }}>cancel</button>
-                <button className="work-btn primary" disabled={busy || !parsed.items.length} onClick={doBreakdown}>
-                  {busy ? 'creating…' : `create ${parsed.items.length} item(s)`}
+                {items.length > 0 && (
+                  <button className="work-btn danger" disabled={busy || !parsed.items.length} onClick={doReplace}
+                          title={`Delete the ${items.length} existing item(s), then create these`}>
+                    replace the plan ({items.length} → {parsed.items.length})
+                  </button>
+                )}
+                <button className="work-btn primary" disabled={busy || !parsed.items.length} onClick={doAdd}>
+                  {busy ? 'creating…'
+                    : items.length ? `add ${parsed.items.length} to the ${items.length} already here`
+                    : `create ${parsed.items.length} item(s)`}
                 </button>
               </div>
             </div>

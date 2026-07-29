@@ -36,8 +36,23 @@ async function call(url, opts) {
   let body = null;
   const text = await r.text();
   if (text) { try { body = JSON.parse(text); } catch { /* non-JSON body (a proxy error page) */ } }
-  if (!r.ok) throw new Error((body && body.error) || `${r.status}`);
+  if (!r.ok) throw new Error((body && body.error) || bareStatus(r.status));
   return body;
+}
+
+// What to say when the answer carries NO `{error}` sentence at all. That happens when the request
+// never reached the API — a proxy 404 for an endpoint this build does not know, a 502 from an nginx
+// in front of a server that is down, a 401 from something in the middle. The old text was the bare
+// number, which told a human "404" and nothing they could act on. These name the likely cause and
+// stay short; a real refusal still wins, because the server's own sentence is always better than a
+// guess about it.
+function bareStatus(status) {
+  if (status === 404) return '404 — the API has no such endpoint or record here, and sent no message. '
+    + 'If the rest of the console works, this build is talking to a server that predates this feature.';
+  if (status === 401 || status === 403) return `${status} — the API refused this request without a message.`;
+  if (status >= 500) return `${status} — the API did not answer properly. It may be down, or the /api `
+    + 'proxy in front of the console may not be reaching it.';
+  return `${status} — the API refused this and sent no message.`;
 }
 
 const send = (url, method, payload) => call(url, {
