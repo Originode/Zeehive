@@ -31,9 +31,17 @@ import WorkItemDrawer from './WorkItemDrawer.jsx';
 // activity, a node cannot become its own descendant, …): duplicating those rules here would create a
 // second, drifting authority. It attempts the move and prints the server's refusal SENTENCE.
 //
-// LIVE UPDATES: zees change this data too (part 3 assigns work items to xells), so the console
-// subscribes to the console's existing SSE stream and refetches when the server emits a `work`
-// event. `subscribe()` in web/src/api.js carries the event-type list; `work` was added to it.
+// LIVE UPDATES: zees change this data too — part 3 assigns work items to xells, and the queenzee's
+// tick MOVES CARDS on its own by projecting a zee's live hive status onto them. So the console
+// subscribes to the console's existing SSE stream and reacts at two speeds: a `work` event is about
+// what is on screen and refreshes almost at once, everything else is background and refreshes
+// lazily (see the effect below). `subscribe()` in web/src/api.js carries the event-type list and now
+// also hands the work payload through `onWork`.
+//
+// WHAT THIS CONSOLE NEVER DOES: write a status on a timer. The tick owns the live projection
+// (assigned/working/blocked/review/shipping — never done/cancelled, which stay a human's call), and
+// a UI that also wrote status periodically would fight it, each overwriting the other's idea of the
+// plan. The console reads, and writes only what a human asked for.
 
 const TAB_KEY = 'zeehive.work.tab';
 const TABS = [
@@ -76,15 +84,32 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
 
   const refresh = useCallback(() => { loadTree(); setRev((n) => n + 1); }, [loadTree]);
 
-  // LIVE. Debounced, because one human action on the server can emit several events and the board
-  // is a multi-request read model — a refetch per frame would fight the drag the human is mid-way
-  // through. `onSnapshot` is a no-op: subscribe() calls it unconditionally, and this console does
-  // not want the fleet snapshot, only the nudge that something changed.
+  // LIVE, at TWO speeds — because two very different things reach this console down one stream.
+  //
+  //   a WORK event (a card created, moved, assigned, or moved by the queenzee's own tick) is about
+  //   the thing on screen, so it lands almost at once: 150ms, just enough to collapse the burst one
+  //   human action produces;
+  //   any OTHER fleet event (a container health flap, a landing, another project's zee) can still
+  //   change what this console renders — a zee's hive status colours a card's chip and drives its
+  //   live_status — but it is background news, so it refreshes lazily and never competes with a
+  //   drag in progress.
+  //
+  // Before this, subscribe() collapsed every type into one onChange and the tracker refetched the
+  // whole tree and board on ALL of it. That was my own bug: correct, and wasteful on a busy hive.
+  // `lastWork` keeps the slow path from re-fetching what the fast path just fetched.
+  const lastWork = useRef(0);
   useEffect(() => {
-    let timer = null;
-    const nudge = () => { clearTimeout(timer); timer = setTimeout(refresh, 400); };
-    const stop = subscribe(projectId, { onSnapshot: () => {}, onChange: nudge });
-    return () => { clearTimeout(timer); stop(); };
+    let slow = null;
+    let fast = null;
+    const onWork = () => { clearTimeout(fast); fast = setTimeout(() => { lastWork.current = Date.now(); refresh(); }, 150); };
+    const onChange = () => {
+      clearTimeout(slow);
+      slow = setTimeout(() => { if (Date.now() - lastWork.current > 3000) refresh(); }, 2500);
+    };
+    // onSnapshot is a no-op: subscribe() calls it unconditionally, and this console does not want
+    // the fleet snapshot — only the nudge that something changed.
+    const stop = subscribe(projectId, { onSnapshot: () => {}, onChange, onWork });
+    return () => { clearTimeout(slow); clearTimeout(fast); stop(); };
   }, [projectId, refresh]);
 
   // Escape closes the drawer first, then the console — the innermost thing goes first, which is what

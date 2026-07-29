@@ -41,7 +41,7 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 
 // ── 1. the files exist and parse ──
 const FILES = ['workApi.js', 'order.js', 'bits.jsx', 'WorkConsole.jsx', 'Board.jsx', 'WorkItemDrawer.jsx',
-               'Tickets.jsx', 'Gantt.jsx'].map((f) => `web/src/work/${f}`);
+               'Tickets.jsx', 'Gantt.jsx', 'DeployZee.jsx'].map((f) => `web/src/work/${f}`);
 for (const f of FILES) {
   const there = existsSync(path(f));
   ok(there, `${f} exists`);
@@ -218,7 +218,8 @@ const smoke = async () => {
         const Tickets = require('./Tickets.jsx').default;
         const Gantt = require('./Gantt.jsx').default;
         const Drawer = require('./WorkItemDrawer.jsx').default;
-        module.exports = { React, renderToString, Board, Tickets, Gantt, Drawer };
+        const DeployZee = require('./DeployZee.jsx').default;
+        module.exports = { React, renderToString, Board, Tickets, Gantt, Drawer, DeployZee };
       `,
       resolveDir: resolve(here, '..', 'web/src/work'),
       loader: 'js',
@@ -237,6 +238,17 @@ const smoke = async () => {
     renderToString(React.createElement(screens.Tickets, { projectId: 'p', statuses, kinds: ['bug'] })),
     renderToString(React.createElement(screens.Gantt, { projectId: 'p', rootId: null })),
     renderToString(React.createElement(screens.Drawer, { itemId: 'i', projectId: 'p', statuses })),
+    // The drawer's first frame has no data yet, so the zee seam is rendered directly — BOTH states,
+    // because "nobody is on it" and "a zee is on it" are different code paths and the empty one is
+    // the one a human meets first.
+    renderToString(React.createElement(screens.DeployZee, {
+      item: { id: 'i', title: 'an item', xell_id: null }, zee: null, events: [],
+    })),
+    renderToString(React.createElement(screens.DeployZee, {
+      item: { id: 'i', title: 'an item', xell_id: 'x' },
+      zee: { slug: 'lively-meadow', hive_status: 'occ-working', hive_status_label: 'working' },
+      events: [{ kind: 'assigned', detail: { xell_slug: 'lively-meadow' } }],
+    })),
   ].join('');
   return html;
 };
@@ -250,9 +262,34 @@ try {
   for (const id of ['work-tickets', 'work-gantt', 'work-drawer']) {
     ok(html.includes(id), `the rendered markup carries ${id}`);
   }
+  ok(/deploy a worker/.test(html), 'an unassigned item offers "deploy a worker" on its first frame');
+  ok(/lively-meadow/.test(html), 'an assigned item renders its zee chip');
 } catch (e) {
   ok(false, `a screen threw while rendering — ${String(e.message).split('\n')[0]}`);
 }
+
+// ── the ASSIGN/DEPLOY seam (part 3's verbs, wired into the drawer) ────────────────────────────
+// Deploying SPAWNS A REAL ZEE. Three properties are worth a test each, because getting any of them
+// wrong costs either tokens or trust.
+const deployz = read('web/src/work/DeployZee.jsx');
+const dcode = code('web/src/work/DeployZee.jsx');
+ok(/<DeployZee[\s/>]/.test(read('web/src/work/WorkItemDrawer.jsx')),
+   'the drawer RENDERS the assign/deploy control in its zee field');
+ok(/showConfirm/.test(dcode) && /showPrompt/.test(dcode),
+   'deploying is confirmed through Dialog.jsx (never a native dialog — it would freeze the SSE stream)');
+ok(/SPAWNS A REAL ZEE/.test(deployz),
+   'the confirmation says in plain words that it starts a real agent');
+ok(/getAssignCandidates/.test(dcode) && !/type="text"[^>]*xell/i.test(dcode),
+   'the picker is the server\'s candidate list — never a free-text xell id box');
+// The queenzee's tick projects the live hive status onto the card. A UI that ALSO wrote status on a
+// timer would fight it, so nothing in the tracker may write status outside a human's own action.
+for (const f of ['DeployZee.jsx', 'Board.jsx', 'WorkConsole.jsx']) {
+  const src = code(`web/src/work/${f}`);
+  ok(!/setInterval|setTimeout\([^)]*status/.test(src),
+     `web/src/work/${f} never writes status on a timer (the queenzee tick owns that)`);
+}
+ok(/xell_id/.test(dcode) && /lastAssignedSlug/.test(dcode),
+   'a reaped xell leaves provenance (was: <slug>) instead of a ghost chip');
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);
