@@ -169,9 +169,14 @@ function usage() {
   zee report --message "..." [--kind reflection]   send your MANAGER a note (a question, a blocker, or your post-ship REFLECTION). The one reach outside your xell a worker is meant to have
   zee inbox [--all]                  read what other zees sent you (reading marks them read); --all shows the history
 
+ the work tracker (the PLAN this job is part of):
+  zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket and acceptance notes
+  zee item [<id>] --status <s> [--progress N] [--note "..."]   report where the WORK has got to. A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
+
  MANAGER-only (refused for a worker, with an explanation):
   zee zees                           YOUR CREW: every worker you dispatched — hive status, what it waits on, its last message
   zee dispatch --task "..." [--model m] [--mode 1..5] [--harness key] [--title "..."]   spawn a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness
+  zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key]   DEPLOY a worker for a WORK ITEM: same dispatch path as "zee dispatch", but the brief is built from the item itself (title, body, ancestors, ticket, acceptance) plus your --task text. Returns the new worker's slug
   zee say --to <slug> --message "..."   type a message straight into that worker's LIVE session
   zee suggest-done --to <slug> --reason "..."   ask a HUMAN to mark that worker done (they confirm; that is what reaps it)
   NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — dispatch a worker instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused.
@@ -380,6 +385,64 @@ switch (cmd) {
     }
     if (j.message) console.log(j.message);
     process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'work': {
+    // THE PLAN you are part of. A MANAGER sees its project's work items in tree order (--board drops
+    // the project root, which is not a card); a WORKER sees the ONE item it is assigned to, with the
+    // ancestors, ticket and acceptance notes it was briefed from. --item <id> reads one item.
+    const item = flag('item') || rest.find((a) => !a.startsWith('--') && /^[0-9a-f-]{8,}$/i.test(a)) || null;
+    const r = await req('GET', `/api/xell/self/work?${item ? `item=${encodeURIComponent(item)}&` : ''}${rest.includes('--board') ? 'board=1' : ''}`);
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    if (Array.isArray(j.items)) {
+      // manager view: the plan, indented by depth, with who is on each item
+      for (const i of j.items) {
+        const who = i.zee ? `  ← ${i.zee.slug}${i.zee.working ? ' (working)' : ''}` : '';
+        console.log(`${'  '.repeat(i.depth)}${String(i.status).padEnd(9)} ${i.title}${who}`);
+        console.log(`${'  '.repeat(i.depth)}          ${i.id}`);
+      }
+    } else if (j.item) {
+      // one item: yours, or the one you asked for
+      console.log(`${j.item.title}   [${j.item.status}${j.item.progress != null ? ` ${j.item.progress}%` : ''}]`);
+      console.log(`  id: ${j.item.id}`);
+      if (j.ancestors?.length) console.log(`  under: ${j.ancestors.map((a) => a.title).join(' → ')}`);
+      if (j.ticket) console.log(`  ticket: ${j.ticket.number ? `#${j.ticket.number} ` : ''}${j.ticket.title || ''}`);
+      if (j.item.body) console.log(`\n${j.item.body}\n`);
+      if (j.item.acceptance) console.log(`  acceptance: ${j.item.acceptance}`);
+      if (j.zee) console.log(`  zee: ${j.zee.slug} (${j.zee.status})`);
+      for (const e of (j.events || []).slice(0, 8)) {
+        console.log(`  · ${e.created_at} ${e.kind} by ${e.actor}`);
+      }
+    }
+    if (j.message) console.log(`\n${j.message}`);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'assign': {
+    // MANAGER only: DEPLOY a worker for a work item. Same dispatch path as `zee dispatch` (the worker
+    // is stamped as your crew, seated beside you, on its own throwaway db) — what this adds is the
+    // brief, built from the ITEM: its title, body, ancestors, ticket and acceptance notes, plus your
+    // --task text. Break the ticket down first; a well-cut item briefs the worker for free.
+    const item = flag('item');
+    if (!item) { console.error('assign needs --item <work-item-id> (run `zee work` to list them)'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/work/assign', {
+      item, task: flag('task') || null, model: flag('model') || null, mode: flag('mode') || null,
+      harness: flag('harness') || null, title: flag('title') || null,
+    }));
+    break;
+  }
+  case 'item': {
+    // Report where the WORK has got to. A manager may report any item in its own project; a worker
+    // only the one it is assigned to (and may omit the id — the server resolves it from your token).
+    // This moves the CARD. It never marks your xell done, lands anything or ships anything.
+    const id = flag('item') || rest.find((a) => !a.startsWith('--')) || null;
+    const progress = flag('progress');
+    out(await req('POST', '/api/xell/self/work/item', {
+      id, status: flag('status') || null,
+      progress: progress == null ? null : Number(progress), note: flag('note') || null,
+    }));
     break;
   }
   case 'suggest-done': {

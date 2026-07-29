@@ -923,3 +923,158 @@ function requireManager(xell, verb) {
     + '(a human adds those in the console). You CAN talk to your manager, if you have one: `zee report '
     + '--message "…"` and `zee inbox`.' };
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WORK-TRACKER VERBS — a zee's view of the PLAN it is executing (lib/work-assign.js owns the domain).
+//
+// The work tracker gave the hive a plan (project → activity → task) and a board. These three verbs
+// are what make the plan reach the agents: a manager can SEE its project's plan and put a worker on
+// an item, and a worker can see the item it is executing and report where it has got to.
+//
+// SCOPE IS RESOLVED FROM THE TOKEN, NEVER FROM A PARAMETER. A manager may touch any item in ITS OWN
+// project; a worker may touch ONLY the item it is assigned to. The caller does not get to say which
+// xell it is — that is the same rule every other verb in this file follows, and it is what stops
+// "which item?" from becoming a way to reach across the fleet.
+//
+// And nothing here is a new gate or a way round one: reporting an item `done` is a report of FACT
+// about the WORK, and it deliberately does not touch the xell's own done/land/ship state.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/xell/self/work — `zee work` (any zee).
+// A MANAGER gets its project's plan in tree order (with each item's status, assignee and live zee);
+// a WORKER gets the item it is assigned to, with the ancestors/ticket/acceptance it was briefed from.
+// `--item <id>` reads one item, scoped the same way.
+export async function selfWork(xell, { board = false, item = null } = {}) {
+  const { workItemTree, workItemDetail, itemForXell } = await import('../lib/work-assign.js');
+  const manager = isManager(xell);
+
+  if (item) {
+    let detail;
+    try { detail = await workItemDetail(item); }
+    catch (e) { return { ok: false, error: e.message }; }
+    if (manager) {
+      if (detail.item.project_id !== xell.project_id) {
+        return { ok: false, status: 'refused', error:
+          'that work item is in another project. You manage the plan of YOUR project only.' };
+      }
+    } else {
+      const mine = await itemForXell(xell.id);
+      if (!mine || mine.id !== detail.item.id) {
+        return { ok: false, status: 'refused', error:
+          'that is not the work item you are assigned to. A worker sees (and reports on) its OWN item '
+          + 'only — run `zee work` with no arguments to see it.' };
+      }
+    }
+    return { ok: true, ...detail };
+  }
+
+  if (manager) {
+    const items = await workItemTree(xell.project_id, { board });
+    const live = items.filter((i) => i.zee).length;
+    return {
+      ok: true, view: board ? 'board' : 'tree', count: items.length, items,
+      message: items.length
+        ? `${items.length} work item(s)${board ? ' (board view — the project root is not a card)' : ''}; `
+          + `${live} with a zee on ${live === 1 ? 'it' : 'them'}. \`zee assign --item <id> --task "…"\` `
+          + 'deploys a worker for one; the board then follows that worker by itself.'
+        : 'No work items in this project yet. Break a ticket down into a plan first — a worker briefed '
+          + 'from a tracked item gets its ancestors, its ticket and its acceptance notes for free.',
+    };
+  }
+
+  const mine = await itemForXell(xell.id);
+  if (!mine) {
+    return { ok: true, item: null,
+      message: 'You are not assigned to a work item — your task brief is the whole job. (If you believe '
+        + 'you should be tracked on the board, say so in `zee report`.)' };
+  }
+  const detail = await workItemDetail(mine.id);
+  return {
+    ok: true, ...detail,
+    message: `You are executing "${detail.item.title}" (${detail.item.status})`
+      + `${detail.ancestors.length ? `, under ${detail.ancestors.map((a) => a.title).join(' → ')}` : ''}. `
+      + 'Report progress with `zee item ' + detail.item.id.slice(0, 8) + ' --status working --note "…"` — '
+      + 'that moves the CARD only; your own done/land/ship stay your verbs and a human\'s gates.',
+  };
+}
+
+// POST /api/xell/self/work/assign — `zee assign` (MANAGER only).
+// Deploys a WORKER for a work item, through the SAME dispatch path `zee dispatch` uses: the worker is
+// still stamped manager_xell_id, still seated next to its manager, still gets its own throwaway db,
+// and a manager still cannot hand it prod, the manager type or the manager harness. What this adds is
+// the BRIEF: it is built from the item itself (title, body, ancestors, ticket, acceptance) plus
+// whatever extra the manager types, so a well-cut plan brief a worker for free.
+export async function selfWorkAssign(xell, { item = null, task = null, model = null, mode = null,
+                                             harness = null, title = null } = {}) {
+  const guard = requireManager(xell, 'assign');
+  if (guard) return guard;
+  if (!item) return { ok: false, error: 'assign needs --item <work-item-id> (see `zee work`)' };
+  const { deployWorkItem, getItem } = await import('../lib/work-assign.js');
+  let row;
+  try { row = await getItem(item); }
+  catch (e) { return { ok: false, error: e.message }; }
+  if (row.project_id !== xell.project_id) {
+    return { ok: false, status: 'refused', error:
+      'that work item is in another project. You may only deploy workers onto YOUR project\'s plan.' };
+  }
+  try {
+    const out = await deployWorkItem(row.id, {
+      task, model, mode, harness, title, actor: xell.slug, managerXellId: xell.id });
+    return {
+      ok: true, ...out,
+      message: `${out.message} It reports to you (\`zee zees\`, \`zee say --to ${out.xell.slug} …\`), it `
+        + 'lands its OWN work, and the item now follows its hive status — you do not have to move the card.',
+    };
+  } catch (e) {
+    return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
+  }
+}
+
+// POST /api/xell/self/work/item — `zee item` (any zee, scoped).
+// A MANAGER may update any item in its own project; a WORKER may update ONLY the item it is assigned
+// to. Both are resolved from the CALLER'S TOKEN — an id that is not theirs is refused with a sentence,
+// never silently applied.
+export async function selfWorkItem(xell, { id = null, status = null, progress = null, note = null } = {}) {
+  const { reportItemStatus, getItem, itemForXell } = await import('../lib/work-assign.js');
+  const manager = isManager(xell);
+
+  let target = null;
+  if (id) {
+    try { target = await getItem(id); }
+    catch (e) { return { ok: false, error: e.message }; }
+  } else if (!manager) {
+    target = await itemForXell(xell.id);
+    if (!target) {
+      return { ok: false, error: 'you are not assigned to a work item, so there is nothing to report on. '
+        + '`zee work` shows what you are executing (if anything).' };
+    }
+  } else {
+    return { ok: false, error: 'item needs an id — `zee item <id> --status <s>` (see `zee work`).' };
+  }
+
+  if (manager) {
+    if (target.project_id !== xell.project_id) {
+      return { ok: false, status: 'refused', error:
+        'that work item is in another project. You manage YOUR project\'s plan only.' };
+    }
+  } else {
+    const mine = await itemForXell(xell.id);
+    if (!mine || mine.id !== target.id) {
+      return { ok: false, status: 'refused', error:
+        'that is not your work item. A worker may only report on the item it is ASSIGNED to — nobody '
+        + 'else\'s, and not the plan around it. Run `zee work` to see yours, and `zee report --message '
+        + '"…"` if something outside it needs saying.' };
+    }
+  }
+
+  const p = progress == null ? null : Number(progress);
+  if (p != null && (!Number.isFinite(p) || p < 0 || p > 100)) {
+    return { ok: false, error: `--progress must be a number 0-100 (got "${progress}")` };
+  }
+  try {
+    const out = await reportItemStatus(target.id, { status, progress: p, note, actor: xell.slug });
+    return out;
+  } catch (e) {
+    return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
+  }
+}
