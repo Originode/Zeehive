@@ -180,6 +180,27 @@ try {
   ok(nod.vars.DATABASE_URL !== SHARED_PROD,
      `no owner DSN leaked to a reader (${nod.vars.DATABASE_URL ?? '(none)'})`);
 
+  // ── 4b. the §6.2 refusal survives the new precedence ────────────────────────────────────────
+  // Following the binding must never become a way to be HANDED a database. When ZEEHIVE
+  // orchestrates itself the production db IS the managing instance's own meta-DB, and a full
+  // (writable) bind to it is exactly what §6.2 refuses — two reconcilers on one meta-DB reap each
+  // other's xells. The refusal must still fire now that the prod container is preferred, and it
+  // must not leave a HALF-DONE binding: the re-emit is best-effort, so the coupling change stands
+  // and the file is simply not rewritten (loudly logged), rather than the attach throwing.
+  console.log('§6.2: preferring the prod container never smuggles in the managing meta-DB');
+  const { config } = await import('../server/src/config.js');
+  const g = await mkXell('guard');
+  const guardBefore = projection(g.wt).text;
+  await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
+          [pid, config.databaseUrl]);
+  const attached = await attachXellDb(g.id, { coupling: 'db-shared-prod' });
+  ok(attached.coupling === 'db-shared-prod', 'the binding change itself still succeeds');
+  ok(/REFUSING to emit/.test(attached.env_error || ''),
+     `and the projection is REFUSED, not written [${(attached.env_error || 'no error').slice(0, 48)}]`);
+  ok(projection(g.wt).text === guardBefore, 'the file on disk is untouched — never the meta-DB');
+  await q(`UPDATE container SET conn_ref=$2 WHERE project_id=$1 AND role='db' AND tier='prod'`,
+          [pid, SHARED_PROD]);
+
   // ── 5. an EMPTY environment must not read like a broken merge ───────────────────────────────
   // The third half of the ticket: when a project's environments hold no vars (Zeehive's own dev
   // AND prod do, today) a perfectly correct merge writes nothing — and "my binding says prod and
