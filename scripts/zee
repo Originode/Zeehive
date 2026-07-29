@@ -244,6 +244,7 @@ function usage() {
   zee zees                           YOUR CREW: every worker you dispatched — hive status, what it waits on, its last message
   zee dispatch --task "..." [--model m] [--mode 1..5] [--harness key] [--title "..."]   spawn a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness
   zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key]   DEPLOY a worker for a WORK ITEM: same dispatch path as "zee dispatch", but the brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text. Returns the new worker's slug
+  zee swap --to <slug> --harness <key> [--task "..."] [--model m] [--mode 1..5]   replace the ZEE working one of YOUR xells with a fresh one wearing a different worker harness, KEEPING the xell: same branch, same commits, same containers, same db, same card. How one piece of work gets a Scout, then a Builder, then a Reviewer. The outgoing zee's commits are collected out of its cage FIRST (refused rather than risked) and the incoming zee is briefed on what it INHERITED. REFUSED: a xell that is not your crew, a manager target, a manager harness, and any xell with a human gate open on it (a landing, a ship, a done suggestion)
   zee say --to <slug> --message "..."   type a message straight into that worker's LIVE session
   zee harness [<key>] [--delete] [--label "..."] [--parent <key>] [--summary "..."] [--glyph x] [--personality "..." | --personality-file <path>] [--spec <file.json>] [--enabled on|off] [--full|--json]   ·   zee harness --new --label "..." [same persona flags]
                                      YOUR PROJECT'S WORKER PERSONAS: bare LISTS what you may use (the system-wide harnesses, plus your own project's — only the latter are yours to edit); "zee harness <key>" READS one (--full for the raw JSON). --new mints one scoped to YOUR project and its KEY is DERIVED from your project + label — you do not pass one, and a key you send is refused. --parent inherits a global worker harness (zee-base carries the cxell manual, dev-base the dev craft), --spec loads {personality,summary,skills[],memory[]} from a JSON file, --delete removes one of yours. Then "zee dispatch --harness <key>". REFUSED: a manager persona, any system-wide harness, another project's, and deleting or DISABLING one a live zee wears or inherits
@@ -458,6 +459,22 @@ switch (cmd) {
     out(await req('POST', '/api/xell/self/dispatch', {
       task, model: flag('model') || null, mode: flag('mode') || null,
       harness: flag('harness') || null, title: flag('title') || null,
+    }));
+    break;
+  }
+  case 'swap': {
+    // MANAGER only: change WHO is in one of your xells without changing the xell. The work stays
+    // exactly where it is (branch, commits, containers, db, work-item card); only the zee and its
+    // harness change, and the incoming zee is told it INHERITED the branch rather than started it.
+    // The queenzee collects the outgoing zee's cage commits before anything recreates the cage —
+    // and refuses the whole swap if it cannot, because those commits exist in one place only.
+    const to = flag('to');
+    const harness = flag('harness');
+    if (!to) { console.error('swap needs --to <worker-slug> (`zee zees` lists your crew)'); process.exit(1); }
+    if (!harness) { console.error('swap needs --harness <key> — the persona the INCOMING zee wears (`zee harness` lists them)'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/swap', {
+      to, harness, task: flag('task') || null, model: flag('model') || null,
+      mode: flag('mode') || null, title: flag('title') || null,
     }));
     break;
   }

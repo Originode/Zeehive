@@ -64,7 +64,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
-         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
+         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSwap, selfSay, selfReport, selfInbox,
          selfSuggestDone, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
@@ -1301,6 +1301,20 @@ router.post('/xell/self/dispatch', async (req, res) => {
     const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfDispatch(x, req.body || {}));
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Replace the ZEE inside one of MY crew's xells, KEEPING the xell (`zee swap`). Not human-gated for
+// the same reason `dispatch` is not: what comes out the other side is an ordinary caged worker whose
+// every irreversible act still meets the same gates. The refusals (not my crew, a manager target, a
+// manager harness, an open human gate on that xell) and the collect-before-recreate ordering that
+// protects the outgoing zee's uncollected commits both live in selfSwap.
+router.post('/xell/self/swap', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfSwap(x, {
+      to: req.body?.to, harness: req.body?.harness, task: req.body?.task || null,
+      model: req.body?.model || null, mode: req.body?.mode || null,
+      runtime: req.body?.runtime || null, title: req.body?.title || null,
+    })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/xell/self/say', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
