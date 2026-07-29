@@ -705,7 +705,12 @@ export default function App() {
             production READ-ONLY and cannot push to the xource, and `zee dispatch` refuses the role
             so managers can never mint managers. Sits beside the prompt buttons because it is the
             same act one level up: starting an agent. */}
-        <AddManagerButton projectId={projectId || project.id} onAdded={refresh} />
+        {/* It opens the SAME composer the "+ prompt" buttons do (Dispatch, manager variant) — a
+            manager's programme is a prompt, and it used to get a one-line input box. `providers`
+            rides along so the one manager button can still choose WHICH connected account runs it,
+            the choice the per-account prompt buttons make by being clicked. */}
+        <AddManagerButton projectId={projectId || project.id} projectName={project.name}
+                          providers={providers} onAdded={refresh} />
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>

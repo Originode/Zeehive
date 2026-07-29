@@ -1104,6 +1104,17 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 7px; padding: 6px 18px; font-size: 13px; font-weight: 600; cursor: pointer; }
 .disp-submit:hover { filter: brightness(1.1); }
 .disp-submit:disabled, .disp-cancel:disabled { opacity: .5; cursor: default; }
+/* the "leave it blank and it proposes a plan" line sits at the LEFT of the manager footer, so the
+   buttons keep their usual place on the right */
+.disp-foot .disp-hint { margin-right: auto; align-self: center; max-width: 46ch; }
+
+/* ADDING A MANAGER ZEE uses the same composer as a worker prompt (one editor, one set of controls)
+   — it is marked in production orange, the colour a manager's hexagon is drawn in, so the heavier
+   act does not look identical to dispatching a worker. */
+.disp.disp-mgr { border-color: var(--prod, #f0913b); }
+.disp.disp-mgr .disp-head { border-bottom-color: var(--prod, #f0913b); }
+.disp.disp-mgr .disp-title { color: var(--prod, #f0913b); }
+.disp.disp-mgr .disp-submit { background: var(--prod, #f0913b); border-color: var(--prod, #f0913b); color: #1b1206; }
 
 /* harness web-UI bridge setup */
 .disp-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }

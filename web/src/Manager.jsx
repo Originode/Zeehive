@@ -13,6 +13,7 @@
 import React, { useState } from 'react';
 import { addManagerZee, decideDoneSuggestion, dismissDoneSuggestion } from './api.js';
 import { showAlert, showPrompt } from './Dialog.jsx';
+import Dispatch from './Dispatch.jsx';
 
 const ago = (ts) => {
   if (!ts) return '';
@@ -23,29 +24,58 @@ const ago = (ts) => {
 };
 
 // ── add a manager zee (unlimited) ────────────────────────────────────────────
-export function AddManagerButton({ projectId, onAdded }) {
+//
+// THE PROMPT IS THE WHOLE POINT, so it gets a real composer. This used to be a one-line
+// showPrompt() `<input>`: a manager's PROGRAMME — the standing brief an agent runs an entire crew
+// from, and the longest-lived prompt in the fleet — had to be typed blind into a single-line text
+// field, with Enter firing it, no way to see what you had written, no paste of a backlog or a
+// screenshot, and no choice of model, autonomy or account. A worker doing one job in one xell got
+// the full composer. So the manager now opens the SAME modal (Dispatch, `manager` variant), and
+// the payload goes to POST /api/managers instead of the dispatch route.
+//
+// Leaving it blank is still allowed and still means something: the server hands it
+// DEFAULT_MANAGER_BRIEF (study the project, propose a programme, ask a human before starting a
+// crew). The composer says so, rather than making a human guess.
+export function AddManagerButton({ projectId, projectName, providers = [], onAdded }) {
+  const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const add = async () => {
-    const brief = await showPrompt(
-      'Add a MANAGER ZEE.\n\n'
-      + 'A manager runs a crew: it dispatches worker zees, talks to them in real time, reads their '
-      + 'post-ship reflections and suggests when one is done (you confirm). It holds the PRODUCTION '
-      + 'database READ-ONLY — its own postgres role, granted SELECT and nothing else — and it has '
-      + 'ZERO push access to the xource: it writes no code and lands none.\n\n'
-      + 'Give it its programme (leave blank and it will study the project, propose a plan, and ask you '
-      + 'before starting a crew):',
-      { okLabel: 'Add manager zee', placeholder: 'e.g. own the console backlog: ship the landing-pad fixes first' });
-    if (brief === null) return;                     // cancelled
+
+  // Every connected AI ACCOUNT that can run a zee — the same list the "+ prompt" buttons are built
+  // from in App.jsx, flattened into one picker because a manager has one button, not one per
+  // account. Empty (no provider connected) → the composer simply shows no Account field and the
+  // server picks the project's newest claude token, exactly as before.
+  const accounts = (providers || [])
+    .filter((p) => p.provider !== 'github' && p.dispatch)
+    .flatMap((p) => (p.accounts || []).map((a) => {
+      const dupes = (p.accounts || []).length > 1;
+      return { id: a.id, provider: p.provider, typeLabel: p.label,
+               name: a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label) };
+    }));
+
+  const add = async (payload) => {
+    setOpen(false);
     setBusy(true);
-    try { await addManagerZee({ project: projectId, task: String(brief || '').trim() || undefined }); onAdded?.(); }
-    catch (e) { await showAlert(`Could not add a manager zee:\n\n${e.message}`, { variant: 'error' }); }
+    try {
+      // Same shape the dispatch composer emits; POST /api/managers stamps the type, binds prod
+      // read-only and cages the zee in the manager harness. `task` is absent when left blank —
+      // the server's DEFAULT_MANAGER_BRIEF then applies (sending '' would be a task of nothing).
+      await addManagerZee(payload);
+      onAdded?.();
+    } catch (e) { await showAlert(`Could not add a manager zee:\n\n${e.message}`, { variant: 'error' }); }
     finally { setBusy(false); }
   };
+
   return (
-    <button className="mgr-add" onClick={add} disabled={busy}
-            title="Add a manager zee: runs a crew of workers, reads production (read-only), cannot push to the xource. Add as many as you like.">
-      {busy ? 'adding…' : '⬢ + manager zee'}
-    </button>
+    <>
+      <button className="mgr-add" data-testid="add-manager-btn" onClick={() => setOpen(true)} disabled={busy}
+              title="Add a manager zee: runs a crew of workers, reads production (read-only), cannot push to the xource. Add as many as you like.">
+        {busy ? 'adding…' : '⬢ + manager zee'}
+      </button>
+      {open && (
+        <Dispatch manager projectId={projectId} projectName={projectName} accounts={accounts}
+                  onClose={() => setOpen(false)} onDispatch={add} />
+      )}
+    </>
   );
 }
 
