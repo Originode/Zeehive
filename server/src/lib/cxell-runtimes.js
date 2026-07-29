@@ -272,4 +272,11 @@ export const AGENT_PROC_PATTERN = `(^|/| )(${[...new Set(Object.values(ADAPTERS)
 //
 // ⚠ MUST stay in lockstep with `live_run()` in docker/zeehive/zee-attach.sh — that script decides
 // the same thing from inside the cage, and the two disagreeing is a message delivered into a void.
-export const HEADLESS_PROC_PATTERN = 'claude --bare -p|codex exec|kimi -p';
+//
+// The BRACKETS are load-bearing, and were put here by a live misfire rather than by theory: this
+// pattern is interpolated into the shell command the queenzee execs over SSH, so `pgrep -f` reads
+// its own wrapper's cmdline — which contains the pattern — and matched IT. Every message would then
+// look mid-turn and queue, in a cage with no turn running at all. `[-]p` matches "-p" while the
+// literal text "[-]p" does not, so the probe cannot see itself. (Same trick, same reason, as
+// `zee-live[.]mjs` in terminal-bridge.js.)
+export const HEADLESS_PROC_PATTERN = 'claude --bare [-]p|codex [e]xec|kimi [-]p';
