@@ -882,7 +882,10 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
       {!custom && (
         <div className="docgen">
           <div className="pc">Generate for <b>{generated.length}</b> provider
-            {generated.length === 1 ? '' : 's'}: <code>{generated.join('</code> · <code>') || 'nothing'}</code>
+            {generated.length === 1 ? '' : 's'}:{' '}
+            {generated.length
+              ? generated.map((p, i) => <span key={p}>{i ? ' · ' : ''}<code>{p}</code></span>)
+              : 'nothing — this doc reaches nobody'}
           </div>
           <div className="docgen-grid">
             {targets.map((t) => (
