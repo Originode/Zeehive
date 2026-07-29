@@ -898,6 +898,10 @@ a.cbox:hover { border-color: var(--accent); }
 .land-approve:hover:not(:disabled) { background: rgba(53,196,107,.12); }
 .land-reject { border-color: var(--error) !important; color: var(--error) !important; }
 .land-reject:hover:not(:disabled) { background: rgba(229,85,78,.12); }
+/* Withdraw sits left of Reject and stays MUTED on purpose: it decides nothing (no rejection, no
+   landing, the sha is not burned), so it must not read as a verdict competing with the two that are. */
+.land-withdraw { border-color: var(--line) !important; color: var(--muted) !important; margin-right: auto; }
+.land-withdraw:hover:not(:disabled) { color: var(--text) !important; background: rgba(255,255,255,.06); }
 /* nothing held any more — approved and waiting on the zee. Green, not alarm-red. */
 .land-panel.settled { border-color: var(--up); }
 .land-panel.settled .land-title { color: var(--up); }

@@ -1,6 +1,6 @@
 // LAND THIS XELL'S WORK — push to the xource, wait for the human, push again. One command.
 //
-//   xell-land.mjs [--wait[=secs]] [--status] [--xell <id>]
+//   xell-land.mjs [--wait[=secs]] [--status] [--withdraw [--reason "…"]] [--xell <id>]
 //
 // WHY THIS EXISTS: the gate declines your push and tells you to "re-run the SAME push once a human
 // approves it" — and then gives you no way to know that ever happened. So a zee either sat blind
@@ -20,6 +20,9 @@ const argv = process.argv.slice(2);
 const waitArg = argv.find((a) => a === '--wait' || a.startsWith('--wait='));
 const waitSecs = waitArg?.includes('=') ? Number(waitArg.split('=')[1]) || 3600 : 3600;
 const statusOnly = argv.includes('--status');
+const withdraw = argv.includes('--withdraw') || argv.includes('--clear');
+const ri = argv.indexOf('--reason');
+const reason = ri >= 0 ? argv[ri + 1] : null;
 const xi = argv.indexOf('--xell');
 const explicit = xi >= 0 ? argv[xi + 1] : null;
 
@@ -51,6 +54,26 @@ if (statusOnly) {
   const r = await req('GET', `/api/land/status?xell=${encodeURIComponent(x.id)}`);
   const s = json(r);
   console.log(r.code >= 400 ? (s.error || 'no land request') : JSON.stringify(s, null, 2));
+  process.exit(0);
+}
+
+// UN-ASK a held landing. The other half of "a zee should never leave a card it no longer means":
+// nothing lands, nothing is rejected, no sha is burned and the branch is untouched — the question
+// simply stops being asked. Withdraw BEFORE you land again; do not stack requests.
+if (withdraw) {
+  const cur = json(await req('GET', `/api/land/status?xell=${encodeURIComponent(x.id)}`));
+  if (!cur?.id) { console.log('Nothing to withdraw — this xell has no land request on record.'); process.exit(0); }
+  if (cur.status !== 'pending') {
+    console.log(`Nothing to withdraw — the latest land request is '${cur.status}', not pending.`);
+    console.log(cur.status === 'approved'
+      ? '  It is APPROVED: a human decided it and the queenzee is landing it. That is not yours to retract.' : '');
+    process.exit(0);
+  }
+  const w = await req('POST', `/api/land/requests/${cur.id}/withdraw`, { by: 'zee@xell-land', reason });
+  const wj = json(w);
+  if (w.code >= 400) { console.log(`Withdraw failed: ${wj.error || w.code}`); process.exit(1); }
+  console.log(`\n  ✓ WITHDRAWN ${String(wj.new_sha).slice(0, 8)} — the card is off the human's screen and nothing`);
+  console.log('    landed, was rejected or was reverted. `xell-land.mjs` again when the work is really ready.\n');
   process.exit(0);
 }
 
@@ -89,6 +112,11 @@ while (Date.now() < deadline) {
   if (s.status === 'rejected') {
     console.log(`\n  ✗ A human REJECTED this exact commit${s.decided_by ? ` (${s.decided_by})` : ''}.`);
     console.log('    Re-pushing it will not help. Do not amend to a new sha to get around it — talk to them.\n');
+    process.exit(1);
+  }
+
+  if (s.status === 'withdrawn') {
+    console.log('\n  ✗ WITHDRAWN — this landing was un-asked; nobody is waiting on it any more.\n');
     process.exit(1);
   }
 

@@ -610,6 +610,19 @@ export async function decideLanding(id, decision, by = 'human@console') {
   return data;
 }
 
+// WITHDRAW a held landing on the zee's behalf — the operator half of `zee land --withdraw`.
+// NOT a rejection: nothing is refused and no sha is burned, so the same work can be pushed and
+// asked again. For the card a zee abandoned (or the older of a stack it left behind).
+export async function withdrawLanding(id, reason = null) {
+  const r = await fetch(`/api/land/requests/${id}/withdraw`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console', reason }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `withdraw failed (${r.status})`);
+  return data;
+}
+
 // ── shipping to production (zee asks · human approves · queenzee ships) ───────
 // approve → the queenzee takes the prod lock and runs the deploy ITSELF, from main.
 // siteId (approve only): aim the ship at a chosen prod site — the dialog's target picker when a
