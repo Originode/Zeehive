@@ -92,6 +92,17 @@ while (Date.now() < deadline) {
     process.exit(1);
   }
 
+  if (s.status === 'stale') {
+    // main moved past this sha while we waited, so the request is dead — no approval can make a
+    // non-fast-forward land. Do NOT keep waiting (this loop used to burn its full hour on it).
+    console.log(`\n  ✗ STALE — ${(s.ref || 'main').replace('refs/heads/', '')} moved past ${String(s.new_sha).slice(0, 8)} while this waited.`);
+    console.log('    Nothing is lost: your commits are still on your branch, and nothing was rewritten.');
+    console.log('    Catch up onto current main, then land the NEW sha (a new decision is expected):');
+    console.log('      zee sync   # merges current main into your branch — resolve any conflict, git add/commit');
+    console.log('      zee land   # raises a FRESH request on the synced sha\n');
+    process.exit(1);
+  }
+
   if (s.status === 'landed') {
     console.log(`\n  ✓ LANDED on ${(s.ref || '').replace('refs/heads/', '')} @ ${String(s.new_sha).slice(0, 8)}.\n`);
     process.exit(0);

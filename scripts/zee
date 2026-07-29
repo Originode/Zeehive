@@ -59,7 +59,17 @@ async function pollLanding(secs) {
     if (land.status !== last) { console.error(`  … ${land.status || 'unknown'}`); last = land.status; }
     if (land.status === 'landed') { console.error(`\n  ✓ LANDED on main${land.new_sha ? ` @ ${String(land.new_sha).slice(0, 8)}` : ''}.\n`); process.exit(0); }
     if (land.status === 'rejected') { console.error('\n  ✗ REJECTED by a human — re-pushing this sha will not help; talk to them.\n'); process.exit(1); }
-    if (land.status === 'stale') { console.error('\n  ✗ STALE — main moved past this sha; make a fresh commit and `zee land` again.\n'); process.exit(1); }
+    if (land.status === 'stale') {
+      // Dead, not rejected: main moved past this sha, so no approval could ever fast-forward it. A
+      // fresh COMMIT is not enough — the branch has to contain current main first, and in the cage
+      // only `zee sync` can do that. (The queenzee nudges you with the same instruction; this is
+      // the backup signal for it.)
+      console.error(`\n  ✗ STALE — main moved past ${land.new_sha ? String(land.new_sha).slice(0, 8) : 'this sha'} while it waited; it can never fast-forward.`);
+      console.error('    Your commits are safe on your branch. Catch up, then ask again:');
+      console.error('      zee sync   # merge current main into your branch (resolve any conflict, git add/commit)');
+      console.error('      zee land   # raises a FRESH request on the new sha\n');
+      process.exit(1);
+    }
     // 'pending' / 'approved' → keep waiting (an approval lands automatically).
   }
   console.error(`\n  ✗ TIMEOUT after ${secs}s — still waiting on a human. Your work is safe on your branch.\n`);

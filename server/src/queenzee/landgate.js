@@ -13,7 +13,7 @@ import { logline } from '../lib/logbus.js';
 import { gitLog, diffStat, cleanGitEnv, headCommit } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
-import { nudgeXellAfterLand } from './nudge.js';
+import { nudgeXellAfterLand, nudgeXellForStaleLanding } from './nudge.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
 import { recordXourceHead } from '../lib/projects.js';
 
@@ -281,7 +281,76 @@ function ffState(repoRoot, ref, sha) {
     ? { state: 'ff', tip: t } : { state: 'diverged', tip: t };
 }
 
-async function landApproved(row, by = 'human') {
+// CLOSE A DEAD LANDING — and TELL THE ZEE. One place, because there are two ways a landing dies of
+// staleness (an approval the ref moved past, and a held request the ref moved past while a human
+// was still deciding) and both used to end the same way: an honest row, an honest log line, and a
+// zee that never heard about it. A cxell zee's turn ENDS at `zee land`; the console is not
+// something it can watch. So closing the row is only half the job — the other half is the nudge
+// that tells it to `zee sync` and raise a fresh request, which is the only recovery that exists.
+//
+// The reason goes into the row's `note` too, so the console (and anyone reading the row later) can
+// see why it died and whether the zee was actually reached, rather than inferring it from the log.
+async function closeAsStale(row, { tip = null, from = 'approved' } = {}) {
+  const branch = (row.ref || '').replace('refs/heads/', '') || 'main';
+  const short = String(row.new_sha || '').slice(0, 8);
+  // A row leaving 'pending' MUST carry a decider (the 009 check constraint `land_decided_has_decider`
+  // — no status change without someone's name on it). Nobody decided this one: it died of staleness,
+  // and the queenzee is what noticed. Say exactly that rather than borrow a human's name, and
+  // COALESCE so an approval that goes stale keeps the human who actually approved it.
+  const stale = await one(
+    `UPDATE land_request
+        SET status='stale', decided_at=COALESCE(decided_at, now()),
+            decided_by=COALESCE(decided_by, 'queenzee@stale')
+      WHERE id=$1 AND status=$2 RETURNING *`, [row.id, from]);
+  if (!stale) return null;                       // someone else decided it first — leave it alone
+  broadcast('land', stale);
+  logline('landgate',
+    `${from === 'pending' ? 'held request' : 'approval'} for ${short} is STALE — ${branch} has moved past it`
+    + `${tip ? ` (now ${String(tip).slice(0, 8)})` : ''}, so it can never fast-forward. The gate binds an approval `
+    + 'to one exact sha: this one needs a synced branch, a fresh sha and a fresh decision. Closed.');
+
+  // The zee is the only one who can fix this, and it is the one party that could not see it happen.
+  const nudged = await nudgeXellForStaleLanding(row.xell_id, { sha: row.new_sha, ref: row.ref, tip })
+    .catch((e) => ({ nudged: false, error: e.message }));
+  const note = `stale: ${branch} moved past ${short}${tip ? ` (now ${String(tip).slice(0, 8)})` : ''} — `
+    + (nudged?.nudged ? 'the zee was nudged to `zee sync` and land again'
+      : nudged?.tended ? `no live cxell to nudge (${nudged.reason ? 'tend raised' : 'tend raised'}) — flagged for a human`
+        : `nothing to nudge (${nudged?.reason || nudged?.error || 'no cxell zee'})`);
+  const noted = await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING *`, [row.id, note])
+    .catch(() => null);
+  if (noted) broadcast('land', noted);
+  logline('landgate', `${short}: ${note}`);
+  return noted || stale;
+}
+
+// HELD REQUESTS THE REF HAS ALREADY MOVED PAST. A pending landing is a question waiting on a human,
+// and the answer can go bad while they are away: another xell lands, and now the sha on the card
+// can never fast-forward. Approving it just walks it into closeAsStale a second later — so the
+// human is being asked to decide something that has no outcome, and the zee is waiting on an answer
+// that cannot help it either way.
+//
+// Sweep them: close each dead pending row and nudge its zee to sync and ask again with a landable
+// sha. Conservative on purpose — ONLY 'diverged' (a proven non-fast-forward) is closed. A sha the
+// ref already contains ('already') is a different animal and is left for a human to look at.
+export async function sweepStalePending() {
+  const rows = await q(
+    `SELECT lr.*, p.repo_root FROM land_request lr JOIN project p ON p.id = lr.project_id
+       WHERE lr.status='pending' ORDER BY lr.requested_at LIMIT 20`);
+  let stale = 0;
+  for (const row of rows) {
+    if (!row.repo_root || !row.new_sha) continue;
+    const { state, tip } = ffState(row.repo_root, row.ref, row.new_sha);
+    if (state !== 'diverged') continue;
+    const closed = await closeAsStale(row, { tip, from: 'pending' }).catch((e) => {
+      logline('landgate', `could not close stale request ${String(row.id).slice(0, 8)}: ${e.message}`);
+      return null;
+    });
+    if (closed) stale++;
+  }
+  return { checked: rows.length, stale };
+}
+
+export async function landApproved(row, by = 'human') {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
   if (!project) return row;
 
@@ -319,15 +388,7 @@ async function landApproved(row, by = 'human') {
     // but the row stayed 'approved', so its "waiting for the zee to re-push" receipt rendered
     // forever (and outlived every restart, which also emptied the set and re-ran the futile push).
     // A stale row leaves the open list, the tick's SELECT, and the console in one honest move.
-    const stale = await one(
-      `UPDATE land_request SET status='stale' WHERE id=$1 AND status='approved' RETURNING *`, [row.id]);
-    if (stale) {
-      broadcast('land', stale);
-      logline('landgate',
-        `approval for ${row.new_sha.slice(0, 8)} is STALE — ${row.ref.replace('refs/heads/', '')} has `
-        + 'moved past it, so it can never fast-forward. The gate binds an approval to one exact sha: '
-        + 'this one needs a fresh commit and a fresh decision. Closed.');
-    }
+    const stale = await closeAsStale(row, { tip, from: 'approved' });
     return { ...(stale || row), stale: true };
   }
 
@@ -416,7 +477,12 @@ export async function tick() {
     if (r && r.status === 'landed') landed++;
     if (r && r.stale) stale++;
   }
-  return { checked: stuck.length, landed, stale };
+  // …and the HELD requests that died while a human was away (see sweepStalePending). Same tick, so
+  // a zee learns its landing is dead within seconds of it becoming dead, not when someone clicks.
+  const swept = await sweepStalePending().catch((e) => {
+    logline('landgate', `stale sweep failed: ${e.message}`); return { checked: 0, stale: 0 };
+  });
+  return { checked: stuck.length, landed, stale: stale + swept.stale, pending_checked: swept.checked };
 }
 
 // "Seen it — stop showing me." A durable fact about VISIBILITY, never about status: a dismissed

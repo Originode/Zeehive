@@ -53,7 +53,10 @@ function PadRow({ item }) {
           <span className="pad-commits"> · {item.commits} commit{item.commits === 1 ? '' : 's'}</span>
         )}
       </span>
-      <span className={`pad-phase ${p.cls}`}>
+      {/* A STALE landing is the one phase whose label raises a question ("stale — and now what?").
+          The note answers it in place: main moved past the sha, and whether the zee was nudged to
+          sync and ask again. Tooltip, not a new line — this is a receipt, not a decision. */}
+      <span className={`pad-phase ${p.cls}`} title={item.note || undefined}>
         {item.processing && <span className="pad-spin" data-testid="pad-spin" aria-label="processing" />}
         {item.next && !item.processing && <span className="pad-nextdot" title="next up" />}
         {p.label}

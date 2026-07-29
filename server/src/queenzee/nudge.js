@@ -16,6 +16,7 @@ import { logline } from '../lib/logbus.js';
 import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from '../lib/cxell.js';
 import { adapterFor } from '../lib/cxell-runtimes.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
+import { setTend } from '../lib/status.js';
 
 const CONTINUE_PROMPT =
   'Your landing was APPROVED and is now on main — the queenzee moved the ref, nothing is left for you '
@@ -25,6 +26,64 @@ const CONTINUE_PROMPT =
   + '  2. If more work remains, keep going and `zee land` again when the next chunk is ready.\n'
   + '  3. When you are satisfied the whole job is complete, run `zee done --summary "…"`.\n'
   + 'Do NOT try to re-run `zee land` for the work that just landed; it is done. Pick the next step and act.';
+
+// A STALE LANDING is the other end of the same loop, and it was the SILENT one. An approval is
+// bound to one exact sha; if main moves past that sha before it lands (another xell landed first,
+// a human pushed by hand), it can never fast-forward and the gate closes the row as 'stale'. That
+// was recorded honestly — in the log, in the row, on the pad — and told NOBODY. The zee's turn had
+// already ended at `zee land`, so it sat there believing a human was still deciding: no nudge, no
+// second request, work stranded on a branch nobody would ever be asked to approve again.
+//
+// So a stale landing nudges too, with the ONE recovery that actually works from inside a cxell:
+// `zee sync` (the queenzee merges current main into the branch — `git fetch`/`git rebase main`
+// cannot work in the cage) and then `zee land` again, which raises a FRESH request on the new sha.
+// Deliberately explicit that this is not a failure of the work and not something to route around:
+// the sha is dead, the commits are not.
+const STALE_PROMPT = (ref, sha, tip) => [
+  `Your landing did NOT land — it went STALE${sha ? ` (${String(sha).slice(0, 8)})` : ''}. While your push was waiting,`,
+  `${ref ? ref.replace('refs/heads/', '') : 'main'} moved on${tip ? ` (it is now at ${String(tip).slice(0, 8)})` : ''} — someone else landed first — so the sha a human`,
+  'approved can no longer fast-forward, and the gate binds an approval to ONE exact sha. Nothing is lost:',
+  'every commit is still on your branch and nothing was rewritten. The sha is dead, your work is not.',
+  '',
+  'Get back on top of main and ask again — two steps, in this order:',
+  '  1. `zee sync` — the queenzee delivers current main INTO your cxell and MERGES it into your branch.',
+  '     This is the ONLY way to catch up in here (`git fetch` / `git rebase main` cannot work — your cage',
+  '     has no main ref). If it reports a genuine CONFLICT the merge is left in progress for YOU: resolve',
+  '     the files, `git add` them, `git commit`. If the merge touched your change, re-verify it',
+  '     (`zee build <role> --wait`, in the BACKGROUND).',
+  '  2. `zee land` — pushes your NEW sha and raises a FRESH request for a human. A new decision on new',
+  '     content is expected, not a setback.',
+  '',
+  'Do NOT re-run the old push, do NOT amend/force to dodge the gate, and do NOT touch origin. If the sync',
+  'conflicts in a way you cannot honestly resolve, stop and raise it: `zee tend --reason "…"`.',
+].join('\n');
+
+// Tell the zee its landing died so it can sync and ask again. Called by the land gate the moment a
+// row is closed as 'stale' — from an approval that could no longer fast-forward, or from the sweep
+// that closes held requests main has already moved past. Best-effort and NEVER throws: closing a
+// dead row must not depend on a cxell being reachable.
+//
+// If there is no live cxell to nudge (the zee finished, or its container is gone) the landing would
+// go unheard entirely — so we raise a TEND instead: "needs a human in the console". A stale landing
+// with nobody listening is exactly the state that must not be silent.
+export async function nudgeXellForStaleLanding(xellId, { sha = null, ref = null, tip = null, by = 'queenzee' } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const r = await nudgeCxell(xellId, {
+    by, prompt: STALE_PROMPT(ref, sha, tip), why: 'landing went stale',
+    log: (slug, sid) => `${slug}: landing ${short} went STALE — resuming cxell session ${sid} to `
+      + '`zee sync` and land again',
+  });
+  if (r?.nudged) return r;
+
+  // Nobody to tell. Don't tend a xell that is already gone — there is no zee to come back to it.
+  const xell = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xellId]).catch(() => null);
+  if (!xell || xell.status === 'retired') return { ...r, tended: false };
+  const reason = `Landing ${short} went STALE — main moved past it, so it can never land. The zee could not be `
+    + `nudged (${r?.reason || r?.error || 'no live cxell'}), so nothing has synced and re-requested it.`;
+  await setTend(xellId, true, { reason, source: 'queenzee' }).catch(() => {});
+  logline('nudge', `${xell.slug}: landing ${short} went STALE and there is no live cxell to nudge — raised a tend for a human`);
+  return { ...r, tended: true, reason };
+}
 
 // THE REFLECTION STAGE — what a worker does AFTER its work is live in production.
 //

@@ -37,7 +37,7 @@ export async function buildLandingPad(projectId) {
 
   const landings = await q(
     `SELECT lr.id, lr.xell_id, x.slug AS xell_slug, lr.status, lr.requested_at, lr.decided_at,
-            lr.landed_at AS finished_at, lr.new_sha AS sha, lr.ref, lr.commits
+            lr.landed_at AS finished_at, lr.new_sha AS sha, lr.ref, lr.commits, lr.note
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
       WHERE lr.project_id = $1 AND lr.dismissed_at IS NULL
         AND (lr.status IN ('pending','approved')
@@ -92,6 +92,10 @@ export function composePad({ landings = [], ships = [], merging = new Set() }) {
       kind, id: r.id, xell_id: r.xell_id, xell_slug: r.xell_slug || 'unknown', status: r.status, phase,
       processing: phase === 'processing',
       sha: r.sha || null, ref: r.ref || null, reason: r.reason || null,
+      // Why a receipt ended the way it did. This is the only place a STALE landing can explain
+      // itself — the landing card renders open requests only, and stale is neither open nor a
+      // rejection — and the note says whether the zee was actually nudged to sync and ask again.
+      note: r.note || null,
       commits: Array.isArray(r.commits) ? r.commits.length : null,
       requested_at: r.requested_at, decided_at: r.decided_at, finished_at: r.finished_at,
     };
