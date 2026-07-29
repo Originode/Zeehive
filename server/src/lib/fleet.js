@@ -59,8 +59,9 @@ async function fetchXellRows(pid) {
             hn.key AS harness_key, hn.label AS harness_label,
             -- RESOLVED ENVIRONMENT (migration 043): which env this xell is loaded with, by the same
             -- rule lib/environments.js uses — an explicit pin, else the default env of the computed
-            -- tier (prod for a xell on production — live, read-only or being it — else dev). env_var_count surfaces the
-            -- empty case (an empty env adds nothing to .zeehive.env — the safe, dormant state).
+            -- tier (prod for a xell on production — live, read-only or being it — else dev).
+            -- env_var_count surfaces the empty case (an empty env adds nothing to .zeehive.env
+            -- — the safe, dormant state).
             env.env_key, env.env_tier, env.env_pinned, env.env_var_count,
             -- FLEET BURN (per xell): sum of what EVERY zee this xell has ever hosted consumed —
             -- tokens + $ — not just the currently-shown zee (z above is one row). A cxell xell can

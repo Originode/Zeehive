@@ -108,10 +108,10 @@ export async function emitXellEnv(xellId) {
   // before, so it is a refusal, not a warning.
   //
   // FIRST, before the xell's own db container: a xell bound to production READ-ONLY. Its
-  // DATABASE_URL is the SELECT-only DSN the queenzee
-  // minted for it (lib/prod-readonly.js), never the prod owner's connection string — and never its
-  // OWN db container either. That precedence is the point: a manager is an ordinary pooled spinoff
-  // (owned db container and all) that is THEN bound read-only, so taking the owned container first
+  // DATABASE_URL is the SELECT-only DSN the queenzee minted for it (lib/prod-readonly.js) — never
+  // the prod owner's connection string, and never its OWN db container either. That precedence is
+  // the point: a manager is an ordinary pooled spinoff (owned db container and all) that is THEN
+  // bound read-only, so taking the owned container first
   // meant the manager's .zeehive.env quietly pointed at its throwaway spinoff database while its
   // binding advertised production (ticket #15). The binding is what the zee was told it has, so the
   // binding wins. Emitted at all because a cxell zee has no docker and reaches postgres over TCP.
@@ -198,8 +198,7 @@ export async function emitXellEnv(xellId) {
   // Environment vars — the meta-DB source of truth for the untracked .env (migration 043).
   // Resolved by tier: a xell ON PRODUCTION (environments.isOnProduction — writing it, reading it
   // read-only, or being it) gets the project's default PROD environment, else the default DEV one;
-  // an explicit xell.environment_id overrides. Merged
-  // AFTER the per-xell truth above (ports/DATABASE_URL/site/slug) and BEFORE the manifest safety
+  // an explicit xell.environment_id overrides. Merged AFTER the per-xell truth above (ports/DATABASE_URL/site/slug) and BEFORE the manifest safety
   // defaults below, and it can never override either: any name already emitted (or declared in
   // spin.env) is skipped, so an environment can't redirect DATABASE_URL past the §6.2 guard nor
   // undo BUILD_MODE=simulate. Best-effort — a projection failure must not sink provisioning.
