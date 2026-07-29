@@ -96,6 +96,11 @@ const liveXell = (id) => (id
            FROM xell WHERE id=$1`, [id])
   : Promise.resolve(null));
 
+// A xell on its way out. `retired` is gone; `tearing-down` is a human's confirmed decision already
+// being executed by the reaper — putting work on either is putting work on something that will not
+// exist in a minute.
+const GOING = ['retired', 'tearing-down'];
+
 // ── assign: link an EXISTING xell to an item ─────────────────────────────────
 // Idempotent: assigning the xell that is already on the item is a no-op success, so a retry after a
 // half-failed call is safe. The status move is queued → assigned ONLY: an item already working (or
@@ -112,9 +117,10 @@ export async function assignWorkItem(id, { xell_id, actor = 'human@console' } = 
   }
 
   // ── the refusals ──
-  if (xell.status === 'retired') {
-    throw refuse(`${xell.slug} is retired — its worktree is gone, so it cannot carry a work item. `
-      + 'Deploy a fresh worker instead (POST /api/work-items/:id/deploy).');
+  if (GOING.includes(xell.status)) {
+    throw refuse(`${xell.slug} is ${xell.status} — it is gone or being torn down, so it cannot `
+      + 'carry a work item (its worktree is going away, and with it anything it has not landed). Deploy '
+      + 'a fresh worker instead (POST /api/work-items/:id/deploy).');
   }
   if (xell.project_id !== item.project_id) {
     throw refuse(`${xell.slug} belongs to a different project than this work item. A xell only ever `
@@ -139,7 +145,9 @@ export async function assignWorkItem(id, { xell_id, actor = 'human@console' } = 
   }
 
   // ── the write ── (three rows: the item, the zee's task stamp, the event)
-  const moved = item.status === 'queued' && !isTerminal(item.status);
+  // queued → assigned, and ONLY that: an item already working/blocked/in review is further along
+  // than this verb knows, and a terminal item has been decided.
+  const moved = item.status === 'queued';
   await tx(async (run) => {
     await run.q(`UPDATE work_item SET xell_id=$2 WHERE id=$1`, [item.id, xell.id]);
     // Stamp the xell's NEWEST task so the zee's own side of the link exists too: `zee work` resolves
@@ -242,7 +250,7 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
       + 'whole worker on work somebody has already decided is over. Reopen it first if that is wrong.');
   }
   const current = await liveXell(item.xell_id);
-  if (current && current.status !== 'retired') {
+  if (current && !GOING.includes(current.status)) {
     throw refuse(`${current.slug} is already deployed on "${item.title}". Talk to it, or unassign it `
       + 'first — deploying again would spawn a second zee onto the same job.');
   }
@@ -342,11 +350,11 @@ export async function workItemTree(projectId, { board = false } = {}) {
   const rows = await q(
     `WITH RECURSIVE tree AS (
        SELECT wi.*, 0 AS depth,
-              ARRAY[LPAD(COALESCE(wi.sort_order, 0)::text, 9, '0') || wi.id::text] AS path
+              ARRAY[LPAD((COALESCE(wi.sort_order, 0) + 1000000000)::text, 12, '0') || wi.id::text] AS path
          FROM work_item wi WHERE wi.project_id = $1 AND wi.parent_id IS NULL
        UNION ALL
        SELECT c.*, t.depth + 1,
-              t.path || (LPAD(COALESCE(c.sort_order, 0)::text, 9, '0') || c.id::text)
+              t.path || (LPAD((COALESCE(c.sort_order, 0) + 1000000000)::text, 12, '0') || c.id::text)
          FROM work_item c JOIN tree t ON c.parent_id = t.id
      )
      SELECT t.*, x.slug AS xell_slug, x.status AS xell_status,
