@@ -200,6 +200,40 @@ try {
   ok(/dataReady\?\.ready === false/.test(cjsx),
      'and when it cannot be checked the item says WHY instead of being offered and then refusing');
 
+
+  // ── 7. THE SQL, AGAINST A REAL POSTGRES ───────────────────────────────────────────────────────
+  // A regex over the SQL proves it was written; running it proves it works. This xell's own database
+  // is a real restore of a real prod dump, so the probe, the exact side and the comparison all run
+  // here for real — including the extension-owned exclusion, built the same way the proddiff
+  // regression builds it (ALTER EXTENSION plpgsql ADD TABLE writes the identical pg_depend row).
+  console.log('\n── the probe run against this xell\'s own restored database ──');
+  const estRows = await q(RC.ROW_COUNT_SQL);
+  const est = RC.parseRowCounts(estRows.map((r) => Object.values(r)[0]).join('\n'));
+  ok(Object.keys(est).length > 0, `the estimate probe reads a real catalog (${Object.keys(est).length} tables)`);
+  ok(!Object.keys(est).some((t) => t.startsWith('pg_')), 'and no system table comes back');
+
+  await q(`CREATE TABLE IF NOT EXISTS zt_rc_ext_probe (id int)`);
+  await q(`ALTER EXTENSION plpgsql ADD TABLE zt_rc_ext_probe`).catch(() => {});
+  const est2 = RC.parseRowCounts((await q(RC.ROW_COUNT_SQL)).map((r) => Object.values(r)[0]).join('\n'));
+  ok(!('public.zt_rc_ext_probe' in est2),
+     'an EXTENSION-OWNED table is excluded from the counts — pg_dump carries no data for it, so counting '
+     + 'it would report a shortfall on every restore for rows that were never in the archive');
+  await q(`ALTER EXTENSION plpgsql DROP TABLE zt_rc_ext_probe`).catch(() => {});
+  await q(`DROP TABLE IF EXISTS zt_rc_ext_probe`);
+
+  // The two sides of a REAL comparison: estimates vs exact counts of the same live database. They must
+  // land inside the tolerance — this is the measurement that justifies the tolerance existing.
+  const exact = RC.parseRowCounts((await q(RC.exactCountSql(Object.keys(est)))).map((r) => Object.values(r)[0]).join('\n'));
+  const live = RC.compareRestoreCounts(est, exact);
+  ok(live.empty.length === 0 && live.short.length === 0,
+     `estimate-vs-exact on the SAME database reports no empty and no short table `
+     + `(est ~${live.ref_total.toLocaleString()} vs exact ${live.got_total.toLocaleString()}) — the tolerance is calibrated, not decorative`);
+  ok(live.verdict !== 'incomplete',
+     'so a faithful database is never told its data is missing (the whole failure mode this check must not have)');
+  ok(live.unknown.every((x) => est[x.table] === -1),
+     'and the only unverifiable tables are the ones the source itself never analyzed');
+
+  console.log('\n── the backups panel ──');
   const bk = read('web/src/Backups.jsx');
   ok(/backup-rows/.test(bk) && /rowsTitle/.test(bk), 'a backup row shows its row count');
   ok(/planner ESTIMATES \(reltuples\)/.test(bk) && /not a comparison of row CONTENTS/.test(bk),
