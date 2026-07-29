@@ -18,7 +18,10 @@
 //      a worktree path taken from a fleet row, or push into repo_root itself.
 //   4. THE CONTINUATION NUDGES (queenzee/nudge.js). Every landing/ship outcome resumes the zee's
 //      session with `docker exec cxell_<slug>` — from a cloned row, that is another zee's live cage.
-//   5. THE SHIP'S SCHEMA STEP (queenzee/shipgate.js → shipmigrate.applyMigrations). The ship reaper
+//   5. THE OUTBOUND VERBS (lib/projects.js). Pull · Push · PR are console buttons that fetch a real
+//      xource from its remote, or publish real main OUTWARD to origin — from a project row that, in
+//      a nested queenzee, is the real fleet's.
+//   6. THE SHIP'S SCHEMA STEP (queenzee/shipgate.js → shipmigrate.applyMigrations). The ship reaper
 //      picks up 'approved' ship_request rows every 5s the same way; the container BUILD honours
 //      SHIP_MODE (the scripts exit early on mode=simulate) but the migration step never read it, so
 //      a nested queenzee would write DDL into the real production database.
@@ -47,6 +50,7 @@ const { tick, landApproved, checkPush } = await import('../server/src/queenzee/l
 const { pushToXource, acceptPullIn } = await import('../server/src/queenzee/xellgit.js');
 const { nudgeXellAfterLand } = await import('../server/src/queenzee/nudge.js');
 const { runShip } = await import('../server/src/queenzee/shipgate.js');
+const { pullProject, pushProject } = await import('../server/src/lib/projects.js');
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -220,6 +224,20 @@ try {
   ok(logsSince(n).some((m) => /SHIP_MODE=simulate/.test(m) && m.includes(MIG)),
      'and the log names the file it would have run on production');
   await freeLock();
+
+  // ── 7. THE OUTBOUND VERBS ───────────────────────────────────────────────────────────────────────
+  // Pull · Push · PR are console buttons that run git against a project's repo_root and its origin,
+  // both read off a project row. A nested console renders the REAL projects with the real buttons.
+  console.log('\n── 7. Pull / Push / PR touch no real checkout and no remote ──');
+  await q(`UPDATE project SET remote_url=$2 WHERE id=$1`, [projId, 'https://example.invalid/zt.git']);
+  const before = master();
+  const pulledP = await pullProject(projId, 'human@test');
+  ok(pulledP.pulled === false && pulledP.dry_run === true && /PROVISION_MODE=simulate/.test(pulledP.reason || ''),
+     'Pull refuses with the reason, before any fetch');
+  const pushedP = await pushProject(projId, 'human@test');
+  ok(pushedP.pushed === false && pushedP.dry_run === true && /PROVISION_MODE=simulate/.test(pushedP.reason || ''),
+     'Push refuses the same way — origin is never contacted');
+  ok(master() === before, 'and the checkout is exactly where it was');
 
   resetDocker();
   const s2 = await newShip();
