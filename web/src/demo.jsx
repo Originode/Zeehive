@@ -50,6 +50,10 @@ xells.push({
 xells[3].manager_xell_id = 'x6';   // bold-harbor reports to it (idle → "1 waiting")
 xells[5].manager_xell_id = 'x6';   // brave-quill too (working)
 xells[3].hive_status = 'occ-tendRequest'; xells[5].hive_status = 'occ-working';
+// A tend is only as useful as the reason on it — the mock hive carries one so the demo shows the
+// ask the way a human meets it ("who wants me, and what for"), not a bare amber hexagon.
+xells[3].tend = { open: true, at: new Date(Date.now() - 9 * 60e3).toISOString(),
+  reason: 'the migration needs prod’s schema — do I ask for a db-catchup or is this a seed?' };
 xells[5].zee_status = 'working'; xells[5].cli_active = true;
 
 // x0/x1 are the two prods (gold), on h0 & h2 → the graph tracks the median of the pair
