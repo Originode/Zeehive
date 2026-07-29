@@ -184,8 +184,14 @@ try {
   const quietSave = await S.selfHarnessUpdate(mgr, B, { enabled: false });
   ok(quietSave.ok === true, 'with nothing live wearing it, disabling is allowed');
   ok(!/has had its persona files rewritten/.test(quietSave.message || ''),
-     `and an enabled-only save (bundle_hash unchanged → no re-injection at all) does not claim a rewrite\n      → ${String(quietSave.message).slice(0, 200)}`);
+     `and a save with no live wearer does not claim a crew was re-briefed\n      → ${String(quietSave.message).slice(0, 200)}`);
   ok(/DISABLED/.test(quietSave.message || ''), 'while still saying where the persona went');
+  // The case the false sentence was worst for: a save that changes NO persona text, so updateHarness
+  // skips the re-injection entirely (bundle_hash identical) and NO workspace is touched at all — while
+  // the answer said every live wearer had been rewritten.
+  const noopSave = await S.selfHarnessUpdate(mgr, B, { enabled: false });
+  ok(noopSave.ok === true && /Nothing in the persona TEXT changed/.test(noopSave.message || ''),
+     `a save that changes no text says exactly that (the re-injection did not run)\n      → ${String(noopSave.message).slice(0, 200)}`);
   ok((await S.selfHarnessUpdate(mgr, B, { enabled: true })).harness?.enabled === true, 'and it is revivable');
 
   // ══ S2 — the re-scope trigger revalidates CHILDREN ════════════════════════
