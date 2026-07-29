@@ -1413,6 +1413,13 @@ a.cbox:hover { border-color: var(--accent); }
 .fx-goin:focus { outline: none; border-color: var(--accent); }
 .term-x.on { color: var(--accent); }
 
+/* ── live-feed chips in the zee terminal header (✱ thinking · ⚒ moves) ──
+   Same chip idiom as the queenzee log's scope filters (.term-chip/.off): lit = shown, dimmed =
+   hidden. `.idle` says the cage has no feed streaming right now, so the click sets the view the
+   NEXT feed opens in rather than repainting something — dashed, not disabled (it still records). */
+.zeeterm .term-filters { flex: 0 0 auto; margin-left: auto; }
+.term-chip.idle { border-style: dashed; }
+
 .zeeterm-foot {
   display: flex; align-items: center; gap: 8px; padding: 8px 10px;
   border-top: 1px solid var(--line); background: var(--panel2);
