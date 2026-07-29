@@ -319,11 +319,11 @@ const { effectiveHarness, harnessLayerText } = await import('../server/src/lib/h
 const { q, pool } = await import('../server/src/db/pool.js');
 try {
   // usage() is written in SECTIONS: a heading has ONE leading space, a verb line has two or more.
-  const sections = [];
+  const sections = [{ heading: '(the verbs before any heading — every zee)', verbs: [] }];
   for (const line of usageBlock.split('\n')) {
     if (/^ \S/.test(line)) sections.push({ heading: line.trim(), verbs: [] });
     const verb = line.match(/^\s{2,}zee ([a-z][a-z-]*)/)?.[1];
-    if (verb) (sections[sections.length - 1] || (sections[0] = { heading: '', verbs: [] }, sections[0])).verbs.push(verb);
+    if (verb) sections[sections.length - 1].verbs.push(verb);
   }
   const managerOnly = [...new Set(sections.filter((s) => /MANAGER-only/i.test(s.heading)).flatMap((s) => s.verbs))];
   const anyZee = [...new Set(sections.filter((s) => !/MANAGER-only/i.test(s.heading)).flatMap((s) => s.verbs))];
