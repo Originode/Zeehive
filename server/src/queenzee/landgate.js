@@ -17,6 +17,24 @@ import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway
 import { shouldProcessNow, processPad } from './landingpad.js';
 import { recordXourceHead } from '../lib/projects.js';
 
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
+// reaper, images, the .zeehive.env reconcile): 'real' touches machines, anything else models.
+//
+// IT HAS TO BE READ HERE because a LANDING is the most irreversible machine effect the queenzee has:
+// it fast-forwards a branch inside project.repo_root — the XOURCE. A xell's database is a CLONE of
+// the meta-DB, so the land_request rows a NESTED queenzee walks (every zee that boots the server
+// inside its own xell — zeehive.yml gives it PROVISION_MODE=simulate) are the REAL fleet's rows,
+// approvals and all. tick() below runs every 10s and needs no human, no click and no push: booting
+// the server was enough to inherit somebody else's approval and push it into the real main. See
+// landApproved() and the approved branch of checkPush() for the two doors that was reached through.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
+// Approvals this process has already REPORTED it will not spend. The report is the whole point (a
+// silent skip and "nothing to land" must not read alike) — but tick() re-reads the same inherited
+// rows every 10 seconds forever, and a report repeated 8,640 times a day is not louder, it is the
+// thing that buries the line a human needed to read. So: once per approval, per process.
+const reportedDryLandings = new Set();
+
 // LANDING IS THE MOST COMMON WAY THE XOURCE HEAD MOVES — far more often than a pull. So the
 // moment a landing advances the ref we must re-record xource.head_commit, or the rollback
 // baseline (populated at onboarding / on pull) goes stale the instant anyone lands: the
@@ -87,7 +105,7 @@ async function resolveXell(projectId, repoRoot, newSha) {
 
 // Called by the hook on EVERY push to main. Returns { allow, request, reason }.
 // allow=true only when a human approved this exact sha and it hasn't been spent yet.
-export async function checkPush({ projectId, ref, oldSha, newSha }) {
+export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PROVISION_MODE } = {}) {
   const project = await one(`SELECT * FROM project WHERE id = $1`, [projectId]);
   if (!project) return { allow: false, reason: 'unknown-project', request: null };
 
@@ -114,6 +132,22 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
     `SELECT * FROM land_request
        WHERE project_id=$1 AND ref=$2 AND new_sha=$3 AND status='approved'`,
     [projectId, ref, newSha]);
+
+  if (approved && mode !== 'real') {
+    // A NESTED QUEENZEE MUST NOT AUTHORISE A REAL PUSH EITHER. This is the second door onto the same
+    // ref: the hook reads its API from "${ZEEHIVE_API:-<baked-in>}" and the queenzee hands its OWN
+    // environment to every git it spawns, so a nested instance can end up being the gate a REAL push
+    // consults — and the approval it would find is the real fleet's, inherited in the db clone.
+    // Answering allow:true there spends a human's approval and lets the ref move. Decline instead,
+    // which is the direction this gate already fails in (the hook fails CLOSED by design), and say
+    // why: a declined push loses nothing, the commits stay on the branch, and the REAL queenzee
+    // still lands it when the real hook asks it.
+    logline('landgate',
+      `DECLINED ${ref} → ${String(newSha).slice(0, 8)} on ${project.name} — PROVISION_MODE=simulate: this `
+      + 'queenzee models the fleet, it does not authorise pushes into a real xource. The approval is '
+      + 'left UNSPENT; re-push against the real queenzee.');
+    return { allow: false, reason: 'nested-queenzee', request: approved, dry_run: true };
+  }
 
   if (approved) {
     // Spend the approval: it authorised this sha once. The ref is about to move (the hook exits
@@ -683,9 +717,29 @@ export async function sweepStalePending() {
   return { checked: rows.length, stale };
 }
 
-export async function landApproved(row, by = 'human') {
+export async function landApproved(row, by = 'human', { mode = PROVISION_MODE } = {}) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
   if (!project) return row;
+
+  // A NESTED QUEENZEE MUST NOT MOVE A REF IN THE XOURCE. Everything below this line acts on
+  // project.repo_root with git — a real path on a real machine, read out of a fleet row this
+  // queenzee may only be MODELLING. Report what it would have landed and touch nothing: no ref, no
+  // row (the approval stays approved, because it is the real fleet's to spend), no nudge into the
+  // cage of the zee that raised it. In real mode nothing about the rest of this function changes.
+  if (mode !== 'real') {
+    const short = String(row.new_sha || '').slice(0, 8);
+    const branch = String(row.ref || '').replace('refs/heads/', '') || 'main';
+    if (!reportedDryLandings.has(row.id)) {
+      reportedDryLandings.add(row.id);
+      logline('landgate',
+        `${short} NOT landed on ${branch} — PROVISION_MODE=simulate: this queenzee models the fleet, it `
+        + `does not move refs in ${project.repo_root}. Would have fast-forwarded ${branch} → ${short} `
+        + `(approved by ${row.decided_by || by}). The approval is left UNSPENT for the real queenzee; `
+        + 'reported once, not once per tick.');
+    }
+    return { ...row, dry_run: true,
+      would_land: { ref: row.ref, sha: row.new_sha, repo_root: project.repo_root } };
+  }
 
   // THE LANDING PAD's FIFO gate. This approval is real, but the runway may be busy (a ship building,
   // another landing merging) or an EARLIER approval may be ahead in line. If so, leave the row
@@ -808,10 +862,13 @@ export async function tick() {
   // been-there set to leak, forget across restarts, or consult.
   const stuck = await q(
     `SELECT * FROM land_request WHERE status='approved' ORDER BY decided_at LIMIT 5`);
-  let landed = 0, stale = 0;
+  let landed = 0, stale = 0, dryRun = 0;
   for (const row of stuck) {
     const r = await landApproved(row).catch((e) => { logline('landgate', `retry failed: ${e.message}`); return null; });
-    if (r && r.status === 'landed') landed++;
+    // A landing this queenzee is not allowed to make is counted SEPARATELY, never as landed: the
+    // tick's own answer is the first place a "did it land?" question gets asked.
+    if (r && r.dry_run) dryRun++;
+    if (r && r.status === 'landed' && !r.dry_run) landed++;
     if (r && r.stale) stale++;
   }
   // …and the HELD requests that died while a human was away (see sweepStalePending). Same tick, so
@@ -828,8 +885,9 @@ export async function tick() {
   const runways = await driveRunways().catch((e) => {
     logline('landgate', `runway drive failed: ${e.message}`); return { runways: 0, cleared: 0 };
   });
-  return { checked: stuck.length, landed, stale: stale + swept.stale, pending_checked: swept.checked,
-    holding_swept: gone.swept, runways: runways.runways, holders_cleared: runways.cleared };
+  return { checked: stuck.length, landed, dry_run: dryRun, stale: stale + swept.stale,
+    pending_checked: swept.checked, holding_swept: gone.swept, runways: runways.runways,
+    holders_cleared: runways.cleared };
 }
 
 // "Seen it — stop showing me." A durable fact about VISIBILITY, never about status: a dismissed

@@ -536,7 +536,7 @@ export async function unlockAndShip(id, { siteId = null, by = 'human@console',
 // Takes the lock, runs each prod container's OWN build script, then starts the release countdown.
 // Exported so the LANDING PAD driver can pull an approved ship onto the runway when it reaches the
 // head of the FIFO line (the same call decideShip and the reaper tick make).
-export async function runShip(shipId) {
+export async function runShip(shipId, { mode = MODE } = {}) {
   const ship = await one(`SELECT * FROM ship_request WHERE id=$1`, [shipId]);
   if (!ship || ship.status !== 'approved') return;
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [ship.xell_id]);
@@ -580,7 +580,7 @@ export async function runShip(shipId) {
   // running — the site frees itself even when the deploy machinery is what broke.
   liveShips.add(ship.id);
   try {
-    await runShipBody(ship, xell, project, site, lockKey);
+    await runShipBody(ship, xell, project, site, lockKey, mode);
   } catch (e) {
     try {
       const done = await one(
@@ -601,7 +601,7 @@ export async function runShip(shipId) {
   }
 }
 
-async function runShipBody(ship, xell, project, site, lockKey) {
+async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
   const shipping = await one(
     `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 RETURNING *`, [ship.id]);
   broadcast('ship', shipping);
@@ -646,6 +646,22 @@ async function runShipBody(ship, xell, project, site, lockKey) {
           + skipped.join('\n') + (ship.db_note ? `\n\nzee's assessment: ${ship.db_note}` : '') });
       logline('ship', `migrations SKIPPED by zee scope (${skipped.length} pending file(s) not applied)`);
     }
+  } else if (ok && mode !== 'real') {
+    // A NESTED QUEENZEE MUST NOT MIGRATE THE REAL PRODUCTION DATABASE. SHIP_MODE=simulate has always
+    // meant "model the deploy" — every build script exits early on mode=simulate (scripts/*.sh) — but
+    // this step never read it, so the one part of a ship that is NOT delegated to a script went
+    // straight through: applyMigrations resolves the prod db container FROM A FLEET ROW and runs DDL
+    // in it over `docker exec … psql`. A xell's database is a CLONE of the meta-DB, so the approved
+    // ship_request rows a nested queenzee's reaper picks up every 5s are the REAL fleet's, and the
+    // container it would have opened is the REAL production database. Report the files, run none.
+    const would = Array.isArray(ship.migrations) ? ship.migrations : [];
+    results.push({ role: 'migrations', ok: true, method: 'not-applied-simulate', applied: [], error: null,
+      log: `SHIP_MODE=simulate: this queenzee models the fleet, it does not write to the production `
+        + `database. ${would.length} pending file(s) NOT applied:\n${would.join('\n') || '(none recorded)'}` });
+    logline('ship',
+      `migrations NOT applied — SHIP_MODE=simulate: this queenzee models the fleet, it does not write to `
+      + `the production database. Would have applied ${would.length} file(s)`
+      + `${would.length ? `: ${would.join(', ')}` : ''}`);
   } else if (ok) {
     const mig = await applyMigrations(project, ship.commit, site);
     if (mig.applied?.length || !mig.ok) {
@@ -665,7 +681,7 @@ async function runShipBody(ship, xell, project, site, lockKey) {
   // leaving the existing .env untouched, so ships behave exactly as before until a human fills the
   // environment in the console. Only in real mode (simulate writes nothing, deploys nothing) and
   // never fatal — a materialize failure falls back to the on-disk .env, which is today's behaviour.
-  if (ok && MODE === 'real') {
+  if (ok && mode === 'real') {
     try {
       const mat = await materializeEnvFile(project.id, 'prod', join(project.repo_root, '.env'));
       if (mat.written) {
@@ -699,7 +715,7 @@ async function runShipBody(ship, xell, project, site, lockKey) {
     const r = await runScript(c, project.repo_root, ship.commit, (line) => {
       logline('ship', `[${c.role}] ${line}`);
       broadcast('ship-log', { id: ship.id, role: c.role, line, ts: Date.now() });
-    }, extraEnv);
+    }, extraEnv, mode);
 
     // Record what prod now RUNS — the same projection lib/build.js does for dev builds. A ship
     // used to skip this entirely, so a successful deploy left last_build_commit untouched and
@@ -730,7 +746,7 @@ async function runShipBody(ship, xell, project, site, lockKey) {
       ok ? null : (results.find((r) => !r.ok)?.error || 'ship failed').slice(0, 1500)]);
   broadcast('ship', done);
   logline('ship', ok
-    ? `SHIPPED ${String(ship.commit).slice(0, 8)} to prod from ${xell.slug} (${MODE})`
+    ? `SHIPPED ${String(ship.commit).slice(0, 8)} to prod from ${xell.slug} (${mode})`
     : `ship FAILED for ${xell.slug}: ${done.error}`);
 
   // If this ship was a BUNDLE carrier, resolve its riders now — one deploy, one verdict for all.
@@ -764,7 +780,7 @@ const LOG_TAIL_BYTES = 64 * 1024;
 // `extraEnv` is passed EXPLICITLY into the child rather than left to cleanGitEnv's inheritance of
 // the queenzee's own process env — a per-ship decision (see allowStaleCxellImage below) must not
 // depend on what the orchestrator happens to have been started with.
-function runScript(container, sourcePath, buildRef = 'main', onLine = null, extraEnv = {}) {
+function runScript(container, sourcePath, buildRef = 'main', onLine = null, extraEnv = {}, mode = MODE) {
   return new Promise((res) => {
     // A bare `bash` (the stored default on every prod container) resolves to C:\Windows\System32\
     // bash.exe (WSL) ahead of Git bash on Windows — with no distro it exits 1 with "WSL has no
@@ -772,7 +788,7 @@ function runScript(container, sourcePath, buildRef = 'main', onLine = null, extr
     // 'shipping' having deployed nothing. Dev builds already go through resolveBash(); ships must
     // too. A real interpreter set by an operator (sh, pwsh, …) is still respected.
     const exec = (!container.build_exec || container.build_exec === 'bash') ? resolveBash() : container.build_exec;
-    const p = spawn(exec, [container.build_script, sourcePath, container.role, container.docker_ctx || '', MODE, buildRef],
+    const p = spawn(exec, [container.build_script, sourcePath, container.role, container.docker_ctx || '', mode, buildRef],
       { env: cleanGitEnv(extraEnv), windowsHide: true });
     let out = '', err = '', buf = '', settled = false;
     // Line-buffered live feed (stdout AND stderr — docker build writes its progress to stderr).
