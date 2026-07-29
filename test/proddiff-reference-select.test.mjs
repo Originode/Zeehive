@@ -124,6 +124,48 @@ try {
     'by_schema rolls the differences up per schema — the line that names the culprit');
   ok(p.by_schema[0].schema === 'core', 'by_schema is ordered by how much drift the schema owns');
 
+  // ── the same thing on a REAL catalog (this xell's postgres, no docker needed) ──
+  // The fingerprints above are hand-built sets; these are read by the REAL exported Q probes from a
+  // real schema, before and after it is changed. Fingerprint A stands in for the reference database
+  // and B for the db being judged — which is exactly what a dev↔dev comparison is, and it proves the
+  // probe SQL, the direction and the rollup against catalogs postgres actually produced.
+  console.log('\n── a real catalog, before vs after (what the two probes really return) ──');
+  const S = `pdref_${Date.now()}`;
+  const realFp = async () => {
+    const fp = {};
+    for (const [kind, sql] of Object.entries(pd.Q)) {
+      fp[kind] = new Set((await q(sql)).map((r) => Object.values(r)[0]).filter((x) => String(x).startsWith(`${S}.`)));
+    }
+    return fp;
+  };
+  try {
+    await q(`CREATE SCHEMA "${S}"`);
+    await q(`CREATE TABLE "${S}".location (id bigint, city varchar)`);
+    await q(`CREATE TABLE "${S}".kitchen_claim (id bigint)`);        // the object the "dev" db will lack
+    await q(`CREATE FUNCTION "${S}".tg() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$`);
+    await q(`CREATE TRIGGER trg BEFORE INSERT ON "${S}".location FOR EACH ROW EXECUTE FUNCTION "${S}".tg()`);
+    const refFp = await realFp();
+
+    await q(`DROP TABLE "${S}".kitchen_claim`);                       // prod has it, this db does not
+    await q(`CREATE TABLE "${S}".scratch (id bigint)`);               // this db has it, prod does not
+    await q(`ALTER TABLE "${S}".location ALTER COLUMN id TYPE integer`);   // same column, different type
+    await q(`DROP TRIGGER trg ON "${S}".location`);                   // a missing trigger is drift too
+    const mineFp = await realFp();
+
+    const real = pd.diffPayload(refFp, mineFp, 60);
+    ok(real.kinds.table.missing.includes(`${S}.kitchen_claim`),
+      'a table the reference has and this db does not is MISSING (the deployed-code-vs-no-table case)');
+    ok(real.kinds.table.extra.includes(`${S}.scratch`), 'a table only this db has is EXTRA');
+    ok(real.kinds.column.missing.includes(`${S}.location.id:bigint`)
+       && real.kinds.column.extra.includes(`${S}.location.id:integer`),
+      'a RETYPED column shows as one missing + one extra (the type is in the fingerprint)');
+    ok(real.kinds.trigger.missing.includes(`${S}.location.trg`), 'a dropped TRIGGER is measured');
+    ok(real.by_schema.length === 1 && real.by_schema[0].schema === S,
+      'the rollup pins every difference to the one schema that owns it');
+  } finally {
+    await q(`DROP SCHEMA IF EXISTS "${S}" CASCADE`).catch(() => {});
+  }
+
   const many = fpOf({ table: Array.from({ length: 30 }, (_, i) => `s.t${String(i).padStart(2, '0')}`) });
   const none = fpOf({});
   const small = pd.diffPayload(many, none);          // default (persisted) sample

@@ -20,7 +20,23 @@ const read = (p) => readFileSync(resolve(here, '..', p), 'utf8');
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 
-const { diffReportText } = await import('../web/src/drift.js');
+const { diffReportText, driftDirection } = await import('../web/src/drift.js');
+
+// ── 0. WHICH WAY the drift runs — the reading that turns a total into a diagnosis ───────────────
+// This is the line the OmniBiz "the dev dbs are always drifted even after a fresh restore from a
+// prod backup" question turned on: every difference there was MISSING and not one was EXTRA, which
+// rules out local schema work and points the investigation at what LOADED the database. The two
+// counts are exact (never sampled), so the reading is sound.
+console.log('\n── driftDirection: subset / superset / both ──');
+const kindsOf = (missing, extra) => ({ kinds: { table: { missing_count: missing, extra_count: extra } } });
+ok(driftDirection(kindsOf(150, 0)).kind === 'subset', 'only MISSING → a strict SUBSET of the reference');
+ok(/SUBSET/.test(driftDirection(kindsOf(150, 0)).text) && /LOADED it/.test(driftDirection(kindsOf(150, 0)).text),
+  'and it says to look at what loaded the db, not at the db');
+ok(driftDirection(kindsOf(0, 12)).kind === 'superset', 'only EXTRA → a strict SUPERSET');
+ok(/drops only what its archive contains/.test(driftDirection(kindsOf(0, 12)).text),
+  'and it names the reason extras survive a "fresh restore" (pg_restore --clean drops what the dump HAS)');
+ok(driftDirection(kindsOf(3, 4)).kind === 'both', 'both directions → two stories in one number');
+ok(driftDirection(kindsOf(0, 0)) === null && driftDirection({}) === null, 'no drift (or no payload) → nothing said');
 
 // ── 1. the report a human reads ─────────────────────────────────────────────────────────────────
 console.log('\n── diffReportText: what the comparison SAYS ──');
