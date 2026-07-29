@@ -47,7 +47,8 @@ import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironme
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { discoverSite, adoptContainers } from '../lib/discovery.js';
-import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
+import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus,
+         withdrawLandRequest } from '../queenzee/landgate.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
@@ -56,15 +57,23 @@ import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrat
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
-import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
+import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
          selfSuggestDone } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor } from '../lib/managers.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
+import { workStatusVocabulary } from '../lib/work-status.js';
+import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
+         addDep, removeDep, boardModel, ganttModel, assertId } from '../lib/work-items.js';
+import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
+         breakdownTicket } from '../lib/tickets.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
+// WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
+import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
+import { selfWork, selfWorkAssign, selfWorkItem } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -128,6 +137,14 @@ router.post('/land/requests/:id/dismiss', async (req, res) => {
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 
+// WITHDRAW a pending request on the zee's behalf (an operator clearing a card whose zee is gone, or
+// tidying up after one that stacked them). NOT a rejection: nothing is refused and no sha is burned,
+// so the same work can be pushed and asked again. Pending rows only — an approved one is a decision.
+router.post('/land/requests/:id/withdraw', async (req, res) => {
+  try { res.json(await withdrawLandRequest(req.params.id, req.body?.by || 'human@console', req.body?.reason || null)); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
 // ── Channel C: shipping to production (the zee asks; the queenzee ships) ─────
 //
 // The zee's ONLY prod verb. It cannot take the lock and cannot run a deploy: approving is a human
@@ -156,8 +173,11 @@ router.get('/ship/status', async (req, res) => {
 router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => {
   const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
   try {
+    // allow_stale_cxell_image: the human's explicit "ship anyway with a stale cxell image" — a
+    // per-ship release valve for the fatal cxell-image guard, recorded on the request (055).
     res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console',
-      { siteId: req.body?.site_id || undefined }));
+      { siteId: req.body?.site_id || undefined,
+        allowStaleCxellImage: !!req.body?.allow_stale_cxell_image }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
 
@@ -166,7 +186,8 @@ router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => 
 router.post('/ship/requests/:id/unlock-and-ship', async (req, res) => {
   try {
     res.json(await unlockAndShip(req.params.id,
-      { siteId: req.body?.site_id || null, by: req.body?.by || 'human@console' }));
+      { siteId: req.body?.site_id || null, by: req.body?.by || 'human@console',
+        allowStaleCxellImage: !!req.body?.allow_stale_cxell_image }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
 
@@ -1072,6 +1093,16 @@ router.post('/xell/self/land', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfLand(x)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// UN-ASK a held landing: the zee lowers its OWN pending land request(s) (`zee land --withdraw`).
+// Symmetric with `zee tend --clear` / `zee done --clear`, and the reason a zee never has to leave a
+// stale card behind when it changes its mind — the discipline is withdraw-then-land, not push again
+// and let a human guess which of three cards is current. Approved requests are left alone: a human's
+// decision is not an agent's to retract.
+router.post('/xell/self/land/withdraw', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfWithdrawLand(x, { reason: req.body?.reason || null, request: req.body?.request || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Reconcile with main ON THE ZEE'S OWN: deliver current main into the cxell, merge it (pure script),
 // rebuild. NOT gated — it touches only this xell's cxell + throwaway containers. `zee sync` maps here.
 router.post('/xell/self/sync', async (req, res) => {
@@ -1114,9 +1145,12 @@ router.get('/xell/self/seed-request', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Propose done — flags the xell for a human's "Mark done"; the zee never despawns itself.
+// {clear:true} WITHDRAWS a done proposal (`zee done --clear`) — symmetric with tend/hint clearing.
+// A zee handed more work after proposing done had no way back, and the stale proposal kept asking a
+// human to reap it. Retracting a proposal a human already CONFIRMED is refused (see retractDone).
 router.post('/xell/self/done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
-    res.json(await selfDone(x, { summary: req.body?.summary || null })); }
+    res.json(await selfDone(x, { summary: req.body?.summary || null, clear: !!req.body?.clear })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Raise (or --clear) a tend: "I need a human in the console". Opens no gate, blocks nothing — it
@@ -1306,6 +1340,250 @@ router.post('/xells/:id/seed', async (req, res) => {
     res.json(await requestProdSeed({ xellId: req.params.id, files: b.files || (b.file ? [b.file] : []),
       reason: b.reason || null, site: b.site || null }));
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── WORK TRACKER: tickets + the work-item hierarchy (058) ────────────────────
+//
+// The layer that records what the work IS, rather than which agents are running. Project-scoped by
+// `?project=` exactly like every other read model here (a POST takes `project` in the body).
+//
+// The error contract, stated once and honoured by every handler below:
+//   400 — bad input, with {error} saying what was wrong. A MALFORMED id is this, not a 404:
+//         `"not-a-uuid" is not a valid work item id`. The two mistakes are different — a typo in
+//         a URL and a link to something deleted — and each deserves its own answer.
+//   404 — a well-formed id that names nothing
+//   409 — a REFUSED move/delete/transition, with the reason as a sentence a human can read
+//   never a bare 500: the database's own refusals (nesting rank, cross-project parent, cycle) are
+//   raised as messages written for a person, and they arrive here as ordinary Errors.
+//
+// Which refusals are 409 rather than 400: a 400 says "you sent nonsense", a 409 says "what you
+// asked for is coherent but conflicts with the state of the tree". A cycle, an activity under a
+// task and a delete of the project root are all the second kind.
+const CONFLICT = /cannot|refused|cycle|same project|nested under|root item|depend on itself|cross projects|legal next/i;
+function workErr(res, err, fallback = 400) {
+  const msg = String(err?.message || err || 'unknown error');
+  return res.status(CONFLICT.test(msg) ? 409 : fallback).json({ error: msg });
+}
+const projectOf = (req) => req.query.project || req.body?.project || req.body?.project_id || null;
+
+// The vocabulary itself — labels, column order, terminal flags and the legal transitions, straight
+// from lib/work-status.js. It is an endpoint so the console never hardcodes a column list of its
+// own; that duplication is exactly what let hive-status and the web palette drift before.
+router.get('/work-statuses', (_req, res) => res.json(workStatusVocabulary()));
+
+// ── tickets ──────────────────────────────────────────────────────────────────
+router.get('/tickets', async (req, res) => {
+  try {
+    res.json(await listTickets({
+      projectId: req.query.project || null, status: req.query.status || null,
+      kind: req.query.kind || null, q: req.query.q || null,
+    }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/tickets', async (req, res) => {
+  try {
+    const project = projectOf(req);
+    if (!project) return res.status(400).json({ error: 'project required' });
+    res.status(201).json(await createTicket({ ...(req.body || {}), project_id: project }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.get('/tickets/:id', async (req, res) => {
+  try {
+    const t = await getTicket(req.params.id);
+    if (!t) return res.status(404).json({ error: 'no such ticket' });
+    res.json(t);
+  } catch (err) { workErr(res, err); }
+});
+
+router.patch('/tickets/:id', async (req, res) => {
+  try {
+    const t = await updateTicket(req.params.id, req.body || {}, { actor: req.body?.actor || null });
+    if (!t) return res.status(404).json({ error: 'no such ticket' });
+    res.json(t);
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/tickets/:id', async (req, res) => {
+  try {
+    const out = await deleteTicket(req.params.id);
+    if (!out) return res.status(404).json({ error: 'no such ticket' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/tickets/:id/comments', async (req, res) => {
+  try {
+    const c = await addComment(req.params.id, req.body || {});
+    if (!c) return res.status(404).json({ error: 'no such ticket' });
+    res.status(201).json(c);
+  } catch (err) { workErr(res, err); }
+});
+
+// The hinge: a ticket becomes a plan. { items: [{title, kind?, parent_id?|ref-of-an-earlier-item, …}] }
+router.post('/tickets/:id/breakdown', async (req, res) => {
+  try {
+    const out = await breakdownTicket(req.params.id, {
+      items: req.body?.items || [], actor: req.body?.actor || null,
+    });
+    if (!out) return res.status(404).json({ error: 'no such ticket' });
+    res.status(201).json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+// ── work items ───────────────────────────────────────────────────────────────
+router.get('/work-items', async (req, res) => {
+  try {
+    res.json(await listWorkItems({
+      projectId: req.query.project || null, status: req.query.status || null,
+      kind: req.query.kind || null, ticketId: req.query.ticket || null,
+      rootId: req.query.root || null, tree: req.query.tree === '1' || req.query.tree === 'true',
+    }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/work-items', async (req, res) => {
+  try {
+    const body = req.body || {};
+    res.status(201).json(await createWorkItem({ ...body, project_id: projectOf(req) || body.project_id }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.get('/work-items/:id', async (req, res) => {
+  try {
+    const item = await getWorkItem(req.params.id);
+    if (!item) return res.status(404).json({ error: 'no such work item' });
+    res.json(item);
+  } catch (err) { workErr(res, err); }
+});
+
+// A PATCH carrying parent_id is a MOVE (it rewrites the path of every descendant); a PATCH carrying
+// status is a transition validated against work-status.js. Both are the same call for the caller.
+router.patch('/work-items/:id', async (req, res) => {
+  try {
+    const item = await updateWorkItem(req.params.id, req.body || {}, { actor: req.body?.actor || null });
+    if (!item) return res.status(404).json({ error: 'no such work item' });
+    res.json(item);
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/work-items/:id', async (req, res) => {
+  try {
+    const out = await deleteWorkItem(req.params.id);
+    if (!out) return res.status(404).json({ error: 'no such work item' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/work-items/:id/deps', async (req, res) => {
+  try {
+    // assertId FIRST: a malformed id must read as 400 "not a valid work item id", and only a
+    // well-formed id that names nothing is a 404. Without the check the existence probe below
+    // hands postgres a bad uuid and the caller gets a cast error instead of either answer.
+    assertId(req.params.id);
+    const item = await one(`SELECT id FROM work_item WHERE id=$1`, [req.params.id]);
+    if (!item) return res.status(404).json({ error: 'no such work item' });
+    res.status(201).json(await addDep(req.params.id, req.body?.depends_on_id, { actor: req.body?.actor || null }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/work-items/:id/deps/:depId', async (req, res) => {
+  try {
+    const out = await removeDep(req.params.id, req.params.depId);
+    if (!out) return res.status(404).json({ error: 'no such dependency' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+// ── the two views ────────────────────────────────────────────────────────────
+router.get('/board', async (req, res) => {
+  try {
+    if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
+    res.json(await boardModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.get('/gantt', async (req, res) => {
+  try {
+    if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
+    res.json(await ganttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
+  } catch (err) { workErr(res, err); }
+});
+
+
+// ── WORK TRACKER: assignment + deployment ─────────────────────────────────────
+// The verbs that turn a plan item into a running agent (lib/work-assign.js). Everything here is a
+// HUMAN/console surface — the cxell entrances to the same verbs are the /xell/self/work* routes
+// below, which resolve the caller from its own token instead of trusting a parameter.
+//
+// The error contract is the SAME one stated at the top of this section, and it is answered by the
+// same workErr() — with one addition: work-assign.js tags its own refusals with an explicit
+// `err.status` (400 you asked wrong · 404 it does not exist · 409 it exists and the answer is still
+// no), because a refusal like "that xell is a manager zee" is a 409 no regex should have to guess at.
+// Anything thrown out of work-items.js still falls through to workErr's sentence-matching.
+const assignErr = (res, err) => (err && err.status
+  ? res.status(err.status).json({ error: err.message })
+  : workErr(res, err));
+
+// Link an EXISTING xell to this item. Refused across projects, onto production, onto a manager zee,
+// or onto a xell already carrying another open item.
+router.post('/work-items/:id/assign', async (req, res) => {
+  try {
+    res.json(await assignWorkItem(req.params.id, {
+      xell_id: req.body?.xell_id, actor: req.body?.actor || 'human@console' }));
+  } catch (err) { assignErr(res, err); }
+});
+// Take the zee off it. The STATUS is deliberately left alone — work that happened, happened.
+router.delete('/work-items/:id/assign', async (req, res) => {
+  try {
+    res.json(await unassignWorkItem(req.params.id, { actor: req.body?.actor || 'human@console' }));
+  } catch (err) { assignErr(res, err); }
+});
+// DISPATCH a fresh worker for this item and assign it. The brief is built from the item (title, body,
+// ancestor chain, linked ticket, dates) plus the caller's extra `task` text; the spawn itself goes
+// through the existing dispatch path, never a second one.
+router.post('/work-items/:id/deploy', async (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json(await deployWorkItem(req.params.id, {
+      task: b.task || null, model: b.model || null, mode: b.mode || null, harness: b.harness || null,
+      title: b.title || null, actor: b.actor || 'human@console',
+      managerXellId: b.manager_xell_id || null }));
+  } catch (err) { assignErr(res, err); }
+});
+// Which xells could take this item — so the console offers a picker instead of asking a human to
+// paste a uuid (the ready pool + live workers with no open item, in this project only).
+router.get('/work-items/:id/candidates', async (req, res) => {
+  try { res.json(await candidatesFor(req.params.id)); }
+  catch (err) { assignErr(res, err); }
+});
+
+// ── WORK TRACKER: the cxell verbs (`zee work` · `zee assign` · `zee item`) ────
+// Token-scoped, exactly like every other /xell/self/ verb: a MANAGER sees and moves its own project's
+// plan, a WORKER sees and reports on the ONE item it is assigned to. The scope is resolved in the
+// SERVER from the caller's token — never from a parameter the caller supplies.
+router.get('/xell/self/work', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfWork(x, { board: req.query.board === '1', item: req.query.item || null })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// MANAGER only: deploy a worker for one of MY project's work items (same dispatch path as `zee dispatch`).
+router.post('/xell/self/work/assign', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    res.json(await selfWorkAssign(x, { item: b.item || null, task: b.task || null, model: b.model || null,
+      mode: b.mode || null, harness: b.harness || null, title: b.title || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Report an item's status/progress. A manager may report any item in its own project; a worker only
+// its OWN. Setting `done` reports the WORK finished — it never touches the xell's done/land/ship.
+router.post('/xell/self/work/item', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    res.json(await selfWorkItem(x, { id: b.id || null, status: b.status || null,
+      progress: b.progress ?? null, note: b.note || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── AI-facing: report/propose the job is done, and query status ──────────────

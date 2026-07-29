@@ -165,6 +165,20 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
 - **Zees checkpoint-commit freely** on their own branch — a commit only moves their branch ref and
   lands nothing, so the prompt now tells them to commit early and often rather than hoard
   uncommitted work while waiting on approval. Only the *push* is gated.
+- **A zee can WITHDRAW its own held landing** (2026-07-29, 061–063). Every other ask a zee raises
+  can be lowered by the zee that raised it (`zee tend --clear`, `zee hint-land --clear`, `zee done
+  --clear`); a land request could not, so a zee that changed its mind pushed again and left a second
+  card for the same job. `zee land --withdraw [--reason]` → `POST /api/xell/self/land/withdraw`:
+  status `withdrawn` (terminal, with `withdrawn_at/by/reason` — never `decided_by`, because nobody
+  decided anything), the row drops out of every open read model, main never moves and the commits
+  stay on the branch. **Pending only**: an approved request is a human's decision the queenzee is
+  acting on, and retracting it is not an agent's call (`zee tend` is). Scoped to `kind='push'`, so it
+  never sweeps up a PR. The console has the same quiet exit beside Reject (Reject *burns* the sha;
+  Withdraw decides nothing), and the pad keeps a brief "withdrawn by zee" receipt.
+  - The DISCIPLINE that goes with it, taught in the manual (062) and the spawn briefing: **one open
+    landing per zee** — withdraw the previous one *before* landing again. `zee land` now names the
+    older open requests it just superseded, and `zee status` carries `landing.open`, so the zee sees
+    its own stack instead of a human discovering it. Test: `node test/land-withdraw.test.mjs`.
 - The xell card therefore shows **two** diffs (`lib/git.js → worktreeDiff`):
   - **source diff** = worktree vs the source (`↑ahead ↓behind · files +ins/−del`, includes
     uncommitted) — everything the zee has produced; what would land.
@@ -334,6 +348,14 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   `zee tend` it. Neither side polices itself.
 - **Honeycomb**: `seatXells()` (web/src/hive/HiveCanvas.jsx) seats a crew in the free cells nearest
   its manager, ring by ring. No managers → byte-for-byte the old layout.
+- **A manager's harness takes NO cell of its own** (2026-07-29). The manager hexagon is already drawn
+  in the harness badge's language (dashed seat + the same persona disc), so seating its harness beside
+  it drew the same avatar twice. `getTimeline()` now emits two lists per harness: `wearer_ids`
+  (everyone wearing it, managers included → persona art, `×N`, hover) and `consumer_ids` (wearers
+  MINUS managers → the grid cell + the series wire). A harness worn by managers only is still in the
+  payload — the manager hexagon reads its art from it — but `badgedHarnesses()` seats no cell for it
+  and `Connectors` routes no wire. Workers are unchanged (in both lists).
+  Test: `node test/harness-manager-cell.test.mjs`.
 - Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
   messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
   over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →

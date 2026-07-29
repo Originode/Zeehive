@@ -28,6 +28,7 @@ import MachineMatrix from './Machines.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
 import Dispatch from './Dispatch.jsx';
+import WorkConsole from './work/WorkConsole.jsx';
 import Toasts from './Toasts.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
@@ -61,6 +62,12 @@ const writeProjectParam = (project) => {
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' };
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');
 const base = (p) => (p ? p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() : '—');
+// One line, capped — for the short prose a zee writes for a human (a tend's reason, say), which is
+// shown inline on a chip that has no room to wrap. The FULL text always rides the element's title.
+const clip = (s, n = 60) => {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t;
+};
 
 // FLEET BURN formatters. Compact token counts (1.2M, 890K, 4.2k → keep it short on a card) and a
 // dollar figure that keeps cents but never a distracting tail of zeros. These render fleet-OWN
@@ -156,6 +163,7 @@ export default function App() {
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
   const [showDispatch, setShowDispatch] = useState(false); // false | { provider } — the "+" prompt composer
+  const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
@@ -711,6 +719,16 @@ export default function App() {
             the choice the per-account prompt buttons make by being clicked. */}
         <AddManagerButton projectId={projectId || project.id} projectName={project.name}
                           providers={providers} onAdded={refresh} />
+        {/* THE WORK TRACKER — tickets in, a plan on a board, a timeline over it. It sits with the
+            prompt buttons because it is the other half of the same question: the prompt buttons
+            start work, this is where the work being done is decided and tracked. It opens as a
+            portalled overlay (no router in this console), so nothing else on this page moves. */}
+        <button className="work-btn-open" data-testid="work-btn" title="Open the work tracker — tickets, board, timeline"
+                onClick={() => setShowWork(true)}>▦ work</button>
+        {showWork && (
+          <WorkConsole projectId={projectId || project.id} projectName={project.name}
+                       onClose={() => setShowWork(false)} />
+        )}
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
@@ -1203,6 +1221,20 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           <span className="rk">status</span>
           <span className={`badge b-${x.status}`} data-testid="xell-status" title={`hive: ${x.hive_status || x.status}`}>{x.hive_status_label || (isProd ? 'live · protected' : x.status)}</span>
         </div>
+        {/* TEND — the zee asked for a human, and WHY. The status badge already says a tend is open;
+            this row is the reason it gave, because "someone needs you" without a what-for is an
+            interruption, not a request. Clipped to the card, full text in the title. It clears when
+            the zee reports working or runs `zee tend --clear`. */}
+        {x.tend?.open && (
+          <div className="row"><span className="rk">tend</span>
+            <span className="tendwhy" data-testid="tend-reason"
+                  title={`${x.tend.full || x.tend.reason || 'The zee raised a tend without a reason.'}\n\n`
+                    + 'Its zee asked for a human in the console. Nothing is gated or blocked — it clears '
+                    + 'when the zee reports working or runs `zee tend --clear`.'}>
+              🖐 {x.tend.reason ? clip(x.tend.reason, 48) : 'no reason given'}
+            </span>
+          </div>
+        )}
         {/* FLEET BURN — what every zee this xell hosted consumed (tokens + $), summed. Compact by
             design (Σ 1.2M tok · $8.90). This is the xell's OWN spend; account-wide %/limits are not
             available to us (only Anthropic's /usage shows those). Shown once there's anything to show. */}
@@ -1332,6 +1364,14 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
     // A zee's TEND ping (occ-tendRequest): it asked for a human in the console. No approve/reject —
     // the chip just takes you to it; the zee (or you) clears the tend once handled.
     const tend = x.hive_status === 'occ-tendRequest' ? 1 : 0;
+    // …and WHY: the brief reason the zee gave when it raised the tend (fleet: x.tend.reason). The
+    // whole point of being called is knowing what you were called for — without it this line could
+    // only say "somebody wants you", and the human had to open the session to find out what for.
+    const tendWhy = tend ? (x.tend?.reason || null) : null;
+    // …and the WHOLE thing, when the brief line is only its head. The chip stays one line (it has
+    // no room), but the opened ask must be readable in full: a tend clipped to "…re-tasking a
+    // manager wi…" with the rest nowhere is barely better than no reason at all.
+    const tendFull = tend ? (x.tend?.full || x.tend?.reason || null) : null;
     // PROD DATA: "bind me to the production database" / "run this landed seed file on production".
     // These are held gates exactly like a landing — the zee cannot proceed until a human answers —
     // so they belong in the one line that says who is waiting on you.
@@ -1340,7 +1380,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
     // A manager suggested this xell is done. It is a real decision waiting on a human — and the only
     // one raised by another AGENT, so if it were not counted here nobody would ever answer it.
     const doneSug = (doneSuggestByXell[x.id] || []).filter((r) => r.status === 'pending').length;
-    return { x, held, prs, tend, bind, seed, doneSug, n: held + prs + tend + bind + seed + doneSug };
+    return { x, held, prs, tend, tendWhy, tendFull, bind, seed, doneSug, n: held + prs + tend + bind + seed + doneSug };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
@@ -1358,7 +1398,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <span className="ny-t">⚠ waiting on you:</span>
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
-                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.tend && 'tend (needs a human)'].filter(Boolean).join(' · ')} — click to review`}>
+                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
             {w.x.slug}
             <span className="ny-n">{[
               w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`,
@@ -1366,7 +1406,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
               w.bind > 0 && '⚠ wants PROD DB',
               w.seed > 0 && `⚠ seed prod (${w.seed})`,
               w.doneSug > 0 && '⬢ manager says done',
-              w.tend > 0 && '🖐 tend',
+              w.tend > 0 && `🖐 tend${w.tendWhy ? `: ${clip(w.tendWhy, 60)}` : ''}`,
             ].filter(Boolean).join(' · ')}</span>
           </button>
         ))}
@@ -1380,8 +1420,9 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
           {doneSugs.map((r) => <DoneSuggestionCard key={r.id} req={r} onDone={onDecided} />)}
           {open.tend > 0 && landings.length === 0 && prs.length === 0 && binds.length === 0
             && seeds.length === 0 && doneSugs.length === 0 && (
-            <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human.
-              Open its session to see why; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
+            <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human
+              {open.tendFull ? <>: <b className="ny-why">{open.tendFull}</b></> : ' (it gave no reason)'}.
+              {' '}Open its session for the detail; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
           )}
         </div>
       )}

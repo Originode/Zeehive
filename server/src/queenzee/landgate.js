@@ -220,6 +220,57 @@ export async function landStatus(xellId) {
        WHERE lr.xell_id = $1 ORDER BY lr.requested_at DESC LIMIT 1`, [xellId]);
 }
 
+// Every land request of this xell a human is still being asked about — pending (undecided) or
+// approved (decided, not yet spent). This is what "don't spam the gate" is measured against: a zee
+// that pushes a second sha while the first is still held leaves TWO cards for one job, and only it
+// knows which one it still means.
+export async function openLandRequests(xellId, { kind = 'push' } = {}) {
+  if (!xellId) return [];
+  // kind='push' is a LANDING (the gate on main). kind='pull' is a PR into a child xource — a
+  // different ask, raised by a different verb, so `zee land --withdraw` must not sweep one up by
+  // accident. Pass kind=null to read both (a human tidying up).
+  return q(
+    `SELECT * FROM land_request
+       WHERE xell_id=$1 AND status IN ('pending','approved') AND dismissed_at IS NULL
+         AND ($2::text IS NULL OR kind::text = $2)
+       ORDER BY requested_at DESC`, [xellId, kind]);
+}
+
+// THE ZEE'S OWN RETRACTION — the counterpart to `zee tend --clear` / `zee done --clear`, and the
+// exit the landing gate never had.
+//
+// A held landing is a question a zee asked a human. Until now the zee could not un-ask it: if it
+// changed its mind (it found a bug in what it pushed, the work turned out to be half-finished, it
+// was handed more scope) its only move was to commit more and push again — raising a SECOND card
+// for the same job while the first one sat there, obsolete and indistinguishable. Withdrawing is
+// therefore not a "cancel" convenience; it is what makes "one open landing per zee" achievable.
+//
+// PENDING ONLY, deliberately. An APPROVED request is a decision a human already made and the
+// queenzee is acting on (the pad may be mid-merge); pulling it out from under them is not a zee's
+// call — that is a `zee tend`. Decided/landed/stale rows are history and history is not editable.
+// The row is never deleted: a withdrawn ask is a fact about what this zee did, and it keeps the
+// commit list a human may have already read.
+export async function withdrawLandRequest(id, by = 'zee', reason = null) {
+  const row = await one(`SELECT * FROM land_request WHERE id=$1`, [id]);
+  if (!row) throw new Error('no such land request');
+  const what = row.kind === 'pull' ? 'PR' : 'landing';
+  if (row.status !== 'pending') {
+    throw new Error(row.status === 'approved'
+      ? `that ${what} is already APPROVED — a human has decided it and the queenzee is landing it; `
+        + 'you cannot withdraw a decision (raise a `zee tend` if it must not land)'
+      : `that ${what} is '${row.status}', not pending — there is nothing open to withdraw`);
+  }
+  const out = await one(
+    `UPDATE land_request SET status='withdrawn', withdrawn_at=now(), withdrawn_by=$2, withdraw_reason=$3
+       WHERE id=$1 AND status='pending' RETURNING *`, [id, by, reason ? String(reason).slice(0, 2000) : null]);
+  if (!out) throw new Error('no such pending request (already decided?)');
+  broadcast('land', out);
+  logline('landgate',
+    `WITHDRAWN ${String(out.new_sha).slice(0, 8)} on ${out.ref.replace('refs/heads/', '')} by ${by}`
+    + `${reason ? ` — ${String(reason).slice(0, 120)}` : ''} (the zee un-asked it; no human decision was made)`);
+  return out;
+}
+
 export async function listLandRequests(projectId, { open = true } = {}) {
   // Open view: undecided or still-working rows a human has NOT dismissed. A dismissed approval
   // keeps being retried by the reaper — it just stops being shown.
@@ -338,10 +389,13 @@ async function closeAsStale(row, { tip = null, from = 'approved' } = {}) {
 // Sweep them: close each dead pending row and nudge its zee to sync and ask again with a landable
 // sha. Conservative on purpose — ONLY 'diverged' (a proven non-fast-forward) is closed. A sha the
 // ref already contains ('already') is a different animal and is left for a human to look at.
+// LANDINGS ONLY (kind='push'). A kind='pull' row is a PR into a CHILD xource — a different ask,
+// judged against a different repository — so measuring it against this project's repo_root would
+// declare it stale on evidence from the wrong tree. `zee land --withdraw` draws the same line.
 export async function sweepStalePending() {
   const rows = await q(
     `SELECT lr.*, p.repo_root FROM land_request lr JOIN project p ON p.id = lr.project_id
-       WHERE lr.status='pending' ORDER BY lr.requested_at LIMIT 20`);
+       WHERE lr.status='pending' AND lr.kind = 'push' ORDER BY lr.requested_at LIMIT 20`);
   let stale = 0;
   for (const row of rows) {
     if (!row.repo_root || !row.new_sha) continue;

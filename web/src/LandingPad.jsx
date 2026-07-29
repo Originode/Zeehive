@@ -29,6 +29,9 @@ const PHASE = {
   failed:              { label: 'failed',             cls: 'pad-failed' },
   rejected:            { label: 'rejected',           cls: 'pad-rejected' },
   stale:               { label: 'stale',              cls: 'pad-stale' },
+  // The zee un-asked its own landing (`zee land --withdraw`). Not a rejection and not a failure:
+  // nobody decided anything, so it reads as a quiet receipt rather than a verdict.
+  withdrawn:           { label: 'withdrawn by zee',   cls: 'pad-stale' },
 };
 
 function PadRow({ item }) {

@@ -9,15 +9,17 @@ import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
+import { startWorkSync } from './queenzee/worksync.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
 import { refreshHarnesses } from './lib/harness.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
-import { pool } from './db/pool.js';
+import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
+import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
 import { startImageJanitor } from './lib/images.js';
@@ -116,6 +118,19 @@ const server = app.listen(config.port, () => {
   // Same principle for teardowns: a xell stranded at 'tearing-down' by a mid-reap death renders
   // on the dashboard forever (only 'retired' is filtered out) and nothing else revisits it.
   recoverOrphanTeardowns().catch((e) => console.error('[reaper] teardown recovery failed:', e.message));
+  // The attend path's renderer is BAKED into the zee-agent image, and only the spawn path replaced
+  // it — so every cxell created before an attend-path ship kept the old one, and the terminal's
+  // ✱/⚒ feed chips wrote a view file nothing in there was watching. Boot is also the moment after
+  // a ship (we restart into the new code), so sweep the RUNNING cxells here. A live cxell is one
+  // whose zee still has an ssh-terminal viewer; the sweep is best-effort per cage.
+  refreshZeeLiveInLiveCxells(async () => (await q(
+    `SELECT DISTINCT x.slug
+       FROM zee z JOIN xell x ON x.id = z.xell_id
+      WHERE z.viewer_kind = 'ssh-terminal'
+        AND z.decommissioned_at IS NULL
+        AND x.status NOT IN ('retired', 'tearing-down')`
+  )).map((r) => ({ ctx: 'default', name: cxellName(r.slug) })))
+    .catch((e) => console.error('[cxell] live-feed renderer sweep failed:', e.message));
   startPool();
   startMonitor();
   startContainerMonitor();
@@ -126,6 +141,10 @@ const server = app.listen(config.port, () => {
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();
+  // The work tracker's board follows the fleet: every item with a zee on it takes that zee's live
+  // hive status (worksync.js). It only ever moves a card BETWEEN the in-flight statuses — finishing
+  // is a human's decision, never a tick's.
+  startWorkSync();
   startHarnessBridge();
 });
 // Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the

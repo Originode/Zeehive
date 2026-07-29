@@ -10,18 +10,21 @@
 -- So: name the state, say the commits are safe, and give the two-step recovery in the same words the
 -- nudge uses (server/src/queenzee/nudge.js → STALE_PROMPT).
 --
--- Surgical and idempotent by guard, exactly as 053: an anchored replacement inside the manual text,
--- applied only if the manual does not already explain a stale landing. The anchor is an exact line
--- from 047/050 — if a human has since edited it in the harness manager, this simply does not fire
--- and leaves their text alone.
+-- Surgical and idempotent by guard (the 063 pattern): one anchored replacement inside the stored
+-- text, applied only if the manual does not already explain a stale landing, and the guard matches
+-- text this migration ITSELF writes — so a re-run past the ledger is a no-op, not a second copy.
+-- The anchor is an exact line from 047/050; if a human has edited it in the harness manager the
+-- replacement simply DOES NOT FIRE and their text is left alone. Writes back into the memory ENTRY
+-- it read (by path, by index), so other memory files are untouched.
 DO $$
 DECLARE
+  idx int;
   txt text;
-  mem jsonb;
 BEGIN
-  SELECT bundle->'memory'->0->>'text' INTO txt FROM harness WHERE key='zee-base';
-  -- The guard matches text this migration ITSELF writes (as 053's did), so a re-run is a no-op even
-  -- outside the ledger — not a second copy of the paragraph.
+  SELECT (a.i - 1), a.e->>'text' INTO idx, txt
+    FROM harness h, LATERAL jsonb_array_elements(h.bundle->'memory') WITH ORDINALITY AS a(e, i)
+   WHERE h.key = 'zee-base' AND a.e->>'path' = 'cxell-zee-manual.md'
+   LIMIT 1;
   IF txt IS NULL OR txt LIKE '%goes STALE%' THEN RETURN; END IF;
 
   txt := replace(txt,
@@ -39,7 +42,7 @@ BEGIN
     || E'(`zee land --wait` and `zee status --wait` both exit on `stale` with the same instruction, and if\n'
     || E'the queenzee cannot reach you it raises a `tend` so a human picks it up instead.)');
 
-  mem := jsonb_build_array(jsonb_build_object('path', 'cxell-zee-manual.md', 'text', txt));
-  UPDATE harness SET bundle = jsonb_set(bundle, '{memory}', mem) WHERE key='zee-base';
+  UPDATE harness SET bundle = jsonb_set(bundle, ARRAY['memory', idx::text, 'text'], to_jsonb(txt))
+   WHERE key = 'zee-base';
   RAISE NOTICE 'cxell-zee manual: taught what a STALE landing is and that `zee sync` is the recovery';
 END $$;

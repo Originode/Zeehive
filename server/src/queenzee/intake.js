@@ -1211,6 +1211,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     logline('cxell', cli.installed
       ? `${name}: zee CLI refreshed from the queenzee's ${cli.src} (never older than this API)`
       : `${name}: zee CLI NOT refreshed (${cli.reason}) — running the image's baked copy`);
+    // The image's own verdict, read BEFORE the refresh overwrote the evidence. Say it plainly on
+    // the spawn line too: a stale fleet image is invisible from inside the cage once the CLI is
+    // refreshed, and the last time it went unnoticed it cost two zees a forensics detour.
+    if (cli.staleImage) {
+      logline('cxell', `${name}: !!! this cxell booted from a STALE zeehive/zee-agent image — rebuild it `
+        + '(the last self-ship that should have done so did not); only the `zee` CLI was repaired at spawn');
+    }
     // Same defence for the ATTEND path's renderer: the dashboard terminal's ✱/⚒ feed chips only
     // work against a zee-live.mjs that watches the view file this queenzee writes.
     await installZeeLiveIntoCxell({ ctx, name });
@@ -1297,6 +1304,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  - `zee sync [--no-rebuild]`  → CATCH UP / REBASE your branch onto current main. NOT gated. This is the ONLY way to reconcile in the cage: your cxell was seeded from a bundle of your branch alone (no main/master ref, `origin` is a consumed bundle), so `git fetch`/`git rebase main` cannot work in here. `zee sync` has the queenzee deliver current main IN as origin/main and MERGE it into your branch, then rebuilds. Reach for it whenever you are asked to rebase or catch up your code, or before landing if main has moved. A genuine merge CONFLICT is left in place for YOU to resolve (edit, git add/commit), then land; a clean sync leaves your HEAD descending from current main.',
     '  - `zee db-catchup [--restore]` → the db counterpart of `zee sync`: roll your OWN (clone/isolated) database FORWARD to prod\'s CURRENT schema by applying the prod-ledger migrations it lacks. NOT gated (writes only your throwaway db; reads prod read-only). `--restore` (isolated dbs only) instead rebuilds from the latest full prod snapshot — exact schema+data, but it DISCARDS your db\'s current contents.',
     '  - `zee land`                 → collect your commits out of the cxell and run the gated push to main. HELD for a human. If main moved since your cage was cut, land self-heals by running a `zee sync` first.',
+    '  - `zee land --withdraw`      → UN-ASK a landing you already raised (nothing lands, nothing is rejected, your commits are untouched). NEVER stack land requests: if you asked to land and are not done, WITHDRAW the open one first, then land again — a human must only ever have ONE card from you to decide.',
     '  - `zee ship --reason "..."`  → ask to deploy to prod (add `--targets server webapp`). Refused unless already landed; a human approves; the QUEENZEE builds from main.',
     '  - `zee hint-land [--reason "…"]` / `zee hint-ship [--reason "…"]` → NOT sure the job is done? Do NOT call land/ship. Hint instead: light the land?/ship? button on your hexagon for a human to decide (opens no gate, pushes nothing). `--clear` lowers it. Use this whenever you finish unsure, so you are never left hanging.',
     '  - `zee tend --reason "…"`    → raise "I need a human in the console" (blocks nothing, opens no gate); `zee tend --clear` (or any `zee working`) lowers it.',

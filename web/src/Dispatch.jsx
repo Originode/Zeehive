@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { getDispatchModes, getDispatchModels, getHarnesses } from './api.js';
 
 // The "+" composer. A human writes a prompt (rich text, paste-friendly, images welcome) and picks
@@ -145,7 +146,21 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
 
   const totalMb = images.reduce((n, im) => n + (im.size || 0), 0) / (1024 * 1024);
 
-  return (
+  // ── PORTALLED TO <body>, ALWAYS ─────────────────────────────────────────────────────────────
+  // A z-index only ranks siblings INSIDE the nearest stacking context, so a full-screen overlay
+  // rendered where its button happens to live is ranked among that pane's contents and nothing
+  // else. The manager composer opens from the toolbar inside `.content` (`position: relative;
+  // z-index: 1`), which is a stacking context — so `.disp-overlay { z-index: 60 }` collapsed to
+  // "z-index 1, in the panels pane", and the graph divider + its grip (z 4/5/6 on `.hive-split`)
+  // and the <Connectors> line overlay (a later sibling at z 1) painted straight over the modal.
+  // Raising the number could not have fixed that: 60 was never being compared with 6.
+  //
+  // So the overlay leaves the tree entirely and mounts on <body>, where its z-index means what it
+  // says against the other real overlays (toasts 80 · dialogs 90 · diff viewer 95, all deliberately
+  // above it). This is unconditional rather than manager-only: the worker composer only escaped by
+  // luck of being rendered high in App's tree, and the next component to open one should not have
+  // to know that.
+  return createPortal((
     <div className="disp-overlay">
       <div className={`disp${manager ? ' disp-mgr' : ''}`} role="dialog"
            aria-label={manager ? 'Add a manager zee' : 'Compose a prompt'}
@@ -347,7 +362,7 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
         </div>
       </div>
     </div>
-  );
+  ), document.body);
 }
 
 // Shown only if the API calls fail — keeps the composer usable rather than blank.

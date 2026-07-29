@@ -6,12 +6,12 @@
 //   zee status [--wait]
 //   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]
 //   zee working [--note "what you are doing"]
-//   zee tend --reason "why you need a human"   |   zee tend --clear
+//   zee tend --reason "why you need a human"   |   zee tend --clear      (the reason is required: it is what the console shows)
 //   zee sync [--no-rebuild]
-//   zee land [--wait]
+//   zee land [--wait]   |   zee land --withdraw [--reason "…"]   (un-ask a held landing)
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
-//   zee done --summary "what you finished"
+//   zee done --summary "what you finished"   |   zee done --clear   (withdraw the proposal)
 //
 // --wait (on `land` and `status`) BLOCKS, polling until the landing is decided (landed/rejected/
 // stale), and exits with that verdict — its exit is your nudge, so run it in the BACKGROUND. The
@@ -34,6 +34,11 @@ const token = process.env.ZEEHIVE_XELL_TOKEN || '';
 const [cmd, ...rest] = process.argv.slice(2);
 
 function flag(name) { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : null; }
+// The bare first argument (`zee item <id> --status working`), and ONLY that. Hunting the argv for
+// "the first thing without a leading --" reads the VALUE of a flag as a positional the moment the
+// caller puts a flag first: `zee item --status working` swallowed "working" as the item id and asked
+// the server for a work item called working. A positional is argv[0] or it does not exist.
+function positional() { return rest.length && !rest[0].startsWith('--') ? rest[0] : null; }
 // --wait is a boolean flag with an optional =<secs> (default 1h). `--wait 30` is NOT supported —
 // the value form is `--wait=30`, so a bare `--wait` never eats the next positional.
 function waitFlag() {
@@ -70,6 +75,7 @@ async function pollLanding(secs) {
       console.error('      zee land   # raises a FRESH request on the new sha\n');
       process.exit(1);
     }
+    if (land.status === 'withdrawn') { console.error('\n  ✗ WITHDRAWN — this landing was un-asked (by you, or by a human on your behalf); nothing is waiting on anyone.\n'); process.exit(1); }
     // 'pending' / 'approved' → keep waiting (an approval lands automatically).
   }
   console.error(`\n  ✗ TIMEOUT after ${secs}s — still waiting on a human. Your work is safe on your branch.\n`);
@@ -164,24 +170,30 @@ function usage() {
   zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
   zee env [--export]                  which ENVIRONMENT your xell is loaded with (its key + var names; values live in .zeehive.env, never echoed). --export dumps the FULL current env text. Read-only. A live-prod/production xell gets the prod env, else the dev env
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
-  zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. --clear lowers it
+  zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
+  zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
   zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
-  zee done --summary "..."           propose done (a human confirms with "Mark done")
+  zee done --summary "..." | --clear   propose done (a human confirms with "Mark done"); --clear WITHDRAWS the proposal if you are back at work
 
  crew (a zee that has a manager, or IS one):
   zee report --message "..." [--kind reflection]   send your MANAGER a note (a question, a blocker, or your post-ship REFLECTION). The one reach outside your xell a worker is meant to have
   zee inbox [--all]                  read what other zees sent you (reading marks them read); --all shows the history
 
+ the work tracker (the PLAN this job is part of):
+  zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
+  zee item [<id>] --status <s> [--progress N] [--note "..."]   report where the WORK has got to. A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
+
  MANAGER-only (refused for a worker, with an explanation):
   zee zees                           YOUR CREW: every worker you dispatched — hive status, what it waits on, its last message
   zee dispatch --task "..." [--model m] [--mode 1..5] [--harness key] [--title "..."]   spawn a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness
+  zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key]   DEPLOY a worker for a WORK ITEM: same dispatch path as "zee dispatch", but the brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text. Returns the new worker's slug
   zee say --to <slug> --message "..."   type a message straight into that worker's LIVE session
   zee suggest-done --to <slug> --reason "..."   ask a HUMAN to mark that worker done (they confirm; that is what reaps it)
   NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — dispatch a worker instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused.
@@ -204,12 +216,22 @@ switch (cmd) {
     const land = r.json?.landing;
     // Nothing pending to wait on → answer now (landed=0, decided-otherwise=1, no landing=0).
     if (!land || !['pending', 'approved'].includes(land.status)) {
-      process.exit(land && land.status !== 'landed' ? (['rejected', 'stale'].includes(land.status) ? 1 : 0) : 0);
+      process.exit(land && land.status !== 'landed' ? (['rejected', 'stale', 'withdrawn'].includes(land.status) ? 1 : 0) : 0);
     }
     await pollLanding(w.secs); // exits
     break;
   }
   case 'land': {
+    // --withdraw (--clear is the same thing, for symmetry with tend/hint/done) UN-ASKS your held
+    // landing instead of raising one: the card leaves the human's screen, nothing lands, nothing is
+    // rejected and your commits are untouched. Use it BEFORE landing again — a second push while the
+    // first is still held leaves two cards for one job and only you know which one you still mean.
+    if (rest.includes('--withdraw') || rest.includes('--clear')) {
+      const r = await req('POST', '/api/xell/self/land/withdraw', {
+        reason: flag('reason') || null, request: flag('request') || null });
+      console.log(JSON.stringify(r.json, null, 2));
+      process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    }
     const r = await req('POST', '/api/xell/self/land', {});
     console.log(JSON.stringify(r.json, null, 2));
     const w = waitFlag();
@@ -284,9 +306,21 @@ switch (cmd) {
   }
   case 'tend': {
     // Flag (or --clear) "I need a human in the console". Opens no gate and blocks nothing.
+    //
+    // Raising REQUIRES a brief reason, because the reason is the whole message: the console shows
+    // it on the xell's card and in the "waiting on you" line, and a tend without one summons a
+    // human who then has to open your session to find out what they were called for. One line —
+    // its first ~200 chars are the glance form on the chip/card, and the console keeps the whole
+    // text for the human who opens the ask, so LEAD with the decision and do not pre-truncate.
+    // `zee tend "why"` (bare, no --reason) is accepted too; it is the same ask.
     const clear = rest.includes('--clear');
-    const reason = flag('reason');
-    if (!clear && !reason) { console.error('tend needs --reason "why you need a human" (or --clear to lower it)'); process.exit(1); }
+    const reason = flag('reason') || rest.find((a) => !a.startsWith('--')) || null;
+    if (!clear && !reason) {
+      console.error('tend needs a BRIEF reason — say why you need a human, in one line:');
+      console.error('  zee tend --reason "stuck: the landing gate declined twice, need a human to look"');
+      console.error('(or --clear to lower an open tend)');
+      process.exit(1);
+    }
     out(await req('POST', '/api/xell/self/tend', { reason: reason || null, clear }));
     break;
   }
@@ -380,6 +414,66 @@ switch (cmd) {
     process.exit(r.code >= 400 ? 1 : 0);
     break;
   }
+  case 'work': {
+    // THE PLAN you are part of. A MANAGER sees its project's work items in tree order (--board drops
+    // the project root, which is not a card); a WORKER sees the ONE item it is assigned to, with the
+    // ancestors, ticket and history it was briefed from. --item <id> reads one item.
+    const item = flag('item') || positional();
+    const r = await req('GET', `/api/xell/self/work?${item ? `item=${encodeURIComponent(item)}&` : ''}${rest.includes('--board') ? 'board=1' : ''}`);
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    if (Array.isArray(j.items)) {
+      // manager view: the plan, indented by depth, with who is on each item
+      for (const i of j.items) {
+        const who = i.zee ? `  ← ${i.zee.slug} (${i.zee.hive_status_label || i.zee.hive_status})` : '';
+        console.log(`${'  '.repeat(i.depth)}${String(i.status).padEnd(9)} ${i.title}${who}`);
+        console.log(`${'  '.repeat(i.depth)}          ${i.id}`);
+      }
+    } else if (j.item) {
+      // one item: yours, or the one you asked for (the same read model /api/work-items/:id serves)
+      const i = j.item;
+      console.log(`${i.title}   [${i.status}${i.progress ? ` ${i.progress}%` : ''}]`);
+      console.log(`  id: ${i.id}   (${i.kind})`);
+      if (i.breadcrumb?.length) console.log(`  under: ${i.breadcrumb.join(' → ')}`);
+      if (i.ticket) console.log(`  ticket: ${i.ticket.number ? `#${i.ticket.number} ` : ''}${i.ticket.title || ''}`);
+      if (i.due_on) console.log(`  due: ${i.due_on}`);
+      if (i.body) console.log(`\n${i.body}\n`);
+      if (i.zee) console.log(`  zee: ${i.zee.slug} (${i.zee.hive_status_label || i.zee.hive_status})`);
+      for (const c of i.children || []) console.log(`  ├ ${String(c.status).padEnd(9)} ${c.title}`);
+      for (const e of (i.events || []).slice(0, 8)) {
+        console.log(`  · ${e.ts} ${e.kind}${e.to_status ? ` → ${e.to_status}` : ''} by ${e.actor || '—'}`);
+      }
+    }
+    if (j.message) console.log(`\n${j.message}`);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'assign': {
+    // MANAGER only: DEPLOY a worker for a work item. Same dispatch path as `zee dispatch` (the worker
+    // is stamped as your crew, seated beside you, on its own throwaway db) — what this adds is the
+    // brief, built from the ITEM: its title, body, ancestors, ticket and dates, plus your
+    // --task text. Break the ticket down first; a well-cut item briefs the worker for free.
+    const item = flag('item');
+    if (!item) { console.error('assign needs --item <work-item-id> (run `zee work` to list them)'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/work/assign', {
+      item, task: flag('task') || null, model: flag('model') || null, mode: flag('mode') || null,
+      harness: flag('harness') || null, title: flag('title') || null,
+    }));
+    break;
+  }
+  case 'item': {
+    // Report where the WORK has got to. A manager may report any item in its own project; a worker
+    // only the one it is assigned to (and may omit the id — the server resolves it from your token).
+    // This moves the CARD. It never marks your xell done, lands anything or ships anything.
+    const id = flag('item') || positional();
+    const progress = flag('progress');
+    out(await req('POST', '/api/xell/self/work/item', {
+      id, status: flag('status') || null,
+      progress: progress == null ? null : Number(progress), note: flag('note') || null,
+    }));
+    break;
+  }
   case 'suggest-done': {
     const to = flag('to');
     if (!to) { console.error('suggest-done needs --to <worker-slug> (and --reason "why it is finished")'); process.exit(1); }
@@ -387,7 +481,12 @@ switch (cmd) {
     break;
   }
   case 'done': {
+    // --clear WITHDRAWS a done proposal. Symmetric with tend/hint clearing, and the half that was
+    // missing: a zee handed more work after proposing done was stuck asking to be reaped, and until
+    // the hive precedence was fixed that stale proposal masked every later signal it raised.
+    if (rest.includes('--clear')) { out(await req('POST', '/api/xell/self/done', { clear: true })); break; }
     const summary = flag('summary');
+    if (!summary) { console.error('done needs --summary "what you finished" (or --clear to withdraw a proposal)'); process.exit(1); }
     out(await req('POST', '/api/xell/self/done', { summary }));
     break;
   }

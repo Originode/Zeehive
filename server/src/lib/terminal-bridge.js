@@ -64,20 +64,42 @@ export function zeeLiveViewCommand(view, write = false) {
   // a poll landing in that gap would read an empty file, fall back to "show everything" and repaint
   // twice. A rename is atomic, so the renderer only ever sees a whole view.
   return (write ? `printf '%s' '${json}' > ${ZEE_LIVE_VIEW_FILE}.tmp 2>/dev/null && mv -f ${ZEE_LIVE_VIEW_FILE}.tmp ${ZEE_LIVE_VIEW_FILE}; ` : '')
-    // `zee-live[.]mjs` so the pattern cannot match the pgrep itself; the marker words keep the
-    // parse independent of any shell noise on the line.
-    + `pgrep -f 'zee-live[.]mjs' >/dev/null 2>&1 && echo ZH-LIVE || echo ZH-IDLE; `
-    + `cat ${ZEE_LIVE_VIEW_FILE} 2>/dev/null`;
+    // Two questions, answered independently — because they are different questions:
+    //
+    //   ZH-READY — is a renderer that WATCHES the view file alive? Its `.ready` marker holds its
+    //     pid, and `kill -0` proves that pid is still running (a marker left by a dead feed proves
+    //     nothing). This is the one that decides whether a chip repaints anything.
+    //   ZH-LIVE  — is any feed streaming at all? `zee-live[.]mjs` (bracketed so the pattern cannot
+    //     match the pgrep itself) is a LOOSE match on purpose: it also catches an older renderer
+    //     that announces nothing, which is exactly the case the header must own up to.
+    //
+    // Deliberately NOT "the running pid equals the announced pid": pgrep -f reads whole command
+    // lines, so any shell whose argv happens to contain the script name (the installer's own
+    // `bash -lc … /tmp/zee-live.mjs`, a wrapper) can come back first and make a perfectly healthy
+    // feed look stale. Caught live — a real renderer reported PID 10994 / READY 11002 and would
+    // have been labelled "older feed". Liveness of the announced pid has no such ambiguity.
+    + `r=$(cat ${ZEE_LIVE_VIEW_FILE}.ready 2>/dev/null); `
+    + `if [ -n "$r" ] && kill -0 "$r" 2>/dev/null; then echo "ZH-READY $r"; else echo ZH-READY; fi; `
+    // `node …zee-live.mjs`: the bracket keeps the pattern from matching the probe's own shell, and
+    // requiring the interpreter keeps the INSTALLER's shell (`bash -lc 'sed … /tmp/zee-live.mjs …'`)
+    // from counting as a feed — the one remaining way a healthy pane could flash "older feed".
+    + `pgrep -f 'node .*zee-live[.]mjs' >/dev/null 2>&1 && echo ZH-LIVE || echo ZH-IDLE; `
+    // `; true` so the probe never exits non-zero just because there is no view file yet
+    + `cat ${ZEE_LIVE_VIEW_FILE} 2>/dev/null; true`;
 }
 
 // Read that command's output back into the frame the browser gets. Unreadable/absent file = the
-// renderer's own default (everything shown), never a guess that hides output.
+// renderer's own default (everything shown), never a guess that hides output. Also separates "a
+// feed is running" from "a feed that can be filtered is running" — see the marker above.
 export function parseZeeLiveViewReply(out) {
   const text = String(out || '');
   const m = text.match(/\{[^{}]*\}/);
   let view = { thinking: true, moves: true };
   if (m) { try { const j = JSON.parse(m[0]); view = { thinking: j.thinking !== false, moves: j.moves !== false }; } catch { /* half-written */ } }
-  return { t: 'v', ...view, live: /ZH-LIVE/.test(text) };
+  // filterable = a renderer that WATCHES the view file is alive → a chip repaints NOW
+  // live       = …or any feed at all is streaming, including an older renderer that ignores it
+  const filterable = /ZH-READY \d+/.test(text);
+  return { t: 'v', ...view, live: filterable || /ZH-LIVE/.test(text), filterable };
 }
 
 async function openTerminal(ws, zeeId) {

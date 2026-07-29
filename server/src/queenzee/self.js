@@ -17,11 +17,11 @@ import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 import { cleanGitEnv } from '../lib/git.js';
-import { landStatus } from './landgate.js';
+import { landStatus, openLandRequests, withdrawLandRequest } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
-import { proposeDone } from './tasks.js';
+import { proposeDone, retractDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
@@ -29,7 +29,7 @@ import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
-import { setTend, tendOpen, setHint, hintOpen, pingWorking } from '../lib/status.js';
+import { setTend, tendState, setHint, hintOpen, pingWorking, briefReason } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          NO_PUSH_REASON } from '../lib/managers.js';
@@ -45,6 +45,7 @@ export async function selfStatus(xell) {
   const zee = await liveZee(xell.id);
   const task = await one(`SELECT id, status, done_at, done_by FROM task WHERE xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [xell.id]);
   const land = await landStatus(xell.id);
+  const openLandings = await openLandRequests(xell.id);
   const ship = await shipStatus(xell.id);
   const prodBind = await one(
     `SELECT id, status, reason, requested_at, decided_at, decided_by FROM prod_bind_request
@@ -54,7 +55,8 @@ export async function selfStatus(xell) {
   const containers = await q(
     `SELECT c.role, c.name, c.tier, host(c.host) AS host, c.host_port FROM xell_uses_container uc
        JOIN container c ON c.id = uc.container_id WHERE uc.xell_id=$1 ORDER BY c.role`, [xell.id]);
-  const tend = await tendOpen(xell.id);
+  // The tend as the console sees it: open + the brief REASON the zee gave for calling a human.
+  const tend = await tendState(xell.id);
   const landHint = await hintOpen(xell.id, 'land');
   const shipHint = await hintOpen(xell.id, 'ship');
   // The DISPLAY status the hive shows for this xell — the same derivation the dashboard renders, so
@@ -66,7 +68,7 @@ export async function selfStatus(xell) {
       // A DEFERRED ship (pending, but a human set it aside for a combined ship) is not "awaiting a
       // human" — it matches how fleet.js derives the hive status, so the zee sees itself as a human does.
       shipPending: ship ? (['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at) : false,
-      tendPending: tend,
+      tendPending: tend.open,
       landHint, shipHint,
       // The two PROD-DATA asks, so a cxell zee sees its own `prod?` / `seed?` hexagon exactly as a
       // human does — and can tell that its request actually reached the console.
@@ -111,12 +113,21 @@ export async function selfStatus(xell) {
       ? { id: doneSuggestion.id, by: doneSuggestion.manager_slug, reason: doneSuggestion.reason,
           status: doneSuggestion.status, pending: doneSuggestion.status === 'pending' }
       : null,
-    tend: { open: tend },
+    tend: { open: tend.open, reason: tend.reason, reason_full: tend.full, since: tend.at },
     zee: zee || null,
     task: task ? { id: task.id, status: task.status, done: task.status === 'done' } : null,
     awaiting_done: xell.status === 'awaiting-done',
     landing: land
-      ? { status: land.status, new_sha: land.new_sha, decided_by: land.decided_by, pending: land.status === 'pending' }
+      ? { status: land.status, new_sha: land.new_sha, decided_by: land.decided_by, pending: land.status === 'pending',
+          // A zee's own retraction (`zee land --withdraw`) — terminal, and NOT a human decision.
+          withdrawn: land.status === 'withdrawn',
+          // How many landings this xell still has in front of a human. >1 is land-request spam: only
+          // the zee knows which one it still means, so it is the zee that must withdraw the rest.
+          open: openLandings.length,
+          ...(openLandings.length > 1
+            ? { note: `${openLandings.length} OPEN land requests from this xell — withdraw the ones you no longer `
+                + 'mean (`zee land --withdraw`) so a human is asked ONE question.' }
+            : {}) }
       : null,
     ship: ship
       ? { status: ship.status, commit: ship.commit, decided_by: ship.decided_by,
@@ -284,13 +295,26 @@ export async function selfLand(xell) {
   const request = await landStatus(xell.id);
   const trulyHeld = request && request.status === 'pending' && request.new_sha === push.head;
   if (trulyHeld) {
+    // DID THIS PUSH LEAVE AN OLDER ASK BEHIND? A second sha raises a second card, and only the zee
+    // knows which one it still means — that is land-request spam, and it is the zee's to clean up.
+    // We do NOT silently close the old ones: a human may already be reading one, and a queenzee that
+    // quietly retracts asks on a zee's behalf teaches nobody anything. We name them and hand back the
+    // one command that lowers them.
+    const stale = (await openLandRequests(xell.id)).filter((r) => r.id !== request.id);
     return {
       ok: true, status: 'held', landed: false, collected, catch_up: caughtUp, healed, request,
+      superseded: stale.map((r) => ({ id: r.id, new_sha: r.new_sha, status: r.status, requested_at: r.requested_at })),
       message: `Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
         + `(land_request ${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote}. Your commits `
         + 'are safe on your branch; nothing lands until a human agrees. You do NOT need to re-run land: when a human '
         + 'approves, the queenzee lands it AND nudges you to continue. To block meanwhile, `zee land --wait` (or '
-        + '`zee status --wait`) in the background — its exit is your nudge.',
+        + '`zee status --wait`) in the background — its exit is your nudge.'
+        + (stale.length
+          ? ` ⚠ You now have ${stale.length + 1} OPEN landing(s) for this xell — ${stale.length} of them older `
+            + `(${stale.map((r) => String(r.new_sha).slice(0, 8)).join(', ')}). A human sees one card each and cannot `
+            + 'tell which one you still mean. Do not stack them up: `zee land --withdraw --reason "…"` un-asks your '
+            + 'open landings, so the order is WITHDRAW first, then `zee land` again for one fresh card.'
+          : ''),
     };
   }
 
@@ -307,6 +331,75 @@ export async function selfLand(xell) {
           + `not a fresh pending hold for ${String(push.head).slice(0, 8)}. Check the ZEEHIVE console — this is NOT a clean held landing.`)
       : 'Push did not land and NO land_request was raised — the gate held nothing (a non-fast-forward the catch-up '
         + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.',
+  };
+}
+
+// ── POST /api/xell/self/land/withdraw — UN-ASK a held landing ────────────────────────────────────
+// The zee's own retraction, and the missing symmetry: `zee tend --clear`, `zee hint-land --clear`
+// and `zee done --clear` all let a zee lower an ask it raised — a LAND REQUEST had no such exit, so
+// a zee that changed its mind (it found a bug in what it pushed, the work turned out half-finished,
+// it was handed more scope) could only push again and leave a second card behind. Two held landings
+// from one xell, one of them obsolete, and only the zee knowing which.
+//
+// It withdraws THIS xell's pending land requests — normally exactly one; more than one is precisely
+// the mess this verb exists to clear. `{ request: <id> }` targets a single one (and it must belong
+// to this xell — a zee can only ever un-ask its own). Nothing is pushed, nothing is reverted: the
+// commits stay on the branch, and `zee land` re-asks with one fresh card whenever the zee is ready.
+//
+// APPROVED requests are NOT withdrawn. A human decided that one and the queenzee is acting on it;
+// pulling it back is not an agent's call — the answer to "it must not land after all" is `zee tend`.
+export async function selfWithdrawLand(xell, { reason = null, request = null } = {}) {
+  const open = await openLandRequests(xell.id);
+  const pending = open.filter((r) => r.status === 'pending');
+  const approved = open.filter((r) => r.status === 'approved');
+
+  const targets = request ? pending.filter((r) => r.id === request) : pending;
+  if (request && !targets.length) {
+    const mine = open.some((r) => r.id === request);
+    return { ok: false, status: 'not-found', withdrawn: [],
+      error: mine ? `land_request ${String(request).slice(0, 8)} is not pending` : 'no such pending land request for this xell',
+      message: mine
+        ? 'That landing is already APPROVED — a human decided it and the queenzee is landing it. If it must NOT land, '
+          + '`zee tend --reason "…"` and say so; you cannot withdraw a decision.'
+        : 'You can only withdraw a landing YOUR xell raised, and only while it is still pending.' };
+  }
+
+  if (!targets.length) {
+    const latest = await landStatus(xell.id);
+    return {
+      ok: true, status: 'nothing-to-withdraw', withdrawn: [],
+      request: latest || null,
+      approved: approved.map((r) => ({ id: r.id, new_sha: r.new_sha })),
+      message: approved.length
+        ? `Nothing pending to withdraw — your landing (${String(approved[0].new_sha).slice(0, 8)}) is already APPROVED and `
+          + 'the queenzee is landing it. A decision is not yours to retract; if it must not land, `zee tend` a human now.'
+        : latest
+          ? `Nothing to withdraw — your latest land request is '${latest.status}'`
+            + `${latest.new_sha ? ` (${String(latest.new_sha).slice(0, 8)})` : ''}, not pending.`
+          : 'Nothing to withdraw — this xell has never raised a land request.',
+    };
+  }
+
+  const done = [];
+  for (const r of targets) {
+    const row = await withdrawLandRequest(r.id, `zee@${xell.slug}`, reason).catch((e) => ({ error: e.message, id: r.id }));
+    done.push(row.error ? { id: r.id, error: row.error } : { id: row.id, new_sha: row.new_sha, status: row.status });
+  }
+  const okCount = done.filter((d) => !d.error).length;
+  // A land HINT is the same claim one notch quieter ("this looks land-ready — a human should
+  // decide"). Un-asking the landing while leaving the hint up would light the land? button for work
+  // the zee just said it does not want landed, so the retraction lowers both. Best-effort.
+  const hadHint = await hintOpen(xell.id, 'land').catch(() => false);
+  if (okCount && hadHint) await setHint(xell.id, 'land', false, { reason: reason || 'landing withdrawn' }).catch(() => {});
+  logline('self', `${xell.slug} withdrew ${okCount} land request(s)${reason ? ` — ${String(reason).slice(0, 120)}` : ''}`);
+  broadcast('xell', { id: xell.id });
+  return {
+    ok: okCount > 0, status: okCount ? 'withdrawn' : 'error', withdrawn: done,
+    message: `WITHDRAWN ${okCount} held landing(s) — ${done.filter((d) => !d.error).map((d) => String(d.new_sha).slice(0, 8)).join(', ') || 'none'}. `
+      + 'The card is off the human\'s screen and nothing was decided, landed or reverted: your commits are still on your '
+      + 'branch exactly as they were. When the work really is ready, `zee land` raises ONE fresh request.'
+      + (hadHint ? ' Your land? hint was lowered with it.' : '')
+      + (approved.length ? ` (Note: ${approved.length} APPROVED landing(s) were left alone — a decision is not yours to retract.)` : ''),
   };
 }
 
@@ -562,7 +655,13 @@ async function resealCxellForStack(xellId) {
 // ── POST /api/xell/self/done — propose done (the human confirms → teardown) ─────
 // The zee never despawns itself. proposeDone flags the xell 'awaiting-done'; a human confirms with
 // "Mark done" in the dashboard, and THAT is what reaps the cxell (collecting its commits first).
-export async function selfDone(xell, { summary = null } = {}) {
+//
+// `{clear:true}` (`zee done --clear`) WITHDRAWS the proposal — symmetric with how tend and the
+// land/ship hints clear. A zee that proposed done and was then handed more work had no way back,
+// and a stale proposal is not harmless: it is the zee still asking a human to reap it. Retracting
+// what a human has ALREADY confirmed is refused inside retractDone — that decision is theirs.
+export async function selfDone(xell, { summary = null, clear = false } = {}) {
+  if (clear) return retractDone({ xell_id: xell.id });
   return proposeDone({ xell_id: xell.id, note: summary });
 }
 
@@ -571,17 +670,30 @@ export async function selfDone(xell, { summary = null } = {}) {
 // a heads-up). Unlike those it opens no gate and blocks nothing — it just flags the xell so the hive
 // shows `occ-tendRequest` and the human knows to look. `--clear` (or {clear:true}) lowers it; a zee
 // that reports working again clears it automatically.
+// RAISING one REQUIRES a brief reason. A tend with no why is the ask that wastes the human it
+// summoned: the console can only show "this xell wants you", and the only way to learn what for is
+// to open the session and read a transcript. The reason is carried to the hexagon and the
+// "waiting on you" line, so it must be one short line — briefReason clamps it (TEND_REASON_MAX).
 export async function selfTend(xell, { reason = null, clear = false } = {}) {
+  // `why` is the DISPLAY line (used to validate, log and answer). The RAW reason is what gets
+  // stored — passing the brief form to setTend is precisely the bug that shipped: it truncated the
+  // ask at the door, so the console faithfully showed all 200 characters that still existed.
+  const why = briefReason(reason);
+  if (!clear && !why) {
+    return { ok: false, error: 'a tend needs a brief reason — say WHY you need a human, in one line '
+      + '(`zee tend --reason "…"`). The reason is what the console shows beside your hexagon; without '
+      + 'it a human is called with no idea what for.' };
+  }
   const zee = await liveZee(xell.id);
   const res = await setTend(xell.id, !clear, { reason, zeeId: zee?.id || null });
-  logline('self', `${xell.slug} ${clear ? 'CLEARED its tend' : 'raised a TEND'}${reason ? `: ${reason}` : ''}`);
+  logline('self', `${xell.slug} ${clear ? 'CLEARED its tend' : 'raised a TEND'}${why ? `: ${why}` : ''}`);
   return {
     ok: true, ...res,
     message: clear
       ? 'Tend cleared — the hive no longer flags this xell for attention.'
-      : 'Tend RAISED — the hive now shows this xell as needing a human (occ-tendRequest). Nothing is '
-        + 'gated or blocked; a human will see it in the console. It clears when you `zee tend --clear` '
-        + 'or report working (`zee working`).',
+      : `Tend RAISED ("${why}") — the hive now shows this xell as needing a human (occ-tendRequest), `
+        + 'with that reason on the card and in the console\'s "waiting on you" line. Nothing is gated '
+        + 'or blocked. It clears when you `zee tend --clear` or report working (`zee working`).',
   };
 }
 
@@ -902,4 +1014,160 @@ function requireManager(xell, verb) {
     + 'job in their own xell; dispatching, monitoring and closing out other zees belongs to a manager '
     + '(a human adds those in the console). You CAN talk to your manager, if you have one: `zee report '
     + '--message "…"` and `zee inbox`.' };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WORK-TRACKER VERBS — a zee's view of the PLAN it is executing (lib/work-assign.js owns the domain).
+//
+// The work tracker gave the hive a plan (project → activity → task) and a board. These three verbs
+// are what make the plan reach the agents: a manager can SEE its project's plan and put a worker on
+// an item, and a worker can see the item it is executing and report where it has got to.
+//
+// SCOPE IS RESOLVED FROM THE TOKEN, NEVER FROM A PARAMETER. A manager may touch any item in ITS OWN
+// project; a worker may touch ONLY the item it is assigned to. The caller does not get to say which
+// xell it is — that is the same rule every other verb in this file follows, and it is what stops
+// "which item?" from becoming a way to reach across the fleet.
+//
+// And nothing here is a new gate or a way round one: reporting an item `done` is a report of FACT
+// about the WORK, and it deliberately does not touch the xell's own done/land/ship state.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/xell/self/work — `zee work` (any zee).
+// A MANAGER gets its project's plan in tree order (with each item's status, assignee and live zee);
+// a WORKER gets the item it is assigned to, with the ancestors/ticket/history it was briefed from.
+// `--item <id>` reads one item, scoped the same way.
+export async function selfWork(xell, { board = false, item = null } = {}) {
+  const { workItemTree, itemForXell } = await import('../lib/work-assign.js');
+  const { getWorkItem } = await import('../lib/work-items.js');
+  const manager = isManager(xell);
+
+  if (item) {
+    let detail;
+    try { detail = await getWorkItem(item); }
+    catch (e) { return { ok: false, error: e.message }; }
+    if (!detail) return { ok: false, error: `no work item ${item}` };
+    if (manager) {
+      if (detail.project_id !== xell.project_id) {
+        return { ok: false, status: 'refused', error:
+          'that work item is in another project. You manage the plan of YOUR project only.' };
+      }
+    } else {
+      const mine = await itemForXell(xell.id);
+      if (!mine || mine.id !== detail.id) {
+        return { ok: false, status: 'refused', error:
+          'that is not the work item you are assigned to. A worker sees (and reports on) its OWN item '
+          + 'only — run `zee work` with no arguments to see it.' };
+      }
+    }
+    return { ok: true, item: detail };
+  }
+
+  if (manager) {
+    const items = await workItemTree(xell.project_id, { board });
+    const live = items.filter((i) => i.zee).length;
+    return {
+      ok: true, view: board ? 'board' : 'tree', count: items.length, items,
+      message: items.length
+        ? `${items.length} work item(s)${board ? ' (board view — the project root is not a card)' : ''}; `
+          + `${live} with a zee on ${live === 1 ? 'it' : 'them'}. \`zee assign --item <id> --task "…"\` `
+          + 'deploys a worker for one; the board then follows that worker by itself.'
+        : 'No work items in this project yet — only the project root exists. Break a ticket down into a '
+          + 'plan first (POST /api/tickets/:id/breakdown): a worker briefed from a tracked item gets its '
+          + 'ancestors and its ticket for free.',
+    };
+  }
+
+  const mine = await itemForXell(xell.id);
+  if (!mine) {
+    return { ok: true, item: null,
+      message: 'You are not assigned to a work item — your task brief is the whole job. (If you believe '
+        + 'you should be tracked on the board, say so in `zee report`.)' };
+  }
+  return {
+    ok: true, item: mine,
+    message: `You are executing "${mine.title}" (${mine.status})`
+      + `${mine.breadcrumb?.length ? `, under ${mine.breadcrumb.join(' → ')}` : ''}. `
+      + 'Report progress with `zee item --status working --note "…"` — that moves the CARD only; your '
+      + 'own done/land/ship stay your verbs and a human\'s gates.',
+  };
+}
+
+// POST /api/xell/self/work/assign — `zee assign` (MANAGER only).
+// Deploys a WORKER for a work item, through the SAME dispatch path `zee dispatch` uses: the worker is
+// still stamped manager_xell_id, still seated next to its manager, still gets its own throwaway db,
+// and a manager still cannot hand it prod, the manager type or the manager harness. What this adds is
+// the BRIEF: it is built from the item itself (title, body, ancestors, ticket, dates) plus whatever
+// extra the manager types, so a well-cut plan briefs a worker for free.
+export async function selfWorkAssign(xell, { item = null, task = null, model = null, mode = null,
+                                             harness = null, title = null } = {}) {
+  const guard = requireManager(xell, 'assign');
+  if (guard) return guard;
+  if (!item) return { ok: false, error: 'assign needs --item <work-item-id> (see `zee work`)' };
+  const { deployWorkItem, getItem } = await import('../lib/work-assign.js');
+  let row;
+  try { row = await getItem(item); }
+  catch (e) { return { ok: false, error: e.message }; }
+  if (row.project_id !== xell.project_id) {
+    return { ok: false, status: 'refused', error:
+      'that work item is in another project. You may only deploy workers onto YOUR project\'s plan.' };
+  }
+  try {
+    const out = await deployWorkItem(row.id, {
+      task, model, mode, harness, title, actor: xell.slug, managerXellId: xell.id });
+    return {
+      ok: true, ...out,
+      message: `${out.message} It reports to you (\`zee zees\`, \`zee say --to ${out.xell.slug} …\`), it `
+        + 'lands its OWN work, and the item now follows its hive status — you do not have to move the card.',
+    };
+  } catch (e) {
+    return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
+  }
+}
+
+// POST /api/xell/self/work/item — `zee item` (any zee, scoped).
+// A MANAGER may update any item in its own project; a WORKER may update ONLY the item it is assigned
+// to. Both are resolved from the CALLER'S TOKEN — an id that is not theirs is refused with a sentence,
+// never silently applied.
+export async function selfWorkItem(xell, { id = null, status = null, progress = null, note = null } = {}) {
+  const { reportItemStatus, getItem, itemForXell } = await import('../lib/work-assign.js');
+  const manager = isManager(xell);
+
+  let target = null;
+  if (id) {
+    try { target = await getItem(id); }
+    catch (e) { return { ok: false, error: e.message }; }
+  } else if (!manager) {
+    target = await itemForXell(xell.id);
+    if (!target) {
+      return { ok: false, error: 'you are not assigned to a work item, so there is nothing to report on. '
+        + '`zee work` shows what you are executing (if anything).' };
+    }
+  } else {
+    return { ok: false, error: 'item needs an id — `zee item <id> --status <s>` (see `zee work`).' };
+  }
+
+  if (manager) {
+    if (target.project_id !== xell.project_id) {
+      return { ok: false, status: 'refused', error:
+        'that work item is in another project. You manage YOUR project\'s plan only.' };
+    }
+  } else {
+    const mine = await itemForXell(xell.id);
+    if (!mine || mine.id !== target.id) {
+      return { ok: false, status: 'refused', error:
+        'that is not your work item. A worker may only report on the item it is ASSIGNED to — nobody '
+        + 'else\'s, and not the plan around it. Run `zee work` to see yours, and `zee report --message '
+        + '"…"` if something outside it needs saying.' };
+    }
+  }
+
+  const p = progress == null ? null : Number(progress);
+  if (p != null && (!Number.isFinite(p) || p < 0 || p > 100)) {
+    return { ok: false, error: `--progress must be a number 0-100 (got "${progress}")` };
+  }
+  try {
+    return await reportItemStatus(target.id, { status, progress: p, note, actor: xell.slug });
+  } catch (e) {
+    return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
+  }
 }

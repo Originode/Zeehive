@@ -264,12 +264,20 @@ export const draftProjectManifest = (projectId, write = false) => siteCall(`/api
 
 // Subscribe to /api/stream for the selected project. Calls onSnapshot(fleet) on the
 // initial snapshot and onChange() on every subsequent event (the app re-fetches on change).
-export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog }) {
+export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork }) {
   const es = new EventSource(`/api/stream${pq(projectId)}`);
   es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
-  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship']) {
+  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work']) {
     es.addEventListener(type, () => onChange());
   }
+  // The WORK channel, delivered WITH its payload as well as counted as a change. Every other
+  // consumer of this stream only needs "something moved, re-read"; the work tracker needs to tell a
+  // work event apart from ordinary fleet churn, because the queenzee's tick moves cards on the board
+  // and that should land at once, while a container health flap should not cost a board refetch.
+  // Optional, so nothing else on the page changes behaviour by this existing.
+  if (onWork) es.addEventListener('work', (e) => {
+    try { onWork(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
+  });
   if (onLog) es.addEventListener('log', (e) => onLog(JSON.parse(e.data)));
   // Per-ship build feed ({id, role, line}) — rendered live on that ship's own card.
   if (onShipLog) es.addEventListener('ship-log', (e) => onShipLog(JSON.parse(e.data)));
@@ -602,14 +610,32 @@ export async function decideLanding(id, decision, by = 'human@console') {
   return data;
 }
 
+// WITHDRAW a held landing on the zee's behalf — the operator half of `zee land --withdraw`.
+// NOT a rejection: nothing is refused and no sha is burned, so the same work can be pushed and
+// asked again. For the card a zee abandoned (or the older of a stack it left behind).
+export async function withdrawLanding(id, reason = null) {
+  const r = await fetch(`/api/land/requests/${id}/withdraw`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console', reason }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `withdraw failed (${r.status})`);
+  return data;
+}
+
 // ── shipping to production (zee asks · human approves · queenzee ships) ───────
 // approve → the queenzee takes the prod lock and runs the deploy ITSELF, from main.
 // siteId (approve only): aim the ship at a chosen prod site — the dialog's target picker when a
 // project has more than one production. Omit to ship to the request's recorded (default) site.
-export async function decideShip(id, decision, by = 'human@console', siteId = undefined) {
+// allowStaleCxellImage (approve only): the human's explicit "ship anyway even if the cxell image
+// cannot be rebuilt". A failed rebuild normally FAILS the ship; this is the per-ship release valve,
+// and it is RECORDED on the request so the audit trail shows a human chose it.
+export async function decideShip(id, decision, by = 'human@console', siteId = undefined,
+                                 allowStaleCxellImage = false) {
   const r = await fetch(`/api/ship/requests/${id}/${decision}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ by, ...(siteId ? { site_id: siteId } : {}) }),
+    body: JSON.stringify({ by, ...(siteId ? { site_id: siteId } : {}),
+                           ...(allowStaleCxellImage ? { allow_stale_cxell_image: true } : {}) }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
@@ -626,10 +652,11 @@ export async function dismissShip(id) {
 
 // Force-release the prod lock for this ship's site, then approve+ship it — one atomic step for the
 // "production is locked, but send this one now" decision. siteId (optional) aims/re-aims the ship.
-export async function unlockAndShip(id, siteId = undefined) {
+export async function unlockAndShip(id, siteId = undefined, allowStaleCxellImage = false) {
   const r = await fetch(`/api/ship/requests/${id}/unlock-and-ship`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(siteId ? { site_id: siteId } : {}),
+    body: JSON.stringify({ ...(siteId ? { site_id: siteId } : {}),
+                           ...(allowStaleCxellImage ? { allow_stale_cxell_image: true } : {}) }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `unlock & ship failed (${r.status})`);

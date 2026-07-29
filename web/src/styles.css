@@ -245,6 +245,9 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-n { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 /* the decision card(s) for the clicked chip, inline right under the bar */
 .ny-decision { display: flex; flex-direction: column; gap: 8px; }
+/* WHY a tend was raised. A tend has no Approve/Reject — the only thing it carries is the zee's
+   reason, so that reason is the loudest word in the note rather than a footnote to it. */
+.ny-why { color: var(--building); }
 /* Jumping to a card is useless if you then can't tell WHICH one it scrolled to. */
 .card.flash { animation: cardflash 1.2s ease-out; }
 @keyframes cardflash {
@@ -299,6 +302,11 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
    `no` is the only one that needs you (land it); `queue` resolves itself when the
    lock frees, so it is muted, not a warning — a red "blocked" there would send you
    hunting for a problem that is already handling itself. */
+/* The tend row on a xell card: the brief reason its zee gave for asking for a human. Same amber as
+   the "waiting on you" bar — it is the card-side face of that ask — and clipped to one line (the
+   full text is on the title), because a card row that wraps pushes the whole grid around. */
+.tendwhy { font-size: 11px; text-align: right; color: var(--building);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shipst { font-size: 11px; text-align: right; }
 .shipst.s-ready { color: var(--up); }
 .shipst.s-no    { color: var(--building); }
@@ -594,6 +602,11 @@ a.cbox:hover { border-color: var(--accent); }
 /* db scope + zee drift assessment on a ship card — part of what the approve click covers */
 .ship-dbscope { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 .ship-dbnote { margin: 3px 0 0; font-size: 12px; color: var(--muted); font-style: italic; }
+/* The cxell-image guard's release valve: quiet until ticked, then it says what it costs. */
+.ship-stale-override { display: block; margin: 5px 0 0; font-size: 12px; color: var(--muted); cursor: pointer; }
+.ship-stale-override input { vertical-align: -1px; margin-right: 2px; }
+.ship-stale-warn { color: #ffcf9e; }
+.ship-stale-chosen { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 /* deploy-target picker on a pending ship card */
 .ship-target { display: flex; align-items: center; gap: 7px; margin: 6px 0 2px; font-size: 13px; }
 .ship-target .k { color: var(--muted); }
@@ -885,6 +898,10 @@ a.cbox:hover { border-color: var(--accent); }
 .land-approve:hover:not(:disabled) { background: rgba(53,196,107,.12); }
 .land-reject { border-color: var(--error) !important; color: var(--error) !important; }
 .land-reject:hover:not(:disabled) { background: rgba(229,85,78,.12); }
+/* Withdraw sits left of Reject and stays MUTED on purpose: it decides nothing (no rejection, no
+   landing, the sha is not burned), so it must not read as a verdict competing with the two that are. */
+.land-withdraw { border-color: var(--line) !important; color: var(--muted) !important; margin-right: auto; }
+.land-withdraw:hover:not(:disabled) { color: var(--text) !important; background: rgba(255,255,255,.06); }
 /* nothing held any more — approved and waiting on the zee. Green, not alarm-red. */
 .land-panel.settled { border-color: var(--up); }
 .land-panel.settled .land-title { color: var(--up); }
@@ -1033,6 +1050,14 @@ a.cbox:hover { border-color: var(--accent); }
   color: #fff; font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 6px; cursor: pointer; }
 .new-prompt-btn:hover { filter: brightness(1.1); }
 
+/* THE OVERLAY BAND — every full-screen overlay is portalled onto <body> (see Dispatch.jsx), so
+   these numbers are compared with each other and nothing else. In-pane chrome (the graph divider
+   z 4–6, the connector lines z 1, context menus z 41) never enters this band, and a z-index here
+   is meaningless for a component still rendered inside a pane: `.content` is its own stacking
+   context, so an overlay left in there ranks at z 1 no matter what number it carries.
+       composer 60  <  toasts 80  <  dialogs 90  <  diff viewer 95
+   The order is deliberate: a dispatch toast and an error dialog must both be readable OVER a
+   composer that is still open. */
 .disp-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
   align-items: flex-start; justify-content: center; z-index: 60; padding: 6vh 16px; }
 .disp { width: min(720px, 96vw); max-height: 88vh; background: var(--panel); border: 1px solid var(--line);
@@ -1425,11 +1450,30 @@ a.cbox:hover { border-color: var(--accent); }
 .term-x.on { color: var(--accent); }
 
 /* ── live-feed chips in the zee terminal header (✱ thinking · ⚒ moves) ──
-   Same chip idiom as the queenzee log's scope filters (.term-chip/.off): lit = shown, dimmed =
-   hidden. `.idle` says the cage has no feed streaming right now, so the click sets the view the
-   NEXT feed opens in rather than repainting something — dashed, not disabled (it still records). */
-.zeeterm .term-filters { flex: 0 0 auto; margin-left: auto; }
-.term-chip.idle { border-style: dashed; }
+   These first shipped as bare .term-chips and came straight back as "it's too difficult to see if
+   the buttons are pressed or not" — correct: .term-chip carries no COLOUR (the queenzee-log chips
+   it was copied from always pass an inline per-scope colour), so they inherited the default button
+   colour on a dark panel, and the only state signal was one opacity step.
+   So the state is carried three independent ways — the WORD (shown/hidden), the colour, and a
+   strike through a hidden label — and the word alone is enough on a bad screen. */
+.feedchips { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+.feedchip { display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  font-family: 'Cascadia Code', monospace; font-size: 11px; line-height: 1.7;
+  padding: 0 3px 0 7px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--panel2); color: var(--muted); }
+.feedchip:hover { border-color: var(--accent); }
+.feedchip .fc-state { font-size: 10px; letter-spacing: .04em; padding: 0 6px; border-radius: 8px;
+  border: 1px solid transparent; }
+/* SHOWN: accent throughout, with the state word reversed out — reads as "lit / pressed in". */
+.feedchip.on { color: var(--accent); border-color: var(--accent); background: rgba(91, 140, 255, .14); }
+.feedchip.on .fc-state { background: var(--accent); color: #0d1017; }
+/* HIDDEN: muted, flat, the label struck through — legible as "off" with no colour at all. */
+.feedchip.off { color: var(--muted); background: transparent; }
+.feedchip.off .fc-label { text-decoration: line-through; text-decoration-thickness: 1px; }
+.feedchip.off .fc-state { border-color: var(--line); }
+/* No feed streaming: said in words, because otherwise a click lands on nothing visible. */
+.fc-idle { font-size: 10px; color: var(--muted); border: 1px dashed var(--line);
+  border-radius: 8px; padding: 0 6px; }
 
 .zeeterm-foot {
   display: flex; align-items: center; gap: 8px; padding: 8px 10px;
@@ -1613,3 +1657,246 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   border-radius: 6px; cursor: pointer; }
 .mgr-add:hover:not(:disabled) { background: rgba(240,145,59,.14); }
 .mgr-add:disabled { opacity: .55; cursor: default; }
+
+/* ══ WORK TRACKER — tickets · board · timeline ═══════════════════════════════════════════════
+   Everything the work console draws, and nothing else: every selector in this fenced section is
+   prefixed `.work-`, so it can be read (and one day lifted) as a unit and can never collide with
+   the fleet console above it.
+
+   It reuses the palette rather than introducing one — --panel/--panel2/--line for surfaces,
+   --accent for selection, --up/--building/--down for the "this is late" temperature — because a
+   board that looks bolted on is a bug: the tracker is part of the console, not a guest in it. The
+   only new colours are the eight status dots, and each one is a tint of a colour the hive already
+   uses for the same feeling (blue = queued/waiting, green = moving, amber = a human is needed,
+   orange/red = touching something irreversible, grey = closed).
+   ═══════════════════════════════════════════════════════════════════════════════════════════ */
+
+/* the button in the status line that opens it */
+.work-btn-open { margin-left: 12px; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--text); font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 6px; cursor: pointer; }
+.work-btn-open:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── the overlay shell ─────────────────────────────────────────────────────── */
+.work-overlay { position: fixed; inset: 0; z-index: 70; background: rgba(6,8,12,.72);
+  display: flex; padding: 26px; }
+.work-shell { flex: 1; min-width: 0; display: flex; flex-direction: column;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: 0 24px 70px rgba(0,0,0,.6); overflow: hidden; }
+.work-head { display: flex; align-items: center; gap: 14px; padding: 10px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex: 0 0 auto; }
+.work-h-title { font-size: 15px; letter-spacing: .02em; }
+.work-tabs { display: flex; gap: 4px; }
+.work-tab { background: none; border: 1px solid transparent; color: var(--muted); font-size: 13px;
+  padding: 4px 14px; border-radius: 7px; cursor: pointer; }
+.work-tab:hover { color: var(--text); }
+.work-tab.on { color: var(--accent); border-color: var(--accent); background: rgba(91,140,255,.10); }
+.work-scope { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.work-scope b { color: var(--text); }
+.work-x { background: none; border: 0; color: var(--muted); font-size: 15px; cursor: pointer; padding: 2px 6px; }
+.work-x:hover { color: var(--text); }
+.work-main { flex: 1 1 auto; min-height: 0; display: flex; }
+.work-pane { flex: 1 1 auto; min-width: 0; overflow: auto; padding: 12px 14px; }
+.work-empty, .work-none { color: var(--muted); font-size: 12.5px; padding: 10px 6px; }
+.work-muted { color: var(--muted); font-size: 12px; }
+.work-warn { color: var(--building); font-size: 12px; padding: 2px 6px; }
+
+/* the refusal sentence — the server's own words, never a bare "failed" */
+.work-err { display: flex; align-items: center; gap: 8px; margin: 8px 0; padding: 7px 11px;
+  background: rgba(229,85,78,.12); border: 1px solid var(--down); border-radius: 8px;
+  color: #f0a9a5; font-size: 12.5px; }
+.work-err-x { margin-left: auto; background: none; border: 0; color: inherit; cursor: pointer; }
+
+/* ── shared bits ───────────────────────────────────────────────────────────── */
+.work-kind { color: var(--muted); font-size: 12px; }
+.work-kind.k-project { color: var(--accent); }
+.work-kind.k-activity { color: #9b8cff; }
+.work-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 auto;
+  background: var(--unknown); }
+.work-st-queued    { background: #5b8cff; }
+.work-st-assigned  { background: #7c83f5; }
+.work-st-working   { background: #35c46b; }
+.work-st-blocked   { background: #e5554e; }
+.work-st-review    { background: #f2c518; }
+.work-st-shipping  { background: #f0913b; }
+.work-st-done      { background: #6fcf97; }
+.work-st-cancelled { background: #6b7688; }
+.work-pips { display: inline-flex; gap: 2px; align-items: center; }
+.work-pips i { width: 4px; height: 4px; border-radius: 50%; background: var(--line); display: block; }
+.work-pips i.on { background: var(--muted); }
+.work-pips.p-1 i.on { background: var(--down); }
+.work-pips.p-2 i.on { background: var(--building); }
+.work-due { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.work-due.soon { color: var(--building); }
+.work-due.today { color: #f0913b; }
+.work-due.over { color: var(--down); font-weight: 600; }
+.work-zee { border: 1px solid; border-radius: 5px; padding: 0 5px; font-size: 10.5px;
+  font-family: 'Cascadia Code', monospace; white-space: nowrap; }
+.work-zee i { font-style: normal; opacity: .75; }
+.work-crumb { color: var(--muted); font-size: 11px; display: block; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.work-label { color: var(--muted); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 5px; font-size: 11px; }
+
+/* form controls, one look for the whole tracker */
+.work-in { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 4px 8px; font-size: 12.5px; font-family: inherit; }
+.work-in:focus { outline: none; border-color: var(--accent); }
+.work-in.num { width: 66px; }
+.work-in.grow { flex: 1 1 auto; min-width: 0; }
+.work-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 4px 12px; font-size: 12.5px; cursor: pointer; }
+.work-btn:hover:not(:disabled) { border-color: var(--accent); }
+.work-btn.primary { border-color: var(--accent); color: var(--accent); }
+.work-btn:disabled { opacity: .45; cursor: default; }
+.work-mini { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 5px;
+  padding: 1px 7px; font-size: 11px; cursor: pointer; }
+.work-mini:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.work-mini.danger:hover { color: var(--down); border-color: var(--down); }
+.work-lbl { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+.work-body { width: 100%; background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 7px; padding: 7px 9px; font-size: 12.5px; font-family: inherit; resize: vertical; }
+.work-body.mono { font-family: 'Cascadia Code', 'Consolas', monospace; }
+
+/* ── the tree rail ─────────────────────────────────────────────────────────── */
+.work-rail { flex: 0 0 258px; border-right: 1px solid var(--line); overflow: auto;
+  padding: 8px 4px; background: var(--panel); }
+.work-nrow { display: flex; align-items: center; gap: 5px; padding: 2px 6px 2px 0; border-radius: 6px;
+  font-size: 12.5px; cursor: grab; }
+.work-nrow:hover { background: var(--panel2); }
+.work-nrow.sel { background: rgba(91,140,255,.14); box-shadow: inset 2px 0 0 var(--accent); }
+.work-nrow.dropon { outline: 1px dashed var(--accent); background: rgba(91,140,255,.10); }
+.work-chev { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 10px;
+  padding: 0 2px; flex: 0 0 14px; }
+.work-chev.none { opacity: .35; cursor: default; }
+.work-nname { flex: 1 1 auto; min-width: 0; background: none; border: 0; color: var(--text);
+  text-align: left; font-size: 12.5px; padding: 1px 2px; cursor: pointer; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.work-nadd { display: none; gap: 3px; flex: 0 0 auto; }
+.work-nrow:hover .work-nadd { display: flex; }
+
+/* ── the board ─────────────────────────────────────────────────────────────── */
+.work-board { height: 100%; display: flex; flex-direction: column; }
+.work-cols { flex: 1 1 auto; display: flex; gap: 10px; overflow-x: auto; align-items: flex-start; padding-bottom: 8px; }
+.work-col { flex: 0 0 236px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  display: flex; flex-direction: column; max-height: 100%; }
+.work-col.terminal { opacity: .82; }
+.work-col.unknown { border-color: var(--building); }
+.work-col-h { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px;
+  border-bottom: 1px solid var(--line); }
+.work-col-name { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.work-col-n { color: var(--text); font-size: 12px; background: var(--panel2); border-radius: 9px; padding: 0 7px; }
+.work-col-note { color: var(--building); font-size: 11px; padding: 4px 10px; }
+.work-col-body { padding: 4px; overflow-y: auto; min-height: 60px; }
+.work-col-empty { color: var(--unknown); text-align: center; font-size: 12px; padding: 6px; }
+
+.work-gap { height: 6px; border-radius: 3px; }
+.work-gap.on { background: var(--accent); box-shadow: 0 0 8px rgba(91,140,255,.7); }
+.work-card { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 9px; margin: 0; cursor: pointer; display: flex; flex-direction: column; gap: 4px; }
+.work-card:hover { border-color: var(--accent); }
+.work-card.dragging { opacity: .45; }
+.work-card-top { display: flex; align-items: baseline; gap: 6px; }
+.work-card-title { flex: 1 1 auto; min-width: 0; font-size: 12.5px; line-height: 1.3; }
+.work-card-tkt { color: var(--accent); font-size: 11px; font-family: 'Cascadia Code', monospace; }
+.work-card-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.work-drift { color: var(--building); font-size: 11px; border-top: 1px dashed var(--line); padding-top: 3px; }
+
+/* ── the drawer ────────────────────────────────────────────────────────────── */
+.work-drawer { flex: 0 0 380px; border-left: 1px solid var(--line); background: var(--panel);
+  display: flex; flex-direction: column; overflow: hidden; }
+.work-drawer-h { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.work-drawer-h .work-crumb { flex: 1 1 auto; }
+.work-drawer-body { overflow: auto; padding: 10px 12px 20px; }
+.work-drawer-title { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+.work-title-in { flex: 1 1 auto; min-width: 0; background: transparent; border: 1px solid transparent;
+  color: var(--text); font-size: 15px; font-family: inherit; padding: 3px 5px; border-radius: 6px; }
+.work-title-in:hover { border-color: var(--line); }
+.work-title-in:focus { outline: none; border-color: var(--accent); background: var(--panel2); }
+.work-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin-bottom: 12px; }
+.work-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.work-field.grow { flex: 1 1 auto; }
+.work-prio-edit, .work-dueedit, .work-progress { display: flex; align-items: center; gap: 7px; }
+.work-progress input { flex: 1 1 auto; min-width: 0; }
+.work-progress b { font-size: 12px; color: var(--muted); width: 38px; text-align: right; }
+.work-tktlink { color: var(--accent); font-size: 12px; }
+.work-sec { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 8px; }
+.work-sec-h { display: flex; align-items: center; justify-content: space-between; color: var(--muted);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 5px; }
+.work-row { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: 0;
+  color: var(--text); text-align: left; font-size: 12.5px; padding: 4px 5px; border-radius: 6px; cursor: pointer; }
+.work-row:hover { background: var(--panel2); }
+.work-row.static { cursor: default; }
+.work-row-t { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-row-t.link { background: none; border: 0; color: var(--text); text-align: left; cursor: pointer; font-size: 12.5px; }
+.work-quickadd { display: flex; gap: 6px; align-items: center; padding: 4px 0; }
+.work-quickadd .work-in { flex: 1 1 auto; min-width: 0; }
+.work-deppick { border: 1px solid var(--line); border-radius: 8px; padding: 6px; margin-bottom: 6px; }
+.work-deplist { max-height: 190px; overflow: auto; margin-top: 4px; }
+.work-ev { display: flex; gap: 8px; font-size: 12px; padding: 3px 4px; }
+.work-ev-when { color: var(--unknown); flex: 0 0 96px; font-family: 'Cascadia Code', monospace; font-size: 11px; }
+.work-ev-what { flex: 1 1 auto; min-width: 0; color: var(--muted); }
+.work-ev-what b { color: var(--text); font-weight: 600; }
+.work-drawer-foot { margin-top: 16px; display: flex; justify-content: flex-end; }
+.work-del { background: none; border: 1px solid var(--down); color: var(--down); border-radius: 6px;
+  padding: 4px 14px; font-size: 12.5px; cursor: pointer; }
+.work-del:hover:not(:disabled) { background: rgba(229,85,78,.14); }
+
+/* ── tickets ───────────────────────────────────────────────────────────────── */
+.work-filters { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.work-composer { border: 1px solid var(--accent); border-radius: 10px; padding: 10px;
+  margin-bottom: 12px; background: var(--panel); display: flex; flex-direction: column; gap: 8px; }
+.work-composer-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.work-composer-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.work-tlist { display: flex; flex-direction: column; gap: 2px; }
+.work-trow { display: flex; align-items: center; gap: 8px; width: 100%; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; color: var(--text); text-align: left;
+  font-size: 12.5px; padding: 6px 10px; cursor: pointer; }
+.work-trow:hover { border-color: var(--accent); }
+.work-trow.sel { border-color: var(--accent); background: rgba(91,140,255,.10); }
+.work-tnum { color: var(--accent); font-family: 'Cascadia Code', monospace; font-size: 11.5px; }
+.work-tkind { color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; font-size: 11px; }
+.work-tcount { color: var(--muted); font-size: 11px; }
+.work-tdetail { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel); padding: 10px 12px; }
+.work-tdetail-h { display: flex; align-items: center; gap: 10px; }
+.work-tmeta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 8px 0; }
+.work-tbody { white-space: pre-wrap; font-size: 12.5px; color: var(--text); background: var(--panel2);
+  border-radius: 8px; padding: 8px 10px; }
+.work-breakdown { display: flex; flex-direction: column; gap: 8px; padding-top: 6px; }
+.work-preview { border: 1px dashed var(--line); border-radius: 8px; padding: 7px 9px; }
+.work-prow { font-size: 12.5px; padding: 1px 0; }
+.work-comment { border-top: 1px solid var(--line); padding: 6px 2px; font-size: 12.5px; display: flex;
+  gap: 8px; flex-wrap: wrap; align-items: baseline; }
+.work-comment-b { flex-basis: 100%; white-space: pre-wrap; color: var(--muted); }
+
+/* ── timeline (placeholder until part 4) ───────────────────────────────────── */
+.work-gantt-note { color: var(--muted); font-size: 12.5px; border: 1px dashed var(--line);
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+.work-gantt-note code { color: var(--accent); font-family: 'Cascadia Code', monospace; }
+.work-gtable { width: 100%; border-collapse: collapse; font-size: 12px; }
+.work-gtable th { text-align: left; color: var(--muted); font-weight: 500; text-transform: uppercase;
+  font-size: 10.5px; letter-spacing: .06em; border-bottom: 1px solid var(--line); padding: 5px 6px; }
+.work-gtable td { border-bottom: 1px solid var(--panel2); padding: 4px 6px; color: var(--text); }
+.work-gtable td.gt-title { color: var(--text); }
+
+/* ── who is on an item: assign / deploy (the zee seam in the drawer) ─────────
+   Deliberately the loudest control in the drawer: "deploy a worker" starts a real agent, so it
+   carries production's orange the way the "+ manager zee" button does — an outline, not a fill,
+   because it is an action you should read before you click. "was: <slug>" is the opposite: a
+   footnote in muted grey, because a reaped xell is history, not a live fact. */
+.work-zeeslot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.work-mini.hot { color: var(--prod, #f0913b); border-color: var(--prod, #f0913b); }
+.work-mini.hot:hover:not(:disabled) { background: rgba(240,145,59,.14); color: var(--prod, #f0913b); }
+.work-was { color: var(--unknown); font-size: 11px; font-style: italic; }
+.work-cands { display: flex; flex-direction: column; gap: 3px; width: 100%; }
+.work-cand { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; width: 100%;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; color: var(--text);
+  text-align: left; padding: 4px 8px; font-size: 12px; cursor: pointer; }
+.work-cand:hover:not(:disabled) { border-color: var(--accent); }
+.work-cand small { color: var(--muted); font-size: 11px; }
+
+/* Keyboard operability: a focused card must be as obvious as a hovered one, because the keyboard
+   path (Alt + arrows) is the only way to move a card without a mouse and an invisible focus ring
+   makes it unusable in practice. */
+.work-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.work-nrow:focus-within { background: var(--panel2); }

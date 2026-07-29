@@ -97,6 +97,12 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
   const defaultSiteId = req.site_id || sites.find((s) => s.is_default)?.id || sites[0]?.id || null;
   const [siteId, setSiteId] = useState(defaultSiteId);
   useEffect(() => { setSiteId(defaultSiteId); }, [defaultSiteId]);
+  // The cxell-image override, decided HERE and recorded on the request. A ship rebuilds
+  // zeehive/zee-agent (the image every cxell zee runs) from the shipped commit, and a failed
+  // rebuild FAILS the ship — because a queenzee on new code with a silently stale fleet image is
+  // the one failure nobody can see. This tick is the release valve for the human who needs the
+  // deploy through anyway: off by default, deliberately a second click, never remembered.
+  const [allowStale, setAllowStale] = useState(false);
   const chosen = sites.find((s) => s.id === siteId) || null;
   const siteName = chosen?.key || req.site_key || null;
   // Is PRODUCTION locked for the site THIS ship targets? A ship takes the prod lock keyed to its
@@ -110,11 +116,20 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
     if (decision === 'approve' && !(await showConfirm(
       `Ship ${short(req.commit)} to PRODUCTION${siteName ? ` @ ${siteName}` : ''}?\n\n`
       + `The queenzee will take the prod lock and deploy it from main — this is real production.\n\n`
-      + `Requested by: ${req.xell_slug}\n${req.reason ? `Reason: ${req.reason}\n` : ''}`,
+      + `Requested by: ${req.xell_slug}\n${req.reason ? `Reason: ${req.reason}\n` : ''}`
+      + (allowStale
+        ? `\n⚠ WITH the cxell-image override: if the zee-agent image cannot be rebuilt, this ship `
+          + `proceeds anyway and new cxells may run a STALE image. Your choice is recorded on the request.\n`
+        : ''),
       { variant: 'danger', okLabel: 'Ship to prod' }))) return;
     if (decision === 'reject' && !(await showConfirm(`Reject this ship request from ${req.xell_slug}?`, { variant: 'danger', okLabel: 'Reject' }))) return;
     setBusy(true); setErr(null);
-    try { await decideShip(req.id, decision, undefined, decision === 'approve' ? siteId || undefined : undefined); onDone?.(); }
+    try {
+      await decideShip(req.id, decision, undefined,
+        decision === 'approve' ? siteId || undefined : undefined,
+        decision === 'approve' && allowStale);
+      onDone?.();
+    }
     catch (e) { setErr(e.message); }
     finally { setBusy(false); }
   };
@@ -149,7 +164,7 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
       + `queenzee then deploys this from main — real production.`,
       { variant: 'danger', okLabel: 'Unlock & ship' }))) return;
     setBusy(true); setErr(null);
-    try { await unlockAndShip(req.id, siteId || undefined); onDone?.(); }
+    try { await unlockAndShip(req.id, siteId || undefined, allowStale); onDone?.(); }
     catch (e) { setErr(e.message); } finally { setBusy(false); }
   };
 
@@ -198,6 +213,27 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
         <div className="ship-dbnote" data-testid="ship-dbnote"
              title="The zee diagnosed its schema drift against the drift detail and judged it non-breaking — this is its reasoning.">
           zee's drift assessment: “{req.db_note}”
+        </div>
+      )}
+      {/* THE CXELL-IMAGE GUARD, and its release valve. Deploying Zeehive rebuilds the zee-agent
+          image every cxell zee runs; a failed rebuild fails the ship, because a queenzee on new
+          code with a silently stale fleet image is the one outcome nobody can detect. Before this
+          existed the only override was an env var on the queenzee's own process — an override that
+          needed a queenzee restart, i.e. itself a deploy, exactly when someone is mid-incident. */}
+      {req.status === 'pending' && (
+        <label className="ship-stale-override" data-testid="ship-stale-override"
+               title="A ship rebuilds zeehive/zee-agent from the shipped commit. If that build fails, the ship fails — new cxells would otherwise silently run an image that is not this code. Tick this only to accept that risk for THIS ship; your choice is recorded on the request.">
+          <input type="checkbox" checked={allowStale} disabled={busy}
+                 onChange={(e) => setAllowStale(e.target.checked)} />
+          {' '}ship anyway if the cxell image can’t be rebuilt
+          {allowStale && <span className="ship-stale-warn"> — new cxells may run a STALE image</span>}
+        </label>
+      )}
+      {/* After the fact: what the human actually chose, on the row, next to who approved it. */}
+      {req.allow_stale_cxell_image && req.status !== 'pending' && (
+        <div className="ship-stale-chosen" data-testid="ship-stale-chosen">
+          ⚠ approved WITH the cxell-image override{req.decided_by ? ` by ${req.decided_by}` : ''} — a
+          failed image rebuild did not fail this ship; new cxells may be running a stale image
         </div>
       )}
       {req.status === 'shipping' && (

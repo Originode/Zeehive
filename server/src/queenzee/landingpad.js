@@ -37,12 +37,16 @@ export async function buildLandingPad(projectId) {
 
   const landings = await q(
     `SELECT lr.id, lr.xell_id, x.slug AS xell_slug, lr.status, lr.requested_at, lr.decided_at,
-            lr.landed_at AS finished_at, lr.new_sha AS sha, lr.ref, lr.commits, lr.note
+            COALESCE(lr.landed_at, lr.withdrawn_at) AS finished_at, lr.new_sha AS sha, lr.ref,
+            lr.commits, lr.note
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
       WHERE lr.project_id = $1 AND lr.dismissed_at IS NULL
         AND (lr.status IN ('pending','approved')
-          OR (lr.status IN ('landed','rejected','stale')
-              AND COALESCE(lr.landed_at, lr.decided_at) > now() - ($2 || ' minutes')::interval))`,
+          -- 'withdrawn' rides the same brief receipt window as the other endings: a card that simply
+          -- VANISHES mid-read is worse than one that says the zee un-asked it. It carries no
+          -- decided_at (nobody decided anything), so its timestamp is withdrawn_at.
+          OR (lr.status IN ('landed','rejected','stale','withdrawn')
+              AND COALESCE(lr.landed_at, lr.decided_at, lr.withdrawn_at) > now() - ($2 || ' minutes')::interval))`,
     [pid, String(RECEIPT_MIN)]);
 
   const ships = await q(
@@ -78,7 +82,7 @@ export function composePad({ landings = [], ships = [], merging = new Set() }) {
     if (kind === 'landing') {
       if (r.status === 'approved') return merging.has(r.xell_id) ? 'processing' : 'queued';
       if (r.status === 'landed') return 'done';
-      return r.status;                 // rejected | stale
+      return r.status;                 // rejected | stale | withdrawn (the zee un-asked it)
     }
     if (r.status === 'approved') return 'queued';
     if (r.status === 'shipping') return 'processing';

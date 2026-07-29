@@ -50,6 +50,10 @@ xells.push({
 xells[3].manager_xell_id = 'x6';   // bold-harbor reports to it (idle → "1 waiting")
 xells[5].manager_xell_id = 'x6';   // brave-quill too (working)
 xells[3].hive_status = 'occ-tendRequest'; xells[5].hive_status = 'occ-working';
+// A tend is only as useful as the reason on it — the mock hive carries one so the demo shows the
+// ask the way a human meets it ("who wants me, and what for"), not a bare amber hexagon.
+xells[3].tend = { open: true, at: new Date(Date.now() - 9 * 60e3).toISOString(),
+  reason: 'the migration needs prod’s schema — do I ask for a db-catchup or is this a seed?' };
 xells[5].zee_status = 'working'; xells[5].cli_active = true;
 
 // x0/x1 are the two prods (gold), on h0 & h2 → the graph tracks the median of the pair
@@ -57,9 +61,11 @@ const timeline = {
   branch: 'master', commits,
   xells: xells.map((x, i) => ({ id: x.id, base_commit: BASES[i] || 'h1',
     color: i < 2 ? '#f0913b' : LANE[i % LANE.length] })),
-  // the manager wears a manager harness — its badge art is what the manager hexagon shows
+  // The manager wears a manager harness — its badge art is what the manager HEXAGON shows, and that
+  // is the whole appearance of this harness in the grid: a manager is a `wearer` but never a
+  // `consumer`, so this harness takes NO cell of its own (it would seat the same avatar twice).
   harnesses: [{ id: 'h-mgr', key: 'manager', label: 'Manager', glyph: '🧭', color: '#9b8cff',
-    base_commit: 'h1', consumer_ids: ['x6'] }],
+    base_commit: 'h1', wearer_ids: ['x6'], consumer_ids: [] }],
 };
 const diffs = Object.fromEntries(xells.map((x, i) => {
   const baseRow = commits.findIndex((c) => c.hash === BASES[i]);
@@ -128,7 +134,8 @@ function Demo() {
             The seventh is a <b>manager</b> (wise-cove): drawn as a persona — dashed seat, its harness
             avatar, a prod-orange double wall — with its crew seated around it, and deliberately
             without a head sha or a diffstat. Bloom it: petals 5/6 are CREW and PROD·AGE, and there is
-            no pull/land/PR to click.
+            no pull/land/PR to click. Note what is <i>not</i> in the grid: its harness gets no cell of
+            its own — the manager hexagon already IS that persona.
           </p>
           <ul style={{ color: 'var(--muted)', font: "12px 'Cascadia Code', monospace", lineHeight: 1.8 }}>
             {timeline.xells.map((tx) => {

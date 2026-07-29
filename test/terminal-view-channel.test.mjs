@@ -37,6 +37,8 @@ const { publicKey } = ensureZeehiveKeypair();
 const allowedPub = utils.parseKey(publicKey);
 const execs = [];        // { cmd, pty } in the order the bridge ran them
 let ptyBytes = null;     // write into the PTY channel (terminal output)
+let feedPid = '412';     // is any feed streaming in the fake cxell…
+let readyPid = '412';    // …and is a view-WATCHING renderer alive (empty ⇒ an older, unfilterable feed)
 
 const sshd = new Server({ hostKeys: [utils.generateKeyPairSync('ed25519').private] }, (client) => {
   client.on('authentication', (ctx) => {
@@ -56,8 +58,9 @@ const sshd = new Server({ hostKeys: [utils.generateKeyPairSync('ed25519').privat
       execs.push({ cmd: info.command, pty });
       const stream = accept2();
       if (/zee-live/.test(info.command)) {
-        // the view probe: answer like a cxell would — a running feed and the file it holds
-        stream.write(`ZH-LIVE\n{"thinking":false,"moves":true}\n`);
+        // the view probe: answer like a cxell would — a running feed, the pid its renderer
+        // announced (equal ⇒ filterable), and the view file it holds
+        stream.write(`ZH-READY ${readyPid}\n${feedPid ? 'ZH-LIVE' : 'ZH-IDLE'}\n{"thinking":false,"moves":true}\n`);
         stream.exit(0); stream.end();
       } else {
         // the tmux PTY: emit terminal output and stay open, like the real pane
@@ -116,6 +119,7 @@ try {
   ok(ctrl.length >= 1, 'the browser is sent a view frame without asking');
   ok(ctrl[0]?.t === 'v' && ctrl[0].thinking === false && ctrl[0].moves === true && ctrl[0].live === true,
      `and it carries what the cage actually holds (${JSON.stringify(ctrl[0])})`);
+  ok(ctrl[0]?.filterable === true, 'including that this feed CAN be filtered (its renderer announced itself)');
   const probe = execs.find((e) => /zee-live/.test(e.cmd));
   ok(!!probe, 'the bridge ran a view probe in the cxell');
   ok(!probe.cmd.includes('printf'), 'which WRITES NOTHING — attaching must not choose a view for anyone');
@@ -137,6 +141,16 @@ try {
   ok(ptyExecs() === ptyBefore, 'and no new terminal session was started (the pane is untouched)');
   for (let i = 0; i < 60 && ctrl.length < 2; i++) await sleep(50);
   ok(ctrl.length >= 2, 'the bridge answers the click with what the cage now reports');
+
+  // ── 2b. the older-renderer case: live, but the chips cannot repaint it ────────────────────
+  console.log('\n── a cxell running an OLDER feed renderer is reported honestly ──');
+  readyPid = '';                       // an older renderer announces nothing
+  const before = ctrl.length;
+  wsClient.send(JSON.stringify({ t: 'v', thinking: true, moves: true }));
+  for (let i = 0; i < 60 && ctrl.length <= before; i++) await sleep(50);
+  const last = ctrl[ctrl.length - 1];
+  ok(last.live === true && last.filterable === false,
+     'the browser is told the feed is LIVE but not filterable — so the header can say "older feed" instead of claiming a filter it never applied');
 
   // ── 3. terminal output is still terminal output ───────────────────────────────────────────
   console.log('\n── terminal bytes and control frames cannot be confused ──');
