@@ -26,6 +26,13 @@
 // everywhere, so editing them changes nothing and desynchronises the record. You repair forward —
 // 071 re-seeds the note any of them deleted. The list below is the record of the bug, not
 // permission to copy it; anything newer must obey the rule.
+//
+// AND SINCE 076 THERE IS A HELPER, so the rule is no longer "remember to address by path" — it is
+// "do not hand-roll it at all". `harness_memory_put(harness_key, path, text)` locates the entry BY
+// PATH, replaces when present, appends when absent and preserves every sibling; `harness_memory_get`
+// is its read half. Every migration that sorts after the helper must go through it, and the second
+// half of this lint enforces exactly that — including on two SAMPLES compiled into the test, so the
+// guard is proved to fire rather than merely proved not to complain about today's files.
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
@@ -59,6 +66,69 @@ for (const f of touchesMemory) {
   ok(!rebuilds, `${f} does not rebuild the memory array (that deletes every other memory file)`);
   ok(!byIndex, `${f} does not read memory by POSITION (index 0 is not a promise)`);
 }
+
+// ── THE HELPER, and the rule that it is now the only way ─────────────────────
+// The lint above catches the next occurrence; the helper removes the opportunity. It lives in the
+// SCHEMA (a migration can call it; a JS module could not) and it is the one function that writes
+// harness memory.
+console.log('\n── the helper ──');
+const HELPER = 'harness_memory_put';
+const helperFile = files.sort().find((f) => new RegExp(`CREATE\\s+OR\\s+REPLACE\\s+FUNCTION\\s+${HELPER}`, 'i')
+  .test(readFileSync(join(DIR, f), 'utf8')));
+ok(!!helperFile, `a migration defines ${HELPER}() — the one function that writes harness memory`);
+const helperSql = helperFile ? readFileSync(join(DIR, helperFile), 'utf8') : '';
+// CREATE OR REPLACE, not CREATE: re-running the file past the ledger must redefine, not fail.
+ok(/CREATE\s+OR\s+REPLACE\s+FUNCTION\s+harness_memory_get/i.test(helperSql),
+   `${helperFile} defines its read half too (harness_memory_get), so an anchored edit never walks the array either`);
+ok(/e\s*->>\s*'path'\s*=\s*p_path/.test(helperSql),
+   'the helper locates the entry BY PATH — the rule 064 wrote down and six migrations broke');
+ok(/COALESCE\s*\(\s*bundle\s*->\s*'memory'[\s\S]{0,120}\|\|/.test(helperSql),
+   'when the entry is absent it APPENDS to the existing array (never rebuilds it)');
+ok(/ARRAY\[\s*'memory'\s*,\s*idx::text\s*,\s*'text'\s*\]/.test(helperSql),
+   'when it is present it writes only that entry\'s text — every sibling, and every other key on the entry, survives');
+
+// The rule, mechanically: anything that sorts AFTER the helper may not touch the memory array by
+// hand. This is the sentence a future author reads when the suite goes red, so it names the helper
+// and the call to make.
+const MUST_USE = (f) => `${f} must edit harness memory through ${HELPER}(<harness key>, <path>, <text>) `
+  + `(read it back with harness_memory_get) — it finds the entry BY PATH, replaces it when present and appends it `
+  + `when absent, so every sibling memory file survives. Hand-rolled jsonb against harness.bundle is what `
+  + `050/051/053/056/057/066 did, and it deleted a memory file out of the live meta-DB.`;
+
+// A file breaks the rule when it WRITES harness.bundle itself while dealing in memory. Defined as a
+// function so the samples below run through the identical check the migrations do.
+const handRollsMemoryWrite = (sql) => {
+  const writesBundle = /UPDATE\s+harness\b[\s\S]{0,400}?\bSET\b[\s\S]{0,400}?\bbundle\s*=/i.test(sql);
+  const dealsInMemory = /'\{memory\}'|bundle\s*->\s*'memory'|ARRAY\[\s*'memory'|'memory'\s*,\s*jsonb_build_array/.test(sql);
+  return writesBundle && dealsInMemory;
+};
+
+console.log('\n── the guard fires (samples, not files) ──');
+const SAMPLE_HAND_ROLLED = `DO $$ DECLARE idx int; txt text; BEGIN
+  SELECT (a.i-1), a.e->>'text' INTO idx, txt FROM harness h,
+    LATERAL jsonb_array_elements(h.bundle->'memory') WITH ORDINALITY AS a(e,i)
+   WHERE h.key='zee-base' AND a.e->>'path'='cxell-zee-manual.md';
+  UPDATE harness SET bundle = jsonb_set(bundle, ARRAY['memory', idx::text, 'text'], to_jsonb(txt || 'more'))
+   WHERE key='zee-base'; END $$;`;
+const SAMPLE_HELPER = `DO $$ DECLARE txt text; BEGIN
+  txt := harness_memory_get('zee-base', 'cxell-zee-manual.md');
+  IF txt IS NULL OR txt LIKE '%more%' THEN RETURN; END IF;
+  PERFORM harness_memory_put('zee-base', 'cxell-zee-manual.md', txt || 'more'); END $$;`;
+ok(handRollsMemoryWrite(SAMPLE_HAND_ROLLED),
+   'a NEW migration that hand-rolls the memory array is caught (even the by-path form — the helper exists now)');
+ok(!handRollsMemoryWrite(SAMPLE_HELPER), `and one written through ${HELPER}() passes`);
+
+console.log('\n── every migration after the helper uses it ──');
+const after = helperFile ? files.filter((f) => f > helperFile) : [];
+ok(after.length > 0, `at least one migration sorts after ${helperFile} and can prove the helper works`);
+let usesHelper = 0;
+for (const f of after) {
+  const sql = readFileSync(join(DIR, f), 'utf8');
+  if (new RegExp(`${HELPER}\\s*\\(`).test(sql)) usesHelper++;
+  if (!handRollsMemoryWrite(sql)) continue;          // the common case: says nothing about memory
+  ok(false, MUST_USE(f));
+}
+ok(usesHelper > 0, `and at least one of them CALLS ${HELPER}() — the helper is exercised by a real migration, not shipped as dead schema`);
 
 // And the repair for the one that did: the note must be re-seedable, guarded, and it must run AFTER
 // the migration that removes it — filename order is the only ordering a forward-only ledger has.
