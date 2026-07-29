@@ -117,8 +117,18 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .setup-grid input:focus, .setup-row input:focus { outline: none; border-color: var(--accent); }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
 
-/* Docs tab: one editor per entry-point doc (AGENTS.md / CLAUDE.md …). A DISABLED doc is dimmed but
-   still readable — it is text somebody wrote, not a deleted thing. */
+/* Docs tab: one editor per SOURCE text, with the provider files it generates ticked below it. A
+   DISABLED doc is dimmed but still readable — it is text somebody wrote, not a deleted thing. */
+.docgen { margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.docgen-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 2px 8px;
+  margin-top: 4px; }
+.docgen-t { display: flex; align-items: baseline; gap: 5px; font-size: 11px; color: var(--muted);
+  padding: 2px 4px; border-radius: 5px; cursor: pointer; min-width: 0; }
+.docgen-t:hover { background: rgba(91, 140, 255, .10); }
+.docgen-t.on { color: var(--text); }
+.docgen-t .mono { font-family: var(--mono, ui-monospace, Menlo, monospace); white-space: nowrap; }
+.docgen-t .pc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.docgen-t input { margin: 0; flex: none; }
 .setup-sub { margin: 8px 0; padding: 8px; background: var(--panel2); border: 1px solid var(--line);
   border-radius: 8px; }
 .setup-sub.off { opacity: 0.55; }

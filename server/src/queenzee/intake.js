@@ -816,8 +816,11 @@ export async function setZeeMode(zeeId, permissionMode) {
 // no context: what is this project and how do I work in it. Never overwrites a git-tracked path
 // (lib/cxell.js decides that inside the cage), and every outcome is logged: a doc an operator wrote
 // and a zee never received is exactly the silence this whole mechanism exists to remove.
-export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId }) {
-  const files = await projectDocFiles(projectId);
+export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId, xellId = null }) {
+  // xellId is what puts THIS xell's stack inventory in the generated files (lib/xell-stack.js) — the
+  // containers, ports, database coupling and build verbs a non-ZEEHIVE agent (Cursor, Copilot, Codex)
+  // reading CLAUDE.md/AGENTS.md has no other way to learn. Absent, the instructions still generate.
+  const files = await projectDocFiles(projectId, { xellId });
   if (!files.length) return { docs: 0, written: 0, skipped: 0, failed: 0 };
   let written = 0, failed = 0;
   const skipped = [];
@@ -907,7 +910,8 @@ export async function reinjectHarnessIntoXell(xellId) {
       + (failed ? ` — ${failed} FAILED to write` : ''));
     // The project's own entry-point docs are regenerated on the same trigger: an operator who fixes
     // AGENTS.md in the console and re-assigns must not have to wait for the next dispatch either.
-    const docs = await injectProjectDocsIntoXell({ ctx: 'default', slug: zee.slug, projectId: zee.project_id })
+    const docs = await injectProjectDocsIntoXell({ ctx: 'default', slug: zee.slug,
+                                                   projectId: zee.project_id, xellId })
       .catch((e) => ({ docs: 0, written: 0, error: e.message }));
     // Honest result: writing NOTHING when there was something to write is a failure, however many
     // individual errors were swallowed above. A caller that logs "re-injected 0 file(s)" as a success
@@ -1330,7 +1334,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     }
     // …and the PROJECT's entry-point docs (AGENTS.md/CLAUDE.md …) from the meta-DB, at the paths a
     // provider actually looks for. Generated, never written over a file the project itself committed.
-    await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id })
+    await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id, xellId: xell.id })
       .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
     // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
