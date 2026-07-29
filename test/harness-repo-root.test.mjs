@@ -57,6 +57,7 @@ try {
   writeFileSync(join(probeDir, 'HARNESS.yml'),
     `version: 1\nlabel: Probe ${tag}\nglyph: "🛰"\nsummary: proof the project repo was read\nzee_type: worker\n`);
   writeFileSync(join(probeDir, 'PERSONALITY.md'), `probe personality ${tag}\n`);
+  writeFileSync(join(probeDir, 'avatar.svg'), `<svg xmlns="http://www.w3.org/2000/svg"><!-- ${tag} --></svg>\n`);
   writeFileSync(join(probeDir, 'skills', 'probe-skill', 'SKILL.md'),
     `---\nname: probe-skill\ndescription: proves skills load from the project repo\n---\n\nprobe body ${tag}\n`);
   git(projectRepo, 'init', '-q', '-b', 'master');
@@ -73,6 +74,14 @@ try {
   await q(`INSERT INTO harness (key, label, dir, enabled, is_law_core) VALUES ($1,$2,$3,true,false)`,
     [ghostKey, `Ghost ${tag}`, `harnesses/${ghostKey}-nowhere`]);
   const ghostBefore = await one(`SELECT bundle, bundle_hash FROM harness WHERE key=$1`, [ghostKey]);
+
+  // Wind the file-backed rows back to their seeded (empty) state, so this is a FIRST boot in that
+  // container and nothing can pass on a bundle a previous run happened to leave behind. The
+  // snapshot taken above puts them back, whatever happens.
+  await q(`UPDATE harness SET bundle='{}'::jsonb, bundle_hash=NULL, head_commit=NULL
+             WHERE dir IS NOT NULL AND NOT is_law_core`);
+  ok((await one(`SELECT bundle_hash FROM harness WHERE key='manager'`)).bundle_hash === null,
+     'the manager harness starts EMPTY, exactly as migration 052 seeds it');
 
   config.repoRoot = runtime;                  // ← the whole bug, in one line
   ok(!existsSync(join(config.repoRoot, 'harnesses')),
@@ -124,8 +133,12 @@ try {
 
   console.log('\n── the avatar resolves from the same base, and stays guarded ──');
   const avatar = await H.harnessAvatarFile('harnesses/manager/avatar.svg');
-  ok(!!avatar && avatar.replace(/\\/g, '/').startsWith(projectRepo.replace(/\\/g, '/')),
-     `GET /api/harnesses/manager/avatar finds the SVG (${avatar ? 'under the project repo' : '404 — BROKEN'})`);
+  ok(!!avatar && !avatar.replace(/\\/g, '/').startsWith(runtime.replace(/\\/g, '/')),
+     `GET /api/harnesses/manager/avatar finds the SVG in a repo that HAS it (${avatar || '404 — BROKEN'})`);
+  // the probe's avatar exists only in the project repo, so this one pins the base exactly
+  const probeAvatar = await H.harnessAvatarFile(`harnesses/${probeKey}/avatar.svg`);
+  ok(!!probeAvatar && probeAvatar.replace(/\\/g, '/').startsWith(projectRepo.replace(/\\/g, '/')),
+     'an avatar that exists ONLY in the project repo resolves under project.repo_root');
   ok(await H.harnessAvatarFile('../../etc/passwd') === null, 'an escaping avatar_path is refused');
   ok(await H.harnessAvatarFile('harnesses/manager/../../../etc/passwd') === null,
      'and so is one that climbs out of harnesses/');
@@ -149,8 +162,9 @@ try {
   await q(`DELETE FROM project WHERE id=$1`, [projId]); projId = null;
   config.repoRoot = REAL_ROOT;
   await H.refreshHarnessRoots();
-  ok(H.harnessRoots().length === 1 && H.harnessRoots()[0] === REAL_ROOT.replace(/\\/g, '/'),
-     'with no project repo to read, the only root is config.repoRoot');
+  const roots = H.harnessRoots();
+  ok(roots[roots.length - 1] === REAL_ROOT.replace(/\\/g, '/') && !roots.includes(projectRepo.replace(/\\/g, '/')),
+     'with that project gone, config.repoRoot is the last root standing (host-process mode)');
   const direct = H.loadHarnessDir('harnesses/manager');
   ok(!!direct.bundle && !direct.missing, 'loadHarnessDir() still reads the checkout unchanged');
   ok((direct.bundle.memory || []).some((m) => /manager-zee-manual/.test(m.path) && m.text?.length > 12000),
