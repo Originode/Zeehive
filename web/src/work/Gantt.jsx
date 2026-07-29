@@ -53,7 +53,9 @@ import WorkItemDrawer from './WorkItemDrawer.jsx';
 //
 // KNOWN LIMITS (stated, not hidden): drag-and-drop has no keyboard parity (the board has the same
 // gap); dependency arrows are drawn between VISIBLE rows only, so collapsing a parent hides the
-// arrows into its subtree; and the zee chip is read from `/api/board`, which is the read model that
+// arrows into its subtree; an SSE refetch that lands mid-drag repaints under the gesture (the drop
+// still commits from the dates the drag STARTED with, held in a ref, so nothing is written wrong);
+// and the zee chip is read from `/api/board`, which is the read model that
 // resolves LIVE xells (policy 4 — a reaped xell lends a work item nothing), because `/api/gantt`
 // carries only `xell_id` and a corpse must not be rendered as an agent.
 
@@ -280,6 +282,10 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
       gesture.current = null;
       setActive(null);
       setGhost(null);
+      // The click that follows this pointerup must be swallowed when the pointer actually MOVED
+      // (a drag is not a click) — but only that one: a drag released off a bar never receives the
+      // click that would otherwise clear the flag, and the next honest click would be eaten.
+      if (dragged.current) setTimeout(() => { dragged.current = false; }, 0);
       if (!g) return;
       if (g.mode === LINK) {
         const target = hit(e);
@@ -336,7 +342,8 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
         <button className="work-mini" title="scroll the canvas to today" disabled={todayX === null}
                 onClick={() => scrollToToday(scroller, todayX)}>today</button>
         <span className="work-gcount">{visible.length} of {rows.length} row(s)</span>
-        {unscheduledCount > 0 && <span className="work-gcount warn">{unscheduledCount} undated</span>}
+        {(unscheduledCount ?? unscheduled.length) > 0 &&
+          <span className="work-gcount warn">{unscheduledCount ?? unscheduled.length} undated</span>}
         <span className="work-ghint">drag a bar to move it · drag its right dot onto another bar to make that one depend on it</span>
       </div>
 
@@ -421,7 +428,7 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
                              data-gbar={r.id} data-testid="work-gbar"
                              style={{ left: span.x, width: span.w }}
                              onPointerDown={(e) => { if (own && !summary) begin(e, r, MOVE); }}
-                             onClick={() => { if (dragged.current) { dragged.current = false; return; } onOpen?.(r.id); }}
+                             onClick={() => { if (!dragged.current) onOpen?.(r.id); }}
                              onMouseEnter={(e) => setTip({ row: r, x: e.clientX, y: e.clientY })}
                              onMouseLeave={() => setTip(null)}>
                           {/* The two spans below take their colour from `.work-st-<key>` in
