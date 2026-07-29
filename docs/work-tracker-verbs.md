@@ -148,3 +148,27 @@ and its refusals **with the dispatch path stubbed** (a test never spawns an agen
 fence in both directions, the token-scoping of the three cxell verbs, and that the routes, the CLI
 and both manuals actually carry the verbs. If 058 is not applied to the target database the suite
 **skips loudly** rather than pretending to pass.
+
+---
+
+## Reconcile-at-merge checklist (written before part 1 landed — delete once done)
+
+Part 3 was built while `db/migrations/058_work_tracker.sql` and `server/src/lib/work-items.js` were
+still held at the landing gate, and verified against a throwaway stand-in for them. Five things to
+check the moment part 1 is on main — each is deliberately a single point in the code:
+
+1. **`work-items.js`'s signatures** — `setStatus` / `emit` / `inTransaction` are called through the
+   three adapters at the top of `work-assign.js` (`event`, `moveStatus`, `tx`). If one differs,
+   change the adapter, not the call sites. Check in particular whether `setStatus` already writes its
+   own `work_item_event` — if it does, `worksync` should not add a second one (its own `emit` there
+   is what carries `actor:'queenzee'`, so keep whichever makes the history read once).
+2. **The status vocabulary** — `worksync.IN_FLIGHT` and `work-assign.TERMINAL` are policy fences kept
+   as explicit lists (the test pins them against the real vocabulary). If `work_status` carries
+   `terminal` / `in_flight` flags, derive them from it instead and keep the test.
+3. **`statusFromHive()`'s real mapping** — the fence means no mapping can produce `done`/`cancelled`
+   from a tick, but the test asserts the actual statuses, so a different mapping changes the expected
+   values, not the code.
+4. **The `broadcast('work', …)` payload** — part 3 sends `{ item_id, project_id, kind, … }`. If parts
+   1/2 already broadcast a different shape, make them one shape; the console (part 4) reads it.
+5. **The routes and the docs** — move part 3's route block to the end of part 1's work-tracker section
+   in `routes.js`, and fold this file into `docs/work-tracker.md`.
