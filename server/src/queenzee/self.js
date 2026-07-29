@@ -218,7 +218,17 @@ function worktreeContainsRef(wt, ref) {
 }
 
 export async function selfLand(xell) {
-  // …AND A NESTED QUEENZEE HAS NO LANDING VERB AT ALL. Step 1 below reaches into `cxell_<slug>` and
+  // A MANAGER zee has zero push access to the xource — refused here, and refused again by the
+  // landgate's git hook (which declines a manager push without raising a request, so there is no
+  // approval path either). Two independent refusals on purpose: this one gives the agent the honest
+  // explanation, the hook is what makes it true even if this call is never made.
+  const managerRefusal = refuseForManager(xell, 'land');
+  if (managerRefusal) {
+    return { ...managerRefusal, landed: false,
+      message: `Refused: ${NO_PUSH_REASON}` };
+  }
+  // …AND A NESTED QUEENZEE HAS NO LANDING VERB AT ALL EITHER — checked after the manager refusal,
+  // which is the more specific answer and needs no machine to be true. Step 1 below reaches into `cxell_<slug>` and
   // fast-forwards a branch in xell.worktree_path — both taken off a fleet row, and a xell's database
   // is a CLONE of the meta-DB, so in a nested queenzee they belong to somebody else's live zee. The
   // push in step 3 is already refused (xellgit's write door), but a refusal at the END of the verb
@@ -232,15 +242,6 @@ export async function selfLand(xell) {
         + 'inside a xell, and the xells in its database are a CLONE of the real fleet\'s. It will not collect '
         + 'commits out of a real cxell, and it will not push into a real xource. Nothing was run and nothing '
         + 'was lost: land through the REAL queenzee (`zee land` from your cxell).' };
-  }
-  // A MANAGER zee has zero push access to the xource — refused here, and refused again by the
-  // landgate's git hook (which declines a manager push without raising a request, so there is no
-  // approval path either). Two independent refusals on purpose: this one gives the agent the honest
-  // explanation, the hook is what makes it true even if this call is never made.
-  const managerRefusal = refuseForManager(xell, 'land');
-  if (managerRefusal) {
-    return { ...managerRefusal, landed: false,
-      message: `Refused: ${NO_PUSH_REASON}` };
   }
   if (!xell.worktree_path) return { ok: false, status: 'error', error: `${xell.slug} has no host worktree to land from` };
 
