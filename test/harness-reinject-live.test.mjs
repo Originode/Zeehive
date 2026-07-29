@@ -1,0 +1,156 @@
+// A REPAIRED HARNESS REACHES THE ZEES ALREADY RUNNING — not just the next ones.
+//
+// This is the last thread of ticket #1. The manual was fixed in the DB and the fleet stayed broken,
+// because the harness files are materialized into a xell at DISPATCH: a zee already working kept the
+// persona it was born with. "New zees only" is exactly what left every manager zee briefed on
+// nothing for weeks, and the injection path into a live cxell already existed (a harness re-assign
+// uses it) — so this is wiring, not machinery.
+//
+// The two conditions on that wiring are what this test is really about:
+//   1. ONLY WHEN THE BUNDLE CHANGED. A refresh that no-ops must write NOTHING into a running zee's
+//      worktree — a zee's workspace is its own, and a queenzee reaching into it uninvited on every
+//      boot is worse than the bug.
+//   2. IT IS LOGGED. A file appearing under a live zee is otherwise indistinguishable from the zee
+//      having written it.
+// Plus the inheritance case: a child harness's effective persona is the merged chain, so repairing a
+// PARENT changes what a xell wearing the CHILD should hold.
+//
+// No docker in a cxell, so the final `docker exec` cannot run here — which makes this the perfect
+// place to pin the THIRD rule: when the write cannot be performed, the log must SAY so. Reporting
+// "re-injected 0 file(s)" as a success is worse than silence: it tells a human a running zee holds
+// files it does not hold. So the assertions below are about SELECTION (which xells) and HONESTY
+// (what each outcome is called), with the docker exec itself as the boundary.
+import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const { config } = await import('../server/src/config.js');
+const { q, one, pool } = await import('../server/src/db/pool.js');
+const { recentLogs } = await import('../server/src/lib/logbus.js');
+const H = await import('../server/src/lib/harness.js');
+
+let failures = 0;
+const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
+
+const REAL_ROOT = config.repoRoot;
+const tag = randomUUID().slice(0, 8);
+const parentKey = `zt-par-${tag}`;      // file-backed, the one that gets repaired
+const childKey = `zt-kid-${tag}`;       // inherits it — its effective persona changes too
+const KEYS = [parentKey, childKey];
+const tmp = mkdtempSync(join(tmpdir(), 'reinject-'));
+const repo = join(tmp, 'repo');
+const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8' }).trim();
+const since = () => recentLogs(400).length;
+const linesSince = (n) => recentLogs(400).slice(n).filter((l) => l.scope === 'harness').map((l) => l.msg);
+
+let projId = null;
+const madeXells = [];
+
+try {
+  // ── a project repo carrying two harness folders, and two live xells wearing them ────────────
+  mkdirSync(join(repo, 'harnesses'), { recursive: true });
+  const mk = (key, extra = '') => {
+    const dir = join(repo, 'harnesses', key);
+    mkdirSync(join(dir, 'skills', 'zt-skill'), { recursive: true });
+    writeFileSync(join(dir, 'HARNESS.yml'), `version: 1\nlabel: ${key}\nsummary: fixture\nzee_type: worker\n${extra}`);
+    writeFileSync(join(dir, 'PERSONALITY.md'), `persona v1 ${tag}\n`);
+    writeFileSync(join(dir, 'skills', 'zt-skill', 'SKILL.md'), `---\nname: zt-skill\ndescription: d\n---\n\nbody v1\n`);
+    return dir;
+  };
+  const parentDir = mk(parentKey);
+  mk(childKey, `parent: ${parentKey}\n`);
+  git('init', '-q', '-b', 'master'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+  git('add', '-A'); git('commit', '-qm', 'harness fixtures');
+
+  projId = (await one(`INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'master') RETURNING id`,
+    [`zt-reinj-${tag}`, repo])).id;
+  const xource = await one(`INSERT INTO xource (project_id, ref) VALUES ($1,'master') RETURNING id`, [projId]);
+  const parentH = await one(`INSERT INTO harness (key,label,dir,enabled,is_law_core) VALUES ($1,$1,$2,true,false) RETURNING id`,
+    [parentKey, `harnesses/${parentKey}`]);
+  const childH = await one(`INSERT INTO harness (key,label,dir,enabled,is_law_core) VALUES ($1,$1,$2,true,false) RETURNING id`,
+    [childKey, `harnesses/${childKey}`]);
+
+  const mkXell = async (slug, harnessId, { live = false } = {}) => {
+    const x = await one(
+      `INSERT INTO xell (project_id, xource_id, slug, branch, worktree_path, status, is_pooled, harness_id)
+         VALUES ($1,$2,$3,$4,$5,'working',false,$6) RETURNING id, slug`,
+      [projId, xource.id, slug, `spinoff/${slug}`, join(tmp, slug), harnessId]);
+    madeXells.push(x.id);
+    if (live) {
+      // what "a live zee" means to the injector: a cxell-cli zee, still running, ssh-terminal viewer
+      await q(`INSERT INTO zee (xell_id, runtime_id, attach_mode, status, entrypoint, viewer_kind)
+               VALUES ($1, (SELECT id FROM agent_runtime LIMIT 1), 'headless-spawn', 'working', 'cxell-cli', 'ssh-terminal')`, [x.id]);
+    }
+    return x;
+  };
+  const wearer = await mkXell(`zt-wear-${tag}`, parentH.id, { live: true });   // wears the repaired one
+  const heir = await mkXell(`zt-heir-${tag}`, childH.id, { live: true });      // wears its CHILD
+  const asleep = await mkXell(`zt-idle-${tag}`, parentH.id);                   // no live zee at all
+
+  // ── 1. first refresh: the bundles are born, so they CHANGED ─────────────────────────────────
+  console.log('\n── a refresh that changes a bundle reaches the zees already running ──');
+  let n = since();
+  await H.refreshHarnesses();
+  let log = linesSince(n);
+  // each LIVE wearer is acted on and named. In this cage the docker write cannot succeed, so the
+  // outcome must be the honest failure line rather than a claim of success.
+  const touched = (slug) => log.filter((m) => m.startsWith(`${slug}:`));
+  ok(touched(wearer.slug).length > 0, 'the xell WEARING the repaired harness is acted on while it runs');
+  ok(touched(heir.slug).length > 0, 'and so is one wearing a harness that INHERITS it (its effective persona changed too)');
+  // (the per-file "could not inject X" lines come from the injector itself; the DECISION lines are
+  // the ones a human scans, and each of those must carry the cause)
+  const decisions = (slug) => touched(slug).filter((m) => /re-injected|injection FAILED|no files to inject/.test(m));
+  ok(decisions(wearer.slug).length > 0 && decisions(wearer.slug).every((m) => /harness ".*" changed/.test(m)),
+     'every decision line says WHY it happened — a file appearing under a live zee must not look self-written');
+  ok(touched(wearer.slug).some((m) => /injection FAILED/.test(m) && /still on its OLD persona/.test(m)),
+     'with no docker reachable it reports the FAILURE and the consequence, never "re-injected 0 file(s)"');
+  ok(!touched(wearer.slug).some((m) => /re-injected 0 file/.test(m)), 'and never claims a write that did not happen');
+  ok(log.some((m) => m.includes(asleep.slug) && /next dispatch/.test(m)),
+     'a xell with no live zee is reported as picking it up at its next dispatch, not silently dropped');
+  ok(log.some((m) => m.includes(parentKey) && /refreshed/.test(m)), 'the refresh itself is still logged as before');
+
+  // ── 2. a refresh that changes NOTHING must not touch a running zee's worktree ───────────────
+  console.log('\n── and a no-op refresh writes nothing at all ──');
+  n = since();
+  await H.refreshHarnesses();
+  log = linesSince(n);
+  ok(!log.some((m) => /re-injected|injection FAILED/.test(m)), 'no injection attempt at all: nothing changed, nothing written');
+  ok(!log.some((m) => /next dispatch/.test(m)), 'and nothing is even considered — the whole path is skipped');
+  ok(log.some((m) => /^harnesses: /.test(m)), 'the summary line still runs (the refresh did happen)');
+
+  // ── 3. edit ONE folder: only that harness's wearers are touched ─────────────────────────────
+  console.log('\n── editing one harness only re-injects the xells that wear it (or inherit it) ──');
+  writeFileSync(join(parentDir, 'PERSONALITY.md'), `persona v2 ${tag}\n`);
+  git('add', '-A'); git('commit', '-qm', 'persona v2');
+  n = since();
+  await H.refreshHarnesses();
+  log = linesSince(n);
+  const hit = log.filter((m) => /re-injected|injection FAILED|next dispatch/.test(m));
+  ok(hit.some((m) => m.includes(wearer.slug)), 'the wearer of the edited harness is re-injected');
+  ok(hit.some((m) => m.includes(heir.slug)), 'the heir too — a parent edit changes the child chain');
+  ok(!log.some((m) => new RegExp(`${childKey}: refreshed`).test(m)),
+     'the untouched CHILD folder is not itself re-read as changed (only its parent moved)');
+
+  // ── 4. the selector is callable on its own, and answers with the counts ─────────────────────
+  const direct = await H.reinjectHarnessIntoLiveXells(parentH.id);
+  ok(direct.xells === 3 && direct.injected + direct.failed + direct.skipped === 3,
+     `reinjectHarnessIntoLiveXells() covers every wearer incl. heirs, and every one is accounted for `
+     + `(${direct.xells} xells: ${direct.injected} injected, ${direct.failed} failed, ${direct.skipped} not live)`);
+  ok(direct.failed === 2 && direct.skipped === 1,
+     'the two LIVE zees are counted as failures here (no docker in a cage), the sleeping one as not-live');
+  const none = await H.reinjectHarnessIntoLiveXells(randomUUID());
+  ok(none.xells === 0 && none.injected === 0, 'and a harness nobody wears is a clean no-op');
+} finally {
+  for (const id of madeXells) await q(`DELETE FROM zee WHERE xell_id=$1`, [id]).catch(() => {});
+  for (const id of madeXells) await q(`DELETE FROM xell WHERE id=$1`, [id]).catch(() => {});
+  if (projId) await q(`DELETE FROM project WHERE id=$1`, [projId]).catch(() => {});
+  await q(`DELETE FROM harness WHERE key = ANY($1)`, [KEYS]).catch(() => {});
+  config.repoRoot = REAL_ROOT;
+  try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
+  await pool.end().catch(() => {});
+}
+
+console.log(failures ? `\n${failures} FAILED` : '\nall good');
+process.exit(failures ? 1 : 0);

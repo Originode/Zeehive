@@ -439,6 +439,21 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   Test: `node test/harness-empty-visible.test.mjs` — the boot line against real rows, plus the real
   components rendered (react-dom/server) and the real canvas functions DRAWN against a recording
   2D context, so a regex over the source can't fake it.
+- **A repaired harness reaches the zees ALREADY RUNNING** (2026-07-29, the last thread of ticket #1).
+  Harness files are materialized into a xell at DISPATCH, so fixing a bundle used to reach new zees
+  only — which is precisely what left the running fleet briefed on nothing while the fix sat in the
+  DB. `refreshHarnesses()` now calls `reinjectHarnessIntoLiveXells(id)` for each harness whose bundle
+  ACTUALLY CHANGED (the no-op branch writes nothing — a queenzee reaching into a running zee's
+  worktree uninvited on every boot would be worse than the bug), covering the xells wearing it AND
+  those wearing a harness that INHERITS it (a child's effective persona is the merged chain). It
+  reuses the existing live-injection path (`reinjectHarnessIntoXell`, what a harness re-assign uses),
+  lazily imported because intake.js imports lib/harness.js.
+  Every outcome is LOGGED, because a file appearing under a live zee is otherwise indistinguishable
+  from the zee having written it: injected (with the count and the cause), no-live-zee (collected
+  into one line — they pick it up at the next dispatch), and FAILED, which is loud on stdout because
+  it means a running zee is still on its old persona. `reinjectHarnessIntoXell` was reporting
+  `injected: true` after writing ZERO files; it now returns `{files, failed, wanted}` and calls that
+  what it is. Test: `node test/harness-reinject-live.test.mjs`.
 - **INJECTED artefacts are not source: nothing under `.zeehive/` is tracked** (2026-07-29, ticket #6).
   `.gitignore` has ignored `.zeehive/` since it was first swept into a commit, but ignore rules do
   not apply to a file already in the index — and `.zeehive/harness/memory/cxell-zee-manual.md` was.

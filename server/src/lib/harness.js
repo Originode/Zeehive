@@ -280,6 +280,7 @@ export function loadHarnessDir(dir, base = harnessBase(dir)) {
 export async function refreshHarnesses() {
   await refreshHarnessRoots();      // the Zeehive project's repo_root is where the folders live
   const rows = await q(`SELECT id, key, dir, bundle_hash, is_law_core, zee_type FROM harness WHERE dir IS NOT NULL`);
+  const changed = [];               // harnesses whose bundle actually moved — see the loop's tail
   for (const h of rows) {
     if (h.is_law_core) continue;   // core's text is code-assembled; nothing to read from a folder
     const base = harnessBase(h.dir);
@@ -308,8 +309,72 @@ export async function refreshHarnesses() {
     await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=COALESCE($5, avatar_path), label=COALESCE($6, label), parent_id=$7, zee_type=$8 WHERE id=$1`,
       [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null, parentId, declared]);
     logline('harness', `${h.key}: refreshed (${bundle.skills?.length || 0} skill(s), ${bundle.parent ? `parent ${bundle.parent}, ` : ''}hash ${hash})`);
+    // The bundle really CHANGED, so every zee ALREADY RUNNING in a xell that wears it is now holding
+    // stale files. Push the repaired persona into them (below) — "new zees only" is precisely what
+    // left the running fleet briefed on nothing while a fix sat in the DB.
+    changed.push(h.id);
   }
+  for (const id of changed) await reinjectHarnessIntoLiveXells(id);
   await logHarnessSummary();
+}
+
+// Re-inject a harness's files into every LIVE xell whose effective persona just changed — the xells
+// wearing it, AND the xells wearing a harness that INHERITS it (a child's effective bundle is the
+// merged chain, so a parent's repair changes the child's files too).
+//
+// Called ONLY from the changed-bundle branch above: a refresh that no-ops must write nothing into a
+// running zee's worktree. And every write is logged, because a file appearing under a live zee is
+// otherwise indistinguishable from the zee having written it — which is how a "did I do that?"
+// half-hour gets spent.
+export async function reinjectHarnessIntoLiveXells(harnessId) {
+  const ids = await harnessAndDescendants(harnessId);
+  // A xell counts as LIVE if it holds a cxell zee that is still running; reinjectHarnessIntoXell
+  // itself re-checks and answers 'no live cxell zee' otherwise, so this query is only a narrowing.
+  const xells = await q(
+    `SELECT x.id, x.slug, h.key FROM xell x JOIN harness h ON h.id = x.harness_id
+      WHERE x.harness_id = ANY($1::uuid[]) AND x.status NOT IN ('retired','tearing-down','husk')`,
+    [ids]);
+  if (!xells.length) return { xells: 0, injected: 0 };
+  // Lazily imported: intake.js imports THIS module, so a static import would close a cycle.
+  const { reinjectHarnessIntoXell } = await import('../queenzee/intake.js');
+  let injected = 0, failed = 0;
+  const skipped = [];
+  for (const x of xells) {
+    const r = await reinjectHarnessIntoXell(x.id).catch((e) => ({ injected: false, error: e.message }));
+    if (r?.injected && r.files) {
+      injected++;
+      logline('harness', `${x.slug}: harness "${x.key}" changed — re-injected ${r.files} file(s) into the LIVE zee`);
+    } else if (r?.injected) {
+      // nothing to write (a core-only xell): true, and worth one quiet line rather than a claim
+      logline('harness', `${x.slug}: harness "${x.key}" changed — no files to inject`);
+    } else if (r?.failed) {
+      failed++;
+      // the zee IS live and we could not reach it: loud, because this one leaves a running zee
+      // holding a stale persona and nothing else will notice
+      logline('harness', `${x.slug}: harness "${x.key}" changed but injection FAILED (${r.failed}/${r.wanted} file(s) unwritten) — that zee is still on its OLD persona`);
+      console.error(`[harness] ${x.slug}: harness "${x.key}" changed but re-injection FAILED — the live zee keeps its old persona`);
+    } else {
+      // NOT a failure in the common case: a xell with no running zee gets the new files at its next
+      // dispatch anyway. Collected into one line rather than one per xell, so a fleet of idle xells
+      // cannot bury the injections that DID happen.
+      skipped.push(`${x.slug} (${r?.reason || r?.error || 'unknown'})`);
+    }
+  }
+  if (skipped.length) logline('harness', `harness change not injected into ${skipped.length} xell(s) — they pick it up on their next dispatch: ${skipped.join(', ')}`);
+  return { xells: xells.length, injected, failed, skipped: skipped.length };
+}
+
+// A harness and every harness that inherits from it, transitively (the parent_id trigger blocks
+// cycles, and the hop cap is belt-and-braces for a DB edited by hand).
+async function harnessAndDescendants(rootId) {
+  const ids = [rootId];
+  let frontier = [rootId], hops = 0;
+  while (frontier.length && hops++ < 32) {
+    const kids = await q(`SELECT id FROM harness WHERE parent_id = ANY($1::uuid[])`, [frontier]);
+    frontier = kids.map((k) => k.id).filter((id) => !ids.includes(id));
+    ids.push(...frontier);
+  }
+  return ids;
 }
 
 // ONE line at the end of every refresh: how many file-backed harnesses carry something, how many

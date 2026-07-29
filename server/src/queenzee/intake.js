@@ -820,13 +820,18 @@ export async function reinjectHarnessIntoXell(xellId) {
     const row = await harnessForXell(xellId);
     const eff = row ? await effectiveHarness(row) : null;
     const files = harnessFiles(eff);
-    let n = 0;
+    let n = 0, failed = 0;
     for (const f of files) {
       try { await writeFileIntoCxell({ ctx: 'default', slug: zee.slug, relPath: f.relPath, text: f.text }); n++; }
-      catch (e) { logline('harness', `${zee.slug}: could not inject ${f.relPath} (${String(e.message).slice(0, 80)})`); }
+      catch (e) { failed++; logline('harness', `${zee.slug}: could not inject ${f.relPath} (${String(e.message).slice(0, 80)})`); }
     }
-    logline('harness', `${zee.slug}: (re)injected ${n} harness file(s) for "${row?.key || '(core only)'}"`);
-    return { injected: true, files: n, harness: row?.key || null };
+    logline('harness', `${zee.slug}: (re)injected ${n} harness file(s) for "${row?.key || '(core only)'}"`
+      + (failed ? ` — ${failed} FAILED to write` : ''));
+    // Honest result: writing NOTHING when there was something to write is a failure, however many
+    // individual errors were swallowed above. A caller that logs "re-injected 0 file(s)" as a success
+    // is worse than one that stays quiet — it tells a human the zee has files it does not have.
+    return { injected: files.length === 0 || n > 0, files: n, failed, wanted: files.length,
+      harness: row?.key || null, ...(n === 0 && files.length ? { reason: 'every file failed to write' } : {}) };
   } catch (e) { return { injected: false, error: e.message }; }
 }
 
@@ -912,6 +917,12 @@ const ZEE_MODELS = [
   { key: 'opus',   label: 'Opus',   note: 'most capable — best for unattended, load-bearing work' },
   { key: 'sonnet', label: 'Sonnet', note: 'fast and cheaper — good for well-scoped or simple jobs' },
   { key: 'haiku',  label: 'Haiku',  note: 'fastest and cheapest — light edits and quick tasks' },
+  // `fable` is a real CLI alias, not a guess: measured on claude 2.1.220 (2026-07-29) it resolves
+  // server-side to claude-fable-5 (1M-token context, 64k max output) exactly the way `opus`
+  // resolves to claude-opus-5 — so no dated id is needed here and none was added. Its note says
+  // what was OBSERVED; unlike the three above it has no track record driving zees in this hive,
+  // so it is offered, not recommended, and Opus stays the unattended default.
+  { key: 'fable',  label: 'Fable',  note: 'newest generation — huge (1M) context; unproven on unattended zee work' },
 ];
 export function listDispatchModels(provider = 'claude') {
   const vendor = providerModels(provider);
