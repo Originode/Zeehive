@@ -232,7 +232,7 @@ BEGIN
   END IF;
   -- IMPOSSIBILITY: nesting upward. project → activity → task → subtask only.
   IF work_item_rank(NEW.kind) < work_item_rank(p_kind) THEN
-    RAISE EXCEPTION 'a % cannot be nested under a % (allowed: project > activity > task)', NEW.kind, p_kind;
+    RAISE EXCEPTION 'a work item of kind "%" cannot be nested under kind "%" (allowed: project > activity > task > subtask)', NEW.kind, p_kind;
   END IF;
   -- IMPOSSIBILITY: a cycle. The parent's path holds every ancestor of the parent, so if this node
   -- is in there, moving under that parent would make the node its own descendant.
