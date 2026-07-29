@@ -77,7 +77,7 @@ and the web palette cannot drift:
 **`live_status` is advisory and is never written back.** The card's column is always its *stored*
 status. A zee going idle for a minute must not silently drag somebody's card into another column.
 
-## Four policies parts 3 and 4 must not misread
+## Five policies the console and the verbs must not misread
 
 These are correct **as built**; they were merely implicit before, which is the same as wrong.
 
@@ -147,6 +147,40 @@ Two consequences worth stating:
   `work_item_event` ledger (`kind:'assigned'`). This module will not hand you a dead zee to render.
   Part 3 keeps that contract: its tick NOTES a departed zee in the ledger (with the slug
   denormalized into `detail`) and never nulls the column — see "The board moves itself" below.
+
+### 5. `priority` is 1..5 and **1 is MOST urgent**
+
+Nothing in the original contract said which end was urgent, so the console had to guess (it guessed
+right, and said so in a comment: *"the API says nothing about which end is urgent"*). That gap is
+worth closing loudly, because the failure is silent and total: if the direction were the other way,
+**every board card in production would be coloured backwards** and nothing would throw.
+
+| priority | meaning |
+|---|---|
+| **1** | most urgent |
+| 2 | |
+| **3** | the DEFAULT — the middle of the scale |
+| 4 | |
+| **5** | least urgent |
+
+Why this direction, and not the other:
+
+- the column defaults to **3**, the exact middle of 1..5. A scale whose default sits in the middle
+  is one where both ends are extremes — if 5 were "most urgent", the default would be 1;
+- it is the near-universal convention a person already carries: P1, "priority one", severity 1,
+  Jira, ITIL. A tracker that inverted it would be technically free to and wrong in every reading;
+- the console already ships this reading (`Pips` fills as the number *drops*, 1 tinted red, 2 amber,
+  tooltip "1 = most urgent"), so stating it changes no rendered pixel — it just stops the next
+  person re-deriving it.
+
+**Careful — this repo contains the opposite convention nearby.** `machine_pool.dev_priority` is
+ordered `DESC` (see `lib/machines.js`, `queenzee/intake.js`): for MACHINES, a **higher** number
+wins. The two columns are unrelated and the names rhyme, which is exactly how somebody transfers one
+convention onto the other. `work_item.priority` and `ticket.priority` are 1-is-most-urgent; nothing
+about the machine pool applies to them.
+
+Nothing on the server orders by `priority` — no read model sorts on it, so there is no behaviour
+that would have broken either way. This is a **display and judgement** contract, and now it is one.
 
 ## The schema (migration 058)
 

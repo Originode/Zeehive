@@ -118,6 +118,8 @@ export async function createTicket(input = {}) {
   return shapeTicket(row);
 }
 
+// priority is 1..5 and 1 is MOST urgent (docs/work-tracker.md, policy 5). Default 3 is the
+// middle of the scale. NB: machine_pool.dev_priority is the OPPOSITE convention — higher wins.
 const TICKET_EDITABLE = ['title', 'body', 'kind', 'priority', 'reporter', 'assignee', 'labels', 'work_item_id'];
 
 export async function updateTicket(id, patch = {}, { actor = null } = {}) {

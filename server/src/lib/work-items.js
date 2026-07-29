@@ -404,6 +404,8 @@ export async function getWorkItem(id) {
 
 // ── writes ───────────────────────────────────────────────────────────────────
 
+// priority is 1..5 and 1 is MOST urgent (docs/work-tracker.md, policy 5). Default 3 is the
+// middle of the scale. NB: machine_pool.dev_priority is the OPPOSITE convention — higher wins.
 const EDITABLE = ['title', 'body', 'priority', 'assignee', 'starts_on', 'due_on',
                   'estimate_hours', 'progress', 'sort_order', 'xell_id', 'ticket_id', 'kind'];
 
