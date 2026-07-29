@@ -30,6 +30,11 @@ import { classifyMergeOutput } from '../queenzee/xellgit.js';
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
 // ghcr — matching the CXELL_IMAGE the self-ship scripts already honor for their rebuild.
 const IMAGE = process.env.CXELL_IMAGE || 'zeehive/zee-agent';
+
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
+// and the .zeehive.env reconcile in provision.js): 'real' touches machines, anything else models.
+// The fleet-wide attend-path sweep below obeys it — see refreshZeeLiveInLiveCxells.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 export const cxellName = (slug) => `cxell_${String(slug).replace(/[^a-zA-Z0-9_.-]/g, '-')}`;
 
 // ── SSH attend: a human reaches a cxell zee's interactive claude over SSH (the dashboard's
@@ -518,13 +523,30 @@ export async function installZeeAttachIntoCxell({ ctx = 'default', name }) {
 // It touches only /usr/local/bin inside cxells the queenzee owns, cannot affect a zee's work, and
 // every failure is per-cxell and logged rather than thrown: one unreachable cage must not stop the
 // sweep, and the sweep must never delay boot.
-export async function refreshZeeLiveInLiveCxells(listLiveCxells) {
+//
+// AND IT OBEYS PROVISION_MODE, for the same reason the harness re-injection and the .zeehive.env
+// reconcile do: the caller (index.js) resolves these container names out of FLEET ROWS, and a
+// nested queenzee's fleet rows are the REAL fleet's — a xell's database is a clone of the meta-DB.
+// So in simulate this boot sweep would `docker cp` + `docker exec -u 0` into every OTHER zee's live
+// cage, installing whatever /usr/local/bin files happen to be in the running zee's own worktree.
+// Report-only there; unchanged in real mode.
+export async function refreshZeeLiveInLiveCxells(listLiveCxells, { mode = PROVISION_MODE } = {}) {
   let ok = 0;
   const failed = [];
   let cxells = [];
   try { cxells = await listLiveCxells(); } catch (e) {
     logline('cxell', `live-feed renderer sweep skipped — could not list cxells (${String(e.message).slice(0, 120)})`);
     return { swept: 0, ok: 0, failed: [] };
+  }
+  if (mode !== 'real') {
+    // Say what it would have done, always — "nothing to sweep" and "not allowed to sweep" must not
+    // look the same in the log.
+    if (cxells.length) {
+      logline('cxell', `attend path NOT refreshed in ${cxells.length} running cxell(s) — PROVISION_MODE=`
+        + 'simulate: this queenzee models the fleet, it does not install files into its cages. Would '
+        + `have refreshed: ${cxells.map((c) => c.name).slice(0, 8).join(', ')}`);
+    }
+    return { swept: cxells.length, ok: 0, failed: [], dry_run: true };
   }
   for (const { ctx = 'default', name } of cxells) {
     // BOTH attend-path files, for one reason: they are two halves of the same pane. The renderer

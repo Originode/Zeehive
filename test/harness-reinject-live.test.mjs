@@ -15,6 +15,12 @@
 // Plus the inheritance case: a child harness's effective persona is the merged chain, so repairing a
 // PARENT changes what a xell wearing the CHILD should hold.
 //
+// Every call below passes `mode: 'real'` EXPLICITLY, because there is now a fourth rule and it is
+// the default: the injection obeys PROVISION_MODE, so a NESTED queenzee (whose fleet rows are the
+// REAL fleet's — a xell's db is a clone of the meta-DB) only reports what it would have written.
+// This file is the LIVE half of that contract and must keep saying so out loud; the simulate half
+// is test/nested-queenzee-fleet-guard.test.mjs.
+//
 // No docker in a cxell, so the final `docker exec` cannot run here — which makes this the perfect
 // place to pin the THIRD rule: when the write cannot be performed, the log must SAY so. Reporting
 // "re-injected 0 file(s)" as a success is worse than silence: it tells a human a running zee holds
@@ -92,7 +98,7 @@ try {
   // ── 1. first refresh: the bundles are born, so they CHANGED ─────────────────────────────────
   console.log('\n── a refresh that changes a bundle reaches the zees already running ──');
   let n = since();
-  await H.refreshHarnesses();
+  await H.refreshHarnesses({ mode: 'real' });
   let log = linesSince(n);
   // each LIVE wearer is acted on and named. In this cage the docker write cannot succeed, so the
   // outcome must be the honest failure line rather than a claim of success.
@@ -114,7 +120,7 @@ try {
   // ── 2. a refresh that changes NOTHING must not touch a running zee's worktree ───────────────
   console.log('\n── and a no-op refresh writes nothing at all ──');
   n = since();
-  await H.refreshHarnesses();
+  await H.refreshHarnesses({ mode: 'real' });
   log = linesSince(n);
   ok(!log.some((m) => /re-injected|injection FAILED/.test(m)), 'no injection attempt at all: nothing changed, nothing written');
   ok(!log.some((m) => /next dispatch/.test(m)), 'and nothing is even considered — the whole path is skipped');
@@ -125,7 +131,7 @@ try {
   writeFileSync(join(parentDir, 'PERSONALITY.md'), `persona v2 ${tag}\n`);
   git('add', '-A'); git('commit', '-qm', 'persona v2');
   n = since();
-  await H.refreshHarnesses();
+  await H.refreshHarnesses({ mode: 'real' });
   log = linesSince(n);
   const hit = log.filter((m) => /re-injected|injection FAILED|next dispatch/.test(m));
   ok(hit.some((m) => m.includes(wearer.slug)), 'the wearer of the edited harness is re-injected');
@@ -134,13 +140,13 @@ try {
      'the untouched CHILD folder is not itself re-read as changed (only its parent moved)');
 
   // ── 4. the selector is callable on its own, and answers with the counts ─────────────────────
-  const direct = await H.reinjectHarnessIntoLiveXells(parentH.id);
+  const direct = await H.reinjectHarnessIntoLiveXells(parentH.id, { mode: 'real' });
   ok(direct.xells === 3 && direct.injected + direct.failed + direct.skipped === 3,
      `reinjectHarnessIntoLiveXells() covers every wearer incl. heirs, and every one is accounted for `
      + `(${direct.xells} xells: ${direct.injected} injected, ${direct.failed} failed, ${direct.skipped} not live)`);
   ok(direct.failed === 2 && direct.skipped === 1,
      'the two LIVE zees are counted as failures here (no docker in a cage), the sleeping one as not-live');
-  const none = await H.reinjectHarnessIntoLiveXells(randomUUID());
+  const none = await H.reinjectHarnessIntoLiveXells(randomUUID(), { mode: 'real' });
   ok(none.xells === 0 && none.injected === 0, 'and a harness nobody wears is a clean no-op');
 } finally {
   for (const id of madeXells) await q(`DELETE FROM zee WHERE xell_id=$1`, [id]).catch(() => {});
