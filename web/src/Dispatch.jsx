@@ -59,7 +59,8 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
   useEffect(() => {
     getDispatchModes().then((ms) => setModes(ms)).catch(() => {});
     // The model list is the PROVIDER'S — a Codex composer offers Codex model ids, a Kimi one
-    // Kimi's; claude keeps opus/sonnet/haiku. The server owns the lists (/xell/models?provider=).
+    // Kimi's; claude keeps its generation ALIASES. The server owns the lists
+    // (/xell/models?provider=) — never restate them here beyond the offline fallback below.
     getDispatchModels(activeProvider).then((ms) => {
       setModels(ms);
       const def = ms.find((m) => m.default) || ms[0];
@@ -377,5 +378,6 @@ const FALLBACK_MODES = [
 // not, so its fallback is the single honest "vendor default" entry (key '' → dispatch sends no
 // model and the vendor CLI runs its own default).
 const fallbackModels = (provider) => provider === 'claude' || !provider
-  ? [{ key: 'opus', label: 'Opus', default: true }, { key: 'sonnet', label: 'Sonnet' }, { key: 'haiku', label: 'Haiku' }]
+  ? [{ key: 'opus', label: 'Opus', default: true }, { key: 'sonnet', label: 'Sonnet' }, { key: 'haiku', label: 'Haiku' },
+     { key: 'fable', label: 'Fable' }]
   : [{ key: '', label: 'default', note: "the vendor CLI's own default model", default: true }];
