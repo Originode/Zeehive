@@ -1098,7 +1098,10 @@ export async function backupDue(projectId, now = Date.now()) {
 // BEST-EFFORT, ABSOLUTELY: it is called from the tick, never from a backup job, every failure is
 // swallowed, and it writes nothing except its own alert bookkeeping. A notifier that can fail a backup
 // is worse than no notifier — the dump is the product.
-async function checkBackupFreshness(projectId, now = Date.now()) {
+// Exported for the test: the once-per-interval bound and the recovery ping live in pool_config, not in
+// the pure decision, so the BOOKKEEPING has to be exercised against a real database or the storm control
+// for the alert itself is unproven.
+export async function checkBackupFreshness(projectId, now = Date.now()) {
   try {
     const cfg = await one(
       `SELECT backup_interval_sec, backup_alerted_at, backup_alert_open FROM pool_config WHERE project_id=$1`,

@@ -187,6 +187,35 @@ try {
   ok((await maint.backupDue(projId, T0 + 100 * HOUR)).kind === 'running',
      'and a running row is never due even 96 hours later — nothing interrupts a live dump');
 
+  // ── 5b. THE ALERT'S OWN STORM CONTROL, against a real database ────────────────────────────────
+  // The threshold is a pure function and is proven above. The BOUND is not: "at most once per policy
+  // interval" and "exactly one recovery ping" live in pool_config, and an alert that re-fires every
+  // tick is the same bug as a backup that retries every tick — one screen over.
+  console.log('\n── the alert is bounded by what is written down, not by memory ──');
+  await q(`DELETE FROM db_snapshot WHERE project_id=$1`, [projId]);
+  await q(`UPDATE pool_config SET backup_alerted_at=NULL, backup_alert_open=false WHERE project_id=$1`, [projId]);
+  const stale27h = await snap('finished', at(T0));
+  const alertState = async () => one(
+    `SELECT backup_alerted_at, backup_alert_open FROM pool_config WHERE project_id=$1`, [projId]);
+
+  const first = await maint.checkBackupFreshness(projId, T0 + 27 * HOUR);
+  ok(first?.fire === true, 'a 27h-old restore point under a 12h policy alerts');
+  const st1 = await alertState();
+  ok(st1.backup_alert_open === true && st1.backup_alerted_at != null,
+     'and it WRITES DOWN that a human was told — so a restart cannot re-ping on boot');
+
+  const second = await maint.checkBackupFreshness(projId, T0 + 27 * HOUR + 1 * MIN);
+  ok(second?.fire === false, 'one minute later, on the next tick, it stays quiet (bounded by the record, not by luck)');
+
+  // …and a real recovery: one ping, then silence, from the same rows.
+  await snap('finished', at(T0 + 40 * HOUR));
+  const rec = await maint.checkBackupFreshness(projId, T0 + 40 * HOUR + 5 * MIN);
+  ok(rec?.clear === true, 'a good dump stands the alert down');
+  ok((await alertState()).backup_alert_open === false, 'and the outstanding flag is cleared');
+  const after2 = await maint.checkBackupFreshness(projId, T0 + 40 * HOUR + 6 * MIN);
+  ok(after2?.clear === false && after2?.fire === false,
+     'the recovery is announced exactly ONCE — no second "all clear" on the next tick');
+
   // ── 6. BEST-EFFORT DISCIPLINE: alerting can never fail a backup ────────────────────────────────
   console.log('\n── the dump is the product ──');
   const m = read('server/src/queenzee/maintenance.js');
