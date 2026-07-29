@@ -64,7 +64,9 @@ function compile(rel, name) {
 async function cleanup() {
   for (const f of compiled) rmSync(f, { force: true });
   for (const k of Object.values(keys)) await q(`DELETE FROM harness WHERE key=$1`, [k]).catch(() => {});
-  await q(`DELETE FROM harness WHERE key LIKE $1`, [`zt-new-${tag}%`]).catch(() => {});
+  // the personas the MANAGER creates are keyed by a derivation we do not spell out here (project +
+  // label, §5) — deleting the project takes them with it, which is the cascade §"scoped personas are
+  // cascaded with their project" asserts.
   for (const p of [P1, P2]) if (p.id) await q(`DELETE FROM project WHERE id=$1`, [p.id]).catch(() => {});
 }
 
@@ -149,8 +151,10 @@ try {
 
   // ── 4. THE HAPPY PATH: the manager mints a specialist that INHERITS a global one ──
   console.log('\n── a manager creates a project persona inheriting a GLOBAL one, and a worker wears it ──');
+  // No `key`: the queenzee DERIVES the stored key from the project and the label (a manager does not
+  // choose one — see test/harness-manager-guards.test.mjs §S1).
   const created = await S.selfHarnessCreate(mgr, {
-    key: `zt-new-${tag}`, label: `ZT Migration Specialist ${tag}`, parent: 'zee-base',
+    label: `ZT Migration Specialist ${tag}`, parent: 'zee-base',
     summary: 'knows this project\'s migration discipline',
     personality: 'You write migrations forward-only and you never renumber one.',
     memory: [{ path: 'migrations.md', text: 'Number clear of the highest in db/migrations/.' }],
@@ -213,7 +217,9 @@ try {
   refused(await S.selfHarnessCreate(w1, { label: 'x' }), /MANAGER verb/, 'and cannot create one either');
   refused(await S.selfHarnessCreate(mgr, {}), /--label/, 'a create with no label is refused');
   refused(await S.selfHarnessCreate(mgr, { label: 'dup', key: newKey }),
-          /already exists/, 'a duplicate key is refused, not silently reused');
+          /do not choose a harness KEY/, 'a caller-supplied key is refused (the key is derived from the project + label)');
+  refused(await S.selfHarnessCreate(mgr, { label: `ZT Migration Specialist ${tag}` }),
+          new RegExp(newKey), 'and a second persona with the same label is refused, naming the key it already has');
   refused(await S.selfHarnessCreate(mgr, { label: 'boss', zee_type: 'manager' }),
           /may not create or edit a MANAGER persona/, 'creating a MANAGER persona is refused');
   refused(await S.selfHarnessUpdate(mgr, newKey, { zee_type: 'manager' }),
@@ -264,6 +270,15 @@ try {
   ok((await S.selfHarnessUpdate(mgr, newKey, { parent: 'dev-base' })).harness.parent === 'dev-base',
      'and so is any global WORKER harness — that is the whole point of the verb');
 
+  // deleting — or DISABLING — one a live xell is wearing: both end with a running zee whose next
+  // briefing has lost the persona, so both are refused (harness-manager-guards covers the ancestor
+  // case and the answer's honesty about the live re-injection).
+  refused(await S.selfHarnessDelete(mgr, newKey), new RegExp(w1.slug),
+          'deleting a harness a LIVE xell is wearing is refused, and names the xell');
+  refused(await S.selfHarnessUpdate(mgr, newKey, { enabled: false }), new RegExp(w1.slug),
+          'and so is disabling it — `enabled:false` reaches the same end state');
+  await H.assignHarness(w1.id, null);
+
   // disabling: it leaves every list (they are all `WHERE enabled`), so the answer has to say where it went
   const off = await S.selfHarnessUpdate(mgr, newKey, { enabled: false });
   ok(off.ok === true && /DISABLED/.test(off.message) && /--enabled on/.test(off.message),
@@ -273,10 +288,6 @@ try {
   ok((await S.selfHarnessGet(mgr, newKey)).ok === true, 'while still readable by name');
   ok((await S.selfHarnessUpdate(mgr, newKey, { enabled: true })).harness.enabled === true, 'and revivable');
 
-  // deleting one a live xell is wearing
-  refused(await S.selfHarnessDelete(mgr, newKey), new RegExp(w1.slug),
-          'deleting a harness a LIVE xell is wearing is refused, and names the xell');
-  await H.assignHarness(w1.id, null);
   const gone = await S.selfHarnessDelete(mgr, newKey);
   ok(gone.ok === true && gone.deleted === true, 'once nothing wears it, the manager deletes its own persona');
   ok(!(await one(`SELECT id FROM harness WHERE key=$1`, [newKey])), 'and the row is really gone');
