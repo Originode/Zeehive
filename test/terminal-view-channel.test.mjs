@@ -130,7 +130,7 @@ try {
   wsClient.send(JSON.stringify({ t: 'v', thinking: false, moves: false }));
   for (let i = 0; i < 60 && !written(); i++) await sleep(50);
   const wrote = written() || { cmd: '(no write exec ever ran)', pty: null };
-  ok(/printf/.test(wrote.cmd) && wrote.cmd.includes(`> ${ZEE_LIVE_VIEW_FILE}`),
+  ok(/printf/.test(wrote.cmd) && wrote.cmd.includes(`mv -f ${ZEE_LIVE_VIEW_FILE}.tmp ${ZEE_LIVE_VIEW_FILE}`),
      'the click writes the view file in the cxell');
   ok(wrote.cmd.includes('{"thinking":false,"moves":false}'), 'with exactly the view the operator chose');
   ok(wrote.pty === false, 'again on a SECOND channel — the PTY never sees it');

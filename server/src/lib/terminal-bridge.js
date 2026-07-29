@@ -60,7 +60,10 @@ export const CTRL_PREFIX = '\u0000ZH';
 export function zeeLiveViewCommand(view, write = false) {
   const b = (v) => (v === false ? 'false' : 'true');
   const json = `{"thinking":${b(view?.thinking)},"moves":${b(view?.moves)}}`;
-  return (write ? `printf '%s' '${json}' > ${ZEE_LIVE_VIEW_FILE} 2>/dev/null; ` : '')
+  // Written via a temp file + mv: the reader POLLS this path, and `>` truncates before it writes —
+  // a poll landing in that gap would read an empty file, fall back to "show everything" and repaint
+  // twice. A rename is atomic, so the renderer only ever sees a whole view.
+  return (write ? `printf '%s' '${json}' > ${ZEE_LIVE_VIEW_FILE}.tmp 2>/dev/null && mv -f ${ZEE_LIVE_VIEW_FILE}.tmp ${ZEE_LIVE_VIEW_FILE}; ` : '')
     // `zee-live[.]mjs` so the pattern cannot match the pgrep itself; the marker words keep the
     // parse independent of any shell noise on the line.
     + `pgrep -f 'zee-live[.]mjs' >/dev/null 2>&1 && echo ZH-LIVE || echo ZH-IDLE; `

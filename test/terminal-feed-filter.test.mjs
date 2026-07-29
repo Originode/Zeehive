@@ -28,13 +28,14 @@ const { zeeLiveViewCommand, parseZeeLiveViewReply, ZEE_LIVE_VIEW_FILE, CTRL_PREF
 console.log('\n── the view command the bridge runs in the cxell ──');
 const write = zeeLiveViewCommand({ thinking: false, moves: true }, true);
 ok(write.includes(`'{"thinking":false,"moves":true}'`), 'writes the chosen view as JSON');
-ok(write.includes(`> ${ZEE_LIVE_VIEW_FILE}`), `into ${ZEE_LIVE_VIEW_FILE} (the file zee-live.mjs watches)`);
+ok(write.includes(`> ${ZEE_LIVE_VIEW_FILE}.tmp`) && write.includes(`mv -f ${ZEE_LIVE_VIEW_FILE}.tmp ${ZEE_LIVE_VIEW_FILE}`),
+   `into ${ZEE_LIVE_VIEW_FILE} ATOMICALLY (a poll landing in a truncate would read an empty view and repaint twice)`);
 ok(/pgrep -f 'zee-live\[\.\]mjs'/.test(write), 'and asks whether a live feed is actually running');
 ok(write.includes('ZH-LIVE') && write.includes('ZH-IDLE'), 'answering with markers the parse can find');
 ok(write.includes(`cat ${ZEE_LIVE_VIEW_FILE}`), 'and reads the view back, so the client is told the TRUTH, not its own guess');
 
 const readOnly = zeeLiveViewCommand(null, false);
-ok(!readOnly.includes('printf') && !readOnly.includes(`> ${ZEE_LIVE_VIEW_FILE}`),
+ok(!readOnly.includes('printf') && !readOnly.includes('mv -f'),
    'the attach-time poll writes NOTHING (it only reports what the cage already holds)');
 
 // The one thing that must never be interpolated: anything a browser sent.
