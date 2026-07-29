@@ -94,6 +94,16 @@ export const addComment = (id, payload) => send(`/api/tickets/${encodeURICompone
 // action. One round trip, because half a created tree is worse than none.
 export const breakdownTicket = (id, items) => send(`/api/tickets/${encodeURIComponent(id)}/breakdown`, 'POST', { items });
 
+// ── telling a manager about a ticket ────────────────────────────────────────
+// The picker is the SERVER'S list, exactly like getAssignCandidates below: the manager zees of this
+// ticket's project as they are right now, each with `live` (has a cxell session a message can be
+// typed into) and its own `why` line. The console never remembers a manager or invents an entry.
+// `notify` answers { code, delivered, delivery, note } — `note` is the sentence to show a human,
+// including when the message was stored but reached no live session.
+export const getTicketManagers = (id) => call(`/api/tickets/${encodeURIComponent(id)}/managers`);
+export const notifyTicketManager = (id, xellId) =>
+  send(`/api/tickets/${encodeURIComponent(id)}/notify`, 'POST', { xell_id: xellId });
+
 // ── work items: the hierarchy ────────────────────────────────────────────────
 export const listWorkItems = (projectId, { tree, status, kind, root, ticket } = {}) =>
   call(`/api/work-items${pq({ project: projectId, tree: tree ? 1 : undefined, status, kind, root, ticket })}`);

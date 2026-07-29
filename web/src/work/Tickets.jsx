@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { showAlert, showConfirm } from '../Dialog.jsx';
 import {
-  addComment, breakdownTicket, createTicket, deleteWorkItem, getTicket, listTickets, patchTicket,
+  addComment, breakdownTicket, createTicket, deleteWorkItem, getTicket, getTicketManagers,
+  listTickets, notifyTicketManager, patchTicket,
 } from './workApi.js';
 import { Breadcrumb, ErrLine, KindGlyph, Pips, StatusDot, legalNext, statusLabel } from './bits.jsx';
 
@@ -270,6 +271,7 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
     <div className="work-tdetail" data-testid="work-ticket-detail">
       <header className="work-tdetail-h">
         <span className="work-tnum">#{t.number ?? '—'}</span>
+        <TicketCode code={t.code} />
         <b className="work-row-t">{t.title}</b>
         <select className="work-in" value={t.status || ''} disabled={busy}
                 onChange={async (e) => {
@@ -293,6 +295,7 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
         {(t.labels || []).map((l) => <span key={l} className="work-label">{l}</span>)}
         <span className="work-muted">{statusLabel(statuses, t.status)}</span>
       </div>
+      <NotifyManager ticketId={id} onError={setErr} />
       {t.body && <div className="work-tbody">{t.body}</div>}
 
       <section className="work-sec">
@@ -371,6 +374,125 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
           </div>
         </div>
       </section>
+    </div>
+  );
+}
+
+// ── the ticket CODE, copyable ────────────────────────────────────────────────
+//
+// `t.code` is the SERVER'S derivation (TKT-<number>-<4 hex of the id>) and the console never builds
+// one of its own: what a human copies here is byte-for-byte what a notified manager receives, and
+// that is the entire point of the code.
+//
+// The code is rendered as real selectable text as well as a copy button, because the console is
+// regularly served over plain http from another machine and `navigator.clipboard` does not exist on
+// an insecure origin. So: the async API where the browser allows it, a throwaway textarea +
+// execCommand where it does not (the same pair ZeeTerminal.jsx carries, for the same reason), and
+// if both are blocked the text is still there to select by hand.
+function TicketCode({ code }) {
+  const [flash, setFlash] = useState('');
+  if (!code) return null;
+  const copy = () => {
+    const done = () => { setFlash('copied'); setTimeout(() => setFlash(''), 1200); };
+    try {
+      const p = navigator.clipboard?.writeText(code);
+      if (p && p.then) { p.then(done).catch(() => { execCopy(code); done(); }); return; }
+    } catch { /* insecure origin / denied — fall through to the textarea */ }
+    execCopy(code); done();
+  };
+  return (
+    <span className="work-tcode">
+      <code>{code}</code>
+      <button className="work-mini" onClick={copy}
+              title="Copy this ticket's code — paste it into a zee's session to name this ticket exactly">
+        {flash || '⧉ copy'}
+      </button>
+    </span>
+  );
+}
+
+function execCopy(text) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+  } catch { /* nothing more we can do — the code is on screen to select by hand */ }
+}
+
+// ── notify a manager ─────────────────────────────────────────────────────────
+//
+// Hand this ticket to one of the managers ACTUALLY DEPLOYED right now. Three rules, all inherited
+// from DeployZee.jsx (the other picker-over-the-live-fleet in this console) — same idiom, no new one:
+//
+// 1. THE LIST IS THE SERVER'S, fetched when the picker OPENS and never cached across opens. A
+//    manager is a live agent; a remembered list is a list that offers someone who is gone.
+// 2. A MANAGER WITH NO LIVE SESSION IS STILL SHOWN, marked ○ and carrying the server's own `why`
+//    line. Hiding it would leave a human wondering where their manager went; what must not happen
+//    is a message that quietly reaches nobody, which is rule 3.
+// 3. THE VERDICT IS PRINTED, whichever way it went — delivered into the live session, or stored in
+//    the inbox because there was none. The server writes that sentence (`note`); this component
+//    does not paraphrase it, and refusals go straight to the detail's ErrLine like every other verb.
+//
+// No confirmation dialog: a notification assigns nothing, opens no gate and cannot be un-sent, but
+// neither can an email. Choosing a manager from a list IS the deliberate act.
+function NotifyManager({ ticketId, onError }) {
+  const [mgrs, setMgrs] = useState(null);        // the whole payload: { managers, note, count }
+  const [picking, setPicking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [verdict, setVerdict] = useState(null);  // { delivered, note } — what actually happened
+
+  useEffect(() => {
+    if (!picking || mgrs) return;
+    let alive = true;
+    getTicketManagers(ticketId)
+      .then((r) => { if (alive) setMgrs(r || { managers: [] }); })
+      .catch((e) => { if (alive) { setPicking(false); onError?.(e); } });
+    return () => { alive = false; };
+  }, [picking, mgrs, ticketId, onError]);
+
+  const notify = async (m) => {
+    setBusy(true);
+    try {
+      const r = await notifyTicketManager(ticketId, m.xell_id);
+      setVerdict({ delivered: !!r.delivered, note: r.note || `${m.slug} was told about this ticket.` });
+      setPicking(false); setMgrs(null);
+    } catch (e) { onError?.(e); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="work-tnotify" data-testid="work-ticket-notify">
+      {!picking && (
+        <button className="work-mini" disabled={busy}
+                onClick={() => { setVerdict(null); setPicking(true); }}
+                title="Tell a deployed manager zee about this ticket — it receives the code, the number and the title">
+          🔔 notify manager
+        </button>
+      )}
+      {picking && (
+        <span className="work-cands">
+          {mgrs === null && <span className="work-muted">looking for deployed managers…</span>}
+          {/* When nobody is deployed the server sends its OWN sentence (and it names the way out —
+              a human adds a manager). Printing that beats inventing a shorter one here. */}
+          {mgrs && !mgrs.managers?.length && (
+            <span className="work-muted">{mgrs.note || 'no manager zee is deployed on this project'}</span>
+          )}
+          {(mgrs?.managers || []).map((m) => (
+            <button key={m.xell_id} className="work-cand" disabled={busy} onClick={() => notify(m)}>
+              <b>{m.live ? '◉' : '○'} {m.slug}</b>
+              {/* the server's OWN 'why' line — the console does not paraphrase it */}
+              {m.why && <small>{m.why}</small>}
+            </button>
+          ))}
+          <button className="work-mini" disabled={busy} onClick={() => setPicking(false)}>cancel</button>
+        </span>
+      )}
+      {verdict && (
+        <div className={`work-verdict${verdict.delivered ? '' : ' cold'}`}>
+          {verdict.delivered ? '✓' : '⚠'} {verdict.note}
+        </div>
+      )}
     </div>
   );
 }
