@@ -318,6 +318,62 @@ try {
   ok((await W.listWorkItems({ projectId: PID, ticketId: t1.id })).length === 4, 'and by ticket');
   ok((await W.listWorkItems({ rootId: act2.id })).length === 3, 'and by root (the subtree, inclusive)');
 
+  // ── REGRESSION: the silent sort_order drop ───────────────────────────────
+  //
+  // A kanban drag WITHIN one column sends {parent_id: <unchanged>, sort_order: N} — the natural
+  // shape for "this card moved, here is where it sits now". The first cut skipped the sort_order
+  // write whenever parent_id was merely PRESENT in the patch, and skipped the move because the
+  // parent had not changed, so the reorder was dropped: HTTP 200, no error, and the card snapped
+  // back on the next reload. Silent wrong answers are the worst failure mode this API can have,
+  // and a board is its primary consumer — so it is pinned here.
+  section('reordering (the drag a board actually sends)');
+  const sibA = await W.createWorkItem({ project_id: PID, title: 'sibling A', kind: 'task' });
+  const sibB = await W.createWorkItem({ project_id: PID, title: 'sibling B', kind: 'task' });
+  ok(sibB.sort_order > sibA.sort_order, 'a new sibling lands after the existing ones');
+
+  const sameParent = await W.updateWorkItem(sibB.id, { parent_id: sibB.parent_id, sort_order: 500 }, { actor: 'test' });
+  ok(sameParent.sort_order === 500,
+     `PATCH {parent_id: <UNCHANGED>, sort_order: 500} PERSISTS the rank (got ${sameParent.sort_order})`);
+  ok((await W.getWorkItem(sibB.id)).sort_order === 500, 'and it is in the database, not just the answer');
+  ok((await W.listWorkItems({ rootId: sibB.parent_id }))
+       .filter((i) => i.id !== sibB.parent_id).map((i) => i.title)[0] === 'sibling B',
+     'so the reordered card really does sort first among its siblings');
+
+  const alone = await W.updateWorkItem(sibA.id, { sort_order: 250 }, { actor: 'test' });
+  ok(alone.sort_order === 250, 'sort_order ALONE (no parent_id) still works');
+
+  const bothMoved = await W.updateWorkItem(sibB.id, { parent_id: act.id, sort_order: 90 }, { actor: 'test' });
+  ok(bothMoved.parent_id === act.id && bothMoved.sort_order === 90,
+     'a real move carrying a rank applies BOTH (the move places it; the field loop must not re-apply)');
+  const movedEvents = (await W.getWorkItem(sibB.id)).events.filter((e) => e.kind === 'moved');
+  ok(movedEvents.length === 1, 'and it produced exactly ONE moved event, not two writes');
+
+  // parent_id:null means "move to the project root", not "become a second root"
+  const toTop = await W.updateWorkItem(sibB.id, { parent_id: null }, { actor: 'test' });
+  ok(toTop.parent_id === root.id && toTop.depth === 1,
+     'PATCH {parent_id: null} moves an item to the PROJECT ROOT (it never becomes a root itself)');
+
+  // ── REGRESSION: ids and refs answer like a person, not like postgres ──────
+  section('bad ids and bad refs get a sentence, not a cast error');
+  await refuses(() => W.getWorkItem('not-a-uuid'), /is not a valid work item id/,
+    'a malformed work item id');
+  await refuses(() => T.getTicket('nope'), /is not a valid ticket id/, 'a malformed ticket id');
+  await refuses(() => W.createWorkItem({ project_id: PID, title: 'x', parent_id: 'bogus' }),
+    /is not a valid parent work item id/, 'a malformed parent_id in a create');
+  await refuses(() => W.addDep(sibA.id, 'bogus'), /is not a valid depends_on_id/, 'a malformed depends_on_id');
+  await refuses(() => W.boardModel({ projectId: 'bogus' }), /is not a valid project id/, 'a malformed project on the board');
+  await refuses(() => W.listWorkItems({ projectId: PID, status: 'nonsense' }), /unknown status/, 'an unknown ?status= filter');
+  ok((await W.getWorkItem('00000000-0000-4000-8000-00000000dead')) === null,
+     'a WELL-FORMED id that names nothing is still simply not found (a 404, not a 400)');
+
+  await refuses(() => T.breakdownTicket(t1.id, { items: [{ title: 'child', parent_id: 'no-such-ref' }] }),
+    /neither a work item id nor a ref/, 'a breakdown naming an unknown ref');
+  await refuses(() => T.breakdownTicket(t1.id, {
+    items: [{ title: 'child', parent_id: 'later' }, { ref: 'later', title: 'parent', kind: 'activity' }],
+  }), /neither a work item id nor a ref/, 'a breakdown naming a ref declared LATER (refs resolve backwards only)');
+
+  await W.deleteWorkItem(sibA.id); await W.deleteWorkItem(sibB.id);
+
   // ── deleting a subtree says what went with it ────────────────────────────
   section('delete');
   const del = await W.deleteWorkItem(taskB.id);

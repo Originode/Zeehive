@@ -18,8 +18,9 @@
 // channel so the console's SSE stream pushes it; the database owns the impossibilities.
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
-import { workLabel, isWorkStatus, nextStatuses, canTransition, TICKET_KINDS } from './work-status.js';
-import { createWorkItem, projectRoot, logWorkEvent, nestItems } from './work-items.js';
+import { workLabel, isWorkStatus, nextStatuses, canTransition, TICKET_KINDS,
+         WORK_STATUS_KEYS } from './work-status.js';
+import { createWorkItem, projectRoot, logWorkEvent, nestItems, assertId, isUuid } from './work-items.js';
 
 const COLS = `id, project_id, number, title, body, kind, status, priority, reporter, assignee,
               labels, work_item_id, created_at, updated_at, closed_at`;
@@ -41,6 +42,13 @@ function shapeTicket(row) {
 // they half-remember a ticket. ILIKE, not full-text: this table is small and a GIN index that has
 // to be maintained for a hundred rows is a liability, not an optimisation.
 export async function listTickets({ projectId, status, kind, q: search } = {}) {
+  if (projectId) assertId(projectId, 'project id');
+  for (const st of [].concat(status || [])) {
+    if (!isWorkStatus(st)) throw new Error(`unknown status "${st}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
+  }
+  for (const k of [].concat(kind || [])) {
+    if (!TICKET_KINDS.includes(k)) throw new Error(`unknown ticket kind "${k}" — one of: ${TICKET_KINDS.join(', ')}`);
+  }
   const where = [];
   const params = [];
   // `add` takes a builder so a filter can spend its ONE parameter on several placeholders (the
@@ -64,6 +72,7 @@ export async function listTickets({ projectId, status, kind, q: search } = {}) {
 }
 
 export async function getTicket(id) {
+  assertId(id, 'ticket id');
   const row = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
   if (!row) return null;
   const comments = await q(
@@ -90,6 +99,7 @@ export async function createTicket(input = {}) {
   if (!title) throw new Error('title required');
   const projectId = input.project_id || input.project;
   if (!projectId) throw new Error('project required');
+  assertId(projectId, 'project id');
   if (input.kind && !TICKET_KINDS.includes(input.kind)) {
     throw new Error(`unknown ticket kind "${input.kind}" — one of: ${TICKET_KINDS.join(', ')}`);
   }
@@ -110,6 +120,8 @@ export async function createTicket(input = {}) {
 const TICKET_EDITABLE = ['title', 'body', 'kind', 'priority', 'reporter', 'assignee', 'labels', 'work_item_id'];
 
 export async function updateTicket(id, patch = {}, { actor = null } = {}) {
+  assertId(id, 'ticket id');
+  if (patch.work_item_id) assertId(patch.work_item_id, 'work item id');
   const before = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
   if (!before) return null;
   if (patch.kind && !TICKET_KINDS.includes(patch.kind)) {
@@ -144,6 +156,7 @@ export async function updateTicket(id, patch = {}, { actor = null } = {}) {
 // work_item.ticket_id keeps the plan and drops the paperwork. The answer says how many items were
 // orphaned so the caller can say it out loud.
 export async function deleteTicket(id) {
+  assertId(id, 'ticket id');
   const row = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
   if (!row) return null;
   const n = await one(`SELECT count(*)::int AS n FROM work_item WHERE ticket_id=$1`, [id]);
@@ -153,6 +166,7 @@ export async function deleteTicket(id) {
 }
 
 export async function addComment(ticketId, { author, body } = {}) {
+  assertId(ticketId, 'ticket id');
   const text = String(body || '').trim();
   if (!text) throw new Error('body required');
   const ticket = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [ticketId]);
@@ -181,7 +195,14 @@ export async function addComment(ticketId, { author, body } = {}) {
 // entry may name an earlier entry's `ref` as its `parent_id` ("parent_id": "act1"). Without it a
 // caller would have to POST the parent, read the uuid back, and POST the children — three round
 // trips to express one thought.
+//
+// THIS IS ADDITIVE, NOT IDEMPOTENT. Calling it twice on the same ticket creates a SECOND set of
+// items — it does not reconcile or replace the first. A "re-break-down" button therefore duplicates
+// the plan unless the caller deletes the previous items first. Left additive on purpose: a ticket
+// legitimately grows more work as it is understood, and a reconcile would have to guess which of
+// the existing items the author meant to keep.
 export async function breakdownTicket(id, { items = [], actor = null } = {}) {
+  assertId(id, 'ticket id');
   const ticket = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
   if (!ticket) return null;
   if (!Array.isArray(items) || !items.length) throw new Error('items required (a non-empty array)');
@@ -193,9 +214,21 @@ export async function breakdownTicket(id, { items = [], actor = null } = {}) {
   const created = [];
   for (const spec of items) {
     if (!spec || !String(spec.title || '').trim()) throw new Error('every item needs a title');
-    // a parent named by local ref, by uuid, or (default) the project root
+    // A parent named by local ref, by uuid, or (default) the project root. A ref only resolves
+    // BACKWARDS — it must have been declared by an earlier entry in this same call — so anything
+    // else that is not a uuid is a typo or a forward reference, and it is named as such here. Left
+    // to fall through it reached postgres as a uuid cast and came back as
+    // 'invalid input syntax for type uuid: "act"', which tells the author nothing about which of
+    // their items was wrong or why.
     let parentId = spec.parent_id || null;
     if (parentId && byRef.has(parentId)) parentId = byRef.get(parentId).id;
+    else if (parentId && !isUuid(parentId)) {
+      const known = [...byRef.keys()];
+      throw new Error(`item "${spec.title}": parent_id "${parentId}" is neither a work item id nor `
+        + `a ref declared by an EARLIER item in this breakdown`
+        + (known.length ? ` (refs so far: ${known.join(', ')})` : ' (no refs declared yet)')
+        + '. A ref must be defined before it is used.');
+    }
     const item = await createWorkItem({
       ...spec,
       ref: undefined,

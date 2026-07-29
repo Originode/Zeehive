@@ -14,9 +14,12 @@
 //   • the DATABASE owns the impossibilities (migration 058): one root per project, same-project
 //     parentage, the nesting rank, cycles, path/depth maintenance, closed_at. This module does not
 //     re-check them — it lets postgres raise and turns the message into something a human reads.
-//   • every mutation ENDS with broadcast('work', row), so the console's SSE stream (/api/stream)
-//     pushes it without a poll, and appends a work_item_event row so "who moved this, when" always
-//     has an answer.
+//   • every mutation ENDS with broadcast('work', …), so the console's SSE stream (/api/stream)
+//     pushes it without a poll, and every mutation that leaves a SURVIVING row also appends a
+//     work_item_event so "who moved this, when" always has an answer. DELETE is the one exception,
+//     and not by omission: work_item_event.work_item_id is ON DELETE CASCADE, so an event written
+//     for a deleted item would be deleted along with it. The delete is announced on the bus only.
+//     Two vocabularies therefore exist and must not be conflated — see the note above emit().
 //   • roll-ups (a parent's dates, a parent's progress) are a READ-MODEL concern and are never
 //     written back. A stored roll-up is a cache that goes stale the first time anyone edits a leaf,
 //     and this repo has no place to invalidate it.
@@ -24,8 +27,8 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import {
-  WORK_STATUS_KEYS, WORK_STATUS, workLabel, isWorkStatus, canTransition, nextStatuses,
-  statusFromHive, isTerminal,
+  WORK_STATUS_KEYS, WORK_STATUS, WORK_ITEM_KINDS, workLabel, isWorkStatus, canTransition,
+  nextStatuses, statusFromHive, isTerminal,
 } from './work-status.js';
 
 // ── small shapers ────────────────────────────────────────────────────────────
@@ -63,6 +66,20 @@ function shapeItem(row) {
   };
 }
 
+// ── ids ──────────────────────────────────────────────────────────────────────
+//
+// Postgres answers a malformed uuid with `invalid input syntax for type uuid: "not-a-uuid"`. That
+// is a database's sentence, not a person's, and it reaches the caller as a 400 that names neither
+// WHICH id was wrong nor what it was for — while a valid-but-unknown id correctly 404s. Two
+// different mistakes deserve two different answers, so every id is checked before it reaches a
+// query: malformed → 400 with this sentence, unknown → 404 from the row read.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isUuid(v) { return typeof v === 'string' && UUID_RE.test(v); }
+export function assertId(v, what = 'work item id') {
+  if (!isUuid(v)) throw new Error(`"${v ?? ''}" is not a valid ${what}`);
+  return v;
+}
+
 const COLS = `id, project_id, parent_id, kind, title, body, status, priority, ticket_id, xell_id,
               assignee, starts_on, due_on, estimate_hours, progress, sort_order, path, depth,
               created_by, created_at, updated_at, closed_at`;
@@ -76,7 +93,15 @@ export async function logWorkEvent(workItemId, kind, { from = null, to = null, a
     [workItemId, kind, from, to, actor || null, detail ? JSON.stringify(detail) : null]);
 }
 
-// Every mutation goes out the same door: the row on the SSE bus, an event row in the ledger.
+// Every surviving-row mutation goes out the same door: the row on the SSE bus, an event row in the
+// ledger. TWO VOCABULARIES, deliberately not merged:
+//
+//   work_item_event.kind  created | status | moved | assigned | edited | comment   (the ledger)
+//   broadcast kind        the six above, PLUS deleted and dep, PLUS the ticket-* kinds
+//
+// 'deleted' and 'dep' are bus-only (there is no surviving row to hang a 'deleted' event on, and a
+// dependency edit is recorded against the item as an 'edited' event); 'comment' is ledger-only.
+// A consumer that assumes one list covers both will wait forever for a 'deleted' event.
 async function emit(row, kind, opts = {}) {
   if (!row) return row;
   await logWorkEvent(row.id, kind, opts);
@@ -170,7 +195,22 @@ export function flattenTree(nodes, out = []) {
   return out;
 }
 
+// Filter values are checked before they reach a query for the same reason ids are: an unknown
+// ?status= must read as "unknown status" and not as a postgres enum cast failure.
+function assertFilters({ status, kind }) {
+  for (const s of [].concat(status || [])) {
+    if (!isWorkStatus(s)) throw new Error(`unknown status "${s}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
+  }
+  for (const k of [].concat(kind || [])) {
+    if (!WORK_ITEM_KINDS.includes(k)) throw new Error(`unknown work item kind "${k}" — one of: ${WORK_ITEM_KINDS.join(', ')}`);
+  }
+}
+
 export async function listWorkItems({ projectId, status, kind, ticketId, rootId, tree } = {}) {
+  if (projectId) assertId(projectId, 'project id');
+  if (ticketId) assertId(ticketId, 'ticket id');
+  if (rootId) assertId(rootId, 'work item id');
+  assertFilters({ status, kind });
   const where = [];
   const params = [];
   const add = (sql, val) => { params.push(val); where.push(sql.replace('?', `$${params.length}`)); };
@@ -193,6 +233,7 @@ export async function listWorkItems({ projectId, status, kind, ticketId, rootId,
 }
 
 export async function getWorkItem(id) {
+  assertId(id);
   const row = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!row) return null;
   const item = shapeItem(row);
@@ -270,6 +311,7 @@ async function nextSortOrder(parentId) {
 
 // The project's root item — the parent everything defaults to.
 export async function projectRoot(projectId) {
+  assertId(projectId, 'project id');
   return one(`SELECT ${COLS} FROM work_item WHERE project_id=$1 AND kind='project'`, [projectId]);
 }
 
@@ -280,11 +322,18 @@ export async function createWorkItem(input = {}) {
 
   let parent = null;
   if (input.parent_id) {
+    assertId(input.parent_id, 'parent work item id');
     parent = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [input.parent_id]);
     if (!parent) throw new Error(`parent_id ${input.parent_id} names no work item`);
   }
   const projectId = input.project_id || input.project || parent?.project_id;
   if (!projectId) throw new Error('project required (or a parent_id to inherit it from)');
+  assertId(projectId, 'project id');
+  if (input.ticket_id) assertId(input.ticket_id, 'ticket id');
+  if (input.xell_id) assertId(input.xell_id, 'xell id');
+  if (!WORK_ITEM_KINDS.includes(kind)) {
+    throw new Error(`unknown work item kind "${kind}" — one of: ${WORK_ITEM_KINDS.join(', ')}`);
+  }
   if (parent && parent.project_id !== projectId) {
     throw new Error('a work item must live in the same project as its parent');
   }
@@ -316,14 +365,26 @@ export async function createWorkItem(input = {}) {
 }
 
 export async function updateWorkItem(id, patch = {}, { actor = null } = {}) {
+  assertId(id);
+  if (patch.parent_id) assertId(patch.parent_id, 'parent work item id');
+  if (patch.ticket_id) assertId(patch.ticket_id, 'ticket id');
+  if (patch.xell_id) assertId(patch.xell_id, 'xell id');
   const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
 
   // A parent_id (or an explicit reparent) in a PATCH is a MOVE — it rewrites the path of every
   // descendant, so it goes through the move path and gets its own 'moved' event.
+  //
+  // `moved` must record whether the move ACTUALLY RAN, not merely whether parent_id was in the
+  // body. The first cut skipped the sort_order write whenever the key was present, so a kanban
+  // drag WITHIN one column — which naturally sends {parent_id: <unchanged>, sort_order: N} — got a
+  // 200 and no reorder: nobody applied it, because the move branch had been skipped too. Silent,
+  // and the card snapped back on the next reload.
   let current = before;
+  let moved = false;
   if ('parent_id' in patch && patch.parent_id !== before.parent_id) {
     current = await moveWorkItem(id, { parent_id: patch.parent_id, sort_order: patch.sort_order }, { actor });
+    moved = true;
   }
   // Status is validated against nextStatuses and gets its own 'status' event.
   if ('status' in patch && patch.status !== before.status) {
@@ -335,7 +396,7 @@ export async function updateWorkItem(id, patch = {}, { actor = null } = {}) {
   const changed = {};
   for (const f of EDITABLE) {
     if (!(f in patch)) continue;
-    if (f === 'sort_order' && 'parent_id' in patch) continue;   // the move already placed it
+    if (f === 'sort_order' && moved) continue;   // the move above already placed it
     params.push(patch[f] === '' ? null : patch[f]);
     sets.push(`${f} = $${params.length}`);
     changed[f] = patch[f];
@@ -354,12 +415,21 @@ export async function updateWorkItem(id, patch = {}, { actor = null } = {}) {
 // the nesting rank and cycles, and rewrites path/depth for the whole subtree; here we only turn
 // its refusal into a sentence and record the event.
 export async function moveWorkItem(id, { parent_id: parentId, sort_order: sortOrder } = {}, { actor = null } = {}) {
+  assertId(id);
+  if (parentId) assertId(parentId, 'parent work item id');
   const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
   if (before.kind === 'project') {
     throw new Error(`"${before.title}" is the project's root item — it is the top of the tree and cannot be moved under anything.`);
   }
-  const nextParent = parentId === undefined ? before.parent_id : (parentId || null);
+  // parent_id: null means "move to the TOP LEVEL", and the top level is the project root — not
+  // "become a second root", which the schema forbids anyway. The guard trigger would re-attach it
+  // for us, but resolving it here means the new sort_order is computed among the siblings the item
+  // will ACTUALLY land beside instead of among the roots.
+  let nextParent = parentId === undefined ? before.parent_id : (parentId || null);
+  if (nextParent === null && before.kind !== 'project') {
+    nextParent = (await projectRoot(before.project_id))?.id ?? null;
+  }
   const rank = sortOrder != null ? Number(sortOrder)
     : (nextParent === before.parent_id ? Number(before.sort_order) : await nextSortOrder(nextParent));
 
@@ -379,6 +449,7 @@ export async function moveWorkItem(id, { parent_id: parentId, sort_order: sortOr
 // models expose open_children instead, so a UI can warn ("3 children still open — close them too?")
 // and the human answers.
 export async function setStatus(id, status, { actor = null, cascade = false } = {}) {
+  assertId(id);
   const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
   if (!isWorkStatus(status)) {
@@ -412,6 +483,7 @@ export async function setStatus(id, status, { actor = null, cascade = false } = 
 // went with it — a delete that silently takes eleven descendants is the one destructive act in this
 // module, and the caller is told the number before and after.
 export async function deleteWorkItem(id) {
+  assertId(id);
   const item = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!item) return null;
   if (item.kind === 'project') {
@@ -428,7 +500,9 @@ export async function deleteWorkItem(id) {
 
 // ── dependencies ─────────────────────────────────────────────────────────────
 export async function addDep(workItemId, dependsOnId, { actor = null } = {}) {
+  assertId(workItemId);
   if (!dependsOnId) throw new Error('depends_on_id required');
+  assertId(dependsOnId, 'depends_on_id');
   const row = await one(
     `INSERT INTO work_item_dep (work_item_id, depends_on_id) VALUES ($1,$2)
      ON CONFLICT DO NOTHING RETURNING *`, [workItemId, dependsOnId]);
@@ -439,6 +513,8 @@ export async function addDep(workItemId, dependsOnId, { actor = null } = {}) {
 }
 
 export async function removeDep(workItemId, dependsOnId, { actor = null } = {}) {
+  assertId(workItemId);
+  assertId(dependsOnId, 'depends_on_id');
   const rows = await q(
     `DELETE FROM work_item_dep WHERE work_item_id=$1 AND depends_on_id=$2 RETURNING *`,
     [workItemId, dependsOnId]);
@@ -536,6 +612,8 @@ export async function boardModel({ projectId, rootId } = {}) {
 //     The UI LISTS those; it does not invent dates for them. An invented date is indistinguishable
 //     from a real one the moment it is on screen.
 export async function ganttModel({ projectId, rootId } = {}) {
+  if (projectId) assertId(projectId, 'project id');
+  if (rootId) assertId(rootId);
   let root = null;
   if (rootId) root = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [rootId]);
   else if (projectId) root = await projectRoot(projectId);

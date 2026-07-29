@@ -65,7 +65,7 @@ import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, sugge
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
 import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
-         addDep, removeDep, boardModel, ganttModel } from '../lib/work-items.js';
+         addDep, removeDep, boardModel, ganttModel, assertId } from '../lib/work-items.js';
 import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
          breakdownTicket } from '../lib/tickets.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
@@ -1326,8 +1326,10 @@ router.post('/xells/:id/seed', async (req, res) => {
 // `?project=` exactly like every other read model here (a POST takes `project` in the body).
 //
 // The error contract, stated once and honoured by every handler below:
-//   400 — bad input, with {error} saying what was wrong
-//   404 — no such id
+//   400 — bad input, with {error} saying what was wrong. A MALFORMED id is this, not a 404:
+//         `"not-a-uuid" is not a valid work item id`. The two mistakes are different — a typo in
+//         a URL and a link to something deleted — and each deserves its own answer.
+//   404 — a well-formed id that names nothing
 //   409 — a REFUSED move/delete/transition, with the reason as a sentence a human can read
 //   never a bare 500: the database's own refusals (nesting rank, cross-project parent, cycle) are
 //   raised as messages written for a person, and they arrive here as ordinary Errors.
@@ -1454,6 +1456,10 @@ router.delete('/work-items/:id', async (req, res) => {
 
 router.post('/work-items/:id/deps', async (req, res) => {
   try {
+    // assertId FIRST: a malformed id must read as 400 "not a valid work item id", and only a
+    // well-formed id that names nothing is a 404. Without the check the existence probe below
+    // hands postgres a bad uuid and the caller gets a cast error instead of either answer.
+    assertId(req.params.id);
     const item = await one(`SELECT id FROM work_item WHERE id=$1`, [req.params.id]);
     if (!item) return res.status(404).json({ error: 'no such work item' });
     res.status(201).json(await addDep(req.params.id, req.body?.depends_on_id, { actor: req.body?.actor || null }));

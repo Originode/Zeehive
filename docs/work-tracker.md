@@ -52,16 +52,64 @@ and the web palette cannot drift:
   `occ-land*`→`review`, `occ-ship*`→`shipping`, `occ-done`/`occ-doneRequest`→`done`. Everything
   else → `null`, and null is a real answer: a status is never invented from a hive state that
   implies none.
-- `nextStatuses(key)` / `canTransition(from,to)` — anything may be **cancelled**; a **terminal**
-  item may only go back to `queued` (reopening restarts the flow, so "how did this reach review?"
-  always has an answer in the event log); otherwise any non-terminal status may move to any other,
-  because work really does go working → blocked → working → review → blocked, and a state machine
-  that pretends otherwise only teaches people to lie to it.
+- `nextStatuses(key)` / `canTransition(from,to)` — the exact sets, because a UI that builds a
+  dropdown from a summary sentence will be missing options the server accepts:
+
+  | from | legal next |
+  |---|---|
+  | any non-terminal (`queued` `assigned` `working` `blocked` `review` `shipping`) | every other non-terminal, plus `done`, plus `cancelled` |
+  | `done` | `queued`, `cancelled` |
+  | `cancelled` | `queued` |
+
+  Anything may be **cancelled**. A **terminal** item reopens through `queued` rather than dropping
+  back into the middle of the flow, so "how did this reach review?" always has an answer in the
+  event log. Otherwise any non-terminal status may move to any other, because work really does go
+  working → blocked → working → review → blocked, and a state machine that pretends otherwise only
+  teaches people to lie to it. `canTransition(x, x)` is **true** — a no-op write is not illegal
+  (and `updateWorkItem` skips it entirely rather than writing a pointless event).
+
+  **Read `next[]` from `GET /api/work-statuses`, never from this prose.** The endpoint is generated
+  from the same table the server validates against; a sentence in a doc is not.
 - `workStatusVocabulary()` — the payload behind `GET /api/work-statuses`, so the console never
   hardcodes a column list, a label or an order.
 
 **`live_status` is advisory and is never written back.** The card's column is always its *stored*
 status. A zee going idle for a minute must not silently drag somebody's card into another column.
+
+## Three policies parts 3 and 4 must not misread
+
+These are correct **as built**; they were merely implicit before, which is the same as wrong.
+
+### 1. Root inclusion differs between the views — on purpose
+
+| endpoint | with `?project=` | with `?root=X` | why |
+|---|---|---|---|
+| `GET /api/board` | the root's whole subtree, **root EXCLUDED** | X's subtree, **X EXCLUDED** | a project root is not a card. It is the scope of the board, and it is returned separately as `root` |
+| `GET /api/gantt` | every item, **root INCLUDED** | X **and** its subtree | the project IS the top summary bar — the row whose dates span everything |
+| `GET /api/work-items` | every item, **root INCLUDED** | X **and** its subtree | a list is a list; it hides nothing |
+
+So the *same* `?root=` gives the board one fewer row than the gantt. Part 3 must not go looking for
+the missing card; part 4 must not treat the top gantt row as a task.
+
+### 2. Nesting is `child_rank >= parent_rank`, and nothing narrower
+
+Ranks are `project(0) < activity(1) < task(2)`. A child's rank must be **greater than or equal to**
+its parent's. That means all of these are **legal**:
+
+- activity under project, task under activity — the ordinary shape;
+- **task under task** — subtasks, to any depth;
+- **activity under activity** — a phase inside a phase.
+
+Only *upward* nesting is refused (an activity under a task), plus a `project` anywhere but the root.
+**A tree UI must therefore handle arbitrary depth and repeated kinds** — do not hardcode three
+levels.
+
+### 3. `parent_id: null` means "move to the project root"
+
+It does **not** detach an item, and it does not make it a second root (the schema forbids that).
+`PATCH /api/work-items/:id {"parent_id": null}` lands the item directly under the project root at
+depth 1 — the "drag to top level" gesture. `moveWorkItem` resolves the root itself so the new
+`sort_order` is computed among the siblings the item actually lands beside.
 
 ## The schema (migration 058)
 
@@ -103,9 +151,12 @@ and the libraries do **not** re-check them — they let it raise and pass the se
 **`path`** is the materialized `'/'`-joined list of **ancestor ids, each followed by `/`**:
 a root is `''`, its child `'<root>/'`, a grandchild `'<root>/<child>/'`. So
 
-- an item's whole subtree is `path LIKE (path || id || '/') || '%'` — one index scan
-  (`work_item (path text_pattern_ops)`), no recursive CTE;
-- its ancestors, in order, are the path split on `/`;
+- compute the item's **subtree prefix** first — `prefix = item.path || item.id || '/'` — then its
+  descendants are the rows matching `path LIKE prefix || '%'`: one index scan
+  (`work_item (path text_pattern_ops)`), no recursive CTE. Note the match is **strict descendants**;
+  the item itself does not match its own prefix, which is exactly why the board (which uses the
+  prefix alone) excludes the root while the gantt adds `OR id = <root>`;
+- its ancestors, in order, are the path split on `/` (`ancestorIds(path)`);
 - the cycle check is `position(id in parent.path) > 0`.
 
 Deleting the **project root** is refused in the library, not the database, deliberately: a
@@ -116,14 +167,29 @@ Deleting the **project root** is refused in the library, not the database, delib
 ### `lib/work-items.js`
 
 Pure data + read models, no HTTP. Every mutation ends with `broadcast('work', …)` (so
-`/api/stream` pushes it) **and** appends a `work_item_event` row (`created | status | moved |
-assigned | edited | comment`).
+`/api/stream` pushes it), and every mutation that leaves a **surviving row** also appends a
+`work_item_event`.
+
+**Two vocabularies, deliberately not merged — do not assume one list covers both:**
+
+| | values |
+|---|---|
+| `work_item_event.kind` (the ledger) | `created` `status` `moved` `assigned` `edited` `comment` |
+| broadcast `kind` (the SSE bus) | the six above, **plus** `deleted` and `dep`, **plus** the `ticket-*` kinds |
+
+`deleted` is bus-only and **there is no `deleted` event, ever**: `work_item_event.work_item_id` is
+`ON DELETE CASCADE`, so an event written for a deleted item would be deleted along with it. A
+consumer waiting for one will wait forever. `dep` is bus-only too (a dependency edit is recorded
+against the item as an `edited` event, with `{added_dep}` / `{removed_dep}` in `detail`), and
+`comment` is ledger-only.
 
 - `listWorkItems({projectId, status, kind, ticketId, rootId, tree})` — flat rows, or nested
   (`children: []`) with `tree`. Siblings ordered by `sort_order, created_at`.
 - `getWorkItem(id)` → the item + `ancestors` (from `path`, root first) + `breadcrumb` + `children` +
-  `open_children` + `descendant_count` + `deps` + `dependents` + `ticket` + `events` (last 50) +
-  `zee` + `live_status`.
+  `open_children` (direct) + `descendant_count` + `open_descendant_count` (whole subtree) + `deps` +
+  `dependents` + `ticket` + `events` (last 50) + `zee` + `live_status`. Every item shape also
+  carries `status_label`, `next_statuses` and `ancestor_ids`, so a detail pane needs no second call
+  to know what it may do next.
 - `createWorkItem`, `updateWorkItem`, `moveWorkItem(id,{parent_id,sort_order})`, `deleteWorkItem(id)`,
   `setStatus(id,status,{actor,cascade})`, `addDep` / `removeDep`, `projectRoot(projectId)`.
 - `boardModel({projectId, rootId})`, `ganttModel({projectId, rootId})`.
@@ -156,6 +222,20 @@ estimate_hours?, progress?, status?, ref? }`. **`ref` is a caller-supplied local
 call can build a whole tree: a later entry may name an earlier entry's `ref` as its `parent_id`.
 Without it, expressing one thought would take three round trips.
 
+Three things about it that are easy to get wrong:
+
+- **It is ADDITIVE, not idempotent.** Calling it twice on the same ticket creates a *second* set of
+  items; it does not reconcile or replace the first. A "re-break-down" button duplicates the plan
+  unless the caller deletes the previous items first. Left additive on purpose — a ticket
+  legitimately grows more work as it is understood, and a reconcile would have to guess which
+  existing items the author meant to keep.
+- **`ref` resolves BACKWARDS only.** A ref must be declared by an *earlier* entry in the same array.
+  A forward or unknown ref is refused by name — `item "child": parent_id "later" is neither a work
+  item id nor a ref declared by an EARLIER item in this breakdown (refs so far: …)` — rather than
+  reaching postgres as a uuid cast.
+- **It is not one transaction.** If entry 5 of 6 is rejected, entries 1–4 have already been created.
+  The error names the offending entry so the caller can fix it and re-send only the rest.
+
 ## The read models
 
 ### `GET /api/board?project=&root=`
@@ -164,13 +244,21 @@ Without it, expressing one thought would take three round trips.
 { root, project_id, total, columns: [ { key, label, order, terminal, items: [card…] } ] }
 ```
 
-One column per `work_status`, in the vocabulary's own order. A **card** is a work item plus
-`breadcrumb` (ancestor titles from `path`), `kind`, `priority`, `progress`, `due_on`,
-`ticket` (`{id, number, title}` when linked), `zee` (`{slug, hive_status, hive_status_label}` when a
-live xell is on it), `open_children`, and `live_status` — `statusFromHive(zee.hive_status)` when a
-zee is on it, else `null`.
+One column per `work_status`, in the vocabulary's own order — **including the empty ones**, so the
+console never has to invent a column list.
 
-Default scope: the **whole subtree of the project root**, excluding the root item itself.
+A **card** carries: `id`, `project_id`, `parent_id`, `kind`, `title`, **`status`**,
+**`status_label`**, `priority`, `progress`, **`depth`**, **`sort_order`**, `assignee`, `starts_on`,
+`due_on`, `breadcrumb` (ancestor titles from `path`), `ticket` (`{id, number, title}` when linked),
+`zee` (`{slug, hive_status, hive_status_label}` when a live xell is on it), `open_children` (direct
+children not in a terminal status), and `live_status` — `statusFromHive(zee.hive_status)` when a zee
+is on it, else `null`.
+
+`status`, `status_label`, `depth` and `sort_order` are on the card precisely because a
+drag-and-drop column needs all four: the column it belongs to, its label, its indent, and its rank.
+
+Default scope: the **whole subtree of the project root, root excluded** — see the root-inclusion
+table above.
 
 ### `GET /api/gantt?project=&root=`
 
@@ -182,14 +270,22 @@ Default scope: the **whole subtree of the project root**, excluding the root ite
 
 Rows in **tree order** (depth-first by `sort_order`). Roll-ups:
 
+Rows include the root (see the root-inclusion table). Roll-ups:
+
 - `computed_start` / `computed_end` — a parent **with no explicit dates** spans
   `min(children start) … max(children end)`. A parent **with** its own dates keeps them: someone
-  stated them on purpose.
-- `rolled_progress` — a parent with no explicit progress is the **child-count-weighted** average of
-  its children's rolled progress, so a branch with nine subtasks outweighs a branch with one.
+  stated them on purpose. Only the missing end is rolled — a parent with a `starts_on` and no
+  `due_on` keeps its start and rolls its end.
+- `rolled_progress` — a parent with no explicit progress is the **leaf-count-weighted** average of
+  its children's rolled progress (each child weighs the number of leaves beneath it, *not* its
+  number of direct children), so a branch with nine subtasks outweighs a branch with one.
+
+  **"No explicit progress" is implemented as `progress === 0`.** There is no way to state a
+  deliberate 0% on a parent — it will always show the rolled average instead. Leaves always report
+  their own `progress` as `rolled_progress`.
 - `unscheduled: true` — no dates anywhere in the subtree. Those rows come back with **nulls** and
-  the flag. The UI **lists** them; it does not invent dates, because an invented date is
-  indistinguishable from a real one the moment it is on screen.
+  the flag, and `unscheduled_count` totals them. The UI **lists** them; it does not invent dates,
+  because an invented date is indistinguishable from a real one the moment it is on screen.
 
 ## The endpoints
 
@@ -220,6 +316,19 @@ reason as a sentence a human can read**, and never a bare 500. The split: a 400 
 nonsense"*, a 409 says *"what you asked is coherent but conflicts with the state of the tree"* — a
 cycle, an activity under a task, deleting the project root, a done item jumping back to working.
 
+**Malformed id vs unknown id.** They are different mistakes — a typo in a URL, and a link to
+something that was deleted — so they get different answers:
+
+| you sent | answer |
+|---|---|
+| `/api/work-items/not-a-uuid` | **400** `{"error":"\"not-a-uuid\" is not a valid work item id"}` |
+| `/api/work-items/<well-formed but unknown>` | **404** `{"error":"no such work item"}` |
+
+The same holds for ticket ids and for `parent_id` / `depends_on_id` / `ticket_id` / `xell_id` /
+`project` in a body, each naming the field it rejected (`… is not a valid parent work item id`). An
+unknown `?status=` or `?kind=` filter is likewise a 400 listing the legal values, never a postgres
+enum cast error.
+
 ## Test
 
 ```sh
@@ -242,7 +351,24 @@ test data).
 - **Import the vocabulary, do not retype it.** `GET /api/work-statuses` (or
   `lib/work-status.js`) gives labels, column order, terminal flags and legal transitions.
 - **`sort_order` is a double** precisely so a drag can insert between two neighbours
-  (`(prev+next)/2`) without renumbering a column.
-- **SSE**: every mutation broadcasts on the `work` channel of `/api/stream`, as
-  `{kind, item}` / `{kind, ticket}` where `kind` is `created|status|moved|assigned|edited|deleted|
-  dep|ticket-created|ticket-updated|ticket-deleted|ticket-comment|ticket-breakdown`.
+  (`(prev+next)/2`) without renumbering a column. Send it however you like: `{sort_order}` alone,
+  or `{parent_id, sort_order}` together — **both work, including when `parent_id` is unchanged**.
+  (They did not always: a same-column drag was silently dropped until the regression now pinned in
+  `test/work-tracker.test.mjs`.) When the parent *does* change, the move applies the rank; you get
+  exactly one `moved` event either way.
+- **SSE**: every mutation broadcasts on the `work` channel of `/api/stream`. The payload shape
+  varies by kind — do not assume `{kind, item}` throughout:
+
+  | broadcast `kind` | payload |
+  |---|---|
+  | `created` `status` `moved` `assigned` `edited` `dep` | `{kind, item}` |
+  | `deleted` | `{kind, item, descendants}` |
+  | `ticket-created` `ticket-updated` `ticket-deleted` | `{kind, ticket}` |
+  | `ticket-comment` | `{kind, ticket, comment}` |
+  | `ticket-breakdown` | `{kind, ticket, created}` — `created` is a **count**, not the items |
+
+  And remember the ledger is a different list (no `deleted`, no `dep`; it has `comment`).
+- **Ticket writes are only partly audited.** A ticket edit or comment appends a `work_item_event`
+  **only when the ticket already has a linked `work_item_id`** — the event hangs off that item's
+  ledger. `createTicket` appends none at all (there is nothing yet to hang it on). If part 3 needs a
+  full ticket history, that is a new table, not something to read out of `work_item_event`.
