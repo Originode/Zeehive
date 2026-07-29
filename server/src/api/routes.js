@@ -47,7 +47,8 @@ import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironme
 import { listSharedContainers, createSharedContainer, updateSharedContainer, deleteSharedContainer }
   from '../lib/inventory.js';
 import { discoverSite, adoptContainers } from '../lib/discovery.js';
-import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus } from '../queenzee/landgate.js';
+import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, landStatus,
+         withdrawLandRequest } from '../queenzee/landgate.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
@@ -56,7 +57,7 @@ import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrat
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
-import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
+import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
          selfSuggestDone } from '../queenzee/self.js';
@@ -133,6 +134,14 @@ router.post('/land/requests/:id/:decision(approve|reject)', async (req, res) => 
 // only: the reaper keeps landing/staling the row on its own schedule.
 router.post('/land/requests/:id/dismiss', async (req, res) => {
   try { res.json(await dismissLandRequest(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// WITHDRAW a pending request on the zee's behalf (an operator clearing a card whose zee is gone, or
+// tidying up after one that stacked them). NOT a rejection: nothing is refused and no sha is burned,
+// so the same work can be pushed and asked again. Pending rows only — an approved one is a decision.
+router.post('/land/requests/:id/withdraw', async (req, res) => {
+  try { res.json(await withdrawLandRequest(req.params.id, req.body?.by || 'human@console', req.body?.reason || null)); }
   catch (err) { res.status(409).json({ error: err.message }); }
 });
 
@@ -1082,6 +1091,16 @@ router.get('/xell/self/status', async (req, res) => {
 // Collect this cxell's commits and run the gated push — HELD for a human (landgate). Never moves main.
 router.post('/xell/self/land', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfLand(x)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// UN-ASK a held landing: the zee lowers its OWN pending land request(s) (`zee land --withdraw`).
+// Symmetric with `zee tend --clear` / `zee done --clear`, and the reason a zee never has to leave a
+// stale card behind when it changes its mind — the discipline is withdraw-then-land, not push again
+// and let a human guess which of three cards is current. Approved requests are left alone: a human's
+// decision is not an agent's to retract.
+router.post('/xell/self/land/withdraw', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfWithdrawLand(x, { reason: req.body?.reason || null, request: req.body?.request || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Reconcile with main ON THE ZEE'S OWN: deliver current main into the cxell, merge it (pure script),

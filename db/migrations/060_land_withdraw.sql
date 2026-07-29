@@ -1,0 +1,19 @@
+-- WITHDRAWING A LANDING — the half of the landing gate the ZEE never had.
+--
+-- Every other ask a zee raises can be lowered by the zee that raised it: `zee tend --clear`,
+-- `zee hint-land --clear`, `zee done --clear`. A LAND REQUEST could not. Once the gate held a push
+-- the only exits were a human's Approve/Reject and the reaper's 'stale' — so a zee that asked to
+-- land and then thought better of it (it spotted a bug, the work turned out to be half-finished,
+-- it was handed more scope) had exactly one move: commit more and push again, raising ANOTHER card
+-- for the same job. That is the land-request spam humans see: three held landings from one xell,
+-- two of them obsolete, and no way to tell which one the zee still means.
+--
+-- So: 'withdrawn' — the zee's own retraction. Terminal, never a decision (no human read it, nobody
+-- approved or refused anything), and it drops the row out of every OPEN list by construction:
+-- fleet.landing, listLandRequests, the landing pad and the hive's land_pending all filter on
+-- status IN ('pending','approved').
+--
+-- ALONE IN THIS FILE ON PURPOSE: postgres refuses to USE a new enum value in the same transaction
+-- that adds it, and the migration runner wraps each file in one. The columns and the CHECK that
+-- reference 'withdrawn' therefore live in 061.
+ALTER TYPE land_status ADD VALUE IF NOT EXISTS 'withdrawn';
