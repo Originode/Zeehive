@@ -568,8 +568,10 @@ were both verified working — it is not the install, and reinstalling is a wast
 - MCP (`mcp/server.js`): `zeehive_get_context`, `zeehive_status`, `zeehive_report_done`,
   `zeehive_prod_lock_{acquire,release,status}`.
 
-The web app is **read-only** (no prompting there); the **▚_ terminal** button by "Status" opens a
-live queenzee activity log.
+The web app is **read-only** about the FLEET (no prompting there); the **▚_ terminal** button by
+"Status" opens a live queenzee activity log. ⚠ That stance was never about the zee TERMINAL —
+"when i said readonly i didnt mean the terminal was readonly". You can converse with any cxell zee
+from its terminal, mid-turn included: see the TALK QUEUE below.
 
 **Attending a cxell zee** (`⌨` on its card) opens the live terminal: while the headless turn runs
 you get its transcript feed (`docker/zeehive/zee-live.mjs` — ✱ thinking, ● what it says, ⚒ tool
@@ -580,3 +582,33 @@ belongs to `claude` after the turn), and the renderer watches the file and REPAI
 also removes what already scrolled past. The queenzee installs its own zee-live.mjs into every
 cxell at spawn, exactly as it does `scripts/zee`, or a stale image would leave the chips dead.
 Tests: `test/zee-live-view.test.mjs`, `test/terminal-feed-filter.test.mjs`.
+
+**The TALK QUEUE — conversing with a zee that is MID-TURN** (2026-07-29). That feed is read-only in
+BOTH directions: it renders the transcript and reads nothing from the terminal. So while a zee
+worked, every keystroke aimed at it vanished — a human's in the browser, and the queenzee's
+`send-keys` behind the 📨 message button, the 💬 nudge and a manager's `zee say` — while the console
+reported "typed into its live session". Worst for a **manager zee**, whose whole job is conversation,
+in the one place a human goes to talk to it.
+
+- **The queenzee decides, from the cage's real state.** `cxellTalkCommand` (`lib/cxell.js`, pure)
+  attaches-or-creates the pane session, then TYPES when the interactive session owns it and QUEUES a
+  file in `/tmp/zee-talk` when a headless turn (or its feed) does. `sendKeysToCxellZee` resolves
+  `{ sent, delivery: 'typed' | 'queued' }` and every caller passes that word on — "delivered" and
+  "will be delivered" are different promises.
+- **The cage drains it.** `zee-attach.sh` starts `drain_talk` AFTER the feed hands over and before
+  the vendor's resume takes the pane: oldest first, newlines collapsed (Enter SUBMITS in the TUI),
+  each file removed BEFORE it is typed (a crash loses a message rather than repeating it), and the
+  drainer is STOPPED before the pane falls back to a login shell — a queued message typed at a bash
+  prompt is a COMMAND, not a message.
+- **One pattern, two places.** `HEADLESS_PROC_PATTERN` (`lib/cxell-runtimes.js`) IS `live_run()` in
+  `zee-attach.sh`; they disagreeing means a message queued that nothing drains. Its brackets are
+  load-bearing: `pgrep -f` reads whole cmdlines and the pattern rides inside the command the
+  queenzee execs, so unbracketed it matched its OWN wrapper and made every cxell look mid-turn
+  forever (caught live). Same trick, same reason, as `zee-live[.]mjs`.
+- **zee-attach.sh now joins the CLI/renderer refresh** (spawn + the boot sweep), or the drainer would
+  exist only in cages built after the next image rebuild while the queue filled in every cxell alive.
+- **The terminal grew 💬 talk** — the same composer 📨 opens (one delivery path, one set of rules for
+  long text and images), highlighted while a feed owns the pane, printing a receipt into the pane
+  that says *typed* or *queued*. The feed banner now says the pane is read-only and where the door is.
+- Tests: `test/cxell-talk.test.mjs` (runs the REAL `drain_talk` against a REAL tmux pane, and the real
+  `sendKeysToCxellZee` against a throwaway sshd) and `test/terminal-talk-button.test.mjs`.
