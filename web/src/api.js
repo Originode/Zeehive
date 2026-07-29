@@ -267,7 +267,7 @@ export const draftProjectManifest = (projectId, write = false) => siteCall(`/api
 export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog }) {
   const es = new EventSource(`/api/stream${pq(projectId)}`);
   es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
-  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship']) {
+  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work']) {
     es.addEventListener(type, () => onChange());
   }
   if (onLog) es.addEventListener('log', (e) => onLog(JSON.parse(e.data)));

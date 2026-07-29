@@ -260,6 +260,70 @@ try {
   ok(blocked.zee.hive_status === 'occ-tendRequest' && blocked.live_status === 'blocked',
      'a zee raising a tend makes the item read live_status=blocked (it is waiting on a human)');
 
+  // ── REGRESSION: a REAPED xell must not keep answering for the item ───────
+  //
+  // reapXell never deletes the xell row — it sets status='retired' — so work_item.xell_id keeps
+  // pointing at a corpse and ON DELETE SET NULL never fires. The corpse used to answer: hiveStatus
+  // had no case for 'retired' and fell through to its 'occ-claimed' fallback, so a card reported a
+  // live zee ('assigned') on work whose agent had been gone for a week. Worse with an open landing:
+  // the reaper releases open SHIPS but never land requests, so it read 'review' instead.
+  //
+  // This replays exactly what reapXell writes, in its order, rather than trusting a description of
+  // it: zee → stopped/decommissioned, owned containers deleted, xell → retired.
+  section('a reaped xell stops speaking for the work');
+  await client.query(
+    `INSERT INTO land_request (project_id, xell_id, status, new_sha, ref)
+       VALUES ($1,$2,'pending','deadbeef','refs/heads/main')`, [PID, xell.id]);
+  const midLanding = await W.getWorkItem(loose.id);
+  ok(midLanding.zee.hive_status === 'occ-landRequest' && midLanding.live_status === 'review',
+     'while the xell is ALIVE, a held landing legitimately reads live_status=review');
+
+  await client.query(`UPDATE zee SET status='stopped', name=NULL, decommissioned_at=now() WHERE xell_id=$1`, [xell.id]);
+  await client.query(`DELETE FROM container WHERE owner_xell_id=$1`, [xell.id]);
+  await client.query(`UPDATE xell SET status='retired', retired_at=now(), is_pooled=false WHERE id=$1`, [xell.id]);
+
+  const reaped = await W.getWorkItem(loose.id);
+  ok(reaped.zee === null, 'after the reap the item reports NO zee (not a corpse that answers)');
+  ok(reaped.live_status === null, 'and live_status is null — no invented "assigned"');
+  ok(reaped.status === 'queued',
+     'while the STORED status is untouched: the AGENT is gone, the WORK is not finished');
+  ok(reaped.xell_id === xell.id,
+     'the xell_id stays on the row as HISTORY (part 2/3 builds "was: <slug>" from it + the ledger)');
+  ok((await client.query(
+    `SELECT count(*)::int n FROM land_request WHERE xell_id=$1 AND status='pending'`, [xell.id])).rows[0].n === 1,
+     'the land request really is still open — the reaper never dismisses one');
+  ok(reaped.live_status !== 'review',
+     '…yet "blocked on a human" does NOT outlive the agent: a dead xell lends the item no signal at all');
+
+  const reapedBoard = await W.boardModel({ projectId: PID });
+  const reapedCard = reapedBoard.columns.flatMap((c) => c.items).find((c) => c.id === loose.id);
+  ok(reapedCard.zee === null && reapedCard.live_status === null, 'and the BOARD card says the same');
+  ok((await W.liveZees([xell.id])).size === 0, 'liveZees resolves a retired xell to nothing at all');
+
+  // hive-status.js keeps its contract for everyone who already filters retired (fleet.js,
+  // managers.crewFor); the new case only stops the fallback speaking for a row it knows nothing of.
+  const { hiveStatus, hiveLabel } = await import('../server/src/lib/hive-status.js');
+  ok(hiveStatus({ status: 'retired' }) === null, 'hiveStatus answers NULL for a retired xell, not occ-claimed');
+  ok(hiveLabel(null) === '—', 'and hiveLabel(null) was already the dash — no new vocabulary needed');
+  ok(hiveStatus({ status: 'working', zee_status: 'working' }) === 'occ-working'
+     && hiveStatus({ status: 'claimed' }) === 'occ-claimed'
+     && hiveStatus({ status: 'ready' }) === 'vac-ready'
+     && hiveStatus({ status: 'husk' }) === 'vac-dirty'
+     && hiveStatus({ status: 'tearing-down' }) === 'occ-done'
+     && hiveStatus({ status: 'awaiting-done' }) === 'occ-doneRequest'
+     && hiveStatus({ is_production: true }, { prodUnprotected: true }) === 'live-unprotected',
+     'every OTHER derivation is byte-for-byte unchanged (fleet.js cannot have shifted)');
+  ok(hiveStatus({ status: 'working' }, { landPending: true }) === 'occ-landRequest'
+     && hiveStatus({ status: 'working' }, { tendPending: true }) === 'occ-tendRequest',
+     'and the signal precedence is untouched');
+
+  // put the xell back so the rest of the file exercises a LIVE zee as before
+  await client.query(`DELETE FROM land_request WHERE xell_id=$1`, [xell.id]);
+  await client.query(`UPDATE xell SET status='working', retired_at=NULL WHERE id=$1`, [xell.id]);
+  await client.query(`UPDATE zee SET status='working', decommissioned_at=NULL WHERE xell_id=$1`, [xell.id]);
+  ok((await W.getWorkItem(loose.id)).zee?.hive_status === 'occ-tendRequest',
+     'and a xell brought back to life resolves again (the filter is on state, not a tombstone)');
+
   // ── 7: the read models ───────────────────────────────────────────────────
   section('the board');
   const board = await W.boardModel({ projectId: PID });
