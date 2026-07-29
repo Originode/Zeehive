@@ -89,9 +89,15 @@ try {
   // — its declared type and its parent chain — is the thing these lints are actually about, so a
   // role added under dev-base is linted whatever it is called, and a manager harness never is
   // however it is named.
+  // …and SYSTEM-WIDE (084). The crew is the FLEET'S shared vocabulary — that is what every lint below
+  // is about: one roster the lead casts from, no project lore, no path or container named, no own
+  // memory. Since 084 a manager can mint a PROJECT-SCOPED persona of its own that inherits dev-base
+  // (exactly the intended use: inherit the craft, add this project's specifics), and every one of
+  // those lints is the wrong question for it — it SHOULD carry project lore, and it is on nobody's
+  // roster. So membership is "descends from dev-base AND belongs to no project".
   const chainOf = (key) => { const c = []; let cur = byKey[key], n = 0;
     while (cur && n++ < 32) { c.push(cur.key); cur = byKey[cur.parent_key]; } return c; };
-  const isCrew = (key) => chainOf(key).includes(CREW_ROOT);
+  const isCrew = (key) => !byKey[key]?.project_id && chainOf(key).includes(CREW_ROOT);
   const crew = all.filter((r) => isCrew(r.key)).sort((a, b) => a.key.localeCompare(b.key));
   const roles = crew.filter((r) => r.key !== CREW_ROOT);
   const crewKeys = crew.map((r) => r.key);

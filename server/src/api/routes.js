@@ -63,7 +63,8 @@ import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
-         selfSuggestDone } from '../queenzee/self.js';
+         selfSuggestDone, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
+         selfHarnessDelete } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor } from '../lib/managers.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
@@ -675,9 +676,12 @@ router.post('/xells/:id/db', async (req, res) => {
 // mutable; { harness: <key|id|null> }, null clears back to core-only).
 // `?zee_type=worker|manager` narrows the list to the harnesses a xell of that TYPE may wear (054) —
 // what every picker should ask for, so an operator is never offered a choice the assign would refuse.
-// Unfiltered still returns everything (the harness manager edits them all).
+// `?project=<id>` narrows it on the SCOPE axis (084): the system-wide harnesses plus that project's
+// own, never another project's — which is what every picker bound to a project should ask for.
+// Unfiltered still returns everything (the harness manager edits them all), and every row SAYS its
+// scope (`scope`, `project_id`, `project_name`).
 router.get('/harnesses', async (req, res) => {
-  try { res.json(await listHarnesses({ zeeType: req.query.zee_type || null })); }
+  try { res.json(await listHarnesses({ zeeType: req.query.zee_type || null, projectId: req.query.project || null })); }
   catch (err) { res.status(503).json({ error: err.message }); }
 });
 // Harness authoring (unlimited DB-owned personas — persona/skills/memory, created from the dashboard).
@@ -1298,6 +1302,34 @@ router.get('/xell/self/inbox', async (req, res) => {
 router.post('/xell/self/suggest-done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfSuggestDone(x, { to: req.body?.to, reason: req.body?.reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── MANAGER-ZEE verbs (harnesses): a manager mints its own specialised WORKER personas ─────────
+// Same authentication, same shape, same NOT-gated reasoning as `zee dispatch`: what a manager creates
+// here is scoped to ITS OWN project (084) and can only ever be worn by a caged worker. The project is
+// resolved from the token and never from the body, and everything that would grow the manager's own
+// authority is refused in self.js with a sentence — a manager persona, any system-wide harness,
+// another project's harness, a non-persona field, or a harness a live xell is wearing.
+router.get('/xell/self/harnesses', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessList(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.get('/xell/self/harness/:key', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessGet(x, req.params.key)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/harness', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessCreate(x, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.put('/xell/self/harness/:key', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHarnessUpdate(x, req.params.key, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/xell/self/harness/:key', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessDelete(x, req.params.key)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

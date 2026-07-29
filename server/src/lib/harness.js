@@ -45,6 +45,20 @@ export function harnessFitsType(harnessType, zeeType) {
   const h = normalizeZeeType(harnessType, 'worker');
   return h === 'any' || h === normalizeZeeType(zeeType, 'worker');
 }
+
+// SCOPE (084) — the same shape as the type rule, for the other axis. A harness with no project_id is
+// SYSTEM-WIDE (the default, and what every harness seeded before 084 is); one with a project_id is
+// visible to that project only. A xell may wear a global harness or its OWN project's, and nothing
+// else. The DB trigger is the wall; this is the one predicate every list, picker and assign path
+// shares so none of them can offer a choice the wall would then refuse.
+export function harnessFitsProject(harnessProjectId, projectId) {
+  return !harnessProjectId || String(harnessProjectId) === String(projectId || '');
+}
+export function scopeMismatchReason(harness, projectName = null) {
+  return `harness "${harness.key}" belongs to ${projectName ? `project "${projectName}"` : 'another project'} `
+    + 'and this xell does not. A project-scoped persona is visible to its own project only (that is what '
+    + 'scoping one means) — pick a system-wide harness, or one of this project\'s own.';
+}
 export function typeMismatchReason(harness, zeeType) {
   return `harness "${harness.key}" is for ${harness.zee_type} zees, but this xell is a `
     + `${normalizeZeeType(zeeType)} zee. A harness carries the manual for a type's verbs and refusals `
@@ -206,8 +220,13 @@ export async function defaultHarnessId(projectId, { zeeType = 'worker' } = {}) {
   // The project default is a WORKER default by construction — it is what a bare dispatch attaches.
   // Never hand it to a manager: that would strip the manual its verbs come from, and the assign
   // would be refused anyway. A manager with no explicit harness gets the manager one instead.
-  const h = await one(`SELECT zee_type FROM harness WHERE id=$1`, [r.default_harness_id]);
-  return harnessFitsType(h?.zee_type, zeeType) ? r.default_harness_id : null;
+  //
+  // The SCOPE check is belt-and-braces (pool_default_harness_scope_guard refuses the column being set
+  // to another project's harness at all), and it fails the way this function already fails: no
+  // default, so the dispatch attaches nothing — never another project's persona.
+  const h = await one(`SELECT zee_type, project_id FROM harness WHERE id=$1`, [r.default_harness_id]);
+  if (!harnessFitsType(h?.zee_type, zeeType)) return null;
+  return harnessFitsProject(h?.project_id, projectId) ? r.default_harness_id : null;
 }
 
 // Resolve a harness key OR id to its row (for --harness / API assign). NULL/'none' → null (core only).
@@ -225,8 +244,14 @@ export async function assignHarness(xellId, keyOrId) {
   // real wall; this check exists so the caller gets a sentence explaining WHY, rather than a raw
   // postgres exception the console would have to render as gibberish.
   if (h) {
-    const x = await one(`SELECT zee_type FROM xell WHERE id=$1`, [xellId]);
+    const x = await one(`SELECT zee_type, project_id FROM xell WHERE id=$1`, [xellId]);
     if (!harnessFitsType(h.zee_type, x?.zee_type)) throw new Error(typeMismatchReason(h, x?.zee_type));
+    // SCOPE next (084), same reasoning: the trigger refuses it either way, but a caller deserves the
+    // sentence rather than a postgres exception — and this one names the project that owns it.
+    if (!harnessFitsProject(h.project_id, x?.project_id)) {
+      const owner = await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]);
+      throw new Error(scopeMismatchReason(h, owner?.name || null));
+    }
   }
   await one(`UPDATE xell SET harness_id=$2 WHERE id=$1 RETURNING id`, [xellId, h?.id || null]);
   logline('harness', `xell ${String(xellId).slice(0, 8)} → harness ${h?.key || '(core only)'}`);
@@ -234,21 +259,31 @@ export async function assignHarness(xellId, keyOrId) {
 }
 
 // List enabled harnesses for the picker/UI (core last — it is implicit/always-on).
-export async function listHarnesses({ zeeType = null } = {}) {
+export async function listHarnesses({ zeeType = null, projectId = null } = {}) {
   const rows = await q(
-    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.head_commit, h.zee_type,
+    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.head_commit, h.zee_type, h.project_id,
             (h.bundle->>'avatar_svg') IS NOT NULL AS has_avatar,
             (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
             h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
             h.bundle->>'personality' AS personality,
-            p.key AS parent
+            p.key AS parent, pr.name AS project_name
        FROM harness h LEFT JOIN harness p ON p.id = h.parent_id
+            LEFT JOIN project pr ON pr.id = h.project_id
       WHERE h.enabled ORDER BY h.is_law_core, h.key`);
   // `zeeType` narrows the list to what a xell of that type may actually WEAR — what every picker
   // must offer, so an operator is never shown a choice the assign path would then refuse.
-  return rows.filter((h) => !zeeType || harnessFitsType(h.zee_type, zeeType)).map((h) => ({
+  //
+  // `projectId` narrows it the same way on the SCOPE axis (084): a project's list is the system-wide
+  // harnesses PLUS that project's own, and never another project's. Omitting it returns everything —
+  // that is the console's harness manager, which edits them all and says which scope each row is.
+  return rows.filter((h) => (!zeeType || harnessFitsType(h.zee_type, zeeType))
+                         && (!projectId || harnessFitsProject(h.project_id, projectId))).map((h) => ({
     id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core, parent: h.parent,
     zee_type: h.zee_type,
+    // SCOPE, on every row: a picker that shows a project persona and a global one identically invites
+    // an operator to edit the fleet's shared vocabulary thinking it is their own.
+    project_id: h.project_id || null, project_name: h.project_name || null,
+    scope: h.project_id ? 'project' : 'global',
     has_avatar: !!h.has_avatar, avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
     head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
@@ -294,17 +329,27 @@ function normalizeMemory(arr) {
     .filter((m) => m.text);
 }
 
-export async function createHarness({ key, label, glyph, zee_type } = {}) {
+export async function createHarness({ key, label, glyph, zee_type, project_id = null } = {}) {
   const k = slugKey(key || label);
   if (k === 'core') throw new Error('"core" is reserved for the law harness');
-  if (await one(`SELECT id FROM harness WHERE key=$1`, [k])) throw new Error(`a harness "${k}" already exists`);
+  // Keys are UNIQUE across the fleet, scoped or not: a key is how a harness is named on a dispatch
+  // (`--harness <key>`) and in the meta-DB, so two harnesses answering to one key would make that
+  // reference ambiguous. Say so, rather than let the raw constraint speak.
+  if (await one(`SELECT id FROM harness WHERE key=$1`, [k])) {
+    throw new Error(`a harness "${k}" already exists — harness keys are unique across the hive `
+      + '(they are how a harness is named on a dispatch), so pick another name');
+  }
   // Which TYPE of zee this persona is for. Worker is the default — the overwhelming majority, and
   // the safe one: a manager harness handed to a worker teaches verbs the worker does not have.
   const type = normalizeZeeType(zee_type, 'worker');
+  // SCOPE (084): NULL = system-wide, and that is the DEFAULT — a harness created without a project is
+  // the fleet's shared vocabulary, exactly as every harness was before scoping existed. A project_id
+  // makes it that project's own, visible nowhere else and deleted with the project.
   const bundle = { label: label || k, zee_type: type, ...(glyph ? { glyph: String(glyph).slice(0, 4) } : {}) };
-  await one(`INSERT INTO harness (key,label,bundle,enabled,is_law_core,zee_type) VALUES ($1,$2,$3,true,false,$4) RETURNING id`,
-    [k, label || k, JSON.stringify(bundle), type]);
-  logline('harness', `created ${type} harness "${k}"`);
+  await one(`INSERT INTO harness (key,label,bundle,enabled,is_law_core,zee_type,project_id)
+               VALUES ($1,$2,$3,true,false,$4,$5) RETURNING id`,
+    [k, label || k, JSON.stringify(bundle), type, project_id || null]);
+  logline('harness', `created ${type} harness "${k}"${project_id ? ` scoped to project ${String(project_id).slice(0, 8)}` : ' (system-wide)'}`);
   return getHarnessFull(k);
 }
 
@@ -385,8 +430,13 @@ export async function getHarnessFull(key) {
     const eff = await effectiveHarness(await one(`SELECT * FROM harness WHERE id=$1`, [h.parent_id]));
     if (eff) inherited = { skills: eff.skills, memory: eff.memory, chain: eff.chain };
   }
+  // Which SCOPE this persona is in (084) — the editor states it, and its parent picker needs it: a
+  // harness may only inherit a global one or one in its own project.
+  const owner = h.project_id ? await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]) : null;
   return {
     key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core,
+    project_id: h.project_id || null, project_name: owner?.name || null,
+    scope: h.project_id ? 'project' : 'global',
     avatar_svg: harnessAvatarSvg(b) || '',
     parent, zee_type: h.zee_type, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
