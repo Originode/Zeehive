@@ -11,8 +11,7 @@ Ask the questions in order. The FIRST yes is the role you cast; stop there.
    public interface, a dependency, a boundary)? → **dev-architect**. Output: a decision record.
 3. Is something broken, with no reliable reproduction yet? → **dev-fixer**. A builder handed a vague
    bug guesses; a fixer reproduces first, and the reproduction is half the deliverable.
-4. Is the behaviour agreed and the change plainly code? → **dev-builder**. The default, and the most
-   common right answer.
+4. Is the behaviour agreed and the change plainly code? → **dev-builder**. The default.
 5. Is the behaviour real but unproven — no way to check it, or a regression that keeps returning?
    → **dev-tester**.
 6. Is the code written and the risk in what it might have broken? → **dev-reviewer**. Cast a
