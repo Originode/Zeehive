@@ -1126,13 +1126,12 @@ export function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = 
   ctx.restore();
 }
 
-// The badge's word for a harness carrying nothing — `files_missing` (its folder in the Zeehive
+// The badge's word for a harness carrying nothing — `bundle_empty` (the harness row in the Zeehive
 // project repo is unreadable from the queenzee) beats `bundle_empty` (no personality/skills/memory),
 // because it names the CAUSE. Same two fields, same precedence and nearly the same words as the DOM
 // surfaces (web/src/harnessHealth.js) — a canvas cannot import the JSX helper, so the wording is
 // kept short here and the two are locked together by test/harness-empty-visible.test.mjs.
 export function harnessWarning(h) {
-  if (h?.files_missing) return '⚠ no files';
   if (h?.bundle_empty) return '⚠ empty';
   return null;
 }

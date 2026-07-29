@@ -663,9 +663,9 @@ router.delete('/harnesses/:key', async (req, res) => {
 });
 // The harness avatar badge (SVG). Resolved from the harness row's avatar_path under the repo the
 // harness FILES live in (the Zeehive project's repo_root, falling back to config.repoRoot) —
-// harnessAvatarFile() is the same resolution loadHarnessDir uses, so the badge and the bundle can
-// never disagree about which repo a harness is. Path-guarded so a crafted avatar_path can't escape
-// harnesses/. 404 when a harness has no avatar (or its folder is not readable from here).
+// avatar SVG is the ONE harness thing still on disk (art, not agent-facing text) — the bundle lives
+// in the row. Path-guarded so a crafted avatar_path can't escape harnesses/. 404 when a harness has
+// no avatar, or when the repo holding it is not readable from here.
 router.get('/harnesses/:key/avatar', async (req, res) => {
   try {
     const h = await one(`SELECT avatar_path FROM harness WHERE key=$1`, [req.params.key]);

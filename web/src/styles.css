@@ -1230,7 +1230,7 @@ a.cbox:hover { border-color: var(--accent); }
   cursor: pointer; padding: 4px 8px; }
 .hm-del:hover { color: var(--del, #e5554e); border-color: var(--del, #e5554e); }
 
-/* A harness carrying NOTHING (files_missing / bundle_empty). It used to render identically to one
+/* A harness carrying NOTHING (bundle_empty). It used to render identically to one
    carrying a 12.9k manual — same row, same badge — which is how a whole fleet of manager zees ran
    with a blank persona unnoticed. The chip's WORDS are the signal (see web/src/harnessHealth.js);
    these rules are reinforcement, never the only cue. */

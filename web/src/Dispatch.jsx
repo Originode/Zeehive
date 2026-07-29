@@ -283,7 +283,7 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
                   )}
                   {/* A harness that carries NOTHING is offered here exactly like a full one, and the
                       zee you dispatch is the one who pays for it — so say so at the point of choice.
-                      files_missing/bundle_empty come from GET /api/harnesses. */}
+                      bundle_empty comes from GET /api/harnesses. */}
                   {harnesses.map((h) => {
                     const warn = emptyWarning(h);
                     return (
