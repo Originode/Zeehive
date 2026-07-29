@@ -14,7 +14,15 @@
 //   2. the generated text: the meta-DB stamp first, the body verbatim, disabled/empty rows skipped;
 //   3. the TRACKED-FILE REFUSAL, run against real `git ls-files` — the exact script the injector
 //      executes inside the cage, so this is the decision itself and not a paraphrase of it;
-//   4. and that an untracked write is git-EXCLUDED, so the artefact can never travel into a commit.
+//   4. that an untracked write is git-EXCLUDED, so the artefact can never travel into a commit;
+//   5. and the INJECTOR'S OWN RETURN VALUE, driven through the real writeGeneratedDocIntoCxell with a
+//      fake `docker` on PATH.
+//
+// (5) exists because of a bug that shipped: the function read `await dk(...)` as a string, but dk
+// resolves { code, out, err }, so the verdict was always '[object Object]' and every doc the container
+// really wrote came back written:false — the write worked and the report lied. Section 3 was green
+// throughout, because extracting the shell script and running it under bash never touches the JS that
+// parses the answer. Testing the half you wrote by hand and trusting the seam is the whole lesson.
 // Everything it creates is deleted in a finally, whatever happens.
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -106,7 +114,7 @@ try {
      'the injector really asks git before writing (its script is read out of the source here)');
   // the target path is interpolated by the caller (shell-quoted there), so it is supplied here the
   // same way: everything else is the source's own lines, in the source's own order.
-  ok(/P=\$\{sq\(safe\)\}/.test(block), 'and the path it asks about is the shell-quoted target');
+  ok(block.includes('P=${sq(safe)}'), 'and the path it asks about is the shell-quoted target');
   const run = (relPath, text) => {
     const script = [`cd ${repo}`, `P='${relPath}'`,
       ...steps.filter((l) => l !== 'cd /work/repo')].join('\n');
@@ -163,6 +171,48 @@ try {
      'the push obeys PROVISION_MODE and says so rather than execing into another zee\'s cxell');
   ok(said.some((m) => m.includes(liveXell.slug)),
      'and NAMES the live xell it would have regenerated in — a report, never a silent skip');
+
+  // ── 5. the injector's own return value, through a fake docker ────────────────────────────────
+  // dk() spawns `docker` off PATH, so a shim IS the real code path: spawn, stdin, close, parse. No
+  // container, no cage, and every branch of the verdict reachable.
+  console.log('\n── the injector parses what the container answers ──');
+  const bin = join(tmp, 'bin');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'docker'), '#!/usr/bin/env bash\ncat > /dev/null\nif [ -n "$FAKE_DOCKER_STDERR" ]; then echo "$FAKE_DOCKER_STDERR" >&2; fi\nprintf "%s" "$FAKE_DOCKER_OUT"\nexit "${FAKE_DOCKER_CODE:-0}"\n', { mode: 0o755 });
+  const realPath = process.env.PATH;
+  process.env.PATH = `${bin}:${realPath}`;
+  const C = await import('../server/src/lib/cxell.js');
+  const inject = (out, extra = {}) => {
+    process.env.FAKE_DOCKER_OUT = out;
+    Object.assign(process.env, extra);
+    return C.writeGeneratedDocIntoCxell({ slug: `zt-${tag}`, relPath: 'AGENTS.md', text: 'body\n' });
+  };
+  try {
+    const wrote = await inject('WROTE\n');
+    ok(wrote.written === true && wrote.rel === 'AGENTS.md' && wrote.path === '/work/repo/AGENTS.md',
+       `WROTE → written:true (${JSON.stringify(wrote)})`);
+    const trackedR = await inject('TRACKED\n');
+    ok(trackedR.written === false && trackedR.skipped === 'tracked' && /tracked by git/.test(trackedR.reason),
+       'TRACKED → written:false with the reason a human reads');
+    // the shell prints its verdict LAST; earlier chatter (a git warning, say) must not win
+    const noisy = await inject('warning: something\nWROTE\n');
+    ok(noisy.written === true, 'the LAST line is the verdict — earlier output does not decide it');
+    ok((await inject('WROTE')).written === true, 'and a verdict with no trailing newline still parses');
+    // the bug's own signature: an answer the parser cannot read must be LOUD, never a silent skip
+    const junk = await inject('[object Object]\n');
+    ok(junk.written === false && junk.skipped === 'unknown' && /could not read the container/.test(junk.reason),
+       `an unreadable answer is reported as unknown, quoting it (${JSON.stringify(junk.reason.slice(-32))})`);
+    const empty = await inject('');
+    ok(empty.skipped === 'unknown', 'so is no answer at all');
+    // a failed exec REJECTS (dk does) — the caller logs it rather than counting a write
+    process.env.FAKE_DOCKER_CODE = '1';
+    const failed = await inject('', { FAKE_DOCKER_STDERR: 'no such container' }).catch((e) => e);
+    ok(failed instanceof Error && /exited 1/.test(failed.message),
+       `a docker failure throws instead of reporting a write (${String(failed.message).slice(0, 42)}…)`);
+  } finally {
+    process.env.PATH = realPath;
+    delete process.env.FAKE_DOCKER_OUT; delete process.env.FAKE_DOCKER_CODE; delete process.env.FAKE_DOCKER_STDERR;
+  }
 
   // ── the rows die with the project ───────────────────────────────────────────────────────────
   console.log('\n── lifecycle ──');

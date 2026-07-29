@@ -1123,13 +1123,22 @@ export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPat
     'if [ -d .git ]; then grep -qxF "$P" .git/info/exclude 2>/dev/null || echo "$P" >> .git/info/exclude; fi',
     'echo WROTE',
   ].join('\n');
-  const out = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script], { input: String(text ?? ''), timeoutMs });
-  const verdict = String(out || '').trim().split('\n').pop();
+  // dk resolves { code, out, err } — destructure it. Reading the whole object as a string is exactly
+  // the bug this shipped with: `String(result)` is '[object Object]', which matches no verdict, so
+  // every doc the container really DID write was reported as skipped. The write worked and the report
+  // lied, which is the worse half.
+  const { out } = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script], { input: String(text ?? ''), timeoutMs });
+  const verdict = String(out || '').split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
   if (verdict === 'TRACKED') {
     return { written: false, skipped: 'tracked', rel: safe,
       reason: `${safe} is tracked by git in this xell — the project's own committed copy is left alone` };
   }
-  return { written: verdict === 'WROTE', rel: safe, path: `/work/repo/${safe}` };
+  if (verdict === 'WROTE') return { written: true, rel: safe, path: `/work/repo/${safe}` };
+  // ANYTHING ELSE IS LOUD. An unrecognised verdict used to be indistinguishable from a deliberate
+  // skip — that silence is what let the parse bug survive a ship. The raw tail rides back so the log
+  // names what actually came out of the container.
+  return { written: false, skipped: 'unknown', rel: safe,
+    reason: `${safe}: the injector could not read the container's answer (got ${JSON.stringify(verdict.slice(0, 60))})` };
 }
 
 export async function removeCxell({ ctx, slug }) {
