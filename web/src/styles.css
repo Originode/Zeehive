@@ -1865,12 +1865,115 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .work-comment-b { flex-basis: 100%; white-space: pre-wrap; color: var(--muted); }
 
-/* ── timeline (placeholder until part 4) ───────────────────────────────────── */
-.work-gantt-note { color: var(--muted); font-size: 12.5px; border: 1px dashed var(--line);
-  border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
-.work-gantt-note code { color: var(--accent); font-family: 'Cascadia Code', monospace; }
-.work-gtable { width: 100%; border-collapse: collapse; font-size: 12px; }
-.work-gtable th { text-align: left; color: var(--muted); font-weight: 500; text-transform: uppercase;
-  font-size: 10.5px; letter-spacing: .06em; border-bottom: 1px solid var(--line); padding: 5px 6px; }
-.work-gtable td { border-bottom: 1px solid var(--panel2); padding: 4px 6px; color: var(--text); }
-.work-gtable td.gt-title { color: var(--text); }
+/* ── the timeline (gantt) ──────────────────────────────────────────────────────
+   The chart is ONE scroller: the name cells are `position: sticky; left: 0` and the axis header is
+   `position: sticky; top: 0`, so vertical scroll is shared with the canvas BY CONSTRUCTION (no JS
+   scroll syncing to judder) and horizontal scroll IS the time axis.
+
+   NO NEW PALETTE. A bar's colour is `.work-st-<key>` — the same eight rules that paint the board's
+   status dots above, and the only place in the web app a status key is written down. The bar's
+   track is that colour at low opacity and the fill is progress, so one hex serves both. The
+   `:where()` default below is deliberately zero-specificity: it colours a bar whose status is not
+   in the vocabulary WITHOUT out-ranking the status rule that follows it in the cascade. */
+.work-gantt { height: 100%; display: flex; flex-direction: column; min-height: 0; }
+.work-gchart { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+
+.work-gtools { display: flex; align-items: center; gap: 6px; padding: 2px 0 8px; flex-wrap: wrap; }
+.work-glbl { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+.work-gtools .work-mini.on { color: var(--accent); border-color: var(--accent); }
+.work-gcount { color: var(--muted); font-size: 11.5px; margin-left: 6px; }
+.work-gcount.warn { color: var(--building); }
+.work-ghint { color: var(--unknown); font-size: 11px; margin-left: auto; }
+
+.work-gempty { border: 1px dashed var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 10px;
+  display: flex; flex-direction: column; gap: 5px; background: var(--panel); }
+.work-gempty b { font-size: 13px; }
+.work-gempty span { color: var(--muted); font-size: 12.5px; max-width: 62ch; line-height: 1.5; }
+
+.work-gscroll { flex: 1 1 auto; min-height: 0; overflow: auto; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--panel); position: relative; }
+.work-gsheet { position: relative; }
+
+.work-ghead { position: sticky; top: 0; z-index: 4; display: flex; background: var(--panel);
+  border-bottom: 1px solid var(--line); }
+.work-ghead-n { position: sticky; left: 0; z-index: 5; flex: 0 0 auto; background: var(--panel);
+  border-right: 1px solid var(--line); display: flex; align-items: flex-end; padding: 0 8px 4px; }
+.work-ghead-t { position: relative; flex: 0 0 auto; }
+.work-gmajor, .work-gminor { position: relative; height: 22px; }
+.work-gmaj, .work-gmin { position: absolute; top: 0; height: 100%; font-size: 10.5px; color: var(--muted);
+  display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap;
+  border-left: 1px solid var(--line); }
+.work-gmaj { color: var(--text); font-size: 11px; letter-spacing: .04em; }
+.work-gmaj.alt { background: rgba(255,255,255,.02); }
+.work-gmin.we { color: var(--unknown); background: rgba(255,255,255,.03); }
+
+.work-gbody { position: relative; }
+.work-gbands { position: absolute; top: 0; z-index: 0; pointer-events: none; }
+.work-gwe { position: absolute; top: 0; bottom: 0; background: rgba(255,255,255,.030); }
+.work-gsep { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); opacity: .55; }
+.work-gtoday { position: absolute; top: 0; width: 2px; z-index: 3; background: var(--accent);
+  box-shadow: 0 0 7px rgba(91,140,255,.75); pointer-events: none; }
+
+.work-grow { position: relative; z-index: 1; display: flex; align-items: center; }
+.work-grow:hover, .work-grow.hot { background: rgba(255,255,255,.035); }
+.work-gname { position: sticky; left: 0; z-index: 3; flex: 0 0 auto; height: 100%; display: flex;
+  align-items: center; gap: 5px; background: var(--panel); border-right: 1px solid var(--line);
+  padding-right: 8px; }
+.work-grow:hover .work-gname, .work-grow.hot .work-gname { background: var(--panel2); }
+.work-gtitle { flex: 1 1 auto; min-width: 0; background: none; border: 0; color: var(--text);
+  text-align: left; font-size: 12.5px; padding: 0 2px; cursor: pointer; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.work-gtitle:hover { color: var(--accent); }
+.work-gpct { color: var(--unknown); font-size: 10.5px; flex: 0 0 auto; }
+.work-gtrack { position: relative; flex: 0 0 auto; height: 100%; }
+
+/* a leaf bar, and the summary bracket a parent draws instead (a plan must read as a plan) */
+.work-gbar, .work-gsum { position: absolute; top: 5px; height: 16px; border-radius: 4px;
+  cursor: grab; z-index: 2; }
+.work-gbar.rolled, .work-gsum { cursor: default; }
+.work-gsum { top: 8px; height: 10px; }
+.work-gbar.ghosting, .work-gsum.ghosting { opacity: .8; outline: 1px dashed var(--accent); }
+.work-gbar.hot, .work-gsum.hot { box-shadow: 0 0 0 1px var(--accent); }
+.work-gbar.over, .work-gsum.over { box-shadow: 0 0 0 1px var(--down); }
+:where(.work-gfill-bg, .work-gfill, .work-gcap) { background: var(--unknown); }
+.work-gfill-bg { position: absolute; inset: 0; border-radius: 4px; opacity: .30; }
+.work-gfill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; opacity: .95; }
+.work-gsum .work-gfill-bg, .work-gsum .work-gfill { top: 0; height: 5px; bottom: auto; border-radius: 2px; }
+.work-gcap { position: absolute; top: 0; width: 2px; height: 10px; }
+.work-gcap.l { left: 0; } .work-gcap.r { right: 0; }
+.work-gopen { position: absolute; right: -1px; top: 0; bottom: 0; width: 6px;
+  background: repeating-linear-gradient(135deg, var(--bg) 0 2px, transparent 2px 4px); }
+.work-ghandle { position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize; z-index: 3; }
+.work-ghandle.l { left: -2px; } .work-ghandle.r { right: 4px; }
+.work-glink { position: absolute; right: -5px; top: 50%; transform: translateY(-50%); width: 9px; height: 9px;
+  border-radius: 50%; background: var(--panel2); border: 1px solid var(--muted); cursor: crosshair; z-index: 4;
+  opacity: 0; }
+.work-grow:hover .work-glink, .work-grow.hot .work-glink { opacity: 1; }
+
+.work-garrows { position: absolute; top: 0; z-index: 2; overflow: visible; pointer-events: none;
+  color: var(--muted); }
+.work-garrow { color: var(--muted); opacity: .22; }
+.work-garrow.on { opacity: 1; color: var(--accent); }
+.work-garrow-line { fill: none; stroke: currentColor; stroke-width: 1.2; }
+.work-garrow-hit { fill: none; stroke: transparent; stroke-width: 9; pointer-events: none; cursor: pointer; }
+.work-garrow.on .work-garrow-hit { pointer-events: stroke; }
+.work-garrow-drawing { fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 4 3; }
+
+.work-gtip { position: fixed; z-index: 90; max-width: 280px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font-size: 12px;
+  box-shadow: 0 10px 26px rgba(0,0,0,.55); pointer-events: none; display: flex; flex-direction: column; gap: 3px; }
+.work-gtip-t { font-size: 12.5px; display: flex; align-items: center; gap: 5px; }
+.work-gtip-r { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
+.work-gtip-r.late { color: var(--down); }
+.work-gtip-d { color: var(--unknown); font-size: 11px; }
+.work-gtip-w { color: var(--building); font-size: 11px; line-height: 1.4; border-top: 1px dashed var(--line); padding-top: 4px; }
+
+/* the undated tray: LISTED, never given invented dates */
+.work-gtray { margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  flex: 0 0 auto; max-height: 30%; display: flex; flex-direction: column; }
+.work-gtray-h { display: flex; align-items: center; gap: 10px; padding: 6px 10px; color: var(--muted);
+  font-size: 11.5px; border-bottom: 1px solid var(--line); }
+.work-gtray-b { overflow: auto; padding: 4px 6px; }
+.work-gtrow { display: flex; align-items: center; gap: 7px; padding: 3px 4px; border-radius: 6px; }
+.work-gtrow:hover { background: var(--panel2); }
+.work-gest { color: var(--unknown); font-size: 11px; }
