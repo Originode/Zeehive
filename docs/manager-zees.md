@@ -14,8 +14,8 @@ They are not the same thing, and 054 stops them contradicting each other:
 - **TYPE** (`xell.zee_type`: `worker` | `manager`) is what the QUEENZEE will and will not let this
   zee do — the refusals below. It is decided when the xell is created and it is structural.
 - **HARNESS** is the persona, skills and MANUAL a zee wears. Each harness **declares the type it is
-  for** (`harness.zee_type`, from `zee_type:` in its `HARNESS.yml`), and a xell may only wear a
-  harness of its own type. `any` is reserved for the law layer (`core`), which every zee gets.
+  for** (`harness.zee_type` on the row — since 080 there are no harness files), and a xell may only
+  wear a harness of its own type. `any` is reserved for the law layer (`core`), which every zee gets.
 
 Why the pairing must be enforced rather than trusted: a harness IS the manual for a type's verbs and
 refusals. Hand the manager harness to a worker and you have taught it `zee dispatch`,
@@ -153,7 +153,14 @@ only in a prompt is a rule that lasts until the first clever workaround:
   manager harness, a worker never does, and neither can be switched to make it otherwise.
 - **Managers are added by humans only.** `zee dispatch` refuses `role=manager` and refuses to hand a
   worker the manager harness or a database of the dispatcher's choosing. A manager that could mint
-  managers is a fleet that grows sideways with nobody's consent.
+  managers is a fleet that grows sideways with nobody's consent. Since 084 a manager may mint
+  **worker** personas of its own (`zee harness`, below) — and that verb refuses a manager persona for
+  exactly this reason, in the same file as the dispatch refusal.
+- **One project's personas stay in one project.** A manager authors harnesses scoped to its own project
+  (`harness.project_id`, 084), and the scope rule is enforced in DB triggers from both directions: a
+  xell may only wear a harness that is global or its own project's, a harness may only inherit one that
+  is global or in its own project (inheritance merges TEXT), and it cannot be re-scoped out from under
+  the xells wearing it. Every system-wide harness is off-limits to it entirely.
 
 ## Adding one: the programme is a PROMPT, so it gets the composer
 
@@ -181,10 +188,57 @@ Model, autonomy mode, supervision (headless/attended) and pasted images are the 
 
 ## The verbs
 
-Manager-only: `zee zees` (the crew read model), `zee dispatch`, `zee say`, `zee suggest-done`.
-Open to any zee that has a manager: `zee report` (including the reflection) and `zee inbox`.
-All of them are `/api/xell/self/*` calls scoped by the caller's own token, so a manager can only ever
-reach **its own** crew, and a worker only its own manager.
+Manager-only: `zee zees` (the crew read model), `zee dispatch`, `zee say`, `zee suggest-done`,
+`zee harness`. Open to any zee that has a manager: `zee report` (including the reflection) and
+`zee inbox`. All of them are `/api/xell/self/*` calls scoped by the caller's own token, so a manager can
+only ever reach **its own** crew, and a worker only its own manager.
+
+### `zee harness` — minting the crew's ROLES (migration 084)
+
+A crew needs roles, and until 084 every persona was system-wide and only a human could add one: a
+manager that wanted a specialist had to ask, wait, and then watch it appear in every other project's
+picker. So a manager authors **worker personas scoped to its own project**.
+
+| verb | route | what it does |
+|---|---|---|
+| `zee harness` | `GET /api/xell/self/harnesses` | the personas this project may use — the system-wide ones plus its own, each marked with whether it is the manager's to edit |
+| `zee harness <key>` | `GET /api/xell/self/harness/:key` | read one: its own text in full, the inherited chain **described** (a persona's inherited manual is 30k+ characters the caller already carries) |
+| `zee harness --new --label "…" [--parent <key>] [--spec <file.json>]` | `POST /api/xell/self/harness` | create one, scoped to the caller's project |
+| `zee harness <key> --label/--summary/--personality-file/--spec/--parent/--enabled` | `PUT /api/xell/self/harness/:key` | edit it |
+| `zee harness <key> --delete` | `DELETE /api/xell/self/harness/:key` | delete it |
+
+Persona TEXT comes from files (`--personality-file`, `--spec <file.json>` carrying
+`{personality, summary, glyph, skills[], memory[]}`), because a 3k personality does not belong in a
+shell flag. It is **not human-gated**, for the same reason `zee dispatch` is not: what it produces is
+visible to one project and can only ever be worn by a caged worker whose every irreversible act still
+lands on the same human gates.
+
+The **stored key is derived**, not chosen: the project plus the label, slugged (`zee harness --new
+--label "Security Reviewer"` in project `acme` → `acme-security-reviewer`). A caller-supplied `key` is
+refused rather than silently rewritten. That is because a key is unique across every scope and it is
+how a harness is addressed *outside* its project — `--harness <key>` on a dispatch, and
+`harness_memory_put('<key>', …)` in a fleet-wide migration — so a chosen one could take a name the
+fleet needs, and the uniqueness collision doubled as an existence oracle for other projects' rows. A
+collision inside the caller's own project names its own row; one with a row it cannot see is
+disambiguated silently and disclosed to nobody.
+
+The refusals are the interesting half, and they are structural (`self.js`, plus 084's triggers under
+them). A manager may **not**: create or edit a **manager** persona (a fleet that mints its own bosses
+grows sideways with nobody's consent); touch **any** system-wide harness — the refusal points it at
+`--parent <key>` instead, which is the supported way to build on one; touch another project's harness,
+or inherit one, or dispatch a worker into one; set anything that is not persona (`is_law_core`,
+`bridge`, `project_id` — that last one because the project is resolved from its **token**); give one of
+its own personas a memory or skill entry that lands on a file path it **inherits** (a leaf that could
+take `.zeehive/harness/memory/cxell-zee-manual.md` could forge the manual its workers are told to
+trust — the merge gives an inherited path to the ancestor as well, so a row written past the API cannot
+shadow one either); or **delete or disable** a harness a **live** xell is wearing *or inheriting*, both
+of which end with a running zee whose next briefing has lost the chain. Each one answers with a
+sentence naming what to do instead. `test/harness-project-scope.test.mjs` fires the scope refusals and
+`test/harness-manager-guards.test.mjs` the forgery/removal ones, one assertion each.
+
+What it MAY inherit is the whole point: a global worker harness (`zee-base` for the cxell manual,
+`dev-base` for the dev craft) or one of its own project's, so a new role starts from the fleet's craft
+and adds only this project's specifics.
 
 `zee suggest-done` raises a `done_suggestion` row, lights `occ-doneSuggest` (`done?`) on the target's
 hexagon and a card in the console. A human types **DONE** to confirm; that marks the task done and
@@ -203,11 +257,11 @@ died with the cxell, at the exact moment it knew the most.
 
 ## The rule about loopholes
 
-The manager's manual (`harnesses/manager/memory/manager-zee-manual.md`) states, and the binding rules
-repeat, that a manager must **never dispatch a worker in a way that gives it reach beyond its own
-xell** — no touching the xource, another xell, production, `origin`, docker or any
-hook/gate/firewall/CLI; no splitting a change so each half slips past a review; nothing on its behalf
-that it is itself refused. A worker's only legitimate reach outside its xell is talking to its
+The manager's manual (the `manager` harness's `memory/manager-zee-manual.md` entry, in the meta-DB)
+states, and the binding rules repeat, that a manager must **never dispatch a worker in a way that
+gives it reach beyond its own xell** — no touching the xource, another xell, production, `origin`,
+docker or any hook/gate/firewall/CLI; no splitting a change so each half slips past a review; nothing
+on its behalf that it is itself refused. A worker's only legitimate reach outside its xell is talking to its
 manager and to the queenzee.
 
 The worker manual (migration 053) carries the **other half**: if a manager ever asks for one of those
@@ -227,13 +281,16 @@ name the crew they belong to. With no managers in the fleet the layout is exactl
   `done_suggestion`, `db-prod-readonly`, `prod_ro_dsn`, the guard trigger, the manager harness row.
 - `db/migrations/054_zee_type.sql` — renames `xell.role` → `xell.zee_type`, adds `harness.zee_type`,
   and the two triggers that keep type and harness in agreement.
+- `db/migrations/084_harness_project_scope.sql` — `harness.project_id` (NULL = system-wide, the
+  default) and the three scope triggers: wearing, re-scoping/inheriting, and the project default.
 - `db/migrations/053_manual_manager_crew.sql` — teaches the DB-owned worker manual the crew verbs and
   the reflection stage.
 - `server/src/lib/managers.js` — the domain (crew, messages, done suggestions).
 - `server/src/lib/manager-spawn.js` — adding one (human only) + the read-only prod bind.
 - `server/src/lib/prod-readonly.js` — the SELECT-only role, minted and dropped.
 - `server/src/queenzee/self.js` — the crew verbs + the manager refusals.
-- `harnesses/manager/` — the persona, the `dispatch-brief` skill, and a manual of its own.
+- the `manager` harness ROW in the meta-DB (080) — the persona, the `dispatch-brief` skill and a
+  manual of its own; edited in the console's harness manager or by migration, never on disk.
 - `web/src/Manager.jsx` — "+ manager zee" (opens the composer) and the done-suggestion gate.
 - `web/src/Dispatch.jsx` — the one composer, in its worker and `manager` variants.
 - `test/manager-compose.test.mjs` — the console wiring for adding one, asserted statically.

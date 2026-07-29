@@ -85,13 +85,24 @@ harness
   bundle_hash   text                -- projection stamp; drift vs the files is surfaced, not silent
   avatar_path   text                -- LEGACY, always NULL since 082 (the badge is bundle.avatar_svg)
   is_law_core   boolean             -- the built-in manual harness (§4); exactly one, undeletable
+  project_id    uuid NULL           -- 084: NULL = system-wide (the default). Non-null = that project only
   enabled       boolean
   created_at    timestamptz
 ```
 
 **THE META-DB OWNS EVERY HARNESS'S TEXT** (migration 080). `bundle` on the row IS the harness —
-personality, skills, memory — and a harness row has **no `project_id`**, which is what "visible to all
-projects" means at the schema level: every enabled harness shows in every project's picker.
+personality, skills, memory.
+
+> **AMENDED by migration 084 (TKT-23-8EE4).** This section originally said a harness row has **no
+> `project_id`**, and that its absence *was* the meaning of "visible to all projects". It now has a
+> nullable one. **NULL still means system-wide, that is still the DEFAULT, and every harness that
+> existed before 084 is one** — core, zee-base, manager, the dev-* crew are the fleet's shared
+> vocabulary and nothing was migrated off it. What the column adds is a persona that belongs to ONE
+> project (`§3.1c`), so a MANAGER zee can mint a specialist for its own backlog without a human and
+> without it appearing in every other project's picker.
+
+Concretely, at the schema level: a harness with `project_id IS NULL` shows in every project's picker;
+one with a `project_id` shows only in that project's.
 
 It is authored in **the console's harness manager** or by **migration** (`harness_memory_put(harness_key,
 path, text)`, house rule 9). The queenzee then **generates** the files it injects into a xell from the
@@ -124,12 +135,79 @@ from the row the instant the next edit lands. Read a harness in the console's ha
 renders the inherited chain, so the manual a wearer gets is readable there), or in any cxell at
 `.zeehive/harness/…` (injected per xell, git-ignored).
 
-### 3.1b Project entry-point docs (migration 081)
-The same rule, one level out: a project's agent-facing entry point (`AGENTS.md`, `CLAUDE.md`, …) is a
-`project_doc` row, generated into each xell on the same trigger. The injector asks git inside the cage
-and **refuses to write over a tracked path** — a project that committed its own entry point keeps it —
-and git-excludes what it does write, so a generated doc can never dirty a worktree or reach a landing
-diff. Authored in the project's **Docs** tab (`lib/project-docs.js`).
+### 3.1c PROJECT-SCOPED harnesses, and who may author one (migration 084)
+
+Two scopes, one column:
+
+| `project_id` | what it means | who authors it |
+|---|---|---|
+| `NULL` (default) | **system-wide** — every project's picker offers it, any project's xell may wear it | a human, in the console's harness manager, or a migration |
+| a project | **that project only** — offered nowhere else, worn nowhere else, deleted with the project | that project's **manager zee** (`zee harness --new`), or a human/migration |
+
+The compatibility rule is enforced in **triggers**, in the shape 054 uses for `zee_type`, and from both
+directions — so the assign path, dispatch, the manager API, the console and any future caller reach the
+same wall, and an existing pairing cannot be broken by editing the harness afterwards:
+
+- `xell_harness_scope_guard` — a xell may only wear a harness that is global or its **own** project's.
+- `harness_scope_guard` — a harness cannot be re-scoped out from under the xells wearing it, the law
+  layer cannot be scoped at all, and a harness may only **inherit** one that is global or in its own
+  project. That last one is the quiet version of the same bug: inheritance MERGES text, so a
+  cross-project parent would pour one project's persona into every other project's briefings.
+- `pool_default_harness_scope_guard` — `pool_config.default_harness_id` cannot name another project's
+  harness. The project default is the one path that attaches a persona with nobody naming it.
+
+**What a MANAGER may do** (`/api/xell/self/harness*`, `zee harness` — §the verbs in
+[manager-zees.md](manager-zees.md)): create, read, edit and delete **worker** personas **in its own
+project**, and inherit a global worker harness — which is the point: a new role inherits `dev-base`,
+gets the manual through `zee-base`, and adds only what is specific to this project. What it is refused,
+structurally and with a sentence: a **manager** persona (only humans add managers), **any** system-wide
+harness, another project's harness, any non-persona field (`is_law_core` included — the create/update
+whitelist is still the law guard), an entry that would occupy a file path the persona **inherits**, and
+deleting *or disabling* a harness a **live** xell is wearing **or inheriting**. The project comes from
+the caller's **token**, never from the body, so "which project?" is not a question it can ask — and the
+stored **key** is derived from the project plus the label for the same reason, since a key is how a
+harness is addressed on a dispatch and in a fleet-wide migration.
+
+Two of those are worth stating as rules of the model rather than as route checks, because they hold
+however a row was written:
+
+- **An inherited file path belongs to the ancestor.** A harness materializes into real files
+  (`.zeehive/harness/memory/<basename>.md`, `.claude/skills/<name>/SKILL.md`), and the injector writes
+  the merged list in order — so a descendant entry on an inherited path used to overwrite the
+  ancestor's copy in every wearer's workspace, the cxell manual included. The merge now gives such a
+  path to the root-most owner and drops the shadow (with a log line), and the authoring functions
+  refuse the save with the collision named.
+- **A persona may not be taken away from a running zee.** `harnessForXell` and `effectiveHarness` both
+  filter on `enabled`, and both FKs are `ON DELETE SET NULL`, so deleting or disabling a harness — or
+  any ANCESTOR of one — empties a live wearer's next briefing with no error it can see. The guard on
+  both verbs covers the harness and its descendants, and the delete is decided in one transaction with
+  `FOR UPDATE` so a dispatch cannot land inside it.
+
+The dev crew is not the crew's opposite here: a project-scoped persona inheriting `dev-base` is the
+intended use, and `test/dev-crew.test.mjs` therefore lints the **system-wide** subtree only — a
+manager's specialist is on no roster and *should* carry this project's lore.
+
+### 3.1b Project entry-point docs (migrations 081, 083)
+The same rule, one level out: a project's agent-facing instructions are a `project_doc` row, generated
+into each xell on the same trigger. The injector asks git inside the cage and **refuses to write over a
+tracked path** — a project that committed its own entry point keeps it — and git-excludes what it does
+write, so a generated doc can never dirty a worktree or reach a landing diff. Authored in the
+project's **Docs** tab (`lib/project-docs.js`).
+
+**The row is the CONTENTS, not a file** (083). 081 had one row per path, so an operator who wanted
+Claude Code *and* Codex *and* Cursor to read the same thing pasted it into three rows and watched them
+drift. Now `body` is the source of truth and `targets` names which provider entry points to generate
+from it; the filenames live in a registry in code (`lib/agent-docs.js`) — `CLAUDE.md`, `AGENTS.md` (the
+~20 tools that read the standard), `GEMINI.md`, `.github/copilot-instructions.md`,
+`.cursor/rules/*.mdc`, `.clinerules/`, `.windsurf`/`.devin/rules/`, `.continue/rules/`, `.roo/rules/`,
+`.amazonq/rules/`, `.kiro/steering/`, `.junie/guidelines.md`, `CONVENTIONS.md`, `.rules`,
+`.goosehints` — each entry carrying the vendor doc that settles it. `rel_path` survives as the escape
+hatch for a one-off custom doc, and the two modes are mutually exclusive.
+
+Every generated file also ends with **that xell's own stack** (`lib/xell-stack.js`): its containers,
+ports, database coupling and build verbs, resolved from the meta-DB at injection time. That is house
+rule 7 applied to the one audience it had been missing — a non-ZEEHIVE agent reading `CLAUDE.md` in a
+xell had no way to learn which containers were its own.
 
 ### 3.2 A xell is ASSIGNED one harness; a human may switch it
 

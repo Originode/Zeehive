@@ -14,11 +14,13 @@ import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
          harnessAvatarSvg } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
-import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc } from '../lib/project-docs.js';
+import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
+         previewProjectDoc } from '../lib/project-docs.js';
+import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
-import { diffOneContainerAgainstProd } from '../queenzee/proddiff.js';
+import { diffOneContainerAgainstProd, diffCandidates } from '../queenzee/proddiff.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
@@ -54,14 +56,18 @@ import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
+import { checkContainerData, dataCheckReadiness } from '../queenzee/datadiff.js';
+import { compareBackupCounts } from '../lib/row-counts.js';
 import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
+         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, selfMigrationNumber,
+         listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
-         selfSuggestDone } from '../queenzee/self.js';
+         selfSuggestDone, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
+         selfHarnessDelete } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor } from '../lib/managers.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
@@ -383,10 +389,16 @@ router.post('/projects/:id/pr', async (req, res) => {
 // ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────
 // The contexts list feeds the console's picker, so a typo'd context can't be entered at all.
 router.get('/docker/contexts', (_req, res) => res.json(listDockerContexts()));
-// ── PROJECT ENTRY-POINT DOCS (the AGENTS.md/CLAUDE.md a zee reads first) ─────
-// Owned by the meta-DB and GENERATED into each xell when a zee is assigned (lib/project-docs.js).
-// The console's Docs tab is the whole authoring surface; the injector refuses to write over a path
-// the project has committed, so an operator cannot silently replace a repo's own instructions.
+// ── PROJECT ENTRY-POINT DOCS (the instructions a zee reads first) ────────────
+// The CONTENTS are owned by the meta-DB and one file per AI provider is GENERATED into each xell when
+// a zee is assigned (lib/project-docs.js). The console's Docs tab is the whole authoring surface; the
+// injector refuses to write over a path the project has committed, so an operator cannot silently
+// replace a repo's own instructions.
+//
+// The catalogue is served rather than duplicated in web/: the filenames are a moving vendor fact
+// (lib/agent-docs.js), and a hard-coded copy in the console would be a second source of truth for
+// them — stale the first time one is renamed.
+router.get('/agent-doc-targets', (_req, res) => res.json(targetCatalogue()));
 router.get('/projects/:id/docs', async (req, res) => {
   try { res.json(await listProjectDocs(req.params.id)); }
   catch (e) { res.status(400).json({ error: e.message }); }
@@ -397,6 +409,12 @@ router.post('/projects/:id/docs', async (req, res) => {
 });
 router.put('/project-docs/:docId', async (req, res) => {
   try { res.json(await updateProjectDoc(req.params.docId, req.body || {})); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+// The generated file itself, for the console's preview — the only place an operator sees the stamp,
+// the sibling list and the xell stack they did not type. Read-only, and it runs the real generator.
+router.get('/project-docs/:docId/preview', async (req, res) => {
+  try { res.json(await previewProjectDoc(req.params.docId, { xellId: req.query.xell || null })); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 router.delete('/project-docs/:docId', async (req, res) => {
@@ -661,9 +679,12 @@ router.post('/xells/:id/db', async (req, res) => {
 // mutable; { harness: <key|id|null> }, null clears back to core-only).
 // `?zee_type=worker|manager` narrows the list to the harnesses a xell of that TYPE may wear (054) —
 // what every picker should ask for, so an operator is never offered a choice the assign would refuse.
-// Unfiltered still returns everything (the harness manager edits them all).
+// `?project=<id>` narrows it on the SCOPE axis (084): the system-wide harnesses plus that project's
+// own, never another project's — which is what every picker bound to a project should ask for.
+// Unfiltered still returns everything (the harness manager edits them all), and every row SAYS its
+// scope (`scope`, `project_id`, `project_name`).
 router.get('/harnesses', async (req, res) => {
-  try { res.json(await listHarnesses({ zeeType: req.query.zee_type || null })); }
+  try { res.json(await listHarnesses({ zeeType: req.query.zee_type || null, projectId: req.query.project || null })); }
   catch (err) { res.status(503).json({ error: err.message }); }
 });
 // Harness authoring (unlimited DB-owned personas — persona/skills/memory, created from the dashboard).
@@ -815,12 +836,40 @@ router.get('/monitor/remote', async (_req, res) => res.json(await remoteAvailabl
 // ── container health: is each container actually running (per `docker ps`)? ───
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
 
-// On-demand schema-drift check of ONE db container against PRODUCTION (the "Check diff" context-menu
-// item on a db chip). Same read-only catalog comparison the 10-min drift tick runs, but measured NOW
-// and for just this container: it persists the verdict and broadcasts the container update, so the
-// chip's drift mark + tooltip repaint live. Returns the payload so the caller can surface a summary.
+// On-demand schema-drift check of ONE db container against a REFERENCE database (the "Check diff"
+// context-menu item on a db chip). Same read-only catalog comparison the 10-min drift tick runs, but
+// measured NOW and for just this container.
+//
+// body.against = another db container's id, or absent/null for PRODUCTION (the default). Only the
+// PROD comparison is a prod_diff verdict: it persists and broadcasts the container, so the chip's
+// drift mark + tooltip repaint live. Any other reference is measured and REPORTED only — comparing
+// dev against dev is how you tell "this db is drifted" from "every db is drifted the same way", and
+// that answer must not overwrite the fleet's drift-from-prod colours.
 router.post('/containers/:id/check-diff', async (req, res) => {
-  try { res.json(await diffOneContainerAgainstProd(req.params.id)); }
+  try { res.json(await diffOneContainerAgainstProd(req.params.id, req.body?.against || null)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// On-demand DATA check of ONE db container: does it hold the ROWS the backup it was restored from
+// recorded? The sibling of check-diff, and deliberately a different route with a different verdict —
+// one number that answered both "is my schema prod's?" and "is my data here?" is what TKT-22-4F0E was
+// about. Read-only counts, and production is refused as a subject (it is the reference).
+router.post('/containers/:id/check-data', async (req, res) => {
+  try { res.json(await checkContainerData(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Can this db be data-checked at all, and against which backup? The console asks BEFORE offering the
+// menu item, so a human is never invited to run a check that can only answer "no reference".
+router.get('/containers/:id/data-check-readiness', async (req, res) => {
+  try { res.json(await dataCheckReadiness(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// The db containers this one can be measured against (the "Check diff" submenu's list): every other
+// db in the project, PRODUCTION first — it is the default and the only reference that writes the chip.
+router.get('/containers/:id/diff-candidates', async (req, res) => {
+  try { res.json(await diffCandidates(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -1140,6 +1189,14 @@ router.post('/xell/self/catchup', async (req, res) => {
     res.json(await selfCatchup(x, { restore: !!req.body?.restore })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Hand out the next free db/migrations number, counting what is LANDED, what every live xell's
+// worktree holds and what other zees have claimed — the one thing a caged zee cannot see for itself.
+// NOT gated and advisory (it hands out a number, it does not gate a landing). `zee migration-number`.
+router.post('/xell/self/migration-number', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMigrationNumber(x, { name: req.body?.name || null, again: !!req.body?.again })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.
 router.post('/xell/self/ship', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
@@ -1272,6 +1329,34 @@ router.get('/xell/self/inbox', async (req, res) => {
 router.post('/xell/self/suggest-done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfSuggestDone(x, { to: req.body?.to, reason: req.body?.reason || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── MANAGER-ZEE verbs (harnesses): a manager mints its own specialised WORKER personas ─────────
+// Same authentication, same shape, same NOT-gated reasoning as `zee dispatch`: what a manager creates
+// here is scoped to ITS OWN project (084) and can only ever be worn by a caged worker. The project is
+// resolved from the token and never from the body, and everything that would grow the manager's own
+// authority is refused in self.js with a sentence — a manager persona, any system-wide harness,
+// another project's harness, a non-persona field, or a harness a live xell is wearing.
+router.get('/xell/self/harnesses', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessList(x)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.get('/xell/self/harness/:key', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessGet(x, req.params.key)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/xell/self/harness', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessCreate(x, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.put('/xell/self/harness/:key', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHarnessUpdate(x, req.params.key, req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.delete('/xell/self/harness/:key', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return; res.json(await selfHarnessDelete(x, req.params.key)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -1686,11 +1771,28 @@ router.get('/backups', async (req, res) => {
     `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables FROM pool_config WHERE project_id=$1`, [proj]);
   // tables = this dump's scoped selection (null = full db). toc_summary->tables = every table the
   // archive contains, so the restore picker offers exactly what can be restored out of THIS backup.
-  const backups = await q(
+  const rows = await q(
     `SELECT id, dump_path, dest_ctx, size_bytes, taken_at, source, status, error, mode, tables,
+            row_total, row_counts,
             toc_summary->'tables' AS toc_tables
        FROM db_snapshot
        WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC`, [proj]);
+  // THE TREND, computed here rather than in the browser: each FULL backup against the next older one
+  // that carries counts. A table that SHRANK between two dumps is the reading that actually speaks to
+  // "is my data fully backed up" (TKT-22-4F0E), and it is the one thing no surface could show before.
+  // row_counts itself is NOT sent — 600+ tables × 14 backups is a payload nobody reads; the verdict,
+  // the totals and the worst few are (compareBackupCounts caps that list).
+  const fullWithCounts = rows.filter((b) => b.status === 'finished' && !b.tables && b.row_counts);
+  const backups = rows.map((b) => {
+    const { row_counts, ...rest } = b;
+    if (!row_counts || b.tables) return rest;
+    const older = fullWithCounts.find((o) => new Date(o.taken_at) < new Date(b.taken_at) && o.row_counts);
+    const trend = compareBackupCounts(older?.row_counts ?? null, row_counts);
+    return { ...rest, row_tables: Object.keys(row_counts).length,
+             row_trend: trend ? { verdict: trend.verdict, counts: trend.counts, worst: trend.worst,
+                                  total_prev: trend.total_prev, total_now: trend.total_now,
+                                  compared_to: older?.taken_at ?? null } : null };
+  });
   // db containers a backup may be restored INTO. Non-prod targets plus the SHARED prod db, flagged
   // is_prod so the modal marks it and demands typed confirmation. Ordered so prod sorts LAST — the
   // modal preselects targets[0], and prod must never be the default restore target. busy_since/

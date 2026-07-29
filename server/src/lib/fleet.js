@@ -9,6 +9,7 @@ import { deviceConfig } from './devices.js';
 import { reasonPair } from './status.js';
 import { listDoneSuggestions } from './managers.js';
 import { holdingByRef } from '../queenzee/landgate.js';
+import { backupDue } from '../queenzee/maintenance.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -345,6 +346,14 @@ export async function getFleet(projectId) {
        WHERE project_id=$1 AND source='prod' AND status='running' ORDER BY taken_at DESC LIMIT 1`, [pid]);
   const backupCount = await one(
     `SELECT count(*)::int AS n FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='finished'`, [pid]);
+  // The newest ATTEMPT, whatever became of it. `last` above is the newest SUCCESS, so on its own it
+  // cannot distinguish "backed up 27 hours ago, on schedule" from "backed up 27 hours ago and every
+  // attempt since has FAILED" — and backupDue() counts a failed row as the window's attempt, so one
+  // failure pushes the next good dump a full interval away. Silently, until now. (TKT-22-4F0E: the
+  // human's fear is about DATA, and backup FRESHNESS is the reading that actually speaks to it.)
+  const lastAttempt = await one(
+    `SELECT id, taken_at, status, error FROM db_snapshot
+       WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC LIMIT 1`, [pid]);
   const backup = {
     config: {
       backup_dir: pool?.backup_dir ?? null,
@@ -354,14 +363,35 @@ export async function getFleet(projectId) {
       backup_tables: pool?.backup_tables ?? null,   // null/[] ⇒ full-database backups (the default)
     },
     last: lastBackup,
+    last_attempt: lastAttempt || null,
+    // WHEN THE NEXT ATTEMPT IS, and why (#26). A failed attempt now shortens the window instead of
+    // consuming it, and that is worth nothing if the panel still leaves a human guessing whether
+    // anything is going to happen. `kind` is 'retry' when the last attempt failed — so the panel can
+    // say "retry in 8 min" rather than showing a red mark next to silence.
+    next: await backupDue(pid).catch(() => null),
     count: backupCount?.n ?? 0,
     running: runningBackup || null,
   };
 
   // Pushes to main being HELD for human verification. Open ones only: this drives a blocking
   // banner, and a blocked zee is stuck until someone acts on it.
+  //
+  // Two extra facts per row, both about the RUNWAY it sits on (#11 gap 2). `runway_occupant` says this
+  // is the landing that OWNS the ref right now — the oldest open one, exactly what landgate's
+  // runwayOccupant() picks — and `holders` counts the zees queued behind it. Together they are what
+  // makes a DISMISSED approval visible again: dismissal hides a receipt, and a landing with zees stacked
+  // behind it is not a receipt, it is a blocker. Computed here, in the same SQL and the same ordering
+  // the tower uses, so the console can never disagree with the gate about who is on the runway.
   const landing = await q(
-    `SELECT lr.*, x.slug AS xell_slug
+    `SELECT lr.*, x.slug AS xell_slug,
+            lr.kind = 'push' AND NOT EXISTS (
+              SELECT 1 FROM land_request o
+                WHERE o.project_id = lr.project_id AND o.ref = lr.ref AND o.kind = 'push'
+                  AND o.status IN ('pending','approved')
+                  AND (o.requested_at, o.id) < (lr.requested_at, lr.id)) AS runway_occupant,
+            (SELECT count(*)::int FROM land_request h
+               WHERE lr.kind = 'push' AND h.project_id = lr.project_id AND h.ref = lr.ref
+                 AND h.kind = 'push' AND h.status = 'holding' AND h.cleared_at IS NULL) AS holders
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
        WHERE lr.project_id = $1 AND lr.status IN ('pending','approved')
        ORDER BY lr.requested_at DESC`, [pid]);

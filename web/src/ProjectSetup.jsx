@@ -10,7 +10,8 @@ import {
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
   getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
   getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
-  getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
+  getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
+  previewProjectDoc,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -759,74 +760,171 @@ function SiteEditor({ site, run, busy }) {
 // stored in the meta-DB, masked here (a secret's value is never returned — only a hint). A xell is
 // loaded with one by TIER: a live-prod / production xell gets the default prod env, a dev/spinoff
 // xell the default dev env — merged into its .zeehive.env by emitXellEnv.
-// ── the project's ENTRY-POINT DOCS ────────────────────────────────────────────
-// The AGENTS.md / CLAUDE.md a zee opens before it designs anything, owned by the meta-DB and
-// GENERATED into every xell when a zee is assigned (lib/project-docs.js) — the same rule the
-// harnesses moved to: one source, and the file in the workspace is an artefact of it.
+// ── the project's ENTRY-POINT DOCS — ONE text, one file per AI provider ───────
+// What an agent opens before it designs anything. The CONTENTS live in the meta-DB and the queenzee
+// generates a file per provider into every xell when a zee is assigned (lib/project-docs.js,
+// lib/agent-docs.js) — the same rule the harnesses moved to: one source, and the files in the
+// workspace are artefacts of it.
 //
-// The two things this surface has to SAY, because they are the two ways an operator gets surprised:
-// a generated doc is never written over a path the project has committed (git decides, in the cage),
-// and it is git-excluded there — so it can carry fleet-wide instructions without ever appearing in a
-// landing diff.
+// THE TEXTBOX IS THE SOURCE, NOT A PATH. That is the whole shape of this surface: an operator writes
+// the project's instructions once, ticks which providers should receive them, and the filenames come
+// from the registry — CLAUDE.md for Claude Code, AGENTS.md for the ~20 tools that read the standard,
+// GEMINI.md, .github/copilot-instructions.md, .cursor/rules/*.mdc … Nobody pastes the same text into
+// four files and watches them drift.
+//
+// The three things it has to SAY, because they are the three ways an operator gets surprised:
+// a generated file is never written over a path the project has committed (git decides, in the cage),
+// it is git-excluded there (so fleet-wide instructions never appear in a landing diff), and every
+// generated file carries a stamp plus THAT xell's own stack inventory — which is why the copy in a
+// workspace is never quite what was typed here.
 export function ProjectDocsSection({ project, run, busy }) {
   const [docs, setDocs] = useState(null);
-  const [add, setAdd] = useState('');
+  const [targets, setTargets] = useState([]);
+  const [addPath, setAddPath] = useState('');
   const load = useCallback(() => getProjectDocs(project.id).then(setDocs).catch(() => {}), [project.id]);
   useEffect(() => { load(); }, [load]);
+  // The catalogue is the server's (vendors rename these files) — an empty answer degrades to
+  // custom-path authoring rather than an empty screen.
+  useEffect(() => { getAgentDocTargets().then(setTargets).catch(() => setTargets([])); }, []);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
-  const suggestions = ['AGENTS.md', 'CLAUDE.md'].filter((p) => !(docs || []).some((d) => d.rel_path.toLowerCase() === p.toLowerCase()));
+  const claimed = new Set((docs || []).flatMap((d) => d.targets || []));
+  const defaults = targets.filter((t) => t.default && !claimed.has(t.key)).map((t) => t.key);
   return (
     <div className="setup-sec" data-testid="project-docs-section">
-      <h3>Docs <span className="pc">(the entry-point markdown a zee reads first — kept in the meta-DB and written into every xell when a zee is assigned)</span></h3>
+      <h3>Docs <span className="pc">(the project's instructions for AI agents — written ONCE here, generated as each provider's entry-point file in every xell)</span></h3>
       <div className="pc">
-        A doc is <b>generated</b> into the xell at its path, stamped as generated, and added to the
-        xell's git excludes — so it never lands in a diff. If the project has <b>committed</b> a file
-        at that path, the repo's own copy wins and nothing is written. Saving also regenerates it in
-        the xells of any zees <b>already running</b>, so a fix does not wait for the next dispatch.
+        What you type below is the <b>source of truth</b>. ZEEHIVE generates one file per provider from
+        it — <code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>GEMINI.md</code>, … — each stamped as
+        generated, each ending with <b>that xell's own stack</b> (its containers, ports, database and
+        build verbs), and each added to the xell's git excludes so it never lands in a diff. If the
+        project has <b>committed</b> a file at one of those paths, the repo's own copy wins and nothing
+        is written there. Saving also regenerates them in the xells of any zees <b>already running</b>,
+        so a fix does not wait for the next dispatch.
       </div>
-      {(docs || []).map((d) => <ProjectDocEditor key={d.id} doc={d} run={wrapped} busy={busy} />)}
-      {docs && docs.length === 0 && <div className="pc">No docs yet — add an <code>AGENTS.md</code> to tell every zee on this project how it works.</div>}
+      {(docs || []).map((d) => (
+        <ProjectDocEditor key={d.id} doc={d} targets={targets} run={wrapped} busy={busy} />
+      ))}
+      {docs && docs.length === 0 && (
+        <div className="pc">No instructions yet — write them once below and every AI agent on this
+          project gets them at the path it looks for.</div>
+      )}
       <div className="setup-row">
-        <input value={add} placeholder="path (e.g. AGENTS.md)" onChange={(e) => setAdd(e.target.value)}
+        <button type="button" disabled={busy}
+                onClick={() => wrapped(() => createProjectDoc(project.id, {
+                  title: 'Project instructions', body: '', targets: defaults.length ? defaults : ['claude'],
+                }))}>＋ Project instructions</button>
+        <span className="pc">generates {(defaults.length ? defaults : ['claude'])
+          .map((k) => targets.find((t) => t.key === k)?.path || k).join(' + ')} — tick more providers after</span>
+      </div>
+      <div className="setup-row">
+        <input value={addPath} placeholder="…or one extra doc at a custom path (e.g. docs/agents/ONBOARDING.md)"
+               onChange={(e) => setAddPath(e.target.value)}
                title="repo-relative, markdown only; .git/ and .zeehive/ are refused" />
-        {suggestions.map((p) => (
-          <button key={p} type="button" className="pill" disabled={busy} onClick={() => setAdd(p)}>{p}</button>
-        ))}
-        <button type="button" disabled={busy || !add.trim()}
-                onClick={() => wrapped(() => createProjectDoc(project.id, { rel_path: add.trim(), body: '' }))
-                  .then(() => setAdd(''))}>＋ Add doc</button>
+        <button type="button" className="pill" disabled={busy || !addPath.trim()}
+                onClick={() => wrapped(() => createProjectDoc(project.id, { rel_path: addPath.trim(), body: '' }))
+                  .then(() => setAddPath(''))}>＋ Add custom path</button>
       </div>
     </div>
   );
 }
 
-export function ProjectDocEditor({ doc, run, busy }) {
+// One source document: its contents, and which provider files it generates. A custom-path row keeps
+// the old path box instead of the provider checkboxes — the two modes are exclusive server-side, so
+// the UI never offers both at once.
+export function ProjectDocEditor({ doc, targets = [], run, busy }) {
   const [body, setBody] = useState(doc.body || '');
-  const [path, setPath] = useState(doc.rel_path);
-  const dirty = body !== (doc.body || '') || path !== doc.rel_path;
-  useEffect(() => { setBody(doc.body || ''); setPath(doc.rel_path); }, [doc.id, doc.body, doc.rel_path]);
+  const [title, setTitle] = useState(doc.title || '');
+  const [path, setPath] = useState(doc.rel_path || '');
+  // The generated file as the queenzee would write it — fetched on demand (it runs the real generator
+  // against a real xell) and dropped whenever the row changes, so a stale preview can never be read as
+  // the current one.
+  const [preview, setPreview] = useState(null);
+  const custom = !(doc.targets || []).length;
+  const dirty = body !== (doc.body || '') || title !== (doc.title || '')
+    || (custom && path !== (doc.rel_path || ''));
+  useEffect(() => {
+    setBody(doc.body || ''); setTitle(doc.title || ''); setPath(doc.rel_path || ''); setPreview(null);
+  }, [doc.id, doc.body, doc.title, doc.rel_path, (doc.targets || []).join(',')]);
+  const on = new Set(doc.targets || []);
+  const generated = custom ? [doc.rel_path] : targets.filter((t) => on.has(t.key)).map((t) => t.path);
+  // Toggling a provider SAVES immediately (like `enabled`): it is one fact, and the pending-edit
+  // dance that a text field needs would only make it possible to lose the body you were typing.
+  const toggle = (key, want) => {
+    const next = want ? [...on, key] : [...on].filter((k) => k !== key);
+    // The last one off is refused rather than saved: the server's CHECK would reject it anyway, and a
+    // doc that generates no file is text an operator wrote that reaches nobody. Say which action they
+    // actually want instead.
+    if (!next.length) {
+      return showAlert('This is the last provider.\n\nA doc that generates no file reaches nobody — '
+        + 'untick "enabled" to stop it being written, or delete it.');
+    }
+    return run(() => updateProjectDoc(doc.id, { targets: next, rel_path: null, body }));
+  };
   return (
-    <div className={`setup-sub${doc.enabled ? '' : ' off'}`} data-testid={`project-doc-${doc.rel_path}`}>
+    <div className={`setup-sub${doc.enabled ? '' : ' off'}`}
+         data-testid={`project-doc-${custom ? doc.rel_path : (doc.targets || []).join('+')}`}>
       <div className="setup-row">
-        <input value={path} onChange={(e) => setPath(e.target.value)} style={{ minWidth: 220 }} />
-        <label className="pc" title="an injected-but-disabled doc is not written into new xells">
+        {custom
+          ? <input value={path} onChange={(e) => setPath(e.target.value)} style={{ minWidth: 220 }} />
+          : <input value={title} placeholder="what to call this text (cosmetic)"
+                   onChange={(e) => setTitle(e.target.value)} style={{ minWidth: 220 }} />}
+        <label className="pc" title="a disabled doc is not written into new xells">
           <input type="checkbox" checked={!!doc.enabled} disabled={busy}
                  onChange={(e) => run(() => updateProjectDoc(doc.id, { enabled: e.target.checked }))} /> enabled
         </label>
-        <span className="pc">{(doc.body || '').length} chars</span>
+        <span className="pc">{(body || '').length} chars</span>
         <button type="button" disabled={busy || !dirty}
-                onClick={() => run(() => updateProjectDoc(doc.id, { rel_path: path.trim(), body }))}>Save</button>
+                onClick={() => run(() => updateProjectDoc(doc.id,
+                  custom ? { rel_path: path.trim(), body } : { title: title.trim() || null, body }))}>Save</button>
         <button type="button" className="hm-del" disabled={busy}
                 onClick={async () => {
-                  if (!await showConfirm(`Delete ${doc.rel_path}?\n\nNew xells stop receiving it. A zee `
-                    + `already working keeps the copy it was given — the queenzee does not delete files out `
-                    + `of a live workspace.`)) return;
+                  if (!await showConfirm(`Delete ${generated.filter(Boolean).join(', ') || 'this doc'}?\n\n`
+                    + `New xells stop receiving it. A zee already working keeps the copy it was given — `
+                    + `the queenzee does not delete files out of a live workspace.`)) return;
                   run(() => deleteProjectDoc(doc.id));
                 }} title="Delete this doc">🗑</button>
       </div>
-      <textarea className="setup-md" rows={10} value={body} spellCheck={false}
-                placeholder="# How this project works&#10;&#10;What a zee arriving with no context needs to know."
+      <textarea className="setup-md" rows={12} value={body} spellCheck={false}
+                placeholder="# How this project works&#10;&#10;What an agent arriving with no context needs to know: what the project IS, how to run and test it, the house rules it must not relearn."
                 onChange={(e) => setBody(e.target.value)} />
+      <div className="setup-row">
+        <button type="button" className="pill" disabled={busy}
+                onClick={() => (preview ? setPreview(null)
+                  : previewProjectDoc(doc.id).then(setPreview).catch((e) => setPreview({ error: e.message })))}>
+          {preview ? 'hide' : 'preview'} what gets written
+        </button>
+        {preview?.note && <span className="pc">{preview.note}</span>}
+        {preview?.error && <span className="pc">could not preview: {preview.error}</span>}
+      </div>
+      {preview?.files?.map((f) => (
+        <div key={f.relPath} className="docpv">
+          <div className="pc mono">{f.relPath}</div>
+          <pre>{f.text}</pre>
+        </div>
+      ))}
+      {!custom && (
+        <div className="docgen">
+          <div className="pc">Generate for <b>{generated.length}</b> provider
+            {generated.length === 1 ? '' : 's'}:{' '}
+            {generated.length
+              ? generated.map((p, i) => <span key={p}>{i ? ' · ' : ''}<code>{p}</code></span>)
+              : 'nothing — this doc reaches nobody'}
+          </div>
+          <div className="docgen-grid">
+            {targets.map((t) => (
+              <label key={t.key} className={`docgen-t${on.has(t.key) ? ' on' : ''}`}
+                     title={`${(t.reads || []).join(', ')}${t.note ? `\n\n${t.note}` : ''}`}>
+                <input type="checkbox" checked={on.has(t.key)} disabled={busy}
+                       onChange={(e) => toggle(t.key, e.target.checked)} />
+                <span className="mono">{t.label || t.path}</span>
+                <span className="pc">{(t.reads || []).slice(0, 3).join(', ')}
+                  {(t.reads || []).length > 3 ? ` +${t.reads.length - 3}` : ''}</span>
+              </label>
+            ))}
+          </div>
+          {!targets.length && <div className="pc">(the provider catalogue could not be loaded — reload the console)</div>}
+        </div>
+      )}
     </div>
   );
 }
@@ -1217,7 +1315,9 @@ function SpawnSection({ project, run }) {
     // Non-core, enabled harnesses only — core is the always-on law layer, never a selectable default.
     // The project DEFAULT harness is what a bare dispatch attaches to a pooled xell — always a
     // worker. A manager gets its harness when a human adds it, so manager personas are not offered.
-    getHarnesses('worker').then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
+    // …and scoped to THIS project (084): another project's persona cannot be this project's default
+    // (pool_default_harness_scope_guard refuses it), so it is never offered here.
+    getHarnesses('worker', project.id).then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     getDockerContexts().then(setCtxs).catch(() => {});
   }, [project.id]);
   if (!pc) return null;
@@ -1241,7 +1341,7 @@ function SpawnSection({ project, run }) {
         <label>Default harness <span className="pc">(persona a bare dispatch wears)</span>
           <select value={pc.harness_key || ''} onChange={(e) => save({ default_harness_key: e.target.value })}>
             <option value="">core only (no persona)</option>
-            {harnesses.map((h) => <option key={h.key} value={h.key}>{h.label}</option>)}
+            {harnesses.map((h) => <option key={h.key} value={h.key}>{h.label}{h.scope === 'project' ? ' ⌂ (this project)' : ''}</option>)}
           </select></label>
         <label>Compile on <span className="pc">(build host for new xells{project.registry ? '' : ' — set a Build registry to enable'})</span>
           <select value={pc.default_build_ctx || ''} onChange={(e) => save({ default_build_ctx: e.target.value })}

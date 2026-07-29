@@ -9,8 +9,9 @@
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
 import React, { useState, useEffect } from 'react';
-import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, duplicateProd } from './api.js';
+import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, getDiffCandidates, checkContainerData, getDataCheckReadiness, duplicateProd } from './api.js';
 import { nick } from './nick.js';
+import { diffReportText, driftDirection, SCOPE_LINE, dataReportText } from './drift.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 // Production is EXCLUDED from decommission entirely (not warned) — a prod container/db is never a
@@ -44,20 +45,40 @@ export function driftState(c) {
   return d.total > 0 ? 'drift' : 'sync';
 }
 
+// TKT-22-4F0E: this chip answers ONE question and a human read it as answering two. It compares
+// catalog SHAPE against production; it never counts a row and never opens a backup. So every reading
+// of it — sync, drifted, or empty — carries its scope, at the place the number is read. Both the scope
+// caveat and the WHICH-WAY reading come from drift.js: the glance and the investigation must not drift
+// apart, and a tooltip is exactly where a worried operator looks first.
+const SCOPE = `\n\n${SCOPE_LINE}`;
+
 // The drift half of the tooltip. Counts are exact; the lists are a SAMPLE (proddiff truncates), so
 // say so rather than let a reader think 8 is the whole story.
-function driftText(c) {
+export function driftText(c) {
   const d = c.prod_diff;
   if (!d) return '';
   const when = c.prod_diff_at ? ` (${new Date(c.prod_diff_at).toLocaleString()})` : '';
   if (!d.ok) return `\n\n⚠ prod diff failed${when}\n${d.error || 'unknown error'}`;
-  if (!d.total) return `\n\n✓ schema matches prod${when}`;
+  if (!d.total) return `\n\n✓ schema matches prod${when}${SCOPE}`;
 
-  const out = [`\n\n⚠ DRIFTED from prod — ${d.total} difference(s)${when}`];
+  // EMPTY is a different fact from DRIFTED, and the server now distinguishes them: a database with
+  // none of prod's tables was never restored. Reporting that as "N differences" is what made a
+  // never-used dev clone look like a data-loss event.
+  if (d.empty_db) {
+    const t = d.kinds?.table || {};
+    return `\n\n⚠ this database is EMPTY — it has NO application tables${when}`
+      + `\nprod has ${t.ref_count ?? '?'}; this db has ${t.mine_count ?? 0}.`
+      + '\nIt was never restored, or its restore failed. This is not drift, and it says nothing'
+      + '\nabout production or its backups.'
+      + SCOPE;
+  }
+
+  const out = [`\n\n⚠ SCHEMA drifted from prod — ${d.total} difference(s)${when}`];
   for (const [kind, v] of Object.entries(d.kinds || {})) {
     const miss = v.missing_count || 0, extra = v.extra_count || 0;
     if (!miss && !extra) continue;
-    out.push(`\n${kind}: ${miss} missing, ${extra} extra`);
+    const have = v.ref_count != null ? ` (prod ${v.ref_count} / here ${v.mine_count})` : '';
+    out.push(`\n${kind}: ${miss} missing, ${extra} extra${have}`);
     // "missing" first and always: prod has it and this db does not, which is what breaks code.
     for (const x of (v.missing || [])) out.push(`\n  − ${x}`);
     if (miss > (v.missing || []).length) out.push(`\n  … +${miss - v.missing.length} more missing`);
@@ -66,6 +87,12 @@ function driftText(c) {
   }
   out.push('\n\n− = prod has it, this db does not (code may expect it)');
   out.push('\n+ = this db has it, prod does not');
+  // WHICH WAY it runs, from drift.js — for a restored db "everything missing, nothing extra" is the
+  // signature of a copy that is simply OLDER than prod, and that reading is the whole of TKT-22-4F0E's
+  // first question. One implementation, so the chip and the report cannot disagree.
+  const dir = driftDirection(d);
+  if (dir) out.push(`\n\n${dir.text}`);
+  out.push(SCOPE);
   return out.join('');
 }
 
@@ -78,7 +105,9 @@ function instancesText(c) {
   const out = [`\n\ndatabases (${list.length}):`];
   for (const i of list) {
     const d = i.prod_diff;
-    const drift = !d ? '' : d.ok === false ? ' · diff err' : d.total > 0 ? ` · ⚠ ${d.total} drift` : ' · ✓ sync';
+    const drift = !d ? '' : d.ok === false ? ' · diff err'
+      : d.empty_db ? ' · ⚠ EMPTY (no app tables)'
+      : d.total > 0 ? ` · ⚠ ${d.total} schema drift` : ' · ✓ schema in sync';
     const who = i.kind === 'clone' ? (i.owner_slug ? ` → ${i.owner_slug}` : ' → ORPHAN (xell gone)') : '';
     out.push(`\n  ${i.name} — ${i.kind}${who}${drift}`);
   }
@@ -186,15 +215,53 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   const [typed, setTyped] = useState('');
   const [busyAct, setBusyAct] = useState(false);
   const [err, setErr] = useState(null);
-  // "Check diff" fires an on-demand drift check against prod; guard against a double-click while the
-  // catalog comparison is in flight. Reset (with the rest) whenever the menu retargets a container.
-  const [diffing, setDiffing] = useState(false);
+  // "Check diff" fires an on-demand drift check; `diffing` holds WHICH reference is in flight
+  // ('prod' | a container id) so a double-click can't fire two comparisons. `picking` opens the
+  // reference picker; `cands` is the lazily-loaded list of db chips it offers (null = not loaded).
+  // Reset (with the rest) whenever the menu retargets a container.
+  const [diffing, setDiffing] = useState(null);
+  const [picking, setPicking] = useState(false);
+  const [cands, setCands] = useState(null);
+  const [candErr, setCandErr] = useState(null);
+  // "Check data" is the OTHER question — did the rows arrive? — so it gets its own in-flight guard and
+  // its own readiness answer, fetched with the menu: a db with no recorded source backup cannot be
+  // checked, and the item says so instead of being offered and then refusing (TKT-22-4F0E).
+  const [dataing, setDataing] = useState(false);
+  const [dataReady, setDataReady] = useState(null);
   // "Duplicate prod" streams a fresh prod dump into THIS dev db (backup + restore in one). Guard the
   // in-flight window so a double-click can't fire two overwrites. Reset when the menu retargets.
   const [dupPending, setDupPending] = useState(false);
   const c = menu?.c;
   const cid = c?.id;
-  useEffect(() => { setConfirming(false); setTyped(''); setBusyAct(false); setErr(null); setDiffing(false); setDupPending(false); }, [cid]);
+  useEffect(() => {
+    setConfirming(false); setTyped(''); setBusyAct(false); setErr(null);
+    setDiffing(null); setPicking(false); setCands(null); setCandErr(null); setDupPending(false);
+    setDataing(false); setDataReady(null);
+  }, [cid]);
+
+  // The reference dbs this container can be measured against, fetched the first time the picker is
+  // opened (same lazy pattern as the build-host contexts above). The SERVER orders them — production
+  // first — so "what is the default" lives in one place, not in two renderers.
+  useEffect(() => {
+    if (!picking || !cid || cands) return;
+    let live = true;
+    getDiffCandidates(cid)
+      .then((list) => { if (live) { setCands(list || []); setCandErr(null); } })
+      .catch((e) => { if (live) { setCands([]); setCandErr(e?.error || e?.message || String(e)); } });
+    return () => { live = false; };
+  }, [picking, cid, cands]);
+
+  // Can this db's ROWS be checked, and against which backup? Asked as soon as the menu opens on a
+  // non-prod db, because the answer decides what the item says. Failure is not fatal: the item stays
+  // available and the server gives the reason if it is clicked.
+  useEffect(() => {
+    if (!cid || menu?.c?.role !== 'db' || isProdContainer(menu?.c)) return;
+    let live = true;
+    getDataCheckReadiness(cid)
+      .then((r) => { if (live) setDataReady(r || null); })
+      .catch(() => { if (live) setDataReady(null); });
+    return () => { live = false; };
+  }, [cid, menu?.c]);
 
   const buildable = c ? isBuildable(c) : false;
   const busy = c ? busyReason(c) : null;
@@ -245,28 +312,51 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
     } catch (e) { setErr(e?.error || e?.message || String(e)); setBusyAct(false); }
   };
 
-  // Check this db's schema against production NOW. The server persists the verdict and broadcasts the
-  // container, so the chip's drift mark repaints over SSE; we also pop a one-line summary. The full
-  // per-object breakdown already lives in the chip's tooltip, so we don't reproduce it here.
-  const runCheckDiff = async () => {
+  // Check this db's schema against a REFERENCE database NOW. `against` = null → PRODUCTION (the
+  // default); any other db container id → an ad-hoc comparison that is REPORTED and never written to
+  // the chip. Comparing dev↔dev is the whole reason the picker exists: "is THIS db drifted, or is
+  // every db drifted the same way?" separates a bad restore from a difference the probe itself sees
+  // (a different postgres/extension build on the host), and it is the first question worth asking
+  // when a freshly restored db still shows drift.
+  //
+  // The full report is shown in the dialog, not just a total: for a non-prod reference nothing is
+  // persisted, so the chip's tooltip cannot be where the breakdown lives. Its WORDING lives in
+  // drift.js — including the scope caveat this dialog must carry on every outcome (TKT-22-4F0E: this
+  // is the most quoted reading of the number, and "✓ matches production" with nothing after it is
+  // exactly how a schema check came to be heard as "production is backed up").
+  const runCheckDiff = async (against = null) => {
     if (diffing) return;
-    setDiffing(true);
+    setDiffing(against || 'prod');
     try {
-      const r = await checkContainerDiff(c.id);
+      const r = await checkContainerDiff(c.id, against);
       onClose();
-      if (r?.same_db) { showAlert(`${c.name} IS the production database — there is nothing to diff.`); return; }
-      if (r?.ok === false) {
-        showAlert(`Could not diff ${c.name} against production:\n\n${r.error || 'unknown error'}`, { variant: 'error' });
-        return;
-      }
-      const total = r?.total || 0;
-      showAlert(total === 0
-        ? `✓ ${c.name} — schema matches production.`
-        : `⚠ ${c.name} has DRIFTED from production — ${total} difference(s).\n\nHover the chip for the per-object breakdown.`,
-        { variant: total === 0 ? 'info' : 'error' });
+      showAlert(diffReportText(c.name, r), {
+        title: r?.ok === false ? 'Check diff failed' : 'Schema comparison',
+        variant: (r?.ok === false || r?.total > 0) ? 'error' : 'info',
+      });
     } catch (e) {
-      setDiffing(false);
+      setDiffing(null);
       showAlert('Check diff failed: ' + (e?.error || e?.message || e), { variant: 'error' });
+    }
+  };
+
+  // Check this db's ROWS against the backup it was restored from. Deliberately NOT folded into
+  // runCheckDiff: they answer different questions, they can disagree (a perfect schema over an empty
+  // database is the exact case that started this), and a human must be able to tell which answer they
+  // are holding. Never persists onto the drift chip — the server keeps it in its own column.
+  const runCheckData = async () => {
+    if (dataing) return;
+    setDataing(true);
+    try {
+      const r = await checkContainerData(c.id);
+      onClose();
+      showAlert(dataReportText(c.name, r), {
+        title: r?.ok === false ? 'Check data failed' : 'Row-count check',
+        variant: (r?.ok === false || r?.verdict === 'incomplete') ? 'error' : 'info',
+      });
+    } catch (e) {
+      setDataing(false);
+      showAlert('Check data failed: ' + (e?.error || e?.message || e), { variant: 'error' });
     }
   };
 
@@ -435,10 +525,69 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
       {isDb && !prod && (busy ? (
         <div className="ctxsub ctxbusy-note" data-testid="check-diff-busy">diff unavailable while busy</div>
       ) : (
-        <button role="menuitem" data-testid="check-diff-open" disabled={diffing} onClick={runCheckDiff}>
-          🔍 {diffing ? 'Checking diff…' : 'Check diff'}
-          <span className="ctxsub">compare this db's schema against production now</span>
-        </button>
+        <>
+          <button role="menuitem" data-testid="check-diff-open" disabled={!!diffing}
+                  onClick={() => runCheckDiff(null)}>
+            🔍 {diffing === 'prod' ? 'Checking diff…' : 'Check diff'}
+            <span className="ctxsub">compare this db's schema against production now</span>
+          </button>
+          {/* …or against ANOTHER db. One extra click, because production is the default and the only
+              reference that repaints the chip; every other one is a report. */}
+          <button role="menuitem" data-testid="check-diff-pick" className={picking ? 'ctxsel' : ''}
+                  aria-expanded={picking} disabled={!!diffing}
+                  onClick={() => setPicking((v) => !v)}>
+            {picking ? '▾' : '▸'} Compare against…
+            <span className="ctxsub">pick another database to measure this one against</span>
+          </button>
+          {picking && (
+            <div className="ctxdbpick" data-testid="check-diff-picker">
+              <div className="ctxsubhead">compare against {cands ? '' : '…'}</div>
+              {candErr && <div className="ctxwarn-err" data-testid="check-diff-picker-err">{candErr}</div>}
+              {cands && !cands.length && !candErr && (
+                <div className="ctxsub ctxbusy-note">no other database in this project</div>
+              )}
+              {(cands || []).map((d) => (
+                <button key={d.id} role="menuitem" data-testid={`check-diff-against-${d.id}`}
+                        className={d.is_prod ? 'ctxsel' : ''} disabled={!!diffing}
+                        title={`measure ${c.name} against ${d.name}`}
+                        onClick={() => runCheckDiff(d.id)}>
+                  {/* the REAL chip, so a db is recognised here exactly as it is everywhere else.
+                      pointer-events are off (see .ctxdbpick .cbox) so the click is always the row's,
+                      and url is dropped so no anchor is nested inside this button. */}
+                  <span className="ctxchip"><ContainerChip c={{ ...d, url: null }} /></span>
+                  <span className="ctxdbname">
+                    {d.name}
+                    <span className="ctxsub">
+                      {d.is_prod ? '🛡 production · default · sets the chip' : d.tier}
+                      {d.owner_slug ? ` · xell ${d.owner_slug}` : ''}
+                      {d.busy_op ? ` · ${d.busy_op}ing…` : ''}
+                      {diffing === d.id ? ' · checking…' : ''}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+          {/* CHECK DATA — the second question, one item down from the first and never merged into it.
+              Its sub-label carries the reference (which backup, taken when) or the reason there isn't
+              one, so the difference between "your rows are missing" and "nobody recorded what should
+              be here" is visible BEFORE the click. TKT-22-4F0E. */}
+          <button role="menuitem" data-testid="check-data-open" disabled={dataing || dataReady?.ready === false}
+                  onClick={runCheckData}
+                  title={dataReady?.ready === false
+                    ? `cannot check rows: ${dataReady.reason}`
+                    : 'count the rows in this db and compare them against the backup it was restored from'}>
+            🧮 {dataing ? 'Counting rows…' : 'Check data'}
+            <span className="ctxsub">
+              {dataReady?.ready === false
+                ? dataReady.reason
+                : dataReady?.snapshot
+                  ? `vs the backup of ${new Date(dataReady.snapshot.taken_at).toLocaleString()}`
+                    + `${dataReady.snapshot.row_total != null ? ` (~${Number(dataReady.snapshot.row_total).toLocaleString()} rows)` : ''}`
+                  : 'do the ROWS match the backup this db was restored from?'}
+            </span>
+          </button>
+        </>
       ))}
 
       {/* Decommission: every non-production container, DEVICES included (035). Production is excluded

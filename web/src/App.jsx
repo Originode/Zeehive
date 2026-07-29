@@ -12,13 +12,16 @@ import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 import HiveCanvas from './hive/HiveCanvas.jsx';
+// the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
+import { crewLinks } from './hive/crew.js';
+import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel, { BackupsModal } from './Backups.jsx';
-import LandingPanel, { LandCard } from './Landing.jsx';
+import LandingPanel, { LandCard, holdsRunway } from './Landing.jsx';
 import ProdAsksPanel, { ProdBindCard, SeedCard } from './ProdData.jsx';
 import { AddManagerButton, DoneSuggestionCard } from './Manager.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
@@ -435,7 +438,12 @@ export default function App() {
     setDismissed((d) => ({ ...d, [id]: true }));
     dismissLanding(id).catch(() => setDismissed((d) => ({ ...d, [id]: false })));
   };
-  const visible = (rs) => (rs || []).filter((r) => !dismissed[r.id] && !r.dismissed_at);
+  // …with ONE exception, and it is the whole of #11's gap 2: a landing that HOLDS THE RUNWAY with zees
+  // queued behind it is not a receipt, it is a blocker, and hiding it hid them too (the approach queue
+  // renders under the card that owns the runway). Dismissal still does not free the ref — the gate's
+  // runwayOccupant ignores dismissed_at on purpose — so the honest resolution is to stop hiding it
+  // rather than to let a hidden card silently pass the next push through. See holdsRunway in Landing.jsx.
+  const visible = (rs) => (rs || []).filter((r) => holdsRunway(r) || (!dismissed[r.id] && !r.dismissed_at));
 
   // Route each landing to the card that will actually RENDER it — which is not the same question as
   // "does it have a xell_id". The fleet only lists xells with status <> 'retired', so a landing
@@ -500,6 +508,9 @@ export default function App() {
 
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
+  // The manager↔crew relation for the DOM surfaces (hive/crew.js — the SAME grouping the honeycomb, the
+  // wires and the graph read; live crew only). Computed once here and handed down, not re-derived per row.
+  const crewOfFleet = crewLinks(xells);
 
   // Open a xell's session in the right surface — the honeycomb flower's click target, and the
   // drawer card's. Web sessions open a tab; desktop-protocol sessions deep-link into Claude Desktop.
@@ -653,13 +664,15 @@ export default function App() {
         )}
       </section>
 
-      <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
-                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+      {/* `xells` rides along to BOTH the graph and the wires so the manager↔crew relation is drawn
+          from the same fleet list the honeycomb uses (hive/crew.js) — three views, one grouping. */}
+      <GraphPane timeline={timeline} xells={xells} orientation={orientation} honeySide={honeySide}
+                 hexPosRef={hexPosRef} prodIds={prodIds} expandedId={expandedId} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
                  onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
-      <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
+      <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />
@@ -762,7 +775,7 @@ export default function App() {
 
       {/* THE BAR — the one thing on the page that can't wait for you to scroll: a zee blocked on a
           human. A pointer, not a copy; clicking a chip expands that xell's flower + action drawer. */}
-      <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
+      <NeedsYouBar xells={xells} links={crewOfFleet} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
                    prodBindByXell={prodBindByXell} seedByXell={seedByXell}
                    doneSuggestByXell={doneSuggestByXell}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
@@ -1039,7 +1052,7 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 // (The old DOM FlowerToolbar was removed: its build/pull/push/PR/mark-done buttons are now drawn
 // directly on the flower by HiveCanvas and hit-tested there — see handleFlowerAction above.)
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines, onEnv }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines, onEnv, links }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const [termOpen, setTermOpen] = useState(false);
@@ -1083,6 +1096,9 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           naturally below and makes the overlap unrepresentable rather than tuned-around. */}
       <div className="cardtop">
         {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
+        {/* whose crew this is, or how big a crew it runs — the one relationship in the fleet that is a
+            real relationship, stated in words because a list is scanned rather than pointed at */}
+        {links && !isProd && <CrewChip x={x} links={links} />}
         {stackCtx && (
           <span className="machinechip" data-testid="machine-chip"
                 title={machine
@@ -1401,7 +1417,7 @@ function shipState(x, diff, prodLock, ship) {
 // EXPANDS that xell's flower (highlighting it on the canvas) AND drops its decision card(s) — the
 // held landing / open PR, with the Approve/Reject buttons — inline right below the bar, so the
 // judgement is made next to its own commits without hunting for a card at the bottom of the page.
-function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
+function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
                        prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {} }) {
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
@@ -1425,13 +1441,25 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
     // A manager suggested this xell is done. It is a real decision waiting on a human — and the only
     // one raised by another AGENT, so if it were not counted here nobody would ever answer it.
     const doneSug = (doneSuggestByXell[x.id] || []).filter((r) => r.status === 'pending').length;
-    return { x, held, prs, tend, tendWhy, tendFull, bind, seed, doneSug, n: held + prs + tend + bind + seed + doneSug };
+    // A landing that HOLDS THE RUNWAY with zees queued behind it, after a human already approved it and
+    // nothing landed (#11 gap 2). It is not "awaiting approval", so nothing counted it — and if it was
+    // also dismissed it was on no screen at all, while the queue behind it waited on a card that had
+    // been hidden. It is the one approved landing that genuinely waits on a human: decide it, or let
+    // the zee withdraw it. Pending occupants are already counted as `held`.
+    const blocking = (landingByXell[x.id] || []).filter((r) => r.status === 'approved' && holdsRunway(r));
+    const blocked = blocking.length;
+    const blockedBy = blocking[0]?.holders || 0;
+    return { x, held, prs, tend, tendWhy, tendFull, bind, seed, doneSug, blocked, blockedBy,
+      n: held + prs + tend + bind + seed + doneSug + blocked };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
   const go = (id) => onJump?.(id === expandedId ? null : id);  // click the open one again to collapse
   const open = waiting.find((w) => w.x.id === expandedId);
-  const landings = open ? visible(landingByXell[open.x.id]).filter((r) => r.status === 'pending') : [];
+  // pending decisions, PLUS an approved landing that is wedging the runway — that one is a decision
+  // again (see `blocked` above), and holdsRunway is why it survives `visible` even when dismissed.
+  const landings = open
+    ? visible(landingByXell[open.x.id]).filter((r) => r.status === 'pending' || holdsRunway(r)) : [];
   const prs = open ? visible(prsFor(open.x)).filter((r) => r.status === 'pending') : [];
   const binds = open ? (prodBindByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
   const seeds = open ? (seedByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
@@ -1443,14 +1471,19 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <span className="ny-t">⚠ waiting on you:</span>
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
-                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
+                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.blocked && `an APPROVED landing is holding the runway with ${w.blockedBy} zee(s) queued behind it — it never landed`, w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
             {w.x.slug}
+            {/* WHOSE crew is asking. A held landing from a crew member is a different decision from one
+                by a lone xell — there is an agent whose plan it belongs to — and this line was the one
+                place a human meets that ask. Same words as the card and the canvas (hive/crew.js). */}
+            {links && <CrewChip x={w.x} links={links} />}
             <span className="ny-n">{[
               w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`,
               w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`,
               w.bind > 0 && '⚠ wants PROD DB',
               w.seed > 0 && `⚠ seed prod (${w.seed})`,
               w.doneSug > 0 && '⬢ manager says done',
+              w.blocked > 0 && `⛔ holds the runway${w.blockedBy ? ` · ${w.blockedBy} queued` : ''}`,
               w.tend > 0 && `🖐 tend${w.tendWhy ? `: ${clip(w.tendWhy, 60)}` : ''}`,
             ].filter(Boolean).join(' · ')}</span>
           </button>

@@ -22,6 +22,13 @@ import { resolveSite } from '../lib/sites.js';
 import { listContainersDetailed } from '../lib/docker.js';
 import { pickDbContainer } from '../lib/xell-db.js';
 import { refreshProdDiffAfterRestore } from './proddiff.js';
+// The DATA half of a backup's guarantee — pure functions + the catalog SQL, kept out of here so both
+// the capture and every reading of it (trend, restore check) are testable with no docker (row-counts.js).
+import { ROW_COUNT_SQL, parseRowCounts, rowTotal, compareBackupCounts } from '../lib/row-counts.js';
+// WHEN the next backup is due (a failure shortens the window, it does not consume it) and WHEN a human
+// is told the restore point is stale — pure decisions, so the TIMING is asserted by a test (#26).
+import { backupDecision, staleAlertDecision } from '../lib/backup-schedule.js';
+import { notifyBackupStale, notifyBackupRecovered } from '../lib/notify.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -509,8 +516,31 @@ export async function backupProd(projectId) {
   return snap;
 }
 
+// PER-TABLE ROW ESTIMATES from the SOURCE, taken next to the dump — the data half of TKT-22-4F0E.
+//
+// Three rules this obeys, and they are the reason it is shaped like this:
+//   1. It NEVER fails a backup. The dump is the product; these counts are instrumentation. Every
+//      failure path returns null and logs a line — a snapshot with no counts is a snapshot, and the
+//      surfaces read null as "not captured", never as "the database was empty".
+//   2. It NEVER extends the window production is locked for. reltuples is a pg_class read: it takes no
+//      table locks, touches no heap, and runs AFTER pg_dump has already let go.
+//   3. It is never an exact count(*) here. Minutes of I/O on a 1.3 GB production database for a number
+//      that only has to be good enough for a trend is not a trade worth making.
+async function sourceRowCounts(ctx, container, dbUser, dbName) {
+  const r = await execAsync('docker',
+    ['--context', ctx, 'exec', container, 'psql', '-U', dbUser, '-d', dbName, '-tAq', '-c', ROW_COUNT_SQL],
+    { timeout: 120000 });
+  if (r.status !== 0) {
+    logline('maint', `row-count probe of ${container}/${dbName} failed (exit ${r.status}) — the BACKUP is `
+      + `unaffected, but this dump records no row counts: ${(r.stderr || '').trim().split('\n').pop()?.slice(0, 160)}`);
+    return null;
+  }
+  const counts = parseRowCounts(r.stdout);
+  return Object.keys(counts).length ? counts : null;
+}
+
 async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, tables = [], keep }) {
-  let size = null, error = null, tocText = null, tocSummary = null;
+  let size = null, error = null, tocText = null, tocSummary = null, rowCounts = null;
   const scoped = Array.isArray(tables) && tables.length > 0;   // a partial, table-scoped dump
   const tArgs = dumpTableArgs(tables);                          // [] for a full-database dump
   try {
@@ -583,6 +613,13 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         tocText = list.stdout;
       }
 
+      // The row estimates for what was just dumped — AFTER the dump, so it cannot delay it or hold
+      // anything of prod's, and inside the same try only so a probe error is logged like any other
+      // (sourceRowCounts itself never throws). Deliberately not gated on `scoped`: a scoped dump's
+      // counts still describe the source, and the restore check reads only the tables it holds.
+      rowCounts = await sourceRowCounts(srcCtx, container, dbUser, dbName)
+        .catch((e) => { logline('maint', `row-count probe errored (backup unaffected): ${e.message}`); return null; });
+
       // ── validation common to both destinations ──────────────────────────────
       const toc = parseDumpToc(tocText);
       // The full-database table list this dump captured, as 'schema.table' strings — feeds the
@@ -639,11 +676,41 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
     return;
   }
 
-  const row = await one(`UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3, toc_summary=$4 WHERE id=$1 RETURNING *`,
-    [snap.id, size, MODE, tocSummary ? JSON.stringify(tocSummary) : null]);
+  const row = await one(
+    `UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3, toc_summary=$4,
+                            row_counts=$5::jsonb, row_total=$6 WHERE id=$1 RETURNING *`,
+    [snap.id, size, MODE, tocSummary ? JSON.stringify(tocSummary) : null,
+     rowCounts ? JSON.stringify(rowCounts) : null, rowCounts ? rowTotal(rowCounts) : null]);
   if (dbc) await clearBusy(dbc.id);
   broadcast('task', { kind: 'db_snapshot', snap: row });
   logline('maint', `backup finished (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath} (${size ?? '?'} bytes)`);
+
+  // THE TREND, which is the reading nothing in this system could give before: a table that SHRANK
+  // since the last good dump. Growth, a new table and a dropped table are all normal and are counted
+  // but never dressed as loss; only a real drop — and worst of all a populated table arriving EMPTY —
+  // is a finding, and it is said out loud HERE, in the log a human watches, as well as on the panel.
+  // Estimates on both sides, equally stale, which is exactly what makes the comparison fair.
+  if (rowCounts && !scoped) {
+    const prevRows = await one(
+      `SELECT row_counts FROM db_snapshot
+         WHERE project_id=$1 AND source='prod' AND status='finished' AND mode='real' AND id<>$2
+           AND tables IS NULL AND row_counts IS NOT NULL
+         ORDER BY taken_at DESC LIMIT 1`, [snap.project_id, snap.id]);
+    const trend = compareBackupCounts(prevRows?.row_counts ?? null, rowCounts);
+    if (!trend) {
+      logline('maint', `row counts recorded for this backup (~${rowTotal(rowCounts).toLocaleString()} rows in `
+        + `${Object.keys(rowCounts).length} tables). No earlier backup carries counts yet, so there is nothing to `
+        + 'compare against — the NEXT backup gets a trend. (Estimates, and about the DUMP SOURCE, not the archive.)');
+    } else if (trend.verdict === 'ok') {
+      logline('maint', `row counts steady vs the last backup: ~${trend.total_now.toLocaleString()} rows `
+        + `(was ~${trend.total_prev.toLocaleString()}) · ${trend.counts.grew} grew, ${trend.counts.steady} unchanged`
+        + `${trend.counts.added ? `, ${trend.counts.added} new table(s)` : ''}`);
+    } else {
+      logline('maint', `⚠ ${trend.emptied.length} table(s) went EMPTY and ${trend.shrunk.length} SHRANK since the last `
+        + `backup — ${trend.worst.map((w) => `${w.table} ${w.prev.toLocaleString()}→${w.now.toLocaleString()}`).join(', ')}`
+        + `. These are planner ESTIMATES, so a small drop can be noise — an emptied table is not. Worth a look.`);
+    }
+  }
   await housekeepBackups(snap.project_id, keep);
 }
 
@@ -794,6 +861,21 @@ export async function restoreBackup({ snapshot, container, confirmProd = false, 
   return { ok: true, status: 'started', container: c.name };
 }
 
+// Remember what a database was loaded FROM (and clear any stale data-check verdict, which described
+// the previous contents). `snapshotId` null = a live pipe with no snapshot in the middle
+// ("Duplicate prod"), which the note then names. Never throws: bookkeeping must not fail a restore.
+async function noteRestoredFrom(containerId, snapshotId, note = null) {
+  try {
+    const row = await one(
+      `UPDATE container SET restored_from=$2, restored_at=now(), restored_note=$3,
+                            data_check=NULL, data_check_at=NULL
+        WHERE id=$1 RETURNING *`, [containerId, snapshotId, note]);
+    if (row) broadcast('container', row);
+  } catch (e) {
+    logline('maint', `could not record what ${containerId} was restored from: ${e.message}`);
+  }
+}
+
 async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
   let restored = false;
   const tArgs = restoreTableArgs(tables);   // [] ⇒ restore the whole archive
@@ -831,6 +913,12 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
     }
     logline('maint', `restore finished → ${c.name}`);
     restored = true;
+    // WHICH DUMP THIS DATABASE NOW IS. Recorded, not inferred: the data check compares a restored db
+    // against the counts of ITS OWN source, and "probably the newest snapshot at the time" is exactly
+    // the kind of guess this ticket exists to stop. A table-scoped restore says so, because then only
+    // those tables came from this archive and a whole-db comparison would be meaningless.
+    await noteRestoredFrom(c.id, snap.id,
+      tables.length ? `restored ${tables.length} table(s) only: ${tables.join(', ')}` : null);
   } catch (e) {
     logline('maint', `restore FAILED → ${c.name}: ${e.message}`);
   } finally {
@@ -930,6 +1018,11 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
     }
     logline('maint', `duplicate finished → ${target.name}`);
     restored = true;
+    // No snapshot in the middle — this WAS live prod, piped. Record that rather than leaving a stale
+    // "restored from last night's dump" behind it: the data check needs to know it has no recorded
+    // reference for this db and must say so instead of grading it against the wrong dump.
+    await noteRestoredFrom(target.id, null,
+      'duplicated LIVE production (a direct pg_dump → pg_restore pipe; no snapshot, so no recorded row counts)');
   } catch (e) {
     logline('maint', `duplicate FAILED → ${target.name}: ${e.message}`);
   } finally {
@@ -967,19 +1060,86 @@ export async function reconcileInterruptedJobs() {
   return { backups: snaps.length, containers: cons.length };
 }
 
-// Is a fresh prod backup due for this project? (no backup yet, or the newest is older than the
-// configured interval.) Considers any latest row so a just-started/failed one prevents a storm.
-async function backupDue(projectId) {
+// Is a fresh prod backup due for this project, and WHY — ticket #26.
+//
+// It used to be one question ("is the newest attempt, of any status, older than the policy interval?")
+// and that let a FAILED attempt SATISFY its window: one failure pushed the next good dump out by a full
+// interval, two in a row cost a day with no restore point, silently. Now a failure schedules a RETRY
+// interval instead (lib/backup-schedule.js: 10 min, doubling per consecutive failure, capped at the
+// policy interval so it can only ever be sooner than the old behaviour, never later).
+//
+// The FAILURE STREAK is read from the ledger rather than held in memory: the incident that produced
+// this ticket was a server restart, and state that forgets across a restart is state that forgets
+// exactly when it matters. Returns the whole decision so the caller can log the reason it acted on.
+export async function backupDue(projectId, now = Date.now()) {
   const cfg = await one(`SELECT backup_interval_sec FROM pool_config WHERE project_id=$1`, [projectId]);
   const interval = cfg?.backup_interval_sec ?? DEFAULT_INTERVAL_SEC;
-  const last = await one(
-    `SELECT taken_at FROM db_snapshot WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC LIMIT 1`,
-    [projectId]);
-  if (!last) return true;
-  const row = await one(
-    `SELECT (now() - $1::timestamptz) >= ($2 || ' seconds')::interval AS due`,
-    [last.taken_at, interval]);
-  return !!row?.due;
+  const lastAttempt = await one(
+    `SELECT id, taken_at, status FROM db_snapshot WHERE project_id=$1 AND source='prod'
+      ORDER BY taken_at DESC LIMIT 1`, [projectId]);
+  const lastGood = await one(
+    `SELECT id, taken_at FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='finished'
+      ORDER BY taken_at DESC LIMIT 1`, [projectId]);
+  // Consecutive failures SINCE the last success — the backoff's exponent. Counted in SQL so a restart
+  // cannot reset it back to "first retry" and start the 10-minute cadence over.
+  const streak = await one(
+    `SELECT count(*)::int AS n FROM db_snapshot
+      WHERE project_id=$1 AND source='prod' AND status='failed'
+        AND ($2::timestamptz IS NULL OR taken_at > $2::timestamptz)`,
+    [projectId, lastGood?.taken_at ?? null]);
+
+  return backupDecision({ lastAttempt, lastGood, failStreak: streak?.n ?? 0, intervalSec: interval, now });
+}
+
+// Tell a human that PRODUCTION'S RESTORE POINT IS STALE, at most once per policy interval, and tell
+// them once when it recovers. All decisions are in lib/backup-schedule.js (pure, and tested with
+// explicit clocks); this is only the plumbing plus the persistence of "who has been told".
+//
+// BEST-EFFORT, ABSOLUTELY: it is called from the tick, never from a backup job, every failure is
+// swallowed, and it writes nothing except its own alert bookkeeping. A notifier that can fail a backup
+// is worse than no notifier — the dump is the product.
+// Exported for the test: the once-per-interval bound and the recovery ping live in pool_config, not in
+// the pure decision, so the BOOKKEEPING has to be exercised against a real database or the storm control
+// for the alert itself is unproven.
+export async function checkBackupFreshness(projectId, now = Date.now()) {
+  try {
+    const cfg = await one(
+      `SELECT backup_interval_sec, backup_alerted_at, backup_alert_open FROM pool_config WHERE project_id=$1`,
+      [projectId]);
+    const interval = cfg?.backup_interval_sec ?? DEFAULT_INTERVAL_SEC;
+    const lastGood = await one(
+      `SELECT id, taken_at FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='finished'
+        ORDER BY taken_at DESC LIMIT 1`, [projectId]);
+    const d = staleAlertDecision({
+      lastGood, intervalSec: interval,
+      alertedAt: cfg?.backup_alerted_at ?? null, alertOpen: !!cfg?.backup_alert_open, now });
+    if (!d.fire && !d.clear) return d;
+
+    const project = await one(`SELECT id, name FROM project WHERE id=$1`, [projectId]);
+    if (d.fire) {
+      const streak = await one(
+        `SELECT count(*)::int AS n FROM db_snapshot
+          WHERE project_id=$1 AND source='prod' AND status='failed' AND taken_at > $2::timestamptz`,
+        [projectId, lastGood.taken_at]);
+      logline('maint', `⚠ ${project?.name || projectId}: PROD RESTORE POINT IS STALE — ${d.reason}. `
+        + 'Telling a human off-screen (a stale restore point is not visible to anyone who is not looking '
+        + 'at the panel, which is how this went unnoticed for 27 hours).');
+      notifyBackupStale({
+        project, ageHours: Math.round(d.ageSec / 3600), thresholdHours: Math.round(d.thresholdSec / 3600),
+        lastGoodAt: lastGood.taken_at, failStreak: streak?.n ?? 0 });
+      await q(`UPDATE pool_config SET backup_alerted_at=now(), backup_alert_open=true WHERE project_id=$1`, [projectId]);
+    } else {
+      logline('maint', `${project?.name || projectId}: ${d.reason}`);
+      notifyBackupRecovered({ project, ageMinutes: Math.round(d.ageSec / 60) });
+      await q(`UPDATE pool_config SET backup_alert_open=false WHERE project_id=$1`, [projectId]);
+    }
+    return d;
+  } catch (e) {
+    // Never propagates: this runs beside the backup decision, and an alerting bug must not be able to
+    // stop backups from being taken.
+    logline('maint', `backup-freshness check failed (backups unaffected): ${e.message}`);
+    return null;
+  }
 }
 
 // Refresh pooled db-isolated xells that have gone stale, from the latest FINISHED prod snapshot.
@@ -1026,11 +1186,15 @@ export function startMaintenance() {
   // Deferral memory: reason we last logged per project, so a held lock logs ONCE when the
   // deferral starts and once when prod frees up — not every 60s tick in between.
   const deferred = new Map();
+  // What we last SAID about a retry, per project, so a 10-minute retry window does not print a line
+  // every 60-second tick. Log noise is the same disease as alert noise, one screen down.
+  const saidRetry = new Map();
   const tick = async () => {
     try {
       const projects = await q(`SELECT id FROM project`);
       for (const p of projects) {
-        if (await backupDue(p.id)) {
+        const d = await backupDue(p.id);
+        if (d.due) {
           const busy = await prodBusyReason(p.id);
           if (busy) {
             if (deferred.get(p.id) !== busy) {
@@ -1039,11 +1203,23 @@ export function startMaintenance() {
             }
           } else {
             if (deferred.delete(p.id)) logline('maint', 'prod is free again — running the deferred backup now');
+            // A RETRY says so, and says which attempt it is: the whole point of #26 is that a failure
+            // brings the next attempt forward, and that has to be visible when it happens.
+            if (d.kind === 'retry') logline('maint', `prod backup RETRY — ${d.reason}`);
+            saidRetry.delete(p.id);
             await backupProd(p.id).catch((e) => {   // starts an async job; may no-op if one runs
               if (!/already running/.test(e.message)) throw e;
             });
           }
+        } else if (d.kind === 'retry' && saidRetry.get(p.id) !== d.dueAt) {
+          // Not due YET, but a retry is scheduled — say it ONCE per schedule, so an operator watching
+          // the terminal can see the backoff working instead of silence.
+          saidRetry.set(p.id, d.dueAt);
+          logline('maint', `prod backup will RETRY in ${Math.ceil(d.waitSec / 60)} min — ${d.reason}`);
         }
+        // Alerting runs on EVERY tick, not only when a backup is due: the whole failure was that
+        // nothing spoke while nothing was happening. It never throws and never touches the dump.
+        await checkBackupFreshness(p.id);
         await refreshStaleXellDbs(p.id);
       }
     } catch (e) { console.error('[maintenance]', e.message); }

@@ -83,7 +83,17 @@ in a header comment, and that header is part of the deliverable.
 
 A Zeehive xell inherits **simulate-mode safety defaults** (`zeehive.yml` → `BUILD_MODE`,
 `PROVISION_MODE`, `SHIP_MODE` = `simulate`, `POOL_TARGET_READY=0`): the nested queenzee you run is a
-subject under test and can never touch the real fleet. That is why your local run provisions nothing.
+subject under test, and every PROVISION, TEARDOWN, BUILD, DEPLOY-FILE and BACKUP path is mode-gated.
+That is why your local run provisions nothing.
+
+⚠ It does **not** follow that it "can never touch the real fleet" — that sentence used to be here and
+it was not true. Your nested meta-DB is a **CLONE of the real one** (real slugs, container names,
+docker contexts, host repo paths), the flags gate ACTIONS and not READS, and in a cxell much of the
+rest is inert only because a cage has no docker binary and no host paths — a property of the cage,
+not of the code. `proddiff` reads real production databases with no mode gate at all, and one write
+path (the ship's migration apply) has none either. The audit, loop by loop, with the read-only versus
+write distinction kept separate:
+[docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md).
 
 **"I wrote it" is not verification.** Exercise the real thing in your own containers before you call
 the work done.
@@ -99,7 +109,8 @@ server/src/
   queenzee/      the loops: pool, intake, monitor, landing + landgate + landingpad, shipgate +
                  shipmigrate, seedgate, reaper, maintenance, dbclone, proddiff, worksync, self
   lib/           provision, cxell driver, git, harness, work-items, remote-git (clone/pull, no
-                 push), projects, fleet, notify, …
+                 push), projects, fleet, notify, agent-docs (every AI provider's entry-point
+                 filename) + project-docs + xell-stack (the docs GENERATED into a xell), …
   db/            migrate.js, seed.js  (seed_demo.js is DEAD — see house rules)
 web/src/         the console (React + Vite): App.jsx, hive/ (honeycomb canvas), work/ (board+gantt),
                  Landing.jsx · Ship.jsx · ProdData.jsx (the human GATES), ZeeTerminal.jsx, DiffViewer.jsx
@@ -139,10 +150,18 @@ docs/            specs and rationale (see the doc map)
    `harnesses/` folder: the row carries the personality, the skills, the memory (080) and the badge
    SVG (082), it is edited in the console's harness manager or by migration, and the queenzee
    GENERATES the files it injects into a xell (stamped as generated). `lib/harness.js` reads no
-   filesystem, so a harness cannot be "missing files" on any project or in any container. Project `AGENTS.md`/`CLAUDE.md` docs work the same way (081,
-   `lib/project-docs.js`) and are never written over a path the project has committed. Do not
-   reintroduce a repo copy of either: the folder-and-row split shipped a fleet of manager zees with
-   no manual at all, and hid a migration's edit behind a hash that said the two agreed.
+   filesystem, so a harness cannot be "missing files" on any project or in any container. Project
+   entry-point docs work the same way (081, 083, `lib/project-docs.js`) and are never written over a
+   path the project has committed. Do not reintroduce a repo copy of either: the folder-and-row split
+   shipped a fleet of manager zees with no manual at all, and hid a migration's edit behind a hash
+   that said the two agreed.
+11. **A project's entry-point doc is ONE text, not one file per tool.** `project_doc.body` is the
+   source of truth and `targets` says which providers receive it; the FILENAMES are a registry in
+   code (`lib/agent-docs.js` — `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.github/copilot-instructions.md`,
+   `.cursor/rules/*.mdc`, …), each entry carrying the vendor doc that settles it. Never add a second
+   row to give another tool the same instructions — tick its provider. Every generated file also ends
+   with THAT xell's stack, generated per xell (`lib/xell-stack.js`): that is house rule 7 for an agent
+   that has no `zee status` to ask.
 
 ## 6. Doc map — which file answers what
 
@@ -156,6 +175,8 @@ docs/            specs and rationale (see the doc map)
 | the role-specialised worker personas (Scout, Builder, Reviewer, …) | [docs/dev-crew.md](docs/dev-crew.md) |
 | the manager harness that runs that crew | [docs/dev-crew-lead.md](docs/dev-crew-lead.md) |
 | how a zee's db catches up to prod's schema | [docs/schema-catchup-plan.md](docs/schema-catchup-plan.md) |
+| a db chip says DRIFTED and you need to know why | [docs/schema-drift-triage.md](docs/schema-drift-triage.md) |
+| why a fresh restore still shows drift, and what a backup does **not** prove | [docs/data-completeness-check.md](docs/data-completeness-check.md) |
 | projects, manifests, deploy sites | [docs/deploy-topology-spec.md](docs/deploy-topology-spec.md) |
 | what runs where in production, and the cutover | [docker/zeehive/README.md](docker/zeehive/README.md) |
 | **why** a gate is shaped the way it is; traps already paid for | [HANDOFF.md](HANDOFF.md) — **history, not instructions** |

@@ -61,9 +61,14 @@ export async function getDispatchModels(provider = 'claude') {
 //
 // `zeeType` narrows the list to what a xell of that TYPE may actually wear (054): a harness carries
 // its type's manual, so offering a manager persona in a worker picker would only produce a refusal
-// at assign time. Omit it in the harness MANAGER, which edits every persona regardless of type.
-export async function getHarnesses(zeeType = null) {
-  const r = await fetch(`/api/harnesses${zeeType ? `?zee_type=${encodeURIComponent(zeeType)}` : ''}`);
+// at assign time. `projectId` narrows it the same way on the SCOPE axis (084): the system-wide
+// harnesses PLUS that project's own, and never another project's — so every picker bound to a project
+// must pass it, or it offers a choice the assign path (and the DB) would then refuse. Omit both in the
+// harness MANAGER, which edits every persona and says which scope each one is.
+export async function getHarnesses(zeeType = null, projectId = null) {
+  const qs = [zeeType ? `zee_type=${encodeURIComponent(zeeType)}` : null,
+              projectId ? `project=${encodeURIComponent(projectId)}` : null].filter(Boolean).join('&');
+  const r = await fetch(`/api/harnesses${qs ? `?${qs}` : ''}`);
   return r.ok ? r.json() : [];
 }
 // Assign/switch a xell's harness (a human action). `harness` is a key/id, or null to clear to core.
@@ -211,12 +216,18 @@ export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${site
 
 // ── environments (masked — the server never returns a secret value, only a hint). The meta-DB
 // source of truth for the untracked .env; resolved onto a xell by tier (lib/environments.js). ──
-// ── the project's ENTRY-POINT DOCS (AGENTS.md / CLAUDE.md …) ──────────────────────────────────
-// Owned by the meta-DB and generated into every xell when a zee is assigned. The console's Docs tab
-// is the authoring surface; the queenzee refuses to write one over a path the project has committed.
+// ── the project's ENTRY-POINT DOCS — one text, one file per AI provider ───────────────────────────
+// The CONTENTS live in the meta-DB and the queenzee generates CLAUDE.md / AGENTS.md / GEMINI.md / …
+// into every xell when a zee is assigned. The console's Docs tab is the authoring surface; the
+// queenzee refuses to write one over a path the project has committed. The TARGET CATALOGUE (which
+// provider reads which filename) is served by the API, never hard-coded here — vendors rename them.
+export const getAgentDocTargets = () => fetch('/api/agent-doc-targets').then((r) => (r.ok ? r.json() : []));
 export const getProjectDocs = (projectId) => fetch(`/api/projects/${projectId}/docs`).then((r) => (r.ok ? r.json() : []));
 export const createProjectDoc = (projectId, body) => siteCall(`/api/projects/${projectId}/docs`, 'POST', body);
 export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${docId}`, 'PUT', body);
+// What will REALLY be written, run through the real generator: the stamp, the sibling list and the
+// stack section an operator never typed and would otherwise first see inside a cage.
+export const previewProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}/preview`, 'GET');
 export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
 
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
@@ -336,17 +347,48 @@ export async function decommissionContainer(containerId, force = false) {
   return data;
 }
 
-// Check ONE db container's schema drift against PRODUCTION on demand (the chip's "Check diff" menu
-// item). The server measures it NOW, persists the verdict, and broadcasts the container update — so
-// the chip's drift mark repaints over SSE — and returns the payload { ok, total, kinds, same_db,
-// error } so the caller can pop a one-line summary.
-export async function checkContainerDiff(containerId) {
+// Check ONE db container's schema against a REFERENCE database on demand (the chip's "Check diff"
+// menu item). `against` = another db container's id, or null/omitted for PRODUCTION — the default,
+// and the only reference whose verdict is persisted + broadcast (so the chip's drift mark repaints
+// over SSE). Any other reference is measured and reported only. Returns the payload
+// { ok, total, kinds, by_schema, reference, persisted, same_db, error } so the caller can show it.
+export async function checkContainerDiff(containerId, against = null) {
   const r = await fetch(`/api/containers/${containerId}/check-diff`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ against: against || null }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `check diff failed (${r.status})`);
   return data;
+}
+
+// Check ONE db container's ROWS against the backup it was restored from (the chip's "Check data" menu
+// item). The sibling of checkContainerDiff, and a different question: that one asks whether the SHAPE
+// matches production, this one asks whether the ROWS the source dump recorded actually arrived. Returns
+// { ok, verdict, checked, ok_count, empty, short, missing, unknown, ref_total, got_total, reference, error }.
+export async function checkContainerData(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/check-data`, { method: 'POST' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `check data failed (${r.status})`);
+  return data;
+}
+
+// Is a data check even possible for this db, and against which backup? Asked before the menu item is
+// offered, so a human is never invited to run a check whose only possible answer is "no reference".
+export async function getDataCheckReadiness(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/data-check-readiness`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `readiness failed (${r.status})`);
+  return data;
+}
+
+// The db containers this one can be compared against (the "Check diff" submenu). Production comes
+// first — it is the default reference and the only one that writes the chip's drift verdict.
+export async function getDiffCandidates(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/diff-candidates`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `diff candidates failed (${r.status})`);
+  return Array.isArray(data.candidates) ? data.candidates : [];
 }
 
 // Duplicate PRODUCTION into a dev db container (the chip's "Duplicate prod" menu item): a prod

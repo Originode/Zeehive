@@ -816,8 +816,11 @@ export async function setZeeMode(zeeId, permissionMode) {
 // no context: what is this project and how do I work in it. Never overwrites a git-tracked path
 // (lib/cxell.js decides that inside the cage), and every outcome is logged: a doc an operator wrote
 // and a zee never received is exactly the silence this whole mechanism exists to remove.
-export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId }) {
-  const files = await projectDocFiles(projectId);
+export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId, xellId = null }) {
+  // xellId is what puts THIS xell's stack inventory in the generated files (lib/xell-stack.js) — the
+  // containers, ports, database coupling and build verbs a non-ZEEHIVE agent (Cursor, Copilot, Codex)
+  // reading CLAUDE.md/AGENTS.md has no other way to learn. Absent, the instructions still generate.
+  const files = await projectDocFiles(projectId, { xellId });
   if (!files.length) return { docs: 0, written: 0, skipped: 0, failed: 0 };
   let written = 0, failed = 0;
   const skipped = [];
@@ -907,7 +910,8 @@ export async function reinjectHarnessIntoXell(xellId) {
       + (failed ? ` — ${failed} FAILED to write` : ''));
     // The project's own entry-point docs are regenerated on the same trigger: an operator who fixes
     // AGENTS.md in the console and re-assigns must not have to wait for the next dispatch either.
-    const docs = await injectProjectDocsIntoXell({ ctx: 'default', slug: zee.slug, projectId: zee.project_id })
+    const docs = await injectProjectDocsIntoXell({ ctx: 'default', slug: zee.slug,
+                                                   projectId: zee.project_id, xellId })
       .catch((e) => ({ docs: 0, written: 0, error: e.message }));
     // Honest result: writing NOTHING when there was something to write is a failure, however many
     // individual errors were swallowed above. A caller that logs "re-injected 0 file(s)" as a success
@@ -1330,7 +1334,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     }
     // …and the PROJECT's entry-point docs (AGENTS.md/CLAUDE.md …) from the meta-DB, at the paths a
     // provider actually looks for. Generated, never written over a file the project itself committed.
-    await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id })
+    await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id, xellId: xell.id })
       .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
     // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
@@ -1414,6 +1418,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  - `zee device [--detach|--status]` → attach a MOBILE DEVICE (Android) to build/install/run your app on. NOT gated (throwaway target). Returns the adb address + the build→install→launch→screenshot loop; a human can watch its screen in a web viewer. Only for projects that support one.',
     '  - `zee sync [--no-rebuild]`  → CATCH UP / REBASE your branch onto current main. NOT gated. This is the ONLY way to reconcile in the cage: your cxell was seeded from a bundle of your branch alone (no main/master ref, `origin` is a consumed bundle), so `git fetch`/`git rebase main` cannot work in here. `zee sync` has the queenzee deliver current main IN as origin/main and MERGE it into your branch, then rebuilds. Reach for it whenever you are asked to rebase or catch up your code, or before landing if main has moved. A genuine merge CONFLICT is left in place for YOU to resolve (edit, git add/commit), then land; a clean sync leaves your HEAD descending from current main.',
     '  - `zee db-catchup [--restore]` → the db counterpart of `zee sync`: roll your OWN (clone/isolated) database FORWARD to prod\'s CURRENT schema by applying the prod-ledger migrations it lacks. NOT gated (writes only your throwaway db; reads prod read-only). `--restore` (isolated dbs only) instead rebuilds from the latest full prod snapshot — exact schema+data, but it DISCARDS your db\'s current contents.',
+    '  - `zee migration-number [--name "…"]` → ASK for the next free db/migrations number. NOT gated. Your worktree shows you what is LANDED plus what YOU wrote, and nothing about the siblings writing migrations on branches you cannot see — which is how six numbers came to be claimed twice or more. The queenzee counts main + every live xell\'s worktree + other zees\' claims, and records yours. Advisory: it hands out a number, it does not gate your landing.',
     '  - `zee land`                 → collect your commits out of the cxell and run the gated push to main. HELD for a human. If main moved since your cage was cut, land self-heals by running a `zee sync` first.',
     '  - `zee land --withdraw`      → UN-ASK a landing you already raised (nothing lands, nothing is rejected, your commits are untouched). NEVER stack land requests: if you asked to land and are not done, WITHDRAW the open one first, then land again — a human must only ever have ONE card from you to decide.',
     '  - `zee ship --reason "..."`  → ask to deploy to prod (add `--targets server webapp`). Refused unless already landed; a human approves; the QUEENZEE builds from main.',

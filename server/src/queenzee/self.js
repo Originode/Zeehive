@@ -13,6 +13,7 @@ import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
@@ -31,6 +32,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
+import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
@@ -40,6 +42,11 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          NO_PUSH_REASON } from '../lib/managers.js';
+// The harness DOMAIN (lib/harness.js) — listed/authored here for the manager harness verbs at the
+// bottom of this file, and read on the dispatch path. Same one-rule-one-place discipline as the type
+// check: this file adds the manager REFUSALS, never a second copy of the rules.
+import { normalizeZeeType, resolveHarness, listHarnesses, createHarness, updateHarness,
+         deleteHarnessUnlessWorn, liveHarnessWearers, wearerList } from '../lib/harness.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -603,6 +610,45 @@ export async function selfCatchup(xell, { restore = false } = {}) {
   };
 }
 
+// ── POST /api/xell/self/migration-number — hand out the next free db/migrations number ──
+// The one question a caged zee genuinely cannot answer: its worktree shows what is LANDED plus what
+// it wrote, and nothing about the siblings writing migrations on branches it cannot see. SIX numbers
+// have been claimed twice or more because of that (ticket #9) — 086 by three xells in one evening. The
+// queenzee can see main AND every live xell's worktree, so it answers — see lib/migration-numbers.js
+// for the three sources it unions.
+//
+// NOT gated, and ADVISORY: it hands out a number, it does not gate a landing (the lint in
+// test/migration-numbers.test.mjs is what fails the build if a duplicate lands anyway). Same class as
+// `zee build` and `zee db-catchup` — a zee helping itself do the work right.
+export async function selfMigrationNumber(xell, { name = null, again = false } = {}) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  if (!project) return { ok: false, error: `${xell.slug} has no project row to read a ledger from` };
+
+  let r;
+  try { r = await claimMigrationNumber(project, xell, { name, again }); }
+  catch (e) { return { ok: false, error: `could not claim a migration number: ${e.message}` }; }
+
+  const others = r.claims.filter((c) => c.xell_slug !== xell.slug);
+  const create = r.filename ? `create ${r.filename}` : `name the file ${r.dir}/${r.prefix}_<what_it_does>.sql`;
+  if (r.reused) {
+    return { ...r, message: `You already hold ${r.prefix} (claimed ${r.claim.claimed_at.toISOString?.() || r.claim.claimed_at}) — `
+      + `same number back, deliberately: the usual repeat is a re-run, and being handed the NEXT number after you have `
+      + `already written this one is the collision this verb exists to prevent. So: ${create}. If you genuinely need a `
+      + `SECOND migration in this landing, ask again with \`--again\`.` };
+  }
+  const counted = [
+    `${r.landed.count} landed on ${r.landed.ref}${r.landed.commit ? ` @ ${String(r.landed.commit).slice(0, 8)}` : ''} (max ${formatNumber(r.landed.max)})`,
+    `${r.worktrees.filter((w) => w.count).length} live xell worktree(s) holding migrations`
+      + (r.worktrees.some((w) => !w.readable) ? ` (⚠ ${r.worktrees.filter((w) => !w.readable).length} unreadable)` : ''),
+    `${others.length} live claim(s) by other zees${others.length ? ` (${others.map((c) => `${c.prefix}→${c.xell_slug}`).join(', ')})` : ''}`,
+  ].join(', ');
+  return { ...r, message: `Migration number ${r.prefix} is yours — ${create}. Counted: ${counted}. Your claim is `
+    + `RECORDED, so the next zee to ask gets a higher number even if you have not written the file yet; it lapses in `
+    + `${CLAIM_TTL_DAYS} days or when this xell is retired. Asking again returns THIS number (\`--again\` for a second one). `
+    + `It is ADVISORY — nothing gates your landing on it, but test/migration-numbers.test.mjs FAILS the build on a new `
+    + `duplicate, so use it.` };
+}
+
 // ── POST /api/xell/self/ship — file a ship request (shipgate) ──────────────────
 // The zee only ASKS. requestShip refuses unless the work is already landed on main (the anti-band-aid
 // rule), holds the request for a human, and the QUEENZEE deploys from main on approval. Identical to
@@ -989,13 +1035,22 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // persona cannot open a side door. (The assign path and the DB would refuse it too; refusing here
   // means the manager gets told why instead of watching a dispatch fail.)
   if (harness) {
-    const { resolveHarness, normalizeZeeType } = await import('../lib/harness.js');
     const h = await resolveHarness(harness).catch(() => null);
     if (h && normalizeZeeType(h.zee_type) === 'manager') {
       return { ok: false, status: 'refused', error:
         `"${h.key}" is a MANAGER harness, and a manager may not dispatch another manager — managers `
         + 'are added by a human, in the console. Dispatch a worker instead (omit --harness, or name a '
         + 'worker harness).' };
+    }
+    // …and a persona SCOPED to another project (084) is not this manager's to hand out either. The
+    // assign path and the DB both refuse it; refusing here means the manager is told which project
+    // owns it instead of watching a dispatch fail half-way through claiming a xell.
+    if (h && h.project_id && String(h.project_id) !== String(xell.project_id)) {
+      const owner = await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]);
+      return { ok: false, status: 'refused', error:
+        `"${h.key}" belongs to project "${owner?.name || h.project_id}" — a project-scoped persona is `
+        + "visible to its own project only. Use a system-wide harness, or one of your project's own "
+        + '(`zee harness` lists them; `zee harness --new` makes one).' };
     }
   }
 
@@ -1299,4 +1354,423 @@ export async function selfWorkItem(xell, { id = null, status = null, progress = 
   } catch (e) {
     return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MANAGER HARNESS VERBS — a manager mints its OWN specialised worker personas.
+//
+// A manager's job is a crew, and a crew needs roles: a persona that knows this project's migration
+// discipline, a reviewer that knows what this codebase gets wrong. Until now every persona was
+// system-wide and only a human could add one, so a manager that wanted a specialist had to ask for
+// one and then wait — and whatever it got appeared in every other project's picker.
+//
+// So a manager may create/edit/delete harnesses IN ITS OWN PROJECT (084's project_id). What it may
+// NOT do is grow its own authority, and every one of those limits is structural rather than a
+// sentence in its manual:
+//   • the harness it creates is stamped with the CALLER'S project_id, taken from the token — never
+//     from a parameter, so "which project?" can never become a way to reach into another one;
+//   • the zee_type is WORKER. A manager that could mint manager personas grows the fleet sideways
+//     with nobody's consent (the same reason `zee dispatch` refuses a manager harness);
+//   • every SYSTEM-WIDE harness is off-limits — core, zee-base, manager, the dev-* crew are the
+//     fleet's shared vocabulary, and one project's manager does not get to edit or delete them;
+//   • the patch is a WHITELIST of persona fields, so there is nowhere to express a land/ship/prod/
+//     gate rule (the same guarantee lib/harness.js's authoring functions already give the console);
+//   • a harness a live xell is WEARING cannot be deleted out from under it.
+// The DB triggers (084) hold the wearing/inheritance rules underneath all of it, so a scoped persona
+// cannot reach another project even if this file were wrong.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// The persona fields a manager may set. Everything else is refused BY NAME rather than ignored: a
+// silently-dropped `is_law_core: true` reads to the caller exactly like a granted one.
+const MANAGER_HARNESS_FIELDS = ['label', 'summary', 'glyph', 'personality', 'skills', 'memory',
+                                'parent', 'enabled', 'avatar_svg'];
+
+// Resolve a harness key the CALLER is allowed to touch, or the refusal explaining why not. The order
+// of the checks is the order a zee needs to hear them in: does it exist, is it the fleet's, is it
+// somebody else's, is it a manager persona.
+async function ownHarness(xell, key) {
+  const k = String(key || '').trim().toLowerCase();
+  if (!k) {
+    return { refusal: { ok: false, error: 'name the harness: `zee harness <key> …` (`zee harness` lists them)' } };
+  }
+  const h = await one(
+    `SELECT h.*, p.name AS project_name FROM harness h LEFT JOIN project p ON p.id = h.project_id
+      WHERE h.key=$1`, [k]);
+  if (!h) {
+    return { refusal: { ok: false, status: 'refused', error:
+      `no harness "${k}" — \`zee harness\` lists the personas you can see (your project's, and the `
+      + 'system-wide ones). You may only edit your own project\'s.' } };
+  }
+  if (!h.project_id) {
+    return { refusal: { ok: false, status: 'refused', error:
+      `"${h.key}" is a SYSTEM-WIDE harness — it belongs to the whole fleet, not to your project, so you `
+      + 'may not edit or delete it. Create your own instead (`zee harness --new --label "…" --parent '
+      + `${h.key}\`), which INHERITS this one and leaves it alone. Changing a shared persona is a `
+      + "human's call in the console." } };
+  }
+  if (String(h.project_id) !== String(xell.project_id)) {
+    return { refusal: { ok: false, status: 'refused', error:
+      `"${h.key}" belongs to project "${h.project_name || h.project_id}" — you manage YOUR project's `
+      + 'personas only. It is not offered to you, and wearing it is refused by the database too.' } };
+  }
+  if (normalizeZeeType(h.zee_type) === 'manager') {
+    return { refusal: { ok: false, status: 'refused', error:
+      `"${h.key}" is a MANAGER persona. Managers are added by humans only, so a manager may neither `
+      + 'create nor edit one — a fleet that can mint its own bosses grows sideways with nobody\'s '
+      + 'consent. Worker personas are yours to make.' } };
+  }
+  return { harness: h };
+}
+
+// A parent must be a WORKER harness that is system-wide or in this project — the whole point of the
+// verb (inherit dev-base, get the manual for free), and the one place a scoped persona could
+// otherwise pull in another project's text. The DB refuses it as well (harness_scope_guard); this is
+// the sentence.
+async function parentFor(xell, parentKey) {
+  const k = String(parentKey || '').trim().toLowerCase();
+  if (!k || k === 'none') return { parent: null };
+  const p = await one(
+    `SELECT h.key, h.zee_type, h.project_id, h.is_law_core, pr.name AS project_name
+       FROM harness h LEFT JOIN project pr ON pr.id = h.project_id WHERE h.key=$1`, [k]);
+  if (!p) return { refusal: { ok: false, error: `no harness "${k}" to inherit — \`zee harness\` lists them` } };
+  if (p.is_law_core) {
+    return { refusal: { ok: false, status: 'refused', error:
+      'the core (law) harness is not a parent — every zee gets it already, always, on top of whatever '
+      + 'it wears. Inherit a WORKER harness (`zee-base` carries the cxell manual; `dev-base` the dev craft).' } };
+  }
+  if (normalizeZeeType(p.zee_type) === 'manager') {
+    return { refusal: { ok: false, status: 'refused', error:
+      `"${p.key}" is a MANAGER persona, so a worker harness cannot inherit it: it would merge the `
+      + "manager's manual into a worker's briefing and teach it verbs it does not have." } };
+  }
+  if (p.project_id && String(p.project_id) !== String(xell.project_id)) {
+    return { refusal: { ok: false, status: 'refused', error:
+      `"${p.key}" belongs to project "${p.project_name || p.project_id}" — a harness may only inherit a `
+      + "SYSTEM-WIDE harness or one of its own project's, or that project's persona would be merged into "
+      + 'your zees\' briefings.' } };
+  }
+  return { parent: p.key };
+}
+
+// Split a body into { patch, rejected }: the persona fields, and the names that are not persona at
+// all. `key`/`zee_type` are the caller's own business (create names one, both refuse a manager type);
+// everything else that is not on the whitelist comes back as `rejected` and is refused BY NAME.
+function harnessPatchOf(body = {}) {
+  const patch = {}, rejected = [];
+  for (const [k, v] of Object.entries(body)) {
+    if (['key', 'zee_type'].includes(k)) continue;
+    if (MANAGER_HARNESS_FIELDS.includes(k)) patch[k] = v;
+    else rejected.push(k);
+  }
+  return { patch, rejected };
+}
+function rejectedFieldsRefusal(rejected) {
+  // The SCOPE fields get their own sentence, because the honest answer is not "that is not a persona
+  // field" — it is "you do not get to say which project", and that is worth stating once, plainly.
+  if (rejected.some((f) => f === 'project' || f === 'project_id')) {
+    return { ok: false, status: 'refused', error:
+      'you cannot set the project on a harness: it is resolved from your own token, so every persona '
+      + 'you create belongs to YOUR project and no other. Nothing you send can move one across.' };
+  }
+  return { ok: false, status: 'refused', error:
+    `a harness carries a PERSONA and nothing else, so ${rejected.map((f) => `\`${f}\``).join(', ')} `
+    + `${rejected.length === 1 ? 'is not a field' : 'are not fields'} you can set on one. What you may set: `
+    + `${MANAGER_HARNESS_FIELDS.join(', ')}. A harness has nowhere to express a land/ship/prod/gate rule `
+    + '— that is the law layer, and it is not a harness\'s to touch.' };
+}
+
+// What a manager gets BACK from a create/edit: the persona described, not recited. getHarnessFull()
+// carries every inherited body — for this crew that is zee-base's 32k manual — and echoing it into the
+// caller's transcript on every save spends the one budget an agent cannot get back, to tell it what it
+// already knew. So: the fields, and the SIZE of the text, which is the number that actually matters
+// (the same honesty the console's "briefed with N characters" total gives a human).
+function managerHarnessView(full) {
+  const size = (t) => String(t || '').length;
+  return {
+    key: full.key, label: full.label, scope: full.scope, project_id: full.project_id,
+    project_name: full.project_name, zee_type: full.zee_type, parent: full.parent,
+    summary: full.summary, glyph: full.glyph, enabled: full.enabled, bundle_empty: full.bundle_empty,
+    personality_chars: size(full.personality),
+    skills: (full.skills || []).map((s) => ({ name: s.name, when: s.when, chars: size(s.body) })),
+    memory: (full.memory || []).map((m) => ({ path: m.path, chars: size(m.text) })),
+    inherited: {
+      chain: full.inherited?.chain || [],
+      skills: (full.inherited?.skills || []).map((s) => `${s.name} (${s.from || '?'})`),
+      memory: (full.inherited?.memory || []).map((m) => `${m.path} (${m.from || '?'}, ${size(m.text)} chars)`),
+    },
+    briefing_chars: size(full.personality)
+      + (full.skills || []).reduce((n, s) => n + size(s.body), 0)
+      + (full.memory || []).reduce((n, m) => n + size(m.text), 0)
+      + (full.inherited?.skills || []).reduce((n, s) => n + size(s.body), 0)
+      + (full.inherited?.memory || []).reduce((n, m) => n + size(m.text), 0),
+  };
+}
+
+// THE STORED KEY OF A MANAGER-CREATED PERSONA IS DERIVED, NEVER CHOSEN.
+//
+// `harness.key` is UNIQUE across every scope, and it is how a harness is ADDRESSED outside the
+// console: `--harness <key>` on a dispatch, and `harness_memory_put('<key>', …)` in a migration
+// (house rule 9). A caller-chosen key therefore reaches further than the project it is scoped to — a
+// manager could take a name a future fleet-wide migration needs ('dev-security'), and the uniqueness
+// collision doubled as an existence oracle for other projects' rows.
+//
+// So the queenzee derives it: the project, then the label, both slugged, inside createHarness's
+// 40-character key budget. Deterministic (the same label in the same project always names the same
+// row) and namespaced (a global key can never be taken by accident).
+const keyPart = (s, max) => String(s || '').toLowerCase().trim()
+  .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, max).replace(/-+$/, '');
+
+async function deriveHarnessKey(xell, label) {
+  const proj = await one(`SELECT name FROM project WHERE id=$1`, [xell.project_id]);
+  const base = `${keyPart(proj?.name, 12) || 'project'}-${keyPart(label, 20) || 'harness'}`;
+  const holder = await one(`SELECT project_id FROM harness WHERE key=$1`, [base]);
+  // Free, or already this project's (which is a refusal the caller can act on — it is their row).
+  if (!holder) return { key: base };
+  if (String(holder.project_id || '') === String(xell.project_id)) return { key: base, mine: true };
+  // Held by a row this caller cannot see (another project's, or a system-wide one). It must NOT be
+  // told that — "that name is taken" about a row it has no access to is exactly the cross-project
+  // oracle this derivation exists to close. Disambiguate silently and report the key it got.
+  for (let n = 2; n <= 9; n++) {
+    const alt = `${base}-${n}`;
+    if (!(await one(`SELECT id FROM harness WHERE key=$1`, [alt]))) return { key: alt };
+  }
+  return { key: `${base.slice(0, 33)}-${randomUUID().slice(0, 6)}` };
+}
+
+// A manager may only make WORKER personas. Checked on the way in as well as on the way out, so the
+// refusal names the field the caller actually sent.
+function refuseManagerType(zeeType) {
+  if (!zeeType || normalizeZeeType(zeeType) !== 'manager') return null;
+  return { ok: false, status: 'refused', error:
+    'a manager may not create or edit a MANAGER persona — managers are added by humans, in the console. '
+    + 'Your harnesses are worker personas: `zee dispatch --harness <key>` puts a worker in one.' };
+}
+
+// GET /api/xell/self/harness/:key — `zee harness <key>` (MANAGER only).
+// READ one persona before editing or inheriting it. Readable for anything this project may SEE — its
+// own AND the system-wide ones, because deciding whether to inherit `dev-base` means reading what
+// `dev-base` says. Another project's is refused, exactly as everywhere else. `editable` says whether
+// this manager may write to it, so it never has to find out by being refused.
+export async function selfHarnessGet(xell, key) {
+  const guard = requireManager(xell, 'harness');
+  if (guard) return guard;
+  const k = String(key || '').trim().toLowerCase();
+  const h = await one(
+    `SELECT h.id, h.key, h.zee_type, h.project_id, h.is_law_core, p.name AS project_name
+       FROM harness h LEFT JOIN project p ON p.id = h.project_id WHERE h.key=$1`, [k]);
+  if (!h) {
+    return { ok: false, status: 'refused', error:
+      `no harness "${k}" — \`zee harness\` lists the personas your project can see.` };
+  }
+  if (h.project_id && String(h.project_id) !== String(xell.project_id)) {
+    return { ok: false, status: 'refused', error:
+      `"${h.key}" belongs to project "${h.project_name || h.project_id}" — you can see YOUR project's `
+      + 'personas and the system-wide ones, and nothing else.' };
+  }
+  const { getHarnessFull } = await import('../lib/harness.js');
+  const full = await getHarnessFull(h.key);
+  const editable = !!h.project_id && normalizeZeeType(h.zee_type) !== 'manager';
+  return {
+    ok: true, editable,
+    // Its OWN text in full (you asked for this one by name), the INHERITED chain described — the same
+    // split managerHarnessView draws, for the same reason.
+    harness: { ...managerHarnessView(full), personality: full.personality,
+               skills: (full.skills || []).map((s) => ({ name: s.name, when: s.when,
+                 chars: String(s.body || '').length, body: s.body || '' })),
+               memory: (full.memory || []).map((m) => ({ path: m.path,
+                 chars: String(m.text || '').length, text: m.text || '' })) },
+    message: editable
+      ? `"${h.key}" is your project's — edit it with \`zee harness ${h.key} --personality-file <path>\` `
+        + '(or --spec <file.json>), and dispatch a worker into it with `zee dispatch --harness '
+        + `${h.key} --task "…"\`.`
+      : `"${h.key}" is ${h.is_law_core ? 'the LAW layer — every zee gets it, always'
+          : 'SYSTEM-WIDE — the fleet\'s, not yours to edit'}. Inherit it instead: `
+        + `\`zee harness --new --label "…" --parent ${h.key}\`.`,
+  };
+}
+
+// GET /api/xell/self/harnesses — `zee harness` (MANAGER only).
+// The personas this manager can actually use: the system-wide worker harnesses (inheritable, not
+// editable) plus its own project's (editable). Every row says which, because "can I change this?" is
+// the first question a manager has about a list it is allowed to edit half of.
+export async function selfHarnessList(xell) {
+  const guard = requireManager(xell, 'harness');
+  if (guard) return guard;
+  const rows = await listHarnesses({ zeeType: 'worker', projectId: xell.project_id });
+  const harnesses = rows.filter((h) => !h.is_law_core)
+    .map((h) => ({ ...h, mine: h.scope === 'project', editable: h.scope === 'project' }));
+  const mine = harnesses.filter((h) => h.mine);
+  return {
+    ok: true, count: harnesses.length, project_id: xell.project_id, harnesses,
+    message: `${harnesses.length} worker persona(s) available to your project — ${mine.length} of them `
+      + `yours to edit${mine.length ? ` (${mine.map((h) => h.key).join(', ')})` : ''}. The system-wide ones `
+      + 'are the fleet\'s: inherit one with `zee harness --new --label "…" --parent <key>` rather than '
+      + 'editing it. Then dispatch into it: `zee dispatch --harness <key> --task "…"`.',
+  };
+}
+
+// POST /api/xell/self/harness — `zee harness --new` (MANAGER only).
+// Creates a WORKER persona SCOPED TO THIS MANAGER'S PROJECT. Not human-gated, for the same reason
+// `zee dispatch` is not: what it produces is visible to one project and can only ever be worn by a
+// caged worker whose every irreversible act still lands on the same human gates.
+export async function selfHarnessCreate(xell, body = {}) {
+  const guard = requireManager(xell, 'harness');
+  if (guard) return guard;
+  const badType = refuseManagerType(body.zee_type);
+  if (badType) return badType;
+  const label = String(body.label || '').trim();
+  if (!label) {
+    return { ok: false, error: 'a new harness needs --label "…" (the name a human reads on the badge). '
+      + 'Give it --parent too unless it is meant to carry the whole manual itself: a persona inheriting '
+      + '`zee-base` gets the cxell manual, and one inheriting `dev-base` the dev craft on top of it.' };
+  }
+  const { patch, rejected } = harnessPatchOf(body);
+  if (rejected.length) return rejectedFieldsRefusal(rejected);
+  const p = await parentFor(xell, body.parent);
+  if (p.refusal) return p.refusal;
+  // THE KEY IS NOT THE CALLER'S TO PICK — said out loud rather than quietly rewritten, because a
+  // caller that asked for one name and got another silently will address the row by the name it asked
+  // for (in a dispatch, in a later edit) and find nothing.
+  const derived = await deriveHarnessKey(xell, label);
+  if (String(body.key || '').trim()) {
+    return { ok: false, status: 'refused', error:
+      `you do not choose a harness KEY — the queenzee derives it from your project and the label, so `
+      + 'the fleet\'s key space stays predictable (a key is how a harness is addressed on a dispatch '
+      + `and in a migration, across every project at once). Drop \`key\` and name it with --label: `
+      + `yours would be "${derived.key}".` };
+  }
+  if (derived.mine) {
+    return { ok: false, status: 'refused', error:
+      `you already have a persona keyed "${derived.key}" — that is what the label "${label}" derives to `
+      + `in your project. Read it with \`zee harness ${derived.key}\`, edit it, or use a different label.` };
+  }
+
+  let created;
+  try {
+    // project_id comes from the TOKEN-resolved xell, never from the body — the one line that makes
+    // "which project?" unaskable.
+    created = await createHarness({ key: derived.key, label, glyph: body.glyph || null,
+                                    zee_type: 'worker', project_id: xell.project_id });
+  } catch (e) { return { ok: false, error: e.message }; }
+  // The persona text (and the parent) ride a normal update, so a manager's harness goes through the
+  // very same validation, hashing and live re-injection the console's editor does — including the
+  // refusal of any entry that would occupy an INHERITED file path. When that refuses, the row this
+  // call just made is REMOVED: half a persona under a key the caller cannot reuse (the derivation is
+  // deterministic, so its next attempt would collide with its own leftover) is worse than no row.
+  try {
+    if (Object.keys(patch).length || p.parent) {
+      created = await updateHarness(created.key, { ...patch, parent: p.parent || null });
+    }
+  } catch (e) {
+    await q(`DELETE FROM harness WHERE key=$1`, [created.key]).catch(() => {});
+    return { ok: false, status: 'refused', error: `${e.message} — nothing was created.` };
+  }
+  logline('crew', `${xell.slug} created project harness "${created.key}"${created.parent ? ` (inherits ${created.parent})` : ''}`);
+  return {
+    ok: true, harness: managerHarnessView(created), scope: 'project',
+    message: `Created "${created.key}" — a WORKER persona visible to your project only`
+      + `${created.parent ? `, inheriting ${created.parent} (its skills and memory come down the chain)` : ''}. `
+      + 'Its key is DERIVED from your project and the label (you do not choose one, and a key is how a '
+      + `dispatch and a migration address a harness). Dispatch into it with \`zee dispatch --harness `
+      + `${created.key} --task "…"\`, and read back what a wearer is briefed with using \`zee harness `
+      + `${created.key}\`.`,
+  };
+}
+
+// PUT /api/xell/self/harness/:key — `zee harness <key> --set…` (MANAGER only).
+export async function selfHarnessUpdate(xell, key, body = {}) {
+  const guard = requireManager(xell, 'harness');
+  if (guard) return guard;
+  const badType = refuseManagerType(body.zee_type);
+  if (badType) return badType;
+  const found = await ownHarness(xell, key);
+  if (found.refusal) return found.refusal;
+  const { patch, rejected } = harnessPatchOf(body);
+  if (rejected.length) return rejectedFieldsRefusal(rejected);
+  if (!Object.keys(patch).length) {
+    return { ok: false, error: 'nothing to change — name at least one field to set '
+      + `(${MANAGER_HARNESS_FIELDS.join(', ')})` };
+  }
+  if ('parent' in patch) {
+    const p = await parentFor(xell, patch.parent);
+    if (p.refusal) return p.refusal;
+    patch.parent = p.parent;
+  }
+  // DISABLING IS THE SAME END STATE AS DELETING, so it meets the same guard. harnessForXell() and
+  // effectiveHarness() both filter on `enabled`, so a disabled harness simply stops existing for a
+  // wearer: its next briefing is core-only, and disabling an ANCESTOR does it more quietly still —
+  // the heir stays enabled while its whole chain (zee-base's manual included) drops out. Neither
+  // raises anything the zee can see, which is precisely why the delete refusal exists.
+  if ('enabled' in patch && !patch.enabled && found.harness.enabled) {
+    const worn = await liveHarnessWearers(found.harness.id);
+    if (worn.length) {
+      return { ok: false, status: 'refused', error:
+        `"${found.harness.key}" cannot be DISABLED while ${worn.length} live xell(s) wear it or inherit `
+        + `it (${wearerList(worn)}) — a disabled harness drops out of every effective persona, so their `
+        + 'next briefing would lose it (the whole inherited chain, manual included) with no error they '
+        + 'could see. That is the end state deleting it is refused for. Switch or finish those zees '
+        + 'first; the rest of the persona is editable while they run.' };
+    }
+  }
+  let saved;
+  try { saved = await updateHarness(found.harness.key, patch); }
+  catch (e) { return { ok: false, status: 'refused', error: e.message }; }
+  logline('crew', `${xell.slug} edited project harness "${saved.key}"`);
+  return {
+    ok: true, harness: managerHarnessView(saved), scope: 'project',
+    // WHAT ACTUALLY HAPPENED, not what usually happens. This sentence used to claim the live crew had
+    // been re-briefed on every save — including the saves that change no text at all (an enabled-only
+    // edit leaves bundle_hash identical, so updateHarness skips the re-injection entirely) and the
+    // ones this queenzee only models. `reinjected` is the real outcome; each branch below is true.
+    message: `Saved "${saved.key}".${reinjectionSentence(saved.reinjected)}`
+      // A disabled harness drops out of every list (they are all `WHERE enabled`), so say where it went
+      // rather than let a manager conclude it was deleted.
+      + (saved.enabled ? '' : ` NOTE: it is DISABLED, so it no longer shows in \`zee harness\` and no new `
+        + `dispatch can attach it. Read or revive it by name: \`zee harness ${saved.key} --enabled on\`.`),
+  };
+}
+
+// The one honest sentence about a save's reach (see updateHarness → `reinjected`).
+function reinjectionSentence(rein) {
+  if (!rein) return ' Nothing in the persona TEXT changed, so no workspace was touched and no live zee'
+    + ' was re-briefed.';
+  if (rein.dry_run) {
+    return ` ${rein.xells} live xell(s) wear it or inherit it, and their files were NOT rewritten: this`
+      + ' queenzee models the fleet (PROVISION_MODE=simulate). They pick the change up on their next dispatch.';
+  }
+  if (rein.injected) {
+    return ` Every LIVE zee wearing it (or inheriting it) has had its persona files rewritten (${rein.injected}`
+      + ` of ${rein.xells} xell(s)) — an edit reaches the crew that is already running, not only the next dispatch.`;
+  }
+  if (rein.xells) {
+    return ` ${rein.xells} xell(s) wear it or inherit it but NO files were written (${rein.failed || 0} failed,`
+      + ` ${rein.skipped || 0} with no live cage) — those zees are still on the OLD text until their next dispatch.`;
+  }
+  return ' Nothing live is wearing it, so there was nothing to re-brief — the next dispatch gets the new text.';
+}
+
+// DELETE /api/xell/self/harness/:key — `zee harness <key> --delete` (MANAGER only).
+// Refused while a live xell is wearing it OR wearing anything that INHERITS it: both FKs are ON
+// DELETE SET NULL, so this would silently strip a running zee back to core-only (direct) or collapse
+// its chain to the leaf alone (an ancestor) mid-task — a persona vanishing under an agent, with no
+// error anywhere. Say who is wearing what and let the manager decide. The guard and the delete are
+// one transaction (deleteHarnessUnlessWorn), so a dispatch cannot land between them.
+export async function selfHarnessDelete(xell, key) {
+  const guard = requireManager(xell, 'harness');
+  if (guard) return guard;
+  const found = await ownHarness(xell, key);
+  if (found.refusal) return found.refusal;
+  let r;
+  try { r = await deleteHarnessUnlessWorn(found.harness.key); }
+  catch (e) { return { ok: false, error: e.message }; }
+  if (r.worn.length) {
+    return { ok: false, status: 'refused', error:
+      `"${found.harness.key}" is worn by ${r.worn.length} live xell(s) (${wearerList(r.worn)}) — deleting `
+      + 'it would strip that zee back to core-only, or collapse the chain it inherits, mid-task and with '
+      + 'no error it could see. Switch or finish those zees first (`--enabled off` is refused for the '
+      + 'same reason while they are running).' };
+  }
+  logline('crew', `${xell.slug} deleted project harness "${found.harness.key}"`);
+  return { ok: true, deleted: true, key: found.harness.key,
+           message: `Deleted "${found.harness.key}". Nothing was wearing it, or inheriting it.` };
 }
