@@ -1180,6 +1180,21 @@ a.cbox:hover { border-color: var(--accent); }
   cursor: pointer; padding: 4px 8px; }
 .hm-del:hover { color: var(--del, #e5554e); border-color: var(--del, #e5554e); }
 
+/* A harness carrying NOTHING (files_missing / bundle_empty). It used to render identically to one
+   carrying a 12.9k manual — same row, same badge — which is how a whole fleet of manager zees ran
+   with a blank persona unnoticed. The chip's WORDS are the signal (see web/src/harnessHealth.js);
+   these rules are reinforcement, never the only cue. */
+.hm-warn { font-size: 10px; font-weight: 700; color: var(--del, #e5554e); white-space: nowrap; }
+.hm-item.hm-hollow { border-color: rgba(229,85,78,.45); background: rgba(229,85,78,.08); }
+.hm-item.hm-hollow .hm-name { color: #ff9a94; }
+.hm-empty { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid rgba(229,85,78,.5); background: rgba(229,85,78,.10); color: var(--text);
+  font-size: 12px; line-height: 1.45; }
+.hm-empty b { color: #ff9a94; font-size: 13px; }
+.hm-empty code { background: rgba(0,0,0,.25); padding: 1px 4px; border-radius: 4px; }
+/* the same warning where a human PICKS a harness for a new zee (Dispatch) */
+.disp-seg.seg-hollow { border-color: rgba(229,85,78,.5); color: #ff9a94; }
+
 /* ── toasts: async-dispatch progress, bottom-right, above the overlay layer ────── */
 .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: flex;
   flex-direction: column; gap: 10px; max-width: min(380px, 92vw); pointer-events: none; }

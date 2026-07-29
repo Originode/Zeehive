@@ -378,6 +378,21 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   harness that briefs a zee with nothing is visible instead of looking healthy.
   Test: `node test/harness-repo-root.test.mjs` (reproduces the container: a `config.repoRoot` with
   no `harnesses/` + a project `repo_root` that has them).
+- **An unloaded harness is impossible to miss** (2026-07-29, the follow-up to the above). Two halves:
+  (1) `refreshHarnesses()` ends with ONE summary line — `harnesses: 3 loaded, 1 EMPTY — <keys> · N
+  live xell(s) are wearing an EMPTY harness` — logged always, `console.error` when any are empty
+  (`logHarnessSummary()` is exported and callable on its own). The per-harness loglines were each
+  true and each easy to miss; a boot is not clean if a zee's persona is a blank page.
+  (2) The console SAYS it, in words: `web/src/harnessHealth.js` (`emptyWarning()`) is the one place
+  `files_missing`/`bundle_empty` become `⚠ no files` / `⚠ empty`, used by the harness manager
+  (`HarnessRow` + `HarnessEmptyBanner`, both exported so they can be RENDERED in a test), the
+  dispatch picker (where a human chooses what a zee will wear), and the honeycomb —
+  `harnessWarning()` in HiveCanvas writes the word under the badge in place of `×N`, and rings +
+  labels a MANAGER hexagon, which IS its persona. `getTimeline()` carries the two fields for that.
+  Colour is reinforcement; the WORD is the signal (same rule as the feed chips).
+  Test: `node test/harness-empty-visible.test.mjs` — the boot line against real rows, plus the real
+  components rendered (react-dom/server) and the real canvas functions DRAWN against a recording
+  2D context, so a regex over the source can't fake it.
 - Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
   messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
   over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
