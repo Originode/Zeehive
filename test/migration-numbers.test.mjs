@@ -12,10 +12,11 @@
 // then two 085s landed, the last pair applying in a single boot on the shipped tip. git shows no
 // conflict for two files that never touch each other.
 //
-// And then it happened AGAIN, under this file, while it was being written: 086 was claimed by THREE
-// separate xells (a stale-backup alert, a harness scope guard and a land-clearance fix) inside one
-// evening, and the guard's first act after a `zee sync` was to fail on them. Six numbers now, one of
-// them three ways — which is the argument for the claim verb rather than better manners.
+// And then it happened AGAIN, twice, under this file, while it was being written: 086 was claimed by
+// THREE separate xells (a stale-backup alert, a harness scope guard and a land-clearance fix) inside
+// one evening, and 088 by two more in the minutes between this lint being written and being landed.
+// The guard's first act after each `zee sync` was to fail on them. Seven numbers now, one of them
+// three ways — which is the argument for the claim verb rather than for better manners.
 //
 // The FIX has two halves and this file is the second one:
 //   * a zee gets a number it can trust from the queenzee, which CAN see every live xell —
@@ -51,6 +52,9 @@ const GRANDFATHERED = {
   // Three xells, one evening, none able to see the others — landed while this lint was being written.
   '086': ['086_backup_stale_alert_state.sql', '086_harness_scope_guard_children.sql',
           '086_land_clearance_silence.sql'],
+  // And one more, landed in the minutes between this lint being written and being landed. Both files
+  // were already on main, so neither was mine to renumber — the repair is forward, i.e. this line.
+  '088': ['088_manager_manual_harness_key.sql', '088_manager_manual_scratch_resolution.sql'],
 };
 
 // The whole check, as a function of a FILE LIST — so the samples below run through the identical

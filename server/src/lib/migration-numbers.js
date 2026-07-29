@@ -5,8 +5,9 @@
 // its OWN worktree, which contains what is landed plus what IT has written — and nothing about the
 // four siblings writing migrations at the same hour on branches it cannot see. So two files claim one
 // number, git shows no conflict (they never touch each other), and postgres applies them in whatever
-// order a string sort gives two names that were meant to be identical. Six numbers so far — 038, 066,
-// 079, 082, 085, and 086 claimed by THREE xells in one evening.
+// order a string sort gives two names that were meant to be identical. It has happened repeatedly, and
+// twice while this file was being written; the landed collisions are LISTED (and re-checked) in
+// test/migration-numbers.test.mjs, which is the only copy of that record worth keeping.
 //
 // The queenzee is the only party that CAN see all of it, so this is where the answer belongs. Three
 // sources, unioned:
