@@ -45,11 +45,27 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
 
   const current = projects.find((p) => p.id === currentId) || null;
 
+  // What is waiting on a human in a project — a pending ship or a held landing. The console is
+  // per-project (production panel, landing banner, honeycomb: all the SELECTED project), so an
+  // approval waiting in the OTHER project is invisible until you happen to switch to it, while its
+  // zee keeps truthfully saying "it is waiting for you". So the switcher carries it: a dot on the
+  // button when it is elsewhere, a count on the row.
+  const waiting = (p) => (Number(p.ships_waiting) || 0) + (Number(p.landings_waiting) || 0);
+  const waitingElsewhere = projects.filter((p) => p.id !== currentId).reduce((n, p) => n + waiting(p), 0);
+  const waitLabel = (p) => [
+    Number(p.ships_waiting) ? `${p.ships_waiting} ship${p.ships_waiting === 1 ? '' : 's'}` : null,
+    Number(p.landings_waiting) ? `${p.landings_waiting} landing${p.landings_waiting === 1 ? '' : 's'}` : null,
+  ].filter(Boolean).join(' + ');
+
   return (
     <span className="projmenu" ref={ref}>
-      <button className="projmenu-btn" title="Switch project"
+      <button className={`projmenu-btn${waitingElsewhere ? ' waiting' : ''}`}
+              title={waitingElsewhere
+                ? `Switch project — ${waitingElsewhere} approval(s) waiting on you in ANOTHER project `
+                  + '(this page only ever shows the selected one)'
+                : 'Switch project'}
               aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
-        ⇄
+        ⇄{waitingElsewhere ? <span className="projmenu-wait" data-testid="projmenu-waiting">{waitingElsewhere}</span> : null}
       </button>
       <button className="projmenu-btn" title={current ? `Settings — ${current.name}` : 'Project settings'}
               aria-label="Project settings" disabled={!current} onClick={() => openSetup(current)}>
@@ -65,6 +81,12 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
                   <span className="dot">{p.id === currentId ? '●' : '○'}</span>
                   <span className="pn">{p.name}</span>
                   <span className="pc">{p.xell_count ?? 0} xell{Number(p.xell_count) === 1 ? '' : 's'}</span>
+                  {waiting(p) > 0 && (
+                    <span className="pw" data-testid="projpop-waiting"
+                          title={`${waitLabel(p)} awaiting your approval in ${p.name}`}>
+                      ⚠ {waiting(p)}
+                    </span>
+                  )}
                 </button>
                 <button className="projpop-del" title={`Configure ${p.name} (sites, ingress, containers, spawn template)`}
                         disabled={busy} onClick={() => openSetup(p)}>✎</button>

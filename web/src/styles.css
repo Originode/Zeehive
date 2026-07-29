@@ -57,6 +57,13 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .projpop-pick .dot { color: var(--accent); font-size: 10px; }
 .projpop-pick .pn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .projpop-pick .pc { color: var(--muted); font-size: 11px; }
+/* "something is waiting on you in a project you are not looking at" — this page is per-project, so
+   without these an approval in the other project is invisible while its zee waits on it. */
+.projmenu-btn.waiting { color: var(--error); border-color: var(--error); position: relative; }
+.projmenu-wait { position: absolute; top: -5px; right: -5px; min-width: 14px; height: 14px;
+  padding: 0 3px; border-radius: 7px; background: var(--error); color: #fff;
+  font-size: 9px; line-height: 14px; font-weight: 700; }
+.projpop-pick .pw { color: var(--error); font-size: 11px; font-weight: 600; }
 .projpop-del { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 13px;
   padding: 6px 8px; border-radius: 6px; }
 .projpop-del:hover:not(:disabled) { color: var(--down); background: var(--panel2); }

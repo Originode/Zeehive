@@ -102,5 +102,60 @@ ok(/A REFUSED ship is not a quiet ship/.test(mig), 'the manual patch teaches tha
 ok(/THEN RETURN; END IF;/.test(mig), 'guarded — re-running it changes nothing');
 ok(/ship_request id and commit/.test(mig), 'and gives the zee the test for "do I actually have one?"');
 
+// ── 6. RENDERED for real: what a human actually sees ──
+//
+// Bundled with esbuild and rendered to static markup, like test/tend-reason.test.mjs — so this
+// asserts the SCREEN, not that a string exists in a source file.
+console.log('\n── the console, rendered ──');
+const { build } = await import('esbuild');
+const { createElement: h } = await import('react');
+const { renderToStaticMarkup } = await import('react-dom/server');
+const { writeFileSync, rmSync } = await import('node:fs');
+
+const WEB = resolve(here, '..', 'web/src');
+const mk = async (src, exportLine, tag) => {
+  const entry = `${WEB}/.${tag}.test-entry.jsx`;
+  const outfile = `${WEB}/.${tag}.test-bundle.mjs`;
+  writeFileSync(entry, read(src) + exportLine);
+  try {
+    await build({ entryPoints: [entry], outfile, bundle: true, format: 'esm', platform: 'node',
+      loader: { '.jsx': 'jsx' }, external: ['react', 'react-dom', 'react/jsx-runtime'], logLevel: 'error' });
+    return await import(`file://${outfile}`);
+  } finally {
+    for (const f of [entry, outfile, outfile.replace(/\.mjs$/, '.css')]) rmSync(f, { force: true });
+  }
+};
+
+const shipUi = await mk('web/src/Ship.jsx', '\nexport { RefusedAsks };\n', 'ship-refusal');
+const refusals = [{ xell_id: 'x1', xell_slug: 'nimble-cove-b90833', at: new Date().toISOString(),
+  reason: '2 commit(s) not landed on main yet — land them first', full: null }];
+const panel = renderToStaticMarkup(h(shipUi.default, {
+  shipping: [], prodLock: null, shipLogs: {}, projectId: 'p1', refused: refusals, onDecided: () => {} }));
+ok(panel !== '', 'the production panel RENDERS with no ships at all, because a refusal is news');
+ok(panel.includes('nimble-cove-b90833'), 'it names the xell that asked');
+ok(/not landed on main/.test(panel), 'and shows the reason the gate gave');
+ok(/nothing here to approve/.test(panel), 'while saying plainly that there is nothing to approve');
+const quiet = renderToStaticMarkup(h(shipUi.default, {
+  shipping: [], prodLock: null, shipLogs: {}, projectId: 'p1', refused: [], onDecided: () => {} }));
+ok(quiet === '', 'and nothing at all when there is nothing to say (no new permanent furniture)');
+
+// The per-project blindness, one level up: an approval waiting in the project you are NOT looking at.
+const menuUi = await mk('web/src/ProjectMenu.jsx', '\n', 'proj-waiting');
+const menu = renderToStaticMarkup(h(menuUi.default, {
+  projects: [{ id: 'p1', name: 'Zeehive', xell_count: 3, ships_waiting: 0, landings_waiting: 0 },
+             { id: 'p2', name: 'omnibiz', xell_count: 2, ships_waiting: 2, landings_waiting: 1 }],
+  currentId: 'p1', onSelect: () => {}, onCreate: () => {}, onDelete: () => {}, onChanged: () => {} }));
+ok(/data-testid="projmenu-waiting"/.test(menu),
+   'the project switcher flags approvals waiting in a project you are not looking at');
+ok(/>3</.test(menu), 'with the count (2 ships + 1 landing) — the console is per-project, so this was invisible');
+const menuQuiet = renderToStaticMarkup(h(menuUi.default, {
+  projects: [{ id: 'p1', name: 'Zeehive', xell_count: 3, ships_waiting: 1, landings_waiting: 0 }],
+  currentId: 'p1', onSelect: () => {}, onCreate: () => {}, onDelete: () => {}, onChanged: () => {} }));
+ok(!/projmenu-waiting/.test(menuQuiet), 'and stays quiet about the project you ARE looking at (the panel has it)');
+
+const projects = read('server/src/lib/projects.js');
+ok(/AS ships_waiting/.test(projects) && /AS landings_waiting/.test(projects),
+   'listProjects counts what waits on a human, per project');
+
 console.log(fail ? `\n${fail} FAILURE(S)\n` : '\nall good\n');
 process.exit(fail ? 1 : 0);
