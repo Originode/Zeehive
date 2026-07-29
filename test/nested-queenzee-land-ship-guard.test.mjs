@@ -51,6 +51,7 @@ const { pushToXource, acceptPullIn } = await import('../server/src/queenzee/xell
 const { nudgeXellAfterLand } = await import('../server/src/queenzee/nudge.js');
 const { runShip } = await import('../server/src/queenzee/shipgate.js');
 const { pullProject, pushProject } = await import('../server/src/lib/projects.js');
+const { selfLand } = await import('../server/src/queenzee/self.js');
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -155,6 +156,11 @@ try {
   ok(!pushed.landed && /PROVISION_MODE=simulate/.test(pushed.refused || pushed.reason || ''),
      `pushToXource refuses and says why (${String(pushed.refused || pushed.reason || pushed.landed).slice(0, 60)}…)`);
   ok(master() === base, 'master still has not moved');
+  // `zee land` itself: it must refuse BEFORE step 1, which collects out of `cxell_<slug>` and moves
+  // the worktree's branch — a refusal at the push would come after that damage was done.
+  const selfLanded = await selfLand(await one(`SELECT * FROM xell WHERE id=$1`, [xell.id]));
+  ok(selfLanded.ok === false && selfLanded.dry_run === true && /models the fleet/i.test(selfLanded.message || ''),
+     'selfLand refuses at the top of the verb, before the collect');
   const pr = await one(
     `INSERT INTO land_request (project_id, xell_id, ref, old_sha, new_sha, commits, stat, kind, status)
        VALUES ($1,$2,'refs/heads/master',$3,$4,'[]'::jsonb,'{}'::jsonb,'pull','pending') RETURNING *`,
