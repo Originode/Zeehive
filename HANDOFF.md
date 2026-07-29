@@ -464,6 +464,24 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
   ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
   rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
+- **Notify a manager about a ticket: proved it ARRIVES, and made it ask first** (2026-07-29,
+  ticket #16). The feature itself (the derived `TKT-<n>-<4hex>` code, the live-manager picker, the
+  notify route through the existing `sendMessageToXell` door) landed separately; two things it was
+  missing were the two the ticket cares most about.
+  **Receipt.** The original test said in its own header that a successful delivery was out of scope.
+  But a notification is a RICH message, so `sendMessageToXell` writes it into the cage as
+  `.zee-inbox/<ts>/message.md` over `docker exec` FIRST and only then types a pointer at it over SSH
+  — and that first hop is the substantive one (it is the file every manager in this fleet actually
+  reads). With `test/_bin/docker` on PATH, the message.md that lands is read back off the recorded
+  stdin: it carries the CODE, the number, the title and the not-an-order sentence. The SSH hop stays
+  unproven here (it needs a real sshd) and is stated as such.
+  **It asks first.** Notifying types into a RUNNING agent's session, and it fired on one click. It
+  now goes through `showConfirm` like every other console action that reaches a live zee, naming the
+  manager, whether it is live, and that a notification assigns nothing.
+  Also asserted, because it is the ticket's hard constraint: notifying creates no work item, sets no
+  assignee, and changes neither the ticket's status nor the manager's xell.
+  Test: `node test/ticket-notify.test.mjs` (55 assertions; `TicketCode`/`NotifyManager` are exported
+  so the human surface is RENDERED rather than grepped).
 - **The go-around "flake" was the TEST'S WAIT, not the runway** (2026-07-29, ticket #19). `land-queue`
   failed once in six full-suite runs on *"the unreachable holder did not block the runway"*, and 0/12
   in isolation. Characterised before touching anything: the fake docker (`test/_bin/docker`) writes

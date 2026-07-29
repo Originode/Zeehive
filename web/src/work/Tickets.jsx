@@ -389,7 +389,10 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
 // an insecure origin. So: the async API where the browser allows it, a throwaway textarea +
 // execCommand where it does not (the same pair ZeeTerminal.jsx carries, for the same reason), and
 // if both are blocked the text is still there to select by hand.
-function TicketCode({ code }) {
+// Exported (with NotifyManager below) so the two claims a human makes about this feature — "I can
+// copy the code in one click" and "it tells me when there is nobody to notify" — can be RENDERED in
+// a test and read off the markup, instead of grepped for in this file.
+export function TicketCode({ code }) {
   const [flash, setFlash] = useState('');
   if (!code) return null;
   const copy = () => {
@@ -436,7 +439,7 @@ function execCopy(text) {
 //
 // No confirmation dialog: a notification assigns nothing, opens no gate and cannot be un-sent, but
 // neither can an email. Choosing a manager from a list IS the deliberate act.
-function NotifyManager({ ticketId, onError }) {
+export function NotifyManager({ ticketId, onError }) {
   const [mgrs, setMgrs] = useState(null);        // the whole payload: { managers, note, count }
   const [picking, setPicking] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -452,6 +455,21 @@ function NotifyManager({ ticketId, onError }) {
   }, [picking, mgrs, ticketId, onError]);
 
   const notify = async (m) => {
+    // This TYPES INTO A RUNNING AGENT'S SESSION, so it asks first — the same habit every other
+    // console action that reaches a live zee follows (WorkItemDrawer's delete, Gantt's remove, the
+    // ship/pull confirms in App.jsx). Picking a name out of a list is not the same as deciding to
+    // interrupt somebody's turn, and one stray click should not be able to do it. The sentence says
+    // WHICH manager, whether it is actually live, and — because this is the constraint the ticket
+    // cares about — that a notification assigns nothing.
+    const ok = await showConfirm(
+      `Notify ${m.slug} about this ticket?\n\n`
+      + `${m.live
+        ? 'It has a live session, so this is typed straight into it — it will read this mid-work.'
+        : 'It has no live session, so this waits in its inbox until it next looks.'}\n\n`
+      + 'It carries the ticket code, number and title. It is a NOTIFICATION, not an assignment: '
+      + 'nothing is dispatched, nobody is assigned, and the ticket does not change.',
+      { okLabel: 'Notify' });
+    if (!ok) return;
     setBusy(true);
     try {
       const r = await notifyTicketManager(ticketId, m.xell_id);
