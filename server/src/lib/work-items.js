@@ -23,7 +23,7 @@
 //   • roll-ups (a parent's dates, a parent's progress) are a READ-MODEL concern and are never
 //     written back. A stored roll-up is a cache that goes stale the first time anyone edits a leaf,
 //     and this repo has no place to invalidate it.
-import { q, one } from '../db/pool.js';
+import { q, one, pool } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import {
@@ -84,10 +84,48 @@ const COLS = `id, project_id, parent_id, kind, title, body, status, priority, ti
               assignee, starts_on, due_on, estimate_hours, progress, sort_order, path, depth,
               created_by, created_at, updated_at, closed_at`;
 
+// ── running inside somebody else's transaction ───────────────────────────────
+//
+// Most writes here are one statement and need nothing. A BREAKDOWN is not: it creates a whole tree
+// and then re-points the ticket at it, and half a plan is worse than none — a manager who asked for
+// six items and got four, with no error path back to a clean state, has to work out by hand which
+// two are missing. Everything else irreversible in this repo is all-or-nothing (a landing is one
+// sha, a seed runs in its own transaction, a ship succeeds or does not), so this is too.
+//
+// The mechanism is deliberately small: every function that may take part accepts an optional
+// `client` (a checked-out pg client already inside BEGIN) and routes its reads and writes through
+// this runner instead of the pool. No client → the pool, exactly as before.
+export const dbRunner = (client) => (client
+  ? {
+    q: async (text, params) => (await client.query(text, params)).rows,
+    one: async (text, params) => (await client.query(text, params)).rows[0] || null,
+  }
+  : { q, one });
+
+// Run fn inside ONE transaction, handing it the client. Broadcasts are collected rather than sent:
+// announcing a row on the SSE bus and then rolling it back would paint a card the database does not
+// have. They go out only after the COMMIT lands.
+export async function inTransaction(fn) {
+  const client = await pool.connect();
+  const pending = [];
+  try {
+    await client.query('BEGIN');
+    const out = await fn({ client, pending });
+    await client.query('COMMIT');
+    for (const [type, payload] of pending) broadcast(type, payload);
+    return out;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* the connection is what failed */ }
+    throw err;                       // nothing was created, and nothing was announced
+  } finally {
+    client.release();
+  }
+}
+
 // ── the audit trail ──────────────────────────────────────────────────────────
 // kind: created | status | moved | assigned | edited | comment
-export async function logWorkEvent(workItemId, kind, { from = null, to = null, actor = null, detail = null } = {}) {
-  return one(
+export async function logWorkEvent(workItemId, kind, { from = null, to = null, actor = null, detail = null } = {}, { client = null } = {}) {
+  return dbRunner(client).one(
     `INSERT INTO work_item_event (work_item_id, kind, from_status, to_status, actor, detail)
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
     [workItemId, kind, from, to, actor || null, detail ? JSON.stringify(detail) : null]);
@@ -102,10 +140,11 @@ export async function logWorkEvent(workItemId, kind, { from = null, to = null, a
 // 'deleted' and 'dep' are bus-only (there is no surviving row to hang a 'deleted' event on, and a
 // dependency edit is recorded against the item as an 'edited' event); 'comment' is ledger-only.
 // A consumer that assumes one list covers both will wait forever for a 'deleted' event.
-async function emit(row, kind, opts = {}) {
+async function emit(row, kind, opts = {}, { client = null, pending = null } = {}) {
   if (!row) return row;
-  await logWorkEvent(row.id, kind, opts);
-  broadcast('work', { kind, item: shapeItem(row) });
+  await logWorkEvent(row.id, kind, opts, { client });
+  const event = ['work', { kind, item: shapeItem(row) }];
+  if (pending) pending.push(event); else broadcast(...event);
   return row;
 }
 
@@ -302,20 +341,24 @@ const EDITABLE = ['title', 'body', 'priority', 'assignee', 'starts_on', 'due_on'
                   'estimate_hours', 'progress', 'sort_order', 'xell_id', 'ticket_id', 'kind'];
 
 // The next rank among a parent's children — a new item lands at the END of its column/branch.
-async function nextSortOrder(parentId) {
-  const r = await one(
+async function nextSortOrder(parentId, client = null) {
+  const r = await dbRunner(client).one(
     `SELECT coalesce(max(sort_order), 0) + 1000 AS n FROM work_item
       WHERE parent_id IS NOT DISTINCT FROM $1`, [parentId]);
   return Number(r?.n ?? 1000);
 }
 
 // The project's root item — the parent everything defaults to.
-export async function projectRoot(projectId) {
+export async function projectRoot(projectId, client = null) {
   assertId(projectId, 'project id');
-  return one(`SELECT ${COLS} FROM work_item WHERE project_id=$1 AND kind='project'`, [projectId]);
+  return dbRunner(client).one(`SELECT ${COLS} FROM work_item WHERE project_id=$1 AND kind='project'`, [projectId]);
 }
 
-export async function createWorkItem(input = {}) {
+// `client`/`pending` are only supplied by a caller that has already opened a transaction (see
+// inTransaction). Reads go through the same client so this sees the siblings created moments ago in
+// the same breakdown — which is what makes each new item's sort_order land after them.
+export async function createWorkItem(input = {}, { client = null, pending = null } = {}) {
+  const db = dbRunner(client);
   const title = String(input.title || '').trim();
   if (!title) throw new Error('title required');
   const kind = input.kind || 'task';
@@ -323,7 +366,7 @@ export async function createWorkItem(input = {}) {
   let parent = null;
   if (input.parent_id) {
     assertId(input.parent_id, 'parent work item id');
-    parent = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [input.parent_id]);
+    parent = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [input.parent_id]);
     if (!parent) throw new Error(`parent_id ${input.parent_id} names no work item`);
   }
   const projectId = input.project_id || input.project || parent?.project_id;
@@ -341,13 +384,13 @@ export async function createWorkItem(input = {}) {
   // itself (migration 058), but resolving it here means sort_order is computed among the right
   // siblings rather than among the roots.
   if (!parent && kind !== 'project') {
-    parent = await projectRoot(projectId);
+    parent = await projectRoot(projectId, client);
     if (!parent) throw new Error(`project ${projectId} has no root work item — cannot attach "${title}"`);
   }
   if (input.status && !isWorkStatus(input.status)) throw new Error(`unknown status "${input.status}"`);
 
-  const sortOrder = input.sort_order != null ? Number(input.sort_order) : await nextSortOrder(parent?.id ?? null);
-  const row = await one(
+  const sortOrder = input.sort_order != null ? Number(input.sort_order) : await nextSortOrder(parent?.id ?? null, client);
+  const row = await db.one(
     `INSERT INTO work_item (project_id, parent_id, kind, title, body, status, priority, ticket_id,
                             xell_id, assignee, starts_on, due_on, estimate_hours, progress,
                             sort_order, created_by)
@@ -360,7 +403,8 @@ export async function createWorkItem(input = {}) {
      input.progress ?? null, sortOrder, input.actor || input.created_by || null]);
 
   await emit(row, 'created', { to: row.status, actor: input.actor || input.created_by || null,
-                               detail: { kind: row.kind, title: row.title, parent_id: row.parent_id } });
+                               detail: { kind: row.kind, title: row.title, parent_id: row.parent_id } },
+             { client, pending });
   return shapeItem(row);
 }
 

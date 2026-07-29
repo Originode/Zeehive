@@ -372,6 +372,53 @@ try {
     items: [{ title: 'child', parent_id: 'later' }, { ref: 'later', title: 'parent', kind: 'activity' }],
   }), /neither a work item id nor a ref/, 'a breakdown naming a ref declared LATER (refs resolve backwards only)');
 
+  // ── ATOMICITY: a breakdown is ALL or NOTHING ─────────────────────────────
+  //
+  // A manager breaking a ticket into a plan and getting four of six items, with no error path back
+  // to a clean state, is the kind of half-truth this repo refuses everywhere else — a landing is one
+  // sha, a seed runs in its own transaction, a ship is all-or-nothing. So is this.
+  section('a breakdown is one transaction');
+  const atomicTicket = await T.createTicket({ project_id: PID, title: 'atomic breakdown', kind: 'chore' });
+  const before6 = (await client.query(`SELECT count(*)::int n FROM work_item WHERE project_id=$1`, [PID])).rows[0].n;
+  const sixWithABadFifth = [
+    { ref: 'p', kind: 'activity', title: 'one' },
+    { kind: 'task', parent_id: 'p', title: 'two' },
+    { kind: 'task', parent_id: 'p', title: 'three' },
+    { kind: 'task', parent_id: 'p', title: 'four' },
+    { kind: 'task', parent_id: 'ref-that-does-not-exist', title: 'five — the bad one' },
+    { kind: 'task', parent_id: 'p', title: 'six' },
+  ];
+  await refuses(() => T.breakdownTicket(atomicTicket.id, { items: sixWithABadFifth, actor: 'test' }),
+    /neither a work item id nor a ref/, 'the 5th of 6 entries is rejected');
+  const after6 = (await client.query(`SELECT count(*)::int n FROM work_item WHERE project_id=$1`, [PID])).rows[0].n;
+  ok(after6 === before6,
+     `and ZERO work items survive — the first four were rolled back too (${before6} before, ${after6} after)`);
+  ok((await client.query(`SELECT count(*)::int n FROM work_item WHERE ticket_id=$1`, [atomicTicket.id])).rows[0].n === 0,
+     'nothing is linked to the ticket');
+  const untouched = await T.getTicket(atomicTicket.id);
+  ok(untouched.status === 'queued' && untouched.work_item_id === null,
+     'and the TICKET is untouched — still queued, still pointing at nothing');
+  ok((await client.query(
+    `SELECT count(*)::int n FROM work_item_event e LEFT JOIN work_item w ON w.id=e.work_item_id
+      WHERE w.id IS NULL`)).rows[0].n === 0,
+     'no orphan events were left behind by the rolled-back inserts');
+
+  // the SAME six with the ref fixed builds the whole plan
+  sixWithABadFifth[4].parent_id = 'p';
+  const good6 = await T.breakdownTicket(atomicTicket.id, { items: sixWithABadFifth, actor: 'test' });
+  ok(good6.count === 6, 'the same six, with the ref corrected, all land in one call');
+  ok((await T.getTicket(atomicTicket.id)).status === 'assigned', 'and the ticket moves to assigned');
+  // The five tasks all hang off ref 'p' and are created one after another INSIDE the transaction,
+  // so each one's nextSortOrder() must see the uncommitted siblings the same transaction just
+  // inserted. Read through the pool (they are committed now) they must be strictly increasing —
+  // if the ranks had been computed off a pool connection outside the transaction they would all
+  // have collided on the same number.
+  const sibs = good6.created.filter((i) => i.depth === 2).map((i) => i.sort_order);
+  ok(sibs.length === 5 && sibs.every((v, n) => n === 0 || v > sibs[n - 1]),
+     `siblings created inside one transaction get strictly increasing ranks (${sibs.join(' < ')})`);
+  await T.deleteTicket(atomicTicket.id);
+  for (const i of good6.created.filter((x) => x.depth === 1)) await W.deleteWorkItem(i.id);
+
   await W.deleteWorkItem(sibA.id); await W.deleteWorkItem(sibB.id);
 
   // ── deleting a subtree says what went with it ────────────────────────────

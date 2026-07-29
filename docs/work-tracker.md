@@ -192,6 +192,9 @@ against the item as an `edited` event, with `{added_dep}` / `{removed_dep}` in `
   to know what it may do next.
 - `createWorkItem`, `updateWorkItem`, `moveWorkItem(id,{parent_id,sort_order})`, `deleteWorkItem(id)`,
   `setStatus(id,status,{actor,cascade})`, `addDep` / `removeDep`, `projectRoot(projectId)`.
+- `inTransaction(fn)` + `dbRunner(client)` — how a multi-write verb becomes atomic (see the
+  breakdown guarantee below). `createWorkItem(input, {client, pending})` participates when handed a
+  client; **part 2 should use this** if dispatching a zee ever has to write more than one row.
 - `boardModel({projectId, rootId})`, `ganttModel({projectId, rootId})`.
 - helpers the console may want too: `nestItems`, `flattenTree`, `ancestorIds`, `subtreePrefix`,
   `liveZees(xellIds)`.
@@ -231,10 +234,35 @@ Three things about it that are easy to get wrong:
   existing items the author meant to keep.
 - **`ref` resolves BACKWARDS only.** A ref must be declared by an *earlier* entry in the same array.
   A forward or unknown ref is refused by name — `item "child": parent_id "later" is neither a work
-  item id nor a ref declared by an EARLIER item in this breakdown (refs so far: …)` — rather than
-  reaching postgres as a uuid cast.
-- **It is not one transaction.** If entry 5 of 6 is rejected, entries 1–4 have already been created.
-  The error names the offending entry so the caller can fix it and re-send only the rest.
+  item id nor a ref declared by an EARLIER item in this breakdown (refs so far: …). A ref must be
+  defined before it is used. Nothing was created.` — rather than reaching postgres as a uuid cast.
+- **It is ONE TRANSACTION — all or nothing.** See the guarantee below.
+
+#### The breakdown transaction guarantee
+
+A breakdown either **builds the whole plan** or **leaves the ticket exactly as it was**. If entry 5
+of 6 is rejected — a bad ref, a missing title, an activity under a task, any database refusal —
+then:
+
+- **zero** work items exist (entries 1–4 are rolled back with the rest);
+- the ticket keeps its old `status` and `work_item_id` (it does not move `queued → assigned`);
+- no `work_item_event` rows survive;
+- **nothing was broadcast** on `/api/stream` — SSE events are collected during the transaction and
+  emitted only after the `COMMIT`, so the console is never shown a card the database does not have;
+- the error names the offending entry and ends with *"Nothing was created."*
+
+This matches how every other irreversible act in this repo behaves — a landing is one sha, a seed
+runs in its own transaction, a ship is all-or-nothing. Half a plan is worse than none: a manager who
+asked for six items and got four, with no error path back to a clean state, has to work out by hand
+which two are missing.
+
+The mechanism is small and reusable: `inTransaction(fn)` in `lib/work-items.js` checks out a client,
+runs `fn({client, pending})` inside `BEGIN`/`COMMIT`, and flushes `pending` broadcasts only on
+success. `createWorkItem(input, {client, pending})`, `projectRoot(projectId, client)` and
+`logWorkEvent(…, {client})` take part when handed a client and use the pool otherwise — so reads
+inside the transaction see the rows the *same* transaction just inserted (which is what gives
+siblings created in one breakdown their increasing `sort_order`). Pinned in the test:
+`1000 < 2000 < 3000 < 4000 < 5000`.
 
 ## The read models
 
@@ -298,7 +326,7 @@ Rows include the root (see the root-inclusion table). Roll-ups:
 | PATCH | `/api/tickets/:id` | title/body/kind/status/priority/reporter/assignee/labels/work_item_id |
 | DELETE | `/api/tickets/:id` | work items survive, `unlinked_work_items` says how many |
 | POST | `/api/tickets/:id/comments` | `{author, body}` |
-| POST | `/api/tickets/:id/breakdown` | `{items:[…], actor}` → the created tree |
+| POST | `/api/tickets/:id/breakdown` | `{items:[…], actor}` → the created tree. **One transaction**: all six items or none |
 | GET | `/api/work-items?project=&tree=1&status=&kind=&root=&ticket=` | |
 | POST | `/api/work-items` | `project` in the body (or inherit it from `parent_id`) |
 | GET | `/api/work-items/:id` | the full detail model |

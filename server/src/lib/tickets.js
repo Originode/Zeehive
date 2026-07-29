@@ -20,7 +20,8 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { workLabel, isWorkStatus, nextStatuses, canTransition, TICKET_KINDS,
          WORK_STATUS_KEYS } from './work-status.js';
-import { createWorkItem, projectRoot, logWorkEvent, nestItems, assertId, isUuid } from './work-items.js';
+import { createWorkItem, projectRoot, logWorkEvent, nestItems, assertId, isUuid,
+         inTransaction, dbRunner } from './work-items.js';
 
 const COLS = `id, project_id, number, title, body, kind, status, priority, reporter, assignee,
               labels, work_item_id, created_at, updated_at, closed_at`;
@@ -203,57 +204,66 @@ export async function addComment(ticketId, { author, body } = {}) {
 // the existing items the author meant to keep.
 export async function breakdownTicket(id, { items = [], actor = null } = {}) {
   assertId(id, 'ticket id');
-  const ticket = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
-  if (!ticket) return null;
   if (!Array.isArray(items) || !items.length) throw new Error('items required (a non-empty array)');
+  // Cheap existence check before opening a transaction, so an unknown ticket is a plain 404 rather
+  // than a rolled-back BEGIN. The authoritative read happens again inside, through the client.
+  if (!(await one(`SELECT id FROM ticket WHERE id=$1`, [id]))) return null;
 
-  const root = await projectRoot(ticket.project_id);
-  if (!root) throw new Error(`project ${ticket.project_id} has no root work item to break this ticket down under`);
+  // ONE TRANSACTION. Either the whole plan exists or the ticket is untouched — no caller ever has
+  // to work out which four of six items got in. Broadcasts are collected by inTransaction and sent
+  // only after the COMMIT, so nothing is announced that was then rolled back.
+  const out = await inTransaction(async ({ client, pending }) => {
+    const db = dbRunner(client);
+    const ticket = await db.one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
+    const root = await projectRoot(ticket.project_id, client);
+    if (!root) throw new Error(`project ${ticket.project_id} has no root work item to break this ticket down under`);
 
-  const byRef = new Map();
-  const created = [];
-  for (const spec of items) {
-    if (!spec || !String(spec.title || '').trim()) throw new Error('every item needs a title');
-    // A parent named by local ref, by uuid, or (default) the project root. A ref only resolves
-    // BACKWARDS — it must have been declared by an earlier entry in this same call — so anything
-    // else that is not a uuid is a typo or a forward reference, and it is named as such here. Left
-    // to fall through it reached postgres as a uuid cast and came back as
-    // 'invalid input syntax for type uuid: "act"', which tells the author nothing about which of
-    // their items was wrong or why.
-    let parentId = spec.parent_id || null;
-    if (parentId && byRef.has(parentId)) parentId = byRef.get(parentId).id;
-    else if (parentId && !isUuid(parentId)) {
-      const known = [...byRef.keys()];
-      throw new Error(`item "${spec.title}": parent_id "${parentId}" is neither a work item id nor `
-        + `a ref declared by an EARLIER item in this breakdown`
-        + (known.length ? ` (refs so far: ${known.join(', ')})` : ' (no refs declared yet)')
-        + '. A ref must be defined before it is used.');
+    const byRef = new Map();
+    const created = [];
+    for (const spec of items) {
+      if (!spec || !String(spec.title || '').trim()) throw new Error('every item needs a title');
+      // A parent named by local ref, by uuid, or (default) the project root. A ref only resolves
+      // BACKWARDS — it must have been declared by an earlier entry in this same call — so anything
+      // else that is not a uuid is a typo or a forward reference, and it is named as such here.
+      // Left to fall through it reached postgres as a uuid cast and came back as
+      // 'invalid input syntax for type uuid: "act"', which tells the author nothing about which of
+      // their items was wrong or why. Raised from in here it now also means NOTHING was created.
+      let parentId = spec.parent_id || null;
+      if (parentId && byRef.has(parentId)) parentId = byRef.get(parentId).id;
+      else if (parentId && !isUuid(parentId)) {
+        const known = [...byRef.keys()];
+        throw new Error(`item "${spec.title}": parent_id "${parentId}" is neither a work item id nor `
+          + `a ref declared by an EARLIER item in this breakdown`
+          + (known.length ? ` (refs so far: ${known.join(', ')})` : ' (no refs declared yet)')
+          + '. A ref must be defined before it is used. Nothing was created.');
+      }
+      const item = await createWorkItem({
+        ...spec,
+        ref: undefined,
+        project_id: ticket.project_id,
+        parent_id: parentId || root.id,
+        kind: spec.kind || 'task',
+        ticket_id: ticket.id,
+        actor,
+      }, { client, pending });
+      if (spec.ref) byRef.set(spec.ref, item);
+      created.push(item);
     }
-    const item = await createWorkItem({
-      ...spec,
-      ref: undefined,
-      project_id: ticket.project_id,
-      parent_id: parentId || root.id,
-      kind: spec.kind || 'task',
-      ticket_id: ticket.id,
-      actor,
-    });
-    if (spec.ref) byRef.set(spec.ref, item);
-    created.push(item);
-  }
 
-  // the ticket points at the TOP of what it became (the shallowest, first-created item), and only
-  // when nothing has claimed that slot already — a re-breakdown must not silently re-point it
-  const top = [...created].sort((a, b) => a.depth - b.depth)[0];
-  const patch = [];
-  const params = [ticket.id];
-  if (!ticket.work_item_id && top) { params.push(top.id); patch.push(`work_item_id = $${params.length}`); }
-  if (ticket.status === 'queued') patch.push(`status = 'assigned'`);
-  const row = patch.length
-    ? await one(`UPDATE ticket SET ${patch.join(', ')} WHERE id=$1 RETURNING ${COLS}`, params)
-    : ticket;
+    // the ticket points at the TOP of what it became (the shallowest, first-created item), and only
+    // when nothing has claimed that slot already — a re-breakdown must not silently re-point it
+    const top = [...created].sort((a, b) => a.depth - b.depth)[0];
+    const patch = [];
+    const params = [ticket.id];
+    if (!ticket.work_item_id && top) { params.push(top.id); patch.push(`work_item_id = $${params.length}`); }
+    if (ticket.status === 'queued') patch.push(`status = 'assigned'`);
+    const row = patch.length
+      ? await db.one(`UPDATE ticket SET ${patch.join(', ')} WHERE id=$1 RETURNING ${COLS}`, params)
+      : ticket;
 
-  broadcast('work', { kind: 'ticket-breakdown', ticket: shapeTicket(row), created: created.length });
-  // the created TREE, nested, so the caller can render what it just made
-  return { ok: true, ticket: shapeTicket(row), created, tree: nestItems(created), count: created.length };
+    pending.push(['work', { kind: 'ticket-breakdown', ticket: shapeTicket(row), created: created.length }]);
+    // the created TREE, nested, so the caller can render what it just made
+    return { ok: true, ticket: shapeTicket(row), created, tree: nestItems(created), count: created.length };
+  });
+  return out;
 }
