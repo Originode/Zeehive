@@ -233,6 +233,25 @@ try {
   ok(live.unknown.every((x) => est[x.table] === -1),
      'and the only unverifiable tables are the ones the source itself never analyzed');
 
+
+  // ── 8. the two regressions running it end-to-end exposed ──────────────────────────────────────
+  // Both were invisible to a unit test and both were user-facing. Asserted on the SOURCE because the
+  // failure was in the ORDER of two probes, and the order is the fix.
+  console.log('\n── a table the backup has and this db does not must not break the check ──');
+  const dsrc = read('server/src/queenzee/datadiff.js');
+  const presentAt = dsrc.indexOf('ROW_COUNT_SQL, dbid');
+  const countAt = dsrc.indexOf('exactCountSql(countable)');
+  ok(presentAt > 0 && countAt > presentAt,
+     'the catalog is read BEFORE the counts: the counts are one UNION ALL, so a reference naming an '
+     + 'absent table used to fail to PARSE and a human got "could not count rows: ^"');
+  ok(dsrc.includes('const countable = Object.keys(snap.row_counts).filter((t) => here.has(t))'),
+     'only the tables that exist are counted — which is also the ONLY way the "missing" verdict can '
+     + 'ever be produced (before this, the path to it was the path that errored)');
+  ok(/none of the \${Object.keys(snap.row_counts).length} table(s)/.test(dsrc)
+     || /none of the /.test(dsrc),
+     'and when NONE of the backup\'s tables exist it says "empty, or not the database that was '
+     + 'restored" once, instead of listing 600 tables as lost rows');
+
   console.log('\n── the backups panel ──');
   const bk = read('web/src/Backups.jsx');
   ok(/backup-rows/.test(bk) && /rowsTitle/.test(bk), 'a backup row shows its row count');

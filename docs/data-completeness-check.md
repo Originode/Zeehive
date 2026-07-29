@@ -1,8 +1,9 @@
 # Is the data actually there? — a proposal, and what is already known
 
-**Status: PROPOSAL. Nothing in "The proposal" below is built.** It is written down because
-TKT-22-4F0E asked a question no existing surface can answer, and the diagnosis is worth more
-today than a half-finished audit tool. The scope decision is a human's.
+**Status: P1 and P2 are BUILT. P3 was deliberately not.** This file was written first as a proposal —
+TKT-22-4F0E asked a question no surface could answer, and the diagnosis was worth more than a
+half-finished audit tool — and the scope was then approved as "P1 and P2, not P3". §4 records what
+each piece is and what shipped; §2 and §3 are the diagnosis they were built on, unchanged.
 
 Raised from **TKT-22-4F0E** — *"any restore on a dev db from latest prod dump always has a big
 diff from prod db … a db cloned or restored from prod should be identical to it. but check diff
@@ -15,7 +16,7 @@ says a massive gap. and im afraid the data might not be fully backed up."*
 | the question | what answers it | verdict |
 |---|---|---|
 | why does a fresh restore show a big diff? | `queenzee/proddiff.js` | **answered** — see §2 |
-| is production's data fully backed up? | *nothing* | **not answerable** — see §3 |
+| is production's data fully backed up? | `queenzee/datadiff.js` + `lib/row-counts.js` | **answerable now** — see §3, §4 |
 
 For getting from a drift *number* to a *cause*, read [schema-drift-triage.md](schema-drift-triage.md)
 — the direction reading, the by-schema rollup and the dev↔dev control experiment. This file is the
@@ -98,40 +99,53 @@ measured 2026-07-29):
 **What that does and does not prove.** It proves a restore does not arrive structurally empty or
 truncated, and that no referenced parent rows are missing. It does **not** prove row-for-row
 completeness: a table nobody references could be short and every check above would still pass. The
-fear is *not confirmed* — and it is also *not refuted*, because the refutation requires a
-comparison nobody has run.
+fear was *not confirmed* — and it was not *refuted* either, because the refutation required a
+comparison nobody had run. §4 is that comparison, now built: on this same database it reports 33 of
+35 tables verified against the counts its source recorded, and names the other two as tables the
+source itself never analyzed. Not "everything is fine" — exactly what was and was not checked.
 
-## 4. The proposal (unbuilt — the cheap version first)
+## 4. What was built (P1 + P2), and what was not (P3)
 
 The instinct "compare the restore's row counts against prod" repeats the exact trap of §2: prod is
 LIVE, so an append-heavy table is always ahead by whatever arrived since the dump, and the check
-would cry wolf forever. Compare a restore against **its own source instead**.
+would cry wolf forever. So a restore is compared against **its own source** instead.
 
-**P1 — record per-table row counts at BACKUP time (small).** During the dump window, when prod is
-already held in `ACCESS SHARE` and no other work may touch it, run one catalog query and store the
-result in `db_snapshot` (`row_counts jsonb`, `row_total bigint`). Use `pg_class.reltuples` /
-`pg_stat_user_tables.n_live_tup` — free, no seq scan, no extra load on a 1.3 GB production database
-(an exact `count(*)` across omnibiz's 627 tables is not free and must never be the default). This
-alone buys:
+### P1 — every backup records what the SOURCE held, per table
 
-* a **backup-to-backup trend** — the real alarm for "my data is not fully backed up" is a table that
-  SHRINKS between dumps, which today nothing would notice;
-* the reference numbers every later restore can be graded against, without touching prod again.
+`db_snapshot.row_counts` / `row_total`, captured in `runBackupJob` from `pg_class.reltuples`.
 
-**P2 — "Check data" on a restored db (small/medium).** The sibling of "Check diff": compare the
-restored database's own counts against the counts recorded for the snapshot it was restored from
-(`db_refresh` already records which snapshot that was). Same-instant comparison, so a difference is
-a real loss, not a clock difference. Report per table: matched / short by N / extra. Wire it where
-"Check diff" already lives, and off a finished restore — and keep the two verdicts VISIBLY separate
-(that separation is this ticket).
+* **Estimates, deliberately.** An exact `count(*)` over a 600-table, 1.3 GB production database is
+  minutes of I/O for instrumentation. `reltuples` is a catalog read: no table locks, no heap.
+* **It cannot cost the backup anything.** Taken AFTER `pg_dump` returns, so it neither delays the dump
+  nor extends the window production is locked for; every failure path records `NULL` and logs a line
+  saying the backup is unaffected. `NULL` means "not captured" and never "the database was empty".
+* **What it buys:** the reading nothing had before — a table that **shrank** since the last good dump.
+  Reported in the maintenance log and on the backup row (`~N rows`, amber when a table shrank or
+  emptied), with an emptied table called out louder than a shrunken one, because no estimate error
+  explains "many" becoming "none". Growth, a new table and a dropped table are counted and never
+  dressed as loss.
 
-**P3 — an exact-count verification pass (optional, human-triggered only).** `count(*)` per table on
-prod, refused while `prodBusyReason()` is non-null, never on a timer. Only worth building if P1's
-estimates prove too coarse to trust.
+### P2 — "Check data": a restore against the backup it came from
 
-Cost, honestly: P1 is a migration + ~40 lines in the backup job + the panel showing a total. P2 is a
-probe, a comparison, a menu item and a payload. P1 is where the value is, and P1 without P2 is still
-useful. **Neither is started.**
+`queenzee/datadiff.js`, `POST /api/containers/:id/check-data`, and a menu item beside "Check diff".
+
+* The reference is the snapshot the database was **recorded** as restored from
+  (`container.restored_from`, written by the restore itself — a live "Duplicate prod" pipe records
+  that it has *no* snapshot, so the check refuses instead of grading against the wrong dump).
+* The restored side is counted **exactly**: a fresh restore has no statistics at all, so every
+  `reltuples` in it reads `-1` and an estimate-vs-estimate comparison would compare nothing.
+* That asymmetry is stated in every verdict, and it is why a sub-10% shortfall is not reported.
+  Measured on this xell's own restore: ~2,369 estimated vs 2,386 exact across 35 tables — 0.7%.
+* Per table: **empty** (populated in the backup, none here — the loud one), **short**, **missing**
+  (absent from the catalog: schema drift, routed back to Check diff, never counted as lost rows),
+  **no-reference** (the source never analyzed it: unknown, neither a pass nor an alarm), **ok**.
+  The verdict lives in `container.data_check` — never `prod_diff`. Two questions, two columns.
+* **Production is refused as a subject**, with the reason: it is the reference, not the patient.
+
+### P3 — an exact-count verification pass on prod: NOT built
+
+A human-triggered `count(*)` over every production table is a real cost for a marginal answer.
+Revisit once P1 has a few days of trend, not before.
 
 ## 5. Not fixed here, and worth a ticket each
 
@@ -142,6 +156,10 @@ useful. **Neither is started.**
    unreachable prod context). The console now shows **⚠ overdue** and **⚠ last attempt failed**
    instead of nothing, but nothing yet *retries sooner* than the next window.
 2. **Nothing alerts.** Backup freshness is a chip a human must look at. There is no notification.
-3. **The restore side is unverified.** `pg_restore` runs without `--exit-on-error`; ignored errors
-   are counted by pg_restore, not by us. A restore that partially failed is far more likely than a
-   dump that partially wrote — and P2 is what would catch it.
+3. **A restore's own ignored errors are still unread.** `pg_restore` runs without `--exit-on-error`;
+   it counts ignored errors and we do not read that count. "Check data" (§4) now catches the
+   CONSEQUENCE — a table that came back short or empty — which is the outcome that matters, but the
+   restore's own error tally would name the cause on the spot and is still on the floor.
+4. **Nobody runs "Check data" for you.** It is on demand, deliberately (it counts rows). Running it
+   automatically off a finished restore is the obvious next step and is not done: a restore that
+   quietly dropped a table would still wait for a human to ask.
