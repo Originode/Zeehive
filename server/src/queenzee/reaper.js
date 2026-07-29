@@ -46,6 +46,76 @@ export async function recoverOrphanTeardowns() {
   return { finished };
 }
 
+// ── IS THERE A ZEE MID-TURN IN THERE? ────────────────────────────────────────
+//
+// The one question the reap guard turns on, and it used to be asked wrong. The old test was
+//
+//     active = cli_active === true || status in (spawning, online, working)
+//
+// — the zee's own status ORed with the MONITOR's flag. Those two do not mean the same thing, and
+// for a cxell zee the second one does not mean "working" at all:
+//
+//   • `zee.status` is the queenzee's OWN record of the turn. It writes 'working' when it starts the
+//     headless run and 'idle' + last_stop_reason='end_turn' when that run returns (intake.js). For a
+//     cxell that is the only lifecycle there is — hooks (Channel A) are not installed in the cage and
+//     the passive poller (Channel B) skips entrypoint='cxell-cli' outright.
+//   • `zee.cli_active` is monitor.js's probe. For a cxell it is cxellZeeActive() — a broad
+//     `pgrep -f '(claude|codex|kimi)'` INSIDE the container (AGENT_PROC_PATTERN). The cage is KEPT
+//     after the turn so commits stay collectible, and the moment anyone opens its terminal or sends
+//     it a message, tmux starts zee-attach.sh, which — once the headless turn is over — runs
+//     `claude --resume <sid>` interactively in the pane and leaves it there for the life of the
+//     container. That resting process matches the probe. So cli_active is "an agent is ATTACHED",
+//     not "an agent is WORKING", and once true it stays true forever.
+//
+// ORing them therefore made the NORMAL END STATE OF EVERY CXELL JOB — turn over, zee idle, a resting
+// session in the pane — read as ACTIVE, and the refusal said so in its own contradictory words:
+// "its zee is still idle (monitor confirms it is really active)". Five human-approved done
+// suggestions were refused that way in one hour, and the humans were told nothing.
+//
+// So: THE ZEE'S OWN STATUS DECIDES, and the monitor's flag is reported as the evidence it actually
+// is (attached / not attached). Nothing was widened for a zee that is genuinely mid-turn: every
+// status the old test refused on it still refuses on, force is still required to get past it, and
+// force is still not the default anywhere.
+//
+// KNOWN GAP, stated rather than papered over: an INTERACTIVE turn (a message typed into the resting
+// pane session) starts a turn nothing in the fleet observes — no hook, no poller, and the pgrep
+// cannot tell a generating TUI from one at its prompt — so such a zee reads 'idle' here. It is not
+// observable from the queenzee today; closing it needs the cage itself to report turn-start/turn-end
+// (the `zee` CLI and token are already in there). Until then that race is what `force` and the human
+// typed confirmation in front of this are for.
+export const MID_TURN_STATUSES = ['spawning', 'online', 'working'];
+
+const agoText = (ts) => {
+  if (!ts) return 'never';
+  const s = Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000);
+  if (s < 90) return `${Math.round(s)}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+};
+
+// Pure — takes the zee row (or null) and returns the verdict plus the evidence behind it, so every
+// caller can SAY which signal decided and when that signal last saw anything.
+export function midTurnVerdict(live) {
+  if (!live) {
+    return { active: false, decided_by: 'zee-rows', zee_status: null, attached: false,
+             last_activity_at: null, why: 'no live zee is bound to it' };
+  }
+  const attached = live.cli_active === true;
+  const seen = live.last_event_at || live.last_monitor_at || null;
+  const base = { zee_status: live.status, attached, last_activity_at: seen,
+                 monitor_source: live.monitor_source || null, monitor_at: live.last_monitor_at || null };
+  if (MID_TURN_STATUSES.includes(live.status)) {
+    return { ...base, active: true, decided_by: 'zee-status',
+      why: `the ZEE'S OWN STATUS says it is ${live.status} — a turn is in flight (last seen ${agoText(seen)})` };
+  }
+  return { ...base, active: false, decided_by: 'zee-status',
+    why: `the ZEE'S OWN STATUS says ${live.status} — its turn ended (last seen ${agoText(seen)})`
+       + (attached
+         ? `; the monitor (${live.monitor_source || 'probe'}, ${agoText(live.last_monitor_at)}) only sees an agent `
+           + 'process ALIVE in its cxell, which after a turn is the resting attached session, not work'
+         : '; the monitor sees no agent process in its cxell either') };
+}
+
 export async function reapXell(xellId, reason = 'task-done', { force = false, mode = PROVISION_MODE } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
   if (!xell) return { ok: false, error: 'xell not found' };
@@ -55,17 +125,20 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
   // deletes its worktree + branch. Refuse unless the caller explicitly forces it — this lives on
   // the server, not just the UI, because a UI-only guard is bypassed by anyone (human OR AI)
   // calling the API directly. That is exactly how a working xell got destroyed.
+  let verdict = null;
   if (!force) {
     const live = await one(
-      `SELECT id, status, cli_active FROM zee
+      `SELECT id, status, cli_active, monitor_source, last_monitor_at, last_event_at, entrypoint
+         FROM zee
         WHERE xell_id=$1 AND status IN ('spawning','online','working','idle') ORDER BY created_at DESC LIMIT 1`,
       [xellId]);
-    const active = live && (live.cli_active === true || ['spawning', 'online', 'working'].includes(live.status));
-    if (active) {
+    verdict = midTurnVerdict(live);
+    if (verdict.active) {
       return {
         ok: false, active: true, xell: xell.slug,
-        error: `xell "${xell.slug}" is ACTIVE — its zee is still ${live.status}`
-             + `${live.cli_active ? ' (monitor confirms it is really active)' : ''}.`
+        decided_by: verdict.decided_by, zee_status: verdict.zee_status, attached: verdict.attached,
+        last_activity_at: verdict.last_activity_at,
+        error: `xell "${xell.slug}" is ACTIVE — ${verdict.why}.`
              + ' Tearing it down kills the agent mid-task and deletes its worktree + branch.'
              + ' Pass force:true to do it anyway.',
       };
@@ -118,7 +191,8 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
       + '(released, NOT deleted) before teardown. Production is untouched.');
   }
 
-  logline('reaper', `decommissioning ${xell.slug} (${reason}) — releasing resources, removing worktree + branch`);
+  logline('reaper', `decommissioning ${xell.slug} (${reason}) — releasing resources, removing worktree + branch`
+    + ` [liveness: ${verdict ? verdict.why : 'FORCED — the guard was not consulted'}]`);
   await one(`UPDATE xell SET status='tearing-down' WHERE id=$1 RETURNING *`, [xellId])
     .then((x) => x && broadcast('xell', x));
 
@@ -223,7 +297,8 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
     logline('reaper', `retired ${xell.slug}: zee decommissioned, worktree + containers removed ✓`);
   }
 
-  return { ok: true, reason, orphaned_worktree: orphaned ? xell.worktree_path : null, despawn, zee_id: zee?.id };
+  return { ok: true, reason, orphaned_worktree: orphaned ? xell.worktree_path : null, despawn, zee_id: zee?.id,
+           liveness: verdict };
 }
 
 // DANGER ZONE — purge every non-production xell in a project, reclaiming the dev fleet back to
