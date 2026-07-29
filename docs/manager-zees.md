@@ -87,6 +87,30 @@ only in a prompt is a rule that lasts until the first clever workaround:
   worker the manager harness or a database of the dispatcher's choosing. A manager that could mint
   managers is a fleet that grows sideways with nobody's consent.
 
+## Adding one: the programme is a PROMPT, so it gets the composer
+
+`⬢ + manager zee` (`web/src/Manager.jsx`) opens the **same modal a worker prompt is written in** —
+`web/src/Dispatch.jsx` with `manager` set — and POSTs the result to `/api/managers`. It used to be a
+one-line `showPrompt()` `<input>`, which had the manager's **programme** (the standing brief an agent
+runs a whole crew from, and the longest-lived prompt in the fleet) typed blind into a text field:
+nothing visible past ~60 characters, no paste of a backlog or a screenshot, Enter fires it, and no
+choice of model, autonomy, harness or account. The worker below it had the full composer.
+
+One composer, and the manager variant differs only where a manager genuinely differs:
+
+- **Harnesses offered are manager-type** (`GET /api/harnesses?zee_type=manager`) — 054's guard would
+  refuse a worker persona anyway — and **"core only" is not offered**: a manager's manual *is* its
+  harness, and a manager that has not read it does not know which doors it has.
+- **No production-DB toggle.** Adding a manager mints its SELECT-only role and binds it, failing
+  closed. A switch would be a lie in both positions, so the field states the fact instead.
+- **A blank programme is legal** and means `DEFAULT_MANAGER_BRIEF` (study the project, propose a
+  plan, ask a human before starting a crew) — the footer says so rather than leaving you to guess.
+- **Account picker.** The prompt buttons are one-per-connected-account, so clicking one *is* the
+  choice; the manager is a single button, so it makes that choice inside the composer.
+
+Model, autonomy mode, supervision (headless/attended) and pasted images are the shared controls, and
+`createManagerZee` forwards all of them — `headless` and `images` used to be dropped on the floor.
+
 ## The verbs
 
 Manager-only: `zee zees` (the crew read model), `zee dispatch`, `zee say`, `zee suggest-done`.
@@ -142,5 +166,7 @@ name the crew they belong to. With no managers in the fleet the layout is exactl
 - `server/src/lib/prod-readonly.js` — the SELECT-only role, minted and dropped.
 - `server/src/queenzee/self.js` — the crew verbs + the manager refusals.
 - `harnesses/manager/` — the persona, the `dispatch-brief` skill, and a manual of its own.
-- `web/src/Manager.jsx` — "+ manager zee" and the done-suggestion gate.
+- `web/src/Manager.jsx` — "+ manager zee" (opens the composer) and the done-suggestion gate.
+- `web/src/Dispatch.jsx` — the one composer, in its worker and `manager` variants.
+- `test/manager-compose.test.mjs` — the console wiring for adding one, asserted statically.
 - `test/manager-zee.test.mjs` — 55 assertions over all of it.
