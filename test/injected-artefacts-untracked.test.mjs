@@ -65,8 +65,11 @@ console.log('\n── the manual has ONE home, and it is not a repo file ──'
 // would drift from that row the day the next migration lands — the scripts/zee lesson.
 ok(!existsSync(join(ROOT, 'docs', 'cxell-zee-manual.md')),
    'there is no docs/cxell-zee-manual.md (the meta DB is the single source)');
+// (harnesses/core/HARNESS.yml used to be in this list and carried the note itself; migration 080
+// moved every harness's text into the meta-DB and the file is gone — docs/dev-crew.md replaces it as
+// the doc most likely to send a reader looking for a manual.)
 const live = ['README.md', 'CLAUDE.md', 'HANDOFF.md', 'docs/harness-proposal.md',
-  'docs/schema-catchup-plan.md', 'harnesses/core/HARNESS.yml', 'server/src/lib/harness.js'];
+  'docs/schema-catchup-plan.md', 'docs/dev-crew.md', 'server/src/lib/harness.js'];
 for (const f of live) {
   // A mention is only allowed when the same line SAYS it does not exist — the point is that no
   // reader is ever sent to that path, not that the six characters never appear.
@@ -76,6 +79,24 @@ for (const f of live) {
   ok(bad.length === 0, bad.length
     ? `${f} still POINTS at the dead path: "${bad[0].trim().slice(0, 80)}"`
     : `${f} does not point at that dead path`);
+}
+
+// ── the OTHER class of injected artefact: a path the operator chooses ────────────────────────────
+// Project entry-point docs (migration 081) are generated into a xell at a repo-relative path like
+// AGENTS.md — outside the directories above, so an ignore rule cannot be the guard. The guard is that
+// the injector asks git first and refuses a TRACKED path, then excludes what it writes. This repo is
+// the perfect witness: its own CLAUDE.md is tracked, so a project doc could never overwrite it.
+console.log('\n── a generated project doc can never overwrite a tracked file ──');
+{
+  const tracked = (p) => { try { git('ls-files', '--error-unmatch', '--', p); return true; } catch { return false; } };
+  ok(tracked('CLAUDE.md'), "this repo's own CLAUDE.md is tracked (the file a generated doc must not touch)");
+  const injector = readFileSync(join(ROOT, 'server/src/lib/cxell.js'), 'utf8');
+  const block = injector.slice(injector.indexOf('writeGeneratedDocIntoCxell'), injector.indexOf('export async function removeCxell'));
+  ok(/git ls-files --error-unmatch/.test(block) && /echo TRACKED/.test(block),
+     'the injector asks git before writing and answers TRACKED rather than overwriting');
+  ok(/\.git\/info\/exclude/.test(block),
+     'and adds what it DOES write to .git/info/exclude, so the artefact cannot reach a commit');
+  // the decision itself is exercised against a real repo in test/project-docs.test.mjs
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall good');

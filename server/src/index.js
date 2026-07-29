@@ -14,7 +14,7 @@ import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
-import { refreshHarnesses } from './lib/harness.js';
+import { logHarnessSummary } from './lib/harness.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
@@ -97,9 +97,10 @@ try {
   // Fresh run (zero projects) → ZEEHIVE onboards itself before anything else looks at the
   // fleet (self-onboard.js). Loud-but-never-fatal, like the migrations above.
   await ensureSelfProject();
-  // Reconcile each harness row with its files under harnesses/<key>/ (parsed, hashed projection —
-  // same as the manifest). Loud-but-never-fatal: a broken harness keeps its last good bundle.
-  await refreshHarnesses();
+  // A harness is entirely in the meta-DB now (080 text, 082 badge) — there is nothing to load, and no
+  // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
+  // a harness that would brief a zee with a blank page is invisible otherwise.
+  await logHarnessSummary();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }

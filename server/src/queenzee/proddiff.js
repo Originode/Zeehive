@@ -14,6 +14,28 @@
 //             prod code, and the one worth a red chip.
 // "extra"   = this db has it, prod does not — usually unshipped work, sometimes dead legacy.
 //
+// WHAT THIS NUMBER IS NOT — TKT-22-4F0E ("any restore on a dev db from latest prod dump always has
+// a big diff from prod db … and im afraid the data might not be fully backed up"). Two questions got
+// merged into one chip, and this file can only answer the first:
+//   • It compares CATALOG SHAPE ONLY — tables, columns, triggers. It never counts a row, never reads
+//     a value, and never opens a dump. So a green 0 is NOT evidence that production's DATA is backed
+//     up, and a red 12802 is NOT evidence that any data was lost. Whoever renders this number must
+//     say what it covers (`scope`/`data_compared` ride in the payload for exactly that reason), and
+//     "is my data there?" needs a row-level comparison — see docs/data-completeness-check.md.
+//   • THE RULER IS *LIVE* PROD, BUT A RESTORE IS A POINT-IN-TIME COPY. A db restored from last
+//     night's dump is faithful to the dump, not to prod as it is now: every object prod migrated
+//     AFTER the dump was taken reads as `missing`. That is real drift in the dangerous direction,
+//     correctly reported — and it is why "a fresh restore ALWAYS shows a gap". The cure is a newer
+//     dump or a ledger catch-up (`zee db-catchup` / catchup-delta.js), never a suppression here.
+//     Measured 2026-07-29 on the live fleet: six Zeehive pool dbs against ONE prod read 0, 1, 1, 13,
+//     13 and 4 — and every object in them was a named migration object (`public.project_doc` and its
+//     columns, `project_doc.targets`), one and two migrations' worth, missing-only. The 4 was the
+//     mirror image: a xell AHEAD of prod on its own unlanded migration, reported as `extra`. Age and
+//     authorship, not noise. Full table in docs/data-completeness-check.md.
+//   • An EMPTY database is not a drifted one, and must not be dressed as one: 'missing everything,
+//     extra nothing' means nothing was ever restored here (or the restore failed). `empty_db` says
+//     so, because the alternative is a chip that reads "your restore lost 12,802 objects".
+//
 // READ-ONLY. Catalog SELECTs over `docker exec psql`. It never writes to any application db.
 import { spawn } from 'node:child_process';
 import { q, one } from '../db/pool.js';
@@ -24,6 +46,11 @@ import { cloneInstanceFor, setInstanceProdDiff, syncDbInstances } from '../lib/d
 import { dbIdentity } from '../lib/projects.js';
 
 const SAMPLE = 8;          // per kind, per direction — this feeds a tooltip, not an audit
+// An ON-DEMAND comparison is read by a human who is TRIAGING ("why is this db drifted at all?"),
+// not glancing at a chip. 8 names per direction is uselessly short for that — you cannot see that
+// every missing object sits in one schema from a sample of 8. This bigger sample is returned to the
+// caller only; what gets PERSISTED onto the chip stays SAMPLE-sized (it rides every SSE frame).
+const DETAIL_SAMPLE = 60;
 const CONCURRENCY = 3;     // db containers probed at once; the NAS is not a datacentre
 
 // Schemas that are pure ENGINE noise, never application schema. postgis/h3 builds differ between
@@ -124,33 +151,100 @@ function diffSets(prodSet, devSet) {
   return { missing, extra };
 }
 
-// Pure comparison of two fingerprints → the persisted payload shape.
-function diffPayload(prodFp, fp) {
+// The SCOPE every payload declares, so no surface can imply more than was measured. Carried as DATA
+// (not left to each renderer's prose) because the console, the /ooney gate and the CLI all read this
+// same jsonb, and a caveat that lives in only one of them is a caveat the human never sees.
+export const DIFF_SCOPE = 'schema';                            // what it measures
+export const DIFF_COVERS = ['table', 'column', 'trigger'];     // and exactly which catalog kinds
+export const DIFF_NOT_COVERED = 'row data (no rows are counted or compared — this is not a backup or data-completeness check)';
+
+// Every fingerprint entry starts `schema.object…`, so the schema is everything before the first dot.
+const schemaOf = (name) => String(name).split('.')[0] || '?';
+
+// WHERE the differences are, by schema — the one line that usually answers "why is a freshly
+// restored db still drifted?". A sample of names cannot show you that all 400 missing objects live
+// in ONE schema (an extension's, a schema the dump never captured, a dead one nothing dropped);
+// counts per schema can, in a glance, and they are exact rather than sampled. Returned to the
+// caller only — never persisted onto the chip, which must stay small enough to ride every SSE frame.
+function bySchema(diffs) {
+  const acc = new Map();
+  for (const { missing, extra } of diffs) {
+    for (const x of missing) {
+      const s = acc.get(schemaOf(x)) || { schema: schemaOf(x), missing: 0, extra: 0 };
+      s.missing++; acc.set(s.schema, s);
+    }
+    for (const x of extra) {
+      const s = acc.get(schemaOf(x)) || { schema: schemaOf(x), missing: 0, extra: 0 };
+      s.extra++; acc.set(s.schema, s);
+    }
+  }
+  return [...acc.values()]
+    .sort((a, b) => (b.missing + b.extra) - (a.missing + a.extra) || a.schema.localeCompare(b.schema));
+}
+
+// Pure comparison of two fingerprints → the persisted payload shape. `refFp` is the RULER (prod, or
+// whatever db the caller chose to measure against); `fp` is the db being judged. `sample` caps the
+// name lists per kind per direction — SAMPLE for anything persisted, DETAIL_SAMPLE for a human
+// triaging on demand. `by_schema` only rides the bigger (detail) payloads.
+//
+// `ref_count`/`mine_count` per kind are the cheap orientation the bare total never gave: "the
+// reference has 627 tables, this db has 0" is a different fact from "627 differences", and it is the
+// difference between a failed restore and a merely older one (TKT-22-4F0E).
+//
+// Exported for the tests: it is the one piece of drift logic that needs no docker daemon, so the
+// direction of "missing"/"extra", the truncation and the schema rollup can all be pinned here.
+export function diffPayload(refFp, fp, sample = SAMPLE) {
   const kinds = {};
+  const all = [];
   let total = 0;
   for (const kind of Object.keys(Q)) {
-    const { missing, extra } = diffSets(prodFp[kind], fp[kind]);
+    const { missing, extra } = diffSets(refFp[kind], fp[kind]);
     total += missing.length + extra.length;
+    all.push({ missing, extra });
     kinds[kind] = {
+      ref_count: refFp[kind].size, mine_count: fp[kind].size,
       missing_count: missing.length, extra_count: extra.length,
-      missing: missing.slice(0, SAMPLE), extra: extra.slice(0, SAMPLE),
+      missing: missing.slice(0, sample), extra: extra.slice(0, sample),
     };
   }
-  return { ok: true, error: null, total, kinds };
+  // EMPTY, not drifted: this db has no application tables at all while the reference has some.
+  // Reporting that as "N differences" is how a never-restored dev clone came to look like a
+  // catastrophic data loss (TKT-22-4F0E — omnibiz_db_prod_dev_local_mardale_prod: 627 tables in prod,
+  // 0 here, nothing extra. An empty database, not a drifted one).
+  const empty_db = fp.table.size === 0 && refFp.table.size > 0;
+  const payload = {
+    ok: true, error: null, total,
+    scope: DIFF_SCOPE, covers: DIFF_COVERS, data_compared: false, not_covered: DIFF_NOT_COVERED,
+    empty_db, kinds,
+  };
+  if (sample !== SAMPLE) payload.by_schema = bySchema(all);
+  return payload;
+}
+
+// Read ONE container's catalog fingerprint: resolve its real (versioned) container name, then probe.
+// `dbName` overrides the database probed inside it (a CLONE instance rather than the primary).
+async function measureContainer(c, dbid, dbName = null) {
+  let real;
+  try { real = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
+  catch (e) { real = null; }
+  if (!real) return { error: `could not resolve the real container for ${c.name}` };
+  return fingerprint(c.docker_ctx, real, dbName ? { ...dbid, name: dbName } : dbid);
 }
 
 // Compare one db container against a prod fingerprint and persist the verdict.
 async function diffContainer(c, prodFp, dbid) {
-  let real;
-  try { real = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
-  catch (e) { real = null; }
-  const got = real ? await fingerprint(c.docker_ctx, real, dbid)
-                    : { error: `could not resolve the real container for ${c.name}` };
-
+  const got = await measureContainer(c, dbid);
   const payload = got.error
     ? { ok: false, error: got.error, total: null, kinds: null }
     : diffPayload(prodFp, got.fp);
+  return persistVerdict(c, payload);
+}
 
+// Write ONE container's drift verdict: the container row (the chip), its primary db_instance row,
+// and a log line only when the verdict CHANGED. Split out of diffContainer so an ad-hoc comparison
+// against a NON-prod database can reuse the measurement without writing a prod_diff that would be
+// a lie (prod_diff means "drift from production", nothing else).
+async function persistVerdict(c, payload) {
   const prev = c.prod_diff?.total;
   const row = await one(
     `UPDATE container SET prod_diff=$2::jsonb, prod_diff_at=now() WHERE id=$1 RETURNING *`,
@@ -166,11 +260,17 @@ async function diffContainer(c, prodFp, dbid) {
   // "still in sync" and make the one line that matters invisible.
   if (payload.ok && prev !== payload.total) {
     logline('proddiff', payload.total === 0
-      ? `${c.name} is IN SYNC with prod`
-      : `${c.name} has DRIFTED from prod: ${payload.total} difference(s) — `
-        + Object.entries(payload.kinds)
-            .filter(([, v]) => v.missing_count + v.extra_count)
-            .map(([k, v]) => `${k} -${v.missing_count}/+${v.extra_count}`).join(', '));
+      ? `${c.name} matches prod's SCHEMA (tables, columns, triggers — no rows compared)`
+      : payload.empty_db
+        // Not drift. Say the thing that is actually true, or the operator debugs a diff that isn't one.
+        ? `${c.name} has NO application tables at all (prod has ${payload.kinds.table.ref_count}) — this `
+          + 'database was never restored, or its restore failed. That is not schema drift.'
+        : `${c.name} has DRIFTED from prod: ${payload.total} SCHEMA difference(s) — `
+          + Object.entries(payload.kinds)
+              .filter(([, v]) => v.missing_count + v.extra_count)
+              .map(([k, v]) => `${k} -${v.missing_count}/+${v.extra_count}`).join(', ')
+          + '. Schema+triggers only; nothing here is a statement about row data. A restore is a '
+          + 'point-in-time copy, so objects prod migrated after its dump read as missing.');
   } else if (!payload.ok && c.prod_diff?.ok !== false) {
     logline('proddiff', `${c.name}: could not compare against prod — ${payload.error}`);
   }
@@ -223,29 +323,81 @@ export async function diffXellDbAgainstProd(projectId, xellId) {
   return diffContainer(mine, got.fp, dbid);
 }
 
-// On-demand diff of ONE db container against prod — what the chip's "Check diff" context-menu item
-// fires, and what a finished restore calls to refresh its own verdict. Measures NOW and persists the
-// same payload shape the tick records (diffContainer broadcasts, so the chip repaints live). This
-// judges the container's PRIMARY database — exactly what its prod_diff chip describes.
-export async function diffOneContainerAgainstProd(containerId) {
+// The db containers this one can be MEASURED AGAINST — what the chip's "Check diff" submenu lists.
+// Every other db container in the same project, PRODUCTION FIRST (it is the default reference and
+// the only one whose verdict is a fact about drift-from-prod), then by tier and name. `is_prod` and
+// `writes_chip` say, per candidate, what picking it means: only prod repaints the drift mark.
+export async function diffCandidates(containerId) {
+  const c = await one(`SELECT * FROM container WHERE id=$1 AND role='db'`, [containerId]);
+  if (!c) return { ok: false, error: 'no such db container', candidates: [] };
+  // The same columns a chip renders from (fleet.js's inventory shape), so the picker can draw the
+  // REAL ContainerChip for each candidate instead of a second, drifting rendering of a container.
+  const rows = await q(
+    `SELECT c.id, c.role, c.name, c.tier, c.isolation, c.docker_ctx, c.health,
+            c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at,
+            (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug
+       FROM container c
+      WHERE c.project_id=$1 AND c.role='db' AND c.id<>$2
+      ORDER BY (c.tier='prod') DESC, c.tier, c.name`, [c.project_id, c.id]);
+  return {
+    ok: true,
+    container: { id: c.id, name: c.name, tier: c.tier },
+    candidates: rows.map((r) => ({ ...r, is_prod: r.tier === 'prod', writes_chip: r.tier === 'prod' })),
+  };
+}
+
+// On-demand diff of ONE db container against a REFERENCE database — what the chip's "Check diff"
+// context-menu item fires, and what a finished restore calls to refresh its own verdict. Measures
+// NOW and returns the payload the tick records, plus the triage extras a human asked for it needs
+// (a DETAIL_SAMPLE-long name list and the by_schema rollup). This judges the container's PRIMARY
+// database — exactly what its prod_diff chip describes.
+//
+// `againstId` = null → PRODUCTION, the default and the only reference the chip's colour may come
+// from: prod_diff means "drift from production", so a comparison against any OTHER db is REPORTED
+// and never PERSISTED. That is the whole point of the picker — "is this db drifted, or is EVERY db
+// drifted the same way?" is answered by measuring dev against dev, and answering it must not
+// overwrite the one verdict the fleet's drift colours are built on.
+export async function diffOneContainerAgainstProd(containerId, againstId = null) {
   const c = await one(`SELECT * FROM container WHERE id=$1 AND role='db'`, [containerId]);
   if (!c) return { ok: false, error: 'no such db container', total: null };
-  // Prod is the ruler: it is measured against nothing and keeps prod_diff NULL.
-  if (c.tier === 'prod') return { ok: true, same_db: true, total: 0, kinds: null };
 
-  const prod = await one(
-    `SELECT * FROM container WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`, [c.project_id]);
-  if (!prod) return { ok: false, error: 'no prod db container to measure against', total: null };
-  if (prod.id === c.id) return { ok: true, same_db: true, total: 0, kinds: null };
+  const ref = againstId
+    ? await one(`SELECT * FROM container WHERE id=$1 AND role='db'`, [againstId])
+    : await one(`SELECT * FROM container WHERE project_id=$1 AND role='db' AND tier='prod' LIMIT 1`,
+                [c.project_id]);
+  if (!ref) {
+    return againstId
+      ? { ok: false, error: 'no such reference db container', total: null }
+      : { ok: false, error: 'no prod db container to measure against', total: null };
+  }
+  if (ref.project_id !== c.project_id) {
+    return { ok: false, error: 'the reference db belongs to another project', total: null };
+  }
+  const reference = { id: ref.id, name: ref.name, tier: ref.tier, is_prod: ref.tier === 'prod' };
+
+  // Prod is the ruler: by DEFAULT it is measured against nothing and keeps prod_diff NULL. An
+  // EXPLICIT reference is a human asking a different question ("what does prod lack that this dev
+  // db has?"), which is answered — but still never written to prod's own chip (see persist below).
+  if (!againstId && c.tier === 'prod') return { ok: true, same_db: true, total: 0, kinds: null, reference };
+  if (ref.id === c.id) return { ok: true, same_db: true, total: 0, kinds: null, reference };
 
   const dbid = await dbIdentity(c.project_id);
-  let realProd;
-  try { realProd = await resolveRealDbContainer(prod.docker_ctx, prod.name, { row: prod }); }
-  catch (e) { return { ok: false, error: e.message, total: null }; }
-  const got = await fingerprint(prod.docker_ctx, realProd, dbid);
-  if (got.error) return { ok: false, error: `prod db unreadable: ${got.error}`, total: null };
+  const refFp = await measureContainer(ref, dbid);
+  if (refFp.error) {
+    return { ok: false, total: null, reference,
+             error: `${reference.is_prod ? 'prod db' : `reference db ${ref.name}`} unreadable: ${refFp.error}` };
+  }
 
-  return diffContainer(c, got.fp, dbid);
+  // Only a comparison against PRODUCTION is a prod_diff verdict, and prod itself never carries one.
+  const persist = reference.is_prod && c.tier !== 'prod';
+  const own = await measureContainer(c, dbid);
+  if (own.error) {
+    const payload = { ok: false, error: own.error, total: null, kinds: null };
+    if (persist) await persistVerdict(c, payload);
+    return { ...payload, reference };
+  }
+  if (persist) await persistVerdict(c, diffPayload(refFp.fp, own.fp));
+  return { ...diffPayload(refFp.fp, own.fp, DETAIL_SAMPLE), reference, persisted: persist };
 }
 
 // A restore loads a NEW catalog into a db container, so its prod_diff chip is instantly stale — it

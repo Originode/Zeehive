@@ -48,8 +48,12 @@ ok(/<AddManagerButton[\s\S]{0,200}providers=\{providers\}/.test(app),
 
 // ── 3. the composer's manager variant ──
 ok(/manager = false/.test(disp), 'Dispatch takes a `manager` variant flag (default false — the worker composer is unchanged)');
-ok(/getHarnesses\(manager \? 'manager' : 'worker'\)/.test(disp),
-   'it offers MANAGER harnesses for a manager and worker harnesses otherwise (054 refuses a mismatch)');
+// …and, since 084, scoped to the project it is composing for: the system-wide personas plus that
+// project's own, never another project's (a xell may only wear one of those two, so anything else in
+// this picker is a button that produces a refusal).
+ok(/getHarnesses\(manager \? 'manager' : 'worker', projectId\)/.test(disp),
+   'it offers MANAGER harnesses for a manager and worker harnesses otherwise (054 refuses a mismatch), '
+   + 'scoped to this project (084)');
 ok(/!task && !manager/.test(disp),
    'a blank brief is allowed for a manager (the server then applies DEFAULT_MANAGER_BRIEF) and refused for a worker');
 ok(/\.\.\.\(task \? \{ task \} : \{\}\)/.test(disp),

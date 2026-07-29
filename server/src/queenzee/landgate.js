@@ -13,9 +13,28 @@ import { logline } from '../lib/logbus.js';
 import { gitLog, diffStat, cleanGitEnv, headCommit } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
-import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway } from './nudge.js';
-import { shouldProcessNow, processPad } from './landingpad.js';
+import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway,
+         nudgeXellForLostClearance, tendForSilentClearance } from './nudge.js';
+import { shouldProcessNow, processPad, RECEIPT_MIN } from './landingpad.js';
 import { recordXourceHead } from '../lib/projects.js';
+
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
+// reaper, images, the .zeehive.env reconcile): 'real' touches machines, anything else models.
+//
+// IT HAS TO BE READ HERE because a LANDING is the most irreversible machine effect the queenzee has:
+// it fast-forwards a branch inside project.repo_root — the XOURCE. A xell's database is a CLONE of
+// the meta-DB, so the land_request rows a NESTED queenzee walks (every zee that boots the server
+// inside its own xell — zeehive.yml gives it PROVISION_MODE=simulate) are the REAL fleet's rows,
+// approvals and all. tick() below runs every 10s and needs no human, no click and no push: booting
+// the server was enough to inherit somebody else's approval and push it into the real main. See
+// landApproved() and the approved branch of checkPush() for the two doors that was reached through.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
+// Approvals this process has already REPORTED it will not spend. The report is the whole point (a
+// silent skip and "nothing to land" must not read alike) — but tick() re-reads the same inherited
+// rows every 10 seconds forever, and a report repeated 8,640 times a day is not louder, it is the
+// thing that buries the line a human needed to read. So: once per approval, per process.
+const reportedDryLandings = new Set();
 
 // LANDING IS THE MOST COMMON WAY THE XOURCE HEAD MOVES — far more often than a pull. So the
 // moment a landing advances the ref we must re-record xource.head_commit, or the rollback
@@ -87,7 +106,7 @@ async function resolveXell(projectId, repoRoot, newSha) {
 
 // Called by the hook on EVERY push to main. Returns { allow, request, reason }.
 // allow=true only when a human approved this exact sha and it hasn't been spent yet.
-export async function checkPush({ projectId, ref, oldSha, newSha }) {
+export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PROVISION_MODE } = {}) {
   const project = await one(`SELECT * FROM project WHERE id = $1`, [projectId]);
   if (!project) return { allow: false, reason: 'unknown-project', request: null };
 
@@ -114,6 +133,22 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
     `SELECT * FROM land_request
        WHERE project_id=$1 AND ref=$2 AND new_sha=$3 AND status='approved'`,
     [projectId, ref, newSha]);
+
+  if (approved && mode !== 'real') {
+    // A NESTED QUEENZEE MUST NOT AUTHORISE A REAL PUSH EITHER. This is the second door onto the same
+    // ref: the hook reads its API from "${ZEEHIVE_API:-<baked-in>}" and the queenzee hands its OWN
+    // environment to every git it spawns, so a nested instance can end up being the gate a REAL push
+    // consults — and the approval it would find is the real fleet's, inherited in the db clone.
+    // Answering allow:true there spends a human's approval and lets the ref move. Decline instead,
+    // which is the direction this gate already fails in (the hook fails CLOSED by design), and say
+    // why: a declined push loses nothing, the commits stay on the branch, and the REAL queenzee
+    // still lands it when the real hook asks it.
+    logline('landgate',
+      `DECLINED ${ref} → ${String(newSha).slice(0, 8)} on ${project.name} — PROVISION_MODE=simulate: this `
+      + 'queenzee models the fleet, it does not authorise pushes into a real xource. The approval is '
+      + 'left UNSPENT; re-push against the real queenzee.');
+    return { allow: false, reason: 'nested-queenzee', request: approved, dry_run: true };
+  }
 
   if (approved) {
     // Spend the approval: it authorised this sha once. The ref is about to move (the hook exits
@@ -433,6 +468,102 @@ export async function sweepHoldingPattern() {
   return { swept };
 }
 
+// ── A CLEARANCE NOBODY ANSWERED ───────────────────────────────────────────────────────────────────
+// clearHolder's nudge is fire-and-forget: `nudged: true` means the resume STARTED. Undeliverable is
+// handled (nudge.js tends a human and the tower calls the next holder), but DELIVERED-THEN-DIED was
+// not: the receipt says the zee was told, the row leaves the pattern (every queue read filters
+// `cleared_at IS NULL`), and nothing ever returns to it. The zee waits forever for a clearance it
+// already received and lost, with unlanded commits and no card anywhere. (#11, confirmed by #19.)
+//
+// The ruling: re-clear ONCE, then tend. Once because the cheap failure is a lost nudge; a tend rather
+// than a retry loop because a zee that ignores two clearances is a human's problem, not a schedule's.
+//
+// THE PERIOD is the landing pad's RECEIPT_MIN (5 minutes) — the only minute-scale window the runway's
+// own machinery already keeps, and the same idea: how long to wait before treating something as
+// settled. It times both stages, so a silent holder is re-called at ~5 minutes and handed to a human at
+// ~10. LAND_CLEARANCE_GRACE_MIN overrides it (the tests set 0 to exercise both stages deterministically
+// rather than sleeping through them).
+const CLEARANCE_GRACE_MIN = process.env.LAND_CLEARANCE_GRACE_MIN !== undefined
+  ? Number(process.env.LAND_CLEARANCE_GRACE_MIN) : RECEIPT_MIN;
+
+// "It never came back" — no land_request from this xell on this ref was raised after the clearance.
+// ANY status counts as coming back (pending, holding, landed, even stale): the zee acted, and what
+// happened next is the gate's business, not this sweep's. Checked in SQL against the row as the
+// database holds it, for the same reason holdingPosition is (µs vs ms round-tripping through JS).
+export async function sweepSilentClearances({ graceMin = CLEARANCE_GRACE_MIN } = {}) {
+  const rows = await q(
+    `SELECT lr.*, x.slug AS xell_slug,
+            round(EXTRACT(EPOCH FROM (now() - lr.cleared_at)) / 60)::int AS silent_min
+       FROM land_request lr JOIN xell x ON x.id = lr.xell_id
+      WHERE lr.kind='push' AND lr.status='holding'
+        AND lr.cleared_at IS NOT NULL AND lr.silence_tended_at IS NULL
+        AND x.status NOT IN ('retired','tearing-down')
+        AND COALESCE(lr.recleared_at, lr.cleared_at) <= now() - ($1 || ' minutes')::interval
+        AND NOT EXISTS (SELECT 1 FROM land_request nx
+                         WHERE nx.xell_id = lr.xell_id AND nx.ref = lr.ref AND nx.kind='push'
+                           AND nx.id <> lr.id AND nx.requested_at > lr.cleared_at)
+      ORDER BY lr.cleared_at ASC LIMIT 20`, [String(graceMin)]);
+  let recalled = 0, tended = 0;
+  for (const row of rows) {
+    const short = String(row.new_sha || '').slice(0, 8);
+    const branch = String(row.ref || '').replace('refs/heads/', '') || 'main';
+    if (!row.recleared_at) {
+      // ONE re-call. The timestamp is written FIRST and guarded, so two ticks (or two queenzees)
+      // cannot both decide they are the one re-call — the loser simply finds the row already stamped.
+      const marked = await one(
+        `UPDATE land_request SET recleared_at=now()
+           WHERE id=$1 AND status='holding' AND cleared_at IS NOT NULL AND recleared_at IS NULL
+           RETURNING *`, [row.id]).catch(() => null);
+      if (!marked) continue;
+      broadcast('land', marked);
+      logline('landgate',
+        `RE-CALLED ${row.xell_slug || 'a xell'} to land ${short} on ${branch} — it was cleared `
+        + `~${row.silent_min}m ago and has not pushed since, so the first clearance was probably lost with `
+        + 'its session. Nothing is approved and nothing has moved; it syncs and pushes for a fresh decision.');
+      const nudged = await nudgeXellForLostClearance(row.xell_id,
+        { sha: row.new_sha, ref: row.ref, minutes: row.silent_min, requestId: row.id })
+        .catch((e) => ({ nudged: false, error: e.message }));
+      // The note is OVERWRITTEN here (unlike clearHolder's write-once): the first clearance's receipt is
+      // no longer the current state of this row, and a receipt that still says "the zee was nudged" is
+      // the exact lie this whole path exists to correct. An undeliverable re-call has already written
+      // its own truthful note (nudge.js), so leave that one alone.
+      const note = `runway clear, then silence (~${row.silent_min}m) — re-called ONCE: `
+        + (nudged?.nudged ? 'the zee was resumed again to `zee sync` and land'
+          : `the zee could NOT be reached (${nudged?.reason || nudged?.error || 'no live cxell'})`);
+      if (!nudged?.tended) {
+        const noted = await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING *`, [row.id, note])
+          .catch(() => null);
+        if (noted) broadcast('land', noted);
+      }
+      recalled++;
+      continue;
+    }
+    // Re-called and STILL silent: this is a human's now. Stamp first (same race guard), then raise it.
+    const done = await one(
+      `UPDATE land_request SET silence_tended_at=now()
+         WHERE id=$1 AND recleared_at IS NOT NULL AND silence_tended_at IS NULL RETURNING *`, [row.id])
+      .catch(() => null);
+    if (!done) continue;
+    broadcast('land', done);
+    // NOT swallowed silently: the tend IS the outcome of this branch, so a failure to raise it must be
+    // said out loud. Swallowing it would recreate the very shape of bug this sweep exists to close —
+    // a row that records a human was told, and a human who was not.
+    const raised = await tendForSilentClearance(row.xell_id,
+      { sha: row.new_sha, ref: row.ref, minutes: row.silent_min, requestId: row.id })
+      .catch((e) => ({ tended: false, error: e.message }));
+    if (!raised?.tended) {
+      logline('landgate',
+        `could NOT raise a tend for ${row.xell_slug || 'a xell'}'s lost clearance `
+        + `(${raised?.error || 'the xell is gone'}) — its row is stamped, so nothing will retry this`);
+    }
+    logline('landgate',
+      `${row.xell_slug || 'a xell'} was cleared to land ${short} on ${branch} ~${row.silent_min}m ago and `
+      + 'never pushed, through TWO clearances — handed to a human (tend). Nothing further is automatic.');
+    tended++;
+  }
+  return { checked: rows.length, recalled, tended };
+}
+
 // The backstop half of the tower: every runway that has somebody waiting gets looked at once a tick,
 // so a clearance missed by a crashed/restarted process (or by a transition path added later that
 // forgets to call freeRunway) is never lost — it just happens a few seconds later.
@@ -683,9 +814,29 @@ export async function sweepStalePending() {
   return { checked: rows.length, stale };
 }
 
-export async function landApproved(row, by = 'human') {
+export async function landApproved(row, by = 'human', { mode = PROVISION_MODE } = {}) {
   const project = await one(`SELECT * FROM project WHERE id=$1`, [row.project_id]);
   if (!project) return row;
+
+  // A NESTED QUEENZEE MUST NOT MOVE A REF IN THE XOURCE. Everything below this line acts on
+  // project.repo_root with git — a real path on a real machine, read out of a fleet row this
+  // queenzee may only be MODELLING. Report what it would have landed and touch nothing: no ref, no
+  // row (the approval stays approved, because it is the real fleet's to spend), no nudge into the
+  // cage of the zee that raised it. In real mode nothing about the rest of this function changes.
+  if (mode !== 'real') {
+    const short = String(row.new_sha || '').slice(0, 8);
+    const branch = String(row.ref || '').replace('refs/heads/', '') || 'main';
+    if (!reportedDryLandings.has(row.id)) {
+      reportedDryLandings.add(row.id);
+      logline('landgate',
+        `${short} NOT landed on ${branch} — PROVISION_MODE=simulate: this queenzee models the fleet, it `
+        + `does not move refs in ${project.repo_root}. Would have fast-forwarded ${branch} → ${short} `
+        + `(approved by ${row.decided_by || by}). The approval is left UNSPENT for the real queenzee; `
+        + 'reported once, not once per tick.');
+    }
+    return { ...row, dry_run: true,
+      would_land: { ref: row.ref, sha: row.new_sha, repo_root: project.repo_root } };
+  }
 
   // THE LANDING PAD's FIFO gate. This approval is real, but the runway may be busy (a ship building,
   // another landing merging) or an EARLIER approval may be ahead in line. If so, leave the row
@@ -808,10 +959,13 @@ export async function tick() {
   // been-there set to leak, forget across restarts, or consult.
   const stuck = await q(
     `SELECT * FROM land_request WHERE status='approved' ORDER BY decided_at LIMIT 5`);
-  let landed = 0, stale = 0;
+  let landed = 0, stale = 0, dryRun = 0;
   for (const row of stuck) {
     const r = await landApproved(row).catch((e) => { logline('landgate', `retry failed: ${e.message}`); return null; });
-    if (r && r.status === 'landed') landed++;
+    // A landing this queenzee is not allowed to make is counted SEPARATELY, never as landed: the
+    // tick's own answer is the first place a "did it land?" question gets asked.
+    if (r && r.dry_run) dryRun++;
+    if (r && r.status === 'landed' && !r.dry_run) landed++;
     if (r && r.stale) stale++;
   }
   // …and the HELD requests that died while a human was away (see sweepStalePending). Same tick, so
@@ -828,8 +982,15 @@ export async function tick() {
   const runways = await driveRunways().catch((e) => {
     logline('landgate', `runway drive failed: ${e.message}`); return { runways: 0, cleared: 0 };
   });
-  return { checked: stuck.length, landed, stale: stale + swept.stale, pending_checked: swept.checked,
-    holding_swept: gone.swept, runways: runways.runways, holders_cleared: runways.cleared };
+  // …and the holders that WERE cleared and then went quiet: re-call each one once, then hand it to a
+  // human. This is the only path that ever looks at a cleared row again — every queue read has already
+  // filtered it out — so without it a lost clearance is permanent.
+  const silent = await sweepSilentClearances().catch((e) => {
+    logline('landgate', `silent-clearance sweep failed: ${e.message}`); return { recalled: 0, tended: 0 };
+  });
+  return { checked: stuck.length, landed, dry_run: dryRun, stale: stale + swept.stale,
+    pending_checked: swept.checked, holding_swept: gone.swept, runways: runways.runways,
+    holders_cleared: runways.cleared, recalled: silent.recalled, silence_tended: silent.tended };
 }
 
 // "Seen it — stop showing me." A durable fact about VISIBILITY, never about status: a dismissed

@@ -6,10 +6,12 @@ Status: **IMPLEMENTED** (all four phases). The design below is unchanged; this s
 - **Schema** — `db/migrations/044_harness.sql`: `harness` table (global, no project_id), `xell.harness_id`,
   `pool_config.default_harness_id`, `task.req_harness_id`, the undeletable `core` law harness + a
   `harness_guard()` trigger, and a seeded `hermes` row.
-- **Library** — `server/src/lib/harness.js`: parse/validate `HARNESS.yml` (rejects reserved LAW keys),
-  load a harness folder, `refreshHarnesses()` (boot reconcile, like the manifest), resolve/assign,
-  `harnessLayerText()` (prompt injection), `harnessSkillFiles()` (Claude SKILL.md materialization),
-  `harnessBridge()`. Boot hook in `server/src/index.js`.
+- **Library** — `server/src/lib/harness.js`: author/validate a bundle (`createHarness`/`updateHarness`,
+  whose field whitelist is what leaves a harness nowhere to express a LAW key), resolve/assign,
+  `effectiveHarness()` (merge the chain), `harnessLayerText()` (prompt injection), `harnessFiles()`
+  (the generated PERSONA/memory/SKILL.md files, each stamped), `reinjectHarnessIntoLiveXells()` (a save
+  reaches the zees already running), `harnessBridge()`. Boot reports what the rows carry
+  (`logHarnessSummary`) — since 080 there is nothing to load.
 - **Injection** — `server/src/queenzee/intake.js`: `briefing()` layers the harness BELOW the law and
   ABOVE the task; `spawnCxell()` materializes SKILL.md files + adjusts the "no skills" line;
   `dispatchXell()` takes `--harness` and applies the project default.
@@ -17,8 +19,9 @@ Status: **IMPLEMENTED** (all four phases). The design below is unchanged; this s
   `routes.js`, `web/src/Connectors.jsx` (series routing through the avatar badge at the junction, with
   consumer count + dashed inbound wire), `web/src/Dispatch.jsx` harness picker, `web/src/fleet.js` card
   field, `web/src/api.js` helpers.
-- **Files** — `harnesses/core/`, `harnesses/hermes/` (HARNESS.yml, PERSONALITY.md, two skills,
-  placeholder `avatar.svg` — swap in the official brand asset).
+- **Text and badge** — in the meta-DB, one `harness` row per harness (080 for the text, 082 for the
+  avatar SVG). There is no `harnesses/` folder in this repo at all, and `lib/harness.js` reads no
+  filesystem.
 - **Hermes bridge** — `server/src/lib/harness-bridge.js`: mode-B outbound transcript mirror
   (`X-Hermes-Session-Key` = slug) + opt-in, token-gated inbound reply via the existing
   `sendMessageToXell` path (`POST /api/harness-bridge/:slug/message`).
@@ -76,47 +79,135 @@ harness
   id            uuid pk
   key           text UNIQUE         -- 'hermes', 'core', ...
   label         text                -- 'Hermes'
-  dir           text                -- 'harnesses/hermes' (relative to the Zeehive repo root)
+  dir           text                -- LEGACY, always NULL since 080 (a folder used to project into bundle)
   head_commit   text                -- commit the graph anchors the harness node to (the dir's last touch)
   bundle        jsonb               -- parsed/validated config (skills[], personality, memory, tools, avatar, bridge…)
   bundle_hash   text                -- projection stamp; drift vs the files is surfaced, not silent
-  avatar_path   text                -- 'harnesses/hermes/avatar.svg' (the badge art)
+  avatar_path   text                -- LEGACY, always NULL since 082 (the badge is bundle.avatar_svg)
   is_law_core   boolean             -- the built-in manual harness (§4); exactly one, undeletable
+  project_id    uuid NULL           -- 084: NULL = system-wide (the default). Non-null = that project only
   enabled       boolean
   created_at    timestamptz
 ```
 
-**Files live in the Zeehive project** under `harnesses/<key>/` — because a harness is system-wide
-and **Zeehive is the system**. So harnesses are versioned, diffable, and travel with the orchestrator
-itself, not with any tenant project. A harness row has **no `project_id`** — that is what "visible to
-all projects" means at the schema level; every enabled harness shows in every project's picker.
+**THE META-DB OWNS EVERY HARNESS'S TEXT** (migration 080). `bundle` on the row IS the harness —
+personality, skills, memory.
 
-```
-harnesses/
-  core/                 # the manual harness (§4) — the law layer, undeletable
-    HARNESS.yml         # a marker only: core's TEXT is not a file (see below)
-  hermes/
-    HARNESS.yml         # bundle manifest: personality, skills list, tools, avatar, bridge config
-    PERSONALITY.md
-    avatar.svg          # the Hermes badge art (see §6)
-    skills/
-      <skill>/SKILL.md
-    memory/*.md
-```
+> **AMENDED by migration 084 (TKT-23-8EE4).** This section originally said a harness row has **no
+> `project_id`**, and that its absence *was* the meaning of "visible to all projects". It now has a
+> nullable one. **NULL still means system-wide, that is still the DEFAULT, and every harness that
+> existed before 084 is one** — core, zee-base, manager, the dev-* crew are the fleet's shared
+> vocabulary and nothing was migrated off it. What the column adds is a persona that belongs to ONE
+> project (`§3.1c`), so a MANAGER zee can mint a specialist for its own backlog without a human and
+> without it appearing in every other project's picker.
 
-`bundle`/`bundle_hash` on the row is the parsed, validated projection of `HARNESS.yml` + that folder,
-refreshed on pull exactly like `project.manifest`. Two amendments this section predates:
+Concretely, at the schema level: a harness with `project_id IS NULL` shows in every project's picker;
+one with a `project_id` shows only in that project's.
 
-- **The folders are read from the ZEEHIVE PROJECT's repo** (`project.repo_root`), not from wherever
-  the server's code happens to sit — the deployed image deliberately carries no copy of them
-  (`lib/harness.js`, 2026-07-29).
-- **`core` and `zee-base` are DB-OWNED (`dir IS NULL`), and the manual is NOT a file.** Migration 047
-  moved the cxell-zee manual into the meta DB (`harness.bundle.memory`, entry `cxell-zee-manual.md`)
-  and deleted the repo copy; every amendment since — 050, 053, 056, 063, 065 — is a migration against
-  that row. `refreshHarnesses()` never touches a `dir IS NULL` harness. **Do not add a repo copy**: it
-  would drift from the row the instant the next migration lands. Read it in the console's harness
-  manager, or in any cxell at `.zeehive/harness/memory/cxell-zee-manual.md` (injected per xell,
-  git-ignored — an artefact, never a source).
+It is authored in **the console's harness manager** or by **migration** (`harness_memory_put(harness_key,
+path, text)`, house rule 9). The queenzee then **generates** the files it injects into a xell from the
+row, when a zee is assigned the harness — `.zeehive/harness/PERSONA.md`, `.zeehive/harness/memory/*.md`,
+`.claude/skills/<name>/SKILL.md` — each stamped with a banner naming the harness it came from and
+saying an edit there is overwritten. Those files are artefacts, never sources.
+
+This section originally specified the opposite (a folder per harness under `harnesses/<key>/`, projected
+into the row at boot), and the history is the reason for the rule:
+
+- **047** moved the cxell-zee manual into the meta-DB and deleted the repo copy, making `core`/`zee-base`
+  DB-owned while everything else stayed file-backed.
+- The deployed image deliberately carries no `harnesses/` (a second copy would drift from the repo the
+  row claimed to project), so in production **every file-backed harness was EMPTY for weeks** — manager
+  zees dispatched with no manual at all. It was repaired by resolving folders against
+  `project.repo_root`, which fixed the instance and left the class.
+- A migration that patched a projected bundle (**059**) then left the row and the folder disagreeing
+  behind a `bundle_hash` that claimed they agreed, with nothing to reconcile them.
+- **080** removed the class: the text was imported into the rows verbatim, the parent chain resolved in
+  SQL, every row detached (`dir` is NULL everywhere and nothing sets it), and the loader deleted.
+
+- **082** finished it: the badge SVG went into `bundle.avatar_svg` too. It had looked like the one
+  harmless exception — art, not agent-facing text — but a badge resolved from `project.repo_root` 404s
+  on any queenzee that cannot read that repo, which is every OTHER project's console. An SVG is text.
+  `harnesses/` is now gone, and with it the repo-root resolution machinery that existed only for it.
+
+So a harness is **complete wherever the meta-DB is reachable** — there is no "no files" state left to
+report, on any project, in any container. **Do not reintroduce a repo copy of any of it**: it drifts
+from the row the instant the next edit lands. Read a harness in the console's harness manager (which
+renders the inherited chain, so the manual a wearer gets is readable there), or in any cxell at
+`.zeehive/harness/…` (injected per xell, git-ignored).
+
+### 3.1c PROJECT-SCOPED harnesses, and who may author one (migration 084)
+
+Two scopes, one column:
+
+| `project_id` | what it means | who authors it |
+|---|---|---|
+| `NULL` (default) | **system-wide** — every project's picker offers it, any project's xell may wear it | a human, in the console's harness manager, or a migration |
+| a project | **that project only** — offered nowhere else, worn nowhere else, deleted with the project | that project's **manager zee** (`zee harness --new`), or a human/migration |
+
+The compatibility rule is enforced in **triggers**, in the shape 054 uses for `zee_type`, and from both
+directions — so the assign path, dispatch, the manager API, the console and any future caller reach the
+same wall, and an existing pairing cannot be broken by editing the harness afterwards:
+
+- `xell_harness_scope_guard` — a xell may only wear a harness that is global or its **own** project's.
+- `harness_scope_guard` — a harness cannot be re-scoped out from under the xells wearing it, the law
+  layer cannot be scoped at all, and a harness may only **inherit** one that is global or in its own
+  project. That last one is the quiet version of the same bug: inheritance MERGES text, so a
+  cross-project parent would pour one project's persona into every other project's briefings.
+- `pool_default_harness_scope_guard` — `pool_config.default_harness_id` cannot name another project's
+  harness. The project default is the one path that attaches a persona with nobody naming it.
+
+**What a MANAGER may do** (`/api/xell/self/harness*`, `zee harness` — §the verbs in
+[manager-zees.md](manager-zees.md)): create, read, edit and delete **worker** personas **in its own
+project**, and inherit a global worker harness — which is the point: a new role inherits `dev-base`,
+gets the manual through `zee-base`, and adds only what is specific to this project. What it is refused,
+structurally and with a sentence: a **manager** persona (only humans add managers), **any** system-wide
+harness, another project's harness, any non-persona field (`is_law_core` included — the create/update
+whitelist is still the law guard), an entry that would occupy a file path the persona **inherits**, and
+deleting *or disabling* a harness a **live** xell is wearing **or inheriting**. The project comes from
+the caller's **token**, never from the body, so "which project?" is not a question it can ask — and the
+stored **key** is derived from the project plus the label for the same reason, since a key is how a
+harness is addressed on a dispatch and in a fleet-wide migration.
+
+Two of those are worth stating as rules of the model rather than as route checks, because they hold
+however a row was written:
+
+- **An inherited file path belongs to the ancestor.** A harness materializes into real files
+  (`.zeehive/harness/memory/<basename>.md`, `.claude/skills/<name>/SKILL.md`), and the injector writes
+  the merged list in order — so a descendant entry on an inherited path used to overwrite the
+  ancestor's copy in every wearer's workspace, the cxell manual included. The merge now gives such a
+  path to the root-most owner and drops the shadow (with a log line), and the authoring functions
+  refuse the save with the collision named.
+- **A persona may not be taken away from a running zee.** `harnessForXell` and `effectiveHarness` both
+  filter on `enabled`, and both FKs are `ON DELETE SET NULL`, so deleting or disabling a harness — or
+  any ANCESTOR of one — empties a live wearer's next briefing with no error it can see. The guard on
+  both verbs covers the harness and its descendants, and the delete is decided in one transaction with
+  `FOR UPDATE` so a dispatch cannot land inside it.
+
+The dev crew is not the crew's opposite here: a project-scoped persona inheriting `dev-base` is the
+intended use, and `test/dev-crew.test.mjs` therefore lints the **system-wide** subtree only — a
+manager's specialist is on no roster and *should* carry this project's lore.
+
+### 3.1b Project entry-point docs (migrations 081, 083)
+The same rule, one level out: a project's agent-facing instructions are a `project_doc` row, generated
+into each xell on the same trigger. The injector asks git inside the cage and **refuses to write over a
+tracked path** — a project that committed its own entry point keeps it — and git-excludes what it does
+write, so a generated doc can never dirty a worktree or reach a landing diff. Authored in the
+project's **Docs** tab (`lib/project-docs.js`).
+
+**The row is the CONTENTS, not a file** (083). 081 had one row per path, so an operator who wanted
+Claude Code *and* Codex *and* Cursor to read the same thing pasted it into three rows and watched them
+drift. Now `body` is the source of truth and `targets` names which provider entry points to generate
+from it; the filenames live in a registry in code (`lib/agent-docs.js`) — `CLAUDE.md`, `AGENTS.md` (the
+~20 tools that read the standard), `GEMINI.md`, `.github/copilot-instructions.md`,
+`.cursor/rules/*.mdc`, `.clinerules/`, `.windsurf`/`.devin/rules/`, `.continue/rules/`, `.roo/rules/`,
+`.amazonq/rules/`, `.kiro/steering/`, `.junie/guidelines.md`, `CONVENTIONS.md`, `.rules`,
+`.goosehints` — each entry carrying the vendor doc that settles it. `rel_path` survives as the escape
+hatch for a one-off custom doc, and the two modes are mutually exclusive.
+
+Every generated file also ends with **that xell's own stack** (`lib/xell-stack.js`): its containers,
+ports, database coupling and build verbs, resolved from the meta-DB at injection time. That is house
+rule 7 applied to the one audience it had been missing — a non-ZEEHIVE agent reading `CLAUDE.md` in a
+xell had no way to learn which containers were its own.
 
 ### 3.2 A xell is ASSIGNED one harness; a human may switch it
 
@@ -243,8 +334,8 @@ Integration caveats for (B), recorded honestly:
   triggering Hermes to generate its own turn.** At attach the bridge **calls Hermes's discovery
   endpoint first** to learn which append/display path the running instance supports (matching
   Zeehive's "surface drift, never guess" ethos); if none exists, Hermes is self-hosted (`~/.hermes/`)
-  so the session store can be written directly. Bridge config (base url, auth, append mode) lives in
-  `harnesses/hermes/HARNESS.yml`, versioned with the harness.
+  so the session store can be written directly. Bridge config (base url, auth, append mode) lives on the
+  harness row and is edited in the console (`lib/harness-bridge.js`).
 - **Two-way (human replies from Hermes's web UI) — feasible, as an opt-in bridge mode.** The
   *inbound delivery machinery already exists and is in daily use*: the dashboard's 📨 button calls
   `sendMessageToXell()` (`queenzee/nudge.js`, `POST /xells/:id/message`), which resolves the xell's
@@ -290,6 +381,8 @@ If you want, the next proposal can spec the orchestrator against that xource-tre
 
 1. **Harness files** → dedicated folders in the **Zeehive project** (`harnesses/<key>/`), because the
    harness is system-wide and Zeehive is the system. ✔
+   **REVERSED by migration 080** — see §3.1. The text lives in the meta-DB and is generated into a
+   xell; only the badge SVG is still a file. Two sources, one silently winning, was the bug.
 2. **Trace** → **in series**; wires route *through* the harness. (Orchestrator = parallel group,
    separate feature.) ✔
 3. **One harness per xell**; **a human may switch it** (a zee cannot re-harness itself). ✔

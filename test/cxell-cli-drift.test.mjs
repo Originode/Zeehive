@@ -23,9 +23,15 @@
 //   c) usage-vs-implementation inside scripts/zee: every advertised verb has a `case`, and every
 //      case is advertised — the same drift one level in;
 //   d) the spawn path installs the queenzee's own CLI into each cxell, and SAYS SO when the image
-//      it booted from is stale (the check that would have caught act two).
+//      it booted from is stale (the check that would have caught act two);
+//   e) usage-vs-MANUAL: every verb the CLI advertises is documented in the manual of the zee type
+//      that has it — the hop this test was missing. `zee harness` (084) reached the CLI and the API
+//      with every manual silent, so the fleet's managers had a verb they could not know they had and
+//      nothing went red. House rule 8 is "what a zee is told is versioned like code"; (c) only ever
+//      compared the CLI against itself, which is one document short of that.
 //
-// Static + unit assertions plus one real `git archive`: no DB, no docker, no network.
+// Static + unit assertions plus one real `git archive`, and — for (e) — the meta-DB, because since
+// 080 a manual is a harness memory entry rather than a file. No docker, no network.
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { join, resolve, dirname } from 'node:path';
@@ -33,6 +39,14 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
+
+// Section (e) lints the MANUALS, and a manual is a row in the meta-DB (080) — there is no file to
+// read. Exit 2 ("could not run") rather than skipping: a lint that quietly checks nothing is how the
+// drift in act three got in.
+if (!process.env.DATABASE_URL) {
+  console.error('DATABASE_URL required — the manuals this file lints live in the meta-DB (see §e)');
+  process.exit(2);
+}
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -284,6 +298,75 @@ ok(/CLI ONLY|CLI only/.test(preamble),
 ok(/cli\.staleImage/.test(intake), 'intake surfaces the verdict on the spawn line too');
 ok(/catch\s*{\s*return null;?\s*}/.test(cxellLib.slice(cxellLib.indexOf('async function bakedZeeCliSha'))),
    'an unreadable baked copy is "unknown", never an error (the check can never sink a spawn)');
+
+// ── (e) usage vs the MANUAL: a verb a zee has must be a verb its manual mentions ──────────────
+//
+// (c) holds the CLI to itself. This holds the CLI to the text the zee is actually briefed with, which
+// is the hop `zee harness` fell through: it was advertised, implemented, routed and tested, and no
+// manual said it existed. An agent cannot use a door nobody told it about.
+//
+// The verb lists are DERIVED FROM THE USAGE TEXT'S OWN SECTIONS — the ` MANAGER-only …:` heading is
+// what says which surface a verb belongs to — so a verb added under either heading is checked the day
+// it lands. A hardcoded list here would be one more thing to remember to edit, which is the failure
+// mode this whole file exists to remove.
+//
+// The manuals are DERIVED TOO: the worker manual is whichever system-wide harness carries a
+// `cxell-zee-manual` memory entry, and the manager manuals are the system-wide manager-type harnesses
+// — checked on their EFFECTIVE (merged) text, so a manager harness that INHERITS the manual (dev-lead)
+// passes on the inherited copy and one that has lost its parent fails.
+console.log('\n── every advertised verb is in the manual of the zee type that has it ──');
+const { effectiveHarness, harnessLayerText } = await import('../server/src/lib/harness.js');
+const { q, pool } = await import('../server/src/db/pool.js');
+try {
+  // usage() is written in SECTIONS: a heading has ONE leading space, a verb line has two or more.
+  const sections = [{ heading: '(the verbs before any heading — every zee)', verbs: [] }];
+  for (const line of usageBlock.split('\n')) {
+    if (/^ \S/.test(line)) sections.push({ heading: line.trim(), verbs: [] });
+    const verb = line.match(/^\s{2,}zee ([a-z][a-z-]*)/)?.[1];
+    if (verb) sections[sections.length - 1].verbs.push(verb);
+  }
+  const managerOnly = [...new Set(sections.filter((s) => /MANAGER-only/i.test(s.heading)).flatMap((s) => s.verbs))];
+  const anyZee = [...new Set(sections.filter((s) => !/MANAGER-only/i.test(s.heading)).flatMap((s) => s.verbs))];
+  ok(managerOnly.length >= 5, `usage marks a MANAGER-only section (${managerOnly.length} verbs: ${managerOnly.join(', ')})`);
+  ok(anyZee.length >= 10, `and the rest is every zee's surface (${anyZee.length} verbs)`);
+  ok(!managerOnly.some((v) => anyZee.includes(v)), 'no verb is in both surfaces (the split is what picks the manual)');
+
+  const rows = await q(
+    `SELECT h.*, (SELECT count(*) FROM jsonb_array_elements(COALESCE(h.bundle->'memory','[]'::jsonb)) e
+                   WHERE e->>'path' LIKE '%cxell-zee-manual%') AS carries_worker_manual
+       FROM harness h WHERE h.enabled AND h.project_id IS NULL`);
+  const briefing = async (row) => harnessLayerText(await effectiveHarness(row));
+  const missing = (text, verbs) => verbs.filter((v) => !text.includes(`zee ${v}`));
+
+  const workerManual = rows.filter((r) => Number(r.carries_worker_manual) > 0);
+  ok(workerManual.length === 1,
+     `exactly one system-wide harness carries the cxell manual (${workerManual.map((r) => r.key).join(', ') || 'NONE — run db:migrate'})`);
+  for (const row of workerManual) {
+    const gaps = missing(await briefing(row), anyZee);
+    ok(!gaps.length, `${row.key}'s manual names every verb a worker has — a verb no manual mentions is a `
+      + `verb no zee knows it has; document it there (missing: ${gaps.join(', ') || 'none'})`);
+  }
+
+  const managers = rows.filter((r) => r.zee_type === 'manager');
+  ok(managers.length >= 1, `there are system-wide manager harnesses to check (${managers.map((r) => r.key).join(', ') || 'NONE'})`);
+  for (const row of managers) {
+    const text = await briefing(row);
+    const gaps = missing(text, managerOnly);
+    ok(!gaps.length, `${row.key} is briefed with every MANAGER-only verb — add it to the manager manual `
+      + `(a migration, house rule 9), or to this harness's own memory (missing: ${gaps.join(', ') || 'none'})`);
+    // …and the manager manual must not name a verb the CLI no longer has: the other direction of the
+    // same drift, and the one that sends a manager to run something that answers "unknown command".
+    // Backticked mentions, plus the verb lines inside a fenced block — NOT bare "zee …" in prose,
+    // which wraps into sentences like "zee is executing" and would invent a verb to complain about.
+    const fenced = [...text.matchAll(/```[\s\S]*?```/g)].map((m) => m[0]).join('\n');
+    const named = [...new Set([...text.matchAll(/`zee ([a-z][a-z-]*)/g), ...fenced.matchAll(/^zee ([a-z][a-z-]*)/gm)]
+      .map((m) => m[1]))];
+    const ghosts = named.filter((v) => !implemented.has(v));
+    ok(!ghosts.length, `and names no verb the CLI does not implement (${ghosts.join(', ') || 'none'})`);
+  }
+} finally {
+  await pool.end().catch(() => {});
+}
 
 console.log(failures ? `\n${failures} FAILED` : '\nall good');
 process.exit(failures ? 1 : 0);

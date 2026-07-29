@@ -285,7 +285,13 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   // the same rule reinjectHarnessIntoLiveXells holds for harness files.
   let changed = true;
   try { changed = readFileSync(path, 'utf8') !== text; } catch { changed = true; }   // unreadable/absent → write
-  if (dryRun) return { ok: true, path, slug: xell.slug, changed, dry_run: true };    // report, write nothing
+  // The zee in the cage reads a COPY of this file, not this file (refreshLiveCxellEnv below). That
+  // copy does its OWN comparison, so it runs whether or not the HOST file moved — see the comment
+  // there for why keying it off `changed` would leave the affected zees unreachable forever.
+  if (dryRun) {                                                                      // report, write nothing
+    return { ok: true, path, slug: xell.slug, changed, dry_run: true,
+             cxell: await refreshLiveCxellEnv(xell, text, { dryRun: true }) };
+  }
   if (changed) writeFileSync(path, text);
 
   // Keep the projection out of git's sight WITHOUT touching the project's committed .gitignore:
@@ -305,7 +311,54 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
       }
     }
   } catch { /* exclusion is a nicety; the projection itself matters more */ }
-  return { ok: true, path, slug: xell.slug, changed };
+  return { ok: true, path, slug: xell.slug, changed,
+           cxell: await refreshLiveCxellEnv(xell, text, { dryRun: false }) };
+}
+
+// ── …AND THE COPY THE ZEE ACTUALLY READS ─────────────────────────────────────────────────────────
+//
+// Everything above lands in the HOST worktree. A cxell zee never reads that file: it reads a COPY,
+// `docker cp`d into /work/repo at spawn (lib/cxell.js cloneIntoCxell, beside the git bundle). So
+// every re-emit — ticket #15's rule fix, a prod bind, a db-clone, a rename, an environment pin, the
+// boot reconcile — was invisible to the only reader that matters: the zee already in the cage,
+// working from the values it was born with. A manager bound to production read-only was TOLD it
+// holds production while its file named its own throwaway spinoff db, and the fix that shipped
+// could not reach it. Fixing the projection and fixing the host file are both necessary and neither
+// is sufficient.
+//
+// So the projection is pushed into the LIVE cxell too, through the mechanism the harness layer
+// already uses (reinjectHarnessIntoLiveXells → a docker exec write into cxell_<slug>), under the
+// same three rules:
+//
+//   • IT COMPARES THE COPY IT IS REPLACING, in the cage, in the same exec (writeFileIntoCxellIf-
+//     Changed). Identical bytes write nothing, here as on the host: a file changing under a working
+//     zee is otherwise indistinguishable from the zee having changed it.
+//     The comparison is against the CAGE's copy deliberately, NOT the host `changed` flag above.
+//     Keying off the host would be the whole bug again: once the boot reconcile has repaired the
+//     host file, host-changed is false at every subsequent emit while the zee's copy stays stale
+//     forever — which is the exact state of every xell that was already running when that reconcile
+//     shipped.
+//   • EVERY WRITE IS LOGGED, saying the queenzee did it, and that whatever already sourced the file
+//     keeps the old values until it re-reads or rebuilds.
+//   • IT OBEYS PROVISION_MODE, for the reason the harness path documents at length: the exec targets
+//     a container named from a fleet row, and a xell's db is a CLONE of the meta-DB, so a NESTED
+//     queenzee's fleet rows are the REAL fleet's. In simulate it REPORTS the cxell it would have
+//     refreshed and execs nothing.
+//
+// It never widens a binding: the text is the projection computed above, from this meta-DB, through
+// the §6.2 guard. This decides WHERE the projection lands, never WHAT it says.
+//
+// Never throws — a xell whose file is correct on disk must not fail its emit because its cage is
+// unreachable. The outcome is returned, logged, and (in emitXellEnv) recorded on the xell row.
+async function refreshLiveCxellEnv(xell, text, { dryRun }) {
+  try {
+    // Lazily imported: intake.js imports THIS module, so a static import would close a cycle — the
+    // same reason lib/harness.js reaches for reinjectHarnessIntoXell this way.
+    const { injectXellEnvIntoCxell } = await import('../queenzee/intake.js');
+    return await injectXellEnvIntoCxell({ xellId: xell.id, slug: xell.slug, text, dryRun });
+  } catch (e) {
+    return { live: null, refreshed: false, error: `cxell env refresh unavailable: ${e.message}` };
+  }
 }
 
 // Emit a xell's .zeehive.env AND record what happened on the xell row. Same signature, same throws,
@@ -320,7 +373,7 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
 export async function emitXellEnv(xellId, { dryRun = false } = {}) {
   try {
     const r = await writeXellEnv(xellId, { dryRun });
-    if (!dryRun) await noteEnvProjection(xellId, null);
+    if (!dryRun) await noteEnvProjection(xellId, null, r.cxell);
     return r;
   } catch (e) {
     // A pooled xell with no worktree on disk yet has nothing to project — that is its normal state,
@@ -333,18 +386,36 @@ export async function emitXellEnv(xellId, { dryRun = false } = {}) {
 }
 
 // Stamp the outcome of a projection. Never throws: bookkeeping about a write must not become a
-// second way for the write to fail. Broadcasts only when the error STATE changes, so a fleet-wide
+// second way for the write to fail. Broadcasts only when an error STATE changes, so a fleet-wide
 // reconcile of healthy xells is silent on the event stream.
-async function noteEnvProjection(xellId, error = null) {
+//
+// TWO outcomes, TWO columns, deliberately not folded into one (migration 082 beside 078):
+// env_projection_error says the HOST file is not what the meta-DB says it should be;
+// env_cxell_error says the host file is fine but the LIVE CXELL's copy — the bytes the zee is
+// actually reading — could not be refreshed. They need different remedies (re-point the xell vs. an
+// unreachable container), and conflating them would have made every host-side xell in the fleet
+// look broken the moment it had no cage. `cxell` null means the refresh was not evaluated at all
+// (a throw before it ran): leave both cage columns exactly as they were rather than inventing news.
+async function noteEnvProjection(xellId, error = null, cxell = null) {
+  // A cage refresh only FAILED if we got far enough to try and could not; "no live cxell zee" is the
+  // normal state of a host-side xell, and it clears any stale failure rather than asserting one.
+  const cxellError = cxell ? (cxell.error || null) : undefined;
+  const cxellOk = !!cxell && !cxell.error && cxell.refreshed;
   try {
-    const prev = await one(`SELECT env_projection_error FROM xell WHERE id=$1`, [xellId]);
+    const prev = await one(`SELECT env_projection_error, env_cxell_error FROM xell WHERE id=$1`, [xellId]);
     if (!prev) return;
     const row = await one(
       `UPDATE xell
           SET env_projection_error = $2,
-              env_projected_at = CASE WHEN $2::text IS NULL THEN now() ELSE env_projected_at END
-        WHERE id=$1 RETURNING *`, [xellId, error || null]);
-    if (row && (prev.env_projection_error || null) !== (error || null)) broadcast('xell', row);
+              env_projected_at = CASE WHEN $2::text IS NULL THEN now() ELSE env_projected_at END,
+              env_cxell_error = CASE WHEN $3::bool THEN $4::text ELSE env_cxell_error END,
+              env_cxell_refreshed_at = CASE WHEN $5::bool THEN now() ELSE env_cxell_refreshed_at END
+        WHERE id=$1 RETURNING *`,
+      [xellId, error || null, cxellError !== undefined, cxellError, cxellOk]);
+    if (row && ((prev.env_projection_error || null) !== (error || null)
+                || (cxellError !== undefined && (prev.env_cxell_error || null) !== cxellError))) {
+      broadcast('xell', row);
+    }
   } catch { /* the projection itself matters more than the note about it */ }
 }
 
@@ -388,11 +459,21 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       ORDER BY x.created_at`);
   let checked = 0, rewritten = 0, failed = 0, skipped = 0;
   const broken = [], stale = [];
+  // The CAGE half, counted separately: a xell's host file and the copy its zee reads are two
+  // different files with two different failure modes (emitXellEnv → refreshLiveCxellEnv), and a
+  // sweep that reported only the host would say "0 rewritten" on the very fleet it just repaired.
+  let cxellRefreshed = 0, cxellFailed = 0, cxellWould = 0;
+  const cxellBroken = [], cxellStale = [];
   for (const x of xells) {
     if (!existsSync(x.worktree_path)) { skipped++; continue; }   // pooled/torn-down: nothing on disk
     checked++;
     try {
       const r = await emitXellEnv(x.id, { dryRun });
+      // Accounted for BEFORE the unchanged-host early-out below: the cage copy is compared in the
+      // cage, so it can be stale while the host file is already correct.
+      if (r.cxell?.error) { cxellFailed++; cxellBroken.push(`${x.slug} (${r.cxell.error})`); }
+      else if (r.cxell?.would_refresh) { cxellWould++; cxellStale.push(x.slug); }
+      else if (r.cxell?.changed) { cxellRefreshed++; cxellStale.push(x.slug); }
       if (!r.changed) continue;
       rewritten++;
       stale.push(x.slug);
@@ -417,12 +498,24 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
     + `${checked} checked, ${rewritten} ${dryRun ? 'STALE (would be rewritten)' : 'rewritten'}`
     + `${stale.length ? ` [${stale.slice(0, 5).join(', ')}${stale.length > 5 ? ', …' : ''}]` : ''}`
     + `, ${failed} FAILED${broken.length ? ` [${broken.slice(0, 3).join('; ')}]` : ''}`
-    + `, ${skipped} skipped (no worktree on disk)`);
+    + `, ${skipped} skipped (no worktree on disk)`
+    // The cage half on the SAME line: the host worktree and the copy a zee reads are the two halves
+    // of one answer to "is the fleet running on what the meta-DB says?", and split across two lines
+    // one of them is the one that scrolls away.
+    + ` · live cxells: ${dryRun ? `${cxellWould} would be refreshed` : `${cxellRefreshed} refreshed`}`
+    + `${cxellStale.length ? ` [${cxellStale.slice(0, 5).join(', ')}${cxellStale.length > 5 ? ', …' : ''}]` : ''}`
+    + `, ${cxellFailed} UNREACHABLE${cxellBroken.length ? ` [${cxellBroken.slice(0, 3).join('; ')}]` : ''}`);
   if (failed) {
     console.error(`[env] ${failed} xell(s) are running on a .zeehive.env that could not be `
       + `reconciled with the meta-DB: ${broken.join('; ')}`);
   }
-  return { checked, rewritten, failed, skipped, broken, stale, dry_run: dryRun };
+  if (cxellFailed) {
+    console.error(`[env] ${cxellFailed} LIVE cxell(s) could not be handed the refreshed .zeehive.env — `
+      + `those zees are still reading their old copy: ${cxellBroken.join('; ')}`);
+  }
+  return { checked, rewritten, failed, skipped, broken, stale, dry_run: dryRun,
+           cxell_refreshed: cxellRefreshed, cxell_failed: cxellFailed, cxell_would_refresh: cxellWould,
+           cxell_broken: cxellBroken, cxell_stale: cxellStale };
 }
 
 // ── bootstrap prerequisites (spec §4.2/§4.3) ──────────────────────────────────

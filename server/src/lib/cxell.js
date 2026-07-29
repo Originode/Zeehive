@@ -1093,6 +1093,100 @@ export async function writeFileIntoCxell({ ctx = 'default', slug, relPath, base6
   return { path: full, rel: safe };
 }
 
+// Write a file into a cxell's /work/repo ONLY IF the bytes there differ — the delivery path for a
+// PROJECTION the meta-DB owns and re-computes (today: .zeehive.env, see lib/provision.js
+// refreshLiveCxellEnv), as opposed to a message, which is new every time.
+//
+// The comparison happens INSIDE the cage, in the same exec that would do the writing, because the
+// copy that matters is the one the zee reads and nothing on the host can tell you what that is. A
+// re-emit whose text is unchanged must therefore write NOTHING here: a file changing under a working
+// zee is otherwise indistinguishable from the zee having changed it (the rule
+// reinjectHarnessIntoLiveXells earned), and mtime is all a zee has to go on.
+//
+// Truncate-in-place (`cat "$tmp" > "$P"`) rather than `mv`: the target is an existing file the zee
+// owns, and moving a root-or-mktemp-owned temp file over it would hand the zee a file it cannot
+// write. The payload is buffered first so the decision cannot half-happen. Resolves
+// { changed, path } — changed:false meaning the cage already held exactly these bytes.
+export async function writeFileIntoCxellIfChanged({ ctx = 'default', slug, relPath, text, timeoutMs = 30000 }) {
+  const name = cxellName(slug);
+  const safe = String(relPath).replace(/\\/g, '/').split('/')
+    .filter((seg) => seg && seg !== '.' && seg !== '..').join('/');
+  if (!safe) throw new Error('empty target path');
+  const full = `/work/repo/${safe}`;
+  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const script = [
+    'set -e',
+    `P=${sq(full)}`,
+    'tmp="$(mktemp)"',
+    'cat > "$tmp"',
+    // sha256sum (coreutils, same package as the base64/mktemp already relied on here) rather than
+    // cmp/diff: a byte-exact comparison with no diffutils dependency on the agent image.
+    'if [ -f "$P" ] && [ "$(sha256sum < "$tmp" | cut -d" " -f1)" = "$(sha256sum < "$P" | cut -d" " -f1)" ]; then',
+    '  rm -f "$tmp"; echo SAME; exit 0',
+    'fi',
+    'mkdir -p "$(dirname "$P")"',
+    'cat "$tmp" > "$P"',
+    'rm -f "$tmp"',
+    'echo WROTE',
+  ].join('\n');
+  const r = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script], { input: String(text ?? ''), timeoutMs });
+  const verdict = String(r?.out || '').trim().split('\n').pop();
+  if (verdict !== 'SAME' && verdict !== 'WROTE') {
+    // Never guess: an exec that exited 0 without printing its verdict wrote something unknown, and
+    // reporting that as "unchanged" is the lie this whole helper exists to avoid.
+    throw new Error(`the cxell did not report what it did with ${safe} (said "${verdict}")`);
+  }
+  return { changed: verdict === 'WROTE', path: full, rel: safe };
+}
+
+// Write a GENERATED file into a cxell — but never over a git-TRACKED path.
+//
+// This is the injector for the project entry-point docs (lib/project-docs.js): markdown the meta-DB
+// owns and the queenzee materializes into a xell, exactly like the harness files. The difference is
+// WHERE they land — a repo-relative path like AGENTS.md, which the project itself may already have
+// committed. Writing over that would replace the project's own instructions with an operator's, dirty
+// the worktree of every xell, and put a file nobody wrote into a landing diff for a human to approve.
+//
+// So git decides, inside the cage, in the same exec that would do the writing: tracked → nothing is
+// written and the caller is told why; untracked → written AND added to .git/info/exclude, so the
+// artefact can never travel into a commit either. The payload is buffered to a temp file first so the
+// decision cannot half-happen (and so a skip does not break the pipe mid-write).
+export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000 }) {
+  const name = cxellName(slug);
+  const safe = String(relPath).replace(/\\/g, '/').split('/')
+    .filter((seg) => seg && seg !== '.' && seg !== '..').join('/');
+  if (!safe) throw new Error('empty target path');
+  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const script = [
+    'set -e',
+    'cd /work/repo',
+    `P=${sq(safe)}`,
+    'tmp="$(mktemp)"',
+    'cat > "$tmp"',
+    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
+    'mkdir -p "$(dirname "$P")"',
+    'mv "$tmp" "$P"',
+    'if [ -d .git ]; then grep -qxF "$P" .git/info/exclude 2>/dev/null || echo "$P" >> .git/info/exclude; fi',
+    'echo WROTE',
+  ].join('\n');
+  // dk resolves { code, out, err } — destructure it. Reading the whole object as a string is exactly
+  // the bug this shipped with: `String(result)` is '[object Object]', which matches no verdict, so
+  // every doc the container really DID write was reported as skipped. The write worked and the report
+  // lied, which is the worse half.
+  const { out } = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script], { input: String(text ?? ''), timeoutMs });
+  const verdict = String(out || '').split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
+  if (verdict === 'TRACKED') {
+    return { written: false, skipped: 'tracked', rel: safe,
+      reason: `${safe} is tracked by git in this xell — the project's own committed copy is left alone` };
+  }
+  if (verdict === 'WROTE') return { written: true, rel: safe, path: `/work/repo/${safe}` };
+  // ANYTHING ELSE IS LOUD. An unrecognised verdict used to be indistinguishable from a deliberate
+  // skip — that silence is what let the parse bug survive a ship. The raw tail rides back so the log
+  // names what actually came out of the container.
+  return { written: false, skipped: 'unknown', rel: safe,
+    reason: `${safe}: the injector could not read the container's answer (got ${JSON.stringify(verdict.slice(0, 60))})` };
+}
+
 export async function removeCxell({ ctx, slug }) {
   await dk(ctx, ['rm', '-f', cxellName(slug)]).catch(() => {});
   // pre-rename containers (zee_cage_<slug>) from the old-vocabulary era — idempotent, so this

@@ -6,14 +6,21 @@
 // nothing for weeks, and the injection path into a live cxell already existed (a harness re-assign
 // uses it) — so this is wiring, not machinery.
 //
+// SINCE MIGRATION 080 the trigger is a SAVE, not a boot refresh: the meta-DB owns a harness's text,
+// so updateHarness() — the console's harness manager, or a migration followed by one — is the only
+// way it ever moves, and therefore the only place that can push it into a running zee.
+//
 // The two conditions on that wiring are what this test is really about:
-//   1. ONLY WHEN THE BUNDLE CHANGED. A refresh that no-ops must write NOTHING into a running zee's
-//      worktree — a zee's workspace is its own, and a queenzee reaching into it uninvited on every
-//      boot is worse than the bug.
+//   1. ONLY WHEN THE BUNDLE CHANGED. A save that no-ops must write NOTHING into a running zee's
+//      worktree — a zee's workspace is its own, and a queenzee reaching into it uninvited is worse
+//      than the bug.
 //   2. IT IS LOGGED. A file appearing under a live zee is otherwise indistinguishable from the zee
 //      having written it.
 // Plus the inheritance case: a child harness's effective persona is the merged chain, so repairing a
 // PARENT changes what a xell wearing the CHILD should hold.
+//
+// (This file used to build harness FOLDERS in a throwaway repo and call refreshHarnesses(). There are
+// no harness folders any more — the rows below carry their own text, which is the point of 080.)
 //
 // Every call below passes `mode: 'real'` EXPLICITLY, because there is now a fourth rule and it is
 // the default: the injection obeys PROVISION_MODE, so a NESTED queenzee (whose fleet rows are the
@@ -42,7 +49,7 @@ const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`)
 
 const REAL_ROOT = config.repoRoot;
 const tag = randomUUID().slice(0, 8);
-const parentKey = `zt-par-${tag}`;      // file-backed, the one that gets repaired
+const parentKey = `zt-par-${tag}`;      // the one that gets repaired
 const childKey = `zt-kid-${tag}`;       // inherits it — its effective persona changes too
 const KEYS = [parentKey, childKey];
 const tmp = mkdtempSync(join(tmpdir(), 'reinject-'));
@@ -55,28 +62,25 @@ let projId = null;
 const madeXells = [];
 
 try {
-  // ── a project repo carrying two harness folders, and two live xells wearing them ────────────
-  mkdirSync(join(repo, 'harnesses'), { recursive: true });
-  const mk = (key, extra = '') => {
-    const dir = join(repo, 'harnesses', key);
-    mkdirSync(join(dir, 'skills', 'zt-skill'), { recursive: true });
-    writeFileSync(join(dir, 'HARNESS.yml'), `version: 1\nlabel: ${key}\nsummary: fixture\nzee_type: worker\n${extra}`);
-    writeFileSync(join(dir, 'PERSONALITY.md'), `persona v1 ${tag}\n`);
-    writeFileSync(join(dir, 'skills', 'zt-skill', 'SKILL.md'), `---\nname: zt-skill\ndescription: d\n---\n\nbody v1\n`);
-    return dir;
-  };
-  const parentDir = mk(parentKey);
-  mk(childKey, `parent: ${parentKey}\n`);
+  // ── two DB-OWNED harnesses (parent + a child that inherits it) and xells wearing them ───────
+  mkdirSync(repo, { recursive: true });
   git('init', '-q', '-b', 'master'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
-  git('add', '-A'); git('commit', '-qm', 'harness fixtures');
+  writeFileSync(join(repo, 'README.md'), 'reinject fixture\n');
+  git('add', '-A'); git('commit', '-qm', 'base');
 
   projId = (await one(`INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'master') RETURNING id`,
     [`zt-reinj-${tag}`, repo])).id;
   const xource = await one(`INSERT INTO xource (project_id, ref) VALUES ($1,'master') RETURNING id`, [projId]);
-  const parentH = await one(`INSERT INTO harness (key,label,dir,enabled,is_law_core) VALUES ($1,$1,$2,true,false) RETURNING id`,
-    [parentKey, `harnesses/${parentKey}`]);
-  const childH = await one(`INSERT INTO harness (key,label,dir,enabled,is_law_core) VALUES ($1,$1,$2,true,false) RETURNING id`,
-    [childKey, `harnesses/${childKey}`]);
+  const bundleV1 = (key) => JSON.stringify({
+    label: key, summary: 'fixture', zee_type: 'worker', personality: `persona v1 ${tag}`,
+    skills: [{ name: 'zt-skill', when: 'd', body: 'body v1' }],
+  });
+  const parentH = await one(
+    `INSERT INTO harness (key,label,bundle,bundle_hash,enabled,is_law_core) VALUES ($1,$1,$2,'v1',true,false) RETURNING id`,
+    [parentKey, bundleV1(parentKey)]);
+  const childH = await one(
+    `INSERT INTO harness (key,label,bundle,bundle_hash,enabled,is_law_core,parent_id) VALUES ($1,$1,$2,'v1',true,false,$3) RETURNING id`,
+    [childKey, bundleV1(childKey), parentH.id]);
 
   const mkXell = async (slug, harnessId, { live = false } = {}) => {
     const x = await one(
@@ -95,10 +99,10 @@ try {
   const heir = await mkXell(`zt-heir-${tag}`, childH.id, { live: true });      // wears its CHILD
   const asleep = await mkXell(`zt-idle-${tag}`, parentH.id);                   // no live zee at all
 
-  // ── 1. first refresh: the bundles are born, so they CHANGED ─────────────────────────────────
-  console.log('\n── a refresh that changes a bundle reaches the zees already running ──');
+  // ── 1. a SAVE that changes the parent's text ────────────────────────────────────────────────
+  console.log('\n── saving a harness edit reaches the zees already running ──');
   let n = since();
-  await H.refreshHarnesses({ mode: 'real' });
+  await H.updateHarness(parentKey, { personality: `persona v2 ${tag}` }, { mode: 'real' });
   let log = linesSince(n);
   // each LIVE wearer is acted on and named. In this cage the docker write cannot succeed, so the
   // outcome must be the honest failure line rather than a claim of success.
@@ -115,29 +119,27 @@ try {
   ok(!touched(wearer.slug).some((m) => /re-injected 0 file/.test(m)), 'and never claims a write that did not happen');
   ok(log.some((m) => m.includes(asleep.slug) && /next dispatch/.test(m)),
      'a xell with no live zee is reported as picking it up at its next dispatch, not silently dropped');
-  ok(log.some((m) => m.includes(parentKey) && /refreshed/.test(m)), 'the refresh itself is still logged as before');
+  ok(log.some((m) => m.includes(parentKey) && /updated harness/.test(m)), 'the save itself is logged');
 
-  // ── 2. a refresh that changes NOTHING must not touch a running zee's worktree ───────────────
-  console.log('\n── and a no-op refresh writes nothing at all ──');
+  // ── 2. a save that changes NOTHING must not touch a running zee's worktree ──────────────────
+  console.log('\n── and a no-op save writes nothing at all ──');
   n = since();
-  await H.refreshHarnesses({ mode: 'real' });
+  await H.updateHarness(parentKey, { personality: `persona v2 ${tag}` }, { mode: 'real' });   // same text again
   log = linesSince(n);
   ok(!log.some((m) => /re-injected|injection FAILED/.test(m)), 'no injection attempt at all: nothing changed, nothing written');
   ok(!log.some((m) => /next dispatch/.test(m)), 'and nothing is even considered — the whole path is skipped');
-  ok(log.some((m) => /^harnesses: /.test(m)), 'the summary line still runs (the refresh did happen)');
+  ok(log.some((m) => /updated harness/.test(m)), 'the save itself still happened (it was simply identical)');
 
-  // ── 3. edit ONE folder: only that harness's wearers are touched ─────────────────────────────
+  // ── 3. edit ONE harness: only that harness's wearers are touched ─────────────────────────────
   console.log('\n── editing one harness only re-injects the xells that wear it (or inherit it) ──');
-  writeFileSync(join(parentDir, 'PERSONALITY.md'), `persona v2 ${tag}\n`);
-  git('add', '-A'); git('commit', '-qm', 'persona v2');
   n = since();
-  await H.refreshHarnesses({ mode: 'real' });
+  await H.updateHarness(parentKey, { personality: `persona v3 ${tag}` }, { mode: 'real' });
   log = linesSince(n);
   const hit = log.filter((m) => /re-injected|injection FAILED|next dispatch/.test(m));
   ok(hit.some((m) => m.includes(wearer.slug)), 'the wearer of the edited harness is re-injected');
   ok(hit.some((m) => m.includes(heir.slug)), 'the heir too — a parent edit changes the child chain');
-  ok(!log.some((m) => new RegExp(`${childKey}: refreshed`).test(m)),
-     'the untouched CHILD folder is not itself re-read as changed (only its parent moved)');
+  ok(!log.some((m) => new RegExp(`updated harness "${childKey}"`).test(m)),
+     'the CHILD row is not itself rewritten (only its parent moved — the heir inherits the change)');
 
   // ── 4. the selector is callable on its own, and answers with the counts ─────────────────────
   const direct = await H.reinjectHarnessIntoLiveXells(parentH.id, { mode: 'real' });

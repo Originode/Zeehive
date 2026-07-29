@@ -1,49 +1,34 @@
 // HARNESSES — shared, system-wide config layers assigned to xells (docs/harness-proposal.md).
 //
-// A harness carries a config BUNDLE (personality, skills, memory, tools, bridge) parsed from files
-// in the Zeehive project under harnesses/<key>/. The DB row (migration 044) is a parsed, hashed
-// PROJECTION of those files — the repo is truth, drift is surfaced (same pattern as project.manifest).
+// A harness carries a config BUNDLE (personality, skills, memory) and **the meta-DB owns it**. The
+// row IS the harness: nothing on any filesystem is a source of its text. It is authored in the
+// console's harness manager or by migration (harness_memory_put — house rule 9), and the queenzee
+// GENERATES the files it injects into a xell from the row when a zee is assigned (harnessFiles).
+//
+// It was not always so, and the split is what taught the rule (migration 080). `core`/`zee-base`
+// were DB-owned while every other harness was FILE-BACKED — its bundle a projection that a boot
+// refresh overwrote from harnesses/<key>/. The deployed server image deliberately carries no
+// harnesses/, so in production every file-backed harness was EMPTY for weeks and manager zees were
+// briefed with nothing; and a migration patching a projected bundle left row and folder disagreeing
+// behind a hash that claimed they agreed. Two sources, one of them silently winning, is the bug.
+//
+// Nothing about a harness is on disk — not even the badge: an avatar is an SVG, and an SVG is text
+// (migration 082, harnessAvatarSvg). A harness is complete wherever the meta-DB is reachable.
 //
 // LAW: the `core` harness is the built-in, undeletable law layer (the cxell-zee manual + the binding
 // rules), assembled in bindingFor()/spawnCxell(). Every xell always gets core; an assigned harness
 // (e.g. hermes) layers BELOW it and may ADD, never OVERRIDE, the queenzee-interaction rules. That
-// non-override is enforced HERE, structurally: parseHarness() REJECTS a bundle that names a reserved
-// (law) key — a harness bundle simply has nowhere to express a land/ship/prod/gate rule. A harness
-// never ships or lands; it is only a guide (the zee is the one to ship/land).
-import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
-import { resolve, join, sep } from 'node:path';
+// non-override is structural: a bundle is only ever written through the authoring functions below,
+// which accept personality/summary/glyph/skills/memory and NOTHING else — so a harness has nowhere
+// to express a land/ship/prod/gate rule. A harness never ships or lands; it is only a guide.
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { parse } from 'yaml';
-import { q, one } from '../db/pool.js';
-import { config } from '../config.js';
+import { q, one, pool } from '../db/pool.js';
 import { logline } from './logbus.js';
-import { cleanGitEnv } from './git.js';
-
-export const HARNESS_MANIFEST = 'HARNESS.yml';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, and the
 // .zeehive.env reconcile in provision.js): 'real' touches machines, anything else models. The live
 // re-injection below obeys it — see reinjectHarnessIntoLiveXells for why that matters.
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
-
-// Keys a harness bundle may NOT define — anything that would redefine how a zee talks to
-// zeehive/queenzee, or a gate. The manual + binding rules own these; a harness that names one is
-// rejected at parse time, so "the manual is law" holds by construction, not by prompt order.
-const RESERVED_LAW_KEYS = new Set([
-  'land', 'ship', 'prod', 'done', 'gate', 'gates', 'rules', 'rule', 'manual',
-  'queenzee', 'binding', 'law', 'landing', 'shipping', 'deploy',
-]);
-
-// Keys a harness bundle MAY define (everything else is ignored with a warning).
-const ALLOWED_KEYS = new Set([
-  'version', 'label', 'summary', 'description', 'personality', 'voice',
-  'skills', 'memory', 'tools', 'avatar', 'bridge', 'parent', 'glyph',
-  // Which ZEE TYPE this harness is for (054). A harness carries the MANUAL for a type's verbs and
-  // refusals, so wearing the wrong one briefs an agent for doors it does not have. `zee_type:` in
-  // HARNESS.yml (or `type:`) declares it; the pairing is enforced in the DB.
-  'zee_type', 'type',
-]);
 
 // Every type a XELL can be, and every type a HARNESS can declare. 'any' is the law layer (core),
 // which applies to every zee whatever its type.
@@ -60,6 +45,20 @@ export function harnessFitsType(harnessType, zeeType) {
   const h = normalizeZeeType(harnessType, 'worker');
   return h === 'any' || h === normalizeZeeType(zeeType, 'worker');
 }
+
+// SCOPE (084) — the same shape as the type rule, for the other axis. A harness with no project_id is
+// SYSTEM-WIDE (the default, and what every harness seeded before 084 is); one with a project_id is
+// visible to that project only. A xell may wear a global harness or its OWN project's, and nothing
+// else. The DB trigger is the wall; this is the one predicate every list, picker and assign path
+// shares so none of them can offer a choice the wall would then refuse.
+export function harnessFitsProject(harnessProjectId, projectId) {
+  return !harnessProjectId || String(harnessProjectId) === String(projectId || '');
+}
+export function scopeMismatchReason(harness, projectName = null) {
+  return `harness "${harness.key}" belongs to ${projectName ? `project "${projectName}"` : 'another project'} `
+    + 'and this xell does not. A project-scoped persona is visible to its own project only (that is what '
+    + 'scoping one means) — pick a system-wide harness, or one of this project\'s own.';
+}
 export function typeMismatchReason(harness, zeeType) {
   return `harness "${harness.key}" is for ${harness.zee_type} zees, but this xell is a `
     + `${normalizeZeeType(zeeType)} zee. A harness carries the manual for a type's verbs and refusals `
@@ -70,275 +69,40 @@ export function typeMismatchReason(harness, zeeType) {
 
 const hashOf = (text) => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
-// ── WHERE the harness folders actually live ──────────────────────────────────
-// A file-backed harness's `dir` ('harnesses/manager') is relative to the ZEEHIVE PROJECT's REPO —
-// the clone the queenzee manages and the DB row projects (self-onboard.js onboards it as the
-// `Zeehive` project; its repo_root is /repos/Zeehive in the container era). It is NOT relative to
-// config.repoRoot, which is merely where the running server's code sits.
+// THE AVATAR IS IN THE ROW TOO (migration 082) — so this module reads no filesystem at all.
 //
-// On a checkout those are the same folder, which is why every test passed while the DEPLOYED
-// queenzee was broken: Dockerfile.server copies server/ scripts/ db/ hooks/ skill/ into /app and
-// deliberately NOT harnesses/ (a second copy in the image would drift from the repo the row claims
-// to project — the same reasoning as the single copy of scripts/zee). So config.repoRoot=/app had
-// no harnesses/ at all, refreshHarnesses() found nothing, and every file-backed harness — the
-// manager's manual included — stayed EMPTY in production.
+// A harness's badge SVG used to be `harnesses/<key>/avatar.svg`, resolved against the ZEEHIVE
+// PROJECT's repo because the server image deliberately carries no harnesses/. That kept a whole
+// repo-root resolution machinery alive for one asset, and it 404'd on any queenzee that could not read
+// that repo. An SVG is text, so it lives in `bundle.avatar_svg` and the route serves it from there.
 //
-// Resolution: the project repo roots first (self project first), then config.repoRoot as the
-// fallback for host-process mode (where the runtime dir IS the repo) and for tests. A root only
-// wins if the folder is actually THERE, so a stale/unreachable repo_root falls through instead of
-// blanking a harness.
-const SELF_PROJECT = 'Zeehive';
-const ROOTS_TTL_MS = 30_000;
-let rootsCache = { at: 0, roots: [] };
-
-const normRoot = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
-
-// Re-read the candidate repo roots from the DB (cheap, cached). Never throws: with no DB/schema
-// yet (a very early boot, a unit test) we simply fall back to config.repoRoot.
-export async function refreshHarnessRoots() {
-  try {
-    const rows = await q(
-      `SELECT repo_root FROM project WHERE repo_root IS NOT NULL
-        ORDER BY (lower(name) = lower($1)) DESC, created_at`, [SELF_PROJECT]);
-    rootsCache = { at: Date.now(), roots: rows.map((r) => normRoot(r.repo_root)).filter(Boolean) };
-  } catch {
-    rootsCache = { at: Date.now(), roots: [] };
-  }
-  return harnessRoots();
-}
-
-// Warm the cache only when it has gone stale — for read paths (list, avatar) that must not fire a
-// query per call.
-export async function ensureHarnessRoots() {
-  if (Date.now() - rootsCache.at > ROOTS_TTL_MS) await refreshHarnessRoots();
-  return harnessRoots();
-}
-
-// Every root a harness folder may live under, best first. config.repoRoot is ALWAYS last, never
-// absent — the fallback is what keeps a checkout-run (tests, host process) working unchanged.
-export function harnessRoots() {
-  return [...new Set([...(rootsCache.roots || []), normRoot(config.repoRoot)])];
-}
-
-// The root a given repo-relative path resolves under (the first that actually has it). Falls back
-// to config.repoRoot so error messages and hashes stay stable when nothing has it.
-export function harnessBase(rel) {
-  if (rel) for (const root of harnessRoots()) if (existsSync(resolve(root, rel))) return root;
-  return normRoot(config.repoRoot);
-}
-
-// The avatar SVG on disk for a harness's avatar_path, or null. Containment-guarded: the file must
-// live under <base>/harnesses/, so a crafted avatar_path can never read outside it. Shared by the
-// API route so the route and the loader agree on the base (they used to disagree — see above).
-export async function harnessAvatarFile(avatarPath) {
-  const rel = String(avatarPath || '').trim();
-  if (!rel) return null;
-  const base = await ensureHarnessRoots().then(() => harnessBase(rel));
-  const abs = resolve(base, rel);
-  if (!abs.startsWith(resolve(base, 'harnesses') + sep)) return null;
-  return existsSync(abs) ? abs : null;
-}
-
-// ── parse + validate a harness manifest ──────────────────────────────────────
-// Structural problems and any RESERVED law key are errors (the bundle cannot be used); an unknown
-// key is a warning. Returns { bundle, errors, warnings }.
-export function parseHarness(text) {
-  const errors = [], warnings = [];
-  let m;
-  try { m = parse(text); } catch (e) { return { bundle: null, errors: [`not valid YAML: ${e.message}`], warnings }; }
-  if (m == null) return { bundle: {}, errors, warnings };            // an empty manifest is a valid no-op harness
-  if (typeof m !== 'object' || Array.isArray(m)) return { bundle: null, errors: ['manifest must be a map'], warnings };
-
-  for (const k of Object.keys(m)) {
-    if (RESERVED_LAW_KEYS.has(k.toLowerCase())) {
-      errors.push(`"${k}" is a reserved LAW key — a harness may add guidance but never redefine how a zee interacts with zeehive/queenzee (land/ship/prod/gates). Remove it.`);
-    } else if (!ALLOWED_KEYS.has(k.toLowerCase())) {
-      warnings.push(`unknown key "${k}" ignored (allowed: ${[...ALLOWED_KEYS].join(', ')})`);
-    }
-  }
-  if (m.skills != null && !Array.isArray(m.skills)) errors.push('skills must be a list');
-  if (m.memory != null && !Array.isArray(m.memory)) errors.push('memory must be a list of file paths');
-  if (m.tools != null && !Array.isArray(m.tools)) errors.push('tools must be a list (it may only NARROW the mode\'s tools, never widen them)');
-  if (m.bridge != null && (typeof m.bridge !== 'object' || Array.isArray(m.bridge))) errors.push('bridge must be a map');
-
-  return { bundle: errors.length ? null : m, errors, warnings };
-}
-
-// Last commit that touched a harness's folder — the graph anchors the harness node here. Best-effort
-// (a fresh repo / uncommitted folder → null, and the timeline falls back to the tip).
-function dirHeadCommit(repoRoot, dir) {
-  try {
-    const r = spawnSync('git', ['-C', repoRoot, 'log', '-1', '--format=%H', '--', dir],
-      { encoding: 'utf8', timeout: 8000, windowsHide: true, env: cleanGitEnv() });
-    return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null;
-  } catch { return null; }
-}
-
-// Read a skill folder (skills/<name>/SKILL.md) into { name, when, body }. A SKILL.md may lead with a
-// YAML frontmatter block (--- ... ---) carrying name/description; if absent we derive name from the
-// folder and use the first paragraph as the "when to use" line. Delivery is provider-neutral here —
-// the adapter decides SKILL.md-file vs prompt-injection (docs §6.2).
-function readSkill(skillDir, folderName, base) {
-  const md = join(skillDir, 'SKILL.md');
-  if (!existsSync(md)) return null;
-  const raw = readFileSync(md, 'utf8');
-  let name = folderName, when = '', body = raw;
-  const fm = raw.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
-  if (fm) {
-    try { const meta = parse(fm[1]) || {}; name = meta.name || name; when = meta.description || meta.when || ''; } catch { /* ignore bad frontmatter */ }
-    body = fm[2].trim();
-  }
-  if (!when) when = body.split('\n\n')[0].replace(/\s+/g, ' ').slice(0, 240);
-  return { name, when, body, path: `${skillDir.replace(normRoot(base) + '/', '')}/SKILL.md` };
-}
-
-// Assemble a bundle object from a harness folder: HARNESS.yml (validated) + PERSONALITY.md +
-// skills/*/SKILL.md + memory/*.md + avatar. Returns { bundle, hash, errors, warnings, files }.
-// `base` is the repo root the dir hangs off — the Zeehive project's repo_root in the deployed
-// queenzee, config.repoRoot on a checkout. Callers that already resolved it (refreshHarnesses)
-// pass it in so every read + the hash below agree on ONE base.
-export function loadHarnessDir(dir, base = harnessBase(dir)) {
-  const root = normRoot(base);
-  const abs = resolve(root, dir);
-  if (!existsSync(abs)) {
-    return { bundle: null, hash: null, missing: true, base: root, files: [], warnings: [],
-      errors: [`harness dir not found: ${dir} (looked under ${harnessRoots().join(', ')})`] };
-  }
-
-  const files = [];
-  let text = '{}';
-  const man = join(abs, HARNESS_MANIFEST);
-  if (existsSync(man)) { text = readFileSync(man, 'utf8'); files.push(`${dir}/${HARNESS_MANIFEST}`); }
-  const { bundle: parsed, errors, warnings } = parseHarness(text);
-  if (!parsed) return { bundle: null, hash: null, errors, warnings, files };
-  const bundle = { ...parsed };
-
-  // personality: inline in the manifest, or PERSONALITY.md beside it
-  const pmd = join(abs, 'PERSONALITY.md');
-  if (typeof bundle.personality === 'string' && bundle.personality.trim() && !bundle.personality.endsWith('.md')) {
-    /* inline text — keep as-is */
-  } else if (existsSync(pmd)) {
-    bundle.personality = readFileSync(pmd, 'utf8').trim();
-    files.push(`${dir}/PERSONALITY.md`);
-  } else if (bundle.personality) {
-    const p = join(abs, bundle.personality);
-    if (existsSync(p)) { bundle.personality = readFileSync(p, 'utf8').trim(); files.push(`${dir}/${bundle.personality}`); }
-  }
-
-  // skills: an entry may be INLINE ({name, when/description, body}) in the manifest, or a NAME that
-  // resolves to a skills/<name>/SKILL.md folder. With no declared list, every folder under skills/.
-  const skillsRoot = join(abs, 'skills');
-  const skills = [];
-  const fromFolder = (n) => {
-    if (!existsSync(skillsRoot)) return;
-    const s = readSkill(join(skillsRoot, n), n, root);
-    if (s) { skills.push(s); files.push(s.path); }
-  };
-  if (Array.isArray(bundle.skills)) {
-    for (const entry of bundle.skills) {
-      if (entry && typeof entry === 'object' && (entry.body || entry.when || entry.description)) {
-        skills.push({ name: String(entry.name || 'skill'), when: String(entry.when || entry.description || ''), body: String(entry.body || '') });
-      } else {
-        const n = typeof entry === 'string' ? entry : entry?.name;
-        if (n) fromFolder(n);
-      }
-    }
-  } else if (existsSync(skillsRoot) && statSync(skillsRoot).isDirectory()) {
-    for (const n of readdirSync(skillsRoot).filter((x) => statSync(join(skillsRoot, x)).isDirectory())) fromFolder(n);
-  }
-  bundle.skills = skills;
-
-  // memory files → inline text. A path resolves against the harness folder first, then the REPO ROOT
-  // (containment-guarded) — so a file-backed harness can incorporate a repo doc live, no copy, no
-  // drift. (Zee Base used to do exactly that with a repo copy of the cxell-zee manual; migration 047
-  // moved that manual INTO the meta DB and made Zee Base DB-owned, so it no longer comes through
-  // here — but the mechanism stands for any other harness that wants a live repo doc.)
-  if (Array.isArray(bundle.memory)) {
-    bundle.memory = bundle.memory.map((rel) => {
-      const local = join(abs, rel);
-      const rooted = resolve(root, rel);
-      let p = null;
-      if (existsSync(local)) p = local;
-      else if (rooted.startsWith(root) && existsSync(rooted)) p = rooted;
-      if (p) { files.push(p.replace(root + '/', '')); return { path: rel, text: readFileSync(p, 'utf8').trim() }; }
-      return { path: rel, text: null, missing: true };
-    });
-  }
-
-  // The hash re-reads every collected file — against the SAME base the bundle was read from. It
-  // used to re-resolve against config.repoRoot, so in the container it hashed a list of empty
-  // strings: two different harnesses would have hashed identical.
-  const hash = hashOf(files.map((f) => `${f}:${existsSync(resolve(root, f)) ? readFileSync(resolve(root, f), 'utf8') : ''}`).join('\0'));
-  return { bundle, hash, base: root, errors, warnings, files };
-}
-
-// ── refresh: reconcile every harness row with its folder (boot / seed) ───────
-// Mirrors the manifest refresh: read the folder, re-validate, store the parsed bundle + hash +
-// anchor commit + avatar. Loud on validation errors (a broken harness stays with its LAST good
-// bundle rather than a half-parsed one), quiet when unchanged.
-//
-// An UNREADABLE folder keeps the last good bundle too — but it is no longer silent. That silence
-// is exactly how the deployed queenzee shipped manager zees with no manual for weeks: the refresh
-// logged nothing a human would read, and /api/harnesses reported a harness that looked fine and
-// carried nothing. Now it screams (stdout + the queenzee log), and the read models carry
-// files_missing / bundle_empty so the console can show it.
-export async function refreshHarnesses({ mode = PROVISION_MODE } = {}) {
-  await refreshHarnessRoots();      // the Zeehive project's repo_root is where the folders live
-  const rows = await q(`SELECT id, key, dir, bundle_hash, is_law_core, zee_type FROM harness WHERE dir IS NOT NULL`);
-  const changed = [];               // harnesses whose bundle actually moved — see the loop's tail
-  for (const h of rows) {
-    if (h.is_law_core) continue;   // core's text is code-assembled; nothing to read from a folder
-    const base = harnessBase(h.dir);
-    const { bundle, hash, missing, errors, warnings } = loadHarnessDir(h.dir, base);
-    if (missing) { await reportMissingHarness(h); continue; }
-    if (!bundle) { logline('harness', `${h.key}: INVALID (${errors.join('; ')}) — keeping last good bundle`); continue; }
-    for (const w of warnings) logline('harness', `${h.key}: ${w}`);
-    // The anchor commit is reconciled every refresh even when the bundle content is unchanged — the
-    // folder's last-touch commit moves as OTHER commits land, and the timeline anchors the node here.
-    const head = dirHeadCommit(base, h.dir);
-    if (hash === h.bundle_hash) {
-      if (head && head !== h.head_commit) await q(`UPDATE harness SET head_commit=$2 WHERE id=$1`, [h.id, head]);
-      continue;   // bundle unchanged
-    }
-    const avatar = existsSync(resolve(base, h.dir, 'avatar.svg')) ? `${h.dir}/avatar.svg` : null;
-    // resolve a declared `parent:` key → parent_id (the trigger blocks cycles). Missing parent → null.
-    let parentId = null;
-    if (bundle.parent) {
-      const p = await one(`SELECT id FROM harness WHERE key=$1`, [bundle.parent]);
-      if (p) parentId = p.id; else logline('harness', `${h.key}: parent "${bundle.parent}" not found — ignored`);
-    }
-    // The folder's declared type is authoritative for a file-backed harness, exactly like its skills
-    // and memory. The DB trigger still refuses a retype that would strand a xell already wearing it,
-    // so a bad edit fails loudly instead of silently re-pointing a live manager at a worker manual.
-    const declared = normalizeZeeType(bundle.zee_type ?? bundle.type, h.zee_type || 'worker');
-    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=COALESCE($5, avatar_path), label=COALESCE($6, label), parent_id=$7, zee_type=$8 WHERE id=$1`,
-      [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null, parentId, declared]);
-    logline('harness', `${h.key}: refreshed (${bundle.skills?.length || 0} skill(s), ${bundle.parent ? `parent ${bundle.parent}, ` : ''}hash ${hash})`);
-    // The bundle really CHANGED, so every zee ALREADY RUNNING in a xell that wears it is now holding
-    // stale files. Push the repaired persona into them (below) — "new zees only" is precisely what
-    // left the running fleet briefed on nothing while a fix sat in the DB.
-    changed.push(h.id);
-  }
-  for (const id of changed) await reinjectHarnessIntoLiveXells(id, { mode });
-  await logHarnessSummary();
+// What that buys, beyond the badge: a harness is now COMPLETE on any machine that can reach the
+// meta-DB. Nothing about it can be "missing files", on any project, in any container.
+export function harnessAvatarSvg(bundle) {
+  const b = typeof bundle === 'string' ? JSON.parse(bundle) : (bundle || {});
+  const svg = String(b.avatar_svg || '').trim();
+  // A stored badge must be an SVG document and nothing else: this is served to a browser, and the row
+  // is operator-editable, so the check belongs here rather than in the one route that reads it.
+  return /^<svg[\s>]/i.test(svg) ? svg : null;
 }
 
 // Re-inject a harness's files into every LIVE xell whose effective persona just changed — the xells
 // wearing it, AND the xells wearing a harness that INHERITS it (a child's effective bundle is the
 // merged chain, so a parent's repair changes the child's files too).
 //
-// Called ONLY from the changed-bundle branch above: a refresh that no-ops must write nothing into a
-// running zee's worktree. And every write is logged, because a file appearing under a live zee is
-// otherwise indistinguishable from the zee having written it — which is how a "did I do that?"
-// half-hour gets spent.
+// Called when a harness's bundle actually CHANGES (the console's harness manager saving an edit, a
+// migration amending a manual): "new zees only" is precisely what left a running fleet briefed on
+// stale text while the repair sat in the DB. Every write is logged, because a file appearing under a
+// live zee is otherwise indistinguishable from the zee having written it — which is how a "did I do
+// that?" half-hour gets spent.
 //
 // AND IT OBEYS PROVISION_MODE, exactly as the .zeehive.env reconcile does (provision.js). The
 // injection is a `docker exec` into `cxell_<slug>`, and the slug comes STRAIGHT OUT OF A FLEET ROW.
 // A xell's database is a CLONE of the meta-DB, so the rows a NESTED queenzee walks (every zee that
 // boots the server inside its own xell — PROVISION_MODE=simulate by manifest default) are the REAL
-// fleet's rows, real container names and all. Unguarded, the first zee to edit a harness folder and
-// boot the server would have written its own harness files into every OTHER zee's live cxell, over
-// the top of the personas they are actually running on. In simulate this REPORTS the xells it would
+// fleet's rows, real container names and all. Unguarded, the first zee to edit a harness and boot
+// the server would have written its own harness files into every OTHER zee's live cxell, over the
+// top of the personas they are actually running on. In simulate this REPORTS the xells it would
 // have injected and execs nothing; in real mode nothing about it changes.
 export async function reinjectHarnessIntoLiveXells(harnessId, { mode = PROVISION_MODE } = {}) {
   const dryRun = mode !== 'real';
@@ -391,38 +155,59 @@ export async function reinjectHarnessIntoLiveXells(harnessId, { mode = PROVISION
 
 // A harness and every harness that inherits from it, transitively (the parent_id trigger blocks
 // cycles, and the hop cap is belt-and-braces for a DB edited by hand).
-async function harnessAndDescendants(rootId) {
+//
+// EXPORTED because "and its descendants" is the correct reach for every question of the form "who
+// would this change reach?" — the live re-injection above, and the wearer guards on delete/disable.
+// A guard that asked only about the harness ITSELF was one level deep: deleting a PARENT collapsed a
+// live wearer's chain just as thoroughly, and returned ok.
+export async function harnessAndDescendants(rootId, { run = q } = {}) {
   const ids = [rootId];
   let frontier = [rootId], hops = 0;
   while (frontier.length && hops++ < 32) {
-    const kids = await q(`SELECT id FROM harness WHERE parent_id = ANY($1::uuid[])`, [frontier]);
+    const kids = await run(`SELECT id FROM harness WHERE parent_id = ANY($1::uuid[])`, [frontier]);
     frontier = kids.map((k) => k.id).filter((id) => !ids.includes(id));
     ids.push(...frontier);
   }
   return ids;
 }
 
+// The LIVE xells wearing a harness or anything that inherits it, and which of the two they wear. The
+// one predicate behind "you cannot delete this" and "you cannot disable this": both end in the same
+// place — a running zee whose next briefing has lost the chain — so they must ask the same question.
+export async function liveHarnessWearers(harnessId, { run = q, scope = null } = {}) {
+  const ids = scope || await harnessAndDescendants(harnessId, { run });
+  return run(
+    `SELECT x.slug, h.key AS harness, h.id = $2 AS direct FROM xell x JOIN harness h ON h.id = x.harness_id
+      WHERE x.harness_id = ANY($1::uuid[]) AND x.status NOT IN ('retired','tearing-down','husk')
+      ORDER BY x.slug`, [ids, harnessId]);
+}
+
+// How a wearer list is said out loud: the xell, and — when it is wearing a DESCENDANT — the harness
+// in between, because "why is xyz in the way?" is otherwise unanswerable from the message.
+export function wearerList(worn) {
+  return worn.map((w) => (w.direct ? w.slug : `${w.slug} (wearing "${w.harness}", which inherits it)`)).join(', ');
+}
+
 // ONE line at the end of every refresh: how many file-backed harnesses carry something, how many
 // carry NOTHING, which ones, and how many live xells are wearing an empty one.
 //
-// The per-harness loglines above are each true and each easy to miss — a queenzee can boot looking
-// perfectly healthy with every file-backed harness empty, which is exactly how manager zees walked
-// around blind for weeks. A boot is not "clean" if a zee's persona is a blank page, so this line is
+// A harness carrying nothing is invisible otherwise — the row looks perfectly healthy while the zee
+// wearing it is briefed with a blank page, which is exactly how manager zees walked around blind for
+// weeks when the text still lived in files the deployed queenzee could not read. A boot is not "clean" if a zee's persona is a blank page, so this line is
 // always emitted, and goes to stdout (the docker log a human actually reads) the moment it isn't 0.
 export async function logHarnessSummary() {
-  await ensureHarnessRoots();
   const rows = await q(
-    `SELECT h.key, h.dir, h.is_law_core,
+    `SELECT h.key, h.is_law_core,
             h.bundle->>'personality' AS personality, (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
             (SELECT count(*)::int FROM xell x
                WHERE x.harness_id = h.id AND x.status NOT IN ('retired','tearing-down','husk')) AS worn
-       FROM harness h WHERE h.dir IS NOT NULL AND NOT h.is_law_core AND h.enabled ORDER BY h.key`);
+       FROM harness h WHERE NOT h.is_law_core AND h.enabled ORDER BY h.key`);
   const empty = [], loaded = [];
   let wornEmpty = 0;
   for (const h of rows) {
     const health = harnessHealth(h);
-    if (health.bundle_empty || health.files_missing) {
-      empty.push(`${h.key}${health.files_missing ? ' (no files)' : ''}${h.worn ? ` ×${h.worn}` : ''}`);
+    if (health.bundle_empty) {
+      empty.push(`${h.key}${h.worn ? ` ×${h.worn}` : ''}`);
       wornEmpty += Number(h.worn || 0);
     } else loaded.push(h.key);
   }
@@ -434,29 +219,9 @@ export async function logHarnessSummary() {
   return { loaded: loaded.length, empty: empty.length, worn_empty: wornEmpty, empty_keys: empty, line };
 }
 
-// A file-backed harness whose folder cannot be read. Keep the last good bundle (never blank a live
-// harness on a bad mount), but say so LOUDLY and name the cost: how many zees are wearing a harness
-// that carries nothing, and where we looked.
-async function reportMissingHarness(h) {
-  let worn = 0;
-  try {
-    worn = Number((await one(
-      `SELECT count(*)::int AS n FROM xell WHERE harness_id=$1
-         AND status NOT IN ('retired','tearing-down','husk')`, [h.id]))?.n || 0);
-  } catch { /* count is colour, not the message */ }
-  const msg = `${h.key}: FOLDER MISSING — "${h.dir}" is not under any known repo root `
-    + `(${harnessRoots().join(' , ')}). Keeping the last stored bundle`
-    + `${worn ? `, but ${worn} live xell(s) wear this harness and get whatever that bundle holds` : ''}`
-    + '. A file-backed harness lives in the ZEEHIVE PROJECT repo (project.repo_root), not in the '
-    + 'server image — check that the project is onboarded and its repo_root is mounted/readable.';
-  logline('harness', msg);
-  console.error(`[harness] ${msg}`);
-}
-
-// NOTE: the cxell manual now lives INSIDE the meta DB — seeded directly into Zee Base's
-// harness.bundle.memory by migration 047, and Zee Base is DB-owned (dir=NULL) so refreshHarnesses
-// never touches it. There is no boot-time file ingest (that depended on a repo file and was fragile);
-// the manual is editable in the manager and injected into a xell only via harness assignment.
+// NOTE: the cxell manual lives INSIDE the meta DB — seeded into Zee Base's harness.bundle.memory by
+// migration 047 and amended by migration since. There is no file ingest anywhere: the manual is
+// editable in the console's harness manager and injected into a xell only via harness assignment.
 
 // ── resolution + assembly (used by the briefing) ─────────────────────────────
 export async function coreHarness() {
@@ -477,8 +242,13 @@ export async function defaultHarnessId(projectId, { zeeType = 'worker' } = {}) {
   // The project default is a WORKER default by construction — it is what a bare dispatch attaches.
   // Never hand it to a manager: that would strip the manual its verbs come from, and the assign
   // would be refused anyway. A manager with no explicit harness gets the manager one instead.
-  const h = await one(`SELECT zee_type FROM harness WHERE id=$1`, [r.default_harness_id]);
-  return harnessFitsType(h?.zee_type, zeeType) ? r.default_harness_id : null;
+  //
+  // The SCOPE check is belt-and-braces (pool_default_harness_scope_guard refuses the column being set
+  // to another project's harness at all), and it fails the way this function already fails: no
+  // default, so the dispatch attaches nothing — never another project's persona.
+  const h = await one(`SELECT zee_type, project_id FROM harness WHERE id=$1`, [r.default_harness_id]);
+  if (!harnessFitsType(h?.zee_type, zeeType)) return null;
+  return harnessFitsProject(h?.project_id, projectId) ? r.default_harness_id : null;
 }
 
 // Resolve a harness key OR id to its row (for --harness / API assign). NULL/'none' → null (core only).
@@ -496,8 +266,14 @@ export async function assignHarness(xellId, keyOrId) {
   // real wall; this check exists so the caller gets a sentence explaining WHY, rather than a raw
   // postgres exception the console would have to render as gibberish.
   if (h) {
-    const x = await one(`SELECT zee_type FROM xell WHERE id=$1`, [xellId]);
+    const x = await one(`SELECT zee_type, project_id FROM xell WHERE id=$1`, [xellId]);
     if (!harnessFitsType(h.zee_type, x?.zee_type)) throw new Error(typeMismatchReason(h, x?.zee_type));
+    // SCOPE next (084), same reasoning: the trigger refuses it either way, but a caller deserves the
+    // sentence rather than a postgres exception — and this one names the project that owns it.
+    if (!harnessFitsProject(h.project_id, x?.project_id)) {
+      const owner = await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]);
+      throw new Error(scopeMismatchReason(h, owner?.name || null));
+    }
   }
   await one(`UPDATE xell SET harness_id=$2 WHERE id=$1 RETURNING id`, [xellId, h?.id || null]);
   logline('harness', `xell ${String(xellId).slice(0, 8)} → harness ${h?.key || '(core only)'}`);
@@ -505,50 +281,62 @@ export async function assignHarness(xellId, keyOrId) {
 }
 
 // List enabled harnesses for the picker/UI (core last — it is implicit/always-on).
-export async function listHarnesses({ zeeType = null } = {}) {
+export async function listHarnesses({ zeeType = null, projectId = null } = {}) {
   const rows = await q(
-    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.avatar_path, h.head_commit, h.dir, h.zee_type,
+    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.head_commit, h.zee_type, h.project_id,
+            (h.bundle->>'avatar_svg') IS NOT NULL AS has_avatar,
             (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
             h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
             h.bundle->>'personality' AS personality,
-            p.key AS parent
+            p.key AS parent, pr.name AS project_name
        FROM harness h LEFT JOIN harness p ON p.id = h.parent_id
+            LEFT JOIN project pr ON pr.id = h.project_id
       WHERE h.enabled ORDER BY h.is_law_core, h.key`);
-  await ensureHarnessRoots();
   // `zeeType` narrows the list to what a xell of that type may actually WEAR — what every picker
   // must offer, so an operator is never shown a choice the assign path would then refuse.
-  return rows.filter((h) => !zeeType || harnessFitsType(h.zee_type, zeeType)).map((h) => ({
+  //
+  // `projectId` narrows it the same way on the SCOPE axis (084): a project's list is the system-wide
+  // harnesses PLUS that project's own, and never another project's. Omitting it returns everything —
+  // that is the console's harness manager, which edits them all and says which scope each row is.
+  return rows.filter((h) => (!zeeType || harnessFitsType(h.zee_type, zeeType))
+                         && (!projectId || harnessFitsProject(h.project_id, projectId))).map((h) => ({
     id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core, parent: h.parent,
     zee_type: h.zee_type,
-    avatar_path: h.avatar_path, head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
-    file_backed: !!h.dir,
+    // SCOPE, on every row: a picker that shows a project persona and a global one identically invites
+    // an operator to edit the fleet's shared vocabulary thinking it is their own.
+    project_id: h.project_id || null, project_name: h.project_name || null,
+    scope: h.project_id ? 'project' : 'global',
+    has_avatar: !!h.has_avatar, avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
+    head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
-    // HONESTY about what this harness actually carries. A file-backed harness whose folder is not
-    // readable from here, and a harness that would brief a zee with nothing, are both invisible
-    // problems otherwise — the row looks perfectly healthy while the zee wearing it gets an empty
-    // persona (the deployed-queenzee bug). Computed at read time, so it is never a stale flag.
+    // HONESTY about what this harness actually carries: a row that would brief a zee with NOTHING
+    // looks identical to one carrying a 15k manual in every picker otherwise. Computed at read time,
+    // so it is never a stale flag.
     ...harnessHealth(h),
   }));
 }
 
-// files_missing: a file-backed harness whose folder is not under any known repo root.
-// bundle_empty: it would brief a zee with NOTHING — no personality, no skills, no memory.
-// core is excluded from both: its text is code-assembled, so an empty bundle there is correct.
+// bundle_empty is the ONE health question now that the meta-DB owns the text: there is no folder
+// that can go missing, only a row that says nothing — no personality, no skills, no memory. core is
+// excluded: its text is code-assembled, so an empty bundle there is correct.
 export function harnessHealth(h) {
-  if (h.is_law_core) return { files_missing: false, bundle_empty: false };
+  if (h.is_law_core) return { bundle_empty: false };
   const skills = Array.isArray(h.skills) ? h.skills : [];
   const memory = Array.isArray(h.memory) ? h.memory : [];
   return {
-    files_missing: !!h.dir && !existsSync(resolve(harnessBase(h.dir), h.dir)),
     bundle_empty: !String(h.personality || '').trim() && !skills.length
       && !memory.some((m) => m && String(m.text || '').trim()),
   };
 }
 
-// ── harness authoring (DB-owned personas — unlimited, created from the dashboard) ────────────────
-// A harness is a PERSONA an AI assumes as a zee: personality + skills + memory. The `core` law
-// harness is off-limits. File-backed harnesses (a `dir`) are repo-managed; EDITING one detaches it
-// to DB ownership (dir → NULL) so refreshHarnesses can no longer clobber the operator's edits.
+// ── harness authoring — the ONLY way a harness's text changes ────────────────────────────────────
+// A harness is a PERSONA an AI assumes as a zee: personality + skills + memory, owned by the meta-DB
+// (migration 080). These functions and `harness_memory_put` in a migration are the whole surface;
+// there is no file to edit. The `core` law harness is off-limits.
+//
+// The field whitelist below is also the LAW guard: a bundle can only ever carry
+// personality/summary/glyph/label/skills/memory/zee_type/parent, so no harness — however it is
+// authored — has anywhere to express a land/ship/prod/gate rule.
 const slugKey = (s) => String(s || '').toLowerCase().trim()
   .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'harness';
 
@@ -563,21 +351,34 @@ function normalizeMemory(arr) {
     .filter((m) => m.text);
 }
 
-export async function createHarness({ key, label, glyph, zee_type } = {}) {
+export async function createHarness({ key, label, glyph, zee_type, project_id = null } = {}) {
   const k = slugKey(key || label);
   if (k === 'core') throw new Error('"core" is reserved for the law harness');
-  if (await one(`SELECT id FROM harness WHERE key=$1`, [k])) throw new Error(`a harness "${k}" already exists`);
+  // Keys are UNIQUE across the fleet, scoped or not: a key is how a harness is named on a dispatch
+  // (`--harness <key>`) and in the meta-DB, so two harnesses answering to one key would make that
+  // reference ambiguous. Say so, rather than let the raw constraint speak.
+  if (await one(`SELECT id FROM harness WHERE key=$1`, [k])) {
+    throw new Error(`a harness "${k}" already exists — harness keys are unique across the hive `
+      + '(they are how a harness is named on a dispatch), so pick another name');
+  }
   // Which TYPE of zee this persona is for. Worker is the default — the overwhelming majority, and
   // the safe one: a manager harness handed to a worker teaches verbs the worker does not have.
   const type = normalizeZeeType(zee_type, 'worker');
+  // SCOPE (084): NULL = system-wide, and that is the DEFAULT — a harness created without a project is
+  // the fleet's shared vocabulary, exactly as every harness was before scoping existed. A project_id
+  // makes it that project's own, visible nowhere else and deleted with the project.
   const bundle = { label: label || k, zee_type: type, ...(glyph ? { glyph: String(glyph).slice(0, 4) } : {}) };
-  await one(`INSERT INTO harness (key,label,bundle,enabled,is_law_core,zee_type) VALUES ($1,$2,$3,true,false,$4) RETURNING id`,
-    [k, label || k, JSON.stringify(bundle), type]);
-  logline('harness', `created ${type} harness "${k}"`);
+  await one(`INSERT INTO harness (key,label,bundle,enabled,is_law_core,zee_type,project_id)
+               VALUES ($1,$2,$3,true,false,$4,$5) RETURNING id`,
+    [k, label || k, JSON.stringify(bundle), type, project_id || null]);
+  logline('harness', `created ${type} harness "${k}"${project_id ? ` scoped to project ${String(project_id).slice(0, 8)}` : ' (system-wide)'}`);
   return getHarnessFull(k);
 }
 
-export async function updateHarness(key, patch = {}) {
+// `mode` rides through to the live re-injection for the same reason refreshHarnesses took one: the
+// write into a running cxell is a real side effect, and a NESTED queenzee (a zee running the server
+// inside its own xell, whose fleet rows are the REAL fleet's) must only ever report it.
+export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } = {}) {
   const h = await one(`SELECT * FROM harness WHERE key=$1`, [key]);
   if (!h) throw new Error(`no harness "${key}"`);
   if (h.is_law_core) throw new Error('the core (law) harness is not editable');
@@ -585,6 +386,14 @@ export async function updateHarness(key, patch = {}) {
   if ('personality' in patch) bundle.personality = String(patch.personality || '');
   if ('summary' in patch) bundle.summary = String(patch.summary || '').slice(0, 200);
   if ('glyph' in patch) bundle.glyph = String(patch.glyph || '').slice(0, 4);
+  // The badge, as text. Refused unless it is an SVG document — this is served to a browser, and an
+  // operator pasting the wrong thing should be told at the save, not by a broken image everywhere.
+  if ('avatar_svg' in patch) {
+    const svg = String(patch.avatar_svg || '').trim();
+    if (svg && !/^<svg[\s>]/i.test(svg)) throw new Error('an avatar must be an SVG document (it starts with <svg …>)');
+    if (svg.length > 200_000) throw new Error('that SVG is too large for a badge (200k max)');
+    if (svg) bundle.avatar_svg = svg; else delete bundle.avatar_svg;
+  }
   if ('skills' in patch) bundle.skills = normalizeSkills(patch.skills);
   if ('memory' in patch) bundle.memory = normalizeMemory(patch.memory);
   const label = 'label' in patch ? (String(patch.label || '').trim() || h.label) : h.label;
@@ -597,21 +406,75 @@ export async function updateHarness(key, patch = {}) {
     await q(`UPDATE harness SET zee_type=$2 WHERE key=$1`, [key, type]);
   }
   // parent: resolve a key → parent_id ('' / null clears). The trigger blocks cycles/self-parent.
+  let parentId = h.parent_id;
   if ('parent' in patch) {
-    let pid = null;
+    parentId = null;
     if (patch.parent) {
       if (patch.parent === key) throw new Error('a harness cannot inherit itself');
       const p = await one(`SELECT id FROM harness WHERE key=$1`, [patch.parent]);
       if (!p) throw new Error(`no parent harness "${patch.parent}"`);
-      pid = p.id;
+      parentId = p.id;
     }
-    await q(`UPDATE harness SET parent_id=$2 WHERE key=$1`, [key, pid]);
   }
-  // detach from any file backing so refreshHarnesses can't overwrite this edit
-  await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5, dir=NULL WHERE key=$1`,
-    [key, JSON.stringify(bundle), label, enabled, hashOf(JSON.stringify(bundle))]);
+  // NO LEAF MAY CLAIM AN INHERITED FILE PATH — checked against the parent chain this save ENDS with,
+  // so re-parenting onto a harness that already owns one of these paths is refused too. Before any
+  // write, because a refused save must leave the stored persona exactly as it was.
+  await assertNoInheritedPathCollision(key, bundle, parentId);
+  if ('parent' in patch) await q(`UPDATE harness SET parent_id=$2 WHERE key=$1`, [key, parentId]);
+  const hash = hashOf(JSON.stringify(bundle));
+  await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5 WHERE key=$1`,
+    [key, JSON.stringify(bundle), label, enabled, hash]);
   logline('harness', `updated harness "${key}" (${(bundle.skills || []).length} skill(s), ${(bundle.memory || []).length} memory)`);
-  return getHarnessFull(key);
+  // A SAVE IS NOW THE ONLY WAY THE TEXT MOVES, so it is also what has to reach the zees ALREADY
+  // RUNNING. While a folder was the source, the boot refresh noticed the change and pushed it in;
+  // with the row as the source that path is gone, and without this an operator fixing a manual would
+  // fix it for the NEXT zee only — the exact "new zees only" failure that left a whole fleet briefed
+  // on stale text (test/harness-reinject-live.test.mjs). Guarded on the hash so a no-op save writes
+  // nothing into anyone's workspace, and PROVISION_MODE-guarded inside.
+  //
+  // AND THE CALLER IS TOLD WHETHER IT RAN: `reinjected: null` means the text did not change, so no
+  // workspace was touched at all; otherwise it is the real outcome (how many xells, how many files
+  // written, whether this queenzee only modelled it). The manager API used to print "every live zee
+  // wearing it has had its persona files rewritten" on EVERY save — including the enabled-only saves
+  // that leave bundle_hash identical and skip this line entirely. An answer that overstates what
+  // happened is its own defect: the repo's whole posture is to say what really happened.
+  const reinjected = hash !== h.bundle_hash ? await reinjectHarnessIntoLiveXells(h.id, { mode }) : null;
+  return { ...(await getHarnessFull(key)), reinjected };
+}
+
+// DELETE, refused while any LIVE xell wears this harness OR anything that INHERITS it — and decided
+// inside ONE transaction, so the answer cannot be overtaken by a dispatch.
+//
+// Both halves are paid-for. `xell.harness_id` is ON DELETE SET NULL and `harness.parent_id` is too,
+// so deleting a harness either strips a running zee back to core-only or collapses its chain to the
+// leaf alone — the same end state, one level up, and the guard that only asked about direct wearers
+// returned ok for it. And the check was a SELECT followed by a DELETE with nothing holding the rows
+// in between: a dispatch landing in that window assigned a harness that was already going. The
+// `FOR UPDATE` conflicts with the FOR KEY SHARE lock that a xell's `harness_id` write takes on the
+// referenced row, so only two orders remain — we see the wearer and refuse, or the assign waits and
+// then fails its foreign key loudly, which is not the same as a zee quietly losing its persona.
+//
+// Returns the wearers instead of throwing: the caller writes the sentence (it knows who is asking).
+export async function deleteHarnessUnlessWorn(key) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const run = async (text, params) => (await client.query(text, params)).rows;
+    const [h] = await run(`SELECT id, is_law_core FROM harness WHERE key=$1`, [key]);
+    if (!h) { await client.query('ROLLBACK'); return { deleted: false, missing: true, worn: [] }; }
+    if (h.is_law_core) { await client.query('ROLLBACK'); throw new Error('the core (law) harness cannot be deleted'); }
+    const scope = await harnessAndDescendants(h.id, { run });
+    await run(`SELECT id FROM harness WHERE id = ANY($1::uuid[]) FOR UPDATE`, [scope]);
+    const worn = await liveHarnessWearers(h.id, { run, scope });
+    if (worn.length) { await client.query('ROLLBACK'); return { deleted: false, worn }; }
+    await run(`DELETE FROM harness WHERE id=$1`, [h.id]);
+    await client.query('COMMIT');
+    logline('harness', `deleted harness "${key}" (nothing live was wearing it or anything inheriting it)`);
+    return { deleted: true, worn: [] };
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally { client.release(); }
 }
 
 export async function deleteHarness(key) {
@@ -636,9 +499,14 @@ export async function getHarnessFull(key) {
     const eff = await effectiveHarness(await one(`SELECT * FROM harness WHERE id=$1`, [h.parent_id]));
     if (eff) inherited = { skills: eff.skills, memory: eff.memory, chain: eff.chain };
   }
-  await ensureHarnessRoots();
+  // Which SCOPE this persona is in (084) — the editor states it, and its parent picker needs it: a
+  // harness may only inherit a global one or one in its own project.
+  const owner = h.project_id ? await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]) : null;
   return {
-    key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core, file_backed: !!h.dir,
+    key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core,
+    project_id: h.project_id || null, project_name: owner?.name || null,
+    scope: h.project_id ? 'project' : 'global',
+    avatar_svg: harnessAvatarSvg(b) || '',
     parent, zee_type: h.zee_type, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
     inherited,
@@ -648,24 +516,55 @@ export async function getHarnessFull(key) {
 }
 
 // The FILES an effective harness materializes into a xell (docs §6) — its persona, skills, and
-// memory (incl. the cxell manual carried by Zee Base). Injected into the cxell at dispatch AND when a
-// harness is (re)assigned to a live zee, so the persona is real files in the workspace, not just
-// prompt text. Skills also load as Claude SKILL.md; persona + memory land under .zeehive/harness/.
+// memory (incl. the cxell manual carried by Zee Base). GENERATED from the harness rows when a zee is
+// assigned the harness (at dispatch, and again whenever the harness changes under a live zee), so the
+// persona is real files in the workspace and not only prompt text. Skills also load as Claude
+// SKILL.md; persona + memory land under .zeehive/harness/.
 const fileSafe = (s) => String(s || 'note').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'note';
+
+// THE FILE AN ENTRY LANDS ON — derived in ONE place, because every other question about it (may this
+// leaf claim that path? did two entries claim the same one?) has to be asked about the path the
+// injector actually writes. A memory entry is keyed on its BASENAME (`memory/x.md` and `x.md` are the
+// same file), a skill on its slugged name.
+export const memoryRelPath = (path) => `.zeehive/harness/memory/`
+  + `${fileSafe(String(path).split('/').pop() || 'memory').replace(/\.md$/, '')}.md`;
+export const skillRelPath = (name) => `.claude/skills/${fileSafe(name)}/SKILL.md`;
+
+// EVERY GENERATED FILE SAYS SO, AND SAYS WHERE THE SOURCE IS.
+//
+// These files look exactly like checked-in repo files to whoever opens one — and a zee that treats
+// its manual as editable repo text will "fix" a page that is regenerated from the meta-DB on the next
+// assignment: the edit lands in no diff, reaches no other zee, and disappears without an error. One
+// header removes that whole class of wasted turn, and it is also how a reader learns where the real
+// source is. `from` names the harness in the chain that OWNS the entry (a dev-crew wearer's manual
+// comes from `zee-base`, not from the harness it is wearing).
+export function generatedBanner({ from, kind, path }) {
+  return `<!-- GENERATED by ZEEHIVE from the meta-DB — harness \`${from}\`, ${kind}${path ? ` \`${path}\`` : ''}.\n`
+    + '     Written into this xell when the harness was assigned, and rewritten whenever it changes.\n'
+    + '     Editing THIS copy changes nothing: it is git-ignored, lands in no diff and is overwritten.\n'
+    + "     The source is the harness row — edit it in the console's harness manager, or by migration. -->";
+}
+
 export function harnessFiles(eff) {
   if (!eff) return [];
   const files = [];
+  const key = eff.key || fileSafe(eff.label);
   if (eff.personality && eff.personality.trim()) {
-    files.push({ relPath: '.zeehive/harness/PERSONA.md', text: `# ${eff.label} — persona\n\n${eff.personality.trim()}\n` });
+    files.push({ relPath: '.zeehive/harness/PERSONA.md',
+      text: `${generatedBanner({ from: key, kind: 'personality' })}\n\n# ${eff.label} — persona\n\n${eff.personality.trim()}\n` });
   }
   for (const s of eff.skills || []) {
     if (!s.body) continue;
-    files.push({ relPath: `.claude/skills/${fileSafe(s.name)}/SKILL.md`, text: `---\nname: ${s.name}\ndescription: ${String(s.when).replace(/\n/g, ' ')}\n---\n\n${s.body}\n` });
+    // The banner goes AFTER the frontmatter block: a SKILL.md's `---` must be the first line or the
+    // provider stops seeing it as a skill at all.
+    files.push({ relPath: skillRelPath(s.name),
+      text: `---\nname: ${s.name}\ndescription: ${String(s.when).replace(/\n/g, ' ')}\n---\n\n`
+        + `${generatedBanner({ from: s.from || key, kind: 'skill', path: s.name })}\n\n${s.body}\n` });
   }
   for (const m of eff.memory || []) {
     if (!m.text) continue;
-    const base = fileSafe(String(m.path).split('/').pop() || 'memory').replace(/\.md$/, '') + '.md';
-    files.push({ relPath: `.zeehive/harness/memory/${base}`, text: m.text });
+    files.push({ relPath: memoryRelPath(m.path),
+      text: `${generatedBanner({ from: m.from || key, kind: 'memory', path: m.path })}\n\n${m.text}` });
   }
   return files;
 }
@@ -682,8 +581,28 @@ export async function effectiveHarness(leafRow) {
     if (!cur.parent_id) break;
     cur = await one(`SELECT * FROM harness WHERE id=$1 AND enabled`, [cur.parent_id]);
   }
-  const merged = { label: leafRow.label, glyph: null, summary: null, personality: '', skills: [], memory: [], chain: chain.map((c) => c.label) };
+  const merged = { key: leafRow.key, label: leafRow.label, glyph: null, summary: null, personality: '', skills: [], memory: [], chain: chain.map((c) => c.label) };
   const bundleOf = (r) => (typeof r.bundle === 'string' ? JSON.parse(r.bundle) : (r.bundle || {}));
+  // ONE ENTRY PER FILE, AND THE ANCESTOR OWNS IT (root wins).
+  //
+  // The union used to be a plain concatenation, while harnessFiles() keys a file on the entry's
+  // BASENAME — so a leaf with a memory entry called `cxell-zee-manual.md` produced a SECOND
+  // .zeehive/harness/memory/cxell-zee-manual.md, and reinjectHarnessIntoXell writes that list in
+  // order with no dedup: the LEAF's text landed last and became the manual the worker was told to
+  // trust (same trick for a skill's SKILL.md, and harnessLayerText carried the second copy in the
+  // prompt as well). A manager may author a project persona, so this was a forgeable law layer.
+  //
+  // The authoring path now refuses such a save with the collision named, but this is the half that
+  // does not depend on how the row got here — a migration or a hand-edited bundle cannot shadow an
+  // inherited file either. Precedence is root-most, deliberately: the ancestor's entry is the one
+  // every wearer of every descendant already relies on.
+  const claimed = new Map();
+  const claim = (relPath, ownerKey, what) => {
+    if (!claimed.has(relPath)) { claimed.set(relPath, ownerKey); return true; }
+    logline('harness', `${leafRow.key}: ${what} from "${ownerKey}" was DROPPED from the effective persona — `
+      + `"${claimed.get(relPath)}" already owns ${relPath}, and an inherited file path cannot be shadowed`);
+    return false;
+  };
   for (const row of chain) {
     const b = bundleOf(row);
     if (b.glyph) merged.glyph = b.glyph;
@@ -692,10 +611,63 @@ export async function effectiveHarness(leafRow) {
       merged.personality += (merged.personality ? '\n\n' : '')
         + (chain.length > 1 ? `— from ${row.label}:\n` : '') + b.personality.trim();
     }
-    if (Array.isArray(b.skills)) merged.skills.push(...b.skills.filter((s) => s && s.name));
-    if (Array.isArray(b.memory)) merged.memory.push(...b.memory.filter((m) => m && m.text));
+    // `from` is provenance, carried so a generated file can name the harness that actually owns the
+    // entry rather than the one being worn (the manual belongs to zee-base, whoever inherits it).
+    if (Array.isArray(b.skills)) {
+      for (const s of b.skills) {
+        if (!s || !s.name) continue;
+        if (claim(skillRelPath(s.name), row.key, `skill "${s.name}"`)) merged.skills.push({ ...s, from: s.from || row.key });
+      }
+    }
+    if (Array.isArray(b.memory)) {
+      for (const m of b.memory) {
+        if (!m || !m.text) continue;
+        if (claim(memoryRelPath(m.path), row.key, `memory "${m.path}"`)) merged.memory.push({ ...m, from: m.from || row.key });
+      }
+    }
   }
   return merged;
+}
+
+// The file paths a harness INHERITS, and which ancestor owns each — what a leaf may not occupy.
+//
+// Walked WITHOUT effectiveHarness's `enabled` filter: a path a DISABLED ancestor owns is still that
+// ancestor's, and a leaf allowed to take it would start shadowing the moment somebody re-enabled it.
+// The map keeps the ROOT-MOST owner, which is the one that actually wins the merge above.
+async function inheritedFilePaths(parentId) {
+  const owner = new Map();
+  let cur = parentId ? await one(`SELECT id, key, parent_id, bundle FROM harness WHERE id=$1`, [parentId]) : null;
+  let hops = 0;
+  while (cur && hops++ < 32) {
+    const b = typeof cur.bundle === 'string' ? JSON.parse(cur.bundle) : (cur.bundle || {});
+    for (const s of b.skills || []) if (s?.name) owner.set(skillRelPath(s.name), cur.key);
+    for (const m of b.memory || []) if (m?.path) owner.set(memoryRelPath(m.path), cur.key);
+    cur = cur.parent_id ? await one(`SELECT id, key, parent_id, bundle FROM harness WHERE id=$1`, [cur.parent_id]) : null;
+  }
+  return owner;
+}
+
+// REFUSE a save that would claim an inherited file path, and NAME the collision — the author is the
+// one person who can fix it, and a silent drop (which is what the merge now does underneath) reads to
+// them like their text saved. Both routes matter: memory and skills materialize into files.
+async function assertNoInheritedPathCollision(key, bundle, parentId) {
+  if (!parentId) return;
+  const owner = await inheritedFilePaths(parentId);
+  if (!owner.size) return;
+  const clashes = [];
+  for (const s of bundle.skills || []) {
+    const p = skillRelPath(s.name);
+    if (owner.has(p)) clashes.push(`skill "${s.name}" would land on ${p}, which it INHERITS from "${owner.get(p)}"`);
+  }
+  for (const m of bundle.memory || []) {
+    const p = memoryRelPath(m.path);
+    if (owner.has(p)) clashes.push(`memory "${m.path}" would land on ${p}, which it INHERITS from "${owner.get(p)}"`);
+  }
+  if (!clashes.length) return;
+  throw new Error(`"${key}" cannot occupy a file path it inherits — ${clashes.join('; ')}. `
+    + 'A harness materializes into REAL FILES in a xell, and a file is keyed on its basename, so this '
+    + "entry would overwrite the ancestor's copy in every wearer's workspace — a worker is told those "
+    + 'files are its law. Rename yours; changing what the ancestor says is done on the ancestor.');
 }
 
 // Build the HARNESS-LAYER text block for a briefing from an EFFECTIVE (merged) harness — personality
@@ -726,8 +698,10 @@ export function harnessLayerText(eff) {
 // with no SKILL.md loader skip this and rely on harnessLayerText instead.
 export function harnessSkillFiles(eff) {
   if (!eff) return [];
+  // Same path derivation as harnessFiles (skillRelPath): two spellings of "where does this skill go"
+  // is one more place a file can be shadowed by an entry the other writer keys differently.
   return (eff.skills || []).filter((s) => s.body).map((s) => ({
-    relPath: `.claude/skills/${String(s.name).toLowerCase().replace(/[^a-z0-9]+/g, '-')}/SKILL.md`,
+    relPath: skillRelPath(s.name),
     text: `---\nname: ${s.name}\ndescription: ${String(s.when).replace(/\n/g, ' ')}\n---\n\n${s.body}\n`,
   }));
 }

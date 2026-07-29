@@ -69,11 +69,13 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
     }).catch(() => {});
     // Harnesses are non-core, enabled config layers; core is always-on and implicit, so the picker
     // only offers the extras (plus a "core only" = none).
-    getHarnesses(manager ? 'manager' : 'worker')
+    // …and scoped to THIS project (084): the fleet's harnesses plus this project's own. A persona
+    // another project owns is never offered — wearing it is refused by the database anyway.
+    getHarnesses(manager ? 'manager' : 'worker', projectId)
       .then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     // focus the editor on open so the human can just start typing
     setTimeout(() => editorRef.current?.focus(), 30);
-  }, [activeProvider, manager]);
+  }, [activeProvider, manager, projectId]);
 
   // Esc closes only when nothing is composed — so it can't silently discard a written prompt.
   useEffect(() => {
@@ -283,15 +285,16 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
                   )}
                   {/* A harness that carries NOTHING is offered here exactly like a full one, and the
                       zee you dispatch is the one who pays for it — so say so at the point of choice.
-                      files_missing/bundle_empty come from GET /api/harnesses. */}
+                      bundle_empty comes from GET /api/harnesses. */}
                   {harnesses.map((h) => {
                     const warn = emptyWarning(h);
                     return (
                     <button key={h.key} className={`disp-seg ${harness === h.key ? 'on' : ''} ${warn ? 'seg-hollow' : ''}`}
                             data-testid={`dispatch-harness-${h.key}`}
-                            title={warn ? `${warn.chip.replace('⚠ ', '')} — ${warn.why}` : (h.summary || h.label)}
+                            title={`${warn ? `${warn.chip.replace('⚠ ', '')} — ${warn.why}` : (h.summary || h.label)}`
+                              + (h.scope === 'project' ? `  (⌂ this project's own persona)` : '  (system-wide)')}
                             onClick={() => setHarness(h.key)}>
-                      {h.label}{warn ? ` ${warn.chip}` : (h.skill_count ? ` ·${h.skill_count}` : '')}
+                      {h.label}{h.scope === 'project' ? ' ⌂' : ''}{warn ? ` ${warn.chip}` : (h.skill_count ? ` ·${h.skill_count}` : '')}
                     </button>
                     );
                   })}

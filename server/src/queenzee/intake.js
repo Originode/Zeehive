@@ -20,13 +20,15 @@ import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
-         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell,
+         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell, writeFileIntoCxellIfChanged,
+         writeGeneratedDocIntoCxell,
          installZeeCliIntoCxell, installZeeLiveIntoCxell, installZeeAttachIntoCxell } from '../lib/cxell.js';
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
 import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harnessBridge, assignHarness, defaultHarnessId,
          resolveHarness, harnessFitsType, typeMismatchReason } from '../lib/harness.js';
+import { projectDocFiles } from '../lib/project-docs.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
 import { isManager } from '../lib/managers.js';
@@ -809,14 +811,93 @@ export async function setZeeMode(zeeId, permissionMode) {
 // switches a harness on the console so the persona/skills/memory take effect without a rebuild. Writes
 // the harness files into the running cxell over SSH and drops a pointer telling the zee it changed.
 // Best-effort: no live cxell → nothing to do; NEVER throws.
+// GENERATE this project's entry-point docs (AGENTS.md/CLAUDE.md …) into a cxell. Same trigger as the
+// harness files — a zee being assigned — because they answer the same question for a zee arriving with
+// no context: what is this project and how do I work in it. Never overwrites a git-tracked path
+// (lib/cxell.js decides that inside the cage), and every outcome is logged: a doc an operator wrote
+// and a zee never received is exactly the silence this whole mechanism exists to remove.
+export async function injectProjectDocsIntoXell({ ctx = 'default', slug, projectId, xellId = null }) {
+  // xellId is what puts THIS xell's stack inventory in the generated files (lib/xell-stack.js) — the
+  // containers, ports, database coupling and build verbs a non-ZEEHIVE agent (Cursor, Copilot, Codex)
+  // reading CLAUDE.md/AGENTS.md has no other way to learn. Absent, the instructions still generate.
+  const files = await projectDocFiles(projectId, { xellId });
+  if (!files.length) return { docs: 0, written: 0, skipped: 0, failed: 0 };
+  let written = 0, failed = 0;
+  const skipped = [];
+  for (const f of files) {
+    try {
+      const r = await writeGeneratedDocIntoCxell({ ctx, slug, relPath: f.relPath, text: f.text });
+      if (r.written) written++; else skipped.push(r.reason || `${f.relPath} not written`);
+    } catch (e) {
+      failed++;
+      logline('project-doc', `${slug}: could not inject ${f.relPath} (${String(e.message).slice(0, 100)})`);
+    }
+  }
+  logline('project-doc', `${slug}: ${written}/${files.length} project doc(s) generated`
+    + (skipped.length ? ` — skipped: ${skipped.join('; ')}` : '')
+    + (failed ? ` — ${failed} FAILED to write` : ''));
+  return { docs: files.length, written, skipped: skipped.length, failed };
+}
+
+// The LIVE cxell zee of a xell, or null — one definition, because every "write into the cage" path
+// asks the identical question: a cxell-cli zee that is still running, with an ssh-terminal viewer.
+async function liveCxellZeeFor(xellId) {
+  const zee = await one(
+    `SELECT z.viewer_kind, x.slug, x.project_id FROM zee z JOIN xell x ON x.id = z.xell_id
+      WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
+        AND z.status IN ('spawning','online','working','idle')
+      ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
+  return zee && zee.viewer_kind === 'ssh-terminal' ? zee : null;
+}
+
+// Push a xell's .zeehive.env PROJECTION into its live cxell — the copy the zee actually reads. The
+// host worktree's file is not it: a cxell gets a `docker cp` copy at spawn (lib/cxell.js
+// cloneIntoCxell), so a host-side re-emit never reached the zee that was running on the wrong
+// values. lib/provision.js refreshLiveCxellEnv owns the rules and explains why; this is the
+// delivery, deliberately the same shape as the harness re-injection above.
+//
+// The TEXT is entirely the caller's: this recomputes nothing and resolves nothing, so it cannot
+// widen a binding — it moves bytes the meta-DB already produced into the place they were meant to
+// land. Never throws; the caller reports the outcome.
+export async function injectXellEnvIntoCxell({ xellId, slug = null, text, dryRun = false }) {
+  let zee = null;
+  try { zee = await liveCxellZeeFor(xellId); }
+  catch (e) { return { live: null, refreshed: false, error: `could not resolve the live cxell zee: ${e.message}` }; }
+  // NOT a failure, and the common case: a host-side xell, or a cage that has already been torn down.
+  // Nothing in a cage is reading a stale copy, so there is nothing to refresh.
+  if (!zee) return { live: false, refreshed: false, reason: 'no live cxell zee' };
+  const name = zee.slug || slug || String(xellId).slice(0, 8);
+  // REPORT-ONLY in simulate, exactly as reinjectHarnessIntoLiveXells does, and for the same reason:
+  // the exec targets cxell_<slug> with a slug straight out of a fleet row, and a nested queenzee's
+  // fleet rows ARE the real fleet's (its db is a clone of the meta-DB).
+  if (dryRun) {
+    logline('cxell', `${name}: .zeehive.env NOT refreshed inside the live cxell — PROVISION_MODE=simulate: `
+      + 'this queenzee models the fleet, it does not exec into its cxells. Would have refreshed '
+      + `/work/repo/.zeehive.env in ${cxellName(name)}`);
+    return { live: true, refreshed: false, dry_run: true, would_refresh: true };
+  }
+  try {
+    const r = await writeFileIntoCxellIfChanged({ ctx: 'default', slug: zee.slug, relPath: '.zeehive.env', text });
+    if (r.changed) {
+      logline('cxell', `${name}: .zeehive.env REFRESHED inside the LIVE cxell from the meta-DB — the `
+        + 'QUEENZEE wrote that file, not the zee. Anything that already sourced it (its shell, its app '
+        + 'tier) still holds the old values until it re-reads the file or rebuilds.');
+    }
+    return { live: true, refreshed: true, changed: r.changed, path: r.path };
+  } catch (e) {
+    // LOUD, both ways — the queenzee log a human reads and stdout. This one leaves a RUNNING zee
+    // reading a file the meta-DB disagrees with, and nothing else will notice.
+    logline('cxell', `${name}: .zeehive.env could NOT be refreshed inside the live cxell — ${e.message}. `
+      + 'That zee is still reading whatever its copy already said.');
+    console.error(`[cxell] ${name}: .zeehive.env cage refresh FAILED — ${e.message}`);
+    return { live: true, refreshed: false, error: e.message };
+  }
+}
+
 export async function reinjectHarnessIntoXell(xellId) {
   try {
-    const zee = await one(
-      `SELECT z.viewer_kind, x.slug FROM zee z JOIN xell x ON x.id = z.xell_id
-        WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
-          AND z.status IN ('spawning','online','working','idle')
-        ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
-    if (!zee || zee.viewer_kind !== 'ssh-terminal') return { injected: false, reason: 'no live cxell zee' };
+    const zee = await liveCxellZeeFor(xellId);
+    if (!zee) return { injected: false, reason: 'no live cxell zee' };
     const row = await harnessForXell(xellId);
     const eff = row ? await effectiveHarness(row) : null;
     const files = harnessFiles(eff);
@@ -827,11 +908,17 @@ export async function reinjectHarnessIntoXell(xellId) {
     }
     logline('harness', `${zee.slug}: (re)injected ${n} harness file(s) for "${row?.key || '(core only)'}"`
       + (failed ? ` — ${failed} FAILED to write` : ''));
+    // The project's own entry-point docs are regenerated on the same trigger: an operator who fixes
+    // AGENTS.md in the console and re-assigns must not have to wait for the next dispatch either.
+    const docs = await injectProjectDocsIntoXell({ ctx: 'default', slug: zee.slug,
+                                                   projectId: zee.project_id, xellId })
+      .catch((e) => ({ docs: 0, written: 0, error: e.message }));
     // Honest result: writing NOTHING when there was something to write is a failure, however many
     // individual errors were swallowed above. A caller that logs "re-injected 0 file(s)" as a success
     // is worse than one that stays quiet — it tells a human the zee has files it does not have.
     return { injected: files.length === 0 || n > 0, files: n, failed, wanted: files.length,
-      harness: row?.key || null, ...(n === 0 && files.length ? { reason: 'every file failed to write' } : {}) };
+      harness: row?.key || null, project_docs: docs,
+      ...(n === 0 && files.length ? { reason: 'every file failed to write' } : {}) };
   } catch (e) { return { injected: false, error: e.message }; }
 }
 
@@ -1245,6 +1332,10 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       try { await writeFileIntoCxell({ ctx, slug: xell.slug, relPath: f.relPath, text: f.text }); }
       catch (e) { logline('cxell', `${name}: could not inject harness file ${f.relPath} (${String(e.message).slice(0, 100)})`); }
     }
+    // …and the PROJECT's entry-point docs (AGENTS.md/CLAUDE.md …) from the meta-DB, at the paths a
+    // provider actually looks for. Generated, never written over a file the project itself committed.
+    await injectProjectDocsIntoXell({ ctx, slug: xell.slug, projectId: xell.project_id, xellId: xell.id })
+      .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
     // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
     logline('cxell', `${name}: warming (npm ci + web build) so the zee starts ready…`);

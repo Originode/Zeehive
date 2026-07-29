@@ -28,13 +28,20 @@ zee-base            DB-owned. Carries the cxell-zee manual — the law: verbs, g
       └── dev-shipwright   Shipwright  landed work → production; rollback thinking; honest reasons
 ```
 
-All nine are `zee_type: worker` — they land code, which a manager never does — and all nine are
-**file-backed** (`harnesses/<key>/`). The parent links are declared in each `HARNESS.yml`
-(`parent:`) and resolved by `refreshHarnesses()` at boot; migration 073 only inserts the rows. That
-is deliberate: the folder is the truth, and a hierarchy half in SQL and half in files drifts.
+All nine are `zee_type: worker` — they land code, which a manager never does — and all nine live
+**in the meta-DB**: the `harness` row carries the personality, the skills and (for `dev-base`) the
+memory, and `parent_id` carries the chain. Migration 073 inserted the rows and **080** imported the
+text and resolved the parents in SQL.
 
-The manual reaches every role **once, by inheritance** from `zee-base`. No file in this subtree
-carries a copy of it or paraphrases a CLI verb — a restated verb is drift the moment the CLI moves
+That reverses what this doc originally said ("the folder is the truth"), and the reason is in §080:
+while a folder projected into the row there were two sources, the deployed image carried no
+`harnesses/` at all, and every file-backed harness in production was EMPTY — a whole fleet of zees
+briefed with nothing, and every other project's console showing the crew as "⚠ no files". One source,
+and the queenzee generates the files it injects. (082 did the same for the badge SVG; there is no
+`harnesses/` folder any more.)
+
+The manual reaches every role **once, by inheritance** from `zee-base`. No role carries a copy of it
+or paraphrases a CLI verb — a restated verb is drift the moment the CLI moves
 (house rule 8), and a pasted manual is a second, staler copy of the wearer's own law.
 
 ## Why the roles map onto the AI-native SDLC
@@ -66,13 +73,15 @@ So the shape is structural, and `test/dev-crew.test.mjs` fails the build if it s
 
 | | dev-base | each role |
 |---|---|---|
-| PERSONALITY.md | ≤ 30 lines | ≤ 40 lines |
-| memory files | exactly 1 (`memory/dev-loop.md`, ≤ 180 lines) | **none** |
-| skills | 1 (`orient-in-a-new-repo`) | 1–2, each body ≤ 30 lines |
+| `personality` | ≤ 30 lines | ≤ 40 lines |
+| `memory` entries | exactly 1 (`memory/dev-loop.md`, ≤ 180 lines) | **none** |
+| `skills` | 1 (`orient-in-a-new-repo`) | 1–2, each body ≤ 30 lines |
 | own briefing text | ≤ 16 000 chars | ≤ 8 000 chars |
 
-"Own" means what that row contributes on top of its parents. Today the roles sit at ~3.7k–5.4k chars
-each, on a ~10.5k `dev-base` and a ~33k `zee-base`.
+"Own" means what that row contributes on top of its parents. These are CEILINGS — the constants at
+the top of `test/dev-crew.test.mjs` are the enforced ones, and it prints what each harness actually
+measures on every run. Read them there rather than from a number written here: a count in this doc is
+true on the day it is pasted and silently wrong after the next edit, while the ceiling is checked.
 
 The one-memory-file rule for `dev-base` and the **zero** for the roles are the load-bearing ones. A
 paragraph written into all eight roles is paid for by every wearer and duplicated eight times in the
@@ -81,21 +90,32 @@ repo, and the eight copies then diverge. If two roles need the same sentence, it
 
 ## Adding a role
 
-1. `harnesses/dev-<role>/HARNESS.yml` — `label`, a one-or-two-line `summary`, a distinct `glyph`,
-   `zee_type: worker`, `parent: dev-base`, and the skill names.
-2. `PERSONALITY.md` — who this role is and what it refuses to do. Judgement only: anything true of
-   every developer is already in `dev-base` and must not be repeated.
-3. `skills/<name>/SKILL.md` — at most two, with YAML frontmatter (`name`, `description` = *when to
-   use it*). A skill is a procedure the wearer follows, not an essay.
-4. A migration that INSERTs the row (`key, label, dir, zee_type, enabled`) with
-   `ON CONFLICT (key) DO NOTHING`. Never write `parent_id` in SQL and never touch `harness.bundle` —
-   see `test/harness-memory-migrations.test.mjs`.
-5. Add it to `ROLES` in `test/dev-crew.test.mjs`, run that test, and run the migration on your own
-   database so `refreshHarnesses()` actually proves the folder parses.
+A role is a row now, so it is added by **migration** (and may then be edited in the console's harness
+manager). There is no folder to create.
+
+1. A migration that INSERTs the row (`key, label, zee_type, enabled`) with
+   `ON CONFLICT (key) DO NOTHING`, sets `parent_id` from `dev-base`, and writes the bundle:
+   `glyph`, a one-or-two-line `summary`, the `personality`, and one or two `skills`
+   (`{name, when, body}`). **Do** set `parent_id` — nothing resolves a chain from a file any more, so
+   a role inserted without one inherits nothing and its wearer gets no manual.
+2. The **personality** is who this role is and what it refuses to do. Judgement only: anything true
+   of every developer is already in `dev-base` and must not be repeated.
+3. **Memory** goes through `harness_memory_put(harness_key, path, text)` — never hand-rolled jsonb
+   (house rule 9, `test/harness-memory-migrations.test.mjs`). A role should carry none.
+4. Run the migration on your own database, then run `test/dev-crew.test.mjs`. **There is no list to
+   add it to**: the test derives the crew from the rows — anything whose parent chain reaches
+   `dev-base` is checked the moment the row exists, and it prints the roster it derived. Set the
+   `parent_id` (step 1) and the new role is linted; forget it and it is not crew at all, which is
+   the loud failure that tells you.
+5. Add the role to `dev-lead`'s `memory/dev-role-roster.md` in the same migration. The test asserts
+   the two agree in both directions — a role the lead has never heard of cannot be cast, and one the
+   lead names that does not exist fails at spawn.
 
 Two rules for the writing itself, both checked by the test: **no CLI verbs or flags** (refer to the
 manual, never quote it) and **no project lore** (no repo paths, container names or scripts — these
-personas work on other people's codebases).
+personas work on other people's codebases). Both are checked on every field of the bundle that
+reaches a wearer, `label` and `summary` included — those two show up in every picker, and while the
+lint read files instead they were the one place lore could be written and never flagged.
 
 ## Using them
 

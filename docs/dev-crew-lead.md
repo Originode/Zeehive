@@ -6,7 +6,7 @@ code, exactly like its parent.
 
 ## What it actually adds
 
-`dev-lead` inherits `manager` (`parent: manager` in `harnesses/dev-lead/HARNESS.yml`), so the manager
+`dev-lead` inherits `manager` (its row's `parent_id`, set by migration), so the manager
 manual, the `dispatch-brief` skill and every manager refusal arrive by inheritance — the chain is
 merged root→leaf by `effectiveHarness()`, and none of it is duplicated in this folder. On top of that
 it adds exactly two things:
@@ -37,5 +37,7 @@ Nothing in the persona, the skill or the roster names a language, a framework, a
 A Crew Lead runs the same eight roles on any project; the first thing it and every worker it casts do
 is read that project's own manual.
 
-Row: migration `074_dev_lead.sql` (key, label, dir, `zee_type='manager'`, enabled). The folder is the
-truth — the row is only the anchor `refreshHarnesses()` fills.
+Row: migration `074_dev_lead.sql` (key, label, `zee_type='manager'`, enabled); **080** imported its
+persona, its `pick-the-role` skill and its roster into the row and set `parent_id` to `manager`. The
+row is the truth — see [docs/harness-proposal.md](harness-proposal.md) §3.1 for why it stopped being a
+folder.

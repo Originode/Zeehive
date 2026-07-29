@@ -1,29 +1,33 @@
-// HARNESS FOLDER RESOLUTION — the deployed-queenzee bug, reproduced.
+// A HARNESS NEEDS NO REPO — nothing about it is on any filesystem.
 //
-// A file-backed harness's `dir` ('harnesses/manager') is relative to the ZEEHIVE PROJECT's repo
-// (project.repo_root — the clone self-onboard.js registers), NOT to config.repoRoot, which is only
-// where the running server's code sits. On a checkout those are the same folder, which is exactly
-// why test/manager-zee.test.mjs passed while production was broken: Dockerfile.server copies
-// server/ scripts/ db/ hooks/ skill/ into /app and deliberately NOT harnesses/, so the deployed
-// queenzee resolved every harness folder under /app, found none, and kept the EMPTY seed bundle —
-// manager zees were dispatched with no manual at all.
+// This file used to reproduce the deployed-queenzee bug from the other side: a file-backed harness's
+// `dir` was resolved against the ZEEHIVE PROJECT's repo_root, not config.repoRoot, because
+// Dockerfile.server copies server/ scripts/ db/ hooks/ skill/ into /app and deliberately NOT
+// harnesses/ — so the deployed queenzee looked under /app, found nothing, and dispatched manager zees
+// with no manual for weeks while every test on a checkout passed.
 //
-// This test reproduces that container: a config.repoRoot with NO harnesses/ folder, plus a project
-// row whose repo_root DOES have one. It asserts:
-//   1. refreshHarnesses() populates `manager` from the PROJECT repo (label, glyph, summary, the
-//      full personality, the dispatch-brief skill, the 12.9k manual, bundle_hash + head_commit);
-//   2. harnessFiles() materializes PERSONA.md, the manual and the SKILL.md into a cxell;
-//   3. the resolution really came from the project row (a probe harness that exists ONLY there);
-//   4. the avatar resolves from the same base, and stays containment-guarded;
-//   5. an unreadable folder is LOUD: last good bundle kept, a logline naming the key, and
-//      files_missing / bundle_empty on the read models;
-//   6. the fallback still works: no project row → config.repoRoot (host-process mode).
+// Migrations 080 and 082 removed the class of bug rather than the instance: the meta-DB owns a
+// harness's TEXT *and* its badge SVG (an SVG is text), `harnesses/` is gone from the repo entirely, and
+// lib/harness.js reads no filesystem at all. So what this test pins now is the invariant that replaced
+// the old resolution rules:
+//
+//   1. a container with NO harnesses/ anywhere — no project repo, no runtime copy — still briefs a
+//      zee completely: the manager's persona, its skill and its 15k manual all come out of the row;
+//   2. the files a cxell receives are GENERATED from that row, and each one says so (the banner is
+//      what stops a zee "fixing" a page that is regenerated on the next assignment);
+//   3. nothing is file-backed any more, and the read models no longer report a files_missing state
+//      that cannot happen;
+//   4. the AVATAR is served from the row and validated as an SVG — the badge cannot 404 because a
+//      repo is unreadable, which is what it did on every project whose console could not see this one;
+//   5. an empty row is still LOUD (that half of the old bug is real and unchanged): bundle_empty on
+//      the read models and the boot summary naming the key.
+//
 // Every row it creates is torn down in a finally, and the harness rows it touches are restored.
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 
 const { config } = await import('../server/src/config.js');
 const { q, one, pool } = await import('../server/src/db/pool.js');
@@ -35,70 +39,44 @@ const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`)
 
 const REAL_ROOT = config.repoRoot;
 const tag = randomUUID().slice(0, 8);
-const probeKey = `zt-probe-${tag}`;           // a harness folder that exists ONLY in the project repo
-const ghostKey = `zt-ghost-${tag}`;           // a harness whose folder exists nowhere
+const hollowKey = `zt-hollow-${tag}`;         // a row with nothing in it — the one empty state left
 const tmp = mkdtempSync(join(tmpdir(), 'harn-root-'));
 const runtime = join(tmp, 'app');             // the IMAGE: server code, no harnesses/
-const projectRepo = join(tmp, 'repo');        // the PROJECT repo: harnesses/ live here
+const projectRepo = join(tmp, 'repo');        // a project repo with NOTHING harness-shaped in it
 const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8' }).trim();
 
 let projId = null, projName = null;
-const snapshot = await q(`SELECT id, bundle, bundle_hash, head_commit, avatar_path, label, parent_id, zee_type FROM harness`);
+const snapshot = await q(`SELECT id, bundle, bundle_hash, label, parent_id, zee_type, dir FROM harness`);
 
 try {
-  // ── the deployed container, reproduced ─────────────────────────────────────
+  // ── the deployed container, reproduced — and this time nothing needs the folder ─────────────
   mkdirSync(join(runtime, 'server', 'src'), { recursive: true });   // /app: code only
   mkdirSync(projectRepo, { recursive: true });
-  cpSync(join(REAL_ROOT, 'harnesses'), join(projectRepo, 'harnesses'), { recursive: true });
-  // a probe harness that exists in the PROJECT repo and nowhere else — it is the proof that the
-  // resolution went through project.repo_root rather than stumbling onto some other checkout.
-  const probeDir = join(projectRepo, 'harnesses', probeKey);
-  mkdirSync(join(probeDir, 'skills', 'probe-skill'), { recursive: true });
-  writeFileSync(join(probeDir, 'HARNESS.yml'),
-    `version: 1\nlabel: Probe ${tag}\nglyph: "🛰"\nsummary: proof the project repo was read\nzee_type: worker\n`);
-  writeFileSync(join(probeDir, 'PERSONALITY.md'), `probe personality ${tag}\n`);
-  writeFileSync(join(probeDir, 'avatar.svg'), `<svg xmlns="http://www.w3.org/2000/svg"><!-- ${tag} --></svg>\n`);
-  writeFileSync(join(probeDir, 'skills', 'probe-skill', 'SKILL.md'),
-    `---\nname: probe-skill\ndescription: proves skills load from the project repo\n---\n\nprobe body ${tag}\n`);
+  writeFileSync(join(projectRepo, 'README.md'), `a project repo with no harnesses/ at all ${tag}\n`);
   git(projectRepo, 'init', '-q', '-b', 'master');
   git(projectRepo, 'config', 'user.email', 't@t'); git(projectRepo, 'config', 'user.name', 't');
-  git(projectRepo, 'add', '-A'); git(projectRepo, 'commit', '-qm', 'harnesses');
+  git(projectRepo, 'add', '-A'); git(projectRepo, 'commit', '-qm', 'base');
 
   // The self project is 'Zeehive' — use that name when it is free (the real resolution path), a
   // unique one when this DB already has it (a dev's own checkout), so the test never collides.
   projName = (await one(`SELECT id FROM project WHERE lower(name)='zeehive'`)) ? `zt-harnroot-${tag}` : 'Zeehive';
   projId = (await one(`INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'master') RETURNING id`,
     [projName, projectRepo])).id;
-  await q(`INSERT INTO harness (key, label, dir, enabled, is_law_core) VALUES ($1,$2,$3,true,false)`,
-    [probeKey, `Probe ${tag}`, `harnesses/${probeKey}`]);
-  await q(`INSERT INTO harness (key, label, dir, enabled, is_law_core) VALUES ($1,$2,$3,true,false)`,
-    [ghostKey, `Ghost ${tag}`, `harnesses/${ghostKey}-nowhere`]);
-  const ghostBefore = await one(`SELECT bundle, bundle_hash FROM harness WHERE key=$1`, [ghostKey]);
+  await q(`INSERT INTO harness (key,label,bundle,enabled,is_law_core) VALUES ($1,$2,'{}'::jsonb,true,false)`,
+    [hollowKey, `Hollow ${tag}`]);
 
-  // Wind the file-backed rows back to their seeded (empty) state, so this is a FIRST boot in that
-  // container and nothing can pass on a bundle a previous run happened to leave behind. The
-  // snapshot taken above puts them back, whatever happens.
-  await q(`UPDATE harness SET bundle='{}'::jsonb, bundle_hash=NULL, head_commit=NULL
-             WHERE dir IS NOT NULL AND NOT is_law_core`);
-  ok((await one(`SELECT bundle_hash FROM harness WHERE key='manager'`)).bundle_hash === null,
-     'the manager harness starts EMPTY, exactly as migration 052 seeds it');
-
-  config.repoRoot = runtime;                  // ← the whole bug, in one line
+  config.repoRoot = runtime;                  // ← the line that used to be the whole bug
   ok(!existsSync(join(config.repoRoot, 'harnesses')),
      'the runtime root carries NO harnesses/ folder (the deployed server image)');
-  ok(existsSync(join(projectRepo, 'harnesses', 'manager')),
-     "but the Zeehive project's repo_root does");
+  ok(!existsSync(join(projectRepo, 'harnesses')),
+     'and neither does the project repo — since 082 there is nothing harness-shaped on any disk');
+  ok(!existsSync(join(REAL_ROOT, 'harnesses')),
+     'not even in this checkout: harnesses/ is gone from the repo entirely');
 
-  console.log('\n── refreshHarnesses() reads the PROJECT repo ──');
-  await H.refreshHarnesses();
+  // ── 1. the row briefs the zee, with no folder anywhere ──────────────────────────────────────
+  console.log('\n── the manager harness is complete with no harnesses/ text on any disk ──');
   const row = await one(`SELECT * FROM harness WHERE key='manager'`);
-  const b = typeof row.bundle === 'string' ? JSON.parse(row.bundle) : (row.bundle || {});
-  ok(row.bundle_hash !== null, `harness.bundle_hash is populated (${row.bundle_hash})`);
-  ok(row.head_commit !== null, `harness.head_commit is populated (${String(row.head_commit).slice(0, 8)})`);
-  ok(row.label === 'Manager Zee', `the label comes from the folder (${row.label})`);
-  ok(row.avatar_path === 'harnesses/manager/avatar.svg', 'the avatar path is recorded');
-
-  console.log('\n── GET /api/harnesses/manager/full comes back POPULATED ──');
+  ok(row.dir === null, 'the row is DB-owned (dir IS NULL) — nothing projects over it');
   const full = await H.getHarnessFull('manager');
   ok(!!full.glyph, `glyph: ${full.glyph || '(EMPTY)'}`);
   ok(full.summary.length > 20, `summary: ${full.summary.slice(0, 60) || '(EMPTY)'}…`);
@@ -109,79 +87,95 @@ try {
   ok((manual?.text || '').length > 12000, `the manager-zee-manual.md memory is there (${manual?.text?.length || 0} chars)`);
   ok(/zee dispatch/.test(manual?.text || '') && /ZERO push access/.test(manual?.text || ''),
      'and it is the real manual (it teaches `zee dispatch` and the zero-push rule)');
-  ok(full.zee_type === 'manager' && b.zee_type === 'manager', 'the 054 type pairing survives the resolution');
-  ok(full.files_missing === false && full.bundle_empty === false,
-     'the read model reports it as present and non-empty');
+  ok(full.zee_type === 'manager', 'the 054 type pairing is on the row');
+  ok(full.bundle_empty === false, 'the read model reports it as carrying something');
 
-  console.log('\n── it materializes into a cxell as real files ──');
+  // ── 2. the files a cxell gets are GENERATED from the row, and say so ────────────────────────
+  console.log('\n── it materializes into a cxell as generated files ──');
   const files = H.harnessFiles(await H.effectiveHarness(row));
   const rels = files.map((f) => f.relPath);
   for (const want of ['.zeehive/harness/PERSONA.md', '.zeehive/harness/memory/manager-zee-manual.md',
                       '.claude/skills/dispatch-brief/SKILL.md']) {
     ok(rels.includes(want), `harnessFiles() materializes ${want}`);
   }
-  ok((files.find((f) => f.relPath === '.zeehive/harness/memory/manager-zee-manual.md')?.text || '').length > 12000,
-     'the materialized manual carries the whole 12.9k text (not an empty file)');
+  const manualFile = files.find((f) => f.relPath === '.zeehive/harness/memory/manager-zee-manual.md');
+  ok((manualFile?.text || '').length > 12000, 'the materialized manual carries the whole text (not an empty file)');
+  ok(manualFile.text.includes(manual.text), 'and it is the row\'s text, verbatim');
+  // the banner is the anti-"I fixed the manual and nothing happened" guard
+  ok(/^<!-- GENERATED by ZEEHIVE from the meta-DB/.test(manualFile.text),
+     'every generated file OPENS with the stamp (a reader sees it before the content)');
+  ok(/harness `manager`/.test(manualFile.text) && /memory `memory\/manager-zee-manual\.md`/.test(manualFile.text),
+     'naming the harness and the entry it was generated from');
+  ok(/Editing THIS copy changes nothing/.test(manualFile.text) && /harness manager/.test(manualFile.text),
+     'and saying an edit here is overwritten, plus where the real source is');
+  const skillFile = files.find((f) => f.relPath === '.claude/skills/dispatch-brief/SKILL.md');
+  ok(skillFile.text.startsWith('---\nname: dispatch-brief'),
+     'a SKILL.md still leads with its frontmatter (the banner goes below, or a provider stops seeing a skill)');
+  ok(skillFile.text.includes('GENERATED by ZEEHIVE'), 'but it carries the stamp too');
 
-  console.log('\n── the base really came from project.repo_root ──');
-  const probe = await H.getHarnessFull(probeKey);
-  ok(probe.personality.includes(`probe personality ${tag}`),
-     'a harness folder that exists ONLY in the project repo is loaded (so the base was its repo_root)');
-  ok(probe.skills.some((s) => s.body?.includes(`probe body ${tag}`)), 'its skill folder loads too');
-  ok(H.harnessBase(`harnesses/${probeKey}`) === projectRepo.replace(/\\/g, '/'),
-     'harnessBase() names the project repo for that folder');
+  // provenance: an INHERITED entry names the harness that owns it, not the one being worn
+  const leadFiles = H.harnessFiles(await H.effectiveHarness(await one(`SELECT * FROM harness WHERE key='dev-lead'`)));
+  const leadManual = leadFiles.find((f) => f.relPath.endsWith('manager-zee-manual.md'));
+  ok(!!leadManual && /harness `manager`/.test(leadManual.text),
+     'a harness that INHERITS the manual stamps it with the parent that owns it (dev-lead → manager)');
 
-  console.log('\n── the avatar resolves from the same base, and stays guarded ──');
-  const avatar = await H.harnessAvatarFile('harnesses/manager/avatar.svg');
-  ok(!!avatar && !avatar.replace(/\\/g, '/').startsWith(runtime.replace(/\\/g, '/')),
-     `GET /api/harnesses/manager/avatar finds the SVG in a repo that HAS it (${avatar || '404 — BROKEN'})`);
-  // the probe's avatar exists only in the project repo, so this one pins the base exactly
-  const probeAvatar = await H.harnessAvatarFile(`harnesses/${probeKey}/avatar.svg`);
-  ok(!!probeAvatar && probeAvatar.replace(/\\/g, '/').startsWith(projectRepo.replace(/\\/g, '/')),
-     'an avatar that exists ONLY in the project repo resolves under project.repo_root');
-  ok(await H.harnessAvatarFile('../../etc/passwd') === null, 'an escaping avatar_path is refused');
-  ok(await H.harnessAvatarFile('harnesses/manager/../../../etc/passwd') === null,
-     'and so is one that climbs out of harnesses/');
-  // a real, existing file OUTSIDE harnesses/ — so this proves the CONTAINMENT guard, not that the
-  // path happened not to exist
-  ok(await H.harnessAvatarFile('docs/manager-zees.md') === null, 'a real file outside harnesses/ is refused too');
+  // ── 3. nothing is file-backed, and the impossible state is not reported ─────────────────────
+  console.log('\n── no harness is file-backed any more ──');
+  const backed = await one(`SELECT count(*)::int AS n FROM harness WHERE dir IS NOT NULL`);
+  ok(backed.n === 0, `no harness row carries a dir (${backed.n})`);
+  const list = await H.listHarnesses();
+  ok(list.length > 0 && list.every((h) => !('files_missing' in h) && !('file_backed' in h)),
+     'and the read model reports neither files_missing nor file_backed — states that can no longer exist');
+  ok(typeof H.loadHarnessDir === 'undefined' && typeof H.refreshHarnesses === 'undefined',
+     'the folder loader and the boot projection are GONE from the module, not merely unused');
 
-  console.log('\n── an unreadable harness folder is LOUD ──');
-  const ghost = (await H.listHarnesses()).find((x) => x.key === ghostKey);
-  ok(ghost?.files_missing === true, 'GET /api/harnesses reports files_missing for the unreadable one');
-  ok(ghost?.bundle_empty === true, 'and bundle_empty — it would brief a zee with nothing');
-  const ghostAfter = await one(`SELECT bundle, bundle_hash FROM harness WHERE key=$1`, [ghostKey]);
-  ok(ghostAfter.bundle_hash === ghostBefore.bundle_hash,
-     'the last good bundle is KEPT (a bad mount never blanks a live harness)');
-  const logged = recentLogs(200).filter((l) => l.scope === 'harness' && l.msg.includes(ghostKey));
-  ok(logged.some((l) => /FOLDER MISSING/.test(l.msg)), 'the refresh logs it by key, loudly');
-  ok(logged.some((l) => /repo_root/.test(l.msg)), 'and the logline says WHERE a harness folder lives');
-  const mgrList = (await H.listHarnesses()).find((x) => x.key === 'manager');
-  ok(mgrList.files_missing === false && mgrList.bundle_empty === false,
-     'while the healthy ones report clean (the flag distinguishes them)');
+  // ── 4. the badge, now also in the row ───────────────────────────────────────────────────────
+  console.log('\n── the avatar is served from the meta-DB, not resolved on disk ──');
+  const mgrRow = await one(`SELECT bundle, avatar_path FROM harness WHERE key='manager'`);
+  ok(mgrRow.avatar_path === null, 'no row points at a file (avatar_path is legacy and NULL)');
+  const svg = H.harnessAvatarSvg(mgrRow.bundle);
+  ok(!!svg && /^<svg[\s>]/i.test(svg), `the badge comes out of the row as an SVG (${(svg || '').length} chars)`);
+  ok(!!full.avatar_svg && full.avatar_svg === svg, 'and the editor read model carries it, so the console can change it');
+  ok((await H.listHarnesses()).find((h) => h.key === 'manager')?.avatar_url === '/api/harnesses/manager/avatar',
+     'the list model advertises the badge route for a harness that has one');
+  ok((await H.listHarnesses()).find((h) => h.key === 'dev-scribe')?.avatar_url === null,
+     'and null for one that has none — the console does not request an image that cannot exist');
+  // it is served to a browser, so what counts as a badge is validated where it is read
+  ok(H.harnessAvatarSvg({ avatar_svg: '<script>alert(1)</script>' }) === null, 'a non-SVG stored badge is refused');
+  ok(H.harnessAvatarSvg({}) === null && H.harnessAvatarSvg(null) === null, 'and a missing one is simply null');
+  const badSave = await H.updateHarness('manager', { avatar_svg: 'not an svg' }).catch((e) => e.message);
+  ok(/must be an SVG/.test(String(badSave)), `the authoring path refuses it too, with a sentence ("${String(badSave).slice(0, 40)}…")`);
+  ok(typeof H.harnessAvatarFile === 'undefined' && typeof H.harnessBase === 'undefined',
+     'the on-disk avatar resolution and its repo-root machinery are GONE from the module');
 
-  console.log('\n── fallback: no project row → config.repoRoot (host-process mode) ──');
+  // ── 5. an EMPTY row is still loud ───────────────────────────────────────────────────────────
+  console.log('\n── a harness that would brief a zee with nothing is still loud ──');
+  const hollow = (await H.listHarnesses()).find((x) => x.key === hollowKey);
+  ok(hollow?.bundle_empty === true, 'GET /api/harnesses reports bundle_empty for a row with nothing in it');
+  const before = recentLogs(300).length;
+  const sum = await H.logHarnessSummary();
+  const lines = recentLogs(300).slice(before).filter((l) => l.scope === 'harness').map((l) => l.msg);
+  ok(lines.some((m) => /^harnesses: /.test(m) && m.includes(hollowKey)),
+     'and the boot summary names it — the empty half of the old bug is unchanged');
+  ok(sum.empty >= 1 && !sum.empty_keys.some((k) => k.startsWith('manager')),
+     `the healthy ones are counted as loaded (${sum.loaded} loaded, ${sum.empty} empty)`);
+
+  // ── the fallback root still works (host-process mode) ───────────────────────────────────────
+  console.log('\n── and with no project row at all, a harness is still complete ──');
   await q(`DELETE FROM project WHERE id=$1`, [projId]); projId = null;
-  config.repoRoot = REAL_ROOT;
-  await H.refreshHarnessRoots();
-  const roots = H.harnessRoots();
-  ok(roots[roots.length - 1] === REAL_ROOT.replace(/\\/g, '/') && !roots.includes(projectRepo.replace(/\\/g, '/')),
-     'with that project gone, config.repoRoot is the last root standing (host-process mode)');
-  const direct = H.loadHarnessDir('harnesses/manager');
-  ok(!!direct.bundle && !direct.missing, 'loadHarnessDir() still reads the checkout unchanged');
-  ok((direct.bundle.memory || []).some((m) => /manager-zee-manual/.test(m.path) && m.text?.length > 12000),
-     'and the manual comes with it (test/manager-zee.test.mjs keeps passing)');
-  const nowhere = H.loadHarnessDir(`harnesses/${probeKey}`);
-  ok(nowhere.missing === true && /looked under/.test(nowhere.errors[0]),
-     'a folder under no root is reported missing, naming the roots it looked under');
+  const orphaned = await H.getHarnessFull('manager');
+  ok(orphaned.personality.length > 800 && orphaned.memory.some((m) => (m.text || '').length > 12000),
+     'no project, no repo, no folder: the persona and the manual come out of the row regardless');
+  ok(!!H.harnessAvatarSvg((await one(`SELECT bundle FROM harness WHERE key='manager'`)).bundle),
+     'and so does the badge — this is the state every other project\'s console was failing in');
 } finally {
   config.repoRoot = REAL_ROOT;
   if (projId) await q(`DELETE FROM project WHERE id=$1`, [projId]).catch(() => {});
-  await q(`DELETE FROM harness WHERE key = ANY($1)`, [[probeKey, ghostKey]]).catch(() => {});
-  // put every harness row back exactly as we found it (the refresh above rewrote real rows)
+  await q(`DELETE FROM harness WHERE key=$1`, [hollowKey]).catch(() => {});
+  // put every harness row back exactly as we found it
   for (const r of snapshot) {
-    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, head_commit=$4, avatar_path=$5, label=$6, parent_id=$7, zee_type=$8 WHERE id=$1`,
-      [r.id, JSON.stringify(r.bundle), r.bundle_hash, r.head_commit, r.avatar_path, r.label, r.parent_id, r.zee_type]).catch(() => {});
+    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, label=$4, parent_id=$5, zee_type=$6, dir=$7 WHERE id=$1`,
+      [r.id, JSON.stringify(r.bundle), r.bundle_hash, r.label, r.parent_id, r.zee_type, r.dir]).catch(() => {});
   }
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
   await pool.end().catch(() => {});

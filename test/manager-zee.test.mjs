@@ -216,17 +216,22 @@ try {
   ok(still.db_coupling !== 'db-prod-readonly' && still.prod_ro_dsn === null,
      'and nothing is left pointing at a production that does not exist');
 
-  // ── 8. the manager harness carries its OWN manual ────────────────────────
-  const { loadHarnessDir } = await import('../server/src/lib/harness.js');
-  const h = loadHarnessDir('harnesses/manager');
-  ok(h.errors.length === 0 && h.bundle, `the manager harness parses (${h.errors.join('; ') || 'no errors'})`);
-  const manual = (h.bundle?.memory || []).find((m) => /manager-zee-manual/.test(m.path));
-  ok(!!manual?.text && manual.text.length > 3000, 'it carries a manual of its own, inline');
+  // ── 8. the manager harness carries its OWN manual — FROM THE META-DB ─────
+  // The row is the harness (migration 080): there is no harnesses/manager/ text to parse, and this
+  // used to read the folder. What must hold is unchanged — a manager is briefed with a manual of its
+  // own, not the worker one with extras.
+  const hrow = (await client.query(
+    `SELECT h.zee_type, h.parent_id, h.dir, harness_memory_get('manager','memory/manager-zee-manual.md') AS manual
+       FROM harness h WHERE h.key='manager'`)).rows[0];
+  ok(!!hrow, 'the manager harness row exists');
+  ok(hrow.dir === null, 'and it is DB-owned — nothing on disk can project over its text');
+  const manual = { text: hrow.manual || '' };
+  ok(manual.text.length > 3000, `it carries a manual of its own, in the row (${manual.text.length} chars)`);
   for (const must of ['zee dispatch', 'zee suggest-done', 'ZERO push access', 'READ-ONLY', 'LOOPHOLES']) {
     ok(manual.text.includes(must), `the manual states: ${must}`);
   }
-  ok(!h.bundle.parent, 'it does NOT inherit the worker manual (a manager has different doors)');
-  ok((h.bundle.zee_type || h.bundle.type) === 'manager', 'the folder DECLARES the zee type it is for');
+  ok(hrow.parent_id === null, 'it does NOT inherit the worker manual (a manager has different doors)');
+  ok(hrow.zee_type === 'manager', 'the row DECLARES the zee type it is for');
 
   // ── 9. TYPE vs HARNESS: the two axes, and the rule between them ──────────
   const H = await import('../server/src/lib/harness.js');
