@@ -217,10 +217,13 @@ function TreeNode({ node, depth, statuses, collapsed, onToggle, selectedId, onSe
         {/* Hover-only, because a rail with two buttons on every row is unreadable — and quick-add is
             the gesture that keeps a plan honest while a human is reading it. */}
         <span className="work-nadd">
-          {node.kind !== 'task' && (
-            <button className="work-mini" title="add an activity under this node"
-                    onClick={(e) => { e.stopPropagation(); onAdd(node, 'activity'); }}>＋ activity</button>
-          )}
+          {/* BOTH buttons on every node, deliberately. An activity may hold an activity and a task
+              may hold a task — the hierarchy is by DEPTH, not by a fixed three-level shape — and
+              which nestings are legal is the server's rule to state, not this rail's to guess. A
+              button hidden on a guess is a legal move a human cannot make; a refused POST at least
+              answers in a sentence. */}
+          <button className="work-mini" title="add an activity under this node"
+                  onClick={(e) => { e.stopPropagation(); onAdd(node, 'activity'); }}>＋ activity</button>
           <button className="work-mini" title="add a task under this node"
                   onClick={(e) => { e.stopPropagation(); onAdd(node, 'task'); }}>＋ task</button>
         </span>
