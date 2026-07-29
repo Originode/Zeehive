@@ -305,6 +305,14 @@ ok(placement(kcol, 'a', 0 + 2).at === 1, 'Alt+Down moves a card exactly one slot
 ok(placement(kcol, 'c', 2 - 1).at === 1, 'Alt+Up moves a card exactly one slot up (gap = index − 1)');
 ok(placement(kcol, 'a', 0 + 2).sortOrder === 2.5 && placement(kcol, 'c', 2 - 1).sortOrder === 1.5,
    'and both write a midpoint, exactly as the equivalent drag would');
+// …and it is WIRED. The first cut of the keyboard path declared onCardKey on the board and wrote
+// `onKeyDown={onKey}` inside Card — a name that existed in neither, so the first card React tried to
+// render threw `ReferenceError: onKey is not defined` and the whole board came back blank. The
+// handler must be a PROP Card accepts and the board passes, per card, with its column and row.
+ok(/function Card\(\{[^}]*\bonKey\b/.test(board), 'Card DECLARES onKey as a prop (not a free identifier)');
+ok(/onKey=\{[^}]*onCardKey\(/.test(board), 'and the board PASSES it, bound to that card');
+ok(/onCardKey\(e, card, colIndex, i\)/.test(board),
+   'bound to the card\'s own column and row — the two indices the move is computed from');
 
 // ── the one place this console could corrupt a plan ───────────────────────────────────────────
 // /breakdown is ADDITIVE: pressing it twice creates a SECOND overlapping tree under one ticket, and

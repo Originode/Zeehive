@@ -275,7 +275,12 @@ const halfOf = (e, index) => {
 // `onKeyDown={onKey}` here without ever declaring or passing it, so the very first card React
 // rendered threw `ReferenceError: onKey is not defined` and took the whole board down with it —
 // vite builds a free identifier happily, and the browser is where it becomes a blank screen.
-function Card({ card, statuses, dragging, onDragStart, onDragEnd, onDragOver, onDrop, onKey, onOpen }) {
+//
+// EXPORTED for that reason. The board itself cannot be rendered outside a browser (its data arrives
+// in an effect), but a card is a pure function of its props — so exporting it lets
+// test/work-board-render.test.mjs actually RENDER one with react-dom/server and catch a throw the
+// way a human's browser would, instead of only reading the source. Nothing imports it but the test.
+export function Card({ card, statuses, dragging, onDragStart, onDragEnd, onDragOver, onDrop, onKey, onOpen }) {
   // The board is the plan; the hive is the fact. Advisory only — see the header.
   const drift = card.live_status && card.live_status !== card.status ? card.live_status : null;
   return (
