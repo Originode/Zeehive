@@ -40,7 +40,7 @@ let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
 
 // ── 1. the files exist and parse ──
-const FILES = ['workApi.js', 'bits.jsx', 'WorkConsole.jsx', 'Board.jsx', 'WorkItemDrawer.jsx',
+const FILES = ['workApi.js', 'order.js', 'bits.jsx', 'WorkConsole.jsx', 'Board.jsx', 'WorkItemDrawer.jsx',
                'Tickets.jsx', 'Gantt.jsx'].map((f) => `web/src/work/${f}`);
 for (const f of FILES) {
   const there = existsSync(path(f));
@@ -149,6 +149,27 @@ ok(/body\.error|body && body\.error/.test(read('web/src/work/workApi.js')),
    "workApi throws the server's sentence (body.error), not a bare status");
 ok(/err\.message \|\| err|message \|\| err/.test(read('web/src/work/bits.jsx')),
    'the shared error line prints that sentence verbatim');
+
+// ── the drag maths, exercised for real (no browser needed — that is why it is a pure module) ──
+// A drag is the board's one genuinely algorithmic moment and the one a static read cannot judge.
+const { placement } = await import('../web/src/work/order.js');
+const col = [{ id: 'a', sort_order: 1 }, { id: 'b', sort_order: 2 }, { id: 'c', sort_order: 3 }];
+ok(placement(col, 'z', 1).sortOrder === 1.5, 'a card dropped between two others takes the MIDPOINT (1.5)');
+ok(placement(col, 'z', 0).sortOrder === 0, 'dropped at the top it goes one step BEFORE the head');
+ok(placement(col, 'z', 3).sortOrder === 4, 'dropped at the end it goes one step PAST the tail');
+ok(placement([], 'z', 0).sortOrder === 0, 'dropped into an empty column it is simply 0');
+// Moving a card DOWN its own column: the gap was numbered with the card still in it.
+ok(placement(col, 'a', 2).at === 1 && placement(col, 'a', 2).sortOrder === 2.5,
+   'a card moved DOWN its own column lands between its new neighbours, not past them (the off-by-one)');
+ok(placement(col, 'c', 0).at === 0 && placement(col, 'c', 0).sortOrder === 0,
+   'a card moved UP its own column lands above the head');
+ok(placement(col, 'z', 99).at === 3, 'an index past the end is clamped, never NaN');
+// Missing sort_order (a server that has not filled it in) must not produce NaN.
+ok(Number.isFinite(placement([{ id: 'x' }, { id: 'y' }], 'z', 1).sortOrder),
+   'a column with no sort_order values still yields a finite number');
+// And the board must USE it rather than keeping a second copy of the maths.
+ok(/placement\(/.test(read('web/src/work/Board.jsx')) && !/\(a \+ b\) \/ 2/.test(read('web/src/work/Board.jsx')),
+   'Board.jsx calls placement() — the maths lives in one place');
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);

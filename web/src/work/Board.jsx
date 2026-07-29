@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getBoard, getWorkStatuses, patchWorkItem } from './workApi.js';
+import { placement } from './order.js';
 import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, ZeeChip, statusLabel } from './bits.jsx';
 
 // WORK TRACKER — the KANBAN board.
@@ -38,8 +39,6 @@ import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, ZeeChip, statusLabel } from 
 // doing) disagrees with the stored `status`, the card carries an advisory marker and NOTHING moves
 // on its own — a human decides whether the plan or the zee is wrong. An auto-moving card would
 // rewrite a manager's plan from a poller, which is precisely the authority a board must not have.
-
-const MID = (a, b) => (a + b) / 2;
 
 export default function Board({ projectId, rootId, statuses: statusesProp, onOpen, reloadKey = 0 }) {
   const [statuses, setStatuses] = useState(statusesProp || null);
@@ -107,18 +106,10 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     const target = cols.find((c) => c.key === toKey);
     if (!target) return;
 
-    // The neighbours the card is landing BETWEEN, with the card itself removed from the list first
-    // (dropping a card back into its own column must not average against itself).
-    const rest = target.items.filter((i) => i.id !== itemId);
-    const at = Math.max(0, Math.min(index ?? rest.length, rest.length));
-    const before = rest[at - 1];
-    const after = rest[at];
-    const so = (n) => (typeof n?.sort_order === 'number' ? n.sort_order : null);
-    let sortOrder = null;
-    if (before && after) sortOrder = MID(so(before) ?? 0, so(after) ?? (so(before) ?? 0) + 2);
-    else if (before) sortOrder = (so(before) ?? 0) + 1;
-    else if (after) sortOrder = (so(after) ?? 0) - 1;
-    else sortOrder = 0;
+    // WHERE it lands, and what sort_order that means — pure maths, in order.js, so the awkward
+    // cases (first slot, last slot, a card moved DOWN its own column) can be tested without a
+    // browser. See that file's header for the midpoint rule and the off-by-one it corrects.
+    const { at, sortOrder } = placement(target.items, itemId, index);
 
     const patch = {};
     if (fromCol.key !== toKey) patch.status = toKey;
