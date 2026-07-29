@@ -1233,6 +1233,17 @@ a.cbox:hover { border-color: var(--accent); }
 .hm-edit { flex: 1; padding: 14px 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
 .hm-row2 { display: flex; gap: 8px; align-items: flex-end; }
 .hm-ta { font-family: inherit; resize: vertical; line-height: 1.4; }
+/* The authoring surface for a 15k manual: monospace, roomy, and honest about size. */
+.hm-mono { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.hm-total { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.hm-inh-head { display: block; width: 100%; text-align: left; background: none; border: none;
+  color: var(--text); font-size: 12px; padding: 3px 0; cursor: pointer; }
+.hm-inh-caret { color: var(--muted); }
+.hm-avatar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.hm-avatar-prev { width: 52px; height: 52px; display: grid; place-items: center; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; }
+.hm-avatar-acts { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.hm-avatar-err { color: var(--bad, #e06c75); }
 .hm-sub { display: flex; flex-direction: column; gap: 5px; padding: 8px; border: 1px solid var(--line);
   border-radius: 8px; background: var(--panel2); margin-bottom: 6px; }
 .hm-add { align-self: flex-start; padding: 5px 10px; border-radius: 6px; border: 1px dashed var(--line);

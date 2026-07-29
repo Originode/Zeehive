@@ -19,6 +19,19 @@ import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
 import { resolveSite } from './sites.js';
 
+// Same switch every other real-side-effect module reads (landgate, xellgit, nudge, harness, reaper,
+// the .zeehive.env reconcile): 'real' touches machines, anything else models. The three OUTBOUND
+// verbs below (Pull · Push · PR) run git against a project's repo_root and its `origin` — both taken
+// off a project row, and a xell's database is a CLONE of the meta-DB, so a NESTED queenzee's project
+// rows are the REAL fleet's. Its console renders the real projects with the real buttons; one click
+// there would fast-forward the real xource from the remote, or publish the real main OUTWARD, from
+// an instance that is only modelling. See outboundRefusal at the head of each verb.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+const outboundRefusal = (what, p) =>
+  `PROVISION_MODE=simulate: this queenzee models the fleet, it does not ${what} — ${p.repo_root} is a `
+  + 'real checkout and its origin is a real remote, and this project row came out of a CLONE of the '
+  + 'meta-DB. Nothing was run. Use the real queenzee.';
+
 // Live statuses that mean a zee is actively bound — deleting such a project is refused.
 const LIVE_ZEE = ['spawning', 'online', 'working', 'idle'];
 
@@ -282,6 +295,10 @@ export async function pullProject(id, by = 'human@console') {
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { pulled: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
+  if (PROVISION_MODE !== 'real') {
+    logline('projects', `${p.name}: PULL from origin NOT run — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return { pulled: false, state: 'refused', dry_run: true, reason: outboundRefusal('pull a real xource from its remote', p) };
+  }
 
   let token = null;
   try { token = (await tokenForSpawn(p.id, 'github'))?.token || null; } catch { /* no token = anonymous fetch (public repo) */ }
@@ -322,6 +339,10 @@ export async function pushProject(id, by = 'human@console') {
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { pushed: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
+  if (PROVISION_MODE !== 'real') {
+    logline('projects', `${p.name}: PUSH to origin NOT run — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return { pushed: false, state: 'refused', dry_run: true, reason: outboundRefusal('publish a real xource to its remote', p) };
+  }
 
   const access = await githubAccess(id);
   if (!access.can_push) return { pushed: false, state: 'refused', reason: access.reason || 'the connected GitHub token cannot push to this repo' };
@@ -346,6 +367,10 @@ export async function pullRequestProject(id, { headBranch = null, title = null, 
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { opened: false, reason: 'project has no remote_url — set one in Project setup first' };
+  if (PROVISION_MODE !== 'real') {
+    logline('projects', `${p.name}: PR on origin NOT opened — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return { opened: false, dry_run: true, reason: outboundRefusal('open or merge a PR on a real remote', p) };
+  }
 
   const access = await githubAccess(id);
   if (!access.can_pr) return { opened: false, reason: access.reason || 'the connected GitHub token cannot open PRs on this repo' };

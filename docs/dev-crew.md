@@ -36,7 +36,9 @@ text and resolved the parents in SQL.
 That reverses what this doc originally said ("the folder is the truth"), and the reason is in §080:
 while a folder projected into the row there were two sources, the deployed image carried no
 `harnesses/` at all, and every file-backed harness in production was EMPTY — a whole fleet of zees
-briefed with nothing. One source, and the queenzee generates the files it injects.
+briefed with nothing, and every other project's console showing the crew as "⚠ no files". One source,
+and the queenzee generates the files it injects. (082 did the same for the badge SVG; there is no
+`harnesses/` folder any more.)
 
 The manual reaches every role **once, by inheritance** from `zee-base`. No role carries a copy of it
 or paraphrases a CLI verb — a restated verb is drift the moment the CLI moves
@@ -71,13 +73,15 @@ So the shape is structural, and `test/dev-crew.test.mjs` fails the build if it s
 
 | | dev-base | each role |
 |---|---|---|
-| PERSONALITY.md | ≤ 30 lines | ≤ 40 lines |
-| memory files | exactly 1 (`memory/dev-loop.md`, ≤ 180 lines) | **none** |
-| skills | 1 (`orient-in-a-new-repo`) | 1–2, each body ≤ 30 lines |
+| `personality` | ≤ 30 lines | ≤ 40 lines |
+| `memory` entries | exactly 1 (`memory/dev-loop.md`, ≤ 180 lines) | **none** |
+| `skills` | 1 (`orient-in-a-new-repo`) | 1–2, each body ≤ 30 lines |
 | own briefing text | ≤ 16 000 chars | ≤ 8 000 chars |
 
-"Own" means what that row contributes on top of its parents. Today the roles sit at ~3.7k–5.4k chars
-each, on a ~10.5k `dev-base` and a ~33k `zee-base`.
+"Own" means what that row contributes on top of its parents. These are CEILINGS — the constants at
+the top of `test/dev-crew.test.mjs` are the enforced ones, and it prints what each harness actually
+measures on every run. Read them there rather than from a number written here: a count in this doc is
+true on the day it is pasted and silently wrong after the next edit, while the ceiling is checked.
 
 The one-memory-file rule for `dev-base` and the **zero** for the roles are the load-bearing ones. A
 paragraph written into all eight roles is paid for by every wearer and duplicated eight times in the
@@ -98,12 +102,20 @@ manager). There is no folder to create.
    of every developer is already in `dev-base` and must not be repeated.
 3. **Memory** goes through `harness_memory_put(harness_key, path, text)` — never hand-rolled jsonb
    (house rule 9, `test/harness-memory-migrations.test.mjs`). A role should carry none.
-4. Add it to `ROLES` in `test/dev-crew.test.mjs`, run the migration on your own database, and run
-   that test — it reads the rows, so it proves what a wearer would actually be briefed with.
+4. Run the migration on your own database, then run `test/dev-crew.test.mjs`. **There is no list to
+   add it to**: the test derives the crew from the rows — anything whose parent chain reaches
+   `dev-base` is checked the moment the row exists, and it prints the roster it derived. Set the
+   `parent_id` (step 1) and the new role is linted; forget it and it is not crew at all, which is
+   the loud failure that tells you.
+5. Add the role to `dev-lead`'s `memory/dev-role-roster.md` in the same migration. The test asserts
+   the two agree in both directions — a role the lead has never heard of cannot be cast, and one the
+   lead names that does not exist fails at spawn.
 
 Two rules for the writing itself, both checked by the test: **no CLI verbs or flags** (refer to the
 manual, never quote it) and **no project lore** (no repo paths, container names or scripts — these
-personas work on other people's codebases).
+personas work on other people's codebases). Both are checked on every field of the bundle that
+reaches a wearer, `label` and `summary` included — those two show up in every picker, and while the
+lint read files instead they were the one place lore could be written and never flagged.
 
 ## Using them
 
