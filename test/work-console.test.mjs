@@ -176,5 +176,20 @@ ok(Number.isFinite(placement([{ id: 'x' }, { id: 'y' }], 'z', 1).sortOrder),
 ok(/placement\(/.test(read('web/src/work/Board.jsx')) && !/\(a \+ b\) \/ 2/.test(read('web/src/work/Board.jsx')),
    'Board.jsx calls placement() — the maths lives in one place');
 
+// ── the contract seams part 1 spelled out, checked where they are easy to get wrong again ──
+const drawer = read('web/src/work/WorkItemDrawer.jsx');
+ok(/next_statuses/.test(drawer),
+   "the status picker offers the item's OWN next_statuses, not the whole vocabulary");
+ok(/vocabOf/.test(read('web/src/work/workApi.js')) && /ticket_kinds/.test(read('web/src/work/workApi.js')),
+   'the whole vocabulary (statuses + kinds) is read from /api/work-statuses, kinds included');
+ok(/ticketKinds|kinds =/.test(read('web/src/work/Tickets.jsx')),
+   'ticket kinds come from that vocabulary, not from a list typed into the console');
+// A same-column drag must send sort_order ALONE. Sending parent_id with it was silently dropped by
+// the server for a while; both shapes work now, but "the parent did not change" is the honest ask.
+const boardMove = board.slice(board.indexOf('const move = useCallback'), board.indexOf('const onDragStart'));
+ok(!/parent_id/.test(boardMove), 'a board drag patches status/sort_order only — never parent_id');
+ok(/ref/.test(read('web/src/work/Tickets.jsx')),
+   'the breakdown editor nests with the API\'s backwards-resolving `ref` handles (one atomic call)');
+
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);

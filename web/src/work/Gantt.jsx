@@ -20,17 +20,24 @@ import { ErrLine } from './bits.jsx';
 // one activity should get one activity's timeline, not the whole project's.
 export default function Gantt({ projectId, rootId }) {
   const [rows, setRows] = useState(null);
+  const [model, setModel] = useState(null);
   const [err, setErr] = useState(null);
 
   useEffect(() => {
     let live = true;
     getGantt(projectId, rootId)
-      .then((r) => { if (live) { setRows(Array.isArray(r) ? r : (r?.rows || [])); setErr(null); } })
+      .then((r) => { if (live) { setModel(r); setRows(Array.isArray(r) ? r : (r?.rows || [])); setErr(null); } })
       .catch((e) => { if (live) setErr(e); });
     return () => { live = false; };
   }, [projectId, rootId]);
 
-  const cols = ['title', 'kind', 'status', 'starts_on', 'due_on', 'estimate_hours', 'progress', 'depth'];
+  // The columns ARE the documented row shape, so part 4 can see every field the server rolls up:
+  // computed_start/computed_end (a parent with no dates spans its children), rolled_progress
+  // (leaf-count-weighted), and `unscheduled` — the rows with no dates anywhere in their subtree,
+  // which the UI must LIST rather than invent dates for.
+  const cols = ['depth', 'kind', 'title', 'status', 'starts_on', 'due_on',
+                'computed_start', 'computed_end', 'progress', 'rolled_progress',
+                'estimate_hours', 'assignee', 'unscheduled'];
 
   return (
     <div className="work-gantt" data-testid="work-gantt">
@@ -38,6 +45,10 @@ export default function Gantt({ projectId, rootId }) {
         <b>Timeline — landing in part 4.</b> Below is the raw <code>/api/gantt</code> read model, so
         the data is at least visible while the bars are not.
       </div>
+      {model?.unscheduled_count > 0 && (
+        <div className="work-warn">⚠ {model.unscheduled_count} row(s) have no dates anywhere in their
+          subtree — they come back with nulls and are LISTED, never given invented dates.</div>
+      )}
       <ErrLine err={err} />
       {rows === null && !err && <div className="work-empty">loading…</div>}
       {rows !== null && !rows.length && <div className="work-empty">no rows</div>}
