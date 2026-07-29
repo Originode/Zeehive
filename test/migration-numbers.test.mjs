@@ -109,5 +109,16 @@ ok(callAt > 0 && applyAt > 0 && callAt < applyAt,
 ok(!/KNOWN_DUPLICATES/.test(runner),
    'the runner carries no copy of the record — it asks the module (the drift this repo keeps paying for)');
 
+// WHAT THE REFUSAL COSTS AT EACH ENTRY POINT — the reason a runtime guard is defensible here at all.
+// The CLI is where a zee or a human is holding the files, so it exits NON-ZERO and says so. The BOOT
+// path deliberately does not die: index.js already treats a failed migration as loud-but-not-fatal
+// ("a queenzee that stays up degraded beats one that exits"), so a collision landed by somebody else
+// costs a queenzee its new schema and a very visible log line, not its availability.
+ok(/process\.exit\(1\)/.test(runner.slice(runner.indexOf('CLI entry'))),
+   'the CLI exits non-zero on a refusal — the surface where somebody is holding the filenames');
+const boot = readFileSync(join(ROOT, 'server/src/index.js'), 'utf8');
+ok(/try \{\n\s*await runMigrations\(\);/.test(boot) && /BOOT MIGRATIONS FAILED \(staying up on the schema we have\)/.test(boot),
+   'while a BOOT logs it loudly and stays up degraded — a refusal must not cost the queenzee its availability');
+
 console.log(fail ? `\n✗ ${fail} FAILED` : '\n✓ a new migration number collision is refused; the old ones are history and still work');
 process.exit(fail ? 1 : 0);
