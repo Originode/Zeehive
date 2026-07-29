@@ -91,9 +91,12 @@ async function fetchXellRows(pid) {
             EXISTS(SELECT 1 FROM prod_seed_request psr WHERE psr.xell_id = x.id
                      AND psr.status IN ('pending','approved','running')
                      AND psr.dismissed_at IS NULL) AS seed_pending,
-            (SELECT se.hook_event_name FROM session_event se
-               WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
-               ORDER BY se.ts DESC LIMIT 1) = 'tend-request' AS tend_pending,
+            tnd.hook_event_name = 'tend-request' AS tend_pending,
+            -- …and WHY. A tend says "a human is needed here"; without the reason the console could
+            -- only say that much, and the human had to open the session and read a transcript to
+            -- find out what for. The zee gives one brief line when it raises (self.selfTend) — it
+            -- rides here so the card and the "waiting on you" chip can show it.
+            tnd.reason AS tend_reason, tnd.ts AS tend_at,
             -- readiness HINTS (zee said "this looks land/ship-ready" without calling the gated verb):
             -- same latest-event-wins ride as tend, one per kind.
             (SELECT se.hook_event_name FROM session_event se
@@ -114,6 +117,14 @@ async function fetchXellRows(pid) {
             dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
        FROM xell x
        LEFT JOIN deploy_lock dl ON dl.xell_id = x.id AND dl.container = 'prod'
+       -- the xell's LATEST tend event (raise or clear): its OPEN state and, when open, the brief
+       -- reason the zee gave. One lateral instead of two correlated scans of the same rows.
+       LEFT JOIN LATERAL (
+         SELECT se.hook_event_name, se.ts, se.raw->>'reason' AS reason
+           FROM session_event se
+          WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
+          ORDER BY se.ts DESC LIMIT 1
+       ) tnd ON true
        LEFT JOIN harness hn ON hn.id = x.harness_id
        JOIN xource xo ON xo.id = x.xource_id
        -- The xell's zee, PREFERRING a living one but falling back to the most recent dead one.
@@ -204,6 +215,13 @@ async function decorateXell(x, heads, deployed, project) {
     prodUnprotected: x.is_production && x.prod_lock_active === true,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
+  // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
+  // hive_status already says THAT one is open; this says WHAT FOR — the console renders it beside
+  // the ask instead of sending the human into the session to find out.
+  x.tend = x.tend_pending === true
+    ? { open: true, reason: x.tend_reason || null, at: x.tend_at || null }
+    : null;
+  delete x.tend_reason; delete x.tend_at;
   delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;
   delete x.land_hint; delete x.ship_hint;
   delete x.prod_bind_pending; delete x.seed_pending;

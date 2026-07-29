@@ -29,7 +29,7 @@ import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
-import { setTend, tendOpen, setHint, hintOpen, pingWorking } from '../lib/status.js';
+import { setTend, tendState, setHint, hintOpen, pingWorking, briefReason } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          NO_PUSH_REASON } from '../lib/managers.js';
@@ -54,7 +54,8 @@ export async function selfStatus(xell) {
   const containers = await q(
     `SELECT c.role, c.name, c.tier, host(c.host) AS host, c.host_port FROM xell_uses_container uc
        JOIN container c ON c.id = uc.container_id WHERE uc.xell_id=$1 ORDER BY c.role`, [xell.id]);
-  const tend = await tendOpen(xell.id);
+  // The tend as the console sees it: open + the brief REASON the zee gave for calling a human.
+  const tend = await tendState(xell.id);
   const landHint = await hintOpen(xell.id, 'land');
   const shipHint = await hintOpen(xell.id, 'ship');
   // The DISPLAY status the hive shows for this xell — the same derivation the dashboard renders, so
@@ -66,7 +67,7 @@ export async function selfStatus(xell) {
       // A DEFERRED ship (pending, but a human set it aside for a combined ship) is not "awaiting a
       // human" — it matches how fleet.js derives the hive status, so the zee sees itself as a human does.
       shipPending: ship ? (['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at) : false,
-      tendPending: tend,
+      tendPending: tend.open,
       landHint, shipHint,
       // The two PROD-DATA asks, so a cxell zee sees its own `prod?` / `seed?` hexagon exactly as a
       // human does — and can tell that its request actually reached the console.
@@ -111,7 +112,7 @@ export async function selfStatus(xell) {
       ? { id: doneSuggestion.id, by: doneSuggestion.manager_slug, reason: doneSuggestion.reason,
           status: doneSuggestion.status, pending: doneSuggestion.status === 'pending' }
       : null,
-    tend: { open: tend },
+    tend: { open: tend.open, reason: tend.reason, since: tend.at },
     zee: zee || null,
     task: task ? { id: task.id, status: task.status, done: task.status === 'done' } : null,
     awaiting_done: xell.status === 'awaiting-done',
@@ -571,17 +572,27 @@ export async function selfDone(xell, { summary = null } = {}) {
 // a heads-up). Unlike those it opens no gate and blocks nothing — it just flags the xell so the hive
 // shows `occ-tendRequest` and the human knows to look. `--clear` (or {clear:true}) lowers it; a zee
 // that reports working again clears it automatically.
+// RAISING one REQUIRES a brief reason. A tend with no why is the ask that wastes the human it
+// summoned: the console can only show "this xell wants you", and the only way to learn what for is
+// to open the session and read a transcript. The reason is carried to the hexagon and the
+// "waiting on you" line, so it must be one short line — briefReason clamps it (TEND_REASON_MAX).
 export async function selfTend(xell, { reason = null, clear = false } = {}) {
+  const why = briefReason(reason);
+  if (!clear && !why) {
+    return { ok: false, error: 'a tend needs a brief reason — say WHY you need a human, in one line '
+      + '(`zee tend --reason "…"`). The reason is what the console shows beside your hexagon; without '
+      + 'it a human is called with no idea what for.' };
+  }
   const zee = await liveZee(xell.id);
-  const res = await setTend(xell.id, !clear, { reason, zeeId: zee?.id || null });
-  logline('self', `${xell.slug} ${clear ? 'CLEARED its tend' : 'raised a TEND'}${reason ? `: ${reason}` : ''}`);
+  const res = await setTend(xell.id, !clear, { reason: why, zeeId: zee?.id || null });
+  logline('self', `${xell.slug} ${clear ? 'CLEARED its tend' : 'raised a TEND'}${why ? `: ${why}` : ''}`);
   return {
     ok: true, ...res,
     message: clear
       ? 'Tend cleared — the hive no longer flags this xell for attention.'
-      : 'Tend RAISED — the hive now shows this xell as needing a human (occ-tendRequest). Nothing is '
-        + 'gated or blocked; a human will see it in the console. It clears when you `zee tend --clear` '
-        + 'or report working (`zee working`).',
+      : `Tend RAISED ("${why}") — the hive now shows this xell as needing a human (occ-tendRequest), `
+        + 'with that reason on the card and in the console\'s "waiting on you" line. Nothing is gated '
+        + 'or blocked. It clears when you `zee tend --clear` or report working (`zee working`).',
   };
 }
 
