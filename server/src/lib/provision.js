@@ -15,7 +15,7 @@ import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
 import { dbIdentity } from './projects.js';
-import { resolveEnvironmentFor, fullVarsFor } from './environments.js';
+import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
 import { warmWorktree } from './npm-cache.js';
 import { logline } from './logbus.js';
 
@@ -225,9 +225,23 @@ export async function emitXellEnv(xellId) {
   // defaults below, and it can never override either: any name already emitted (or declared in
   // spin.env) is skipped, so an environment can't redirect DATABASE_URL past the §6.2 guard nor
   // undo BUILD_MODE=simulate. Best-effort — a projection failure must not sink provisioning.
+  //
+  // The resolution is STATED in the file even when it contributes nothing. A project whose
+  // environments are empty (Zeehive's own dev AND prod are, today: 0 vars each) merges correctly
+  // and writes zero lines — which reads exactly like ticket #15 did, "my binding says prod and my
+  // .zeehive.env clearly does not". One comment line naming the environment, its tier and its var
+  // count is the difference between "the merge is broken" and "the environment is empty", and it
+  // costs nothing: a comment is not a variable, so nothing consumes it and no rule bends for it.
   try {
     const env = await resolveEnvironmentFor(xell);
     const envVars = await fullVarsFor(env?.id);
+    if (!env) {
+      lines.push(`# —— environment: none configured for this project at tier `
+        + `${isOnProduction(xell) ? 'prod' : 'dev'} (nothing to merge) ——`);
+    } else if (!envVars.length) {
+      lines.push(`# —— environment: ${env.key} (${env.tier}) — resolved, but it holds 0 vars in the `
+        + 'meta-DB, so nothing was merged ——');
+    }
     if (env && envVars.length) {
       // Reserve, UNCONDITIONALLY, the structural keys emitXellEnv owns — not just the ones already
       // emitted. A db-less xell emits no DATABASE_URL line, so a dynamic-only reserve would let an

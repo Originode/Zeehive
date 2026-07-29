@@ -75,7 +75,7 @@ try {
     }
     return e;
   };
-  await mkEnv(`dev-${tag}`, 'dev', { WHICH_ENV: 'dev', API_BASE: 'https://dev.example' });
+  const devEnv = await mkEnv(`dev-${tag}`, 'dev', { WHICH_ENV: 'dev', API_BASE: 'https://dev.example' });
   await mkEnv(`prod-${tag}`, 'prod', {
     WHICH_ENV: 'prod', API_BASE: 'https://prod.example',
     DATABASE_URL: 'postgresql://hijack@elsewhere:5432/hijack',   // reserved name — must never land
@@ -179,6 +179,19 @@ try {
   const nod = projection(n.wt);
   ok(nod.vars.DATABASE_URL !== SHARED_PROD,
      `no owner DSN leaked to a reader (${nod.vars.DATABASE_URL ?? '(none)'})`);
+
+  // ── 5. an EMPTY environment must not read like a broken merge ───────────────────────────────
+  // The third half of the ticket: when a project's environments hold no vars (Zeehive's own dev
+  // AND prod do, today) a perfectly correct merge writes nothing — and "my binding says prod and
+  // my .zeehive.env plainly does not" is exactly what a BROKEN merge looks like too. So the file
+  // states which environment it resolved even when that environment contributes nothing.
+  console.log('an empty environment is STATED in the file, not silent');
+  await q(`DELETE FROM environment_var WHERE environment_id=$1`, [devEnv.id]);
+  await attachXellDb(n.id, { coupling: 'db-shared-dev' });      // a binding change → a fresh emit
+  const emptyEnv = projection(n.wt);
+  ok(new RegExp(`environment: dev-${tag} \\(dev\\)[^\\n]*0 vars`).test(emptyEnv.text),
+     'the projection names the resolved (empty) environment — "empty" is distinguishable from "wrong"');
+  ok(emptyEnv.vars.WHICH_ENV === undefined, '…and merges nothing, which is correct');
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
