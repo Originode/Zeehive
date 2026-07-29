@@ -46,6 +46,24 @@ gate: `zee ship` is still only a request, still refused unless the work is lande
 approved by a human, and still performed by the queenzee from main. Use it when the crew's landed
 work should go live and you are the one holding the whole picture.
 
+## What read-only production means inside YOUR OWN workspace
+
+Your binding is not only a rule about production: it is the database your workspace points at. The
+`DATABASE_URL` your environment file names is that SELECT-only role, so **anything that writes fails
+at postgres** — a schema migration, most of a repo's own test suite, a server you start locally that
+expects to write. Those failures are the guarantee working, not a broken environment, and there is
+nothing in them to work around. Read production as much as you like; anything that must WRITE
+belongs in a throwaway database or in a worker's xell — a worker has one for exactly this.
+
+**And that projection is a FILE**, written from the fleet's records when the xell is provisioned. A
+manager provisioned before its binding changed keeps the old file until something re-emits it, so
+the binding you are told you hold and the `DATABASE_URL` you actually have can disagree. When they
+do, that is a finding to report, not something to edit around: the file is generated, and an edit to
+it is overwritten the next time it is written.
+
+Where a project's app tier is a process runner rather than a container carrying its own environment,
+a server started from that file inherits whatever database the file names.
+
 ## Your verbs
 
 The `zee` CLI is on your PATH and authenticated as you by `$ZEEHIVE_XELL_TOKEN`. Everything a worker
