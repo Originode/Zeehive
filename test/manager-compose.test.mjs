@@ -65,6 +65,25 @@ ok(/provider: activeProvider/.test(disp) && /activeTokenId \? \{ provider_token_
 ok(/data-testid=\{manager \? 'manager-submit' : 'dispatch-submit'\}/.test(disp),
    'the submit button names the act it performs (Add manager zee / Dispatch)');
 
+// ── 3b. the overlay ESCAPES the pane it is opened from ──
+// The manager button lives in the toolbar inside `.content` (`position: relative; z-index: 1`),
+// which is a stacking context — so a full-screen overlay rendered in place ranked at z 1 among the
+// panels pane's contents, and the graph divider/grip (z 4/5/6 on `.hive-split`) plus the
+// <Connectors> line overlay painted over the modal. No z-index value can fix that; the overlay has
+// to leave the tree. Both variants portal onto <body>.
+ok(/import \{ createPortal \} from 'react-dom'/.test(disp), 'Dispatch imports createPortal');
+ok(/return createPortal\(\(/.test(disp) && /\), document\.body\);/.test(disp),
+   'the overlay is portalled onto document.body — unconditionally, not just for the manager variant');
+ok(!/\{manager \?[\s\S]{0,80}createPortal/.test(disp),
+   'the portal is not conditional on the variant (the worker composer only escaped by luck of where App renders it)');
+const css2 = read('web/src/styles.css');
+ok(/composer 60\s+<\s+toasts 80\s+<\s+dialogs 90\s+<\s+diff viewer 95/.test(css2),
+   'the overlay band is written down beside .disp-overlay (toasts/dialogs must stay above a composer)');
+const zOf = (sel) => Number((css2.match(new RegExp(`\\${sel}[^}]*z-index:\\s*(\\d+)`, 's')) || [])[1]);
+ok(zOf('.disp-overlay') < zOf('.toast-stack') && zOf('.toast-stack') < zOf('.dlg-overlay')
+   && zOf('.dlg-overlay') < zOf('.dv-overlay'),
+   `the band holds in the CSS: composer ${zOf('.disp-overlay')} < toasts ${zOf('.toast-stack')} < dialog ${zOf('.dlg-overlay')} < diff ${zOf('.dv-overlay')}`);
+
 // ── 4. the server accepts everything the composer can now compose ──
 ok(/headless, images,/.test(spawn) || /headless,\s*images/.test(spawn),
    'createManagerZee takes headless + images');

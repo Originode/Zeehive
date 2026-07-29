@@ -112,7 +112,7 @@ export async function selfStatus(xell) {
       ? { id: doneSuggestion.id, by: doneSuggestion.manager_slug, reason: doneSuggestion.reason,
           status: doneSuggestion.status, pending: doneSuggestion.status === 'pending' }
       : null,
-    tend: { open: tend.open, reason: tend.reason, since: tend.at },
+    tend: { open: tend.open, reason: tend.reason, reason_full: tend.full, since: tend.at },
     zee: zee || null,
     task: task ? { id: task.id, status: task.status, done: task.status === 'done' } : null,
     awaiting_done: xell.status === 'awaiting-done',
@@ -583,6 +583,9 @@ export async function selfDone(xell, { summary = null, clear = false } = {}) {
 // to open the session and read a transcript. The reason is carried to the hexagon and the
 // "waiting on you" line, so it must be one short line — briefReason clamps it (TEND_REASON_MAX).
 export async function selfTend(xell, { reason = null, clear = false } = {}) {
+  // `why` is the DISPLAY line (used to validate, log and answer). The RAW reason is what gets
+  // stored — passing the brief form to setTend is precisely the bug that shipped: it truncated the
+  // ask at the door, so the console faithfully showed all 200 characters that still existed.
   const why = briefReason(reason);
   if (!clear && !why) {
     return { ok: false, error: 'a tend needs a brief reason — say WHY you need a human, in one line '
@@ -590,7 +593,7 @@ export async function selfTend(xell, { reason = null, clear = false } = {}) {
       + 'it a human is called with no idea what for.' };
   }
   const zee = await liveZee(xell.id);
-  const res = await setTend(xell.id, !clear, { reason: why, zeeId: zee?.id || null });
+  const res = await setTend(xell.id, !clear, { reason, zeeId: zee?.id || null });
   logline('self', `${xell.slug} ${clear ? 'CLEARED its tend' : 'raised a TEND'}${why ? `: ${why}` : ''}`);
   return {
     ok: true, ...res,

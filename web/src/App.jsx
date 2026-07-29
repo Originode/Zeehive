@@ -1216,7 +1216,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
         {x.tend?.open && (
           <div className="row"><span className="rk">tend</span>
             <span className="tendwhy" data-testid="tend-reason"
-                  title={`${x.tend.reason || 'The zee raised a tend without a reason.'}\n\n`
+                  title={`${x.tend.full || x.tend.reason || 'The zee raised a tend without a reason.'}\n\n`
                     + 'Its zee asked for a human in the console. Nothing is gated or blocked — it clears '
                     + 'when the zee reports working or runs `zee tend --clear`.'}>
               🖐 {x.tend.reason ? clip(x.tend.reason, 48) : 'no reason given'}
@@ -1356,6 +1356,10 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
     // whole point of being called is knowing what you were called for — without it this line could
     // only say "somebody wants you", and the human had to open the session to find out what for.
     const tendWhy = tend ? (x.tend?.reason || null) : null;
+    // …and the WHOLE thing, when the brief line is only its head. The chip stays one line (it has
+    // no room), but the opened ask must be readable in full: a tend clipped to "…re-tasking a
+    // manager wi…" with the rest nowhere is barely better than no reason at all.
+    const tendFull = tend ? (x.tend?.full || x.tend?.reason || null) : null;
     // PROD DATA: "bind me to the production database" / "run this landed seed file on production".
     // These are held gates exactly like a landing — the zee cannot proceed until a human answers —
     // so they belong in the one line that says who is waiting on you.
@@ -1364,7 +1368,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
     // A manager suggested this xell is done. It is a real decision waiting on a human — and the only
     // one raised by another AGENT, so if it were not counted here nobody would ever answer it.
     const doneSug = (doneSuggestByXell[x.id] || []).filter((r) => r.status === 'pending').length;
-    return { x, held, prs, tend, tendWhy, bind, seed, doneSug, n: held + prs + tend + bind + seed + doneSug };
+    return { x, held, prs, tend, tendWhy, tendFull, bind, seed, doneSug, n: held + prs + tend + bind + seed + doneSug };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
@@ -1382,7 +1386,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <span className="ny-t">⚠ waiting on you:</span>
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
-                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.tend && `tend (needs a human)${w.tendWhy ? `: ${w.tendWhy}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
+                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
             {w.x.slug}
             <span className="ny-n">{[
               w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`,
@@ -1405,7 +1409,7 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
           {open.tend > 0 && landings.length === 0 && prs.length === 0 && binds.length === 0
             && seeds.length === 0 && doneSugs.length === 0 && (
             <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human
-              {open.tendWhy ? <>: <b className="ny-why">{open.tendWhy}</b></> : ' (it gave no reason)'}.
+              {open.tendFull ? <>: <b className="ny-why">{open.tendFull}</b></> : ' (it gave no reason)'}.
               {' '}Open its session for the detail; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
           )}
         </div>
