@@ -14,6 +14,26 @@
 //             prod code, and the one worth a red chip.
 // "extra"   = this db has it, prod does not — usually unshipped work, sometimes dead legacy.
 //
+// WHAT THIS NUMBER IS NOT — TKT-22-4F0E ("any restore on a dev db from latest prod dump always has
+// a big diff from prod db … and im afraid the data might not be fully backed up"). Two questions got
+// merged into one chip, and this file can only answer the first:
+//   • It compares CATALOG SHAPE ONLY — tables, columns, triggers. It never counts a row, never reads
+//     a value, and never opens a dump. So a green 0 is NOT evidence that production's DATA is backed
+//     up, and a red 12802 is NOT evidence that any data was lost. Whoever renders this number must
+//     say what it covers (`scope`/`data_compared` ride in the payload for exactly that reason), and
+//     "is my data there?" needs a row-level comparison — see docs/data-completeness-check.md.
+//   • THE RULER IS *LIVE* PROD, BUT A RESTORE IS A POINT-IN-TIME COPY. A db restored from last
+//     night's dump is faithful to the dump, not to prod as it is now: every object prod migrated
+//     AFTER the dump was taken reads as `missing`. That is real drift in the dangerous direction,
+//     correctly reported — and it is why "a fresh restore ALWAYS shows a gap". The cure is a newer
+//     dump or a ledger catch-up (`zee db-catchup` / catchup-delta.js), never a suppression here.
+//     Measured 2026-07-29 on the live fleet: three Zeehive pool dbs cut from the same code and the
+//     same prod read 0, 12 and 21 — and the 12/21 were, to the object, one and two migrations'
+//     worth of `public.project_doc` and `land_request.holding_since…`. Age, not noise.
+//   • An EMPTY database is not a drifted one, and must not be dressed as one: 'missing everything,
+//     extra nothing' means nothing was ever restored here (or the restore failed). `empty_db` says
+//     so, because the alternative is a chip that reads "your restore lost 12,802 objects".
+//
 // READ-ONLY. Catalog SELECTs over `docker exec psql`. It never writes to any application db.
 import { spawn } from 'node:child_process';
 import { q, one } from '../db/pool.js';
@@ -124,19 +144,38 @@ function diffSets(prodSet, devSet) {
   return { missing, extra };
 }
 
+// The SCOPE every payload declares, so no surface can imply more than was measured. Carried as DATA
+// (not left to each renderer's prose) because the console, the /ooney gate and the CLI all read this
+// same jsonb, and a caveat that lives in only one of them is a caveat the human never sees.
+export const DIFF_SCOPE = 'schema';                            // what it measures
+export const DIFF_COVERS = ['table', 'column', 'trigger'];     // and exactly which catalog kinds
+export const DIFF_NOT_COVERED = 'row data (no rows are counted or compared — this is not a backup or data-completeness check)';
+
 // Pure comparison of two fingerprints → the persisted payload shape.
-function diffPayload(prodFp, fp) {
+// `prod_count`/`mine_count` per kind are the cheap orientation the bare total never gave: "prod has
+// 627 tables, this db has 0" is a different fact from "627 differences", and it is the difference
+// between a failed restore and a stale one.
+export function diffPayload(prodFp, fp) {
   const kinds = {};
   let total = 0;
   for (const kind of Object.keys(Q)) {
     const { missing, extra } = diffSets(prodFp[kind], fp[kind]);
     total += missing.length + extra.length;
     kinds[kind] = {
+      prod_count: prodFp[kind].size, mine_count: fp[kind].size,
       missing_count: missing.length, extra_count: extra.length,
       missing: missing.slice(0, SAMPLE), extra: extra.slice(0, SAMPLE),
     };
   }
-  return { ok: true, error: null, total, kinds };
+  // EMPTY, not drifted: this db has no application tables at all while prod has some. Reporting that
+  // as "N differences" is how a never-restored dev clone came to look like a catastrophic data loss
+  // (TKT-22-4F0E — omnibiz_db_prod_dev_local_mardale_prod, 627/627 tables 'missing', 0 extra).
+  const empty_db = fp.table.size === 0 && prodFp.table.size > 0;
+  return {
+    ok: true, error: null, total,
+    scope: DIFF_SCOPE, covers: DIFF_COVERS, data_compared: false, not_covered: DIFF_NOT_COVERED,
+    empty_db, kinds,
+  };
 }
 
 // Compare one db container against a prod fingerprint and persist the verdict.
@@ -166,11 +205,17 @@ async function diffContainer(c, prodFp, dbid) {
   // "still in sync" and make the one line that matters invisible.
   if (payload.ok && prev !== payload.total) {
     logline('proddiff', payload.total === 0
-      ? `${c.name} is IN SYNC with prod`
-      : `${c.name} has DRIFTED from prod: ${payload.total} difference(s) — `
-        + Object.entries(payload.kinds)
-            .filter(([, v]) => v.missing_count + v.extra_count)
-            .map(([k, v]) => `${k} -${v.missing_count}/+${v.extra_count}`).join(', '));
+      ? `${c.name} matches prod's SCHEMA (tables, columns, triggers — no rows compared)`
+      : payload.empty_db
+        // Not drift. Say the thing that is actually true, or the operator debugs a diff that isn't one.
+        ? `${c.name} has NO application tables at all (prod has ${payload.kinds.table.prod_count}) — this `
+          + 'database was never restored, or its restore failed. That is not schema drift.'
+        : `${c.name} has DRIFTED from prod: ${payload.total} SCHEMA difference(s) — `
+          + Object.entries(payload.kinds)
+              .filter(([, v]) => v.missing_count + v.extra_count)
+              .map(([k, v]) => `${k} -${v.missing_count}/+${v.extra_count}`).join(', ')
+          + '. Schema+triggers only; nothing here is a statement about row data. A restore is a '
+          + 'point-in-time copy, so objects prod migrated after its dump read as missing.');
   } else if (!payload.ok && c.prod_diff?.ok !== false) {
     logline('proddiff', `${c.name}: could not compare against prod — ${payload.error}`);
   }

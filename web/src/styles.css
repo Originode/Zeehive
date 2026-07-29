@@ -829,6 +829,11 @@ a.cbox:hover { border-color: var(--accent); }
 /* scoped-backup badge + per-row restore table picker */
 .bkscoped { justify-self: start; color: #b58bd9; border: 1px solid #b58bd9; border-radius: 6px;
   padding: 1px 7px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; }
+/* "N tables in archive" — what the dump actually contains, read back out of the written file. Muted,
+   not a warning: it is the reassurance an operator comes to this panel for, and its tooltip is where
+   the limit of that reassurance is stated (tables are verified, rows are not counted). TKT-22-4F0E. */
+.bktoc { justify-self: start; color: var(--muted); border: 1px solid var(--line); border-radius: 6px;
+  padding: 1px 7px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
 .bkbtn.sm.active { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--panel2)); }
 .bkrow-pick { grid-column: 1 / -1; margin: 6px 2px 2px; }
 

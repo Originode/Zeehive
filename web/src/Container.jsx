@@ -44,20 +44,44 @@ export function driftState(c) {
   return d.total > 0 ? 'drift' : 'sync';
 }
 
+// TKT-22-4F0E: this chip answers ONE question and a human read it as answering two. It compares
+// catalog SHAPE against production; it never counts a row and never opens a backup. So every reading
+// of it — sync, drifted, or empty — carries its scope, at the place the number is read. The words are
+// here (not only in proddiff.js's comments) because the tooltip is what a worried operator hovers.
+const SCOPE_LINE = '\n\nWhat this covers: SCHEMA only — tables, columns, triggers.'
+  + '\nWhat it does NOT: row data. It counts no rows and reads no backup, so it can neither confirm'
+  + '\nnor deny that production data is fully backed up. (Backups panel → a dump\'s own table list.)';
+// Why a faithful restore still shows a gap. The ruler is LIVE prod; a restore is the dump's instant.
+const AGE_LINE = '\n\nA restore/clone is a point-in-time copy: anything prod migrated AFTER its dump'
+  + '\nshows here as − missing. That is age, not corruption — take a newer dump, or catch the ledger up.';
+
 // The drift half of the tooltip. Counts are exact; the lists are a SAMPLE (proddiff truncates), so
 // say so rather than let a reader think 8 is the whole story.
-function driftText(c) {
+export function driftText(c) {
   const d = c.prod_diff;
   if (!d) return '';
   const when = c.prod_diff_at ? ` (${new Date(c.prod_diff_at).toLocaleString()})` : '';
   if (!d.ok) return `\n\n⚠ prod diff failed${when}\n${d.error || 'unknown error'}`;
-  if (!d.total) return `\n\n✓ schema matches prod${when}`;
+  if (!d.total) return `\n\n✓ schema matches prod${when}${SCOPE_LINE}`;
 
-  const out = [`\n\n⚠ DRIFTED from prod — ${d.total} difference(s)${when}`];
+  // EMPTY is a different fact from DRIFTED, and the server now distinguishes them: a database with
+  // none of prod's tables was never restored. Reporting that as "N differences" is what made a
+  // never-used dev clone look like a data-loss event.
+  if (d.empty_db) {
+    const t = d.kinds?.table || {};
+    return `\n\n⚠ this database is EMPTY — it has NO application tables${when}`
+      + `\nprod has ${t.prod_count ?? '?'}; this db has ${t.mine_count ?? 0}.`
+      + '\nIt was never restored, or its restore failed. This is not drift, and it says nothing'
+      + '\nabout production or its backups.'
+      + SCOPE_LINE;
+  }
+
+  const out = [`\n\n⚠ SCHEMA drifted from prod — ${d.total} difference(s)${when}`];
   for (const [kind, v] of Object.entries(d.kinds || {})) {
     const miss = v.missing_count || 0, extra = v.extra_count || 0;
     if (!miss && !extra) continue;
-    out.push(`\n${kind}: ${miss} missing, ${extra} extra`);
+    const have = v.prod_count != null ? ` (prod ${v.prod_count} / here ${v.mine_count})` : '';
+    out.push(`\n${kind}: ${miss} missing, ${extra} extra${have}`);
     // "missing" first and always: prod has it and this db does not, which is what breaks code.
     for (const x of (v.missing || [])) out.push(`\n  − ${x}`);
     if (miss > (v.missing || []).length) out.push(`\n  … +${miss - v.missing.length} more missing`);
@@ -66,6 +90,8 @@ function driftText(c) {
   }
   out.push('\n\n− = prod has it, this db does not (code may expect it)');
   out.push('\n+ = this db has it, prod does not');
+  out.push(AGE_LINE);
+  out.push(SCOPE_LINE);
   return out.join('');
 }
 
@@ -78,7 +104,9 @@ function instancesText(c) {
   const out = [`\n\ndatabases (${list.length}):`];
   for (const i of list) {
     const d = i.prod_diff;
-    const drift = !d ? '' : d.ok === false ? ' · diff err' : d.total > 0 ? ` · ⚠ ${d.total} drift` : ' · ✓ sync';
+    const drift = !d ? '' : d.ok === false ? ' · diff err'
+      : d.empty_db ? ' · ⚠ EMPTY (no app tables)'
+      : d.total > 0 ? ` · ⚠ ${d.total} schema drift` : ' · ✓ schema in sync';
     const who = i.kind === 'clone' ? (i.owner_slug ? ` → ${i.owner_slug}` : ' → ORPHAN (xell gone)') : '';
     out.push(`\n  ${i.name} — ${i.kind}${who}${drift}`);
   }
@@ -248,6 +276,10 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   // Check this db's schema against production NOW. The server persists the verdict and broadcasts the
   // container, so the chip's drift mark repaints over SSE; we also pop a one-line summary. The full
   // per-object breakdown already lives in the chip's tooltip, so we don't reproduce it here.
+  //
+  // The summary states its SCOPE every time (TKT-22-4F0E). This dialog is the most quoted reading of
+  // the number, and "✓ matches production" with nothing after it is exactly how a schema check came
+  // to be heard as "production is backed up".
   const runCheckDiff = async () => {
     if (diffing) return;
     setDiffing(true);
@@ -260,9 +292,17 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
         return;
       }
       const total = r?.total || 0;
-      showAlert(total === 0
-        ? `✓ ${c.name} — schema matches production.`
-        : `⚠ ${c.name} has DRIFTED from production — ${total} difference(s).\n\nHover the chip for the per-object breakdown.`,
+      const scope = '\n\nThis compares SCHEMA only — tables, columns and triggers. It counts no rows, '
+        + 'so it says nothing about whether data arrived or whether production is fully backed up.';
+      showAlert(r?.empty_db
+        ? `⚠ ${c.name} is EMPTY — it has NO application tables at all (production has `
+          + `${r?.kinds?.table?.prod_count ?? '?'}).\n\nNothing was ever restored into it, or its restore `
+          + `failed. This is not drift — restore a backup into it.${scope}`
+        : total === 0
+          ? `✓ ${c.name} — schema matches production.${scope}`
+          : `⚠ ${c.name} has DRIFTED from production — ${total} SCHEMA difference(s).\n\nHover the chip for `
+            + `the per-object breakdown. A restored/cloned db is a point-in-time copy, so objects `
+            + `production migrated after its dump show as missing.${scope}`,
         { variant: total === 0 ? 'info' : 'error' });
     } catch (e) {
       setDiffing(false);

@@ -254,6 +254,23 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
                     </span>
                   )}
                   {b.dest_ctx && <span className="bkdest" title={`on docker context ${b.dest_ctx}`}>{b.dest_ctx}</span>}
+                  {/* WHAT THIS DUMP CONTAINS, and what was actually checked (TKT-22-4F0E). "is my data
+                      backed up?" is asked HERE, and the row used to answer with bytes and a path only
+                      — while the archive's own table list was already recorded and unread. State the
+                      guarantee AND its limit: the TOC is proof the tables are in the archive; nobody
+                      counted a row, so this is not a row-level completeness certificate. */}
+                  {Array.isArray(b.toc_tables) && b.toc_tables.length > 0 && (
+                    <span className="bktoc" data-testid="backup-toc"
+                          title={`This archive contains ${b.toc_tables.length} table(s) — read back out of the dump `
+                            + `itself with pg_restore --list after it was written, and checked against the previous `
+                            + `good backup (no lost schemas, no size collapse).\n\nVERIFIED: the archive is a valid `
+                            + `pg_dump, and these tables are in it.\nNOT VERIFIED: row counts. A dump's TOC lists `
+                            + `tables, not rows — so this is not a row-by-row completeness check of production.\n\n`
+                            + b.toc_tables.slice(0, 40).join(', ')
+                            + (b.toc_tables.length > 40 ? `, … +${b.toc_tables.length - 40} more` : '')}>
+                      {b.toc_tables.length} tables in archive
+                    </span>
+                  )}
                   {Array.isArray(b.tables) && <span className="bkscoped" title={`this backup captured only: ${b.tables.join(', ')}`}>scoped · {b.tables.length} table(s)</span>}
                   <span className="bkpath mono" title={b.dump_path}>{b.dump_path}</span>
                   <span className="bkacts">
