@@ -1,7 +1,7 @@
 # The work tracker — tickets + a work-item hierarchy
 
-**Status:** part 1 of 4 (schema + REST API, server only). Migrations `058_work_tracker.sql`
-and `060_work_item_schedule_sanity.sql`,
+**Status:** part 1 of 4 (schema + REST API, server only). Migrations `058_work_tracker.sql`,
+`060_work_item_schedule_sanity.sql` and `066_work_tracker_column_meanings.sql`,
 `server/src/lib/work-status.js`, `server/src/lib/work-items.js`, `server/src/lib/tickets.js`,
 routes in `server/src/api/routes.js`, test `test/work-tracker.test.mjs`.
 Parts 2–4 hang zee-assignment and the console (kanban + gantt) off exactly this contract.
@@ -185,6 +185,11 @@ about the machine pool applies to them.
 
 Nothing on the server orders by `priority` — no read model sorts on it, so there is no behaviour
 that would have broken either way. This is a **display and judgement** contract, and now it is one.
+
+It is also stated **in the database**: migration 066 puts this same sentence on
+`work_item.priority` and `ticket.priority` as a column comment (along with `progress`, the dates,
+`depth`, `status` and `ticket.number`), because `\d+ work_item` in psql is the first place somebody
+stands when they are re-deriving a meaning — and until then it answered with a range and nothing else.
 
 ## The schema (migration 058)
 
@@ -470,6 +475,20 @@ The same holds for ticket ids and for `parent_id` / `depends_on_id` / `ticket_id
 `project` in a body, each naming the field it rejected (`… is not a valid parent work item id`). An
 unknown `?status=` or `?kind=` filter is likewise a 400 listing the legal values, never a postgres
 enum cast error.
+
+**The status is carried on the error, never read out of its text.** `lib/work-items.js` exports
+`bad()` / `notFound()` / `refuse()` (400 / 404 / 409) and tags every refusal it raises;
+`httpStatusOf(err)` is what the route answers with, defaulting to 400 for anything untagged. A
+refusal raised by one of migration 058's **guard triggers** is classified by its postgres **error
+code** — `P0001` (a plpgsql `RAISE EXCEPTION`) is 409 — so a trigger message could be rewritten in
+any words, or any language, and stay a 409.
+
+This replaced a regex over the message text, which had quietly made every refusal sentence
+load-bearing prose: reword one and its HTTP status flipped with **nothing to catch it** — no test
+failing, no log line, and every client branching on 409-vs-400 wrong from then on. Pinned by
+assertions that an error stuffed with every old trigger word stays 400 when tagged 400, and a bland
+sentence stays 409 when tagged 409. (`lib/work-assign.js` already worked this way; this is part 1
+adopting its own follow-up.)
 
 ## Part 3 — putting a ZEE on a work item
 
