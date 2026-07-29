@@ -1,17 +1,26 @@
-# ZEEHIVE — handover
+# ZEEHIVE — the rationale of record
 
-Paste this into a fresh Claude Code session **opened in `D:\Repos\Zeehive`**.
+> ## ⚠ This is NOT your orientation. [`CLAUDE.md`](CLAUDE.md) is.
+>
+> **If you are a zee: read [`CLAUDE.md`](CLAUDE.md) and [`README.md`](README.md) first, and your
+> own manual at `.zeehive/harness/memory/cxell-zee-manual.md`.** Then come back here for *why*.
+>
+> This file is **history and reasoning, not instructions.** It was written as a paste-in handover
+> for a **host** Claude Code session on one Windows machine, in an earlier era of this repo, and it
+> is kept because code comments cite it and because the expensive mistakes recorded here are worth
+> not repeating. It is **not maintained as a description of the current system**.
+>
+> Zees have repeatedly read it as their briefing and gone chasing things that do not exist for
+> them — a design doc on somebody's `C:` drive, worktrees under `D:\Repos\…`, `docker --context`
+> commands, `/xell` slash-commands, MCP tools that were retired. **A caged zee has none of that**;
+> its whole toolset is the `zee` CLI. Treat any drive letter, machine name, docker context or
+> container name below as a museum piece.
+>
+> **Read it for the WHY, take the WHAT from the code.** Where the two disagree, the code is right —
+> fix the line here, do not work around it.
 
-**Every factual claim here was verified against the live system on 2026-07-15.** It will rot
-anyway — the previous version told two sessions to delete a folder that no longer existed, and
-listed as "broken" two things that had since been fixed. **Check before you trust.** If you find
-a claim that is wrong, fix the line; do not work around it.
-
----
-
-You are picking up **ZEEHIVE**, a deterministic agent-environment orchestrator. Read this whole
-file, then `README.md`, then skim the design doc at
-`C:\Users\Mark\.claude\plans\okay-so-here-is-merry-gizmo.md` (the full rationale — verified present).
+Sections are dated where the record is worth keeping. Claims marked **[stale]** are left in place,
+struck through in prose, because they explain a decision that is still load-bearing.
 
 ## What it is (vocabulary)
 
@@ -27,63 +36,40 @@ file, then `README.md`, then skim the design doc at
 Core thesis: **provisioning is 100% deterministic and belongs in a script; the AI only does the
 actual work, starting from a proven-correct environment.**
 
-## Projects (both live in the same meta-DB)
+## Projects
 
-| project | repo_root | main_branch | target_ready |
-|---|---|---|---|
-| OmniBiz | `D:\Repos\OmniBiz\omnibiz` | `main` | 3 |
-| Zeehive | `D:\Repos\Zeehive` | `master` | 0 |
+**[stale — deleted]** This section used to table the two live projects with their `repo_root`
+paths, branches and pool targets. It was wrong within days, every time. Projects, paths, branches,
+pool targets, container names and couplings are **DATA**: they live in the meta-DB and the API
+resolves them live. Read them from the console or the API, never from prose. (The same lesson,
+generalised, is house rule #7 in `CLAUDE.md`.)
 
-Zeehive orchestrates **itself** as of the rename. Its pool target is 0, so it warms nothing — it
-provisions on demand only. `/xell` resolves the project from the **invoker's cwd**; there is no
-default, and an unresolvable cwd refuses rather than guessing (that guess used to silently hand
-out an OmniBiz worktree to a session standing in this repo).
+What is worth keeping from it: **Zeehive orchestrates itself**, and `/xell` resolves the project
+from the **invoker's cwd** — there is no default, and an unresolvable cwd refuses rather than
+guessing. That guess used to silently hand a session standing in this repo a worktree belonging to
+a different project.
 
 ## Layout
 
-```
-db/migrations/*.sql      001 init · 002 monitor · 003 deploy_lock · 004 production
-                         005 container_build · 006 db_backups · 007 container_restoring
-                         008 async_backup_jobs · 009 land_gate · … · 049 prod_seed
-                         (the list stopped being maintained around 009 — read the FOLDER; it is
-                          forward-only and filename-ordered, so the newest number is the truth)
-server/src/
-  db/        migrate.js, seed.js, seed_demo.js  ← seed_demo is DEAD to us (see House rules)
-  api/routes.js          all HTTP routes
-  queenzee/  pool (reconciler), intake (claim+dispatch), landing, poller, monitor, containers,
-             reaper, tasks, maintenance, deploylock, shipgate + shipmigrate (code+schema to prod),
-             seedgate (DATA to prod: an approved seed file the queenzee runs), self (cxell verbs)
-  lib/       fleet, timeline, git, sessions, session-title, claude-cli, provision, project-resolve,
-             rename-xell, build, xell-db, reveal, runtimes, names, projects, logbus, events, status
-web/src/     App.jsx, Container.jsx (reusable chip), GitRail.jsx, Connectors.jsx, Backups.jsx,
-             ProjectMenu.jsx, Terminal.jsx (queenzee log modal), nick.js, api.js, styles.css,
-             ZeeTerminal.jsx (the live cxell terminal: clipboard tray, file explorer, feed chips),
-             Landing.jsx / Ship.jsx / ProdData.jsx — the three human GATES (main · prod code · prod data)
-mcp/server.js            MCP server wrapping the API
-skill/xell, skill/xell-done   source of the slash-command skills (installed copies live in
-                              ~/.claude/skills/ — edit BOTH or they drift)
-scripts/     provision-xell.sh, provision-xell-db.sh, despawn-xell.sh, land-xell.sh,
-             rename-xell.sh, build-container.sh, check-containers.sh, xell-*.mjs
-```
+**Current layout: [`CLAUDE.md` §4](CLAUDE.md).** The copy that used to live here listed migrations
+up to `049`, two skills and half of `lib/` — it drifted, as any hand-maintained tree does.
+
+The rule that made it drift is the one to keep: **`db/migrations/` is forward-only and
+filename-ordered, so the FOLDER is the truth** and the newest number is the tip. Never enumerate it
+in a doc.
 
 ## Run it
 
-Meta-DB is Postgres on the `ugreen-nas` Docker context: container **`zeehive_db`** at
-`10.1.0.18:5445` (`.env` → `DATABASE_URL`). It was migrated from the old `xeehive_db` by
-pg_dump/pg_restore, verified table-by-table.
+**[stale]** The meta-DB was on the `ugreen-nas` Docker context when this was written; it was
+migrated onto the local daemon on 2026-07-18, and later the whole stack became self-starting from
+published images. **For how to run it today see [`README.md`](README.md) (self-start) and
+[`docker/zeehive/README.md`](docker/zeehive/README.md) (what runs where in production); to run it
+inside a xell see [`CLAUDE.md` §3](CLAUDE.md).**
 
-```bash
-npm install
-docker --context ugreen-nas compose up -d db     # compose pins `name: zeehive` — do not remove it
-# Mark's standard run — REAL provisioning, pool on, no app tier:
-PROVISION_MODE=real PROVISION_APP_TIER=false POOL_ENABLED=true POLLER_ENABLED=false \
-  NODE_NO_WARNINGS=1 node server/src/index.js
-npm --workspace web run dev                       # dashboard on http://localhost:5180
-```
-
-`docker-compose.yml` pins `name: zeehive` deliberately: compose otherwise derives the volume
-prefix from the **folder name**, so moving the repo would make it look for a volume that doesn't
-exist and quietly start an **empty meta database**.
+One detail from here that still matters: `docker-compose.yml` pins `name: zeehive` deliberately —
+compose otherwise derives the project name, and therefore the **volume prefix**, from the folder it
+is run from, so renaming or moving the repo would make it look for a volume that doesn't exist and
+quietly start an **empty meta database**. Do not remove that pin.
 
 Flags: `PROVISION_MODE=real|simulate` · `PROVISION_APP_TIER` (false = worktree only, no NAS
 containers) · `POOL_ENABLED` · `POLLER_ENABLED` · `BUILD_MODE=real|simulate` · `ZEE_MODEL`
@@ -198,10 +184,15 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
     and "the zee just wrote five new files and hasn't committed" is exactly when this is opened.
   - Capped three ways (whole payload / per file / file count) and every cap is *reported* on the
     card, never silently applied. Test: `node test/diff-viewer.test.mjs`.
-- **Installed for OmniBiz only.** `.git/hooks` is machine-local and not version-controlled, so it
-  does NOT travel with a clone — re-run the installer per machine, and after any `main_branch`
-  change (the protected ref is baked in). Zeehive's own repo is NOT gated yet.
-  - status: `bash scripts/install-land-gate.sh --status D:/Repos/OmniBiz/omnibiz`
+- **Installation is per machine, because `.git/hooks` is.** ~~Installed for OmniBiz only; Zeehive's
+  own repo is NOT gated yet~~ — **[superseded]**: onboarding a project by CLONE now installs the
+  gate itself (`lib/projects.js` runs `scripts/install-land-gate.sh` best-effort, and reports a
+  warning rather than rolling back if it fails), and that includes ZEEHIVE's own self-onboard.
+  Onboarding an existing FOLDER still leaves it manual. The underlying fact is unchanged and is why
+  the installer exists: `.git/hooks` is machine-local and not version-controlled, so the gate does
+  **not** travel with a clone — re-run the installer per machine, and after any `main_branch` change
+  (the protected ref is baked in).
+  - status: `bash scripts/install-land-gate.sh --status <repo path>`
   - override (human, on purpose): `git -c core.hooksPath=/dev/null push . HEAD:main`
 
 ## Shipping to production (the zee asks; the QUEENZEE ships)
@@ -356,6 +347,28 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   payload — the manager hexagon reads its art from it — but `badgedHarnesses()` seats no cell for it
   and `Connectors` routes no wire. Workers are unchanged (in both lists).
   Test: `node test/harness-manager-cell.test.mjs`.
+- **A file-backed harness lives in the ZEEHIVE PROJECT's repo, not in the server image**
+  (2026-07-29, ticket #1 — "manager zee has no manual at all"). `harness.dir` ('harnesses/manager')
+  is relative to `project.repo_root` (the clone self-onboard registers), NOT to `config.repoRoot`,
+  which is only where the running server's code sits. On a checkout they are the same folder — which
+  is why every test passed while the DEPLOYED queenzee shipped manager zees with an EMPTY harness:
+  `Dockerfile.server` copies `server/ scripts/ db/ hooks/ skill/` and deliberately **not**
+  `harnesses/` (one copy of the files, in the repo the DB row projects — same reasoning as the single
+  copy of `scripts/zee`), so `/app` had no harness folders and `refreshHarnesses()` kept the empty
+  seed bundle. `GET /api/harnesses/manager/full` returned `""` for persona, summary, glyph, and no
+  skills or memory at all. Fixed in `lib/harness.js`: ONE resolution (`harnessRoots()` /
+  `harnessBase()` — project repo roots first, self project first, `config.repoRoot` always last and
+  never absent) shared by `loadHarnessDir()`, its hash re-read, `dirHeadCommit()`, the avatar
+  (`harnessAvatarFile()`, which `GET /api/harnesses/:key/avatar` now calls) and the read models. A
+  root only wins if the folder is actually there, so a stale `repo_root` falls through instead of
+  blanking a harness. **Do NOT "fix" this by COPYing `harnesses/` into the image** — a second copy
+  drifts from the repo the row claims to project.
+  And it is no longer SILENT: an unreadable folder still keeps its last good bundle, but logs
+  `FOLDER MISSING` (queenzee log + stdout) naming the key, the roots searched and how many live
+  xells wear it, and `GET /api/harnesses` / `…/full` carry `files_missing` + `bundle_empty` so a
+  harness that briefs a zee with nothing is visible instead of looking healthy.
+  Test: `node test/harness-repo-root.test.mjs` (reproduces the container: a `config.repoRoot` with
+  no `harnesses/` + a project `repo_root` that has them).
 - Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
   messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
   over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
@@ -540,33 +553,54 @@ were both verified working — it is not the install, and reinstalling is a wast
    needs a xell with commits ahead of its xource. Use a DUMMY, targeted by explicit slug (House
    rule: never test on live xells).
 
-1. **Delete the leftover `D:\Repos\Xeehive`** — Zeehive was built fresh from the pushed commit
-   because the folder could not be renamed while a Claude Code session held it as its cwd. The old
-   folder is a clean, fully-pushed duplicate holding nothing unique. Run
-   `pwsh -File D:\Repos\remove-old-xeehive.ps1` (it refuses unless the new folder is complete).
-   *This is the third time a rename has left a leftover — Originode → Xeehive → Zeehive.*
-2. **Drop the meta-DB rollback** once you're confident: container `xeehive_db` (stopped) and
-   volume `xeehive_xeehive_pgdata` on `ugreen-nas` are the pre-migration copy, kept on purpose.
-3. **Dispatch is one-shot** (open decision). A dispatched zee runs exactly one `query()` turn and
-   then idles until a human prompts it — Mark: *"the zees are really slow, I have to keep prompting
-   them back."* Either add a continuation loop in `spawnHeadless`, or keep one-shot and size tasks
-   to fit one turn. Not decided.
-4. **Zeehive's pool target is 0** — set `pool_config.target_ready` if you want it warming xells.
-5. **Skills are duplicated, and they HAVE already drifted** — `skill/` in the repo vs the
-   installed `~/.claude/skills/`. Not hypothetical: as of 2026-07-15 `skill/xell/SKILL.md` is 33
-   lines and the installed copy is 61 — the installed one has the claim GATE, the project-handover
-   note and the build rules; the repo copy has none of them. **The installed copy is what actually
-   runs**, so treat it as authoritative and back-port, don't overwrite it with the repo's. (The
-   landing-gate text was added to both.) Worth making the repo the source and installing from it.
+1–2. **[closed — old-repo housekeeping, deleted.]** These were one machine's chores from the
+   `Xeehive` → `Zeehive` rename: delete a leftover `D:\Repos\Xeehive` folder with a PowerShell
+   script, and drop a stopped pre-migration meta-DB container kept as a rollback. Both are long
+   gone — the meta-DB moved off that host on 2026-07-18, and the stack now self-starts from
+   published images. **They are the reason this file got a warning banner**: a zee orienting on
+   HANDOFF read them as live work and went looking for drives it cannot see. The durable lesson,
+   and all that is worth keeping: *a rename leaves a leftover every single time* (Originode →
+   Xeehive → Zeehive), so plan the cleanup as part of the rename, not after it.
+
+3. **Dispatch is one-shot** (open decision, 2026-07-15 — **check before you trust**; the nudge/
+   resume paths in `queenzee/nudge.js` have moved a long way since). A dispatched zee ran exactly
+   one `query()` turn and then idled until a human prompted it — *"the zees are really slow, I have
+   to keep prompting them back."* Either a continuation loop in `spawnHeadless`, or keep one-shot
+   and size tasks to fit one turn. What DID land in this space: a background `--wait` exiting
+   re-invokes the session, and the queenzee resumes a zee's session for a stale landing or a
+   post-ship reflection — i.e. "something ended" is the nudge, rather than a polling loop.
+
+4. **Pool targets are DATA** (`pool_config.target_ready`), per project — read them from the
+   console, not from here. A target of 0 warms nothing and provisions on demand only.
+
+5. **Duplicated copies of a thing an agent runs WILL drift** — the single most repeated failure in
+   this repo. Recorded here as `skill/` in the repo vs the installed `~/.claude/skills/` (2026-07-15:
+   33 lines vs 61 — the installed copy had the claim gate, the project-handover note and the build
+   rules; the repo copy had none of them, and the installed copy is what actually ran). The same
+   bug then recurred one layer down and stranded a manager zee in its cage, with a hand-synced
+   duplicate of the cxell CLI baked into the agent image.
+   **The fix, now enforced:** there is exactly ONE copy of `scripts/zee`, the image COPYs it, the
+   queenzee installs it at spawn — and `test/cxell-cli-drift.test.mjs` fails if a duplicate is
+   reintroduced or if the CLI, the routes, the briefing and the manual drift apart. Apply the same
+   rule to anything else an agent reads: one source, asserted by a test. A comment saying "update
+   both" is not a mechanism.
 
 ## How to talk to it as an agent
+
+⚠ **This section is the HOST surface only.** A caged zee has none of it — no slash-commands, no
+MCP, no `scripts/`. Its entire toolset is the `zee` CLI; see `CLAUDE.md` §2 and the manual delivered
+into every xell at `.zeehive/harness/memory/cxell-zee-manual.md`.
 
 - `/xell <task>` — claims a ready xell **only if your cwd IS its worktree**; otherwise it refuses
   and offers a confirmed dispatch (`scripts/xell-dispatch.mjs`, `--mode 1..5`, default 5=bypass;
   `--attended`; `--db`/`--dump`/`--db-container`).
 - `/xell-done` — marks this xell done and tears it down.
 - MCP (`mcp/server.js`): `zeehive_get_context`, `zeehive_status`, `zeehive_report_done`,
-  `zeehive_prod_lock_{acquire,release,status}`.
+  `zeehive_build{,_status,_contexts}`, `zeehive_set_build_context`, `zeehive_ooney`,
+  `zeehive_ship_{request,status}`, `zeehive_seed_request`, `zeehive_prod_lock_status` (read-only).
+  ~~`zeehive_prod_lock_{acquire,release}`~~ are **gone** — the zee-driven lock path was retired with
+  the ship gate (see "Shipping"), and this line contradicted that section for a while. Read the
+  tool list from `mcp/server.js`, not from here.
 
 The web app is **read-only** (no prompting there); the **▚_ terminal** button by "Status" opens a
 live queenzee activity log.
