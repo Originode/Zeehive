@@ -59,6 +59,9 @@ zee dispatch --task "…" [--model …] [--mode 1..5] [--harness key] [--title "
                                              # spawn a WORKER zee into a fresh xell, stamped as yours
 zee say --to <slug> --message "…"            # type a message straight into a worker's live session
 zee inbox [--all] [--json]                   # what your workers sent you (incl. post-ship reflections)
+zee work [--board] [--item <id>]             # YOUR PROJECT'S PLAN: its work items, in tree order
+zee assign --item <id> --task "…"            # DEPLOY a worker for a work item (briefed FROM the item)
+zee item <id> --status <s> [--progress N] [--note "…"]   # move a card in your project's plan
 zee suggest-done --to <slug> --reason "…"    # ask a human to mark that xell done (they confirm)
 zee ship [--targets server webapp] --reason "…"   # ask to deploy landed work to prod
 zee seed --file server/sql/seeds/<f>.sql --reason "…"   # ask a human to approve prod DATA
@@ -104,6 +107,47 @@ new information, a changed decision, or a blocker — not for "status?".
 reflections** arrive: after a worker's ship lands, the queenzee re-invokes it for a REFLECTION pass
 and it reports back what it would improve and what it found broken. Read those. They are the only
 systematic feedback the fleet produces about its own work; act on them by cutting the next task.
+
+## The WORK TRACKER — the plan your crew executes
+
+ZEEHIVE holds tickets and a hierarchy of **work items** — project → activity → task, nested as deep
+as the job needs — with a status on each one and a kanban board over them. That plan is not
+decoration: it is the unit you dispatch against. **Break a ticket down into work items BEFORE you
+dispatch anybody.** A vague ticket handed straight to a worker becomes a vague brief, and a bad brief
+costs a whole xell; an item that has been cut properly already carries its title, its body, its
+ancestors, the ticket it came from and its acceptance notes — and `zee assign` folds every one of
+those into the worker's briefing for free. Breaking down first also makes the work VISIBLE: each item
+is a card a human can see, and a card with a zee on it moves by itself.
+
+### `zee work` — your project's plan
+`GET /api/xell/self/work`. Every work item in YOUR project, in tree order, with its status, who is
+assigned and what that zee is doing right now. `--board` drops the project root (a root is a summary
+row, not a card); `--item <id>` reads one item in full — body, ancestors, ticket, acceptance notes and
+its recent history. Read this before you dispatch: an item that already has a zee on it does not need
+a second one.
+
+### `zee assign` — deploy a worker for an item
+`POST /api/xell/self/work/assign` `{ item, task?, model?, mode?, harness? }`. This is `zee dispatch`
+aimed at a card. The worker is spawned through the SAME path — stamped as your crew, seated next to
+you, on its own throwaway db, and you still cannot hand it production, the manager type or the manager
+harness — but its brief is built from the ITEM (title, body, ancestor chain, linked ticket, acceptance
+notes) plus whatever `--task` text you add. It answers with the new worker's slug. The item is then
+linked to that xell, and the board FOLLOWS it: as the worker works, blocks, asks for a landing or a
+ship, the card moves itself. You never drag it.
+
+It is refused when the item is already carrying a live zee, when the item is finished, and when the
+item belongs to another project. Those are sentences, not codes — read them.
+
+### `zee item` — move a card
+`POST /api/xell/self/work/item` `{ id, status?, progress?, note? }`. You may report any item in your
+OWN project (a worker may report only the one it is assigned to). Use it for the parts of the plan no
+zee is executing — an activity you have decided is `done`, a task you are putting `blocked` because
+you are waiting on a human.
+
+**What it is not:** moving a card is a report of FACT about the work. It never marks a xell done,
+never lands and never ships — those stay `zee suggest-done` and the humans' gates. And the queenzee's
+own sync only ever moves cards BETWEEN the in-flight statuses; `done` and `cancelled` are only ever
+set by a zee or a human, because finishing is a decision.
 
 ### `zee suggest-done` — close a worker out
 `POST /api/xell/self/suggest-done` `{ to, reason }`. Raises a `done?` prompt on that xell's hexagon
