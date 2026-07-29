@@ -3,9 +3,10 @@
 // The lint next door (test/migration-numbers.test.mjs) refuses a duplicate that has already been
 // written. This is the verb that means a zee never writes one: a cxell zee reads db/migrations/ in its
 // OWN worktree, which knows what is LANDED and what IT wrote and nothing about the siblings writing
-// migrations on branches it cannot see — five numbers were claimed twice exactly that way (038, 066,
-// 079, 082, 085). Only the queenzee can see main AND every live xell's worktree, so it hands the
-// number out and RECORDS the claim, which is what makes two asks seconds apart answer differently.
+// migrations on branches it cannot see — six numbers were claimed twice or more exactly that way (038,
+// 066, 079, 082, 085, and 086 by three xells in one evening). Only the queenzee can see main AND
+// every live xell's worktree, so it hands the number out and RECORDS the claim — which is what makes
+// two asks seconds apart answer differently.
 //
 // Exercised for real, against DATABASE_URL: a temp git repo standing in for the xource (with two
 // files already claiming 085, because that is the history), two real git worktrees, one of them

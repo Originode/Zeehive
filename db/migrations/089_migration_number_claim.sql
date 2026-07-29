@@ -3,10 +3,10 @@
 -- The folder IS the ledger and the FILENAME is its only ordering, so the number in front of a
 -- migration is its apply order. A cxell zee chooses that number by reading db/migrations/ in its own
 -- worktree — which knows what is landed and what IT wrote, and nothing whatever about the siblings
--- writing migrations on branches it cannot see. Five collisions came out of that: 038, 066, 079, 082
--- and 085, the last pair applying in a single boot on the shipped tip, in whatever order a string
--- sort gave two names that were meant to be identical. git never showed a conflict, because two files
--- that never touch each other do not have one.
+-- writing migrations on branches it cannot see. Six numbers came out of that: 038, 066, 079, 082, 085
+-- (that pair applying in a single boot on the shipped tip, in whatever order a string sort gave two
+-- names that were meant to be identical) and then 086, claimed by THREE xells in one evening. git
+-- never showed a conflict, because two files that never touch each other do not have one.
 --
 -- The queenzee is the only party that can see the whole picture (main, plus EVERY live xell's
 -- worktree), so `zee migration-number` asks it — and this table is the third input: a number handed
@@ -76,8 +76,8 @@ BEGIN
     || E'`POST /api/xell/self/migration-number`. `db/migrations/` IS the ledger and the FILENAME is its\n'
     || E'only ordering, so the number in front of a migration is its apply order. Your worktree can only\n'
     || E'show you what is LANDED plus what you wrote — never the four siblings writing migrations on\n'
-    || E'branches you cannot see. That is not a theory: five numbers have been claimed twice (038, 066,\n'
-    || E'079, 082, 085), the last pair applying in a single boot, and git showed no conflict either time\n'
+    || E'branches you cannot see. That is not a theory: six numbers have been claimed twice or more (038,\n'
+    || E'066, 079, 082, 085 — and 086 by THREE xells in one evening), and git showed no conflict any time\n'
     || E'because two files that never touch each other do not have one.\n'
     || E'\n'
     || E'So ASK, before you name the file. The queenzee unions three things it can see and you cannot:\n'

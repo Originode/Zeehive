@@ -9,8 +9,13 @@
 // WHY IT KEEPS HAPPENING (ticket #9): a cxell zee reads db/migrations/ in its OWN worktree, takes the
 // next free number, writes the file and lands. Every sibling zee working at the same hour does the
 // same, and none of them can see the others' branches — so two 038s, two 066s, two 079s, two 082s and
-// finally two 085s landed, the last pair applying in a single boot on the shipped tip. git shows no
+// then two 085s landed, the last pair applying in a single boot on the shipped tip. git shows no
 // conflict for two files that never touch each other.
+//
+// And then it happened AGAIN, under this file, while it was being written: 086 was claimed by THREE
+// separate xells (a stale-backup alert, a harness scope guard and a land-clearance fix) inside one
+// evening, and the guard's first act after a `zee sync` was to fail on them. Six numbers now, one of
+// them three ways — which is the argument for the claim verb rather than better manners.
 //
 // The FIX has two halves and this file is the second one:
 //   * a zee gets a number it can trust from the queenzee, which CAN see every live xell —
@@ -18,11 +23,11 @@
 //   * and if a duplicate is ever written anyway, THE BUILD SAYS SO — here — instead of postgres
 //     deciding the order quietly.
 //
-// The five landed pairs are GRANDFATHERED, not renumbered: a forward-only ledger is already applied
+// The landed collisions are GRANDFATHERED, not renumbered: a forward-only ledger is already applied
 // everywhere, so renaming a landed file desynchronises `schema_migrations` on every database that
 // has run it (the same reasoning test/harness-memory-migrations.test.mjs grandfathers its six
 // offenders with). The list below is the RECORD of the bug, not permission to add to it — and each
-// entry is checked to still BE a duplicate, so it cannot rot into a licence for a new one.
+// entry is checked to still BE that exact set, so it cannot rot into a licence for a new one.
 import { readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +48,9 @@ const GRANDFATHERED = {
   '079': ['079_manager_manual_readonly_workspace.sql', '079_manual_shell_safe_bodies.sql'],
   '082': ['082_env_cxell_projection.sql', '082_harness_avatars_into_meta_db.sql'],
   '085': ['085_manager_manual_harness_verbs.sql', '085_snapshot_row_counts.sql'],
+  // Three xells, one evening, none able to see the others — landed while this lint was being written.
+  '086': ['086_backup_stale_alert_state.sql', '086_harness_scope_guard_children.sql',
+          '086_land_clearance_silence.sql'],
 };
 
 // The whole check, as a function of a FILE LIST — so the samples below run through the identical
@@ -62,7 +70,7 @@ function collisions(files) {
 }
 
 // The sentence a future author reads when the suite goes red. It names the verb, because "pick
-// another number" is exactly the instruction that produced five collisions.
+// another number" is exactly the instruction that produced every one of these collisions.
 const FIX = 'RENUMBER it before landing, and get the number from the queenzee — `zee migration-number` '
   + 'accounts for what is landed AND what every other live xell has claimed, which your own worktree cannot.';
 
@@ -81,16 +89,16 @@ for (const c of found.filter((c) => !known.has(c.number))) {
     + `ordering is the filename, so postgres would apply these in whatever order a string sort gives. ${FIX}`);
 }
 ok(found.every((c) => known.has(c.number)),
-   `no migration number is claimed twice, apart from the ${known.size} landed pairs below`);
+   `no migration number is claimed twice, apart from the ${known.size} landed collisions below`);
 
 // A grandfathered entry must still describe a real duplicate. Otherwise the list quietly becomes a
 // blanket permit for that number — and 086 is written by a zee reading this file, not by this file.
-console.log('\n── and the grandfathered pairs are still exactly what the list says ──');
+console.log('\n── and the grandfathered collisions are still exactly what the list says ──');
 for (const [number, expected] of Object.entries(GRANDFATHERED)) {
   const actual = found.find((c) => c.number === number);
   ok(!!actual, `${number} is still a duplicate (if it is not, DELETE its line — a stale entry permits a new collision)`);
   ok(actual && actual.files.join(' + ') === [...expected].sort().join(' + '),
-     `${number} is the known pair: ${[...expected].sort().join(' + ')}${actual ? ` (found: ${actual.files.join(' + ')})` : ''}`);
+     `${number} is the known collision: ${[...expected].sort().join(' + ')}${actual ? ` (found: ${actual.files.join(' + ')})` : ''}`);
 }
 
 console.log('\n── the guard fires (samples, not files) ──');

@@ -612,9 +612,10 @@ export async function selfCatchup(xell, { restore = false } = {}) {
 
 // ── POST /api/xell/self/migration-number — hand out the next free db/migrations number ──
 // The one question a caged zee genuinely cannot answer: its worktree shows what is LANDED plus what
-// it wrote, and nothing about the siblings writing migrations on branches it cannot see. Five numbers
-// have been claimed twice because of that (ticket #9). The queenzee can see main AND every live
-// xell's worktree, so it answers — see lib/migration-numbers.js for the three sources it unions.
+// it wrote, and nothing about the siblings writing migrations on branches it cannot see. SIX numbers
+// have been claimed twice or more because of that (ticket #9) — 086 by three xells in one evening. The
+// queenzee can see main AND every live xell's worktree, so it answers — see lib/migration-numbers.js
+// for the three sources it unions.
 //
 // NOT gated, and ADVISORY: it hands out a number, it does not gate a landing (the lint in
 // test/migration-numbers.test.mjs is what fails the build if a duplicate lands anyway). Same class as
