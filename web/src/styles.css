@@ -948,6 +948,15 @@ a.cbox:hover { border-color: var(--accent); }
 /* a folded rider: informational, riding a carrier's single deploy — no actions of its own. */
 .ship-deferred.bundled { border-left-color: var(--building); color: var(--building); }
 
+/* REFUSED asks: a zee asked to ship and the gate said no, so no card exists to approve. Quiet and
+   informational — it answers "did anyone even ask?", which an empty panel used to answer wrongly. */
+.ship-refused { background: var(--panel2); border: 1px dashed var(--line); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 8px; }
+.ship-refused-head { color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.ship-refused-row { color: var(--muted); font-size: 12.5px; margin-top: 5px;
+  border-left: 2px solid var(--muted); padding-left: 8px; cursor: help; }
+.ship-refused-row b { color: var(--text); }
+
 /* prod is locked: why the plain approve is greyed out, and the unlock-&-ship escape hatch. */
 .ship-locked-note { color: var(--building); font-size: 12.5px; margin-top: 8px;
   border-left: 2px solid var(--building); padding-left: 8px; }

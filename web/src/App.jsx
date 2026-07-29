@@ -753,7 +753,7 @@ export default function App() {
       {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
           both are decisions only a human may make, and both block a zee until made. */}
       <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock} shipLogs={shipLogs}
-                 projectId={projectId || project.id} onDecided={refresh}
+                 refused={fleet.ship_refused} projectId={projectId || project.id} onDecided={refresh}
                  onForwardToZee={(xell, text) => setMsgXell({ ...xell, initialText: text })} />
 
       {/* THE LANDING PAD — every landing + shipment in one chronological FIFO queue, with the item

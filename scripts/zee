@@ -157,8 +157,31 @@ function req(method, path, body) {
   });
 }
 
-function out(r) {
+// Print the queenzee's answer — and, when the answer is "no", SAY SO and exit non-zero.
+//
+// Every verb here is a request that can be declined, and a decline comes back HTTP 200 with
+// `ok:false` (the call worked; the thing you asked for did not happen). The old out() printed that
+// JSON and exited 0, so a refusal looked exactly like a success: same shape, same green exit. A zee
+// whose `zee ship` was refused for unlanded work would relay "the ship request is waiting for your
+// approval" to a human who had nothing on their screen, because nothing had been raised. Reported
+// as "xells insist they have ship requests… i see zero".
+//
+// So: `ok:false` is a FAILED command. It prints the full JSON (nothing is hidden), then one
+// unambiguous line naming what did not happen, and exits 1 — which is also what makes `zee x || …`
+// and a harness's exit-code nudge tell the truth.
+function out(r, what = cmd) {
   console.log(JSON.stringify(r.json, null, 2));
+  const j = r.json || {};
+  if (r.code < 400 && j.ok === false) {
+    const why = j.reason || j.error || j.message || 'the queenzee declined it';
+    console.error(`\n  ✗ ${String(what).toUpperCase()} DID NOT HAPPEN: ${why}`);
+    if (j.refused) {
+      console.error('    NOTHING was raised and NOTHING is awaiting a human — there is no request in the');
+      console.error('    console for anyone to approve. Do not report this as pending: fix the reason above,');
+      console.error('    then ask again.');
+    }
+    process.exit(1);
+  }
   process.exit(r.code >= 400 ? 1 : 0);
 }
 
@@ -327,7 +350,17 @@ switch (cmd) {
   case 'ship': {
     const reason = flag('reason'); const targets = multi('targets');
     if (!reason) { console.error('ship needs --reason "what you are shipping"'); process.exit(1); }
-    out(await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) }));
+    const r = await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) });
+    // Say in ONE plain sentence whether a request now exists, before out() decides the exit code.
+    // The whole failure this fixes was a zee reading a JSON blob and telling its human the opposite
+    // of what it said — so the sentence a zee is most likely to relay is printed for it.
+    if (r.code < 400 && r.json?.ok !== false && r.json?.request) {
+      const q = r.json.request;
+      console.log(`\n  ✓ ship request ${String(q.id).slice(0, 8)} is ${q.status} @ ${String(q.commit).slice(0, 8)}`
+        + ' — a human decides it in the ZEEHIVE console.');
+      if (r.json.note) console.log(`    (${r.json.note})`);
+    }
+    out(r, 'ship');
     break;
   }
   case 'hint-land': case 'hint-ship': {

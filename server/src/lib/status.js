@@ -203,6 +203,52 @@ export async function hintOpen(xellId, kind) {
   return row?.hook_event_name === `${kind}hint-request`;
 }
 
+// ── a ship ask that was REFUSED (the one ask that used to leave no trace) ──────
+// `requestShip` can refuse outright — the work is not landed, the tree is dirty, the ship ref will
+// not resolve — and when it does, NO ship_request row exists. That was the whole of the record: a
+// line in the queenzee's ring-buffer log, gone on the next restart. So a zee could ask to ship, be
+// refused, tell its human "the ship request is waiting for you", and the human would open the
+// console and see nothing at all — because there was nothing to see. Reported as "xells insist they
+// have ship requests… i see zero".
+//
+// A refusal is now RECORDED, on the same append-only session_event ride tend/hints use (no DDL,
+// the shared schema is frozen): latest-event-wins between 'ship-refused' and 'ship-refused-clear',
+// with the reason in raw. It is not a gate and not a request — nothing is held and nothing is
+// pending. It is evidence, so the answer to "did anyone ask?" is a fact on the screen rather than
+// a zee's word against an empty panel. A successful request (or a decided one) clears it.
+export async function setShipRefusal(xellId, reason, { zeeId = null, source = 'self' } = {}) {
+  const why = storeReason(reason);
+  await recordEvent({
+    source, hook_event_name: 'ship-refused',
+    zee_id: zeeId, xell_id: xellId, raw: why ? { reason: why } : null,
+  });
+  broadcast('xell', { id: xellId });
+  return { xell_id: xellId, refused: true, reason: briefReason(why), reason_full: why };
+}
+
+// The refusal stops being true the moment a real request exists (or the zee lands the work), so
+// clearing is part of the same verb rather than a human's chore.
+export async function clearShipRefusal(xellId, { zeeId = null, source = 'self' } = {}) {
+  await recordEvent({
+    source, hook_event_name: 'ship-refused-clear',
+    zee_id: zeeId, xell_id: xellId, raw: null,
+  });
+  broadcast('xell', { id: xellId });
+  return { xell_id: xellId, refused: false };
+}
+
+// The xell's last ship ask, if it was refused and nothing has superseded it. Same shape as
+// tendState: brief line for a chip, full text for the opened ask.
+export async function shipRefusalState(xellId) {
+  const row = await one(
+    `SELECT hook_event_name, ts, raw->>'reason' AS reason FROM session_event
+       WHERE xell_id = $1 AND hook_event_name IN ('ship-refused','ship-refused-clear')
+       ORDER BY ts DESC LIMIT 1`, [xellId]);
+  const refused = row?.hook_event_name === 'ship-refused';
+  const { brief, full } = refused ? reasonPair(row.reason) : { brief: null, full: null };
+  return { refused, reason: brief, full, at: refused ? row.ts : null };
+}
+
 // A zee PINGS that it is actively working. Mirrors what a harness UserPromptSubmit hook would do
 // (Channel A is not installed for cxell zees), so the hive can show live activity even when the
 // passive poller is blind to a cxell. Reporting work also CLEARS any open tend — asking for a human
