@@ -13,6 +13,14 @@ if [ "${DOCKER_FAKE_EARLY_CLOSE:-}" = "1" ] && [ ! -t 0 ]; then
   head -c 16 >/dev/null 2>&1 || true
   exit 0
 fi
+# SLOW-STDIN simulation: the argv line above is on disk the instant docker starts, but the PROMPT
+# only reaches the log after this process has finished reading stdin. On a loaded box that gap is
+# real, and a test that asserts on the prompt after merely seeing `--resume` reads the gap as a
+# broken protocol (ticket #19 — the go-around "flake"). This knob makes the gap deterministic so a
+# wait that is too loose fails every time instead of one run in thirty.
+if [ -n "${DOCKER_FAKE_SLOW_STDIN_MS:-}" ]; then
+  sleep "$(awk "BEGIN{print ${DOCKER_FAKE_SLOW_STDIN_MS}/1000}")"
+fi
 # read stdin (the resume prompt) if any, record it
 if [ ! -t 0 ]; then
   IN="$(cat)"
