@@ -468,10 +468,12 @@ try {
     for (const c of ["case 'work'", "case 'assign'", "case 'item'"]) ok(cli.includes(c), `the zee CLI has ${c}`);
     ok(/zee work \[--board\]/.test(cli) && /zee assign --item/.test(cli), 'and its usage text names them');
 
-    // 059 and the manager harness FILE are two copies of ONE manual — they must say the same words.
+    // 059 patched the manual through SQL; since 080 the meta-DB is the only copy of it, so the words
+    // 059 writes must be verbatim in the ROW (this used to compare against harnesses/manager/…, a
+    // file that no longer exists).
     const sql = readFileSync('db/migrations/059_work_tracker_verbs.sql', 'utf8');
-    const manualPath = 'harnesses/manager/memory/manager-zee-manual.md';
-    const manual = readFileSync(manualPath, 'utf8');
+    const manual = (await client.query(
+      `SELECT harness_memory_get('manager','memory/manager-zee-manual.md') AS t`)).rows[0].t;
     const decode = (s) => s.replace(/''/g, "'").replace(/\\n/g, '\n');
     // Each `txt := replace(txt, E'anchor', E'…' || E'…')` call: the first E-literal is the anchor,
     // the rest are the replacement. Split on the CALLS (not on a ');' inside the markdown — the
@@ -484,12 +486,12 @@ try {
     ok(mgrReps.length === 2, `059's manager block makes ${mgrReps.length} anchored replacements`);
     for (const r of mgrReps) {
       ok(manual.includes(r.replacement),
-         `what 059 writes is VERBATIM in the harness file ("${r.replacement.split('\n')[0].slice(0, 46)}…")`);
+         `what 059 writes is VERBATIM in the manual the meta-DB holds ("${r.replacement.split('\n')[0].slice(0, 46)}…")`);
     }
     // …and prove it end to end: reverse-apply 059 to the file to get the manual as it stood BEFORE,
     // seed the row with that, run the block, and the row must come back byte-for-byte the file.
     const before = mgrReps.reduce((t, r) => t.split(r.replacement).join(r.anchor), manual);
-    ok(before !== manual, 'the migration is reversible on the file (so the "before" text is exact)');
+    ok(before !== manual, 'the migration is reversible on that text (so the "before" is exact)');
     const saved = (await client.query(`SELECT bundle FROM harness WHERE key='manager'`)).rows[0]?.bundle ?? null;
     try {
       const block2 = sql.slice(sql.indexOf('-- ── (2)'));

@@ -357,7 +357,10 @@ export async function createHarness({ key, label, glyph, zee_type } = {}) {
   return getHarnessFull(k);
 }
 
-export async function updateHarness(key, patch = {}) {
+// `mode` rides through to the live re-injection for the same reason refreshHarnesses took one: the
+// write into a running cxell is a real side effect, and a NESTED queenzee (a zee running the server
+// inside its own xell, whose fleet rows are the REAL fleet's) must only ever report it.
+export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } = {}) {
   const h = await one(`SELECT * FROM harness WHERE key=$1`, [key]);
   if (!h) throw new Error(`no harness "${key}"`);
   if (h.is_law_core) throw new Error('the core (law) harness is not editable');
@@ -387,9 +390,17 @@ export async function updateHarness(key, patch = {}) {
     }
     await q(`UPDATE harness SET parent_id=$2 WHERE key=$1`, [key, pid]);
   }
+  const hash = hashOf(JSON.stringify(bundle));
   await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5 WHERE key=$1`,
-    [key, JSON.stringify(bundle), label, enabled, hashOf(JSON.stringify(bundle))]);
+    [key, JSON.stringify(bundle), label, enabled, hash]);
   logline('harness', `updated harness "${key}" (${(bundle.skills || []).length} skill(s), ${(bundle.memory || []).length} memory)`);
+  // A SAVE IS NOW THE ONLY WAY THE TEXT MOVES, so it is also what has to reach the zees ALREADY
+  // RUNNING. While a folder was the source, the boot refresh noticed the change and pushed it in;
+  // with the row as the source that path is gone, and without this an operator fixing a manual would
+  // fix it for the NEXT zee only — the exact "new zees only" failure that left a whole fleet briefed
+  // on stale text (test/harness-reinject-live.test.mjs). Guarded on the hash so a no-op save writes
+  // nothing into anyone's workspace, and PROVISION_MODE-guarded inside.
+  if (hash !== h.bundle_hash) await reinjectHarnessIntoLiveXells(h.id, { mode });
   return getHarnessFull(key);
 }
 
