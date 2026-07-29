@@ -59,7 +59,7 @@ async function fetchXellRows(pid) {
             hn.key AS harness_key, hn.label AS harness_label,
             -- RESOLVED ENVIRONMENT (migration 043): which env this xell is loaded with, by the same
             -- rule lib/environments.js uses — an explicit pin, else the default env of the computed
-            -- tier (prod for a live-prod / production xell, else dev). env_var_count surfaces the
+            -- tier (prod for a xell on production — live, read-only or being it — else dev). env_var_count surfaces the
             -- empty case (an empty env adds nothing to .zeehive.env — the safe, dormant state).
             env.env_key, env.env_tier, env.env_pinned, env.env_var_count,
             -- FLEET BURN (per xell): sum of what EVERY zee this xell has ever hosted consumed —
@@ -154,8 +154,13 @@ async function fetchXellRows(pid) {
            FROM environment e
           WHERE e.project_id = x.project_id
             AND ((x.environment_id IS NOT NULL AND e.id = x.environment_id)
+              -- the SQL copy of lib/environments.js isOnProduction(): a xell on production —
+              -- writing it (db-shared-prod), READING it (db-prod-readonly, the manager binding) or
+              -- being it (is_production) — is loaded with the prod environment. Keep the two in
+              -- step; ticket #15 was them disagreeing about the read-only case.
               OR (x.environment_id IS NULL AND e.is_default
-                  AND e.tier = CASE WHEN x.is_production OR x.db_coupling = 'db-shared-prod'
+                  AND e.tier = CASE WHEN x.is_production
+                                      OR x.db_coupling IN ('db-shared-prod','db-prod-readonly')
                                     THEN 'prod'::container_tier ELSE 'dev'::container_tier END))
           ORDER BY (e.id = x.environment_id) DESC
           LIMIT 1
