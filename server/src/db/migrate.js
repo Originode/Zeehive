@@ -9,6 +9,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { pool } from './pool.js';
 import { config } from '../config.js';
+import { assertUniqueMigrationNumbers } from './migration-numbers.js';
 
 const migrationsDir = resolve(config.repoRoot, 'db', 'migrations');
 
@@ -28,6 +29,14 @@ export async function runMigrations() {
     const files = readdirSync(migrationsDir)
       .filter((f) => f.endsWith('.sql'))
       .sort();
+
+    // TWO FILES, ONE NUMBER (#9). Filename order IS apply order, so a shared prefix means the sequence
+    // is decided by string comparison between two authors who each thought they were next. Checked
+    // BEFORE anything is applied, so a refusal can never leave a half-migrated database — and checked
+    // here rather than only in a test because the zee that lands the collision is not always the one
+    // that runs the suite. Known duplicates are history and pass; a new one stops the run and says how
+    // to fix it (server/src/db/migration-numbers.js).
+    assertUniqueMigrationNumbers(files);
 
     let count = 0;
     for (const file of files) {
