@@ -111,7 +111,16 @@ export async function crewFor(managerXellId) {
     return {
       xell_id: r.id, slug: r.slug, branch: r.branch, status: r.status,
       hive_status: hive, hive_status_label: hiveLabel(hive),
-      zee_status: r.zee_status || null, working: r.cli_active === true || r.zee_status === 'working',
+      zee_status: r.zee_status || null,
+      // WORKING is the zee's own status, and ATTACHED is the monitor's probe — two different facts,
+      // reported under two different names. They used to be ORed into `working`, and for a cxell
+      // worker that is simply wrong: the probe is a broad pgrep inside the cage, and once anyone has
+      // talked to that worker, zee-attach.sh leaves `claude --resume` in its pane for the life of the
+      // container, so the flag goes true on the first attach and never comes back down. A manager
+      // read five finished workers as busy for a whole session on the strength of it — and this read
+      // model is the only instrument a manager has.
+      working: r.zee_status === 'working',
+      attached: r.cli_active === true,
       model: r.model || null, title: r.zee_title || null,
       task: r.task_text ? String(r.task_text).split('\n')[0].slice(0, 160) : null,
       head_commit: r.head_commit || null,
@@ -230,9 +239,37 @@ export async function dismissDoneSuggestion(id, by = 'human@console') {
   return row;
 }
 
+// An approval the queenzee could NOT carry out. The suggestion goes BACK to pending — it is still a
+// card, with the refusal attached — and the manager is told, the same way a rejection tells it.
+//
+// This exists because the opposite was written first and it lost work-hours: the row was flipped out
+// of 'pending' BEFORE the reap, and stamped 'failed' when the reap refused. listDoneSuggestions()
+// only ever shows 'pending', so the card left the console, the worker stayed alive, the manager
+// heard nothing, and the human believed they had closed it. Five of one manager's crew sat in that
+// state in a single hour. A decision that did not happen must not consume the ask that raised it.
+async function refuseApproval({ id, row, manager, by, error, detail = null }) {
+  const back = await one(
+    `UPDATE done_suggestion SET status='pending', decided_at=NULL, decided_by=NULL, result=$2::jsonb
+       WHERE id=$1 RETURNING *`,
+    [id, JSON.stringify({ refused: true, error, by, at: new Date().toISOString(), detail })]);
+  broadcast('done-suggestion', back);
+  if (row.target_xell_id) broadcast('xell', { id: row.target_xell_id });
+  logline('crew', `done suggestion for ${row.target_slug} was APPROVED by ${by} but the xell was NOT closed `
+    + `(${error}) — the card stays open`);
+  if (manager) {
+    await postMessage({ from: null, to: manager, kind: 'report', by,
+      body: `A human APPROVED your suggestion that ${row.target_slug} is done, but the queenzee could NOT `
+        + `close it: ${error} The suggestion is still open in the console — nothing was decided and `
+        + `nothing was lost. Check whether ${row.target_slug} really is finished before it is approved again.` })
+      .catch(() => {});
+  }
+  return { ...back, ok: false, refused: true, error };
+}
+
 // The HUMAN's decision on a done suggestion. Approve → the queenzee marks the xell's task done and
 // reaps it, exactly as the console's own "Mark done" does (same function, same reap, same commit
-// collection). Reject → the manager is told, and nothing happens to the xell.
+// collection). Reject → the manager is told, and nothing happens to the xell. An approval the reap
+// REFUSES is not a decision at all — see refuseApproval above.
 //
 // tasks.js is imported lazily: it reaches back into provisioning/reaping, and a top-level import
 // here would make lib ↔ queenzee circular for a call that runs once per human click.
@@ -257,9 +294,18 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
     return row;
   }
 
+  // The one refusal that can never come right: there is no xell left to close. It stays 'failed'
+  // (re-raising a card for a xell that does not exist would ask a human an unanswerable question),
+  // but the manager is still told rather than left waiting on a decision it will never hear about.
   if (!target) {
     const gone = await one(`UPDATE done_suggestion SET status='failed', result=$2::jsonb WHERE id=$1 RETURNING *`,
       [id, JSON.stringify({ error: 'the target xell no longer exists' })]);
+    broadcast('done-suggestion', gone);
+    if (manager) {
+      await postMessage({ from: null, to: manager, kind: 'report', by,
+        body: `A human approved your suggestion that ${row.target_slug} is done, but that xell no longer `
+          + 'exists — there was nothing left to close. Removed from your crew.' }).catch(() => {});
+    }
     return gone;
   }
 
@@ -270,11 +316,11 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
   try {
     if (task) {
       result = await markTaskDone(task.id, by, { force });
+      // The reap refused (an ACTIVE zee, a ship this queenzee is deploying right now). The task is
+      // NOT done and the xell is untouched, so the ask goes back on the board.
       if (result?.blocked) {
-        const held = await one(`UPDATE done_suggestion SET status='failed', result=$2::jsonb WHERE id=$1 RETURNING *`,
-          [id, JSON.stringify(result)]);
-        broadcast('done-suggestion', held);
-        return held;
+        return refuseApproval({ id, row, manager, by, detail: result,
+          error: result.reap?.error || 'the queenzee refused to close that xell.' });
       }
     } else {
       // A xell with no task row (a bare dispatch) is reaped directly — the same path the console's
@@ -282,17 +328,14 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
       const { reapXell } = await import('../queenzee/reaper.js');
       result = { reap: await reapXell(target.id, 'done-suggestion', { force }) };
       if (result.reap?.ok === false) {
-        const held = await one(`UPDATE done_suggestion SET status='failed', result=$2::jsonb WHERE id=$1 RETURNING *`,
-          [id, JSON.stringify(result)]);
-        broadcast('done-suggestion', held);
-        return held;
+        return refuseApproval({ id, row, manager, by, detail: result,
+          error: result.reap?.error || 'the queenzee refused to close that xell.' });
       }
     }
   } catch (e) {
-    const failed = await one(`UPDATE done_suggestion SET status='failed', result=$2::jsonb WHERE id=$1 RETURNING *`,
-      [id, JSON.stringify({ error: e.message })]);
-    broadcast('done-suggestion', failed);
-    return failed;
+    // An operational failure is still "the xell was not closed" — same treatment, or the card
+    // disappears on a transient error and nobody ever learns the click did nothing.
+    return refuseApproval({ id, row, manager, by, error: `the teardown threw: ${e.message}` });
   }
 
   const done = await one(`UPDATE done_suggestion SET result=$2::jsonb WHERE id=$1 RETURNING *`,
