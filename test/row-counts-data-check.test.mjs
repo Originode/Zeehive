@@ -244,7 +244,7 @@ try {
   ok(presentAt > 0 && countAt > presentAt,
      'the catalog is read BEFORE the counts: the counts are one UNION ALL, so a reference naming an '
      + 'absent table used to fail to PARSE and a human got "could not count rows: ^"');
-  ok(dsrc.includes('const countable = Object.keys(snap.row_counts).filter((t) => here.has(t))'),
+  ok(dsrc.includes('const countable = Object.keys(reference).filter((t) => here.has(t))'),
      'only the tables that exist are counted — which is also the ONLY way the "missing" verdict can '
      + 'ever be produced (before this, the path to it was the path that errored)');
   ok(/none of the \${Object.keys(snap.row_counts).length} table(s)/.test(dsrc)

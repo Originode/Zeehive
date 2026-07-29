@@ -193,7 +193,7 @@ async function decorateXell(x, heads, deployed, project) {
             c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
             c.docker_ctx, c.build_ctx,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
-            c.prod_diff, c.prod_diff_at, uc.relation, ${INSTANCES_AGG}
+            c.prod_diff, c.prod_diff_at, c.data_check, c.data_check_at, c.restore_report, c.restored_at, uc.relation, ${INSTANCES_AGG}
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1
       ORDER BY CASE c.role WHEN 'db' THEN 1 WHEN 'server' THEN 2 WHEN 'webapp' THEN 3 ELSE 4 END`,
@@ -305,7 +305,10 @@ export async function getFleet(projectId) {
             -- where a PROCESS role (docker_ctx NULL) lives: its site's context, so the machine
             -- matrix can place it in the right column instead of 'elsewhere'
             (SELECT ds.docker_ctx FROM deploy_site ds WHERE ds.id = c.site_id) AS site_docker_ctx,
-            c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at, ${instancesAgg}
+            c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at,
+            -- the DATA readings, beside the schema one and never merged with it (#22/#30): the row-count
+            -- verdict for this database, and what pg_restore reported the last time it was loaded.
+            c.data_check, c.data_check_at, c.restore_report, c.restored_at, ${instancesAgg}
        FROM container c WHERE c.project_id = $1
        ORDER BY c.role, c.tier, c.name`, [pid]);
   // Same shell-capability the xell stack carries (decorateXell) — the MATRIX renders these rows,

@@ -154,3 +154,53 @@ export function dataReportText(name, r) {
     + '\nWhat it does NOT: the contents of a row, and the SCHEMA (that is Check diff).');
   return out.join('');
 }
+
+// ── the chip's DATA lines: what the last restore reported, and how its rows graded ────────────────
+// Two facts, adjacent and separate, because they answer different questions and neither substitutes for
+// the other (#30): the TALLY says "this restore had trouble, and here is the cause", the GRADE says
+// "and here is what is missing". A restore can ignore 400 errors while every table it loaded still
+// passes its counts — indexes, constraints and triggers are not rows.
+//
+// And the schema drift lines above are a THIRD question. All three live on one chip, so each says which
+// it is; that separation is the whole of TKT-22-4F0E.
+export function dataText(c) {
+  const out = [];
+  const r = c.restore_report;
+  if (r) {
+    const when = c.restored_at ? new Date(c.restored_at).toLocaleString() : '';
+    if (r.ok === false) {
+      out.push(`\n\n⚠ last restore FAILED${when ? ` (${when})` : ''}\n${r.reason || ''}`);
+    } else if (r.ignored) {
+      out.push(`\n\n⚠ last restore IGNORED ${r.ignored} error(s)${when ? ` (${when})` : ''}`);
+      out.push('\nThe data loaded, with holes in it. pg_restore continued past these:');
+      for (const e of (r.errors || []).slice(0, 5)) out.push(`\n  · ${e}`);
+      if (r.truncated || (r.error_count || 0) > (r.errors || []).length) {
+        out.push(`\n  … ${(r.error_count || 0) - (r.errors || []).length} more distinct error(s)`);
+      }
+      out.push('\nRows are a separate question — see the row check below.');
+    } else {
+      // Clean restores get ONE quiet line. A pool refresh restores databases all day.
+      out.push(`\n\n✓ last restore clean${when ? ` (${when})` : ''} — pg_restore ignored no errors`);
+    }
+  }
+
+  const d = c.data_check;
+  if (d) {
+    const when = c.data_check_at ? ` (${new Date(c.data_check_at).toLocaleString()})` : '';
+    if (d.ok === false) {
+      out.push(`\n\nrow check: not run${when} — ${d.error || 'unknown reason'}`);
+    } else if (d.verdict === 'incomplete') {
+      out.push(`\n\n⚠ ROWS MISSING vs the backup this db was restored from${when}`);
+      out.push(`\n${d.empty?.length || 0} table(s) EMPTY, ${d.short?.length || 0} short (${d.ok_count}/${d.checked} verified)`);
+      for (const x of [...(d.empty || []), ...(d.short || [])].slice(0, 5)) {
+        out.push(`\n  · ${x.table} — backup ~${x.ref?.toLocaleString?.() ?? x.ref}, here ${x.got?.toLocaleString?.() ?? x.got}`);
+      }
+    } else if (d.verdict === 'unverified') {
+      out.push(`\n\nrow check${when}: ${d.ok_count}/${d.checked} table(s) match; the rest could not be judged`);
+    } else {
+      out.push(`\n\n✓ rows match the backup this db was restored from${when} (${d.ok_count}/${d.checked} tables)`);
+    }
+    out.push('\nRow COUNTS only — not the contents of a row, and not the schema.');
+  }
+  return out.join('');
+}

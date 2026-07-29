@@ -28,6 +28,9 @@ import { ROW_COUNT_SQL, parseRowCounts, rowTotal, compareBackupCounts } from '..
 // WHEN the next backup is due (a failure shortens the window, it does not consume it) and WHEN a human
 // is told the restore point is stale — pure decisions, so the TIMING is asserted by a test (#26).
 import { backupDecision, staleAlertDecision } from '../lib/backup-schedule.js';
+// What pg_restore actually reported, and whether it FINISHED — its exit code cannot tell you (#30).
+import { restoreOutcome, restoreErrorLine } from '../lib/restore-errors.js';
+import { checkContainerData } from './datadiff.js';
 import { notifyBackupStale, notifyBackupRecovered } from '../lib/notify.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
@@ -864,12 +867,13 @@ export async function restoreBackup({ snapshot, container, confirmProd = false, 
 // Remember what a database was loaded FROM (and clear any stale data-check verdict, which described
 // the previous contents). `snapshotId` null = a live pipe with no snapshot in the middle
 // ("Duplicate prod"), which the note then names. Never throws: bookkeeping must not fail a restore.
-async function noteRestoredFrom(containerId, snapshotId, note = null) {
+async function noteRestoredFrom(containerId, snapshotId, note = null, report = null) {
   try {
     const row = await one(
       `UPDATE container SET restored_from=$2, restored_at=now(), restored_note=$3,
-                            data_check=NULL, data_check_at=NULL
-        WHERE id=$1 RETURNING *`, [containerId, snapshotId, note]);
+                            restore_report=$4::jsonb, data_check=NULL, data_check_at=NULL
+        WHERE id=$1 RETURNING *`,
+      [containerId, snapshotId, note, report ? JSON.stringify(report) : null]);
     if (row) broadcast('container', row);
   } catch (e) {
     logline('maint', `could not record what ${containerId} was restored from: ${e.message}`);
@@ -877,7 +881,7 @@ async function noteRestoredFrom(containerId, snapshotId, note = null) {
 }
 
 async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
-  let restored = false;
+  let restored = false, report = null;
   const tArgs = restoreTableArgs(tables);   // [] ⇒ restore the whole archive
   try {
     if (MODE === 'real') {
@@ -894,9 +898,17 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
           { cmd: 'docker', args: ['--context', snap.dest_ctx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'cat', `/out/${file}`] },
           { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...tArgs, '-d', dbName] },
           { timeout: 1800000 });
-        if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
-          throw new Error(`streamed restore into ${target}/${dbName} from [${snap.dest_ctx}] failed `
-            + `(reader exit ${piped.srcStatus}, pg_restore exit ${piped.dstStatus}): ${((piped.dstStderr || piped.srcStderr) || '').slice(-300)}`);
+        // The READER is unconditional: if cat/the mount failed, no archive reached pg_restore at all.
+        if (piped.srcStatus !== 0) {
+          throw new Error(`streamed restore into ${target}/${dbName} from [${snap.dest_ctx}] failed to read the `
+            + `archive (reader exit ${piped.srcStatus}): ${((piped.srcStderr || piped.dstStderr) || '').slice(-300)}`);
+        }
+        // pg_restore EXITS 1 WHEN IT MERELY IGNORED ERRORS (verified against a real restore), so exit
+        // code alone cannot tell "never finished" from "finished with holes". Its own tally can. #30.
+        report = restoreOutcome({ status: piped.dstStatus, stderr: piped.dstStderr });
+        if (!report.ok) {
+          throw new Error(`streamed restore into ${target}/${dbName} from [${snap.dest_ctx}] failed: `
+            + `${report.reason}: ${((piped.dstStderr || piped.srcStderr) || '').slice(-300)}`);
         }
       } else {
         const remoteTmp = `/tmp/restore_${randomBytes(3).toString('hex')}.dump`;
@@ -906,19 +918,29 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
           ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...tArgs, '-d', dbName, remoteTmp],
           { timeout: 1800000 });
         await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000 });
-        if (rest.status !== 0) throw new Error(`pg_restore into ${target}/${dbName} failed: ${(rest.stderr || '').slice(-300)}`);
+        report = restoreOutcome({ status: rest.status, stderr: rest.stderr });
+        if (!report.ok) {
+          throw new Error(`pg_restore into ${target}/${dbName} failed: ${report.reason}: ${(rest.stderr || '').slice(-300)}`);
+        }
       }
     } else {
       await wait(SIM_RESTORE_MS);   // simulate: hold the busy state briefly so the spinner is visible
     }
-    logline('maint', `restore finished → ${c.name}`);
+    // WHAT pg_restore SAID. A clean restore logs the plain line it always did; one that ignored errors
+    // says so, with the first cause named — that is the half of #30 the row comparison cannot answer,
+    // because a table can pass its counts and still have lost its indexes, its constraints or a trigger.
+    const trouble = restoreErrorLine(report);
+    logline('maint', trouble
+      ? `restore finished → ${c.name}, BUT ${trouble}`
+      : `restore finished → ${c.name}`);
     restored = true;
     // WHICH DUMP THIS DATABASE NOW IS. Recorded, not inferred: the data check compares a restored db
     // against the counts of ITS OWN source, and "probably the newest snapshot at the time" is exactly
     // the kind of guess this ticket exists to stop. A table-scoped restore says so, because then only
     // those tables came from this archive and a whole-db comparison would be meaningless.
     await noteRestoredFrom(c.id, snap.id,
-      tables.length ? `restored ${tables.length} table(s) only: ${tables.join(', ')}` : null);
+      tables.length ? `restored ${tables.length} table(s) only: ${tables.join(', ')}` : null,
+      report ? { ...report, at: new Date().toISOString(), snapshot_id: snap.id, scoped: tables.length > 0 } : null);
   } catch (e) {
     logline('maint', `restore FAILED → ${c.name}: ${e.message}`);
   } finally {
@@ -931,7 +953,47 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
   if (restored) {
     refreshProdDiffAfterRestore(c.id)
       .catch((e) => logline('proddiff', `post-restore drift refresh for ${c.name} failed: ${e.message}`));
+    // …and GRADE IT, without anyone asking (#30). A restore finishing is the one instant when the
+    // source snapshot, the target database and the reason for both are all known at once — and the
+    // whole point of this ticket family is that the failure is silent, which a check nobody runs also
+    // is. A SCOPED restore is graded only over the tables it actually loaded: comparing the whole
+    // database against the whole reference would report every untouched table as missing, which is the
+    // false alarm that teaches a human to ignore the real one.
+    gradeRestore(c, tables)
+      .catch((e) => logline('datadiff', `post-restore data check for ${c.name} failed: ${e.message}`));
   }
+}
+
+// Grade a finished restore against the counts recorded for ITS OWN source snapshot. Fire-and-forget by
+// construction: it runs after busy is cleared, it is awaited by nobody, and every failure is logged and
+// swallowed — the same rule the backup counts follow, for the same reason. It never touches production
+// (checkContainerData refuses a prod subject outright) and it never compares against live prod.
+//
+// WHAT A CLEAN RESULT DOES: one quiet line, and nothing else. No ping, no chip alarm, no dialog. The
+// pool refreshes databases all day; a green announcement on every one of them is precisely how the one
+// line that matters becomes invisible. The verdict is still PERSISTED, so a human who opens the chip
+// sees it without re-counting anything — quiet is not the same as unrecorded.
+async function gradeRestore(c, tables = []) {
+  const r = await checkContainerData(c.id, { only: tables.length ? tables : null });
+  if (!r?.ok) {
+    // Not an alarm: "no reference counts on that snapshot" is the ordinary answer for any dump taken
+    // before row counts existed, and for a live 'Duplicate prod' pipe there is no snapshot at all.
+    logline('datadiff', `${c.name}: rows not graded after the restore — ${r?.error || 'unknown reason'}`);
+    return r;
+  }
+  if (r.verdict === 'incomplete') {
+    logline('datadiff', `⚠ ${c.name}: the restore is MISSING DATA — ${r.empty.length} table(s) empty and `
+      + `${r.short.length} short of what its backup recorded: `
+      + `${[...r.empty, ...r.short].slice(0, 5).map((x) => `${x.table} ${x.ref}→${x.got}`).join(', ')}`
+      + `. Graded automatically the moment the restore finished; nobody had to ask.`);
+  } else if (r.verdict === 'unverified') {
+    logline('datadiff', `${c.name}: ${r.ok_count}/${r.checked} table(s) verified after the restore; `
+      + `${r.missing.length} absent and ${r.unknown.length} with no reference count (not graded either way)`);
+  } else {
+    // The quiet case, said once and small.
+    logline('datadiff', `${c.name}: rows check out after the restore (${r.ok_count}/${r.checked} tables)`);
+  }
+  return r;
 }
 
 // ── DUPLICATE PROD → a dev db (backup + restore, fused into one action) ─────────
@@ -993,7 +1055,7 @@ export async function duplicateProdInto({ container }) {
 }
 
 async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
-  let restored = false;
+  let restored = false, report = null;
   try {
     if (MODE === 'real') {
       // Resolve BOTH endpoints by IDENTITY (ctx + host_port), never name shape — the same rule the
@@ -1008,21 +1070,35 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
         { cmd: 'docker', args: ['--context', srcCtx, 'exec', src.name, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName] },
         { cmd: 'docker', args: ['--context', dstCtx, 'exec', '-i', dst.name, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName] },
         { timeout: 1800000 });
-      if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
-        const why = piped.timedOut ? 'timed out' : `pg_dump exit ${piped.srcStatus}, pg_restore exit ${piped.dstStatus}`;
+      // The SOURCE side is unconditional: a failed pg_dump means nothing reached the target.
+      if (piped.srcStatus !== 0 || piped.timedOut) {
+        const why = piped.timedOut ? 'timed out' : `pg_dump exit ${piped.srcStatus}`;
         throw new Error(`duplicate prod → ${target.name} failed (${why}): `
+          + `${((piped.srcStderr || piped.dstStderr) || '(no output)').slice(-300)}`);
+      }
+      // …and the target side reads pg_restore's OWN tally rather than its exit code, which is 1 for a
+      // restore that merely ignored errors (#30). A duplicate that landed with holes is still a
+      // duplicate, and saying "failed" about it loses both the data and the reason.
+      report = restoreOutcome({ status: piped.dstStatus, stderr: piped.dstStderr });
+      if (!report.ok) {
+        throw new Error(`duplicate prod → ${target.name} failed: ${report.reason}: `
           + `${((piped.dstStderr || piped.srcStderr) || '(no output)').slice(-300)}`);
       }
     } else {
       await wait(SIM_RESTORE_MS);   // simulate: hold the busy state so the spinner is visible
     }
-    logline('maint', `duplicate finished → ${target.name}`);
+    const trouble = restoreErrorLine(report);
+    logline('maint', trouble ? `duplicate finished → ${target.name}, BUT ${trouble}`
+                             : `duplicate finished → ${target.name}`);
     restored = true;
     // No snapshot in the middle — this WAS live prod, piped. Record that rather than leaving a stale
     // "restored from last night's dump" behind it: the data check needs to know it has no recorded
     // reference for this db and must say so instead of grading it against the wrong dump.
+    // No snapshot in the middle, so there is nothing to GRADE against — but the tally still applies,
+    // and it is the only signal this path has. Recorded for exactly that reason.
     await noteRestoredFrom(target.id, null,
-      'duplicated LIVE production (a direct pg_dump → pg_restore pipe; no snapshot, so no recorded row counts)');
+      'duplicated LIVE production (a direct pg_dump → pg_restore pipe; no snapshot, so no recorded row counts)',
+      report ? { ...report, at: new Date().toISOString(), snapshot_id: null, scoped: false } : null);
   } catch (e) {
     logline('maint', `duplicate FAILED → ${target.name}: ${e.message}`);
   } finally {
