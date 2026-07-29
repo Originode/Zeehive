@@ -198,8 +198,28 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
     HOLDING PATTERN, names the go-around, and the test asserts those bytes through a real push.
   - Test: `node test/land-queue.test.mjs` (two xells, one card; clearance on land/reject/withdraw/
     stale; the no-cxell go-around; the retired-xell sweep; auto-approve as a no-op).
-  - **Console + manuals are deliberately NOT in this** — separate tasks. A holding row renders
-    nowhere yet; it is invisible by construction, not by omission.
+  - **The human surface, one task later** (069–072): the console renders the APPROACH QUEUE under the
+    card holding it up — slug, position, commits waiting — with no buttons, because only one thing on
+    a runway is ever a question, and it survives the card being collapsed (which is when it matters
+    most). A queued zee gets its own hexagon, `occ-landHolding` (`holding`, cool slate), ranked
+    **below every ask** — a tend behind a queued landing is still the thing to act on — and **above
+    plain activity**, because it is the only thing that answers "why has this zee gone quiet with
+    commits it wants to land?". Holders whose runway has no card render in the orphan panel, loudly:
+    that should be impossible, and if it happens those zees were about to be invisible again.
+    - The manual is taught by MIGRATION (069/070, the 065 pattern), because the manual a zee reads
+      lives in the meta-DB: holding is normal, nothing was rejected, no human has been asked, you
+      will be resumed, and the recovery is `zee sync` → `zee land`. It also heads off the three
+      wrong reactions (re-push, tend, withdraw-and-re-land) — a state a zee meets first in an
+      unexpected answer is a state it will improvise around.
+    - Test: `node test/land-queue-console.test.mjs` RENDERS the real component with
+      `react-dom/server` rather than grepping it, so what is asserted is the markup a human reads.
+  - **`tend-or-land.md` was seeded at last** (071/072, ticket #3). That hygiene note existed only
+    because a human typed it into the harness manager — it was in NO migration, so on any database
+    that has only ever seen migrations it was absent, three assertions in `land-withdraw` failed, and
+    "is the suite green?" had no answer. Every cxell database is exactly that. 071 seeds it in full
+    (the human's words verbatim) when absent; 072 appends the holding half to databases that already
+    had it; both paths converge on identical text. Proved by migrating a virgin database and running
+    the landgate suite against it — which is the only way this class of bug is ever actually fixed.
 - The xell card therefore shows **two** diffs (`lib/git.js → worktreeDiff`):
   - **source diff** = worktree vs the source (`↑ahead ↓behind · files +ins/−del`, includes
     uncommitted) — everything the zee has produced; what would land.

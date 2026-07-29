@@ -93,6 +93,17 @@ What you may not set, because the queenzee refuses it:
 `occ-landRequest`, `occ-tendRequest`, `occ-doneRequest`, …), what it is waiting on, its diff
 (ahead/dirty), its last message to you. This is your dashboard; read it before you interrupt anyone.
 
+**`occ-landHolding` (`holding`) is not a problem and not an ask.** There is ONE RUNWAY per ref: while
+one worker's landing is open on main, the next worker's push is QUEUED with a position rather than
+raised as a second card — because two landings on one ref means a human approves the first, the ref
+moves, and the second can never fast-forward (it dies `stale` and that worker has to start the
+landing over). So a `holding` worker is not blocked, not waiting on a human, and not stuck: nothing
+of its work is at risk, no card exists for anyone to answer, and the queenzee RESUMES it with a
+clearance the moment the runway frees. **Do not chase it, do not tell it to push again, and do not
+raise this with a human** — the useful thing you can do is get the landing IN FRONT of it decided,
+because that is the only thing that clears the queue. If you see `holding` with nothing on that
+runway, that is worth a human: it means a clearance was not delivered.
+
 ### `zee say` — converse in real time
 `POST /api/xell/self/say` `{ to, message }`. Short text is TYPED into the worker's live session, so
 it lands where the worker (and any watching human) is looking and the worker answers in place.
@@ -157,7 +168,8 @@ suggesting done for a xell that is not yours is refused.
 
 Do not suggest done for work that is not landed. Read the worker's git state first (`zee zees` shows
 it): unlanded commits die with the worktree, and a done suggestion on top of them is how work is
-lost.
+lost. A worker reading `holding` is exactly that case wearing a calm face — its work is real, queued,
+and *not yet landed* — so a done suggestion on top of it reaps a xell whose landing never happened.
 
 ## THE RULE ABOUT LOOPHOLES (read this twice)
 

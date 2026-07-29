@@ -60,9 +60,28 @@ process.env.DOCKER_LOG = DOCKER_LOG;
 process.env.PATH = `${join(ROOT, 'test', '_bin')}:${process.env.PATH}`;
 const readLog = () => (existsSync(DOCKER_LOG) ? readFileSync(DOCKER_LOG, 'utf8') : '');
 const resetLog = () => { try { rmSync(DOCKER_LOG); } catch { /* first run */ } };
-async function awaitResume() {
+// TWO waits, in this order, because they are two different kinds of fact.
+//
+// `awaitCleared` polls the ROW: clearing a holder is a database write the queenzee makes before it
+// tries to reach anyone, so it is deterministic and quick. `awaitResume` polls the fake docker log
+// for the resume itself, which is fire-and-forget — spawning it takes as long as it takes, and on a
+// loaded box that is not 100ms. Asserting the delivery without first pinning the state change is
+// what made this test flaky: one nudge that lost the race failed seven assertions downstream and
+// read as a broken protocol rather than a slow spawn.
+async function awaitCleared(id) {
+  for (let i = 0; i < 60; i++) {
+    const r = await one(`SELECT cleared_at FROM land_request WHERE id=$1`, [id]);
+    if (r?.cleared_at) return true;
+    await sleep(100);
+  }
+  return false;
+}
+const lastHolding = (xellId) => one(
+  `SELECT id FROM land_request WHERE xell_id=$1 AND status='holding'
+     ORDER BY requested_at DESC LIMIT 1`, [xellId]);
+async function awaitResume(want = /--resume/) {
   let log = '';
-  for (let i = 0; i < 40 && !/--resume/.test(log); i++) { await sleep(120); log = readLog(); }
+  for (let i = 0; i < 80 && !want.test(log); i++) { await sleep(150); log = readLog(); }
   return log;
 }
 
@@ -198,6 +217,7 @@ console.log('\n── alpha lands → bravo is cleared, by a resume that names s
 resetLog();
 const decided = await decideLandRequest(cards[0].id, 'approved', 'human@test');
 ok(decided?.status === 'landed', `alpha's landing landed (${decided?.status})`);
+ok(await awaitCleared(rowB.id), 'bravo was cleared out of the pattern (the row says so before anyone is nudged)');
 const log = await awaitResume();
 ok(/exec/.test(log) && /--resume/.test(log), 'the queenzee ran `docker exec … claude … --resume`');
 ok(log.includes(SID_B), `the resume targeted BRAVO's cxell session (${SID_B.slice(0, 8)}…), the holder`);
@@ -231,7 +251,9 @@ const landA2 = await selfLand(alpha);
 ok(landA2.status === 'holding', `alpha now holds behind bravo's card (${landA2.status})`);
 resetLog();
 const bravoCard = (await listLandRequests(project.id, { open: true }))[0];
+const alphaHold = await lastHolding(alpha.id);
 await decideLandRequest(bravoCard.id, 'rejected', 'human@test');
+ok(await awaitCleared(alphaHold.id), 'the rejection cleared alpha out of the pattern');
 const log2 = await awaitResume();
 ok(log2.includes(SID_A) && /runway is CLEAR/.test(log2), 'a rejection clears the next holder — alpha was resumed');
 ok((await runwayOccupant(project.id, 'refs/heads/main')) === null, 'and the runway is genuinely free (no occupant)');
@@ -254,8 +276,10 @@ ok((await one(`SELECT status, withdrawn_by FROM land_request WHERE id=$1`, [wHol
 const landB5 = await selfLand(bravo);
 ok(landB5.status === 'holding', 'bravo holds again');
 resetLog();
+const bravoHold = await lastHolding(bravo.id);
 const wOcc = await selfWithdrawLand(alpha, { reason: 'found a bug' });
 ok(wOcc.ok, 'alpha withdraws the landing that was on the runway');
+ok(await awaitCleared(bravoHold.id), 'and that freed the runway for the holder');
 const log3 = await awaitResume();
 ok(log3.includes(SID_B) && /runway is CLEAR/.test(log3), 'and the withdrawal cleared bravo — a withdrawn card frees the runway');
 
@@ -303,7 +327,10 @@ const holdB = await selfLand(bravo);
 ok(holdB.status === 'holding' && holdB.position === 2, `bravo is #${holdB.position}, behind it`);
 resetLog();
 const alphaCard = (await listLandRequests(project.id, { open: true }))[0];
+const bravoQueued = await lastHolding(bravo.id);
 await decideLandRequest(alphaCard.id, 'approved', 'human@test');
+ok(await awaitCleared(bravoQueued.id),
+   'the unreachable holder was passed over and BRAVO was cleared — one dead zee cannot hold the runway shut');
 const log5 = await awaitResume();
 ok(log5.includes(SID_B) && /runway is CLEAR/.test(log5),
    'the unreachable holder did not block the runway — the NEXT in line was cleared');
@@ -374,6 +401,44 @@ ok(waiter.indexOf("s.status === 'holding'") < waiter.indexOf('TIMEOUT after'),
    'and it answers BEFORE the timeout branch — the way it used to fail on stale');
 ok(/zee sync/.test(cli.slice(cli.indexOf('function printHolding'), cli.indexOf('async function pollLanding'))),
    'the cleared message names the recovery (`zee sync`)');
+
+// ── 15. THE MANUAL. A state a zee can land in must be a state it was TOLD about ────────────────
+// House rule: the manual, the briefing and the CLI move together. The manual zees actually read is
+// the one in the meta DB (harness zee-base), edited by migration — so this asserts the DATABASE,
+// not a file, and it passes only on a database the migrations have been applied to.
+console.log('\n── the worker manual teaches the pattern ──');
+const manual = read('db/migrations/069_manual_runway.sql');
+ok(/HOLDING PATTERN/.test(manual) && /zee sync/.test(manual), '069 teaches the holding pattern and the go-around');
+ok(/IF txt IS NULL OR txt LIKE '%HOLDING PATTERN%' THEN RETURN/.test(manual),
+   'guarded on text it writes itself, so a re-run is a no-op rather than a second copy');
+ok(/a\.e->>'path' = 'cxell-zee-manual\.md'/.test(manual), 'and it finds the manual BY PATH, never by index');
+const stored = await one(
+  `SELECT a.e->>'text' AS t FROM harness h, LATERAL jsonb_array_elements(h.bundle->'memory') AS a(e)
+     WHERE h.key='zee-base' AND a.e->>'path'='cxell-zee-manual.md'`);
+const m = String(stored?.t || '');
+ok(/HOLDING PATTERN, nothing is wrong/.test(m), 'the stored manual really carries it after migrating');
+ok(/no human has been asked anything yet/.test(m), 'it says plainly that nothing is in front of a human');
+ok(/nothing was rejected, nothing was dropped/.test(m), 'and that nothing was rejected or dropped');
+ok(m.indexOf('`zee sync`', m.indexOf('CLEARANCE')) < m.indexOf('`zee land`', m.indexOf('CLEARANCE')),
+   'the clearance recovery names sync BEFORE land — the only order that works');
+ok(/do NOT raise a `tend` \(nobody is blocked/.test(m),
+   'and it heads off the wrong reactions: no tend, no re-push, no queue-jumping');
+ok(/or QUEUE behind/.test(m), 'the verb list at the top says `zee land` can queue, so a skimmer sees it too');
+
+// TICKET #3, folded in: the hygiene note is SEEDED now, not hand-typed. Every cxell database is
+// fresh and migration-only, so a note that lives in one hand-edited database is a note no cxell zee
+// has — and three assertions in land-withdraw could not pass on any of them.
+const seeded = await one(
+  `SELECT a.e->>'text' AS t FROM harness h, LATERAL jsonb_array_elements(h.bundle->'memory') AS a(e)
+     WHERE h.key='zee-base' AND a.e->>'path'='tend-or-land.md'`);
+ok(!!seeded?.t, 'the tend-or-land hygiene note exists on a migrated database (071 seeds it)');
+ok(/revoke your tend request/.test(String(seeded?.t || '')),
+   'with the human\'s original words kept verbatim — it is their note');
+ok(/zee land --withdraw/.test(String(seeded?.t || '')), 'plus the landing half 064 appends');
+ok(/HOLDING/.test(String(seeded?.t || '')) && /nobody is blocked/.test(String(seeded?.t || '')),
+   'and the holding half: a queued push is not an ask, so there is nothing to keep true');
+ok(/IF has_note THEN RETURN/.test(read('db/migrations/071_seed_tend_or_land_note.sql')),
+   'and the seed never overwrites a note somebody has already edited');
 
 server.close();
 await pool.end().catch(() => {});
