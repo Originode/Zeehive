@@ -301,6 +301,20 @@ Three habits, all deliberate:
 `deleteTicket` (keeps the plan — `ticket_id` is `ON DELETE SET NULL` — and reports how many items
 were unlinked), `addComment`, and:
 
+`ticketCode(row)` — the short handle a human copies: `TKT-<number>-<4 hex of the id>`, **derived,
+never stored**. `ref` (`#16`) is what a person says out loud and is only unique per project; the code
+is that number made unambiguous across projects, from two immutable columns, so there is no column
+to migrate and no way for it to disagree with the row. Every shaped ticket carries it as `code`.
+
+`ticketManagers(id)` / `notifyManagerOfTicket(id, { xellId, by })` — handing a ticket to a manager
+zee. The first is a picker read model (the manager xells of *this* ticket's project as they are right
+now, each with `live`: whether it has a cxell session a message can be typed into) built the same way
+as `work-assign.js`'s `candidatesFor`. The second sends through the **existing** delivery path —
+`managers.postMessage` → `sendMessageToXell`, the console's 📨 door — so the message is stored in the
+manager's inbox and typed into its live session, and the not-delivered verdict is passed back
+verbatim rather than rounded up to "sent". It is a NOTIFICATION: it assigns nothing and opens no
+gate, and the text says so.
+
 `breakdownTicket(id, { items, actor })` — the hinge. Creates the work items (default parent = the
 **project root**, default kind `task`), links every one to the ticket, sets `ticket.work_item_id` to
 the shallowest created item when unset, moves the ticket `queued → assigned`, and returns
@@ -446,6 +460,8 @@ which is not ISO 8601 and gives `NaN` or a silently different day depending on t
 | DELETE | `/api/tickets/:id` | work items survive, `unlinked_work_items` says how many |
 | POST | `/api/tickets/:id/comments` | `{author, body}` |
 | POST | `/api/tickets/:id/breakdown` | `{items:[…], actor}` → the created tree. **One transaction**: all six items or none |
+| GET | `/api/tickets/:id/managers` | the manager zees of this ticket's project, resolved live, each with `live` + a `why` line |
+| POST | `/api/tickets/:id/notify` | `{xell_id, by}` → tells that manager about the ticket. Answers `{code, delivered, delivery, note}` |
 | GET | `/api/work-items?project=&tree=1&status=&kind=&root=&ticket=` | |
 | POST | `/api/work-items` | `project` in the body (or inherit it from `parent_id`) |
 | GET | `/api/work-items/:id` | the full detail model |

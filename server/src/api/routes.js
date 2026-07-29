@@ -68,7 +68,7 @@ import { workStatusVocabulary } from '../lib/work-status.js';
 import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
          addDep, removeDep, boardModel, ganttModel, assertId, httpStatusOf } from '../lib/work-items.js';
 import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
-         breakdownTicket } from '../lib/tickets.js';
+         breakdownTicket, ticketManagers, notifyManagerOfTicket } from '../lib/tickets.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
@@ -1427,6 +1427,31 @@ router.post('/tickets/:id/comments', async (req, res) => {
     const c = await addComment(req.params.id, req.body || {});
     if (!c) return res.status(404).json({ error: 'no such ticket' });
     res.status(201).json(c);
+  } catch (err) { workErr(res, err); }
+});
+
+// WHO could be told about this ticket — the manager zees of its project, resolved LIVE, each with
+// whether it has a session a message can be typed into. The picker in the tickets window IS this
+// list (same contract as /work-items/:id/candidates: the server decides who is offerable).
+router.get('/tickets/:id/managers', async (req, res) => {
+  try {
+    const out = await ticketManagers(req.params.id);
+    if (!out) return res.status(404).json({ error: 'no such ticket' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+// Tell one of them about it: { xell_id }. Reuses the EXISTING delivery path (managers.postMessage →
+// sendMessageToXell, the 📨 button's door) — nothing new reaches into a cxell — and answers with the
+// verdict, including when it could not be typed into a live session.
+router.post('/tickets/:id/notify', async (req, res) => {
+  try {
+    const out = await notifyManagerOfTicket(req.params.id, {
+      xellId: req.body?.xell_id || req.body?.manager || null,
+      by: req.body?.by || 'human@console',
+    });
+    if (!out) return res.status(404).json({ error: 'no such ticket' });
+    res.json(out);
   } catch (err) { workErr(res, err); }
 });
 

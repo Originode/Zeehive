@@ -6,9 +6,9 @@
 // console lists is masked — same discipline as lib/provider-tokens.js.
 //
 // Resolution (resolveEnvironmentFor) is the rule the task asked for: an explicit xell.environment_id
-// wins; else a live-prod (db-shared-prod) or is_production xell gets the default PROD environment;
-// else the default DEV one. Spinoff/dev xells therefore get dev env, prod xells get prod env, and a
-// xell handed the live prod db is loaded with the production environment.
+// wins; else a xell ON PRODUCTION (see isOnProduction) gets the default PROD environment; else the
+// default DEV one. Spinoff/dev xells therefore get dev env, prod xells get prod env, and a xell
+// handed the prod db is loaded with the production environment.
 import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pool, q, one } from '../db/pool.js';
@@ -281,15 +281,34 @@ export async function diffEnvironments(aId, bId) {
 }
 
 // ── RESOLUTION — the heart of it ────────────────────────────────────────────────
+// WHICH couplings count as "on production" for the purpose of loading an environment. ONE
+// definition, used by resolveEnvironmentFor, resolvedEnvView and (as SQL) lib/fleet.js — the three
+// places that each carried their own copy of the test until ticket #15 found them disagreeing.
+//
+// db-prod-readonly is on production. A xell READING the live database talks to the live system, so
+// it needs the live system's env vars (API bases, bucket names, service accounts) for anything it
+// reads to mean what it says; loading it with dev vars is how a manager zee ended up holding
+// production and a dev .env at the same time. Read-only is NOT widened by this: the binding lives in
+// DATABASE_URL, which emitXellEnv owns as a RESERVED name — an environment can never set it, so a
+// reader keeps the SELECT-only DSN the queenzee minted for it whatever the prod environment says.
+//
+// db-clone is NOT on production, deliberately: a clone is a throwaway COPY of prod's data sitting in
+// the dev cluster. Handing it prod's environment would point a disposable xell at prod's real
+// services with a database that only looks like prod.
+export function isOnProduction(xell) {
+  return xell?.db_coupling === 'db-shared-prod'
+      || xell?.db_coupling === 'db-prod-readonly'
+      || xell?.is_production === true;
+}
+
 // Returns the environment row a xell should get, or null if none is configured. The precedence is
-// the task's rule, in order: explicit pin → live-prod/production → dev.
+// the task's rule, in order: explicit pin → on-production → dev.
 export async function resolveEnvironmentFor(xell) {
   if (xell.environment_id) {
     const pinned = await one(`SELECT * FROM environment WHERE id=$1`, [xell.environment_id]);
     if (pinned) return pinned;   // pin dropped out from under us → fall through to tier default
   }
-  const wantsProd = xell.db_coupling === 'db-shared-prod' || xell.is_production === true;
-  const tier = wantsProd ? 'prod' : 'dev';
+  const tier = isOnProduction(xell) ? 'prod' : 'dev';
   return one(
     `SELECT * FROM environment WHERE project_id=$1 AND tier=$2 AND is_default LIMIT 1`,
     [xell.project_id, tier]);
@@ -359,14 +378,14 @@ export async function extractXellEnv(xellId) {
 export async function resolvedEnvView(xell) {
   const env = await resolveEnvironmentFor(xell);
   if (!env) {
-    return { environment: null, pinned: !!xell.environment_id, tier: xell.is_production || xell.db_coupling === 'db-shared-prod' ? 'prod' : 'dev', vars: [] };
+    return { environment: null, pinned: !!xell.environment_id, tier: isOnProduction(xell) ? 'prod' : 'dev', vars: [] };
   }
   const vars = await q(
     `SELECT name, value, is_secret, updated_at FROM environment_var WHERE environment_id=$1 ORDER BY name`, [env.id]);
   return {
     environment: { id: env.id, key: env.key, label: env.label, tier: env.tier, is_default: env.is_default },
     pinned: !!xell.environment_id,
-    reason: xell.environment_id ? 'pinned' : (env.tier === 'prod' ? 'live-prod/production xell → prod env' : 'dev/spinoff xell → dev env'),
+    reason: xell.environment_id ? 'pinned' : (env.tier === 'prod' ? 'production xell (live or read-only) → prod env' : 'dev/spinoff xell → dev env'),
     vars: vars.map(maskVar),
   };
 }

@@ -1929,6 +1929,17 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-tnum { color: var(--accent); font-family: 'Cascadia Code', monospace; font-size: 11.5px; }
 .work-tkind { color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; font-size: 11px; }
 .work-tcount { color: var(--muted); font-size: 11px; }
+/* The ticket CODE: monospace and selectable, because half its job is being read off a screen and
+   typed by hand when the clipboard is blocked (a console served over plain http has none). */
+.work-tcode { display: inline-flex; align-items: center; gap: 5px; }
+.work-tcode code { font-family: 'Cascadia Code', monospace; font-size: 11.5px; color: var(--text);
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px;
+  user-select: all; }
+/* Notify: the verdict is never styled as success until it IS one — a message that reached no live
+   session is amber, because "stored in its inbox" is a different fact from "delivered". */
+.work-tnotify { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; margin: 6px 0 10px; }
+.work-verdict { font-size: 11.5px; color: var(--muted); }
+.work-verdict.cold { color: var(--prod, #f0913b); }
 .work-tdetail { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px;
   background: var(--panel); padding: 10px 12px; }
 .work-tdetail-h { display: flex; align-items: center; gap: 10px; }

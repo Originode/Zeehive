@@ -18,13 +18,31 @@
 // channel so the console's SSE stream pushes it; the database owns the impossibilities.
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
+import { postMessage } from './managers.js';
 import { workLabel, isWorkStatus, nextStatuses, canTransition, TICKET_KINDS,
          WORK_STATUS_KEYS } from './work-status.js';
 import { createWorkItem, projectRoot, logWorkEvent, nestItems, assertId, isUuid,
-         inTransaction, dbRunner, bad, refuse } from './work-items.js';
+         inTransaction, dbRunner, bad, notFound, refuse } from './work-items.js';
 
 const COLS = `id, project_id, number, title, body, kind, status, priority, reporter, assignee,
               labels, work_item_id, created_at, updated_at, closed_at`;
+
+// THE TICKET CODE — the short handle a human copies and a zee is told.
+//
+// `ref` (#16) is what a person says out loud, and it is per-project: two projects both have a #16,
+// so a bare number pasted into an agent's session names two different tickets. The CODE is that same
+// number made unambiguous, by DERIVATION only — the ticket's own number plus the first four hex of
+// its uuid. Nothing is stored, so there is no column to migrate, nothing to backfill and no way for
+// the code to disagree with the row: both halves are immutable, so the same ticket always renders
+// the same code, and a code always names exactly one ticket in practice.
+//
+// Uppercase and hyphenated because its whole job is to survive a copy-paste into a terminal and be
+// recognised again on the way back out.
+export function ticketCode(row) {
+  if (!row?.number) return null;
+  const short = String(row.id || '').replace(/-/g, '').slice(0, 4).toUpperCase();
+  return short ? `TKT-${row.number}-${short}` : `TKT-${row.number}`;
+}
 
 function shapeTicket(row) {
   if (!row) return null;
@@ -34,6 +52,7 @@ function shapeTicket(row) {
     status_label: workLabel(row.status),
     next_statuses: nextStatuses(row.status),
     ref: `#${row.number}`,
+    code: ticketCode(row),
   };
 }
 
@@ -268,4 +287,126 @@ export async function breakdownTicket(id, { items = [], actor = null } = {}) {
     return { ok: true, ticket: shapeTicket(row), created, tree: nestItems(created), count: created.length };
   });
   return out;
+}
+
+// ── telling a MANAGER about a ticket ─────────────────────────────────────────
+//
+// A ticket that nobody reads is a ticket nobody acts on, and the fleet's readers are manager zees.
+// So the tickets window can hand one to a manager directly. Two rules shape this, and both are
+// about not lying to the human who pressed the button:
+//
+// 1. THE LIST IS RESOLVED LIVE, never remembered. `ticketManagers` reads the manager xells of THIS
+//    ticket's project as they are right now — the same idea as work-assign.js's `candidatesFor`,
+//    and the same reason: a picker that offers something the server would then refuse is worse than
+//    a picker that offers fewer options. A manager with no live cxell session is still LISTED, with
+//    `live:false` and a `why` line saying so, because hiding it would leave a human wondering where
+//    their manager went; what must not happen is a message that quietly reaches nobody.
+//
+// 2. DELIVERY IS THE EXISTING PATH, and its verdict is passed straight back. `postMessage` STORES
+//    the message (so `zee inbox` finds it whenever the manager next looks) and then types it into
+//    the live session — the same door the console's 📨 button uses. Nothing new reaches into a
+//    cxell. When the typing cannot happen it says why, and the answer here repeats that sentence
+//    rather than rounding it up to "sent".
+//
+// A notification is NOT an order: it assigns nothing, opens no gate and casts no work. The text
+// says so out loud, because an agent handed a ticket will otherwise start on it.
+const MANAGER_COLS = `x.id, x.slug, x.status, x.created_at,
+                      z.status AS zee_status, z.model, z.viewer_kind, z.claude_session_id`;
+
+export async function ticketManagers(id) {
+  assertId(id, 'ticket id');
+  const ticket = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
+  if (!ticket) return null;
+  const rows = await q(
+    `SELECT ${MANAGER_COLS}
+       FROM xell x
+       LEFT JOIN LATERAL (
+         SELECT * FROM zee zz WHERE zz.xell_id = x.id AND zz.entrypoint = 'cxell-cli'
+          ORDER BY zz.created_at DESC LIMIT 1) z ON true
+      WHERE x.project_id = $1
+        AND COALESCE(x.zee_type,'worker') = 'manager'
+        AND x.status NOT IN ('retired','tearing-down','error','husk')
+      ORDER BY x.created_at`, [ticket.project_id]);
+
+  // `live` mirrors EXACTLY what nudge.js's sendMessageToXell requires to type into a session (a
+  // cxell-cli zee sitting in an ssh-terminal cxell). Deriving it from anything else would let the
+  // picker promise a delivery the send path then refuses.
+  const managers = rows.map((r) => {
+    const live = r.viewer_kind === 'ssh-terminal';
+    return {
+      xell_id: r.id, slug: r.slug, status: r.status, zee_status: r.zee_status || null,
+      model: r.model || null, live,
+      why: live
+        ? 'a live cxell session — the notification is typed straight into it'
+        : 'no live cxell session — the notification is stored in its inbox, but nothing is typed in',
+    };
+  });
+  return {
+    ok: true,
+    ticket: { id: ticket.id, number: ticket.number, code: ticketCode(ticket), title: ticket.title },
+    count: managers.length,
+    managers,
+    note: managers.length ? null
+      : 'This project has no manager zee to notify — a human adds one from the console (POST /api/managers).',
+  };
+}
+
+export async function notifyManagerOfTicket(id, { xellId, by = 'human@console' } = {}) {
+  assertId(id, 'ticket id');
+  if (!xellId) throw bad('xell_id required — the manager to notify, from GET /api/tickets/:id/managers');
+  assertId(xellId, 'xell id');
+  const ticket = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
+  if (!ticket) return null;
+  const manager = await one(
+    `SELECT id, slug, project_id, status, COALESCE(zee_type,'worker') AS zee_type FROM xell WHERE id=$1`,
+    [xellId]);
+  if (!manager) throw notFound('no such xell — that manager is gone. Re-open the picker for the live list.');
+  if (manager.zee_type !== 'manager') {
+    throw refuse(`${manager.slug} is not a manager zee — a ticket notification goes to a manager, `
+      + 'not to a worker. Workers are briefed when a human casts the work onto them.');
+  }
+  if (manager.status === 'retired') throw refuse(`${manager.slug} is retired — there is nobody there to read it.`);
+  if (manager.project_id !== ticket.project_id) {
+    throw refuse(`${manager.slug} manages another project — a ticket is only ever handed to a manager of its own.`);
+  }
+
+  const shaped = shapeTicket(ticket);
+  // from: null, kind 'report' — the same shape managers.js already uses for a queenzee/console-side
+  // notice addressed to a manager (see decideDoneSuggestion).
+  const sent = await postMessage({ from: null, to: manager, kind: 'report', by,
+                                   body: notifyBody(shaped, by) });
+  return {
+    ok: true,
+    code: shaped.code,
+    ticket: { id: shaped.id, number: shaped.number, title: shaped.title, code: shaped.code },
+    manager: { xell_id: manager.id, slug: manager.slug },
+    delivered: sent.delivered,
+    delivery: sent.delivery,
+    message_id: sent.message?.id || null,
+    note: sent.delivered
+      ? `${manager.slug} was told about ${shaped.code} — typed into its live session, and in its inbox.`
+      : `${shaped.code} is in ${manager.slug}'s inbox, but it was NOT typed into a live session: `
+        + `${sent.delivery?.reason || sent.delivery?.error || 'no reason given'}. It reads it with `
+        + '`zee inbox` when it next runs; nothing was lost.',
+  };
+}
+
+// What the manager actually receives. The CODE leads, because that is the handle every later
+// sentence about this ticket will use; the body is trimmed rather than sent whole (a 40kB ticket
+// typed into a session is noise, and the id is right there to read the rest by).
+function notifyBody(t, by) {
+  const lines = [
+    `📋 TICKET ${t.code} — #${t.number}: ${t.title}`,
+    `${t.kind} · priority ${t.priority} · ${t.status_label || t.status}`
+      + (t.reporter ? ` · reported by ${t.reporter}` : ''),
+    `ticket id: ${t.id}`,
+  ];
+  const body = String(t.body || '').trim();
+  if (body) lines.push('', body.length > 1500 ? `${body.slice(0, 1500)}…` : body);
+  lines.push('',
+    'This is a NOTIFICATION, not an order: nothing is assigned, no gate is open and no work has been '
+    + 'cast. Read it and decide — if it is yours to run, break it down into work items and dispatch a '
+    + `worker. Quote ${t.code} whenever you talk about it.`,
+    `— sent from the tickets window by ${by}.`);
+  return lines.join('\n');
 }

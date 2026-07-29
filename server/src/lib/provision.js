@@ -102,10 +102,25 @@ export async function emitXellEnv(xellId) {
     `ZEEHIVE_DOCKER_CONTEXT=${xellCtx || site?.docker_ctx || config.dockerCtx}`,
   ];
 
-  // The xell's OWN database, when it has one. HARD GUARD (spec §6.2): never emit the managing
-  // instance's meta-DB — two queenzees reconciling one meta-DB reap each other's xells; that
-  // failure class has destroyed live work before, so it is a refusal, not a warning.
-  let dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
+  // DATABASE_URL — the one database this xell's zee is meant to talk to, in binding order. HARD
+  // GUARD (spec §6.2, below): never emit the managing instance's meta-DB — two queenzees
+  // reconciling one meta-DB reap each other's xells; that failure class has destroyed live work
+  // before, so it is a refusal, not a warning.
+  //
+  // FIRST, before the xell's own db container: a xell bound to production READ-ONLY. Its
+  // DATABASE_URL is the SELECT-only DSN the queenzee minted for it (lib/prod-readonly.js) — never
+  // the prod owner's connection string, and never its OWN db container either. That precedence is
+  // the point: a manager is an ordinary pooled spinoff (owned db container and all) that is THEN
+  // bound read-only, so taking the owned container first
+  // meant the manager's .zeehive.env quietly pointed at its throwaway spinoff database while its
+  // binding advertised production (ticket #15). The binding is what the zee was told it has, so the
+  // binding wins. Emitted at all because a cxell zee has no docker and reaches postgres over TCP.
+  // Falls through when no DSN was minted (a project with no prod db registered — bindManagerToProd-
+  // Readonly skips the bind there): a xell then keeps whatever database it really has, rather than
+  // being left with none. The §6.2 refusal below still applies to this DSN like any other.
+  let dbUrl = (xell.db_coupling === 'db-prod-readonly' && xell.prod_ro_dsn) ? xell.prod_ro_dsn : null;
+  // …else the xell's OWN db container, when it has one.
+  if (!dbUrl) dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
   // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
   // dev postgres — the shared container's conn_ref with the database name swapped for the
   // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
@@ -121,12 +136,6 @@ export async function emitXellEnv(xellId) {
       } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
     }
   }
-  // A MANAGER xell holds production READ-ONLY: its DATABASE_URL is the SELECT-only DSN the queenzee
-  // minted for it (lib/prod-readonly.js), never the prod owner's connection string. Emitted here
-  // because a cxell zee has no docker and reaches postgres over TCP — without this line it holds a
-  // binding it cannot use. The role itself is what makes this safe to hand over.
-  if (!dbUrl && xell.db_coupling === 'db-prod-readonly' && xell.prod_ro_dsn) dbUrl = xell.prod_ro_dsn;
-
   // db-shared-dev on a PROCESS-runner project: the xell's server is a bare process, so unlike a
   // compose stack there is no network alias handing it a database — the projection must carry
   // the shared dev db's conn_ref outright. Scoped to process runners so compose projects keep
@@ -156,17 +165,40 @@ export async function emitXellEnv(xellId) {
   }
   if (dbUrl) {
     if (sameDatabase(dbUrl, config.databaseUrl)) {
-      throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
-        + `managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}) — `
-        + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
+      // §6.2, and the ONE exemption — the minted READ-ONLY reader.
+      //
+      // What the refusal protects against is a nested queenzee OPERATING on the managing instance's
+      // meta-DB: two reconcilers on one meta-DB reap each other's xells, and that has destroyed live
+      // work. Every part of that needs WRITE access — DELETE, UPDATE, the reaper. A db-prod-readonly
+      // xell holds a role minted by lib/prod-readonly.js: NOSUPERUSER, no write grant of any kind,
+      // `default_transaction_read_only = on`. It cannot reap anything; the worst it can do is crash
+      // its own nested server on the first INSERT.
+      //
+      // It has to be exempt, because when ZEEHIVE orchestrates ITSELF the production database IS the
+      // managing instance's meta-DB: refusing here would refuse the ENTIRE projection (ports, site,
+      // env vars — the file is written at the end) for every manager zee on this project, and the
+      // manager would keep pointing at its own throwaway spinoff db while its binding said
+      // production. That is ticket #15 again, with a scarier log line.
+      //
+      // The exemption is deliberately as narrow as it can be: this exact xell must be coupled
+      // read-only AND the URL must be the DSN the queenzee itself minted for it. An owner credential,
+      // an owned db container, a clone — anything else that resolves to the meta-DB is still refused.
+      const readerBinding = xell.db_coupling === 'db-prod-readonly' && dbUrl === xell.prod_ro_dsn;
+      if (!readerBinding) {
+        throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
+          + `managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}) — `
+          + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
+      }
+      logline('prod-ro', `${xell.slug}: DATABASE_URL is the managing instance's own meta-DB, emitted `
+        + 'because this xell holds it READ-ONLY (SELECT-only role) — the §6.2 reap risk needs writes');
     }
     lines.push(`DATABASE_URL=${dbUrl}`);
   }
 
   // Environment vars — the meta-DB source of truth for the untracked .env (migration 043).
-  // Resolved by tier: a live-prod (db-shared-prod) or is_production xell gets the project's default
-  // PROD environment, else the default DEV one; an explicit xell.environment_id overrides. Merged
-  // AFTER the per-xell truth above (ports/DATABASE_URL/site/slug) and BEFORE the manifest safety
+  // Resolved by tier: a xell ON PRODUCTION (environments.isOnProduction — writing it, reading it
+  // read-only, or being it) gets the project's default PROD environment, else the default DEV one;
+  // an explicit xell.environment_id overrides. Merged AFTER the per-xell truth above (ports/DATABASE_URL/site/slug) and BEFORE the manifest safety
   // defaults below, and it can never override either: any name already emitted (or declared in
   // spin.env) is skipped, so an environment can't redirect DATABASE_URL past the §6.2 guard nor
   // undo BUILD_MODE=simulate. Best-effort — a projection failure must not sink provisioning.
