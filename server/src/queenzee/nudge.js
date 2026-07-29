@@ -85,6 +85,70 @@ export async function nudgeXellForStaleLanding(xellId, { sha = null, ref = null,
   return { ...r, ...tended };
 }
 
+// CLEARED FOR LANDING — the third message in this loop, and the one that makes a QUEUE possible.
+//
+// When a zee pushes while another xell's landing is still open on the ref, its push is not raised as
+// a second card: it enters the holding pattern (067). That is only humane if somebody calls it back.
+// A cxell zee's turn ends at `zee land`, so a holder that is never told the runway freed is a zee
+// that waits forever on a card that was never on a human's screen.
+//
+// So the tower resumes it, with the SAME two steps as the stale recovery — for the same reason: the
+// ref has usually just moved (the xell ahead landed), so its sha is behind main, and `zee sync` is
+// the only way to catch up inside a cage. Deliberately explicit that clearance is NOT approval:
+// nothing of this zee's has been read by a human yet, and the fresh push is what raises the card.
+const CLEARED_PROMPT = (ref, sha, reason) => [
+  `The runway is CLEAR — you are next to land on ${ref ? ref.replace('refs/heads/', '') : 'main'}.`,
+  `While you were holding, the landing ahead of you finished${reason ? ` (${reason})` : ''}, so nothing is in front of`,
+  'you any more. Your push was never dropped and never rejected: it waited in a holding pattern so that a',
+  'human only ever had ONE landing to decide on this ref, which is what stops two zees racing and one of',
+  'them going stale.',
+  '',
+  'Take the runway — two steps, in this order:',
+  `  1. \`zee sync\` — the xell ahead of you probably just landed, so ${ref ? ref.replace('refs/heads/', '') : 'main'} has moved and your sha is`,
+  '     behind it. `zee sync` delivers current main INTO your cxell and MERGES it into your branch (in a cage',
+  '     `git fetch` / `git rebase main` cannot work). If it reports a genuine CONFLICT the merge is left in',
+  '     progress for YOU: resolve the files, `git add` them, `git commit`. If the merge touched your change,',
+  '     re-verify it (`zee build <role> --wait`, in the BACKGROUND).',
+  '  2. `zee land` — pushes your sha and raises a FRESH request for a human. THIS is the card they read.',
+  '',
+  'Being cleared is NOT an approval: nobody has looked at your commits yet, and nothing lands until they do.',
+  'Do not amend/force to dodge the gate, and do not touch origin. If the sync conflicts in a way you cannot',
+  'honestly resolve, stop and raise it: `zee tend --reason "…"`.',
+].join('\n');
+
+// Call a holder onto the runway. Same contract as the stale nudge — best-effort, NEVER throws, and a
+// zee that cannot be reached becomes a TEND rather than silence, because a clearance nobody hears is
+// a zee stranded in a pattern with no card and no way to know.
+export async function nudgeXellForClearedRunway(xellId, { sha = null, ref = null, reason = null, requestId = null, by = 'queenzee' } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const r = await nudgeCxell(xellId, {
+    by, prompt: CLEARED_PROMPT(ref, sha, reason), why: 'runway cleared',
+    log: (slug, sid) => `${slug}: CLEARED to land ${short} — resuming cxell session ${sid} to `
+      + '`zee sync` and land',
+    onFail: (e) => clearanceUndelivered(xellId, { short, requestId, why: e.message }).catch(() => {}),
+  });
+  if (r?.nudged) return r;
+  const tended = await clearanceUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
+  return { ...r, ...tended };
+}
+
+// The go-around: nobody was home when the runway freed. Raise "needs a human in the console" and
+// correct the receipt, exactly as a stale landing does — the queue then calls the NEXT holder, so
+// one unreachable zee never leaves the runway standing empty.
+async function clearanceUndelivered(xellId, { short, requestId = null, why = 'unknown' } = {}) {
+  const xell = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xellId]).catch(() => null);
+  if (!xell || xell.status === 'retired') return { tended: false };
+  const reason = `The runway is clear and this xell is next to land ${short}, but its zee could NOT be nudged `
+    + `(${why}) — so nothing has synced or re-pushed, and the landing is waiting on a human.`;
+  await setTend(xellId, true, { reason, source: 'queenzee' }).catch(() => {});
+  if (requestId) {
+    await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING id`,
+      [requestId, `runway clear: ${reason}`]).catch(() => {});
+  }
+  logline('nudge', `${xell.slug}: cleared to land ${short} but the zee could NOT be reached (${why}) — raised a tend for a human`);
+  return { tended: true, reason };
+}
+
 // Nobody heard it. Raise "needs a human in the console" and correct the request's receipt, which
 // until this ran said the zee had been nudged. Never throws; never tends a xell that is already
 // gone (there is no zee left to come back to it, and a tend on a corpse is just noise).

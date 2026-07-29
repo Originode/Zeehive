@@ -1,7 +1,6 @@
 // All HTTP routes: hooks sink, read models, SSE stream, xell claim, task intake.
 import { Router } from 'express';
-import { resolve, sep } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { projectHook } from '../lib/status.js';
 import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.js';
@@ -12,7 +11,8 @@ import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
-         createHarness, updateHarness, deleteHarness, getHarnessFull } from '../lib/harness.js';
+         createHarness, updateHarness, deleteHarness, getHarnessFull,
+         harnessAvatarFile } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
@@ -66,7 +66,7 @@ import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, sugge
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
 import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
-         addDep, removeDep, boardModel, ganttModel, assertId } from '../lib/work-items.js';
+         addDep, removeDep, boardModel, ganttModel, assertId, httpStatusOf } from '../lib/work-items.js';
 import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
          breakdownTicket } from '../lib/tickets.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
@@ -661,14 +661,17 @@ router.delete('/harnesses/:key', async (req, res) => {
   try { res.json(await deleteHarness(req.params.key)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
-// The harness avatar badge (SVG). Resolved from the harness row's avatar_path under the repo root,
-// path-guarded so a crafted key can't escape harnesses/. 404 when a harness has no avatar.
+// The harness avatar badge (SVG). Resolved from the harness row's avatar_path under the repo the
+// harness FILES live in (the Zeehive project's repo_root, falling back to config.repoRoot) —
+// harnessAvatarFile() is the same resolution loadHarnessDir uses, so the badge and the bundle can
+// never disagree about which repo a harness is. Path-guarded so a crafted avatar_path can't escape
+// harnesses/. 404 when a harness has no avatar (or its folder is not readable from here).
 router.get('/harnesses/:key/avatar', async (req, res) => {
   try {
     const h = await one(`SELECT avatar_path FROM harness WHERE key=$1`, [req.params.key]);
     if (!h?.avatar_path) return res.status(404).end();
-    const abs = resolve(config.repoRoot, h.avatar_path);
-    if (!abs.startsWith(resolve(config.repoRoot, 'harnesses') + sep) || !existsSync(abs)) return res.status(404).end();
+    const abs = await harnessAvatarFile(h.avatar_path);
+    if (!abs) return res.status(404).end();
     res.type(abs.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream');
     res.setHeader('Cache-Control', 'public, max-age=300');
     res.send(readFileSync(abs));
@@ -1359,10 +1362,16 @@ router.post('/xells/:id/seed', async (req, res) => {
 // Which refusals are 409 rather than 400: a 400 says "you sent nonsense", a 409 says "what you
 // asked for is coherent but conflicts with the state of the tree". A cycle, an activity under a
 // task and a delete of the project root are all the second kind.
-const CONFLICT = /cannot|refused|cycle|same project|nested under|root item|depend on itself|cross projects|legal next/i;
-function workErr(res, err, fallback = 400) {
-  const msg = String(err?.message || err || 'unknown error');
-  return res.status(CONFLICT.test(msg) ? 409 : fallback).json({ error: msg });
+// The status is read from the ERROR, never matched out of its text. work-items.js tags every
+// refusal it raises (bad/notFound/refuse) and translates a postgres trigger refusal by its CODE, so
+// the wording of a sentence and the status of a response are independent facts.
+//
+// They were not always: this used to be a regex over the message, which made every refusal sentence
+// load-bearing prose — reword one and its HTTP status flipped silently, with no test failing and no
+// log line to notice. httpStatusOf() defaults to 400 for anything untagged, exactly as the old
+// fallback did.
+function workErr(res, err) {
+  return res.status(httpStatusOf(err)).json({ error: String(err?.message || err || 'unknown error') });
 }
 const projectOf = (req) => req.query.project || req.body?.project || req.body?.project_id || null;
 

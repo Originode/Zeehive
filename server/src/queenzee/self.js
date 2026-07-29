@@ -17,7 +17,7 @@ import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 import { cleanGitEnv } from '../lib/git.js';
-import { landStatus, openLandRequests, withdrawLandRequest } from './landgate.js';
+import { landStatus, openLandRequests, holdingRequests, withdrawLandRequest } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
@@ -121,6 +121,17 @@ export async function selfStatus(xell) {
       ? { status: land.status, new_sha: land.new_sha, decided_by: land.decided_by, pending: land.status === 'pending',
           // A zee's own retraction (`zee land --withdraw`) — terminal, and NOT a human decision.
           withdrawn: land.status === 'withdrawn',
+          // THE HOLDING PATTERN (067). Not a card and not a decision: another xell's landing is open
+          // on this ref, so this push is queued with a POSITION and its zee is nudged when the runway
+          // clears. `cleared` means that call already came — the recovery is `zee sync`, `zee land`.
+          ...(land.status === 'holding'
+            ? { holding: !land.cleared_at, position: land.holding_position, behind: land.holding_behind,
+                cleared: !!land.cleared_at, since: land.holding_since,
+                note: land.cleared_at
+                  ? 'Your holding pattern was CLEARED — the runway is free. `zee sync`, then `zee land` to raise a fresh request.'
+                  : `HOLDING at position ${land.holding_position} behind ${land.holding_behind?.xell_slug || 'another xell'}'s landing. `
+                    + 'Nothing is in front of a human for you yet; the queenzee resumes you when the runway clears.' }
+            : {}),
           // How many landings this xell still has in front of a human. >1 is land-request spam: only
           // the zee knows which one it still means, so it is the zee that must withdraw the rest.
           open: openLandings.length,
@@ -293,6 +304,28 @@ export async function selfLand(xell) {
   // Push was HELD → a pending land_request for THIS EXACT sha must now exist. Verify it before we
   // dare say "held" — the whole point of the fix is that the status can be trusted.
   const request = await landStatus(xell.id);
+
+  // HOLDING — another xell's landing is open on this ref, so the gate did not raise a second card:
+  // it put this push in the pattern with a position. Say EXACTLY that. "Held" would be a lie (no
+  // human has been asked anything), and silence is what leaves a zee polling a card that does not
+  // exist. The zee's turn can end here: the queenzee resumes it when the runway clears.
+  if (request && request.status === 'holding' && !request.cleared_at && request.new_sha === push.head) {
+    const ahead = request.holding_behind;
+    return {
+      ok: true, status: 'holding', landed: false, collected, catch_up: caughtUp, healed, request,
+      position: request.holding_position,
+      behind: ahead ? { xell_slug: ahead.xell_slug, new_sha: ahead.new_sha, status: ahead.status } : null,
+      message: `HOLDING at position ${request.holding_position} — ${ahead?.xell_slug || 'another xell'} already has a landing `
+        + `open on ${(request.ref || '').replace('refs/heads/', '') || 'main'}${ahead ? ` (${String(ahead.new_sha).slice(0, 8)}, ${ahead.status})` : ''}, and the runway takes ONE at a `
+        + 'time. Your push was NOT rejected and NOT dropped: it is recorded (land_request '
+        + `${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote} and your commits are safe on your branch. `
+        + 'No card was raised for a human, deliberately — two landings on one ref is how one of them ends up stale. '
+        + 'You do NOT need to poll or re-push: when the runway clears the queenzee RESUMES your session and tells you '
+        + 'to `zee sync` and then `zee land` again. Keep working, or stop here. To leave the pattern instead, '
+        + '`zee land --withdraw --reason "…"`.',
+    };
+  }
+
   const trulyHeld = request && request.status === 'pending' && request.new_sha === push.head;
   if (trulyHeld) {
     // DID THIS PUSH LEAVE AN OLDER ASK BEHIND? A second sha raises a second card, and only the zee
@@ -350,12 +383,17 @@ export async function selfLand(xell) {
 // pulling it back is not an agent's call — the answer to "it must not land after all" is `zee tend`.
 export async function selfWithdrawLand(xell, { reason = null, request = null } = {}) {
   const open = await openLandRequests(xell.id);
-  const pending = open.filter((r) => r.status === 'pending');
+  // A landing that is HOLDING (067) is un-askable too: it is this zee's own ask, nobody has decided
+  // it, and a zee that no longer means it should be able to leave the pattern rather than be called
+  // for a runway it does not want. It is kept separate from `open` on purpose — a holding request is
+  // not a card in front of a human, so it must never be counted as one.
+  const holding = await holdingRequests(xell.id);
+  const pending = [...open.filter((r) => r.status === 'pending'), ...holding];
   const approved = open.filter((r) => r.status === 'approved');
 
   const targets = request ? pending.filter((r) => r.id === request) : pending;
   if (request && !targets.length) {
-    const mine = open.some((r) => r.id === request);
+    const mine = [...open, ...holding].some((r) => r.id === request);
     return { ok: false, status: 'not-found', withdrawn: [],
       error: mine ? `land_request ${String(request).slice(0, 8)} is not pending` : 'no such pending land request for this xell',
       message: mine
