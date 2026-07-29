@@ -1088,12 +1088,18 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           </span>
         )}
         {x.env_key && (
-          <span className={`envchip env-${x.env_tier}${Number(x.env_var_count) === 0 ? ' env-empty' : ''}`}
+          <span className={`envchip env-${x.env_tier}${Number(x.env_var_count) === 0 ? ' env-empty' : ''}`
+                  /* the .zeehive.env PROJECTION failed (078) — the file on disk is not what the
+                     meta-DB says it should be, and no log line survives long enough to say so */
+                  + (x.env_projection_error ? ' env-broken' : '')}
                 data-testid="env-chip"
                 title={`Environment: ${x.env_key} (${x.env_tier})`
                   + (x.env_pinned ? ' — pinned to this xell' : ` — default for ${x.env_tier} xells`)
                   + `\n${x.env_var_count} var(s) from the meta-DB`
                   + (Number(x.env_var_count) === 0 ? ' (empty → nothing added to .zeehive.env; xell runs as before)' : '')
+                  + (x.env_projection_error
+                    ? `\n\n⚠ .zeehive.env is NOT in sync with the meta-DB — the last projection failed:\n${x.env_projection_error}`
+                    : '')
                   + `\n\nClick to extract this xell's current .env`}
                 onClick={async (e) => {
                   e.stopPropagation();
@@ -1104,7 +1110,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
                       { title: `${x.slug} — current environment${r.source === 'zeehive-env' ? ' (.zeehive.env)' : r.environment ? ` (resolved: ${r.environment})` : ''}` });
                   } catch (err) { showAlert('Extract failed: ' + (err?.message || err), { variant: 'error' }); }
                 }}>
-            ❖ {x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}
+            ❖ {x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}{x.env_projection_error ? ' ⚠' : ''}
           </span>
         )}
         <span className="cardtop-right">

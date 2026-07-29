@@ -470,6 +470,9 @@ a.cbox:hover { border-color: var(--accent); }
 .envchip:hover { color: var(--fg); border-color: var(--muted); }
 .envchip.env-prod { color: #c8863c; border-color: #7a5a2e; }
 .envchip.env-empty { opacity: .55; font-style: italic; }
+/* the projection FAILED (xell.env_projection_error, 078): this xell's .zeehive.env does not match
+   the meta-DB and the queenzee could not make it — the state ticket #15 had no way to show. */
+.envchip.env-broken { color: #d06a5a; border-color: #7a3a30; }
 
 /* terminal button + modal */
 /* container build affordances */

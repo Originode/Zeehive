@@ -76,10 +76,15 @@ function sameDatabase(a, b) {
   return host(ua) === host(ub) && ua.port === ub.port && ua.pathname === ub.pathname;
 }
 
-export async function emitXellEnv(xellId) {
+// Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
+// The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
+// ordinary state of a pooled xell, not a projection failure worth flagging to a human.
+async function writeXellEnv(xellId) {
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
-  if (!xell?.worktree_path) throw new Error('xell has no worktree');
-  if (!existsSync(xell.worktree_path)) throw new Error(`worktree does not exist: ${xell.worktree_path}`);
+  if (!xell?.worktree_path) throw Object.assign(new Error('xell has no worktree'), { no_worktree: true });
+  if (!existsSync(xell.worktree_path)) {
+    throw Object.assign(new Error(`worktree does not exist: ${xell.worktree_path}`), { no_worktree: true });
+  }
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
   const site = await resolveSite(xell.project_id, 'dev');
   const cs = await q(
@@ -232,7 +237,14 @@ export async function emitXellEnv(xellId) {
 
   const wt = xell.worktree_path.replace(/\\/g, '/');
   const path = `${wt}/.zeehive.env`;
-  writeFileSync(path, lines.join('\n'));
+  const text = lines.join('\n');
+  // A projection identical to what is already on disk is a NO-OP, not a write. The reconcile below
+  // runs over the whole fleet, and a queenzee that rewrites an unchanged file under every working
+  // zee is indistinguishable (mtime, watchers, "did I do that?") from the zee having edited it —
+  // the same rule reinjectHarnessIntoLiveXells holds for harness files.
+  let changed = true;
+  try { changed = readFileSync(path, 'utf8') !== text; } catch { changed = true; }   // unreadable/absent → write
+  if (changed) writeFileSync(path, text);
 
   // Keep the projection out of git's sight WITHOUT touching the project's committed .gitignore:
   // the repo-local exclude file (info/exclude, shared across this repo's worktrees) exists for
@@ -251,7 +263,113 @@ export async function emitXellEnv(xellId) {
       }
     }
   } catch { /* exclusion is a nicety; the projection itself matters more */ }
-  return { ok: true, path, slug: xell.slug };
+  return { ok: true, path, slug: xell.slug, changed };
+}
+
+// Emit a xell's .zeehive.env AND record what happened on the xell row. Same signature, same throws,
+// same result (plus `changed`) — every existing caller is unaffected.
+//
+// The bookkeeping is the point: until now the ONLY trace of a failed projection was a log line, and
+// every caller after provisioning re-emits best-effort (bindManagerToProdReadonly, dbclone, rename,
+// an environment pin). So a manager could be bound to production, be told it holds production, and
+// keep a file pointing at its own throwaway spinoff db, with nothing a human could look at (ticket
+// #15). env_projected_at / env_projection_error (migration 078) are that read model; fleet.js
+// selects x.*, so the console's env chip carries them for free.
+export async function emitXellEnv(xellId) {
+  try {
+    const r = await writeXellEnv(xellId);
+    await noteEnvProjection(xellId, null);
+    return r;
+  } catch (e) {
+    // A pooled xell with no worktree on disk yet has nothing to project — that is its normal state,
+    // not a fault, and flagging it would bury the failures that ARE faults.
+    if (!e?.no_worktree) await noteEnvProjection(xellId, e.message);
+    throw e;
+  }
+}
+
+// Stamp the outcome of a projection. Never throws: bookkeeping about a write must not become a
+// second way for the write to fail. Broadcasts only when the error STATE changes, so a fleet-wide
+// reconcile of healthy xells is silent on the event stream.
+async function noteEnvProjection(xellId, error = null) {
+  try {
+    const prev = await one(`SELECT env_projection_error FROM xell WHERE id=$1`, [xellId]);
+    if (!prev) return;
+    const row = await one(
+      `UPDATE xell
+          SET env_projection_error = $2,
+              env_projected_at = CASE WHEN $2::text IS NULL THEN now() ELSE env_projected_at END
+        WHERE id=$1 RETURNING *`, [xellId, error || null]);
+    if (row && (prev.env_projection_error || null) !== (error || null)) broadcast('xell', row);
+  } catch { /* the projection itself matters more than the note about it */ }
+}
+
+// ── THE FLEET-WIDE CATCH-UP (ticket #15 follow-up) ───────────────────────────────────────────────
+//
+// .zeehive.env is a FILE, written from the meta-DB at provision time. Fix the RULE that computes it
+// — which is what ticket #15 did — and every xell provisioned before the fix keeps its wrong file
+// forever: its binding says production read-only, its file says its own throwaway spinoff database,
+// and nothing tells anyone. A human had to remember to re-bind each manager by hand.
+//
+// WHEN this runs: at queenzee BOOT, over every non-retired xell (index.js, beside the other boot
+// reconciles). Deliberately not a periodic tick — every path that CHANGES a xell's binding already
+// re-emits (bind/unbind, the db-clone watch, rename, an environment pin), so the only way a
+// correctly-emitted file goes stale is that the PROJECTION RULE changed, and a rule change arrives
+// as new code, which restarts the queenzee. A loop re-walking every worktree on a timer would be
+// scanning for a condition that can only appear at a deploy.
+//
+// WHAT it writes: only what is provably stale. emitXellEnv compares the computed text with the file
+// and no-ops when they are identical, so a healthy fleet is read-only here. A rewrite UNDER A LIVE
+// ZEE is logged as such — a file changing under a working zee is otherwise indistinguishable from
+// the zee having changed it (the rule reinjectHarnessIntoLiveXells earned).
+//
+// WHAT it never does: widen a binding. It recomputes from the meta-DB through the same emitXellEnv
+// every other caller uses — §6.2 guard, reserved names and all. It cannot invent access a xell's
+// row does not already carry.
+export async function reconcileXellEnvs({ reason = 'boot' } = {}) {
+  const xells = await q(
+    `SELECT x.id, x.slug, x.worktree_path,
+            EXISTS(SELECT 1 FROM zee z WHERE z.xell_id = x.id AND z.decommissioned_at IS NULL
+                     AND z.status IN ('spawning','online','working','idle')) AS live
+       FROM xell x
+      WHERE x.status NOT IN ('retired','tearing-down','husk') AND x.worktree_path IS NOT NULL
+      ORDER BY x.created_at`);
+  let checked = 0, rewritten = 0, failed = 0, skipped = 0;
+  const broken = [], stale = [];
+  for (const x of xells) {
+    if (!existsSync(x.worktree_path)) { skipped++; continue; }   // pooled/torn-down: nothing on disk
+    checked++;
+    try {
+      const r = await emitXellEnv(x.id);
+      if (!r.changed) continue;
+      rewritten++;
+      stale.push(x.slug);
+      logline('env', `${x.slug}: .zeehive.env was STALE — rewritten from the meta-DB`
+        + (x.live
+          ? ' WHILE A ZEE IS WORKING IN IT. The QUEENZEE wrote that file, not the zee; its app tier '
+            + 'still runs on the old values until its next build.'
+          : ''));
+    } catch (e) {
+      failed++;
+      broken.push(`${x.slug} (${e.message})`);
+      // LOUD, both ways: the queenzee log a human reads in the console, and stdout (the docker log).
+      // This is the exact failure that used to disappear into a `.catch(() => {})`.
+      logline('env', `${x.slug}: .zeehive.env could NOT be reconciled — ${e.message}. That xell is `
+        + 'still running on whatever its file already said.');
+      console.error(`[env] ${x.slug}: .zeehive.env projection FAILED — ${e.message}`);
+    }
+  }
+  // ONE summary line, always — a reconcile that found nothing must still say it ran, or "no news"
+  // and "never ran" look identical (the lesson logHarnessSummary is built on).
+  logline('env', `.zeehive.env reconcile (${reason}): ${checked} checked, ${rewritten} rewritten`
+    + `${stale.length ? ` [${stale.slice(0, 5).join(', ')}${stale.length > 5 ? ', …' : ''}]` : ''}`
+    + `, ${failed} FAILED${broken.length ? ` [${broken.slice(0, 3).join('; ')}]` : ''}`
+    + `, ${skipped} skipped (no worktree on disk)`);
+  if (failed) {
+    console.error(`[env] ${failed} xell(s) are running on a .zeehive.env that could not be `
+      + `reconciled with the meta-DB: ${broken.join('; ')}`);
+  }
+  return { checked, rewritten, failed, skipped, broken, stale };
 }
 
 // ── bootstrap prerequisites (spec §4.2/§4.3) ──────────────────────────────────

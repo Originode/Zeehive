@@ -47,14 +47,25 @@ export async function bindManagerToProdReadonly(xellId) {
   const reader = await mintProdReader(xell, project);
   const db = await attachXellDb(xellId, { coupling: 'db-prod-readonly' });
   // Re-emit .zeehive.env so the xell's DATABASE_URL is the read-only DSN (provision.js reads
-  // prod_ro_dsn for this coupling). Best-effort: a xell whose worktree is not yet on disk still gets
-  // the DSN through its binding, and the next emit picks it up.
-  await emitXellEnv(xellId).catch((e) => logline('prod-ro', `${xell.slug}: .zeehive.env not re-emitted (${e.message})`));
+  // prod_ro_dsn for this coupling). Best-effort — a xell whose worktree is not yet on disk still
+  // gets the DSN through its binding — but NEVER silent: this is the exact moment ticket #15 went
+  // wrong, and a bind that reports success while the file still points at the xell's throwaway
+  // spinoff db is worse than a bind that fails. So: the queenzee log, stdout, AND the failure rides
+  // back in the result. emitXellEnv also stamps xell.env_projection_error, and the boot reconcile
+  // (provision.reconcileXellEnvs) retries it.
+  const emit = await emitXellEnv(xellId).catch((e) => ({ error: e.message }));
+  if (emit?.error) {
+    logline('prod-ro', `${xell.slug}: BOUND read-only but .zeehive.env was NOT re-emitted (${emit.error}) `
+      + '— its file still points at whatever it said before, so the zee holds prod in its binding and '
+      + 'something else in its env. Fix the cause; the queenzee re-projects it at boot.');
+    console.error(`[prod-ro] ${xell.slug}: .zeehive.env NOT re-emitted after the read-only bind — ${emit.error}`);
+  }
   const row = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   broadcast('xell', row);
   logline('prod-ro', `${xell.slug} bound to PRODUCTION READ-ONLY as ${reader.role} `
     + `(${reader.container}/${reader.database}${reader.mode === 'simulate' ? ', SIMULATED' : ''})`);
-  return { ...db, readonly: true, role: reader.role, mode: reader.mode, address: reader.address };
+  return { ...db, readonly: true, role: reader.role, mode: reader.mode, address: reader.address,
+    env_emitted: !emit?.error, ...(emit?.error ? { env_error: emit.error } : {}) };
 }
 
 // ── THE COMPENSATING ACTION for a bind that is no longer wanted ──────────────────────────────────
@@ -88,13 +99,19 @@ export async function unbindManagerFromProdReadonly(xellId, reason = 'the dispat
                 WHERE uc.container_id=c.id AND uc.xell_id=$1 AND c.role='db' AND c.tier='prod'`, [xellId]);
       await q(`UPDATE xell SET db_coupling='db-shared-dev'::db_coupling, prod_ro_dsn=NULL WHERE id=$1`, [xellId]);
     }
-    await emitXellEnv(xellId).catch(() => {});
+    // Re-project the file too — and SAY SO when it fails. This used to be `.catch(() => {})`, which
+    // could leave a xell whose row is back on shared dev holding a .zeehive.env that still names the
+    // production read-only DSN: the exact inversion of ticket #15, and invisible.
+    const emit = await emitXellEnv(xellId).catch((e) => ({ error: e.message }));
     const row = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
     if (row) broadcast('xell', row);
     logline('prod-ro', `${xell.slug}: UNBOUND from production read-only (${reason}) — `
       + `${dropped.dropped ? `role ${dropped.role} dropped` : `role NOT dropped (${dropped.reason || dropped.error || '?'})`}`
-      + `, db back to shared dev${db?.error ? ` (re-attach failed: ${db.error} — coupling cleared directly)` : ''}`);
-    return { unbound: true, dropped: !!dropped.dropped, role: dropped.role || null };
+      + `, db back to shared dev${db?.error ? ` (re-attach failed: ${db.error} — coupling cleared directly)` : ''}`
+      + `${emit?.error ? `. WARNING: .zeehive.env NOT re-emitted (${emit.error}) — its file may still name the prod read-only DSN` : ''}`);
+    if (emit?.error) console.error(`[prod-ro] ${xell.slug}: .zeehive.env NOT re-emitted after unbind — ${emit.error}`);
+    return { unbound: true, dropped: !!dropped.dropped, role: dropped.role || null,
+      ...(emit?.error ? { env_error: emit.error } : {}) };
   } catch (e) {
     // Never let the compensation itself sink the caller's own error reporting.
     logline('prod-ro', `could not unbind ${String(xellId).slice(0, 8)} from production read-only: ${e.message}`);
