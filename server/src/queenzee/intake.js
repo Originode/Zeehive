@@ -21,7 +21,7 @@ import { logline } from '../lib/logbus.js';
 import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
          ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell,
-         installZeeCliIntoCxell } from '../lib/cxell.js';
+         installZeeCliIntoCxell, installZeeLiveIntoCxell } from '../lib/cxell.js';
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
@@ -1211,6 +1211,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     logline('cxell', cli.installed
       ? `${name}: zee CLI refreshed from the queenzee's ${cli.src} (never older than this API)`
       : `${name}: zee CLI NOT refreshed (${cli.reason}) — running the image's baked copy`);
+    // Same defence for the ATTEND path's renderer: the dashboard terminal's ✱/⚒ feed chips only
+    // work against a zee-live.mjs that watches the view file this queenzee writes.
+    await installZeeLiveIntoCxell({ ctx, name });
     // INJECT the assigned harness's files into the cxell (docs §6): its persona (.zeehive/harness/
     // PERSONA.md), its SKILL.md files (.claude/skills/…, Claude-loadable), and its MEMORY — including
     // the cxell manual carried by Zee Base — under .zeehive/harness/memory/. This is why the manual is

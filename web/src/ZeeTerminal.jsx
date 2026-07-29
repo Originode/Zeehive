@@ -23,6 +23,11 @@ function pathFromSelection(sel) {
 // doesn't turn into a sea of links.
 const PATH_RE = /(?:\.{0,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+(?::\d+(?::\d+)?)?|\b[A-Za-z0-9_-]+\.(?:jsx?|tsx?|mjs|cjs|json|css|md|py|sh|ya?ml|html?|sql|txt|toml|ini|env|lock)\b/g;
 
+// Frames from the bridge that are CONTROL, not terminal bytes: a NUL-tagged JSON string (terminal
+// output arrives as binary, so the two can never be confused). Must match CTRL_PREFIX in
+// server/src/lib/terminal-bridge.js.
+const CTRL_PREFIX = '\u0000ZH';
+
 // One live-terminal modal, two doors (same wire protocol on both — {t:'i'} keystrokes and
 // {t:'r'} resizes up, raw bytes down):
 //   ZeeTerminal       → /api/zees/:id/terminal       (SSH → tmux inside a cxell)
@@ -44,6 +49,10 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   const [clip, setClip] = useState('');              // the IN-APP clipboard: last selection captured here
   const [clipOpen, setClipOpen] = useState(false);   // the clipboard tray visible?
   const [flash, setFlash] = useState('');
+  // The zee's LIVE FEED view (the ✱/⚒ chips). `live` is what the bridge last told us about the
+  // cage: true = a feed is running and a chip repaints it now, false = the feed is not up (the
+  // turn ended and the interactive session owns the pane), null = we have not been told yet.
+  const [feed, setFeed] = useState({ thinking: true, moves: true, live: null });
 
   // Open a path in the explorer (opening the panel if needed). The bumping `n` makes every request
   // distinct so clicking the SAME path again re-opens it (identity, not value, drives the effect).
@@ -98,7 +107,17 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
     const settle = setTimeout(() => { refit(); sendResize(); }, 250);
 
     ws.onopen = () => { setStatus('live'); refit(); sendResize(); };
-    ws.onmessage = (e) => term.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data));
+    ws.onmessage = (e) => {
+      // control frame (the live-feed view) or terminal bytes — never both, see CTRL_PREFIX
+      if (typeof e.data === 'string' && e.data.startsWith(CTRL_PREFIX)) {
+        try {
+          const m = JSON.parse(e.data.slice(CTRL_PREFIX.length));
+          if (m.t === 'v') setFeed({ thinking: m.thinking !== false, moves: m.moves !== false, live: !!m.live });
+        } catch { /* a malformed control frame must not kill the terminal */ }
+        return;
+      }
+      term.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data));
+    };
     ws.onclose = () => setStatus('closed');
     ws.onerror = () => setStatus('error');
     term.onData((d) => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d })));
@@ -190,6 +209,24 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   // path box). So 📁 does both: a Shift+drag selection that LOOKS like a path opens that file (and
   // the panel with it); otherwise it plain toggles the panel. The selection is cleared after it is
   // consumed, so the very next click toggles instead of re-opening the same file.
+  // ── the live-feed chips: show/hide the zee's thinking, and its detailed moves ──
+  // A cxell zee's pane streams its transcript while it works (zee-live.mjs): ✱ thinking, ● what it
+  // says, ⚒ every tool call with its ↳ result. That firehose is the point when you want detail and
+  // the problem when you want to see what it is DOING. The chip flips a view flag in the cage and
+  // the feed REPAINTS — so hiding thinking also removes the thinking that already scrolled past,
+  // and showing it brings it back. We never send keystrokes for this: the pane belongs to the
+  // interactive session once the turn ends, and a stray keypress there would type into the zee.
+  const setFeedFlag = (key) => {
+    const next = { ...feed, [key]: !feed[key] };
+    setFeed(next);                                   // optimistic; the bridge answers with the truth
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'v', thinking: next.thinking, moves: next.moves }));
+    termRef.current?.focus();
+  };
+  const feedTitle = (on, what) =>
+    `${on ? 'Hide' : 'Show'} ${what} in the zee's live feed`
+    + (feed.live === false ? ' — no feed is streaming right now, so this is the view the next one starts in' : ' (the feed redraws)');
+
   const toggleExplorer = () => {
     const term = termRef.current;
     const p = pathFromSelection(term?.getSelection?.() || '');
@@ -210,6 +247,17 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
             {prod && <span className="term-prodtag" data-testid="term-prodtag">PRODUCTION</span>}
             <span className={`tstat t-${status}`}>{status}</span>
           </span>
+          {/* Only the zee door has a feed to filter — a container shell is just a shell. */}
+          {explorerZeeId && (
+            <span className="term-filters" data-testid="feed-filters">
+              <button className={`term-chip${feed.thinking ? '' : ' off'}${feed.live === false ? ' idle' : ''}`}
+                      data-testid="feed-thinking" onClick={() => setFeedFlag('thinking')}
+                      title={feedTitle(feed.thinking, "the zee's thinking (the ✱ lines)")}>✱ thinking</button>
+              <button className={`term-chip${feed.moves ? '' : ' off'}${feed.live === false ? ' idle' : ''}`}
+                      data-testid="feed-moves" onClick={() => setFeedFlag('moves')}
+                      title={feedTitle(feed.moves, 'the detailed moves — every ⚒ tool call and its ↳ result')}>⚒ moves</button>
+            </span>
+          )}
           <span>
             <button className={`term-x${clipOpen ? ' on' : ''}${clip && !clipOpen ? ' dot' : ''}`} data-testid="clip-toggle"
                     onClick={() => setClipOpen((v) => !v)}
@@ -278,7 +326,7 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
       {/* Copy is non-obvious: tmux mouse mode owns a plain drag, so a browser selection needs Shift.
           Surface it so nobody has to guess (reported: "I can't copy text"). */}
       <span className="pc kbd-hint" title="A plain drag goes to the app; Shift+drag makes a selection, captured into the 📋 clipboard tray">
-        <b>Shift+drag</b> → 📋 clipboard · click a <b>path</b> to open it
+        <b>Shift+drag</b> → 📋 clipboard · click a <b>path</b> to open it · <b>✱ ⚒</b> filter the live feed
       </span>
       <input className="mono" readOnly value={sshCmd || ''} onFocus={(e) => e.target.select()} />
       <button type="button" onClick={copy}>{copied ? '✓ copied' : '⧉ copy'}</button>

@@ -11,6 +11,10 @@
 #      by zee-live.mjs — so the attending human sees prior turns + tool calls + results AND new
 #      activity as it happens. This is READ-ONLY and starts no second `claude`, so it never forks
 #      the running session nor disturbs the -p stdout the SSE feed captures. Ctrl-C skips ahead.
+#      That feed is FILTERABLE from the dashboard: the terminal header's ✱ thinking / ⚒ moves chips
+#      write /tmp/zee-live-view.json (terminal-bridge.js, over a SECOND ssh channel — never
+#      keystrokes, because step 2 hands this pane to claude), and zee-live.mjs watches it, repaints
+#      and shows/hides that half of the feed.
 #   2. When the turn ends (or if it had already finished), `claude --resume <sid>` loads the FULL
 #      transcript interactively, scrolled to the latest turn. The cxell IS the permission system,
 #      so we drive with --dangerously-skip-permissions (pre-acknowledged in ~/.claude.json) — no
