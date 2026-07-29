@@ -21,6 +21,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
+import { briefReason } from './status.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
 
@@ -96,7 +97,7 @@ export async function crewFor(managerXellId) {
       r.ship_pending && 'a ship is awaiting a human',
       r.prod_bind_pending && 'it asked for the PROD database',
       r.seed_pending && 'it asked for production to be SEEDED',
-      r.tend_pending && `it raised a TEND (needs a human)${r.tend_reason ? `: ${r.tend_reason}` : ''}`,
+      r.tend_pending && `it raised a TEND (needs a human)${briefReason(r.tend_reason) ? `: ${briefReason(r.tend_reason)}` : ''}`,
       r.status === 'awaiting-done' && 'it proposed DONE (a human must confirm)',
       r.done_suggested && 'you already suggested it is done (awaiting a human)',
     ].filter(Boolean);

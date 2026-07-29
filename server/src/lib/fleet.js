@@ -6,6 +6,7 @@ import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { deviceConfig } from './devices.js';
+import { briefReason } from './status.js';
 import { listDoneSuggestions } from './managers.js';
 
 export async function defaultProject() {
@@ -218,8 +219,10 @@ async function decorateXell(x, heads, deployed, project) {
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
   // hive_status already says THAT one is open; this says WHAT FOR — the console renders it beside
   // the ask instead of sending the human into the session to find out.
+  // briefReason on the way OUT too: raising clamps it now, but rows written before that (and any
+  // future writer) can still hold an essay, and a card row is not where an essay may land.
   x.tend = x.tend_pending === true
-    ? { open: true, reason: x.tend_reason || null, at: x.tend_at || null }
+    ? { open: true, reason: briefReason(x.tend_reason), at: x.tend_at || null }
     : null;
   delete x.tend_reason; delete x.tend_at;
   delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;
