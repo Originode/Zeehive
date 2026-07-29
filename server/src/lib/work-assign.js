@@ -294,8 +294,9 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
 // THIS item's project and neither of them production or a manager:
 //   • the READY POOL — vacant xells waiting for a zee;
 //   • LIVE WORKERS with no open item — a zee that is between jobs.
-// A xell already carrying another open item is excluded (assign would refuse it anyway) — a picker
-// that offers a choice the server then rejects is worse than one that offers fewer.
+// A xell already carrying an open item is excluded — including the one already on THIS item, which
+// cannot "take" what it is already doing. A picker that offers a choice the server then rejects (or
+// that does nothing) is worse than one that offers fewer.
 export async function candidatesFor(id) {
   const item = await getItem(id);
   const rows = await q(
@@ -314,9 +315,9 @@ export async function candidatesFor(id) {
         AND NOT x.is_production
         AND COALESCE(x.zee_type,'worker') <> 'manager'
         AND NOT EXISTS (SELECT 1 FROM work_item wi
-                         WHERE wi.xell_id = x.id AND wi.id <> $2 AND wi.status <> ALL($3::text[]))
+                         WHERE wi.xell_id = x.id AND wi.status <> ALL($2::text[]))
       ORDER BY (x.status = 'ready') DESC, x.created_at`,
-    [item.project_id, item.id, TERMINAL]);
+    [item.project_id, TERMINAL]);
   return {
     ok: true, item: { id: item.id, title: item.title, status: item.status, xell_id: item.xell_id },
     count: rows.length,

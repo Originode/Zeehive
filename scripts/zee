@@ -34,6 +34,11 @@ const token = process.env.ZEEHIVE_XELL_TOKEN || '';
 const [cmd, ...rest] = process.argv.slice(2);
 
 function flag(name) { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : null; }
+// The bare first argument (`zee item <id> --status working`), and ONLY that. Hunting the argv for
+// "the first thing without a leading --" reads the VALUE of a flag as a positional the moment the
+// caller puts a flag first: `zee item --status working` swallowed "working" as the item id and asked
+// the server for a work item called working. A positional is argv[0] or it does not exist.
+function positional() { return rest.length && !rest[0].startsWith('--') ? rest[0] : null; }
 // --wait is a boolean flag with an optional =<secs> (default 1h). `--wait 30` is NOT supported —
 // the value form is `--wait=30`, so a bare `--wait` never eats the next positional.
 function waitFlag() {
@@ -391,7 +396,7 @@ switch (cmd) {
     // THE PLAN you are part of. A MANAGER sees its project's work items in tree order (--board drops
     // the project root, which is not a card); a WORKER sees the ONE item it is assigned to, with the
     // ancestors, ticket and acceptance notes it was briefed from. --item <id> reads one item.
-    const item = flag('item') || rest.find((a) => !a.startsWith('--') && /^[0-9a-f-]{8,}$/i.test(a)) || null;
+    const item = flag('item') || positional();
     const r = await req('GET', `/api/xell/self/work?${item ? `item=${encodeURIComponent(item)}&` : ''}${rest.includes('--board') ? 'board=1' : ''}`);
     if (rest.includes('--json')) { out(r); break; }
     const j = r.json || {};
@@ -437,7 +442,7 @@ switch (cmd) {
     // Report where the WORK has got to. A manager may report any item in its own project; a worker
     // only the one it is assigned to (and may omit the id — the server resolves it from your token).
     // This moves the CARD. It never marks your xell done, lands anything or ships anything.
-    const id = flag('item') || rest.find((a) => !a.startsWith('--')) || null;
+    const id = flag('item') || positional();
     const progress = flag('progress');
     out(await req('POST', '/api/xell/self/work/item', {
       id, status: flag('status') || null,
