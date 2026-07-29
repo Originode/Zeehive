@@ -29,7 +29,8 @@ import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
-import { setTend, tendState, setHint, hintOpen, pingWorking, briefReason } from '../lib/status.js';
+import { setTend, tendState, setHint, hintOpen, pingWorking, briefReason,
+  shipRefusalState } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          NO_PUSH_REASON } from '../lib/managers.js';
@@ -59,6 +60,10 @@ export async function selfStatus(xell) {
   const tend = await tendState(xell.id);
   const landHint = await hintOpen(xell.id, 'land');
   const shipHint = await hintOpen(xell.id, 'ship');
+  // A ship ask the gate REFUSED outright (no ship_request row was written). Carried here so `zee
+  // status` cannot read as "nothing happened" when the zee's last ship went nowhere — the exact
+  // mismatch behind "xells insist they have ship requests… i see zero" (lib/status.setShipRefusal).
+  const shipRefused = await shipRefusalState(xell.id);
   // The DISPLAY status the hive shows for this xell — the same derivation the dashboard renders, so
   // a cxell zee sees itself exactly as a human does (and can tell its tend/hint/land/ship pings landed).
   const hive = hiveStatus(
@@ -148,7 +153,19 @@ export async function selfStatus(xell) {
           // deferred: a human set this ship aside to batch it into one combined ship; it is NOT
           // rejected and NOT awaiting approval — it goes when they resume it.
           deferred: !!ship.deferred_at,
-          pending: ['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at }
+          // dismissed: the request exists but a human took its card off their screen. It is NOT
+          // something anyone is looking at, so a zee must never read it as "awaiting approval".
+          dismissed: !!ship.dismissed_at,
+          pending: ['pending', 'approved', 'shipping'].includes(ship.status)
+            && !ship.deferred_at && !ship.dismissed_at }
+      : null,
+    // Your last ship ask, if it was REFUSED (no request was raised, nothing is pending, nobody is
+    // being asked anything). This is here so a zee cannot honestly believe it has a ship waiting
+    // when it does not — the state a human sees as an empty production panel.
+    ship_refused: shipRefused.refused
+      ? { reason: shipRefused.reason, reason_full: shipRefused.full, at: shipRefused.at,
+          note: 'your last `zee ship` was REFUSED — NO request exists and nothing is awaiting a human. '
+            + 'Fix the reason and ask again; do not report a ship as pending.' }
       : null,
     prod_bind: prodBind
       ? { id: prodBind.id, status: prodBind.status, pending: prodBind.status === 'pending' }
@@ -562,9 +579,25 @@ export async function selfCatchup(xell, { restore = false } = {}) {
 // The zee only ASKS. requestShip refuses unless the work is already landed on main (the anti-band-aid
 // rule), holds the request for a human, and the QUEENZEE deploys from main on approval. Identical to
 // the host-side scripts/xell-ship.mjs path — this is just the cxell entry to it.
+// The answer is written to be UNMISREADABLE, because misreading it is what this cost: a refusal
+// used to come back as a bare `{ok:false, reason}` that a zee could relay to its human as "the ship
+// request is waiting for you" — while the console had nothing to show, because nothing was raised.
+// So a raised request says so with its request id and sha, and a refusal says NO REQUEST EXISTS.
 export async function selfShip(xell, { targets = null, reason = null } = {}) {
   const zee = await liveZee(xell.id);
-  return requestShip({ xellId: xell.id, zeeId: zee?.id || null, reason, targets });
+  const r = await requestShip({ xellId: xell.id, zeeId: zee?.id || null, reason, targets });
+  if (r.ok === false) return r;                      // requestShip already wrote the loud message
+  const req = r.request;
+  const decided = ['shipped', 'failed', 'rejected'].includes(req?.status);
+  return {
+    ...r,
+    message: decided
+      ? `Your ship request is '${req.status}' — see \`zee status\`.`
+      : `Ship REQUESTED (ship_request ${String(req.id).slice(0, 8)}, commit ${String(req.commit).slice(0, 8)}) — `
+        + 'a human must approve it in the ZEEHIVE console, and the QUEENZEE deploys from main. It is on '
+        + `their screen now${r.restored ? ' (it had been dismissed; asking again put it back)' : ''}. `
+        + 'Nothing you do speeds it up.',
+  };
 }
 
 // ── POST /api/xell/self/prod-request — ASK to bind this xell to the prod stack ──

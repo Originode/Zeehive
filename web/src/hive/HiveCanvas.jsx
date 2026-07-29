@@ -1084,7 +1084,7 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
 // draws a faint dashed hex seat with a circular AVATAR at its centre, its label + consumer count
 // below. The avatar image is a preloaded <img> drawn to canvas (reliable, unlike an SVG <image>);
 // a lettermark is the fallback while it loads or if it fails.
-function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false } = {}) {
+export function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false } = {}) {
   const col = h.color || '#5b8cff';
   const ay = cy - size * 0.06;                 // avatar centre, nudged up to leave room for the label
   const r = size * 0.42;
@@ -1109,13 +1109,32 @@ function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false }
   ctx.fillText(fit(ctx, h.label || '', hexWidth(size) * 0.82), cx, cy + size * 0.5);
   // ×N counts every xell WEARING it, not just the ones wired to this cell — a manager wears a harness
   // without consuming a cell for it (its own hexagon is the persona), and it still counts as harnessed.
+  // A harness that carries NOTHING says so in WORDS in place of that count: it looked identical to a
+  // full one here (same seat, same disc, same label) while every zee wearing it was briefed with a
+  // blank page. Colour is reinforcement; the word is the signal.
+  const warn = harnessWarning(h);
   const n = wearersOf(h).length;
-  if (n) {
+  if (warn) {
+    ctx.font = `700 ${Math.max(8, size * 0.14)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.error;
+    ctx.fillText(fit(ctx, `${warn}${n ? ` ×${n}` : ''}`, hexWidth(size) * 0.86), cx, cy + size * 0.68);
+  } else if (n) {
     ctx.font = `600 ${Math.max(8, size * 0.13)}px 'Segoe UI', sans-serif`;
     ctx.fillStyle = COL.muted;
     ctx.fillText(`×${n}`, cx, cy + size * 0.68);
   }
   ctx.restore();
+}
+
+// The badge's word for a harness carrying nothing — `files_missing` (its folder in the Zeehive
+// project repo is unreadable from the queenzee) beats `bundle_empty` (no personality/skills/memory),
+// because it names the CAUSE. Same two fields, same precedence and nearly the same words as the DOM
+// surfaces (web/src/harnessHealth.js) — a canvas cannot import the JSX helper, so the wording is
+// kept short here and the two are locked together by test/harness-empty-visible.test.mjs.
+export function harnessWarning(h) {
+  if (h?.files_missing) return '⚠ no files';
+  if (h?.bundle_empty) return '⚠ empty';
+  return null;
 }
 
 // The persona disc: a preloaded avatar image, else the harness's authored glyph, else a lettermark —
@@ -1197,6 +1216,19 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
   const discY = cy - size * (full ? 0.42 : 0.3);
   drawAvatarDisc(ctx, cx, discY, discR, harness?.color || COL.prod,
     { img, glyph: harness?.glyph || (harness ? null : '⬢'), letter: String(harness?.label || 'M')[0] });
+  // A manager IS its persona here — so when that persona carries nothing, the hexagon must say it.
+  // (This is the shape the original bug took: a manager zee, correctly seated, wearing a harness
+  // with no manual in it, and nothing on screen different from a manager that had one.)
+  const hwarn = harnessWarning(harness);
+  if (hwarn) {
+    ctx.beginPath(); ctx.arc(cx, discY, discR + 3, 0, Math.PI * 2);
+    ctx.lineWidth = 2; ctx.strokeStyle = COL.error; ctx.stroke();
+    if (full) {
+      ctx.font = `700 ${Math.max(7, size * 0.12)}px 'Segoe UI', sans-serif`;
+      ctx.fillStyle = COL.error;
+      ctx.fillText(fit(ctx, `${hwarn} harness`, w * 0.8), cx, cy - size * 0.17);
+    }
+  }
 
   // identity (⬢ slug), grown to fill the seat
   fillFont(ctx, card.label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);

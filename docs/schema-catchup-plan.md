@@ -233,7 +233,9 @@ a test.
 2. **Phase 2 — verify + fallback. ✅ DONE.** Post-run `diffXellDbAgainstProd` (`residual_missing` in
    the result); `zee db-catchup --restore`; auto `recommend_restore` when residual `missing` remains;
    the CLI message nudges the follow-up `zee db-migrate` for branch files.
-3. **Phase 3 — surface + document.** ✅ `docs/cxell-zee-manual.md` verb added. ⏳ Still to do: a
+3. **Phase 3 — surface + document.** ✅ the verb was added to the cxell-zee manual — which lives in
+   the meta DB (harness `zee-base`, memory `cxell-zee-manual.md`, amended by migration, injected into
+   each xell at `.zeehive/harness/memory/`), not in `docs/`. ⏳ Still to do: a
    proddiff-chip "Catch up to prod" action in the console (`web/src/`), and a line in the dispatch
    binding so a schema-work zee is told to `zee db-catchup` before writing migrations.
 

@@ -57,6 +57,13 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .projpop-pick .dot { color: var(--accent); font-size: 10px; }
 .projpop-pick .pn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .projpop-pick .pc { color: var(--muted); font-size: 11px; }
+/* "something is waiting on you in a project you are not looking at" — this page is per-project, so
+   without these an approval in the other project is invisible while its zee waits on it. */
+.projmenu-btn.waiting { color: var(--error); border-color: var(--error); position: relative; }
+.projmenu-wait { position: absolute; top: -5px; right: -5px; min-width: 14px; height: 14px;
+  padding: 0 3px; border-radius: 7px; background: var(--error); color: #fff;
+  font-size: 9px; line-height: 14px; font-weight: 700; }
+.projpop-pick .pw { color: var(--error); font-size: 11px; font-weight: 600; }
 .projpop-del { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 13px;
   padding: 6px 8px; border-radius: 6px; }
 .projpop-del:hover:not(:disabled) { color: var(--down); background: var(--panel2); }
@@ -966,6 +973,15 @@ a.cbox:hover { border-color: var(--accent); }
 /* a folded rider: informational, riding a carrier's single deploy — no actions of its own. */
 .ship-deferred.bundled { border-left-color: var(--building); color: var(--building); }
 
+/* REFUSED asks: a zee asked to ship and the gate said no, so no card exists to approve. Quiet and
+   informational — it answers "did anyone even ask?", which an empty panel used to answer wrongly. */
+.ship-refused { background: var(--panel2); border: 1px dashed var(--line); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 8px; }
+.ship-refused-head { color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.ship-refused-row { color: var(--muted); font-size: 12.5px; margin-top: 5px;
+  border-left: 2px solid var(--muted); padding-left: 8px; cursor: help; }
+.ship-refused-row b { color: var(--text); }
+
 /* prod is locked: why the plain approve is greyed out, and the unlock-&-ship escape hatch. */
 .ship-locked-note { color: var(--building); font-size: 12.5px; margin-top: 8px;
   border-left: 2px solid var(--building); padding-left: 8px; }
@@ -1197,6 +1213,21 @@ a.cbox:hover { border-color: var(--accent); }
 .hm-del { background: none; border: 1px solid var(--line); border-radius: 6px; color: var(--muted);
   cursor: pointer; padding: 4px 8px; }
 .hm-del:hover { color: var(--del, #e5554e); border-color: var(--del, #e5554e); }
+
+/* A harness carrying NOTHING (files_missing / bundle_empty). It used to render identically to one
+   carrying a 12.9k manual — same row, same badge — which is how a whole fleet of manager zees ran
+   with a blank persona unnoticed. The chip's WORDS are the signal (see web/src/harnessHealth.js);
+   these rules are reinforcement, never the only cue. */
+.hm-warn { font-size: 10px; font-weight: 700; color: var(--del, #e5554e); white-space: nowrap; }
+.hm-item.hm-hollow { border-color: rgba(229,85,78,.45); background: rgba(229,85,78,.08); }
+.hm-item.hm-hollow .hm-name { color: #ff9a94; }
+.hm-empty { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid rgba(229,85,78,.5); background: rgba(229,85,78,.10); color: var(--text);
+  font-size: 12px; line-height: 1.45; }
+.hm-empty b { color: #ff9a94; font-size: 13px; }
+.hm-empty code { background: rgba(0,0,0,.25); padding: 1px 4px; border-radius: 4px; }
+/* the same warning where a human PICKS a harness for a new zee (Dispatch) */
+.disp-seg.seg-hollow { border-color: rgba(229,85,78,.5); color: #ff9a94; }
 
 /* ── toasts: async-dispatch progress, bottom-right, above the overlay layer ────── */
 .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: flex;
@@ -1466,6 +1497,17 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 6px; padding: 2px 8px; font-family: 'Cascadia Code', monospace; font-size: 11px; }
 .fx-goin:focus { outline: none; border-color: var(--accent); }
 .term-x.on { color: var(--accent); }
+
+/* ── 💬 talk: the conversation door in the zee terminal header ──
+   It is a WORD, not a bare glyph, because it is the answer to "I typed and nothing happened" and a
+   human has to find it without hovering. `.urge` fires while a live feed owns the pane — the exact
+   state in which typing into the terminal reaches nobody — so the one moment the button matters
+   most is the one moment it is impossible to miss. */
+.term-x.talk { font-size: 11.5px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px;
+  margin-right: 6px; background: var(--panel2); color: var(--text); white-space: nowrap; }
+.term-x.talk:hover { border-color: var(--accent); }
+.term-x.talk.on { border-color: var(--accent); color: var(--accent); }
+.term-x.talk.urge { border-color: #e0a53b; color: #f0c46a; background: rgba(224,165,59,.12); }
 
 /* ── live-feed chips in the zee terminal header (✱ thinking · ⚒ moves) ──
    These first shipped as bare .term-chips and came straight back as "it's too difficult to see if

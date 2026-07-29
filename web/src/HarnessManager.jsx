@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { getHarnesses, getHarnessFull, createHarness, updateHarness, deleteHarness } from './api.js';
+import { emptyWarning } from './harnessHealth.js';
 
 // Author harnesses — the personas an AI assumes as a zee. A harness = personality + skills + memory,
 // layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
@@ -18,6 +19,47 @@ function treeRows(list) {
   const seen = new Set(rows.map((r) => r.h.key));
   for (const h of list) if (!seen.has(h.key)) rows.push({ h, depth: 0 });
   return rows;
+}
+
+// One row of the harness list. Exported (and prop-driven) so the "does it SAY it carries nothing"
+// contract can be rendered and read in a test, instead of grepped for in this file's source.
+export function HarnessRow({ h, depth = 0, on = false, onOpen }) {
+  const warn = emptyWarning(h);
+  return (
+    <button className={`hm-item ${on ? 'on' : ''} ${warn ? 'hm-hollow' : ''}`}
+            data-testid={`harness-item-${h.key}`} onClick={onOpen}
+            style={{ marginLeft: depth * 14 }}
+            title={warn ? warn.why : (depth ? `inherits ${h.parent}` : '')}>
+      {depth > 0 && <span className="hm-branch">↳</span>}
+      <span className="hm-glyph">{h.glyph || (h.label || '?')[0]}</span>
+      <span className="hm-name">{h.label}</span>
+      {warn
+        ? <span className="hm-warn" data-testid={`harness-empty-${h.key}`}>{warn.chip}</span>
+        : <span className="hm-meta">
+            {h.zee_type === 'manager' ? '⬢ mgr · ' : ''}{h.skill_count}★{h.file_backed ? ' · repo' : ''}
+          </span>}
+    </button>
+  );
+}
+
+// The loud version, where an operator is looking straight at the persona: a harness that carries
+// nothing is a broken assignment, not a style choice. Renders nothing when the harness is healthy.
+export function HarnessEmptyBanner({ h }) {
+  const warn = emptyWarning(h);
+  if (!warn) return null;
+  return (
+    <div className="hm-empty" data-testid="harness-empty-banner">
+      <b>{`⚠ this harness carries ${warn.kind === 'files_missing' ? 'no files' : 'nothing'}`}</b>
+      <span>{warn.why}</span>
+      {h.file_backed && (
+        <span>
+          It is defined in the repo (<code>harnesses/{h.key}/</code>) and read from the Zeehive
+          project's checkout — check that project is onboarded and its folder is readable, then
+          reboot the queenzee. Editing it here instead detaches it to dashboard ownership.
+        </span>
+      )}
+    </div>
+  );
 }
 
 export default function HarnessManager({ onClose }) {
@@ -84,21 +126,14 @@ export default function HarnessManager({ onClose }) {
         <div className="hm-body">
           <aside className="hm-list">
             {treeRows(list).map(({ h, depth }) => (
-              <button key={h.key} className={`hm-item ${sel === h.key ? 'on' : ''}`} onClick={() => open(h.key)}
-                      style={{ marginLeft: depth * 14 }} title={depth ? `inherits ${h.parent}` : ''}>
-                {depth > 0 && <span className="hm-branch">↳</span>}
-                <span className="hm-glyph">{h.glyph || (h.label || '?')[0]}</span>
-                <span className="hm-name">{h.label}</span>
-                <span className="hm-meta">
-                  {h.zee_type === 'manager' ? '⬢ mgr · ' : ''}{h.skill_count}★{h.file_backed ? ' · repo' : ''}
-                </span>
-              </button>
+              <HarnessRow key={h.key} h={h} depth={depth} on={sel === h.key} onOpen={() => open(h.key)} />
             ))}
             <button className="hm-new" onClick={startNew}>＋ New harness</button>
           </aside>
 
           <section className="hm-edit">
             {!form && <div className="disp-note">Select a harness, or create one. A harness is a persona — personality, skills, and memory — that a zee wears when it works a xell. It layers below the law (the manual &amp; your binding rules), never over it.</div>}
+            {form && <HarnessEmptyBanner h={form} />}
             {form && (
               <>
                 <div className="hm-row2">

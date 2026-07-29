@@ -28,19 +28,85 @@
 #
 # All claude first-run prompts (onboarding/theme/trust/bypass) are pre-answered by
 # cxell-claude-seed.mjs, so the claude path drops straight in on first open and every open.
+#
+# ── THE TALK QUEUE (a message sent while the zee was mid-turn) ────────────────────────────────────
+# Step 1's feed is read-only in BOTH directions: it renders the transcript and reads nothing from
+# the terminal, so anything typed at it — by a human in the browser, or send-keys'd by the queenzee
+# for a 📨 message / a manager's `zee say` — was swallowed. The queenzee therefore QUEUES a message
+# for a mid-turn zee as a file in $TALK_DIR (server/src/lib/cxell.js, cxellTalkCommand) instead of
+# typing it into a void, and this script types it into the interactive session the moment step 2
+# takes the pane. "You cannot talk to a working zee" becomes "it arrives when its turn ends".
 set -uo pipefail
 SID="${1:-}"
 RUNTIME="${ZEE_RUNTIME:-claude-code-cxell}"
 PROJ_DIR="$HOME/.claude/projects/-work-repo"
 JSONL="$PROJ_DIR/${SID}.jsonl"
+TALK_DIR="${ZEE_TALK_DIR:-/tmp/zee-talk}"
+# Where the drainer types. TMUX_PANE is this exact pane (set by tmux for the pane's command), which
+# is more precise than a session name if a second window is ever opened; the session is the fallback
+# for a pane started outside tmux.
+TALK_TARGET="${TMUX_PANE:-zee}"
 
 # Is the queenzee's headless run for this cxell still in flight? (one zee per cxell)
-live_run() { pgrep -f 'claude --bare -p|codex exec|kimi -p' >/dev/null 2>&1; }
+# ⚠ This pattern is HEADLESS_PROC_PATTERN in server/src/lib/cxell-runtimes.js — the queenzee decides
+# "type or queue" with the same test, and the two disagreeing loses messages. The brackets match the
+# same processes while keeping the probe from matching its OWN command line (see that constant).
+live_run() { pgrep -f 'claude --bare [-]p|codex [e]xec|kimi [-]p' >/dev/null 2>&1; }
+
+# Deliver queued operator messages into whatever holds the pane now, oldest first, one Enter each.
+# Runs in the BACKGROUND for as long as the interactive session owns this pane, so a message that
+# arrives while the human is reading also lands without them doing anything.
+#
+# Deliberate choices, each one a way this could go wrong:
+#   • started only AFTER the live feed is done — typing into the feed is the bug being fixed;
+#   • an opening sleep, because `claude --resume` needs a beat before its prompt box accepts input
+#     (the same reason the queenzee sleeps 6 when IT starts the session);
+#   • the file is removed BEFORE it is typed, so a crash mid-delivery loses a message rather than
+#     repeating it — a duplicated instruction to an agent is worse than a lost one;
+#   • newlines are collapsed to spaces: Enter SUBMITS in the TUI, so a multi-line paste would fire
+#     off half-messages. Long/rich text never comes through here anyway (the queenzee hands that
+#     over as files in .zee-inbox and queues a one-line pointer to them).
+drain_talk() {
+  mkdir -p "$TALK_DIR" 2>/dev/null
+  sleep "${1:-8}"
+  local f msg
+  while :; do
+    for f in "$TALK_DIR"/*.msg; do
+      [[ -e "$f" ]] || continue
+      msg="$(tr '\r\n' '  ' < "$f")"
+      rm -f "$f"
+      [[ -n "${msg// /}" ]] || continue
+      tmux send-keys -t "$TALK_TARGET" -l "$msg" 2>/dev/null || true
+      sleep 0.3
+      tmux send-keys -t "$TALK_TARGET" Enter 2>/dev/null || true
+      sleep 1
+    done
+    sleep 2
+  done
+}
+
+start_talk_drain() {
+  drain_talk "${1:-8}" &
+  TALK_PID=$!
+  trap 'stop_talk_drain' EXIT
+}
+
+stop_talk_drain() {
+  [[ -n "${TALK_PID:-}" ]] || return 0
+  kill "$TALK_PID" 2>/dev/null
+  TALK_PID=''
+}
 
 follow_live() {
   [[ -n "$SID" && -f "$JSONL" ]] || return 0
   live_run || return 0
+  # SAY that this pane cannot hear you, and where the door is. A human who types here while the
+  # feed is up gets no echo and no answer, and the honest reading of that is "the terminal is
+  # read-only" — which is exactly how it was reported.
   printf '\033[2m── attaching live — the zee is working; streaming its activity (Ctrl-C to jump to the session) ──\033[0m\r\n'
+  printf '\033[2m   this pane is a READ-ONLY feed until the turn ends. To talk to it now, use 💬 talk in the\r\n'
+  printf '   terminal header (or the 📨 button on its hexagon): your message is typed into its session\r\n'
+  printf '   the moment this turn finishes.\033[0m\r\n'
   local fifo tpid npid stop=0
   fifo="$(mktemp -u)"; mkfifo "$fifo"
   tail -n +1 -f "$JSONL" > "$fifo" 2>/dev/null & tpid=$!
@@ -66,9 +132,13 @@ wait_live() {
   trap - INT
 }
 
+# Each branch: wait out the headless turn (feed or plain wait), THEN start the queue drainer, THEN
+# hand the pane to the interactive session. The order is the whole contract — a drainer started any
+# earlier would type into the read-only feed, which is the failure it exists to end.
 case "$RUNTIME" in
   codex-cxell)
     wait_live
+    start_talk_drain
     if [[ -n "$SID" ]]; then
       codex resume "$SID" --dangerously-bypass-approvals-and-sandbox \
         || codex --dangerously-bypass-approvals-and-sandbox
@@ -79,6 +149,7 @@ case "$RUNTIME" in
     ;;
   kimi-code-cxell)
     wait_live
+    start_talk_drain
     # kimi resumes by workdir, not id (headless print mode never surfaces one); --yolo because
     # the cxell is the permission system, same stance as the other runtimes
     kimi --continue --yolo || kimi --yolo
@@ -86,10 +157,17 @@ case "$RUNTIME" in
   *)
     if [[ -n "$SID" ]]; then
       follow_live
+      start_talk_drain
       claude --resume "$SID" --dangerously-skip-permissions 2>/dev/null || claude --dangerously-skip-permissions
     else
+      start_talk_drain
       claude --dangerously-skip-permissions
     fi
     ;;
 esac
+# The agent has exited and the pane falls back to a login shell. STOP the drainer first: `exec`
+# replaces this process, so its EXIT trap would never fire, and a queued message typed at a bash
+# prompt is not a message — it is a COMMAND. (This is the failure mode that makes send-keys into an
+# unknown pane dangerous, and the one place this script can close it.)
+stop_talk_drain
 exec bash -l

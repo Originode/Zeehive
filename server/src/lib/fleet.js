@@ -382,6 +382,27 @@ export async function getFleet(projectId) {
     `SELECT dl.*, x.slug AS xell_slug FROM deploy_lock dl JOIN xell x ON x.id = dl.xell_id
        WHERE dl.project_id = $1 AND dl.container = 'prod'`, [pid]);
 
+  // Ship asks that were REFUSED — the ones that never became a row. requestShip refuses outright
+  // when the work is not landed (or the ship ref will not resolve), and until this existed the
+  // refusal lived only in the queenzee's ring-buffer log: the zee had asked, the human saw an empty
+  // production panel, and the two could not be reconciled ("xells insist they have ship requests…
+  // i see zero"). Latest-event-wins per xell (shipgate → lib/status.setShipRefusal), still-current
+  // only, and bounded to a day so a refusal a zee has moved on from does not haunt the panel.
+  const refusedRows = await q(
+    `SELECT DISTINCT ON (se.xell_id)
+            se.xell_id, se.ts, se.hook_event_name, se.raw->>'reason' AS reason, x.slug AS xell_slug
+       FROM session_event se JOIN xell x ON x.id = se.xell_id
+      WHERE x.project_id = $1 AND x.status <> 'retired'
+        AND se.hook_event_name IN ('ship-refused','ship-refused-clear')
+        AND se.ts > now() - interval '24 hours'
+      ORDER BY se.xell_id, se.ts DESC`, [pid]);
+  const shipRefused = refusedRows
+    .filter((r) => r.hook_event_name === 'ship-refused')
+    .map((r) => {
+      const why = reasonPair(r.reason);
+      return { xell_id: r.xell_id, xell_slug: r.xell_slug, at: r.ts, reason: why.brief, full: why.full };
+    });
+
   // PROD-DATA asks awaiting a human: a zee asking to be BOUND to the live production database, and
   // a zee asking the queenzee to run a landed SEED file against production. Both render on the
   // asking xell's card (App.jsx → ProdData.jsx). Recently-decided seeds ride along for 15 minutes,
@@ -421,6 +442,7 @@ export async function getFleet(projectId) {
     landing,
     holding,
     shipping,
+    ship_refused: shipRefused,
     prod_bind: prodBind,
     prod_seed: prodSeed,
     prod_lock: prodLock || null,

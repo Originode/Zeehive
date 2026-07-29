@@ -6,6 +6,7 @@ import { gitLog, diffStat, worktreeDiff, worktreeHead, isAncestor, countBehind }
 import { cxellDiff } from './cxell.js';
 import { defaultProject } from './fleet.js';
 import { isManager } from './managers.js';
+import { harnessHealth, ensureHarnessRoots } from './harness.js';
 
 // A cxell zee's work lives INSIDE its cxell, not in the host worktree (see cxellDiff): the host
 // worktree stays frozen at the provisioning base until `zee land`, so worktreeDiff reads 0/0 for
@@ -165,14 +166,21 @@ export async function getTimeline(projectId, n = 250) {
   const assignedHarnessIds = [...new Set(anchored.map((a) => a.harness_id).filter(Boolean))];
   let harnesses = [];
   if (assignedHarnessIds.length) {
+    // dir + the bundle's three carrying fields ride along so the badge can say when a harness is
+    // EMPTY. A xell wearing a blank persona looked identical to one wearing a 12k manual in the
+    // honeycomb, which is how the deployed queenzee hid it for weeks.
     const hrows = await q(
-      `SELECT id, key, label, avatar_path, head_commit, bundle->>'summary' AS summary, bundle->>'glyph' AS glyph
+      `SELECT id, key, label, avatar_path, head_commit, dir, is_law_core,
+              bundle->>'summary' AS summary, bundle->>'glyph' AS glyph,
+              bundle->>'personality' AS personality, (bundle->'skills') AS skills, (bundle->'memory') AS memory
          FROM harness WHERE id = ANY($1::uuid[]) AND enabled`, [assignedHarnessIds]);
+    await ensureHarnessRoots();
     harnesses = hrows.map((h, i) => {
       const hbase = h.head_commit && known.has(h.head_commit) ? h.head_commit : allCommits[0]?.hash;
       const wearers = anchored.filter((a) => a.harness_id === h.id);
       return {
         id: h.id, key: h.key, label: h.label, summary: h.summary, glyph: h.glyph,
+        ...harnessHealth(h),
         avatar_url: h.avatar_path ? `/api/harnesses/${h.key}/avatar` : null,
         base_commit: hbase,
         wearer_ids: wearers.map((a) => a.id),

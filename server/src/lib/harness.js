@@ -244,8 +244,10 @@ export function loadHarnessDir(dir, base = harnessBase(dir)) {
   bundle.skills = skills;
 
   // memory files → inline text. A path resolves against the harness folder first, then the REPO ROOT
-  // (containment-guarded) — so a harness like Zee Base can incorporate docs/cxell-zee-manual.md live,
-  // no copy, no drift.
+  // (containment-guarded) — so a file-backed harness can incorporate a repo doc live, no copy, no
+  // drift. (Zee Base used to do exactly that with a repo copy of the cxell-zee manual; migration 047
+  // moved that manual INTO the meta DB and made Zee Base DB-owned, so it no longer comes through
+  // here — but the mechanism stands for any other harness that wants a live repo doc.)
   if (Array.isArray(bundle.memory)) {
     bundle.memory = bundle.memory.map((rel) => {
       const local = join(abs, rel);
@@ -307,6 +309,39 @@ export async function refreshHarnesses() {
       [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null, parentId, declared]);
     logline('harness', `${h.key}: refreshed (${bundle.skills?.length || 0} skill(s), ${bundle.parent ? `parent ${bundle.parent}, ` : ''}hash ${hash})`);
   }
+  await logHarnessSummary();
+}
+
+// ONE line at the end of every refresh: how many file-backed harnesses carry something, how many
+// carry NOTHING, which ones, and how many live xells are wearing an empty one.
+//
+// The per-harness loglines above are each true and each easy to miss — a queenzee can boot looking
+// perfectly healthy with every file-backed harness empty, which is exactly how manager zees walked
+// around blind for weeks. A boot is not "clean" if a zee's persona is a blank page, so this line is
+// always emitted, and goes to stdout (the docker log a human actually reads) the moment it isn't 0.
+export async function logHarnessSummary() {
+  await ensureHarnessRoots();
+  const rows = await q(
+    `SELECT h.key, h.dir, h.is_law_core,
+            h.bundle->>'personality' AS personality, (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
+            (SELECT count(*)::int FROM xell x
+               WHERE x.harness_id = h.id AND x.status NOT IN ('retired','tearing-down','husk')) AS worn
+       FROM harness h WHERE h.dir IS NOT NULL AND NOT h.is_law_core AND h.enabled ORDER BY h.key`);
+  const empty = [], loaded = [];
+  let wornEmpty = 0;
+  for (const h of rows) {
+    const health = harnessHealth(h);
+    if (health.bundle_empty || health.files_missing) {
+      empty.push(`${h.key}${health.files_missing ? ' (no files)' : ''}${h.worn ? ` ×${h.worn}` : ''}`);
+      wornEmpty += Number(h.worn || 0);
+    } else loaded.push(h.key);
+  }
+  const line = `harnesses: ${loaded.length} loaded, ${empty.length} EMPTY`
+    + (empty.length ? ` — ${empty.join(', ')}` : '')
+    + (wornEmpty ? ` · ${wornEmpty} live xell(s) are wearing an EMPTY harness — those zees get no persona, no skills, no manual` : '');
+  logline('harness', line);
+  if (empty.length) console.error(`[harness] ${line}`);
+  return { loaded: loaded.length, empty: empty.length, worn_empty: wornEmpty, empty_keys: empty, line };
 }
 
 // A file-backed harness whose folder cannot be read. Keep the last good bundle (never blank a live
@@ -409,7 +444,7 @@ export async function listHarnesses({ zeeType = null } = {}) {
 // files_missing: a file-backed harness whose folder is not under any known repo root.
 // bundle_empty: it would brief a zee with NOTHING — no personality, no skills, no memory.
 // core is excluded from both: its text is code-assembled, so an empty bundle there is correct.
-function harnessHealth(h) {
+export function harnessHealth(h) {
   if (h.is_law_core) return { files_missing: false, bundle_empty: false };
   const skills = Array.isArray(h.skills) ? h.skills : [];
   const memory = Array.isArray(h.memory) ? h.memory : [];
