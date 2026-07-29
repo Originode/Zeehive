@@ -141,10 +141,34 @@ try {
   ok(nested.verdict === 'WROTE' && existsSync(join(repo, 'docs/agents/ONBOARDING.md')),
      'a doc in a subdirectory has its directories created');
 
+  // ── an edit reaches the zees ALREADY RUNNING ────────────────────────────────────────────────
+  // Same rule a harness save obeys: "new zees only" is the failure that left a fleet briefed on stale
+  // text. In THIS cxell PROVISION_MODE is simulate (a nested queenzee's fleet rows are the real
+  // fleet's), so the correct behaviour is to REPORT the live xells it would have regenerated in and
+  // exec into none of them — and to say which, never a silent skip.
+  console.log('\n── saving a doc pushes it into live zees (reported, not executed, in simulate) ──');
+  const { recentLogs } = await import('../server/src/lib/logbus.js');
+  const xource = await one(`INSERT INTO xource (project_id, ref) VALUES ($1,'master') RETURNING id`, [projId]);
+  const liveXell = await one(
+    `INSERT INTO xell (project_id, xource_id, slug, branch, worktree_path, status, is_pooled)
+       VALUES ($1,$2,$3,'spinoff/zt-doc','/tmp/zt-doc','working',false) RETURNING id, slug`,
+    [projId, xource.id, `zt-doclive-${tag}`]);
+  await q(`INSERT INTO zee (xell_id, runtime_id, attach_mode, status, entrypoint, viewer_kind)
+           VALUES ($1, (SELECT id FROM agent_runtime LIMIT 1), 'headless-spawn', 'working', 'cxell-cli', 'ssh-terminal')`,
+    [liveXell.id]);
+  const before = recentLogs(300).length;
+  await P.updateProjectDoc(agents.id, { body: `# edited ${tag}\n` });
+  const said = recentLogs(300).slice(before).filter((l) => l.scope === 'project-doc').map((l) => l.msg);
+  ok(said.some((m) => /NOT pushed into 1 live xell/.test(m) && /PROVISION_MODE=/.test(m)),
+     'the push obeys PROVISION_MODE and says so rather than execing into another zee\'s cxell');
+  ok(said.some((m) => m.includes(liveXell.slug)),
+     'and NAMES the live xell it would have regenerated in — a report, never a silent skip');
+
   // ── the rows die with the project ───────────────────────────────────────────────────────────
   console.log('\n── lifecycle ──');
   const n = (await P.listProjectDocs(projId)).length;
   ok(n === 2, `the project has its docs listed (${n})`);
+  await q(`DELETE FROM zee WHERE xell_id=$1`, [liveXell.id]);
   await q(`DELETE FROM project WHERE id=$1`, [projId]);
   const after = await q(`SELECT count(*)::int AS n FROM project_doc WHERE project_id=$1`, [projId]);
   ok(after[0].n === 0, 'and they are deleted with the project (ON DELETE CASCADE)');

@@ -781,7 +781,8 @@ export function ProjectDocsSection({ project, run, busy }) {
       <div className="pc">
         A doc is <b>generated</b> into the xell at its path, stamped as generated, and added to the
         xell's git excludes — so it never lands in a diff. If the project has <b>committed</b> a file
-        at that path, the repo's own copy wins and nothing is written.
+        at that path, the repo's own copy wins and nothing is written. Saving also regenerates it in
+        the xells of any zees <b>already running</b>, so a fix does not wait for the next dispatch.
       </div>
       {(docs || []).map((d) => <ProjectDocEditor key={d.id} doc={d} run={wrapped} busy={busy} />)}
       {docs && docs.length === 0 && <div className="pc">No docs yet — add an <code>AGENTS.md</code> to tell every zee on this project how it works.</div>}
@@ -817,7 +818,9 @@ export function ProjectDocEditor({ doc, run, busy }) {
                 onClick={() => run(() => updateProjectDoc(doc.id, { rel_path: path.trim(), body }))}>Save</button>
         <button type="button" className="hm-del" disabled={busy}
                 onClick={async () => {
-                  if (!await showConfirm(`Delete ${doc.rel_path}? New xells stop receiving it.`)) return;
+                  if (!await showConfirm(`Delete ${doc.rel_path}?\n\nNew xells stop receiving it. A zee `
+                    + `already working keeps the copy it was given — the queenzee does not delete files out `
+                    + `of a live workspace.`)) return;
                   run(() => deleteProjectDoc(doc.id));
                 }} title="Delete this doc">🗑</button>
       </div>

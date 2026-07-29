@@ -14,6 +14,46 @@
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 
+// Same switch every other real-side-effect module reads: 'real' touches machines, anything else
+// models. The live push below obeys it — a NESTED queenzee (a zee running the server inside its own
+// xell, whose fleet rows are the REAL fleet's) must only ever report what it would have written.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
+// PUSH AN EDIT INTO THE ZEES ALREADY RUNNING — the same rule a harness save obeys (lib/harness.js).
+// An operator who fixes a project's AGENTS.md has fixed it for the NEXT zee only unless something
+// carries it into the live ones, and "new zees only" is the failure that left a whole fleet briefed on
+// stale text. Best-effort and never throws: the row is saved either way, and the reason it did not
+// reach a xell is logged rather than swallowed.
+//
+// A DELETE deliberately does NOT reach in and remove the file: a queenzee deleting files out of a
+// working zee's workspace is a worse surprise than a stale artefact, and the row is already gone from
+// every future dispatch. The console says so where an operator deletes.
+async function pushDocsToLiveXells(projectId, { mode = PROVISION_MODE } = {}) {
+  const xells = await q(
+    `SELECT x.id, x.slug FROM xell x
+       WHERE x.project_id = $1 AND x.status NOT IN ('retired','tearing-down','husk')
+         AND EXISTS (SELECT 1 FROM zee z WHERE z.xell_id = x.id AND z.entrypoint = 'cxell-cli'
+                       AND z.status IN ('spawning','online','working','idle'))`, [projectId]);
+  if (!xells.length) return { xells: 0, pushed: 0 };
+  if (mode !== 'real') {
+    logline('project-doc', `doc change NOT pushed into ${xells.length} live xell(s) — PROVISION_MODE=`
+      + 'simulate: this queenzee models the fleet, it does not exec into its cxells. Would have '
+      + `regenerated in: ${xells.map((x) => x.slug).join(', ')}`);
+    return { xells: xells.length, pushed: 0, would_push: xells.length, dry_run: true };
+  }
+  // Lazily imported: intake.js imports this module, so a static import would close a cycle.
+  const { injectProjectDocsIntoXell } = await import('../queenzee/intake.js');
+  let pushed = 0;
+  for (const x of xells) {
+    const r = await injectProjectDocsIntoXell({ ctx: 'default', slug: x.slug, projectId })
+      .catch((e) => ({ written: 0, error: e.message }));
+    if (r.written) pushed++;
+    else logline('project-doc', `${x.slug}: doc change not applied`
+      + `${r.error ? ` (${String(r.error).slice(0, 80)})` : ' (nothing written — see above)'}`);
+  }
+  return { xells: xells.length, pushed };
+}
+
 // A path a generated doc may land on. Deliberately narrow — it is an entry point for an agent, not a
 // way to write anywhere in someone's repo.
 export function validateDocPath(relPath) {
@@ -47,6 +87,7 @@ export async function createProjectDoc(projectId, { rel_path, title = null, body
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
     [projectId, v.path, title || null, String(body || ''), !!enabled, Number(sort) || 0]);
   logline('project-doc', `${v.path}: created for project ${String(projectId).slice(0, 8)} (${String(body || '').length} chars)`);
+  await pushDocsToLiveXells(projectId).catch(() => {});
   return row;
 }
 
@@ -72,6 +113,7 @@ export async function updateProjectDoc(id, patch = {}) {
      'enabled' in patch ? !!patch.enabled : cur.enabled,
      'sort' in patch ? (Number(patch.sort) || 0) : cur.sort]);
   logline('project-doc', `${row.rel_path}: updated (${row.body.length} chars${row.enabled ? '' : ', DISABLED'})`);
+  await pushDocsToLiveXells(cur.project_id).catch(() => {});
   return row;
 }
 
