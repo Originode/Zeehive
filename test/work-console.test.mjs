@@ -322,5 +322,20 @@ ok(/not one \n?\s*\+ ?'transaction|are not one/.test(tickets),
 ok(/bareStatus/.test(read('web/src/work/workApi.js')),
    'an answer with no {error} body becomes a sentence, not a bare status code');
 
+// ── priority direction is POLICY, and the console must point at it, not re-derive it ──────────
+// docs/work-tracker.md §5 fixes 1 = MOST urgent. The console shipped that reading before it was
+// written down; a comment claiming the contract is silent is what makes the next person derive it
+// again — and derive it backwards, silently, on every card in production.
+const bits = read('web/src/work/bits.jsx');
+ok(/1 is MOST urgent|1 = most urgent/.test(bits), 'bits.jsx states the direction');
+ok(/docs\/work-tracker\.md/.test(bits), 'and cites the policy rather than claiming the API is silent');
+ok(!/API says nothing about which end/.test(bits), 'the old "the API says nothing" claim is gone');
+ok(/dev_priority/.test(bits), 'and it warns about the OPPOSITE convention this repo carries nearby');
+ok(/1 = most urgent/.test(read('web/src/work/WorkItemDrawer.jsx'))
+   && /1 = most urgent/.test(read('web/src/work/Tickets.jsx')),
+   'the fact is on the inputs where a human WRITES a priority, not only where it is read');
+const policyDoc = existsSync(path('docs/work-tracker.md')) ? read('docs/work-tracker.md') : '';
+ok(!policyDoc || /1 is MOST urgent/i.test(policyDoc), 'the policy the console cites actually says that');
+
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);

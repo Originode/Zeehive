@@ -23,13 +23,52 @@
 //   • roll-ups (a parent's dates, a parent's progress) are a READ-MODEL concern and are never
 //     written back. A stored roll-up is a cache that goes stale the first time anyone edits a leaf,
 //     and this repo has no place to invalidate it.
-import { q, one, pool } from '../db/pool.js';
+import { q as rawQ, one as rawOne, pool } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import {
   WORK_STATUS_KEYS, WORK_STATUS, WORK_ITEM_KINDS, workLabel, isWorkStatus, canTransition,
   nextStatuses, statusFromHive, isTerminal,
 } from './work-status.js';
+
+// ── how a refusal becomes an HTTP STATUS ─────────────────────────────────────
+//
+// The status is carried ON THE ERROR, never inferred from its text.
+//
+// The first cut of this classified by REGEX-MATCHING the message ("cannot", "cycle", "root item"…),
+// which quietly made every refusal sentence load-bearing prose: reword one and its HTTP status flips
+// with nothing to catch it — no test fails, no log line appears, and every client that branches on
+// 409-vs-400 is simply wrong from then on. That is the worst failure shape there is, so the wording
+// and the status are now independent. lib/work-assign.js already did it this way; this is part 1
+// adopting its own follow-up.
+//
+// 400 you asked wrong · 404 it does not exist · 409 it exists and the answer is still no.
+export const httpError = (status, message) => Object.assign(new Error(message), { status });
+export const bad = (m) => httpError(400, m);
+export const notFound = (m) => httpError(404, m);
+export const refuse = (m) => httpError(409, m);
+
+// What the route layer answers with. Reads the tag; falls back to 400 (you asked wrong) for anything
+// untagged. Deliberately NOT a text match — see above.
+export function httpStatusOf(err) {
+  const s = Number(err?.status);
+  return s >= 400 && s <= 599 ? s : 400;
+}
+
+// A postgres error becomes a status by its CODE, which is a fact, not by its message, which is prose.
+// P0001 is a plpgsql RAISE EXCEPTION — i.e. one of migration 058's own guard triggers (the nesting
+// rank, a cross-project parent, a cycle, a self/cross-project dependency). Every one of those is
+// "the tree says no", so 409. Anything else keeps whatever it had and falls through to 400, exactly
+// as it did before this change.
+function pgStatus(err) {
+  if (err && !err.status && err.code === 'P0001') err.status = 409;
+  return err;
+}
+// Every database call in this module goes through these, so a trigger refusal is tagged once, here,
+// rather than at a dozen call sites that would each have to remember.
+const withStatus = (fn) => async (...args) => { try { return await fn(...args); } catch (e) { throw pgStatus(e); } };
+const q = withStatus(rawQ);
+const one = withStatus(rawOne);
 
 // ── small shapers ────────────────────────────────────────────────────────────
 
@@ -76,7 +115,7 @@ function assertSchedule(startsOn, dueOn, what = 'this work item') {
   if (!s || !d) return;
   if (spanDays(s, d) === null) return;        // unparseable — let postgres have the last word
   if (d < s) {
-    throw new Error(`"${what}": due_on ${d} is before starts_on ${s} — a work item may not finish `
+    throw bad(`"${what}": due_on ${d} is before starts_on ${s} — a work item may not finish `
       + 'before it starts. Give due_on on or after starts_on, or leave it empty for "no end yet".');
   }
 }
@@ -116,7 +155,7 @@ function shapeItem(row) {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isUuid(v) { return typeof v === 'string' && UUID_RE.test(v); }
 export function assertId(v, what = 'work item id') {
-  if (!isUuid(v)) throw new Error(`"${v ?? ''}" is not a valid ${what}`);
+  if (!isUuid(v)) throw bad(`"${v ?? ''}" is not a valid ${what}`);
   return v;
 }
 
@@ -137,8 +176,8 @@ const COLS = `id, project_id, parent_id, kind, title, body, status, priority, ti
 // this runner instead of the pool. No client → the pool, exactly as before.
 export const dbRunner = (client) => (client
   ? {
-    q: async (text, params) => (await client.query(text, params)).rows,
-    one: async (text, params) => (await client.query(text, params)).rows[0] || null,
+    q: withStatus(async (text, params) => (await client.query(text, params)).rows),
+    one: withStatus(async (text, params) => (await client.query(text, params)).rows[0] || null),
   }
   : { q, one });
 
@@ -305,10 +344,10 @@ export function flattenTree(nodes, out = []) {
 // ?status= must read as "unknown status" and not as a postgres enum cast failure.
 function assertFilters({ status, kind }) {
   for (const s of [].concat(status || [])) {
-    if (!isWorkStatus(s)) throw new Error(`unknown status "${s}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
+    if (!isWorkStatus(s)) throw bad(`unknown status "${s}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
   }
   for (const k of [].concat(kind || [])) {
-    if (!WORK_ITEM_KINDS.includes(k)) throw new Error(`unknown work item kind "${k}" — one of: ${WORK_ITEM_KINDS.join(', ')}`);
+    if (!WORK_ITEM_KINDS.includes(k)) throw bad(`unknown work item kind "${k}" — one of: ${WORK_ITEM_KINDS.join(', ')}`);
   }
 }
 
@@ -404,6 +443,8 @@ export async function getWorkItem(id) {
 
 // ── writes ───────────────────────────────────────────────────────────────────
 
+// priority is 1..5 and 1 is MOST urgent (docs/work-tracker.md, policy 5). Default 3 is the
+// middle of the scale. NB: machine_pool.dev_priority is the OPPOSITE convention — higher wins.
 const EDITABLE = ['title', 'body', 'priority', 'assignee', 'starts_on', 'due_on',
                   'estimate_hours', 'progress', 'sort_order', 'xell_id', 'ticket_id', 'kind'];
 
@@ -427,34 +468,34 @@ export async function projectRoot(projectId, client = null) {
 export async function createWorkItem(input = {}, { client = null, pending = null } = {}) {
   const db = dbRunner(client);
   const title = String(input.title || '').trim();
-  if (!title) throw new Error('title required');
+  if (!title) throw bad('title required');
   const kind = input.kind || 'task';
 
   let parent = null;
   if (input.parent_id) {
     assertId(input.parent_id, 'parent work item id');
     parent = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [input.parent_id]);
-    if (!parent) throw new Error(`parent_id ${input.parent_id} names no work item`);
+    if (!parent) throw bad(`parent_id ${input.parent_id} names no work item`);
   }
   const projectId = input.project_id || input.project || parent?.project_id;
-  if (!projectId) throw new Error('project required (or a parent_id to inherit it from)');
+  if (!projectId) throw bad('project required (or a parent_id to inherit it from)');
   assertId(projectId, 'project id');
   if (input.ticket_id) assertId(input.ticket_id, 'ticket id');
   if (input.xell_id) assertId(input.xell_id, 'xell id');
   if (!WORK_ITEM_KINDS.includes(kind)) {
-    throw new Error(`unknown work item kind "${kind}" — one of: ${WORK_ITEM_KINDS.join(', ')}`);
+    throw bad(`unknown work item kind "${kind}" — one of: ${WORK_ITEM_KINDS.join(', ')}`);
   }
   if (parent && parent.project_id !== projectId) {
-    throw new Error('a work item must live in the same project as its parent');
+    throw refuse('a work item must live in the same project as its parent');
   }
   // No explicit parent and not a project root → the project's root item. The database would do this
   // itself (migration 058), but resolving it here means sort_order is computed among the right
   // siblings rather than among the roots.
   if (!parent && kind !== 'project') {
     parent = await projectRoot(projectId, client);
-    if (!parent) throw new Error(`project ${projectId} has no root work item — cannot attach "${title}"`);
+    if (!parent) throw bad(`project ${projectId} has no root work item — cannot attach "${title}"`);
   }
-  if (input.status && !isWorkStatus(input.status)) throw new Error(`unknown status "${input.status}"`);
+  if (input.status && !isWorkStatus(input.status)) throw bad(`unknown status "${input.status}"`);
   assertSchedule(input.starts_on, input.due_on, title);
 
   const sortOrder = input.sort_order != null ? Number(input.sort_order) : await nextSortOrder(parent?.id ?? null, client);
@@ -539,7 +580,7 @@ export async function moveWorkItem(id, { parent_id: parentId, sort_order: sortOr
   const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
   if (before.kind === 'project') {
-    throw new Error(`"${before.title}" is the project's root item — it is the top of the tree and cannot be moved under anything.`);
+    throw refuse(`"${before.title}" is the project's root item — it is the top of the tree and cannot be moved under anything.`);
   }
   // parent_id: null means "move to the TOP LEVEL", and the top level is the project root — not
   // "become a second root", which the schema forbids anyway. The guard trigger would re-attach it
@@ -572,10 +613,10 @@ export async function setStatus(id, status, { actor = null, cascade = false } = 
   const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
   if (!isWorkStatus(status)) {
-    throw new Error(`unknown status "${status}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
+    throw bad(`unknown status "${status}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
   }
   if (!canTransition(before.status, status)) {
-    throw new Error(`cannot move "${before.title}" from ${before.status} to ${status}`
+    throw refuse(`cannot move "${before.title}" from ${before.status} to ${status}`
       + ` — legal next statuses are: ${nextStatuses(before.status).join(', ')}`);
   }
   const row = await one(`UPDATE work_item SET status=$2 WHERE id=$1 RETURNING ${COLS}`, [id, status]);
@@ -606,7 +647,7 @@ export async function deleteWorkItem(id) {
   const item = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!item) return null;
   if (item.kind === 'project') {
-    throw new Error(`"${item.title}" is the root item of its project and cannot be deleted — every `
+    throw refuse(`"${item.title}" is the root item of its project and cannot be deleted — every `
       + 'other work item hangs off it, and the project row itself owns it (delete the project to '
       + 'delete the tree).');
   }
@@ -620,7 +661,7 @@ export async function deleteWorkItem(id) {
 // ── dependencies ─────────────────────────────────────────────────────────────
 export async function addDep(workItemId, dependsOnId, { actor = null } = {}) {
   assertId(workItemId);
-  if (!dependsOnId) throw new Error('depends_on_id required');
+  if (!dependsOnId) throw bad('depends_on_id required');
   assertId(dependsOnId, 'depends_on_id');
   const row = await one(
     `INSERT INTO work_item_dep (work_item_id, depends_on_id) VALUES ($1,$2)
@@ -655,7 +696,7 @@ export async function boardModel({ projectId, rootId } = {}) {
   let root = null;
   if (rootId) root = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [rootId]);
   else if (projectId) root = await projectRoot(projectId);
-  if (!root && !projectId) throw new Error('project or root required');
+  if (!root && !projectId) throw bad('project or root required');
 
   const params = [];
   let where = '';
@@ -736,7 +777,7 @@ export async function ganttModel({ projectId, rootId } = {}) {
   let root = null;
   if (rootId) root = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [rootId]);
   else if (projectId) root = await projectRoot(projectId);
-  if (!root && !projectId) throw new Error('project or root required');
+  if (!root && !projectId) throw bad('project or root required');
 
   const params = [];
   let where;

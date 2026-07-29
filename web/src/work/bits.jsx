@@ -53,9 +53,17 @@ export function StatusDot({ status, statuses, className = '' }) {
   );
 }
 
-// Priority is 1..5 and the API says nothing about which end is urgent — the tracker treats 1 as the
-// most urgent (the usual P1 convention), so the pips FILL as the number drops and the tooltip spells
-// it out rather than leaving a human to infer it from five dots.
+// Priority is 1..5 and **1 is MOST urgent** — that is stated policy now, not this file's guess:
+// docs/work-tracker.md §5 fixes the direction (default 3 sits in the middle of the scale, and P1 is
+// the convention a person already carries), with the same note at the server's read/write points.
+// So the pips FILL as the number drops, 1 tints red and 2 amber, and the tooltip says it in words
+// rather than leaving a human to infer a direction from five dots.
+//
+// The failure this closes is silent and total: read the other way, every card in production would be
+// coloured backwards and nothing would throw. And the repo carries the OPPOSITE convention nearby —
+// `machine_pool.dev_priority` is ordered DESC, so a higher number wins for MACHINES. The names
+// rhyme, the columns are unrelated, and that is exactly how one convention gets transferred onto the
+// other; work items and tickets are 1-is-most-urgent, full stop.
 export function Pips({ priority }) {
   const p = Number(priority) || 3;
   const filled = Math.max(0, Math.min(5, 6 - p));

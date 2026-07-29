@@ -66,7 +66,7 @@ import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, sugge
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
 import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
-         addDep, removeDep, boardModel, ganttModel, assertId } from '../lib/work-items.js';
+         addDep, removeDep, boardModel, ganttModel, assertId, httpStatusOf } from '../lib/work-items.js';
 import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
          breakdownTicket } from '../lib/tickets.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
@@ -1362,10 +1362,16 @@ router.post('/xells/:id/seed', async (req, res) => {
 // Which refusals are 409 rather than 400: a 400 says "you sent nonsense", a 409 says "what you
 // asked for is coherent but conflicts with the state of the tree". A cycle, an activity under a
 // task and a delete of the project root are all the second kind.
-const CONFLICT = /cannot|refused|cycle|same project|nested under|root item|depend on itself|cross projects|legal next/i;
-function workErr(res, err, fallback = 400) {
-  const msg = String(err?.message || err || 'unknown error');
-  return res.status(CONFLICT.test(msg) ? 409 : fallback).json({ error: msg });
+// The status is read from the ERROR, never matched out of its text. work-items.js tags every
+// refusal it raises (bad/notFound/refuse) and translates a postgres trigger refusal by its CODE, so
+// the wording of a sentence and the status of a response are independent facts.
+//
+// They were not always: this used to be a regex over the message, which made every refusal sentence
+// load-bearing prose — reword one and its HTTP status flipped silently, with no test failing and no
+// log line to notice. httpStatusOf() defaults to 400 for anything untagged, exactly as the old
+// fallback did.
+function workErr(res, err) {
+  return res.status(httpStatusOf(err)).json({ error: String(err?.message || err || 'unknown error') });
 }
 const projectOf = (req) => req.query.project || req.body?.project || req.body?.project_id || null;
 
