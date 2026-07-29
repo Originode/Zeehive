@@ -26,6 +26,7 @@
 //
 // Isolated throwaway project in the real meta DB; PROVISION_MODE=simulate so the reap retires rows
 // and touches no machine. Everything it creates is torn down in a finally, whatever happens.
+import { readFileSync } from 'node:fs';
 import pg from 'pg';
 
 const url = process.env.DATABASE_URL;
@@ -158,6 +159,14 @@ try {
   const rejected = await managers.decideDoneSuggestion(rej.suggestion.id, 'rejected', 'test@human');
   ok(rejected.status === 'rejected' && rejected.refused !== true,
      'REJECT still decides immediately and consumes the card');
+
+  // ── the console shows the refusal on the card it kept ─────────────────────
+  // Static, because the server half is worthless if the human still sees nothing: the card is back
+  // on their screen carrying `result.refused`, and it has to SAY so.
+  console.log('\n── the console card ──');
+  const card = readFileSync('web/src/Manager.jsx', 'utf8');
+  ok(/result\?\.refused/.test(card), 'DoneSuggestionCard reads the refusal off the suggestion it kept');
+  ok(/r\?\.refused/.test(card), 'and an approval answered with refused:true is surfaced as an error, not a success');
 
   console.log(fail ? `\n${fail} check(s) FAILED` : '\nall checks passed');
 } catch (err) {
