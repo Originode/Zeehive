@@ -21,6 +21,12 @@
 //      the sweep's own result, and on the xell row (env_projection_error, migration 078) so it
 //      outlives the log. It clears itself once the cause is gone.
 //
+//   5. IT OBEYS PROVISION_MODE. A xell's database is a CLONE of the meta-DB, so the fleet rows a
+//      NESTED queenzee (every zee running the server inside its own xell, PROVISION_MODE=simulate
+//      by manifest default) walks are the REAL fleet's rows, worktree paths and all. Unguarded, the
+//      first zee to run this would have reconciled every other zee's .zeehive.env from a snapshot.
+//      In simulate it REPORTS what is stale and writes nothing.
+//
 // …plus: retired xells are left alone, and the two `.catch()` swallows in lib/manager-spawn.js
 // (bind/unbind) are gone, because that is where this class of bug hid.
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
@@ -117,7 +123,15 @@ try {
   // ── 1. a stale projection corrects itself ───────────────────────────────────────────────────
   console.log('reconcileXellEnvs: a stale .zeehive.env catches up to the meta-DB, with no human');
   const mark = since();
-  const r1 = await reconcileXellEnvs({ reason: 'test' });
+
+  // SIMULATE first — the mode every nested queenzee runs in. It must SEE the drift and touch nothing.
+  const dry = await reconcileXellEnvs({ reason: 'test-simulate', mode: 'simulate' });
+  ok(dry.dry_run && dry.stale.includes(mgr.slug),
+     'PROVISION_MODE=simulate: the sweep still reports the stale xells it found');
+  ok(read(mgr) === STALE('mgr') && read(spin) === STALE('spin'),
+     'PROVISION_MODE=simulate: …and writes NOTHING — a nested queenzee walks the REAL fleet\'s rows');
+
+  const r1 = await reconcileXellEnvs({ reason: 'test', mode: 'real' });
 
   const mgrVars = varsOf(read(mgr));
   ok(mgrVars.DATABASE_URL === RO_DSN,
@@ -142,7 +156,7 @@ try {
   const mtimeBefore = statSync(envFile(mgr)).mtimeMs;
   const textBefore = read(mgr);
   await new Promise((res) => setTimeout(res, 12));   // ensure a rewrite would move mtime
-  const r2 = await reconcileXellEnvs({ reason: 'test-again' });
+  const r2 = await reconcileXellEnvs({ reason: 'test-again', mode: 'real' });
   ok(!r2.stale.includes(mgr.slug) && !r2.stale.includes(spin.slug),
      'the second sweep rewrites nothing — the fleet is already in sync');
   ok(statSync(envFile(mgr)).mtimeMs === mtimeBefore,
@@ -152,11 +166,12 @@ try {
   // ── 3. a rewrite UNDER A LIVE ZEE is logged as the queenzee's doing ──────────────────────────
   console.log('writing into a live zee\'s worktree is logged');
   const logs = envLogsSince(mark);
-  const mgrLine = logs.find((m) => m.startsWith(`${mgr.slug}:`));
-  ok(/STALE/.test(mgrLine || ''), `the rewrite is logged [${(mgrLine || '(none)').slice(0, 60)}…]`);
+  // the REAL-mode line (the simulate pass logged a report-only one first)
+  const mgrLine = logs.filter((m) => m.startsWith(`${mgr.slug}:`) && !/NOT rewritten/.test(m)).pop();
+  ok(/STALE — rewritten/.test(mgrLine || ''), `the rewrite is logged [${(mgrLine || '(none)').slice(0, 60)}…]`);
   ok(/WHILE A ZEE IS WORKING|QUEENZEE wrote/.test(mgrLine || ''),
      'the log says a zee is working in it and that the QUEENZEE wrote the file');
-  const spinLine = logs.find((m) => m.startsWith(`${spin.slug}:`));
+  const spinLine = logs.filter((m) => m.startsWith(`${spin.slug}:`) && !/NOT rewritten/.test(m)).pop();
   ok(spinLine && !/WHILE A ZEE IS WORKING/.test(spinLine),
      'a xell with no live zee gets the plain line, not the live-zee warning');
   ok(logs.some((m) => /reconcile \(test\):.*checked.*rewritten.*FAILED/.test(m)),
@@ -181,7 +196,7 @@ try {
 
   // the error clears itself once the cause is gone — a stale "broken" badge is its own bug
   await q(`UPDATE container SET conn_ref=$2 WHERE owner_xell_id=$1 AND role='db'`, [meta.id, OWNED('meta')]);
-  const r3 = await reconcileXellEnvs({ reason: 'test-fixed' });
+  const r3 = await reconcileXellEnvs({ reason: 'test-fixed', mode: 'real' });
   const metaFixed = await one(`SELECT env_projected_at, env_projection_error FROM xell WHERE id=$1`, [meta.id]);
   ok(!r3.broken.some((b) => b.startsWith(meta.slug)) && metaFixed.env_projection_error === null
      && metaFixed.env_projected_at !== null,

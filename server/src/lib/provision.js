@@ -19,6 +19,10 @@ import { resolveEnvironmentFor, fullVarsFor } from './environments.js';
 import { warmWorktree } from './npm-cache.js';
 import { logline } from './logbus.js';
 
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines): 'real'
+// touches machines, anything else models. The fleet-wide .zeehive.env reconcile below obeys it.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
 const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* noop */ } };
 
 const ADJ = ['swift', 'calm', 'bright', 'bold', 'keen', 'lively', 'nimble', 'quiet', 'sunny', 'wise'];
@@ -79,7 +83,7 @@ function sameDatabase(a, b) {
 // Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
 // The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
 // ordinary state of a pooled xell, not a projection failure worth flagging to a human.
-async function writeXellEnv(xellId) {
+async function writeXellEnv(xellId, { dryRun = false } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
   if (!xell?.worktree_path) throw Object.assign(new Error('xell has no worktree'), { no_worktree: true });
   if (!existsSync(xell.worktree_path)) {
@@ -244,6 +248,7 @@ async function writeXellEnv(xellId) {
   // the same rule reinjectHarnessIntoLiveXells holds for harness files.
   let changed = true;
   try { changed = readFileSync(path, 'utf8') !== text; } catch { changed = true; }   // unreadable/absent → write
+  if (dryRun) return { ok: true, path, slug: xell.slug, changed, dry_run: true };    // report, write nothing
   if (changed) writeFileSync(path, text);
 
   // Keep the projection out of git's sight WITHOUT touching the project's committed .gitignore:
@@ -275,10 +280,10 @@ async function writeXellEnv(xellId) {
 // keep a file pointing at its own throwaway spinoff db, with nothing a human could look at (ticket
 // #15). env_projected_at / env_projection_error (migration 078) are that read model; fleet.js
 // selects x.*, so the console's env chip carries them for free.
-export async function emitXellEnv(xellId) {
+export async function emitXellEnv(xellId, { dryRun = false } = {}) {
   try {
-    const r = await writeXellEnv(xellId);
-    await noteEnvProjection(xellId, null);
+    const r = await writeXellEnv(xellId, { dryRun });
+    if (!dryRun) await noteEnvProjection(xellId, null);
     return r;
   } catch (e) {
     // A pooled xell with no worktree on disk yet has nothing to project — that is its normal state,
@@ -326,7 +331,15 @@ async function noteEnvProjection(xellId, error = null) {
 // WHAT it never does: widen a binding. It recomputes from the meta-DB through the same emitXellEnv
 // every other caller uses — §6.2 guard, reserved names and all. It cannot invent access a xell's
 // row does not already carry.
-export async function reconcileXellEnvs({ reason = 'boot' } = {}) {
+//
+// AND IT OBEYS PROVISION_MODE. Writing into worktrees is a real side effect on real machines, so a
+// queenzee running with PROVISION_MODE=simulate — every NESTED queenzee a zee runs inside its own
+// xell, by manifest default — only REPORTS what is stale and writes nothing. That is not caution
+// for its own sake: a xell's database is a CLONE of the meta-DB, so a nested queenzee's fleet rows
+// are the REAL fleet's rows, worktree paths and all. Unguarded, the first zee to run the server in
+// its own xell would have reconciled every other zee's .zeehive.env from a snapshot of the meta-DB.
+export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE } = {}) {
+  const dryRun = mode !== 'real';
   const xells = await q(
     `SELECT x.id, x.slug, x.worktree_path,
             EXISTS(SELECT 1 FROM zee z WHERE z.xell_id = x.id AND z.decommissioned_at IS NULL
@@ -340,12 +353,12 @@ export async function reconcileXellEnvs({ reason = 'boot' } = {}) {
     if (!existsSync(x.worktree_path)) { skipped++; continue; }   // pooled/torn-down: nothing on disk
     checked++;
     try {
-      const r = await emitXellEnv(x.id);
+      const r = await emitXellEnv(x.id, { dryRun });
       if (!r.changed) continue;
       rewritten++;
       stale.push(x.slug);
-      logline('env', `${x.slug}: .zeehive.env was STALE — rewritten from the meta-DB`
-        + (x.live
+      logline('env', `${x.slug}: .zeehive.env is STALE — ${dryRun ? 'NOT rewritten (PROVISION_MODE=simulate: this queenzee models the fleet, it does not touch it)' : 'rewritten from the meta-DB'}`
+        + (!dryRun && x.live
           ? ' WHILE A ZEE IS WORKING IN IT. The QUEENZEE wrote that file, not the zee; its app tier '
             + 'still runs on the old values until its next build.'
           : ''));
@@ -361,7 +374,8 @@ export async function reconcileXellEnvs({ reason = 'boot' } = {}) {
   }
   // ONE summary line, always — a reconcile that found nothing must still say it ran, or "no news"
   // and "never ran" look identical (the lesson logHarnessSummary is built on).
-  logline('env', `.zeehive.env reconcile (${reason}): ${checked} checked, ${rewritten} rewritten`
+  logline('env', `.zeehive.env reconcile (${reason}${dryRun ? ', SIMULATE — nothing written' : ''}): `
+    + `${checked} checked, ${rewritten} ${dryRun ? 'STALE (would be rewritten)' : 'rewritten'}`
     + `${stale.length ? ` [${stale.slice(0, 5).join(', ')}${stale.length > 5 ? ', …' : ''}]` : ''}`
     + `, ${failed} FAILED${broken.length ? ` [${broken.slice(0, 3).join('; ')}]` : ''}`
     + `, ${skipped} skipped (no worktree on disk)`);
@@ -369,7 +383,7 @@ export async function reconcileXellEnvs({ reason = 'boot' } = {}) {
     console.error(`[env] ${failed} xell(s) are running on a .zeehive.env that could not be `
       + `reconciled with the meta-DB: ${broken.join('; ')}`);
   }
-  return { checked, rewritten, failed, skipped, broken, stale };
+  return { checked, rewritten, failed, skipped, broken, stale, dry_run: dryRun };
 }
 
 // ── bootstrap prerequisites (spec §4.2/§4.3) ──────────────────────────────────
