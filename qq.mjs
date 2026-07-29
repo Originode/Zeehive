@@ -1,0 +1,11 @@
+import pg from 'pg';
+import { readFileSync } from 'node:fs';
+const env = readFileSync('/work/repo/.zeehive.env','utf8');
+const url = env.split('\n').find(l=>l.startsWith('DATABASE_URL=')).slice('DATABASE_URL='.length).trim();
+const c = new pg.Client({connectionString:url});
+await c.connect();
+const sql = process.argv[2] ?? readFileSync(0,'utf8');
+const r = await c.query(sql);
+if (Array.isArray(r)) for (const x of r) console.log(JSON.stringify(x.rows,null,1));
+else console.log(JSON.stringify(r.rows,null,1));
+await c.end();
