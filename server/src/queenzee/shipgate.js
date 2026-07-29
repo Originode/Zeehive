@@ -372,9 +372,13 @@ export async function shipStatus(xellId) {
 // request time; re-aiming here re-resolves the migration set against the chosen site's ledger, so
 // what deploys is exactly what the human approved FOR that site. One production → nothing to
 // choose, the recorded (default) site ships as always.
-export async function decideShip(id, decision, by = 'human@console', { siteId } = {}) {
+export async function decideShip(id, decision, by = 'human@console',
+                                 { siteId, allowStaleCxellImage = false } = {}) {
   if (!['approved', 'rejected'].includes(decision)) throw new Error(`bad decision: ${decision}`);
   let retarget = null;
+  // The human's cxell-image override, recorded WITH the approval (migration 055). Only meaningful
+  // on an approve, and only ever set true here — nothing may quietly clear a guard.
+  const allowStale = decision === 'approved' && !!allowStaleCxellImage;
   if (decision === 'approved' && siteId) {
     const pending = await one(`SELECT * FROM ship_request WHERE id=$1 AND status='pending'`, [id]);
     if (!pending) throw new Error('no such pending ship request (already decided?)');
@@ -389,15 +393,21 @@ export async function decideShip(id, decision, by = 'human@console', { siteId } 
   }
   const row = retarget
     ? await one(
-      `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3, site_id=$4, migrations=$5::jsonb
-         WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by, retarget.site.id, retarget.migrations])
+      `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3, site_id=$4, migrations=$5::jsonb,
+              allow_stale_cxell_image=$6
+         WHERE id=$1 AND status='pending' RETURNING *`,
+      [id, decision, by, retarget.site.id, retarget.migrations, allowStale])
     : await one(
-      `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3
-         WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by]);
+      `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3, allow_stale_cxell_image=$4
+         WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by, allowStale]);
   if (!row) throw new Error('no such pending ship request (already decided?)');
   broadcast('ship', row);
   logline('ship', `${decision.toUpperCase()} ship ${String(row.commit).slice(0, 8)} by ${by}`
-    + (retarget ? ` → site ${retarget.site.key} (re-aimed at approval)` : ''));
+    + (retarget ? ` → site ${retarget.site.key} (re-aimed at approval)` : '')
+    // Say it at approval time, not just at build time: this is a human knowingly accepting a fleet
+    // image that may not be the shipped code, and it belongs in the log next to who approved it.
+    + (allowStale ? ` — WITH the cxell-image override: a failed image rebuild will NOT fail this `
+                    + `ship, and new cxells may run a STALE image (chosen by ${by})` : ''));
   // A rejected BUNDLE carrier must not strand its riders pointing at it — free them back to
   // plain-deferred so a human can resume or re-bundle them.
   if (decision === 'rejected') {
@@ -416,7 +426,8 @@ export async function decideShip(id, decision, by = 'human@console', { siteId } 
 // ship's target site and then approves it in one step, so the queenzee takes the freed lock and
 // deploys. Folding the two acts ("Release now", then "Approve") into one also closes the window
 // between them where a queued ship could grab the lock first. HUMAN-only, like every ship decision.
-export async function unlockAndShip(id, { siteId = null, by = 'human@console' } = {}) {
+export async function unlockAndShip(id, { siteId = null, by = 'human@console',
+                                          allowStaleCxellImage = false } = {}) {
   const ship = await one(`SELECT * FROM ship_request WHERE id=$1 AND status='pending'`, [id]);
   if (!ship) throw new Error('no such pending ship request (already decided?)');
   if (ship.deferred_at) throw new Error('this ship is deferred — resume it before shipping');
@@ -437,7 +448,7 @@ export async function unlockAndShip(id, { siteId = null, by = 'human@console' } 
   }
   // Approve → runShip takes the (now free) lock and deploys. Pass the re-aim through so the ship
   // hits (and re-resolves its migrations for) the site the human chose.
-  return decideShip(id, 'approved', by, { siteId: siteId || undefined });
+  return decideShip(id, 'approved', by, { siteId: siteId || undefined, allowStaleCxellImage });
 }
 
 // ── the queenzee ships ───────────────────────────────────────────────────────
@@ -597,10 +608,17 @@ async function runShipBody(ship, xell, project, site, lockKey) {
     // Live-feed every build line TWICE: to the logbus (the ▚ terminal firehose), and as a
     // 'ship-log' event addressed to THIS ship — the request's own card renders that stream, so
     // watching a deploy doesn't mean fishing its lines out of everything else the hive is saying.
+    // The cxell-image override, decided per-ship by a HUMAN on the card (allow_stale_cxell_image,
+    // migration 055) and passed EXPLICITLY here. Unticked, nothing is set: the build script's
+    // default is fatal, and a queenzee genuinely started with CXELL_IMAGE_REQUIRED=0 (the
+    // operator-level escape, for a host with no reachable docker daemon) still inherits its own
+    // env. Ticked, this one build is told to report a failed cxell-image rebuild without failing
+    // the ship — a choice that is on the request afterwards, not a setting nobody can see.
+    const extraEnv = ship.allow_stale_cxell_image ? { CXELL_IMAGE_REQUIRED: '0' } : {};
     const r = await runScript(c, project.repo_root, ship.commit, (line) => {
       logline('ship', `[${c.role}] ${line}`);
       broadcast('ship-log', { id: ship.id, role: c.role, line, ts: Date.now() });
-    });
+    }, extraEnv);
 
     // Record what prod now RUNS — the same projection lib/build.js does for dev builds. A ship
     // used to skip this entirely, so a successful deploy left last_build_commit untouched and
@@ -662,7 +680,10 @@ async function runShipBody(ship, xell, project, site, lockKey) {
 // verdict (and any failure) is at the bottom of a build log, the cache-hit noise at the top.
 const LOG_TAIL_BYTES = 64 * 1024;
 
-function runScript(container, sourcePath, buildRef = 'main', onLine = null) {
+// `extraEnv` is passed EXPLICITLY into the child rather than left to cleanGitEnv's inheritance of
+// the queenzee's own process env — a per-ship decision (see allowStaleCxellImage below) must not
+// depend on what the orchestrator happens to have been started with.
+function runScript(container, sourcePath, buildRef = 'main', onLine = null, extraEnv = {}) {
   return new Promise((res) => {
     // A bare `bash` (the stored default on every prod container) resolves to C:\Windows\System32\
     // bash.exe (WSL) ahead of Git bash on Windows — with no distro it exits 1 with "WSL has no
@@ -671,7 +692,7 @@ function runScript(container, sourcePath, buildRef = 'main', onLine = null) {
     // too. A real interpreter set by an operator (sh, pwsh, …) is still respected.
     const exec = (!container.build_exec || container.build_exec === 'bash') ? resolveBash() : container.build_exec;
     const p = spawn(exec, [container.build_script, sourcePath, container.role, container.docker_ctx || '', MODE, buildRef],
-      { env: cleanGitEnv(), windowsHide: true });
+      { env: cleanGitEnv(extraEnv), windowsHide: true });
     let out = '', err = '', buf = '', settled = false;
     // Line-buffered live feed (stdout AND stderr — docker build writes its progress to stderr).
     // The ship used to run in total silence and only a 1500-char error tail survived a failure;

@@ -606,10 +606,15 @@ export async function decideLanding(id, decision, by = 'human@console') {
 // approve → the queenzee takes the prod lock and runs the deploy ITSELF, from main.
 // siteId (approve only): aim the ship at a chosen prod site — the dialog's target picker when a
 // project has more than one production. Omit to ship to the request's recorded (default) site.
-export async function decideShip(id, decision, by = 'human@console', siteId = undefined) {
+// allowStaleCxellImage (approve only): the human's explicit "ship anyway even if the cxell image
+// cannot be rebuilt". A failed rebuild normally FAILS the ship; this is the per-ship release valve,
+// and it is RECORDED on the request so the audit trail shows a human chose it.
+export async function decideShip(id, decision, by = 'human@console', siteId = undefined,
+                                 allowStaleCxellImage = false) {
   const r = await fetch(`/api/ship/requests/${id}/${decision}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ by, ...(siteId ? { site_id: siteId } : {}) }),
+    body: JSON.stringify({ by, ...(siteId ? { site_id: siteId } : {}),
+                           ...(allowStaleCxellImage ? { allow_stale_cxell_image: true } : {}) }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
@@ -626,10 +631,11 @@ export async function dismissShip(id) {
 
 // Force-release the prod lock for this ship's site, then approve+ship it — one atomic step for the
 // "production is locked, but send this one now" decision. siteId (optional) aims/re-aims the ship.
-export async function unlockAndShip(id, siteId = undefined) {
+export async function unlockAndShip(id, siteId = undefined, allowStaleCxellImage = false) {
   const r = await fetch(`/api/ship/requests/${id}/unlock-and-ship`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(siteId ? { site_id: siteId } : {}),
+    body: JSON.stringify({ ...(siteId ? { site_id: siteId } : {}),
+                           ...(allowStaleCxellImage ? { allow_stale_cxell_image: true } : {}) }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `unlock & ship failed (${r.status})`);

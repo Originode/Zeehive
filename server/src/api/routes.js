@@ -156,8 +156,11 @@ router.get('/ship/status', async (req, res) => {
 router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => {
   const decision = req.params.decision === 'approve' ? 'approved' : 'rejected';
   try {
+    // allow_stale_cxell_image: the human's explicit "ship anyway with a stale cxell image" — a
+    // per-ship release valve for the fatal cxell-image guard, recorded on the request (055).
     res.json(await decideShip(req.params.id, decision, req.body?.by || 'human@console',
-      { siteId: req.body?.site_id || undefined }));
+      { siteId: req.body?.site_id || undefined,
+        allowStaleCxellImage: !!req.body?.allow_stale_cxell_image }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
 
@@ -166,7 +169,8 @@ router.post('/ship/requests/:id/:decision(approve|reject)', async (req, res) => 
 router.post('/ship/requests/:id/unlock-and-ship', async (req, res) => {
   try {
     res.json(await unlockAndShip(req.params.id,
-      { siteId: req.body?.site_id || null, by: req.body?.by || 'human@console' }));
+      { siteId: req.body?.site_id || null, by: req.body?.by || 'human@console',
+        allowStaleCxellImage: !!req.body?.allow_stale_cxell_image }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
 
@@ -1114,9 +1118,12 @@ router.get('/xell/self/seed-request', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Propose done — flags the xell for a human's "Mark done"; the zee never despawns itself.
+// {clear:true} WITHDRAWS a done proposal (`zee done --clear`) — symmetric with tend/hint clearing.
+// A zee handed more work after proposing done had no way back, and the stale proposal kept asking a
+// human to reap it. Retracting a proposal a human already CONFIRMED is refused (see retractDone).
 router.post('/xell/self/done', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
-    res.json(await selfDone(x, { summary: req.body?.summary || null })); }
+    res.json(await selfDone(x, { summary: req.body?.summary || null, clear: !!req.body?.clear })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Raise (or --clear) a tend: "I need a human in the console". Opens no gate, blocks nothing — it

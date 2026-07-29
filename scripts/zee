@@ -11,7 +11,7 @@
 //   zee land [--wait]
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
-//   zee done --summary "what you finished"
+//   zee done --summary "what you finished"   |   zee done --clear   (withdraw the proposal)
 //
 // --wait (on `land` and `status`) BLOCKS, polling until the landing is decided (landed/rejected/
 // stale), and exits with that verdict — its exit is your nudge, so run it in the BACKGROUND. The
@@ -163,7 +163,7 @@ function usage() {
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
   zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
-  zee done --summary "..."           propose done (a human confirms with "Mark done")
+  zee done --summary "..." | --clear   propose done (a human confirms with "Mark done"); --clear WITHDRAWS the proposal if you are back at work
 
  crew (a zee that has a manager, or IS one):
   zee report --message "..." [--kind reflection]   send your MANAGER a note (a question, a blocker, or your post-ship REFLECTION). The one reach outside your xell a worker is meant to have
@@ -388,7 +388,12 @@ switch (cmd) {
     break;
   }
   case 'done': {
+    // --clear WITHDRAWS a done proposal. Symmetric with tend/hint clearing, and the half that was
+    // missing: a zee handed more work after proposing done was stuck asking to be reaped, and until
+    // the hive precedence was fixed that stale proposal masked every later signal it raised.
+    if (rest.includes('--clear')) { out(await req('POST', '/api/xell/self/done', { clear: true })); break; }
     const summary = flag('summary');
+    if (!summary) { console.error('done needs --summary "what you finished" (or --clear to withdraw a proposal)'); process.exit(1); }
     out(await req('POST', '/api/xell/self/done', { summary }));
     break;
   }

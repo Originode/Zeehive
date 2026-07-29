@@ -21,7 +21,7 @@ import { landStatus } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
-import { proposeDone } from './tasks.js';
+import { proposeDone, retractDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
@@ -563,7 +563,13 @@ async function resealCxellForStack(xellId) {
 // ── POST /api/xell/self/done — propose done (the human confirms → teardown) ─────
 // The zee never despawns itself. proposeDone flags the xell 'awaiting-done'; a human confirms with
 // "Mark done" in the dashboard, and THAT is what reaps the cxell (collecting its commits first).
-export async function selfDone(xell, { summary = null } = {}) {
+//
+// `{clear:true}` (`zee done --clear`) WITHDRAWS the proposal — symmetric with how tend and the
+// land/ship hints clear. A zee that proposed done and was then handed more work had no way back,
+// and a stale proposal is not harmless: it is the zee still asking a human to reap it. Retracting
+// what a human has ALREADY confirmed is refused inside retractDone — that decision is theirs.
+export async function selfDone(xell, { summary = null, clear = false } = {}) {
+  if (clear) return retractDone({ xell_id: xell.id });
   return proposeDone({ xell_id: xell.id, note: summary });
 }
 

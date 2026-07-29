@@ -20,6 +20,7 @@ import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
 import { adapterFor, CLAUDE_ADAPTER, AGENT_PROC_PATTERN } from './cxell-runtimes.js';
@@ -458,6 +459,27 @@ export async function installZeeLiveIntoCxell({ ctx = 'default', name }) {
   }
 }
 
+// ── Is the IMAGE this cxell booted from actually built from the current code? ─────────────────
+//
+// The refresh below hides the answer by design: it overwrites /usr/local/bin/zee, so afterwards the
+// one file that could testify no longer can. That is not hypothetical — on the cad07a8 ship the
+// zee-agent image was never really rebuilt (the build read the pre-landing working tree and hit
+// cache on every layer), and the only reason anyone found out was a zee comparing baked-file mtimes
+// by hand across two cages. Nothing in the system said a word.
+//
+// So ASK BEFORE OVERWRITING, while the baked file is still there: sha256 the image's `zee` and
+// compare it to the queenzee's own scripts/zee. A mismatch means the image predates this code —
+// the fleet image is stale, the spawn-time refresh is the only thing making the cage work, and the
+// next capability that is NOT the CLI (cxell-sshd.sh, zee-attach.sh, the agent CLIs, the firewall)
+// silently will not be there at all. Cheap: one exec, at spawn, best-effort.
+async function bakedZeeCliSha({ ctx, name }) {
+  try {
+    const r = await dk(ctx, ['exec', '-u', '0', name, 'sha256sum', ZEE_CLI_DEST], { timeoutMs: 20000 });
+    const sha = String(r.out || '').trim().split(/\s+/)[0];
+    return /^[0-9a-f]{64}$/.test(sha) ? sha : null;
+  } catch { return null; }   // no baked copy / no sha256sum — unknown, never fatal
+}
+
 // Install (idempotently — it is an overwrite) the queenzee's current `zee` CLI into the cxell.
 // Best-effort with a LOUD log, the same stance as the prompt-attachments copy above and the
 // cxell-image rebuild in self-ship.sh: the baked CLI is still there, so a failed refresh must not
@@ -469,9 +491,21 @@ export async function installZeeCliIntoCxell({ ctx = 'default', name }) {
       + 'repo; the cxell keeps the CLI baked into its image, which may be OLDER than this queenzee');
     return { installed: false, reason: 'source-missing', src };
   }
+  // Read the image's verdict FIRST — the install below destroys the evidence.
+  const baked = await bakedZeeCliSha({ ctx, name });
+  const mine = createHash('sha256').update(readFileSync(src)).digest('hex');
+  const staleImage = baked ? baked !== mine : null;
+  if (staleImage) {
+    logline('cxell', `${name}: !!! STALE CXELL IMAGE — the \`zee\` baked into this container's image `
+      + `(sha ${baked.slice(0, 12)}) is NOT this queenzee's scripts/zee (sha ${mine.slice(0, 12)}). The `
+      + 'zee-agent image was not rebuilt from the current code. The spawn-time refresh below papers '
+      + 'over it FOR THE CLI ONLY — every other baked file (cxell-sshd.sh, zee-attach.sh, the agent '
+      + 'CLIs, cxell-firewall.sh) is still the old build and nothing refreshes those. Rebuild the '
+      + 'image: git archive <sha> | docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent -');
+  }
   try {
     for (const args of zeeCliInstallCommands({ name, src })) await dk(ctx, args);
-    return { installed: true, src };
+    return { installed: true, src, staleImage, bakedSha: baked, sourceSha: mine };
   } catch (e) {
     logline('cxell', `${name}: !!! could not refresh the zee CLI from ${src} (${String(e.message).slice(0, 200)}) — `
       + 'the cxell falls back to the CLI baked into its image, which may be OLDER than this queenzee '
