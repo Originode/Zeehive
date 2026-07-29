@@ -136,7 +136,29 @@ await sweepStalePending();
 ok((await one(`SELECT status FROM land_request WHERE id=$1`, [goodReq.id])).status === 'pending',
   'a landable held request is untouched by the sweep — only proven non-fast-forwards are closed');
 
-// ── 3. NOBODY HOME: no live cxell to nudge → raise a tend for a human ─────────
+// ── 3. THE NUDGE ITSELF FAILS TO DELIVER → tend + an honest receipt ───────────
+// The resume is fire-and-forget, so "we started one" is all the delivery layer can return. For a
+// stale landing that is not good enough: it is the zee's only way to learn, so a resume that never
+// starts (docker gone, cxell torn down between the SELECT and the exec) must reach a human — and
+// must not leave a receipt claiming the zee was told. Reproduced exactly as it happens in the wild,
+// by taking `docker` off PATH (→ spawn ENOENT) for this one close.
+console.log('\n── the resume cannot even start → a human is flagged, and the receipt says so ──');
+{
+  const savedPath = process.env.PATH;
+  process.env.PATH = '/nonexistent';                       // no docker → the nudge cannot spawn
+  const req3 = await mkRequest(liveXell.id, 'approved');
+  await landApproved(req3, 'human@test');
+  let tended = false;
+  for (let i = 0; i < 30 && !tended; i++) { await sleep(120); tended = await tendOpen(liveXell.id); }
+  process.env.PATH = savedPath;
+  ok(tended === true, 'an undeliverable nudge raises a TEND — the zee never heard, so a human must');
+  const row3 = await one(`SELECT * FROM land_request WHERE id=$1`, [req3.id]);
+  ok(row3.status === 'stale', `the row is still closed 'stale' (${row3.status}) — the landing is dead either way`);
+  ok(/could NOT be nudged/.test(String(row3.note || '')),
+    `the receipt says the zee was NOT reached, not that it was: "${String(row3.note || '').slice(0, 80)}…"`);
+}
+
+// ── 4. NOBODY HOME: no live cxell to nudge → raise a tend for a human ─────────
 console.log('\n── no live cxell to nudge → a human is flagged instead ──');
 const orphan = await mkXell('stale-orphan');   // no zee row at all
 const orphanReq = await mkRequest(orphan.id, 'approved');

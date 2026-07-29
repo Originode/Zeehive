@@ -310,17 +310,23 @@ async function closeAsStale(row, { tip = null, from = 'approved' } = {}) {
     + 'to one exact sha: this one needs a synced branch, a fresh sha and a fresh decision. Closed.');
 
   // The zee is the only one who can fix this, and it is the one party that could not see it happen.
-  const nudged = await nudgeXellForStaleLanding(row.xell_id, { sha: row.new_sha, ref: row.ref, tip })
+  // requestId rides along so a delivery that fails AFTER we return can correct this row's receipt —
+  // "the zee was nudged" must not outlive the nudge actually failing.
+  const nudged = await nudgeXellForStaleLanding(row.xell_id,
+    { sha: row.new_sha, ref: row.ref, tip, requestId: row.id })
     .catch((e) => ({ nudged: false, error: e.message }));
   const note = `stale: ${branch} moved past ${short}${tip ? ` (now ${String(tip).slice(0, 8)})` : ''} — `
     + (nudged?.nudged ? 'the zee was nudged to `zee sync` and land again'
-      : nudged?.tended ? `no live cxell to nudge (${nudged.reason ? 'tend raised' : 'tend raised'}) — flagged for a human`
-        : `nothing to nudge (${nudged?.reason || nudged?.error || 'no cxell zee'})`);
-  const noted = await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING *`, [row.id, note])
+      : `nothing to nudge (${nudged?.reason || nudged?.error || 'no cxell zee'})`);
+  // `AND note IS NULL` because the nudge can fail ASYNCHRONOUSLY — the resume is fire-and-forget, so
+  // an undeliverable one (docker gone, cxell torn down) writes the truthful "could NOT be reached"
+  // receipt from its own catch, possibly before we get here. Whoever knows the delivery FAILED wins;
+  // this optimistic line must never overwrite it. (Both orders converge on the same final note.)
+  const noted = await one(
+    `UPDATE land_request SET note=$2 WHERE id=$1 AND note IS NULL RETURNING *`, [row.id, note])
     .catch(() => null);
-  if (noted) broadcast('land', noted);
-  logline('landgate', `${short}: ${note}`);
-  return noted || stale;
+  if (noted) { broadcast('land', noted); logline('landgate', `${short}: ${note}`); }
+  return noted || (await one(`SELECT * FROM land_request WHERE id=$1`, [row.id]).catch(() => stale)) || stale;
 }
 
 // HELD REQUESTS THE REF HAS ALREADY MOVED PAST. A pending landing is a question waiting on a human,

@@ -138,6 +138,27 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
   working normally) is untouched, and a queenzee outage can never block a non-main push.
 - Approval is bound to the **exact sha** a human read; it is **spent on use**. Amend/rebase → new
   sha → new decision. Approve → the zee re-runs the **same** push and it goes through.
+- **A landing that main moved past is STALE, and the zee is TOLD** (added 2026-07-29,
+  `landgate.js → closeAsStale` + `nudge.js → nudgeXellForStaleLanding`). Binding an approval to one
+  sha means another xell landing first kills it: it can never fast-forward. That was already
+  recorded honestly (row → `stale`, log line, pad receipt) and told **nobody** — a cxell zee's turn
+  ends at `zee land`, so it sat waiting on a decision that had already become impossible. Now
+  closing the row **resumes the zee's session** with the only recovery that works from inside a
+  cage: `zee sync` (merge current main in — `git fetch`/`git rebase main` cannot work there) then
+  `zee land` again for a fresh decision on a landable sha. No live cxell to reach → a **tend** is
+  raised instead, so it reaches a human. The reason, and whether the zee was actually nudged, is
+  written to `land_request.note` (shown on the pad receipt).
+  - **Held** requests are swept too (`sweepStalePending`, on the 10s land-reaper tick): a pending
+    card main has already moved past is a human being asked to approve something with no possible
+    outcome. Only a **proven non-fast-forward** is closed; a sha the ref already contains is left
+    alone for a human.
+  - A row leaving `pending` needs a decider (009's `land_decided_has_decider` check), and nobody
+    decided this one — it is recorded as `queenzee@stale`, never a human's name.
+  - Both waiters (`scripts/zee`, `scripts/xell-land.mjs`) exit on `stale` with the same
+    sync-then-land instruction. `xell-land.mjs` had **no** stale case and burned its full hour
+    timeout on a dead landing.
+  - Test: `node test/land-stale-nudge.test.mjs` (real git repos + throwaway postgres; the fake
+    `docker` in `test/_bin` captures the resume prompt).
 - Console: held landings render **above everything** (`web/src/Landing.jsx`) with the commit list
   + diffstat and Approve/Reject. A T-Keyboard ping fires too (`lib/notify.js`, `TKB_NOTIFY=0` to
   mute) — a held push blocks a zee, so it must reach you off-screen.

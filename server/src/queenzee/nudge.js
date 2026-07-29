@@ -66,23 +66,40 @@ const STALE_PROMPT = (ref, sha, tip) => [
 // If there is no live cxell to nudge (the zee finished, or its container is gone) the landing would
 // go unheard entirely — so we raise a TEND instead: "needs a human in the console". A stale landing
 // with nobody listening is exactly the state that must not be silent.
-export async function nudgeXellForStaleLanding(xellId, { sha = null, ref = null, tip = null, by = 'queenzee' } = {}) {
+export async function nudgeXellForStaleLanding(xellId, { sha = null, ref = null, tip = null, requestId = null, by = 'queenzee' } = {}) {
   const short = sha ? String(sha).slice(0, 8) : 'a landing';
   const r = await nudgeCxell(xellId, {
     by, prompt: STALE_PROMPT(ref, sha, tip), why: 'landing went stale',
     log: (slug, sid) => `${slug}: landing ${short} went STALE — resuming cxell session ${sid} to `
       + '`zee sync` and land again',
+    // Delivery is fire-and-forget, so "we started a resume" is all nudgeCxell can honestly return.
+    // For most nudges that is fine. Not this one: it is the zee's ONLY way to learn its landing
+    // died, so a delivery that never even starts (docker gone, cxell torn down between the SELECT
+    // and the exec) must degrade to a HUMAN rather than to silence — and the receipt must stop
+    // claiming the zee was told.
+    onFail: (e) => staleNudgeUndelivered(xellId, { short, requestId, why: e.message })
+      .catch(() => {}),
   });
   if (r?.nudged) return r;
+  const tended = await staleNudgeUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
+  return { ...r, ...tended };
+}
 
-  // Nobody to tell. Don't tend a xell that is already gone — there is no zee to come back to it.
+// Nobody heard it. Raise "needs a human in the console" and correct the request's receipt, which
+// until this ran said the zee had been nudged. Never throws; never tends a xell that is already
+// gone (there is no zee left to come back to it, and a tend on a corpse is just noise).
+async function staleNudgeUndelivered(xellId, { short, requestId = null, why = 'unknown' } = {}) {
   const xell = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xellId]).catch(() => null);
-  if (!xell || xell.status === 'retired') return { ...r, tended: false };
-  const reason = `Landing ${short} went STALE — main moved past it, so it can never land. The zee could not be `
-    + `nudged (${r?.reason || r?.error || 'no live cxell'}), so nothing has synced and re-requested it.`;
+  if (!xell || xell.status === 'retired') return { tended: false };
+  const reason = `Landing ${short} went STALE — main moved past it, so it can never land. The zee could NOT be `
+    + `nudged (${why}), so nothing has synced and re-requested it.`;
   await setTend(xellId, true, { reason, source: 'queenzee' }).catch(() => {});
-  logline('nudge', `${xell.slug}: landing ${short} went STALE and there is no live cxell to nudge — raised a tend for a human`);
-  return { ...r, tended: true, reason };
+  if (requestId) {
+    await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING id`,
+      [requestId, `stale: ${reason}`]).catch(() => {});
+  }
+  logline('nudge', `${xell.slug}: landing ${short} went STALE and the zee could NOT be reached (${why}) — raised a tend for a human`);
+  return { tended: true, reason };
 }
 
 // THE REFLECTION STAGE — what a worker does AFTER its work is live in production.
@@ -271,7 +288,7 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
 
 // The shared delivery: resolve this xell's live cxell zee and resume its claude session with
 // `prompt`. Fire-and-forget (the turn can run for minutes), best-effort, NEVER throws.
-async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log } = {}) {
+async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, onFail = null } = {}) {
   try {
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
@@ -301,7 +318,12 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log } =
       prompt, model: zee.model, adapter, token,
     })
       .then((r) => logline('nudge', `${zee.slug}: nudge session exited (code ${r?.code ?? '?'})`))
-      .catch((e) => logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`));
+      .catch((e) => {
+        logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`);
+        // The caller may need to KNOW the message never arrived (a stale landing has no other way
+        // to reach its zee). Best-effort by construction: this is already the failure path.
+        try { onFail?.(e); } catch { /* a failing handler must not become an unhandled rejection */ }
+      });
 
     return { nudged: true, zee_id: zee.id, session: zee.claude_session_id, prompt };
   } catch (e) {
