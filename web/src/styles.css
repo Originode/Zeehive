@@ -57,6 +57,13 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .projpop-pick .dot { color: var(--accent); font-size: 10px; }
 .projpop-pick .pn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .projpop-pick .pc { color: var(--muted); font-size: 11px; }
+/* "something is waiting on you in a project you are not looking at" — this page is per-project, so
+   without these an approval in the other project is invisible while its zee waits on it. */
+.projmenu-btn.waiting { color: var(--error); border-color: var(--error); position: relative; }
+.projmenu-wait { position: absolute; top: -5px; right: -5px; min-width: 14px; height: 14px;
+  padding: 0 3px; border-radius: 7px; background: var(--error); color: #fff;
+  font-size: 9px; line-height: 14px; font-weight: 700; }
+.projpop-pick .pw { color: var(--error); font-size: 11px; font-weight: 600; }
 .projpop-del { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 13px;
   padding: 6px 8px; border-radius: 6px; }
 .projpop-del:hover:not(:disabled) { color: var(--down); background: var(--panel2); }
@@ -947,6 +954,15 @@ a.cbox:hover { border-color: var(--accent); }
 .ship-bundle-btn:disabled { opacity: .5; cursor: default; }
 /* a folded rider: informational, riding a carrier's single deploy — no actions of its own. */
 .ship-deferred.bundled { border-left-color: var(--building); color: var(--building); }
+
+/* REFUSED asks: a zee asked to ship and the gate said no, so no card exists to approve. Quiet and
+   informational — it answers "did anyone even ask?", which an empty panel used to answer wrongly. */
+.ship-refused { background: var(--panel2); border: 1px dashed var(--line); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 8px; }
+.ship-refused-head { color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.ship-refused-row { color: var(--muted); font-size: 12.5px; margin-top: 5px;
+  border-left: 2px solid var(--muted); padding-left: 8px; cursor: help; }
+.ship-refused-row b { color: var(--text); }
 
 /* prod is locked: why the plain approve is greyed out, and the unlock-&-ship escape hatch. */
 .ship-locked-note { color: var(--building); font-size: 12.5px; margin-top: 8px;

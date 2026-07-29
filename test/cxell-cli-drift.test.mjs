@@ -27,7 +27,7 @@
 //
 // Static + unit assertions plus one real `git archive`: no DB, no docker, no network.
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,9 +44,21 @@ const SHIP_SCRIPTS = ['scripts/self-ship.sh', 'scripts/self-ship-container.sh'];
 const dockerfile = read(DOCKERFILE);
 const cli = read(CLI);
 
-// ── (a) ONE copy of the CLI ───────────────────────────────────────────────────────────────────
+// ── (a) ONE copy of the CLI, and it PARSES ────────────────────────────────────────────────────
 console.log('\n── one source of truth for the cxell CLI ──');
 ok(existsSync(join(ROOT, CLI)), `the authoritative CLI lives at ${CLI}`);
+
+// It must at least be valid JavaScript. This file is not imported by anything the test suite ran,
+// so a syntax error in it passed every check and LANDED: an unescaped backtick inside usage()'s
+// template literal ("… then `zee sync`") closed the string, and `zee` became a SyntaxError. The
+// queenzee installs this exact file into every cxell it spawns, so that one character takes every
+// verb away from every new zee — status, land, ship, tend — with no way to ask for help but the
+// one command that no longer runs. One `node --check` is the whole guard.
+{
+  const r = spawnSync(process.execPath, ['--check', join(ROOT, CLI)], { encoding: 'utf8' });
+  ok(r.status === 0, `${CLI} is syntactically valid JS — every cxell's only door out runs it`
+    + (r.status === 0 ? '' : `\n      ${String(r.stderr).split('\n').slice(0, 3).join('\n      ')}`));
+}
 
 // Walk docker/ for any file that looks like the CLI (a node script wrapping /api/xell/self/*).
 function walk(dir, out = []) {

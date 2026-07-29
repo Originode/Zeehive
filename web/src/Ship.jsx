@@ -374,7 +374,34 @@ function LockCountdown({ lock, projectId, onChanged }) {
   );
 }
 
-export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onDecided, onForwardToZee }) {
+// Ship asks that were REFUSED — the ones that never became a card, because requestShip refuses a
+// ship whose work is not landed and writes no row. That refusal used to exist only in the queenzee
+// log, so a zee could ask, be refused, tell its human "it is waiting for your approval", and the
+// human would find an empty production panel and no way to tell whether anything had been asked at
+// all. These are NOT decisions: there is nothing to approve — that is the point of showing them.
+function RefusedAsks({ refused }) {
+  if (!refused?.length) return null;
+  return (
+    <div className="ship-refused" data-testid="ship-refused">
+      <div className="ship-refused-head">
+        ⃠ {refused.length} ship ask{refused.length === 1 ? '' : 's'} REFUSED — no request was raised,
+        so there is nothing here to approve
+      </div>
+      {refused.map((r) => (
+        <div className="ship-refused-row" key={r.xell_id} data-testid="ship-refused-row"
+             title={`${r.full || r.reason || 'no reason recorded'}\n\n`
+               + 'The zee asked to ship and the gate refused it outright — a ship builds from main, so '
+               + 'unlanded or uncommitted work would not be in it. Nothing is pending: it must land first, '
+               + 'then ask again. This line clears as soon as it raises a real request.'}>
+          <b>{r.xell_slug}</b> asked {r.at ? new Date(r.at).toLocaleTimeString() : ''} — {r.reason || 'no reason recorded'}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onDecided, onForwardToZee,
+                                    refused = [] }) {
   const open = shipping || [];
   // The project's prod sites — the approve dialog's target choices. Loaded once per project and
   // only while something is actually open (no ships → no fetch).
@@ -386,7 +413,9 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
       .catch(() => { /* picker simply doesn't render */ });
     return () => { live = false; };
   }, [projectId, open.length]);
-  if (!open.length && !prodLock) return null;
+  // The panel also renders for refusals alone: "a zee asked and was refused" is exactly the thing
+  // that was invisible, so an empty panel must stop being the answer to it.
+  if (!open.length && !prodLock && !refused?.length) return null;
   // Deferred ships are still 'pending' server-side but a human set them aside, so they do NOT count
   // toward the loud "awaiting your approval" alarm — they render as quiet deferred cards.
   const pending = open.filter((s) => s.status === 'pending' && !s.deferred_at).length;
@@ -403,6 +432,7 @@ export default function ShipPanel({ shipping, prodLock, shipLogs, projectId, onD
             ? `⏸ ${deferred} ship${deferred === 1 ? '' : 's'} deferred — bundle them into one combined ship`
             : '⇪ production'}
       </div>
+      <RefusedAsks refused={refused} />
       <LockCountdown lock={prodLock} projectId={projectId} onChanged={onDecided} />
       {bundleable >= 2 && (
         <BundleBar count={bundleable} projectId={projectId} onDone={onDecided} />
