@@ -211,6 +211,14 @@ export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${site
 
 // ── environments (masked — the server never returns a secret value, only a hint). The meta-DB
 // source of truth for the untracked .env; resolved onto a xell by tier (lib/environments.js). ──
+// ── the project's ENTRY-POINT DOCS (AGENTS.md / CLAUDE.md …) ──────────────────────────────────
+// Owned by the meta-DB and generated into every xell when a zee is assigned. The console's Docs tab
+// is the authoring surface; the queenzee refuses to write one over a path the project has committed.
+export const getProjectDocs = (projectId) => fetch(`/api/projects/${projectId}/docs`).then((r) => (r.ok ? r.json() : []));
+export const createProjectDoc = (projectId, body) => siteCall(`/api/projects/${projectId}/docs`, 'POST', body);
+export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${docId}`, 'PUT', body);
+export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
+
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
 export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);
 export const updateEnvironment = (envId, body) => siteCall(`/api/environments/${envId}`, 'PATCH', body);
@@ -221,6 +229,13 @@ export const deleteEnvVar = (envId, name) => siteCall(`/api/environments/${envId
 export const importEnv = (envId, text, is_secret = true) => siteCall(`/api/environments/${envId}/import`, 'POST', { text, is_secret });
 export const exportEnv = (envId) => siteCall(`/api/environments/${envId}/export`, 'GET');
 export const lintEnv = (envId) => fetch(`/api/environments/${envId}/lint`).then((r) => r.json());
+// …and the XELL side of the same fact (ticket #20): which environment a xell RESOLVED to (pinned or
+// by tier), its var NAMES and counts — never values — and the pin/clear that re-projects
+// .zeehive.env. Names-and-counts only: full values leave the meta-DB through exactly two doors
+// (the .zeehive.env projection and the deploy materializer) and a picker must not become a third.
+export const getXellEnvironment = (xellId) => siteCall(`/api/xells/${xellId}/environment`, 'GET');
+export const setXellEnvironment = (xellId, environmentId) =>
+  siteCall(`/api/xells/${xellId}/environment`, 'POST', { environment_id: environmentId || null });
 // Extract a xell's CURRENT environment (its live .zeehive.env, else the resolved meta-DB env) as
 // full .env text — the "pull out what this xell is running with" reveal.
 export const extractXellEnv = (xellId) => siteCall(`/api/xells/${xellId}/env/export`, 'GET');

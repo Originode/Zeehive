@@ -83,10 +83,32 @@ async function awaitCleared(id) {
 const lastHolding = (xellId) => one(
   `SELECT id FROM land_request WHERE xell_id=$1 AND status='holding'
      ORDER BY requested_at DESC LIMIT 1`, [xellId]);
+// TICKET #19 — why this waits for the WHOLE invocation and not just `--resume`.
+//
+// The fake docker writes its argv line the instant it starts, and the PROMPT only after it has
+// finished READING STDIN. Those are two writes with a real gap between them, and everything the
+// assertions actually care about — "runway is CLEAR", `zee sync` before `zee land`, "not an
+// approval" — lives in the second one. Returning as soon as `--resume` appeared meant the caller
+// asserted on a half-written log: green when the box was quiet, red about once in thirty when it
+// was not, and reading as a broken clearance protocol rather than a slow spawn. (Case 9 had grown
+// its own extra polling loop for exactly this; the other five call sites had not.)
+//
+// So: wait until the invocation that matches `want` is COMPLETE — a closed stdin block is the
+// marker that it was fully recorded. Per INVOCATION, because one clearance step can produce TWO of
+// them (case 9 nudges the stale occupant AND clears the holder behind it), and "some resume, fully
+// written" would return on the first while the second was half-recorded — the same bug one layer up.
+// Callers pass what they are about to assert on, so the wait and the assertion can never drift.
+//
+// Proof this is the WAIT and not the protocol: with the gap forced deterministically
+// (DOCKER_FAKE_SLOW_STDIN_MS) the pre-fix test failed 7 assertions across 5 cases every run, while
+// every ROW-level assertion — cleared_at, the tend, the go-around itself — still passed; and a timed
+// probe put the argv line at 32ms and the prompt at 1,526ms of the SAME invocation. Late, not lost.
+const invocations = (log) => log.split(/^=== docker /m).slice(1).map((r) => `=== docker ${r}`);
 async function awaitResume(want = /--resume/) {
-  let log = '';
-  for (let i = 0; i < 80 && !want.test(log); i++) { await sleep(150); log = readLog(); }
-  return log;
+  const done = () => invocations(readLog())
+    .some((rec) => want.test(rec) && /STDIN<<[\s\S]*>>STDIN/.test(rec));
+  for (let i = 0; i < 160 && !done(); i++) await sleep(150);
+  return readLog();
 }
 
 // ── 1. one xource, TWO xells that both work on it ─────────────────────────────
@@ -222,7 +244,7 @@ resetLog();
 const decided = await decideLandRequest(cards[0].id, 'approved', 'human@test');
 ok(decided?.status === 'landed', `alpha's landing landed (${decided?.status})`);
 ok(await awaitCleared(rowB.id), 'bravo was cleared out of the pattern (the row says so before anyone is nudged)');
-const log = await awaitResume();
+const log = await awaitResume(/runway is CLEAR/);
 ok(/exec/.test(log) && /--resume/.test(log), 'the queenzee ran `docker exec … claude … --resume`');
 ok(log.includes(SID_B), `the resume targeted BRAVO's cxell session (${SID_B.slice(0, 8)}…), the holder`);
 ok(/runway is CLEAR/.test(log), 'the prompt tells it the runway is clear');
@@ -258,7 +280,7 @@ const bravoCard = (await listLandRequests(project.id, { open: true }))[0];
 const alphaHold = await lastHolding(alpha.id);
 await decideLandRequest(bravoCard.id, 'rejected', 'human@test');
 ok(await awaitCleared(alphaHold.id), 'the rejection cleared alpha out of the pattern');
-const log2 = await awaitResume();
+const log2 = await awaitResume(/runway is CLEAR/);
 ok(log2.includes(SID_A) && /runway is CLEAR/.test(log2), 'a rejection clears the next holder — alpha was resumed');
 ok((await runwayOccupant(project.id, 'refs/heads/main')) === null, 'and the runway is genuinely free (no occupant)');
 ok((await holdingQueue(project.id, 'refs/heads/main')).length === 0, 'the queue emptied with nothing stuck');
@@ -284,7 +306,7 @@ const bravoHold = await lastHolding(bravo.id);
 const wOcc = await selfWithdrawLand(alpha, { reason: 'found a bug' });
 ok(wOcc.ok, 'alpha withdraws the landing that was on the runway');
 ok(await awaitCleared(bravoHold.id), 'and that freed the runway for the holder');
-const log3 = await awaitResume();
+const log3 = await awaitResume(/runway is CLEAR/);
 ok(log3.includes(SID_B) && /runway is CLEAR/.test(log3), 'and the withdrawal cleared bravo — a withdrawn card frees the runway');
 
 // ── 9. STALE frees it — the case the whole protocol exists to make rare ───────
@@ -302,10 +324,13 @@ commit(src, 'hand.txt', 'landed by hand\n', 'H (a human landed by hand)');
 resetLog();
 const swept = await sweepStalePending();
 ok(swept.stale >= 1, `the held card is swept stale (${swept.stale})`);
-const log4 = await awaitResume();
+const log4 = await awaitResume(/went STALE/);
 ok(/went STALE/.test(log4) && log4.includes(SID_B), 'bravo (the occupant) is told its landing went stale');
-for (let i = 0; i < 40 && !new RegExp('runway is CLEAR').test(readLog()); i++) await sleep(120);
-ok(/runway is CLEAR/.test(readLog()) && readLog().includes(SID_A),
+// TWO nudges come out of this one step — the stale notice to the occupant and the clearance to the
+// holder behind it — so this waits for the SECOND on its own terms. (The ad-hoc polling loop that
+// used to sit here was compensating for exactly that, in one place, silently.)
+const log4b = await awaitResume(/runway is CLEAR/);
+ok(/runway is CLEAR/.test(log4b) && log4b.includes(SID_A),
    'and alpha, the holder, is cleared onto the free runway in the same breath');
 
 // ── 10. NOBODY HOME: the head holder cannot be reached → tend + next in line ──
@@ -335,7 +360,7 @@ const bravoQueued = await lastHolding(bravo.id);
 await decideLandRequest(alphaCard.id, 'approved', 'human@test');
 ok(await awaitCleared(bravoQueued.id),
    'the unreachable holder was passed over and BRAVO was cleared — one dead zee cannot hold the runway shut');
-const log5 = await awaitResume();
+const log5 = await awaitResume(/runway is CLEAR/);
 ok(log5.includes(SID_B) && /runway is CLEAR/.test(log5),
    'the unreachable holder did not block the runway — the NEXT in line was cleared');
 let tendedC = false;

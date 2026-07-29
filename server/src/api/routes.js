@@ -14,6 +14,7 @@ import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
          harnessAvatarFile } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
+import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc } from '../lib/project-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
@@ -382,6 +383,27 @@ router.post('/projects/:id/pr', async (req, res) => {
 // ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────
 // The contexts list feeds the console's picker, so a typo'd context can't be entered at all.
 router.get('/docker/contexts', (_req, res) => res.json(listDockerContexts()));
+// ── PROJECT ENTRY-POINT DOCS (the AGENTS.md/CLAUDE.md a zee reads first) ─────
+// Owned by the meta-DB and GENERATED into each xell when a zee is assigned (lib/project-docs.js).
+// The console's Docs tab is the whole authoring surface; the injector refuses to write over a path
+// the project has committed, so an operator cannot silently replace a repo's own instructions.
+router.get('/projects/:id/docs', async (req, res) => {
+  try { res.json(await listProjectDocs(req.params.id)); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/projects/:id/docs', async (req, res) => {
+  try { res.json(await createProjectDoc(req.params.id, req.body || {})); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.put('/project-docs/:docId', async (req, res) => {
+  try { res.json(await updateProjectDoc(req.params.docId, req.body || {})); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.delete('/project-docs/:docId', async (req, res) => {
+  try { res.json(await deleteProjectDoc(req.params.docId)); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
 router.get('/projects/:id/sites', async (req, res) => res.json(await listSites(req.params.id)));
 router.post('/projects/:id/sites', async (req, res) => {
   try { res.json(await createSite(req.params.id, req.body || {})); }
@@ -663,9 +685,9 @@ router.delete('/harnesses/:key', async (req, res) => {
 });
 // The harness avatar badge (SVG). Resolved from the harness row's avatar_path under the repo the
 // harness FILES live in (the Zeehive project's repo_root, falling back to config.repoRoot) —
-// harnessAvatarFile() is the same resolution loadHarnessDir uses, so the badge and the bundle can
-// never disagree about which repo a harness is. Path-guarded so a crafted avatar_path can't escape
-// harnesses/. 404 when a harness has no avatar (or its folder is not readable from here).
+// avatar SVG is the ONE harness thing still on disk (art, not agent-facing text) — the bundle lives
+// in the row. Path-guarded so a crafted avatar_path can't escape harnesses/. 404 when a harness has
+// no avatar, or when the repo holding it is not readable from here.
 router.get('/harnesses/:key/avatar', async (req, res) => {
   try {
     const h = await one(`SELECT avatar_path FROM harness WHERE key=$1`, [req.params.key]);

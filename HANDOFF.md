@@ -464,6 +464,88 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
   ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
   rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
+- **Inject a project environment into a xell, from the console** (2026-07-29, ticket #20). The server
+  half already existed — `resolveEnvironmentFor` (pin → on-production → dev), `resolvedEnvView`,
+  `setXellEnvironment` — and none of it was reachable without curl. `web/src/XellEnvironment.jsx` is
+  that surface: what the xell resolved to and WHY (pinned vs by tier), its var names, and a picker
+  over the project's environments with a clear-the-pin. It is a picker, not a second editor;
+  environments are still authored in Project setup.
+  **The trap it is built around:** on this project both Zeehive environments hold ZERO vars, so a
+  correct injection writes nothing and reads exactly like a bug (ticket #15 lost an afternoon to it).
+  So absent / empty / populated are three different sentences, in the panel AND on the card chip —
+  which now renders a third face (`no env`) instead of vanishing when nothing resolves, because an
+  absent chip read as "fine". A var the projection owns (`DATABASE_URL`, the slug, …) is LABELLED
+  "not injected (queenzee-owned)" rather than silently dropped.
+  Pinning asks first (it rewrites a file in a live xell) and says the thing people get wrong: a
+  process already running keeps the environment it started with.
+  Test: `node test/xell-environment-inject.test.mjs` — pin → re-read `.zeehive.env` off disk → clear
+  → re-read, against a real xell row with a real worktree; a `db-shared-prod` xell resolving to the
+  PROD environment with no pin; the reserved names refused at projection time even when the
+  environment sets them; and a secret's value absent from the picker payload (a NON-secret value is
+  not a secret and does come through — the panel says so accurately rather than overclaiming).
+- **Compose a long body the shell will not execute** (2026-07-29, ticket #21 — migration 079).
+  Three incidents in one afternoon across three zees: backticks inside a DOUBLE-quoted shell string
+  are a command substitution, so composing a report body that way RUNS what it meant to name (it
+  invoked the ship verb once and the build verb once), and an apostrophe inside a single-quoted
+  `git commit -m` closes the quote early. The note teaches the quoted heredoc / single quotes, and
+  `git commit -F` for anything multi-line or apostrophe-bearing — with the REASON, which is the part
+  that makes it stick: **those two invocations were refused only because those verbs require an
+  argument, and `zee land` does not.** Whether a gated verb should refuse a bare invocation is
+  ticket #17 and a human's call; 079 is documentation only.
+  It also shows the SPLIT every manual edit has to respect: `zee-base` is DB-owned (`dir IS NULL`),
+  so its manual is patched by migration through 076's `harness_memory_put` in 077's anchored/guarded
+  shape; the MANAGER manual is FILE-backed (`harnesses/manager/`, reloaded from the folder at every
+  boot), so its copy of the note is a repo file edit — a DB write there is overwritten on the next
+  boot. Verified on a VIRGIN database (created empty, migrated from scratch: 81 migrations, the note
+  present, both `zee-base` memory files intact) and re-applied past the ledger as a byte-identical
+  no-op. Suite 77/0 on both the virgin and the in-place database.
+- **Notify a manager about a ticket: proved it ARRIVES, and made it ask first** (2026-07-29,
+  ticket #16). The feature itself (the derived `TKT-<n>-<4hex>` code, the live-manager picker, the
+  notify route through the existing `sendMessageToXell` door) landed separately; two things it was
+  missing were the two the ticket cares most about.
+  **Receipt.** The original test said in its own header that a successful delivery was out of scope.
+  But a notification is a RICH message, so `sendMessageToXell` writes it into the cage as
+  `.zee-inbox/<ts>/message.md` over `docker exec` FIRST and only then types a pointer at it over SSH
+  — and that first hop is the substantive one (it is the file every manager in this fleet actually
+  reads). With `test/_bin/docker` on PATH, the message.md that lands is read back off the recorded
+  stdin: it carries the CODE, the number, the title and the not-an-order sentence. The SSH hop stays
+  unproven here (it needs a real sshd) and is stated as such.
+  **It asks first.** Notifying types into a RUNNING agent's session, and it fired on one click. It
+  now goes through `showConfirm` like every other console action that reaches a live zee, naming the
+  manager, whether it is live, and that a notification assigns nothing.
+  Also asserted, because it is the ticket's hard constraint: notifying creates no work item, sets no
+  assignee, and changes neither the ticket's status nor the manager's xell.
+  Test: `node test/ticket-notify.test.mjs` (55 assertions; `TicketCode`/`NotifyManager` are exported
+  so the human surface is RENDERED rather than grepped).
+- **The go-around "flake" was the TEST'S WAIT, not the runway** (2026-07-29, ticket #19). `land-queue`
+  failed once in six full-suite runs on *"the unreachable holder did not block the runway"*, and 0/12
+  in isolation. Characterised before touching anything: the fake docker (`test/_bin/docker`) writes
+  its ARGV line the instant it starts and the PROMPT only after it finishes reading stdin — two
+  writes with a real gap — and `awaitResume()` returned as soon as `--resume` appeared, so the caller
+  asserted on a half-written log. Everything the assertions care about ("runway is CLEAR", `zee sync`
+  before `zee land`, "clearance is not approval") is in the SECOND write. Case 9 had grown its own
+  extra polling loop for exactly this; five other call sites had not.
+  RATES, measured: **1 failure in 6 full-suite runs** (the only condition that has ever produced it),
+  **0/12** in isolation on an idle box, and — worth knowing — **0/15 pre-fix under 4-way CPU load**,
+  so plain CPU pressure does NOT reproduce it. That is why the mechanism was forced directly instead.
+  Post-fix: **15/15** with the gap varied 0–1299ms, and green at 2.5s.
+  Made deterministic with a new `DOCKER_FAKE_SLOW_STDIN_MS` knob (same spirit as the existing
+  `DOCKER_FAKE_EARLY_CLOSE`): at a forced 1.5s gap the pre-fix test failed **7 assertions across 5
+  cases**, every time — while the ROW-level assertions (`cleared_at`, the tend, the go-around itself)
+  still passed, which is what proves the protocol sound and the wait loose. A direct probe timed the
+  argv line at 32ms and the prompt at 1,526ms of the same invocation: **late, never lost.**
+  `awaitResume(want)` now waits until the INVOCATION matching `want` is complete (a closed stdin block
+  is the marker), per record — because one clearance step can emit TWO nudges (case 9: the stale
+  notice to the occupant AND the clearance to the holder behind it), and "some resume, fully written"
+  would return on the first while the second was half-recorded. Every call site now passes what it is
+  about to assert on, so the wait and the assertion cannot drift apart. **The assertion still fails when the go-around genuinely breaks** —
+  proved by deleting the `if (r.nudged) break` go-around in `clearRunway()` and watching it go red.
+  NOT the cause, and still open (ticket #11's, not folded in here): `clearRunway` fires on
+  `setImmediate` from checkPush's ALLOW path just before git moves the ref — a different call path
+  from the one this assertion exercises (`decideLandRequest` → `landOne`, where the ref has already
+  moved), whose consequence is a late clearance the reaper's `driveRunways` backstop picks up; and
+  the clearance nudge is fire-and-forget with no retry, so a nudge that STARTS and dies is still
+  recorded as delivered. Neither was what made the test red.
 - **The warm never rewrites the lockfile a zee then lands** (2026-07-29, ticket #14 — found while
   building the cache above). `warmCxell()` ran `npm ci … || npm install …` UNCONDITIONALLY, in
   `/work/repo` — the tree the zee lands from. `npm install` rewrites package-lock.json, so any lock

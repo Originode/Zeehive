@@ -3,17 +3,21 @@
 // A lead adds exactly ONE thing to `manager`: the roster of dev roles and the judgement of which
 // role a piece of work needs. Everything else — the manager manual, the dispatch-brief skill, the
 // refusals — must arrive by INHERITANCE. The two ways that quietly breaks are what this test is for:
-// a folder that COPIES the parent's manual (two manuals, one of which rots), and a harness whose
-// declared type drifts off `manager` (a lead is a manager zee; 054 refuses cross-type inheritance
-// and refuses a worker xell wearing a manager harness at all).
+// a COPY of the parent's manual (two manuals, one of which rots), and a harness whose declared type
+// drifts off `manager` (a lead is a manager zee; 054 refuses cross-type inheritance and refuses a
+// worker xell wearing a manager harness at all).
 //
-// It asserts, against the real meta DB and the real harness loader:
-//   1. the folder parses and refreshHarnesses() fills the ROW — parent resolves to `manager`,
-//      zee_type stays `manager`, and neither files_missing nor bundle_empty is set;
-//   2. the CHAIN merges root→leaf: the manager manual and dispatch-brief are in the effective
-//      persona, byte-identical to the parent's files, and are NOT copied into this folder;
-//   3. the size budget every one of these files was written to (persona/skill ≤ 30 lines, memory
-//      ≤ 80), and that the folder carries nothing else;
+// Since migration 080 the harness is the ROW: there is no harnesses/dev-lead/ folder, so "is it
+// copied?" is a question about the bundle rather than about files, and the budget is measured in the
+// text that actually reaches a briefing.
+//
+// It asserts, against the real meta DB:
+//   1. the ROW is right — parent resolves to `manager`, zee_type stays `manager`, label/glyph/summary
+//      are there and bundle_empty is not set;
+//   2. the CHAIN merges root→leaf: the manager manual and dispatch-brief are in the effective persona,
+//      byte-identical to the PARENT's row, and are NOT duplicated into dev-lead's own bundle;
+//   3. the size budget this harness was written to (persona/skill ≤ 30 lines, memory ≤ 80), measured
+//      on the row, and that it adds nothing else;
 //   4. the roster keys the skill casts from are the eight real crew keys;
 //   5. the DB TYPE GUARD refuses a worker xell wearing it — from both directions.
 //
@@ -55,33 +59,25 @@ async function cleanup({ files = false } = {}) {
 try {
   await cleanup();
 
-  // ── 1. the folder parses, and the ROW is filled from it ──────────────────
-  console.log('\n── the harness row is filled from the folder ──');
-  const loaded = H.loadHarnessDir(DIR);
-  ok(!!loaded.bundle && !loaded.errors.length, `${DIR} parses (${loaded.errors.join('; ') || 'no errors'})`);
-  ok(!loaded.warnings.length, `HARNESS.yml declares no unknown keys (${loaded.warnings.join('; ') || 'none'})`);
-  ok(loaded.bundle?.parent === 'manager', 'HARNESS.yml declares parent: manager');
-  ok((loaded.bundle?.zee_type ?? loaded.bundle?.type) === 'manager', 'HARNESS.yml declares zee_type: manager');
-
+  // ── 1. the ROW is the harness ────────────────────────────────────────────
+  console.log('\n── the harness row carries it (no folder, since 080) ──');
   const seeded = await one(`SELECT id FROM harness WHERE key='dev-lead'`);
   ok(!!seeded, 'migration 074 seeded the dev-lead row (run db:migrate first)');
   if (!seeded) throw new Error('dev-lead row missing — apply db/migrations/074_dev_lead.sql');
 
-  await H.refreshHarnesses();
   const row = await one(
     `SELECT h.*, p.key AS parent_key FROM harness h LEFT JOIN harness p ON p.id=h.parent_id WHERE h.key='dev-lead'`);
   const bundle = typeof row.bundle === 'string' ? JSON.parse(row.bundle) : (row.bundle || {});
   ok(row.parent_key === 'manager', `parent resolves to manager (got ${row.parent_key})`);
   ok(row.zee_type === 'manager', `zee_type stays manager (got ${row.zee_type})`);
-  ok(row.label === 'Crew Lead' && !!bundle.glyph && !!bundle.summary, 'label/glyph/summary come from the folder');
-  ok(!!row.bundle_hash, 'the bundle hash is stored (the row is a projection of the files)');
+  ok(row.label === 'Crew Lead' && !!bundle.glyph && !!bundle.summary, 'label/glyph/summary are on the row');
+  ok(row.dir === null, 'and it is DB-owned — no folder can project over it');
 
   const health = H.harnessHealth({ ...row, skills: bundle.skills, memory: bundle.memory, personality: bundle.personality });
-  ok(!health.files_missing && !health.bundle_empty,
-     `neither files_missing nor bundle_empty (${JSON.stringify(health)})`);
+  ok(!health.bundle_empty, `it would not brief a zee with nothing (${JSON.stringify(health)})`);
 
   const listed = (await H.listHarnesses({ zeeType: 'manager' })).find((h) => h.key === 'dev-lead');
-  ok(!!listed && listed.parent === 'manager' && listed.zee_type === 'manager' && !listed.files_missing && !listed.bundle_empty,
+  ok(!!listed && listed.parent === 'manager' && listed.zee_type === 'manager' && !listed.bundle_empty,
      'GET /api/harnesses read model shows it healthy, parent manager, zee_type manager');
   const asWorker = (await H.listHarnesses({ zeeType: 'worker' })).find((h) => h.key === 'dev-lead');
   ok(!asWorker, 'and the worker picker never offers it');
@@ -91,48 +87,48 @@ try {
   const eff = await H.effectiveHarness(row);
   ok(eff.chain.join(' → ') === 'Manager Zee → Crew Lead', `chain merges root→leaf (${eff.chain.join(' → ')})`);
 
-  const manual = readFileSync(join(ROOT, 'harnesses/manager/memory/manager-zee-manual.md'), 'utf8').trim();
+  const manual = (await one(
+    `SELECT harness_memory_get('manager','memory/manager-zee-manual.md') AS t`)).t;
   const inherited = (eff.memory || []).find((m) => m.path.endsWith('manager-zee-manual.md'));
-  ok(!!inherited && inherited.text === manual, 'the effective persona carries the parent manual, byte-identical');
+  ok(!!inherited && inherited.text === manual, "the effective persona carries the PARENT ROW's manual, byte-identical");
+  ok(inherited.from === 'manager', 'stamped with the harness that owns it, so a generated file can name it');
   ok((bundle.memory || []).length === 1 && bundle.memory[0].path.endsWith('dev-role-roster.md'),
      `dev-lead's OWN memory is the roster and nothing else (${(bundle.memory || []).map((m) => m.path).join(', ')})`);
 
-  // a copy is the failure this whole harness is shaped to avoid — look for the parent's text under
-  // this folder, by a sentence only the manager manual has.
+  // a copy is the failure this whole harness is shaped to avoid — look for the parent's text inside
+  // dev-lead's OWN bundle, by a sentence only the manager manual has.
   const marker = 'You are a **manager zee**';
-  const own = [];
-  (function walk(d) {
-    for (const e of readdirSync(join(ROOT, d), { withFileTypes: true })) {
-      if (e.isDirectory()) walk(join(d, e.name)); else own.push(join(d, e.name));
-    }
-  })(DIR);
-  ok(!own.some((f) => readFileSync(join(ROOT, f), 'utf8').includes(marker)),
-     'no file under harnesses/dev-lead/ copies the manager manual');
+  const ownText = [bundle.personality || '', ...(bundle.skills || []).map((s) => s.body || ''),
+                   ...(bundle.memory || []).map((m) => m.text || '')].join('\n');
+  ok(!ownText.includes(marker), "dev-lead's own bundle does not copy the manager manual");
+  ok(!existsSync(join(ROOT, DIR)) || !readdirSync(join(ROOT, DIR)).some((f) => f.endsWith('.md')),
+     'and no .md file has come back under harnesses/dev-lead/ (the meta-DB owns the text)');
 
   const skillNames = (eff.skills || []).map((s) => s.name);
   ok(skillNames.includes('dispatch-brief'), 'dispatch-brief is inherited (not re-authored here)');
   ok(skillNames.includes('pick-the-role'), 'pick-the-role is the skill this harness adds');
   ok((bundle.skills || []).length === 1, `and it is the ONLY skill in this folder (${(bundle.skills || []).length})`);
-  ok(!own.some((f) => f.includes('dispatch-brief')), 'dispatch-brief is not duplicated as a folder here');
+  ok(!(bundle.skills || []).some((s) => s.name === 'dispatch-brief'), "dispatch-brief is not duplicated into dev-lead's own bundle");
 
   const text = H.harnessLayerText(eff);
   ok(text.includes('inheriting: Manager Zee'), 'the briefing says what it inherits');
   ok(text.includes(marker) && text.includes('dev-role-roster'),
      'the briefing inlines both the inherited manual and the added roster');
 
-  // ── 3. the size budget ───────────────────────────────────────────────────
+  // ── 3. the size budget, measured on the ROW ──────────────────────────────
+  // The budget is what a wearer PAYS for on every dispatch, and since 080 that is the row's text —
+  // there is no file left to count lines in, so the same numbers are counted there.
   console.log('\n── size budget ──');
-  const pl = lines(`${DIR}/PERSONALITY.md`), sl = lines(`${DIR}/skills/pick-the-role/SKILL.md`),
-        ml = lines(`${DIR}/memory/dev-role-roster.md`);
-  ok(pl <= 30, `PERSONALITY.md is ${pl} lines (budget 30)`);
-  ok(sl <= 30, `pick-the-role/SKILL.md is ${sl} lines (budget 30)`);
-  ok(ml <= 80, `dev-role-roster.md is ${ml} lines (budget 80)`);
-  const expected = new Set([
-    `${DIR}/HARNESS.yml`, `${DIR}/PERSONALITY.md`,
-    `${DIR}/skills/pick-the-role/SKILL.md`, `${DIR}/memory/dev-role-roster.md`,
-  ].map((p) => p.split('/').join('/')));
-  const extra = own.map((f) => f.split('\\').join('/')).filter((f) => !expected.has(f));
-  ok(!extra.length, `the folder carries nothing else (${extra.join(', ') || 'clean'})`);
+  const lineCount = (t) => String(t || '').split('\n').filter((l, i, a) => !(i === a.length - 1 && l === '')).length;
+  const pl = lineCount(bundle.personality);
+  const skillBody = (bundle.skills || []).find((s) => s.name === 'pick-the-role')?.body;
+  const sl = lineCount(skillBody);
+  const ml = lineCount((bundle.memory || [])[0]?.text);
+  ok(pl <= 30, `the personality is ${pl} lines (budget 30)`);
+  ok(sl <= 30, `the pick-the-role skill body is ${sl} lines (budget 30)`);
+  ok(ml <= 80, `the dev-role-roster memory is ${ml} lines (budget 80)`);
+  ok((bundle.skills || []).length === 1 && (bundle.memory || []).length === 1,
+     `and it adds nothing else: ${(bundle.skills || []).length} skill, ${(bundle.memory || []).length} memory entry`);
 
   // ── 4. it casts from the REAL crew keys ──────────────────────────────────
   console.log('\n── the roster is the real crew ──');
@@ -187,7 +183,6 @@ try {
   }
 } finally {
   await cleanup({ files: true });
-  try { await H.refreshHarnesses(); } catch { /* leave the row as the folder says */ }
   await pool.end();
 }
 

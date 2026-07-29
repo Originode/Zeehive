@@ -84,6 +84,10 @@ export function DoneSuggestionCard({ req, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const target = req.live_target_slug || req.target_slug || 'that xell';
+  // A PREVIOUS approval the queenzee could not carry out (managers.js refuseApproval): the card came
+  // back to pending carrying its reason, so show the reason on it. Without this the human re-clicks
+  // an approval that already failed once and is told nothing about why.
+  const refused = req.result?.refused ? req.result : null;
 
   const decide = async (decision) => {
     if (decision === 'approve') {
@@ -93,6 +97,7 @@ export function DoneSuggestionCard({ req, onDone }) {
       const typed = await showPrompt(
         `Mark ${target} DONE, on ${req.live_manager_slug || req.manager_slug || 'a manager'}'s suggestion?\n\n`
         + `${req.reason ? `Its manager says: “${req.reason}”\n\n` : ''}`
+        + `${refused ? `⚠ A PREVIOUS approval was refused and the xell was NOT closed:\n${refused.error}\n\n` : ''}`
         + 'This marks the task done and REAPS the xell: its cxell is torn down and its worktree removed '
         + '(commits are collected first). Anything it has NOT landed lives only on its branch. '
         + 'A manager can only suggest this — you are the one deciding.\n\nType DONE to confirm.',
@@ -102,7 +107,11 @@ export function DoneSuggestionCard({ req, onDone }) {
     setBusy(true); setErr(null);
     try {
       const r = await decideDoneSuggestion(req.id, decision);
-      if (r?.status === 'failed') setErr(r.result?.reap?.reason || r.result?.error || 'the queenzee could not close that xell');
+      // REFUSED is not decided: the server put the suggestion back to pending with its reason, so the
+      // card is still here — say why, rather than letting a refusal read as a successful close.
+      if (r?.refused || r?.status === 'failed') {
+        setErr(r.error || r.result?.error || r.result?.reap?.error || 'the queenzee could not close that xell');
+      }
       onDone?.();
     } catch (e) { setErr(e.message); }
     finally { setBusy(false); }
@@ -127,6 +136,11 @@ export function DoneSuggestionCard({ req, onDone }) {
         {req.target_status ? ` · currently ${req.target_status}` : ''}
       </div>
       {req.reason && <div className="prod-ask-reason">“{req.reason}”</div>}
+      {refused && (
+        <div className="land-err">
+          ⚠ approved {ago(refused.at)} by {refused.by || 'a human'} — <b>not closed</b>: {refused.error}
+        </div>
+      )}
       <div className="prod-ask-note">
         Approving marks the task done and reaps the xell (commits collected first). Check its diff
         before you do: unlanded commits live only on its branch. Reject leaves it working, and its

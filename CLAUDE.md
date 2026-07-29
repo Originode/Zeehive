@@ -103,7 +103,7 @@ server/src/
   db/            migrate.js, seed.js  (seed_demo.js is DEAD — see house rules)
 web/src/         the console (React + Vite): App.jsx, hive/ (honeycomb canvas), work/ (board+gantt),
                  Landing.jsx · Ship.jsx · ProdData.jsx (the human GATES), ZeeTerminal.jsx, DiffViewer.jsx
-harnesses/       persona/skill/memory layers a xell wears (core, hermes, manager, …)
+harnesses/       badge SVGs only. A harness's TEXT lives in the meta-DB (see house rule 10)
 hooks/           land-gate-update.sh (the xource push gate), prod-guard.mjs (+ its canary)
 scripts/         provisioning/build/ship/land scripts, and `zee` — the ONE copy of the in-cxell CLI
 docker/zeehive/  Dockerfile.{server,web,zee-agent}, compose, and the deployment playbook (README.md)
@@ -136,6 +136,13 @@ docs/            specs and rationale (see the doc map)
    `jsonb_set(bundle,'{memory}', …)`: six migrations rebuilt that array from `memory->0` and deleted
    a memory file out of the LIVE meta-DB — invisible on a fresh database, which is every cxell's.
    `test/harness-memory-migrations.test.mjs` fails anything newer that tries.
+10. **A harness's TEXT is in the meta-DB, and so is a project's entry-point doc.** Since 080 nothing
+   under `harnesses/` is a source of persona/skill/memory text — the row is, edited in the console's
+   harness manager or by migration, and the queenzee GENERATES the files it injects into a xell
+   (stamped as generated). Project `AGENTS.md`/`CLAUDE.md` docs work the same way (081,
+   `lib/project-docs.js`) and are never written over a path the project has committed. Do not
+   reintroduce a repo copy of either: the folder-and-row split shipped a fleet of manager zees with
+   no manual at all, and hid a migration's edit behind a hash that said the two agreed.
 
 ## 6. Doc map — which file answers what
 
@@ -145,7 +152,7 @@ docs/            specs and rationale (see the doc map)
 | **your verbs as a caged zee** | `.zeehive/harness/memory/cxell-zee-manual.md` (in your xell) |
 | a zee that runs other zees | [docs/manager-zees.md](docs/manager-zees.md) |
 | tickets, work items, the board | [docs/work-tracker.md](docs/work-tracker.md) (nouns) · [docs/work-tracker-verbs.md](docs/work-tracker-verbs.md) (verbs) |
-| harnesses (persona/skill/memory layers) | [docs/harness-proposal.md](docs/harness-proposal.md) |
+| harnesses (persona/skill/memory layers) — and where their text lives | [docs/harness-proposal.md](docs/harness-proposal.md) (§3.1) |
 | the role-specialised worker personas (Scout, Builder, Reviewer, …) | [docs/dev-crew.md](docs/dev-crew.md) |
 | the manager harness that runs that crew | [docs/dev-crew-lead.md](docs/dev-crew-lead.md) |
 | how a zee's db catches up to prod's schema | [docs/schema-catchup-plan.md](docs/schema-catchup-plan.md) |

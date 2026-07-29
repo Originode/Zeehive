@@ -82,18 +82,18 @@ try {
      'the fake docker is first on PATH — so "did it try?" is answerable, not inferred from a missing binary');
 
   // ── fixtures: a project repo with one harness folder, worn by a xell with a LIVE cxell zee ────
-  mkdirSync(join(repo, 'harnesses', KEY), { recursive: true });
-  writeFileSync(join(repo, 'harnesses', KEY, 'HARNESS.yml'), `version: 1\nlabel: ${KEY}\nsummary: fixture\nzee_type: worker\n`);
-  writeFileSync(join(repo, 'harnesses', KEY, 'PERSONALITY.md'), `persona v1 ${tag}\n`);
+  mkdirSync(repo, { recursive: true });
+  writeFileSync(join(repo, 'README.md'), `nested guard fixture ${tag}\n`);
   git('init', '-q', '-b', 'master'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
-  git('add', '-A'); git('commit', '-qm', 'harness fixture');
+  git('add', '-A'); git('commit', '-qm', 'base');
 
   projId = (await one(`INSERT INTO project (name, repo_root, main_branch) VALUES ($1,$2,'master') RETURNING id`,
     [`zt-nest-${tag}`, repo])).id;
   const xource = await one(`INSERT INTO xource (project_id, ref) VALUES ($1,'master') RETURNING id`, [projId]);
+  // DB-owned, like every harness since 080 — its text is in the row, not in a folder.
   const harness = await one(
-    `INSERT INTO harness (key,label,dir,enabled,is_law_core) VALUES ($1,$1,$2,true,false) RETURNING id`,
-    [KEY, `harnesses/${KEY}`]);
+    `INSERT INTO harness (key,label,bundle,bundle_hash,enabled,is_law_core) VALUES ($1,$1,$2,'v1',true,false) RETURNING id`,
+    [KEY, JSON.stringify({ label: KEY, summary: 'fixture', zee_type: 'worker', personality: `persona v1 ${tag}` })]);
 
   const mkXell = async (slug, { harnessId = null, live = false, worktree = null, status = 'working' } = {}) => {
     const x = await one(
@@ -110,13 +110,14 @@ try {
   const wearer = await mkXell(`zt-wear-${tag}`, { harnessId: harness.id, live: true });
 
   // ── 1. HARNESS RE-INJECTION ───────────────────────────────────────────────────────────────────
-  console.log('\n── 1. a harness refresh does not exec into another zee\'s cxell (PROVISION_MODE=simulate) ──');
-  // the BOOT path (refreshHarnesses → the bundle changes → reinject) is what a zee running
-  // `npm run server` in its own xell actually hits, with no one asking it to.
+  console.log('\n── 1. a harness edit does not exec into another zee\'s cxell (PROVISION_MODE=simulate) ──');
+  // The path a zee running `npm run server` in its own xell actually hits: since 080 a harness's text
+  // changes by SAVE (updateHarness), and a save pushes into the live wearers. In a nested queenzee
+  // those "live wearers" are the REAL fleet's zees — its db is a clone of the meta-DB.
   let n = since();
   resetDocker();
-  await H.refreshHarnesses();
-  ok(dockerCalls().length === 0, `the boot refresh execs nothing (${dockerCalls().length} docker calls recorded)`);
+  await H.updateHarness(KEY, { personality: `persona v2 ${tag}` });
+  ok(dockerCalls().length === 0, `the save execs nothing (${dockerCalls().length} docker calls recorded)`);
   ok(logsSince(n).some((m) => m.includes(wearer.slug) && /PROVISION_MODE=simulate/.test(m) && /NOT injected/i.test(m)),
      'and says so in the log, naming the live xell it left alone — a report, never a silent skip');
 

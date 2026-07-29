@@ -173,6 +173,35 @@ export async function tendOpen(xellId) {
   return (await tendState(xellId)).open;
 }
 
+// ── the tend NUDGE: an ANSWERED ask that is still up ───────────────────────────
+// The failure this closes (ticket #18): a zee raises a tend, a manager/human answers the question
+// (a zee_message arrives), and the flag stays up for an hour — because answering a zee's ask is a
+// separate act from lowering the flag it raised, and neither party does the second thing. An open
+// tend outranks awaiting-done in the hive derivation, so an already-answered one cries "this zee
+// needs you" next to real tends, and teaches humans to skim.
+//
+// So: whenever a zee reads a self verb's answer while its tend is OPEN and a zee_message to it
+// arrived SINCE the tend was raised (created_at > tendState.at), hand it ONE line saying so.
+// Deliberately NOT auto-cleared — a tend is the zee's own statement, and only the zee (or its own
+// working ping) lowers it; this just makes it impossible to forget. Null when there is nothing to
+// say, so callers can carry it on a stable field unconditionally. Pass an already-fetched
+// tendState as `tend` to save the extra query (selfStatus has one in hand).
+export async function tendNudge(xellId, tend = null) {
+  const t = tend ?? await tendState(xellId);
+  if (!t.open || !t.at) return null;
+  // The FIRST reply since the ask — one indexed probe on (to_xell_id, created_at).
+  const reply = await one(
+    `SELECT from_slug, created_at FROM zee_message
+       WHERE to_xell_id = $1 AND created_at > $2
+       ORDER BY created_at ASC LIMIT 1`, [xellId, t.at]);
+  if (!reply) return null;
+  const mins = Math.max(1, Math.round((Date.now() - new Date(t.at).getTime()) / 60000));
+  const age = mins >= 90 ? `${Math.round(mins / 60)} h` : `${mins} min`;
+  return `Your tend is still open (raised ${age} ago) and you have had a reply since`
+    + `${reply.from_slug ? ` (from ${reply.from_slug})` : ''}`
+    + ' — clear it with `zee tend --clear` if it is handled.';
+}
+
 // ── the zee's READINESS HINT (hint-land / hint-ship) ────────────────────────────
 // A zee that is NOT 100% certain the job is done — so it must NOT call the real, gated `zee land`
 // / `zee ship` — but HAS reached a landable/shippable checkpoint, drops a HINT: "human, this looks

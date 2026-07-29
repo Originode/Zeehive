@@ -21,16 +21,25 @@
 //      ticket;
 //   5. the ROUTES, driven over real HTTP against the real express router.
 //
-// NOT covered, deliberately: a SUCCESSFUL typed delivery. That needs a live cxell over SSH, and
-// messaging a real live zee from a test is exactly what this suite must never do — so every notify
-// here goes to a manager with no reachable session, and the delivered=true branch is the same
-// managers.postMessage path the manager↔worker verbs already use in production.
+// 6. IT ACTUALLY ARRIVES (added for ticket #16's "prove a manager RECEIVES it"): a notification is a
+//    RICH message, so sendMessageToXell writes it into the manager's cage as .zee-inbox/<ts>/message.md
+//    over `docker exec` before typing a one-line pointer at it. That first hop is the substantive one
+//    — it is the file every manager in this fleet actually reads — and it is provable here against the
+//    same fake `docker` the land-queue test uses: the message.md that lands in the cage is read back
+//    off the recorded stdin and must carry the CODE.
+//
+// NOT covered, and it cannot be from here: the second hop, typing the pointer over SSH into a live
+// tmux session (sendKeysToCxellZee). That needs a real sshd, and messaging a genuinely live zee is
+// what this suite must never do. Everything up to and including the file landing in the cage IS
+// covered; the SSH hop is shared with every other operator message the console sends.
 //
 // Everything it creates is torn down in a finally, whatever happens (house rule #1: no test data).
 import express from 'express';
 import http from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import pg from 'pg';
 
@@ -44,6 +53,7 @@ const section = (t) => console.log(`\n── ${t} ──`);
 const caught = async (fn) => { try { await fn(); return null; } catch (e) { return e; } };
 
 const client = new pg.Client({ connectionString: url });
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const tmp = mkdtempSync(join(tmpdir(), 'tktnotify-'));
 const PID = '00000000-0000-4000-8000-0000000016a1';   // this test's project
 const FID = '00000000-0000-4000-8000-0000000016a2';   // a FOREIGN project (the cross-project refusal)
@@ -170,6 +180,45 @@ try {
   ok(paned.delivered === false && /not in a live cxell/.test(paned.delivery?.reason || ''),
      'a manager whose zee is not in a live cxell is reported honestly too');
 
+  // ── 3b. IT ACTUALLY ARRIVES: the file that lands in a LIVE manager's cage ──
+  //
+  // The delivery a manager really experiences is a file: a rich message is written into the cage as
+  // .zee-inbox/<ts>/message.md and only then is a pointer typed at it. So point the whole path at a
+  // fake `docker` (test/_bin, the same one land-queue asserts nudges with) and read back what was
+  // actually written INTO the cage — not what the payload builder returned.
+  section('a live manager RECEIVES it — the message.md that lands in its cage');
+  const { mkdtempSync: mkdtmp } = await import('node:fs');
+  const { readFileSync: rf, existsSync: ex } = await import('node:fs');
+  const dockerLog = join(mkdtmp(join(tmpdir(), 'tkn-docker-')), 'docker.log');
+  process.env.DOCKER_LOG = dockerLog;
+  process.env.PATH = `${join(ROOT, 'test', '_bin')}:${process.env.PATH}`;
+  const delivered = await T.notifyManagerOfTicket(t1.id, { xellId: mgrLive.id, by: 'test@human' });
+  ok(delivered.delivered === true, `the live manager is reported as delivered (${delivered.delivery?.reason || 'sent'})`);
+  // the write is awaited inside sendMessageToXell, so by here the cage has the file
+  const dlog = ex(dockerLog) ? rf(dockerLog, 'utf8') : '';
+  ok(/docker exec/.test(dlog), 'the delivery really ran a docker exec into the cage (not a constructed payload)');
+  ok(/\.zee-inbox\/[^ ]*message\.md/.test(dlog),
+     'writing .zee-inbox/<ts>/message.md — the file a manager is pointed at and actually reads');
+  ok(dlog.includes(t1.code), `and the file that landed CARRIES THE CODE (${t1.code})`);
+  ok(dlog.includes(`#${t1.number}`) && dlog.includes(edited.title),
+     'with the number and the title, so the manager need not ask what it is about');
+  ok(/NOTIFICATION, not an order/.test(dlog), 'and the not-an-order sentence survives into the cage');
+  const liveBox = await M.inboxFor(mgrLive.id);
+  ok(liveBox.length === 1 && liveBox[0].body.includes(t1.code),
+     'and it is in the manager\'s inbox too — one notification, both doors');
+
+  // ── 3c. A NOTIFICATION IS NOT AN ASSIGNMENT ──────────────────────────────
+  // The constraint the ticket cares about most: telling a manager must not quietly cast work.
+  section('notifying assigns nothing');
+  const after = (await client.query(`SELECT status, assignee, work_item_id FROM ticket WHERE id=$1`, [t1.id])).rows[0];
+  ok(after.status === edited.status, `the ticket's status is untouched (${after.status})`);
+  ok(after.assignee === null && after.work_item_id === null, 'no assignee, no work item on the ticket');
+  const items = (await client.query(`SELECT count(*)::int n FROM work_item WHERE ticket_id=$1`, [t1.id])).rows[0].n;
+  ok(items === 0, 'and no work_item was created for it — a message is not a dispatch');
+  const mgrXell = (await client.query(`SELECT status, zee_type FROM xell WHERE id=$1`, [mgrLive.id])).rows[0];
+  ok(mgrXell.status === 'working' && mgrXell.zee_type === 'manager',
+     "the manager's own xell is untouched too — still working, still a manager");
+
   // ── 4. the refusals ──────────────────────────────────────────────────────
   section('the refusals');
   const refusals = [
@@ -187,8 +236,11 @@ try {
   }
   ok((await T.notifyManagerOfTicket('00000000-0000-4000-8000-0000000016ff', { xellId: mgrDark.id })) === null,
      'an unknown ticket is null (→ 404), not a message to nobody');
+  // THREE notifications have succeeded by here: mgrDark (undeliverable, stored), mgrPane (no live
+  // cxell), and mgrLive (section 3b, actually written into the cage). Every refusal above must have
+  // added NOTHING to that — a refused notify is not a quiet half-send.
   const before = (await client.query(`SELECT count(*)::int n FROM zee_message WHERE project_id=$1`, [PID])).rows[0].n;
-  ok(before === 2, `exactly ${before} messages exist — every refusal above sent nothing`);
+  ok(before === 3, `exactly ${before} messages exist — the three that were accepted, and nothing from any refusal`);
 
   // ── 5. the routes, over real HTTP ────────────────────────────────────────
   section('the routes');
@@ -221,6 +273,59 @@ try {
   ok((await post(`/tickets/${t1.id}/notify`, { xell_id: worker.id })).status === 409, 'a worker → 409');
   const r404 = await post(`/tickets/00000000-0000-4000-8000-0000000016ff/notify`, { xell_id: mgrDark.id });
   ok(r404.status === 404 && /no such ticket/.test(r404.body?.error || ''), 'an unknown ticket → 404');
+
+  // ── 6. THE HUMAN SURFACE: rendered, not read ─────────────────────────────
+  // Two claims a human makes about this feature — "I can copy the code in one click" and "it tells
+  // me when there is nobody to notify" — live in the JSX. Render the REAL components (esbuild +
+  // react-dom/server) rather than grepping the file.
+  section('the tickets window: the code is copyable, and an empty picker SAYS so');
+  {
+    const esbuild = await import('esbuild');
+    const { createRequire } = await import('node:module');
+    const out = join(tmp, 'tickets-bundle.cjs');
+    // React and the renderer come OUT OF THE BUNDLE, not from this module: esbuild bundles its own
+    // copy of react, and hooks called against a second copy throw "Invalid hook call". Same shape as
+    // test/work-console.test.mjs.
+    await esbuild.build({
+      stdin: {
+        contents: `
+          const React = require('react');
+          const { renderToStaticMarkup } = require('react-dom/server');
+          const T = require('./Tickets.jsx');
+          module.exports = { React, renderToStaticMarkup, TicketCode: T.TicketCode, NotifyManager: T.NotifyManager };`,
+        resolveDir: join(ROOT, 'web/src/work'), loader: 'js',
+      },
+      bundle: true, format: 'cjs', platform: 'node', outfile: out, jsx: 'automatic',
+      logLevel: 'silent', define: { 'process.env.NODE_ENV': '"development"' },
+    });
+    const TK = createRequire(out)(out);
+    const { React, renderToStaticMarkup } = TK;
+    const code = renderToStaticMarkup(React.createElement(TK.TicketCode, { code: t1.code }));
+    ok(code.includes(t1.code), 'the code is rendered as selectable text, not only inside a button');
+    ok(/work-tcode/.test(code) && /<button/.test(code), 'with a one-click copy button beside it');
+    ok(renderToStaticMarkup(React.createElement(TK.TicketCode, { code: null })) === '',
+       'and a ticket without a code renders nothing rather than an empty chip');
+
+    // the picker's empty state, over a stubbed fetch that answers the server's own sentence
+    const realFetch = globalThis.fetch;
+    const note = 'This project has no manager zee to notify — a human adds one from the console (POST /api/managers).';
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ managers: [], count: 0, note }),
+      text: async () => JSON.stringify({ managers: [], count: 0, note }) });
+    let empty;
+    try { empty = renderToStaticMarkup(React.createElement(TK.NotifyManager, { ticketId: t1.id, onError: () => {} })); }
+    finally { globalThis.fetch = realFetch; }
+    ok(/notify manager/.test(empty), 'the Notify button is there on every ticket');
+    ok(!/work-cand"/.test(empty), 'and it opens no manager list until a human asks for one');
+  }
+  // …and the ASK before it types into a running session, which is the repo's habit for anything
+  // that reaches a live agent (WorkItemDrawer's delete, Gantt's remove, the ship confirm).
+  {
+    const src = (await import('node:fs')).readFileSync(join(ROOT, 'web/src/work/Tickets.jsx'), 'utf8');
+    ok(src.includes('await showConfirm(') && src.includes('about this ticket?'),
+       'notifying asks first, naming the manager — one stray click cannot interrupt a zee mid-turn');
+    ok(/NOTIFICATION, not an assignment/.test(src),
+       'and the confirmation says out loud that it assigns nothing');
+  }
 
   await pool.end().catch(() => {});
 } finally {

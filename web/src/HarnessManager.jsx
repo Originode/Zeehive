@@ -6,7 +6,7 @@ import { emptyWarning } from './harnessHealth.js';
 // layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
 // law harness is not shown here (it is not editable). This is a DB-owned surface: create/edit/delete
 // applies live, no land/ship.
-const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, zee_type: 'worker', skills: [], memory: [], enabled: true, file_backed: false, inherited: { skills: [], memory: [], chain: [] } });
+const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, zee_type: 'worker', skills: [], memory: [], enabled: true, inherited: { skills: [], memory: [], chain: [] } });
 
 // order the flat harness list into a parent→child tree (depth for indentation)
 function treeRows(list) {
@@ -36,7 +36,7 @@ export function HarnessRow({ h, depth = 0, on = false, onOpen }) {
       {warn
         ? <span className="hm-warn" data-testid={`harness-empty-${h.key}`}>{warn.chip}</span>
         : <span className="hm-meta">
-            {h.zee_type === 'manager' ? '⬢ mgr · ' : ''}{h.skill_count}★{h.file_backed ? ' · repo' : ''}
+            {h.zee_type === 'manager' ? '⬢ mgr · ' : ''}{h.skill_count}★
           </span>}
     </button>
   );
@@ -49,15 +49,12 @@ export function HarnessEmptyBanner({ h }) {
   if (!warn) return null;
   return (
     <div className="hm-empty" data-testid="harness-empty-banner">
-      <b>{`⚠ this harness carries ${warn.kind === 'files_missing' ? 'no files' : 'nothing'}`}</b>
+      <b>⚠ this harness carries nothing</b>
       <span>{warn.why}</span>
-      {h.file_backed && (
-        <span>
-          It is defined in the repo (<code>harnesses/{h.key}/</code>) and read from the Zeehive
-          project's checkout — check that project is onboarded and its folder is readable, then
-          reboot the queenzee. Editing it here instead detaches it to dashboard ownership.
-        </span>
-      )}
+      <span>
+        Its text lives in the meta-DB, so fill it in right here — personality, skills and memory are
+        saved to the harness row and injected into every xell that wears it.
+      </span>
     </div>
   );
 }
@@ -146,7 +143,6 @@ export default function HarnessManager({ onClose }) {
                     <input className="disp-input" value={form.glyph || ''} onChange={(e) => set('glyph', e.target.value)} placeholder="✒️" maxLength={4} />
                   </div>
                 </div>
-                {form.file_backed && <div className="disp-hint">Defined in the repo (harnesses/…). Saving here detaches it to dashboard ownership.</div>}
 
                 {/* WHICH ZEE TYPE this persona is for. A harness carries the MANUAL for a type's
                     verbs and refusals, so a xell may only wear one of its own type — a manager
