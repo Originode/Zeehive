@@ -1046,6 +1046,14 @@ a.cbox:hover { border-color: var(--accent); }
   color: #fff; font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 6px; cursor: pointer; }
 .new-prompt-btn:hover { filter: brightness(1.1); }
 
+/* THE OVERLAY BAND — every full-screen overlay is portalled onto <body> (see Dispatch.jsx), so
+   these numbers are compared with each other and nothing else. In-pane chrome (the graph divider
+   z 4–6, the connector lines z 1, context menus z 41) never enters this band, and a z-index here
+   is meaningless for a component still rendered inside a pane: `.content` is its own stacking
+   context, so an overlay left in there ranks at z 1 no matter what number it carries.
+       composer 60  <  toasts 80  <  dialogs 90  <  diff viewer 95
+   The order is deliberate: a dispatch toast and an error dialog must both be readable OVER a
+   composer that is still open. */
 .disp-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex;
   align-items: flex-start; justify-content: center; z-index: 60; padding: 6vh 16px; }
 .disp { width: min(720px, 96vw); max-height: 88vh; background: var(--panel); border: 1px solid var(--line);
