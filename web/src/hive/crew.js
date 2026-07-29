@@ -28,6 +28,9 @@ export const isManagerXell = (x) => x?.zee_type === 'manager';
 // manager id → its LIVE crew, and worker id → the manager it reports to (only when that manager is
 // itself live — a husk manager cannot be "who this one reports to"). A dead manager's own hover still
 // gets a crew list: the manager row is vacant, but the workers it dispatched are real and running.
+// `byId` rides along because a view that has the relation usually needs the OTHER END of it as an
+// object, not an id — the card list names the manager it belongs to — and re-scanning the fleet for
+// that is how a second grouping starts.
 export function crewLinks(xells = []) {
   const byId = new Map();
   for (const x of xells || []) if (x?.id) byId.set(x.id, x);
@@ -39,7 +42,7 @@ export function crewLinks(xells = []) {
     (crewOf[mid] ||= []).push(x);
     if (isLiveXell(byId.get(mid))) managerOf[x.id] = mid;
   }
-  return { crewOf, managerOf };
+  return { crewOf, managerOf, byId };
 }
 
 // Who is RELATED to the focused (hovered or selected) xell, and HOW → Map(id → 'crew' | 'manager').
