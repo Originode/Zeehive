@@ -15,8 +15,10 @@
 // What this covers, per db_coupling, against real fixture rows:
 //   • which environment resolves (dev vs prod) — resolveEnvironmentFor, resolvedEnvView, streamXells;
 //   • what DATABASE_URL emitXellEnv actually writes;
-//   • the rules that must NOT move: the §6.2 meta-DB refusal (now also on the read-only path), the
-//     reserved-name rule (an environment can never redirect DATABASE_URL), and db-clone staying dev.
+//   • the rules that must NOT move: the reserved-name rule (an environment can never redirect
+//     DATABASE_URL), db-clone staying dev, and the §6.2 meta-DB refusal — which now has exactly one
+//     exemption, the minted SELECT-only reader, because when ZEEHIVE orchestrates ITSELF production
+//     IS the managing meta-DB and refusing there would refuse a manager's entire projection.
 import { mkdtempSync, rmSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -167,13 +169,33 @@ try {
   ok(prodFile.vars.API_BASE === 'https://prod.example',
      'a read-only prod xell gets the PROD api base, which is the whole of ticket #15');
 
-  // ── 3. the refusals that must NOT have moved ────────────────────────────────────────────────
-  console.log('§6.2: never emit the managing instance\'s own meta-DB — on the read-only path too');
-  const meta = await mkXell('meta', { coupling: 'db-prod-readonly', roDsn: config.databaseUrl });
-  let metaErr = null;
-  try { await emitXellEnv(meta.id); } catch (e) { metaErr = e.message; }
-  ok(/REFUSING to emit/.test(metaErr || ''),
-     `a prod_ro_dsn pointing at the meta-DB is REFUSED, not emitted [${(metaErr || 'no error').slice(0, 60)}]`);
+  // ── 3. §6.2 — the refusal, and its ONE exemption ────────────────────────────────────────────
+  // The guard exists so a nested queenzee never OPERATES on the managing instance's meta-DB (two
+  // reconcilers reap each other's xells). That needs writes. A minted read-only reader has none —
+  // and when ZEEHIVE orchestrates itself, production IS the meta-DB, so refusing there would refuse
+  // every manager's whole projection. So: read-only reader through, everything else refused.
+  console.log('§6.2: the meta-DB refusal, and the read-only exemption');
+  const metaOwner = await mkXell('metaowner', { coupling: 'db-isolated', ownedDb: config.databaseUrl });
+  let ownerErr = null;
+  try { await emitXellEnv(metaOwner.id); } catch (e) { ownerErr = e.message; }
+  ok(/REFUSING to emit/.test(ownerErr || ''),
+     `an OWNED db resolving to the meta-DB is still REFUSED [${(ownerErr || 'no error').slice(0, 60)}]`);
+
+  const metaRo = await mkXell('metaro', { coupling: 'db-prod-readonly', roDsn: config.databaseUrl });
+  let roErr = null;
+  try { await emitXellEnv(metaRo.id); } catch (e) { roErr = e.message; }
+  ok(!roErr, `the minted READ-ONLY reader on the meta-DB is emitted, not refused [${roErr || 'no error'}]`);
+  ok(!roErr && readEmitted(metaRo.wt).vars.DATABASE_URL === config.databaseUrl,
+     'a Zeehive-on-Zeehive manager gets the read-only DSN it was bound to (ticket #15 on this project)');
+
+  // the exemption is bound to THAT DSN: a read-only xell whose owned db happens to be the meta-DB
+  // is not a reader, and is refused like anything else.
+  const metaRoFake = await mkXell('metarofake', {
+    coupling: 'db-prod-readonly', roDsn: null, ownedDb: config.databaseUrl });
+  let fakeErr = null;
+  try { await emitXellEnv(metaRoFake.id); } catch (e) { fakeErr = e.message; }
+  ok(/REFUSING to emit/.test(fakeErr || ''),
+     'the exemption is the minted prod_ro_dsn only, not the coupling on its own');
 
   // ── 4. the console's two other copies of the same rule ──────────────────────────────────────
   console.log('resolvedEnvView + fleet SQL agree with resolveEnvironmentFor');

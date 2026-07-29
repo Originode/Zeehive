@@ -165,9 +165,32 @@ export async function emitXellEnv(xellId) {
   }
   if (dbUrl) {
     if (sameDatabase(dbUrl, config.databaseUrl)) {
-      throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
-        + `managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}) — `
-        + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
+      // §6.2, and the ONE exemption — the minted READ-ONLY reader.
+      //
+      // What the refusal protects against is a nested queenzee OPERATING on the managing instance's
+      // meta-DB: two reconcilers on one meta-DB reap each other's xells, and that has destroyed live
+      // work. Every part of that needs WRITE access — DELETE, UPDATE, the reaper. A db-prod-readonly
+      // xell holds a role minted by lib/prod-readonly.js: NOSUPERUSER, no write grant of any kind,
+      // `default_transaction_read_only = on`. It cannot reap anything; the worst it can do is crash
+      // its own nested server on the first INSERT.
+      //
+      // It has to be exempt, because when ZEEHIVE orchestrates ITSELF the production database IS the
+      // managing instance's meta-DB: refusing here would refuse the ENTIRE projection (ports, site,
+      // env vars — the file is written at the end) for every manager zee on this project, and the
+      // manager would keep pointing at its own throwaway spinoff db while its binding said
+      // production. That is ticket #15 again, with a scarier log line.
+      //
+      // The exemption is deliberately as narrow as it can be: this exact xell must be coupled
+      // read-only AND the URL must be the DSN the queenzee itself minted for it. An owner credential,
+      // an owned db container, a clone — anything else that resolves to the meta-DB is still refused.
+      const readerBinding = xell.db_coupling === 'db-prod-readonly' && dbUrl === xell.prod_ro_dsn;
+      if (!readerBinding) {
+        throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
+          + `managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}) — `
+          + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
+      }
+      logline('prod-ro', `${xell.slug}: DATABASE_URL is the managing instance's own meta-DB, emitted `
+        + 'because this xell holds it READ-ONLY (SELECT-only role) — the §6.2 reap risk needs writes');
     }
     lines.push(`DATABASE_URL=${dbUrl}`);
   }
