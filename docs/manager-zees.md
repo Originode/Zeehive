@@ -14,8 +14,8 @@ They are not the same thing, and 054 stops them contradicting each other:
 - **TYPE** (`xell.zee_type`: `worker` | `manager`) is what the QUEENZEE will and will not let this
   zee do — the refusals below. It is decided when the xell is created and it is structural.
 - **HARNESS** is the persona, skills and MANUAL a zee wears. Each harness **declares the type it is
-  for** (`harness.zee_type`, from `zee_type:` in its `HARNESS.yml`), and a xell may only wear a
-  harness of its own type. `any` is reserved for the law layer (`core`), which every zee gets.
+  for** (`harness.zee_type` on the row — since 080 there are no harness files), and a xell may only
+  wear a harness of its own type. `any` is reserved for the law layer (`core`), which every zee gets.
 
 Why the pairing must be enforced rather than trusted: a harness IS the manual for a type's verbs and
 refusals. Hand the manager harness to a worker and you have taught it `zee dispatch`,
@@ -244,9 +244,9 @@ died with the cxell, at the exact moment it knew the most.
 
 ## The rule about loopholes
 
-The manager's manual (`harnesses/manager/memory/manager-zee-manual.md`) states, and the binding rules
-repeat, that a manager must **never dispatch a worker in a way that gives it reach beyond its own
-xell** — no touching the xource, another xell, production, `origin`, docker or any
+The manager's manual (the `manager` harness's `memory/manager-zee-manual.md` entry, in the meta-DB)
+states, and the binding rules repeat, that a manager must **never dispatch a worker in a way that
+gives it reach beyond its own xell** — no touching the xource, another xell, production, `origin`, docker or any
 hook/gate/firewall/CLI; no splitting a change so each half slips past a review; nothing on its behalf
 that it is itself refused. A worker's only legitimate reach outside its xell is talking to its
 manager and to the queenzee.
@@ -276,7 +276,8 @@ name the crew they belong to. With no managers in the fleet the layout is exactl
 - `server/src/lib/manager-spawn.js` — adding one (human only) + the read-only prod bind.
 - `server/src/lib/prod-readonly.js` — the SELECT-only role, minted and dropped.
 - `server/src/queenzee/self.js` — the crew verbs + the manager refusals.
-- `harnesses/manager/` — the persona, the `dispatch-brief` skill, and a manual of its own.
+- the `manager` harness ROW in the meta-DB (080) — the persona, the `dispatch-brief` skill and a
+  manual of its own; edited in the console's harness manager or by migration, never on disk.
 - `web/src/Manager.jsx` — "+ manager zee" (opens the composer) and the done-suggestion gate.
 - `web/src/Dispatch.jsx` — the one composer, in its worker and `manager` variants.
 - `test/manager-compose.test.mjs` — the console wiring for adding one, asserted statically.
