@@ -24,6 +24,10 @@ import { fileURLToPath } from 'node:url';
 const API_PORT = 47998;
 const API = `http://127.0.0.1:${API_PORT}`;
 process.env.ZEEHIVE_API = API;
+// These exercise the LIVE half of the nested-queenzee guard (test/nested-queenzee-land-ship-guard.test.mjs):
+// a real queenzee moves real refs and resumes real cages, and this suite is what proves that did not
+// change. Declared BEFORE any import, because the modules read it once at load.
+process.env.PROVISION_MODE = 'real';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
