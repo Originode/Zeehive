@@ -1,4 +1,4 @@
--- The receipt for a withdrawal (see 060 for the why) — WHO withdrew it, WHEN, and their reason.
+-- The receipt for a withdrawal (see 061 for the why) — WHO withdrew it, WHEN, and their reason.
 --
 -- Kept separate from decided_at/decided_by, which mean "a HUMAN judged this": a withdrawal is the
 -- zee lowering its own ask, and writing the zee into decided_by would make the audit trail claim a

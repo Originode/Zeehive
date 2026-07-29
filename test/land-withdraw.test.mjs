@@ -199,7 +199,7 @@ ok(/'\/xell\/self\/land\/withdraw'/.test(routes), 'the zee route exists');
 ok(/'\/land\/requests\/:id\/withdraw'/.test(routes), 'and an operator route for a card whose zee is gone');
 ok(/zee land --withdraw/.test(read('server/src/queenzee/intake.js')),
    'the spawn briefing lists the verb (a zee reads that before anything else)');
-const manual = read('db/migrations/062_manual_land_withdraw.sql');
+const manual = read('db/migrations/063_manual_land_withdraw.sql');
 ok(/zee land --withdraw/.test(manual) && /do NOT spam the gate/i.test(manual),
    'the manual migration teaches both the verb AND the one-open-landing discipline');
 ok(/harness/.test(manual) && /zee-base/.test(manual), 'and it patches the DB-owned zee-base manual');

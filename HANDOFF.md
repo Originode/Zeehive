@@ -144,7 +144,7 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
 - **Zees checkpoint-commit freely** on their own branch — a commit only moves their branch ref and
   lands nothing, so the prompt now tells them to commit early and often rather than hoard
   uncommitted work while waiting on approval. Only the *push* is gated.
-- **A zee can WITHDRAW its own held landing** (2026-07-29, 060–062). Every other ask a zee raises
+- **A zee can WITHDRAW its own held landing** (2026-07-29, 061–063). Every other ask a zee raises
   can be lowered by the zee that raised it (`zee tend --clear`, `zee hint-land --clear`, `zee done
   --clear`); a land request could not, so a zee that changed its mind pushed again and left a second
   card for the same job. `zee land --withdraw [--reason]` → `POST /api/xell/self/land/withdraw`:

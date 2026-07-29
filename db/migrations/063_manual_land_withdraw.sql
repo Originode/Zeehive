@@ -1,4 +1,4 @@
--- TEACH THE MANUAL HOW TO UN-ASK A LANDING — `zee land --withdraw` (060/061, queenzee/landgate.js).
+-- TEACH THE MANUAL HOW TO UN-ASK A LANDING — `zee land --withdraw` (061/062, queenzee/landgate.js).
 --
 -- A verb that is not in the manual does not exist to a zee: the cxell-zee manual is DB-owned
 -- (harness `zee-base`, memory file cxell-zee-manual.md) and reaches a xell only through harness

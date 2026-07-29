@@ -15,5 +15,5 @@
 --
 -- ALONE IN THIS FILE ON PURPOSE: postgres refuses to USE a new enum value in the same transaction
 -- that adds it, and the migration runner wraps each file in one. The columns and the CHECK that
--- reference 'withdrawn' therefore live in 061.
+-- reference 'withdrawn' therefore live in 062.
 ALTER TYPE land_status ADD VALUE IF NOT EXISTS 'withdrawn';
