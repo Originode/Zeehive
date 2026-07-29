@@ -211,6 +211,25 @@ ok(/zee land --withdraw/.test(stored?.t || ''), 'and the stored manual really ca
 ok(/withdraw the open request first, then land again/i.test(stored?.t || ''),
    'including the withdraw-then-land order a zee is meant to follow');
 
+// The HYGIENE NOTE (zee-base memory 'tend-or-land.md') — the short reminder a zee re-reads when it
+// is deciding whether to bother a human. It could only teach half the lesson while a landing had no
+// retraction; 064 gives it the other half, and the long form in the manual must not disagree with it.
+const hygiene = read('db/migrations/064_harness_hygiene_withdraw.sql');
+ok(/tend-or-land\.md/.test(hygiene) && /a\.e->>'path'/.test(hygiene),
+   '064 finds the hygiene note BY PATH inside the memory array (never by index)');
+ok(/txt := txt \|\|/.test(hygiene) && !/replace\(txt,/.test(hygiene),
+   'and it APPENDS — a human wrote that note, so nothing rewrites their line');
+ok(/LIKE '%--withdraw%' THEN RETURN/.test(hygiene), 'guarded on the verb, so it runs at most once');
+const note = await one(
+  `SELECT a.e->>'text' AS t FROM harness h, LATERAL jsonb_array_elements(h.bundle->'memory') AS a(e)
+     WHERE h.key='zee-base' AND a.e->>'path'='tend-or-land.md'`);
+ok(/revoke your tend request/.test(note?.t || ''),
+   'the human\'s original words survive the append (their note, their phrasing)');
+ok(/zee land --withdraw/.test(note?.t || '') && /ONE open landing per zee/.test(note?.t || ''),
+   'and it now teaches the landing half: withdraw the open one, one card per zee');
+ok(/zee hint-land/.test(note?.t || '') && /not yours to retract/.test(note?.t || ''),
+   'including the two things it is NOT — an approved landing, and a request you should never have raised');
+
 const landingJsx = read('web/src/Landing.jsx');
 ok(/withdrawLanding/.test(read('web/src/api.js')) && /land-withdraw/.test(landingJsx),
    'the console offers a human the same quiet exit (Withdraw, next to Reject)');
