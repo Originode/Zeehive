@@ -1943,8 +1943,10 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-gtrack { position: relative; flex: 0 0 auto; height: 100%; }
 
 /* a leaf bar, and the summary bracket a parent draws instead (a plan must read as a plan) */
+/* touch-action:none is what makes the gesture exist on a touchscreen at all: without it the browser
+   claims the drag for panning and a bar can only be dragged with a mouse. */
 .work-gbar, .work-gsum { position: absolute; top: 5px; height: 16px; border-radius: 4px;
-  cursor: grab; z-index: 2; }
+  cursor: grab; z-index: 2; touch-action: none; }
 .work-gbar.rolled, .work-gsum { cursor: default; }
 .work-gsum { top: 8px; height: 10px; }
 .work-gbar.ghosting, .work-gsum.ghosting { opacity: .8; outline: 1px dashed var(--accent); }
@@ -1958,11 +1960,12 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-gcap.l { left: 0; } .work-gcap.r { right: 0; }
 .work-gopen { position: absolute; right: -1px; top: 0; bottom: 0; width: 6px;
   background: repeating-linear-gradient(135deg, var(--bg) 0 2px, transparent 2px 4px); }
-.work-ghandle { position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize; z-index: 3; }
+.work-ghandle { position: absolute; top: 0; bottom: 0; width: 6px; cursor: ew-resize; z-index: 3;
+  touch-action: none; }
 .work-ghandle.l { left: -2px; } .work-ghandle.r { right: 4px; }
 .work-glink { position: absolute; right: -5px; top: 50%; transform: translateY(-50%); width: 9px; height: 9px;
   border-radius: 50%; background: var(--panel2); border: 1px solid var(--muted); cursor: crosshair; z-index: 4;
-  opacity: 0; }
+  opacity: 0; touch-action: none; }
 .work-grow:hover .work-glink, .work-grow.hot .work-glink { opacity: 1; }
 
 .work-garrows { position: absolute; top: 0; z-index: 4; overflow: visible; pointer-events: none;
@@ -1972,6 +1975,9 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-garrow-line { fill: none; stroke: currentColor; stroke-width: 1.2; }
 .work-garrow-hit { fill: none; stroke: transparent; stroke-width: 9; pointer-events: none; cursor: pointer; }
 .work-garrow.on .work-garrow-hit { pointer-events: stroke; }
+/* …except while a dependency is being drawn, when an arrow lying over the target bar would swallow
+   the drop and the dependency would silently not be created. */
+.work-garrows.linking .work-garrow-hit { pointer-events: none; }
 .work-garrow-drawing { fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 4 3; }
 
 /* the clamp notice, an undrawable dependency, and a row whose dates contradict each other —

@@ -68,11 +68,18 @@ const ZOOM_KEY = 'zeehive.work.gantt.zoom';
 export default function Gantt({ projectId, rootId }) {
   const [model, setModel] = useState(null);
   const [statuses, setStatuses] = useState([]);
-  const [zees, setZees] = useState(() => new Map());   // item id → the LIVE zee on it, from /api/board
+  // null = NOT KNOWN (the board has not answered, or its answer failed). A Map is knowledge; null
+  // is the absence of it, and the tooltip says which. Starting at an empty Map made "the board did
+  // not answer" indistinguishable from "nobody is on this item" — a lie with a confident voice.
+  const [zees, setZees] = useState(null);              // item id → the LIVE zee on it, from /api/board
   const [err, setErr] = useState(null);
   const [openItem, setOpenItem] = useState(null);
-  // Optimistic date overrides, keyed by item id, cleared when the refetch lands (or the server refuses).
+  // Optimistic date overrides, keyed by item id, cleared when the refetch lands (or the server
+  // refuses). `inFlight` is which of them still have a PATCH outstanding: a refetch triggered by
+  // somebody else's SSE event used to clear the whole map, which snapped a bar the human was still
+  // waiting on back to its old dates — it read as "the drag failed" and then it moved again.
   const [over, setOver] = useState(() => new Map());
+  const inFlight = useRef(new Set());
 
   useEffect(() => {
     let live = true;
@@ -88,7 +95,13 @@ export default function Gantt({ projectId, rootId }) {
     const [g, b] = await Promise.allSettled([getGantt(projectId, rootId), getBoard(projectId, rootId)]);
     if (g.status === 'fulfilled') {
       setModel(g.value);
-      setOver(new Map());
+      // Keep the overrides whose own PATCH is still outstanding; drop the rest, because this answer
+      // already contains them.
+      setOver((m) => {
+        const n = new Map();
+        for (const [id, v] of m) if (inFlight.current.has(id)) n.set(id, v);
+        return n;
+      });
       setErr(null);
     } else setErr(g.reason);
     if (b.status === 'fulfilled') {
@@ -97,7 +110,7 @@ export default function Gantt({ projectId, rootId }) {
         for (const card of col.items || []) if (card?.zee) m.set(card.id, card.zee);
       }
       setZees(m);
-    }
+    } else setZees(null);        // unknown, and the tooltip will SAY unknown
   }, [projectId, rootId]);
   useEffect(() => { load(); }, [load]);
 
@@ -127,12 +140,15 @@ export default function Gantt({ projectId, rootId }) {
   // rolled back with the server's own sentence.
   const reschedule = useCallback(async (id, dates) => {
     setOver((m) => new Map(m).set(id, dates));
+    inFlight.current.add(id);
     try {
       await patchWorkItem(id, dates);
       setErr(null);
+      inFlight.current.delete(id);
       await load();
     } catch (e) {
       setErr(e);
+      inFlight.current.delete(id);
       setOver((m) => { const n = new Map(m); n.delete(id); return n; });
     }
   }, [load]);
@@ -155,7 +171,8 @@ export default function Gantt({ projectId, rootId }) {
       {model !== null && (
         <GanttChart rows={rows} statuses={statuses} zees={zees}
                     unscheduledCount={model?.unscheduled_count}
-                    onOpen={setOpenItem} onReschedule={reschedule} onLink={link} onUnlink={unlink} />
+                    onOpen={setOpenItem} onReschedule={reschedule} onLink={link} onUnlink={unlink}
+                    onRefuse={(m) => setErr(new Error(m))} />
       )}
       {openItem && (
         <WorkItemDrawer itemId={openItem} projectId={projectId} statuses={statuses}
@@ -170,7 +187,7 @@ export default function Gantt({ projectId, rootId }) {
 // (test/work-gantt.test.mjs server-renders it over real rows and asserts on the markup). It owns
 // only view state — zoom, collapse, hover, the gesture in flight — and asks its parent to write.
 export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
-                             onOpen, onReschedule, onLink, onUnlink, today = new Date() }) {
+                             onOpen, onReschedule, onLink, onUnlink, onRefuse, today }) {
   const [zoom, setZoom] = useState(() => {
     try { const z = localStorage.getItem(ZOOM_KEY); return ZOOMS.some((x) => x.key === z) ? z : ZOOMS[1].key; }
     catch { return ZOOMS[1].key; }
@@ -181,6 +198,10 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
   const [ghost, setGhost] = useState(null);       // the live preview of the gesture in flight
   const [active, setActive] = useState(null);     // "<id>:<mode>" while a gesture is live
   const gesture = useRef(null);
+  // The rows as of THIS render, for the drop handler to check against — a gesture holds the dates
+  // it began with, and a refetch can land under it.
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
   const dragged = useRef(false);          // a drag that MOVED must not also open the drawer on click
   const scroller = useRef(null);
   const centred = useRef(false);
@@ -188,7 +209,12 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
   useEffect(() => { try { localStorage.setItem(ZOOM_KEY, zoom); } catch { /* private mode */ } }, [zoom]);
 
   const px = zoomOf(zoom).px;
-  const t0 = useMemo(() => startOfDay(today), [today]);
+  // TODAY, memoised on the DAY rather than on the object. `new Date()` as a default prop was a
+  // fresh object every render, so this memo — and win, axis and geom below it, which all depend on
+  // it — missed on EVERY render, and a render happens on every pointermove of a drag (the ghost is
+  // state). The whole ruler was being rebuilt, per mouse event, for nothing.
+  const todayKey = today ? dayKey(today) : null;
+  const t0 = useMemo(() => startOfDay(today || new Date()), [todayKey]);   // eslint-disable-line
   const byId = useMemo(() => new Map(rows.map((r) => [r.id, r])), [rows]);
   const kidsOf = useMemo(() => {
     const m = new Map();
@@ -302,6 +328,17 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
       // enough; both, because "a click silently rescheduled the item" is the worst kind of bug —
       // it looks like the human did it.
       if (!dragged.current) return;
+      // LAST WRITE WINS IS NOT A POLICY, IT IS AN ACCIDENT. The gesture carries the dates it started
+      // from; if the row moved underneath it (another zee, another human, the drawer behind this
+      // tab) the drop would silently overwrite the newer dates with ones derived from the older.
+      // So the drop checks, refuses, and says so — the same shape as a server refusal, for a
+      // conflict the server cannot see.
+      const now = rowsRef.current.find((r) => r.id === g.id);
+      if (now && (now.computed_start !== dayKey(g.start) || now.computed_end !== dayKey(g.end))) {
+        onRefuse?.(`“${now.title}” moved while you were dragging it (it now runs ${now.computed_start} → ${now.computed_end}). `
+          + 'Nothing was written — look at where it is now and drag it again.');
+        return;
+      }
       const next = dragDates(g, daysAt(e.clientX - g.x0, px), zoom);
       if (next.starts_on === dayKey(g.start) && next.due_on === dayKey(g.end)) return;
       onReschedule?.(g.id, next);
@@ -328,7 +365,7 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
       window.removeEventListener('pointercancel', up);
       window.removeEventListener('keydown', key, true);
     };
-  }, [active, px, zoom, onLink, onReschedule]);
+  }, [active, px, zoom, onLink, onReschedule, onRefuse]);
 
   // A dependency whose predecessor has no bar cannot be drawn — and silence reads as "that
   // dependency was deleted". So every undrawable edge is collected WITH ITS REASON and marked on
@@ -524,7 +561,12 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
               {/* DEPENDENCIES. Routed through the gap ABOVE the successor row rather than straight
                   across, so a line never lies on top of a bar, and dimmed unless one of its two
                   rows is hovered/selected — every arrow at full strength is a hairball. */}
-              <svg className="work-garrows" style={{ left: LEFT, width, height: rowsH }} width={width} height={rowsH}>
+              {/* While a dependency is being DRAWN, the arrows go inert: a hovered arrow's hit path
+                  is 9px of stroke sitting above the bars, and releasing on the few pixels where one
+                  crosses the target bar found the path instead of the bar — the dependency was
+                  silently not created. */}
+              <svg className={`work-garrows${ghost?.mode === LINK ? ' linking' : ''}`}
+                   style={{ left: LEFT, width, height: rowsH }} width={width} height={rowsH}>
                 <defs>
                   <marker id="work-garrowhead" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
                     <path d="M0,0 L7,3.5 L0,7 z" fill="currentColor" />
@@ -553,6 +595,7 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
 
       {tip && !ghost && (
         <Tip row={tip.row} x={tip.x} y={tip.y} statuses={statuses} zee={zees?.get?.(tip.row.id)}
+             zeesKnown={!!zees}
              crumb={crumbOf(tip.row, byId)} summary={(kidsOf.get(tip.row.id) || []).length > 0}
              hidden={hiddenDeps.get(tip.row.id)} inverted={geom.get(tip.row.id)?.span?.inverted}
              today={t0} terminal={isTerminal(tip.row.status)} />
@@ -612,7 +655,7 @@ function arrowPath(from, to) {
 
 // The tooltip. It says what the bar is, WHEN it is, who is on it, and — when the bar cannot be
 // dragged — why, because a dead handle with no explanation is the worst kind of UI.
-function Tip({ row, x, y, statuses, zee, crumb, summary, hidden, inverted, today, terminal }) {
+export function Tip({ row, x, y, statuses, zee, zeesKnown = true, crumb, summary, hidden, inverted, today, terminal }) {
   const own = !!(row.starts_on && row.due_on);
   const end = row.computed_end;
   const late = !!end && diffDays(today, end) < 0 && !terminal;
@@ -628,8 +671,13 @@ function Tip({ row, x, y, statuses, zee, crumb, summary, hidden, inverted, today
       <div className={`work-gtip-r${late ? ' late' : ''}`}>
         {row.computed_start || '—'} → {end || '—'}{late ? ' · overdue' : ''}
       </div>
+      {/* Three DIFFERENT facts, and the third one used to be told as the second: a zee is on it, a
+          zee is not on it, or the board did not answer and this chart does not know. */}
       {zee ? <ZeeChip zee={zee} /> : (
-        <div className="work-gtip-d">{row.assignee ? `assignee: ${row.assignee}` : 'nobody on it'}</div>
+        <div className="work-gtip-d">
+          {!zeesKnown ? 'could not read who is on it — the board did not answer'
+            : row.assignee ? `assignee: ${row.assignee}` : 'nobody on it'}
+        </div>
       )}
       {inverted && (
         <div className="work-gtip-w">the due date is BEFORE the start date — this bar spans the

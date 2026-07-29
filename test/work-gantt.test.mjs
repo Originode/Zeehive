@@ -103,6 +103,21 @@ ok(/shiftBy/.test(scale) && !/snapDate/.test(scale),
 ok(/MAX_SPAN_DAYS/.test(scale) && /clamped/.test(gcode),
    'the window is capped by a NAMED constant and the chart announces the cap');
 
+// ── 4c. the six sharp edges the audit left, once they were fixed ──
+ok(/const todayKey = today \? dayKey\(today\) : null;/.test(gcode) && /\[todayKey\]/.test(gcode),
+   'today is memoised on the DAY, not on a fresh object per render (the axis no longer rebuilds on every pointermove)');
+ok(!/today = new Date\(\) \}/.test(gcode), 'and it is no longer a default prop that changes identity every render');
+ok(/setZees\(null\)/.test(gcode) && /zeesKnown/.test(gcode),
+   'a board that does not answer leaves the zees UNKNOWN, rather than asserting nobody is on the item');
+ok(/inFlight/.test(gcode) && /inFlight\.current\.has\(id\)/.test(gcode),
+   'a refetch clears only the optimistic overrides whose PATCH has already settled');
+ok(/moved while you were dragging it/.test(gantt) && /onRefuse/.test(gcode),
+   'a drop whose row moved under the gesture is REFUSED, not written last-wins');
+ok(/linking/.test(gcode) && /\.work-garrows\.linking \.work-garrow-hit \{ pointer-events: none/.test(fence),
+   'arrows go inert while a dependency is being drawn, so one cannot swallow the drop');
+ok(/touch-action: none/.test(fence.slice(fence.indexOf('.work-gbar, .work-gsum'))),
+   'bars and their handles set touch-action:none — the drag exists on a touchscreen at all');
+
 // ── 5. dialogs, drawer, live ──
 ok(/import\s*\{[^}]*showConfirm[^}]*\}\s*from\s*['"]\.\.\/Dialog\.jsx['"]/.test(gantt),
    'removing a dependency asks through Dialog.jsx (showConfirm), imported where it is called');
@@ -273,7 +288,7 @@ const render = async () => {
         const React = require('react');
         const { renderToString } = require('react-dom/server');
         const G = require('./Gantt.jsx');
-        module.exports = { React, renderToString, Gantt: G.default, GanttChart: G.GanttChart, crumbOf: G.crumbOf, hiddenTitle: G.hiddenTitle };
+        module.exports = { React, renderToString, Gantt: G.default, GanttChart: G.GanttChart, crumbOf: G.crumbOf, hiddenTitle: G.hiddenTitle, Tip: G.Tip };
       `,
       resolveDir: resolve(here, '..', 'web/src/work'),
       loader: 'js',
@@ -285,7 +300,7 @@ const render = async () => {
 };
 
 try {
-  const { React, renderToString, Gantt, GanttChart, crumbOf, hiddenTitle } = await render();
+  const { React, renderToString, Gantt, GanttChart, crumbOf, hiddenTitle, Tip } = await render();
   globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '{"rows":[]}' });
   const el = (C, props) => React.createElement(C, props);
   const today = D(2026, 7, 29);
@@ -320,6 +335,24 @@ try {
 
   ok(crumbOf(ROWS[3], new Map(ROWS.map((r) => [r.id, r]))).join(' › ') === 'Project › Activity',
      'the tooltip breadcrumb is built from the rows already in hand — no second request');
+
+  // THE TOOLTIP, rendered directly. It only appears on hover, so a chart render cannot reach it —
+  // and it is where three genuinely different facts about "who is on it" are told apart.
+  {
+    const row = { id: 't1', title: 'x', kind: 'task', status: serverKeys[0], starts_on: '2026-07-20',
+                  due_on: '2026-07-24', computed_start: '2026-07-20', computed_end: '2026-07-24', assignee: null };
+    const tip = (props) => renderToString(el(Tip, { row, x: 10, y: 10, statuses, crumb: [], today, ...props }));
+    ok(/could not read who is on it/.test(tip({ zeesKnown: false })),
+       'when the board did not answer, the tooltip says it does not KNOW who is on it');
+    ok(/nobody on it/.test(tip({ zeesKnown: true })), 'when it does know and nobody is, it says so');
+    ok(/alice/.test(tip({ zeesKnown: true, row: { ...row, assignee: 'alice' } })), 'an assignee is named');
+    ok(/work-zee/.test(tip({ zeesKnown: true, zee: { slug: 'brisk-fen-1', hive_status: 'occ-working' } })),
+       'and a live zee is drawn as the hive chip, in the hive palette');
+    ok(/rolled up from the children/.test(tip({ summary: true, row: { ...row, starts_on: null, due_on: null } })),
+       'a computed-only row explains why it cannot be dragged');
+    ok(/waits for/.test(tip({ hidden: [{ title: 'blocker', why: 'has no dates yet' }] })),
+       'and an undrawable dependency is spelled out where a human is already looking');
+  }
 
   // ── the four UI fixes, rendered ───────────────────────────────────────────────────────────
   const R = (o) => ({ parent_id: null, depth: 0, kind: 'task', status: serverKeys[0], progress: 0,
