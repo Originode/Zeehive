@@ -211,6 +211,13 @@ ok(/zee land --withdraw/.test(stored?.t || ''), 'and the stored manual really ca
 ok(/withdraw the open request first, then land again/i.test(stored?.t || ''),
    'including the withdraw-then-land order a zee is meant to follow');
 
+const landingJsx = read('web/src/Landing.jsx');
+ok(/withdrawLanding/.test(read('web/src/api.js')) && /land-withdraw/.test(landingJsx),
+   'the console offers a human the same quiet exit (Withdraw, next to Reject)');
+ok(landingJsx.indexOf('land-withdraw') < landingJsx.indexOf('land-reject'),
+   'and it sits BEFORE Reject — withdrawing decides nothing, rejecting burns the sha');
+ok(/withdrawn/.test(read('web/src/LandingPad.jsx')), 'the landing pad has a phase label for it (a brief receipt)');
+
 server.close();
 await pool.end().catch(() => {});
 console.log(`\n${failures === 0 ? 'ALL PASSED ✓' : `${failures} FAILURE(S) ✗`}`);
