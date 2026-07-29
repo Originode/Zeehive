@@ -19,6 +19,10 @@
 // DRAWN. This test therefore runs the REAL module (HiveCanvas.jsx, esbuild-transformed then imported)
 // — its pure decisions asserted as data, and its drawing EXECUTED against a recording 2D context, the
 // same shape as test/manager-hexagon.test.mjs.
+//
+// The last section closes the loop on the ticket's other constraint — no new endpoint, no per-hover
+// request — by running the REAL fleet read model (lib/fleet.js) against this xell's own postgres and
+// feeding its payload straight into the same helpers. It needs DATABASE_URL; everything above does not.
 import { transformSync } from 'esbuild';
 import { readFileSync, writeFileSync, rmSync } from 'node:fs';
 
@@ -205,6 +209,8 @@ for (const size of [70, 40, 20]) {
   const words = [...w.text, ...m.text].filter((t) => /\bcrew\b|\bmanager\b/.test(t.t));
   ok(size >= 30 ? words.length > 0 : words.length === 0,
      `size ${size}: the word is painted where it can be read, and not squeezed in where it cannot`);
+  ok(!words.some((t) => /…/.test(t.t)),
+     `size ${size}: and it is never CLIPPED to an ellipsis — '⬢ manag…' is not a word, so it shrinks to fit`);
 }
 ok(drawRelationMark(recorder(), 10, 10, 70, { kind: null }) === null,
    'no relation, no mark at all (the draw is a no-op, not a stray ring)');
@@ -234,5 +240,83 @@ const drawBody = src.slice(src.indexOf('const draw = useCallback'), src.indexOf(
 ok(!/manager_xell_id/.test(drawBody),
    'and the draw loop names manager_xell_id nowhere — the relationship is read through crewLinks alone');
 
+// ── 8. THE PAYLOAD: the relationship really does ride on what the console polls ─
+// The rule above is only worth anything if `manager_xell_id` (and the STATUS the liveness rule reads)
+// actually arrive on the fleet payload the console already consumes — the ticket's "no new endpoint,
+// no per-hover request" constraint. So this last section runs the REAL read model (lib/fleet.js
+// getFleet) against this xell's own postgres and feeds its output straight into the canvas helpers
+// above. Needs DATABASE_URL; without one the pure + painted sections above still stand alone.
+if (!process.env.DATABASE_URL) {
+  console.log('\n── (skipped: no DATABASE_URL — the fleet-payload section needs this xell’s own db) ──');
+} else {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, mkdirSync, writeFileSync: wf, rmSync: rf } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const pg = (await import('pg')).default;
+
+  const PID = '00000000-0000-4000-8000-00000024a111';
+  const XID = '00000000-0000-4000-8000-00000024a222';
+  const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  const dir = mkdtempSync(join(tmpdir(), 'crewhl-'));
+  const clean = async () => { try { await client.query('DELETE FROM project WHERE id=$1', [PID]); } catch { /* */ } };
+  try {
+    await client.connect();
+    await clean();
+    const repo = join(dir, 'repo');
+    mkdirSync(repo);
+    const git = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8' }).trim();
+    git('init', '-q', '-b', 'master'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+    wf(join(repo, 'f.md'), 'x\n'); git('add', '-A'); git('commit', '-qm', 'c1');
+    const tip = git('rev-parse', 'HEAD');
+    await client.query(
+      `INSERT INTO project (id, name, repo_root, main_branch, db_name, db_user)
+         VALUES ($1,'crewhl-test',$2,'master','crewhl','postgres')`, [PID, repo]);
+    await client.query(`INSERT INTO xource (id, project_id, ref) VALUES ($1,$2,'master')`, [XID, PID]);
+    const mk = async (slug, zeeType, status, managerId) => (await client.query(
+      `INSERT INTO xell (project_id, xource_id, slug, branch, status, is_pooled, zee_type,
+                         manager_xell_id, head_commit)
+         VALUES ($1,$2,$3,$4,$5,false,$6,$7,$8) RETURNING id`,
+      [PID, XID, slug, `spinoff/${slug}`, status, zeeType, managerId, tip])).rows[0].id;
+    const M = await mk('pay-mgr', 'manager', 'working', null);
+    const A = await mk('pay-live', 'worker', 'working', M);
+    const B = await mk('pay-idle', 'worker', 'idle', M);
+    const D = await mk('pay-husk', 'worker', 'husk', M);        // reaped: must lend nothing
+    const N = await mk('pay-none', 'worker', 'working', null);
+
+    const { getFleet } = await import('../server/src/lib/fleet.js');
+    const fleet = await getFleet(PID);
+    const rows = fleet.xells;
+    const byId = Object.fromEntries(rows.map((x) => [x.id, x]));
+
+    console.log('\n── the fleet payload the console already polls ──');
+    ok(byId[A].manager_xell_id === M && byId[A].zee_type === 'worker' && byId[M].zee_type === 'manager',
+       'it carries manager_xell_id and zee_type per xell — no new endpoint, no per-hover request');
+    ok(byId[D].status === 'husk' && byId[A].status === 'working',
+       'and the STATUS the liveness rule reads (the husk is in the payload — it still owns a cell)');
+
+    console.log('\n── that payload, straight into the highlight ──');
+    const l = crewLinks(rows);
+    ok(l.crewOf[M].map((x) => x.slug).sort().join(',') === 'pay-idle,pay-live',
+       `the manager's crew from a REAL payload is its two live workers (${l.crewOf[M].map((x) => x.slug)})`);
+    const r = relatedTo(rows, M, l);
+    ok(r.get(A) === 'crew' && r.get(B) === 'crew', 'both live workers are marked as crew');
+    ok(!r.has(D), 'the HUSK worker is not marked — it is drawn in the grid and lends no highlight');
+    ok(!r.has(N) && !r.has(M) && r.size === 2, 'and nothing else in the project is marked');
+    ok(relatedTo(rows, A, l).get(M) === 'manager', 'and the reverse hop answers from the same payload');
+    ok(managerCard(byId[M], l.crewOf[M]).crew === '⬡ 2 crew',
+       'so the manager hexagon counts 2 crew, not 3 — the count and the highlight cannot disagree');
+  } catch (e) {
+    console.error('\n✗ threw:', e?.stack || e?.message || e);
+    fail++;
+  } finally {
+    await clean();
+    try { rf(dir, { recursive: true, force: true }); } catch { /* */ }
+    try { await client.end(); } catch { /* */ }
+    try { const { pool } = await import('../server/src/db/pool.js'); await pool.end(); } catch { /* */ }
+  }
+}
+
 console.log(fail ? `\n✗ ${fail} FAILED` : '\n✓ a manager lights its crew, in words');
 process.exit(fail ? 1 : 0);
+
