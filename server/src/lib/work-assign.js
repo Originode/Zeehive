@@ -36,8 +36,7 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import {
-  getWorkItem, listWorkItems, flattenTree, nestItems, liveZees, logWorkEvent, inTransaction,
-  dbRunner, assertId, isUuid,
+  getWorkItem, listWorkItems, flattenTree, liveZees, logWorkEvent, inTransaction, dbRunner, assertId,
 } from './work-items.js';
 import { WORK_STATUS_KEYS, isTerminal, isWorkStatus, canTransition, nextStatuses,
          statusFromHive } from './work-status.js';
