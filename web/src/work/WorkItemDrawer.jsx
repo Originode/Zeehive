@@ -31,6 +31,7 @@ export default function WorkItemDrawer({ itemId, projectId, statuses, onClose, o
   const [busy, setBusy] = useState(false);
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
+  const [progress, setProgress] = useState(0);
   const [addingChild, setAddingChild] = useState(false);
   const [childTitle, setChildTitle] = useState('');
   const [depSearch, setDepSearch] = useState(null);   // null = picker closed, '' = open and empty
@@ -46,6 +47,7 @@ export default function WorkItemDrawer({ itemId, projectId, statuses, onClose, o
       const it = d?.item || d;
       setTitle(it?.title || '');
       setBody(it?.body || '');
+      setProgress(Number(it?.progress) || 0);
       setErr(null);
     } catch (e) { setErr(e); }
   }, [itemId]);
@@ -184,13 +186,14 @@ export default function WorkItemDrawer({ itemId, projectId, statuses, onClose, o
                      }} />
             </Field>
             <Field label="progress">
+              {/* The slider tracks locally while it is being dragged and PATCHes when the gesture
+                  ENDS (mouse up / key up) — one write per decision, not one per pixel. */}
               <span className="work-progress">
-                <input type="range" min="0" max="100" step="5" defaultValue={item.progress ?? 0}
-                       key={`pr-${item.progress ?? 0}`} disabled={busy}
-                       onChange={(e) => { e.currentTarget.nextSibling.textContent = `${e.target.value}%`; }}
-                       onMouseUp={(e) => save({ progress: Number(e.target.value) })}
-                       onKeyUp={(e) => save({ progress: Number(e.target.value) })} />
-                <b>{item.progress ?? 0}%</b>
+                <input type="range" min="0" max="100" step="5" value={progress} disabled={busy}
+                       onChange={(e) => setProgress(Number(e.target.value))}
+                       onMouseUp={() => { if (progress !== (item.progress ?? 0)) save({ progress }); }}
+                       onKeyUp={() => { if (progress !== (item.progress ?? 0)) save({ progress }); }} />
+                <b>{progress}%</b>
               </span>
             </Field>
             {data?.zee && <Field label="zee"><ZeeChip zee={data.zee} /></Field>}
