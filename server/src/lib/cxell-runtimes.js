@@ -263,3 +263,20 @@ export const providerModels = (provider) => VENDOR_MODELS[provider] || null;
 // interactive session over SSH alike (see cxellZeeActive). Word-ish boundaries keep it from
 // matching substrings of unrelated cmdlines.
 export const AGENT_PROC_PATTERN = `(^|/| )(${[...new Set(Object.values(ADAPTERS).map((a) => a.bin))].join('|')})( |$)`;
+
+// pgrep -f pattern for the NARROWER question: "is the queenzee's HEADLESS turn in flight right
+// now?" — as opposed to AGENT_PROC_PATTERN, which also matches the interactive session a human
+// drives in the pane. The difference decides who owns the cxell's terminal, and therefore whether
+// a message can be TYPED into it at all (see cxellTalkCommand): during a headless turn the pane is
+// zee-attach.sh's read-only feed, and keystrokes sent there are swallowed.
+//
+// ⚠ MUST stay in lockstep with `live_run()` in docker/zeehive/zee-attach.sh — that script decides
+// the same thing from inside the cage, and the two disagreeing is a message delivered into a void.
+//
+// The BRACKETS are load-bearing, and were put here by a live misfire rather than by theory: this
+// pattern is interpolated into the shell command the queenzee execs over SSH, so `pgrep -f` reads
+// its own wrapper's cmdline — which contains the pattern — and matched IT. Every message would then
+// look mid-turn and queue, in a cage with no turn running at all. `[-]p` matches "-p" while the
+// literal text "[-]p" does not, so the probe cannot see itself. (Same trick, same reason, as
+// `zee-live[.]mjs` in terminal-bridge.js.)
+export const HEADLESS_PROC_PATTERN = 'claude --bare [-]p|codex [e]xec|kimi [-]p';

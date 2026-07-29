@@ -21,6 +21,7 @@
 //
 // Everything it creates is torn down in a finally, whatever happens. NO test data is left behind.
 import pg from 'pg';
+import { readFileSync } from 'node:fs';
 
 const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
@@ -490,6 +491,47 @@ try {
   await refuses(() => T.breakdownTicket(t1.id, {
     items: [{ title: 'child', parent_id: 'later' }, { ref: 'later', title: 'parent', kind: 'activity' }],
   }), /neither a work item id nor a ref/, 'a breakdown naming a ref declared LATER (refs resolve backwards only)');
+
+  // ── REGRESSION: the HTTP status is CARRIED, not matched out of the prose ─
+  //
+  // This used to be a regex over the message text ("cannot", "cycle", "root item"…). That made every
+  // refusal sentence load-bearing: reword one and its status flipped silently — no test failing, no
+  // log line, and every client branching on 409-vs-400 wrong from then on. The wording and the
+  // status are now independent, and these assertions are what keep them that way.
+  section('a status is a tag, not a word in a sentence');
+  const statusOf = async (fn) => { try { await fn(); return null; } catch (e) { return W.httpStatusOf(e); } };
+
+  ok(await statusOf(() => W.getWorkItem('not-a-uuid')) === 400, 'a malformed id is 400');
+  ok(await statusOf(() => W.createWorkItem({ project_id: PID })) === 400, 'a missing title is 400');
+  ok(await statusOf(() => W.createWorkItem({ project_id: PID, title: 'x', status: 'nonsense' })) === 400,
+     'an unknown status is 400');
+  ok(await statusOf(() => W.deleteWorkItem(root.id)) === 409, 'deleting the project root is 409');
+  ok(await statusOf(() => W.moveWorkItem(root.id, { parent_id: act.id })) === 409, 'moving the root is 409');
+  const doneItem = await W.createWorkItem({ project_id: PID, title: 'finished', kind: 'task', status: 'done' });
+  ok(await statusOf(() => W.setStatus(doneItem.id, 'working')) === 409, 'a done item jumping to working is 409');
+  await W.deleteWorkItem(doneItem.id);
+
+  // the DATABASE's own refusals are tagged by postgres ERROR CODE (P0001 = our guard triggers),
+  // never by their wording — so a trigger message could be rewritten in any language and stay 409
+  ok(await statusOf(() => W.createWorkItem({ project_id: PID, parent_id: root2.id, title: 'x', kind: 'task' })) === 409,
+     'a cross-project parent (raised by a TRIGGER) is 409, classified by pg error code');
+  ok(await statusOf(() => W.addDep(taskC.id, taskC.id)) === 409, 'a self-dependency (trigger) is 409');
+  ok(await statusOf(() => W.updateWorkItem(taskC.id, { starts_on: '2026-08-10', due_on: '2026-08-01' })) === 400,
+     'an inverted schedule is 400 — bad input, not a conflict');
+
+  // THE POINT: the text cannot move the status, in either direction.
+  ok(W.httpStatusOf(Object.assign(new Error('cannot cycle under the root item — legal next'), { status: 400 })) === 400,
+     'an error stuffed with every old trigger word stays 400 when it is TAGGED 400');
+  ok(W.httpStatusOf(Object.assign(new Error('a perfectly bland sentence'), { status: 409 })) === 409,
+     'and a bland sentence is still 409 when it is TAGGED 409');
+  ok(W.httpStatusOf(new Error('cannot cycle root item same project nested under cross projects')) === 400,
+     'an UNTAGGED error is 400 however many of the old regex words it contains');
+  ok(W.httpStatusOf(new Error('anything')) === 400 && W.httpStatusOf(null) === 400,
+     'and the fallback for anything untagged is 400, as it always was');
+  ok(W.refuse('x').status === 409 && W.bad('x').status === 400 && W.notFound('x').status === 404,
+     'the three constructors carry 409 / 400 / 404');
+  ok(!readFileSync('server/src/api/routes.js', 'utf8').includes('const CONFLICT ='),
+     'and routes.js no longer carries a regex that reads refusal text at all');
 
   // ── ATOMICITY: a breakdown is ALL or NOTHING ─────────────────────────────
   //

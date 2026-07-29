@@ -48,7 +48,9 @@ and a zee goes to work in one.
   (`cxell_<slug>` on the `zee-hive-net` network). No docker socket, no host filesystem, a
   default-deny egress firewall — the queenzee API is its only door out, and every privileged
   verb behind that door lands on a human gate. The repo enters as a git bundle; commits leave
-  the same way. See [docs/cxell-zee-manual.md](docs/cxell-zee-manual.md).
+  the same way. The zee's manual is not a file in this repo: it lives in the **meta-DB** (harness
+  `zee-base`, seeded and amended by `db/migrations/`) and is delivered into every xell at
+  `.zeehive/harness/memory/cxell-zee-manual.md`, so it can never drift from the API it documents.
 - **zee** — an agent (a Claude session) bound to exactly one xell, running inside its cxell.
 - **manager zee** — a zee whose job is running OTHER zees: it dispatches workers, talks to them in
   real time, reads their post-ship reflections, and suggests when one is done (a human confirms).
@@ -105,8 +107,11 @@ docker/zeehive/  Dockerfile.server (the queenzee), Dockerfile.zee-agent (the cxe
 scripts/         provisioning/despawn/build/ship scripts + `zee`, the ONE copy of the in-cxell
                  CLI (the zee-agent image COPYs it from the repo-root build context; the
                  queenzee also installs it into each cxell at spawn — never a second copy)
-docs/            deploy-topology spec, the cxell zee manual
+docs/            deploy-topology spec, manager zees, the work tracker, harnesses
 ```
+
+**Working on ZEEHIVE (human or zee)? Start at [CLAUDE.md](CLAUDE.md)** — how to tell which surface
+you are on, the verbs that are actually yours, how to run and verify, and a map of the docs.
 
 ## Developing ZEEHIVE with ZEEHIVE
 
