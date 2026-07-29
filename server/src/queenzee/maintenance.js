@@ -25,6 +25,10 @@ import { refreshProdDiffAfterRestore } from './proddiff.js';
 // The DATA half of a backup's guarantee — pure functions + the catalog SQL, kept out of here so both
 // the capture and every reading of it (trend, restore check) are testable with no docker (row-counts.js).
 import { ROW_COUNT_SQL, parseRowCounts, rowTotal, compareBackupCounts } from '../lib/row-counts.js';
+// WHEN the next backup is due (a failure shortens the window, it does not consume it) and WHEN a human
+// is told the restore point is stale — pure decisions, so the TIMING is asserted by a test (#26).
+import { backupDecision, staleAlertDecision } from '../lib/backup-schedule.js';
+import { notifyBackupStale, notifyBackupRecovered } from '../lib/notify.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -1056,19 +1060,83 @@ export async function reconcileInterruptedJobs() {
   return { backups: snaps.length, containers: cons.length };
 }
 
-// Is a fresh prod backup due for this project? (no backup yet, or the newest is older than the
-// configured interval.) Considers any latest row so a just-started/failed one prevents a storm.
-async function backupDue(projectId) {
+// Is a fresh prod backup due for this project, and WHY — ticket #26.
+//
+// It used to be one question ("is the newest attempt, of any status, older than the policy interval?")
+// and that let a FAILED attempt SATISFY its window: one failure pushed the next good dump out by a full
+// interval, two in a row cost a day with no restore point, silently. Now a failure schedules a RETRY
+// interval instead (lib/backup-schedule.js: 10 min, doubling per consecutive failure, capped at the
+// policy interval so it can only ever be sooner than the old behaviour, never later).
+//
+// The FAILURE STREAK is read from the ledger rather than held in memory: the incident that produced
+// this ticket was a server restart, and state that forgets across a restart is state that forgets
+// exactly when it matters. Returns the whole decision so the caller can log the reason it acted on.
+export async function backupDue(projectId, now = Date.now()) {
   const cfg = await one(`SELECT backup_interval_sec FROM pool_config WHERE project_id=$1`, [projectId]);
   const interval = cfg?.backup_interval_sec ?? DEFAULT_INTERVAL_SEC;
-  const last = await one(
-    `SELECT taken_at FROM db_snapshot WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC LIMIT 1`,
-    [projectId]);
-  if (!last) return true;
-  const row = await one(
-    `SELECT (now() - $1::timestamptz) >= ($2 || ' seconds')::interval AS due`,
-    [last.taken_at, interval]);
-  return !!row?.due;
+  const lastAttempt = await one(
+    `SELECT id, taken_at, status FROM db_snapshot WHERE project_id=$1 AND source='prod'
+      ORDER BY taken_at DESC LIMIT 1`, [projectId]);
+  const lastGood = await one(
+    `SELECT id, taken_at FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='finished'
+      ORDER BY taken_at DESC LIMIT 1`, [projectId]);
+  // Consecutive failures SINCE the last success — the backoff's exponent. Counted in SQL so a restart
+  // cannot reset it back to "first retry" and start the 10-minute cadence over.
+  const streak = await one(
+    `SELECT count(*)::int AS n FROM db_snapshot
+      WHERE project_id=$1 AND source='prod' AND status='failed'
+        AND ($2::timestamptz IS NULL OR taken_at > $2::timestamptz)`,
+    [projectId, lastGood?.taken_at ?? null]);
+
+  return backupDecision({ lastAttempt, lastGood, failStreak: streak?.n ?? 0, intervalSec: interval, now });
+}
+
+// Tell a human that PRODUCTION'S RESTORE POINT IS STALE, at most once per policy interval, and tell
+// them once when it recovers. All decisions are in lib/backup-schedule.js (pure, and tested with
+// explicit clocks); this is only the plumbing plus the persistence of "who has been told".
+//
+// BEST-EFFORT, ABSOLUTELY: it is called from the tick, never from a backup job, every failure is
+// swallowed, and it writes nothing except its own alert bookkeeping. A notifier that can fail a backup
+// is worse than no notifier — the dump is the product.
+async function checkBackupFreshness(projectId, now = Date.now()) {
+  try {
+    const cfg = await one(
+      `SELECT backup_interval_sec, backup_alerted_at, backup_alert_open FROM pool_config WHERE project_id=$1`,
+      [projectId]);
+    const interval = cfg?.backup_interval_sec ?? DEFAULT_INTERVAL_SEC;
+    const lastGood = await one(
+      `SELECT id, taken_at FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='finished'
+        ORDER BY taken_at DESC LIMIT 1`, [projectId]);
+    const d = staleAlertDecision({
+      lastGood, intervalSec: interval,
+      alertedAt: cfg?.backup_alerted_at ?? null, alertOpen: !!cfg?.backup_alert_open, now });
+    if (!d.fire && !d.clear) return d;
+
+    const project = await one(`SELECT id, name FROM project WHERE id=$1`, [projectId]);
+    if (d.fire) {
+      const streak = await one(
+        `SELECT count(*)::int AS n FROM db_snapshot
+          WHERE project_id=$1 AND source='prod' AND status='failed' AND taken_at > $2::timestamptz`,
+        [projectId, lastGood.taken_at]);
+      logline('maint', `⚠ ${project?.name || projectId}: PROD RESTORE POINT IS STALE — ${d.reason}. `
+        + 'Telling a human off-screen (a stale restore point is not visible to anyone who is not looking '
+        + 'at the panel, which is how this went unnoticed for 27 hours).');
+      notifyBackupStale({
+        project, ageHours: Math.round(d.ageSec / 3600), thresholdHours: Math.round(d.thresholdSec / 3600),
+        lastGoodAt: lastGood.taken_at, failStreak: streak?.n ?? 0 });
+      await q(`UPDATE pool_config SET backup_alerted_at=now(), backup_alert_open=true WHERE project_id=$1`, [projectId]);
+    } else {
+      logline('maint', `${project?.name || projectId}: ${d.reason}`);
+      notifyBackupRecovered({ project, ageMinutes: Math.round(d.ageSec / 60) });
+      await q(`UPDATE pool_config SET backup_alert_open=false WHERE project_id=$1`, [projectId]);
+    }
+    return d;
+  } catch (e) {
+    // Never propagates: this runs beside the backup decision, and an alerting bug must not be able to
+    // stop backups from being taken.
+    logline('maint', `backup-freshness check failed (backups unaffected): ${e.message}`);
+    return null;
+  }
 }
 
 // Refresh pooled db-isolated xells that have gone stale, from the latest FINISHED prod snapshot.
@@ -1115,11 +1183,15 @@ export function startMaintenance() {
   // Deferral memory: reason we last logged per project, so a held lock logs ONCE when the
   // deferral starts and once when prod frees up — not every 60s tick in between.
   const deferred = new Map();
+  // What we last SAID about a retry, per project, so a 10-minute retry window does not print a line
+  // every 60-second tick. Log noise is the same disease as alert noise, one screen down.
+  const saidRetry = new Map();
   const tick = async () => {
     try {
       const projects = await q(`SELECT id FROM project`);
       for (const p of projects) {
-        if (await backupDue(p.id)) {
+        const d = await backupDue(p.id);
+        if (d.due) {
           const busy = await prodBusyReason(p.id);
           if (busy) {
             if (deferred.get(p.id) !== busy) {
@@ -1128,11 +1200,23 @@ export function startMaintenance() {
             }
           } else {
             if (deferred.delete(p.id)) logline('maint', 'prod is free again — running the deferred backup now');
+            // A RETRY says so, and says which attempt it is: the whole point of #26 is that a failure
+            // brings the next attempt forward, and that has to be visible when it happens.
+            if (d.kind === 'retry') logline('maint', `prod backup RETRY — ${d.reason}`);
+            saidRetry.delete(p.id);
             await backupProd(p.id).catch((e) => {   // starts an async job; may no-op if one runs
               if (!/already running/.test(e.message)) throw e;
             });
           }
+        } else if (d.kind === 'retry' && saidRetry.get(p.id) !== d.dueAt) {
+          // Not due YET, but a retry is scheduled — say it ONCE per schedule, so an operator watching
+          // the terminal can see the backoff working instead of silence.
+          saidRetry.set(p.id, d.dueAt);
+          logline('maint', `prod backup will RETRY in ${Math.ceil(d.waitSec / 60)} min — ${d.reason}`);
         }
+        // Alerting runs on EVERY tick, not only when a backup is due: the whole failure was that
+        // nothing spoke while nothing was happening. It never throws and never touches the dump.
+        await checkBackupFreshness(p.id);
         await refreshStaleXellDbs(p.id);
       }
     } catch (e) { console.error('[maintenance]', e.message); }

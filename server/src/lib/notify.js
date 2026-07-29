@@ -65,3 +65,29 @@ export function notifyLandRequest({ project, xell, commits, request }) {
     `${who} -> ${project.name}/${request.ref.replace('refs/heads/', '')}: ${n} commit(s) need your OK`,
     'orange');
 }
+
+// PRODUCTION'S RESTORE POINT IS STALE — ticket #26. This is the one notification in here that is not
+// about a zee waiting on a decision: nobody is blocked, and that is exactly why it needs the off-screen
+// path. A held landing stops work and gets noticed within minutes; a backup that quietly stopped
+// happening is only visible to someone who thinks to look at a panel, and the cost of not looking is
+// measured in hours of production data with no restore point. It went unnoticed for ~27 hours under a
+// 12-hour policy before anyone found it, and only then because a zee was reading the table.
+//
+// Deliberately BOUNDED by the caller (lib/backup-schedule.js): it fires when the newest GOOD dump is
+// older than two policy intervals, then at most once per policy interval. The first thing a chatty
+// alert costs is the next real one.
+export function notifyBackupStale({ project, ageHours, thresholdHours, lastGoodAt, failStreak }) {
+  ping('Prod backup STALE',
+    // ASCII only: the device drops non-latin1 glyphs (a '→' arrives as a blank).
+    `${project?.name || 'project'}: newest good dump is ${ageHours}h old (policy allows ${thresholdHours}h)`
+    + `${failStreak ? `, ${failStreak} failed attempt(s) since` : ''}`,
+    'red');
+}
+
+// And the same alert standing down. Sent ONLY when a stale alert was outstanding, so a human who was
+// woken is told it is fixed and nobody else hears anything at all.
+export function notifyBackupRecovered({ project, ageMinutes }) {
+  ping('Prod backup OK',
+    `${project?.name || 'project'}: a good dump landed ${ageMinutes} min ago — restore point is current`,
+    'green');
+}

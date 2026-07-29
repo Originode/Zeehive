@@ -805,6 +805,10 @@ a.cbox:hover { border-color: var(--accent); }
    healthy, the RESTORE POINT is old — a warning to act on, not an outage. The label itself takes the
    amber border so the reading a human already looks at is the thing that changes. */
 .bklast.stale { border-color: #d9a441; color: #e8c98a; }
+/* "retry in 8 min" — what the queenzee will DO about a failed attempt (#26). Muted, not a warning:
+   it is the reassuring half of the sentence the amber marks start. */
+.bknext { color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px;
+  font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
 .bkstale { color: #d9a441; border: 1px solid #d9a441; border-radius: 6px; padding: 1px 7px;
   font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
 .bkcog { margin-left: auto; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
