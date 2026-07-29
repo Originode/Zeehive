@@ -24,6 +24,7 @@ import { createHash } from 'node:crypto';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
 import { adapterFor, CLAUDE_ADAPTER, AGENT_PROC_PATTERN, HEADLESS_PROC_PATTERN } from './cxell-runtimes.js';
+import { cxellCacheRunArgs, cxellCacheFixupCommand, CXELL_NPM_CACHE_DIR } from './npm-cache.js';
 import { classifyMergeOutput } from '../queenzee/xellgit.js';
 
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
@@ -375,6 +376,18 @@ export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source',
 // SSH port on 127.0.0.1 (the attend door — host-only; the queenzee's ssh2 bridge and a
 // same-machine Claude Code desktop both reach it, nothing on the LAN does). Returns the port
 // actually bound, scanning upward if the slug-derived one is taken.
+// The `docker run` argv for a cxell, as data — pure, so a test can assert what a cage is created
+// with (the shared npm cache mount included) without a daemon, the same way the file-install
+// commands are asserted.
+export function cxellRunArgs({ name, net, port, img, xellId }) {
+  return ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
+    '-p', `127.0.0.1:${port}:22`,
+    // ONE npm cache for the whole fleet: without it every cxell re-downloads the same tarballs
+    // into its own empty ~/.npm, which is the repetition ticket #7 is about. Empty when disabled.
+    ...cxellCacheRunArgs(),
+    '--label', 'zeehive.cxell=1', '--label', `zeehive.xell=${xellId || ''}`, img];
+}
+
 export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image }) {
   const name = cxellName(slug);
   const img = image || IMAGE;   // per-project override (e.g. the Android SDK variant); else the base
@@ -386,9 +399,17 @@ export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image }
   let port = sshPort || cxellSshPort(slug);
   for (let attempt = 0; attempt < 12; attempt++, port++) {
     try {
-      await dk(ctx, ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
-        '-p', `127.0.0.1:${port}:22`,
-        '--label', 'zeehive.cxell=1', '--label', `zeehive.xell=${xellId || ''}`, img]);
+      await dk(ctx, cxellRunArgs({ name, net, port, img, xellId }));
+      // A fresh named volume is root-owned; npm runs as `zee`. Fix it (cheap, idempotent) and SAY
+      // when the cache came up read-only, because that turns every `npm ci` in this cage into a
+      // failure a human would otherwise have to guess at. Best-effort: never fails the create.
+      const fixup = cxellCacheFixupCommand(name);
+      if (fixup) {
+        const r = await dk(ctx, fixup).catch((e) => ({ out: `CACHE_ERR ${e.message}` }));
+        if (!/CACHE_RW/.test(r.out || '')) {
+          logline('cxell', `${name}: shared npm cache is NOT writable (${String(r.out).trim().slice(0, 120)}) — npm in this cage falls back to its own cache; set CXELL_NPM_CACHE_VOLUME=off if this persists`);
+        }
+      }
       return { name, sshPort: port };
     } catch (e) {
       if (/port is already allocated|address already in use|bind/i.test(e.message)) {
@@ -674,11 +695,16 @@ export async function sealCxell({ ctx, name, blockTcp = [] }) {
 // zee can still install what it needs.
 export async function warmCxell({ ctx, name }) {
   try {
+    // `npm ci` here reads the SHARED cache volume mounted by ensureCxell, so this is an unpack from
+    // local content-addressed storage rather than a registry download — the same work, without the
+    // network. It reports the cache it used so a slow warm can be told apart from a cold cache.
     const r = await dk(ctx, ['exec', name, 'bash', '-lc',
-      'cd /work/repo && (npm ci --no-audit --no-fund || npm install --no-audit --no-fund) '
+      'cd /work/repo && echo "npm cache: $(npm config get cache)" '
+      + '&& (npm ci --no-audit --no-fund || npm install --no-audit --no-fund) '
       + '&& (npm run build --workspace web >/dev/null 2>&1 || true) && echo WARM_OK'],
       { timeoutMs: 900000 });
-    return { warmed: /WARM_OK/.test(r.out) };
+    const shared = new RegExp(`npm cache: ${CXELL_NPM_CACHE_DIR}`).test(r.out);
+    return { warmed: /WARM_OK/.test(r.out), sharedCache: shared };
   } catch (e) {
     logline('cxell', `${name}: warm (npm/build) incomplete — the zee will install as needed: ${String(e.message).slice(0, 160)}`);
     return { warmed: false, error: e.message };

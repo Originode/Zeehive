@@ -439,6 +439,31 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   Test: `node test/harness-empty-visible.test.mjs` — the boot line against real rows, plus the real
   components rendered (react-dom/server) and the real canvas functions DRAWN against a recording
   2D context, so a regex over the source can't fake it.
+- **ONE npm cache for the fleet, and a pooled xell warms itself** (2026-07-29, ticket #7 — "give
+  provisioned xells the usual stuff needed such as pg driver so they dont have to install it every
+  time"). Nothing was broken: `warmCxell()` already ran `npm ci` in a cage and
+  `start-xell-process.sh` runs one on a host worktree. The waste was that each started from a COLD
+  cache — a cxell is a fresh container with its own empty `~/.npm`, so every xell of every project
+  re-downloaded the same tarballs. Now: `ensureCxell()` mounts a shared docker volume
+  (`zeehive_npm_cache` → `/npm-cache`, `NPM_CONFIG_CACHE` set with it) and the queenzee spawns the
+  host-side starter with `npmCacheEnv()` (`<reposDir>/.npm-cache`); `provisionXell()` warms a
+  POOLED xell's worktree while it sits ready, so the install is on the pool's clock, not the zee's.
+  All of it in `server/src/lib/npm-cache.js`, all of it best-effort — a cold volume, an unwritable
+  cache or a failed warm may never fail a provision or a dispatch, and `CXELL_NPM_CACHE_VOLUME=off`
+  / `ZEEHIVE_NPM_CACHE=off` restore the old behaviour exactly.
+  **`npm ci`, never `npm install`, on a pool-watched worktree** — install rewrites the lockfile, the
+  pool reads a dirty worktree and reaps the xell (the 2026-07-20 provision→build→reap loop). A
+  worktree with no lockfile is SKIPPED by the warm rather than installed.
+  Measured in a cxell on this repo (217 packages, 577MB `node_modules`), same machine, cache the
+  only variable: cold **20.6 / 31.8 / 46.1s** (176MB downloaded) vs warm **9.9 / 13.2 / 27.4s** (zero
+  downloaded), and `npm ci --offline` against the warm cache succeeds in **13.3s** — proof the cache
+  alone satisfies the whole install. All the saving is network, so a slower link gains more.
+  Ownership matters: a fresh named volume is root-owned and npm runs as `zee`, so Dockerfile.zee-agent
+  ships `/npm-cache` owned by zee (docker seeds a new volume from the image path) and the create path
+  chowns + probes it, logging loudly if the cache came up read-only. No project `node_modules` are
+  baked into the agent image — it is shared by every project and would go stale against each lockfile.
+  Test: `node test/npm-cache.test.mjs`. NOT verified: no docker in a cxell, so the mount, the fixup
+  and a real warm were never observed running — only the argv/env they are built from.
 - **A repaired harness reaches the zees ALREADY RUNNING** (2026-07-29, the last thread of ticket #1).
   Harness files are materialized into a xell at DISPATCH, so fixing a bundle used to reach new zees
   only — which is precisely what left the running fleet briefed on nothing while the fix sat in the

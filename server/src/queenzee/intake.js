@@ -1249,7 +1249,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
     logline('cxell', `${name}: warming (npm ci + web build) so the zee starts ready…`);
     const warm = await warmCxell({ ctx, name });
-    logline('cxell', `${name}: ${warm.warmed ? 'warmed (deps + web build ready)' : 'warm incomplete — zee will install as needed'}`);
+    logline('cxell', `${name}: ${warm.warmed ? 'warmed (deps + web build ready)' : 'warm incomplete — zee will install as needed'}`
+      + `${warm.sharedCache ? ' [shared npm cache]' : ' [per-container npm cache — a cold download]'}`);
     const sealed = await sealCxell({ ctx, name, blockTcp });
     logline('cxell', `${name}: ${sealed[sealed.length - 1]}`);
     // Open the attend door: authorize the fleet key and start sshd with the token in the login

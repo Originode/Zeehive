@@ -16,6 +16,8 @@ import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { resolveEnvironmentFor, fullVarsFor } from './environments.js';
+import { warmWorktree } from './npm-cache.js';
+import { logline } from './logbus.js';
 
 const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* noop */ } };
 
@@ -497,6 +499,14 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {
       await emitXellEnv(xell.id).catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
+      // WARM THE WORKTREE ON THE POOL'S CLOCK, not the zee's. A pooled xell sits `ready` for
+      // minutes or hours; doing its `npm ci` now costs nobody anything, fills the SHARED package
+      // cache for every xell that follows, and means the first build of a process role is not also
+      // a cold install. Deliberately NOT awaited and never fatal — a provision that failed because
+      // a cache was cold would be a far worse bug than the one this fixes. `npm ci` only: a
+      // worktree with no lockfile is skipped rather than `npm install`ed, because install rewrites
+      // the lock and the pool reaps a dirty worktree (the 2026-07-20 provision→build→reap loop).
+      warmWorktree(worktree, { slug }).catch((e) => logline('pool', `${slug}: worktree warm errored (ignored): ${e.message}`));
     }
     return { ...xell, ports, url, mode };
   } catch (err) {

@@ -76,7 +76,14 @@ RUN sed -i 's/\r$//' /usr/local/bin/cxell-firewall.sh /usr/local/bin/cxell-sshd.
 
 RUN useradd -m -s /bin/bash zee \
     && mkdir -p /work && chown zee:zee /work \
-    && mkdir -p /home/zee/.ssh && chmod 700 /home/zee/.ssh && chown zee:zee /home/zee/.ssh
+    && mkdir -p /home/zee/.ssh && chmod 700 /home/zee/.ssh && chown zee:zee /home/zee/.ssh \
+    # The SHARED npm cache mountpoint (ticket #7). It exists in the image, owned by `zee`, purely so
+    # that the first cxell to mount the fleet's cache VOLUME here initializes it with that ownership
+    # — docker seeds a new named volume from the image path, and a root-owned cache would give npm
+    # (which runs as zee) EACCES on every install. NOT a cache: nothing is baked in, and project
+    # node_modules deliberately never are — the image is shared by every project and would go stale
+    # against each one's lockfile. See server/src/lib/npm-cache.js.
+    && mkdir -p /npm-cache && chown zee:zee /npm-cache
 USER zee
 WORKDIR /work
 ENV NODE_NO_WARNINGS=1 \
