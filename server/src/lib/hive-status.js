@@ -85,6 +85,20 @@ export function hiveStatus(x, sig = {}) {
   if (s === 'tearing-down')              return 'occ-done';          // a human confirmed; reaping
   if (s === 'error' || s === 'husk')     return 'vac-dirty';         // needs queenzee housekeeping
 
+  // RETIRED: the xell is GONE — reaped, worktree and containers removed, zee decommissioned. There
+  // is no hive word for it because the hive never draws one: every caller here filters
+  // `status <> 'retired'` before asking (fleet.js, managers.crewFor), and self.js only ever asks
+  // about a live xell it is running inside. So this is a GUARD, not a new state, and it changes no
+  // existing behaviour — nothing that calls this function today can reach this line.
+  //
+  // It exists because the fallback at the bottom of this function ("an occupied-but-unclassified
+  // row reads as claimed rather than blank") was speaking for retired rows too, and that answer is
+  // a lie rather than a safe default: a caller that did NOT pre-filter got 'occ-claimed' for a xell
+  // reaped weeks ago. lib/work-items.js resolves xells by id — it inherits no such filter — so a
+  // board card reported a live zee on work whose agent no longer existed. Answering null says the
+  // only true thing: this row has no place on the hive. hiveLabel(null) is already '—'.
+  if (s === 'retired')                   return null;
+
   // ── vacant pool xells (no zee has claimed them yet) ──
   if (s === 'provisioning')              return 'vac-provisioning';
   if (s === 'ready')                     return 'vac-ready';

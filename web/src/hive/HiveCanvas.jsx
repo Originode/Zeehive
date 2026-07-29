@@ -61,6 +61,17 @@ const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
 // read-only hold on production.
 export const isManagerXell = (x) => x?.zee_type === 'manager';
 
+// ── who WEARS a harness vs who its badge is FOR ──────────────────────────────
+// `wearer_ids` is every live xell wearing the harness; `consumer_ids` is the subset the badge is
+// drawn for — the xells that get a wire routed through its cell. A MANAGER is a wearer and never a
+// consumer (server/src/lib/timeline.js), because a manager's hexagon is ALREADY drawn as that
+// harness's persona: dashed seat + its avatar disc. Giving the same harness its own cell beside the
+// manager seats the identical avatar twice and spends a grid cell saying what the manager xell
+// already says. So a harness worn by managers ONLY earns no cell at all — it still travels in the
+// payload, because the manager hexagon needs its art.
+export const wearersOf = (h) => h?.wearer_ids || h?.consumer_ids || [];   // old payloads: wearers = consumers
+export const badgedHarnesses = (harnesses = []) => (harnesses || []).filter((h) => (h?.consumer_ids || []).length > 0);
+
 // What a manager's hexagon says, as data (pure — unit-tested; the drawing below only paints it).
 export function managerCard(x, crew = []) {
   const list = crew || [];
@@ -539,7 +550,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     const harnesses = timeline?.harnesses || [];
     const crewOf = {};
     for (const x of list) if (x.manager_xell_id) (crewOf[x.manager_xell_id] ||= []).push(x);
-    const harnessOf = (id) => harnesses.find((h) => (h.consumer_ids || []).includes(id)) || null;
+    // WEARS it (wearer_ids), not "is a consumer of" it: a manager is a wearer but never a consumer,
+    // because its hexagon IS the badge — the persona disc below is exactly the art this looks up.
+    // Falling back to consumer_ids keeps an older payload (and the demo fixture) rendering.
+    const harnessOf = (id) => harnesses.find((h) => wearersOf(h).includes(id)) || null;
     const getImg = (url) => {
       if (!url) return null;
       let img = imgCacheRef.current.get(url);
@@ -553,11 +567,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     };
 
     // hover highlight: a hovered hex, a hovered commit dot, OR a hovered harness badge lights up the
-    // matching hex(es). Hovering a harness highlights every xell that wears it (its consumers) —
-    // the reverse of a xell hover highlighting the harness it wears.
+    // matching hex(es). Hovering a harness highlights every xell that WEARS it — the reverse of a
+    // xell hover highlighting the harness it wears. Wearers, not consumers: a manager wears it and
+    // belongs in that highlight even though it never takes a cell or a wire from it.
     const H = hoverRef ? hoverRef.current : { id: null, commit: null, harness: null };
-    const hovHarness = H.harness ? (timeline?.harnesses || []).find((h) => h.id === H.harness) : null;
-    const hovHarnessConsumers = new Set(hovHarness?.consumer_ids || []);
+    const hovHarness = H.harness ? harnesses.find((h) => h.id === H.harness) : null;
+    const hovHarnessConsumers = new Set(wearersOf(hovHarness));
     const hoverActive = !!(H.id || H.commit || H.harness);
     const isHov = (id) => id === H.id || (!!H.commit && baseOf(id) === H.commit) || hovHarnessConsumers.has(id);
 
@@ -600,8 +615,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // never collides with one. The avatar is drawn on the CANVAS (reliable drawImage of a preloaded
     // SVG) rather than an SVG <image> that browsers fail to load; <Connectors> routes the consumer
     // wires through this centre.
+    // ...and only the harnesses whose badge is FOR someone: a manager-only harness is skipped here,
+    // because the manager's own hexagon (drawn above, in this badge's language) already indicates it.
+    const badged = badgedHarnesses(harnesses);
     const harnessCells = [];
-    if (harnesses.length) {
+    if (badged.length) {
       const cols = Math.max(1, lay.cols);
       const occupied = new Set(Object.values(cells).map(([r, c]) => cellKey(r, c)));
       for (const k of reserved) occupied.add(k);
@@ -623,12 +641,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       if (H.commit) for (const t of (timeline?.xells || [])) if (t.base_commit === H.commit) focusedIds.add(t.id);
       for (const id of hovHarnessConsumers) focusedIds.add(id);
       const anyFocus = focusedIds.size > 0 || !!H.harness;
-      for (const h of harnesses) {
+      for (const h of badged) {
         const [row, col] = nextFree();
         const [cx, cy] = cellCenter(row, col, cellSize, originX, originY);
         harnessCells.push({ id: h.id, cx, cy, size: drawSize, cell: cellSize, color: h.color });
         // a harness badge is hi when it is the one being hovered, or a focused xell wears it
-        const hi = h.id === H.harness || (h.consumer_ids || []).some((id) => focusedIds.has(id));
+        const hi = h.id === H.harness || wearersOf(h).some((id) => focusedIds.has(id));
         drawHarnessBadge(ctx, cx, cy, drawSize, h, getImg(h.avatar_url), { hi, dim: anyFocus && !hi });
       }
     }
@@ -1089,7 +1107,9 @@ function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false }
   ctx.font = `600 ${Math.max(9, size * 0.16)}px 'Segoe UI', sans-serif`;
   ctx.fillStyle = COL.text;
   ctx.fillText(fit(ctx, h.label || '', hexWidth(size) * 0.82), cx, cy + size * 0.5);
-  const n = (h.consumer_ids || []).length;
+  // ×N counts every xell WEARING it, not just the ones wired to this cell — a manager wears a harness
+  // without consuming a cell for it (its own hexagon is the persona), and it still counts as harnessed.
+  const n = wearersOf(h).length;
   if (n) {
     ctx.font = `600 ${Math.max(8, size * 0.13)}px 'Segoe UI', sans-serif`;
     ctx.fillStyle = COL.muted;
