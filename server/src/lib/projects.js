@@ -614,8 +614,15 @@ export async function updatePoolConfig(projectId, body = {}) {
       vals.push(null);
       sets.push(`default_harness_id = $${vals.length}`);
     } else {
-      const h = await one(`SELECT id FROM harness WHERE key=$1 AND enabled AND NOT is_law_core`, [key]);
+      const h = await one(`SELECT id, project_id FROM harness WHERE key=$1 AND enabled AND NOT is_law_core`, [key]);
       if (!h) throw new Error(`no enabled harness keyed "${key}"`);
+      // SCOPE (084): a project-scoped harness is only a default for ITS project. The DB trigger
+      // (pool_default_harness_scope_guard) is the wall; this is the sentence, because the default is
+      // the one path that attaches a persona without anybody naming it.
+      if (h.project_id && String(h.project_id) !== String(projectId)) {
+        throw new Error(`harness "${key}" belongs to another project — it cannot be this project's `
+          + "default harness. A default must be system-wide, or this project's own.");
+      }
       vals.push(h.id);
       sets.push(`default_harness_id = $${vals.length}`);
     }

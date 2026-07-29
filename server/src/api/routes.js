@@ -675,9 +675,12 @@ router.post('/xells/:id/db', async (req, res) => {
 // mutable; { harness: <key|id|null> }, null clears back to core-only).
 // `?zee_type=worker|manager` narrows the list to the harnesses a xell of that TYPE may wear (054) —
 // what every picker should ask for, so an operator is never offered a choice the assign would refuse.
-// Unfiltered still returns everything (the harness manager edits them all).
+// `?project=<id>` narrows it on the SCOPE axis (084): the system-wide harnesses plus that project's
+// own, never another project's — which is what every picker bound to a project should ask for.
+// Unfiltered still returns everything (the harness manager edits them all), and every row SAYS its
+// scope (`scope`, `project_id`, `project_name`).
 router.get('/harnesses', async (req, res) => {
-  try { res.json(await listHarnesses({ zeeType: req.query.zee_type || null })); }
+  try { res.json(await listHarnesses({ zeeType: req.query.zee_type || null, projectId: req.query.project || null })); }
   catch (err) { res.status(503).json({ error: err.message }); }
 });
 // Harness authoring (unlimited DB-owned personas — persona/skills/memory, created from the dashboard).
