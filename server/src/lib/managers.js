@@ -111,7 +111,16 @@ export async function crewFor(managerXellId) {
     return {
       xell_id: r.id, slug: r.slug, branch: r.branch, status: r.status,
       hive_status: hive, hive_status_label: hiveLabel(hive),
-      zee_status: r.zee_status || null, working: r.cli_active === true || r.zee_status === 'working',
+      zee_status: r.zee_status || null,
+      // WORKING is the zee's own status, and ATTACHED is the monitor's probe — two different facts,
+      // reported under two different names. They used to be ORed into `working`, and for a cxell
+      // worker that is simply wrong: the probe is a broad pgrep inside the cage, and once anyone has
+      // talked to that worker, zee-attach.sh leaves `claude --resume` in its pane for the life of the
+      // container, so the flag goes true on the first attach and never comes back down. A manager
+      // read five finished workers as busy for a whole session on the strength of it — and this read
+      // model is the only instrument a manager has.
+      working: r.zee_status === 'working',
+      attached: r.cli_active === true,
       model: r.model || null, title: r.zee_title || null,
       task: r.task_text ? String(r.task_text).split('\n')[0].slice(0, 160) : null,
       head_commit: r.head_commit || null,
