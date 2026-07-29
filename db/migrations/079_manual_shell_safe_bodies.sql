@@ -18,6 +18,13 @@
 -- their words are left alone. It goes through 076's `harness_memory_get`/`harness_memory_put`, which
 -- locate the entry BY PATH — the array is never rebuilt, so no sibling memory file can be lost.
 --
+-- SUPERSEDED BY 080 (kept as the record of what this migration did, and of what was true when it ran):
+-- the paragraph below describes the manager harness as FILE-BACKED, which stopped being true at 080.
+-- Every harness now lives entirely in the meta-DB — `harnesses/` is gone, `harness.dir` is NULL and
+-- `lib/harness.js` reads no filesystem (CLAUDE.md house rule 10) — so patching the MANAGER manual is a
+-- migration exactly like patching zee-base's, not a repo file edit, and nothing overwrites it at boot.
+-- This misled a reader in ticket #31; 088 is the manager-side put it should have been.
+--
 -- Only the `zee-base` manual is patched here. The MANAGER manual is file-backed
 -- (harnesses/manager/, refreshHarnesses reloads it from the folder at every boot), so its copy of
 -- this note lives in that FILE — a DB write to it would be overwritten on the next boot.
