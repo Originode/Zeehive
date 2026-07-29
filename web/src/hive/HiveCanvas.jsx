@@ -997,38 +997,43 @@ export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color =
   ctx.setLineDash([2, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
-  // The word rides an opaque pill INSIDE the seat (never outside it — a label in the corridor would
-  // be read as belonging to the wires). It is an overlay while a hover lasts, so it may cover a row
-  // of the card; it takes the topmost one, which is the least load-bearing. A hex too small to read
-  // the card's own text keeps the dashed ring alone — still a signal that is not a colour.
+  // The word rides an opaque pill INSIDE the seat (never outside it — a label in the corridor would be
+  // read as belonging to the wires). `tagY` is a PREFERENCE ORDER of rows, in fractions of the radius:
+  // a pointy-top hex narrows fast toward its vertex, so the roomiest row is not always the one that
+  // covers least, and the caller lists the rows it would rather give up in order. The first row where
+  // the whole word fits wins. A hex too small to read the card's own text keeps the dashed ring alone
+  // — still a signal that is not a colour.
   let shown = null;
   if (size >= 30) {
-    const y = cy + size * tagY;
     const pad = 10, nomPx = Math.max(7, size * 0.12);
-    const room = Math.max(0, hexHalfWidthAt(size, Math.abs(size * tagY)) * 2 * 0.94 - pad);
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     const font = (px) => `600 ${px}px 'Segoe UI', sans-serif`;
     const widthAt = (t, px) => { ctx.font = font(px); return ctx.measureText(t).width; };
     const long = `${tag.glyph} ${tag.long}`, short = `${tag.glyph} ${tag.word}`;
-    // The long form (which names the other end) if it fits, else the bare relation, else the bare
-    // relation SHRUNK to fit. Never an ellipsis: a word is the signal here, and "⬢ manag…" is not a
-    // word — if it cannot be read whole even at the floor size, the dashed ring carries the mark alone.
-    if (widthAt(long, nomPx) <= room) shown = long;
-    else if (widthAt(short, nomPx) <= room) shown = short;
-    else {
-      fillFont(ctx, short, room, 6.5, nomPx, font);
-      shown = ctx.measureText(short).width <= room ? short : null;
+    let at = null;
+    for (const ty of (Array.isArray(tagY) ? tagY : [tagY])) {
+      const room = Math.max(0, hexHalfWidthAt(size, Math.abs(size * ty)) * 2 * 0.94 - pad);
+      // The long form (which names the other end) if it fits, else the bare relation, else the bare
+      // relation SHRUNK to fit. Never an ellipsis: the word IS the signal here and "⬢ manag…" is not a
+      // word — if it cannot be read whole even at the floor size, this row is not the row.
+      if (widthAt(long, nomPx) <= room) shown = long;
+      else if (widthAt(short, nomPx) <= room) shown = short;
+      else {
+        fillFont(ctx, short, room, 6.5, nomPx, font);
+        shown = ctx.measureText(short).width <= room ? short : null;
+      }
+      if (shown) { at = cy + size * ty; break; }
     }
     if (!shown) { ctx.restore(); return { word: null, kind: tag.kind }; }
     const pw = ctx.measureText(shown).width + pad, ph = Math.max(10, size * 0.17);
     ctx.beginPath();
-    ctx.roundRect(cx - pw / 2, y - ph / 2, pw, ph, ph / 2);
+    ctx.roundRect(cx - pw / 2, at - ph / 2, pw, ph, ph / 2);
     ctx.fillStyle = withAlpha('#0a0d13', 0.86);
     ctx.fill();
     ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(col, 0.85);
     ctx.setLineDash([2, 3]); ctx.stroke(); ctx.setLineDash([]);
     ctx.fillStyle = col;
-    ctx.fillText(shown, cx, y + 0.5);
+    ctx.fillText(shown, cx, at + 0.5);
   }
   ctx.restore();
   return { word: shown, kind: tag.kind };
@@ -1344,9 +1349,12 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
   }
 
-  // its relation mark sits OUTSIDE the prod wall (gap 6, not 3) so the two dashed rings stay two rings
+  // its relation mark sits OUTSIDE the prod wall (gap 6, not 3) so the two dashed rings stay two rings,
+  // and its word prefers the strip ABOVE the persona disc — only falling onto the disc's top edge on a
+  // hex too narrow up there to read the word whole (a manager IS its avatar; cover it last)
   const mark = () => (related
-    ? drawRelationMark(ctx, cx, cy, size, { kind: related, slug: relatedTo, color: relColor, gap: 6 })
+    ? drawRelationMark(ctx, cx, cy, size, { kind: related, slug: relatedTo, color: relColor,
+                                            gap: 6, tagY: [-0.78, -0.62] })
     : null);
 
   ctx.save();

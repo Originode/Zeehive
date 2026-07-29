@@ -199,6 +199,11 @@ ok(mgrMarked.text.some((t) => t.t === '⬢ wise-cove') && mgrMarked.text.some((t
    && mgrMarked.text.some((t) => t.t === '🧭'),
    'identity, its read-only hold on prod and its persona glyph all still paint');
 ok(mgrMarked.text.every((t) => Math.abs(t.y - 200) <= 70), 'and nothing it paints leaves the hexagon');
+const mgrWord = (rec) => rec.text.find((t) => /^⬢ manager/.test(t.t));
+ok(((mgrWord(mgrMarked).y - 200) / 70) < -0.7,
+   'and at full size its word takes the strip ABOVE the persona disc — a manager IS its avatar, so the mark covers it last');
+ok(((mgrWord(paintMgr(mgr, 40, { related: 'manager', relatedTo: 'alpha' })).y - 200) / 40) > -0.7,
+   'on a hex too narrow up there to read the word whole it falls back a row rather than dropping the word');
 
 console.log('\n── every size branch, and the sane-by-default cases ──');
 for (const size of [70, 40, 20]) {
