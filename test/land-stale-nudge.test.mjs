@@ -20,6 +20,11 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// These exercise the LIVE half of the nested-queenzee guard (test/nested-queenzee-land-ship-guard.test.mjs):
+// a real queenzee moves real refs and resumes real cages, and this suite is what proves that did not
+// change. Declared BEFORE any import, because the modules read it once at load.
+process.env.PROVISION_MODE = 'real';
+
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { landApproved, sweepStalePending } = await import('../server/src/queenzee/landgate.js');
 const { tendOpen } = await import('../server/src/lib/status.js');

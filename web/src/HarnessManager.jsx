@@ -6,7 +6,87 @@ import { emptyWarning } from './harnessHealth.js';
 // layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
 // law harness is not shown here (it is not editable). This is a DB-owned surface: create/edit/delete
 // applies live, no land/ship.
-const blank = () => ({ label: '', glyph: '', summary: '', personality: '', parent: null, zee_type: 'worker', skills: [], memory: [], enabled: true, inherited: { skills: [], memory: [], chain: [] } });
+//
+// Since migration 080 this is THE authoring surface — the meta-DB owns every harness's text and there
+// is no file to edit instead — so it has to be usable for the real thing: a manual is 15k characters,
+// not a sentence. Hence full-height monospace editors with character counts, and INHERITED text that
+// can actually be read here (it was a char count, while the docs told people to "read it in the
+// harness manager"). What a wearer is briefed with is shown as one total, because that is what the
+// harness costs on every dispatch.
+const blank = () => ({ label: '', glyph: '', summary: '', personality: '', avatar_svg: '', parent: null, zee_type: 'worker', skills: [], memory: [], enabled: true, inherited: { skills: [], memory: [], chain: [] } });
+
+const chars = (t) => `${String(t || '').length.toLocaleString()} chars`;
+const fileSafe = (s) => String(s || 'note').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'note';
+const skillFile = (name) => fileSafe(name || 'skill');
+const memFile = (path) => `${fileSafe(String(path || 'memory').split('/').pop()).replace(/\.md$/, '')}.md`;
+
+// Everything a wearer is briefed with: this harness's own text plus the whole inherited chain. The
+// number is the point — a harness is tokens spent before the zee has read any code.
+export function briefingChars(form) {
+  if (!form) return 0;
+  const len = (t) => String(t || '').length;
+  const sum = (arr, pick) => (arr || []).reduce((n, x) => n + len(pick(x)), 0);
+  return len(form.personality)
+    + sum(form.skills, (s) => `${s.name}${s.when}${s.body}`)
+    + sum(form.memory, (m) => m.text)
+    + sum(form.inherited?.skills, (s) => `${s.name}${s.when}${s.body}`)
+    + sum(form.inherited?.memory, (m) => m.text);
+}
+
+// An inherited skill/memory entry: the line you could always see, plus the TEXT you could not. Closed
+// by default (the chain is long), read-only when open — the source is the parent harness.
+export function InheritedEntry({ icon, name, note, text }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="hm-inh">
+      <button type="button" className="hm-inh-head" onClick={() => setOpen(!open)}
+              aria-expanded={open} title={open ? 'collapse' : 'read it'}>
+        <span className="hm-inh-caret">{open ? '▾' : '▸'}</span> {icon} <b>{name}</b>
+        {note ? <span className="disp-hint"> — {note}</span> : null}
+        <span className="disp-hint"> ({chars(text)})</span>
+      </button>
+      {open && <textarea className="disp-input hm-ta hm-mono" rows={20} value={text || ''} readOnly spellCheck={false} />}
+    </div>
+  );
+}
+
+// The badge editor: paste or load an SVG, see it rendered, clear it. Kept deliberately plain — an SVG
+// preview is the only honest check that what you pasted is the art you meant.
+export function AvatarField({ svg, onChange }) {
+  const [err, setErr] = useState(null);
+  const looksSvg = /^<svg[\s>]/i.test(String(svg || '').trim());
+  const take = (text) => {
+    const t = String(text || '').trim();
+    if (t && !/^<svg[\s>]/i.test(t)) { setErr('that is not an SVG document (it must start with <svg …>)'); return; }
+    setErr(null); onChange(t);
+  };
+  return (
+    <div className="disp-field" data-testid="harness-avatar-field">
+      <label className="disp-label">
+        Badge art <span className="disp-hint">SVG, stored in the meta-DB — no repo needed{svg ? `, ${chars(svg)}` : ''}</span>
+      </label>
+      <div className="hm-avatar-row">
+        <div className="hm-avatar-prev" aria-label="badge preview">
+          {looksSvg
+            ? <img alt="" src={`data:image/svg+xml;utf8,${encodeURIComponent(svg)}`} width={48} height={48} />
+            : <span className="disp-hint">none</span>}
+        </div>
+        <div className="hm-avatar-acts">
+          <input type="file" accept=".svg,image/svg+xml" onChange={async (e) => {
+            const f = e.target.files?.[0];
+            if (f) take(await f.text());
+            e.target.value = '';
+          }} />
+          {svg ? <button type="button" className="hm-del" onClick={() => take('')} title="Remove the badge art">🗑 clear</button> : null}
+        </div>
+      </div>
+      <textarea className="disp-input hm-ta hm-mono" rows={4} value={svg} spellCheck={false}
+                placeholder="<svg xmlns=…>  — paste the badge here, or load a file above"
+                onChange={(e) => onChange(e.target.value)} onBlur={(e) => take(e.target.value)} />
+      {err && <div className="disp-hint hm-avatar-err">{err}</div>}
+    </div>
+  );
+}
 
 // order the flat harness list into a parent→child tree (depth for indentation)
 function treeRows(list) {
@@ -144,6 +224,11 @@ export default function HarnessManager({ onClose }) {
                   </div>
                 </div>
 
+                {/* The BADGE ART, stored in the meta-DB like everything else (082). It used to be a
+                    file in the Zeehive repo, which meant the badge vanished on any queenzee that could
+                    not read that repo — so it is editable here, and it travels with the harness. */}
+                <AvatarField svg={form.avatar_svg || ''} onChange={(v) => set('avatar_svg', v)} />
+
                 {/* WHICH ZEE TYPE this persona is for. A harness carries the MANUAL for a type's
                     verbs and refusals, so a xell may only wear one of its own type — a manager
                     persona describes dispatch/say/suggest-done and says landing is refused, which is
@@ -190,9 +275,11 @@ export default function HarnessManager({ onClose }) {
                 </div>
 
                 <div className="disp-field">
-                  <label className="disp-label">Personality / voice</label>
-                  <textarea className="disp-input hm-ta" rows={4} value={form.personality || ''} onChange={(e) => set('personality', e.target.value)}
-                            placeholder="How this persona thinks and writes…" />
+                  <label className="disp-label">
+                    Personality / voice <span className="disp-hint">{chars(form.personality)}</span>
+                  </label>
+                  <textarea className="disp-input hm-ta hm-mono" rows={12} value={form.personality || ''} onChange={(e) => set('personality', e.target.value)}
+                            spellCheck={false} placeholder="How this persona thinks and writes…" />
                 </div>
 
                 <div className="disp-field">
@@ -204,7 +291,9 @@ export default function HarnessManager({ onClose }) {
                         <button className="hm-del" onClick={() => rmSkill(i)} title="Remove skill">🗑</button>
                       </div>
                       <input className="disp-input" value={s.when} onChange={(e) => setSkill(i, 'when', e.target.value)} placeholder="when to use it" />
-                      <textarea className="disp-input hm-ta" rows={2} value={s.body} onChange={(e) => setSkill(i, 'body', e.target.value)} placeholder="the instructions" />
+                      <textarea className="disp-input hm-ta hm-mono" rows={10} value={s.body} onChange={(e) => setSkill(i, 'body', e.target.value)}
+                                spellCheck={false} placeholder="the instructions — a procedure the wearer follows" />
+                      <div className="disp-hint">{chars(s.body)} · lands in the xell as <code>.claude/skills/{skillFile(s.name)}/SKILL.md</code></div>
                     </div>
                   ))}
                   <button className="hm-add" onClick={addSkill}>＋ Add skill</button>
@@ -218,7 +307,9 @@ export default function HarnessManager({ onClose }) {
                         <input className="disp-input" value={m.path} onChange={(e) => setMem(i, 'path', e.target.value)} placeholder="note name" />
                         <button className="hm-del" onClick={() => rmMem(i)} title="Remove memory">🗑</button>
                       </div>
-                      <textarea className="disp-input hm-ta" rows={2} value={m.text} onChange={(e) => setMem(i, 'text', e.target.value)} placeholder="a fact the persona always carries" />
+                      <textarea className="disp-input hm-ta hm-mono" rows={18} value={m.text} onChange={(e) => setMem(i, 'text', e.target.value)}
+                                spellCheck={false} placeholder="a fact the persona always carries — a manual, a note, a checklist" />
+                      <div className="disp-hint">{chars(m.text)} · lands in the xell as <code>.zeehive/harness/memory/{memFile(m.path)}</code>, stamped as generated</div>
                     </div>
                   ))}
                   <button className="hm-add" onClick={addMem}>＋ Add memory</button>
@@ -228,14 +319,20 @@ export default function HarnessManager({ onClose }) {
                   <div className="disp-field">
                     <label className="disp-label">Inherited — from {form.inherited.chain.join(' → ') || 'parent'}</label>
                     {form.inherited.skills.map((s, i) => (
-                      <div key={`is${i}`} className="hm-inh">★ <b>{s.name}</b> <span className="disp-hint">— {s.when}</span></div>
+                      <InheritedEntry key={`is${i}`} icon="★" name={s.name} note={s.when} text={s.body} />
                     ))}
                     {form.inherited.memory.map((m, i) => (
-                      <div key={`im${i}`} className="hm-inh">🧠 <b>{m.path}</b> <span className="disp-hint">({(m.text || '').length.toLocaleString()} chars)</span></div>
+                      <InheritedEntry key={`im${i}`} icon="🧠" name={m.path} text={m.text} />
                     ))}
-                    <div className="disp-hint">Read-only — carried from the parent chain (e.g. the cxell manual from Zee Base). Edit it on the parent.</div>
+                    <div className="disp-hint">Read-only — carried from the parent chain (the cxell manual comes down from Zee Base this way). Open one to read exactly what a wearer gets; to change it, edit the parent.</div>
                   </div>
                 )}
+
+                <div className="disp-hint hm-total">
+                  A zee wearing this is briefed with <b>{briefingChars(form).toLocaleString()}</b> characters
+                  of persona, skills and memory (its own plus everything inherited) — paid on every
+                  dispatch, before it has read a line of the project.
+                </div>
 
                 <div className="disp-field">
                   <label className="disp-label">Enabled</label>

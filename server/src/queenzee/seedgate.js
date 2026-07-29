@@ -38,7 +38,13 @@ export const SEED_DIR = 'server/sql/seeds';
 // end-to-end without a production database in the loop (mirrors SHIP_MODE). Read per call, not
 // once at import: a test that flips the mode mid-run must get the mode it set, and nothing here is
 // hot enough for one env read to matter.
-const seedMode = () => (process.env.SEED_MODE === 'simulate' ? 'simulate' : 'real');
+// It FALLS BACK TO SHIP_MODE when unset — the same inheritance lib/prod-readonly.js uses, and for
+// the same reason: a xell is given SHIP_MODE=simulate by zeehive.yml and knows nothing about
+// SEED_MODE, so without this a NESTED queenzee (whose prod_seed_request rows are the REAL fleet's,
+// inherited in the db clone) would run approved seed SQL against the REAL production database the
+// moment somebody clicked approve on its own console. Live is unchanged: neither var is set in
+// production, and both default to 'real'.
+const seedMode = () => ((process.env.SEED_MODE || process.env.SHIP_MODE) === 'simulate' ? 'simulate' : 'real');
 const OPEN = ['pending', 'approved', 'running'];
 
 const gitOk = (repoRoot, args) => spawnSync('git', ['-C', repoRoot, ...args],

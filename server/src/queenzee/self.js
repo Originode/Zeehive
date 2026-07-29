@@ -23,6 +23,12 @@ import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
 import { proposeDone, retractDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
+
+// Same switch every other real-side-effect module reads: 'real' touches machines, anything else
+// models. selfLand() is the only verb here that acts on a machine before any gate answers — it
+// collects out of `cxell_<slug>` and moves a branch in a worktree, both named by a fleet row. See
+// the guard at the head of selfLand.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
@@ -226,6 +232,22 @@ export async function selfLand(xell) {
   if (managerRefusal) {
     return { ...managerRefusal, landed: false,
       message: `Refused: ${NO_PUSH_REASON}` };
+  }
+  // …AND A NESTED QUEENZEE HAS NO LANDING VERB AT ALL EITHER — checked after the manager refusal,
+  // which is the more specific answer and needs no machine to be true. Step 1 below reaches into `cxell_<slug>` and
+  // fast-forwards a branch in xell.worktree_path — both taken off a fleet row, and a xell's database
+  // is a CLONE of the meta-DB, so in a nested queenzee they belong to somebody else's live zee. The
+  // push in step 3 is already refused (xellgit's write door), but a refusal at the END of the verb
+  // would happen AFTER the collect had already rewritten another zee's worktree. Refuse at the top.
+  if (PROVISION_MODE !== 'real') {
+    logline('self', `${xell.slug}: land REFUSED — PROVISION_MODE=simulate: this queenzee models the fleet, `
+      + 'it does not collect from a real cxell or push into a real xource.');
+    return { ok: false, status: 'refused', stage: 'nested-queenzee', landed: false, dry_run: true,
+      error: 'PROVISION_MODE=simulate',
+      message: 'This queenzee MODELS the fleet (PROVISION_MODE=simulate) — it is a nested instance running '
+        + 'inside a xell, and the xells in its database are a CLONE of the real fleet\'s. It will not collect '
+        + 'commits out of a real cxell, and it will not push into a real xource. Nothing was run and nothing '
+        + 'was lost: land through the REAL queenzee (`zee land` from your cxell).' };
   }
   if (!xell.worktree_path) return { ok: false, status: 'error', error: `${xell.slug} has no host worktree to land from` };
 

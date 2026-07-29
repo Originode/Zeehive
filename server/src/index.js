@@ -14,7 +14,7 @@ import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
-import { refreshHarnessRoots, logHarnessSummary } from './lib/harness.js';
+import { logHarnessSummary } from './lib/harness.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
@@ -97,10 +97,9 @@ try {
   // Fresh run (zero projects) → ZEEHIVE onboards itself before anything else looks at the
   // fleet (self-onboard.js). Loud-but-never-fatal, like the migrations above.
   await ensureSelfProject();
-  // Harness TEXT is owned by the meta-DB (migration 080) — there is nothing to project at boot.
-  // What is still worth doing: warm the repo roots the avatar badges resolve under, and SAY what the
-  // rows actually carry. A harness that would brief a zee with a blank page is otherwise invisible.
-  await refreshHarnessRoots();
+  // A harness is entirely in the meta-DB now (080 text, 082 badge) — there is nothing to load, and no
+  // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
+  // a harness that would brief a zee with a blank page is invisible otherwise.
   await logHarnessSummary();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
