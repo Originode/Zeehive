@@ -209,11 +209,30 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
     }
   }
 
-  // stop the zee
-  const zee = await one(
-    `UPDATE zee SET status='stopped', name=NULL, decommissioned_at=now()
-       WHERE xell_id=$1 AND status IN ('spawning','online','working','idle') RETURNING *`, [xellId]);
-  if (zee) broadcast('zee', zee);
+  // STOP THE ZEE — every zee row this xell hosted, whatever state it is in.
+  //
+  // This used to be gated on `status IN ('spawning','online','working','idle')`, i.e. on the
+  // statuses that mean "a turn is in flight". Everything else was left untouched — and 'errored'
+  // is everything else. A headless turn that dies on an API 429/529 lands in 'errored', so the
+  // teardown of such a xell retired the xell, removed the cage, and left the zee row saying
+  // decommissioned_at IS NULL, name set, cli_active true: a row that claims a live, ATTACHED agent
+  // in a cage that no longer exists. Six of them were sitting in the live meta-DB when this was
+  // found (the oldest four days old), and nothing revisits a zee row after its xell is retired, so
+  // they never age out. `scripts/audit-agent-sessions.mjs` reports them as GHOST ROWS.
+  //
+  // The fix is to key on the FACT (this row has not been decommissioned) instead of on a status
+  // whitelist. cli_active goes false too: it is the monitor's "an agent is attached" probe, and
+  // there is provably nothing to attach to once the cage is gone. The status a run ENDED in is
+  // preserved for anything but a live-turn status — 'errored' is why this row stopped and
+  // last_stop_reason is the detail, so overwriting it with 'stopped' would delete the diagnosis.
+  // Multiple rows are possible (a cxell xell can outlive several zees), so this is q(), not one().
+  const stopped = await q(
+    `UPDATE zee
+        SET status = CASE WHEN status IN ('spawning','online','working','idle') THEN 'stopped'
+                          ELSE status END,
+            name = NULL, cli_active = false, decommissioned_at = now()
+      WHERE xell_id = $1 AND decommissioned_at IS NULL RETURNING *`, [xellId]);
+  for (const z of stopped) broadcast('zee', z);
 
   // ── FROM HERE DOWN, EVERY STEP TOUCHES A REAL MACHINE ───────────────────────
   // …with names taken straight out of the rows above, so it is the whole point of the guard at the
@@ -298,7 +317,11 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
     logline('reaper', `retired ${xell.slug}: zee decommissioned, worktree + containers removed ✓`);
   }
 
-  return { ok: true, reason, orphaned_worktree: orphaned ? xell.worktree_path : null, despawn, zee_id: zee?.id,
+  return { ok: true, reason, orphaned_worktree: orphaned ? xell.worktree_path : null, despawn,
+           // The zee this teardown stopped (the newest, when a cxell xell hosted several) plus how
+           // many rows were stamped — a caller that only ever saw one id could not tell that a
+           // second, differently-statused row had been left behind.
+           zee_id: stopped[stopped.length - 1]?.id || null, zees_decommissioned: stopped.length,
            liveness: verdict };
 }
 
