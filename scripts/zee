@@ -278,7 +278,8 @@ switch (cmd) {
     // Raising REQUIRES a brief reason, because the reason is the whole message: the console shows
     // it on the xell's card and in the "waiting on you" line, and a tend without one summons a
     // human who then has to open your session to find out what they were called for. One line —
-    // the server clamps it to ~200 chars (put the detail in your session, not in the flag).
+    // its first ~200 chars are the glance form on the chip/card, and the console keeps the whole
+    // text for the human who opens the ask, so LEAD with the decision and do not pre-truncate.
     // `zee tend "why"` (bare, no --reason) is accepted too; it is the same ask.
     const clear = rest.includes('--clear');
     const reason = flag('reason') || rest.find((a) => !a.startsWith('--')) || null;

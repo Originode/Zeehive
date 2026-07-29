@@ -116,9 +116,16 @@ async function touch(zee) {
 //
 // The reason is the POINT of a tend, not decoration: "a xell needs a human" with no why makes the
 // human open a terminal and read a transcript to find out what they were called for. So it is
-// recorded (raw.reason), read back with the open state (tendState), and carried all the way to the
-// console — but BRIEF, because it rides a hexagon and a one-line "waiting on you" chip, not a card.
-export const TEND_REASON_MAX = 200;
+// recorded (raw.reason), read back with the open state (tendState), and carried to the console.
+//
+// TWO lengths, because there are two surfaces and clipping the STORED text served neither: the
+// hexagon chip and the card row get ONE brief line (they physically cannot hold more), but the
+// opened ask gets the whole thing. The first cut of this clamped on write AND on read, which threw
+// the tail away — a zee's tend reporting a prod problem read "…re-tasking a manager wi…" and the
+// rest existed nowhere a human could reach. So: STORE what the zee said (bounded, not clipped),
+// DISPLAY the brief line, and keep the full text one click away.
+export const TEND_REASON_MAX = 200;      // the one-line display form (chip / card row)
+export const TEND_REASON_STORE_MAX = 2000; // what a tend may CARRY (a bound on the row, not an edit)
 
 // One brief line: collapse whitespace/newlines, trim, cap at `max` (…-elided). null when empty, so
 // "no reason" stays distinguishable from "a reason that says nothing".
@@ -127,26 +134,38 @@ export function briefReason(reason, max = TEND_REASON_MAX) {
   if (!s) return null;
   return s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s;
 }
+// What actually gets STORED: the same one-line normalisation (a tend is prose, not a document), but
+// kept whole up to a bound generous enough that no honest reason ever hits it.
+export const storeReason = (reason) => briefReason(reason, TEND_REASON_STORE_MAX);
+
+// Both forms of one reason: `brief` for a one-line surface, `full` only when there IS more to read
+// (null when the brief line already IS the whole reason — so a caller never renders "more" twice).
+export function reasonPair(reason) {
+  const full = storeReason(reason);
+  const brief = briefReason(full);
+  return { brief, full: full && full !== brief ? full : null };
+}
 
 export async function setTend(xellId, on, { reason = null, zeeId = null, source = 'self' } = {}) {
-  const why = briefReason(reason);
+  const why = storeReason(reason);
   await recordEvent({
     source, hook_event_name: on ? 'tend-request' : 'tend-clear',
     zee_id: zeeId, xell_id: xellId, raw: why ? { reason: why } : null,
   });
   broadcast('xell', { id: xellId });
-  return { xell_id: xellId, tend: !!on, reason: why };
+  return { xell_id: xellId, tend: !!on, reason: briefReason(why), reason_full: why };
 }
 
-// The xell's tend as the console needs it: is it open, and WHY (the brief reason the zee gave),
-// and since when. Latest-event-wins, exactly like tendOpen — which is now this, narrowed.
+// The xell's tend as the console needs it: is it open, WHY (brief line + the full text when there
+// is more), and since when. Latest-event-wins, exactly like tendOpen — which is now this, narrowed.
 export async function tendState(xellId) {
   const row = await one(
     `SELECT hook_event_name, ts, raw->>'reason' AS reason FROM session_event
        WHERE xell_id = $1 AND hook_event_name IN ('tend-request','tend-clear')
        ORDER BY ts DESC LIMIT 1`, [xellId]);
   const open = row?.hook_event_name === 'tend-request';
-  return { open, reason: open ? briefReason(row.reason) : null, at: open ? row.ts : null };
+  const { brief, full } = open ? reasonPair(row.reason) : { brief: null, full: null };
+  return { open, reason: brief, full, at: open ? row.ts : null };
 }
 
 // Is this xell's tend currently OPEN? (latest tend event is a request, not a clear)

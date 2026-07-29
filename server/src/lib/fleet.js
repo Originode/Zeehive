@@ -6,7 +6,7 @@ import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { deviceConfig } from './devices.js';
-import { briefReason } from './status.js';
+import { reasonPair } from './status.js';
 import { listDoneSuggestions } from './managers.js';
 
 export async function defaultProject() {
@@ -219,10 +219,13 @@ async function decorateXell(x, heads, deployed, project) {
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
   // hive_status already says THAT one is open; this says WHAT FOR — the console renders it beside
   // the ask instead of sending the human into the session to find out.
-  // briefReason on the way OUT too: raising clamps it now, but rows written before that (and any
-  // future writer) can still hold an essay, and a card row is not where an essay may land.
+  // BOTH forms, split on the way out: `reason` is the one line a chip/card row can hold, `full` is
+  // the whole text when there is more of it (null when there isn't). Clipping only, never editing —
+  // the first cut of this clamped the payload itself, and a tend reporting a prod problem reached
+  // the console as "…re-tasking a manager wi…" with the rest unreadable anywhere.
+  const why = reasonPair(x.tend_reason);
   x.tend = x.tend_pending === true
-    ? { open: true, reason: briefReason(x.tend_reason), at: x.tend_at || null }
+    ? { open: true, reason: why.brief, full: why.full, at: x.tend_at || null }
     : null;
   delete x.tend_reason; delete x.tend_at;
   delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;

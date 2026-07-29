@@ -112,7 +112,7 @@ export async function selfStatus(xell) {
       ? { id: doneSuggestion.id, by: doneSuggestion.manager_slug, reason: doneSuggestion.reason,
           status: doneSuggestion.status, pending: doneSuggestion.status === 'pending' }
       : null,
-    tend: { open: tend.open, reason: tend.reason, since: tend.at },
+    tend: { open: tend.open, reason: tend.reason, reason_full: tend.full, since: tend.at },
     zee: zee || null,
     task: task ? { id: task.id, status: task.status, done: task.status === 'done' } : null,
     awaiting_done: xell.status === 'awaiting-done',

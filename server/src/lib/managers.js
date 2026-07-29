@@ -21,7 +21,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
-import { briefReason } from './status.js';
+import { reasonPair } from './status.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
 
@@ -86,6 +86,9 @@ export async function crewFor(managerXellId) {
       ORDER BY x.created_at`, [managerXellId]);
 
   return rows.map((r) => {
+    // the tend's reason in both forms: one line for the waiting summary, the whole text on the row
+    // (a manager has no console to hover and no terminal to open — a clipped tail would be lost).
+    const why = reasonPair(r.tend_reason);
     const hive = hiveStatus(
       { ...r, is_production: false },
       { landPending: r.land_pending, shipPending: r.ship_pending, tendPending: r.tend_pending,
@@ -97,7 +100,7 @@ export async function crewFor(managerXellId) {
       r.ship_pending && 'a ship is awaiting a human',
       r.prod_bind_pending && 'it asked for the PROD database',
       r.seed_pending && 'it asked for production to be SEEDED',
-      r.tend_pending && `it raised a TEND (needs a human)${briefReason(r.tend_reason) ? `: ${briefReason(r.tend_reason)}` : ''}`,
+      r.tend_pending && `it raised a TEND (needs a human)${why.brief ? `: ${why.brief}` : ''}`,
       r.status === 'awaiting-done' && 'it proposed DONE (a human must confirm)',
       r.done_suggested && 'you already suggested it is done (awaiting a human)',
     ].filter(Boolean);
@@ -109,6 +112,7 @@ export async function crewFor(managerXellId) {
       task: r.task_text ? String(r.task_text).split('\n')[0].slice(0, 160) : null,
       head_commit: r.head_commit || null,
       waiting_on_human: waiting,
+      tend: r.tend_pending ? { open: true, reason: why.brief, full: why.full } : null,
       last_message: r.last_message ? String(r.last_message).slice(0, 300) : null,
       last_message_at: r.last_message_at || null,
     };
