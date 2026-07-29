@@ -26,6 +26,14 @@ if [ ! -t 0 ]; then
   IN="$(cat)"
   if [ -n "$IN" ]; then printf 'STDIN<<\n%s\n>>STDIN\n' "$IN" >> "$LOG"; fi
 fi
+# CXELL FILE-WRITE simulation: writeFileIntoCxellIfChanged pipes a payload in and asks the CAGE
+# whether those bytes differ from the file already there, and REFUSES to guess when no verdict comes
+# back. A fake container cannot run that script (and must not — the script's target is a real
+# /work/repo), so a test states the answer it wants: WROTE (the copy was stale) or SAME (identical).
+if [ -n "${DOCKER_FAKE_CXELL_VERDICT:-}" ]; then
+  printf '%s\n' "$DOCKER_FAKE_CXELL_VERDICT"
+  exit 0
+fi
 for a in "$@"; do
   if [ "$a" = "/etc/environment" ]; then
     printf 'ANTHROPIC_AUTH_TOKEN=sk-ant-fake-tok\nZEEHIVE_XELL_TOKEN=fake-ident-tok\n'

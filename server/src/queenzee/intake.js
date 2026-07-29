@@ -20,7 +20,8 @@ import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
 import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
-         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell, writeGeneratedDocIntoCxell,
+         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell, writeFileIntoCxellIfChanged,
+         writeGeneratedDocIntoCxell,
          installZeeCliIntoCxell, installZeeLiveIntoCxell, installZeeAttachIntoCxell } from '../lib/cxell.js';
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
@@ -835,14 +836,65 @@ export async function injectProjectDocsIntoXell({ ctx = 'default', slug, project
   return { docs: files.length, written, skipped: skipped.length, failed };
 }
 
+// The LIVE cxell zee of a xell, or null — one definition, because every "write into the cage" path
+// asks the identical question: a cxell-cli zee that is still running, with an ssh-terminal viewer.
+async function liveCxellZeeFor(xellId) {
+  const zee = await one(
+    `SELECT z.viewer_kind, x.slug, x.project_id FROM zee z JOIN xell x ON x.id = z.xell_id
+      WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
+        AND z.status IN ('spawning','online','working','idle')
+      ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
+  return zee && zee.viewer_kind === 'ssh-terminal' ? zee : null;
+}
+
+// Push a xell's .zeehive.env PROJECTION into its live cxell — the copy the zee actually reads. The
+// host worktree's file is not it: a cxell gets a `docker cp` copy at spawn (lib/cxell.js
+// cloneIntoCxell), so a host-side re-emit never reached the zee that was running on the wrong
+// values. lib/provision.js refreshLiveCxellEnv owns the rules and explains why; this is the
+// delivery, deliberately the same shape as the harness re-injection above.
+//
+// The TEXT is entirely the caller's: this recomputes nothing and resolves nothing, so it cannot
+// widen a binding — it moves bytes the meta-DB already produced into the place they were meant to
+// land. Never throws; the caller reports the outcome.
+export async function injectXellEnvIntoCxell({ xellId, slug = null, text, dryRun = false }) {
+  let zee = null;
+  try { zee = await liveCxellZeeFor(xellId); }
+  catch (e) { return { live: null, refreshed: false, error: `could not resolve the live cxell zee: ${e.message}` }; }
+  // NOT a failure, and the common case: a host-side xell, or a cage that has already been torn down.
+  // Nothing in a cage is reading a stale copy, so there is nothing to refresh.
+  if (!zee) return { live: false, refreshed: false, reason: 'no live cxell zee' };
+  const name = zee.slug || slug || String(xellId).slice(0, 8);
+  // REPORT-ONLY in simulate, exactly as reinjectHarnessIntoLiveXells does, and for the same reason:
+  // the exec targets cxell_<slug> with a slug straight out of a fleet row, and a nested queenzee's
+  // fleet rows ARE the real fleet's (its db is a clone of the meta-DB).
+  if (dryRun) {
+    logline('cxell', `${name}: .zeehive.env NOT refreshed inside the live cxell — PROVISION_MODE=simulate: `
+      + 'this queenzee models the fleet, it does not exec into its cxells. Would have refreshed '
+      + `/work/repo/.zeehive.env in ${cxellName(name)}`);
+    return { live: true, refreshed: false, dry_run: true, would_refresh: true };
+  }
+  try {
+    const r = await writeFileIntoCxellIfChanged({ ctx: 'default', slug: zee.slug, relPath: '.zeehive.env', text });
+    if (r.changed) {
+      logline('cxell', `${name}: .zeehive.env REFRESHED inside the LIVE cxell from the meta-DB — the `
+        + 'QUEENZEE wrote that file, not the zee. Anything that already sourced it (its shell, its app '
+        + 'tier) still holds the old values until it re-reads the file or rebuilds.');
+    }
+    return { live: true, refreshed: true, changed: r.changed, path: r.path };
+  } catch (e) {
+    // LOUD, both ways — the queenzee log a human reads and stdout. This one leaves a RUNNING zee
+    // reading a file the meta-DB disagrees with, and nothing else will notice.
+    logline('cxell', `${name}: .zeehive.env could NOT be refreshed inside the live cxell — ${e.message}. `
+      + 'That zee is still reading whatever its copy already said.');
+    console.error(`[cxell] ${name}: .zeehive.env cage refresh FAILED — ${e.message}`);
+    return { live: true, refreshed: false, error: e.message };
+  }
+}
+
 export async function reinjectHarnessIntoXell(xellId) {
   try {
-    const zee = await one(
-      `SELECT z.viewer_kind, x.slug, x.project_id FROM zee z JOIN xell x ON x.id = z.xell_id
-        WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
-          AND z.status IN ('spawning','online','working','idle')
-        ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
-    if (!zee || zee.viewer_kind !== 'ssh-terminal') return { injected: false, reason: 'no live cxell zee' };
+    const zee = await liveCxellZeeFor(xellId);
+    if (!zee) return { injected: false, reason: 'no live cxell zee' };
     const row = await harnessForXell(xellId);
     const eff = row ? await effectiveHarness(row) : null;
     const files = harnessFiles(eff);

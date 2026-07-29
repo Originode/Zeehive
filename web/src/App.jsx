@@ -1100,8 +1100,12 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           <span className={`envchip env-${x.env_tier || 'none'}${x.env_key && Number(x.env_var_count) === 0 ? ' env-empty' : ''}`
                   + (!x.env_key ? ' env-absent' : '')
                   /* the .zeehive.env PROJECTION failed (078) — the file on disk is not what the
-                     meta-DB says it should be, and no log line survives long enough to say so */
-                  + (x.env_projection_error ? ' env-broken' : '')}
+                     meta-DB says it should be, and no log line survives long enough to say so.
+                     env_cxell_error (082) is the OTHER half: the host file is right and the zee
+                     cannot see it, because its cage copy could not be refreshed. Same badge — from
+                     the outside both mean "this zee is running on values the meta-DB disagrees
+                     with" — and the tooltip says which. */
+                  + (x.env_projection_error || x.env_cxell_error ? ' env-broken' : '')}
                 data-testid="env-chip"
                 title={(x.env_key
                   ? `Environment: ${x.env_key} (${x.env_tier})`
@@ -1113,11 +1117,16 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
                   + (x.env_projection_error
                     ? `\n\n⚠ .zeehive.env is NOT in sync with the meta-DB — the last projection failed:\n${x.env_projection_error}`
                     : '')
+                  + (x.env_cxell_error
+                    ? '\n\n⚠ the file on the worktree is in sync, but this zee reads a COPY inside its'
+                      + ' cxell and that copy could NOT be refreshed — it is still working from the old'
+                      + ` values:\n${x.env_cxell_error}`
+                    : '')
                   + '\n\nClick to see it, pin one, or clear the pin'}
                 onClick={(e) => { e.stopPropagation(); onEnv?.(x); }}>
             ❖ {x.env_key
               ? <>{x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}</>
-              : 'no env'}{x.env_projection_error ? ' ⚠' : ''}
+              : 'no env'}{x.env_projection_error || x.env_cxell_error ? ' ⚠' : ''}
           </span>
         )}
         <span className="cardtop-right">
