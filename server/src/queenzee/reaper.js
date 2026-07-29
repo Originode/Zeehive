@@ -108,12 +108,13 @@ export function midTurnVerdict(live) {
     return { ...base, active: true, decided_by: 'zee-status',
       why: `the ZEE'S OWN STATUS says it is ${live.status} — a turn is in flight (last seen ${agoText(seen)})` };
   }
+  const cage = live.entrypoint === 'cxell-cli';
   return { ...base, active: false, decided_by: 'zee-status',
     why: `the ZEE'S OWN STATUS says ${live.status} — its turn ended (last seen ${agoText(seen)})`
        + (attached
-         ? `; the monitor (${live.monitor_source || 'probe'}, ${agoText(live.last_monitor_at)}) only sees an agent `
-           + 'process ALIVE in its cxell, which after a turn is the resting attached session, not work'
-         : '; the monitor sees no agent process in its cxell either') };
+         ? `; the monitor (${live.monitor_source || 'probe'}, ${agoText(live.last_monitor_at)}) only proves a session `
+           + `is ATTACHED${cage ? ' — after a turn that is the `claude --resume` zee-attach.sh leaves in its pane' : ''}`
+         : `; the monitor (${live.monitor_source || 'probe'}) sees no live agent session either`) };
 }
 
 export async function reapXell(xellId, reason = 'task-done', { force = false, mode = PROVISION_MODE } = {}) {

@@ -311,7 +311,7 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
       // NOT done and the xell is untouched, so the ask goes back on the board.
       if (result?.blocked) {
         return refuseApproval({ id, row, manager, by, detail: result,
-          error: `${result.reap?.error || 'the queenzee refused to close that xell.'}` });
+          error: result.reap?.error || 'the queenzee refused to close that xell.' });
       }
     } else {
       // A xell with no task row (a bare dispatch) is reaped directly — the same path the console's
@@ -320,7 +320,7 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
       result = { reap: await reapXell(target.id, 'done-suggestion', { force }) };
       if (result.reap?.ok === false) {
         return refuseApproval({ id, row, manager, by, detail: result,
-          error: `${result.reap?.error || 'the queenzee refused to close that xell.'}` });
+          error: result.reap?.error || 'the queenzee refused to close that xell.' });
       }
     }
   } catch (e) {
