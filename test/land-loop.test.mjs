@@ -18,6 +18,10 @@ import { join } from 'node:path';
 const API_PORT = 47999;
 const API = `http://127.0.0.1:${API_PORT}`;
 process.env.ZEEHIVE_API = API;
+// These exercise the LIVE half of the nested-queenzee guard (test/nested-queenzee-land-ship-guard.test.mjs):
+// a real queenzee moves real refs and resumes real cages, and this suite is what proves that did not
+// change. Declared BEFORE any import, because the modules read it once at load.
+process.env.PROVISION_MODE = 'real';
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { selfLand } = await import('../server/src/queenzee/self.js');
