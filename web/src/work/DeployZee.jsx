@@ -40,7 +40,7 @@ import { ZeeChip } from './bits.jsx';
 // also wrote status on a timer would fight it, and the two would take turns overwriting a human's
 // plan. Assign, unassign, deploy — and let the tick say what the zee is doing.
 export default function DeployZee({ item, zee, events = [], busy, onDone, onError }) {
-  const [candidates, setCandidates] = useState(null);
+  const [cands, setCands] = useState(null);      // the whole payload: { candidates, note, count }
   const [picking, setPicking] = useState(false);
   const [working, setWorking] = useState(false);
   const disabled = busy || working;
@@ -48,17 +48,19 @@ export default function DeployZee({ item, zee, events = [], busy, onDone, onErro
   // Candidates are fetched when the picker OPENS, never on drawer open: it is a live read of which
   // xells could take this item right now, and a stale one is worse than a slow one.
   useEffect(() => {
-    if (!picking || candidates) return;
+    if (!picking || cands) return;
     let live = true;
     getAssignCandidates(item.id)
-      .then((r) => { if (live) setCandidates(Array.isArray(r) ? r : (r?.candidates || [])); })
+      // An array is accepted as well as the documented object — a read model that grows a wrapper
+      // (or loses one) must not blank the picker.
+      .then((r) => { if (live) setCands(Array.isArray(r) ? { candidates: r } : (r || { candidates: [] })); })
       .catch((e) => { if (live) onError?.(e); });
     return () => { live = false; };
-  }, [picking, candidates, item.id, onError]);
+  }, [picking, cands, item.id, onError]);
 
   const run = useCallback(async (fn) => {
     setWorking(true);
-    try { await fn(); setCandidates(null); setPicking(false); onDone?.(); }
+    try { await fn(); setCands(null); setPicking(false); onDone?.(); }
     catch (e) { onError?.(e); }
     finally { setWorking(false); }
   }, [onDone, onError]);
@@ -66,8 +68,11 @@ export default function DeployZee({ item, zee, events = [], busy, onDone, onErro
   const deploy = async () => {
     // FIRST the task, THEN the confirmation — see rule 2.
     const task = await showPrompt(
-      `What should the zee do for “${item.title}”?`,
-      { okLabel: 'Next', defaultValue: item.title || '', placeholder: 'the brief this worker starts from' });
+      `Anything to ADD to the brief for “${item.title}”?\n\n`
+      + 'The server writes the brief itself from this item — its title, its notes, the activities above '
+      + 'it and the ticket it came from. Type only what that would not already say (a constraint, a '
+      + 'starting point, a warning). Leave it empty and the item alone is the brief.',
+      { okLabel: 'Next', defaultValue: '', placeholder: 'optional — extra context for the worker' });
     if (task === null) return;                       // cancelled at the wording step
     const ok = await showConfirm(
       `Deploy a worker onto “${item.title}”?\n\n`
@@ -112,12 +117,16 @@ export default function DeployZee({ item, zee, events = [], busy, onDone, onErro
       )}
       {picking && (
         <span className="work-cands">
-          {candidates === null && <span className="work-muted">looking for xells…</span>}
-          {candidates?.length === 0 && <span className="work-muted">no xell can take this right now</span>}
-          {(candidates || []).map((c) => (
+          {cands === null && <span className="work-muted">looking for xells…</span>}
+          {/* When nothing is eligible the server sends its OWN sentence (and it names the way out —
+              deploy a fresh worker). Printing that beats inventing a shorter one here. */}
+          {cands && !cands.candidates?.length && (
+            <span className="work-muted">{cands.note || 'no xell can take this right now'}</span>
+          )}
+          {(cands?.candidates || []).map((c) => (
             <button key={c.xell_id || c.id} className="work-cand" disabled={disabled}
                     onClick={() => run(() => assignWorkItem(item.id, c.xell_id || c.id))}>
-              <b>{c.slug || c.name || c.xell_id}</b>
+              <b>{c.slug || c.name || c.xell_id || c.id}</b>
               {/* the server's OWN 'why' line — the console does not paraphrase it */}
               {c.why && <small>{c.why}</small>}
             </button>
