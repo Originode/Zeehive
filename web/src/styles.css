@@ -117,8 +117,23 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .setup-grid input:focus, .setup-row input:focus { outline: none; border-color: var(--accent); }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
 
-/* Docs tab: one editor per entry-point doc (AGENTS.md / CLAUDE.md …). A DISABLED doc is dimmed but
-   still readable — it is text somebody wrote, not a deleted thing. */
+/* Docs tab: one editor per SOURCE text, with the provider files it generates ticked below it. A
+   DISABLED doc is dimmed but still readable — it is text somebody wrote, not a deleted thing. */
+.docgen { margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.docgen-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 2px 8px;
+  margin-top: 4px; }
+.docgen-t { display: flex; align-items: baseline; gap: 5px; font-size: 11px; color: var(--muted);
+  padding: 2px 4px; border-radius: 5px; cursor: pointer; min-width: 0; }
+.docgen-t:hover { background: rgba(91, 140, 255, .10); }
+.docgen-t.on { color: var(--text); }
+.docgen-t .mono { font-family: var(--mono, ui-monospace, Menlo, monospace); white-space: nowrap; }
+.docgen-t .pc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.docgen-t input { margin: 0; flex: none; }
+/* the preview: what the queenzee really writes, stamp and stack included */
+.docpv { margin-top: 6px; }
+.docpv pre { margin: 2px 0 0; padding: 8px; max-height: 320px; overflow: auto; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 11px; line-height: 1.4;
+  white-space: pre-wrap; word-break: break-word; color: var(--muted); }
 .setup-sub { margin: 8px 0; padding: 8px; background: var(--panel2); border: 1px solid var(--line);
   border-radius: 8px; }
 .setup-sub.off { opacity: 0.55; }
@@ -556,6 +571,19 @@ a.cbox:hover { border-color: var(--accent); }
   padding: 6px 8px 2px; margin-top: 2px; border-top: 1px solid var(--line); }
 .ctxmenu button.ctxsel { color: var(--accent); font-weight: 600; }
 .ctxmenu button.ctxsel:hover { color: #fff; }
+/* ── "Compare against…" — the Check-diff reference picker ────────────────────── */
+/* A list of real container CHIPS, so a database is recognised here exactly as it is on the canvas
+   and in the matrix. The chips are click-THROUGH: the whole row is the button, and a chip that ate
+   the click would leave "nothing happens when I pick prod". Scrolls, because a project can have one
+   db per xell and this list must never push the destructive items off screen. */
+.ctxmenu .ctxdbpick { max-height: 46vh; overflow-y: auto; }
+.ctxmenu .ctxdbpick button { align-items: center; }
+.ctxmenu .ctxchip { display: inline-flex; flex: 0 0 auto; pointer-events: none; }
+/* two-thirds scale: the chip is an identifier here, not the subject */
+.ctxmenu .ctxchip .cbox { width: 28px; height: 24px; font-size: 9px; padding-bottom: 3px; border-radius: 5px; }
+.ctxmenu .ctxdbname { display: flex; flex-direction: column; gap: 2px; min-width: 0; max-width: 240px;
+  font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }
+.ctxmenu .ctxdbname > .ctxsub { font-family: inherit; }
 /* restore-over-prod entry: loud, because it targets live production */
 .ctxmenu button.ctxdanger-item { color: #ff8b81; }
 .ctxmenu button.ctxdanger-item:hover { background: #b3261e; color: #fff; }

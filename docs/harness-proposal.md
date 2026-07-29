@@ -124,12 +124,27 @@ from the row the instant the next edit lands. Read a harness in the console's ha
 renders the inherited chain, so the manual a wearer gets is readable there), or in any cxell at
 `.zeehive/harness/…` (injected per xell, git-ignored).
 
-### 3.1b Project entry-point docs (migration 081)
-The same rule, one level out: a project's agent-facing entry point (`AGENTS.md`, `CLAUDE.md`, …) is a
-`project_doc` row, generated into each xell on the same trigger. The injector asks git inside the cage
-and **refuses to write over a tracked path** — a project that committed its own entry point keeps it —
-and git-excludes what it does write, so a generated doc can never dirty a worktree or reach a landing
-diff. Authored in the project's **Docs** tab (`lib/project-docs.js`).
+### 3.1b Project entry-point docs (migrations 081, 083)
+The same rule, one level out: a project's agent-facing instructions are a `project_doc` row, generated
+into each xell on the same trigger. The injector asks git inside the cage and **refuses to write over a
+tracked path** — a project that committed its own entry point keeps it — and git-excludes what it does
+write, so a generated doc can never dirty a worktree or reach a landing diff. Authored in the
+project's **Docs** tab (`lib/project-docs.js`).
+
+**The row is the CONTENTS, not a file** (083). 081 had one row per path, so an operator who wanted
+Claude Code *and* Codex *and* Cursor to read the same thing pasted it into three rows and watched them
+drift. Now `body` is the source of truth and `targets` names which provider entry points to generate
+from it; the filenames live in a registry in code (`lib/agent-docs.js`) — `CLAUDE.md`, `AGENTS.md` (the
+~20 tools that read the standard), `GEMINI.md`, `.github/copilot-instructions.md`,
+`.cursor/rules/*.mdc`, `.clinerules/`, `.windsurf`/`.devin/rules/`, `.continue/rules/`, `.roo/rules/`,
+`.amazonq/rules/`, `.kiro/steering/`, `.junie/guidelines.md`, `CONVENTIONS.md`, `.rules`,
+`.goosehints` — each entry carrying the vendor doc that settles it. `rel_path` survives as the escape
+hatch for a one-off custom doc, and the two modes are mutually exclusive.
+
+Every generated file also ends with **that xell's own stack** (`lib/xell-stack.js`): its containers,
+ports, database coupling and build verbs, resolved from the meta-DB at injection time. That is house
+rule 7 applied to the one audience it had been missing — a non-ZEEHIVE agent reading `CLAUDE.md` in a
+xell had no way to learn which containers were its own.
 
 ### 3.2 A xell is ASSIGNED one harness; a human may switch it
 

@@ -14,11 +14,13 @@ import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
          harnessAvatarSvg } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
-import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc } from '../lib/project-docs.js';
+import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
+         previewProjectDoc } from '../lib/project-docs.js';
+import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
-import { diffOneContainerAgainstProd } from '../queenzee/proddiff.js';
+import { diffOneContainerAgainstProd, diffCandidates } from '../queenzee/proddiff.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
 import { buildContainer, buildXell, getBuildStatus, setContainerBuildCtx, setXellBuildCtx } from '../lib/build.js';
 import { listMachines, createMachine, updateMachine, deleteMachine, provisionDevDb, setMachinePool,
@@ -383,10 +385,16 @@ router.post('/projects/:id/pr', async (req, res) => {
 // ── deploy sites: where each tier runs + how it's reached (spec §5) ───────────
 // The contexts list feeds the console's picker, so a typo'd context can't be entered at all.
 router.get('/docker/contexts', (_req, res) => res.json(listDockerContexts()));
-// ── PROJECT ENTRY-POINT DOCS (the AGENTS.md/CLAUDE.md a zee reads first) ─────
-// Owned by the meta-DB and GENERATED into each xell when a zee is assigned (lib/project-docs.js).
-// The console's Docs tab is the whole authoring surface; the injector refuses to write over a path
-// the project has committed, so an operator cannot silently replace a repo's own instructions.
+// ── PROJECT ENTRY-POINT DOCS (the instructions a zee reads first) ────────────
+// The CONTENTS are owned by the meta-DB and one file per AI provider is GENERATED into each xell when
+// a zee is assigned (lib/project-docs.js). The console's Docs tab is the whole authoring surface; the
+// injector refuses to write over a path the project has committed, so an operator cannot silently
+// replace a repo's own instructions.
+//
+// The catalogue is served rather than duplicated in web/: the filenames are a moving vendor fact
+// (lib/agent-docs.js), and a hard-coded copy in the console would be a second source of truth for
+// them — stale the first time one is renamed.
+router.get('/agent-doc-targets', (_req, res) => res.json(targetCatalogue()));
 router.get('/projects/:id/docs', async (req, res) => {
   try { res.json(await listProjectDocs(req.params.id)); }
   catch (e) { res.status(400).json({ error: e.message }); }
@@ -397,6 +405,12 @@ router.post('/projects/:id/docs', async (req, res) => {
 });
 router.put('/project-docs/:docId', async (req, res) => {
   try { res.json(await updateProjectDoc(req.params.docId, req.body || {})); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+// The generated file itself, for the console's preview — the only place an operator sees the stamp,
+// the sibling list and the xell stack they did not type. Read-only, and it runs the real generator.
+router.get('/project-docs/:docId/preview', async (req, res) => {
+  try { res.json(await previewProjectDoc(req.params.docId, { xellId: req.query.xell || null })); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 router.delete('/project-docs/:docId', async (req, res) => {
@@ -815,12 +829,24 @@ router.get('/monitor/remote', async (_req, res) => res.json(await remoteAvailabl
 // ── container health: is each container actually running (per `docker ps`)? ───
 router.post('/containers/check', async (_req, res) => res.json(await checkContainers()));
 
-// On-demand schema-drift check of ONE db container against PRODUCTION (the "Check diff" context-menu
-// item on a db chip). Same read-only catalog comparison the 10-min drift tick runs, but measured NOW
-// and for just this container: it persists the verdict and broadcasts the container update, so the
-// chip's drift mark + tooltip repaint live. Returns the payload so the caller can surface a summary.
+// On-demand schema-drift check of ONE db container against a REFERENCE database (the "Check diff"
+// context-menu item on a db chip). Same read-only catalog comparison the 10-min drift tick runs, but
+// measured NOW and for just this container.
+//
+// body.against = another db container's id, or absent/null for PRODUCTION (the default). Only the
+// PROD comparison is a prod_diff verdict: it persists and broadcasts the container, so the chip's
+// drift mark + tooltip repaint live. Any other reference is measured and REPORTED only — comparing
+// dev against dev is how you tell "this db is drifted" from "every db is drifted the same way", and
+// that answer must not overwrite the fleet's drift-from-prod colours.
 router.post('/containers/:id/check-diff', async (req, res) => {
-  try { res.json(await diffOneContainerAgainstProd(req.params.id)); }
+  try { res.json(await diffOneContainerAgainstProd(req.params.id, req.body?.against || null)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// The db containers this one can be measured against (the "Check diff" submenu's list): every other
+// db in the project, PRODUCTION first — it is the default and the only reference that writes the chip.
+router.get('/containers/:id/diff-candidates', async (req, res) => {
+  try { res.json(await diffCandidates(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

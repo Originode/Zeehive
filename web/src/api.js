@@ -211,12 +211,18 @@ export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${site
 
 // ── environments (masked — the server never returns a secret value, only a hint). The meta-DB
 // source of truth for the untracked .env; resolved onto a xell by tier (lib/environments.js). ──
-// ── the project's ENTRY-POINT DOCS (AGENTS.md / CLAUDE.md …) ──────────────────────────────────
-// Owned by the meta-DB and generated into every xell when a zee is assigned. The console's Docs tab
-// is the authoring surface; the queenzee refuses to write one over a path the project has committed.
+// ── the project's ENTRY-POINT DOCS — one text, one file per AI provider ───────────────────────────
+// The CONTENTS live in the meta-DB and the queenzee generates CLAUDE.md / AGENTS.md / GEMINI.md / …
+// into every xell when a zee is assigned. The console's Docs tab is the authoring surface; the
+// queenzee refuses to write one over a path the project has committed. The TARGET CATALOGUE (which
+// provider reads which filename) is served by the API, never hard-coded here — vendors rename them.
+export const getAgentDocTargets = () => fetch('/api/agent-doc-targets').then((r) => (r.ok ? r.json() : []));
 export const getProjectDocs = (projectId) => fetch(`/api/projects/${projectId}/docs`).then((r) => (r.ok ? r.json() : []));
 export const createProjectDoc = (projectId, body) => siteCall(`/api/projects/${projectId}/docs`, 'POST', body);
 export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${docId}`, 'PUT', body);
+// What will REALLY be written, run through the real generator: the stamp, the sibling list and the
+// stack section an operator never typed and would otherwise first see inside a cage.
+export const previewProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}/preview`, 'GET');
 export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
 
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
@@ -336,17 +342,28 @@ export async function decommissionContainer(containerId, force = false) {
   return data;
 }
 
-// Check ONE db container's schema drift against PRODUCTION on demand (the chip's "Check diff" menu
-// item). The server measures it NOW, persists the verdict, and broadcasts the container update — so
-// the chip's drift mark repaints over SSE — and returns the payload { ok, total, kinds, same_db,
-// error } so the caller can pop a one-line summary.
-export async function checkContainerDiff(containerId) {
+// Check ONE db container's schema against a REFERENCE database on demand (the chip's "Check diff"
+// menu item). `against` = another db container's id, or null/omitted for PRODUCTION — the default,
+// and the only reference whose verdict is persisted + broadcast (so the chip's drift mark repaints
+// over SSE). Any other reference is measured and reported only. Returns the payload
+// { ok, total, kinds, by_schema, reference, persisted, same_db, error } so the caller can show it.
+export async function checkContainerDiff(containerId, against = null) {
   const r = await fetch(`/api/containers/${containerId}/check-diff`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ against: against || null }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `check diff failed (${r.status})`);
   return data;
+}
+
+// The db containers this one can be compared against (the "Check diff" submenu). Production comes
+// first — it is the default reference and the only one that writes the chip's drift verdict.
+export async function getDiffCandidates(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/diff-candidates`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `diff candidates failed (${r.status})`);
+  return Array.isArray(data.candidates) ? data.candidates : [];
 }
 
 // Duplicate PRODUCTION into a dev db container (the chip's "Duplicate prod" menu item): a prod
