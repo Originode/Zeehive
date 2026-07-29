@@ -148,5 +148,65 @@ ok(/tables in archive/.test(bk), 'labelled as what is IN the archive');
 ok(/NOT VERIFIED: row counts/.test(bk),
    'and states the limit of that proof: tables are verified, rows are not counted');
 
+// ── 7. BACKUP FRESHNESS — the reading that DOES speak to the data fear ──────────────────────────
+// "Last backup: (27 hours ago)" cannot be graded without the interval, and a FAILED attempt in
+// between left no mark at all — while backupDue() counts that failed row as the window's attempt, so
+// one failure delays the next good dump by a full interval. Live evidence, from the meta-db this xell
+// was cloned from: omnibiz backs up every 12h; its last GOOD dump was 2026-07-28 18:30 and the newest
+// attempt (2026-07-29 19:32) FAILED — two windows missed, nothing on the panel saying so.
+console.log('\n── an overdue or failed backup is visible where the human reads it ──');
+const tmp2 = resolve(here, '..', 'web/src/.backups-fresh.test-build.mjs');
+writeFileSync(tmp2, transformSync(read('web/src/Backups.jsx'), { loader: 'jsx', format: 'esm' }).code
+  .replace(/import[^\n]*\.\/(api|Dialog)\.jsx?['"];?/g, (_m, mod) => ({
+    api: 'const getBackups=async()=>({}),setBackupConfig=async()=>{},runBackup=async()=>{},'
+       + 'revealBackup=async()=>{},restoreBackup=async()=>{},deleteBackup=async()=>{};',
+    Dialog: 'const showConfirm=async()=>true,showPrompt=async()=>null;',
+  }[mod] || '')));
+let BackupsPanel, backupFreshness;
+try {
+  const mod = await import(`${tmp2}?t=${process.pid}`);
+  BackupsPanel = mod.default; backupFreshness = mod.backupFreshness;
+} finally { rmSync(tmp2, { force: true }); }
+
+const H = 3600 * 1000;
+const twelveH = { config: { backup_interval_sec: 43200 } };
+const onTime = backupFreshness({ ...twelveH,
+  last: { taken_at: new Date(Date.now() - 2 * H).toISOString() },
+  last_attempt: { taken_at: new Date(Date.now() - 2 * H).toISOString(), status: 'finished' } });
+ok(onTime.state === 'ok' && onTime.failedSince === false, 'a backup inside its interval reads ok');
+
+// The real omnibiz shape: last good dump 25h ago on a 12h policy, newest attempt failed since.
+const omni = { ...twelveH,
+  last: { taken_at: new Date(Date.now() - 25 * H).toISOString() },
+  last_attempt: { taken_at: new Date(Date.now() - 2 * H).toISOString(), status: 'failed',
+                  error: 'interrupted by server restart' } };
+const f = backupFreshness(omni);
+ok(f.state === 'overdue', 'a good dump older than its interval reads OVERDUE');
+ok(f.missedWindows === 2, 'and says HOW MANY windows went by (2)');
+ok(f.failedSince === true, 'and that the newest ATTEMPT failed after the last success');
+ok(backupFreshness({ ...twelveH, last: null, last_attempt: null }).state === 'none',
+   'no backup at all is its own state, never "ok"');
+// A success AFTER the failure clears it — the panel must not cry about yesterday's failure forever.
+ok(backupFreshness({ ...twelveH,
+  last: { taken_at: new Date(Date.now() - 1 * H).toISOString() },
+  last_attempt: { taken_at: new Date(Date.now() - 3 * H).toISOString(), status: 'failed' } }).failedSince === false,
+   'a failure OLDER than the last success is not reported as outstanding');
+
+const panel = renderToStaticMarkup(React.createElement(BackupsPanel, { backup: omni, projectId: 'p1' }));
+ok(/overdue/.test(panel), 'the panel renders an "overdue" mark');
+ok(/last attempt failed/.test(panel), 'and an "last attempt failed" mark — two facts, said separately');
+ok(/interrupted by server restart/.test(panel), 'naming the failure reason the operator needs');
+ok(/separate question/.test(panel),
+   'and it keeps the split: backup AGE is not a statement about a dump\'s CONTENTS');
+const clean = renderToStaticMarkup(React.createElement(BackupsPanel, {
+  backup: { ...twelveH, last: { taken_at: new Date(Date.now() - 1 * H).toISOString() },
+            last_attempt: { taken_at: new Date(Date.now() - 1 * H).toISOString(), status: 'finished' } },
+  projectId: 'p1' }));
+ok(!/overdue|last attempt failed/.test(clean), 'a healthy schedule shows neither mark (no crying wolf)');
+
+// The server has to SEND last_attempt or the panel can never know (the seam, asserted once).
+ok(/last_attempt: lastAttempt/.test(read('server/src/lib/fleet.js')),
+   'fleet.js sends the newest ATTEMPT alongside the newest success');
+
 console.log(`\n${failures === 0 ? 'ALL PASSED ✓' : `${failures} FAILURE(S) ✗`}`);
 process.exit(failures === 0 ? 0 : 1);

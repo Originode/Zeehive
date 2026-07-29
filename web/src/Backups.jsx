@@ -93,23 +93,78 @@ function TableSelect({ available = [], value, onChange, allLabel = 'the whole da
   );
 }
 
+// Is the newest SUCCESSFUL backup older than the policy that was configured for it? Pure, so the
+// wording is testable. `graceRatio` tolerates the scheduler's own tick + a dump's duration — the
+// signal is "a whole backup window has gone by", not "we are a minute late".
+//
+// This exists because "Last backup: (27 hours ago)" is not a reading a human can grade: whether that
+// is fine or alarming depends on an interval that lives behind the ⚙, and a FAILED attempt in between
+// (which backupDue counts as the window's attempt, delaying the next good dump by a full interval)
+// left no mark here at all. TKT-22-4F0E asked whether production data is fully backed up; the honest
+// half of that answer is freshness, and it was the one number this panel was not showing.
+export function backupFreshness(backup, now = Date.now()) {
+  const last = backup?.last;
+  const interval = Number(backup?.config?.backup_interval_sec) || 0;
+  const attempt = backup?.last_attempt || null;
+  // The newest attempt failed and no success has happened since it — the operator must know, whether
+  // or not the schedule has slipped yet.
+  const failedSince = !!attempt && attempt.status === 'failed'
+    && (!last || new Date(attempt.taken_at) > new Date(last.taken_at));
+  if (!last) return { state: 'none', failedSince, attempt, ageSec: null, interval };
+  const ageSec = Math.max(0, Math.floor((now - new Date(last.taken_at).getTime()) / 1000));
+  const graceRatio = 1.25;
+  const overdue = interval > 0 && ageSec > interval * graceRatio;
+  return {
+    state: overdue ? 'overdue' : 'ok', failedSince, attempt, ageSec, interval,
+    missedWindows: interval > 0 ? Math.floor(ageSec / interval) : 0,
+  };
+}
+
 // ── the panel (sits above the container inventory) ────────────────────────────
 export default function BackupsPanel({ backup, projectId }) {
   const [showList, setShowList] = useState(false);
   const [showCfg, setShowCfg] = useState(false);
   const last = backup?.last;
   const running = !!backup?.running;   // a backup job is in flight
+  const fresh = backupFreshness(backup);
+  const stale = !running && (fresh.state === 'overdue' || fresh.failedSince);
 
   return (
     <section className="backups" data-testid="backups-panel">
       <span className="bklabel">Last backup:</span>
-      <button className={`bklast ${last ? '' : 'none'}`} onClick={() => setShowList(true)}
-              title="Show all backups" data-testid="last-backup">
+      <button className={`bklast ${last ? '' : 'none'}${stale ? ' stale' : ''}`} onClick={() => setShowList(true)}
+              title={last
+                ? `The newest SUCCESSFUL dump of production. Policy: every ${Math.round(fresh.interval / 3600) || '?'}h.`
+                  + (fresh.state === 'overdue'
+                    ? `\n\n⚠ OVERDUE — ${fresh.missedWindows} backup window(s) have passed since it. Production `
+                      + `itself is fine; what is old is your restore point.`
+                    : '')
+                  + (fresh.failedSince
+                    ? `\n\n⚠ The most recent ATTEMPT (${stampFmt(fresh.attempt.taken_at)}) FAILED: `
+                      + `${fresh.attempt.error || 'no reason recorded'}\nA failed attempt uses up its window, so the `
+                      + `next good dump is a full interval away unless you run one now.`
+                    : '')
+                  + '\n\nThis is about the AGE of the backup. Whether a dump\'s CONTENTS are complete is a '
+                  + 'separate question — open the list and read what each archive contains.'
+                : 'Show all backups'}
+              data-testid="last-backup">
         {last
           ? <><span className="mono">{stampFmt(last.taken_at)}</span>
               <span className="bkago">({ago(last.taken_at)})</span></>
           : <span className="bkago">no backups yet</span>}
       </button>
+      {/* Loud where it is read, not buried in a log. Two distinct facts, so both are said. */}
+      {!running && fresh.state === 'overdue' && (
+        <span className="bkstale" data-testid="backup-overdue"
+              title={`No successful backup for ${fresh.missedWindows} window(s) of the configured `
+                + `${Math.round(fresh.interval / 3600) || '?'}h interval.`}>⚠ overdue</span>
+      )}
+      {!running && fresh.failedSince && (
+        <span className="bkstale" data-testid="backup-last-failed"
+              title={`The last attempt failed: ${fresh.attempt?.error || 'no reason recorded'}`}>
+          ⚠ last attempt failed
+        </span>
+      )}
       {running && (
         <span className="bkrunning" data-testid="backup-running" title="A backup is running">
           <span className="cspin backup" />backing up…
