@@ -17,6 +17,10 @@ says a massive gap. and im afraid the data might not be fully backed up."*
 | why does a fresh restore show a big diff? | `queenzee/proddiff.js` | **answered** — see §2 |
 | is production's data fully backed up? | *nothing* | **not answerable** — see §3 |
 
+For getting from a drift *number* to a *cause*, read [schema-drift-triage.md](schema-drift-triage.md)
+— the direction reading, the by-schema rollup and the dev↔dev control experiment. This file is the
+other half: what that number can never mean, and what would actually answer the data question.
+
 `proddiff` compares CATALOG SHAPE: tables, columns, triggers. It counts no rows, reads no values
 and never opens a dump. A green `0` is therefore not evidence that data is safe, and a red `12802`
 is not evidence that any data was lost. That conflation is the defect the ticket actually found;

@@ -55,8 +55,8 @@ ok(drifted.total === 2, 'the total still counts every catalog difference (1 tabl
 
 // ── 2. AGE is visible: prod has N, this db has M ────────────────────────────────────────────────
 console.log('\n── a restore that is merely OLDER than prod is readable as such ──');
-ok(drifted.kinds.table.prod_count === 2 && drifted.kinds.table.mine_count === 1,
-   'per-kind prod_count/mine_count are carried (prod 2 tables / here 1) — not just "3 differences"');
+ok(drifted.kinds.table.ref_count === 2 && drifted.kinds.table.mine_count === 1,
+   'per-kind ref_count/mine_count are carried (reference 2 tables / here 1) — not just "2 differences"');
 ok(drifted.kinds.table.missing[0] === 'public.project_doc' && drifted.kinds.table.extra_count === 0,
    'the missing object is named, and nothing is EXTRA — the one-directional signature of a stale copy');
 ok(drifted.empty_db === false, 'a db that is one migration behind is NOT flagged empty');
@@ -72,8 +72,8 @@ ok(ahead.kinds.table.extra_count === 1 && ahead.kinds.table.missing_count === 0,
 console.log('\n── a database with none of prod\'s tables was never restored ──');
 const emptyDb = diffPayload(prod, fp([], [], []));
 ok(emptyDb.empty_db === true, 'no application tables at all → empty_db: true');
-ok(emptyDb.kinds.table.prod_count === 2 && emptyDb.kinds.table.mine_count === 0,
-   'and it reports prod has 2, this db has 0 — the fact, not a difference count');
+ok(emptyDb.kinds.table.ref_count === 2 && emptyDb.kinds.table.mine_count === 0,
+   'and it reports the reference has 2 and this db has 0 — the fact, not a difference count');
 // The ruler itself being empty is NOT a claim about the measured db (a prod probe that read nothing
 // would otherwise flag every db in the fleet as empty).
 ok(diffPayload(fp([]), fp([])).empty_db === false,
@@ -117,7 +117,10 @@ ok(/SCHEMA drifted from prod/.test(html), 'a drifted chip says SCHEMA drifted (n
 ok(/SCHEMA only/.test(html), 'the tooltip states the scope: schema only');
 ok(/row data/.test(html) && /(backed up|fully backed up)/.test(html),
    'and says in so many words that it cannot confirm or deny that data is backed up');
-ok(/point-in-time/.test(html), 'and explains why a faithful restore still shows missing objects');
+// The WHICH-WAY sentence comes from drift.js (driftDirection), so the glance and the on-demand
+// report cannot disagree about what "everything missing, nothing extra" means.
+ok(/strict SUBSET of the reference/.test(html),
+   'and explains why a faithful restore still shows missing objects — one-directional drift is a stale LOAD');
 ok(/prod 2 \/ here 1/.test(html), 'the counts ride along, so "behind" is visible at a glance');
 
 // The GREEN reading needs the caveat MOST: "✓ schema matches prod" with nothing after it is the
@@ -132,12 +135,20 @@ ok(/EMPTY/.test(emptyHtml) && /never restored/.test(emptyHtml),
    'an empty db reads as "EMPTY … never restored", not as a huge drift number');
 ok(!/difference\(s\)/.test(emptyHtml), 'and it does not report a difference COUNT at all');
 
-// The other half of the same confusion: the on-demand "Check diff" dialog.
-const cjsx = read('web/src/Container.jsx');
-const diag = cjsx.slice(cjsx.indexOf('const runCheckDiff'), cjsx.indexOf('const runDuplicateProd'));
-ok(/compares SCHEMA only/.test(diag) && /counts no rows/.test(diag),
-   'the "Check diff" result dialog states its scope on every outcome');
-ok(/empty_db/.test(diag), 'and reports an empty database as empty rather than as drift');
+// The other half of the same confusion: the on-demand "Check diff" report. Its words live in
+// drift.js (shared with the picker this landed beside), so assert the REAL renderer, and assert that
+// the caveat rides the GREEN outcome too — that is the one that gets quoted as reassurance.
+const { diffReportText } = await import('../web/src/drift.js');
+const ref = { name: 'omnibiz_db_prod', is_prod: true };
+const greenReport = diffReportText('dev_db', { ok: true, total: 0, kinds: {}, reference: ref, persisted: true });
+ok(/SCHEMA only/.test(greenReport) && /counts no rows/.test(greenReport),
+   'the "Check diff" report states its scope on the GREEN outcome');
+const red = diffReportText('dev_db', { ...drifted, reference: ref, persisted: true });
+ok(/SCHEMA only/.test(red), 'and on the drifted one');
+const emptyReport = diffReportText('dev_db', { ...emptyDb, reference: ref, persisted: true });
+ok(/EMPTY/.test(emptyReport) && /never restored/.test(emptyReport) && /omnibiz_db_prod \(production\) has 2/.test(emptyReport),
+   'and an empty database is reported as EMPTY, naming what the reference holds');
+ok(!/difference\(s\)/.test(emptyReport), 'never as a difference COUNT');
 
 // ── 6. the BACKUPS panel — where "is my data backed up?" is actually asked ──────────────────────
 console.log('\n── the backups row answers with what the archive contains ──');

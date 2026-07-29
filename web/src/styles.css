@@ -571,6 +571,19 @@ a.cbox:hover { border-color: var(--accent); }
   padding: 6px 8px 2px; margin-top: 2px; border-top: 1px solid var(--line); }
 .ctxmenu button.ctxsel { color: var(--accent); font-weight: 600; }
 .ctxmenu button.ctxsel:hover { color: #fff; }
+/* ── "Compare against…" — the Check-diff reference picker ────────────────────── */
+/* A list of real container CHIPS, so a database is recognised here exactly as it is on the canvas
+   and in the matrix. The chips are click-THROUGH: the whole row is the button, and a chip that ate
+   the click would leave "nothing happens when I pick prod". Scrolls, because a project can have one
+   db per xell and this list must never push the destructive items off screen. */
+.ctxmenu .ctxdbpick { max-height: 46vh; overflow-y: auto; }
+.ctxmenu .ctxdbpick button { align-items: center; }
+.ctxmenu .ctxchip { display: inline-flex; flex: 0 0 auto; pointer-events: none; }
+/* two-thirds scale: the chip is an identifier here, not the subject */
+.ctxmenu .ctxchip .cbox { width: 28px; height: 24px; font-size: 9px; padding-bottom: 3px; border-radius: 5px; }
+.ctxmenu .ctxdbname { display: flex; flex-direction: column; gap: 2px; min-width: 0; max-width: 240px;
+  font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }
+.ctxmenu .ctxdbname > .ctxsub { font-family: inherit; }
 /* restore-over-prod entry: loud, because it targets live production */
 .ctxmenu button.ctxdanger-item { color: #ff8b81; }
 .ctxmenu button.ctxdanger-item:hover { background: #b3261e; color: #fff; }
