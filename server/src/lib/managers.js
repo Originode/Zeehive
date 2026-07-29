@@ -21,6 +21,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
+import { briefReason } from './status.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
 
@@ -60,9 +61,10 @@ export async function crewFor(managerXellId) {
             EXISTS(SELECT 1 FROM prod_bind_request pbr WHERE pbr.xell_id=x.id AND pbr.status='pending') AS prod_bind_pending,
             EXISTS(SELECT 1 FROM prod_seed_request psr WHERE psr.xell_id=x.id
                      AND psr.status IN ('pending','approved','running') AND psr.dismissed_at IS NULL) AS seed_pending,
-            (SELECT se.hook_event_name FROM session_event se
-               WHERE se.xell_id=x.id AND se.hook_event_name IN ('tend-request','tend-clear')
-               ORDER BY se.ts DESC LIMIT 1) = 'tend-request' AS tend_pending,
+            tnd.hook_event_name = 'tend-request' AS tend_pending,
+            -- WHY it raised the tend: a manager reading "it needs a human" and nothing else cannot
+            -- tell whether that is its business or a human's, so the brief reason rides along.
+            tnd.reason AS tend_reason,
             EXISTS(SELECT 1 FROM done_suggestion ds WHERE ds.target_xell_id=x.id
                      AND ds.status='pending' AND ds.dismissed_at IS NULL) AS done_suggested,
             (SELECT zm.body FROM zee_message zm WHERE zm.from_xell_id=x.id AND zm.to_xell_id=$1
@@ -76,6 +78,10 @@ export async function crewFor(managerXellId) {
                    zz.created_at DESC LIMIT 1) z ON true
        LEFT JOIN LATERAL (
          SELECT * FROM task tt WHERE tt.xell_id = x.id ORDER BY tt.created_at DESC LIMIT 1) t ON true
+       LEFT JOIN LATERAL (
+         SELECT se.hook_event_name, se.raw->>'reason' AS reason FROM session_event se
+          WHERE se.xell_id=x.id AND se.hook_event_name IN ('tend-request','tend-clear')
+          ORDER BY se.ts DESC LIMIT 1) tnd ON true
       WHERE x.manager_xell_id = $1 AND x.status <> 'retired'
       ORDER BY x.created_at`, [managerXellId]);
 
@@ -91,7 +97,7 @@ export async function crewFor(managerXellId) {
       r.ship_pending && 'a ship is awaiting a human',
       r.prod_bind_pending && 'it asked for the PROD database',
       r.seed_pending && 'it asked for production to be SEEDED',
-      r.tend_pending && 'it raised a TEND (needs a human)',
+      r.tend_pending && `it raised a TEND (needs a human)${briefReason(r.tend_reason) ? `: ${briefReason(r.tend_reason)}` : ''}`,
       r.status === 'awaiting-done' && 'it proposed DONE (a human must confirm)',
       r.done_suggested && 'you already suggested it is done (awaiting a human)',
     ].filter(Boolean);

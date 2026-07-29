@@ -71,7 +71,8 @@ human's click.**
 - **Ship gate** — production deploys are requests; a human approves, and the *queenzee* builds
   from the landed main and deploys. A zee never holds the prod lock or runs a prod build.
 - **Prod data** — binding a xell to a production database is a per-xell human grant.
-- **Done** — a zee proposes it's finished; a human's "Mark done" is what tears the cxell down
+- **Done** — a zee proposes it's finished (and can withdraw that with `zee done --clear` if it is
+  handed more work); a human's "Mark done" is what tears the cxell down
   (commits are collected first). A **manager zee** may only *suggest* that another xell is done —
   the same human click, with a typed confirmation, is still what ends it.
 

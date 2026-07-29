@@ -113,22 +113,45 @@ async function touch(zee) {
 // 'tend-clear'). recordEvent already writes the reason into `raw`. Cleared automatically when the
 // zee reports working again (see setTendFromWork), so a stale "needs you" can't dangle after the
 // zee moved on.
+//
+// The reason is the POINT of a tend, not decoration: "a xell needs a human" with no why makes the
+// human open a terminal and read a transcript to find out what they were called for. So it is
+// recorded (raw.reason), read back with the open state (tendState), and carried all the way to the
+// console — but BRIEF, because it rides a hexagon and a one-line "waiting on you" chip, not a card.
+export const TEND_REASON_MAX = 200;
+
+// One brief line: collapse whitespace/newlines, trim, cap at `max` (…-elided). null when empty, so
+// "no reason" stays distinguishable from "a reason that says nothing".
+export function briefReason(reason, max = TEND_REASON_MAX) {
+  const s = String(reason ?? '').replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  return s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s;
+}
+
 export async function setTend(xellId, on, { reason = null, zeeId = null, source = 'self' } = {}) {
+  const why = briefReason(reason);
   await recordEvent({
     source, hook_event_name: on ? 'tend-request' : 'tend-clear',
-    zee_id: zeeId, xell_id: xellId, raw: reason ? { reason } : null,
+    zee_id: zeeId, xell_id: xellId, raw: why ? { reason: why } : null,
   });
   broadcast('xell', { id: xellId });
-  return { xell_id: xellId, tend: !!on, reason };
+  return { xell_id: xellId, tend: !!on, reason: why };
+}
+
+// The xell's tend as the console needs it: is it open, and WHY (the brief reason the zee gave),
+// and since when. Latest-event-wins, exactly like tendOpen — which is now this, narrowed.
+export async function tendState(xellId) {
+  const row = await one(
+    `SELECT hook_event_name, ts, raw->>'reason' AS reason FROM session_event
+       WHERE xell_id = $1 AND hook_event_name IN ('tend-request','tend-clear')
+       ORDER BY ts DESC LIMIT 1`, [xellId]);
+  const open = row?.hook_event_name === 'tend-request';
+  return { open, reason: open ? briefReason(row.reason) : null, at: open ? row.ts : null };
 }
 
 // Is this xell's tend currently OPEN? (latest tend event is a request, not a clear)
 export async function tendOpen(xellId) {
-  const row = await one(
-    `SELECT hook_event_name FROM session_event
-       WHERE xell_id = $1 AND hook_event_name IN ('tend-request','tend-clear')
-       ORDER BY ts DESC LIMIT 1`, [xellId]);
-  return row?.hook_event_name === 'tend-request';
+  return (await tendState(xellId)).open;
 }
 
 // ── the zee's READINESS HINT (hint-land / hint-ship) ────────────────────────────

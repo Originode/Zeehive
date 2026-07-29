@@ -245,6 +245,9 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .ny-n { color: var(--muted); font-size: 11px; font-family: 'Segoe UI', sans-serif; }
 /* the decision card(s) for the clicked chip, inline right under the bar */
 .ny-decision { display: flex; flex-direction: column; gap: 8px; }
+/* WHY a tend was raised. A tend has no Approve/Reject — the only thing it carries is the zee's
+   reason, so that reason is the loudest word in the note rather than a footnote to it. */
+.ny-why { color: var(--building); }
 /* Jumping to a card is useless if you then can't tell WHICH one it scrolled to. */
 .card.flash { animation: cardflash 1.2s ease-out; }
 @keyframes cardflash {
@@ -299,6 +302,11 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
    `no` is the only one that needs you (land it); `queue` resolves itself when the
    lock frees, so it is muted, not a warning — a red "blocked" there would send you
    hunting for a problem that is already handling itself. */
+/* The tend row on a xell card: the brief reason its zee gave for asking for a human. Same amber as
+   the "waiting on you" bar — it is the card-side face of that ask — and clipped to one line (the
+   full text is on the title), because a card row that wraps pushes the whole grid around. */
+.tendwhy { font-size: 11px; text-align: right; color: var(--building);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shipst { font-size: 11px; text-align: right; }
 .shipst.s-ready { color: var(--up); }
 .shipst.s-no    { color: var(--building); }
@@ -594,6 +602,11 @@ a.cbox:hover { border-color: var(--accent); }
 /* db scope + zee drift assessment on a ship card — part of what the approve click covers */
 .ship-dbscope { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 .ship-dbnote { margin: 3px 0 0; font-size: 12px; color: var(--muted); font-style: italic; }
+/* The cxell-image guard's release valve: quiet until ticked, then it says what it costs. */
+.ship-stale-override { display: block; margin: 5px 0 0; font-size: 12px; color: var(--muted); cursor: pointer; }
+.ship-stale-override input { vertical-align: -1px; margin-right: 2px; }
+.ship-stale-warn { color: #ffcf9e; }
+.ship-stale-chosen { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 /* deploy-target picker on a pending ship card */
 .ship-target { display: flex; align-items: center; gap: 7px; margin: 6px 0 2px; font-size: 13px; }
 .ship-target .k { color: var(--muted); }

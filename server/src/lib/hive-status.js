@@ -62,7 +62,26 @@ export function hiveStatus(x, sig = {}) {
   const s = x.status;
 
   // ── terminal / housekeeping (these outrank everything: they describe where the xell IS going) ──
-  if (s === 'awaiting-done')             return 'occ-doneRequest';   // the zee proposed done
+  //
+  // NOTE what is NOT here any more: 'awaiting-done'. It used to sit on this line, above every
+  // signal, and that was a category error with a real cost — a zee that proposes done and is then
+  // handed more work had every later signal MASKED behind a stale done card: an open tend, a held
+  // landing, a pending ship button. It happened to a manager zee whose tend said "approve the urgent
+  // ship" and stayed invisible for about seven hours, and a second zee independently worked out the
+  // trap and routed around it by refusing to propose done while its ship was pending. A rule a zee
+  // has to remember and route around is a design flaw, not a discipline problem. So:
+  //
+  //   'tearing-down' is a FACT — a human already confirmed, the queenzee is reaping, and nothing
+  //   the zee wants can change it. Showing anything else would invite action on a xell that is
+  //   disappearing. It keeps outranking everything.
+  //
+  //   'awaiting-done' is a REQUEST — the zee ASKING to be finished. That makes it a sibling of
+  //   land?/ship?/tend?, not of tearing-down, and it is the WEAKEST of them: nothing is blocked
+  //   while it waits, and it is the one ask whose wrong answer is destructive (confirming it reaps
+  //   the cxell). Every other signal is either more urgent or is something the human needs to see
+  //   BEFORE answering it — unlanded commits especially. So it now ranks just above plain activity,
+  //   below the gates, tend, a manager's done-suggestion and the readiness hints. See the occupied
+  //   block below.
   if (s === 'tearing-down')              return 'occ-done';          // a human confirmed; reaping
   if (s === 'error' || s === 'husk')     return 'vac-dirty';         // needs queenzee housekeeping
 
@@ -87,6 +106,14 @@ export function hiveStatus(x, sig = {}) {
   // live activity — a "this looks ready" prompt should be visible even while the zee keeps polishing.
   if (shipHint)                          return 'occ-shipHint';
   if (landHint)                          return 'occ-landHint';
+  // The zee's OWN done proposal — deliberately the last human-actionable signal (see the note
+  // above). It outranks only plain activity. Below the hints on purpose: the manual already warns
+  // that proposing done "masks your own land? button and invites a human to tear you down with work
+  // still only on your branch" — with this order that hazard cannot happen, because a xell with
+  // unlanded commits shows land? until the work is landed, and only then reads done?. The proposal
+  // is never lost: `awaiting_done` is its own field on the read models, so the console's done card
+  // does not depend on this key.
+  if (s === 'awaiting-done')             return 'occ-doneRequest';
 
   const working = x.zee_status === 'working' || x.cli_active === true || s === 'working';
   if (working)                           return 'occ-working';
