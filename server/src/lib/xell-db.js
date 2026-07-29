@@ -586,6 +586,29 @@ export async function attachXellDb(xellId, { coupling, container, dump } = {}) {
     + (snapshot ? ` restored from ${snapshot.dump_path}` : '')
     + (mode === 'db-shared-prod' ? '  ⚠ LIVE PRODUCTION DATA' : ''));
 
+  // ── THE PROJECTION FOLLOWS THE BINDING (ticket #15) ─────────────────────────────────────────
+  // .zeehive.env is what the zee actually runs with — its DATABASE_URL, and (resolved by tier)
+  // the project's dev or PROD environment. Until this call it was written at PROVISION time and
+  // essentially never again, so a human granting prod to a LIVE xell moved the binding and left
+  // the file behind: the card said "this xell holds production", the file handed over a writable
+  // dev clone and dev secrets. A binding that means one thing and a file that means another is a
+  // safety statement that is false in both directions — a zee trusting the binding writes to
+  // something it believes refused, one trusting the file reads stale data and calls it prod.
+  //
+  // This is the choke point for EVERY db re-target (the console/API attach, attachProdStack and
+  // detachProdStack, the manager's read-only bind, `zee db-catchup --restore`, dispatch), so the
+  // re-emit belongs here rather than at each call site — the ones that already re-emit stay
+  // correct, they just emit an unchanged file.
+  //
+  // Best-effort and NEVER fatal, exactly like the existing call sites: a pooled xell whose
+  // worktree is not yet on disk has nothing to write, and a projection failure must not undo a
+  // binding change that has already happened (nor sink the caller). It is logged, loudly enough
+  // to be found — including the §6.2 refusal, which stays a refusal.
+  const { emitXellEnv } = await import('./provision.js');
+  const emitted = await emitXellEnv(xellId).then(() => null).catch((e) => e.message);
+  if (emitted) logline('xell-db', `${xell.slug}: .zeehive.env NOT re-emitted for ${mode} — ${emitted}`);
+
   return { coupling: mode, container: target.name, container_id: target.id, database: cloneName,
-           restored_from: snapshot?.dump_path || null, prod: mode === 'db-shared-prod' };
+           restored_from: snapshot?.dump_path || null, prod: mode === 'db-shared-prod',
+           env_emitted: !emitted, env_error: emitted || null };
 }

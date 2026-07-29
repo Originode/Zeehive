@@ -107,20 +107,43 @@ export async function emitXellEnv(xellId) {
   // reconciling one meta-DB reap each other's xells; that failure class has destroyed live work
   // before, so it is a refusal, not a warning.
   //
-  // FIRST, before the xell's own db container: a xell bound to production READ-ONLY. Its
-  // DATABASE_URL is the SELECT-only DSN the queenzee minted for it (lib/prod-readonly.js) — never
-  // the prod owner's connection string, and never its OWN db container either. That precedence is
-  // the point: a manager is an ordinary pooled spinoff (owned db container and all) that is THEN
-  // bound read-only, so taking the owned container first
-  // meant the manager's .zeehive.env quietly pointed at its throwaway spinoff database while its
-  // binding advertised production (ticket #15). The binding is what the zee was told it has, so the
-  // binding wins. Emitted at all because a cxell zee has no docker and reaches postgres over TCP.
-  // Falls through when no DSN was minted (a project with no prod db registered — bindManagerToProd-
-  // Readonly skips the bind there): a xell then keeps whatever database it really has, rather than
-  // being left with none. The §6.2 refusal below still applies to this DSN like any other.
-  let dbUrl = (xell.db_coupling === 'db-prod-readonly' && xell.prod_ro_dsn) ? xell.prod_ro_dsn : null;
+  // FIRST, before the xell's own db container: PRODUCTION, when the COUPLING says the xell holds
+  // it. A xell on prod is an ordinary pooled spinoff — owned db container and all — that was THEN
+  // re-pointed (attachXellDb links the prod container and flips the coupling together), so taking
+  // the owned container first meant the file quietly named the throwaway spinoff database while
+  // the binding advertised production (ticket #15). The binding is what the zee was TOLD it has,
+  // so the binding wins. Emitted at all because a cxell zee has no docker and reaches postgres
+  // over TCP. The §6.2 refusal below applies to whatever this resolves to, like any other DSN.
+  //
+  // The two prod couplings are the same link and DIFFERENT credentials, and that distinction is a
+  // safety boundary, not a detail:
+  //   • db-shared-prod  — a full human-granted bind: the prod container's own conn_ref.
+  //   • db-prod-readonly — the manager binding: ONLY the SELECT-only DSN lib/prod-readonly.js
+  //     minted for this xell. Never the prod owner's connection string — following the binding
+  //     must never widen a reader into a writer — and never its own clone either. If the reader
+  //     was not minted (or was dropped) while the xell is still LINKED to prod, we emit no
+  //     DATABASE_URL at all: no database is a fixable state, the wrong database is a silent one.
+  // A coupling with NO prod db linked (a project with no production registered — bindManagerTo-
+  // ProdReadonly skips the bind there) is not "on prod" in any usable sense, so it falls through
+  // to the ordinary resolution below and keeps whatever database it really has.
+  let dbUrl = null;
+  let bindingIsProd = false;                 // linked to prod → the owned container is NOT a fallback
+  if (xell.db_coupling === 'db-shared-prod' || xell.db_coupling === 'db-prod-readonly') {
+    const linkedProd = await one(
+      `SELECT c.conn_ref FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+        WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [xellId]);
+    bindingIsProd = !!linkedProd || !!xell.prod_ro_dsn;
+    dbUrl = xell.db_coupling === 'db-prod-readonly'
+      ? (xell.prod_ro_dsn || null)
+      : (linkedProd?.conn_ref || xell.prod_ro_dsn || null);
+    if (bindingIsProd && !dbUrl) {
+      logline('prod-ro', `${xell.slug}: coupled ${xell.db_coupling} but no usable production DSN `
+        + '(no minted reader / the prod container row records no conn_ref) — .zeehive.env is emitted '
+        + 'with NO DATABASE_URL rather than a database the binding does not mean');
+    }
+  }
   // …else the xell's OWN db container, when it has one.
-  if (!dbUrl) dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
+  if (!dbUrl && !bindingIsProd) dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
   // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
   // dev postgres — the shared container's conn_ref with the database name swapped for the
   // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
