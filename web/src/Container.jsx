@@ -9,8 +9,9 @@
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
 import React, { useState, useEffect } from 'react';
-import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, duplicateProd } from './api.js';
+import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, getDiffCandidates, duplicateProd } from './api.js';
 import { nick } from './nick.js';
+import { diffReportText } from './drift.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 // Production is EXCLUDED from decommission entirely (not warned) — a prod container/db is never a
@@ -186,15 +187,35 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   const [typed, setTyped] = useState('');
   const [busyAct, setBusyAct] = useState(false);
   const [err, setErr] = useState(null);
-  // "Check diff" fires an on-demand drift check against prod; guard against a double-click while the
-  // catalog comparison is in flight. Reset (with the rest) whenever the menu retargets a container.
-  const [diffing, setDiffing] = useState(false);
+  // "Check diff" fires an on-demand drift check; `diffing` holds WHICH reference is in flight
+  // ('prod' | a container id) so a double-click can't fire two comparisons. `picking` opens the
+  // reference picker; `cands` is the lazily-loaded list of db chips it offers (null = not loaded).
+  // Reset (with the rest) whenever the menu retargets a container.
+  const [diffing, setDiffing] = useState(null);
+  const [picking, setPicking] = useState(false);
+  const [cands, setCands] = useState(null);
+  const [candErr, setCandErr] = useState(null);
   // "Duplicate prod" streams a fresh prod dump into THIS dev db (backup + restore in one). Guard the
   // in-flight window so a double-click can't fire two overwrites. Reset when the menu retargets.
   const [dupPending, setDupPending] = useState(false);
   const c = menu?.c;
   const cid = c?.id;
-  useEffect(() => { setConfirming(false); setTyped(''); setBusyAct(false); setErr(null); setDiffing(false); setDupPending(false); }, [cid]);
+  useEffect(() => {
+    setConfirming(false); setTyped(''); setBusyAct(false); setErr(null);
+    setDiffing(null); setPicking(false); setCands(null); setCandErr(null); setDupPending(false);
+  }, [cid]);
+
+  // The reference dbs this container can be measured against, fetched the first time the picker is
+  // opened (same lazy pattern as the build-host contexts above). The SERVER orders them — production
+  // first — so "what is the default" lives in one place, not in two renderers.
+  useEffect(() => {
+    if (!picking || !cid || cands) return;
+    let live = true;
+    getDiffCandidates(cid)
+      .then((list) => { if (live) { setCands(list || []); setCandErr(null); } })
+      .catch((e) => { if (live) { setCands([]); setCandErr(e?.error || e?.message || String(e)); } });
+    return () => { live = false; };
+  }, [picking, cid, cands]);
 
   const buildable = c ? isBuildable(c) : false;
   const busy = c ? busyReason(c) : null;
@@ -245,27 +266,27 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
     } catch (e) { setErr(e?.error || e?.message || String(e)); setBusyAct(false); }
   };
 
-  // Check this db's schema against production NOW. The server persists the verdict and broadcasts the
-  // container, so the chip's drift mark repaints over SSE; we also pop a one-line summary. The full
-  // per-object breakdown already lives in the chip's tooltip, so we don't reproduce it here.
-  const runCheckDiff = async () => {
+  // Check this db's schema against a REFERENCE database NOW. `against` = null → PRODUCTION (the
+  // default); any other db container id → an ad-hoc comparison that is REPORTED and never written to
+  // the chip. Comparing dev↔dev is the whole reason the picker exists: "is THIS db drifted, or is
+  // every db drifted the same way?" separates a bad restore from a difference the probe itself sees
+  // (a different postgres/extension build on the host), and it is the first question worth asking
+  // when a freshly restored db still shows drift.
+  //
+  // The full report is shown in the dialog, not just a total: for a non-prod reference nothing is
+  // persisted, so the chip's tooltip cannot be where the breakdown lives.
+  const runCheckDiff = async (against = null) => {
     if (diffing) return;
-    setDiffing(true);
+    setDiffing(against || 'prod');
     try {
-      const r = await checkContainerDiff(c.id);
+      const r = await checkContainerDiff(c.id, against);
       onClose();
-      if (r?.same_db) { showAlert(`${c.name} IS the production database — there is nothing to diff.`); return; }
-      if (r?.ok === false) {
-        showAlert(`Could not diff ${c.name} against production:\n\n${r.error || 'unknown error'}`, { variant: 'error' });
-        return;
-      }
-      const total = r?.total || 0;
-      showAlert(total === 0
-        ? `✓ ${c.name} — schema matches production.`
-        : `⚠ ${c.name} has DRIFTED from production — ${total} difference(s).\n\nHover the chip for the per-object breakdown.`,
-        { variant: total === 0 ? 'info' : 'error' });
+      showAlert(diffReportText(c.name, r), {
+        title: r?.ok === false ? 'Check diff failed' : 'Schema comparison',
+        variant: (r?.ok === false || r?.total > 0) ? 'error' : 'info',
+      });
     } catch (e) {
-      setDiffing(false);
+      setDiffing(null);
       showAlert('Check diff failed: ' + (e?.error || e?.message || e), { variant: 'error' });
     }
   };
@@ -435,10 +456,50 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
       {isDb && !prod && (busy ? (
         <div className="ctxsub ctxbusy-note" data-testid="check-diff-busy">diff unavailable while busy</div>
       ) : (
-        <button role="menuitem" data-testid="check-diff-open" disabled={diffing} onClick={runCheckDiff}>
-          🔍 {diffing ? 'Checking diff…' : 'Check diff'}
-          <span className="ctxsub">compare this db's schema against production now</span>
-        </button>
+        <>
+          <button role="menuitem" data-testid="check-diff-open" disabled={!!diffing}
+                  onClick={() => runCheckDiff(null)}>
+            🔍 {diffing === 'prod' ? 'Checking diff…' : 'Check diff'}
+            <span className="ctxsub">compare this db's schema against production now</span>
+          </button>
+          {/* …or against ANOTHER db. One extra click, because production is the default and the only
+              reference that repaints the chip; every other one is a report. */}
+          <button role="menuitem" data-testid="check-diff-pick" className={picking ? 'ctxsel' : ''}
+                  aria-expanded={picking} disabled={!!diffing}
+                  onClick={() => setPicking((v) => !v)}>
+            {picking ? '▾' : '▸'} Compare against…
+            <span className="ctxsub">pick another database to measure this one against</span>
+          </button>
+          {picking && (
+            <div className="ctxdbpick" data-testid="check-diff-picker">
+              <div className="ctxsubhead">compare against {cands ? '' : '…'}</div>
+              {candErr && <div className="ctxwarn-err" data-testid="check-diff-picker-err">{candErr}</div>}
+              {cands && !cands.length && !candErr && (
+                <div className="ctxsub ctxbusy-note">no other database in this project</div>
+              )}
+              {(cands || []).map((d) => (
+                <button key={d.id} role="menuitem" data-testid={`check-diff-against-${d.id}`}
+                        className={d.is_prod ? 'ctxsel' : ''} disabled={!!diffing}
+                        title={`measure ${c.name} against ${d.name}`}
+                        onClick={() => runCheckDiff(d.id)}>
+                  {/* the REAL chip, so a db is recognised here exactly as it is everywhere else.
+                      pointer-events are off (see .ctxdbpick .cbox) so the click is always the row's,
+                      and url is dropped so no anchor is nested inside this button. */}
+                  <span className="ctxchip"><ContainerChip c={{ ...d, url: null }} /></span>
+                  <span className="ctxdbname">
+                    {d.name}
+                    <span className="ctxsub">
+                      {d.is_prod ? '🛡 production · default · sets the chip' : d.tier}
+                      {d.owner_slug ? ` · xell ${d.owner_slug}` : ''}
+                      {d.busy_op ? ` · ${d.busy_op}ing…` : ''}
+                      {diffing === d.id ? ' · checking…' : ''}
+                    </span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </>
       ))}
 
       {/* Decommission: every non-production container, DEVICES included (035). Production is excluded
