@@ -12,7 +12,7 @@ import { bus, broadcast } from '../lib/events.js';
 import { claimXell, dispatchXell, DISPATCH_MODES, PERMISSION_MODES, setZeeMode, listDispatchModels, reinjectHarnessIntoXell } from '../queenzee/intake.js';
 import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
-         harnessAvatarFile } from '../lib/harness.js';
+         harnessAvatarSvg } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
 import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc } from '../lib/project-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
@@ -683,20 +683,18 @@ router.delete('/harnesses/:key', async (req, res) => {
   try { res.json(await deleteHarness(req.params.key)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
-// The harness avatar badge (SVG). Resolved from the harness row's avatar_path under the repo the
-// harness FILES live in (the Zeehive project's repo_root, falling back to config.repoRoot) —
-// avatar SVG is the ONE harness thing still on disk (art, not agent-facing text) — the bundle lives
-// in the row. Path-guarded so a crafted avatar_path can't escape harnesses/. 404 when a harness has
-// no avatar, or when the repo holding it is not readable from here.
+// The harness avatar badge — served from the META-DB (`bundle.avatar_svg`, migration 082). It used to
+// be read off disk under the Zeehive project's repo, which 404'd the badge on any queenzee that could
+// not reach that repo; an SVG is text, so the row carries it like the rest of the harness. 404 when a
+// harness has no badge stored. harnessAvatarSvg() is what validates it is really an SVG.
 router.get('/harnesses/:key/avatar', async (req, res) => {
   try {
-    const h = await one(`SELECT avatar_path FROM harness WHERE key=$1`, [req.params.key]);
-    if (!h?.avatar_path) return res.status(404).end();
-    const abs = await harnessAvatarFile(h.avatar_path);
-    if (!abs) return res.status(404).end();
-    res.type(abs.endsWith('.svg') ? 'image/svg+xml' : 'application/octet-stream');
+    const h = await one(`SELECT bundle FROM harness WHERE key=$1`, [req.params.key]);
+    const svg = h ? harnessAvatarSvg(h.bundle) : null;
+    if (!svg) return res.status(404).end();
+    res.type('image/svg+xml');
     res.setHeader('Cache-Control', 'public, max-age=300');
-    res.send(readFileSync(abs));
+    res.send(svg);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 router.post('/xells/:id/harness', async (req, res) => {

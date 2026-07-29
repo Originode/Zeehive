@@ -1,4 +1,4 @@
-// A HARNESS NEEDS NO REPO — and the avatar is the one thing that still does.
+// A HARNESS NEEDS NO REPO — nothing about it is on any filesystem.
 //
 // This file used to reproduce the deployed-queenzee bug from the other side: a file-backed harness's
 // `dir` was resolved against the ZEEHIVE PROJECT's repo_root, not config.repoRoot, because
@@ -6,9 +6,10 @@
 // harnesses/ — so the deployed queenzee looked under /app, found nothing, and dispatched manager zees
 // with no manual for weeks while every test on a checkout passed.
 //
-// Migration 080 removed the class of bug rather than the instance: harness TEXT is owned by the
-// meta-DB, the folder projection is gone, and there is no filesystem left for a harness's personality,
-// skills or memory to fail to be on. So what this test pins now is the invariant that replaced it:
+// Migrations 080 and 082 removed the class of bug rather than the instance: the meta-DB owns a
+// harness's TEXT *and* its badge SVG (an SVG is text), `harnesses/` is gone from the repo entirely, and
+// lib/harness.js reads no filesystem at all. So what this test pins now is the invariant that replaced
+// the old resolution rules:
 //
 //   1. a container with NO harnesses/ anywhere — no project repo, no runtime copy — still briefs a
 //      zee completely: the manager's persona, its skill and its 15k manual all come out of the row;
@@ -16,8 +17,8 @@
 //      what stops a zee "fixing" a page that is regenerated on the next assignment);
 //   3. nothing is file-backed any more, and the read models no longer report a files_missing state
 //      that cannot happen;
-//   4. the AVATAR — the only harness artefact still on disk — resolves under the PROJECT repo, with
-//      the containment guard intact;
+//   4. the AVATAR is served from the row and validated as an SVG — the badge cannot 404 because a
+//      repo is unreadable, which is what it did on every project whose console could not see this one;
 //   5. an empty row is still LOUD (that half of the old bug is real and unchanged): bundle_empty on
 //      the read models and the boot summary naming the key.
 //
@@ -41,22 +42,20 @@ const tag = randomUUID().slice(0, 8);
 const hollowKey = `zt-hollow-${tag}`;         // a row with nothing in it — the one empty state left
 const tmp = mkdtempSync(join(tmpdir(), 'harn-root-'));
 const runtime = join(tmp, 'app');             // the IMAGE: server code, no harnesses/
-const projectRepo = join(tmp, 'repo');        // the PROJECT repo: only the avatar lives here now
+const projectRepo = join(tmp, 'repo');        // a project repo with NOTHING harness-shaped in it
 const git = (cwd, ...a) => execFileSync('git', ['-C', cwd, ...a], { encoding: 'utf8' }).trim();
 
 let projId = null, projName = null;
-const snapshot = await q(`SELECT id, bundle, bundle_hash, avatar_path, label, parent_id, zee_type, dir FROM harness`);
+const snapshot = await q(`SELECT id, bundle, bundle_hash, label, parent_id, zee_type, dir FROM harness`);
 
 try {
   // ── the deployed container, reproduced — and this time nothing needs the folder ─────────────
   mkdirSync(join(runtime, 'server', 'src'), { recursive: true });   // /app: code only
-  mkdirSync(join(projectRepo, 'harnesses', 'manager'), { recursive: true });
-  // the ONE harness file that is still a file. Deliberately the only thing in this repo's harnesses/.
-  writeFileSync(join(projectRepo, 'harnesses', 'manager', 'avatar.svg'),
-    `<svg xmlns="http://www.w3.org/2000/svg"><!-- ${tag} --></svg>\n`);
+  mkdirSync(projectRepo, { recursive: true });
+  writeFileSync(join(projectRepo, 'README.md'), `a project repo with no harnesses/ at all ${tag}\n`);
   git(projectRepo, 'init', '-q', '-b', 'master');
   git(projectRepo, 'config', 'user.email', 't@t'); git(projectRepo, 'config', 'user.name', 't');
-  git(projectRepo, 'add', '-A'); git(projectRepo, 'commit', '-qm', 'the avatar, and nothing else');
+  git(projectRepo, 'add', '-A'); git(projectRepo, 'commit', '-qm', 'base');
 
   // The self project is 'Zeehive' — use that name when it is free (the real resolution path), a
   // unique one when this DB already has it (a dev's own checkout), so the test never collides.
@@ -67,11 +66,12 @@ try {
     [hollowKey, `Hollow ${tag}`]);
 
   config.repoRoot = runtime;                  // ← the line that used to be the whole bug
-  await H.refreshHarnessRoots();
   ok(!existsSync(join(config.repoRoot, 'harnesses')),
      'the runtime root carries NO harnesses/ folder (the deployed server image)');
-  ok(!existsSync(join(projectRepo, 'harnesses', 'manager', 'PERSONALITY.md')),
-     "and the project repo carries no harness TEXT either — there is none to carry");
+  ok(!existsSync(join(projectRepo, 'harnesses')),
+     'and neither does the project repo — since 082 there is nothing harness-shaped on any disk');
+  ok(!existsSync(join(REAL_ROOT, 'harnesses')),
+     'not even in this checkout: harnesses/ is gone from the repo entirely');
 
   // ── 1. the row briefs the zee, with no folder anywhere ──────────────────────────────────────
   console.log('\n── the manager harness is complete with no harnesses/ text on any disk ──');
@@ -129,19 +129,24 @@ try {
   ok(typeof H.loadHarnessDir === 'undefined' && typeof H.refreshHarnesses === 'undefined',
      'the folder loader and the boot projection are GONE from the module, not merely unused');
 
-  // ── 4. the avatar, the one thing still on disk ──────────────────────────────────────────────
-  console.log('\n── the avatar resolves from the PROJECT repo, and stays guarded ──');
-  const avatar = await H.harnessAvatarFile('harnesses/manager/avatar.svg');
-  ok(!!avatar && avatar.replace(/\\/g, '/').startsWith(projectRepo.replace(/\\/g, '/')),
-     `the badge SVG resolves under project.repo_root, not the image (${avatar || '404 — BROKEN'})`);
-  ok(H.harnessBase('harnesses/manager/avatar.svg') === projectRepo.replace(/\\/g, '/'),
-     'harnessBase() names the project repo for it');
-  ok(await H.harnessAvatarFile('../../etc/passwd') === null, 'an escaping avatar_path is refused');
-  ok(await H.harnessAvatarFile('harnesses/manager/../../../etc/passwd') === null,
-     'and so is one that climbs out of harnesses/');
-  writeFileSync(join(projectRepo, 'outside.md'), 'not a harness file\n');
-  ok(await H.harnessAvatarFile('outside.md') === null,
-     'a real file outside harnesses/ is refused too (the containment guard, not a missing path)');
+  // ── 4. the badge, now also in the row ───────────────────────────────────────────────────────
+  console.log('\n── the avatar is served from the meta-DB, not resolved on disk ──');
+  const mgrRow = await one(`SELECT bundle, avatar_path FROM harness WHERE key='manager'`);
+  ok(mgrRow.avatar_path === null, 'no row points at a file (avatar_path is legacy and NULL)');
+  const svg = H.harnessAvatarSvg(mgrRow.bundle);
+  ok(!!svg && /^<svg[\s>]/i.test(svg), `the badge comes out of the row as an SVG (${(svg || '').length} chars)`);
+  ok(!!full.avatar_svg && full.avatar_svg === svg, 'and the editor read model carries it, so the console can change it');
+  ok((await H.listHarnesses()).find((h) => h.key === 'manager')?.avatar_url === '/api/harnesses/manager/avatar',
+     'the list model advertises the badge route for a harness that has one');
+  ok((await H.listHarnesses()).find((h) => h.key === 'dev-scribe')?.avatar_url === null,
+     'and null for one that has none — the console does not request an image that cannot exist');
+  // it is served to a browser, so what counts as a badge is validated where it is read
+  ok(H.harnessAvatarSvg({ avatar_svg: '<script>alert(1)</script>' }) === null, 'a non-SVG stored badge is refused');
+  ok(H.harnessAvatarSvg({}) === null && H.harnessAvatarSvg(null) === null, 'and a missing one is simply null');
+  const badSave = await H.updateHarness('manager', { avatar_svg: 'not an svg' }).catch((e) => e.message);
+  ok(/must be an SVG/.test(String(badSave)), `the authoring path refuses it too, with a sentence ("${String(badSave).slice(0, 40)}…")`);
+  ok(typeof H.harnessAvatarFile === 'undefined' && typeof H.harnessBase === 'undefined',
+     'the on-disk avatar resolution and its repo-root machinery are GONE from the module');
 
   // ── 5. an EMPTY row is still loud ───────────────────────────────────────────────────────────
   console.log('\n── a harness that would brief a zee with nothing is still loud ──');
@@ -156,25 +161,21 @@ try {
      `the healthy ones are counted as loaded (${sum.loaded} loaded, ${sum.empty} empty)`);
 
   // ── the fallback root still works (host-process mode) ───────────────────────────────────────
-  console.log('\n── fallback: no project row → config.repoRoot (host-process mode) ──');
+  console.log('\n── and with no project row at all, a harness is still complete ──');
   await q(`DELETE FROM project WHERE id=$1`, [projId]); projId = null;
-  config.repoRoot = REAL_ROOT;
-  await H.refreshHarnessRoots();
-  const roots = H.harnessRoots();
-  ok(roots[roots.length - 1] === REAL_ROOT.replace(/\\/g, '/') && !roots.includes(projectRepo.replace(/\\/g, '/')),
-     'with that project gone, config.repoRoot is the last root standing');
-  ok(!!(await H.harnessAvatarFile('harnesses/manager/avatar.svg')),
-     'and the checkout\'s own avatar resolves through it, unchanged');
-  ok((await H.getHarnessFull('manager')).personality.length > 800,
-     'while the harness text — which never came from a root — is unaffected either way');
+  const orphaned = await H.getHarnessFull('manager');
+  ok(orphaned.personality.length > 800 && orphaned.memory.some((m) => (m.text || '').length > 12000),
+     'no project, no repo, no folder: the persona and the manual come out of the row regardless');
+  ok(!!H.harnessAvatarSvg((await one(`SELECT bundle FROM harness WHERE key='manager'`)).bundle),
+     'and so does the badge — this is the state every other project\'s console was failing in');
 } finally {
   config.repoRoot = REAL_ROOT;
   if (projId) await q(`DELETE FROM project WHERE id=$1`, [projId]).catch(() => {});
   await q(`DELETE FROM harness WHERE key=$1`, [hollowKey]).catch(() => {});
   // put every harness row back exactly as we found it
   for (const r of snapshot) {
-    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, avatar_path=$4, label=$5, parent_id=$6, zee_type=$7, dir=$8 WHERE id=$1`,
-      [r.id, JSON.stringify(r.bundle), r.bundle_hash, r.avatar_path, r.label, r.parent_id, r.zee_type, r.dir]).catch(() => {});
+    await q(`UPDATE harness SET bundle=$2, bundle_hash=$3, label=$4, parent_id=$5, zee_type=$6, dir=$7 WHERE id=$1`,
+      [r.id, JSON.stringify(r.bundle), r.bundle_hash, r.label, r.parent_id, r.zee_type, r.dir]).catch(() => {});
   }
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
   await pool.end().catch(() => {});

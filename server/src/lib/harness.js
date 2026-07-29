@@ -12,8 +12,8 @@
 // briefed with nothing; and a migration patching a projected bundle left row and folder disagreeing
 // behind a hash that claimed they agreed. Two sources, one of them silently winning, is the bug.
 //
-// What is still on disk: a harness's AVATAR SVG (art, not agent-facing text), resolved from the
-// Zeehive project's repo — see harnessAvatarFile.
+// Nothing about a harness is on disk — not even the badge: an avatar is an SVG, and an SVG is text
+// (migration 082, harnessAvatarSvg). A harness is complete wherever the meta-DB is reachable.
 //
 // LAW: the `core` harness is the built-in, undeletable law layer (the cxell-zee manual + the binding
 // rules), assembled in bindingFor()/spawnCxell(). Every xell always gets core; an assigned harness
@@ -21,11 +21,8 @@
 // non-override is structural: a bundle is only ever written through the authoring functions below,
 // which accept personality/summary/glyph/skills/memory and NOTHING else — so a harness has nowhere
 // to express a land/ship/prod/gate rule. A harness never ships or lands; it is only a guide.
-import { existsSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { q, one } from '../db/pool.js';
-import { config } from '../config.js';
 import { logline } from './logbus.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, and the
@@ -58,67 +55,21 @@ export function typeMismatchReason(harness, zeeType) {
 
 const hashOf = (text) => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
-// ── WHERE A HARNESS'S AVATAR LIVES (the only harness thing still on disk) ────
-// `avatar_path` ('harnesses/manager/avatar.svg') is relative to the ZEEHIVE PROJECT's REPO — the
-// clone the queenzee manages (self-onboard.js onboards it as the `Zeehive` project) — NOT to
-// config.repoRoot, which is merely where the running server's code sits. Dockerfile.server copies
-// server/ scripts/ db/ hooks/ skill/ into /app and deliberately NOT harnesses/, so a badge resolved
-// against the image would 404 in production while working perfectly on every checkout. The harness's
-// TEXT no longer depends on any of this (migration 080): it is in the row.
+// THE AVATAR IS IN THE ROW TOO (migration 082) — so this module reads no filesystem at all.
 //
-// Resolution: the project repo roots first (self project first), then config.repoRoot as the
-// fallback for host-process mode (where the runtime dir IS the repo) and for tests. A root only
-// wins if the file is actually THERE, so a stale/unreachable repo_root falls through.
-const SELF_PROJECT = 'Zeehive';
-const ROOTS_TTL_MS = 30_000;
-let rootsCache = { at: 0, roots: [] };
-
-const normRoot = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
-
-// Re-read the candidate repo roots from the DB (cheap, cached). Never throws: with no DB/schema
-// yet (a very early boot, a unit test) we simply fall back to config.repoRoot.
-export async function refreshHarnessRoots() {
-  try {
-    const rows = await q(
-      `SELECT repo_root FROM project WHERE repo_root IS NOT NULL
-        ORDER BY (lower(name) = lower($1)) DESC, created_at`, [SELF_PROJECT]);
-    rootsCache = { at: Date.now(), roots: rows.map((r) => normRoot(r.repo_root)).filter(Boolean) };
-  } catch {
-    rootsCache = { at: Date.now(), roots: [] };
-  }
-  return harnessRoots();
-}
-
-// Warm the cache only when it has gone stale — for read paths (list, avatar) that must not fire a
-// query per call.
-export async function ensureHarnessRoots() {
-  if (Date.now() - rootsCache.at > ROOTS_TTL_MS) await refreshHarnessRoots();
-  return harnessRoots();
-}
-
-// Every root a harness folder may live under, best first. config.repoRoot is ALWAYS last, never
-// absent — the fallback is what keeps a checkout-run (tests, host process) working unchanged.
-export function harnessRoots() {
-  return [...new Set([...(rootsCache.roots || []), normRoot(config.repoRoot)])];
-}
-
-// The root a given repo-relative path resolves under (the first that actually has it). Falls back
-// to config.repoRoot so error messages and hashes stay stable when nothing has it.
-export function harnessBase(rel) {
-  if (rel) for (const root of harnessRoots()) if (existsSync(resolve(root, rel))) return root;
-  return normRoot(config.repoRoot);
-}
-
-// The avatar SVG on disk for a harness's avatar_path, or null. Containment-guarded: the file must
-// live under <base>/harnesses/, so a crafted avatar_path can never read outside it. Shared by the
-// API route so the route and the loader agree on the base (they used to disagree — see above).
-export async function harnessAvatarFile(avatarPath) {
-  const rel = String(avatarPath || '').trim();
-  if (!rel) return null;
-  const base = await ensureHarnessRoots().then(() => harnessBase(rel));
-  const abs = resolve(base, rel);
-  if (!abs.startsWith(resolve(base, 'harnesses') + sep)) return null;
-  return existsSync(abs) ? abs : null;
+// A harness's badge SVG used to be `harnesses/<key>/avatar.svg`, resolved against the ZEEHIVE
+// PROJECT's repo because the server image deliberately carries no harnesses/. That kept a whole
+// repo-root resolution machinery alive for one asset, and it 404'd on any queenzee that could not read
+// that repo. An SVG is text, so it lives in `bundle.avatar_svg` and the route serves it from there.
+//
+// What that buys, beyond the badge: a harness is now COMPLETE on any machine that can reach the
+// meta-DB. Nothing about it can be "missing files", on any project, in any container.
+export function harnessAvatarSvg(bundle) {
+  const b = typeof bundle === 'string' ? JSON.parse(bundle) : (bundle || {});
+  const svg = String(b.avatar_svg || '').trim();
+  // A stored badge must be an SVG document and nothing else: this is served to a browser, and the row
+  // is operator-editable, so the check belongs here rather than in the one route that reads it.
+  return /^<svg[\s>]/i.test(svg) ? svg : null;
 }
 
 // Re-inject a harness's files into every LIVE xell whose effective persona just changed — the xells
@@ -209,7 +160,6 @@ async function harnessAndDescendants(rootId) {
 // weeks when the text still lived in files the deployed queenzee could not read. A boot is not "clean" if a zee's persona is a blank page, so this line is
 // always emitted, and goes to stdout (the docker log a human actually reads) the moment it isn't 0.
 export async function logHarnessSummary() {
-  await ensureHarnessRoots();
   const rows = await q(
     `SELECT h.key, h.is_law_core,
             h.bundle->>'personality' AS personality, (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
@@ -286,20 +236,21 @@ export async function assignHarness(xellId, keyOrId) {
 // List enabled harnesses for the picker/UI (core last — it is implicit/always-on).
 export async function listHarnesses({ zeeType = null } = {}) {
   const rows = await q(
-    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.avatar_path, h.head_commit, h.zee_type,
+    `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.head_commit, h.zee_type,
+            (h.bundle->>'avatar_svg') IS NOT NULL AS has_avatar,
             (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
             h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
             h.bundle->>'personality' AS personality,
             p.key AS parent
        FROM harness h LEFT JOIN harness p ON p.id = h.parent_id
       WHERE h.enabled ORDER BY h.is_law_core, h.key`);
-  await ensureHarnessRoots();
   // `zeeType` narrows the list to what a xell of that type may actually WEAR — what every picker
   // must offer, so an operator is never shown a choice the assign path would then refuse.
   return rows.filter((h) => !zeeType || harnessFitsType(h.zee_type, zeeType)).map((h) => ({
     id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core, parent: h.parent,
     zee_type: h.zee_type,
-    avatar_path: h.avatar_path, head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
+    has_avatar: !!h.has_avatar, avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
+    head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
     // HONESTY about what this harness actually carries: a row that would brief a zee with NOTHING
     // looks identical to one carrying a 15k manual in every picker otherwise. Computed at read time,
@@ -368,6 +319,14 @@ export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } =
   if ('personality' in patch) bundle.personality = String(patch.personality || '');
   if ('summary' in patch) bundle.summary = String(patch.summary || '').slice(0, 200);
   if ('glyph' in patch) bundle.glyph = String(patch.glyph || '').slice(0, 4);
+  // The badge, as text. Refused unless it is an SVG document — this is served to a browser, and an
+  // operator pasting the wrong thing should be told at the save, not by a broken image everywhere.
+  if ('avatar_svg' in patch) {
+    const svg = String(patch.avatar_svg || '').trim();
+    if (svg && !/^<svg[\s>]/i.test(svg)) throw new Error('an avatar must be an SVG document (it starts with <svg …>)');
+    if (svg.length > 200_000) throw new Error('that SVG is too large for a badge (200k max)');
+    if (svg) bundle.avatar_svg = svg; else delete bundle.avatar_svg;
+  }
   if ('skills' in patch) bundle.skills = normalizeSkills(patch.skills);
   if ('memory' in patch) bundle.memory = normalizeMemory(patch.memory);
   const label = 'label' in patch ? (String(patch.label || '').trim() || h.label) : h.label;
@@ -426,9 +385,9 @@ export async function getHarnessFull(key) {
     const eff = await effectiveHarness(await one(`SELECT * FROM harness WHERE id=$1`, [h.parent_id]));
     if (eff) inherited = { skills: eff.skills, memory: eff.memory, chain: eff.chain };
   }
-  await ensureHarnessRoots();
   return {
     key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core,
+    avatar_svg: harnessAvatarSvg(b) || '',
     parent, zee_type: h.zee_type, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
     inherited,

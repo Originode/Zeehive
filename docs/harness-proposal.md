@@ -19,8 +19,9 @@ Status: **IMPLEMENTED** (all four phases). The design below is unchanged; this s
   `routes.js`, `web/src/Connectors.jsx` (series routing through the avatar badge at the junction, with
   consumer count + dashed inbound wire), `web/src/Dispatch.jsx` harness picker, `web/src/fleet.js` card
   field, `web/src/api.js` helpers.
-- **Text** — in the meta-DB, one `harness` row per harness (migration 080). The only harness FILE left
-  in this repo is a badge `avatar.svg` under `harnesses/<key>/`.
+- **Text and badge** — in the meta-DB, one `harness` row per harness (080 for the text, 082 for the
+  avatar SVG). There is no `harnesses/` folder in this repo at all, and `lib/harness.js` reads no
+  filesystem.
 - **Hermes bridge** — `server/src/lib/harness-bridge.js`: mode-B outbound transcript mirror
   (`X-Hermes-Session-Key` = slug) + opt-in, token-gated inbound reply via the existing
   `sendMessageToXell` path (`POST /api/harness-bridge/:slug/message`).
@@ -82,7 +83,7 @@ harness
   head_commit   text                -- commit the graph anchors the harness node to (the dir's last touch)
   bundle        jsonb               -- parsed/validated config (skills[], personality, memory, tools, avatar, bridge…)
   bundle_hash   text                -- projection stamp; drift vs the files is surfaced, not silent
-  avatar_path   text                -- 'harnesses/hermes/avatar.svg' (the badge art)
+  avatar_path   text                -- LEGACY, always NULL since 082 (the badge is bundle.avatar_svg)
   is_law_core   boolean             -- the built-in manual harness (§4); exactly one, undeletable
   enabled       boolean
   created_at    timestamptz
@@ -112,11 +113,16 @@ into the row at boot), and the history is the reason for the rule:
 - **080** removed the class: the text was imported into the rows verbatim, the parent chain resolved in
   SQL, every row detached (`dir` is NULL everywhere and nothing sets it), and the loader deleted.
 
-The only harness FILE left is the badge `avatar.svg` under `harnesses/<key>/`, still resolved from the
-ZEEHIVE PROJECT's repo (`project.repo_root`) because the server image does not carry it. **Do not
-reintroduce a repo copy of any harness text**: it drifts from the row the instant the next edit lands.
-Read a harness in the console's harness manager, or in any cxell at `.zeehive/harness/…` (injected per
-xell, git-ignored).
+- **082** finished it: the badge SVG went into `bundle.avatar_svg` too. It had looked like the one
+  harmless exception — art, not agent-facing text — but a badge resolved from `project.repo_root` 404s
+  on any queenzee that cannot read that repo, which is every OTHER project's console. An SVG is text.
+  `harnesses/` is now gone, and with it the repo-root resolution machinery that existed only for it.
+
+So a harness is **complete wherever the meta-DB is reachable** — there is no "no files" state left to
+report, on any project, in any container. **Do not reintroduce a repo copy of any of it**: it drifts
+from the row the instant the next edit lands. Read a harness in the console's harness manager (which
+renders the inherited chain, so the manual a wearer gets is readable there), or in any cxell at
+`.zeehive/harness/…` (injected per xell, git-ignored).
 
 ### 3.1b Project entry-point docs (migration 081)
 The same rule, one level out: a project's agent-facing entry point (`AGENTS.md`, `CLAUDE.md`, …) is a

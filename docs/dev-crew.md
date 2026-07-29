@@ -36,7 +36,9 @@ text and resolved the parents in SQL.
 That reverses what this doc originally said ("the folder is the truth"), and the reason is in §080:
 while a folder projected into the row there were two sources, the deployed image carried no
 `harnesses/` at all, and every file-backed harness in production was EMPTY — a whole fleet of zees
-briefed with nothing. One source, and the queenzee generates the files it injects.
+briefed with nothing, and every other project's console showing the crew as "⚠ no files". One source,
+and the queenzee generates the files it injects. (082 did the same for the badge SVG; there is no
+`harnesses/` folder any more.)
 
 The manual reaches every role **once, by inheritance** from `zee-base`. No role carries a copy of it
 or paraphrases a CLI verb — a restated verb is drift the moment the CLI moves
