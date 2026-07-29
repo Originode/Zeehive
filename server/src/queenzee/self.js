@@ -65,6 +65,9 @@ export async function selfStatus(xell) {
     { ...xell, zee_status: zee?.status },
     {
       landPending: land ? ['pending', 'approved'].includes(land.status) : false,
+      // Queued for the runway (067) — the zee sees the same `holding` hexagon a human does, which is
+      // how it can tell its push really did land in the pattern rather than vanish.
+      landHolding: land ? (land.status === 'holding' && !land.cleared_at) : false,
       // A DEFERRED ship (pending, but a human set it aside for a combined ship) is not "awaiting a
       // human" — it matches how fleet.js derives the hive status, so the zee sees itself as a human does.
       shipPending: ship ? (['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at) : false,

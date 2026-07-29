@@ -263,6 +263,9 @@ export async function liveZees(xellIds) {
             z.status AS zee_status, z.cli_active, z.name AS zee_name, z.title AS zee_title,
             EXISTS(SELECT 1 FROM land_request lr WHERE lr.xell_id=x.id
                      AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL) AS land_pending,
+            -- queued for the runway (067) — see fleet.js for why this is not land_pending
+            EXISTS(SELECT 1 FROM land_request lh WHERE lh.xell_id=x.id
+                     AND lh.status='holding' AND lh.cleared_at IS NULL) AS land_holding,
             EXISTS(SELECT 1 FROM ship_request sr WHERE sr.xell_id=x.id
                      AND sr.status IN ('pending','approved','shipping') AND sr.dismissed_at IS NULL
                      AND sr.deferred_at IS NULL) AS ship_pending,
@@ -301,6 +304,7 @@ export async function liveZees(xellIds) {
       prodBindPending: x.prod_bind_pending === true,
       seedPending: x.seed_pending === true,
       doneSuggested: x.done_suggested === true,
+      landHolding: x.land_holding === true,
     });
     // Belt AND braces. The WHERE clause above is what actually keeps dead xells out; this second
     // check catches the case it cannot see — a status hive-status.js declines to speak for (it

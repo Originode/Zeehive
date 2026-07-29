@@ -55,6 +55,10 @@ export async function crewFor(managerXellId) {
             t.prompt_text AS task_text,
             EXISTS(SELECT 1 FROM land_request lr WHERE lr.xell_id=x.id
                      AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL) AS land_pending,
+            -- queued for the runway (067) — a manager watching a crew needs to know WHY a worker
+            -- has gone quiet with unlanded commits, and "it is 2nd in line" is that answer.
+            EXISTS(SELECT 1 FROM land_request lh WHERE lh.xell_id=x.id
+                     AND lh.status='holding' AND lh.cleared_at IS NULL) AS land_holding,
             EXISTS(SELECT 1 FROM ship_request sr WHERE sr.xell_id=x.id
                      AND sr.status IN ('pending','approved','shipping') AND sr.dismissed_at IS NULL
                      AND sr.deferred_at IS NULL) AS ship_pending,
@@ -93,7 +97,7 @@ export async function crewFor(managerXellId) {
       { ...r, is_production: false },
       { landPending: r.land_pending, shipPending: r.ship_pending, tendPending: r.tend_pending,
         prodBindPending: r.prod_bind_pending, seedPending: r.seed_pending,
-        doneSuggested: r.done_suggested },
+        doneSuggested: r.done_suggested, landHolding: r.land_holding },
     );
     const waiting = [
       r.land_pending && 'a landing is HELD for a human',

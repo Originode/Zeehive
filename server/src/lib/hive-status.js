@@ -34,6 +34,11 @@ export const HIVE_STATUS = {
   'occ-doneSuggest':  { label: 'done?',        group: 'occ' },
   'occ-landHint':     { label: 'land?',        group: 'occ' },
   'occ-shipHint':     { label: 'ship?',        group: 'occ' },
+  // QUEUED FOR THE RUNWAY (067). Deliberately NOT `land?`: nobody is being asked anything. Another
+  // xell's landing is open on the ref, so this zee's push is in the holding pattern with a position
+  // and will be cleared by a nudge when the runway frees. Showing it as a held landing would put a
+  // question on a human's screen that has no card and no button behind it.
+  'occ-landHolding':  { label: 'holding',      group: 'occ' },
   'occ-doneRequest':  { label: 'done?',        group: 'occ' },
   'occ-done':         { label: 'done',         group: 'occ' },
   'live-protected':   { label: 'protected',    group: 'live' },
@@ -53,7 +58,7 @@ export function hiveStatus(x, sig = {}) {
   const {
     landPending = false, shipPending = false, tendPending = false, prodUnprotected = false,
     landHint = false, shipHint = false, prodBindPending = false, seedPending = false,
-    doneSuggested = false,
+    doneSuggested = false, landHolding = false,
   } = sig;
 
   // ── production ──
@@ -128,6 +133,14 @@ export function hiveStatus(x, sig = {}) {
   // is never lost: `awaiting_done` is its own field on the read models, so the console's done card
   // does not depend on this key.
   if (s === 'awaiting-done')             return 'occ-doneRequest';
+
+  // HOLDING for the runway — below every ask, above plain activity, and that placement is the whole
+  // argument. It asks a human for NOTHING, so it must never outrank something that does (a tend
+  // behind a queued landing is still the thing to act on). But it outranks working/idle because it
+  // is the only thing on the screen that ANSWERS "why has this zee gone quiet with commits it wants
+  // to land?" — without it, a queued zee is indistinguishable from an idle one, which is exactly the
+  // invisibility this protocol would otherwise introduce.
+  if (landHolding)                       return 'occ-landHolding';
 
   const working = x.zee_status === 'working' || x.cli_active === true || s === 'working';
   if (working)                           return 'occ-working';

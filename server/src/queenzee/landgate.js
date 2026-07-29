@@ -292,6 +292,26 @@ export async function holdingQueue(projectId, ref) {
       ORDER BY lr.requested_at ASC, lr.id ASC`, [projectId, ref]);
 }
 
+// THE APPROACH QUEUE, for a HUMAN — every runway in this project that has somebody waiting, with
+// each holder's position, slug and how much work is queued behind the decision on screen.
+//
+// The console could not show this before and that is the point of it: a human approving a landing
+// was looking at ONE card with no way to know that three other zees were stacked behind it. The
+// position is numbered here, in SQL, over the same (requested_at, id) order the tower calls them in
+// — one ordering, so the number a zee is told and the number a human reads can never disagree.
+export async function holdingByRef(projectId) {
+  if (!projectId) return [];
+  return q(
+    `SELECT lr.id, lr.xell_id, lr.ref, lr.new_sha, lr.requested_at, lr.holding_since, lr.attempts,
+            lr.behind_request_id, lr.stat, x.slug AS xell_slug,
+            jsonb_array_length(lr.commits) AS commit_count,
+            row_number() OVER (PARTITION BY lr.project_id, lr.ref
+                               ORDER BY lr.requested_at, lr.id)::int AS position
+       FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
+      WHERE lr.project_id=$1 AND lr.kind='push' AND lr.status='holding' AND lr.cleared_at IS NULL
+      ORDER BY lr.ref, lr.requested_at, lr.id`, [projectId]);
+}
+
 // This xell's live place(s) in the pattern — what `zee land --withdraw` may lower, and what the
 // zee's own status reads. A cleared row is history: it is out of the queue and its zee has been told.
 export async function holdingRequests(xellId) {

@@ -890,6 +890,24 @@ a.cbox:hover { border-color: var(--accent); }
 .land-more { color: var(--muted); font-style: italic; }
 .land-err { color: var(--error); font-size: 12px; margin-top: 8px; }
 .land-approved { color: var(--up); font-size: 12.5px; margin-top: 10px; }
+/* ── the APPROACH QUEUE (067) ───────────────────────────────────────────────
+   Zees holding for this runway. Styled QUIET on purpose, and with no controls: it is the only
+   block on a landing card that is not a question. It is here so the decision above it reads
+   honestly — approving that card is what clears the next zee — and so a queued zee is visible
+   at all, which before this it was not. Slate blue matches its hexagon (hive/status.js). */
+.land-queue { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.land-queue-title { font-size: 11px; color: #6f8fbf; font-weight: 600; letter-spacing: .02em; }
+.land-queue-note { color: var(--muted); font-weight: 400; margin-left: 6px; }
+.land-queue-list { list-style: none; margin: 6px 0 0; padding: 0; }
+.land-queue-list li { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; color: var(--muted); padding: 2px 0; }
+.land-queue-list li b { color: var(--text); font-weight: 600; }
+.land-queue-pos { color: #6f8fbf; font-variant-numeric: tabular-nums; font-weight: 700;
+  min-width: 22px; }
+.land-queue-sha code { font-size: 11px; }
+.land-queue-since { margin-left: auto; }
+.land-orphan-queue { margin-top: 10px; }
+
 .land-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 .land-actions button { border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer;
   border: 1px solid var(--line); background: var(--panel); color: var(--text); }

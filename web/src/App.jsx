@@ -451,14 +451,33 @@ export default function App() {
   const gridXells = streamedXells.length ? streamedXells
     : (fleetMatchesSelection ? (fleet.xells || []) : []);
   const carded = new Set(gridXells.map((x) => x.id));
+  // THE APPROACH QUEUE, by ref (067). One runway per ref, so the queue belongs under the card that
+  // is holding it up — keyed the same way, and never merged into `landing` (a holding row is not a
+  // card, and putting it there would raise the second question the runway exists to prevent).
+  const holdingByRef = {};
+  for (const h of fleet.holding || []) (holdingByRef[h.ref] ||= []).push(h);
+  const queueFor = (r) => holdingByRef[r?.ref] || [];
+  // Attached to the ROW at routing time rather than threaded down as a prop: a LandCard renders in
+  // three different component trees, and the queue has to arrive in all of them.
+  const withQueue = (r) => ({ ...r, queue: queueFor(r) });
+
   const landingByXell = {};
   const prsByRef = {};
   const orphanLandings = [];
+  const refsWithCard = new Set();
   for (const r of fleet.landing || []) {
-    if (r.kind === 'pull') (prsByRef[r.ref] ||= []).push(r);
-    else if (r.xell_id && carded.has(r.xell_id)) (landingByXell[r.xell_id] ||= []).push(r);
-    else orphanLandings.push(r);   // no xell (gate could not match the sha), or its xell is gone
+    if (r.kind === 'pull') { (prsByRef[r.ref] ||= []).push(r); continue; }
+    refsWithCard.add(r.ref);
+    if (r.xell_id && carded.has(r.xell_id)) (landingByXell[r.xell_id] ||= []).push(withQueue(r));
+    else orphanLandings.push(withQueue(r));   // no xell (gate could not match the sha), or its xell is gone
   }
+  // Holders whose runway has NO card to sit under. This should be a blink — the tower clears the
+  // queue the moment the runway frees — but if a clearance ever fails to land, those zees would be
+  // waiting with nothing on any screen, which is precisely the invisibility this protocol must not
+  // introduce. So they get rendered somewhere rather than nowhere.
+  const orphanQueues = Object.entries(holdingByRef)
+    .filter(([ref]) => !refsWithCard.has(ref))
+    .map(([ref, queue]) => ({ ref, queue }));
   const prsFor = (x) => prsByRef[`refs/heads/${x.remote_source?.ref || ''}`]
     // production IS local main, so PRs against main are production's to answer. Its remote_source
     // is origin (what it tracks), which is NOT what it receives work on — hence the special case.
@@ -740,7 +759,7 @@ export default function App() {
                    doneSuggestByXell={doneSuggestByXell}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
-      <LandingPanel landing={orphanLandings} onDecided={refresh} />
+      <LandingPanel landing={orphanLandings} onDecided={refresh} orphanQueues={orphanQueues} />
 
       {/* PRODUCTION DATA — a zee asking for the live prod database, or for a landed seed file to be
           run on it, plus the receipt of every seed that ran. Live asks render on their xell's chip

@@ -16,12 +16,50 @@ const ago = (ts) => {
   return `${Math.floor(s / 3600)}h ago`;
 };
 
+// THE APPROACH QUEUE — who is stacked up behind the decision you are looking at (067).
+//
+// The runway takes one landing per ref, so a second zee pushing is not a second card: it holds with
+// a position and is nudged when this one clears. That is the right protocol and it was, until this
+// rendered, completely invisible — a human approved a landing with no way to know that two more zees
+// were waiting on the answer, and a queued zee looked simply idle.
+//
+// Deliberately INERT: no buttons, no ✕, nothing to decide. These are not asks — the whole point is
+// that only ONE thing on this ref is ever a question. It is here so the answer you give has its real
+// consequences visible: clearing this card is what releases the next one.
+function ApproachQueue({ queue }) {
+  if (!queue?.length) return null;
+  return (
+    <div className="land-queue" data-testid="approach-queue">
+      <div className="land-queue-title">
+        ✈ {queue.length} {queue.length === 1 ? 'zee is' : 'zees are'} holding for this runway
+        <span className="land-queue-note">— queued, not asking: deciding this one clears the next</span>
+      </div>
+      <ol className="land-queue-list">
+        {queue.map((h) => (
+          <li key={h.id}>
+            <span className="land-queue-pos" title="position in the holding pattern">#{h.position}</span>
+            <b>{h.xell_slug || 'unknown xell'}</b>
+            <span className="land-queue-sha"><code>{shortSha(h.new_sha)}</code></span>
+            <span className="land-queue-commits">
+              {h.commit_count ?? 0} commit{h.commit_count === 1 ? '' : 's'} waiting
+            </span>
+            <span className="land-queue-since">{ago(h.holding_since || h.requested_at)}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 // Exported because a landing now renders on the CARD of the xell that raised it, not only in the
 // top panel: "nimble-atlas wants to land" is information about nimble-atlas, and reading it three
 // feet from that xell's own diff and status is the difference between a notice and a nag. The
 // panel keeps only the ones with no card to live on (the gate resolves the xell by sha, so an
 // unmatched push has no xell_id).
-export function LandCard({ req, onDone, onDismiss }) {
+//
+// `queue` is the approach queue for THIS ref — rendered under the card, because the thing a human
+// most needs to know about a queue is which decision is holding it up.
+export function LandCard({ req, onDone, onDismiss, queue = req.queue }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const commits = Array.isArray(req.commits) ? req.commits : [];
@@ -84,9 +122,12 @@ export function LandCard({ req, onDone, onDismiss }) {
         )}
       </div>
 
+      {/* The queue rides with the card in BOTH states. Collapsing an approved landing must not hide
+          the fact that three zees are waiting on it — that is the moment it matters most. */}
       {!open ? (
         <div className="land-mini">
           ✓ approved — {shortSha(req.new_sha)} · {commits.length} commit{commits.length === 1 ? '' : 's'} · waiting for the zee to re-push
+          <ApproachQueue queue={queue} />
         </div>
       ) : (
         <>
@@ -137,6 +178,8 @@ export function LandCard({ req, onDone, onDismiss }) {
               </button>
             </div>
           )}
+
+          <ApproachQueue queue={queue} />
         </>
       )}
     </div>
@@ -153,18 +196,39 @@ export function LandCard({ req, onDone, onDismiss }) {
 //     that no longer exists. This is the one that actually bit: an approved landing sat invisible.
 //
 // The caller decides what is orphaned (it knows which cards exist); this just renders them.
-export default function LandingPanel({ landing, onDecided }) {
+//
+// `orphanQueues` is the same idea for the APPROACH QUEUE: zees holding for a runway that has no card
+// anywhere on the page. That should never last longer than a blink (the tower clears the queue as
+// soon as the runway frees), but a clearance that failed would otherwise leave those zees waiting
+// with nothing on any screen — the exact invisibility the runway must not introduce. Rendered here,
+// loudly, because if you are seeing it something is wrong.
+export default function LandingPanel({ landing, onDecided, orphanQueues = [] }) {
   const open = landing || [];
-  if (!open.length) return null;
+  if (!open.length && !orphanQueues.length) return null;
   const held = open.filter((r) => r.status === 'pending').length;
   return (
     <section className={`land-panel${held ? '' : ' settled'}`}>
-      <div className="land-title">
-        {held
-          ? `⚠ ${held} landing${held === 1 ? '' : 's'} HELD with no xell card — needs your verification`
-          : '✓ Landing approved, but its xell is gone — nothing will re-push it'}
-      </div>
-      {open.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} />)}
+      {!!open.length && (
+        <div className="land-title">
+          {held
+            ? `⚠ ${held} landing${held === 1 ? '' : 's'} HELD with no xell card — needs your verification`
+            : '✓ Landing approved, but its xell is gone — nothing will re-push it'}
+        </div>
+      )}
+      {open.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} queue={r.queue} />)}
+      {orphanQueues.map(({ ref, queue }) => (
+        <div key={ref} className="land-orphan-queue">
+          <div className="land-title">
+            ⚠ {queue.length} zee{queue.length === 1 ? '' : 's'} holding for{' '}
+            <b>{ref.replace('refs/heads/', '')}</b> — but nothing is on that runway
+          </div>
+          <div className="land-queue-note">
+            The queue should have been cleared when the last landing finished. Check the queenzee log
+            for a clearance that could not be delivered; a `zee sync` + `zee land` from those xells re-asks.
+          </div>
+          <ApproachQueue queue={queue} />
+        </div>
+      ))}
     </section>
   );
 }

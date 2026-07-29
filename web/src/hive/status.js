@@ -28,6 +28,10 @@ export const HIVE_COLORS = {
   'occ-idle':         '#e0a53b',   // amber — a zee gone quiet
   'occ-tendRequest':  '#f2c518',   // yellow — "I need a human"
   'occ-doneSuggest':  '#3bb0c6',   // cyan — a MANAGER zee suggested this xell is finished (a human confirms)
+  // Deliberately COOL, and deliberately not the land? red: a queued landing asks a human for
+  // NOTHING. It is a waiting state that explains a quiet zee, so it should read as "parked", not
+  // as another thing on fire.
+  'occ-landHolding':  '#6f8fbf',   // slate blue — queued for the runway, nothing to decide
   // ── hot: something irreversible is being touched ────────────────────────────
   'occ-landHint':     '#ef8f6a',   // soft red-orange — land looks ready (a softer ask)
   'occ-shipHint':     '#f2a06a',   // soft orange — ship looks ready
@@ -53,6 +57,7 @@ export const HIVE_HEAT = {
   'occ-idle':         0.62,
   'occ-tendRequest':  0.72,
   'occ-doneSuggest':  0.30,
+  'occ-landHolding':  0.34,
   'occ-landHint':     0.80,
   'occ-shipHint':     0.82,
   'live-protected':   0.86,
@@ -80,6 +85,7 @@ export const HIVE_LABELS = {
   'occ-seedRequest':  'seed?',
   'occ-landHint':     'land?',
   'occ-shipHint':     'ship?',
+  'occ-landHolding':  'holding',
   'occ-doneRequest':  'done?',
   'occ-doneSuggest':  'done?',
   'occ-done':         'done',

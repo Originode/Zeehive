@@ -8,6 +8,7 @@ import { buildLandingPad } from '../queenzee/landingpad.js';
 import { deviceConfig } from './devices.js';
 import { reasonPair } from './status.js';
 import { listDoneSuggestions } from './managers.js';
+import { holdingByRef } from '../queenzee/landgate.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -78,6 +79,11 @@ async function fetchXellRows(pid) {
             -- read so the honeycomb's per-xell status costs no extra round-trips (see lib/hive-status).
             EXISTS(SELECT 1 FROM land_request lr WHERE lr.xell_id = x.id
                      AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL) AS land_pending,
+            -- QUEUED for the runway (067): another xell's landing is open on this ref, so this
+            -- one's push is in the holding pattern. It is NOT a card and asks nothing of a human —
+            -- but a zee gone quiet waiting for a runway must not read as merely idle.
+            EXISTS(SELECT 1 FROM land_request lh WHERE lh.xell_id = x.id
+                     AND lh.status = 'holding' AND lh.cleared_at IS NULL) AS land_holding,
             -- deferred_at IS NULL: a ship a human DEFERRED is deliberately set aside, so it no
             -- longer nags on the xell's hexagon as "ship awaiting a human".
             EXISTS(SELECT 1 FROM ship_request sr WHERE sr.xell_id = x.id
@@ -213,6 +219,7 @@ async function decorateXell(x, heads, deployed, project) {
     prodBindPending: x.prod_bind_pending === true,
     seedPending: x.seed_pending === true,
     doneSuggested: x.done_suggested === true,
+    landHolding: x.land_holding === true,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
@@ -353,6 +360,12 @@ export async function getFleet(projectId) {
        WHERE lr.project_id = $1 AND lr.status IN ('pending','approved')
        ORDER BY lr.requested_at DESC`, [pid]);
 
+  // THE APPROACH QUEUE — who is stacked up behind those decisions (067). Fetched separately, and
+  // deliberately NOT merged into `landing`: that list is "cards a human must answer", and putting a
+  // holding row in it would raise exactly the second question the runway exists to prevent. The
+  // console renders these UNDER the card that owns the runway, as information, with no buttons.
+  const holding = await holdingByRef(pid);
+
   // Ships awaiting a human, plus whoever holds prod right now. `auto_release_at` drives the
   // console's countdown + Hold prompt; the card renders a padlock on the holder.
   // Open ships, plus anything that FINISHED in the last 15 minutes: a card that vanished the
@@ -406,6 +419,7 @@ export async function getFleet(projectId) {
     xells,
     fleet_burn: fleetBurn,
     landing,
+    holding,
     shipping,
     prod_bind: prodBind,
     prod_seed: prodSeed,
