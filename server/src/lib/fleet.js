@@ -345,6 +345,14 @@ export async function getFleet(projectId) {
        WHERE project_id=$1 AND source='prod' AND status='running' ORDER BY taken_at DESC LIMIT 1`, [pid]);
   const backupCount = await one(
     `SELECT count(*)::int AS n FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='finished'`, [pid]);
+  // The newest ATTEMPT, whatever became of it. `last` above is the newest SUCCESS, so on its own it
+  // cannot distinguish "backed up 27 hours ago, on schedule" from "backed up 27 hours ago and every
+  // attempt since has FAILED" — and backupDue() counts a failed row as the window's attempt, so one
+  // failure pushes the next good dump a full interval away. Silently, until now. (TKT-22-4F0E: the
+  // human's fear is about DATA, and backup FRESHNESS is the reading that actually speaks to it.)
+  const lastAttempt = await one(
+    `SELECT id, taken_at, status, error FROM db_snapshot
+       WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC LIMIT 1`, [pid]);
   const backup = {
     config: {
       backup_dir: pool?.backup_dir ?? null,
@@ -354,6 +362,7 @@ export async function getFleet(projectId) {
       backup_tables: pool?.backup_tables ?? null,   // null/[] ⇒ full-database backups (the default)
     },
     last: lastBackup,
+    last_attempt: lastAttempt || null,
     count: backupCount?.n ?? 0,
     running: runningBackup || null,
   };

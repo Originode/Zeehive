@@ -28,6 +28,9 @@
 // built commit/hot flag/health all stay truthful — COMMIT before you build.
 import http from 'node:http';
 import https from 'node:https';
+// `zee harness` takes persona TEXT, and text belongs in a file rather than a shell flag (--spec /
+// --personality-file). Nothing else here reads the filesystem.
+import { readFileSync } from 'node:fs';
 
 const api = process.env.ZEEHIVE_API || 'http://host.docker.internal:4700';
 const token = process.env.ZEEHIVE_XELL_TOKEN || '';
@@ -242,6 +245,8 @@ function usage() {
   zee dispatch --task "..." [--model m] [--mode 1..5] [--harness key] [--title "..."]   spawn a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness
   zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key]   DEPLOY a worker for a WORK ITEM: same dispatch path as "zee dispatch", but the brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text. Returns the new worker's slug
   zee say --to <slug> --message "..."   type a message straight into that worker's LIVE session
+  zee harness [<key>] [--new] [--delete] [--label "..."] [--parent <key>] [--summary "..."] [--glyph x] [--personality "..." | --personality-file <path>] [--spec <file.json>] [--enabled on|off] [--full|--json]
+                                     YOUR PROJECT'S WORKER PERSONAS: bare LISTS what you may use (the system-wide harnesses, plus your own project's — only the latter are yours to edit); "zee harness <key>" READS one (--full for the raw JSON). --new mints one scoped to YOUR project, --parent inherits a global worker harness (zee-base carries the cxell manual, dev-base the dev craft), --spec loads {personality,summary,skills[],memory[]} from a JSON file, --delete removes one of yours. Then "zee dispatch --harness <key>". REFUSED: a manager persona, any system-wide harness, another project's, and deleting one a live zee is wearing
   zee suggest-done --to <slug> --reason "..."   ask a HUMAN to mark that worker done (they confirm; that is what reaps it)
   NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — dispatch a worker instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused.
 
@@ -454,6 +459,85 @@ switch (cmd) {
       task, model: flag('model') || null, mode: flag('mode') || null,
       harness: flag('harness') || null, title: flag('title') || null,
     }));
+    break;
+  }
+  case 'harness': {
+    // MANAGER only: the WORKER PERSONAS your project can use, and the ones you may author.
+    //
+    // A persona is text, and text does not fit in a shell flag: a 3k personality or a memory file
+    // typed into --personality is how a quoting mistake becomes a mangled briefing. So the body may
+    // come from FILES — --personality-file for the voice, --spec <file.json> for the whole bundle
+    // ({personality, summary, glyph, skills:[{name,when,body}], memory:[{path,text}]}) — and the
+    // inline flags stay for the one-liners. Anything the server does not accept as persona is
+    // refused BY NAME, not quietly dropped.
+    const key = positional();
+    const spec = flag('spec');
+    let body = {};
+    if (spec) {
+      try { body = JSON.parse(readFileSync(spec, 'utf8')); }
+      catch (e) { console.error(`--spec ${spec}: ${e.message}`); process.exit(1); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        console.error(`--spec ${spec} must contain a JSON object (personality/summary/skills/memory)`); process.exit(1);
+      }
+    }
+    const pfile = flag('personality-file');
+    if (pfile) {
+      try { body.personality = readFileSync(pfile, 'utf8'); }
+      catch (e) { console.error(`--personality-file ${pfile}: ${e.message}`); process.exit(1); }
+    }
+    for (const f of ['label', 'summary', 'glyph', 'personality', 'parent']) {
+      const v = flag(f);
+      if (v !== null) body[f] = v;
+    }
+    if (rest.includes('--enabled')) body.enabled = flag('enabled') !== 'off';
+
+    if (rest.includes('--delete')) {
+      if (!key) { console.error('which one? `zee harness <key> --delete`'); process.exit(1); }
+      out(await req('DELETE', `/api/xell/self/harness/${encodeURIComponent(key)}`));
+      break;
+    }
+    if (rest.includes('--new')) {
+      if (!body.label) { console.error('a new harness needs --label "…" (and usually --parent zee-base)'); process.exit(1); }
+      out(await req('POST', '/api/xell/self/harness', { ...body, ...(key ? { key } : {}) }));
+      break;
+    }
+    if (Object.keys(body).length) {
+      if (!key) { console.error('which one? `zee harness <key> --label "…"` (or --new to create one)'); process.exit(1); }
+      out(await req('PUT', `/api/xell/self/harness/${encodeURIComponent(key)}`, body));
+      break;
+    }
+    if (key) {
+      // READ one: its own text, and the chain it inherits DESCRIBED rather than recited (a persona's
+      // inherited manual is 30k+ characters you are already carrying). --full prints the raw JSON.
+      const r = await req('GET', `/api/xell/self/harness/${encodeURIComponent(key)}`);
+      if (rest.includes('--full') || rest.includes('--json')) { out(r); break; }
+      const j = r.json || {};
+      if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+      const h = j.harness;
+      console.log(`${h.label} (${h.key})   ${h.scope === 'project' ? `yours — project ${h.project_name}` : 'system-wide (the fleet\'s)'}`
+        + `${j.editable ? '' : ' · read-only for you'}`);
+      if (h.parent) console.log(`  inherits: ${h.inherited.chain.join(' → ')}`);
+      if (h.summary) console.log(`  summary: ${h.summary}`);
+      console.log(`  briefed with ${h.briefing_chars.toLocaleString()} chars in total (its own + inherited)`);
+      if (h.personality) console.log(`\n— personality (${h.personality_chars} chars) —\n${h.personality}`);
+      for (const s of h.skills || []) console.log(`\n— skill: ${s.name} (${s.chars} chars) — when: ${s.when}`);
+      for (const m of h.memory || []) console.log(`\n— memory: ${m.path} (${m.chars} chars)`);
+      for (const s of h.inherited.skills || []) console.log(`  ↳ inherited skill: ${s}`);
+      for (const m of h.inherited.memory || []) console.log(`  ↳ inherited memory: ${m}`);
+      if (j.message) console.log(`\n${j.message}`);
+      process.exit(r.code >= 400 ? 1 : 0);
+    }
+    // no key, no fields → LIST
+    const r = await req('GET', '/api/xell/self/harnesses');
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    for (const h of j.harnesses || []) {
+      console.log(`  ${h.key.padEnd(24)} ${(h.scope === 'project' ? 'yours' : 'fleet').padEnd(6)}`
+        + `${h.parent ? `↳ ${h.parent}`.padEnd(20) : ''.padEnd(20)} ${h.summary || h.label}`);
+    }
+    if (j.message) console.log(`\n${j.message}`);
+    process.exit(r.code >= 400 ? 1 : 0);
     break;
   }
   case 'say': {

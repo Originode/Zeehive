@@ -85,13 +85,24 @@ harness
   bundle_hash   text                -- projection stamp; drift vs the files is surfaced, not silent
   avatar_path   text                -- LEGACY, always NULL since 082 (the badge is bundle.avatar_svg)
   is_law_core   boolean             -- the built-in manual harness (§4); exactly one, undeletable
+  project_id    uuid NULL           -- 084: NULL = system-wide (the default). Non-null = that project only
   enabled       boolean
   created_at    timestamptz
 ```
 
 **THE META-DB OWNS EVERY HARNESS'S TEXT** (migration 080). `bundle` on the row IS the harness —
-personality, skills, memory — and a harness row has **no `project_id`**, which is what "visible to all
-projects" means at the schema level: every enabled harness shows in every project's picker.
+personality, skills, memory.
+
+> **AMENDED by migration 084 (TKT-23-8EE4).** This section originally said a harness row has **no
+> `project_id`**, and that its absence *was* the meaning of "visible to all projects". It now has a
+> nullable one. **NULL still means system-wide, that is still the DEFAULT, and every harness that
+> existed before 084 is one** — core, zee-base, manager, the dev-* crew are the fleet's shared
+> vocabulary and nothing was migrated off it. What the column adds is a persona that belongs to ONE
+> project (`§3.1c`), so a MANAGER zee can mint a specialist for its own backlog without a human and
+> without it appearing in every other project's picker.
+
+Concretely, at the schema level: a harness with `project_id IS NULL` shows in every project's picker;
+one with a `project_id` shows only in that project's.
 
 It is authored in **the console's harness manager** or by **migration** (`harness_memory_put(harness_key,
 path, text)`, house rule 9). The queenzee then **generates** the files it injects into a xell from the
@@ -123,6 +134,40 @@ report, on any project, in any container. **Do not reintroduce a repo copy of an
 from the row the instant the next edit lands. Read a harness in the console's harness manager (which
 renders the inherited chain, so the manual a wearer gets is readable there), or in any cxell at
 `.zeehive/harness/…` (injected per xell, git-ignored).
+
+### 3.1c PROJECT-SCOPED harnesses, and who may author one (migration 084)
+
+Two scopes, one column:
+
+| `project_id` | what it means | who authors it |
+|---|---|---|
+| `NULL` (default) | **system-wide** — every project's picker offers it, any project's xell may wear it | a human, in the console's harness manager, or a migration |
+| a project | **that project only** — offered nowhere else, worn nowhere else, deleted with the project | that project's **manager zee** (`zee harness --new`), or a human/migration |
+
+The compatibility rule is enforced in **triggers**, in the shape 054 uses for `zee_type`, and from both
+directions — so the assign path, dispatch, the manager API, the console and any future caller reach the
+same wall, and an existing pairing cannot be broken by editing the harness afterwards:
+
+- `xell_harness_scope_guard` — a xell may only wear a harness that is global or its **own** project's.
+- `harness_scope_guard` — a harness cannot be re-scoped out from under the xells wearing it, the law
+  layer cannot be scoped at all, and a harness may only **inherit** one that is global or in its own
+  project. That last one is the quiet version of the same bug: inheritance MERGES text, so a
+  cross-project parent would pour one project's persona into every other project's briefings.
+- `pool_default_harness_scope_guard` — `pool_config.default_harness_id` cannot name another project's
+  harness. The project default is the one path that attaches a persona with nobody naming it.
+
+**What a MANAGER may do** (`/api/xell/self/harness*`, `zee harness` — §the verbs in
+[manager-zees.md](manager-zees.md)): create, read, edit and delete **worker** personas **in its own
+project**, and inherit a global worker harness — which is the point: a new role inherits `dev-base`,
+gets the manual through `zee-base`, and adds only what is specific to this project. What it is refused,
+structurally and with a sentence: a **manager** persona (only humans add managers), **any** system-wide
+harness, another project's harness, any non-persona field (`is_law_core` included — the create/update
+whitelist is still the law guard), and deleting a harness a **live** xell is wearing. The project comes
+from the caller's **token**, never from the body, so "which project?" is not a question it can ask.
+
+The dev crew is not the crew's opposite here: a project-scoped persona inheriting `dev-base` is the
+intended use, and `test/dev-crew.test.mjs` therefore lints the **system-wide** subtree only — a
+manager's specialist is on no roster and *should* carry this project's lore.
 
 ### 3.1b Project entry-point docs (migrations 081, 083)
 The same rule, one level out: a project's agent-facing instructions are a `project_doc` row, generated

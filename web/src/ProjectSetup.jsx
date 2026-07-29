@@ -1315,7 +1315,9 @@ function SpawnSection({ project, run }) {
     // Non-core, enabled harnesses only — core is the always-on law layer, never a selectable default.
     // The project DEFAULT harness is what a bare dispatch attaches to a pooled xell — always a
     // worker. A manager gets its harness when a human adds it, so manager personas are not offered.
-    getHarnesses('worker').then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
+    // …and scoped to THIS project (084): another project's persona cannot be this project's default
+    // (pool_default_harness_scope_guard refuses it), so it is never offered here.
+    getHarnesses('worker', project.id).then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     getDockerContexts().then(setCtxs).catch(() => {});
   }, [project.id]);
   if (!pc) return null;
@@ -1339,7 +1341,7 @@ function SpawnSection({ project, run }) {
         <label>Default harness <span className="pc">(persona a bare dispatch wears)</span>
           <select value={pc.harness_key || ''} onChange={(e) => save({ default_harness_key: e.target.value })}>
             <option value="">core only (no persona)</option>
-            {harnesses.map((h) => <option key={h.key} value={h.key}>{h.label}</option>)}
+            {harnesses.map((h) => <option key={h.key} value={h.key}>{h.label}{h.scope === 'project' ? ' ⌂ (this project)' : ''}</option>)}
           </select></label>
         <label>Compile on <span className="pc">(build host for new xells{project.registry ? '' : ' — set a Build registry to enable'})</span>
           <select value={pc.default_build_ctx || ''} onChange={(e) => save({ default_build_ctx: e.target.value })}
