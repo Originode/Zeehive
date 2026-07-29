@@ -422,12 +422,41 @@ export const zeeCliSourcePath = () => resolve(config.repoRoot, 'scripts', 'zee')
 // checkout would otherwise leave `#!/usr/bin/env node\r`, which dies as `node\r: No such file or
 // directory` — the same belt-and-braces the Dockerfile applies), chmods it executable and pins
 // root ownership so the zee cannot rewrite its own CLI.
-export function zeeCliInstallCommands({ name, src = zeeCliSourcePath() }) {
+export function cxellFileInstallCommands({ name, src, dest, tmp }) {
   return [
-    ['cp', src, `${name}:/tmp/zee.cli`],
+    ['cp', src, `${name}:${tmp}`],
     ['exec', '-u', '0', name, 'bash', '-lc',
-      `sed -i 's/\\r$//' /tmp/zee.cli && install -o root -g root -m 0755 /tmp/zee.cli ${ZEE_CLI_DEST} && rm -f /tmp/zee.cli`],
+      `sed -i 's/\\r$//' ${tmp} && install -o root -g root -m 0755 ${tmp} ${dest} && rm -f ${tmp}`],
   ];
+}
+export function zeeCliInstallCommands({ name, src = zeeCliSourcePath() }) {
+  return cxellFileInstallCommands({ name, src, dest: ZEE_CLI_DEST, tmp: '/tmp/zee.cli' });
+}
+
+// The ATTEND-side twin of the CLI refresh: zee-live.mjs renders the transcript feed a human watches
+// in the dashboard terminal, and it is baked into the image exactly like `zee` was — so a fleet on
+// an older zee-agent shows an older feed. It matters now that the terminal has ✱/⚒ view chips: the
+// chips write /tmp/zee-live-view.json (terminal-bridge.js) and only a renderer that WATCHES that
+// file reacts. Without this refresh the buttons would be dead in every cage spawned from a stale
+// image — the precise failure mode the CLI install exists to prevent.
+export const ZEE_LIVE_DEST = '/usr/local/bin/zee-live.mjs';
+export const zeeLiveSourcePath = () => resolve(config.repoRoot, 'docker', 'zeehive', 'zee-live.mjs');
+export const zeeLiveInstallCommands = ({ name, src = zeeLiveSourcePath() }) =>
+  cxellFileInstallCommands({ name, src, dest: ZEE_LIVE_DEST, tmp: '/tmp/zee-live.mjs' });
+
+export async function installZeeLiveIntoCxell({ ctx = 'default', name }) {
+  const src = zeeLiveSourcePath();
+  if (!existsSync(src)) return { installed: false, reason: 'source-missing', src };
+  try {
+    for (const args of zeeLiveInstallCommands({ name, src })) await dk(ctx, args);
+    return { installed: true, src };
+  } catch (e) {
+    // Quieter than the CLI's !!!: a stale feed renderer costs a human a filter button, it does not
+    // strand a zee. Still said out loud, never swallowed.
+    logline('cxell', `${name}: could not refresh the live-feed renderer from ${src} `
+      + `(${String(e.message).slice(0, 160)}) — the terminal's ✱/⚒ chips may do nothing in this cxell`);
+    return { installed: false, reason: 'exec-failed', src, error: e.message };
+  }
 }
 
 // ── Is the IMAGE this cxell booted from actually built from the current code? ─────────────────

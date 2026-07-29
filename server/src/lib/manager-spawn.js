@@ -105,6 +105,7 @@ export async function unbindManagerFromProdReadonly(xellId, reason = 'the dispat
 // Create a manager zee. Everything after the type stamp is the ordinary dispatch path, so a manager
 // is observed, built, nudged and reaped exactly like any other xell.
 export async function createManagerZee({ project, cwd, task, title, model, mode, runtime, harness,
+                                         headless, images,
                                          provider = 'claude', provider_token_id = null } = {}) {
   const brief = String(task || '').trim() || DEFAULT_MANAGER_BRIEF;
   const { dispatchXell } = await import('../queenzee/intake.js');
@@ -112,6 +113,12 @@ export async function createManagerZee({ project, cwd, task, title, model, mode,
     task: brief, project, cwd, title: title || 'manager zee', zee_type: 'manager',
     harness: harness || 'manager',
     ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
+    // The console composes a manager's programme in the SAME modal a worker's prompt is written in
+    // (web/src/Dispatch.jsx, `manager` variant), so the same two attachments must survive the trip:
+    // a PASTED SCREENSHOT (saved into the worktree and appended to the brief) and the ATTENDED
+    // flag. Dropping them here is why a manager composed with an image silently lost it.
+    ...(headless === undefined || headless === null ? {} : { headless: headless !== false }),
+    ...(Array.isArray(images) && images.length ? { images } : {}),
     provider, provider_token_id,
   });
   logline('crew', `MANAGER zee added on ${out.slug} — production is readable (read-only), pushing is not`);

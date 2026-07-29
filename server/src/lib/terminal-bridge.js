@@ -8,6 +8,10 @@
 // Wire protocol (identical on both doors): client→server is JSON control frames —
 // {t:'i',d:<input>} keystrokes, {t:'r',cols,rows} resize. server→client is raw terminal bytes
 // (straight into xterm.write).
+//
+// The ZEE door has one frame more, in each direction: {t:'v',thinking,moves} up (the ✱/⚒ chips in
+// the terminal header) and a CTRL_PREFIX-tagged JSON frame down (the view the cxell actually holds
+// + whether a live feed is running). See "the live-feed view channel" below.
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
@@ -32,6 +36,48 @@ export function attachTerminalBridge(server) {
     wss.handleUpgrade(req, socket, head, (ws) => (zee ? openTerminal(ws, zee[1]) : openContainerShell(ws, cont[1])));
   });
   return wss;
+}
+
+// ── the live-feed view channel (the ✱ thinking / ⚒ moves chips) ───────────────────────────────
+//
+// While the headless zee is working, the cxell pane runs zee-live.mjs — the transcript feed of
+// thinking, tool calls and results. A human attending it asked for the obvious control: show/hide
+// the thinking, show/hide the detailed moves. The renderer is inside the cage, so the chips need a
+// way in, and it must be one that cannot type into whatever else owns the pane (the `claude
+// --resume` TUI takes the pane the moment the turn ends — keystrokes there would land in the
+// zee's prompt box). So the chips do NOT send keys: they write a tiny JSON view file over the same
+// SSH connection, which zee-live.mjs watches and repaints from. When no feed is running the write
+// is simply the view the NEXT one starts in, and we tell the client so (`live:false`) instead of
+// pretending the click did something.
+export const ZEE_LIVE_VIEW_FILE = '/tmp/zee-live-view.json';
+// Frames the browser must NOT write into xterm. Terminal data arrives as binary (Buffers), so a
+// text frame with this NUL-tagged prefix can never collide with terminal output.
+export const CTRL_PREFIX = '\u0000ZH';
+
+// The remote command behind a chip click. `write` false = read-only poll (what the client is sent
+// on attach). Nothing from the client is interpolated: the view is reduced to two BOOLEANS here,
+// so no message can smuggle shell into the cage.
+export function zeeLiveViewCommand(view, write = false) {
+  const b = (v) => (v === false ? 'false' : 'true');
+  const json = `{"thinking":${b(view?.thinking)},"moves":${b(view?.moves)}}`;
+  // Written via a temp file + mv: the reader POLLS this path, and `>` truncates before it writes —
+  // a poll landing in that gap would read an empty file, fall back to "show everything" and repaint
+  // twice. A rename is atomic, so the renderer only ever sees a whole view.
+  return (write ? `printf '%s' '${json}' > ${ZEE_LIVE_VIEW_FILE}.tmp 2>/dev/null && mv -f ${ZEE_LIVE_VIEW_FILE}.tmp ${ZEE_LIVE_VIEW_FILE}; ` : '')
+    // `zee-live[.]mjs` so the pattern cannot match the pgrep itself; the marker words keep the
+    // parse independent of any shell noise on the line.
+    + `pgrep -f 'zee-live[.]mjs' >/dev/null 2>&1 && echo ZH-LIVE || echo ZH-IDLE; `
+    + `cat ${ZEE_LIVE_VIEW_FILE} 2>/dev/null`;
+}
+
+// Read that command's output back into the frame the browser gets. Unreadable/absent file = the
+// renderer's own default (everything shown), never a guess that hides output.
+export function parseZeeLiveViewReply(out) {
+  const text = String(out || '');
+  const m = text.match(/\{[^{}]*\}/);
+  let view = { thinking: true, moves: true };
+  if (m) { try { const j = JSON.parse(m[0]); view = { thinking: j.thinking !== false, moves: j.moves !== false }; } catch { /* half-written */ } }
+  return { t: 'v', ...view, live: /ZH-LIVE/.test(text) };
 }
 
 async function openTerminal(ws, zeeId) {
@@ -76,6 +122,25 @@ async function openTerminal(ws, zeeId) {
   let stream = null;
   let lastSize = { cols: 100, rows: 30 };   // fallback only — normally overwritten before exec
   const earlyInput = [];
+
+  // A SECOND exec channel on the same SSH connection (ssh2 multiplexes), so the view file is
+  // written without a byte touching the PTY. Best-effort in every branch: a failed chip must never
+  // disturb the terminal it rides on.
+  let sshReady = false;
+  let pendingView = null;   // a chip clicked before SSH came up — replayed, not dropped
+  const applyView = (view, write) => {
+    if (!sshReady) { if (write) pendingView = view; return; }
+    try {
+      conn.exec(zeeLiveViewCommand(view, write), (err, s) => {
+        if (err || !s) return;
+        let out = '';
+        s.on('data', (d) => { out += d.toString(); });
+        s.stderr?.on('data', () => { /* pgrep/cat noise is not an error worth surfacing */ });
+        s.on('close', () => { if (ws.readyState === 1) send(CTRL_PREFIX + JSON.stringify(parseZeeLiveViewReply(out))); });
+      });
+    } catch { /* connection went away under us */ }
+  };
+
   ws.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.t === 'i') { if (stream) stream.write(msg.d); else earlyInput.push(msg.d); }
@@ -83,9 +148,19 @@ async function openTerminal(ws, zeeId) {
       lastSize = { cols: msg.cols, rows: msg.rows };
       if (stream) stream.setWindow(msg.rows, msg.cols, 0, 0);
     }
+    // the ✱/⚒ chips: write the view the operator chose, then answer with what the cage now holds
+    else if (msg.t === 'v') applyView({ thinking: msg.thinking, moves: msg.moves }, true);
   });
   ws.on('close', () => { try { stream?.close(); } catch {} conn.end(); });
   conn.on('ready', () => {
+    sshReady = true;
+    // Seed the chips from the cage, so a reopened terminal shows the view that is actually in
+    // force (and whether a live feed is running at all) instead of assuming the default. A chip
+    // clicked while we were still connecting wins over that poll — the same "queue what arrives
+    // early" lesson the resize below learned, and dropping it would silently revert the operator's
+    // click a second after they made it.
+    if (pendingView) applyView(pendingView, true); else applyView(null, false);
+    pendingView = null;
     conn.exec(cmd, { pty: { term: 'xterm-256color', cols: lastSize.cols, rows: lastSize.rows } }, (err, s) => {
       if (err) return fail(`exec failed: ${err.message}`);
       stream = s;

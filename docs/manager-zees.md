@@ -49,6 +49,35 @@ the ship gate: a ship is still refused unless the work is landed, still approved
 still performed by the queenzee from main. A manager is often the right agent to ask for one — it is
 the one holding the whole picture.
 
+## How a manager READS in the console (2026-07-29)
+
+A manager's hexagon is not a work-cell, and is no longer drawn as one. The honeycomb's worker card is
+built around git — a head sha, a source diffstat, pull/land/PR — and every one of those describes
+work a manager is structurally refused. So `web/src/hive/HiveCanvas.jsx` draws it in the **harness
+badge's** visual language instead (`drawManagerHex`, beside `drawHarnessBadge`; both seat their
+persona with the same `drawAvatarDisc`):
+
+- a **dashed** seat — the badge's "part of the grid, but not a work-cell" tell — inside the
+  prod-orange double wall that says "this one holds production";
+- the **persona disc** of the harness it wears (its avatar art, else its glyph, else ⬢);
+- `⬢ slug` on the seam over `manager · ⬡ N crew`, and the crew's **activity** (`N working · N
+  waiting`) where a worker's diffstat sits — a manager's work is its crew;
+- the same hive status pill every hexagon carries, and `🛡 read-only` where a worker's ship line is;
+- **no head sha and no diffstat, anywhere on it.**
+
+Its bloom keeps the five facets it owns (identity, branch, session, containers, machine) and swaps
+the two git ones: petal 5 is **CREW** (one status-coloured dot per worker, the colour of that
+worker's own hexagon) and petal 6 is **PROD · AGE**. Clicking either opens nothing — `diffPetal()`
+returns null for a manager, so a petal that no longer shows a diff can never open the diff viewer.
+The buttons follow the same rule (`petalVerbs`, pure and unit-tested): **pull, land and PR are
+absent** — offering them would offer a human three clicks that can only return the refusal above —
+while build, terminal, nudge, env, message, done and **ship** remain.
+
+`test/manager-hexagon.test.mjs` holds that shape: it transforms the real JSX with esbuild, imports
+it, and PAINTS the hexagon at each size against a recording 2D context, asserting what actually
+landed on the canvas (and that nothing resembling a sha or a diffstat did). `web/demo.html` seats a
+manager and its crew in the mock hive so it can be looked at without a live fleet.
+
 ## Why the refusals are structural
 
 Every limit here is enforced somewhere a persuasive agent cannot reach, because a rule that lives
@@ -86,6 +115,30 @@ only in a prompt is a rule that lasts until the first clever workaround:
 - **Managers are added by humans only.** `zee dispatch` refuses `role=manager` and refuses to hand a
   worker the manager harness or a database of the dispatcher's choosing. A manager that could mint
   managers is a fleet that grows sideways with nobody's consent.
+
+## Adding one: the programme is a PROMPT, so it gets the composer
+
+`⬢ + manager zee` (`web/src/Manager.jsx`) opens the **same modal a worker prompt is written in** —
+`web/src/Dispatch.jsx` with `manager` set — and POSTs the result to `/api/managers`. It used to be a
+one-line `showPrompt()` `<input>`, which had the manager's **programme** (the standing brief an agent
+runs a whole crew from, and the longest-lived prompt in the fleet) typed blind into a text field:
+nothing visible past ~60 characters, no paste of a backlog or a screenshot, Enter fires it, and no
+choice of model, autonomy, harness or account. The worker below it had the full composer.
+
+One composer, and the manager variant differs only where a manager genuinely differs:
+
+- **Harnesses offered are manager-type** (`GET /api/harnesses?zee_type=manager`) — 054's guard would
+  refuse a worker persona anyway — and **"core only" is not offered**: a manager's manual *is* its
+  harness, and a manager that has not read it does not know which doors it has.
+- **No production-DB toggle.** Adding a manager mints its SELECT-only role and binds it, failing
+  closed. A switch would be a lie in both positions, so the field states the fact instead.
+- **A blank programme is legal** and means `DEFAULT_MANAGER_BRIEF` (study the project, propose a
+  plan, ask a human before starting a crew) — the footer says so rather than leaving you to guess.
+- **Account picker.** The prompt buttons are one-per-connected-account, so clicking one *is* the
+  choice; the manager is a single button, so it makes that choice inside the composer.
+
+Model, autonomy mode, supervision (headless/attended) and pasted images are the shared controls, and
+`createManagerZee` forwards all of them — `headless` and `images` used to be dropped on the floor.
 
 ## The verbs
 
@@ -142,5 +195,7 @@ name the crew they belong to. With no managers in the fleet the layout is exactl
 - `server/src/lib/prod-readonly.js` — the SELECT-only role, minted and dropped.
 - `server/src/queenzee/self.js` — the crew verbs + the manager refusals.
 - `harnesses/manager/` — the persona, the `dispatch-brief` skill, and a manual of its own.
-- `web/src/Manager.jsx` — "+ manager zee" and the done-suggestion gate.
+- `web/src/Manager.jsx` — "+ manager zee" (opens the composer) and the done-suggestion gate.
+- `web/src/Dispatch.jsx` — the one composer, in its worker and `manager` variants.
+- `test/manager-compose.test.mjs` — the console wiring for adding one, asserted statically.
 - `test/manager-zee.test.mjs` — 55 assertions over all of it.
