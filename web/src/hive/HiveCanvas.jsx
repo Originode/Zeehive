@@ -51,6 +51,44 @@ function heatWash(x, hover, base = 0) {
 }
 const shortSlug = (s) => String(s || '');
 const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
+
+// ── a MANAGER zee is not a work-cell ─────────────────────────────────────────
+// A manager has ZERO push/PR access to the xource (refused in server/src/queenzee/xellgit.js's
+// ctx(), the one door every git write verb passes through): it writes no code and lands none. So its
+// head sha and its diffstat count work it can never land — noise dressed as progress. Its hexagon
+// therefore drops both and is drawn in the HARNESS BADGE's visual language instead (dashed seat +
+// the persona disc it wears), spending the space on what a manager actually IS: its crew, and its
+// read-only hold on production.
+export const isManagerXell = (x) => x?.zee_type === 'manager';
+
+// What a manager's hexagon says, as data (pure — unit-tested; the drawing below only paints it).
+export function managerCard(x, crew = []) {
+  const list = crew || [];
+  const busy = list.filter((w) => w.cli_active === true || w.zee_status === 'working').length;
+  // anything the hive is holding for a human on a crew member: land?/ship?/prod?/seed?/tend?/done?
+  const waiting = list.filter((w) => /(Request|Hint|Suggest)$/.test(w.hive_status || '')).length;
+  // Two short lines, not one long one: a hexagon is ~14 characters wide at a readable size, so the
+  // count rides the identity seam and the activity gets the line a worker spends on its diffstat.
+  const crewLine = list.length ? `⬡ ${list.length} crew` : '⬡ no crew yet';
+  const activity = [busy ? `▶ ${busy} working` : null, waiting ? `⚑ ${waiting} waiting` : null]
+    .filter(Boolean).join(' · ') || null;
+  // A pointy-top hex narrows fast toward its bottom vertex — the line under the status pill has only
+  // ~half the card's width — so the compact card gets the short form and the bloom's petal the full one.
+  const grip = x?.db_coupling === 'db-prod-readonly' ? 'read-only'
+    : x?.db_coupling === 'db-shared-prod' ? 'read/write'
+    : null;
+  return {
+    label: `⬢ ${shortSlug(x?.slug)}`,
+    role: 'manager',
+    crew: crewLine,
+    activity,
+    count: list.length,
+    busy,
+    waiting,
+    prod: grip ? `🛡 prod · ${grip}` : null,
+    prodShort: grip ? `🛡 ${grip}` : null,
+  };
+}
 // compact burn formatters (mirror the dashboard's fmtTok/fmtUsd) for the per-xell burn on the flower
 const fmtTok = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n || 0));
 const fmtUsd = (n) => '$' + (n >= 100 ? Math.round(n) : (n || 0).toFixed(2));
@@ -494,6 +532,26 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     });
     const hexById = {}; for (const hx of hexes) hexById[hx.id] = hx;
 
+    // Every manager's CREW, and the harness art each xell wears — both needed BEFORE the hexes are
+    // drawn, because a manager's hexagon is drawn as a persona badge (its harness avatar) over its
+    // crew, not as a work-cell. The avatar loader is shared with the harness badges below (one image
+    // cache; a load triggers one redraw).
+    const harnesses = timeline?.harnesses || [];
+    const crewOf = {};
+    for (const x of list) if (x.manager_xell_id) (crewOf[x.manager_xell_id] ||= []).push(x);
+    const harnessOf = (id) => harnesses.find((h) => (h.consumer_ids || []).includes(id)) || null;
+    const getImg = (url) => {
+      if (!url) return null;
+      let img = imgCacheRef.current.get(url);
+      if (!img) {
+        img = new Image();
+        img.onload = () => requestAnimationFrame(() => drawRef.current && drawRef.current());
+        img.src = url;
+        imgCacheRef.current.set(url, img);
+      }
+      return img;
+    };
+
     // hover highlight: a hovered hex, a hovered commit dot, OR a hovered harness badge lights up the
     // matching hex(es). Hovering a harness highlights every xell that wears it (its consumers) —
     // the reverse of a xell hover highlighting the harness it wears.
@@ -510,7 +568,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       if (expanded && hx.id === expanded.id) continue;     // the flower draws it
       const hovered = isHov(hx.id);
       const dim = (expandedId && expandedId !== hx.id) || (hoverActive && !hovered);
-      drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines });
+      if (isManagerXell(hx.x)) {
+        const h = harnessOf(hx.id);
+        drawManagerHex(ctx, hx, { hover: hovered, dim, crew: crewOf[hx.id] || [],
+          harness: h, img: getImg(h?.avatar_url) });
+      } else {
+        drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines });
+      }
     }
     geomRef.current.flower = null;
     geomRef.current.buttons = null;
@@ -519,7 +583,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       const [er, ec] = cells[expanded.id];
       const centers = [cellCenter(er, ec, cellSize, originX, originY),
         ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, cellSize, originX, originY))];
-      drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines, tById[expanded.id]?.color || null);
+      drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines,
+        tById[expanded.id]?.color || null, crewOf[expanded.id] || []);
       geomRef.current.flower = { centers, size: cellSize, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
       // Per-xell ACTIONS drawn straight onto the flower (no DOM toolbar): a hit-tested button row
@@ -535,7 +600,6 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // never collides with one. The avatar is drawn on the CANVAS (reliable drawImage of a preloaded
     // SVG) rather than an SVG <image> that browsers fail to load; <Connectors> routes the consumer
     // wires through this centre.
-    const harnesses = timeline?.harnesses || [];
     const harnessCells = [];
     if (harnesses.length) {
       const cols = Math.max(1, lay.cols);
@@ -549,17 +613,6 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
           hc++; if (hc >= cols) { hc = 0; hr++; }
           if (!occupied.has(k)) { occupied.add(k); return out; }
         }
-      };
-      const getImg = (url) => {
-        if (!url) return null;
-        let img = imgCacheRef.current.get(url);
-        if (!img) {
-          img = new Image();
-          img.onload = () => requestAnimationFrame(() => drawRef.current && drawRef.current());
-          img.src = url;
-          imgCacheRef.current.set(url, img);
-        }
-        return img;
       };
       // which xell(s) are focused right now (hovered/expanded, OR the consumers of a hovered harness)
       // → a harness badge lights up when a focused xell WEARS it, and dims with everything else when
@@ -711,7 +764,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (expandedId) {
       const b = hitButton(wx, wy);
       const f = hitFlower(wx, wy);
-      cursor = b || (f && ((f.cell === 0 && f.openable) || DIFF_PETAL[f.cell])) ? 'pointer'
+      cursor = b || (f && ((f.cell === 0 && f.openable) || diffPetal(expanded, f.cell))) ? 'pointer'
         : hitContainer(wx, wy) ? 'context-menu' : 'default';   // right-click hint on an icon
       emitHover({ id: null, commit: null });
     } else {
@@ -749,9 +802,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
           if (x) onOpenSession?.(x);
         } else if (DIFF_PETAL[f.cell]) {
           // The two DIFF petals (commit/source stat, own stat) open the diff viewer — clicking the
-          // numbers is how you read the lines they count, here exactly as on the card.
+          // numbers is how you read the lines they count, here exactly as on the card. A manager's
+          // petals 5/6 are CREW and PROD·AGE, so diffPetal() returns null and the click does nothing.
           const x = (xells || []).find((xx) => xx.id === f.id);
-          if (x) onAction?.(DIFF_PETAL[f.cell], x, diffs?.[f.id]);
+          if (x && diffPetal(x, f.cell)) onAction?.(DIFF_PETAL[f.cell], x, diffs?.[f.id]);
         }
         return;                                              // petal clicks keep the flower open
       }
@@ -828,6 +882,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
 // ── compact hex: the two-half card ────────────────────────────────────────────
 // upper half: ⌂ machine + container chips (nick + health dot)
 // lower half: head sha · source diff · status pill · ship line
+// This is the WORKER (and production) card — it is built around the git state, so a MANAGER never
+// reaches it: drawManagerHex draws that one instead (no sha, no diffstat, a persona and its crew).
 function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);
@@ -852,12 +908,6 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   if (hx.color) {
     hexPath(ctx, cx, cy, size - 3);
     ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
-  }
-  // A MANAGER zee's hexagon is double-walled: it runs a crew (seated in the cells around it) and
-  // holds production read-only, so it should be identifiable before you read a single word on it.
-  if (x.zee_type === 'manager') {
-    hexPath(ctx, cx, cy, size + 2.5);
-    ctx.lineWidth = 2; ctx.strokeStyle = withAlpha(COL.prod, hover ? 0.95 : 0.7); ctx.stroke();
   }
   ctx.save();
   hexPath(ctx, cx, cy, size - 2);
@@ -934,15 +984,11 @@ function drawCompactHex(ctx, hx, { hover, dim, diff, machines }) {
   // the dispatch convention prefixes titles with "xell : " — identity noise on a card this small
   const ownTitle = full && !x.is_production ? (x.zee_title || '').replace(/^xell\s*:\s*/i, '').trim() : '';
   const zeeTitle = !full || x.is_production ? ''
-    : x.zee_type === 'manager' ? 'manager zee — runs a crew, reads prod'
-    // a managed worker names its crew ahead of its task: the cluster around a double-walled hex
+    // a managed worker names its crew ahead of its task: the cluster around a manager's persona hex
     // should not be a coincidence you have to infer
     : x.manager_slug ? `↳${x.manager_slug}${ownTitle ? ` · ${ownTitle}` : ''}`
     : ownTitle;
-  // A manager is named as one on the seam, and a managed worker names the crew it belongs to — the
-  // hexagons around a double-walled hex should not be a coincidence you have to infer.
-  const label = x.is_production ? '🛡 PRODUCTION'
-    : x.zee_type === 'manager' ? `⬢ ${shortSlug(x.slug)}` : shortSlug(x.slug);
+  const label = x.is_production ? '🛡 PRODUCTION' : shortSlug(x.slug);
   fillFont(ctx, label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
   ctx.fillStyle = COL.text;
   ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * (zeeTitle ? 0.14 : 0.06) : size * 0.2));
@@ -1037,26 +1083,7 @@ function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false }
     ctx.beginPath(); ctx.arc(cx, ay, r + 4, 0, Math.PI * 2);
     ctx.lineWidth = 2.5; ctx.strokeStyle = COL.text; ctx.stroke();
   }
-  // avatar disc
-  ctx.beginPath(); ctx.arc(cx, ay, r, 0, Math.PI * 2);
-  ctx.fillStyle = COL.bg; ctx.fill();
-  ctx.lineWidth = 2; ctx.strokeStyle = col; ctx.stroke();
-  if (img && img.complete && img.naturalWidth) {
-    ctx.save();
-    ctx.beginPath(); ctx.arc(cx, ay, r - 2, 0, Math.PI * 2); ctx.clip();
-    ctx.drawImage(img, cx - (r - 2), ay - (r - 2), (r - 2) * 2, (r - 2) * 2);
-    ctx.restore();
-  } else if (h.glyph) {
-    // authored persona badge: its chosen glyph (emoji/char) — no image needed
-    ctx.font = `${r * 1.1}px 'Segoe UI Emoji', 'Segoe UI', sans-serif`;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(String(h.glyph), cx, ay + r * 0.04);
-  } else {
-    ctx.fillStyle = col;
-    ctx.font = `700 ${r}px 'Segoe UI', sans-serif`;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(String(h.label || 'H')[0], cx, ay);
-  }
+  drawAvatarDisc(ctx, cx, ay, r, col, { img, glyph: h.glyph, letter: String(h.label || 'H')[0] });
   // label + consumer count
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.font = `600 ${Math.max(9, size * 0.16)}px 'Segoe UI', sans-serif`;
@@ -1071,10 +1098,145 @@ function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false }
   ctx.restore();
 }
 
+// The persona disc: a preloaded avatar image, else the harness's authored glyph, else a lettermark —
+// on a dark disc ringed in the badge's colour. Shared by the HARNESS badge and the MANAGER hexagon,
+// so "a persona seated in the grid" is drawn by ONE piece of code and the two cannot drift apart.
+function drawAvatarDisc(ctx, cx, cy, r, col, { img, glyph, letter } = {}) {
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = COL.bg; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = col; ctx.stroke();
+  if (img && img.complete && img.naturalWidth) {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, r - 2, 0, Math.PI * 2); ctx.clip();
+    ctx.drawImage(img, cx - (r - 2), cy - (r - 2), (r - 2) * 2, (r - 2) * 2);
+    ctx.restore();
+    return;
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (glyph) {
+    // authored persona badge: its chosen glyph (emoji/char) — no image needed
+    ctx.font = `${r * 1.1}px 'Segoe UI Emoji', 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.text;
+    ctx.fillText(String(glyph), cx, cy + r * 0.04);
+  } else {
+    ctx.fillStyle = col;
+    ctx.font = `700 ${r}px 'Segoe UI', sans-serif`;
+    ctx.fillText(String(letter || 'H'), cx, cy);
+  }
+}
+
+// ── the MANAGER hexagon: a persona, not a work-cell ───────────────────────────
+// Drawn in the HARNESS BADGE's language (dashed seat + the persona disc of the harness it wears) so a
+// manager is identifiable across the room, before a single word is read — and deliberately WITHOUT
+// the two things a manager can never act on: its head sha and its diffstat. In their place: the crew
+// it runs (count, and how many are working / waiting on a human) and its read-only hold on prod. The
+// prod-orange outer wall stays — that ring is the "this one holds production" tell.
+export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null, img = null }) {
+  const { cx, cy, size, x } = hx;
+  const col = statusColor(x);                 // its hive status still colours it — a manager idles too
+  const card = managerCard(x, crew);
+  const w = hexWidth(size);
+  ctx.save();
+  if (dim) ctx.globalAlpha = 0.3;
+
+  // seat: the status wash, stroked DASHED — the harness badge's "part of the grid, not a work-cell"
+  hexPath(ctx, cx, cy, size);
+  const g = ctx.createLinearGradient(cx, cy - size, cx, cy + size);
+  const wash = heatWash(x, hover);
+  g.addColorStop(0, withAlpha(col, wash.top));
+  g.addColorStop(1, withAlpha(col, wash.bot));
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = hover ? 2.4 : 1.4;
+  ctx.strokeStyle = hover ? col : withAlpha(col, 0.7);
+  ctx.setLineDash([5, 3]); ctx.stroke(); ctx.setLineDash([]);
+  // double wall in production orange: it runs a crew AND holds production read-only
+  hexPath(ctx, cx, cy, size + 2.5);
+  ctx.lineWidth = 2; ctx.strokeStyle = withAlpha(COL.prod, hover ? 0.95 : 0.7);
+  ctx.setLineDash([5, 3]); ctx.stroke(); ctx.setLineDash([]);
+  if (hx.color) {
+    hexPath(ctx, cx, cy, size - 3);
+    ctx.lineWidth = 1.3; ctx.strokeStyle = withAlpha(hx.color, 0.9); ctx.stroke();
+  }
+
+  ctx.save();
+  hexPath(ctx, cx, cy, size - 2);
+  ctx.clip();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+
+  if (size < 30) {                            // tiny: the persona dot, ringed prod-orange
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.24), 0, Math.PI * 2);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha(COL.prod, 0.9); ctx.stroke();
+    ctx.restore(); ctx.restore(); return;
+  }
+
+  const full = size >= 52;
+  // the persona it wears: the harness avatar/glyph, ⬢ when it wears none
+  const discR = size * (full ? 0.24 : 0.26);
+  const discY = cy - size * (full ? 0.42 : 0.3);
+  drawAvatarDisc(ctx, cx, discY, discR, harness?.color || COL.prod,
+    { img, glyph: harness?.glyph || (harness ? null : '⬢'), letter: String(harness?.label || 'M')[0] });
+
+  // identity (⬢ slug), grown to fill the seat
+  fillFont(ctx, card.label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
+  ctx.fillStyle = COL.text;
+  ctx.fillText(fit(ctx, card.label, w * 0.82), cx, cy + size * (full ? 0.02 : 0.16));
+
+  if (full) {
+    // seam: what it is and how big its crew is — where a worker names its task
+    const seam = `${card.role} · ${card.crew}`;
+    fillFont(ctx, seam, w * 0.88, 7.5, size * 0.13, (p) => `italic ${p}px 'Segoe UI', sans-serif`);
+    ctx.fillStyle = COL.muted;
+    ctx.fillText(fit(ctx, seam, w * 0.88), cx, cy + size * 0.19);
+    // the crew's ACTIVITY stands where a worker's DIFFSTAT stands — a manager's work is its crew.
+    // Sized to FILL the card (the file's rule for every stat): it shrinks to fit rather than clipping
+    // "1 working · 1 waiting" down to an ellipsis, which is where the whole line's information is.
+    const line = card.activity || (card.count ? 'crew idle' : '—');
+    fillFont(ctx, line, w * 0.82, 7, size * 0.15, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
+    ctx.fillStyle = card.activity ? COL.text : withAlpha(COL.muted, 0.75);
+    const shown = fit(ctx, line, w * 0.82);
+    ctx.fillText(shown, cx, cy + size * 0.35);
+    // and the yellow "actively working" dot rides beside it, exactly as it does on a worker
+    if (isBusyZee(x)) {
+      drawBusyDot(ctx, cx - ctx.measureText(shown).width / 2 - size * 0.11, cy + size * 0.35,
+        Math.max(2.4, size * 0.055));
+    }
+  }
+
+  // status pill — the same pill every hexagon carries
+  const st = hiveStatusLabel(x);
+  if (full && st) {
+    ctx.font = `600 ${Math.max(7.5, size * 0.13)}px 'Segoe UI', sans-serif`;
+    const pw = ctx.measureText(st).width + 12, ph = Math.max(11, size * 0.19);
+    const py = cy + size * 0.53;
+    ctx.beginPath(); ctx.roundRect(cx - pw / 2, py - ph / 2, pw, ph, ph / 2);
+    ctx.fillStyle = withAlpha(col, 0.22); ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(col, 0.7); ctx.stroke();
+    ctx.fillStyle = col;
+    ctx.fillText(st, cx, py + 0.5);
+    // where a worker's ship line sits: what this manager holds in production
+    if (card.prodShort) {
+      ctx.font = `${Math.max(7.5, size * 0.125)}px 'Segoe UI', sans-serif`;
+      ctx.fillStyle = COL.prod;
+      ctx.fillText(fit(ctx, card.prodShort, w * 0.5), cx, cy + size * 0.7);
+    }
+  } else if (!full) {
+    ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.muted;
+    ctx.fillText(fit(ctx, `⬡ ×${card.count} · ${st}`, w * 0.7), cx, cy + size * 0.38);
+  }
+  ctx.restore();   // unclip
+  ctx.restore();
+}
+
 // ── the flower: rendered ON the grid cells it consumes (no overlay) ───────────
-function drawFlower(ctx, centers, size, x, diff, machines, traceColor) {
+function drawFlower(ctx, centers, size, x, diff, machines, traceColor, crew = []) {
   const col = statusColor(x);
-  const petals = flowerFacets(x, diff, machines);
+  // A manager's bloom keeps the five facets it has (identity, branch, session, containers, machine)
+  // and swaps the two GIT facets — commit head and diffstat — for the two things a manager owns:
+  // its CREW and its read-only reach into production.
+  const petals = isManagerXell(x) ? managerFacets(x, machines, crew) : flowerFacets(x, diff, machines);
   // the focused bloom stays vivid, but still darker when cold / brighter when hot (base lifts it)
   const wash = heatWash(x, false, 0.14);
   centers.forEach(([hx, hy], i) => {
@@ -1153,16 +1315,46 @@ function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
 // The natural progression falls out: unlanded → land, landed → ship, and done is always there. A
 // pending request is OR'd in so the button still surfaces before the diff has loaded. Buttons sit
 // low in their petal so the facet's own text still reads above them.
-function drawFlowerButtons(ctx, centers, size, x, diff) {
-  if (x.is_production) return [];
+export function petalVerbs(x, diff) {
+  if (x.is_production) return {};
   const buildable = (x.stack || []).some((c) => c.role === 'server' || c.role === 'webapp');
   const cxell = x.viewer_kind === 'ssh-terminal' && !!x.viewer_url;
+  const manager = isManagerXell(x);
   const st = x.hive_status;
-  const showDone = true;                                          // mark-done: visible on any status
   const canLand = (!!diff && diff.ahead > 0)                      // committed work not yet on main…
     || st === 'occ-landRequest' || st === 'occ-landHint';         // …or a land request/hint standing
   const canShip = shipLine(x, diff) === 'ready'                   // landed, clean, not in prod…
     || st === 'occ-shipRequest' || st === 'occ-shipHint';         // …or a ship request/hint standing
+  const v = {};
+  if (buildable) v[3] = ['build'];                                // CONTAINERS petal
+  v[2] = cxell ? ['terminal', 'nudge'] : [];                      // SESSION petal (a live cxell zee)
+  v[4] = cxell ? ['env', 'message'] : ['env'];                    // MACHINE petal
+  v[1] = ['done'];                                                // BRANCH petal (the teardown verb)
+  // The GIT verbs — pull, land and PR — exist only for a xell that can write to the xource. A MANAGER
+  // cannot: xellgit's ctx() refuses every git write verb for it, and the landgate declines its push
+  // without even raising a request. Drawing those buttons on a manager offers a human three clicks
+  // that can only ever return a refusal, so the manager's two petals (CREW, PROD·AGE) carry neither.
+  // SHIP stays: a ship is deliberately NOT blocked for a manager — it is often the agent holding the
+  // whole picture, and the ship gate still refuses anything unlanded and still runs from main.
+  if (!manager) {
+    v[5] = canLand ? ['pull', 'land'] : ['pull'];                 // COMMIT petal
+    v[6] = canShip ? ['pr', 'ship'] : ['pr'];                     // DIFF·AGE petal
+  } else if (canShip) {
+    v[6] = ['ship'];                                              // PROD·AGE petal
+  }
+  return v;
+}
+
+// kind → the label and accent it is drawn with (the verb list above stays pure/testable).
+const VERB_LABEL = {
+  build: '🔨 build', terminal: '⌨ terminal', nudge: '💬 nudge', env: '❖ env', message: '📨 message',
+  pull: '↓ pull', land: '⬆ land', pr: 'PR', ship: '🚀 ship',
+};
+const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod', done: 'error' };
+
+function drawFlowerButtons(ctx, centers, size, x, diff) {
+  if (x.is_production) return [];
+  const verbs = petalVerbs(x, diff);
   const R = COL.ready, D = COL.error, G = COL.working, P = COL.prod;
   const h = Math.max(15, size * 0.28);
   const padX = size * 0.13;
@@ -1198,38 +1390,15 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
     ctx.restore();
   };
 
-  // build → CONTAINERS petal
-  if (buildable) row(3, [{ label: '🔨 build', kind: 'build' }]);
-  // terminal + nudge → SESSION petal (both act on the live zee; only a cxell zee is reachable)
-  {
-    const s = [];
-    if (cxell) s.push({ label: '⌨ terminal', kind: 'terminal' });
-    if (cxell) s.push({ label: '💬 nudge', kind: 'nudge', accent: G });
-    row(2, s);
-  }
-  // env extract (+ message) → MACHINE petal. '❖ env' pulls out the xell's CURRENT environment
-  // (its .zeehive.env); message is the long-text/image composer, only for a reachable cxell zee.
-  {
-    const s = [{ label: '❖ env', kind: 'env' }];
-    if (cxell) s.push({ label: '📨 message', kind: 'message', accent: G });
-    row(4, s);
-  }
-  // pull, and LAND when there is work to land → COMMIT petal
-  {
-    const s = [{ label: '↓ pull', kind: 'pull' }];
-    if (canLand) s.push({ label: '⬆ land', kind: 'land', accent: G });
-    row(5, s);
-  }
-  // PR, and SHIP when it is shippable → DIFF·AGE petal
-  {
-    const s = [{ label: 'PR', kind: 'pr' }];
-    if (canShip) s.push({ label: '🚀 ship', kind: 'ship', accent: P });
-    row(6, s);
-  }
-  // mark-done → BRANCH petal (the teardown verb, kept away from the git actions)
-  if (showDone) {
-    const label = x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? '✓ mark done' : '✕ clean up');
-    row(1, [{ label, kind: 'done', accent: D }]);
+  // mark-done reads its state (confirm / mark / clean up); every other verb has a fixed label.
+  const doneLabel = x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? '✓ mark done' : '✕ clean up');
+  const accent = { working: G, prod: P, error: D };
+  for (const [petal, kinds] of Object.entries(verbs)) {
+    row(Number(petal), (kinds || []).map((kind) => ({
+      kind,
+      label: kind === 'done' ? doneLabel : VERB_LABEL[kind] || kind,
+      accent: accent[VERB_ACCENT[kind]] || R,
+    })));
   }
   return rects;
 }
@@ -1237,7 +1406,10 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
 // Which PETAL is which diffstat — the two facets whose numbers open the DIFF VIEWER when clicked.
 // A petal's index IS its facet index (drawFlower maps centers[i] → flowerFacets()[i]), so this must
 // move with the facet order in flowerFacets: 5 = 'commit' (source diff), 6 = 'diff · age' (own diff).
+// On a MANAGER those two petals are CREW and PROD·AGE instead (managerFacets), so there is no diff to
+// open — hence `diffPetal()` rather than a bare lookup: a dead click beats the wrong viewer.
 const DIFF_PETAL = { 5: 'srcdiff', 6: 'owndiff' };
+const diffPetal = (x, cell) => (isManagerXell(x) ? null : DIFF_PETAL[cell] || null);
 
 function flowerFacets(x, diff, machines) {
   const src = x.remote_source || {};
@@ -1260,6 +1432,23 @@ function flowerFacets(x, diff, machines) {
       lines: [(x.is_production ? x.deployed_commit : (diff?.head || x.head_commit))?.slice(0, 8) || '—'], diff },
     { title: 'diff · age', kind: 'owndiff', diff, age: ageText(x.created_at) },
   ];
+}
+
+// The MANAGER bloom: the same seven petals, with the two GIT facets replaced. Petal 5 (commit head +
+// source diffstat) and petal 6 (own diffstat) describe landing work — the one thing a manager is
+// structurally refused — so they are swapped for CREW (who it runs, and what they are doing) and
+// PROD · AGE (its read-only hold on production). Pure, so the swap is unit-tested rather than eyeballed.
+export function managerFacets(x, machines, crew = []) {
+  const base = flowerFacets(x, null, machines);
+  const card = managerCard(x, crew);
+  const f = base.slice();
+  f[1] = { title: 'branch', lines: [stripBranch(x.branch) || '—', 'lands nothing — dispatches workers'] };
+  f[5] = { title: 'crew', kind: 'crew', crew: (crew || []).map((w) => ({
+    id: w.id, slug: shortSlug(w.slug), color: statusColor(w), busy: isBusyZee(w),
+  })), card };
+  f[6] = { title: 'prod · age', lines: [card.prod || 'no prod bind',
+    base[6].age ? `age ${base[6].age}` : ''] };
+  return f;
 }
 
 function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
@@ -1303,6 +1492,42 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
         ctx.setLineDash([]);
       }
     });
+    return;
+  }
+
+  // CREW facet (managers only): one status-coloured dot per worker — the same colour its own hexagon
+  // is painted, so the cluster seated around this manager and this row read as the same crew — over
+  // the count, and a caption of what they are doing. This is a manager's "diffstat": its work is the
+  // crew, not a patch.
+  if (facet.kind === 'crew') {
+    ctx.textBaseline = 'middle';
+    const card = facet.card || {};
+    const rows = facet.crew || [];
+    const headW = hexHalfWidthAt(size, size * 0.18) * 2 * 0.8;
+    fillFont(ctx, `⬡ ×${rows.length}`, headW, 10, size * 0.3, (p) => `700 ${p}px 'Segoe UI', sans-serif`);
+    ctx.fillStyle = rows.length ? COL.text : withAlpha(COL.muted, 0.8);
+    ctx.fillText(rows.length ? `⬡ ×${rows.length}` : '⬡ no crew', cx, cy - size * 0.18);
+    if (rows.length) {
+      const shown = rows.slice(0, 12);
+      const r = Math.max(2.5, size * 0.05);
+      const gap = r * 2.8;
+      let dx = cx - ((shown.length - 1) * gap) / 2;
+      for (const wkr of shown) {
+        ctx.beginPath(); ctx.arc(dx, cy + size * 0.06, r, 0, Math.PI * 2);
+        ctx.fillStyle = wkr.color; ctx.fill();
+        if (wkr.busy) { ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha('#ffd93b', 0.9); ctx.stroke(); }
+        dx += gap;
+      }
+      if (rows.length > shown.length) {
+        ctx.font = `${Math.min(9.5, size * 0.12)}px 'Segoe UI', sans-serif`;
+        ctx.fillStyle = COL.muted;
+        ctx.fillText(`+${rows.length - shown.length}`, cx, cy + size * 0.06 + r * 3);
+      }
+    }
+    ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.muted;
+    const caption = card.activity || (card.count ? 'crew idle' : 'nothing dispatched yet');
+    ctx.fillText(fit(ctx, caption, hexHalfWidthAt(size, size * 0.3) * 2 * 0.9), cx, cy + size * 0.3);
     return;
   }
 
