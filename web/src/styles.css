@@ -940,6 +940,11 @@ a.cbox:hover { border-color: var(--accent); }
 /* ── landing gate — a push to main held for human verification ────────────────
    Loud on purpose: a held landing blocks a zee until a human decides. Uses --error
    rather than --building because this is not "in progress", it is "stopped, needs you". */
+/* Why a DISMISSED landing card is back on screen: it holds the runway and zees are queued behind it.
+   Stated on the card, because a human who hid this needs to know it returned and why (#11 gap 2). */
+.land-blocker { margin: 6px 0 0; padding: 6px 8px; border-radius: 6px; font-size: 12px; line-height: 1.45;
+  color: var(--error); background: rgba(229,85,78,0.08); border: 1px dashed var(--error); }
+
 .land-panel { border: 1px solid var(--error); border-radius: 10px; background: var(--panel);
   padding: 12px 14px; margin: 12px 0; }
 .land-title { color: var(--error); font-weight: 600; font-size: 13px; letter-spacing: .02em;
@@ -1143,6 +1148,12 @@ a.cbox:hover { border-color: var(--accent); }
 .pad-phase.pad-done { color: var(--ready); }
 .pad-phase.pad-failed, .pad-phase.pad-rejected { color: var(--error); }
 .pad-phase.pad-stale { color: var(--muted); }
+/* HIDDEN, BUT STILL ON THE RUNWAY (#11 gap 2): a landing somebody dismissed that is still open, so the
+   queenzee still has work to do on it and it still holds the ref. Dashed, because it is the same idea
+   the honeycomb draws with a dash — a fact ABOUT the row rather than a status of it — and loud enough
+   to be read, because the state it replaces was invisible. */
+.pad-hidden { font-size: 11px; font-weight: 600; color: var(--error); white-space: nowrap;
+  border: 1px dashed var(--error); border-radius: 6px; padding: 0 5px; }
 .pad-age { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px; color: var(--muted);
   min-width: 30px; text-align: right; }
 .pad-spin { width: 11px; height: 11px; border: 2px solid var(--line); border-top-color: var(--building);

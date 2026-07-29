@@ -213,15 +213,28 @@ shell flag. It is **not human-gated**, for the same reason `zee dispatch` is not
 visible to one project and can only ever be worn by a caged worker whose every irreversible act still
 lands on the same human gates.
 
+The **stored key is derived**, not chosen: the project plus the label, slugged (`zee harness --new
+--label "Security Reviewer"` in project `acme` → `acme-security-reviewer`). A caller-supplied `key` is
+refused rather than silently rewritten. That is because a key is unique across every scope and it is
+how a harness is addressed *outside* its project — `--harness <key>` on a dispatch, and
+`harness_memory_put('<key>', …)` in a fleet-wide migration — so a chosen one could take a name the
+fleet needs, and the uniqueness collision doubled as an existence oracle for other projects' rows. A
+collision inside the caller's own project names its own row; one with a row it cannot see is
+disambiguated silently and disclosed to nobody.
+
 The refusals are the interesting half, and they are structural (`self.js`, plus 084's triggers under
 them). A manager may **not**: create or edit a **manager** persona (a fleet that mints its own bosses
 grows sideways with nobody's consent); touch **any** system-wide harness — the refusal points it at
 `--parent <key>` instead, which is the supported way to build on one; touch another project's harness,
 or inherit one, or dispatch a worker into one; set anything that is not persona (`is_law_core`,
-`bridge`, `project_id` — that last one because the project is resolved from its **token**); or delete a
-harness a **live** xell is wearing, which would strip a running zee to core-only mid-task. Each one
-answers with a sentence naming what to do instead. `test/harness-project-scope.test.mjs` fires all of
-them, one assertion each.
+`bridge`, `project_id` — that last one because the project is resolved from its **token**); give one of
+its own personas a memory or skill entry that lands on a file path it **inherits** (a leaf that could
+take `.zeehive/harness/memory/cxell-zee-manual.md` could forge the manual its workers are told to
+trust — the merge gives an inherited path to the ancestor as well, so a row written past the API cannot
+shadow one either); or **delete or disable** a harness a **live** xell is wearing *or inheriting*, both
+of which end with a running zee whose next briefing has lost the chain. Each one answers with a
+sentence naming what to do instead. `test/harness-project-scope.test.mjs` fires the scope refusals and
+`test/harness-manager-guards.test.mjs` the forgery/removal ones, one assertion each.
 
 What it MAY inherit is the whole point: a global worker harness (`zee-base` for the cxell manual,
 `dev-base` for the dev craft) or one of its own project's, so a new role starts from the fleet's craft

@@ -22,7 +22,7 @@
 // which accept personality/summary/glyph/skills/memory and NOTHING else — so a harness has nowhere
 // to express a land/ship/prod/gate rule. A harness never ships or lands; it is only a guide.
 import { createHash } from 'node:crypto';
-import { q, one } from '../db/pool.js';
+import { q, one, pool } from '../db/pool.js';
 import { logline } from './logbus.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, and the
@@ -155,15 +155,37 @@ export async function reinjectHarnessIntoLiveXells(harnessId, { mode = PROVISION
 
 // A harness and every harness that inherits from it, transitively (the parent_id trigger blocks
 // cycles, and the hop cap is belt-and-braces for a DB edited by hand).
-async function harnessAndDescendants(rootId) {
+//
+// EXPORTED because "and its descendants" is the correct reach for every question of the form "who
+// would this change reach?" — the live re-injection above, and the wearer guards on delete/disable.
+// A guard that asked only about the harness ITSELF was one level deep: deleting a PARENT collapsed a
+// live wearer's chain just as thoroughly, and returned ok.
+export async function harnessAndDescendants(rootId, { run = q } = {}) {
   const ids = [rootId];
   let frontier = [rootId], hops = 0;
   while (frontier.length && hops++ < 32) {
-    const kids = await q(`SELECT id FROM harness WHERE parent_id = ANY($1::uuid[])`, [frontier]);
+    const kids = await run(`SELECT id FROM harness WHERE parent_id = ANY($1::uuid[])`, [frontier]);
     frontier = kids.map((k) => k.id).filter((id) => !ids.includes(id));
     ids.push(...frontier);
   }
   return ids;
+}
+
+// The LIVE xells wearing a harness or anything that inherits it, and which of the two they wear. The
+// one predicate behind "you cannot delete this" and "you cannot disable this": both end in the same
+// place — a running zee whose next briefing has lost the chain — so they must ask the same question.
+export async function liveHarnessWearers(harnessId, { run = q, scope = null } = {}) {
+  const ids = scope || await harnessAndDescendants(harnessId, { run });
+  return run(
+    `SELECT x.slug, h.key AS harness, h.id = $2 AS direct FROM xell x JOIN harness h ON h.id = x.harness_id
+      WHERE x.harness_id = ANY($1::uuid[]) AND x.status NOT IN ('retired','tearing-down','husk')
+      ORDER BY x.slug`, [ids, harnessId]);
+}
+
+// How a wearer list is said out loud: the xell, and — when it is wearing a DESCENDANT — the harness
+// in between, because "why is xyz in the way?" is otherwise unanswerable from the message.
+export function wearerList(worn) {
+  return worn.map((w) => (w.direct ? w.slug : `${w.slug} (wearing "${w.harness}", which inherits it)`)).join(', ');
 }
 
 // ONE line at the end of every refresh: how many file-backed harnesses carry something, how many
@@ -384,16 +406,21 @@ export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } =
     await q(`UPDATE harness SET zee_type=$2 WHERE key=$1`, [key, type]);
   }
   // parent: resolve a key → parent_id ('' / null clears). The trigger blocks cycles/self-parent.
+  let parentId = h.parent_id;
   if ('parent' in patch) {
-    let pid = null;
+    parentId = null;
     if (patch.parent) {
       if (patch.parent === key) throw new Error('a harness cannot inherit itself');
       const p = await one(`SELECT id FROM harness WHERE key=$1`, [patch.parent]);
       if (!p) throw new Error(`no parent harness "${patch.parent}"`);
-      pid = p.id;
+      parentId = p.id;
     }
-    await q(`UPDATE harness SET parent_id=$2 WHERE key=$1`, [key, pid]);
   }
+  // NO LEAF MAY CLAIM AN INHERITED FILE PATH — checked against the parent chain this save ENDS with,
+  // so re-parenting onto a harness that already owns one of these paths is refused too. Before any
+  // write, because a refused save must leave the stored persona exactly as it was.
+  await assertNoInheritedPathCollision(key, bundle, parentId);
+  if ('parent' in patch) await q(`UPDATE harness SET parent_id=$2 WHERE key=$1`, [key, parentId]);
   const hash = hashOf(JSON.stringify(bundle));
   await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5 WHERE key=$1`,
     [key, JSON.stringify(bundle), label, enabled, hash]);
@@ -404,8 +431,50 @@ export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } =
   // fix it for the NEXT zee only — the exact "new zees only" failure that left a whole fleet briefed
   // on stale text (test/harness-reinject-live.test.mjs). Guarded on the hash so a no-op save writes
   // nothing into anyone's workspace, and PROVISION_MODE-guarded inside.
-  if (hash !== h.bundle_hash) await reinjectHarnessIntoLiveXells(h.id, { mode });
-  return getHarnessFull(key);
+  //
+  // AND THE CALLER IS TOLD WHETHER IT RAN: `reinjected: null` means the text did not change, so no
+  // workspace was touched at all; otherwise it is the real outcome (how many xells, how many files
+  // written, whether this queenzee only modelled it). The manager API used to print "every live zee
+  // wearing it has had its persona files rewritten" on EVERY save — including the enabled-only saves
+  // that leave bundle_hash identical and skip this line entirely. An answer that overstates what
+  // happened is its own defect: the repo's whole posture is to say what really happened.
+  const reinjected = hash !== h.bundle_hash ? await reinjectHarnessIntoLiveXells(h.id, { mode }) : null;
+  return { ...(await getHarnessFull(key)), reinjected };
+}
+
+// DELETE, refused while any LIVE xell wears this harness OR anything that INHERITS it — and decided
+// inside ONE transaction, so the answer cannot be overtaken by a dispatch.
+//
+// Both halves are paid-for. `xell.harness_id` is ON DELETE SET NULL and `harness.parent_id` is too,
+// so deleting a harness either strips a running zee back to core-only or collapses its chain to the
+// leaf alone — the same end state, one level up, and the guard that only asked about direct wearers
+// returned ok for it. And the check was a SELECT followed by a DELETE with nothing holding the rows
+// in between: a dispatch landing in that window assigned a harness that was already going. The
+// `FOR UPDATE` conflicts with the FOR KEY SHARE lock that a xell's `harness_id` write takes on the
+// referenced row, so only two orders remain — we see the wearer and refuse, or the assign waits and
+// then fails its foreign key loudly, which is not the same as a zee quietly losing its persona.
+//
+// Returns the wearers instead of throwing: the caller writes the sentence (it knows who is asking).
+export async function deleteHarnessUnlessWorn(key) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const run = async (text, params) => (await client.query(text, params)).rows;
+    const [h] = await run(`SELECT id, is_law_core FROM harness WHERE key=$1`, [key]);
+    if (!h) { await client.query('ROLLBACK'); return { deleted: false, missing: true, worn: [] }; }
+    if (h.is_law_core) { await client.query('ROLLBACK'); throw new Error('the core (law) harness cannot be deleted'); }
+    const scope = await harnessAndDescendants(h.id, { run });
+    await run(`SELECT id FROM harness WHERE id = ANY($1::uuid[]) FOR UPDATE`, [scope]);
+    const worn = await liveHarnessWearers(h.id, { run, scope });
+    if (worn.length) { await client.query('ROLLBACK'); return { deleted: false, worn }; }
+    await run(`DELETE FROM harness WHERE id=$1`, [h.id]);
+    await client.query('COMMIT');
+    logline('harness', `deleted harness "${key}" (nothing live was wearing it or anything inheriting it)`);
+    return { deleted: true, worn: [] };
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally { client.release(); }
 }
 
 export async function deleteHarness(key) {
@@ -453,6 +522,14 @@ export async function getHarnessFull(key) {
 // SKILL.md; persona + memory land under .zeehive/harness/.
 const fileSafe = (s) => String(s || 'note').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'note';
 
+// THE FILE AN ENTRY LANDS ON — derived in ONE place, because every other question about it (may this
+// leaf claim that path? did two entries claim the same one?) has to be asked about the path the
+// injector actually writes. A memory entry is keyed on its BASENAME (`memory/x.md` and `x.md` are the
+// same file), a skill on its slugged name.
+export const memoryRelPath = (path) => `.zeehive/harness/memory/`
+  + `${fileSafe(String(path).split('/').pop() || 'memory').replace(/\.md$/, '')}.md`;
+export const skillRelPath = (name) => `.claude/skills/${fileSafe(name)}/SKILL.md`;
+
 // EVERY GENERATED FILE SAYS SO, AND SAYS WHERE THE SOURCE IS.
 //
 // These files look exactly like checked-in repo files to whoever opens one — and a zee that treats
@@ -480,14 +557,13 @@ export function harnessFiles(eff) {
     if (!s.body) continue;
     // The banner goes AFTER the frontmatter block: a SKILL.md's `---` must be the first line or the
     // provider stops seeing it as a skill at all.
-    files.push({ relPath: `.claude/skills/${fileSafe(s.name)}/SKILL.md`,
+    files.push({ relPath: skillRelPath(s.name),
       text: `---\nname: ${s.name}\ndescription: ${String(s.when).replace(/\n/g, ' ')}\n---\n\n`
         + `${generatedBanner({ from: s.from || key, kind: 'skill', path: s.name })}\n\n${s.body}\n` });
   }
   for (const m of eff.memory || []) {
     if (!m.text) continue;
-    const base = fileSafe(String(m.path).split('/').pop() || 'memory').replace(/\.md$/, '') + '.md';
-    files.push({ relPath: `.zeehive/harness/memory/${base}`,
+    files.push({ relPath: memoryRelPath(m.path),
       text: `${generatedBanner({ from: m.from || key, kind: 'memory', path: m.path })}\n\n${m.text}` });
   }
   return files;
@@ -507,6 +583,26 @@ export async function effectiveHarness(leafRow) {
   }
   const merged = { key: leafRow.key, label: leafRow.label, glyph: null, summary: null, personality: '', skills: [], memory: [], chain: chain.map((c) => c.label) };
   const bundleOf = (r) => (typeof r.bundle === 'string' ? JSON.parse(r.bundle) : (r.bundle || {}));
+  // ONE ENTRY PER FILE, AND THE ANCESTOR OWNS IT (root wins).
+  //
+  // The union used to be a plain concatenation, while harnessFiles() keys a file on the entry's
+  // BASENAME — so a leaf with a memory entry called `cxell-zee-manual.md` produced a SECOND
+  // .zeehive/harness/memory/cxell-zee-manual.md, and reinjectHarnessIntoXell writes that list in
+  // order with no dedup: the LEAF's text landed last and became the manual the worker was told to
+  // trust (same trick for a skill's SKILL.md, and harnessLayerText carried the second copy in the
+  // prompt as well). A manager may author a project persona, so this was a forgeable law layer.
+  //
+  // The authoring path now refuses such a save with the collision named, but this is the half that
+  // does not depend on how the row got here — a migration or a hand-edited bundle cannot shadow an
+  // inherited file either. Precedence is root-most, deliberately: the ancestor's entry is the one
+  // every wearer of every descendant already relies on.
+  const claimed = new Map();
+  const claim = (relPath, ownerKey, what) => {
+    if (!claimed.has(relPath)) { claimed.set(relPath, ownerKey); return true; }
+    logline('harness', `${leafRow.key}: ${what} from "${ownerKey}" was DROPPED from the effective persona — `
+      + `"${claimed.get(relPath)}" already owns ${relPath}, and an inherited file path cannot be shadowed`);
+    return false;
+  };
   for (const row of chain) {
     const b = bundleOf(row);
     if (b.glyph) merged.glyph = b.glyph;
@@ -517,10 +613,61 @@ export async function effectiveHarness(leafRow) {
     }
     // `from` is provenance, carried so a generated file can name the harness that actually owns the
     // entry rather than the one being worn (the manual belongs to zee-base, whoever inherits it).
-    if (Array.isArray(b.skills)) merged.skills.push(...b.skills.filter((s) => s && s.name).map((s) => ({ ...s, from: s.from || row.key })));
-    if (Array.isArray(b.memory)) merged.memory.push(...b.memory.filter((m) => m && m.text).map((m) => ({ ...m, from: m.from || row.key })));
+    if (Array.isArray(b.skills)) {
+      for (const s of b.skills) {
+        if (!s || !s.name) continue;
+        if (claim(skillRelPath(s.name), row.key, `skill "${s.name}"`)) merged.skills.push({ ...s, from: s.from || row.key });
+      }
+    }
+    if (Array.isArray(b.memory)) {
+      for (const m of b.memory) {
+        if (!m || !m.text) continue;
+        if (claim(memoryRelPath(m.path), row.key, `memory "${m.path}"`)) merged.memory.push({ ...m, from: m.from || row.key });
+      }
+    }
   }
   return merged;
+}
+
+// The file paths a harness INHERITS, and which ancestor owns each — what a leaf may not occupy.
+//
+// Walked WITHOUT effectiveHarness's `enabled` filter: a path a DISABLED ancestor owns is still that
+// ancestor's, and a leaf allowed to take it would start shadowing the moment somebody re-enabled it.
+// The map keeps the ROOT-MOST owner, which is the one that actually wins the merge above.
+async function inheritedFilePaths(parentId) {
+  const owner = new Map();
+  let cur = parentId ? await one(`SELECT id, key, parent_id, bundle FROM harness WHERE id=$1`, [parentId]) : null;
+  let hops = 0;
+  while (cur && hops++ < 32) {
+    const b = typeof cur.bundle === 'string' ? JSON.parse(cur.bundle) : (cur.bundle || {});
+    for (const s of b.skills || []) if (s?.name) owner.set(skillRelPath(s.name), cur.key);
+    for (const m of b.memory || []) if (m?.path) owner.set(memoryRelPath(m.path), cur.key);
+    cur = cur.parent_id ? await one(`SELECT id, key, parent_id, bundle FROM harness WHERE id=$1`, [cur.parent_id]) : null;
+  }
+  return owner;
+}
+
+// REFUSE a save that would claim an inherited file path, and NAME the collision — the author is the
+// one person who can fix it, and a silent drop (which is what the merge now does underneath) reads to
+// them like their text saved. Both routes matter: memory and skills materialize into files.
+async function assertNoInheritedPathCollision(key, bundle, parentId) {
+  if (!parentId) return;
+  const owner = await inheritedFilePaths(parentId);
+  if (!owner.size) return;
+  const clashes = [];
+  for (const s of bundle.skills || []) {
+    const p = skillRelPath(s.name);
+    if (owner.has(p)) clashes.push(`skill "${s.name}" would land on ${p}, which it INHERITS from "${owner.get(p)}"`);
+  }
+  for (const m of bundle.memory || []) {
+    const p = memoryRelPath(m.path);
+    if (owner.has(p)) clashes.push(`memory "${m.path}" would land on ${p}, which it INHERITS from "${owner.get(p)}"`);
+  }
+  if (!clashes.length) return;
+  throw new Error(`"${key}" cannot occupy a file path it inherits — ${clashes.join('; ')}. `
+    + 'A harness materializes into REAL FILES in a xell, and a file is keyed on its basename, so this '
+    + "entry would overwrite the ancestor's copy in every wearer's workspace — a worker is told those "
+    + 'files are its law. Rename yours; changing what the ancestor says is done on the ancestor.');
 }
 
 // Build the HARNESS-LAYER text block for a briefing from an EFFECTIVE (merged) harness — personality
@@ -551,8 +698,10 @@ export function harnessLayerText(eff) {
 // with no SKILL.md loader skip this and rely on harnessLayerText instead.
 export function harnessSkillFiles(eff) {
   if (!eff) return [];
+  // Same path derivation as harnessFiles (skillRelPath): two spellings of "where does this skill go"
+  // is one more place a file can be shadowed by an entry the other writer keys differently.
   return (eff.skills || []).filter((s) => s.body).map((s) => ({
-    relPath: `.claude/skills/${String(s.name).toLowerCase().replace(/[^a-z0-9]+/g, '-')}/SKILL.md`,
+    relPath: skillRelPath(s.name),
     text: `---\nname: ${s.name}\ndescription: ${String(s.when).replace(/\n/g, ' ')}\n---\n\n${s.body}\n`,
   }));
 }
