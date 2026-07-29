@@ -24,7 +24,7 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { resolveRealDbContainer } from '../lib/xell-db.js';
 import { dbIdentity } from '../lib/projects.js';
-import { exactCountSql, parseRowCounts, compareRestoreCounts, SHORTFALL_TOLERANCE } from '../lib/row-counts.js';
+import { ROW_COUNT_SQL, exactCountSql, parseRowCounts, compareRestoreCounts, SHORTFALL_TOLERANCE } from '../lib/row-counts.js';
 
 // count(*) over a whole dev database is real work — minutes on a big one. Generous, and bounded.
 const COUNT_TIMEOUT_MS = Number(process.env.DATADIFF_TIMEOUT_MS) || 600000;
@@ -85,20 +85,35 @@ export async function checkContainerData(containerId, { persist = true } = {}) {
   try { real = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
   catch (e) { return fail(e.message); }
 
-  // Ask about exactly the tables the reference recorded. A table the reference never had is not this
-  // check's business (that is schema drift), and asking only for known names keeps the SQL bounded.
-  const sql = exactCountSql(Object.keys(snap.row_counts));
+  // WHICH OF THE REFERENCE'S TABLES ARE EVEN HERE — asked FIRST, and this ordering is not cosmetic.
+  // Counting a list that names one absent table makes the whole UNION fail, so a single missing table
+  // used to turn a legitimate finding ("the backup has a table this database does not") into a psql
+  // parse error with a caret in it, and the `missing` verdict the comparison supports could never
+  // actually be produced. Found by running the thing end-to-end, which is the only way that shows up.
+  // So: read the catalog (the same cheap estimate probe), count only what exists, and let
+  // compareRestoreCounts report the rest as MISSING — which is schema drift, and says so.
+  const present = await dockerPsql(c.docker_ctx, real, ROW_COUNT_SQL, dbid, 120000);
+  if (!present.ok) {
+    return fail(`could not read the table list in ${c.name}: `
+      + `${(present.err || 'psql failed').trim().split('\n').filter(Boolean)[0]?.slice(0, 200)}`);
+  }
+  const here = new Set(Object.keys(parseRowCounts(present.out)));
+  const countable = Object.keys(snap.row_counts).filter((t) => here.has(t));
+
+  // Nothing the backup carries exists here at all: that is an EMPTY (or wrong) database, not a row
+  // shortfall, and pretending to count it would say "every table is missing" in 600 lines.
+  if (!countable.length) {
+    return fail(`none of the ${Object.keys(snap.row_counts).length} table(s) this backup recorded exist in `
+      + `${c.name} — this database is empty, or it is not the database that was restored. That is a SCHEMA `
+      + `finding, not a row shortfall: run "Check diff" first.`, { empty_db: true });
+  }
+
+  const sql = exactCountSql(countable);
   if (!sql) return fail('the reference records no countable tables');
   const r = await dockerPsql(c.docker_ctx, real, sql, dbid, COUNT_TIMEOUT_MS);
   if (!r.ok) {
-    // A table in the reference that no longer exists here makes the whole UNION fail — which IS a
-    // finding, and it is a SCHEMA one. Name it, and point at the check that answers it.
-    const why = (r.err || 'psql failed').trim().split('\n').filter(Boolean).pop()?.slice(0, 200);
-    return fail(/does not exist/i.test(why || '')
-      ? `could not count: ${why}. A table the backup contains is MISSING from this database — that is `
-        + `schema drift, not a row shortfall. Run "Check diff" first; the rows cannot be judged until `
-        + `the tables are there.`
-      : `could not count rows in ${c.name}: ${why}`);
+    const why = (r.err || 'psql failed').trim().split('\n').filter(Boolean)[0]?.slice(0, 200);
+    return fail(`could not count rows in ${c.name}: ${why}`);
   }
 
   const got = parseRowCounts(r.out);
