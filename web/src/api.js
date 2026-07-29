@@ -211,12 +211,18 @@ export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${site
 
 // ── environments (masked — the server never returns a secret value, only a hint). The meta-DB
 // source of truth for the untracked .env; resolved onto a xell by tier (lib/environments.js). ──
-// ── the project's ENTRY-POINT DOCS (AGENTS.md / CLAUDE.md …) ──────────────────────────────────
-// Owned by the meta-DB and generated into every xell when a zee is assigned. The console's Docs tab
-// is the authoring surface; the queenzee refuses to write one over a path the project has committed.
+// ── the project's ENTRY-POINT DOCS — one text, one file per AI provider ───────────────────────────
+// The CONTENTS live in the meta-DB and the queenzee generates CLAUDE.md / AGENTS.md / GEMINI.md / …
+// into every xell when a zee is assigned. The console's Docs tab is the authoring surface; the
+// queenzee refuses to write one over a path the project has committed. The TARGET CATALOGUE (which
+// provider reads which filename) is served by the API, never hard-coded here — vendors rename them.
+export const getAgentDocTargets = () => fetch('/api/agent-doc-targets').then((r) => (r.ok ? r.json() : []));
 export const getProjectDocs = (projectId) => fetch(`/api/projects/${projectId}/docs`).then((r) => (r.ok ? r.json() : []));
 export const createProjectDoc = (projectId, body) => siteCall(`/api/projects/${projectId}/docs`, 'POST', body);
 export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${docId}`, 'PUT', body);
+// What will REALLY be written, run through the real generator: the stamp, the sibling list and the
+// stack section an operator never typed and would otherwise first see inside a cage.
+export const previewProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}/preview`, 'GET');
 export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
 
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
