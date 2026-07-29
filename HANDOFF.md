@@ -464,6 +464,53 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
   ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
   rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
+- **Notify a manager about a ticket: proved it ARRIVES, and made it ask first** (2026-07-29,
+  ticket #16). The feature itself (the derived `TKT-<n>-<4hex>` code, the live-manager picker, the
+  notify route through the existing `sendMessageToXell` door) landed separately; two things it was
+  missing were the two the ticket cares most about.
+  **Receipt.** The original test said in its own header that a successful delivery was out of scope.
+  But a notification is a RICH message, so `sendMessageToXell` writes it into the cage as
+  `.zee-inbox/<ts>/message.md` over `docker exec` FIRST and only then types a pointer at it over SSH
+  — and that first hop is the substantive one (it is the file every manager in this fleet actually
+  reads). With `test/_bin/docker` on PATH, the message.md that lands is read back off the recorded
+  stdin: it carries the CODE, the number, the title and the not-an-order sentence. The SSH hop stays
+  unproven here (it needs a real sshd) and is stated as such.
+  **It asks first.** Notifying types into a RUNNING agent's session, and it fired on one click. It
+  now goes through `showConfirm` like every other console action that reaches a live zee, naming the
+  manager, whether it is live, and that a notification assigns nothing.
+  Also asserted, because it is the ticket's hard constraint: notifying creates no work item, sets no
+  assignee, and changes neither the ticket's status nor the manager's xell.
+  Test: `node test/ticket-notify.test.mjs` (55 assertions; `TicketCode`/`NotifyManager` are exported
+  so the human surface is RENDERED rather than grepped).
+- **The go-around "flake" was the TEST'S WAIT, not the runway** (2026-07-29, ticket #19). `land-queue`
+  failed once in six full-suite runs on *"the unreachable holder did not block the runway"*, and 0/12
+  in isolation. Characterised before touching anything: the fake docker (`test/_bin/docker`) writes
+  its ARGV line the instant it starts and the PROMPT only after it finishes reading stdin — two
+  writes with a real gap — and `awaitResume()` returned as soon as `--resume` appeared, so the caller
+  asserted on a half-written log. Everything the assertions care about ("runway is CLEAR", `zee sync`
+  before `zee land`, "clearance is not approval") is in the SECOND write. Case 9 had grown its own
+  extra polling loop for exactly this; five other call sites had not.
+  RATES, measured: **1 failure in 6 full-suite runs** (the only condition that has ever produced it),
+  **0/12** in isolation on an idle box, and — worth knowing — **0/15 pre-fix under 4-way CPU load**,
+  so plain CPU pressure does NOT reproduce it. That is why the mechanism was forced directly instead.
+  Post-fix: **15/15** with the gap varied 0–1299ms, and green at 2.5s.
+  Made deterministic with a new `DOCKER_FAKE_SLOW_STDIN_MS` knob (same spirit as the existing
+  `DOCKER_FAKE_EARLY_CLOSE`): at a forced 1.5s gap the pre-fix test failed **7 assertions across 5
+  cases**, every time — while the ROW-level assertions (`cleared_at`, the tend, the go-around itself)
+  still passed, which is what proves the protocol sound and the wait loose. A direct probe timed the
+  argv line at 32ms and the prompt at 1,526ms of the same invocation: **late, never lost.**
+  `awaitResume(want)` now waits until the INVOCATION matching `want` is complete (a closed stdin block
+  is the marker), per record — because one clearance step can emit TWO nudges (case 9: the stale
+  notice to the occupant AND the clearance to the holder behind it), and "some resume, fully written"
+  would return on the first while the second was half-recorded. Every call site now passes what it is
+  about to assert on, so the wait and the assertion cannot drift apart. **The assertion still fails when the go-around genuinely breaks** —
+  proved by deleting the `if (r.nudged) break` go-around in `clearRunway()` and watching it go red.
+  NOT the cause, and still open (ticket #11's, not folded in here): `clearRunway` fires on
+  `setImmediate` from checkPush's ALLOW path just before git moves the ref — a different call path
+  from the one this assertion exercises (`decideLandRequest` → `landOne`, where the ref has already
+  moved), whose consequence is a late clearance the reaper's `driveRunways` backstop picks up; and
+  the clearance nudge is fire-and-forget with no retry, so a nudge that STARTS and dies is still
+  recorded as delivered. Neither was what made the test red.
 - **The warm never rewrites the lockfile a zee then lands** (2026-07-29, ticket #14 — found while
   building the cache above). `warmCxell()` ran `npm ci … || npm install …` UNCONDITIONALLY, in
   `/work/repo` — the tree the zee lands from. `npm install` rewrites package-lock.json, so any lock
