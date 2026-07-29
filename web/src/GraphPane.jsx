@@ -174,7 +174,9 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
   if (hov.id) { const b = (timeline.xells || []).find((t) => t.id === hov.id)?.base_commit; if (b) hovCommits.add(b); }
   if (hov.harness) {
     const h = (timeline.harnesses || []).find((hh) => hh.id === hov.harness);
-    for (const id of h?.consumer_ids || []) {
+    // every xell that WEARS it — a manager wears one without taking a cell or a wire from it, and
+    // its commit dot belongs in the same highlight (see wearersOf in hive/HiveCanvas.jsx).
+    for (const id of h?.wearer_ids || h?.consumer_ids || []) {
       const b = (timeline.xells || []).find((t) => t.id === id)?.base_commit;
       if (b) hovCommits.add(b);
     }

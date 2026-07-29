@@ -73,6 +73,28 @@ The buttons follow the same rule (`petalVerbs`, pure and unit-tested): **pull, l
 absent** — offering them would offer a human three clicks that can only return the refusal above —
 while build, terminal, nudge, env, message, done and **ship** remain.
 
+### Its harness takes no cell of its own
+
+A harness normally seats itself in the grid as its **own hexagon cell** (docs/harness-proposal.md §5)
+and every xell wearing it has its wire routed through that cell. A manager is the exception, because
+the manager hexagon described above **already is** that badge: same dashed seat, same
+`drawAvatarDisc` persona. Seating the harness beside it drew the identical avatar twice and spent a
+grid cell restating what the manager xell was already saying.
+
+So `getTimeline()` splits the two questions it used to answer with one list:
+
+| field | means | who is in it |
+|---|---|---|
+| `wearer_ids` | wears this harness | every live xell, **managers included** |
+| `consumer_ids` | the badge is *for* it | wearers **minus** managers |
+
+`consumer_ids` drives the cell and the series wire (`HiveCanvas.badgedHarnesses()`,
+`Connectors.jsx`), so a harness worn by managers ONLY gets **no cell and no wire** — it still travels
+in the payload because the manager hexagon needs its art. `wearer_ids` drives everything about
+*wearing* it: the manager's persona lookup (`wearersOf`), the `×N` count on a badge, and the hover
+highlight in all three views. Nothing else changes for a worker: it is in both lists, exactly as
+before.
+
 `test/manager-hexagon.test.mjs` holds that shape: it transforms the real JSX with esbuild, imports
 it, and PAINTS the hexagon at each size against a recording 2D context, asserting what actually
 landed on the canvas (and that nothing resembling a sha or a diffstat did). `web/demo.html` seats a

@@ -164,6 +164,14 @@ it — the same way the schema, not a rule, is what stops a xell tracking its ow
   `Connectors.jsx`/`GraphPane.jsx` already supports per-id highlight).
 - **No ship/land affordance.** A harness node carries none of the land?/ship? buttons a xell/prod
   hexagon does — it is a guide, not a work-cell (§7 of the manual: only the zee lands/ships).
+- **A MANAGER wears one without seating it.** `harnesses[]` therefore carries two lists:
+  `wearer_ids` (every xell wearing it) and `consumer_ids` (the wearers the badge is drawn *for* —
+  wearers minus managers). A manager's hexagon is itself drawn in this badge's language (dashed seat
+  + the same persona disc, `drawManagerHex`), so giving its harness a second cell beside it seats the
+  same avatar twice; the manager xell already indicates the harness. A harness worn by managers ONLY
+  is emitted with **no consumers** — no cell, no wire — but stays in the payload because the manager
+  hexagon reads its art from it. Wearing (persona lookup, `×N`, hover) keys on `wearer_ids`; the cell
+  and the series wire key on `consumer_ids`. See docs/manager-zees.md.
 
 `getTimeline()` + `Connectors.jsx` + `HiveCanvas.jsx` are the three files that change; the anchor,
 wire-routing and hover machinery all already exist.

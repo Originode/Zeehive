@@ -61,9 +61,11 @@ const timeline = {
   branch: 'master', commits,
   xells: xells.map((x, i) => ({ id: x.id, base_commit: BASES[i] || 'h1',
     color: i < 2 ? '#f0913b' : LANE[i % LANE.length] })),
-  // the manager wears a manager harness — its badge art is what the manager hexagon shows
+  // The manager wears a manager harness — its badge art is what the manager HEXAGON shows, and that
+  // is the whole appearance of this harness in the grid: a manager is a `wearer` but never a
+  // `consumer`, so this harness takes NO cell of its own (it would seat the same avatar twice).
   harnesses: [{ id: 'h-mgr', key: 'manager', label: 'Manager', glyph: '🧭', color: '#9b8cff',
-    base_commit: 'h1', consumer_ids: ['x6'] }],
+    base_commit: 'h1', wearer_ids: ['x6'], consumer_ids: [] }],
 };
 const diffs = Object.fromEntries(xells.map((x, i) => {
   const baseRow = commits.findIndex((c) => c.hash === BASES[i]);
@@ -132,7 +134,8 @@ function Demo() {
             The seventh is a <b>manager</b> (wise-cove): drawn as a persona — dashed seat, its harness
             avatar, a prod-orange double wall — with its crew seated around it, and deliberately
             without a head sha or a diffstat. Bloom it: petals 5/6 are CREW and PROD·AGE, and there is
-            no pull/land/PR to click.
+            no pull/land/PR to click. Note what is <i>not</i> in the grid: its harness gets no cell of
+            its own — the manager hexagon already IS that persona.
           </p>
           <ul style={{ color: 'var(--muted)', font: "12px 'Cascadia Code', monospace", lineHeight: 1.8 }}>
             {timeline.xells.map((tx) => {
