@@ -386,6 +386,11 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
     done.push(row.error ? { id: r.id, error: row.error } : { id: row.id, new_sha: row.new_sha, status: row.status });
   }
   const okCount = done.filter((d) => !d.error).length;
+  // A land HINT is the same claim one notch quieter ("this looks land-ready — a human should
+  // decide"). Un-asking the landing while leaving the hint up would light the land? button for work
+  // the zee just said it does not want landed, so the retraction lowers both. Best-effort.
+  const hadHint = await hintOpen(xell.id, 'land').catch(() => false);
+  if (okCount && hadHint) await setHint(xell.id, 'land', false, { reason: reason || 'landing withdrawn' }).catch(() => {});
   logline('self', `${xell.slug} withdrew ${okCount} land request(s)${reason ? ` — ${String(reason).slice(0, 120)}` : ''}`);
   broadcast('xell', { id: xell.id });
   return {
@@ -393,6 +398,7 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
     message: `WITHDRAWN ${okCount} held landing(s) — ${done.filter((d) => !d.error).map((d) => String(d.new_sha).slice(0, 8)).join(', ') || 'none'}. `
       + 'The card is off the human\'s screen and nothing was decided, landed or reverted: your commits are still on your '
       + 'branch exactly as they were. When the work really is ready, `zee land` raises ONE fresh request.'
+      + (hadHint ? ' Your land? hint was lowered with it.' : '')
       + (approved.length ? ` (Note: ${approved.length} APPROVED landing(s) were left alone — a decision is not yours to retract.)` : ''),
   };
 }

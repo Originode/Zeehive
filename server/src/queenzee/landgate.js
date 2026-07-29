@@ -224,12 +224,16 @@ export async function landStatus(xellId) {
 // approved (decided, not yet spent). This is what "don't spam the gate" is measured against: a zee
 // that pushes a second sha while the first is still held leaves TWO cards for one job, and only it
 // knows which one it still means.
-export async function openLandRequests(xellId) {
+export async function openLandRequests(xellId, { kind = 'push' } = {}) {
   if (!xellId) return [];
+  // kind='push' is a LANDING (the gate on main). kind='pull' is a PR into a child xource — a
+  // different ask, raised by a different verb, so `zee land --withdraw` must not sweep one up by
+  // accident. Pass kind=null to read both (a human tidying up).
   return q(
     `SELECT * FROM land_request
        WHERE xell_id=$1 AND status IN ('pending','approved') AND dismissed_at IS NULL
-       ORDER BY requested_at DESC`, [xellId]);
+         AND ($2::text IS NULL OR kind::text = $2)
+       ORDER BY requested_at DESC`, [xellId, kind]);
 }
 
 // THE ZEE'S OWN RETRACTION — the counterpart to `zee tend --clear` / `zee done --clear`, and the
@@ -249,11 +253,12 @@ export async function openLandRequests(xellId) {
 export async function withdrawLandRequest(id, by = 'zee', reason = null) {
   const row = await one(`SELECT * FROM land_request WHERE id=$1`, [id]);
   if (!row) throw new Error('no such land request');
+  const what = row.kind === 'pull' ? 'PR' : 'landing';
   if (row.status !== 'pending') {
     throw new Error(row.status === 'approved'
-      ? 'that landing is already APPROVED — a human has decided it and the queenzee is landing it; '
+      ? `that ${what} is already APPROVED — a human has decided it and the queenzee is landing it; `
         + 'you cannot withdraw a decision (raise a `zee tend` if it must not land)'
-      : `that landing is '${row.status}', not pending — there is nothing open to withdraw`);
+      : `that ${what} is '${row.status}', not pending — there is nothing open to withdraw`);
   }
   const out = await one(
     `UPDATE land_request SET status='withdrawn', withdrawn_at=now(), withdrawn_by=$2, withdraw_reason=$3

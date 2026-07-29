@@ -162,6 +162,17 @@ const stillApproved = await one(`SELECT status FROM land_request WHERE id=$1`, [
 ok(stillApproved.status === 'approved', 'the approved row is untouched');
 await q(`DELETE FROM land_request WHERE id=$1`, [approved.id]);
 
+// ── 8b. a PR is a DIFFERENT ask — `zee land --withdraw` must not sweep it up ──
+const pr = await one(
+  `INSERT INTO land_request (project_id, xell_id, ref, old_sha, new_sha, kind)
+     VALUES ($1,$2,'refs/heads/spinoff/other',$3,$4,'pull') RETURNING *`,
+  [project.id, xell.id, shaA, git(wt, ['rev-parse', 'HEAD'])]);
+const wPr = await selfWithdrawLand(xell, {});
+ok(wPr.status === 'nothing-to-withdraw', 'an open PR is not counted as a landing to withdraw');
+ok((await one(`SELECT status FROM land_request WHERE id=$1`, [pr.id])).status === 'pending',
+   'and the PR row is left pending — a landing verb does not retract a pull request');
+await q(`DELETE FROM land_request WHERE id=$1`, [pr.id]);
+
 // ── 9. the DISCIPLINE: withdraw, then land again = ONE card ───────────────────
 console.log('\n── withdraw-then-land leaves exactly one card ──');
 writeFileSync(join(wt, 'zee.txt'), 'third pass (fixed)\n'); git(wt, ['add', '.']); git(wt, ['commit', '-qm', 'Z3 (fixed)']);
