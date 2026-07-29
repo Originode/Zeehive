@@ -17,6 +17,10 @@
 //
 // Pure unit + static: no docker daemon, so every install FAILS here — which is exactly the path
 // worth proving, because a sweep that throws would take the queenzee's boot down with it.
+//
+// The sweep also obeys PROVISION_MODE now (it installs files into cages named from FLEET ROWS, and
+// a nested queenzee's fleet rows are the real fleet's), so the live-behaviour calls below say
+// `mode: 'real'` out loud. The simulate half is test/nested-queenzee-fleet-guard.test.mjs.
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -39,7 +43,7 @@ ok(none.swept === 0 && none.ok === 0, 'an empty fleet sweeps nothing and reports
 // No docker in a test runner ⇒ every install fails. The sweep must still resolve.
 const some = await refreshZeeLiveInLiveCxells(async () => ([
   { ctx: 'default', name: 'cxell_zt-one' }, { ctx: 'default', name: 'cxell_zt-two' },
-]));
+]), { mode: 'real' });
 ok(some.swept === 2, 'it visits every cxell it was given');
 ok(some.failed.length === 2 && some.ok === 0,
    'an unreachable cage is COUNTED as failed, not thrown — one bad cxell must not stop the sweep');

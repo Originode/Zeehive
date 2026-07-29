@@ -23,6 +23,14 @@ import { SCHEMA_DIR, OPS_DIR } from './shipmigrate.js';
 
 const MIG_PATHS = [SCHEMA_DIR, OPS_DIR];
 
+// Same switch attachXellDb itself reads (lib/xell-db.js): 'real' touches machines, anything else
+// models. It has to be read HERE too, because the OTHER half of an attach — regenerating the
+// xell's .zeehive.env — is a write into a worktree whose path came out of a fleet row, and a
+// nested queenzee's fleet rows are the REAL fleet's (a xell's db is a CLONE of the meta-DB). The
+// boot-time reconcile of that same file is gated the same way (provision.reconcileXellEnvs); this
+// timer is its second caller and was the way around it.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
 const git = (cwd, args) => {
   const r = spawnSync('git', ['-C', cwd, ...args],
     { encoding: 'utf8', timeout: 20000, windowsHide: true, env: cleanGitEnv() });
@@ -70,7 +78,13 @@ export async function dbCloneTick() {
         `${x.slug} → db-clone (${r.database} in ${r.container}). Its app tier still runs on the OLD `
         + 'DATABASE_URL until its next build — the zee is told to rebuild; nothing is restarted under it.');
       // regenerate the harness-free projection so the next build/compose picks the clone up
-      await emitXellEnv(x.id).catch((e) => logline('dbclone', `${x.slug}: .zeehive.env not regenerated — ${e.message}`));
+      // (dryRun in simulate: report the drift, write into no worktree — see PROVISION_MODE above)
+      await emitXellEnv(x.id, { dryRun: PROVISION_MODE !== 'real' })
+        .catch((e) => logline('dbclone', `${x.slug}: .zeehive.env not regenerated — ${e.message}`));
+      if (PROVISION_MODE !== 'real') {
+        logline('dbclone', `${x.slug}: .zeehive.env NOT rewritten — PROVISION_MODE=simulate: this `
+          + 'queenzee models the fleet, it does not write into its worktrees');
+      }
     } catch (e) {
       logline('dbclone', `could not attach a clone to ${x.slug}: ${e.message} — will retry next tick`);
     }
