@@ -121,7 +121,7 @@ ok(/rest\.find\(\(a\) => !a\.startsWith\('--'\)\)/.test(tendCase),
 
 // ── 6. the manual says so (it is the zee's only instruction) ──
 console.log('\n── the manual ──');
-const mig = read('db/migrations/055_manual_tend_reason.sql');
+const mig = read('db/migrations/056_manual_tend_reason.sql');
 ok(/The reason is REQUIRED/.test(mig), 'the manual patch teaches that the reason is required');
 ok(/IF txt IS NULL OR txt LIKE '%The reason is REQUIRED%' THEN RETURN/.test(mig),
    'the patch is guarded — re-running it, or running it over a human-edited manual, changes nothing');
