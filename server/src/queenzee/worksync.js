@@ -28,21 +28,26 @@
 //   • move an item that has not started (`queued`) — that is what assignment is for.
 //   • touch an item nobody is on. No xell, no fact — it stays plan.
 //
-// When the assigned xell is GONE (retired, or the row deleted) the status is left exactly where it
-// was and only the LINK is cleared, with an event that says why: the work that happened still
-// happened, and the card goes back to being plan. Guessing a status backwards would destroy the one
-// thing the history exists to record.
+// When the assigned xell is GONE (retired, or the row deleted) this tick NOTES it in the ledger and
+// CHANGES NOTHING ELSE — not the status, and not the link:
 //
-// ⚠ ONE PLACE THIS DISAGREES WITH PART 1'S DOC, ON PURPOSE AND OUT LOUD. Policy 4 in
-// docs/work-tracker.md keeps a dead xell's id on the row ("xell_id: <still there, as history>") and
-// suggests part 2/3 build a "was: <slug>" affordance from it. Part 3's brief says the opposite: when
-// the zee is gone the item "goes back to being plan, not fact", so the link is cleared. Both agree on
-// the thing that matters — a reap must NEVER move the item, and a dead xell must never lend it a
-// signal (liveZees filters retired/husk/error, so a husk simply yields no hive word and this tick
-// leaves it entirely alone). The history is not lost either way: the clearing event is a
-// kind:'assigned' row whose detail carries xell_id AND xell_slug, which is what "was: <slug>" should
-// be rendered from — a denormalized slug outlives the xell row, and reading it needs no join to a
-// corpse. If the console would rather have the column, this is a one-line change here plus a test.
+//   xell_id is HISTORY. Liveness is resolved at READ time, never by nulling the column.
+//
+// That is policy 4 of docs/work-tracker.md, and it is where the guard belongs. `liveZees()` filters
+// retired/husk/error and `hive-status.js` answers null for a retired row, so a stale id CANNOT lie to
+// anybody: the read models already hand a dead xell's card `zee: null, live_status: null`. A SECOND
+// guard here, at write time, would be the cache invalidation that doc warns about — missed by
+// `purgeDevXells`, by `recoverOrphanTeardowns` finishing a half-done reap, and by a human updating a
+// row — and it would cost the board its provenance: which agent was actually on this work. A tracker
+// that quietly forgets that thirty seconds after a reap is less trustworthy, not more.
+//
+// (Part 3's brief originally said to CLEAR the column. It was surfaced rather than silently obeyed,
+// and the ruling was to keep it — the read-time guard is enough, and 'was: <slug>' should render from
+// a column with the ledger as corroboration, not from the ledger as the only witness. Do not
+// "restore" the clearing: the event below is the whole job.)
+//
+// The event is written ONCE per dead xell, not once per tick — the link survives now, so the branch
+// below would otherwise fire every 30 seconds forever and turn an item's history into a stutter.
 //
 // Every move it does make is written by part 1's ledger with actor 'queenzee', so the item's history
 // reads honestly as "the board moved itself" and is never mistaken for a human's judgement.
@@ -65,11 +70,18 @@ export const IN_FLIGHT = WORK_STATUS_KEYS.filter((k) => k !== 'queued' && !isTer
 const inFlight = (s) => IN_FLIGHT.includes(s);
 
 // Every work item that claims a xell, with the xell's own lifecycle status. A LEFT JOIN,
-// deliberately: an item pointing at a xell that no longer exists is exactly the case to clean up.
+// deliberately: an item pointing at a xell whose row no longer exists is exactly the case to note.
+// `gone_recorded` is the idempotency key — have we already said, in this item's ledger, that THIS
+// xell went away? (Matched on the xell id in the event's detail, so a later re-assignment to a
+// different xell that also dies gets its own entry.)
 async function assignedItems() {
   return q(
     `SELECT wi.id, wi.project_id, wi.title, wi.status, wi.xell_id,
-            x.id AS xell_row_id, x.slug AS xell_slug, x.status AS xell_status
+            x.id AS xell_row_id, x.slug AS xell_slug, x.status AS xell_status,
+            EXISTS (SELECT 1 FROM work_item_event e
+                     WHERE e.work_item_id = wi.id AND e.kind = 'assigned'
+                       AND e.detail->>'zee_gone' = 'true'
+                       AND e.detail->>'xell_id' = wi.xell_id::text) AS gone_recorded
        FROM work_item wi
        LEFT JOIN xell x ON x.id = wi.xell_id
       WHERE wi.xell_id IS NOT NULL`);
@@ -83,33 +95,34 @@ export async function workSyncTick() {
     // An older meta-DB may not have the work tracker at all. That is not an error worth spamming
     // every 30s about, and it must never take the queenzee's other loops down with it.
     if (/relation .*work_item/i.test(e.message)) {
-      return { scanned: 0, moved: 0, cleared: 0, skipped: 'no work tracker schema' };
+      return { scanned: 0, moved: 0, noted: 0, skipped: 'no work tracker schema' };
     }
     throw e;
   }
-  if (!rows.length) return { scanned: 0, moved: 0, cleared: 0 };
+  if (!rows.length) return { scanned: 0, moved: 0, noted: 0 };
 
   // ONE batched read for every zee on the board (part 1's helper — a board of eighty cards must not
   // cost eighty queries), and the same hive status the hexagon and the board chip show.
   const zees = await liveZees(rows.map((r) => r.xell_id));
 
-  let moved = 0, cleared = 0;
+  let moved = 0, noted = 0;
   for (const row of rows) {
     try {
-      // ── the xell is GONE: clear the link, keep the status, say so ──
+      // ── the xell is GONE: say so in the ledger, ONCE, and change nothing else ──
       // Only 'retired' (or a vanished row) counts as gone here. A 'husk'/'error' xell is awaiting
       // queenzee housekeeping and may yet come back, and liveZees already refuses to speak for it —
-      // so it is left completely untouched rather than half-cleaned by a tick.
+      // so it is left completely untouched rather than half-handled by a tick.
       if (!row.xell_row_id || row.xell_status === 'retired') {
-        await q(`UPDATE work_item SET xell_id=NULL WHERE id=$1`, [row.id]);
+        if (row.gone_recorded) continue;                 // already noted; the link is history now
         await logWorkEvent(row.id, 'assigned', { actor: 'queenzee',
-          detail: { unassigned: true, xell_id: row.xell_id, xell_slug: row.xell_slug || null,
+          detail: { zee_gone: true, xell_id: row.xell_id, xell_slug: row.xell_slug || null,
                     reason: 'the assigned xell is gone', status_kept: row.status } });
-        await announceWorkItem('assigned', row.id, { unassigned: true });
+        await announceWorkItem('assigned', row.id, { zee_gone: true });
         logline('worksync',
-          `"${row.title}": its zee (${row.xell_slug || row.xell_id}) is gone — cleared the assignment and LEFT `
-          + `the status at '${row.status}' (work that happened, happened; the card is plan again)`);
-        cleared++;
+          `"${row.title}": its zee (${row.xell_slug || row.xell_id}) is GONE — noted in the ledger and `
+          + `nothing else touched: the status stays '${row.status}' (the agent left; the work did not `
+          + 'finish) and xell_id stays as history (the read models already refuse to resolve a dead xell)');
+        noted++;
         continue;
       }
 
@@ -133,7 +146,7 @@ export async function workSyncTick() {
       logline('worksync', `could not sync work item ${row.id}: ${e.message} — will retry next tick`);
     }
   }
-  return { scanned: rows.length, moved, cleared };
+  return { scanned: rows.length, moved, noted };
 }
 
 export function startWorkSync() {

@@ -144,6 +144,8 @@ Two consequences worth stating:
   close its children".
 - **"was: &lt;slug&gt;" is part 2/3's to build**, from the surviving `xell_id` plus the
   `work_item_event` ledger (`kind:'assigned'`). This module will not hand you a dead zee to render.
+  Part 3 keeps that contract: its tick NOTES a departed zee in the ledger (with the slug
+  denormalized into `detail`) and never nulls the column — see "The board moves itself" below.
 
 ## The schema (migration 058)
 
@@ -493,19 +495,26 @@ disagree and nobody knows which is right.
 - move a `queued` item — starting work is what assignment is for;
 - touch an item nobody is on — no zee, no fact, it stays plan.
 
-When the assigned xell is **gone** (retired, or the row deleted) the status is left exactly where it
-was and only the LINK is cleared, with a ledger entry saying why: the card goes back to being plan. A
-`husk`/`error` xell is *not* treated as gone — it is awaiting housekeeping and `liveZees` already
-refuses to speak for it, so the tick leaves that card completely alone rather than half-cleaning it.
+When the assigned xell is **gone** (retired, or its row deleted) the tick **notes it in the ledger
+and changes nothing else** — not the status, and not the link:
 
-⚠ **This clears `xell_id`, where policy 4 above keeps it as history — a deliberate, visible
-disagreement.** Both halves agree on what matters (a reap never moves the item, and a dead xell never
-lends it a signal); they differ on whether the corpse's id stays on the row. Part 3 clears it because
-an item nobody is on is plan, not fact. **The history is not lost:** the clearing event is a
-`kind:'assigned'` row whose `detail` carries `xell_id` **and `xell_slug`, denormalized**, so policy
-4's "was: &lt;slug&gt;" affordance should be rendered from the ledger — which needs no join to a
-dead xell row. If the console would rather read the column, it is one line in `worksync.js` and one
-assertion in the test.
+> **`xell_id` is history. Liveness is resolved at READ time, never by nulling the column.**
+
+That is policy 4 above, and part 3 obeys it rather than adding a second guard. `liveZees()` already
+filters `retired`/`husk`/`error` and `hive-status.js` answers `null` for a retired row, so a stale id
+cannot lie to anyone — the card comes back `zee: null, live_status: null` with the id still on it. A
+write-time guard would be exactly the cache invalidation policy 4 warns about (missed by
+`purgeDevXells`, by `recoverOrphanTeardowns` finishing a half-done reap, and by a human editing a
+row), and it would cost the board its **provenance**: which agent was actually on this work. A
+tracker that forgets that thirty seconds after a reap is less trustworthy, not more. So "was:
+&lt;slug&gt;" renders from the column, with the ledger entry — a `kind:'assigned'` row whose `detail`
+carries `zee_gone`, the id and the **denormalized slug** — as corroboration.
+
+The note is written **once per dead xell**, not once per tick: the link survives now, so the branch
+would otherwise restate itself every 30 seconds and turn an item's history into a stutter.
+
+A `husk`/`error` xell is *not* treated as gone at all — it is awaiting housekeeping and may come
+back, and `liveZees` already refuses to speak for it, so that card is left completely untouched.
 
 Every move it makes is a `work_item_event` with `actor:'queenzee'`, so the history reads honestly as
 "the board moved itself", and every move is announced as `{ kind, item }` — the shape this document

@@ -15,7 +15,8 @@
 //      follows, and its refusals — with the dispatch path STUBBED, never a real zee;
 //   6. worksync: a live hive status MOVES a card, and the fence holds — never to `done` (not even
 //      from occ-done, which statusFromHive really does map there), never out of a terminal status,
-//      never a queued card and never one nobody is on; a vanished zee clears the LINK only;
+//      never a queued card and never one nobody is on; a vanished zee is NOTED once and changes
+//      nothing (xell_id is history — liveness is resolved at read time, never by nulling it);
 //   7. the cxell verbs' SCOPING: a worker may touch its OWN item and nothing else, a manager only
 //      its own project — resolved from the caller's token, never from a parameter;
 //   8. the manuals: migration 059 and the manager harness FILE say the same words (they are two
@@ -316,34 +317,39 @@ try {
     ok((await client.query(`SELECT status FROM work_item WHERE id=$1`, [activity.id])).rows[0].status === idle,
        'an item with no zee on it is left alone (no fact, no move)');
 
-    // the zee is GONE → clear the LINK, keep the status
+    // the zee is GONE → NOTE it, and change nothing: not the status, not the link.
+    // xell_id is HISTORY; liveness is resolved at READ time (policy 4), never by nulling the column.
     await client.query(`UPDATE work_item SET status='review' WHERE id=$1`, [item.id]);
     await client.query(`UPDATE xell SET status='retired' WHERE id=$1`, [worker.id]);
     const t3 = await worksync.workSyncTick();
     const orphan = (await client.query(`SELECT status, xell_id FROM work_item WHERE id=$1`, [item.id])).rows[0];
-    ok(orphan.xell_id === null && orphan.status === 'review',
-       `a retired zee clears the assignment and KEEPS the status (${t3.cleared} cleared)`);
-    const cleared = (await events(item.id, 'assigned')).find((e) => e.actor === 'queenzee' && e.detail?.unassigned === true);
-    ok(!!cleared, 'with a ledger entry saying the queenzee did it, and why');
-    // The link is cleared (part 3's brief) but the HISTORY is not: policy 4's "was: <slug>" is built
-    // from this event, and the slug is denormalized into it so nothing has to join to a dead xell.
-    ok(cleared?.detail?.xell_slug === 'wa-worker' && cleared?.detail?.xell_id === worker.id,
-       'and that entry carries the dead zee\'s SLUG and id — "was: <slug>" survives the clear');
-    ok(cleared?.detail?.status_kept === 'review', 'and the status it deliberately did not touch');
+    ok(orphan.status === 'review', `a retired zee does NOT move the card (still '${orphan.status}') — the agent left, the work did not finish`);
+    ok(orphan.xell_id === worker.id,
+       `and the LINK SURVIVES the reap (${t3.noted} noted) — xell_id is provenance, not a liveness flag`);
+    const gone = (await events(item.id, 'assigned')).find((e) => e.actor === 'queenzee' && e.detail?.zee_gone === true);
+    ok(!!gone && gone.detail.xell_slug === 'wa-worker' && gone.detail.status_kept === 'review',
+       'the ledger says the queenzee saw it go, naming the slug and the status it kept');
+    // the read model is where liveness is decided — and it lends the card nothing
+    const dead = await getWorkItem(item.id);
+    ok(dead.xell_id === worker.id && dead.zee === null && dead.live_status === null,
+       'the READ model still resolves no zee and no live status for it (a stale id cannot lie)');
+    // …and the note is written ONCE, not once per tick — the link survives, so this branch re-runs
+    await worksync.workSyncTick();
+    await worksync.workSyncTick();
+    ok((await events(item.id, 'assigned')).filter((e) => e.detail?.zee_gone === true).length === 1,
+       'and it is noted exactly ONCE however often the tick runs (a history, not a stutter)');
     await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [worker.id]);
 
     // a HUSK/ERROR xell is not gone, just unwell: liveZees refuses to speak for it, so the tick
-    // must leave the card ENTIRELY alone — no move, and no half-clean either.
-    await WA.assignWorkItem(item.id, { xell_id: worker.id });
+    // must leave the card ENTIRELY alone — no move, and no note either.
     await client.query(`UPDATE work_item SET status='blocked' WHERE id=$1`, [item.id]);
     await client.query(`UPDATE xell SET status='husk' WHERE id=$1`, [worker.id]);
     const evH = (await events(item.id)).length;
     await worksync.workSyncTick();
     const husked = (await client.query(`SELECT status, xell_id FROM work_item WHERE id=$1`, [item.id])).rows[0];
     ok(husked.status === 'blocked' && husked.xell_id === worker.id && (await events(item.id)).length === evH,
-       'a husk xell moves nothing and clears nothing (a dead xell lends a work item no signal — policy 4)');
+       'a husk xell moves nothing and writes nothing (a dead xell lends a work item no signal — policy 4)');
     await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [worker.id]);
-    await WA.unassignWorkItem(item.id);
   }
 
   // ── 7. the cxell verbs are SCOPED from the caller, never a parameter ─────
