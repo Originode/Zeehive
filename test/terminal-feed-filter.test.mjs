@@ -100,10 +100,13 @@ ok(/msg\.t === 'v'/.test(zeeDoor), "the zee door handles the {t:'v'} frame");
 const apply = zeeDoor.slice(zeeDoor.indexOf('const applyView'), zeeDoor.indexOf("ws.on('message'"));
 ok(/conn\.exec\(zeeLiveViewCommand/.test(apply), 'by running the view command on its own exec channel');
 ok(!/stream\.write/.test(apply), 'never writing to the PTY stream (no bytes land in whatever owns the pane)');
-ok(/if \(!sshReady\) return;/.test(apply), 'and not before the SSH connection is up');
+ok(/if \(!sshReady\)/.test(apply) && /pendingView = view/.test(apply),
+   'a chip clicked before SSH is up is QUEUED, not dropped (dropping it would revert the operator a second later)');
 ok(/try\s*{/.test(apply) && /catch/.test(apply), 'best-effort: a failed chip must not disturb the terminal it rides on');
 ok(/applyView\(null, false\)/.test(zeeDoor), 'on attach it POLLS the cage, so a reopened terminal shows the view in force');
-ok(zeeDoor.indexOf('applyView(null, false)') < zeeDoor.indexOf('conn.exec(cmd'),
+ok(/if \(pendingView\) applyView\(pendingView, true\); else applyView\(null, false\);/.test(zeeDoor),
+   'unless a click is already waiting — that wins over the poll');
+ok(zeeDoor.indexOf('if (pendingView)') < zeeDoor.indexOf('conn.exec(cmd'),
    'seeded before the PTY exec, so the chips are right from the first frame');
 
 // ── the cage gets a renderer that understands the file ────────────────────────────────────────

@@ -124,8 +124,9 @@ async function openTerminal(ws, zeeId) {
   // written without a byte touching the PTY. Best-effort in every branch: a failed chip must never
   // disturb the terminal it rides on.
   let sshReady = false;
+  let pendingView = null;   // a chip clicked before SSH came up — replayed, not dropped
   const applyView = (view, write) => {
-    if (!sshReady) return;
+    if (!sshReady) { if (write) pendingView = view; return; }
     try {
       conn.exec(zeeLiveViewCommand(view, write), (err, s) => {
         if (err || !s) return;
@@ -151,8 +152,12 @@ async function openTerminal(ws, zeeId) {
   conn.on('ready', () => {
     sshReady = true;
     // Seed the chips from the cage, so a reopened terminal shows the view that is actually in
-    // force (and whether a live feed is running at all) instead of assuming the default.
-    applyView(null, false);
+    // force (and whether a live feed is running at all) instead of assuming the default. A chip
+    // clicked while we were still connecting wins over that poll — the same "queue what arrives
+    // early" lesson the resize below learned, and dropping it would silently revert the operator's
+    // click a second after they made it.
+    if (pendingView) applyView(pendingView, true); else applyView(null, false);
+    pendingView = null;
     conn.exec(cmd, { pty: { term: 'xterm-256color', cols: lastSize.cols, rows: lastSize.rows } }, (err, s) => {
       if (err) return fail(`exec failed: ${err.message}`);
       stream = s;
