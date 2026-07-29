@@ -1894,9 +1894,9 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   border-radius: 10px; background: var(--panel); position: relative; }
 .work-gsheet { position: relative; }
 
-.work-ghead { position: sticky; top: 0; z-index: 4; display: flex; background: var(--panel);
+.work-ghead { position: sticky; top: 0; z-index: 8; display: flex; background: var(--panel);
   border-bottom: 1px solid var(--line); }
-.work-ghead-n { position: sticky; left: 0; z-index: 5; flex: 0 0 auto; background: var(--panel);
+.work-ghead-n { position: sticky; left: 0; z-index: 9; flex: 0 0 auto; background: var(--panel);
   border-right: 1px solid var(--line); display: flex; align-items: flex-end; padding: 0 8px 4px; }
 .work-ghead-t { position: relative; flex: 0 0 auto; }
 .work-gmajor, .work-gminor { position: relative; height: 22px; }
@@ -1907,16 +1907,20 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-gmaj.alt { background: rgba(255,255,255,.02); }
 .work-gmin.we { color: var(--unknown); background: rgba(255,255,255,.03); }
 
+/* PAINT ORDER, stated once so it cannot drift: bands(0) < rows/bars(2) < arrows(4) < the today
+   line(5) < the sticky name cells(6) < the sticky axis header(8). A row must NOT carry a z-index
+   of its own: that makes it a stacking context, traps its sticky name cell below the today line,
+   and the line then paints across the name column as soon as the canvas is scrolled. */
 .work-gbody { position: relative; }
 .work-gbands { position: absolute; top: 0; z-index: 0; pointer-events: none; }
 .work-gwe { position: absolute; top: 0; bottom: 0; background: rgba(255,255,255,.030); }
 .work-gsep { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); opacity: .55; }
-.work-gtoday { position: absolute; top: 0; width: 2px; z-index: 3; background: var(--accent);
+.work-gtoday { position: absolute; top: 0; width: 2px; z-index: 5; background: var(--accent);
   box-shadow: 0 0 7px rgba(91,140,255,.75); pointer-events: none; }
 
-.work-grow { position: relative; z-index: 1; display: flex; align-items: center; }
+.work-grow { position: relative; display: flex; align-items: center; }
 .work-grow:hover, .work-grow.hot { background: rgba(255,255,255,.035); }
-.work-gname { position: sticky; left: 0; z-index: 3; flex: 0 0 auto; height: 100%; display: flex;
+.work-gname { position: sticky; left: 0; z-index: 6; flex: 0 0 auto; height: 100%; display: flex;
   align-items: center; gap: 5px; background: var(--panel); border-right: 1px solid var(--line);
   padding-right: 8px; }
 .work-grow:hover .work-gname, .work-grow.hot .work-gname { background: var(--panel2); }
@@ -1950,7 +1954,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   opacity: 0; }
 .work-grow:hover .work-glink, .work-grow.hot .work-glink { opacity: 1; }
 
-.work-garrows { position: absolute; top: 0; z-index: 2; overflow: visible; pointer-events: none;
+.work-garrows { position: absolute; top: 0; z-index: 4; overflow: visible; pointer-events: none;
   color: var(--muted); }
 .work-garrow { color: var(--muted); opacity: .22; }
 .work-garrow.on { opacity: 1; color: var(--accent); }
