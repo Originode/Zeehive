@@ -85,7 +85,7 @@ export function suggestFilename(number, name) {
 
 const claimRow = (c) => ({
   number: c.number, prefix: formatNumber(c.number), xell_slug: c.xell_slug,
-  filename: c.filename, claimed_at: c.claimed_at, expires_at: c.expires_at, note: c.note,
+  filename: c.filename, claimed_at: c.claimed_at, expires_at: c.expires_at,
 });
 
 // The claims still worth honouring: not expired, and not held by a xell that has been reaped.
@@ -108,7 +108,7 @@ export async function liveClaims(projectId) {
 //   locked: the whole read-then-insert runs under a per-project advisory lock, so two asks in the
 //           same second cannot both read the same max. The lock is transaction-scoped — it is
 //           released by COMMIT/ROLLBACK, including on a crash, so nothing can wedge it.
-export async function claimMigrationNumber(project, xell, { name = null, again = false, note = null } = {}) {
+export async function claimMigrationNumber(project, xell, { name = null, again = false } = {}) {
   const ref = project.ship_ref || project.main_branch || 'main';
   const commit = headCommit(project.repo_root, ref);
   const landedFiles = commit ? landedMigrationFiles(project.repo_root, commit) : [];
@@ -128,7 +128,8 @@ export async function claimMigrationNumber(project, xell, { name = null, again =
       return { ok: true, reused: true, number: c.number, prefix: formatNumber(c.number),
                filename: c.filename, dir: MIGRATIONS_DIR,
                landed: { ref, commit, count: landedFiles.length, max: highest(landed) },
-               worktrees: [], claims: claims.map(claimRow), claim: claimRow(c) };
+               worktrees: null,   // not scanned: the answer is the claim you already hold
+               claims: claims.map(claimRow), claim: claimRow(c) };
     }
 
     // Every live xell's worktree, including this one — the source the asking zee cannot see.
@@ -136,28 +137,31 @@ export async function claimMigrationNumber(project, xell, { name = null, again =
       `SELECT id, slug, worktree_path FROM xell
          WHERE project_id=$1 AND status <> 'retired' AND worktree_path IS NOT NULL
          ORDER BY created_at`, [project.id])).rows;
-    const worktrees = xells.map((x) => {
+    const scanned = xells.map((x) => {
       const files = worktreeMigrationFiles(x.worktree_path);
       const nums = files ? numbersIn(files) : [];
-      return { xell_slug: x.slug, readable: files != null, count: files ? files.length : 0, max: highest(nums), numbers: nums };
+      return { xell_slug: x.slug, readable: files != null, count: nums.length, max: highest(nums), numbers: nums };
     });
+    // What the zee is shown: every worktree that CONTRIBUTED, plus every one that could not be read —
+    // an unreadable sibling is a hole in the answer, so it is reported rather than silently dropped.
+    const worktrees = scanned.filter((w) => w.count || !w.readable).map(({ numbers, ...w }) => w);
 
-    const taken = new Set([...landed, ...worktrees.flatMap((w) => w.numbers), ...claims.map((c) => c.number)]);
+    const taken = new Set([...landed, ...scanned.flatMap((w) => w.numbers), ...claims.map((c) => c.number)]);
     const number = highest([...taken]) + 1;
     const filename = suggestFilename(number, name);
 
     const { rows: [claim] } = await client.query(
       `INSERT INTO migration_number_claim
-         (project_id, xell_id, xell_slug, number, filename, note, expires_at)
-       VALUES ($1,$2,$3,$4,$5,$6, now() + ($7 || ' days')::interval) RETURNING *`,
-      [project.id, xell.id, xell.slug, number, filename, note, String(CLAIM_TTL_DAYS)]);
+         (project_id, xell_id, xell_slug, number, filename, expires_at)
+       VALUES ($1,$2,$3,$4,$5, now() + ($6 || ' days')::interval) RETURNING *`,
+      [project.id, xell.id, xell.slug, number, filename, String(CLAIM_TTL_DAYS)]);
     await client.query('COMMIT');
     logline('migrations', `${xell.slug} claimed migration number ${formatNumber(number)}`
       + `${filename ? ` (${filename})` : ''} — landed max ${formatNumber(highest(landed))}, `
       + `${claims.length} other live claim(s)`);
     return { ok: true, reused: false, number, prefix: formatNumber(number), filename, dir: MIGRATIONS_DIR,
              landed: { ref, commit, count: landedFiles.length, max: highest(landed) },
-             worktrees: worktrees.filter((w) => w.count), claims: claims.map(claimRow), claim: claimRow(claim) };
+             worktrees, claims: claims.map(claimRow), claim: claimRow(claim) };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;

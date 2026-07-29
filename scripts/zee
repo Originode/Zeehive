@@ -222,6 +222,7 @@ function usage() {
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
+  zee migration-number [--name "..."] [--again]   ASK for the next free db/migrations number: the queenzee counts what is LANDED plus what every other LIVE xell's worktree and claims already hold — the sibling branches you cannot see (ticket #9). NOT gated. Advisory: it hands out a number, it does not gate your landing. Asking twice returns the SAME number; --again gets a second one
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
                                      ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
@@ -349,6 +350,19 @@ switch (cmd) {
     // read-only). `--restore` (isolated only) rebuilds from the latest full prod snapshot instead:
     // exact schema+data, but it DISCARDS your db's current contents.
     const r = await req('POST', '/api/xell/self/catchup', { restore: rest.includes('--restore') });
+    console.log(JSON.stringify(r.json, null, 2));
+    process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'migration-number': {
+    // ASK for the next free db/migrations number. Your worktree can only show you what is LANDED plus
+    // what you wrote — never a sibling's unlanded migration on a branch you cannot see, which is how
+    // five numbers came to be claimed twice (ticket #9). The queenzee counts main + every live xell's
+    // worktree + the claims other zees hold, and RECORDS yours. NOT gated, and advisory: it hands out
+    // a number, it does not gate your landing. Asking twice returns the SAME number (--again for a
+    // second one, when one landing carries two migrations).
+    const r = await req('POST', '/api/xell/self/migration-number', {
+      name: flag('name'), again: rest.includes('--again') });
     console.log(JSON.stringify(r.json, null, 2));
     process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
     break;

@@ -31,7 +31,6 @@ CREATE TABLE IF NOT EXISTS migration_number_claim (
   xell_slug  text,                                    -- readable in the log after the xell is gone
   number     int  NOT NULL,
   filename   text,                                    -- the suggested path, when the zee named one
-  note       text,
   claimed_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL DEFAULT now() + interval '7 days'
 );
