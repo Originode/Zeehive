@@ -76,7 +76,7 @@ and the web palette cannot drift:
 **`live_status` is advisory and is never written back.** The card's column is always its *stored*
 status. A zee going idle for a minute must not silently drag somebody's card into another column.
 
-## Three policies parts 3 and 4 must not misread
+## Four policies parts 3 and 4 must not misread
 
 These are correct **as built**; they were merely implicit before, which is the same as wrong.
 
@@ -110,6 +110,40 @@ It does **not** detach an item, and it does not make it a second root (the schem
 `PATCH /api/work-items/:id {"parent_id": null}` lands the item directly under the project root at
 depth 1 — the "drag to top level" gesture. `moveWorkItem` resolves the root itself so the new
 `sort_order` is computed among the siblings the item actually lands beside.
+
+### 4. A dead xell lends a work item nothing — no zee, and no signal
+
+`work_item.xell_id` is a **durable record of the last assignment**, but a xell dies long before the
+work does. `reapXell` never deletes the xell row — it sets `status='retired'` — so the column's
+`ON DELETE SET NULL` essentially never fires and the item keeps pointing at a corpse.
+
+The read models therefore resolve **only live xells**. A xell that is `retired`, `husk` or `error`
+(the states `hive-status.js` itself classifies as gone or vacant) yields:
+
+```
+zee: null        live_status: null        xell_id: <still there, as history>
+```
+
+This is enforced at **read time** in `liveZees()`, deliberately *not* by a release hook in the reap
+path. A hook is a cache invalidation and it will be missed — `purgeDevXells` reaps in bulk,
+`recoverOrphanTeardowns` finishes reaps a dead queenzee left half-done, and a human can update a row
+by hand. A `WHERE` clause cannot be bypassed by a code path nobody has written yet.
+
+What this fixed: a reaped xell used to report `hive_status: 'occ-claimed'` (the unclassified
+fallback in `hive-status.js`) and therefore `live_status: 'assigned'` — a card claiming an agent was
+on work whose agent had been gone for a week. Reaped **with a landing still undecided** it read
+`review`, because the reaper releases open **ships** (`releaseXellShips`) but never land requests.
+`hiveStatus()` now answers `null` for a retired row rather than letting that fallback speak for it;
+every other derivation is unchanged, and every existing caller (`fleet.js`, `managers.crewFor`,
+`self.js`) already filtered retired before calling, so nothing there moved.
+
+Two consequences worth stating:
+
+- **A reap must never move the item to `done`.** The agent is gone; the work is not finished. The
+  stored status stays exactly as a human left it — the same argument as "closing a parent does not
+  close its children".
+- **"was: &lt;slug&gt;" is part 2/3's to build**, from the surviving `xell_id` plus the
+  `work_item_event` ledger (`kind:'assigned'`). This module will not hand you a dead zee to render.
 
 ## The schema (migration 058)
 
@@ -371,7 +405,8 @@ test data).
 
 ## What parts 2–4 need to know
 
-- **`work_item.xell_id`** is the zee currently on an item; **`assignee`** is free text for when a
+- **`work_item.xell_id`** is the zee currently on an item — read models resolve it only while
+  the xell is LIVE (see policy 4); **`assignee`** is free text for when a
   human holds it. `task.work_item_id` already exists (added by 058) for part 2 to stamp a
   dispatched worker's task with the item it was cut for — no new migration needed for that.
 - **Never write `live_status` back into `status`.** It is a hint. The stored status is a human's (or

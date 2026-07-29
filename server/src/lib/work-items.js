@@ -154,6 +154,28 @@ async function emit(row, kind, opts = {}, { client = null, pending = null } = {}
 // so the hive status is derived by lib/hive-status.js — the one source of truth — from the same live
 // signals fleet.js folds into its row read (a held landing, a tend, a hint…). Batched: a board of
 // eighty cards must not cost eighty queries.
+//
+// ONLY A LIVE XELL COUNTS. work_item.xell_id is a DURABLE record of the last assignment, but a xell
+// dies long before the work does: reapXell never deletes the row, it sets status='retired' (so the
+// ON DELETE SET NULL on the column essentially never fires) — and the item was left pointing at a
+// corpse that still answered. A reaped xell reported hive_status 'occ-claimed' (the unclassified
+// fallback) and therefore live_status 'assigned'; if it had been reaped with a landing still
+// undecided it read 'occ-landRequest' → 'review', because the reaper releases open SHIPS
+// (releaseXellShips) but never land requests. Either way a board card claimed an agent was on work
+// whose agent had been gone for a week.
+//
+// The fix is here, at READ time, and deliberately not a release hook in the reap path: a hook is a
+// cache invalidation and it WILL be missed — purgeDevXells reaps in bulk, recoverOrphanTeardowns
+// finishes reaps a dead queenzee left half-done, and a human can update a row by hand. A WHERE
+// clause cannot be bypassed by a path nobody has written yet. The three excluded statuses are the
+// ones hive-status.js itself classifies as gone ('retired') or VACANT ('husk'/'error' → vac-dirty):
+// no zee occupies any of them, so none of them may lend a work item a zee OR a signal.
+//
+// A dead xell therefore resolves to NO ENTRY: callers see `zee: null`, `live_status: null`. The
+// xell_id stays on the row as history — building a `last_zee` / "was:" affordance from it plus the
+// work_item_event ledger is part 2/3's read model, not this one's.
+const LIVE_XELL_STATUSES = `x.status NOT IN ('retired','husk','error')`;
+
 export async function liveZees(xellIds) {
   const ids = [...new Set((xellIds || []).filter(Boolean))];
   if (!ids.length) return new Map();
@@ -187,7 +209,7 @@ export async function liveZees(xellIds) {
           ORDER BY CASE WHEN zz.status IN ('spawning','online','working','idle') THEN 0 ELSE 1 END,
                    zz.created_at DESC LIMIT 1
        ) z ON true
-      WHERE x.id = ANY($1::uuid[])`, [ids]);
+      WHERE x.id = ANY($1::uuid[]) AND ${LIVE_XELL_STATUSES}`, [ids]);
 
   const map = new Map();
   for (const x of rows) {
@@ -201,6 +223,11 @@ export async function liveZees(xellIds) {
       seedPending: x.seed_pending === true,
       doneSuggested: x.done_suggested === true,
     });
+    // Belt AND braces. The WHERE clause above is what actually keeps dead xells out; this second
+    // check catches the case it cannot see — a status hive-status.js declines to speak for (it
+    // answers null rather than let its 'occ-claimed' fallback invent one). If there is no honest
+    // hive word for this row, there is no honest zee to hand a card either.
+    if (!key) continue;
     map.set(x.id, {
       xell_id: x.id, slug: x.slug, status: x.status, branch: x.branch,
       zee_name: x.zee_name || null, zee_title: x.zee_title || null,
