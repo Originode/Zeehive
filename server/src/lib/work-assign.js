@@ -79,10 +79,12 @@ const liveXell = (id) => (id
            FROM xell WHERE id=$1`, [id])
   : Promise.resolve(null));
 
-// What the SSE bus is told after a commit. Part 1's own emit() sends { kind, item } — same shape
-// here, so a console consumer never has to know which file wrote the row. The event LEDGER is
-// deliberately not re-read into it (up to 50 rows on a bus message nobody reads them from).
-async function announce(kind, itemId, extra = {}) {
+// What the SSE bus is told after a commit. Part 1's own emit() sends { kind, item } and its doc
+// PINS that shape for the 'assigned' and 'status' kinds — so every broadcast from part 3 carries the
+// item too, and a console consumer never has to know which file wrote the row. The event LEDGER is
+// deliberately left out of it (up to 50 rows on a bus message nobody reads them from).
+// Exported because queenzee/worksync.js announces the same two kinds when the board moves itself.
+export async function announceWorkItem(kind, itemId, extra = {}) {
   const item = await getWorkItem(itemId);
   if (!item) return null;
   const { events, ...lean } = item;
@@ -163,7 +165,7 @@ export async function assignWorkItem(id, { xell_id, actor = 'human@console' } = 
     }
   });
 
-  const shaped = await announce('assigned', item.id, { xell_id: xell.id });
+  const shaped = await announceWorkItem('assigned', item.id, { xell_id: xell.id });
   broadcast('xell', { id: xell.id });
   logline('work', `${xell.slug} assigned to work item "${item.title}"${moved ? ' (queued → assigned)' : ''} by ${actor}`);
   return {
@@ -194,7 +196,7 @@ export async function unassignWorkItem(id, { actor = 'human@console' } = {}) {
       detail: { unassigned: true, xell_id: item.xell_id, xell_slug: xell?.slug || null,
                 status_kept: item.status } }, { client });
   });
-  const shaped = await announce('assigned', item.id);
+  const shaped = await announceWorkItem('assigned', item.id);
   if (xell) broadcast('xell', { id: xell.id });
   logline('work', `${xell?.slug || item.xell_id} taken off work item "${item.title}" by ${actor}`);
   return {
@@ -428,7 +430,7 @@ export async function reportItemStatus(id, { status = null, progress = null, not
     }
     if (note && !moved) await logWorkEvent(item.id, 'comment', { actor, detail: { note, progress } }, { client });
   });
-  const shaped = await announce('status', item.id);
+  const shaped = await announceWorkItem('status', item.id);
   logline('work', `work item "${item.title}" reported ${status || item.status}`
     + `${progress != null ? ` (${progress}%)` : ''} by ${actor}${note ? `: ${String(note).slice(0, 120)}` : ''}`);
   return {

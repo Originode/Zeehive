@@ -39,10 +39,12 @@
 // Same shape as queenzee/dbclone.js: a pure-script tick, loud in the log, disabled with
 // WORKSYNC_ENABLED=false, and every failure isolated per item so one bad row cannot stop the sweep.
 import { q } from '../db/pool.js';
-import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { statusFromHive, isTerminal, WORK_STATUS_KEYS, canTransition } from '../lib/work-status.js';
 import { liveZees, logWorkEvent } from '../lib/work-items.js';
+// The board announces itself in the SAME shape part 1 documents for these kinds ({ kind, item }) —
+// a card the console cannot patch is a card that only moves on a refresh.
+import { announceWorkItem } from '../lib/work-assign.js';
 
 // The window this tick may move within: everything that is neither FINISHED nor NOT-YET-STARTED.
 // Derived from the vocabulary rather than listed, so a new in-flight status is picked up and a new
@@ -89,7 +91,7 @@ export async function workSyncTick() {
         await logWorkEvent(row.id, 'assigned', { actor: 'queenzee',
           detail: { unassigned: true, xell_id: row.xell_id, xell_slug: row.xell_slug || null,
                     reason: 'the assigned xell is gone', status_kept: row.status } });
-        broadcast('work', { kind: 'assigned', item_id: row.id, project_id: row.project_id, unassigned: true });
+        await announceWorkItem('assigned', row.id, { unassigned: true });
         logline('worksync',
           `"${row.title}": its zee (${row.xell_slug || row.xell_id}) is gone — cleared the assignment and LEFT `
           + `the status at '${row.status}' (work that happened, happened; the card is plan again)`);
@@ -109,7 +111,7 @@ export async function workSyncTick() {
       await q(`UPDATE work_item SET status=$2 WHERE id=$1`, [row.id, next]);
       await logWorkEvent(row.id, 'status', { from: row.status, to: next, actor: 'queenzee',
         detail: { hive_status: hive, xell_slug: row.xell_slug, by: 'worksync' } });
-      broadcast('work', { kind: 'status', item_id: row.id, project_id: row.project_id, status: next });
+      await announceWorkItem('status', row.id);
       logline('worksync',
         `"${row.title}" ${row.status} → ${next} — ${row.xell_slug} is ${hive} (the board moved itself)`);
       moved++;

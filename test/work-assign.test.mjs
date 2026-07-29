@@ -391,6 +391,26 @@ try {
        "and a manager cannot deploy onto another project's plan");
   }
 
+  // ── 7b. the SSE payloads keep part 1's documented shape ─────────────────
+  {
+    const { bus } = await import('../server/src/lib/events.js');
+    const seen = [];
+    const listen = (e) => { if (e.type === 'work') seen.push(e.payload); };
+    bus.on('event', listen);
+    await WA.unassignWorkItem(item.id, { actor: 'test@human' });
+    await WA.assignWorkItem(item.id, { xell_id: (await reread(worker)).id, actor: 'test@human' });
+    await client.query(`UPDATE work_item SET status='assigned' WHERE id=$1`, [item.id]);
+    await worksync.workSyncTick();
+    bus.off('event', listen);
+    ok(seen.length >= 3, `the work channel carried ${seen.length} events`);
+    ok(seen.every((p) => p.kind && p.item && p.item.id),
+       "every one is { kind, item } — the shape part 1's doc pins for 'assigned' and 'status'");
+    ok(seen.every((p) => p.item.status_label && Array.isArray(p.item.next_statuses)),
+       'and the item is SHAPED (labels + legal next statuses), not a raw row');
+    ok(seen.some((p) => p.kind === 'status' && p.item.status === 'working'),
+       'including the tick\'s own move — the console can patch a self-moving card without a refresh');
+  }
+
   // ── 8. the manuals, the routes and the CLI ───────────────────────────────
   {
     const routes = readFileSync('server/src/api/routes.js', 'utf8');
