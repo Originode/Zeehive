@@ -4,7 +4,7 @@
 // that a zee cannot: whether work reaches main. It renders only when something is held, but then
 // it is loud and top-of-page on purpose — a held push means a zee is blocked, waiting on you.
 import React, { useState } from 'react';
-import { decideLanding } from './api.js';
+import { decideLanding, withdrawLanding } from './api.js';
 import { showConfirm } from './Dialog.jsx';
 import { showDiff } from './DiffViewer.jsx';
 
@@ -32,6 +32,20 @@ export function LandCard({ req, onDone, onDismiss }) {
   // being a question and becomes a receipt: still true, still worth seeing, but it should not go on
   // burying the xell's own buttons underneath it. Either state is one click away.
   const [open, setOpen] = useState(!approved);
+
+  // WITHDRAW — the third answer, and the quiet one. Reject BURNS the sha (the gate refuses it for
+  // good and says so to the zee); this only takes the question off the screen, so the same work can
+  // be asked again. It is what a stack of cards from one xell needs: the zee kept working and left
+  // the old asks behind, and none of them deserve a verdict. The zee has the same verb
+  // (`zee land --withdraw`) — this is here for the cards whose zee is gone or is not listening.
+  const withdraw = async () => {
+    if (!(await showConfirm(`Withdraw ${shortSha(req.new_sha)}?\n\nThe card leaves your screen and nothing is decided — no rejection, no landing, and the zee can ask again.`,
+      { okLabel: 'Withdraw' }))) return;
+    setBusy(true); setErr(null);
+    try { await withdrawLanding(req.id, 'withdrawn in the console'); onDone?.(); }
+    catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  };
 
   const decide = async (decision) => {
     if (decision === 'reject'
@@ -113,6 +127,10 @@ export function LandCard({ req, onDone, onDismiss }) {
             </div>
           ) : (
             <div className="land-actions">
+              <button className="land-withdraw" disabled={busy} onClick={withdraw}
+                      title="Take this question off the screen without deciding it — nothing is rejected and the zee can ask again">
+                Withdraw
+              </button>
               <button className="land-reject" disabled={busy} onClick={() => decide('reject')}>Reject</button>
               <button className="land-approve" disabled={busy} onClick={() => decide('approve')}>
                 {busy ? '…' : 'Approve landing'}

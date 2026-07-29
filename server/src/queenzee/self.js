@@ -17,7 +17,7 @@ import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
 import { cleanGitEnv } from '../lib/git.js';
-import { landStatus } from './landgate.js';
+import { landStatus, openLandRequests, withdrawLandRequest } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
@@ -45,6 +45,7 @@ export async function selfStatus(xell) {
   const zee = await liveZee(xell.id);
   const task = await one(`SELECT id, status, done_at, done_by FROM task WHERE xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [xell.id]);
   const land = await landStatus(xell.id);
+  const openLandings = await openLandRequests(xell.id);
   const ship = await shipStatus(xell.id);
   const prodBind = await one(
     `SELECT id, status, reason, requested_at, decided_at, decided_by FROM prod_bind_request
@@ -117,7 +118,16 @@ export async function selfStatus(xell) {
     task: task ? { id: task.id, status: task.status, done: task.status === 'done' } : null,
     awaiting_done: xell.status === 'awaiting-done',
     landing: land
-      ? { status: land.status, new_sha: land.new_sha, decided_by: land.decided_by, pending: land.status === 'pending' }
+      ? { status: land.status, new_sha: land.new_sha, decided_by: land.decided_by, pending: land.status === 'pending',
+          // A zee's own retraction (`zee land --withdraw`) — terminal, and NOT a human decision.
+          withdrawn: land.status === 'withdrawn',
+          // How many landings this xell still has in front of a human. >1 is land-request spam: only
+          // the zee knows which one it still means, so it is the zee that must withdraw the rest.
+          open: openLandings.length,
+          ...(openLandings.length > 1
+            ? { note: `${openLandings.length} OPEN land requests from this xell — withdraw the ones you no longer `
+                + 'mean (`zee land --withdraw`) so a human is asked ONE question.' }
+            : {}) }
       : null,
     ship: ship
       ? { status: ship.status, commit: ship.commit, decided_by: ship.decided_by,
@@ -285,13 +295,26 @@ export async function selfLand(xell) {
   const request = await landStatus(xell.id);
   const trulyHeld = request && request.status === 'pending' && request.new_sha === push.head;
   if (trulyHeld) {
+    // DID THIS PUSH LEAVE AN OLDER ASK BEHIND? A second sha raises a second card, and only the zee
+    // knows which one it still means — that is land-request spam, and it is the zee's to clean up.
+    // We do NOT silently close the old ones: a human may already be reading one, and a queenzee that
+    // quietly retracts asks on a zee's behalf teaches nobody anything. We name them and hand back the
+    // one command that lowers them.
+    const stale = (await openLandRequests(xell.id)).filter((r) => r.id !== request.id);
     return {
       ok: true, status: 'held', landed: false, collected, catch_up: caughtUp, healed, request,
+      superseded: stale.map((r) => ({ id: r.id, new_sha: r.new_sha, status: r.status, requested_at: r.requested_at })),
       message: `Landing REQUESTED — your push is HELD at the gate for a human to approve in the ZEEHIVE console `
         + `(land_request ${String(request.id).slice(0, 8)}, sha ${String(push.head).slice(0, 8)})${caughtNote}. Your commits `
         + 'are safe on your branch; nothing lands until a human agrees. You do NOT need to re-run land: when a human '
         + 'approves, the queenzee lands it AND nudges you to continue. To block meanwhile, `zee land --wait` (or '
-        + '`zee status --wait`) in the background — its exit is your nudge.',
+        + '`zee status --wait`) in the background — its exit is your nudge.'
+        + (stale.length
+          ? ` ⚠ You now have ${stale.length + 1} OPEN landing(s) for this xell — ${stale.length} of them older `
+            + `(${stale.map((r) => String(r.new_sha).slice(0, 8)).join(', ')}). A human sees one card each and cannot `
+            + 'tell which one you still mean. Do not stack them up: `zee land --withdraw --reason "…"` un-asks your '
+            + 'open landings, so the order is WITHDRAW first, then `zee land` again for one fresh card.'
+          : ''),
     };
   }
 
@@ -308,6 +331,75 @@ export async function selfLand(xell) {
           + `not a fresh pending hold for ${String(push.head).slice(0, 8)}. Check the ZEEHIVE console — this is NOT a clean held landing.`)
       : 'Push did not land and NO land_request was raised — the gate held nothing (a non-fast-forward the catch-up '
         + 'did not resolve, or the gate is unreachable). This is a real failure, not a held landing.',
+  };
+}
+
+// ── POST /api/xell/self/land/withdraw — UN-ASK a held landing ────────────────────────────────────
+// The zee's own retraction, and the missing symmetry: `zee tend --clear`, `zee hint-land --clear`
+// and `zee done --clear` all let a zee lower an ask it raised — a LAND REQUEST had no such exit, so
+// a zee that changed its mind (it found a bug in what it pushed, the work turned out half-finished,
+// it was handed more scope) could only push again and leave a second card behind. Two held landings
+// from one xell, one of them obsolete, and only the zee knowing which.
+//
+// It withdraws THIS xell's pending land requests — normally exactly one; more than one is precisely
+// the mess this verb exists to clear. `{ request: <id> }` targets a single one (and it must belong
+// to this xell — a zee can only ever un-ask its own). Nothing is pushed, nothing is reverted: the
+// commits stay on the branch, and `zee land` re-asks with one fresh card whenever the zee is ready.
+//
+// APPROVED requests are NOT withdrawn. A human decided that one and the queenzee is acting on it;
+// pulling it back is not an agent's call — the answer to "it must not land after all" is `zee tend`.
+export async function selfWithdrawLand(xell, { reason = null, request = null } = {}) {
+  const open = await openLandRequests(xell.id);
+  const pending = open.filter((r) => r.status === 'pending');
+  const approved = open.filter((r) => r.status === 'approved');
+
+  const targets = request ? pending.filter((r) => r.id === request) : pending;
+  if (request && !targets.length) {
+    const mine = open.some((r) => r.id === request);
+    return { ok: false, status: 'not-found', withdrawn: [],
+      error: mine ? `land_request ${String(request).slice(0, 8)} is not pending` : 'no such pending land request for this xell',
+      message: mine
+        ? 'That landing is already APPROVED — a human decided it and the queenzee is landing it. If it must NOT land, '
+          + '`zee tend --reason "…"` and say so; you cannot withdraw a decision.'
+        : 'You can only withdraw a landing YOUR xell raised, and only while it is still pending.' };
+  }
+
+  if (!targets.length) {
+    const latest = await landStatus(xell.id);
+    return {
+      ok: true, status: 'nothing-to-withdraw', withdrawn: [],
+      request: latest || null,
+      approved: approved.map((r) => ({ id: r.id, new_sha: r.new_sha })),
+      message: approved.length
+        ? `Nothing pending to withdraw — your landing (${String(approved[0].new_sha).slice(0, 8)}) is already APPROVED and `
+          + 'the queenzee is landing it. A decision is not yours to retract; if it must not land, `zee tend` a human now.'
+        : latest
+          ? `Nothing to withdraw — your latest land request is '${latest.status}'`
+            + `${latest.new_sha ? ` (${String(latest.new_sha).slice(0, 8)})` : ''}, not pending.`
+          : 'Nothing to withdraw — this xell has never raised a land request.',
+    };
+  }
+
+  const done = [];
+  for (const r of targets) {
+    const row = await withdrawLandRequest(r.id, `zee@${xell.slug}`, reason).catch((e) => ({ error: e.message, id: r.id }));
+    done.push(row.error ? { id: r.id, error: row.error } : { id: row.id, new_sha: row.new_sha, status: row.status });
+  }
+  const okCount = done.filter((d) => !d.error).length;
+  // A land HINT is the same claim one notch quieter ("this looks land-ready — a human should
+  // decide"). Un-asking the landing while leaving the hint up would light the land? button for work
+  // the zee just said it does not want landed, so the retraction lowers both. Best-effort.
+  const hadHint = await hintOpen(xell.id, 'land').catch(() => false);
+  if (okCount && hadHint) await setHint(xell.id, 'land', false, { reason: reason || 'landing withdrawn' }).catch(() => {});
+  logline('self', `${xell.slug} withdrew ${okCount} land request(s)${reason ? ` — ${String(reason).slice(0, 120)}` : ''}`);
+  broadcast('xell', { id: xell.id });
+  return {
+    ok: okCount > 0, status: okCount ? 'withdrawn' : 'error', withdrawn: done,
+    message: `WITHDRAWN ${okCount} held landing(s) — ${done.filter((d) => !d.error).map((d) => String(d.new_sha).slice(0, 8)).join(', ') || 'none'}. `
+      + 'The card is off the human\'s screen and nothing was decided, landed or reverted: your commits are still on your '
+      + 'branch exactly as they were. When the work really is ready, `zee land` raises ONE fresh request.'
+      + (hadHint ? ' Your land? hint was lowered with it.' : '')
+      + (approved.length ? ` (Note: ${approved.length} APPROVED landing(s) were left alone — a decision is not yours to retract.)` : ''),
   };
 }
 

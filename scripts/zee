@@ -8,7 +8,7 @@
 //   zee working [--note "what you are doing"]
 //   zee tend --reason "why you need a human"   |   zee tend --clear      (the reason is required: it is what the console shows)
 //   zee sync [--no-rebuild]
-//   zee land [--wait]
+//   zee land [--wait]   |   zee land --withdraw [--reason "…"]   (un-ask a held landing)
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
 //   zee done --summary "what you finished"   |   zee done --clear   (withdraw the proposal)
@@ -65,6 +65,7 @@ async function pollLanding(secs) {
     if (land.status === 'landed') { console.error(`\n  ✓ LANDED on main${land.new_sha ? ` @ ${String(land.new_sha).slice(0, 8)}` : ''}.\n`); process.exit(0); }
     if (land.status === 'rejected') { console.error('\n  ✗ REJECTED by a human — re-pushing this sha will not help; talk to them.\n'); process.exit(1); }
     if (land.status === 'stale') { console.error('\n  ✗ STALE — main moved past this sha; make a fresh commit and `zee land` again.\n'); process.exit(1); }
+    if (land.status === 'withdrawn') { console.error('\n  ✗ WITHDRAWN — this landing was un-asked (by you, or by a human on your behalf); nothing is waiting on anyone.\n'); process.exit(1); }
     // 'pending' / 'approved' → keep waiting (an approval lands automatically).
   }
   console.error(`\n  ✗ TIMEOUT after ${secs}s — still waiting on a human. Your work is safe on your branch.\n`);
@@ -163,6 +164,7 @@ function usage() {
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
+  zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
@@ -204,12 +206,22 @@ switch (cmd) {
     const land = r.json?.landing;
     // Nothing pending to wait on → answer now (landed=0, decided-otherwise=1, no landing=0).
     if (!land || !['pending', 'approved'].includes(land.status)) {
-      process.exit(land && land.status !== 'landed' ? (['rejected', 'stale'].includes(land.status) ? 1 : 0) : 0);
+      process.exit(land && land.status !== 'landed' ? (['rejected', 'stale', 'withdrawn'].includes(land.status) ? 1 : 0) : 0);
     }
     await pollLanding(w.secs); // exits
     break;
   }
   case 'land': {
+    // --withdraw (--clear is the same thing, for symmetry with tend/hint/done) UN-ASKS your held
+    // landing instead of raising one: the card leaves the human's screen, nothing lands, nothing is
+    // rejected and your commits are untouched. Use it BEFORE landing again — a second push while the
+    // first is still held leaves two cards for one job and only you know which one you still mean.
+    if (rest.includes('--withdraw') || rest.includes('--clear')) {
+      const r = await req('POST', '/api/xell/self/land/withdraw', {
+        reason: flag('reason') || null, request: flag('request') || null });
+      console.log(JSON.stringify(r.json, null, 2));
+      process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    }
     const r = await req('POST', '/api/xell/self/land', {});
     console.log(JSON.stringify(r.json, null, 2));
     const w = waitFlag();
