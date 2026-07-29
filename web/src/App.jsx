@@ -5,6 +5,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
          extractXellEnv, attachXellDevice, detachXellDevice } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
+import XellEnvironment from './XellEnvironment.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import { showDiff } from './DiffViewer.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
@@ -181,6 +182,7 @@ export default function App() {
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
+  const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
@@ -530,13 +532,12 @@ export default function App() {
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
     if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
-    if (kind === 'env') {                                    // extract this xell's CURRENT environment
-      try {
-        const r = await extractXellEnv(x.id);
-        await showAlert(
-          <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
-          { title: `${x.slug} — current environment${r.source === 'zeehive-env' ? ' (.zeehive.env on disk)' : r.environment ? ` (resolved: ${r.environment})` : ''}` });
-      } catch (e) { showAlert('Extract failed: ' + (e?.message || e), { variant: 'error' }); }
+    if (kind === 'env') {
+      // Opens the ENVIRONMENT panel (ticket #20): which environment this xell resolved to and why,
+      // its var names, and the pin/clear. The raw .zeehive.env dump this used to show is still one
+      // click away inside it — but the file alone could not answer "why is it unchanged?", which is
+      // the question that actually gets asked.
+      setEnvXell(x);
       return;
     }
     if (kind === 'build') {
@@ -639,6 +640,9 @@ export default function App() {
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
                        xellId={termXell.id} onClose={() => setTermXell(null)} />
+        )}
+        {envXell && (
+          <XellEnvironment xell={envXell} onClose={() => setEnvXell(null)} onChanged={refresh} />
         )}
         {msgXell && (
           <MessageComposer xell={msgXell} initialText={msgXell.initialText || ''} onClose={() => setMsgXell(null)}
@@ -1035,7 +1039,7 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 // (The old DOM FlowerToolbar was removed: its build/pull/push/PR/mark-done buttons are now drawn
 // directly on the flower by HiveCanvas and hit-tested there — see handleFlowerAction above.)
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines, onEnv }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const [termOpen, setTermOpen] = useState(false);
@@ -1087,30 +1091,33 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             ⌂ {machine ? machine.key : stackCtx}
           </span>
         )}
-        {x.env_key && (
-          <span className={`envchip env-${x.env_tier}${Number(x.env_var_count) === 0 ? ' env-empty' : ''}`
+        {/* WHICH ENVIRONMENT THIS XELL GETS. It renders even when NOTHING resolves (ticket #20):
+            an absent environment used to be an absent chip, which reads as "fine" — and the whole
+            trap here is that "empty" and "absent" and "healthy" all look alike from the outside.
+            Three states, three faces: ∅ = resolved but 0 vars, ·N = resolved with N, and "no env" =
+            nothing resolves at all. Clicking opens the panel that can PIN or CLEAR one. */}
+        {(x.env_key || !x.is_production) && (
+          <span className={`envchip env-${x.env_tier || 'none'}${x.env_key && Number(x.env_var_count) === 0 ? ' env-empty' : ''}`
+                  + (!x.env_key ? ' env-absent' : '')
                   /* the .zeehive.env PROJECTION failed (078) — the file on disk is not what the
                      meta-DB says it should be, and no log line survives long enough to say so */
                   + (x.env_projection_error ? ' env-broken' : '')}
                 data-testid="env-chip"
-                title={`Environment: ${x.env_key} (${x.env_tier})`
-                  + (x.env_pinned ? ' — pinned to this xell' : ` — default for ${x.env_tier} xells`)
-                  + `\n${x.env_var_count} var(s) from the meta-DB`
-                  + (Number(x.env_var_count) === 0 ? ' (empty → nothing added to .zeehive.env; xell runs as before)' : '')
+                title={(x.env_key
+                  ? `Environment: ${x.env_key} (${x.env_tier})`
+                    + (x.env_pinned ? ' — pinned to this xell' : ` — default for ${x.env_tier} xells`)
+                    + `\n${x.env_var_count} var(s) from the meta-DB`
+                    + (Number(x.env_var_count) === 0 ? ' (empty → nothing added to .zeehive.env; xell runs as before)' : '')
+                  : 'NO environment resolves for this xell — nothing from the meta-DB is projected into its'
+                    + ' .zeehive.env (its ports and DATABASE_URL still are; the queenzee owns those)')
                   + (x.env_projection_error
                     ? `\n\n⚠ .zeehive.env is NOT in sync with the meta-DB — the last projection failed:\n${x.env_projection_error}`
                     : '')
-                  + `\n\nClick to extract this xell's current .env`}
-                onClick={async (e) => {
-                  e.stopPropagation();
-                  try {
-                    const r = await extractXellEnv(x.id);
-                    await showAlert(
-                      <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
-                      { title: `${x.slug} — current environment${r.source === 'zeehive-env' ? ' (.zeehive.env)' : r.environment ? ` (resolved: ${r.environment})` : ''}` });
-                  } catch (err) { showAlert('Extract failed: ' + (err?.message || err), { variant: 'error' }); }
-                }}>
-            ❖ {x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}{x.env_projection_error ? ' ⚠' : ''}
+                  + '\n\nClick to see it, pin one, or clear the pin'}
+                onClick={(e) => { e.stopPropagation(); onEnv?.(x); }}>
+            ❖ {x.env_key
+              ? <>{x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}</>
+              : 'no env'}{x.env_projection_error ? ' ⚠' : ''}
           </span>
         )}
         <span className="cardtop-right">
