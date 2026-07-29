@@ -846,9 +846,12 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
   // dance that a text field needs would only make it possible to lose the body you were typing.
   const toggle = (key, want) => {
     const next = want ? [...on, key] : [...on].filter((k) => k !== key);
+    // The last one off is refused rather than saved: the server's CHECK would reject it anyway, and a
+    // doc that generates no file is text an operator wrote that reaches nobody. Say which action they
+    // actually want instead.
     if (!next.length) {
-      return showConfirm('Turn off the last provider?\n\nA doc that generates no file reaches nobody. '
-        + 'Delete it instead, or leave one provider on.').then(() => {});
+      return showAlert('This is the last provider.\n\nA doc that generates no file reaches nobody — '
+        + 'untick "enabled" to stop it being written, or delete it.');
     }
     return run(() => updateProjectDoc(doc.id, { targets: next, rel_path: null, body }));
   };

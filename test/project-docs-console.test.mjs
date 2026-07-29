@@ -50,6 +50,15 @@ for (const m of docsSection.match(/<code>[^<]+<\/code>/g) || []) {
      `the example ${p} is a path the registry really knows`);
 }
 
+// A dialog helper called but not imported is a module-scope free identifier: vite builds it happily
+// and it throws ReferenceError the first time an operator clicks. That has bitten this console twice
+// (see app-dialog-imports.test.mjs), and the provider checklist added another call site.
+const dlg = jsx.match(/import\s*\{([^}]*)\}\s*from\s*['"]\.\/Dialog\.jsx['"]/);
+const imported = new Set((dlg ? dlg[1] : '').split(',').map((s) => s.trim()));
+for (const name of new Set([...jsx.matchAll(/\b(show(?:Alert|Confirm|Prompt))\s*\(/g)].map((m) => m[1]))) {
+  ok(imported.has(name), `ProjectSetup.jsx imports ${name} before calling it`);
+}
+
 // ── 2. RENDER IT. What does an operator see? ────────────────────────────────────────────────────
 console.log('\n── the rendered surface ──');
 const React = (await import('react')).default;
@@ -71,7 +80,7 @@ writeFileSync(tmp, transformSync(jsx, { loader: 'jsx', format: 'esm' }).code
        + 'adoptDiscovered=async()=>({}),purgeProject=async()=>({}),deleteProject=async()=>({}),'
        + 'getProjectPool=async()=>({}),setProjectPool=async()=>{},getHarnesses=async()=>[],'
        + 'browseFs=async()=>({}),getProjects=async()=>[];',
-    Dialog: 'const showConfirm=async()=>true,showPrompt=async()=>null;',
+    Dialog: 'const showConfirm=async()=>true,showAlert=async()=>{},showPrompt=async()=>null;',
     DiffViewer: 'const showDiff=()=>{};',
   }[mod] || '')));
 let ProjectDocEditor, ProjectDocsSection;
