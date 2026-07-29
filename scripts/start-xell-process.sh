@@ -31,10 +31,24 @@ if [ ! -d "$WT" ]; then emit false "no-worktree"; exit 1; fi
 # dirty worktree and decommissions the xell right after its first build — an endless
 # provision→build→reap loop (seen live on the boot instance, 2026-07-20). ci never touches
 # the lock; plain install remains the fallback for a worktree without one.
+#
+# 2026-07-29 (ticket #14): that rule was stated in this comment and NOT enforced by the code below
+# it. `[ -f lock ] && npm ci || npm install` runs the `||` branch when EITHER test fails — including
+# when `npm ci` itself fails. So a worktree WITH a lockfile that had drifted still ran `npm install`,
+# rewrote the lock, and re-armed the exact loop this comment warns about. Spelled out as if/else so
+# the failure is loud instead of papered over: a `ci` that cannot run is a repo state someone must
+# fix deliberately, and this script's job is to say so, not to mutate the tree until it installs.
 if [ ! -d "$WT/node_modules" ]; then
-  echo "node_modules missing — npm ci (first start of this worktree)" >&2
-  (cd "$WT" && { [ -f package-lock.json ] && npm ci --no-audit --no-fund || npm install --no-audit --no-fund; }) >&2 \
-    || { emit false "npm-install-failed"; exit 1; }
+  if [ -f "$WT/package-lock.json" ]; then
+    echo "node_modules missing — npm ci (first start of this worktree)" >&2
+    (cd "$WT" && npm ci --no-audit --no-fund) >&2 \
+      || { echo "npm ci FAILED — package-lock.json disagrees with package.json. NOT falling back to 'npm install': that would rewrite the lock in a worktree the pool watches." >&2
+           emit false "npm-ci-failed"; exit 1; }
+  else
+    echo "node_modules missing and NO package-lock.json — npm install (there is no lock to rewrite)" >&2
+    (cd "$WT" && npm install --no-audit --no-fund) >&2 \
+      || { emit false "npm-install-failed"; exit 1; }
+  fi
 fi
 
 # Kill whatever already listens on this role's port (restart semantics), then start detached.

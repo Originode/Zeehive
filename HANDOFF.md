@@ -464,6 +464,27 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
   ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
   rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
+- **The warm never rewrites the lockfile a zee then lands** (2026-07-29, ticket #14 — found while
+  building the cache above). `warmCxell()` ran `npm ci … || npm install …` UNCONDITIONALLY, in
+  `/work/repo` — the tree the zee lands from. `npm install` rewrites package-lock.json, so any lock
+  drift at dispatch handed the zee a dirty tree before it had done anything, and from there into an
+  accidental lockfile change in somebody's landing, attributed to a zee that never touched
+  dependencies. Now: `npm ci` with NO fallback when a lockfile exists (a failing `ci` in a fresh cage
+  IS the signal), the lockfile-less branch kept because `npm install` there CREATES the missing file
+  rather than rewriting a committed one, a lock-drift failure named as such in the log, and a
+  post-warm `git status package-lock.json` check that shouts if anything ever dirties it again.
+  The warm stays best-effort — a failed warm still never fails a dispatch.
+  **The same bug was live on the HOST side, hidden in a shell idiom**: `scripts/start-xell-process.sh`
+  carried the ci-not-install rule as a COMMENT while its code read
+  `[ -f lock ] && npm ci || npm install` — the `||` branch runs when EITHER part fails, including a
+  failing `npm ci`, so a drifted worktree still ran install and re-armed the provision→build→reap
+  loop that comment warns about. Spelled out as if/else; a `ci` that cannot run now emits
+  `npm-ci-failed` instead of mutating the tree until it installs.
+  Test: `node test/warm-never-rewrites-lock.test.mjs` — it RUNS both scripts against real npm (no
+  daemon needed: the scripts are the behaviour, `docker exec` only carries them), reproduces the old
+  idiom rewriting the lock, and proves the new one leaves it byte-identical. It also sweeps every
+  remaining `npm install` in server/ and scripts/ against an allowlist with reasons, so a new
+  unguarded one fails there.
 - **ONE npm cache for the fleet, and a pooled xell warms itself** (2026-07-29, ticket #7 — "give
   provisioned xells the usual stuff needed such as pg driver so they dont have to install it every
   time"). Nothing was broken: `warmCxell()` already ran `npm ci` in a cage and

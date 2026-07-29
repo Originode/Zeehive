@@ -693,21 +693,65 @@ export async function sealCxell({ ctx, name, blockTcp = [] }) {
 // drives it over docker exec, so it costs zero agent tokens. Runs with egress fully open (before
 // the prod-db block is applied). Best-effort: a slow/failed warm must NOT fail the dispatch — the
 // zee can still install what it needs.
+// The warm's install step, as a shell script — pure, so what runs in a cage is assertable without
+// a daemon (ticket #14).
+//
+// `npm ci` NEVER falls back to `npm install` on a worktree that HAS a lockfile. That fallback used
+// to be unconditional, and it runs in /work/repo — the tree the zee lands from. `npm install`
+// rewrites package-lock.json, so any lock drift at dispatch handed the zee a dirty tree before it
+// had done anything, and from there into an accidental lockfile change in somebody's landing,
+// attributed to a zee that never touched dependencies. This repo already paid for that exact
+// mechanism once on the HOST side (start-xell-process.sh: install rewrote the lock, the pool read
+// the worktree as dirty and reaped the xell — a live provision→build→reap loop).
+//
+// So a failing `ci` in a fresh cage is now the SIGNAL, not something to paper over: the warm fails,
+// says why, and the tree is left exactly as the clone left it. A worktree with genuinely NO lockfile
+// still installs — `npm ci` requires one, and there is no lock to damage.
+export function warmInstallScript(repoDir = '/work/repo') {
+  return `cd ${repoDir} && echo "npm cache: $(npm config get cache)" && `
+    + 'if [ -f package-lock.json ]; then '
+    // no `|| npm install` — see above. The marker lets the caller tell lock drift from a network
+    // failure without parsing npm's prose twice.
+    + 'npm ci --no-audit --no-fund || { echo "WARM_CI_FAILED"; exit 1; }; '
+    + 'else echo "no package-lock.json — npm install (nothing to rewrite)"; '
+    + 'npm install --no-audit --no-fund || { echo "WARM_INSTALL_FAILED"; exit 1; }; fi && '
+    + '(npm run build --workspace web >/dev/null 2>&1 || true) && '
+    // Prove the tree is as clean as we found it. Nothing above should touch the lockfile; if that
+    // ever changes, this is what says so instead of a zee discovering it in `git status`.
+    + 'if [ -n "$(git status --porcelain package-lock.json 2>/dev/null)" ]; then echo WARM_LOCK_DIRTY; fi && '
+    + 'echo WARM_OK';
+}
+
 export async function warmCxell({ ctx, name }) {
   try {
     // `npm ci` here reads the SHARED cache volume mounted by ensureCxell, so this is an unpack from
     // local content-addressed storage rather than a registry download — the same work, without the
     // network. It reports the cache it used so a slow warm can be told apart from a cold cache.
-    const r = await dk(ctx, ['exec', name, 'bash', '-lc',
-      'cd /work/repo && echo "npm cache: $(npm config get cache)" '
-      + '&& (npm ci --no-audit --no-fund || npm install --no-audit --no-fund) '
-      + '&& (npm run build --workspace web >/dev/null 2>&1 || true) && echo WARM_OK'],
-      { timeoutMs: 900000 });
+    const r = await dk(ctx, ['exec', name, 'bash', '-lc', warmInstallScript()], { timeoutMs: 900000 });
     const shared = new RegExp(`npm cache: ${CXELL_NPM_CACHE_DIR}`).test(r.out);
-    return { warmed: /WARM_OK/.test(r.out), sharedCache: shared };
+    const lockDirty = /WARM_LOCK_DIRTY/.test(r.out);
+    if (lockDirty) {
+      // Should be unreachable now that nothing in the warm writes the lock. Loud anyway: a dirty
+      // lockfile at dispatch is a change the zee did not make and would land without noticing.
+      logline('cxell', `${name}: !!! the warm left package-lock.json MODIFIED — the zee starts on a dirty tree it did not dirty; `
+        + 'do not let it land that file without deciding to');
+    }
+    return { warmed: /WARM_OK/.test(r.out), sharedCache: shared, lockDirty };
   } catch (e) {
-    logline('cxell', `${name}: warm (npm/build) incomplete — the zee will install as needed: ${String(e.message).slice(0, 160)}`);
-    return { warmed: false, error: e.message };
+    // A failed `npm ci` arrives here (dk rejects on a non-zero exit). Say WHICH failure it was:
+    // lock drift is a repo problem a human or the zee must fix deliberately, and it reads nothing
+    // like a registry timeout.
+    const out = `${e.message || ''}`;
+    const drift = /WARM_CI_FAILED/.test(out)
+      && /can only install packages when your package\.json and package-lock\.json|EUSAGE|Missing:|Invalid: lock/i.test(out);
+    if (drift) {
+      logline('cxell', `${name}: warm FAILED — package-lock.json disagrees with package.json at this commit, so \`npm ci\` `
+        + 'cannot run. The lockfile was NOT rewritten (that used to happen silently and land in the zee\'s branch). '
+        + 'The zee starts without node_modules; fixing the lock is a deliberate commit, not a side effect.');
+    } else {
+      logline('cxell', `${name}: warm (npm/build) incomplete — the zee will install as needed: ${String(e.message).slice(0, 160)}`);
+    }
+    return { warmed: false, error: e.message, lockDrift: drift };
   }
 }
 
