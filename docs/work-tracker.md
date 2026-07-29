@@ -1,6 +1,7 @@
 # The work tracker — tickets + a work-item hierarchy
 
-**Status:** part 1 of 4 (schema + REST API, server only). Migration `058_work_tracker.sql`,
+**Status:** part 1 of 4 (schema + REST API, server only). Migrations `058_work_tracker.sql`
+and `060_work_item_schedule_sanity.sql`,
 `server/src/lib/work-status.js`, `server/src/lib/work-items.js`, `server/src/lib/tickets.js`,
 routes in `server/src/api/routes.js`, test `test/work-tracker.test.mjs`.
 Parts 2–4 hang zee-assignment and the console (kanban + gantt) off exactly this contract.
@@ -160,6 +161,12 @@ work_item_dep(work_item_id, depends_on_id, created_at)         -- finish→start
 work_item_event(id, work_item_id, ts, kind, from_status, to_status, actor, detail jsonb)
 task.work_item_id                                              -- added for part 2
 ```
+
+Migration **060** adds one constraint to the above: `work_item_dates_ordered` — `due_on` may
+not precede `starts_on` (see "The schedule invariant" below). It repairs any already-inverted row
+by **clearing `due_on`** rather than swapping the pair or pinning it to `starts_on`: an inverted
+pair means one of the two dates is wrong and we cannot know which, so "no end date" is the only
+thing actually true about such a row.
 
 Enums: `work_status` (above), `work_item_kind` (`project|activity|task`),
 `ticket_kind` (`bug|feature|chore|question|incident`).
@@ -327,14 +334,16 @@ table above.
 ### `GET /api/gantt?project=&root=`
 
 ```
-{ root, project_id, unscheduled_count, rows: [ { id, parent_id, depth, kind, title, status,
-  starts_on, due_on, computed_start, computed_end, progress, rolled_progress, estimate_hours,
-  assignee, xell_id, unscheduled, deps: [id…] } ] }
+{ root, project_id, unscheduled_count,
+  span: { start, end, days } | null,
+  rows: [ { id, parent_id, depth, kind, title, status, status_label,
+            starts_on, due_on, computed_start, computed_end, span_days,
+            progress, rolled_progress, estimate_hours, assignee, xell_id,
+            unscheduled, deps: [id…] } ] }
 ```
 
-Rows in **tree order** (depth-first by `sort_order`). Roll-ups:
-
-Rows include the root (see the root-inclusion table). Roll-ups:
+Rows in **tree order** (depth-first by `sort_order`), and they **include the root** (see the
+root-inclusion table). Roll-ups:
 
 - `computed_start` / `computed_end` — a parent **with no explicit dates** spans
   `min(children start) … max(children end)`. A parent **with** its own dates keeps them: someone
@@ -350,6 +359,37 @@ Rows include the root (see the root-inclusion table). Roll-ups:
 - `unscheduled: true` — no dates anywhere in the subtree. Those rows come back with **nulls** and
   the flag, and `unscheduled_count` totals them. The UI **lists** them; it does not invent dates,
   because an invented date is indistinguishable from a real one the moment it is on screen.
+- `span_days` (per row) and `span: {start, end, days}` (per model) — how wide the bar is, and how
+  wide the whole chart is, in **whole inclusive days** (a task starting and ending the same day is
+  `1`, not `0`). `null` when the row is unscheduled, and `span` is `null` when nothing is scheduled
+  at all.
+
+### The schedule invariant, and the span that is *not* one
+
+**`due_on` may never precede `starts_on`.** It is a `CHECK` constraint (`work_item_dates_ordered`,
+migration 060) *and* a lib-level refusal, so a caller gets a sentence —
+
+> `"scheduled thing": due_on 2026-08-01 is before starts_on 2026-08-10 — a work item may not finish
+> before it starts. Give due_on on or after starts_on, or leave it empty for "no end yet".`
+
+— rather than `new row for relation "work_item" violates check constraint …`. A **400**, not a 409:
+it is bad input, not a conflict with the state of the tree. Patching **one** date is validated
+against the **stored** other, which is the half that used to slip through. Still legal: equal dates
+(a real one-day task), and either end missing.
+
+Why it is an invariant and not a UI concern: a chart cannot draw a negative bar, so it renders a
+stub — **visually identical to a legitimate one-day task**. The schedule was wrong and the picture
+looked right, which is the worst pair of properties a read model can have.
+
+**Nothing bounds how far apart the two dates may be**, and that is deliberate. `0001-01-01` →
+`9999-12-31` is legal, ordered, and absurd: 2,958,099 days. The gantt returns it **faithfully** and
+**states `span_days`**. It does not clamp, because truncating a stored date would invent a date, in
+exactly the way inventing a start for an unscheduled row would — and because how much window to show
+is the renderer's decision, not the server's. The number is there so a client can clamp *knowingly*,
+and say that it clamped, instead of discovering the scale by trying to draw it.
+
+(Dates are emitted with a **4-digit-padded year**. `0001-01-01` used to come back as `1-01-01`,
+which is not ISO 8601 and gives `NaN` or a silently different day depending on the runtime.)
 
 ## The endpoints
 

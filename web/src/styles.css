@@ -1878,3 +1878,19 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   font-size: 10.5px; letter-spacing: .06em; border-bottom: 1px solid var(--line); padding: 5px 6px; }
 .work-gtable td { border-bottom: 1px solid var(--panel2); padding: 4px 6px; color: var(--text); }
 .work-gtable td.gt-title { color: var(--text); }
+
+/* ── who is on an item: assign / deploy (the zee seam in the drawer) ─────────
+   Deliberately the loudest control in the drawer: "deploy a worker" starts a real agent, so it
+   carries production's orange the way the "+ manager zee" button does — an outline, not a fill,
+   because it is an action you should read before you click. "was: <slug>" is the opposite: a
+   footnote in muted grey, because a reaped xell is history, not a live fact. */
+.work-zeeslot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.work-mini.hot { color: var(--prod, #f0913b); border-color: var(--prod, #f0913b); }
+.work-mini.hot:hover:not(:disabled) { background: rgba(240,145,59,.14); color: var(--prod, #f0913b); }
+.work-was { color: var(--unknown); font-size: 11px; font-style: italic; }
+.work-cands { display: flex; flex-direction: column; gap: 3px; width: 100%; }
+.work-cand { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; width: 100%;
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; color: var(--text);
+  text-align: left; padding: 4px 8px; font-size: 12px; cursor: pointer; }
+.work-cand:hover:not(:disabled) { border-color: var(--accent); }
+.work-cand small { color: var(--muted); font-size: 11px; }

@@ -3,7 +3,8 @@ import { showConfirm } from '../Dialog.jsx';
 import {
   addDep, createWorkItem, deleteWorkItem, getWorkItem, listWorkItems, patchWorkItem, removeDep,
 } from './workApi.js';
-import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, ZeeChip, legalNext, statusLabel, toInputDate } from './bits.jsx';
+import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, legalNext, statusLabel, toInputDate } from './bits.jsx';
+import DeployZee from './DeployZee.jsx';
 
 // WORK TRACKER — the ITEM DRAWER: everything about one work item, and every edit you can make to it.
 //
@@ -207,7 +208,8 @@ export default function WorkItemDrawer({ itemId, projectId, statuses, onClose, o
                 status, ticket_id), `data.zee`, and `onChanged`/`load` to refresh the drawer and
                 the board after a deploy. Nothing else in this file needs to move. */}
             <Field label="zee">
-              {data?.zee ? <ZeeChip zee={data.zee} /> : <span className="work-muted">— nobody on it —</span>}
+              <DeployZee item={item} zee={data?.zee} events={events} busy={busy}
+                         onDone={() => { load(); onChanged?.(); }} onError={setErr} />
             </Field>
             {data?.ticket && (
               <Field label="ticket">

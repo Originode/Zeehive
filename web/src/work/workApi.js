@@ -101,3 +101,17 @@ export const removeDep = (id, depId) =>
 export const getBoard = (projectId, rootId) => call(`/api/board${pq({ project: projectId, root: rootId })}`);
 // gantt: tree-ordered rows with computed dates. Part 4 renders it; Gantt.jsx is a placeholder today.
 export const getGantt = (projectId, rootId) => call(`/api/gantt${pq({ project: projectId, root: rootId })}`);
+
+// ── who is ON an item: assign an existing xell, or deploy a new worker (part 3's verbs) ──────
+// These three are a different WEIGHT to everything above. `candidates` is a read model built for a
+// picker — only the xells the server would accept, each with a `why` line — so the console never
+// has to offer a uuid box or guess which xells are eligible. `assign`/`unassign` bind and unbind an
+// existing xell. `deploy` SPAWNS A REAL ZEE, which is why the UI in DeployZee.jsx confirms it in
+// plain words first; the client stays thin either way, and a refusal comes back as the same 409
+// sentence every other verb here throws.
+export const getAssignCandidates = (id) => call(`/api/work-items/${encodeURIComponent(id)}/candidates`);
+export const assignWorkItem = (id, xellId) => send(`/api/work-items/${encodeURIComponent(id)}/assign`, 'POST', { xell_id: xellId });
+export const unassignWorkItem = (id) => call(`/api/work-items/${encodeURIComponent(id)}/assign`, { method: 'DELETE' });
+// { task?, model?, mode?, harness? } — every field optional; the server holds the defaults, so an
+// omitted model is the server's choice and not a stale copy of one made in the browser.
+export const deployWorkItem = (id, opts = {}) => send(`/api/work-items/${encodeURIComponent(id)}/deploy`, 'POST', opts);
