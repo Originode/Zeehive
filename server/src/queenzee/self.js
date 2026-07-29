@@ -1130,6 +1130,71 @@ async function branchHandover(target, mainBranch = 'main') {
   return { lines, diff, log };
 }
 
+// THE HANDOVER — the whole point of the swap, and the reason it is not a plain re-dispatch.
+//
+// A fresh zee that re-reads the entire repo and re-does the previous phase is the failure mode this
+// feature exists to avoid, and a brief is the only thing that prevents it: the incoming zee must be
+// told, before it does anything, that the branch ALREADY CARRIES WORK, whose work it was, what that
+// zee was asked to do, what it last reported, and what is actually on the branch.
+//
+// Exported so it can be exercised directly (test/manager-swap.test.mjs): the brief is built long
+// before the spawn, and it is the artefact that decides whether a swap is cheap or wasteful, so it
+// deserves an assertion on its TEXT rather than on the fact that a function ran.
+export async function swapBrief({ manager, target, harness: h, task = null }) {
+  const prevTask = await one(`SELECT prompt_text FROM task WHERE xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [target.id]);
+  const prevZee = await one(
+    `SELECT z.id, z.status, z.title, z.model, z.last_stop_reason, h.key AS harness_key, h.label AS harness_label
+       FROM zee z LEFT JOIN harness h ON h.id=$2 WHERE z.xell_id=$1 ORDER BY z.created_at DESC LIMIT 1`,
+    [target.id, target.harness_id]);
+  const lastReport = await one(
+    `SELECT body, created_at FROM zee_message WHERE from_xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [target.id]);
+  const item = await one(`SELECT id, title, status FROM work_item WHERE xell_id=$1 LIMIT 1`, [target.id]);
+  const project = await one(`SELECT main_branch FROM project WHERE id=$1`, [target.project_id]);
+  const branchInfo = await branchHandover(target, project?.main_branch || 'main');
+  const firstLines = (t, n) => String(t || '').split('\n').filter((l) => l.trim()).slice(0, n).join('\n');
+
+  const handover = [
+    '## YOU ARE INHERITING THIS XELL — it is not a fresh start',
+    '',
+    `Your manager swapped the previous zee out of \`${target.slug}\` and put YOU in, wearing the`,
+    `**${h.label || h.key}** harness. Everything the previous zee produced is still here: the same branch,`,
+    'the same commits, the same containers, the same database, the same card on the board. Nothing was',
+    'reset. **Read what is already on the branch before you write anything** — re-reading the whole repo',
+    'from scratch and re-doing the previous phase is exactly the waste this swap exists to avoid.',
+    '',
+    `- previous persona: ${prevZee?.harness_label || prevZee?.harness_key || target.harness_id || 'unknown'}`,
+    `- previous zee ended: ${prevZee?.status || 'unknown'}${prevZee?.last_stop_reason ? ` (${prevZee.last_stop_reason})` : ''}`,
+    '',
+    '### What the previous zee was asked to do',
+    '',
+    prevTask?.prompt_text ? firstLines(prevTask.prompt_text, 40) : '(no task on record for this xell)',
+    '',
+    '### The last thing it reported',
+    '',
+    lastReport?.body ? firstLines(lastReport.body, 25) : '(it reported nothing to its manager)',
+    '',
+    '### What is on the branch right now',
+    '',
+    ...branchInfo.lines,
+    '',
+    ...(item ? [`This xell is on work item "${item.title}" (${item.status}) — \`zee work\` reads it in full, `
+                + 'and `zee item --status … --note "…"` is how you report where the WORK has got to.', ''] : []),
+    'Start by orienting in what is here: `git log`, `git diff`, the files the commits above touched, and',
+    '`zee work` if there is a card. Then do YOUR part of the job. Your verbs are unchanged — you land',
+    'your own work (`zee land`, a human approves) and only a human marks this xell done.',
+  ].join('\n');
+
+  const brief = [
+    String(task || '').trim() || `Continue the work on \`${target.slug}\` in the role your harness describes.`,
+    '',
+    handover,
+    '',
+    managerBriefBlock(manager.slug, 'swapped you INTO this xell (it was already running work) and is watching it'),
+  ].join('\n');
+
+  return { brief, handover, item, prevZee, prevTask, lastReport, branch: branchInfo };
+}
+
 // POST /api/xell/self/swap — replace the ZEE working one of my crew xells (`zee swap`).
 //
 // The verb that lets a manager play a Scout, then a Builder, then a Reviewer over ONE piece of work.
@@ -1231,66 +1296,21 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
     // step could have saved. Proceed, and SAY SO in the answer rather than implying work was rescued.
     collected = { collected: false, reason: `the cxell is not running (${e.message})` };
   }
-  if (collected?.collected === false && running && /diverge|fast-forward/i.test(collected?.reason || '')) {
+  // The other way a running cage's work is unreachable: there is no host worktree to collect ONTO.
+  // The re-dispatch would clone from that same missing worktree, so this is a refusal too, not a
+  // warning. (A DIVERGED worktree throws instead, and is caught above — reconcileBundleIntoWorktree
+  // anchors the commits under refs/zeehive/stranded/<slug> before it does, so nothing is lost.)
+  if (running && collected?.collected === false && /no host worktree/i.test(collected?.reason || '')) {
     return { ok: false, status: 'refused', stage: 'collect', error:
-      `${target.slug}'s worktree has diverged from its cage (${collected.reason}), so its commits cannot `
-      + 'be collected — and a swap would recreate the cage from that worktree. Refused; nothing was '
-      + 'touched. This needs a human.' };
+      `${target.slug}'s cage is running but it has no host worktree on disk (${collected.reason}), so its `
+      + 'commits have nowhere to be collected to and the new cage would have nothing to clone from. '
+      + 'Refused; nothing was touched. This needs a human.' };
   }
   logline('crew', `${xell.slug} swapping ${target.slug} → harness ${h.key}: `
     + `commits ${collected?.collected ? `collected (HEAD ${String(collected.head).slice(0, 8)})` : `not collected (${collected?.reason || 'n/a'})`}`);
 
   // ── 5. The HANDOVER — what the incoming zee is told it walked into ───────────────────────────
-  const prevTask = await one(`SELECT prompt_text FROM task WHERE xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [target.id]);
-  const prevZee = await one(
-    `SELECT z.id, z.status, z.title, z.model, z.last_stop_reason, h.key AS harness_key, h.label AS harness_label
-       FROM zee z LEFT JOIN harness h ON h.id=$2 WHERE z.xell_id=$1 ORDER BY z.created_at DESC LIMIT 1`,
-    [target.id, target.harness_id]);
-  const lastReport = await one(
-    `SELECT body, created_at FROM zee_message WHERE from_xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [target.id]);
-  const item = await one(`SELECT id, title, status FROM work_item WHERE xell_id=$1 LIMIT 1`, [target.id]);
-  const project = await one(`SELECT main_branch FROM project WHERE id=$1`, [target.project_id]);
-  const branchInfo = await branchHandover(target, project?.main_branch || 'main');
-  const firstLines = (t, n) => String(t || '').split('\n').filter((l) => l.trim()).slice(0, n).join('\n');
-
-  const handover = [
-    '## YOU ARE INHERITING THIS XELL — it is not a fresh start',
-    '',
-    `Your manager swapped the previous zee out of \`${target.slug}\` and put YOU in, wearing the`,
-    `**${h.label || h.key}** harness. Everything the previous zee produced is still here: the same branch,`,
-    'the same commits, the same containers, the same database, the same card on the board. Nothing was',
-    'reset. **Read what is already on the branch before you write anything** — re-reading the whole repo',
-    'from scratch and re-doing the previous phase is exactly the waste this swap exists to avoid.',
-    '',
-    `- previous persona: ${prevZee?.harness_label || prevZee?.harness_key || target.harness_id || 'unknown'}`,
-    `- previous zee ended: ${prevZee?.status || 'unknown'}${prevZee?.last_stop_reason ? ` (${prevZee.last_stop_reason})` : ''}`,
-    '',
-    '### What the previous zee was asked to do',
-    '',
-    prevTask?.prompt_text ? firstLines(prevTask.prompt_text, 40) : '(no task on record for this xell)',
-    '',
-    '### The last thing it reported',
-    '',
-    lastReport?.body ? firstLines(lastReport.body, 25) : '(it reported nothing to its manager)',
-    '',
-    '### What is on the branch right now',
-    '',
-    ...branchInfo.lines,
-    '',
-    ...(item ? [`This xell is on work item "${item.title}" (${item.status}) — \`zee work\` reads it in full, `
-                + 'and `zee item --status … --note "…"` is how you report where the WORK has got to.', ''] : []),
-    'Start by orienting in what is here: `git log`, `git diff`, the files the commits above touched, and',
-    '`zee work` if there is a card. Then do YOUR part of the job. Your verbs are unchanged — you land',
-    'your own work (`zee land`, a human approves) and only a human marks this xell done.',
-  ].join('\n');
-
-  const brief = [
-    String(task || '').trim() || `Continue the work on \`${target.slug}\` in the role your harness describes.`,
-    '',
-    handover,
-    '',
-    managerBriefBlock(xell.slug, `swapped you INTO this xell (it was already running work) and is watching it`),
-  ].join('\n');
+  const { brief, item, prevZee } = await swapBrief({ manager: xell, target, harness: h, task });
 
   // ── 6. RETIRE the outgoing zee row — honestly, not by deleting it ────────────────────────────
   // The row is the record that this agent existed, what it cost and why it stopped. The reason names
