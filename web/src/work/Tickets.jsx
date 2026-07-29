@@ -138,6 +138,7 @@ function Composer({ projectId, kinds, onClose, onCreated }) {
         </label>
         <label className="work-field"><span className="work-lbl">priority</span>
           <input className="work-in num" type="number" min="1" max="5" value={v.priority}
+                 title="1 = most urgent · 3 = the default (the middle of the scale) · 5 = least urgent"
                  onChange={(e) => setV({ ...v, priority: e.target.value })} />
         </label>
         <label className="work-field"><span className="work-lbl">reporter</span>

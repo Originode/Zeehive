@@ -161,6 +161,7 @@ export default function WorkItemDrawer({ itemId, projectId, statuses, onClose, o
             <Field label="priority">
               <span className="work-prio-edit">
                 <input className="work-in num" type="number" min="1" max="5" value={item.priority ?? 3} disabled={busy}
+                       title="1 = most urgent · 3 = the default (the middle of the scale) · 5 = least urgent"
                        onChange={(e) => save({ priority: Number(e.target.value) })} />
                 <Pips priority={item.priority} />
               </span>
