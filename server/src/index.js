@@ -124,14 +124,6 @@ const server = app.listen(config.port, () => {
   // ✱/⚒ feed chips wrote a view file nothing in there was watching. Boot is also the moment after
   // a ship (we restart into the new code), so sweep the RUNNING cxells here. A live cxell is one
   // whose zee still has an ssh-terminal viewer; the sweep is best-effort per cage.
-  // Same shape, for the OTHER file the queenzee projects into a worktree: .zeehive.env is written
-  // from the meta-DB at provision time and never re-emitted on its own, so a fix to the projection
-  // RULE (ticket #15: a xell holding production read-only kept its dev vars and its own spinoff db)
-  // left every xell provisioned before it wrong forever, with a human expected to remember. Boot is
-  // exactly when a rule change arrives, so recompute every non-retired xell here and write only the
-  // ones that are provably stale (lib/provision.reconcileXellEnvs).
-  reconcileXellEnvs({ reason: 'boot' })
-    .catch((e) => console.error('[env] .zeehive.env reconcile failed:', e.message));
   refreshZeeLiveInLiveCxells(async () => (await q(
     `SELECT DISTINCT x.slug
        FROM zee z JOIN xell x ON x.id = z.xell_id
@@ -140,6 +132,14 @@ const server = app.listen(config.port, () => {
         AND x.status NOT IN ('retired', 'tearing-down')`
   )).map((r) => ({ ctx: 'default', name: cxellName(r.slug) })))
     .catch((e) => console.error('[cxell] live-feed renderer sweep failed:', e.message));
+  // Same shape, for the OTHER file the queenzee projects into a worktree: .zeehive.env is written
+  // from the meta-DB at provision time and never re-emitted on its own, so a fix to the projection
+  // RULE (ticket #15: a xell holding production read-only kept its dev vars and its own spinoff db)
+  // left every xell provisioned before it wrong forever, with a human expected to remember. Boot is
+  // exactly when a rule change arrives, so recompute every non-retired xell here and write only the
+  // ones that are provably stale (lib/provision.reconcileXellEnvs).
+  reconcileXellEnvs({ reason: 'boot' })
+    .catch((e) => console.error('[env] .zeehive.env reconcile failed:', e.message));
   startPool();
   startMonitor();
   startContainerMonitor();
