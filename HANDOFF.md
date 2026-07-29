@@ -439,6 +439,31 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   Test: `node test/harness-empty-visible.test.mjs` — the boot line against real rows, plus the real
   components rendered (react-dom/server) and the real canvas functions DRAWN against a recording
   2D context, so a regex over the source can't fake it.
+- **The ship card names EVERY migration the deploy applies — including the ones it applies at BOOT**
+  (2026-07-29, ticket #12). `ship_request.migrations` only ever held the DEPLOY-TIME set
+  (`server/sql/migrations|ops`, applied by the queenzee before the containers build). Zeehive
+  migrates ITSELF: `runMigrations()` applies `db/migrations/*.sql` to the live meta-DB as the new
+  server boots. Nothing joined those facts, so every Zeehive ship card said **"no migrations"** while
+  one deploy applied five — including the one that repaired live data loss and two that rewrote the
+  manual every zee reads. A GATE bug, not a display bug: the gate is only as good as what it tells
+  the human (same class as the harness that rendered healthy while carrying nothing).
+  `pendingBootMigrations()` (shipmigrate.js) resolves the boot set at request time and
+  `ship_request.boot_migrations` (075) records it. Detected from the project's SHAPE at the shipped
+  sha — `db: { boot_migrations: … }` in zeehive.yml, else a repo carrying both `db/migrations/*.sql`
+  and a `runMigrations()` boot runner — so a fork or rename keeps working and any project can opt in
+  or out. The ledger (`schema_migrations`) is read over the queenzee's OWN pool when the prod db row
+  names the database it is already connected to (the self-hosting case), else through `psql`.
+  **The two sets are never merged**: deploy-time runs under the queenzee before anything swaps and a
+  failure stops the ship; boot-time runs inside the new process after the swap. `ShipSchema`
+  (web/src/Ship.jsx) renders them apart, each with WHEN it runs — and an unreadable ledger renders as
+  **UNKNOWN with the reason**, never as "none", because a silent zero is the bug itself.
+  Also: a ship is FLEET-WIDE and deploys the **current tip of main**, not the requester's landed sha
+  (one deploy went out 5 commits ahead of the asking zee's). The approve confirmation, the request
+  confirmation and the answer `zee ship` gives now all say so.
+  Test: `node test/ship-boot-migrations.test.mjs` — a REAL `requestShip()` against a throwaway
+  project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
+  ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
+  rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
 - **ONE npm cache for the fleet, and a pooled xell warms itself** (2026-07-29, ticket #7 — "give
   provisioned xells the usual stuff needed such as pg driver so they dont have to install it every
   time"). Nothing was broken: `warmCxell()` already ran `npm ci` in a cage and

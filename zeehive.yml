@@ -38,4 +38,10 @@ naming:
 
 # password is the committed dev credential (same one docker-compose.yml carries) — a process
 # xell must SCRAM-authenticate over TCP, unlike a compose sibling reaching its db by alias.
-db: { name: zeehive, user: zeehive, password: zeehive }
+#
+# boot_migrations: ZEEHIVE migrates ITSELF — runMigrations() applies db/migrations/*.sql to the
+# meta-DB as the new server boots, because a self-ship IS the restart. Declaring it here is what
+# lets the SHIP CARD tell the approving human about that schema (ticket #12): without it a deploy
+# said "no migrations" while applying five to the live meta-DB. lib/shipmigrate.js also detects
+# this shape automatically; the declaration is the explicit version, and `false` opts out.
+db: { name: zeehive, user: zeehive, password: zeehive, boot_migrations: db/migrations }

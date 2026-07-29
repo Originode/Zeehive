@@ -556,7 +556,9 @@ export default function App() {
     }
     if (kind === 'ship') {
       if (!(await showConfirm(`Ship ${x.slug} to PRODUCTION?\n\nThis files a ship request. It is REFUSED unless the work is `
-        + `already landed on main; a human then approves it in the ship panel, and the queenzee deploys from main.`,
+        + `already landed on main; a human then approves it in the ship panel, and the queenzee deploys from main.\n\n`
+        + `A ship is FLEET-WIDE: it deploys the CURRENT TIP of main — every landing on main at that moment, `
+        + `not only ${x.slug}'s work. The ship card names the sha and the migrations that ride with it.`,
         { variant: 'danger', okLabel: 'Request ship' }))) return;
       const id = `ship-${x.id}-${Date.now()}`;
       pushToast({ id, kind: 'progress', title: `Requesting ship of ${x.slug}…` });

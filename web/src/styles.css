@@ -607,6 +607,19 @@ a.cbox:hover { border-color: var(--accent); }
   cursor: pointer; font-size: 9px; padding: 0 4px; }
 .mx-prod:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 /* db scope + zee drift assessment on a ship card — part of what the approve click covers */
+/* WHAT SCHEMA RIDES THIS SHIP (ticket #12) — deploy-time and boot-time, never merged. The card
+   showed neither until a Zeehive deploy applied five meta-DB migrations under a "no migrations"
+   card, so this block is the gate's honesty, not decoration. */
+.ship-schema { margin: 6px 0 0; font-size: 12px; line-height: 1.5; border-left: 2px solid var(--line);
+  padding-left: 9px; }
+.ship-schema .k { color: var(--muted); }
+.ship-schema-row + .ship-schema-row { margin-top: 4px; }
+.ship-schema-when { color: var(--muted); }
+.ship-schema-none { color: var(--muted); }
+.ship-schema-unknown { color: var(--down, #e5554e); }
+.ship-schema-err { color: #ffcf9e; margin-top: 2px; }
+.ship-schema-files { margin: 3px 0 0; padding-left: 18px; color: var(--text); }
+.ship-schema-files code { font-size: 11px; }
 .ship-dbscope { margin: 5px 0 0; font-size: 12px; color: #ffcf9e; }
 .ship-dbnote { margin: 3px 0 0; font-size: 12px; color: var(--muted); font-style: italic; }
 /* The cxell-image guard's release valve: quiet until ticked, then it says what it costs. */

@@ -583,6 +583,20 @@ export async function selfCatchup(xell, { restore = false } = {}) {
 // used to come back as a bare `{ok:false, reason}` that a zee could relay to its human as "the ship
 // request is waiting for you" — while the console had nothing to show, because nothing was raised.
 // So a raised request says so with its request id and sha, and a refusal says NO REQUEST EXISTS.
+// The schema a ship carries, for the zee's own answer — the same two sets the human's card shows
+// (deploy-time vs boot-time), so the zee and the console cannot describe the same ship differently.
+function shipSchemaNote(req) {
+  const deploy = Array.isArray(req?.migrations) ? req.migrations.length : 0;
+  const boot = req?.boot_migrations && typeof req.boot_migrations === 'object' ? req.boot_migrations : null;
+  if (!deploy && !boot?.applicable) return '';
+  const parts = [`${deploy} migration(s) at deploy time`];
+  if (boot?.applicable) {
+    parts.push(boot.ok ? `${boot.pending.length} applied at BOOT from ${boot.dir}`
+      : `an UNKNOWN number at BOOT from ${boot.dir} (the ledger could not be read)`);
+  }
+  return ` Schema riding with it: ${parts.join('; ')}.`;
+}
+
 export async function selfShip(xell, { targets = null, reason = null } = {}) {
   const zee = await liveZee(xell.id);
   const r = await requestShip({ xellId: xell.id, zeeId: zee?.id || null, reason, targets });
@@ -596,7 +610,12 @@ export async function selfShip(xell, { targets = null, reason = null } = {}) {
       : `Ship REQUESTED (ship_request ${String(req.id).slice(0, 8)}, commit ${String(req.commit).slice(0, 8)}) — `
         + 'a human must approve it in the ZEEHIVE console, and the QUEENZEE deploys from main. It is on '
         + `their screen now${r.restored ? ' (it had been dismissed; asking again put it back)' : ''}. `
-        + 'Nothing you do speeds it up.',
+        + 'Nothing you do speeds it up. '
+        // A ship is FLEET-WIDE and aimed at the TIP of main, not at your landed sha: say so, because
+        // a zee that reports "my work shipped" is understating what it just asked a human to deploy.
+        + `NOTE: this deploys the CURRENT TIP of main (${String(req.commit).slice(0, 8)}) — every landing `
+        + 'on main at this moment, not only your commits. Do not describe it as shipping only your work.'
+        + shipSchemaNote(req),
   };
 }
 

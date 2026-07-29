@@ -537,3 +537,110 @@ export async function catchUpXellToProd(xellId) {
     recommend_restore: !!(r.ok && residual != null && residual > 0 && xell.db_coupling === 'db-isolated'),
   };
 }
+
+// ── BOOT-TIME migrations: the schema a ship applies when the new process STARTS ───────────────
+//
+// Ticket #12. Everything above is DEPLOY-TIME schema: files under server/sql/migrations|ops that
+// the queenzee applies to the production database before the containers build, decided at request
+// time so a human approves code and schema as one thing.
+//
+// But a project can also migrate ITSELF at boot — Zeehive does: `runMigrations()` in
+// server/src/index.js applies db/migrations/*.sql to its own meta-DB as the new server comes up,
+// because a self-ship IS the restart. Nothing here knew about that set, so `ship_request.migrations`
+// was `[]` for every Zeehive ship and the card told the approving human "no migrations" while the
+// deploy applied five to the live meta-DB — including one that repaired data loss and two that
+// rewrote the manual every zee reads. The gate was less informative than the human believed.
+//
+// The two sets are NOT interchangeable and are deliberately kept apart: deploy-time runs under the
+// queenzee's control, before anything swaps, and a failure stops the ship; boot-time runs inside the
+// new process after the swap, where a failure leaves a started server on a partly-migrated schema.
+// A card that merged them would misstate the risk of both.
+export const BOOT_LEDGER = 'schema_migrations';   // written by runMigrations(); filename is the PK
+export const BOOT_DIR_DEFAULT = 'db/migrations';
+
+// Read a file out of the repo at a sha (null when absent) — the manifest AS THE DEPLOY WILL SEE IT.
+function fileAt(repoRoot, sha, path) {
+  const r = spawnSync('git', ['-C', repoRoot, 'show', `${sha}:${path}`],
+    { encoding: 'utf8', timeout: 20000, windowsHide: true, env: cleanGitEnv() });
+  return r.status === 0 ? r.stdout : null;
+}
+
+// WHICH directory (if any) this project migrates itself from at boot, decided from the project's
+// SHAPE at the shipped sha — not from its name, so a fork or a rename keeps working.
+//   1. `db: { boot_migrations: <dir|false> }` in zeehive.yml — explicit, and any project can opt in
+//      or out. Read at the SHA, so the answer is the one the deploy will act on.
+//   2. otherwise: a repo that carries BOTH db/migrations/*.sql AND the boot runner that applies
+//      them (server/src/db/migrate.js, called from server/src/index.js) is self-migrating.
+// Returns null when the project has no boot-applied schema at all (every normal project).
+export function bootMigrationDir(project, sha) {
+  const yml = fileAt(project.repo_root, sha, 'zeehive.yml');
+  if (yml) {
+    const m = yml.match(/^\s*boot_migrations:\s*(.+?)\s*$/m);
+    if (m) {
+      const v = m[1].replace(/^["']|["']$/g, '');
+      if (/^(false|none|off|no)$/i.test(v)) return null;
+      if (v) return v;
+    }
+  }
+  const declared = project?.manifest?.db?.boot_migrations;
+  if (declared === false) return null;
+  if (typeof declared === 'string' && declared.trim()) return declared.trim();
+  const files = listMigrationFiles(project.repo_root, sha, [BOOT_DIR_DEFAULT]);
+  if (!files?.length) return null;
+  const runner = fileAt(project.repo_root, sha, 'server/src/db/migrate.js');
+  const boot = fileAt(project.repo_root, sha, 'server/src/index.js');
+  return runner && boot && /runMigrations\s*\(/.test(boot) ? BOOT_DIR_DEFAULT : null;
+}
+
+// Is the production database of this project OUR OWN database? For a self-hosting Zeehive it is:
+// the meta-DB the queenzee is connected to IS the prod db it ships. That matters because it can
+// then be read over the existing pool instead of `docker exec psql` — more direct, and it works
+// wherever the queenzee runs. Compared on host+port+database, never on string equality.
+export function isOwnDatabase(connRef, databaseUrl = config.databaseUrl) {
+  const parse = (s) => { try { return new URL(String(s).replace(/^postgres(ql)?:/, 'http:')); } catch { return null; } };
+  const a = parse(connRef), b = parse(databaseUrl);
+  if (!a || !b) return false;
+  const host = (u) => (['localhost', '127.0.0.1', '::1'].includes(u.hostname) ? 'localhost' : u.hostname);
+  return host(a) === host(b) && (a.port || '5432') === (b.port || '5432') && a.pathname === b.pathname;
+}
+
+// Which BOOT migrations a ship at `sha` will actually run, and against which ledger.
+// Shape: { applicable, dir, ok, pending: [...], applied: n, via, error }
+//   applicable:false → this project has no boot-applied schema (nothing to say on the card)
+//   ok:false         → we could not READ the ledger. The card must say "unknown", never "none":
+//                      an unreadable ledger silently rendering as zero is the whole bug.
+// Never throws: a ship request must not fail because a ledger was unreachable.
+export async function pendingBootMigrations(project, sha, site = null) {
+  const dir = bootMigrationDir(project, sha);
+  if (!dir) return { applicable: false, dir: null, ok: true, pending: [], applied: 0 };
+  const all = listMigrationFiles(project.repo_root, sha, [dir]) || [];
+  const base = { applicable: true, dir, pending: [], applied: 0 };
+  try {
+    const db = await prodDb(project, site);
+    if (!db) return { ...base, ok: false, error: 'no prod db container registered — cannot read the boot ledger', pending: all };
+    let applied = null;
+    if (isOwnDatabase(db.conn_ref)) {
+      // the self-hosting case: the prod database IS the meta-DB this queenzee is connected to
+      const rows = await q(`SELECT filename FROM ${BOOT_LEDGER}`).catch((e) => {
+        if (/does not exist/i.test(e.message)) return [];      // fresh database: everything is pending
+        throw e;
+      });
+      applied = new Set(rows.map((r) => r.filename));
+      return { ...base, ok: true, via: 'own-pool', applied: applied.size,
+        pending: all.filter((f) => !applied.has(f.split('/').pop())) };
+    }
+    const r = await psql(db, ['-Atc', `SELECT filename FROM ${BOOT_LEDGER}`]);
+    if (!r.ok) {
+      if (/does not exist/i.test(r.err || '')) {
+        return { ...base, ok: true, via: 'psql', applied: 0, pending: all };
+      }
+      return { ...base, ok: false, via: 'psql', pending: all,
+        error: `could not read ${BOOT_LEDGER} on ${db.container}: ${(r.err || '').trim().split('\n').pop()?.slice(0, 200)}` };
+    }
+    applied = new Set(r.out.split('\n').map((s) => s.trim()).filter(Boolean));
+    return { ...base, ok: true, via: 'psql', applied: applied.size,
+      pending: all.filter((f) => !applied.has(f.split('/').pop())) };
+  } catch (e) {
+    return { ...base, ok: false, pending: all, error: String(e.message).slice(0, 200) };
+  }
+}

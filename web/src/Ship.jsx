@@ -13,6 +13,20 @@ import { shipFailureReport, shipHasFailureOutput } from './shipFailure.js';
 
 const short = (s) => (s ? String(s).slice(0, 8) : '—');
 
+// The schema half of the approve confirmation, in one line per set. Exported for the same reason
+// ShipSchema is: the "UNKNOWN, never none" rule is a contract, so it is read from real output.
+export function schemaConfirmLine(req) {
+  const deploy = Array.isArray(req?.migrations) ? req.migrations.length : 0;
+  const boot = req?.boot_migrations && typeof req.boot_migrations === 'object' ? req.boot_migrations : null;
+  const parts = [`${deploy} migration(s) at deploy time`];
+  if (boot?.applicable) {
+    parts.push(boot.ok
+      ? `${boot.pending.length} at boot (${boot.dir}, applied by the server as it restarts)`
+      : `an UNKNOWN number at boot (${boot.dir} — the ledger could not be read)`);
+  }
+  return `Schema: ${parts.join('; ')}.\n\n`;
+}
+
 // ONE force-release path, shared by the padlock badge and the countdown bar's "Release now".
 // Same act → same words. Two different confirmations for one consequential click is how a human
 // learns to skim past the one that matters. The warning escalates when the lock is HELD: a
@@ -79,6 +93,67 @@ function LiveBuildLog({ lines }) {
   );
 }
 
+// WHAT SCHEMA THIS SHIP APPLIES, in the two places it actually applies it. Exported so the contract
+// ("a card that cannot read the ledger says UNKNOWN, never none") can be rendered and read in a test.
+//
+//  • DEPLOY-TIME (`migrations`) — server/sql/migrations|ops, applied by the queenzee to the
+//    production database BEFORE the containers build. A failure here stops the ship.
+//  • BOOT-TIME (`boot_migrations`) — for a project that migrates itself as the new process starts
+//    (Zeehive: db/migrations/*.sql against the meta-DB, via runMigrations()). A failure here happens
+//    AFTER the swap, on a server that is already up.
+// They are listed separately because that difference is the risk, and a card that merged them would
+// misstate both. `boot_migrations.ok === false` means the ledger could not be read: the count is
+// unknown, and saying "none" there is exactly the bug this fixes.
+export function ShipSchema({ req }) {
+  const deploy = Array.isArray(req?.migrations) ? req.migrations : [];
+  const boot = req?.boot_migrations && typeof req.boot_migrations === 'object' ? req.boot_migrations : null;
+  const bootOn = !!boot?.applicable;
+  if (!deploy.length && !bootOn) {
+    return (
+      <div className="ship-schema" data-testid="ship-schema">
+        <span className="k">schema:</span> <span className="ship-schema-none">no migrations ride this ship</span>
+      </div>
+    );
+  }
+  const list = (files) => (
+    <ul className="ship-schema-files">
+      {files.map((f) => <li key={f}><code>{f}</code></li>)}
+    </ul>
+  );
+  return (
+    <div className="ship-schema" data-testid="ship-schema">
+      <div className="ship-schema-row" data-testid="ship-schema-deploy">
+        <span className="k">at deploy:</span>{' '}
+        {deploy.length
+          ? <b>{deploy.length} migration(s)</b>
+          : <span className="ship-schema-none">none</span>}
+        <span className="ship-schema-when"> — the queenzee applies these to the production database before the containers build</span>
+        {deploy.length > 0 && list(deploy)}
+      </div>
+      {bootOn && (
+        <div className="ship-schema-row" data-testid="ship-schema-boot">
+          <span className="k">at boot:</span>{' '}
+          {boot.ok
+            ? (boot.pending.length
+              ? <b>{boot.pending.length} migration(s)</b>
+              : <span className="ship-schema-none">none</span>)
+            : <b className="ship-schema-unknown" data-testid="ship-schema-unknown">UNKNOWN</b>}
+          <span className="ship-schema-when">
+            {' '}— the shipped server applies <code>{boot.dir}</code> to its own database when it restarts
+          </span>
+          {boot.ok && boot.pending.length > 0 && list(boot.pending)}
+          {!boot.ok && (
+            <div className="ship-schema-err">
+              could not read the boot ledger, so this count is not known: {boot.error || 'no reason recorded'}.
+              {' '}{boot.pending?.length ? `${boot.pending.length} file(s) exist at this commit; some or all may already be applied.` : ''}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -116,6 +191,12 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
     if (decision === 'approve' && !(await showConfirm(
       `Ship ${short(req.commit)} to PRODUCTION${siteName ? ` @ ${siteName}` : ''}?\n\n`
       + `The queenzee will take the prod lock and deploy it from main — this is real production.\n\n`
+      // A ship is FLEET-WIDE: it deploys the TIP of main, which carries every landing that reached
+      // it, not only the requesting xell's work. One deploy went out at a sha 5 commits ahead of the
+      // requester's, so work nobody had read reached production under someone else's approval.
+      + `This deploys the CURRENT TIP of main (${short(req.commit)}) — every landing on main at this `
+      + `moment, not only ${req.xell_slug}'s work.\n\n`
+      + schemaConfirmLine(req)
       + `Requested by: ${req.xell_slug}\n${req.reason ? `Reason: ${req.reason}\n` : ''}`
       + (allowStale
         ? `\n⚠ WITH the cxell-image override: if the zee-agent image cannot be rebuilt, this ship `
@@ -200,6 +281,12 @@ function ShipCard({ req, live, prodSites, prodLock, onDone, onForwardToZee }) {
       <div className="land-stat">
         builds local <b>main</b> @ <b>{short(req.commit)}</b> — not the xell's worktree, not origin
       </div>
+      {/* THE SCHEMA THIS SHIP CARRIES — both sets, never merged (ticket #12). The card used to show
+          nothing at all unless the ship was code-only, and `migrations` is empty for a project that
+          migrates itself at BOOT: a Zeehive deploy told the approving human "no migrations" while
+          applying five to the live meta-DB, two of which rewrote the manual every zee reads. The
+          gate is only as good as what it tells the human. */}
+      <ShipSchema req={req} />
       {/* DB scope + the zee's drift assessment — the human approves the SCOPE and the REASONING,
           not a bare green tick. A code-only ship says what it deliberately will not run. */}
       {req.skip_migrations && (

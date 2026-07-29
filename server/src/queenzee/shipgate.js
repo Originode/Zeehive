@@ -18,7 +18,7 @@ import { logline } from '../lib/logbus.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
-import { pendingMigrations, applyMigrations } from './shipmigrate.js';
+import { pendingMigrations, applyMigrations, pendingBootMigrations } from './shipmigrate.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
 import { setShipRefusal, clearShipRefusal } from '../lib/status.js';
@@ -112,7 +112,11 @@ async function resolveShipCommit(project, shipSite, main) {
   const commit = headCommit(project.repo_root, shipRef);
   if (!commit) throw new Error(`ship_ref "${shipRef}" does not resolve in ${project.repo_root}`);
   const mig = await pendingMigrations(project, commit, shipSite);
-  return { commit, migrations: mig.pending || [] };
+  // …and the schema the shipped PROCESS applies at boot, for a project that migrates itself
+  // (ticket #12). Best-effort and never throws: an unreadable ledger becomes {ok:false} on the
+  // card — "unknown", which is the honest answer — not a silent zero.
+  const boot = await pendingBootMigrations(project, commit, shipSite);
+  return { commit, migrations: mig.pending || [], bootMigrations: boot };
 }
 
 // ── the zee's only prod verb ─────────────────────────────────────────────────
@@ -184,17 +188,17 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // whose integration truth is remote (ship_ref like 'origin/main') gets that remote fetched
   // FIRST so the human approves the sha that is actually current, not a stale mirror. What schema
   // rides along is decided NOW too, so the human approves code and migrations as one thing.
-  let commit, migrations;
-  try { ({ commit, migrations } = await resolveShipCommit(project, shipSite, main)); }
+  let commit, migrations, bootMigrations;
+  try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, shipSite, main)); }
   catch (e) { return refuse(e.message); }
   let row;
   try {
     row = await one(
       `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id,
-                                 skip_migrations, db_note)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10) RETURNING *`,
+                                 skip_migrations, db_note, boot_migrations)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb) RETURNING *`,
       [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(migrations), shipSite?.id || null,
-       !!skipDb, dbNote]);
+       !!skipDb, dbNote, JSON.stringify(bootMigrations)]);
   } catch (e) {
     // ship_request_open_uq (one open ship per xell) — two asks raced, or a row appeared between the
     // check above and here. The zee's ask IS satisfied by the winner, so hand that back rather than
@@ -289,19 +293,20 @@ export async function resumeShip(id, by = 'human@console') {
     return { ok: false, reason: state.reason, request: deferred };
   }
 
-  let commit, migrations;
-  try { ({ commit, migrations } = await resolveShipCommit(project, site, main)); }
+  let commit, migrations, bootMigrations;
+  try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, site, main)); }
   catch (e) { return { ok: false, reason: e.message, request: deferred }; }
 
   const row = await one(
-    `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, commit=$2, migrations=$3::jsonb,
+    `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, commit=$2, migrations=$3::jsonb, boot_migrations=$4::jsonb,
             requested_at=now()
        WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
-    [id, commit, JSON.stringify(migrations)]);
+    [id, commit, JSON.stringify(migrations), JSON.stringify(bootMigrations)]);
   if (!row) throw new Error('ship request changed underneath the resume — reload and try again');
   broadcast('ship', row);
   logline('ship', `RESUMED ship for ${xell?.slug || deferred.xell_id} by ${by} @ ${String(commit).slice(0, 8)}`
-    + ` — re-aimed at the current ${main} tip (${migrations.length} pending migration(s))`);
+    + ` — re-aimed at the current ${main} tip (${migrations.length} deploy-time migration(s)`
+    + `${bootMigrations?.applicable ? `, ${bootMigrations.ok ? bootMigrations.pending.length : '?'} at boot` : ''})`);
   notifyShipRequest({ project, xell, request: row });
   return { ok: true, request: row };
 }
@@ -355,8 +360,8 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
     const site = landed[0].site_id
       ? await one(`SELECT * FROM deploy_site WHERE id=$1`, [landed[0].site_id])
       : await resolveShipSite(projectId, null);
-    let commit, migrations;
-    try { ({ commit, migrations } = await resolveShipCommit(project, site, main)); }
+    let commit, migrations, bootMigrations;
+    try { ({ commit, migrations, bootMigrations } = await resolveShipCommit(project, site, main)); }
     catch (e) { skipped.push({ slug: `site ${site?.key || 'default'}`, reason: e.message }); continue; }
 
     const [carrier, ...riders] = landed;
@@ -369,9 +374,9 @@ export async function bundleDeferredShips(projectId, { by = 'human@console' } = 
     // xell's landed work, because they all resolve to this same main tip.
     const c = await one(
       `UPDATE ship_request SET deferred_at=NULL, deferred_by=NULL, bundled_into=NULL,
-              commit=$2, migrations=$3::jsonb, requested_at=now(), reason=$4
+              commit=$2, migrations=$3::jsonb, requested_at=now(), reason=$4, boot_migrations=$5::jsonb
          WHERE id=$1 AND status='pending' AND deferred_at IS NOT NULL RETURNING *`,
-      [carrier.id, commit, JSON.stringify(migrations), reason]);
+      [carrier.id, commit, JSON.stringify(migrations), reason, JSON.stringify(bootMigrations)]);
     if (!c) { skipped.push({ slug: carrier.xell_slug, reason: 'changed underneath the bundle' }); continue; }
     broadcast('ship', c);
 
@@ -461,15 +466,18 @@ export async function decideShip(id, decision, by = 'human@console',
       if (!site) throw new Error('chosen site is not a prod site of this project');
       const project = await one(`SELECT * FROM project WHERE id=$1`, [pending.project_id]);
       const mig = await pendingMigrations(project, pending.commit, site);
-      retarget = { site, migrations: JSON.stringify(mig.pending || []) };
+      // the boot set is per-DATABASE too — a different site is a different ledger, so re-resolve it
+      // rather than carry the one computed for the site the human just moved away from
+      const boot = await pendingBootMigrations(project, pending.commit, site);
+      retarget = { site, migrations: JSON.stringify(mig.pending || []), boot: JSON.stringify(boot) };
     }
   }
   const row = retarget
     ? await one(
       `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3, site_id=$4, migrations=$5::jsonb,
-              allow_stale_cxell_image=$6
+              allow_stale_cxell_image=$6, boot_migrations=$7::jsonb
          WHERE id=$1 AND status='pending' RETURNING *`,
-      [id, decision, by, retarget.site.id, retarget.migrations, allowStale])
+      [id, decision, by, retarget.site.id, retarget.migrations, allowStale, retarget.boot])
     : await one(
       `UPDATE ship_request SET status=$2, decided_at=now(), decided_by=$3, allow_stale_cxell_image=$4
          WHERE id=$1 AND status='pending' RETURNING *`, [id, decision, by, allowStale]);
