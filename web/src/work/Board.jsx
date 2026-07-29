@@ -236,6 +236,7 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
                         onDragStart={(e) => onDragStart(e, card, col.key)} onDragEnd={endDrag}
                         onDragOver={(e) => allow(e, col.key, halfOf(e, i))}
                         onDrop={(e) => onDrop(e, col.key, halfOf(e, i))}
+                        onKey={(e) => onCardKey(e, card, colIndex, i)}
                         onOpen={() => onOpen?.(card.id)} />
                 </React.Fragment>
               ))}
@@ -269,7 +270,12 @@ const halfOf = (e, index) => {
   return e.clientY < r.top + r.height / 2 ? index : index + 1;
 };
 
-function Card({ card, statuses, dragging, onDragStart, onDragEnd, onDragOver, onDrop, onOpen }) {
+// `onKey` is the keyboard half of the same move the drag makes (Board.onCardKey, bound per card to
+// its column and row). It is a PROP, not a free identifier: the first cut of the keyboard path wrote
+// `onKeyDown={onKey}` here without ever declaring or passing it, so the very first card React
+// rendered threw `ReferenceError: onKey is not defined` and took the whole board down with it —
+// vite builds a free identifier happily, and the browser is where it becomes a blank screen.
+function Card({ card, statuses, dragging, onDragStart, onDragEnd, onDragOver, onDrop, onKey, onOpen }) {
   // The board is the plan; the hive is the fact. Advisory only — see the header.
   const drift = card.live_status && card.live_status !== card.status ? card.live_status : null;
   return (
