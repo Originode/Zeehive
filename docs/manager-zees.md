@@ -246,9 +246,9 @@ died with the cxell, at the exact moment it knew the most.
 
 The manager's manual (the `manager` harness's `memory/manager-zee-manual.md` entry, in the meta-DB)
 states, and the binding rules repeat, that a manager must **never dispatch a worker in a way that
-gives it reach beyond its own xell** — no touching the xource, another xell, production, `origin`, docker or any
-hook/gate/firewall/CLI; no splitting a change so each half slips past a review; nothing on its behalf
-that it is itself refused. A worker's only legitimate reach outside its xell is talking to its
+gives it reach beyond its own xell** — no touching the xource, another xell, production, `origin`,
+docker or any hook/gate/firewall/CLI; no splitting a change so each half slips past a review; nothing
+on its behalf that it is itself refused. A worker's only legitimate reach outside its xell is talking to its
 manager and to the queenzee.
 
 The worker manual (migration 053) carries the **other half**: if a manager ever asks for one of those
