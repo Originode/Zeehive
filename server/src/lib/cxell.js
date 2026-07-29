@@ -23,7 +23,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
-import { adapterFor, CLAUDE_ADAPTER, AGENT_PROC_PATTERN } from './cxell-runtimes.js';
+import { adapterFor, CLAUDE_ADAPTER, AGENT_PROC_PATTERN, HEADLESS_PROC_PATTERN } from './cxell-runtimes.js';
 import { classifyMergeOutput } from '../queenzee/xellgit.js';
 
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
@@ -459,6 +459,31 @@ export async function installZeeLiveIntoCxell({ ctx = 'default', name }) {
   }
 }
 
+// The THIRD baked attend-path file, refreshed for the same reason as the two above: zee-attach.sh is
+// what a human's terminal actually runs, and it is now also what DRAINS the talk queue (a message
+// sent to a mid-turn zee). Left to the image, that drainer would exist only in cages spawned after
+// the next zee-agent rebuild — and the queue would silently fill in every cxell alive today, which
+// is a worse failure than the one it fixes. installZeeCliIntoCxell's own comment names this file as
+// the next capability that would "silently not be there at all"; this is that comment being acted on.
+export const ZEE_ATTACH_DEST = '/usr/local/bin/zee-attach.sh';
+export const zeeAttachSourcePath = () => resolve(config.repoRoot, 'docker', 'zeehive', 'zee-attach.sh');
+export const zeeAttachInstallCommands = ({ name, src = zeeAttachSourcePath() }) =>
+  cxellFileInstallCommands({ name, src, dest: ZEE_ATTACH_DEST, tmp: '/tmp/zee-attach.sh' });
+
+export async function installZeeAttachIntoCxell({ ctx = 'default', name }) {
+  const src = zeeAttachSourcePath();
+  if (!existsSync(src)) return { installed: false, reason: 'source-missing', src };
+  try {
+    for (const args of zeeAttachInstallCommands({ name, src })) await dk(ctx, args);
+    return { installed: true, src };
+  } catch (e) {
+    logline('cxell', `${name}: could not refresh the attach script from ${src} `
+      + `(${String(e.message).slice(0, 160)}) — a message sent to this zee MID-TURN may sit in `
+      + `${CXELL_TALK_DIR} undelivered`);
+    return { installed: false, reason: 'exec-failed', src, error: e.message };
+  }
+}
+
 // Refresh the renderer into cxells that ALREADY EXIST — not just the ones we are about to spawn.
 //
 // The spawn-time install above only ever helped the next cage. Every cxell created before it
@@ -481,13 +506,18 @@ export async function refreshZeeLiveInLiveCxells(listLiveCxells) {
     return { swept: 0, ok: 0, failed: [] };
   }
   for (const { ctx = 'default', name } of cxells) {
+    // BOTH attend-path files, for one reason: they are two halves of the same pane. The renderer
+    // draws the feed; the attach script decides when the feed hands the pane over — and now drains
+    // the talk queue at that exact moment. A sweep that refreshed only one of them would leave a
+    // cage that queues messages nothing ever types in.
     const r = await installZeeLiveIntoCxell({ ctx, name });
-    if (r.installed) ok++; else failed.push(name);
+    const a = await installZeeAttachIntoCxell({ ctx, name });
+    if (r.installed && a.installed) ok++; else failed.push(name);
   }
   if (cxells.length) {
-    logline('cxell', `live-feed renderer refreshed in ${ok}/${cxells.length} running cxell(s)`
+    logline('cxell', `attend path (live-feed renderer + attach script) refreshed in ${ok}/${cxells.length} running cxell(s)`
       + (failed.length ? ` — not reachable: ${failed.slice(0, 5).join(', ')}` : '')
-      + ' (one mid-turn picks it up on its NEXT feed)');
+      + ' (one mid-turn picks it up on its NEXT feed / attach)');
   }
   return { swept: cxells.length, ok, failed };
 }
@@ -867,37 +897,86 @@ function sshExecInCxell({ sshPort, slug, cmd, timeoutMs = 20000 }) {
   });
 }
 
+// ── TALKING TO A ZEE, INCLUDING ONE THAT IS MID-TURN ─────────────────────────────────────────────
+//
+// A cxell's pane has two owners, and only one of them can hear you:
+//
+//   • BETWEEN TURNS the interactive session (`claude --resume`) holds it. Keystrokes land in the
+//     zee's prompt box — this is the conversation the dashboard terminal, the 📨 message button and
+//     a manager's `zee say` were built on, and it works.
+//   • DURING a headless turn the pane is zee-attach.sh's LIVE FEED, which is READ-ONLY by
+//     construction: it renders the transcript and reads nothing from the terminal. Every keystroke
+//     sent there — typed by a human in the browser, or send-keys'd by the queenzee — is swallowed.
+//
+// Nothing said so. A human opening a busy zee's terminal (a MANAGER most of all, whose entire job
+// is conversation) found a terminal that ignored them, and the console cheerfully reported "typed
+// into its live session" for a message that reached nobody.
+//
+// So a message to a busy zee is QUEUED instead of dropped: written as a file in the cage's talk
+// queue, which zee-attach.sh DRAINS into the interactive session the moment the turn ends (and at
+// the start of any attach). The human is told which of the two happened, in those words. The queue
+// lives in /tmp — it is in-flight conversation, not work product: a cxell restart is a new pane
+// with a new session, and re-typing a message from a dead session is worse than losing it.
+export const CXELL_TALK_DIR = '/tmp/zee-talk';
+// The pgrep the queue decision turns on. TWO questions, because either one means the pane cannot
+// hear a keystroke: is the headless turn still running, and is a feed renderer holding the pane
+// (it outlives the turn by a beat while the last transcript lines drain).
+const PANE_IS_FEED_SH = (sq) =>
+  `pgrep -f ${sq(HEADLESS_PROC_PATTERN)} >/dev/null 2>&1 || pgrep -f 'node .*zee-live[.]mjs' >/dev/null 2>&1`;
+
+// The exact remote command behind "say this to the zee" — PURE, so the whole decision is testable
+// without a container. Nothing is interpolated unquoted: the message goes through single-quote
+// escaping and the session id is reduced to a uuid.
+export function cxellTalkCommand({ text, session = 'zee', sessionId = '', enter = true } = {}) {
+  const sid = String(sessionId || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — shell-interpolated
+  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;         // safe single-quote for bash
+  return [
+    // Attach-or-create the session that OWNS the pane. It is what a human attaches to, and — because
+    // it runs zee-attach.sh — it is also what drains the queue when the turn ends, so creating it
+    // here is what makes a queued message eventually arrive with nobody watching.
+    `if tmux has-session -t ${session} 2>/dev/null; then started=0; ` +
+      `else tmux new-session -d -s ${session} -x 200 -y 50 -c /work/repo 'zee-attach.sh ${sid}'; started=1; fi`,
+    // wheel-scroll needs tmux mouse mode (alt-screen has no xterm scrollback); idempotent
+    `tmux set -g mouse on 2>/dev/null || true`,
+    // The fork: QUEUE while the feed owns the pane, TYPE when the interactive session does.
+    `if ${PANE_IS_FEED_SH(sq)}; then `
+      // Written to a .part and renamed: the drainer reads whole files only, so it can never type
+      // half a message that was still being written.
+      + `mkdir -p ${CXELL_TALK_DIR} && f=${CXELL_TALK_DIR}/$(date +%s%N) `
+      + `&& printf '%s' ${sq(text)} > "$f.part" && mv -f "$f.part" "$f.msg" `
+      + `&& echo __ZEE_TALK_QUEUED__ || echo __ZEE_TALK_FAILED__; `
+    + `else `
+      // Only sleep when WE just started the session, so an already-open terminal (the common case)
+      // receives the keys with no added latency.
+      + `[ "$started" = 1 ] && sleep 6; `
+      // `-l` sends the text LITERALLY (so "status?" can never be read as a key name); Enter submits.
+      + `tmux send-keys -t ${session} -l ${sq(text)}; `
+      + (enter ? `sleep 0.2; tmux send-keys -t ${session} Enter; ` : '')
+      + `echo __ZEE_KEYS_SENT__; `
+    + `fi`,
+  ].join('; ');
+}
+
 // TYPE literal text into a cxell zee's LIVE interactive claude — the exact session a human watches
 // in the dashboard terminal — by sending keystrokes to its tmux session over SSH, as if the operator
 // typed them there. This is what a "nudge" should be: poke the running agent IN PLACE so its reply
 // lands where the operator is looking. Contrast nudgeCxellZee, which forks a SECOND `claude --resume
 // -p` whose output goes to a queenzee log nobody reads (hence "nudge does not work").
 //
-// If no interactive session is up yet, one is started with the SAME `zee-attach.sh` command the
-// terminal bridge uses (attach-or-create, detached) and we give the TUI a beat to come alive before
-// typing, so the keystrokes are not swallowed by a still-loading prompt. `-l` makes tmux send the
-// text LITERALLY (so "status?" can never be read as a key name); a separate Enter submits it.
+// Resolves { sent:true, delivery:'typed'|'queued' } — 'queued' meaning the zee was MID-TURN and the
+// message waits in the cage for zee-attach.sh to type it in when the turn ends. Callers must pass
+// that word on rather than reporting a plain success: "delivered" and "will be delivered" are
+// different promises, and only one of them was true before this existed.
 // Best-effort by contract — rejects if the cxell/SSH is unreachable; the caller just logs it.
 export async function sendKeysToCxellZee({ sshPort, slug, text, sessionId, session = 'zee', enter = true, timeoutMs = 30000 }) {
   if (!sshPort && !slug) throw new Error('no SSH port or slug for this cxell');
-  const sid = String(sessionId || '').replace(/[^0-9a-fA-F-]/g, ''); // uuid only — shell-interpolated
-  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;         // safe single-quote for bash
-  const sh = [
-    // Attach-or-create the interactive session; only sleep when we actually just started it, so an
-    // already-open terminal (the common case) receives the keys with no added latency.
-    `if tmux has-session -t ${session} 2>/dev/null; then :; ` +
-      `else tmux new-session -d -s ${session} -x 200 -y 50 -c /work/repo 'zee-attach.sh ${sid}'; sleep 6; fi`,
-    // wheel-scroll needs tmux mouse mode (alt-screen has no xterm scrollback); idempotent
-    `tmux set -g mouse on 2>/dev/null || true`,
-    `tmux send-keys -t ${session} -l ${sq(text)}`,
-    ...(enter ? ['sleep 0.2', `tmux send-keys -t ${session} Enter`] : []),
-    'echo __ZEE_KEYS_SENT__',
-  ].join('; ');
+  const sh = cxellTalkCommand({ text, session, sessionId, enter });
   const r = await sshExecInCxell({ sshPort, slug, cmd: sh, timeoutMs });
+  if (/__ZEE_TALK_QUEUED__/.test(r.out)) return { sent: true, text, delivery: 'queued' };
   if (!/__ZEE_KEYS_SENT__/.test(r.out)) {
     throw new Error(`send-keys did not confirm (exit ${r.code}): ${(r.err || r.out || '').slice(0, 200)}`);
   }
-  return { sent: true, text };
+  return { sent: true, text, delivery: 'typed' };
 }
 
 // WRITE a file INTO a live cxell's /work/repo — the delivery path for an operator's rich message

@@ -68,6 +68,34 @@ decline() {
   exit 1
 }
 
+# HOLDING is a decline too — the ref does not move, and it must not — but it is NOT the message
+# above. Nobody has been asked to verify anything: another xell's landing is open on this ref, so
+# this push was queued behind it (one runway, one card). Telling the zee to "tell your human the
+# landing is waiting in the console" would send it chasing a card that does not exist, and a human
+# looking for a request nobody raised. Say what actually happened, and what actually comes next.
+hold() {
+  echo "" >&2
+  echo "  ┌─ ZEEHIVE ─────────────────────────────────────────────────────────────" >&2
+  echo "  │ HOLDING PATTERN — you are queued for ${REF#refs/heads/}, not held for a human." >&2
+  echo "  │" >&2
+  echo "  │ Another xell already has a landing open on this ref, and the runway" >&2
+  echo "  │ takes ONE at a time: two landings on one ref is how a human approves" >&2
+  echo "  │ the first and the second can never fast-forward again." >&2
+  echo "  │" >&2
+  echo "  │ NOTHING was rejected and NOTHING was dropped: your push is recorded" >&2
+  echo "  │ with a position, and your commits are safe on your branch. No card was" >&2
+  echo "  │ raised for a human — deliberately." >&2
+  echo "  │" >&2
+  echo "  │ WHAT TO DO: nothing. Do NOT poll and do NOT push again. When the runway" >&2
+  echo "  │ clears the queenzee RESUMES your session and tells you to:" >&2
+  echo "  │     zee sync    # the xell ahead landed, so main moved — merge it in" >&2
+  echo "  │     zee land    # raises the FRESH request a human decides on" >&2
+  echo "  │ To leave the pattern instead:  zee land --withdraw --reason \"…\"" >&2
+  echo "  └───────────────────────────────────────────────────────────────────────" >&2
+  echo "" >&2
+  exit 1
+}
+
 command -v curl >/dev/null 2>&1 || decline "Gate unreachable: curl not found (failing closed)."
 
 BODY=$(printf '{"project_id":"%s","ref":"%s","old":"%s","new":"%s"}' "$PROJECT_ID" "$REF" "$OLD" "$NEW")
@@ -88,6 +116,7 @@ case "$RESP" in
     ;;
   *'"reason":"rejected"'*)  decline "A human REJECTED this exact commit. Re-pushing it will not help." ;;
   *'"reason":"pending"'*)   decline "Raised for verification in the ZEEHIVE console — waiting on a human." ;;
+  *'"reason":"holding"'*)   hold ;;
   *'"reason":"deletion-refused"'*) decline "Deleting ${REF#refs/heads/} is never allowed." ;;
   *'"allow":false'*) decline "Declined by the queenzee." ;;
   *) decline "Gate gave an unreadable answer (failing closed): $(echo "$RESP" | cut -c1-120)" ;;

@@ -13,7 +13,7 @@ import { logline } from '../lib/logbus.js';
 import { gitLog, diffStat, cleanGitEnv, headCommit } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
-import { nudgeXellAfterLand, nudgeXellForStaleLanding } from './nudge.js';
+import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway } from './nudge.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
 import { recordXourceHead } from '../lib/projects.js';
 
@@ -128,15 +128,29 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
     // The receive path is about to move the ref to newSha — keep the rollback baseline fresh so a
     // land does not leave head_commit stale (and later trip a false BACKWARD on pull).
     await recordLandedHead(project, newSha);
+    // The runway is free the moment this approval is spent — call whoever is holding for it.
+    freeRunway(projectId, ref, `${newSha.slice(0, 8)} landed`);
     return { allow: true, reason: 'approved', request: row };
   }
 
+  // Operator policy: when auto-approve is on, an unjudged push is let straight through. The push is
+  // already in flight (the hook is waiting on this answer), so returning allow:true lets THIS push
+  // move the ref — no update-ref, no re-entrancy. The row is recorded as landed-by-policy so the
+  // audit trail shows exactly what went in without a human. (Prior rejections are handled below.)
+  // Read BEFORE the upsert lookup because it decides whether the holding pattern exists at all: with
+  // the policy on, every push lands on arrival, so the runway is never occupied and the queue must be
+  // a no-op rather than a new place to wait.
+  const auto = !!project.auto_approve_land;
+
   // No approval → this push is a REQUEST. Upsert so a retrying zee bumps attempts instead of
-  // filling the console with duplicate cards for the same sha.
+  // filling the console with duplicate cards for the same sha — and, since 067, so a zee re-pushing
+  // while it HOLDS keeps its one place in line instead of taking a second.
   const existing = await one(
     `SELECT * FROM land_request
-       WHERE project_id=$1 AND ref=$2 AND new_sha=$3 AND status IN ('pending','rejected')
-       ORDER BY requested_at DESC LIMIT 1`, [projectId, ref, newSha]);
+       WHERE project_id=$1 AND ref=$2 AND new_sha=$3
+         AND (status IN ('pending','rejected')
+              OR (NOT $4::bool AND status='holding' AND cleared_at IS NULL))
+       ORDER BY requested_at DESC LIMIT 1`, [projectId, ref, newSha, auto]);
 
   if (existing && existing.status === 'rejected') {
     // A human said no to THIS sha. Auto-approve is a policy for UNJUDGED pushes; it must never
@@ -145,11 +159,19 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
     return { allow: false, reason: 'rejected', request: existing };
   }
 
-  // Operator policy: when auto-approve is on, an unjudged push is let straight through. The push is
-  // already in flight (the hook is waiting on this answer), so returning allow:true lets THIS push
-  // move the ref — no update-ref, no re-entrancy. The row is recorded as landed-by-policy so the
-  // audit trail shows exactly what went in without a human. (Prior rejections are handled above.)
-  const auto = !!project.auto_approve_land;
+  if (existing && existing.status === 'holding') {
+    // Still in the pattern: same sha, same place in line. Bump attempts (the row records how many
+    // times this zee has asked) and tell it where it stands — a zee that pushes again must not be
+    // met with silence, and it must not be given a second slot for pushing twice.
+    const row = await one(
+      `UPDATE land_request SET attempts = attempts + 1 WHERE id=$1 RETURNING *`, [existing.id]);
+    broadcast('land', row);
+    const position = await holdingPosition(row);
+    logline('landgate',
+      `${newSha.slice(0, 8)} is HOLDING at position ${position} on ${ref.replace('refs/heads/', '')} `
+      + `(${pusher?.slug || 'unknown'} re-pushed; the runway is still occupied)`);
+    return { allow: false, reason: 'holding', request: row, position };
+  }
 
   if (existing) {
     if (auto) {
@@ -196,6 +218,36 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
     return { allow: true, reason: 'auto-approved', request: row };
   }
 
+  // ── IS THE RUNWAY FREE? ──────────────────────────────────────────────────────
+  // One open landing per ref. If ANOTHER xell already has a landing open on this ref, this push does
+  // not become a second card — it enters the HOLDING PATTERN with a position, and its zee is told so
+  // and nudged when the runway clears. Two cards for one runway is the deadlock: a human approves
+  // one, the ref moves, and the other can never fast-forward.
+  //
+  // Two deliberate exemptions:
+  //   • the SAME xell pushing again — that is the "one open landing per zee" case, and the answer to
+  //     it is `zee land --withdraw` (061), not a queue. Sequencing a zee behind itself would leave it
+  //     waiting for a runway it is already standing on.
+  //   • an UNATTRIBUTED push (no xell resolved on either side) — a human pushing by hand, or a sha we
+  //     could not match. Hiding that in a queue would hide it from the human who made it, so it is
+  //     held for review exactly as before. It is still declined; nothing lands unreviewed.
+  const occupant = await runwayOccupant(projectId, ref);
+  if (occupant && occupant.xell_id && xell?.id && occupant.xell_id !== xell.id) {
+    const held = await one(
+      `INSERT INTO land_request (project_id, xell_id, ref, old_sha, new_sha, commits, stat,
+          status, holding_since, behind_request_id)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,'holding',now(),$8) RETURNING *`,
+      [projectId, xell.id, ref, oldSha || null, newSha,
+        JSON.stringify(commits), stat ? JSON.stringify(stat) : null, occupant.id]);
+    broadcast('land', held);
+    const position = await holdingPosition(held);
+    logline('landgate',
+      `HOLDING ${ref.replace('refs/heads/', '')} → ${newSha.slice(0, 8)} on ${project.name} — ${xell.slug} is `
+      + `#${position} in the pattern behind ${occupant.xell_slug || 'another xell'}'s landing `
+      + `(${String(occupant.new_sha).slice(0, 8)}). No second card was raised; its zee is nudged when the runway clears.`);
+    return { allow: false, reason: 'holding', request: held, position, behind: occupant };
+  }
+
   const row = await one(
     `INSERT INTO land_request (project_id, xell_id, ref, old_sha, new_sha, commits, stat)
        VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb) RETURNING *`,
@@ -210,14 +262,195 @@ export async function checkPush({ projectId, ref, oldSha, newSha }) {
   return { allow: false, reason: 'pending', request: row };
 }
 
+// ── THE RUNWAY AND ITS HOLDING PATTERN ───────────────────────────────────────────────────────────
+// One runway per (project, ref). It is OCCUPIED while a landing on that ref is open — pending (a
+// human is deciding) or approved (the queenzee is landing it). Everything below is about who is on
+// it, who is waiting, and what happens the moment it frees.
+//
+// Nothing here decides anything. Clearance is a NUDGE: the holder's zee syncs and pushes again, and
+// THAT push raises a fresh request a human reads. The queue orders who asks first; the gate still
+// grants. (The database refuses a holding→approved promotion outright — 067.)
+
+// Who is on the runway right now: the OLDEST open landing on this ref. Oldest, not newest, because
+// that is the one a human has been looking at longest and the one the FIFO landing pad will process
+// first. `dismissed_at` is deliberately NOT filtered — dismissal hides a receipt, it does not free a
+// runway, and an approved-but-hidden landing is still about to move the ref.
+export async function runwayOccupant(projectId, ref) {
+  return one(
+    `SELECT lr.*, x.slug AS xell_slug FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
+       WHERE lr.project_id=$1 AND lr.ref=$2 AND lr.kind='push' AND lr.status IN ('pending','approved')
+       ORDER BY lr.requested_at ASC, lr.id ASC LIMIT 1`, [projectId, ref]);
+}
+
+// Everyone in the pattern for this runway, in the order the tower will call them.
+export async function holdingQueue(projectId, ref) {
+  return q(
+    `SELECT lr.*, x.slug AS xell_slug, x.status AS xell_status FROM land_request lr
+       LEFT JOIN xell x ON x.id = lr.xell_id
+      WHERE lr.project_id=$1 AND lr.ref=$2 AND lr.kind='push'
+        AND lr.status='holding' AND lr.cleared_at IS NULL
+      ORDER BY lr.requested_at ASC, lr.id ASC`, [projectId, ref]);
+}
+
+// This xell's live place(s) in the pattern — what `zee land --withdraw` may lower, and what the
+// zee's own status reads. A cleared row is history: it is out of the queue and its zee has been told.
+export async function holdingRequests(xellId) {
+  if (!xellId) return [];
+  return q(
+    `SELECT * FROM land_request
+       WHERE xell_id=$1 AND kind='push' AND status='holding' AND cleared_at IS NULL
+       ORDER BY requested_at ASC`, [xellId]);
+}
+
+// 1-based position, COUNTED rather than stored. A stored number would have to be renumbered every
+// time a holder leaves, and a queue that lies about position is worse than one that does not report
+// it — "you are #3" while two ahead of you have withdrawn is how a zee decides to give up.
+export async function holdingPosition(row) {
+  if (!row || row.status !== 'holding' || row.cleared_at) return null;
+  // Compared against the row AS THE DATABASE HOLDS IT, never against a timestamp round-tripped
+  // through JS: postgres keeps timestamptz to the microsecond and a JS Date truncates to the
+  // millisecond, so a row passed back in "<= itself" and counted ZERO. A position of null is exactly
+  // the thing this whole feature exists to avoid telling a zee.
+  const n = await one(
+    `SELECT count(*)::int AS n FROM land_request lr,
+            (SELECT project_id, ref, requested_at, id FROM land_request WHERE id=$1) me
+       WHERE lr.project_id=me.project_id AND lr.ref=me.ref AND lr.kind='push'
+         AND lr.status='holding' AND lr.cleared_at IS NULL
+         AND (lr.requested_at, lr.id) <= (me.requested_at, me.id)`, [row.id]);
+  return n?.n || null;
+}
+
+// RELEASE ONE HOLDER. The row stays 'holding' and gains a clearance receipt — it was never decided,
+// so it must never be dressed as a decision — and its zee is resumed with the go-around: `zee sync`,
+// then `zee land`. Returns whether the zee was actually reached, because the caller uses that to
+// decide whether to call the NEXT one instead (a clearance nobody heard clears nobody).
+async function clearHolder(row, { reason, by = 'queenzee@runway' } = {}) {
+  const branch = (row.ref || '').replace('refs/heads/', '') || 'main';
+  const short = String(row.new_sha || '').slice(0, 8);
+  const cleared = await one(
+    `UPDATE land_request SET cleared_at=now(), cleared_by=$2, clear_reason=$3
+       WHERE id=$1 AND status='holding' AND cleared_at IS NULL RETURNING *`,
+    [row.id, by, String(reason || 'the runway is clear').slice(0, 2000)]);
+  if (!cleared) return { id: row.id, cleared: false };   // somebody else cleared it first
+  broadcast('land', cleared);
+  logline('landgate',
+    `CLEARED ${row.xell_slug || 'a xell'} to land ${short} on ${branch} — ${reason}. `
+    + 'Its sha is not approved and nothing has moved: the zee syncs and pushes again for a fresh decision.');
+
+  const nudged = await nudgeXellForClearedRunway(row.xell_id,
+    { sha: row.new_sha, ref: row.ref, reason, requestId: row.id })
+    .catch((e) => ({ nudged: false, error: e.message }));
+  const note = `runway clear (${reason}) — `
+    + (nudged?.nudged ? 'the zee was nudged to `zee sync` and land again'
+      : `nothing to nudge (${nudged?.reason || nudged?.error || 'no cxell zee'})`);
+  // Same race as closeAsStale: the resume is fire-and-forget, so an undeliverable one may already
+  // have written the truthful "could NOT be reached" receipt. Whoever knows delivery FAILED wins.
+  const noted = await one(
+    `UPDATE land_request SET note=$2 WHERE id=$1 AND note IS NULL RETURNING *`, [row.id, note])
+    .catch(() => null);
+  if (noted) broadcast('land', noted);
+  return { id: row.id, cleared: true, nudged: !!nudged?.nudged, xell_id: row.xell_id };
+}
+
+// THE TOWER. Called after every transition that frees a runway (a landing, a rejection, a
+// withdrawal, a stale close) and again on the land-reaper tick as the backstop. Idempotent by
+// construction: it does nothing while the runway is still occupied, so it is safe to call from
+// anywhere, and a missed call self-heals within a tick instead of stranding the queue.
+//
+// It clears until somebody actually HEARS it. A holder whose cxell is gone is tended (a human must
+// know a zee is waiting on a runway it can no longer be told about) and the next in line is called —
+// otherwise one dead zee at the head of the pattern would keep the runway empty forever.
+export async function clearRunway(projectId, ref, { reason = 'the runway is clear' } = {}) {
+  const occupant = await runwayOccupant(projectId, ref);
+  if (occupant) return { cleared: [], busy: true, occupant: occupant.id };
+  const queue = await holdingQueue(projectId, ref);
+  if (!queue.length) return { cleared: [], empty: true };
+  const cleared = [];
+  for (const holder of queue) {
+    const r = await clearHolder(holder, { reason }).catch((e) => {
+      logline('landgate', `could not clear holder ${String(holder.id).slice(0, 8)}: ${e.message}`);
+      return { id: holder.id, cleared: false };
+    });
+    cleared.push(r);
+    if (r.nudged) break;               // it has the runway now; the rest keep their place in line
+  }
+  return { cleared };
+}
+
+// Fire-and-forget clearance for the transitions that free a runway. Never awaited by a landing path:
+// a landing must not fail, slow down, or roll back because a holder's cxell is unreachable.
+function freeRunway(projectId, ref, reason) {
+  if (!projectId || !ref) return;
+  setImmediate(() => clearRunway(projectId, ref, { reason }).catch((e) => {
+    logline('landgate', `clearing the runway for ${String(ref).replace('refs/heads/', '')} failed: ${e.message}`);
+  }));
+}
+
+// A REAPED XELL MUST NOT HOLD A PLACE IN LINE. Its zee is gone: it will never sync, never re-push,
+// and clearing it would only tend a corpse — but left in the pattern it inflates every position
+// behind it and, at the head, wastes a clearance on nobody. So it is swept out of the queue with an
+// honest receipt (and no nudge: there is nothing to nudge).
+export async function sweepHoldingPattern() {
+  const rows = await q(
+    `SELECT lr.id, lr.new_sha, lr.ref, x.slug, x.status AS xell_status FROM land_request lr
+       LEFT JOIN xell x ON x.id = lr.xell_id
+      WHERE lr.status='holding' AND lr.cleared_at IS NULL AND lr.kind='push'
+        AND (lr.xell_id IS NULL OR x.id IS NULL OR x.status='retired') LIMIT 20`);
+  let swept = 0;
+  for (const row of rows) {
+    const gone = await one(
+      `UPDATE land_request SET cleared_at=now(), cleared_by='queenzee@sweep',
+          clear_reason='the xell was retired while it held — swept out of the pattern so it does not '
+                     || 'hold a place nobody will ever take'
+        WHERE id=$1 AND status='holding' AND cleared_at IS NULL RETURNING *`, [row.id]).catch(() => null);
+    if (!gone) continue;
+    broadcast('land', gone);
+    logline('landgate',
+      `swept ${row.slug || 'a retired xell'}'s holding request ${String(row.new_sha).slice(0, 8)} out of the `
+      + `${String(row.ref).replace('refs/heads/', '')} pattern — the xell is ${row.xell_status || 'gone'}`);
+    swept++;
+  }
+  return { swept };
+}
+
+// The backstop half of the tower: every runway that has somebody waiting gets looked at once a tick,
+// so a clearance missed by a crashed/restarted process (or by a transition path added later that
+// forgets to call freeRunway) is never lost — it just happens a few seconds later.
+async function driveRunways() {
+  const runways = await q(
+    `SELECT DISTINCT project_id, ref FROM land_request
+       WHERE status='holding' AND cleared_at IS NULL AND kind='push'`);
+  let cleared = 0;
+  for (const r of runways) {
+    const out = await clearRunway(r.project_id, r.ref, { reason: 'the runway is clear' })
+      .catch(() => ({ cleared: [] }));
+    cleared += (out.cleared || []).filter((c) => c.cleared).length;
+  }
+  return { runways: runways.length, cleared };
+}
+
 // What a WAITING zee polls (scripts/xell-land.mjs --wait). The gate tells a declined zee to
 // "re-run the SAME push once a human approves it" and, until this existed, gave it no way to learn
 // that had happened — so it either sat blind or re-pushed on a guess. The ship gate has had
 // shipStatus() for exactly this since 010; landing never got its half.
 export async function landStatus(xellId) {
-  return one(
+  const row = await one(
     `SELECT lr.*, x.slug AS xell_slug FROM land_request lr JOIN xell x ON x.id = lr.xell_id
        WHERE lr.xell_id = $1 ORDER BY lr.requested_at DESC LIMIT 1`, [xellId]);
+  if (!row || row.status !== 'holding') return row;
+  // A state a zee can land in must be a state the zee is TOLD about — and for a holding request the
+  // one thing it needs is WHERE IT STANDS. Both waiters read this row (`zee land --wait` via
+  // self/status, `xell-land.mjs` via /api/land/status), so the position is attached here, once,
+  // rather than computed twice and disagreeing.
+  const ahead = row.cleared_at ? null : await runwayOccupant(row.project_id, row.ref);
+  return {
+    ...row,
+    holding_position: await holdingPosition(row),
+    holding_behind: ahead ? { id: ahead.id, xell_slug: ahead.xell_slug, new_sha: ahead.new_sha, status: ahead.status } : null,
+    // Cleared = the runway freed and this zee was told to go around. It is out of the pattern; the
+    // only way back is `zee sync` then `zee land`.
+    cleared: !!row.cleared_at,
+  };
 }
 
 // Every land request of this xell a human is still being asked about — pending (undecided) or
@@ -254,20 +487,32 @@ export async function withdrawLandRequest(id, by = 'zee', reason = null) {
   const row = await one(`SELECT * FROM land_request WHERE id=$1`, [id]);
   if (!row) throw new Error('no such land request');
   const what = row.kind === 'pull' ? 'PR' : 'landing';
-  if (row.status !== 'pending') {
+  // HOLDING is withdrawable too, and for the same reason pending is: a zee that no longer means its
+  // ask should be able to leave the pattern rather than be called for a runway it does not want. A
+  // CLEARED holder has already left it (it was told to sync and re-push), so there is nothing open.
+  const holding = row.status === 'holding' && !row.cleared_at;
+  if (row.status !== 'pending' && !holding) {
     throw new Error(row.status === 'approved'
       ? `that ${what} is already APPROVED — a human has decided it and the queenzee is landing it; `
         + 'you cannot withdraw a decision (raise a `zee tend` if it must not land)'
-      : `that ${what} is '${row.status}', not pending — there is nothing open to withdraw`);
+      : row.status === 'holding'
+        ? `that ${what} was already CLEARED out of the holding pattern — the runway freed and you were told `
+          + 'to `zee sync` and `zee land` again. There is nothing left to un-ask'
+        : `that ${what} is '${row.status}', not pending — there is nothing open to withdraw`);
   }
   const out = await one(
     `UPDATE land_request SET status='withdrawn', withdrawn_at=now(), withdrawn_by=$2, withdraw_reason=$3
-       WHERE id=$1 AND status='pending' RETURNING *`, [id, by, reason ? String(reason).slice(0, 2000) : null]);
+       WHERE id=$1 AND status=$4::land_status AND (status <> 'holding' OR cleared_at IS NULL) RETURNING *`,
+    [id, by, reason ? String(reason).slice(0, 2000) : null, row.status]);
   if (!out) throw new Error('no such pending request (already decided?)');
   broadcast('land', out);
   logline('landgate',
     `WITHDRAWN ${String(out.new_sha).slice(0, 8)} on ${out.ref.replace('refs/heads/', '')} by ${by}`
-    + `${reason ? ` — ${String(reason).slice(0, 120)}` : ''} (the zee un-asked it; no human decision was made)`);
+    + `${reason ? ` — ${String(reason).slice(0, 120)}` : ''} (the zee un-asked it; no human decision was made)`
+    + `${holding ? ' — it was holding, so it simply leaves the pattern' : ''}`);
+  // Withdrawing the OCCUPANT frees the runway; withdrawing a HOLDER just shortens the queue (and
+  // clearRunway is a no-op while somebody is still on the runway, so this is safe either way).
+  if (out.kind === 'push') freeRunway(out.project_id, out.ref, `${String(out.new_sha).slice(0, 8)} was withdrawn`);
   return out;
 }
 
@@ -304,7 +549,12 @@ export async function decideLandRequest(id, decision, by = 'human') {
   if (!row) throw new Error('no such pending request (already decided?)');
   broadcast('land', row);
   logline('landgate', `${decision.toUpperCase()} ${row.new_sha.slice(0, 8)} by ${by}`);
-  if (decision !== 'approved') return row;
+  if (decision !== 'approved') {
+    // A rejection frees the runway just as surely as a landing does — the ref did not move, so the
+    // next holder's sha may well still be landable. Call it.
+    freeRunway(row.project_id, row.ref, `${row.new_sha.slice(0, 8)} was rejected`);
+    return row;
+  }
   return landApproved(row, by);
 }
 
@@ -377,6 +627,9 @@ async function closeAsStale(row, { tip = null, from = 'approved' } = {}) {
     `UPDATE land_request SET note=$2 WHERE id=$1 AND note IS NULL RETURNING *`, [row.id, note])
     .catch(() => null);
   if (noted) { broadcast('land', noted); logline('landgate', `${short}: ${note}`); }
+  // A landing that died still frees the runway it was occupying — the next holder must not inherit
+  // this one's fate by waiting behind a corpse.
+  freeRunway(row.project_id, row.ref, `${short} went stale`);
   return noted || (await one(`SELECT * FROM land_request WHERE id=$1`, [row.id]).catch(() => stale)) || stale;
 }
 
@@ -440,6 +693,7 @@ export async function landApproved(row, by = 'human') {
     await recordLandedHead(project, headCommit(project.repo_root, project.main_branch));
     // A cxell zee that raised this landing is waiting to continue — resume its session (best-effort).
     nudgeXellAfterLand(row.xell_id, { by }).catch(() => {});
+    freeRunway(row.project_id, row.ref, `${row.new_sha.slice(0, 8)} is already on the ref`);
     return landed || row;
   }
 
@@ -505,6 +759,9 @@ export async function landApproved(row, by = 'human') {
     // The runway is free again — pull the next item onto the pad promptly rather than waiting for
     // the next tick. Best-effort: the tick is the backstop.
     setImmediate(() => processPad(row.project_id).catch(() => {}));
+    // …and call whoever has been holding for THIS ref. (Different queues: the pad orders what the
+    // queenzee ACTS on across both lanes; the runway orders which zee gets to ASK next.)
+    freeRunway(row.project_id, row.ref, `${row.new_sha.slice(0, 8)} landed`);
     return landed || row;
   }
 
@@ -542,7 +799,17 @@ export async function tick() {
   const swept = await sweepStalePending().catch((e) => {
     logline('landgate', `stale sweep failed: ${e.message}`); return { checked: 0, stale: 0 };
   });
-  return { checked: stuck.length, landed, stale: stale + swept.stale, pending_checked: swept.checked };
+  // …and the HOLDING PATTERN: drop the holders whose xell has been reaped (they will never take the
+  // runway), then call whoever is next on every runway that is standing free. Both are backstops —
+  // each freeing transition already calls the tower — so in the normal case they find nothing.
+  const gone = await sweepHoldingPattern().catch((e) => {
+    logline('landgate', `holding sweep failed: ${e.message}`); return { swept: 0 };
+  });
+  const runways = await driveRunways().catch((e) => {
+    logline('landgate', `runway drive failed: ${e.message}`); return { runways: 0, cleared: 0 };
+  });
+  return { checked: stuck.length, landed, stale: stale + swept.stale, pending_checked: swept.checked,
+    holding_swept: gone.swept, runways: runways.runways, holders_cleared: runways.cleared };
 }
 
 // "Seen it — stop showing me." A durable fact about VISIBILITY, never about status: a dismissed

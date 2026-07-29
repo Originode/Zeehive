@@ -48,8 +48,30 @@ function waitFlag() {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// THE HOLDING PATTERN (067). Another xell's landing is open on this ref, so the gate queued this
+// push instead of raising a second card — one runway, one card, no races. There is NOTHING to wait
+// for here: no human has been asked, and the clearance arrives as a nudge (the queenzee resumes the
+// session). So both waiters PRINT THE POSITION AND STOP rather than burn their timeout on a card
+// that does not exist — the exact failure `xell-land.mjs` used to have on 'stale'.
+function printHolding(land) {
+  if (land.cleared) {
+    console.error(`\n  ✈ CLEARED — the runway is free and you are next${land.new_sha ? ` (${String(land.new_sha).slice(0, 8)})` : ''}.`);
+    console.error('    Nothing of yours was approved; nobody has read your commits yet. Take it:');
+    console.error('      zee sync   # the xell ahead landed, so main moved — merge it in (resolve any conflict, git add/commit)');
+    console.error('      zee land   # raises the FRESH request a human actually decides on\n');
+    return;
+  }
+  console.error(`\n  ⏳ HOLDING at position ${land.position || '?'}${land.behind?.xell_slug ? ` behind ${land.behind.xell_slug}'s landing` : ''}`
+    + `${land.new_sha ? ` (your sha ${String(land.new_sha).slice(0, 8)})` : ''}.`);
+  console.error('    Your push was NOT rejected and NOT dropped — it is recorded and queued. No card was raised');
+  console.error('    for a human: one landing per ref at a time is what stops two zees racing and one going stale.');
+  console.error('    Do NOT poll and do NOT re-push. When the runway clears the queenzee RESUMES your session and');
+  console.error('    tells you to `zee sync` then `zee land`. To leave the pattern: `zee land --withdraw --reason "…"`.\n');
+}
+
 // Poll self/status until the landing is decided. Exit is the caller's nudge: landed=0, rejected/
 // stale/timeout=1. 'approved' just keeps waiting — the queenzee lands an approval itself now.
+// 'holding' does NOT wait: see printHolding.
 async function pollLanding(secs) {
   const deadline = Date.now() + secs * 1000;
   let last = '';
@@ -76,6 +98,7 @@ async function pollLanding(secs) {
       process.exit(1);
     }
     if (land.status === 'withdrawn') { console.error('\n  ✗ WITHDRAWN — this landing was un-asked (by you, or by a human on your behalf); nothing is waiting on anyone.\n'); process.exit(1); }
+    if (land.status === 'holding') { printHolding(land); process.exit(land.cleared ? 1 : 0); }
     // 'pending' / 'approved' → keep waiting (an approval lands automatically).
   }
   console.error(`\n  ✗ TIMEOUT after ${secs}s — still waiting on a human. Your work is safe on your branch.\n`);
@@ -174,6 +197,7 @@ function usage() {
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
+                                     ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then `zee sync`, then `zee land`
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
@@ -214,6 +238,10 @@ switch (cmd) {
     const w = waitFlag();
     if (!w.on) process.exit(r.code >= 400 ? 1 : 0);
     const land = r.json?.landing;
+    // A landing in the HOLDING PATTERN is not waiting on a human, so there is nothing to poll for —
+    // say where it stands and exit (0 while holding: the ask is alive; 1 once cleared: it needs you
+    // to act now).
+    if (land?.status === 'holding') { printHolding(land); process.exit(land.cleared ? 1 : 0); }
     // Nothing pending to wait on → answer now (landed=0, decided-otherwise=1, no landing=0).
     if (!land || !['pending', 'approved'].includes(land.status)) {
       process.exit(land && land.status !== 'landed' ? (['rejected', 'stale', 'withdrawn'].includes(land.status) ? 1 : 0) : 0);
@@ -238,6 +266,13 @@ switch (cmd) {
     const status = r.json?.status;
     if (r.code >= 400 || status === 'needs-resolution' || status === 'error') process.exit(1);
     if (status === 'landed') process.exit(0);
+    // HOLDING: queued behind another xell's landing on this ref. Print the position and exit cleanly
+    // even under --wait — waiting would burn the whole timeout on a card no human will ever see, and
+    // the clearance comes as a session nudge, not as a status a poll could catch.
+    if (status === 'holding') {
+      printHolding({ status, position: r.json?.position, behind: r.json?.behind, new_sha: r.json?.request?.new_sha });
+      process.exit(0);
+    }
     if (!w.on) process.exit(0); // held, but not asked to wait — the queenzee will nudge on approval
     if (status === 'held') { await pollLanding(w.secs); } // exits
     process.exit(0);

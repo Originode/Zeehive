@@ -21,7 +21,7 @@ import { logline } from '../lib/logbus.js';
 import { spawnCreds } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
          ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell,
-         installZeeCliIntoCxell, installZeeLiveIntoCxell } from '../lib/cxell.js';
+         installZeeCliIntoCxell, installZeeLiveIntoCxell, installZeeAttachIntoCxell } from '../lib/cxell.js';
 import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
@@ -1221,6 +1221,10 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // Same defence for the ATTEND path's renderer: the dashboard terminal's ✱/⚒ feed chips only
     // work against a zee-live.mjs that watches the view file this queenzee writes.
     await installZeeLiveIntoCxell({ ctx, name });
+    // …and its other half: zee-attach.sh is what an attending human's pane actually runs, and it is
+    // what DRAINS the talk queue when the headless turn ends — so a message sent to this zee while
+    // it was working is typed into its session instead of swallowed by the read-only feed.
+    await installZeeAttachIntoCxell({ ctx, name });
     // INJECT the assigned harness's files into the cxell (docs §6): its persona (.zeehive/harness/
     // PERSONA.md), its SKILL.md files (.claude/skills/…, Claude-loadable), and its MEMORY — including
     // the cxell manual carried by Zee Base — under .zeehive/harness/memory/. This is why the manual is
@@ -1280,10 +1284,14 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '',
     '## READ THE PROJECT MANUAL FIRST',
     '- You run headless with NO host-side config, so project memory/instructions are NOT auto-loaded',
-    '  — open the manual yourself before you design anything. Read the repo\'s top-level manual/',
-    '  handover (look for CLAUDE.md, AGENTS.md, HANDOFF.md or README.md at /work/repo, and the',
-    '  memory files they reference). That, plus the docs it points to, is how this repo actually',
-    '  works; guessing instead is how a zee wastes its whole turn.',
+    '  — open the manual yourself before you design anything. Start with CLAUDE.md or AGENTS.md at',
+    '  /work/repo, then README.md, then the docs and memory files they point at. That is how this',
+    '  repo actually works; guessing instead is how a zee wastes its whole turn.',
+    '- A HANDOFF/handover doc is NOT a manual. Those are usually written for a HOST session on one',
+    '  developer\'s machine in an earlier era of the repo, and they age badly: absolute paths, machine',
+    '  and container names, docker commands and tooling that no longer exist — none of which you can',
+    '  reach from a cxell anyway. Read one for RATIONALE (why a thing is built the way it is), and',
+    '  take every current fact from the code, from CLAUDE.md/README.md, and from your own manual.',
     '',
     '## YOUR QUEENZEE VERBS — how a cxell zee lands/ships/goes-to-prod/finishes',
     harness && harnessFiles(harness).length

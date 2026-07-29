@@ -87,6 +87,19 @@ export function parseDay(s) {
 }
 const DAY_FMT = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
 export const fmtDay = (s) => { const d = parseDay(s); return d ? DAY_FMT.format(d) : ''; };
+// A TIMESTAMP (an event's `ts`), not a day: the history list needs the hour a thing happened, and
+// `fmtDay` deliberately drops it. It lives here rather than in the drawer because a refactor that
+// moved `legalNext` out of WorkItemDrawer.jsx took this with it and left the call behind — the
+// drawer's history then threw `ReferenceError: fmtWhen is not defined` the moment an item was
+// opened. A shared helper has one home; that home is this file.
+// An unparseable value renders AS ITSELF rather than as an empty span: a timestamp the server sent
+// in a shape we did not expect is information, and "" would hide it.
+const WHEN_FMT = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+export function fmtWhen(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? String(ts) : WHEN_FMT.format(d);
+}
 export const toInputDate = (s) => {
   const d = parseDay(s);
   if (!d) return '';

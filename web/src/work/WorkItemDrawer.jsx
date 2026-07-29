@@ -3,7 +3,8 @@ import { showConfirm } from '../Dialog.jsx';
 import {
   addDep, createWorkItem, deleteWorkItem, getWorkItem, listWorkItems, patchWorkItem, removeDep,
 } from './workApi.js';
-import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, legalNext, statusLabel, toInputDate } from './bits.jsx';
+import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, fmtWhen, legalNext, statusLabel,
+         toInputDate } from './bits.jsx';
 import DeployZee from './DeployZee.jsx';
 
 // WORK TRACKER — the ITEM DRAWER: everything about one work item, and every edit you can make to it.

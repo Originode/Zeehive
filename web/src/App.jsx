@@ -613,9 +613,11 @@ export default function App() {
             </div>
           </div>
         )}
+        {/* xellId lights the terminal's 💬 talk composer — the door that reaches this zee even while
+            it is mid-turn (the pane is a read-only feed then, so typing reaches nobody). */}
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
-                       onClose={() => setTermXell(null)} />
+                       xellId={termXell.id} onClose={() => setTermXell(null)} />
         )}
         {msgXell && (
           <MessageComposer xell={msgXell} initialText={msgXell.initialText || ''} onClose={() => setMsgXell(null)}
@@ -1144,7 +1146,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
         )}
         {cxell && termOpen && (
           <ZeeTerminal zeeId={x.zee_id} slug={x.slug} viewerUrl={x.viewer_url}
-                       onClose={() => setTermOpen(false)} />
+                       xellId={x.id} onClose={() => setTermOpen(false)} />
         )}
         {!isProd && <Row k="zee" v={working ? x.zee_name : '—'} highlight={working} testid="zee-name" />}
         {isProd
