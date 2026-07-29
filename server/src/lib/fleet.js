@@ -9,6 +9,7 @@ import { deviceConfig } from './devices.js';
 import { reasonPair } from './status.js';
 import { listDoneSuggestions } from './managers.js';
 import { holdingByRef } from '../queenzee/landgate.js';
+import { backupDue } from '../queenzee/maintenance.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -363,6 +364,11 @@ export async function getFleet(projectId) {
     },
     last: lastBackup,
     last_attempt: lastAttempt || null,
+    // WHEN THE NEXT ATTEMPT IS, and why (#26). A failed attempt now shortens the window instead of
+    // consuming it, and that is worth nothing if the panel still leaves a human guessing whether
+    // anything is going to happen. `kind` is 'retry' when the last attempt failed — so the panel can
+    // say "retry in 8 min" rather than showing a red mark next to silence.
+    next: await backupDue(pid).catch(() => null),
     count: backupCount?.n ?? 0,
     running: runningBackup || null,
   };

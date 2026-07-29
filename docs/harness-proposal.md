@@ -162,8 +162,26 @@ project**, and inherit a global worker harness — which is the point: a new rol
 gets the manual through `zee-base`, and adds only what is specific to this project. What it is refused,
 structurally and with a sentence: a **manager** persona (only humans add managers), **any** system-wide
 harness, another project's harness, any non-persona field (`is_law_core` included — the create/update
-whitelist is still the law guard), and deleting a harness a **live** xell is wearing. The project comes
-from the caller's **token**, never from the body, so "which project?" is not a question it can ask.
+whitelist is still the law guard), an entry that would occupy a file path the persona **inherits**, and
+deleting *or disabling* a harness a **live** xell is wearing **or inheriting**. The project comes from
+the caller's **token**, never from the body, so "which project?" is not a question it can ask — and the
+stored **key** is derived from the project plus the label for the same reason, since a key is how a
+harness is addressed on a dispatch and in a fleet-wide migration.
+
+Two of those are worth stating as rules of the model rather than as route checks, because they hold
+however a row was written:
+
+- **An inherited file path belongs to the ancestor.** A harness materializes into real files
+  (`.zeehive/harness/memory/<basename>.md`, `.claude/skills/<name>/SKILL.md`), and the injector writes
+  the merged list in order — so a descendant entry on an inherited path used to overwrite the
+  ancestor's copy in every wearer's workspace, the cxell manual included. The merge now gives such a
+  path to the root-most owner and drops the shadow (with a log line), and the authoring functions
+  refuse the save with the collision named.
+- **A persona may not be taken away from a running zee.** `harnessForXell` and `effectiveHarness` both
+  filter on `enabled`, and both FKs are `ON DELETE SET NULL`, so deleting or disabling a harness — or
+  any ANCESTOR of one — empties a live wearer's next briefing with no error it can see. The guard on
+  both verbs covers the harness and its descendants, and the delete is decided in one transaction with
+  `FOR UPDATE` so a dispatch cannot land inside it.
 
 The dev crew is not the crew's opposite here: a project-scoped persona inheriting `dev-base` is the
 intended use, and `test/dev-crew.test.mjs` therefore lints the **system-wide** subtree only — a
