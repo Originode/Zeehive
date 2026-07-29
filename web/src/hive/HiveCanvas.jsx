@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
 import { hiveColor, hiveStatusLabel, hiveHeat } from './status.js';
+import { isManagerXell, crewLinks, relatedTo, focusIdOf, hexDim, relationTag, REL_DASH } from './crew.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
@@ -61,8 +62,9 @@ const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
 // head sha and its diffstat count work it can never land — noise dressed as progress. Its hexagon
 // therefore drops both and is drawn in the HARNESS BADGE's visual language instead (dashed seat +
 // the persona disc it wears), spending the space on what a manager actually IS: its crew, and its
-// read-only hold on production.
-export const isManagerXell = (x) => x?.zee_type === 'manager';
+// read-only hold on production. (The predicate itself lives in hive/crew.js with the rest of the
+// manager↔crew relation — every layer that draws the relation asks the same question of the same code.)
+export { isManagerXell } from './crew.js';
 
 // ── who WEARS a harness vs who its badge is FOR ──────────────────────────────
 // `wearer_ids` is every live xell wearing the harness; `consumer_ids` is the subset the badge is
@@ -75,69 +77,13 @@ export const isManagerXell = (x) => x?.zee_type === 'manager';
 export const wearersOf = (h) => h?.wearer_ids || h?.consumer_ids || [];   // old payloads: wearers = consumers
 export const badgedHarnesses = (harnesses = []) => (harnesses || []).filter((h) => (h?.consumer_ids || []).length > 0);
 
-// ── a manager and its CREW: the one real grouping in the honeycomb ────────────
-// seatXells already sits a manager's crew in the cells NEAREST to it, so the relationship was half
-// expressed by layout and not at all by interaction: hovering a manager told you nothing about which
-// of the cells around it were actually its own. These three pure helpers are that answer, and they
-// cost no request — `xell.manager_xell_id` already rides on the fleet payload the console polls.
-//
-// LIVE crew only, by the SAME rule the work tracker resolves a live zee with (server/src/lib/
-// work-items.js LIVE_XELL_STATUSES): 'retired' is gone and 'husk'/'error' are VACANT (lib/
-// hive-status.js classes both as vac-dirty), so no zee occupies any of them. A reaped worker lighting
-// up as though it were still there draws a crew that does not exist — worse than no highlight.
-const DEAD_XELL_STATUSES = ['retired', 'husk', 'error'];
-export const isLiveXell = (x) => !!x && !DEAD_XELL_STATUSES.includes(String(x.status || ''));
-
-// manager id → its LIVE crew, and worker id → the manager it reports to (only when that manager is
-// itself live — a husk manager cannot be "who this one reports to"). A dead manager's own hover still
-// gets a crew list: the manager row is vacant, but the workers it dispatched are real and running.
-export function crewLinks(xells = []) {
-  const byId = new Map();
-  for (const x of xells || []) if (x?.id) byId.set(x.id, x);
-  const crewOf = {};
-  const managerOf = {};
-  for (const x of xells || []) {
-    const mid = x?.manager_xell_id;
-    if (!mid || !isLiveXell(x)) continue;
-    (crewOf[mid] ||= []).push(x);
-    if (isLiveXell(byId.get(mid))) managerOf[x.id] = mid;
-  }
-  return { crewOf, managerOf };
-}
-
-// Who is RELATED to the focused (hovered or selected) xell, and HOW → Map(id → 'crew' | 'manager').
-// ONE hop, deliberately: a manager marks its crew, and a worker marks the manager it reports to
-// ("who does this one report to" is the same question asked backwards). A worker does NOT mark its
-// SIBLINGS — they are not related to it, they merely share a boss, and lighting five cells from one
-// worker's hover reads as a selection sweep rather than an answer.
-export function relatedTo(xells = [], focusId, links = null) {
-  const rel = new Map();
-  if (!focusId) return rel;
-  const focus = (xells || []).find((x) => x?.id === focusId);
-  if (!focus) return rel;
-  const l = links || crewLinks(xells);
-  if (isManagerXell(focus)) for (const w of l.crewOf[focusId] || []) rel.set(w.id, 'crew');
-  const mid = l.managerOf[focusId];
-  if (mid && mid !== focusId) rel.set(mid, 'manager');
-  return rel;
-}
-
-// A hex DIMS when the focus is elsewhere — but a RELATED hex never dims, and that is the whole
-// highlight: the focus lights its own group and the rest of the fleet recedes behind it. Pure, so the
-// decision the draw loop makes is testable without a canvas.
-export const hexDim = ({ hexId, expandedId = null, hovered = false, hoverActive = false, related = null }) =>
-  !related && ((!!expandedId && expandedId !== hexId) || (hoverActive && !hovered));
-
-// The WORD a relation mark carries. This codebase's rule is that the word is the signal and colour is
-// only reinforcement — a highlight that exists as a hue alone fails for anyone who cannot separate
-// those hues — so every relation mark says which relation it is, in words, and the long form names
-// the other end of it when there is room for it.
-export function relationTag(kind, otherSlug = null) {
-  const other = String(otherSlug || '').trim();
-  if (kind === 'crew') return { kind, glyph: '⬡', word: 'crew', long: other ? `crew of ${other}` : 'crew' };
-  if (kind === 'manager') return { kind, glyph: '⬢', word: 'manager', long: other ? `manager of ${other}` : 'manager' };
-  return null;
-}
+// ── a manager and its CREW ───────────────────────────────────────────────────
+// The relation itself — who is crew, who is live, which xell the hive is focused on, and the DASH that
+// says "related" in every layer — lives in hive/crew.js, because the honeycomb is not the only view
+// that draws it: the wire overlay (Connectors.jsx) and the git graph's dots (GraphPane.jsx) draw the
+// same relationship over the same fleet, and a second copy of the rule is exactly the bug #24 removed
+// from this file. Re-exported here so a caller that reads the honeycomb's vocabulary finds it.
+export { isLiveXell, crewLinks, relatedTo, focusIdOf, hexDim, relationTag, REL_DASH } from './crew.js';
 
 // What a manager's hexagon says, as data (pure — unit-tested; the drawing below only paints it).
 export function managerCard(x, crew = []) {
@@ -342,6 +288,9 @@ function drawDiffFilled(ctx, cx, cy, parts, { maxW, minPx, maxPx, weight = 600, 
 // The "this stat is a link" affordance: a hairline under the drawn diffstat plus a small muted
 // caption. The flower's two diff petals open the DIFF VIEWER when clicked, and on a canvas there is
 // no cursor:pointer to discover by hovering half a pixel — so the affordance has to be drawn.
+// A falsy `caption` draws the hairline ALONE — for a facet whose next line already carries the words
+// (the crew facet says "hover a dot · click to open" there, because it has one text line to spend and
+// spending it twice would push the row out of the petal).
 function drawStatLink(ctx, cx, row, caption) {
   const y = row.y + Math.max(6, row.width * 0.02);
   ctx.save();
@@ -351,10 +300,12 @@ function drawStatLink(ctx, cx, row, caption) {
   ctx.moveTo(cx - row.width / 2, y);
   ctx.lineTo(cx + row.width / 2, y);
   ctx.stroke();
-  ctx.fillStyle = withAlpha(COL.muted, 0.75);
-  ctx.font = "9px 'Segoe UI', sans-serif";
-  ctx.textAlign = 'center';
-  ctx.fillText(caption, cx, y + 7);
+  if (caption) {
+    ctx.fillStyle = withAlpha(COL.muted, 0.75);
+    ctx.font = "9px 'Segoe UI', sans-serif";
+    ctx.textAlign = 'center';
+    ctx.fillText(caption, cx, y + 7);
+  }
   ctx.restore();
 }
 
@@ -648,7 +599,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // — the SELECTED (bloomed) one, so a manager's crew stays marked while its flower is open. Its
     // live crew (or, hovering a worker, the manager it reports to) is marked as RELATED: never
     // dimmed, and drawn with the dashed tie-ring + the word, which is nothing selection uses.
-    const focusId = H.id || expandedId || null;
+    // focusIdOf is shared with the wire overlay and the graph (#25) — three views, one answer.
+    const focusId = focusIdOf(H, expandedId);
     const related = relatedTo(list, focusId, { crewOf, managerOf });
     const focus = focusId ? list.find((x) => x.id === focusId) : null;
     const relColor = focusId ? (tById[focusId]?.color || null) : null;
@@ -673,12 +625,15 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     geomRef.current.flower = null;
     geomRef.current.buttons = null;
     geomRef.current.containers = null;
+    geomRef.current.crew = null;
     if (expanded && cells[expanded.id]) {
       const [er, ec] = cells[expanded.id];
       const centers = [cellCenter(er, ec, cellSize, originX, originY),
         ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, cellSize, originX, originY))];
+      // H.id is the hovered CREW DOT while a bloom is open (see onPointerMove): the facet rings that
+      // dot and names the worker, and the same id lights its hexagon, its wire and its commit dot.
       drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines,
-        tById[expanded.id]?.color || null, crewOf[expanded.id] || []);
+        tById[expanded.id]?.color || null, crewOf[expanded.id] || [], { hoverId: H.id });
       geomRef.current.flower = { centers, size: cellSize, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
       // Per-xell ACTIONS drawn straight onto the flower (no DOM toolbar): a hit-tested button row
@@ -687,6 +642,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       // Container icons in the CONTAINERS petal are right-clickable — record their rects so a
       // context-menu event can open the same ContainerMenu the inventory chips use.
       geomRef.current.containers = flowerContainerRects(centers, cellSize, expanded);
+      // …and the CREW petal's dots are hoverable/clickable rows: the crew was listed in words here and
+      // led nowhere, which is the one surface a human reads AFTER they have already asked "whose crew?".
+      geomRef.current.crew = isManagerXell(expanded)
+        ? flowerCrewRects(centers, cellSize, crewOf[expanded.id] || []) : null;
     }
 
     // HARNESSES sit in the honeycomb grid too — each takes its own hexagon CELL (docs §5: the badge
@@ -831,6 +790,13 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     for (const r of cs) if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) return r.c;
     return null;
   }, []);
+  // a dot in the open manager's CREW petal → that worker (circular targets, so distance not a box)
+  const hitCrew = useCallback((wx, wy) => {
+    for (const d of geomRef.current.crew || []) {
+      if ((wx - d.x) ** 2 + (wy - d.y) ** 2 <= d.r ** 2) return d;
+    }
+    return null;
+  }, []);
 
   const relPos = (e) => {
     const r = canvasRef.current.getBoundingClientRect();
@@ -859,11 +825,15 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     const [wx, wy] = toWorld(mx, my);
     let cursor = 'default';
     if (expandedId) {
-      const b = hitButton(wx, wy);
-      const f = hitFlower(wx, wy);
-      cursor = b || (f && ((f.cell === 0 && f.openable) || diffPetal(expanded, f.cell))) ? 'pointer'
+      // A CREW dot answers first: it is the smallest target in the bloom and the only one that means
+      // another xell, so hovering it emits THAT worker's id — which is how the crew list leads back to
+      // its hexagons (and its wires, and its commit dots). Everything else in a bloom clears the hover.
+      const cw = hitCrew(wx, wy);
+      const b = cw ? null : hitButton(wx, wy);
+      const f = cw ? null : hitFlower(wx, wy);
+      cursor = cw || b || (f && ((f.cell === 0 && f.openable) || diffPetal(expanded, f.cell))) ? 'pointer'
         : hitContainer(wx, wy) ? 'context-menu' : 'default';   // right-click hint on an icon
-      emitHover({ id: null, commit: null });
+      emitHover({ id: cw?.id || null, commit: null, harness: null });
     } else {
       const hx = hitHex(wx, wy);
       if (hx) {
@@ -885,7 +855,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (d?.moved) return;                                    // it was a pan, not a click
     const [wx, wy] = toWorld(...relPos(e));
     if (expandedId) {
-      // Action buttons first — they sit just below the flower and own their clicks.
+      // A crew dot is a jump: open THAT worker's bloom. It comes first for the same reason it does on
+      // hover — it is the smallest target and it sits inside a petal whose own click does nothing.
+      const cw = hitCrew(wx, wy);
+      if (cw && cw.id !== expandedId) { setExpandedId(cw.id); return; }
+      // Action buttons next — they sit just below the flower and own their clicks.
       const b = hitButton(wx, wy);
       if (b) {
         const x = (xells || []).find((xx) => xx.id === expandedId);
@@ -994,7 +968,7 @@ export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color =
   hexPath(ctx, cx, cy, size + gap);
   ctx.lineWidth = 1.6;
   ctx.strokeStyle = withAlpha(col, 0.95);
-  ctx.setLineDash([2, 4]);
+  ctx.setLineDash(REL_DASH);          // the SAME dash the related wire and the related commit dot use
   ctx.stroke();
   ctx.setLineDash([]);
   // The word rides an opaque pill INSIDE the seat (never outside it — a label in the corridor would be
@@ -1444,8 +1418,39 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
   ctx.restore();
 }
 
+// ── the CREW facet's dot row, as geometry ─────────────────────────────────────
+// One dot per crew member, in petal 5 of a MANAGER's bloom. Pure and SHARED: the facet draws from this
+// and the hit-test records from it (flowerCrewRects), so a dot can never be drawn somewhere the pointer
+// does not find it — the flower's buttons and container icons are recorded the same way. `max` caps the
+// row at what fits; the overflow is counted in words ("+3") rather than crammed in.
+export const CREW_PETAL = 5;
+export function crewDotLayout(cx, cy, size, count, max = 12) {
+  const shown = Math.min(Math.max(0, count), max);
+  const r = Math.max(2.5, size * 0.05);
+  const gap = r * 2.8;
+  const y = cy + size * 0.06;
+  const x0 = cx - ((shown - 1) * gap) / 2;
+  return {
+    r, y, gap, shown, hidden: Math.max(0, count - shown),
+    dots: Array.from({ length: shown }, (_, i) => ({ x: x0 + i * gap, y, r })),
+  };
+}
+// World-space pick targets for those dots, one per crew member: hovering one emits that WORKER's id —
+// which lights its hexagon, its wire and its commit dot (#24/#25) — and clicking it opens its own
+// bloom. The pick radius is padded well past the drawn dot: a 3px disc is a target you have to aim at.
+export function flowerCrewRects(centers, size, crew = []) {
+  const rows = crew || [];
+  const centre = centers?.[CREW_PETAL];
+  if (!rows.length || !centre) return null;
+  const lay = crewDotLayout(centre[0], centre[1], size, rows.length);
+  const pick = Math.max(lay.r * 1.9, 7);
+  return lay.dots.map((d, i) => ({ x: d.x, y: d.y, r: pick, id: rows[i].id, slug: rows[i].slug }));
+}
+
 // ── the flower: rendered ON the grid cells it consumes (no overlay) ───────────
-function drawFlower(ctx, centers, size, x, diff, machines, traceColor, crew = []) {
+// Exported for the same reason the two hexagons are: its CREW facet is now an interactive list, and the
+// only honest way to assert what a human sees there is to paint it into a recording 2D context.
+export function drawFlower(ctx, centers, size, x, diff, machines, traceColor, crew = [], { hoverId = null } = {}) {
   const col = statusColor(x);
   // A manager's bloom keeps the five facets it has (identity, branch, session, containers, machine)
   // and swaps the two GIT facets — commit head and diffstat — for the two things a manager owns:
@@ -1467,7 +1472,7 @@ function drawFlower(ctx, centers, size, x, diff, machines, traceColor, crew = []
     ctx.strokeStyle = isCenter ? col : withAlpha(col, 0.45);
     ctx.stroke();
     ctx.clip();
-    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x, traceColor);
+    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x, traceColor, { hoverId });
     ctx.restore();
   });
 }
@@ -1665,7 +1670,7 @@ export function managerFacets(x, machines, crew = []) {
   return f;
 }
 
-function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
+function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor, { hoverId = null } = {}) {
   ctx.textAlign = 'center';
   if (isCenter) {
     ctx.textBaseline = 'middle';
@@ -1721,27 +1726,59 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor) {
     fillFont(ctx, `⬡ ×${rows.length}`, headW, 10, size * 0.3, (p) => `700 ${p}px 'Segoe UI', sans-serif`);
     ctx.fillStyle = rows.length ? COL.text : withAlpha(COL.muted, 0.8);
     ctx.fillText(rows.length ? `⬡ ×${rows.length}` : '⬡ no crew', cx, cy - size * 0.18);
+    // The dot row is a LIST OF WORKERS, and it is interactive: hovering a dot lights that worker
+    // everywhere (hexagon, wire, commit dot) and clicking it opens its own bloom. Two consequences for
+    // the drawing. First, the geometry comes from crewDotLayout — the same function the hit-test reads,
+    // so the dot you point at is the worker you get. Second, a dot was a COLOUR-ONLY signal (status
+    // hue, nothing else): hovering one now NAMES it, because the word is the signal here too.
+    const hovered = rows.findIndex((w) => w.id && w.id === hoverId);
     if (rows.length) {
-      const shown = rows.slice(0, 12);
-      const r = Math.max(2.5, size * 0.05);
-      const gap = r * 2.8;
-      let dx = cx - ((shown.length - 1) * gap) / 2;
-      for (const wkr of shown) {
-        ctx.beginPath(); ctx.arc(dx, cy + size * 0.06, r, 0, Math.PI * 2);
+      const lay = crewDotLayout(cx, cy, size, rows.length);
+      lay.dots.forEach((d, i) => {
+        const wkr = rows[i];
+        const on = i === hovered;
+        ctx.beginPath(); ctx.arc(d.x, d.y, on ? d.r * 1.6 : d.r, 0, Math.PI * 2);
         ctx.fillStyle = wkr.color; ctx.fill();
-        if (wkr.busy) { ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha('#ffd93b', 0.9); ctx.stroke(); }
-        dx += gap;
-      }
-      if (rows.length > shown.length) {
+        if (on) {                                  // the one under the cursor: ringed, so it is unmissable
+          ctx.lineWidth = 1.6; ctx.strokeStyle = COL.text; ctx.stroke();
+        } else if (wkr.busy) {
+          ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha('#ffd93b', 0.9); ctx.stroke();
+        }
+      });
+      if (lay.hidden) {
         ctx.font = `${Math.min(9.5, size * 0.12)}px 'Segoe UI', sans-serif`;
         ctx.fillStyle = COL.muted;
-        ctx.fillText(`+${rows.length - shown.length}`, cx, cy + size * 0.06 + r * 3);
+        ctx.fillText(`+${lay.hidden}`, cx, lay.y + lay.r * 3);
       }
+      // the affordance, DRAWN — this file's rule: on a canvas there is no cursor:pointer to discover by
+      // hovering half a pixel. A hairline under the row says "these are links"…
+      const rowW = (lay.shown - 1) * lay.gap + lay.r * 2;
+      drawStatLink(ctx, cx, { y: lay.y + lay.r * (lay.hidden ? 4.2 : 1.6), width: rowW }, null);
     }
+    // …and this line says what you can do with them, in words. It sits BELOW the caption rather than
+    // sharing it: the caption is already a full line of information ("1 working · 1 waiting"), and an
+    // affordance that has to fight the information for room is the one that loses.
+    const room = (dy) => hexHalfWidthAt(size, size * dy) * 2 * 0.9;
+    const pick = (variants, r) => variants.find((t) => ctx.measureText(t).width <= r) || null;
+    // The caption: the crew's ACTIVITY — unless a dot is under the cursor, in which case it names WHO
+    // that is. A named worker beats "1 working · 1 waiting" while you are pointing at one, and until now
+    // a dot said nothing at all but its status colour.
     ctx.font = `${Math.min(10, size * 0.13)}px 'Segoe UI', sans-serif`;
-    ctx.fillStyle = COL.muted;
-    const caption = card.activity || (card.count ? 'crew idle' : 'nothing dispatched yet');
-    ctx.fillText(fit(ctx, caption, hexHalfWidthAt(size, size * 0.3) * 2 * 0.9), cx, cy + size * 0.3);
+    ctx.fillStyle = hovered >= 0 ? COL.text : COL.muted;
+    ctx.fillText(fit(ctx, hovered >= 0
+      ? `⬡ ${rows[hovered].slug}`
+      : card.activity || (card.count ? 'crew idle' : 'nothing dispatched yet'), room(0.3)),
+    cx, cy + size * 0.3);
+    if (rows.length) {
+      ctx.font = "9px 'Segoe UI', sans-serif";
+      ctx.fillStyle = withAlpha(COL.muted, 0.75);
+      // longest that FITS; if even the short form cannot be read, nothing is drawn rather than an
+      // ellipsised instruction (a truncated verb is not an affordance)
+      const say = hovered >= 0
+        ? pick(['click to open it', 'open it'], room(0.44))
+        : pick(['hover a dot · click to open', 'hover a dot'], room(0.44));
+      if (say) ctx.fillText(say, cx, cy + size * 0.44);
+    }
     return;
   }
 

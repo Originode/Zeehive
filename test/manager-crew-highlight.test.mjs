@@ -36,7 +36,7 @@ writeFileSync(tmp, transformSync(src, { loader: 'jsx', format: 'esm' }).code);
 let mod;
 try { mod = await import('../' + tmp); } finally { rmSync(tmp, { force: true }); }
 const { isLiveXell, crewLinks, relatedTo, hexDim, relationTag, drawRelationMark,
-        drawManagerHex, drawCompactHex, managerCard } = mod;
+        drawManagerHex, drawCompactHex, managerCard, focusIdOf } = mod;
 
 // ── the fleet under test: one manager with three workers (one of them REAPED), a second manager
 //    with no crew at all, and a loner nobody manages ──────────────────────────
@@ -228,8 +228,9 @@ ok(managerCard(mgr, crewLinks(fleet).crewOf.M).count === 2,
 console.log('\n── the honeycomb wires it up (what only the source can show) ──');
 ok(/const \{ crewOf, managerOf \} = crewLinks\(list\)/.test(src),
    'the draw loop builds the links from the fleet list it already has — no per-hover request');
-ok(/const focusId = H\.id \|\| expandedId \|\| null/.test(src),
-   'the focus is the hovered hex, or the SELECTED one when nothing is hovered');
+ok(/const focusId = focusIdOf\(H, expandedId\)/.test(src)
+   && focusIdOf({ id: 'a' }, 'b') === 'a' && focusIdOf({ id: null }, 'b') === 'b' && focusIdOf(null, null) === null,
+   'the focus is the hovered hex, or the SELECTED one when nothing is hovered — resolved by focusIdOf, the one the wires and the graph ask too (#25)');
 ok(/const related = relatedTo\(list, focusId, \{ crewOf, managerOf \}\)/.test(src),
    'and the marks come from relatedTo, not from a second copy of the rule');
 ok(/const dim = hexDim\(\{ hexId: hx\.id, expandedId, hovered, hoverActive, related: rel \}\)/.test(src),

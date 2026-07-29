@@ -489,6 +489,18 @@ a.cbox:hover { border-color: var(--accent); }
 .machinechip { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: default;
   font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
 
+/* WHOSE CREW this xell is, or how big a crew it runs (tickets #24/#25/#28). The honeycomb marks the
+   relation against a FOCUS — dashed = related to what you are pointing at — but a list has no focus, so
+   here it is a persistent WORD instead of a highlight. Deliberately the same quiet chip language as the
+   machine/env chips (not the `.active` selected state, and no accent fill): a relationship is context,
+   not a status, and it must never read as the row being selected. The dashed left edge is the one
+   borrowed cue — the same "related" dash the hexes, wires and commit dots use. */
+.crewchip { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: default;
+  font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px;
+  border-left: 2px dashed var(--muted); }
+.crewchip[data-crew="manager"] { border-left-style: solid; }   /* a manager HAS a crew; it is not "related to" one */
+.ny-chip .crewchip { margin-left: 6px; opacity: .9; }
+
 /* WHICH environment the xell is loaded with (migration 043). Same quiet chip language, but this one
    IS an action — click to extract the xell's current .env — so it gets a pointer + hover lift. Prod
    env tints warm (it carries live secrets); an empty env (∅) reads dim: dormant, nothing merged. */
