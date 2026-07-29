@@ -459,6 +459,39 @@ export async function installZeeLiveIntoCxell({ ctx = 'default', name }) {
   }
 }
 
+// Refresh the renderer into cxells that ALREADY EXIST — not just the ones we are about to spawn.
+//
+// The spawn-time install above only ever helped the next cage. Every cxell created before it
+// shipped kept the renderer baked into its image, so the terminal's ✱/⚒ chips wrote a view file
+// that nothing in there was watching: the chip lit up "hidden" and the feed went on showing
+// thinking. A toggle that confidently reports a state it did not apply is worse than one that
+// looks inert — which is exactly how this reached a human as "the buttons dont work".
+//
+// Run at BOOT, which is also the moment after a ship (the queenzee restarts into the new code) —
+// so a shipped attend-path change reaches the RUNNING fleet instead of waiting for it to recycle.
+// It touches only /usr/local/bin inside cxells the queenzee owns, cannot affect a zee's work, and
+// every failure is per-cxell and logged rather than thrown: one unreachable cage must not stop the
+// sweep, and the sweep must never delay boot.
+export async function refreshZeeLiveInLiveCxells(listLiveCxells) {
+  let ok = 0;
+  const failed = [];
+  let cxells = [];
+  try { cxells = await listLiveCxells(); } catch (e) {
+    logline('cxell', `live-feed renderer sweep skipped — could not list cxells (${String(e.message).slice(0, 120)})`);
+    return { swept: 0, ok: 0, failed: [] };
+  }
+  for (const { ctx = 'default', name } of cxells) {
+    const r = await installZeeLiveIntoCxell({ ctx, name });
+    if (r.installed) ok++; else failed.push(name);
+  }
+  if (cxells.length) {
+    logline('cxell', `live-feed renderer refreshed in ${ok}/${cxells.length} running cxell(s)`
+      + (failed.length ? ` — not reachable: ${failed.slice(0, 5).join(', ')}` : '')
+      + ' (one mid-turn picks it up on its NEXT feed)');
+  }
+  return { swept: cxells.length, ok, failed };
+}
+
 // ── Is the IMAGE this cxell booted from actually built from the current code? ─────────────────
 //
 // The refresh below hides the answer by design: it overwrites /usr/local/bin/zee, so afterwards the

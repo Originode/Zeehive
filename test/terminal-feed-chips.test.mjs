@@ -78,6 +78,18 @@ ok(/next feed opens in/.test(idle), 'and the tooltip explains the click still re
 ok(!render({ thinking: true, moves: true, live: true }).includes('no live feed'), 'and it is absent while a feed IS running');
 ok(!render({ thinking: true, moves: true, live: null }).includes('no live feed'), 'and while we have not been told yet (null ≠ known-idle)');
 
+// ── the case that reached a human as "the buttons dont work" ─────────────────────────────────
+console.log('\n── a live feed from an OLDER renderer ──');
+const staleFeed = render({ thinking: false, moves: true, live: true, filterable: false });
+ok(staleFeed.includes('older feed'), 'the header says the feed is an older renderer');
+ok(/data-testid="feed-stale"/.test(staleFeed), 'as its own marked element (distinct from "no live feed")');
+ok(!staleFeed.includes('no live feed'), 'and not confused with the no-feed case — a feed IS running');
+ok(/applies to its next feed/.test(staleFeed), 'the tooltip says the choice is recorded for the next feed');
+ok(/cannot be repainted/.test(chipOf(staleFeed, 'thinking')),
+   "and the chip's own tooltip stops promising a repaint it cannot do");
+ok(!render({ thinking: true, moves: true, live: true, filterable: true }).includes('older feed'),
+   'a current renderer says nothing at all (no noise in the normal case)');
+
 // ── the stylesheet reinforces it independently ───────────────────────────────────────────────
 console.log('\n── the CSS adds colour and a strike, and never relies on opacity alone ──');
 const css = read('web/src/styles.css');

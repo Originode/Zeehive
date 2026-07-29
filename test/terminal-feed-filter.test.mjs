@@ -30,8 +30,15 @@ const write = zeeLiveViewCommand({ thinking: false, moves: true }, true);
 ok(write.includes(`'{"thinking":false,"moves":true}'`), 'writes the chosen view as JSON');
 ok(write.includes(`> ${ZEE_LIVE_VIEW_FILE}.tmp`) && write.includes(`mv -f ${ZEE_LIVE_VIEW_FILE}.tmp ${ZEE_LIVE_VIEW_FILE}`),
    `into ${ZEE_LIVE_VIEW_FILE} ATOMICALLY (a poll landing in a truncate would read an empty view and repaint twice)`);
-ok(/pgrep -f 'zee-live\[\.\]mjs'/.test(write), 'and asks whether a live feed is actually running');
-ok(write.includes('ZH-LIVE') && write.includes('ZH-IDLE'), 'answering with markers the parse can find');
+ok(/pgrep -f 'node \.\*zee-live\[\.\]mjs'/.test(write),
+   'and asks whether a live feed is running — matching the INTERPRETER too, so the installer\'s own shell (bash -lc … /tmp/zee-live.mjs) cannot pass for a feed');
+ok(write.includes('ZH-LIVE') && write.includes('ZH-READY'),
+   'answering TWO questions: is any feed up, and is a view-WATCHING renderer alive');
+ok(/kill -0 "\$r"/.test(write),
+   'proving the announced pid is still ALIVE (a marker left by a dead feed proves nothing)');
+ok(!/ZH-PID/.test(write),
+   'and never comparing pgrep\'s pid to the marker: pgrep -f matches whole command lines, so a shell whose argv contains the script name can shadow the real renderer (seen live: PID 10994 vs READY 11002)');
+ok(write.includes(`${ZEE_LIVE_VIEW_FILE}.ready`), 'the announcement marker zee-live.mjs writes when it starts watching');
 ok(write.includes(`cat ${ZEE_LIVE_VIEW_FILE}`), 'and reads the view back, so the client is told the TRUTH, not its own guess');
 
 const readOnly = zeeLiveViewCommand(null, false);
@@ -48,13 +55,22 @@ ok(zeeLiveViewCommand({ thinking: false, moves: false }, true).includes('"thinki
 
 // ── the reply the client is sent ──────────────────────────────────────────────────────────────
 console.log('\n── parsing what the cxell answered ──');
-const live = parseZeeLiveViewReply('ZH-LIVE\n{"thinking":false,"moves":true}\n');
+const live = parseZeeLiveViewReply('ZH-READY 412\nZH-LIVE\n{"thinking":false,"moves":true}\n');
 ok(live.t === 'v' && live.thinking === false && live.moves === true && live.live === true,
    'a running feed with a view file is reported exactly');
-const idle = parseZeeLiveViewReply('ZH-IDLE\n');
-ok(idle.live === false && idle.thinking === true && idle.moves === true,
+ok(live.filterable === true, 'and it is FILTERABLE: the running pid is the one that announced itself');
+// The case that reached a human as "the buttons dont work": a cxell from an older image.
+const stale = parseZeeLiveViewReply('ZH-READY\nZH-LIVE\n{"thinking":false,"moves":true}\n');
+ok(stale.live === true && stale.filterable === false,
+   'a feed with NO announcement is live but NOT filterable (an older renderer that ignores the view file)');
+ok(parseZeeLiveViewReply('ZH-READY\nZH-LIVE\n').filterable === false,
+   'a marker whose pid is no longer alive does not count either — the shell only echoes one it could kill -0');
+ok(parseZeeLiveViewReply('ZH-READY 412\nZH-IDLE\n').live === true,
+   'and a watching renderer is live even if the loose pgrep missed it — the precise signal wins');
+const idle = parseZeeLiveViewReply('ZH-READY\nZH-IDLE\n');
+ok(idle.live === false && idle.filterable === false && idle.thinking === true && idle.moves === true,
    'no feed + no view file = idle, showing everything (the renderer\'s own default)');
-ok(parseZeeLiveViewReply('ZH-IDLE\n{ half-writ').thinking === true,
+ok(parseZeeLiveViewReply('ZH-READY\nZH-IDLE\n{ half-writ').thinking === true,
    'a half-written view file falls back to showing everything, never to hiding output');
 ok(parseZeeLiveViewReply(null).live === false, 'and a dead channel answers idle instead of throwing');
 
@@ -70,6 +86,8 @@ ok(/startsWith\(CTRL_PREFIX\)/.test(onmsg), 'onmessage checks the prefix BEFORE 
 ok(/return;/.test(onmsg) && onmsg.indexOf('return;') < onmsg.indexOf('term.write'),
    'a control frame returns instead of being painted as garbage in the terminal');
 ok(/catch\s*{/.test(onmsg), 'a malformed control frame cannot kill the terminal');
+ok(/filterable: m\.filterable !== false/.test(onmsg),
+   "and the frame's `filterable` is KEPT — dropping it is how the \"older feed\" warning would silently never appear");
 
 // ── the buttons ───────────────────────────────────────────────────────────────────────────────
 // (their LEGIBILITY — the "can't tell if it's pressed" defect — is pinned by

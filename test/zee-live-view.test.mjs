@@ -13,7 +13,7 @@
 //
 // Runs the REAL script as a child process on a REAL temp view file. No DB, no docker, no ssh.
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -74,6 +74,13 @@ try {
   ok(a.out().includes('Reading the manual first.'), "and what the zee SAYS is rendered");
   ok(!a.out().includes('\x1b[3J'), 'and nothing repainted (no view ever changed)');
 
+  // ── the ANNOUNCEMENT: how the bridge tells this renderer from an older one ──────────────────
+  console.log('\n── it announces itself, so a stale renderer cannot be mistaken for this one ──');
+  const readyFile = `${viewFile}.ready`;
+  ok(existsSync(readyFile), 'a .ready marker is written once it is actually watching');
+  ok(readFileSync(readyFile, 'utf8').trim() === String(a.proc.pid),
+     'carrying its OWN pid, which is what the bridge compares against the process it finds running');
+
   // ── (c) a mid-stream change REPAINTS ────────────────────────────────────────────────────────
   console.log('\n── ✱ thinking off, mid-stream: the feed redraws without it ──');
   setView({ thinking: false, moves: true });
@@ -108,6 +115,8 @@ try {
   a.end();
   const code = await Promise.race([exited, sleep(3000).then(() => 'timeout')]);
   ok(code === 0, `stdin ending still ends the process (exit: ${code})`);
+  ok(!existsSync(readyFile),
+     'and it takes its announcement with it — a leftover marker would make the NEXT feed look filterable when it is not');
 
   // ── (b) a view chosen BEFORE the feed starts is honoured ─────────────────────────────────────
   console.log('\n── a view set before the feed opens is already in force ──');

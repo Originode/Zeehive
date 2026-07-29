@@ -53,7 +53,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   // The zee's LIVE FEED view (the ✱/⚒ chips). `live` is what the bridge last told us about the
   // cage: true = a feed is running and a chip repaints it now, false = the feed is not up (the
   // turn ended and the interactive session owns the pane), null = we have not been told yet.
-  const [feed, setFeed] = useState({ thinking: true, moves: true, live: null });
+  const [feed, setFeed] = useState({ thinking: true, moves: true, live: null, filterable: null });
 
   // Open a path in the explorer (opening the panel if needed). The bumping `n` makes every request
   // distinct so clicking the SAME path again re-opens it (identity, not value, drives the effect).
@@ -113,7 +113,10 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
       if (typeof e.data === 'string' && e.data.startsWith(CTRL_PREFIX)) {
         try {
           const m = JSON.parse(e.data.slice(CTRL_PREFIX.length));
-          if (m.t === 'v') setFeed({ thinking: m.thinking !== false, moves: m.moves !== false, live: !!m.live });
+          // keep `filterable` too: it is the difference between "your click repainted the feed" and
+          // "a feed is running that cannot hear you" (an older renderer) — the chips say which.
+          if (m.t === 'v') setFeed({ thinking: m.thinking !== false, moves: m.moves !== false,
+                                     live: !!m.live, filterable: m.filterable !== false });
         } catch { /* a malformed control frame must not kill the terminal */ }
         return;
       }

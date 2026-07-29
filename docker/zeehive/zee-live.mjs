@@ -19,7 +19,13 @@
 // feed can never disagree about what is on. Because we keep every event we have rendered, a change
 // REPAINTS: hiding thinking removes the thinking that already scrolled by, showing it brings it
 // back — a real show/hide, not just "quieter from here on".
-import { readFileSync, watchFile, unwatchFile } from 'node:fs';
+//
+// It also ANNOUNCES ITSELF (the .ready file below). A cxell built from an older image runs an older
+// renderer that knows nothing about views: the chips would write the file, the feed would ignore it,
+// and the header would confidently claim "hidden" while the thinking kept scrolling. The marker
+// lets the bridge tell "a feed is running" from "a feed that can be filtered is running", so the
+// terminal can say which — a toggle must never report a state it did not apply.
+import { readFileSync, writeFileSync, unlinkSync, watchFile, unwatchFile } from 'node:fs';
 
 const C = { dim:'\x1b[2m', reset:'\x1b[0m', cyan:'\x1b[36m', green:'\x1b[32m', yellow:'\x1b[33m', mag:'\x1b[35m', bold:'\x1b[1m' };
 const w = (s) => process.stdout.write(s + '\r\n');
@@ -27,6 +33,10 @@ const clip = (s, n = 200) => { s = String(s).replace(/\s+/g, ' ').trim(); return
 
 // Where the dashboard chips land. Overridable so a test can drive the same file without /tmp.
 const VIEW_FILE = process.env.ZEE_LIVE_VIEW_FILE || '/tmp/zee-live-view.json';
+// "a renderer that understands views is running, and it is THIS pid". The bridge compares it with
+// the pid it finds running: equal = the chips will actually do something; missing/stale = an older
+// renderer from an older image, and the terminal says so instead of pretending.
+const READY_FILE = `${VIEW_FILE}.ready`;
 const VIEW_POLL_MS = Number(process.env.ZEE_LIVE_VIEW_POLL_MS || 400);
 // What a repaint can redraw. A long turn is thousands of events; keeping every one of them would
 // grow without bound and redraw a wall. The tail is what an attending human is reading anyway.
@@ -40,7 +50,13 @@ process.stdin.on('data', (d) => {
   buf += d.toString(); let nl;
   while ((nl = buf.indexOf('\n')) >= 0) { const line = buf.slice(0, nl); buf = buf.slice(nl + 1); if (line.trim()) feed(line); }
 });
-process.stdin.on('end', () => { if (buf.trim()) feed(buf); unwatchFile(VIEW_FILE); });
+process.stdin.on('end', () => { if (buf.trim()) feed(buf); shutdown(); });
+// Leave nothing behind that would make the NEXT feed look filterable when it is not.
+const shutdown = () => {
+  unwatchFile(VIEW_FILE);
+  try { unlinkSync(READY_FILE); } catch { /* already gone, or never written */ }
+};
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { shutdown(); process.exit(0); });
 
 function feed(line) {
   let e; try { e = JSON.parse(line); } catch { return; } // non-JSON / bookkeeping noise
@@ -113,3 +129,6 @@ function readView() {
 
 readView();                                                  // honour a view chosen before we started
 watchFile(VIEW_FILE, { interval: VIEW_POLL_MS }, readView);  // polling: survives the atomic-rewrite that fs.watch misses
+// Announce LAST: by here we are actually watching, so the marker can never claim a filterable feed
+// a moment before it is one. Best-effort — a read-only /tmp costs the hint, not the feed.
+try { writeFileSync(READY_FILE, String(process.pid)); } catch { /* the bridge will just report 'older feed' */ }

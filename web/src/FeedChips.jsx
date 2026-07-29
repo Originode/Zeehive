@@ -22,16 +22,31 @@ import React from 'react';
 // instead of trusting a JSX read. Living in its own file is what makes that possible.
 export default function FeedChips({ feed, onToggle }) {
   const live = feed.live;
+  // Three things can be true of the pane, and only one of them means "your click repaints it now":
+  //   live=false        → no feed at all; the interactive session owns the pane
+  //   live, !filterable → a feed IS streaming, but from a renderer too old to watch the view file
+  //                       (a cxell built before this shipped). The chip records the view; it cannot
+  //                       apply it until the next feed.
+  //   live, filterable  → the normal case, say nothing.
+  // The middle one is the dangerous one: without it the header reads "hidden" while the thinking
+  // keeps scrolling — a toggle reporting a state it never applied.
+  const note = live === false
+    ? { kind: 'idle', text: 'no live feed',
+        title: 'The zee is not streaming a live feed right now (its turn ended, so the interactive session owns this pane). The chips set the view the next feed opens in.' }
+    : (live === true && feed.filterable === false)
+      ? { kind: 'stale', text: 'older feed',
+          title: 'This cxell is streaming from an older feed renderer that does not watch the view file, so these chips cannot repaint it. Your choice is recorded and applies to its next feed.' }
+      : null;
+  const applies = note
+    ? ' — this feed cannot be repainted, so it applies to the next one'
+    : ' (the feed redraws, including what already scrolled past)';
   const chip = (key, glyph, label, what) => {
     const on = feed[key] !== false;
     return (
       <button type="button" data-testid={`feed-${key}`} aria-pressed={on}
               className={`feedchip ${on ? 'on' : 'off'}`}
               onClick={() => onToggle(key)}
-              title={`${on ? 'Hide' : 'Show'} ${what} in the zee's live feed`
-                     + (live === false
-                        ? ' — no feed is streaming right now, so this is the view the next one starts in'
-                        : ' (the feed redraws, including what already scrolled past)')}>
+              title={`${on ? 'Hide' : 'Show'} ${what} in the zee's live feed` + applies}>
         <span className="fc-glyph">{glyph}</span>
         <span className="fc-label">{label}</span>
         {/* the word IS the state — never rely on the shade alone */}
@@ -43,13 +58,10 @@ export default function FeedChips({ feed, onToggle }) {
     <span className="feedchips" data-testid="feed-filters">
       {chip('thinking', '✱', 'thinking', "the zee's thinking (the ✱ lines)")}
       {chip('moves', '⚒', 'moves', 'the detailed moves — every ⚒ tool call and its ↳ result')}
-      {/* Say it out loud rather than leaving a click to land on nothing: while no feed is running
-          the pane belongs to the interactive session, and a toggle only sets what the NEXT feed
-          opens in. */}
-      {live === false && (
-        <span className="fc-idle" data-testid="feed-idle"
-              title="The zee is not streaming a live feed right now (its turn ended, so the interactive session owns this pane). The chips set the view the next feed opens in.">
-          no live feed
+      {/* Say it out loud rather than leaving a click to land on nothing. */}
+      {note && (
+        <span className="fc-idle" data-testid={`feed-${note.kind}`} data-kind={note.kind} title={note.title}>
+          {note.text}
         </span>
       )}
     </span>
