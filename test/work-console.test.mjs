@@ -198,5 +198,61 @@ ok(/dlg-overlay/.test(read('web/src/work/WorkConsole.jsx')),
    'Escape while a Dialog is open answers the dialog only — it does not also close the console');
 ok(/THE ZEE SEAM/.test(drawer), 'the drawer keeps a named seam for part 3\'s assign-a-zee control');
 
+// ── a real RENDER pass: the cheapest thing that catches a free identifier ──────────────────────
+// Static reading cannot see that a component references a name that is not in scope — and vite
+// happily BUILDS one (I shipped exactly that bug into this file's filter select while fixing
+// something else, and `npm run build` was green). So each screen is server-rendered once with
+// react-dom/server over a stubbed fetch: no browser, no DOM library, ~1s. A ReferenceError, a bad
+// hook call or a crash on first paint fails here instead of in front of a human.
+const smoke = async () => {
+  const esbuild = await import('esbuild');
+  const { tmpdir } = await import('node:os');
+  const { createRequire } = await import('node:module');
+  const out = resolve(tmpdir(), 'work-console-smoke.cjs');
+  await esbuild.build({
+    stdin: {
+      contents: `
+        const React = require('react');
+        const { renderToString } = require('react-dom/server');
+        const Board = require('./Board.jsx').default;
+        const Tickets = require('./Tickets.jsx').default;
+        const Gantt = require('./Gantt.jsx').default;
+        const Drawer = require('./WorkItemDrawer.jsx').default;
+        module.exports = { React, renderToString, Board, Tickets, Gantt, Drawer };
+      `,
+      resolveDir: resolve(here, '..', 'web/src/work'),
+      loader: 'js',
+    },
+    bundle: true, format: 'cjs', platform: 'node', outfile: out, jsx: 'automatic',
+    logLevel: 'silent', define: { 'process.env.NODE_ENV': '"development"' },
+  });
+  const req = createRequire(out);
+  const { React, renderToString, ...screens } = req(out);
+  // Every screen renders its shell before any effect resolves, which is the frame a human sees
+  // first — so that is the frame this asserts on.
+  const statuses = [...server].map((key, i) => ({ key, label: key, order: i, terminal: false }));
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '[]' });
+  const html = [
+    renderToString(React.createElement(screens.Board, { projectId: 'p', rootId: null, statuses })),
+    renderToString(React.createElement(screens.Tickets, { projectId: 'p', statuses, kinds: ['bug'] })),
+    renderToString(React.createElement(screens.Gantt, { projectId: 'p', rootId: null })),
+    renderToString(React.createElement(screens.Drawer, { itemId: 'i', projectId: 'p', statuses })),
+  ].join('');
+  return html;
+};
+try {
+  const html = await smoke();
+  ok(true, 'every screen renders without throwing (free identifiers, bad hooks, first-paint crashes)');
+  // The board's FIRST frame is its loading shell (it has no columns until /api/board answers), so
+  // that is what the markup carries — asserting on work-board here would be asserting that the
+  // stubbed fetch had already resolved, which is not what a first paint is.
+  ok(/loading the board/.test(html), 'the board renders its loading shell on the first frame');
+  for (const id of ['work-tickets', 'work-gantt', 'work-drawer']) {
+    ok(html.includes(id), `the rendered markup carries ${id}`);
+  }
+} catch (e) {
+  ok(false, `a screen threw while rendering — ${String(e.message).split('\n')[0]}`);
+}
+
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);
