@@ -117,8 +117,12 @@ you are on, the verbs that are actually yours, how to run and verify, and a map 
 
 ZEEHIVE is its own first project: work on it happens in xells like any other project. A Zeehive
 xell gets its own per-xell meta-DB container (`zeehive_db_spin_<slug>`), and the nested queenzee
-inside it runs with simulate-mode safety defaults (`zeehive.yml`) — it can never touch the real
-fleet. Landed work reaches the running instance via its **self-ship**: the approved ref is
+inside it runs with simulate-mode safety defaults (`zeehive.yml`) — every provisioning, teardown,
+build, deploy-file and backup path is mode-gated, so it provisions and deploys nothing. It is **not**
+fully sealed off, though: its meta-DB is a clone of the real one, the flags gate actions rather than
+reads, and `proddiff` reads real production databases with no mode gate
+([docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md) is the loop-by-loop
+audit). Landed work reaches the running instance via its **self-ship**: the approved ref is
 rebuilt and the server replaces itself, finishing the ship record on the new boot.
 
 Legacy note: a host-process deployment mode (the pre-container era) still exists alongside the

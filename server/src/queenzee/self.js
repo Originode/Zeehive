@@ -13,6 +13,7 @@ import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
+import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { collectCxellDiffToWorktree, sealCxell, cxellName, cxellRunning, syncCxellWithXource } from '../lib/cxell.js';
 import { pushToXource, catchUpToXource } from './xellgit.js';
@@ -45,7 +46,7 @@ import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, 
 // bottom of this file, and read on the dispatch path. Same one-rule-one-place discipline as the type
 // check: this file adds the manager REFUSALS, never a second copy of the rules.
 import { normalizeZeeType, resolveHarness, listHarnesses, createHarness, updateHarness,
-         deleteHarness } from '../lib/harness.js';
+         deleteHarnessUnlessWorn, liveHarnessWearers, wearerList } from '../lib/harness.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -1504,6 +1505,37 @@ function managerHarnessView(full) {
   };
 }
 
+// THE STORED KEY OF A MANAGER-CREATED PERSONA IS DERIVED, NEVER CHOSEN.
+//
+// `harness.key` is UNIQUE across every scope, and it is how a harness is ADDRESSED outside the
+// console: `--harness <key>` on a dispatch, and `harness_memory_put('<key>', …)` in a migration
+// (house rule 9). A caller-chosen key therefore reaches further than the project it is scoped to — a
+// manager could take a name a future fleet-wide migration needs ('dev-security'), and the uniqueness
+// collision doubled as an existence oracle for other projects' rows.
+//
+// So the queenzee derives it: the project, then the label, both slugged, inside createHarness's
+// 40-character key budget. Deterministic (the same label in the same project always names the same
+// row) and namespaced (a global key can never be taken by accident).
+const keyPart = (s, max) => String(s || '').toLowerCase().trim()
+  .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, max).replace(/-+$/, '');
+
+async function deriveHarnessKey(xell, label) {
+  const proj = await one(`SELECT name FROM project WHERE id=$1`, [xell.project_id]);
+  const base = `${keyPart(proj?.name, 12) || 'project'}-${keyPart(label, 20) || 'harness'}`;
+  const holder = await one(`SELECT project_id FROM harness WHERE key=$1`, [base]);
+  // Free, or already this project's (which is a refusal the caller can act on — it is their row).
+  if (!holder) return { key: base };
+  if (String(holder.project_id || '') === String(xell.project_id)) return { key: base, mine: true };
+  // Held by a row this caller cannot see (another project's, or a system-wide one). It must NOT be
+  // told that — "that name is taken" about a row it has no access to is exactly the cross-project
+  // oracle this derivation exists to close. Disambiguate silently and report the key it got.
+  for (let n = 2; n <= 9; n++) {
+    const alt = `${base}-${n}`;
+    if (!(await one(`SELECT id FROM harness WHERE key=$1`, [alt]))) return { key: alt };
+  }
+  return { key: `${base.slice(0, 33)}-${randomUUID().slice(0, 6)}` };
+}
+
 // A manager may only make WORKER personas. Checked on the way in as well as on the way out, so the
 // refusal names the field the caller actually sent.
 function refuseManagerType(zeeType) {
@@ -1595,30 +1627,52 @@ export async function selfHarnessCreate(xell, body = {}) {
   if (rejected.length) return rejectedFieldsRefusal(rejected);
   const p = await parentFor(xell, body.parent);
   if (p.refusal) return p.refusal;
+  // THE KEY IS NOT THE CALLER'S TO PICK — said out loud rather than quietly rewritten, because a
+  // caller that asked for one name and got another silently will address the row by the name it asked
+  // for (in a dispatch, in a later edit) and find nothing.
+  const derived = await deriveHarnessKey(xell, label);
+  if (String(body.key || '').trim()) {
+    return { ok: false, status: 'refused', error:
+      `you do not choose a harness KEY — the queenzee derives it from your project and the label, so `
+      + 'the fleet\'s key space stays predictable (a key is how a harness is addressed on a dispatch '
+      + `and in a migration, across every project at once). Drop \`key\` and name it with --label: `
+      + `yours would be "${derived.key}".` };
+  }
+  if (derived.mine) {
+    return { ok: false, status: 'refused', error:
+      `you already have a persona keyed "${derived.key}" — that is what the label "${label}" derives to `
+      + `in your project. Read it with \`zee harness ${derived.key}\`, edit it, or use a different label.` };
+  }
 
   let created;
   try {
     // project_id comes from the TOKEN-resolved xell, never from the body — the one line that makes
     // "which project?" unaskable.
-    created = await createHarness({ key: body.key || label, label, glyph: body.glyph || null,
+    created = await createHarness({ key: derived.key, label, glyph: body.glyph || null,
                                     zee_type: 'worker', project_id: xell.project_id });
   } catch (e) { return { ok: false, error: e.message }; }
   // The persona text (and the parent) ride a normal update, so a manager's harness goes through the
-  // very same validation, hashing and live re-injection the console's editor does.
+  // very same validation, hashing and live re-injection the console's editor does — including the
+  // refusal of any entry that would occupy an INHERITED file path. When that refuses, the row this
+  // call just made is REMOVED: half a persona under a key the caller cannot reuse (the derivation is
+  // deterministic, so its next attempt would collide with its own leftover) is worse than no row.
   try {
     if (Object.keys(patch).length || p.parent) {
       created = await updateHarness(created.key, { ...patch, parent: p.parent || null });
     }
   } catch (e) {
-    return { ok: false, error: `the harness was created as "${created.key}" but the persona did not save: ${e.message}` };
+    await q(`DELETE FROM harness WHERE key=$1`, [created.key]).catch(() => {});
+    return { ok: false, status: 'refused', error: `${e.message} — nothing was created.` };
   }
   logline('crew', `${xell.slug} created project harness "${created.key}"${created.parent ? ` (inherits ${created.parent})` : ''}`);
   return {
     ok: true, harness: managerHarnessView(created), scope: 'project',
     message: `Created "${created.key}" — a WORKER persona visible to your project only`
       + `${created.parent ? `, inheriting ${created.parent} (its skills and memory come down the chain)` : ''}. `
-      + `Dispatch into it with \`zee dispatch --harness ${created.key} --task "…"\`, and read back what a `
-      + 'wearer is briefed with using `zee harness ' + created.key + '`.',
+      + 'Its key is DERIVED from your project and the label (you do not choose one, and a key is how a '
+      + `dispatch and a migration address a harness). Dispatch into it with \`zee dispatch --harness `
+      + `${created.key} --task "…"\`, and read back what a wearer is briefed with using \`zee harness `
+      + `${created.key}\`.`,
   };
 }
 
@@ -1641,14 +1695,33 @@ export async function selfHarnessUpdate(xell, key, body = {}) {
     if (p.refusal) return p.refusal;
     patch.parent = p.parent;
   }
+  // DISABLING IS THE SAME END STATE AS DELETING, so it meets the same guard. harnessForXell() and
+  // effectiveHarness() both filter on `enabled`, so a disabled harness simply stops existing for a
+  // wearer: its next briefing is core-only, and disabling an ANCESTOR does it more quietly still —
+  // the heir stays enabled while its whole chain (zee-base's manual included) drops out. Neither
+  // raises anything the zee can see, which is precisely why the delete refusal exists.
+  if ('enabled' in patch && !patch.enabled && found.harness.enabled) {
+    const worn = await liveHarnessWearers(found.harness.id);
+    if (worn.length) {
+      return { ok: false, status: 'refused', error:
+        `"${found.harness.key}" cannot be DISABLED while ${worn.length} live xell(s) wear it or inherit `
+        + `it (${wearerList(worn)}) — a disabled harness drops out of every effective persona, so their `
+        + 'next briefing would lose it (the whole inherited chain, manual included) with no error they '
+        + 'could see. That is the end state deleting it is refused for. Switch or finish those zees '
+        + 'first; the rest of the persona is editable while they run.' };
+    }
+  }
   let saved;
   try { saved = await updateHarness(found.harness.key, patch); }
-  catch (e) { return { ok: false, error: e.message }; }
+  catch (e) { return { ok: false, status: 'refused', error: e.message }; }
   logline('crew', `${xell.slug} edited project harness "${saved.key}"`);
   return {
     ok: true, harness: managerHarnessView(saved), scope: 'project',
-    message: `Saved "${saved.key}". Every LIVE zee wearing it (or inheriting it) has had its persona `
-      + 'files rewritten — an edit reaches the crew that is already running, not only the next dispatch.'
+    // WHAT ACTUALLY HAPPENED, not what usually happens. This sentence used to claim the live crew had
+    // been re-briefed on every save — including the saves that change no text at all (an enabled-only
+    // edit leaves bundle_hash identical, so updateHarness skips the re-injection entirely) and the
+    // ones this queenzee only models. `reinjected` is the real outcome; each branch below is true.
+    message: `Saved "${saved.key}".${reinjectionSentence(saved.reinjected)}`
       // A disabled harness drops out of every list (they are all `WHERE enabled`), so say where it went
       // rather than let a manager conclude it was deleted.
       + (saved.enabled ? '' : ` NOTE: it is DISABLED, so it no longer shows in \`zee harness\` and no new `
@@ -1656,27 +1729,47 @@ export async function selfHarnessUpdate(xell, key, body = {}) {
   };
 }
 
+// The one honest sentence about a save's reach (see updateHarness → `reinjected`).
+function reinjectionSentence(rein) {
+  if (!rein) return ' Nothing in the persona TEXT changed, so no workspace was touched and no live zee'
+    + ' was re-briefed.';
+  if (rein.dry_run) {
+    return ` ${rein.xells} live xell(s) wear it or inherit it, and their files were NOT rewritten: this`
+      + ' queenzee models the fleet (PROVISION_MODE=simulate). They pick the change up on their next dispatch.';
+  }
+  if (rein.injected) {
+    return ` Every LIVE zee wearing it (or inheriting it) has had its persona files rewritten (${rein.injected}`
+      + ` of ${rein.xells} xell(s)) — an edit reaches the crew that is already running, not only the next dispatch.`;
+  }
+  if (rein.xells) {
+    return ` ${rein.xells} xell(s) wear it or inherit it but NO files were written (${rein.failed || 0} failed,`
+      + ` ${rein.skipped || 0} with no live cage) — those zees are still on the OLD text until their next dispatch.`;
+  }
+  return ' Nothing live is wearing it, so there was nothing to re-brief — the next dispatch gets the new text.';
+}
+
 // DELETE /api/xell/self/harness/:key — `zee harness <key> --delete` (MANAGER only).
-// Refused while a live xell is wearing it: the FK is ON DELETE SET NULL, so this would silently strip
-// a running zee back to core-only mid-task — a persona vanishing under an agent, with no error
-// anywhere. Say who is wearing it and let the manager decide.
+// Refused while a live xell is wearing it OR wearing anything that INHERITS it: both FKs are ON
+// DELETE SET NULL, so this would silently strip a running zee back to core-only (direct) or collapse
+// its chain to the leaf alone (an ancestor) mid-task — a persona vanishing under an agent, with no
+// error anywhere. Say who is wearing what and let the manager decide. The guard and the delete are
+// one transaction (deleteHarnessUnlessWorn), so a dispatch cannot land between them.
 export async function selfHarnessDelete(xell, key) {
   const guard = requireManager(xell, 'harness');
   if (guard) return guard;
   const found = await ownHarness(xell, key);
   if (found.refusal) return found.refusal;
-  const worn = await q(
-    `SELECT slug FROM xell WHERE harness_id=$1 AND status NOT IN ('retired','tearing-down','husk')
-      ORDER BY slug`, [found.harness.id]);
-  if (worn.length) {
-    return { ok: false, status: 'refused', error:
-      `"${found.harness.key}" is being worn by ${worn.length} live xell(s) (${worn.map((w) => w.slug).join(', ')}) `
-      + '— deleting it would strip that zee back to core-only mid-task, with no error it could see. '
-      + 'Switch or finish those zees first, or `--enabled off` it so nothing new picks it up.' };
-  }
-  try { await deleteHarness(found.harness.key); }
+  let r;
+  try { r = await deleteHarnessUnlessWorn(found.harness.key); }
   catch (e) { return { ok: false, error: e.message }; }
+  if (r.worn.length) {
+    return { ok: false, status: 'refused', error:
+      `"${found.harness.key}" is worn by ${r.worn.length} live xell(s) (${wearerList(r.worn)}) — deleting `
+      + 'it would strip that zee back to core-only, or collapse the chain it inherits, mid-task and with '
+      + 'no error it could see. Switch or finish those zees first (`--enabled off` is refused for the '
+      + 'same reason while they are running).' };
+  }
   logline('crew', `${xell.slug} deleted project harness "${found.harness.key}"`);
   return { ok: true, deleted: true, key: found.harness.key,
-           message: `Deleted "${found.harness.key}". Nothing was wearing it.` };
+           message: `Deleted "${found.harness.key}". Nothing was wearing it, or inheriting it.` };
 }

@@ -147,6 +147,21 @@ export function rowsTitle(b) {
   return L.join('\n\n');
 }
 
+// WHAT HAPPENS NEXT, in words (#26). A failure now brings the next attempt FORWARD instead of consuming
+// its window — and that is worth nothing if the panel shows a red mark next to silence and leaves a human
+// wondering whether anything is going to happen. `backup.next` is the server's own decision
+// (lib/backup-schedule.js), so this cannot drift from what the scheduler will actually do.
+export function nextAttemptLine(backup) {
+  const n = backup?.next;
+  if (!n || backup?.running) return null;
+  if (n.kind === 'running') return null;
+  if (n.kind === 'retry') {
+    return n.due ? 'retrying now' : `retry in ${Math.max(1, Math.ceil((n.waitSec || 0) / 60))} min`;
+  }
+  if (n.due) return 'backup due now';
+  return null;                       // on schedule and not due — say nothing; silence is the good news
+}
+
 // ── the panel (sits above the container inventory) ────────────────────────────
 export default function BackupsPanel({ backup, projectId }) {
   const [showList, setShowList] = useState(false);
@@ -155,6 +170,7 @@ export default function BackupsPanel({ backup, projectId }) {
   const running = !!backup?.running;   // a backup job is in flight
   const fresh = backupFreshness(backup);
   const stale = !running && (fresh.state === 'overdue' || fresh.failedSince);
+  const nextAttempt = nextAttemptLine(backup);
 
   return (
     <section className="backups" data-testid="backups-panel">
@@ -190,6 +206,19 @@ export default function BackupsPanel({ backup, projectId }) {
         <span className="bkstale" data-testid="backup-last-failed"
               title={`The last attempt failed: ${fresh.attempt?.error || 'no reason recorded'}`}>
           ⚠ last attempt failed
+        </span>
+      )}
+      {/* …and what the queenzee will DO about it. A failed attempt schedules a RETRY (10 min, doubling,
+          capped at the policy interval) instead of waiting out the whole window — so the mark above is
+          never the end of the sentence. #26. */}
+      {nextAttempt && (
+        <span className="bknext" data-testid="backup-next"
+              title={backup?.next?.reason
+                ? `${backup.next.reason}.\n\nA failed attempt shortens the next window instead of consuming it: `
+                  + 'the retry interval starts at 10 minutes and doubles per consecutive failure, capped at '
+                  + 'the policy interval — so it is always sooner than the schedule alone, and never a storm.'
+                : 'when the next attempt is due'}>
+          {nextAttempt}
         </span>
       )}
       {running && (
