@@ -323,9 +323,27 @@ try {
     const orphan = (await client.query(`SELECT status, xell_id FROM work_item WHERE id=$1`, [item.id])).rows[0];
     ok(orphan.xell_id === null && orphan.status === 'review',
        `a retired zee clears the assignment and KEEPS the status (${t3.cleared} cleared)`);
-    ok((await events(item.id, 'assigned')).some((e) => e.actor === 'queenzee' && e.detail?.unassigned === true),
-       'with a ledger entry saying the queenzee did it, and why');
+    const cleared = (await events(item.id, 'assigned')).find((e) => e.actor === 'queenzee' && e.detail?.unassigned === true);
+    ok(!!cleared, 'with a ledger entry saying the queenzee did it, and why');
+    // The link is cleared (part 3's brief) but the HISTORY is not: policy 4's "was: <slug>" is built
+    // from this event, and the slug is denormalized into it so nothing has to join to a dead xell.
+    ok(cleared?.detail?.xell_slug === 'wa-worker' && cleared?.detail?.xell_id === worker.id,
+       'and that entry carries the dead zee\'s SLUG and id — "was: <slug>" survives the clear');
+    ok(cleared?.detail?.status_kept === 'review', 'and the status it deliberately did not touch');
     await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [worker.id]);
+
+    // a HUSK/ERROR xell is not gone, just unwell: liveZees refuses to speak for it, so the tick
+    // must leave the card ENTIRELY alone — no move, and no half-clean either.
+    await WA.assignWorkItem(item.id, { xell_id: worker.id });
+    await client.query(`UPDATE work_item SET status='blocked' WHERE id=$1`, [item.id]);
+    await client.query(`UPDATE xell SET status='husk' WHERE id=$1`, [worker.id]);
+    const evH = (await events(item.id)).length;
+    await worksync.workSyncTick();
+    const husked = (await client.query(`SELECT status, xell_id FROM work_item WHERE id=$1`, [item.id])).rows[0];
+    ok(husked.status === 'blocked' && husked.xell_id === worker.id && (await events(item.id)).length === evH,
+       'a husk xell moves nothing and clears nothing (a dead xell lends a work item no signal — policy 4)');
+    await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [worker.id]);
+    await WA.unassignWorkItem(item.id);
   }
 
   // ── 7. the cxell verbs are SCOPED from the caller, never a parameter ─────

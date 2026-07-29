@@ -33,6 +33,17 @@
 // happened, and the card goes back to being plan. Guessing a status backwards would destroy the one
 // thing the history exists to record.
 //
+// ⚠ ONE PLACE THIS DISAGREES WITH PART 1'S DOC, ON PURPOSE AND OUT LOUD. Policy 4 in
+// docs/work-tracker.md keeps a dead xell's id on the row ("xell_id: <still there, as history>") and
+// suggests part 2/3 build a "was: <slug>" affordance from it. Part 3's brief says the opposite: when
+// the zee is gone the item "goes back to being plan, not fact", so the link is cleared. Both agree on
+// the thing that matters — a reap must NEVER move the item, and a dead xell must never lend it a
+// signal (liveZees filters retired/husk/error, so a husk simply yields no hive word and this tick
+// leaves it entirely alone). The history is not lost either way: the clearing event is a
+// kind:'assigned' row whose detail carries xell_id AND xell_slug, which is what "was: <slug>" should
+// be rendered from — a denormalized slug outlives the xell row, and reading it needs no join to a
+// corpse. If the console would rather have the column, this is a one-line change here plus a test.
+//
 // Every move it does make is written by part 1's ledger with actor 'queenzee', so the item's history
 // reads honestly as "the board moved itself" and is never mistaken for a human's judgement.
 //
@@ -86,6 +97,9 @@ export async function workSyncTick() {
   for (const row of rows) {
     try {
       // ── the xell is GONE: clear the link, keep the status, say so ──
+      // Only 'retired' (or a vanished row) counts as gone here. A 'husk'/'error' xell is awaiting
+      // queenzee housekeeping and may yet come back, and liveZees already refuses to speak for it —
+      // so it is left completely untouched rather than half-cleaned by a tick.
       if (!row.xell_row_id || row.xell_status === 'retired') {
         await q(`UPDATE work_item SET xell_id=NULL WHERE id=$1`, [row.id]);
         await logWorkEvent(row.id, 'assigned', { actor: 'queenzee',
