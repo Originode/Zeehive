@@ -23,8 +23,11 @@
 //   resumable / needsSid         → can a finished session be re-invoked, and does that need an id
 
 // The dispatch model picker offers claude aliases; they mean nothing to other vendors' CLIs,
-// so non-claude adapters drop them and run the vendor's own default model.
-const CLAUDE_MODEL_ALIASES = new Set(['opus', 'sonnet', 'haiku']);
+// so non-claude adapters drop them and run the vendor's own default model. EVERY alias the
+// picker can offer must be listed here — vendorModel() treats anything NOT in this set as a
+// vendor-specific model id, so a missing alias is not a claude bug: it silently launches a
+// Codex/Kimi dispatch with `--model <claude alias>`.
+const CLAUDE_MODEL_ALIASES = new Set(['opus', 'sonnet', 'haiku', 'fable']);
 const vendorModel = (model) => (model && !CLAUDE_MODEL_ALIASES.has(model) ? model : null);
 
 // sanitize anything interpolated into the in-cxell bash command line
