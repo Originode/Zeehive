@@ -28,6 +28,7 @@ import MachineMatrix from './Machines.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
 import Dispatch from './Dispatch.jsx';
+import WorkConsole from './work/WorkConsole.jsx';
 import Toasts from './Toasts.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
@@ -162,6 +163,7 @@ export default function App() {
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
   const [showDispatch, setShowDispatch] = useState(false); // false | { provider } — the "+" prompt composer
+  const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
@@ -717,6 +719,16 @@ export default function App() {
             the choice the per-account prompt buttons make by being clicked. */}
         <AddManagerButton projectId={projectId || project.id} projectName={project.name}
                           providers={providers} onAdded={refresh} />
+        {/* THE WORK TRACKER — tickets in, a plan on a board, a timeline over it. It sits with the
+            prompt buttons because it is the other half of the same question: the prompt buttons
+            start work, this is where the work being done is decided and tracked. It opens as a
+            portalled overlay (no router in this console), so nothing else on this page moves. */}
+        <button className="work-btn-open" data-testid="work-btn" title="Open the work tracker — tickets, board, timeline"
+                onClick={() => setShowWork(true)}>▦ work</button>
+        {showWork && (
+          <WorkConsole projectId={projectId || project.id} projectName={project.name}
+                       onClose={() => setShowWork(false)} />
+        )}
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
