@@ -142,7 +142,24 @@ export function hiveStatus(x, sig = {}) {
   // invisibility this protocol would otherwise introduce.
   if (landHolding)                       return 'occ-landHolding';
 
-  const working = x.zee_status === 'working' || x.cli_active === true || s === 'working';
+  // WORKING is decided by the ZEE'S OWN STATUS, and by nothing else.
+  //
+  // `cli_active` used to be ORed in here and it does not mean what the name suggests. It is
+  // monitor.js's probe, and for a cxell zee that probe is a BROAD `pgrep claude|codex|kimi` inside
+  // the cage (AGENT_PROC_PATTERN). The container is kept after the turn so commits stay
+  // collectible, and the moment anyone opens the zee's terminal or sends it a message, zee-attach.sh
+  // leaves `claude --resume` sitting in the pane for the life of that container. So the flag goes
+  // true on the first attach and NEVER goes false again: it observes ATTACHMENT, not work.
+  //
+  // ORing it made the normal end state of every cxell job — turn returned, zee idle, a resting
+  // session in the pane — render `working` forever, and a manager watching its crew read five
+  // finished workers as busy for a whole session. The zee's own status is the queenzee's own record
+  // of the turn ('working' when it starts the run, 'idle' + end_turn when it returns), so it is both
+  // the honest signal and the only one that can ever go back down.
+  //
+  // This is DISPLAY only. What may be reaped is decided by reaper.midTurnVerdict(), which is a
+  // separate guard with its own force gate — nothing here widens it.
+  const working = x.zee_status === 'working' || s === 'working';
   if (working)                           return 'occ-working';
   if (s === 'claimed')                   return 'occ-claimed';
   if (s === 'idle')                      return 'occ-idle';
