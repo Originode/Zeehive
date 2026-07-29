@@ -110,3 +110,47 @@ export function diffReportText(name, r) {
       + `the chip's drift-from-production mark is unchanged.`);
   return out.join('');
 }
+
+// ── the "Check data" report — the OTHER question, kept visibly other ────────────────────────────
+// TKT-22-4F0E arrived as two questions in one sentence ("check diff says a massive gap. and im afraid
+// the data might not be fully backed up") and the console had one number for both. This is the second
+// answer, and it is written to be unmistakable for the first: it never says "drift", it names the
+// BACKUP it compared against and when that backup was taken, and it states the asymmetry it rests on
+// (an estimate on the reference side, an exact count here) so a few percent is never read as loss.
+export function dataReportText(name, r) {
+  const head = `${name}\n  rows vs the backup it was restored from\n`;
+  if (r?.ok === false) return `${head}\n⚠ could not check:\n${r.error || 'unknown error'}`;
+
+  const ref = r?.reference || {};
+  const when = ref.taken_at ? new Date(ref.taken_at).toLocaleString() : 'unknown time';
+  const out = [head, `\nbackup taken ${when}`];
+  if (r?.restored_note) out.push(`\n(${r.restored_note})`);
+
+  out.push(r.verdict === 'complete'
+    ? `\n\n✓ every table has the rows that backup recorded — ${r.ok_count}/${r.checked} tables, `
+      + `~${(r.got_total || 0).toLocaleString()} rows counted here vs ~${(r.ref_total || 0).toLocaleString()} recorded.`
+    : r.verdict === 'incomplete'
+      ? `\n\n⚠ DATA IS MISSING — ${r.empty.length} table(s) are EMPTY and ${r.short.length} are short of what `
+        + `the backup recorded (${r.ok_count}/${r.checked} tables verified).`
+      : `\n\n… NOT FULLY VERIFIED — ${r.ok_count}/${r.checked} tables match; the rest could not be judged.`);
+
+  const list = (label, rows, fmt) => {
+    if (!rows?.length) return;
+    out.push(`\n\n${label} (${rows.length}):`);
+    for (const x of rows.slice(0, 20)) out.push(`\n  ${fmt(x)}`);
+    if (rows.length > 20) out.push(`\n  … +${rows.length - 20} more`);
+  };
+  // EMPTY first, always: it is the only shape no estimate error can explain away.
+  list('EMPTY here, populated in the backup', r.empty, (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here 0`);
+  list('short of the backup', r.short, (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here ${x.got.toLocaleString()}`);
+  list('ABSENT from this database (schema, not rows — run Check diff)', r.missing, (x) => `${x.table}`);
+  list('no reference count (never analyzed in the source)', r.unknown, (x) => `${x.table} — here ${x.got.toLocaleString()}`);
+
+  out.push('\n\nThe reference is the planner\'s row ESTIMATE taken from the source when the dump was made;'
+    + `\nthis side is an exact count. Expect a few percent either way — a shortfall under `
+    + `${Math.round((ref.tolerance ?? 0.1) * 100)}% is not\nreported, and a table with MORE rows than the backup is `
+    + 'normal (rows kept arriving, or this db\nhas been written to since).');
+  out.push('\n\nWhat this covers: ROW COUNTS per table.'
+    + '\nWhat it does NOT: the contents of a row, and the SCHEMA (that is Check diff).');
+  return out.join('');
+}

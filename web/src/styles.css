@@ -860,6 +860,12 @@ a.cbox:hover { border-color: var(--accent); }
 /* scoped-backup badge + per-row restore table picker */
 .bkscoped { justify-self: start; color: #b58bd9; border: 1px solid #b58bd9; border-radius: 6px;
   padding: 1px 7px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; }
+/* "~N rows" — what the SOURCE held when the dump was taken, and the trend against the last backup.
+   Muted normally; amber when a table shrank or emptied since the previous dump, which is the one
+   backup reading that speaks to "is my data fully backed up". TKT-22-4F0E. */
+.bkrows { justify-self: start; color: var(--muted); border: 1px solid var(--line); border-radius: 6px;
+  padding: 1px 7px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
+.bkrows.warn { color: #d9a441; border-color: #d9a441; }
 /* "N tables in archive" — what the dump actually contains, read back out of the written file. Muted,
    not a warning: it is the reassurance an operator comes to this panel for, and its tooltip is where
    the limit of that reassurance is stated (tables are verified, rows are not counted). TKT-22-4F0E. */
