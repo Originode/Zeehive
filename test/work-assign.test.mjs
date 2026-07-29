@@ -47,6 +47,9 @@ const PID = '00000000-0000-4000-8000-00000000e111';   // this test's project
 const FID = '00000000-0000-4000-8000-00000000e112';   // a FOREIGN project (the cross-project refusal)
 
 async function cleanup({ files = false } = {}) {
+  // A failure inside the fixture transaction leaves it open; the DELETEs below would then be part of
+  // it and vanish on the rollback the connection close performs. Roll back first, always.
+  try { await client.query('ROLLBACK'); } catch { /* not in a transaction — fine */ }
   // work_item cascades off project; the ledger cascades off work_item. Belt and braces anyway.
   for (const sql of [
     `DELETE FROM work_item_event WHERE work_item_id IN (SELECT id FROM work_item WHERE project_id IN ($1,$2))`,
@@ -82,11 +85,28 @@ try {
 
   const XO = '00000000-0000-4000-8000-00000000e222';
   const XOF = '00000000-0000-4000-8000-00000000e223';
+  // ── the whole fixture in ONE transaction, and a pool_config row with it ──────────────────────
+  // A running queenzee's pool tick reconciles EVERY project: `ensureReady()` reads
+  // `COALESCE(pc.target_ready, 0)`, so a project with no pool_config row has a target of ZERO — and
+  // `fillTrim` does not filter on `is_pooled`, so this suite's 'ready' fixture xell looked like
+  // SURPLUS and was reaped mid-run. `candidatesFor` then correctly stopped offering it and the
+  // "candidates … and the ready pool" assertion failed, about one run in ten. A flaky test is worse
+  // than a missing one — it teaches everyone who follows to ignore a red run.
+  //
+  // So: declare a target that MATCHES the fixture (exactly one ready xell), which makes both branches
+  // inert — nothing to trim, nothing to fill. It must be explicit: the column DEFAULTS TO 3, and a
+  // row that took the default would have the pool PROVISIONING two real xells into a throwaway
+  // project instead. And it goes in the same TRANSACTION as the project and the xells, because
+  // otherwise a tick landing between the two statements sees the other half of the same race.
+  // (`POOL_ENABLED=false` is the weaker fix: that flag is read by the server process, not by this
+  // test, so it protects only a run whose server happens to have been started with it.)
+  await client.query('BEGIN');
   for (const [id, name, dbn] of [[PID, 'workassign-test', 'watest'], [FID, 'workassign-foreign', 'wftest']]) {
     await client.query(
       `INSERT INTO project (id, name, repo_root, main_branch, db_name, db_user)
          VALUES ($1,$2,$3,'master',$4,'postgres')`, [id, name, repo, dbn]);
   }
+  await client.query(`INSERT INTO pool_config (project_id, target_ready) VALUES ($1,1),($2,0)`, [PID, FID]);
   await client.query(`INSERT INTO xource (id, project_id, ref) VALUES ($1,$2,'master'),($3,$4,'master')`,
     [XO, PID, XOF, FID]);
 
@@ -105,6 +125,8 @@ try {
   const prodXell = await mkXell(PID, XO, 'wa-prod', 'working', { is_production: true });
   const foreign = await mkXell(FID, XOF, 'wa-foreign', 'working');
   await client.query(`UPDATE xell SET manager_xell_id=$1 WHERE id IN ($2,$3)`, [manager.id, worker.id, spare.id]);
+  // COMMIT: from here the fixture is visible to other connections — as a whole, never half-built.
+  await client.query('COMMIT');
   const reread = async (x) => (await client.query(`SELECT * FROM xell WHERE id=$1`, [x.id])).rows[0];
 
   // a live zee on the worker, and a task for it (assign stamps task.work_item_id)
