@@ -63,6 +63,11 @@ import { selfStatus, selfLand, selfSync, selfShip, selfProdRequest, selfDone, se
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor } from '../lib/managers.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
+import { workStatusVocabulary } from '../lib/work-status.js';
+import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
+         addDep, removeDep, boardModel, ganttModel, assertId } from '../lib/work-items.js';
+import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
+         breakdownTicket } from '../lib/tickets.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
 
@@ -1313,6 +1318,175 @@ router.post('/xells/:id/seed', async (req, res) => {
     res.json(await requestProdSeed({ xellId: req.params.id, files: b.files || (b.file ? [b.file] : []),
       reason: b.reason || null, site: b.site || null }));
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── WORK TRACKER: tickets + the work-item hierarchy (058) ────────────────────
+//
+// The layer that records what the work IS, rather than which agents are running. Project-scoped by
+// `?project=` exactly like every other read model here (a POST takes `project` in the body).
+//
+// The error contract, stated once and honoured by every handler below:
+//   400 — bad input, with {error} saying what was wrong. A MALFORMED id is this, not a 404:
+//         `"not-a-uuid" is not a valid work item id`. The two mistakes are different — a typo in
+//         a URL and a link to something deleted — and each deserves its own answer.
+//   404 — a well-formed id that names nothing
+//   409 — a REFUSED move/delete/transition, with the reason as a sentence a human can read
+//   never a bare 500: the database's own refusals (nesting rank, cross-project parent, cycle) are
+//   raised as messages written for a person, and they arrive here as ordinary Errors.
+//
+// Which refusals are 409 rather than 400: a 400 says "you sent nonsense", a 409 says "what you
+// asked for is coherent but conflicts with the state of the tree". A cycle, an activity under a
+// task and a delete of the project root are all the second kind.
+const CONFLICT = /cannot|refused|cycle|same project|nested under|root item|depend on itself|cross projects|legal next/i;
+function workErr(res, err, fallback = 400) {
+  const msg = String(err?.message || err || 'unknown error');
+  return res.status(CONFLICT.test(msg) ? 409 : fallback).json({ error: msg });
+}
+const projectOf = (req) => req.query.project || req.body?.project || req.body?.project_id || null;
+
+// The vocabulary itself — labels, column order, terminal flags and the legal transitions, straight
+// from lib/work-status.js. It is an endpoint so the console never hardcodes a column list of its
+// own; that duplication is exactly what let hive-status and the web palette drift before.
+router.get('/work-statuses', (_req, res) => res.json(workStatusVocabulary()));
+
+// ── tickets ──────────────────────────────────────────────────────────────────
+router.get('/tickets', async (req, res) => {
+  try {
+    res.json(await listTickets({
+      projectId: req.query.project || null, status: req.query.status || null,
+      kind: req.query.kind || null, q: req.query.q || null,
+    }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/tickets', async (req, res) => {
+  try {
+    const project = projectOf(req);
+    if (!project) return res.status(400).json({ error: 'project required' });
+    res.status(201).json(await createTicket({ ...(req.body || {}), project_id: project }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.get('/tickets/:id', async (req, res) => {
+  try {
+    const t = await getTicket(req.params.id);
+    if (!t) return res.status(404).json({ error: 'no such ticket' });
+    res.json(t);
+  } catch (err) { workErr(res, err); }
+});
+
+router.patch('/tickets/:id', async (req, res) => {
+  try {
+    const t = await updateTicket(req.params.id, req.body || {}, { actor: req.body?.actor || null });
+    if (!t) return res.status(404).json({ error: 'no such ticket' });
+    res.json(t);
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/tickets/:id', async (req, res) => {
+  try {
+    const out = await deleteTicket(req.params.id);
+    if (!out) return res.status(404).json({ error: 'no such ticket' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/tickets/:id/comments', async (req, res) => {
+  try {
+    const c = await addComment(req.params.id, req.body || {});
+    if (!c) return res.status(404).json({ error: 'no such ticket' });
+    res.status(201).json(c);
+  } catch (err) { workErr(res, err); }
+});
+
+// The hinge: a ticket becomes a plan. { items: [{title, kind?, parent_id?|ref-of-an-earlier-item, …}] }
+router.post('/tickets/:id/breakdown', async (req, res) => {
+  try {
+    const out = await breakdownTicket(req.params.id, {
+      items: req.body?.items || [], actor: req.body?.actor || null,
+    });
+    if (!out) return res.status(404).json({ error: 'no such ticket' });
+    res.status(201).json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+// ── work items ───────────────────────────────────────────────────────────────
+router.get('/work-items', async (req, res) => {
+  try {
+    res.json(await listWorkItems({
+      projectId: req.query.project || null, status: req.query.status || null,
+      kind: req.query.kind || null, ticketId: req.query.ticket || null,
+      rootId: req.query.root || null, tree: req.query.tree === '1' || req.query.tree === 'true',
+    }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/work-items', async (req, res) => {
+  try {
+    const body = req.body || {};
+    res.status(201).json(await createWorkItem({ ...body, project_id: projectOf(req) || body.project_id }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.get('/work-items/:id', async (req, res) => {
+  try {
+    const item = await getWorkItem(req.params.id);
+    if (!item) return res.status(404).json({ error: 'no such work item' });
+    res.json(item);
+  } catch (err) { workErr(res, err); }
+});
+
+// A PATCH carrying parent_id is a MOVE (it rewrites the path of every descendant); a PATCH carrying
+// status is a transition validated against work-status.js. Both are the same call for the caller.
+router.patch('/work-items/:id', async (req, res) => {
+  try {
+    const item = await updateWorkItem(req.params.id, req.body || {}, { actor: req.body?.actor || null });
+    if (!item) return res.status(404).json({ error: 'no such work item' });
+    res.json(item);
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/work-items/:id', async (req, res) => {
+  try {
+    const out = await deleteWorkItem(req.params.id);
+    if (!out) return res.status(404).json({ error: 'no such work item' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+router.post('/work-items/:id/deps', async (req, res) => {
+  try {
+    // assertId FIRST: a malformed id must read as 400 "not a valid work item id", and only a
+    // well-formed id that names nothing is a 404. Without the check the existence probe below
+    // hands postgres a bad uuid and the caller gets a cast error instead of either answer.
+    assertId(req.params.id);
+    const item = await one(`SELECT id FROM work_item WHERE id=$1`, [req.params.id]);
+    if (!item) return res.status(404).json({ error: 'no such work item' });
+    res.status(201).json(await addDep(req.params.id, req.body?.depends_on_id, { actor: req.body?.actor || null }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/work-items/:id/deps/:depId', async (req, res) => {
+  try {
+    const out = await removeDep(req.params.id, req.params.depId);
+    if (!out) return res.status(404).json({ error: 'no such dependency' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
+// ── the two views ────────────────────────────────────────────────────────────
+router.get('/board', async (req, res) => {
+  try {
+    if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
+    res.json(await boardModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
+  } catch (err) { workErr(res, err); }
+});
+
+router.get('/gantt', async (req, res) => {
+  try {
+    if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
+    res.json(await ganttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
+  } catch (err) { workErr(res, err); }
 });
 
 // ── AI-facing: report/propose the job is done, and query status ──────────────
