@@ -179,6 +179,41 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
     landing per zee** — withdraw the previous one *before* landing again. `zee land` now names the
     older open requests it just superseded, and `zee status` carries `landing.open`, so the zee sees
     its own stack instead of a human discovering it. Test: `node test/land-withdraw.test.mjs`.
+- **ONE RUNWAY PER REF — the rest fly a HOLDING PATTERN** (2026-07-29, 066–067). One open landing per
+  zee was only half the problem: two *different* zees finishing together both pushed, so a human got
+  TWO cards for one ref. Approving either moved the ref, and the other could never fast-forward — it
+  was swept `stale` and its zee sent back to `zee sync`. A human was asked to decide something that
+  already had no outcome. Three zees made it three cards and two go-arounds.
+  - A push that arrives while **another xell's** landing is open on that ref is no longer raised as a
+    second card: it enters the pattern as `holding` — recorded, with a POSITION, never in front of a
+    human. `checkPush → runwayOccupant()` is the whole decision.
+  - When the runway frees (**landed, rejected, withdrawn or stale — all four**), `clearRunway()`
+    calls the next holder: a session resume (`nudge.js → CLEARED_PROMPT`) naming `zee sync` then
+    `zee land`. Clearance is a NUDGE, never an approval — the zee re-pushes and *that* raises the card.
+  - **The human gate did not move**, and 067 is where that is made true rather than promised: a
+    trigger refuses `holding → approved/landed` outright (any code path, any hand-run UPDATE), a
+    holding row cannot carry a decider/`landed_at`, PRs cannot enter the pattern, and one live
+    holding row per sha. 009's `land_decided_has_decider` is *widened* the way 062 did for
+    `withdrawn`; its partial indexes on `status IN ('pending','approved')` are untouched — a holder
+    sitting **outside** them is exactly what keeps it off `/api/land/requests`, the pad, and
+    `land_pending`.
+  - Position is **counted at read time**, never stored: a stored number goes stale the moment a
+    holder leaves, and "you are #3" when two ahead have withdrawn is how a zee gives up.
+  - **Never auto-lands, never merges, never rebases from the queenzee side.** `auto_approve_land`
+    lands on arrival, so the runway is never occupied and the queue is a no-op in that mode.
+  - Nobody home → a **tend** on that xell and the NEXT in line is cleared, so one dead zee cannot
+    keep the runway empty. A reaped xell's holding row is swept (`sweepHoldingPattern`), and the land
+    reaper tick re-drives every runway as the backstop for a missed clearance.
+  - Both waiters print the position and **exit** — waiting would burn the full timeout on a card no
+    human will ever see, which is exactly how `xell-land.mjs` used to fail on `stale`.
+  - **The git hook needed its own branch** — found by pushing for real, not by reading it: with no
+    `holding` case it fell through to "LANDING HELD — a human must verify this… tell your human the
+    landing is waiting in the console", every word of which is false for a queued push. It now says
+    HOLDING PATTERN, names the go-around, and the test asserts those bytes through a real push.
+  - Test: `node test/land-queue.test.mjs` (two xells, one card; clearance on land/reject/withdraw/
+    stale; the no-cxell go-around; the retired-xell sweep; auto-approve as a no-op).
+  - **Console + manuals are deliberately NOT in this** — separate tasks. A holding row renders
+    nowhere yet; it is invisible by construction, not by omission.
 - The xell card therefore shows **two** diffs (`lib/git.js → worktreeDiff`):
   - **source diff** = worktree vs the source (`↑ahead ↓behind · files +ins/−del`, includes
     uncommitted) — everything the zee has produced; what would land.
