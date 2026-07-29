@@ -9,6 +9,7 @@ import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
+import { startWorkSync } from './queenzee/worksync.js';
 import { recoverOrphanBuilds } from './lib/build.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
@@ -140,6 +141,10 @@ const server = app.listen(config.port, () => {
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();
+  // The work tracker's board follows the fleet: every item with a zee on it takes that zee's live
+  // hive status (worksync.js). It only ever moves a card BETWEEN the in-flight statuses — finishing
+  // is a human's decision, never a tick's.
+  startWorkSync();
   startHarnessBridge();
 });
 // Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
