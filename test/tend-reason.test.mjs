@@ -49,6 +49,11 @@ const blank = await selfTend(xell, { reason: '   \n ' });   // whitespace preten
 ok(bare.ok === false && /brief reason/i.test(bare.error), 'a tend with no reason is refused, and says why');
 ok(blank.ok === false, 'whitespace is not a reason');
 ok(/zee tend --reason/.test(bare.error), 'the refusal shows the zee the exact call to make');
+// The door must not clip on the way in. selfTend validates with the BRIEF form and stores the RAW
+// one; passing the brief form to setTend is the bug that shipped, and no read-side fix can undo it.
+const selfSrc = read('server/src/queenzee/self.js');
+ok(/setTend\(xell\.id, !clear, \{ reason, zeeId/.test(selfSrc),
+   'selfTend stores the RAW reason (the brief form is for validating, logging and answering only)');
 const cleared = await selfTend.toString().includes('if (!clear && !why)');
 ok(cleared, '--clear still needs no reason (lowering an open tend is not an ask)');
 
