@@ -357,8 +357,8 @@ switch (cmd) {
   case 'migration-number': {
     // ASK for the next free db/migrations number. Your worktree can only show you what is LANDED plus
     // what you wrote — never a sibling's unlanded migration on a branch you cannot see, which is how
-    // six numbers came to be claimed twice or more (ticket #9). The queenzee counts main + every live xell's
-    // worktree + the claims other zees hold, and RECORDS yours. NOT gated, and advisory: it hands out
+    // six numbers came to be claimed twice or more (ticket #9). The queenzee counts main + every live
+    // xell's worktree + the claims other zees hold, and RECORDS yours. NOT gated, and advisory: it hands out
     // a number, it does not gate your landing. Asking twice returns the SAME number (--again for a
     // second one, when one landing carries two migrations).
     const r = await req('POST', '/api/xell/self/migration-number', {
