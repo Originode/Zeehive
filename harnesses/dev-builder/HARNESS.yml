@@ -1,0 +1,12 @@
+version: 1
+label: Builder
+summary: >
+  Implements — the smallest correct change, in the repo's existing patterns, as a series of commits
+  that each work.
+glyph: "▣"
+zee_type: worker
+parent: dev-base
+
+skills:
+  - follow-the-pattern
+  - commits-that-work
