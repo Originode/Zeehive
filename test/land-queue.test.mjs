@@ -14,7 +14,7 @@
 // does not: `docker` (test/_bin, whose argv+stdin we ASSERT on for the clearance prompt) and the tiny
 // HTTP server the git hook curls (which calls the SAME checkPush the route calls).
 import http from 'node:http';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -42,6 +42,17 @@ const git = (cwd, args) => {
   return (r.stdout || '').trim();
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A REAL `git push . HEAD:main` through the REAL update hook, spawned ASYNC on purpose: the hook
+// curls back into this same process, so a synchronous push would block the loop that has to answer
+// it (the self-deadlock pushToXource documents). Returns everything the pusher sees.
+const realPush = (wt) => new Promise((resolve) => {
+  const p = spawn('git', ['-C', wt, 'push', '.', 'HEAD:refs/heads/main'], { windowsHide: true });
+  let out = '';
+  p.stdout.on('data', (d) => (out += d));
+  p.stderr.on('data', (d) => (out += d));
+  p.on('error', (e) => resolve(`${out}\n${e.message}`));
+  p.on('close', () => resolve(out));
+});
 
 // The nudge is fire-and-forget; the fake docker records it. Reset before each clearance we assert on.
 const DOCKER_LOG = join(mkdtempSync(join(tmpdir(), 'queue-log-')), 'docker.log');
@@ -126,6 +137,16 @@ const landA = await selfLand(alpha);
 ok(landA.status === 'held', `alpha is on the runway: HELD for a human (${landA.status})`);
 const landB = await selfLand(bravo);
 ok(landB.status === 'holding', `bravo is NOT a second card — it is HOLDING (${landB.status})`);
+// THE GIT HOOK'S OWN WORDS. It is the first thing a pushing zee reads and the one surface the
+// server cannot correct afterwards — so a queued push must not be told "a human must verify this"
+// about a card nobody raised. Pushed for real (async: the hook curls back into this process, and a
+// synchronous push would deadlock against its own gate — the reason pushToXource spawns async).
+const hookOut = await realPush(wtB);
+ok(/HOLDING PATTERN/.test(hookOut), 'the git hook says HOLDING PATTERN, not "LANDING HELD"');
+ok(!/tell your human the landing is waiting/.test(hookOut),
+   'and does NOT send the zee chasing a card that was never raised');
+ok(/zee sync/.test(hookOut) && /zee land/.test(hookOut), 'it names the go-around, in order');
+ok(/NOTHING was rejected/.test(hookOut), 'and says plainly that nothing was rejected');
 ok(landB.position === 1, `and it is told its position: #${landB.position}`);
 ok(landB.behind?.xell_slug === 'queue-alpha', `it is told WHO is on the runway (${landB.behind?.xell_slug})`);
 ok(/HOLDING at position 1/.test(landB.message || ''), 'the message leads with the position, not with a refusal');
