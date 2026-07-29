@@ -57,6 +57,7 @@ server/src/
              rename-xell, build, xell-db, reveal, runtimes, names, projects, logbus, events, status
 web/src/     App.jsx, Container.jsx (reusable chip), GitRail.jsx, Connectors.jsx, Backups.jsx,
              ProjectMenu.jsx, Terminal.jsx (queenzee log modal), nick.js, api.js, styles.css,
+             ZeeTerminal.jsx (the live cxell terminal: clipboard tray, file explorer, feed chips),
              Landing.jsx / Ship.jsx / ProdData.jsx — the three human GATES (main · prod code · prod data)
 mcp/server.js            MCP server wrapping the API
 skill/xell, skill/xell-done   source of the slash-command skills (installed copies live in
@@ -526,3 +527,13 @@ were both verified working — it is not the install, and reinstalling is a wast
 
 The web app is **read-only** (no prompting there); the **▚_ terminal** button by "Status" opens a
 live queenzee activity log.
+
+**Attending a cxell zee** (`⌨` on its card) opens the live terminal: while the headless turn runs
+you get its transcript feed (`docker/zeehive/zee-live.mjs` — ✱ thinking, ● what it says, ⚒ tool
+calls + ↳ results), then `claude --resume` takes the pane for the full interactive session. The
+header's **✱ thinking / ⚒ moves** chips show/hide the two noisy halves of that feed: they write
+`/tmp/zee-live-view.json` into the cxell over a SECOND ssh channel (never keystrokes — the pane
+belongs to `claude` after the turn), and the renderer watches the file and REPAINTS, so hiding
+also removes what already scrolled past. The queenzee installs its own zee-live.mjs into every
+cxell at spawn, exactly as it does `scripts/zee`, or a stale image would leave the chips dead.
+Tests: `test/zee-live-view.test.mjs`, `test/terminal-feed-filter.test.mjs`.
