@@ -47,11 +47,25 @@ const send = (url, method, payload) => call(url, {
 });
 
 // ── the status vocabulary ────────────────────────────────────────────────────
-// [{key,label,order,terminal}] — queued…cancelled. The BOARD'S COLUMNS ARE THIS RESPONSE, in
-// `order`. Nothing in web/src/work/ may hardcode the list: the server owns the vocabulary (it is
-// also what the DB constrains and what a zee's live hive status maps onto), and a second copy in
-// the browser is a copy that drifts. If this call fails, the board says so — it does not guess.
+// { statuses:[{key,label,order,terminal,next:[…]}], item_kinds:[…], ticket_kinds:[…] } — the WHOLE
+// vocabulary in one call: the board's columns ARE `statuses`, in `order`; the drawer's picker is
+// that status's own `next`; the ticket composer's kinds are `ticket_kinds`. Nothing in
+// web/src/work/ may hardcode any of it — the server owns these words (the DB constrains them and a
+// zee's live hive status maps onto them), and a second copy in the browser is a copy that drifts.
 export const getWorkStatuses = () => call('/api/work-statuses');
+
+// The vocabulary, defensively unwrapped. It is read by four screens, and a console that renders
+// zero columns because the payload was an array instead of an object (or the other way round) is
+// a console that looks like the tracker is empty. Also sorts by the server's own `order` once,
+// here, so no caller has to remember to.
+export function vocabOf(v) {
+  const statuses = Array.isArray(v) ? v : (v?.statuses || []);
+  return {
+    statuses: [...statuses].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)),
+    itemKinds: v?.item_kinds || [],
+    ticketKinds: v?.ticket_kinds || [],
+  };
+}
 
 // ── tickets: intake ─────────────────────────────────────────────────────────
 export const listTickets = (projectId, { status, kind, q } = {}) =>

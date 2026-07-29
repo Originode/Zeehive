@@ -82,13 +82,18 @@ ok(/\/api\/work-statuses/.test(read('web/src/work/workApi.js')), 'workApi.js cal
 // The server's list — the one authority. Part 1 owns it; until it lands, the CSS keys below are
 // checked against the documented vocabulary instead, and this test says which it used.
 const SERVER_FILE = 'server/src/lib/work-status.js';
+// The documented vocabulary, used ONLY while part 1 is still in flight. Once the module is on main
+// it is imported for real (it is pure and dependency-free, exactly like hive-status.js — which is
+// why prod-asks-console.test.mjs can import that one too) and this list stops being consulted.
 const DOCUMENTED = ['queued', 'assigned', 'working', 'blocked', 'review', 'shipping', 'done', 'cancelled'];
 let serverKeys = null;
 if (existsSync(path(SERVER_FILE))) {
-  const src = read(SERVER_FILE);
-  serverKeys = [...new Set([...src.matchAll(/key:\s*'([a-z_]+)'/g)].map((m) => m[1]))];
-  if (!serverKeys.length) serverKeys = [...new Set([...src.matchAll(/'([a-z_]+)'\s*:/g)].map((m) => m[1]))];
+  const mod = await import('../server/src/lib/work-status.js');
+  serverKeys = mod.WORK_STATUS_KEYS || Object.keys(mod.WORK_STATUS || {});
   ok(serverKeys.length > 0, `${SERVER_FILE} publishes a status vocabulary (${serverKeys.join(', ')})`);
+  // The vocabulary is served, not retyped: GET /api/work-statuses is generated from that module.
+  ok(/workStatusVocabulary\(\)/.test(read('server/src/api/routes.js')),
+     '/api/work-statuses is generated from that module, so the console can trust it');
 } else {
   console.log(`  · ${SERVER_FILE} not landed yet — checking against the documented vocabulary`);
   serverKeys = DOCUMENTED;

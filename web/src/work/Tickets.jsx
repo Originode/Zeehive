@@ -19,11 +19,11 @@ import { Breadcrumb, ErrLine, KindGlyph, Pips, StatusDot, statusLabel } from './
 // before anything is posted, because a silent mis-parse (a tab instead of two spaces) would create
 // the wrong hierarchy and quietly move on.
 //
-// KINDS ARE NOT HARDCODED. Ticket kinds (bug / feature / …) are the server's vocabulary and there is
-// no endpoint that publishes them, so the filter offers the kinds actually PRESENT in the tickets it
-// fetched and the composer takes free text with those as suggestions. Inventing a list here would be
-// inventing a vocabulary the server never agreed to; when it refuses one, its sentence is shown.
-export default function Tickets({ projectId, statuses, onOpenItem, reloadKey = 0 }) {
+// KINDS ARE NOT HARDCODED EITHER. `ticket_kinds` (bug / feature / chore / question / incident) rides
+// along on GET /api/work-statuses — the same call that carries the status vocabulary — because it is
+// the same fact: a postgres enum the server validates against. So the filter and the composer offer
+// exactly what the server accepts, and a kind added to the enum appears here with no web change.
+export default function Tickets({ projectId, statuses, kinds = [], onOpenItem, reloadKey = 0 }) {
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -39,8 +39,6 @@ export default function Tickets({ projectId, statuses, onOpenItem, reloadKey = 0
 
   // Debounced so typing in the free-text box does not fire a request per keystroke.
   useEffect(() => { const t = setTimeout(load, f.q ? 250 : 0); return () => clearTimeout(t); }, [load, reloadKey]);
-
-  const kinds = useMemo(() => [...new Set(rows.map((t) => t.kind).filter(Boolean))].sort(), [rows]);
 
   return (
     <div className="work-tickets" data-testid="work-tickets">
@@ -96,7 +94,7 @@ export default function Tickets({ projectId, statuses, onOpenItem, reloadKey = 0
 
 // ── the composer ─────────────────────────────────────────────────────────────
 function Composer({ projectId, kinds, onClose, onCreated }) {
-  const [v, setV] = useState({ title: '', body: '', kind: kinds[0] || '', priority: 3, reporter: '', labels: '' });
+  const [v, setV] = useState({ title: '', body: '', kind: '', priority: 3, reporter: '', labels: '' });
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -129,9 +127,10 @@ function Composer({ projectId, kinds, onClose, onCreated }) {
                 value={v.body} onChange={(e) => setV({ ...v, body: e.target.value })} />
       <div className="work-composer-row">
         <label className="work-field"><span className="work-lbl">kind</span>
-          <input className="work-in" list="work-kinds" value={v.kind} placeholder="e.g. bug"
-                 onChange={(e) => setV({ ...v, kind: e.target.value })} />
-          <datalist id="work-kinds">{kinds.map((k) => <option key={k} value={k} />)}</datalist>
+          <select className="work-in" value={v.kind} onChange={(e) => setV({ ...v, kind: e.target.value })}>
+            <option value="">(server default)</option>
+            {kinds.map((k) => <option key={k} value={k}>{k}</option>)}
+          </select>
         </label>
         <label className="work-field"><span className="work-lbl">priority</span>
           <input className="work-in num" type="number" min="1" max="5" value={v.priority}
@@ -187,7 +186,7 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
     if (!parsed.items.length) return;
     setBusy(true);
     try {
-      await breakdownTicket(id, parsed.items);
+      await breakdownTicket(id, breakdownPayload(parsed.items));
       setPlan(''); setBreaking(false);
       await load(); onChanged?.();
     } catch (e) { setErr(e); }
@@ -255,6 +254,13 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
                 ))}
                 {!parsed.items.length && <div className="work-none">type a line above</div>}
                 {parsed.warnings.map((w, i) => <div key={i} className="work-warn">⚠ {w}</div>)}
+                {/* Breaking a ticket down twice ADDS a second plan — the API is additive on
+                    purpose (a ticket legitimately grows work as it is understood) and it does not
+                    reconcile. Said out loud here, because the button does not look additive. */}
+                {items.length > 0 && (
+                  <div className="work-warn">⚠ this ticket already has {items.length} item(s) —
+                    a breakdown ADDS to the plan, it does not replace it</div>
+                )}
               </div>
               <div className="work-composer-foot">
                 <button className="work-btn" onClick={() => { setBreaking(false); setPlan(''); }}>cancel</button>
@@ -292,12 +298,24 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
 // TWO SPACES = ONE LEVEL. Deliberately strict and deliberately simple: a tab, or an odd number of
 // spaces, is rounded down to the nearest level AND reported as a warning rather than guessed at
 // silently — a mis-parsed indent creates the wrong tree, and the preview is the only chance a human
-// has to notice. Depth also picks the KIND (top level → activity, nested → task), which is the
-// hierarchy the tracker models: one project root, activities under it, tasks under those.
+// has to notice.
+//
+// NESTING RIDES ON `ref`. The breakdown API lets an entry name an EARLIER entry's caller-supplied
+// `ref` as its `parent_id`, which is what makes a whole tree one atomic call (and one transaction:
+// all of it, or an untouched ticket). So each line gets a ref, and an indented line names the ref of
+// the nearest line above it that is one level shallower. Refs resolve BACKWARDS only — which is
+// exactly what an indented text block gives you, so the two agree by construction.
+//
+// Depth also picks the default KIND: level 0 → activity (it lands under the project root), deeper →
+// task. Both `activity under activity` and `task under task` are legal, so this is only a sensible
+// default for the common shape, not a rule — the server's own nesting rule (child rank ≥ parent
+// rank) is the authority, and it answers in a sentence when a line breaks it.
 export function parsePlan(text) {
   const items = [];
   const warnings = [];
+  const refAt = [];               // refAt[d] = the ref of the last line seen at depth d
   let prevDepth = 0;
+  let n = 0;
   for (const raw of String(text || '').split('\n')) {
     if (!raw.trim()) continue;
     const lead = raw.match(/^[ \t]*/)[0];
@@ -310,7 +328,16 @@ export function parsePlan(text) {
       depth = prevDepth + 1;
     }
     prevDepth = depth;
-    items.push({ title: raw.trim(), kind: depth === 0 ? 'activity' : 'task', _depth: depth });
+    const ref = `n${++n}`;
+    refAt[depth] = ref;
+    refAt.length = depth + 1;     // anything deeper is out of scope now
+    const item = { ref, title: raw.trim(), kind: depth === 0 ? 'activity' : 'task', _depth: depth };
+    if (depth > 0 && refAt[depth - 1]) item.parent_id = refAt[depth - 1];
+    items.push(item);
   }
   return { items, warnings };
 }
+
+// What actually goes on the wire: the preview's own bookkeeping (`_depth`) is not the server's
+// business. Everything else — including `ref` — is part of the documented entry shape.
+export const breakdownPayload = (items) => items.map(({ _depth, ...entry }) => entry);

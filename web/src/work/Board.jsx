@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { getBoard, getWorkStatuses, patchWorkItem } from './workApi.js';
+import { getBoard, getWorkStatuses, patchWorkItem, vocabOf } from './workApi.js';
 import { placement } from './order.js';
 import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, ZeeChip, statusLabel } from './bits.jsx';
 
@@ -56,7 +56,7 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     if (statusesProp) { setStatuses(statusesProp); return; }
     let live = true;
     getWorkStatuses()
-      .then((v) => { if (live) setStatuses(v || []); })
+      .then((v) => { if (live) setStatuses(vocabOf(v).statuses); })
       .catch((e) => { if (live) setErr(e); });
     return () => { live = false; };
   }, [statusesProp]);

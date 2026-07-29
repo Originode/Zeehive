@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom';
 import { subscribe } from '../api.js';
 import { showPrompt } from '../Dialog.jsx';
-import { createWorkItem, getWorkStatuses, listWorkItems, patchWorkItem } from './workApi.js';
+import { createWorkItem, getWorkStatuses, listWorkItems, patchWorkItem, vocabOf } from './workApi.js';
 import { ErrLine, KindGlyph, StatusDot } from './bits.jsx';
 import Board from './Board.jsx';
 import Tickets from './Tickets.jsx';
@@ -47,7 +47,7 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
     try { const t = localStorage.getItem(TAB_KEY); return TABS.some((x) => x.id === t) ? t : 'board'; }
     catch { return 'board'; }
   });
-  const [statuses, setStatuses] = useState([]);
+  const [vocab, setVocab] = useState({ statuses: [], itemKinds: [], ticketKinds: [] });
   const [tree, setTree] = useState(null);
   const [selected, setSelected] = useState(null);      // the work item scoping board + timeline
   const [openItem, setOpenItem] = useState(null);      // the drawer
@@ -64,7 +64,7 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
   // read-only vocabulary is three chances for them to disagree mid-render.
   useEffect(() => {
     let live = true;
-    getWorkStatuses().then((v) => { if (live) setStatuses(v || []); }).catch((e) => { if (live) setErr(e); });
+    getWorkStatuses().then((v) => { if (live) setVocab(vocabOf(v)); }).catch((e) => { if (live) setErr(e); });
     return () => { live = false; };
   }, []);
 
@@ -99,6 +99,7 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [openItem, onClose]);
 
+  const statuses = vocab.statuses;
   const rootId = selected?.id || null;
   const scopeLabel = selected ? selected.title : 'whole project';
 
@@ -166,7 +167,8 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
 
           <section className="work-pane">
             {tab === 'tickets' && (
-              <Tickets projectId={projectId} statuses={statuses} reloadKey={rev} onOpenItem={setOpenItem} />
+              <Tickets projectId={projectId} statuses={statuses} kinds={vocab.ticketKinds}
+                       reloadKey={rev} onOpenItem={setOpenItem} />
             )}
             {tab === 'board' && (
               <Board projectId={projectId} rootId={rootId} statuses={statuses} reloadKey={rev}
