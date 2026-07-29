@@ -144,6 +144,20 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
 - **Zees checkpoint-commit freely** on their own branch — a commit only moves their branch ref and
   lands nothing, so the prompt now tells them to commit early and often rather than hoard
   uncommitted work while waiting on approval. Only the *push* is gated.
+- **A zee can WITHDRAW its own held landing** (2026-07-29, 060–062). Every other ask a zee raises
+  can be lowered by the zee that raised it (`zee tend --clear`, `zee hint-land --clear`, `zee done
+  --clear`); a land request could not, so a zee that changed its mind pushed again and left a second
+  card for the same job. `zee land --withdraw [--reason]` → `POST /api/xell/self/land/withdraw`:
+  status `withdrawn` (terminal, with `withdrawn_at/by/reason` — never `decided_by`, because nobody
+  decided anything), the row drops out of every open read model, main never moves and the commits
+  stay on the branch. **Pending only**: an approved request is a human's decision the queenzee is
+  acting on, and retracting it is not an agent's call (`zee tend` is). Scoped to `kind='push'`, so it
+  never sweeps up a PR. The console has the same quiet exit beside Reject (Reject *burns* the sha;
+  Withdraw decides nothing), and the pad keeps a brief "withdrawn by zee" receipt.
+  - The DISCIPLINE that goes with it, taught in the manual (062) and the spawn briefing: **one open
+    landing per zee** — withdraw the previous one *before* landing again. `zee land` now names the
+    older open requests it just superseded, and `zee status` carries `landing.open`, so the zee sees
+    its own stack instead of a human discovering it. Test: `node test/land-withdraw.test.mjs`.
 - The xell card therefore shows **two** diffs (`lib/git.js → worktreeDiff`):
   - **source diff** = worktree vs the source (`↑ahead ↓behind · files +ins/−del`, includes
     uncommitted) — everything the zee has produced; what would land.
