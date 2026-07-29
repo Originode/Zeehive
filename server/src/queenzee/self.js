@@ -942,30 +942,32 @@ function requireManager(xell, verb) {
 
 // GET /api/xell/self/work — `zee work` (any zee).
 // A MANAGER gets its project's plan in tree order (with each item's status, assignee and live zee);
-// a WORKER gets the item it is assigned to, with the ancestors/ticket/acceptance it was briefed from.
+// a WORKER gets the item it is assigned to, with the ancestors/ticket/history it was briefed from.
 // `--item <id>` reads one item, scoped the same way.
 export async function selfWork(xell, { board = false, item = null } = {}) {
-  const { workItemTree, workItemDetail, itemForXell } = await import('../lib/work-assign.js');
+  const { workItemTree, itemForXell } = await import('../lib/work-assign.js');
+  const { getWorkItem } = await import('../lib/work-items.js');
   const manager = isManager(xell);
 
   if (item) {
     let detail;
-    try { detail = await workItemDetail(item); }
+    try { detail = await getWorkItem(item); }
     catch (e) { return { ok: false, error: e.message }; }
+    if (!detail) return { ok: false, error: `no work item ${item}` };
     if (manager) {
-      if (detail.item.project_id !== xell.project_id) {
+      if (detail.project_id !== xell.project_id) {
         return { ok: false, status: 'refused', error:
           'that work item is in another project. You manage the plan of YOUR project only.' };
       }
     } else {
       const mine = await itemForXell(xell.id);
-      if (!mine || mine.id !== detail.item.id) {
+      if (!mine || mine.id !== detail.id) {
         return { ok: false, status: 'refused', error:
           'that is not the work item you are assigned to. A worker sees (and reports on) its OWN item '
           + 'only — run `zee work` with no arguments to see it.' };
       }
     }
-    return { ok: true, ...detail };
+    return { ok: true, item: detail };
   }
 
   if (manager) {
@@ -977,8 +979,9 @@ export async function selfWork(xell, { board = false, item = null } = {}) {
         ? `${items.length} work item(s)${board ? ' (board view — the project root is not a card)' : ''}; `
           + `${live} with a zee on ${live === 1 ? 'it' : 'them'}. \`zee assign --item <id> --task "…"\` `
           + 'deploys a worker for one; the board then follows that worker by itself.'
-        : 'No work items in this project yet. Break a ticket down into a plan first — a worker briefed '
-          + 'from a tracked item gets its ancestors, its ticket and its acceptance notes for free.',
+        : 'No work items in this project yet — only the project root exists. Break a ticket down into a '
+          + 'plan first (POST /api/tickets/:id/breakdown): a worker briefed from a tracked item gets its '
+          + 'ancestors and its ticket for free.',
     };
   }
 
@@ -988,13 +991,12 @@ export async function selfWork(xell, { board = false, item = null } = {}) {
       message: 'You are not assigned to a work item — your task brief is the whole job. (If you believe '
         + 'you should be tracked on the board, say so in `zee report`.)' };
   }
-  const detail = await workItemDetail(mine.id);
   return {
-    ok: true, ...detail,
-    message: `You are executing "${detail.item.title}" (${detail.item.status})`
-      + `${detail.ancestors.length ? `, under ${detail.ancestors.map((a) => a.title).join(' → ')}` : ''}. `
-      + 'Report progress with `zee item ' + detail.item.id.slice(0, 8) + ' --status working --note "…"` — '
-      + 'that moves the CARD only; your own done/land/ship stay your verbs and a human\'s gates.',
+    ok: true, item: mine,
+    message: `You are executing "${mine.title}" (${mine.status})`
+      + `${mine.breadcrumb?.length ? `, under ${mine.breadcrumb.join(' → ')}` : ''}. `
+      + 'Report progress with `zee item --status working --note "…"` — that moves the CARD only; your '
+      + 'own done/land/ship stay your verbs and a human\'s gates.',
   };
 }
 
@@ -1002,8 +1004,8 @@ export async function selfWork(xell, { board = false, item = null } = {}) {
 // Deploys a WORKER for a work item, through the SAME dispatch path `zee dispatch` uses: the worker is
 // still stamped manager_xell_id, still seated next to its manager, still gets its own throwaway db,
 // and a manager still cannot hand it prod, the manager type or the manager harness. What this adds is
-// the BRIEF: it is built from the item itself (title, body, ancestors, ticket, acceptance) plus
-// whatever extra the manager types, so a well-cut plan brief a worker for free.
+// the BRIEF: it is built from the item itself (title, body, ancestors, ticket, dates) plus whatever
+// extra the manager types, so a well-cut plan briefs a worker for free.
 export async function selfWorkAssign(xell, { item = null, task = null, model = null, mode = null,
                                              harness = null, title = null } = {}) {
   const guard = requireManager(xell, 'assign');
@@ -1072,8 +1074,7 @@ export async function selfWorkItem(xell, { id = null, status = null, progress = 
     return { ok: false, error: `--progress must be a number 0-100 (got "${progress}")` };
   }
   try {
-    const out = await reportItemStatus(target.id, { status, progress: p, note, actor: xell.slug });
-    return out;
+    return await reportItemStatus(target.id, { status, progress: p, note, actor: xell.slug });
   } catch (e) {
     return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
   }

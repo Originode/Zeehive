@@ -4,19 +4,23 @@
 // items, a manager xell, worker xells, a production xell and a foreign project) and exercises the
 // whole assignment layer WITHOUT SPAWNING A SINGLE AGENT:
 //
-//   1. assign: the link, the queued → assigned move, the event, the task stamp — and idempotence;
+//   1. assign: the link, the queued → assigned move, the ledger entry, the task stamp — and
+//      idempotence, including the self-healing retry after a half-done assignment;
 //   2. THE REFUSALS, which are the point: another project's xell, production, a MANAGER zee, a xell
-//      already carrying an open item, an unknown item/xell — each with a readable sentence and the
-//      right HTTP code;
+//      already carrying an open item, a xell being torn down, an unknown item/xell — each with a
+//      readable sentence and the right HTTP code;
 //   3. unassign: the link goes, the STATUS STAYS (work that happened, happened);
 //   4. candidates: the ready pool + free live workers, and nobody who would be refused;
-//   5. deploy: the brief built FROM the item (ancestors, ticket, acceptance, extra), the assignment
-//      that follows, and its refusals — with the dispatch path STUBBED, never a real zee;
-//   6. worksync: a live hive status MOVES a card, and the fence holds — never to `done`, never out
-//      of a terminal status, never a card nobody is on; a vanished zee clears the LINK only;
+//   5. deploy: the brief built FROM the item (ancestors, ticket, dates, extra), the assignment that
+//      follows, and its refusals — with the dispatch path STUBBED, never a real zee;
+//   6. worksync: a live hive status MOVES a card, and the fence holds — never to `done` (not even
+//      from occ-done, which statusFromHive really does map there), never out of a terminal status,
+//      never a queued card and never one nobody is on; a vanished zee clears the LINK only;
 //   7. the cxell verbs' SCOPING: a worker may touch its OWN item and nothing else, a manager only
-//      its own project — resolved from the caller, never from a parameter;
-//   8. the manuals and the CLI actually carry the verbs (a verb no manual mentions does not exist).
+//      its own project — resolved from the caller's token, never from a parameter;
+//   8. the manuals: migration 059 and the manager harness FILE say the same words (they are two
+//      copies of one manual), it is idempotent, and it does not fire when a human has moved an
+//      anchor. Plus the routes and the CLI actually carry the verbs.
 //
 // Everything it creates is torn down in a finally, whatever happens (HANDOFF house rule #1: no test
 // data). If the work tracker's schema (058) is not present the whole suite SKIPS LOUDLY rather than
@@ -42,22 +46,22 @@ const PID = '00000000-0000-4000-8000-00000000e111';   // this test's project
 const FID = '00000000-0000-4000-8000-00000000e112';   // a FOREIGN project (the cross-project refusal)
 
 async function cleanup({ files = false } = {}) {
-  // work items first in case 058 did not cascade them off the project.
+  // work_item cascades off project; the ledger cascades off work_item. Belt and braces anyway.
   for (const sql of [
     `DELETE FROM work_item_event WHERE work_item_id IN (SELECT id FROM work_item WHERE project_id IN ($1,$2))`,
     `DELETE FROM work_item WHERE project_id IN ($1,$2)`,
+    `DELETE FROM ticket WHERE project_id IN ($1,$2)`,
   ]) { try { await client.query(sql, [PID, FID]); } catch { /* no such table yet */ } }
   try { await client.query(`DELETE FROM project WHERE id IN ($1,$2)`, [PID, FID]); } catch { /* */ }
   if (files) { try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ } }
 }
 
 await client.connect();
-// Is the work tracker's schema here at all? (058 is part 1; this is part 3.)
 const haveSchema = (await client.query(
   `SELECT to_regclass('public.work_item') IS NOT NULL AS yes`)).rows[0].yes;
 if (!haveSchema) {
   console.error('\n  ⚠ SKIPPED — this database has no `work_item` table, so part 1 (db/migrations/058)');
-  console.error('    is not applied here. Nothing was asserted. Run `zee sync` / migrate, then re-run:');
+  console.error('    is not applied here. Nothing was asserted. Migrate, then re-run:');
   console.error('    DATABASE_URL=… node test/work-assign.test.mjs\n');
   await client.end();
   rmSync(tmp, { recursive: true, force: true });
@@ -95,6 +99,7 @@ try {
   const worker = await mkXell(PID, XO, 'wa-worker', 'working');
   const spare = await mkXell(PID, XO, 'wa-spare', 'working');
   const pooled = await mkXell(PID, XO, 'wa-ready', 'ready');
+  const dying = await mkXell(PID, XO, 'wa-dying', 'tearing-down');
   const manager = await mkXell(PID, XO, 'wa-mgr', 'working', { zee_type: 'manager' });
   const prodXell = await mkXell(PID, XO, 'wa-prod', 'working', { is_production: true });
   const foreign = await mkXell(FID, XOF, 'wa-foreign', 'working');
@@ -102,71 +107,76 @@ try {
   const reread = async (x) => (await client.query(`SELECT * FROM xell WHERE id=$1`, [x.id])).rows[0];
 
   // a live zee on the worker, and a task for it (assign stamps task.work_item_id)
-  const zee = (await client.query(
+  await client.query(
     `INSERT INTO zee (xell_id, status, model, attach_mode)
-       VALUES ($1,'working','opus','headless-spawn') RETURNING *`, [worker.id])).rows[0];
+       VALUES ($1,'working','opus','headless-spawn') RETURNING *`, [worker.id]);
   const task = (await client.query(
     `INSERT INTO task (project_id, xell_id, prompt_text, status) VALUES ($1,$2,'do the thing','working') RETURNING *`,
     [PID, worker.id])).rows[0];
 
   const WA = await import('../server/src/lib/work-assign.js');
   const worksync = await import('../server/src/queenzee/worksync.js');
-  const workStatus = await import('../server/src/lib/work-status.js');
+  const WS = await import('../server/src/lib/work-status.js');
   const { HIVE_STATUS } = await import('../server/src/lib/hive-status.js');
-  const { createWorkItem } = await import('../server/src/lib/work-items.js');
+  const { createWorkItem, projectRoot, getWorkItem } = await import('../server/src/lib/work-items.js');
 
-  // ── the ONE place part 1's create signature is assumed ────────────────────
-  // Written against the contract while 058 was still held at the landing gate. If createWorkItem
-  // turns out to take a different shape, THIS helper is the only thing to change in the suite.
-  const mkItem = async (fields) => createWorkItem({ project_id: PID, ...fields });
+  // The plan: every project gets its ROOT item by trigger (058), so the test adds the branch below it.
+  const root = await projectRoot(PID);
+  ok(!!root && root.kind === 'project', 'the project has its root work item (created by 058, not by us)');
+  const activity = await createWorkItem({ project_id: PID, parent_id: root.id, kind: 'activity',
+    title: 'wa: an activity' });
+  const item = await createWorkItem({ project_id: PID, parent_id: activity.id, kind: 'task',
+    title: 'wa: the task', body: 'the leaf a zee actually executes' });
+  const events = async (id, kind = null) => (await client.query(
+    `SELECT kind, actor, from_status, to_status, detail FROM work_item_event
+      WHERE work_item_id=$1 ${kind ? 'AND kind=$2' : ''} ORDER BY ts, id`,
+    kind ? [id, kind] : [id])).rows;
 
-  const root = await mkItem({ title: 'wa: the project', body: 'root of the test plan' });
-  const activity = await mkItem({ parent_id: root.id, title: 'wa: an activity' });
-  const item = await mkItem({
-    parent_id: activity.id, title: 'wa: the task', body: 'the leaf a zee actually executes',
-    acceptance: 'the board moves by itself and nothing is left behind' });
-
-  // ── 0. the vocabulary this code fences against is the REAL one ───────────
+  // ── 0. the fences are built from the REAL vocabulary ─────────────────────
   {
-    const statuses = await client.query(`SELECT * FROM work_status`).catch(() => null);
-    if (statuses) {
-      const names = statuses.rows.map((r) => r.key || r.name || r.status);
-      ok(WA.TERMINAL.every((s) => names.includes(s)),
-         `work-assign's TERMINAL fence names real statuses (${WA.TERMINAL.join(', ')})`);
-      ok(worksync.IN_FLIGHT.every((s) => names.includes(s)),
-         `worksync's IN_FLIGHT window names real statuses (${worksync.IN_FLIGHT.join(', ')})`);
-      ok(!worksync.IN_FLIGHT.some((s) => WA.TERMINAL.includes(s)),
-         'the in-flight window and the terminal fence never overlap');
-    } else {
-      ok(true, '(no work_status table to pin the vocabulary against — skipped)');
-    }
-    // whatever the hive → work-status map says, a TICK can never produce a terminal status
-    const reachable = Object.keys(HIVE_STATUS).map((k) => workStatus.statusFromHive(k)).filter(Boolean);
-    ok(reachable.every((s) => !WA.TERMINAL.includes(s) || !worksync.IN_FLIGHT.includes(s)),
-       'no hive status maps onto a terminal work status that the tick would be allowed to write');
+    const vocab = WS.workStatusVocabulary().statuses;
+    const terminal = vocab.filter((s) => s.terminal).map((s) => s.key);
+    ok(WA.TERMINAL.join() === terminal.join(),
+       `work-assign's TERMINAL fence IS the vocabulary's terminal set (${WA.TERMINAL.join(', ')})`);
+    ok(worksync.IN_FLIGHT.join() === 'assigned,working,blocked,review,shipping',
+       `worksync's in-flight window is exactly the middle of the vocabulary (${worksync.IN_FLIGHT.join(', ')})`);
+    ok(!worksync.IN_FLIGHT.some((s) => WA.TERMINAL.includes(s)) && !worksync.IN_FLIGHT.includes('queued'),
+       'and it contains neither a terminal status nor the not-started one');
+    // the hazard this fence exists for, stated as an assertion
+    ok(WS.statusFromHive('occ-done') === 'done' && WS.statusFromHive('occ-doneRequest') === 'done',
+       'statusFromHive DOES map occ-done / occ-doneRequest to `done` — which is exactly why the tick is fenced');
+    const reachable = Object.keys(HIVE_STATUS).map(WS.statusFromHive).filter(Boolean);
+    ok(reachable.some((s) => WA.TERMINAL.includes(s)) && !worksync.IN_FLIGHT.some((s) => WA.TERMINAL.includes(s)),
+       'so a terminal status IS reachable from a hive key, and the tick is the thing that refuses to write it');
   }
 
   // ── 1. assign ────────────────────────────────────────────────────────────
   const assigned = await WA.assignWorkItem(item.id, { xell_id: worker.id, actor: 'test@human' });
   ok(assigned.ok && assigned.item.xell_id === worker.id, 'assign links the xell to the work item');
   ok(assigned.item.status === 'assigned', `queued → assigned (${assigned.item.status})`);
+  ok(assigned.item.zee?.slug === 'wa-worker',
+     "the item read model carries the zee CHIP the board card renders (slug + hive status)");
   const stamped = (await client.query(`SELECT work_item_id FROM task WHERE id=$1`, [task.id])).rows[0];
   ok(stamped.work_item_id === item.id, "the zee's newest task is stamped with the work item");
-  const ev = (await client.query(
-    `SELECT * FROM work_item_event WHERE work_item_id=$1 ORDER BY created_at`, [item.id])).rows;
-  ok(ev.some((e) => e.kind === 'assigned'), "the history records kind:'assigned'");
-  ok(ev.some((e) => e.actor === 'test@human'), 'and who did it');
+  const ev = await events(item.id);
+  ok(ev.some((e) => e.kind === 'assigned' && e.actor === 'test@human'),
+     "the ledger records kind:'assigned' and who did it");
+  ok(ev.some((e) => e.kind === 'status' && e.from_status === 'queued' && e.to_status === 'assigned'),
+     'and the status move with BOTH ends of it (part 1\'s event shape, not a second dialect)');
 
   const again = await WA.assignWorkItem(item.id, { xell_id: worker.id });
   ok(again.ok && again.already === true, 'assigning the same xell again is an idempotent no-op');
-  const evCount = (await client.query(
-    `SELECT count(*)::int n FROM work_item_event WHERE work_item_id=$1 AND kind='assigned'`, [item.id])).rows[0].n;
-  ok(evCount === 1, 'and it does not write a second event');
+  ok((await events(item.id, 'assigned')).length === 1, 'and it does not write a second event');
+  // self-healing: a half-done assignment (linked, never moved) is completed by a retry
+  await client.query(`UPDATE work_item SET status='queued' WHERE id=$1`, [item.id]);
+  const healed = await WA.assignWorkItem(item.id, { xell_id: worker.id, actor: 'test@human' });
+  ok(healed.status_moved === true && healed.item.status === 'assigned',
+     'a retry after a half-done assignment finishes the queued → assigned move (self-healing)');
 
   // ── 2. the refusals ──────────────────────────────────────────────────────
   const refusal = async (fn, re, what) => {
     const e = await caught(fn);
-    ok(e && e.status === 409 && re.test(e.message), `${what} — 409: "${String(e?.message).slice(0, 72)}…"`);
+    ok(e && e.status === 409 && re.test(e.message), `${what} — 409: "${String(e?.message).slice(0, 70)}…"`);
   };
   await refusal(() => WA.assignWorkItem(activity.id, { xell_id: foreign.id }), /different project/i,
                 "a xell from ANOTHER PROJECT cannot take an item");
@@ -174,6 +184,8 @@ try {
                 'PRODUCTION is not a worker');
   await refusal(() => WA.assignWorkItem(activity.id, { xell_id: manager.id }), /MANAGER/i,
                 'a MANAGER zee cannot execute an item (it dispatches one that can)');
+  await refusal(() => WA.assignWorkItem(activity.id, { xell_id: dying.id }), /torn down/i,
+                'a xell being TORN DOWN cannot be handed work');
   await refusal(() => WA.assignWorkItem(activity.id, { xell_id: worker.id }), /already on an open work item/i,
                 'a xell already carrying an open item is not free');
   const gone = await caught(() => WA.assignWorkItem('00000000-0000-4000-8000-0000000000ff', { xell_id: worker.id }));
@@ -183,7 +195,8 @@ try {
   const noArg = await caught(() => WA.assignWorkItem(activity.id, {}));
   ok(noArg?.status === 400 && /xell_id/.test(noArg.message), 'a missing xell_id is 400 with the reason');
   const notUuid = await caught(() => WA.getItem('banana'));
-  ok(notUuid?.status === 400, 'a malformed id is 400, not a postgres error');
+  ok(notUuid?.status === 400 && /not a valid work item id/.test(notUuid.message),
+     "a malformed id is 400 in part 1's own words, not a postgres cast error");
 
   // ── 3. unassign keeps the status ─────────────────────────────────────────
   await client.query(`UPDATE work_item SET status='working' WHERE id=$1`, [item.id]);
@@ -192,9 +205,8 @@ try {
   ok(un.item.status === 'working', 'and LEAVES the status alone (work that happened, happened)');
   ok((await client.query(`SELECT work_item_id FROM task WHERE id=$1`, [task.id])).rows[0].work_item_id === null,
      "the zee's task stamp is cleared too");
-  ok((await client.query(
-    `SELECT count(*)::int n FROM work_item_event WHERE work_item_id=$1 AND kind='unassigned'`,
-    [item.id])).rows[0].n === 1, 'and it is in the history');
+  ok((await events(item.id, 'assigned')).some((e) => e.detail?.unassigned === true),
+     "it is in the ledger as an 'assigned' event saying it was cleared (no invented event kind)");
   ok((await WA.unassignWorkItem(item.id)).already === true, 'unassigning nothing is an idempotent no-op');
 
   // ── 4. candidates ────────────────────────────────────────────────────────
@@ -205,16 +217,14 @@ try {
     ok(slugs.includes('wa-ready'), 'and the ready pool');
     ok(!slugs.includes('wa-mgr'), 'never a manager zee');
     ok(!slugs.includes('wa-prod'), 'never production');
+    ok(!slugs.includes('wa-dying'), 'never one being torn down');
     ok(!slugs.includes('wa-foreign'), "never another project's xell");
     ok(c.candidates.every((x) => x.why), 'each candidate says WHY it is offered (a picker, not a uuid prompt)');
-    // a xell carrying an open item drops out of the list — another item, or THIS one
     await WA.assignWorkItem(activity.id, { xell_id: spare.id });
-    const c2 = await WA.candidatesFor(item.id);
-    ok(!c2.candidates.map((x) => x.slug).includes('wa-spare'),
+    ok(!(await WA.candidatesFor(item.id)).candidates.map((x) => x.slug).includes('wa-spare'),
        'a xell that assign would refuse is never offered in the first place');
     await WA.assignWorkItem(item.id, { xell_id: worker.id });
-    const c3 = await WA.candidatesFor(item.id);
-    ok(!c3.candidates.map((x) => x.slug).includes('wa-worker'),
+    ok(!(await WA.candidatesFor(item.id)).candidates.map((x) => x.slug).includes('wa-worker'),
        'nor is the xell already ON this item (it cannot "take" what it is already doing)');
     await WA.unassignWorkItem(item.id);
     await WA.unassignWorkItem(activity.id);
@@ -222,30 +232,27 @@ try {
 
   // ── 5. deploy (dispatch STUBBED — no agent is ever spawned) ──────────────
   {
-    // a ticket to be briefed from, if 058 models one
-    let ticket = null;
-    try {
-      ticket = (await client.query(
-        `INSERT INTO ticket (project_id, number, title, body) VALUES ($1, 4242, 'the ticket', 'why this exists')
-         RETURNING *`, [PID])).rows[0];
-      await client.query(`UPDATE work_item SET ticket_id=$2 WHERE id=$1`, [item.id, ticket.id]);
-    } catch { /* no ticket table / different shape — the brief is simply thinner */ }
+    const ticket = (await client.query(
+      `INSERT INTO ticket (project_id, title, body, kind) VALUES ($1,'the ticket','why this exists','feature')
+       RETURNING *`, [PID])).rows[0];
+    await client.query(`UPDATE work_item SET ticket_id=$2, due_on='2026-08-01' WHERE id=$1`, [item.id, ticket.id]);
 
     let seen = null;
     const stub = async ({ task: brief, title }) => { seen = { brief, title }; return { xell_id: spare.id, slug: spare.slug }; };
-    const out = await WA.deployWorkItem(item.id, { task: 'and mind the acceptance notes', actor: 'test@human', dispatchFn: stub });
+    const out = await WA.deployWorkItem(item.id, { task: 'and mind the dates', actor: 'test@human', dispatchFn: stub });
     ok(out.ok && out.xell.id === spare.id, 'deploy assigns the dispatched worker to the item');
     ok(/wa: the task/.test(seen.brief), 'the brief carries the item itself');
-    ok(/wa: the project/.test(seen.brief) && /wa: an activity/.test(seen.brief),
+    ok(/wa: an activity/.test(seen.brief) && /YOUR item/.test(seen.brief),
        'and its ANCESTOR chain (the worker knows what it sits under)');
-    ok(/the board moves by itself/.test(seen.brief), 'and its acceptance notes ("what done means")');
-    ok(/and mind the acceptance notes/.test(seen.brief), "and the deployer's extra instructions");
-    ok(!ticket || /4242|the ticket/.test(seen.brief), 'and the linked ticket');
-    ok(/zee item/.test(seen.brief) && /never marks/i.test(seen.brief) === false || /zee work/.test(seen.brief),
-       'and tells the worker how to report progress');
-    ok((await client.query(
-      `SELECT count(*)::int n FROM work_item_event WHERE work_item_id=$1 AND kind='deployed'`,
-      [item.id])).rows[0].n === 1, "the history records kind:'deployed'");
+    ok(new RegExp(`#${ticket.number}`).test(seen.brief) && /why this exists/.test(seen.brief),
+       `and the linked ticket (#${ticket.number}, with its body)`);
+    ok(/due 2026-08-01/.test(seen.brief), 'and the dates it is actually held to');
+    ok(/and mind the dates/.test(seen.brief), "and the deployer's extra instructions");
+    ok(/zee work/.test(seen.brief) && /zee item/.test(seen.brief), 'and how to report progress');
+    ok(/never marks your xell done/.test(seen.brief),
+       'while saying plainly that reporting the item is NOT landing, shipping or being done');
+    ok((await events(item.id, 'assigned')).some((e) => e.detail?.deployed === true),
+       'the ledger records the deployment (an assigned event whose detail says it was deployed)');
 
     const twice = await caught(() => WA.deployWorkItem(item.id, { dispatchFn: stub }));
     ok(twice?.status === 409 && /already deployed/i.test(twice.message),
@@ -256,55 +263,54 @@ try {
     const finished = await caught(() => WA.deployWorkItem(item.id, { dispatchFn: stub }));
     ok(finished?.status === 409 && /done/.test(finished.message),
        'and deploying onto a FINISHED item is refused (a whole worker on work somebody ended)');
-    await client.query(`UPDATE work_item SET status='assigned' WHERE id=$1`, [item.id]);
+    await client.query(`UPDATE work_item SET status='queued' WHERE id=$1`, [item.id]);
   }
 
   // ── 6. worksync: the board moves itself, and the fence holds ─────────────
   {
     await WA.assignWorkItem(item.id, { xell_id: worker.id });
-    await client.query(`UPDATE work_item SET status='assigned' WHERE id=$1`, [item.id]);
 
-    // the zee is WORKING → the card follows it
     const t1 = await worksync.workSyncTick();
     const after1 = (await client.query(`SELECT status FROM work_item WHERE id=$1`, [item.id])).rows[0].status;
-    const expect1 = workStatus.statusFromHive('occ-working');
-    ok(after1 === expect1, `a working zee moves its card to '${expect1}' (got '${after1}', ${t1.moved} move(s))`);
-    const qz = (await client.query(
-      `SELECT * FROM work_item_event WHERE work_item_id=$1 AND actor='queenzee' ORDER BY created_at DESC`,
-      [item.id])).rows;
-    ok(qz.length >= 1, "each self-move is recorded with actor:'queenzee' (the board says it moved itself)");
+    ok(after1 === WS.statusFromHive('occ-working'),
+       `a working zee moves its card to '${WS.statusFromHive('occ-working')}' (got '${after1}', ${t1.moved} move(s))`);
+    ok((await events(item.id, 'status')).some((e) => e.actor === 'queenzee' && e.to_status === after1),
+       "each self-move is in the ledger with actor:'queenzee' (the board says it moved itself)");
 
-    // a HELD LANDING is a different hive status → a different card position
     const land = (await client.query(
       `INSERT INTO land_request (project_id, xell_id, ref, new_sha, status)
          VALUES ($1,$2,'refs/heads/master','deadbeef','pending') RETURNING *`, [PID, worker.id])).rows[0];
     await worksync.workSyncTick();
     const after2 = (await client.query(`SELECT status FROM work_item WHERE id=$1`, [item.id])).rows[0].status;
-    const expect2 = workStatus.statusFromHive('occ-landRequest');
-    ok(after2 === expect2, `a held landing moves it to '${expect2}' (got '${after2}') — the same signal a human's hexagon shows`);
+    ok(after2 === WS.statusFromHive('occ-landRequest'),
+       `a held landing moves it to '${WS.statusFromHive('occ-landRequest')}' (got '${after2}') — the same signal the hexagon shows`);
     await client.query(`DELETE FROM land_request WHERE id=$1`, [land.id]);
 
-    // THE FENCE: a terminal card is never touched, whatever the zee is doing
+    // THE FENCE: never OUT of a terminal status
     await client.query(`UPDATE work_item SET status='done' WHERE id=$1`, [item.id]);
-    const evBefore = (await client.query(
-      `SELECT count(*)::int n FROM work_item_event WHERE work_item_id=$1`, [item.id])).rows[0].n;
+    const evBefore = (await events(item.id)).length;
     await worksync.workSyncTick();
-    const stayed = (await client.query(`SELECT status FROM work_item WHERE id=$1`, [item.id])).rows[0].status;
-    const evAfter = (await client.query(
-      `SELECT count(*)::int n FROM work_item_event WHERE work_item_id=$1`, [item.id])).rows[0].n;
-    ok(stayed === 'done', 'the tick NEVER moves a card out of a terminal status');
-    ok(evAfter === evBefore, 'and writes no event pretending it considered it');
+    ok((await client.query(`SELECT status FROM work_item WHERE id=$1`, [item.id])).rows[0].status === 'done',
+       'the tick NEVER moves a card out of a terminal status');
+    ok((await events(item.id)).length === evBefore, 'and writes no event pretending it considered it');
 
-    // …and it can never move one INTO done: the only statuses it writes are in-flight
+    // THE FENCE: never INTO one, even when the hive says 'done'
     await client.query(`UPDATE work_item SET status='working' WHERE id=$1`, [item.id]);
-    await client.query(`UPDATE xell SET status='tearing-down' WHERE id=$1`, [worker.id]);   // hive: occ-done
+    await client.query(`UPDATE xell SET status='tearing-down' WHERE id=$1`, [worker.id]);
     await worksync.workSyncTick();
     const notDone = (await client.query(`SELECT status FROM work_item WHERE id=$1`, [item.id])).rows[0].status;
-    ok(!WA.TERMINAL.includes(notDone),
-       `a zee whose xell is being torn down does NOT finish the work item (still '${notDone}') — finishing is a decision`);
+    ok(notDone === 'working',
+       `a zee whose xell is being torn down (hive occ-done → statusFromHive 'done') does NOT finish the item (still '${notDone}')`);
     await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [worker.id]);
 
-    // a card nobody is on is not touched at all
+    // THE FENCE: a QUEUED card is not started by a tick — assignment does that
+    await client.query(`UPDATE work_item SET status='queued' WHERE id=$1`, [item.id]);
+    await worksync.workSyncTick();
+    ok((await client.query(`SELECT status FROM work_item WHERE id=$1`, [item.id])).rows[0].status === 'queued',
+       'a queued card is left alone (starting work is assignment, not a tick)');
+    await client.query(`UPDATE work_item SET status='working' WHERE id=$1`, [item.id]);
+
+    // an item nobody is on
     const idle = (await client.query(`SELECT status FROM work_item WHERE id=$1`, [activity.id])).rows[0].status;
     await worksync.workSyncTick();
     ok((await client.query(`SELECT status FROM work_item WHERE id=$1`, [activity.id])).rows[0].status === idle,
@@ -317,9 +323,8 @@ try {
     const orphan = (await client.query(`SELECT status, xell_id FROM work_item WHERE id=$1`, [item.id])).rows[0];
     ok(orphan.xell_id === null && orphan.status === 'review',
        `a retired zee clears the assignment and KEEPS the status (${t3.cleared} cleared)`);
-    ok((await client.query(
-      `SELECT count(*)::int n FROM work_item_event WHERE work_item_id=$1 AND kind='unassigned' AND actor='queenzee'`,
-      [item.id])).rows[0].n === 1, 'with an event saying the queenzee did it, and why');
+    ok((await events(item.id, 'assigned')).some((e) => e.actor === 'queenzee' && e.detail?.unassigned === true),
+       'with a ledger entry saying the queenzee did it, and why');
     await client.query(`UPDATE xell SET status='working' WHERE id=$1`, [worker.id]);
   }
 
@@ -332,26 +337,31 @@ try {
 
     const mine = await selfWork(w);
     ok(mine.ok && mine.item?.id === item.id, '`zee work` shows a worker the item it is executing');
-    ok(mine.ancestors?.length === 2, 'with its ancestor chain');
+    ok(mine.item.breadcrumb?.length === 2 && mine.item.ticket, 'with its ancestor chain and its ticket');
     const plan = await selfWork(m);
-    ok(plan.ok && plan.count >= 3 && plan.items[0].depth === 0,
-       "`zee work` shows a MANAGER its project's plan in tree order");
+    ok(plan.ok && plan.count >= 3 && plan.items[0].kind === 'project',
+       "`zee work` shows a MANAGER its project's plan in tree order, root first");
+    ok(plan.items.some((i) => i.zee?.slug === 'wa-worker'), 'with the live zee on the item that has one');
     const board = await selfWork(m, { board: true });
-    ok(board.items.every((i) => i.depth > 0), '--board drops the project root (a root is not a card)');
+    ok(board.items.every((i) => i.kind !== 'project'), '--board drops the project root (a root is not a card)');
 
     const nosy = await selfWork(w, { item: activity.id });
     ok(nosy.ok === false && /not the work item you are assigned to/.test(nosy.error),
        "a worker cannot read another item — not even one in its own project");
     const stranger = await selfWorkItem(s, { id: item.id, status: 'blocked' });
     ok(stranger.ok === false && /not your work item/.test(stranger.error),
-       'a worker cannot report on somebody else\'s item (the id it supplied is refused)');
+       "a worker cannot report on somebody else's item (the id it supplied is refused)");
     ok((await client.query(`SELECT status FROM work_item WHERE id=$1`, [item.id])).rows[0].status === 'assigned',
        'and nothing was written when it tried');
 
     const report = await selfWorkItem(w, { status: 'working', progress: 40, note: 'digging in' });
-    ok(report.ok && report.item.status === 'working', 'a worker reports its OWN item without naming it at all');
+    ok(report.ok && report.item.status === 'working' && report.item.progress === 40,
+       'a worker reports its OWN item without naming it at all');
     const bad = await selfWorkItem(w, { progress: 400 });
     ok(bad.ok === false && /0-100/.test(bad.error), 'a nonsense progress is refused with the range');
+    const nonsense = await selfWorkItem(w, { status: 'nearly' });
+    ok(nonsense.ok === false && /unknown status/.test(nonsense.error),
+       'and an unknown status is refused with the vocabulary');
 
     const done = await selfWorkItem(w, { status: 'done', note: 'work finished' });
     ok(done.ok && done.item.status === 'done', 'a worker MAY report its work done (a fact, not a gate)');
@@ -361,21 +371,27 @@ try {
     ok(!(await client.query(`SELECT count(*)::int n FROM land_request WHERE xell_id=$1`, [w.id])).rows[0].n,
        'nor does it land anything');
     const reopen = await selfWorkItem(w, { status: 'working' });
-    ok(reopen.ok === false && /human/.test(reopen.error), 'and it cannot REOPEN what it just finished');
+    ok(reopen.ok === false && /legal next statuses/.test(reopen.error),
+       'and what it may do next comes from the VOCABULARY, not from a rule this file invented');
     await client.query(`UPDATE work_item SET status='working' WHERE id=$1`, [item.id]);
 
-    // manager scoping
-    const notMine = await selfWork(m, { item: (await mkItemInForeign()).id });
+    const other = await createWorkItem({ project_id: FID, kind: 'task', title: "wa: somebody else's plan" });
+    const notMine = await selfWork(m, { item: other.id });
     ok(notMine.ok === false && /another project/.test(notMine.error),
        "a manager cannot read another project's item");
+    const mgrMove = await selfWorkItem(m, { id: activity.id, status: 'blocked', note: 'waiting on a human' });
+    ok(mgrMove.ok && mgrMove.item.status === 'blocked', 'a manager may move a card in its own project');
     const workerAssign = await selfWorkAssign(w, { item: item.id, task: 'go' });
     ok(workerAssign.ok === false && /MANAGER verb/.test(workerAssign.error),
        '`zee assign` is refused for a worker, with the explanation (not a 404)');
     const noItem = await selfWorkAssign(m, {});
     ok(noItem.ok === false && /--item/.test(noItem.error), 'and it needs an item');
+    const foreignAssign = await selfWorkAssign(m, { item: other.id, task: 'go' });
+    ok(foreignAssign.ok === false && /another project/.test(foreignAssign.error),
+       "and a manager cannot deploy onto another project's plan");
   }
 
-  // ── 8. the verbs exist where a zee will look for them ────────────────────
+  // ── 8. the manuals, the routes and the CLI ───────────────────────────────
   {
     const routes = readFileSync('server/src/api/routes.js', 'utf8');
     for (const r of ['/work-items/:id/assign', '/work-items/:id/deploy', '/work-items/:id/candidates',
@@ -386,23 +402,58 @@ try {
     for (const c of ["case 'work'", "case 'assign'", "case 'item'"]) ok(cli.includes(c), `the zee CLI has ${c}`);
     ok(/zee work \[--board\]/.test(cli) && /zee assign --item/.test(cli), 'and its usage text names them');
 
-    const mgrManual = readFileSync('harnesses/manager/memory/manager-zee-manual.md', 'utf8');
-    for (const s of ['zee work', 'zee assign --item', 'zee item', 'Break a ticket down into work items BEFORE you']) {
-      ok(mgrManual.includes(s), `the manager manual teaches: ${s}`);
+    // 059 and the manager harness FILE are two copies of ONE manual — they must say the same words.
+    const sql = readFileSync('db/migrations/059_work_tracker_verbs.sql', 'utf8');
+    const manualPath = 'harnesses/manager/memory/manager-zee-manual.md';
+    const manual = readFileSync(manualPath, 'utf8');
+    const decode = (s) => s.replace(/''/g, "'").replace(/\\n/g, '\n');
+    // Each `txt := replace(txt, E'anchor', E'…' || E'…')` call: the first E-literal is the anchor,
+    // the rest are the replacement. Split on the CALLS (not on a ');' inside the markdown — the
+    // manual says "a card); `--item <id>`", and truncating there silently parsed half a section).
+    const replacementsIn = (text) => text.split('txt := replace(txt,').slice(1).map((chunk) => {
+      const lits = [...chunk.matchAll(/E'((?:[^']|'')*)'/g)].map((m) => decode(m[1]));
+      return { anchor: lits[0], replacement: lits.slice(1).join('') };
+    });
+    const mgrReps = replacementsIn(sql.slice(sql.indexOf('-- ── (2)')));
+    ok(mgrReps.length === 2, `059's manager block makes ${mgrReps.length} anchored replacements`);
+    for (const r of mgrReps) {
+      ok(manual.includes(r.replacement),
+         `what 059 writes is VERBATIM in the harness file ("${r.replacement.split('\n')[0].slice(0, 46)}…")`);
     }
-    const mig = readFileSync('db/migrations/059_work_tracker_verbs.sql', 'utf8');
-    ok(/key = 'zee-base'/.test(mig) && /key = 'manager'/.test(mig), '059 teaches BOTH manuals');
-    ok(/IF txt IS NULL OR txt LIKE/.test(mig), 'and is guarded (idempotent, no-op when an anchor moved)');
-    const stored = (await client.query(
-      `SELECT bundle->'memory'->0->>'text' AS t FROM harness WHERE key='zee-base'`)).rows;
-    if (stored.length && stored[0].t) {
-      ok(/zee work \[--board\]/.test(stored[0].t) && /zee item/.test(stored[0].t),
-         'and the WORKER manual in this database carries them (059 applied)');
+    // …and prove it end to end: reverse-apply 059 to the file to get the manual as it stood BEFORE,
+    // seed the row with that, run the block, and the row must come back byte-for-byte the file.
+    const before = mgrReps.reduce((t, r) => t.split(r.replacement).join(r.anchor), manual);
+    ok(before !== manual, 'the migration is reversible on the file (so the "before" text is exact)');
+    const saved = (await client.query(`SELECT bundle FROM harness WHERE key='manager'`)).rows[0]?.bundle ?? null;
+    try {
+      const block2 = sql.slice(sql.indexOf('-- ── (2)'));
+      await client.query(`UPDATE harness SET bundle = jsonb_build_object('memory',
+          jsonb_build_array(jsonb_build_object('path','memory/manager-zee-manual.md','text',$1::text)))
+        WHERE key='manager'`, [before]);
+      await client.query(block2);
+      const got = async () => (await client.query(
+        `SELECT bundle->'memory'->0->>'text' AS t FROM harness WHERE key='manager'`)).rows[0]?.t;
+      ok((await got()) === manual, 'applying 059 to that text reproduces the FILE exactly — the two cannot drift');
+      await client.query(block2);
+      ok((await got()) === manual, 're-running it changes nothing (guarded, idempotent)');
+      const edited = before.replace(mgrReps[1].anchor, '### a human renamed this section');
+      await client.query(`UPDATE harness SET bundle = jsonb_set(bundle,'{memory,0,text}',to_jsonb($1::text)) WHERE key='manager'`, [edited]);
+      await client.query(block2);
+      ok((await got()).includes('### a human renamed this section'),
+         'an anchor a human has MOVED makes that replacement not fire (no half-rewritten manual)');
+      await client.query(`UPDATE harness SET bundle='{}'::jsonb WHERE key='manager'`);
+      await client.query(block2);
+      ok(true, 'a harness row with no manual at all is a clean no-op, not a crash');
+    } finally {
+      if (saved !== null) await client.query(`UPDATE harness SET bundle=$1 WHERE key='manager'`, [saved]);
     }
-  }
 
-  async function mkItemInForeign() {
-    return createWorkItem({ project_id: FID, title: 'wa: somebody else\'s plan' });
+    const stored = (await client.query(
+      `SELECT bundle->'memory'->0->>'text' AS t FROM harness WHERE key='zee-base'`)).rows[0]?.t;
+    if (stored) {
+      ok(/zee work \[--board\]/.test(stored) && /may only ever touch YOUR OWN item/.test(stored),
+         'and the WORKER manual in this database carries the verbs and the own-item rule (059 applied)');
+    }
   }
 
 } finally {

@@ -115,14 +115,14 @@ as the job needs — with a status on each one and a kanban board over them. Tha
 decoration: it is the unit you dispatch against. **Break a ticket down into work items BEFORE you
 dispatch anybody.** A vague ticket handed straight to a worker becomes a vague brief, and a bad brief
 costs a whole xell; an item that has been cut properly already carries its title, its body, its
-ancestors, the ticket it came from and its acceptance notes — and `zee assign` folds every one of
+ancestors, the ticket it came from and its dates — and `zee assign` folds every one of
 those into the worker's briefing for free. Breaking down first also makes the work VISIBLE: each item
 is a card a human can see, and a card with a zee on it moves by itself.
 
 ### `zee work` — your project's plan
 `GET /api/xell/self/work`. Every work item in YOUR project, in tree order, with its status, who is
 assigned and what that zee is doing right now. `--board` drops the project root (a root is a summary
-row, not a card); `--item <id>` reads one item in full — body, ancestors, ticket, acceptance notes and
+row, not a card); `--item <id>` reads one item in full — body, ancestors, ticket, children and
 its recent history. Read this before you dispatch: an item that already has a zee on it does not need
 a second one.
 
@@ -130,8 +130,8 @@ a second one.
 `POST /api/xell/self/work/assign` `{ item, task?, model?, mode?, harness? }`. This is `zee dispatch`
 aimed at a card. The worker is spawned through the SAME path — stamped as your crew, seated next to
 you, on its own throwaway db, and you still cannot hand it production, the manager type or the manager
-harness — but its brief is built from the ITEM (title, body, ancestor chain, linked ticket, acceptance
-notes) plus whatever `--task` text you add. It answers with the new worker's slug. The item is then
+harness — but its brief is built from the ITEM (title, body, ancestor chain, linked ticket, dates and
+priority) plus whatever `--task` text you add. It answers with the new worker's slug. The item is then
 linked to that xell, and the board FOLLOWS it: as the worker works, blocks, asks for a landing or a
 ship, the card moves itself. You never drag it.
 
