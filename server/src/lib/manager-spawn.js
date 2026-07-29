@@ -21,7 +21,7 @@ import { logline } from './logbus.js';
 import { broadcast } from './events.js';
 import { attachXellDb } from './xell-db.js';
 import { emitXellEnv } from './provision.js';
-import { mintProdReader } from './prod-readonly.js';
+import { mintProdReader, dropProdReader } from './prod-readonly.js';
 
 // Bind a xell to production READ-ONLY. Used by the manager dispatch path; safe to re-run (the role
 // is re-minted with a fresh password, which also re-applies the GRANTs as the schema moves).
@@ -55,6 +55,51 @@ export async function bindManagerToProdReadonly(xellId) {
   logline('prod-ro', `${xell.slug} bound to PRODUCTION READ-ONLY as ${reader.role} `
     + `(${reader.container}/${reader.database}${reader.mode === 'simulate' ? ', SIMULATED' : ''})`);
   return { ...db, readonly: true, role: reader.role, mode: reader.mode, address: reader.address };
+}
+
+// ── THE COMPENSATING ACTION for a bind that is no longer wanted ──────────────────────────────────
+//
+// bindManagerToProdReadonly mints a real credential on a real cluster and re-points the xell at
+// production. Everything AFTER it in the dispatch can still fail — the cage build most of all — and
+// until now nothing undid it: the `zee_ro_<slug>` role stayed on the production cluster and the xell
+// row stayed `db-prod-readonly`, both waiting on a teardown that only happens when the xell is
+// reaped. A credential nobody is using, on production, for an agent that never started, is exactly
+// the thing the reaper exists to prevent — it should not depend on the reaper running.
+//
+// So: drop the reader and put the xell back on the shared dev database. Deliberately best-effort and
+// NEVER throws — this runs on a path that is already failing, and a compensating action that raises
+// its own error just replaces one bad outcome with a more confusing one. The revert target is
+// `db-shared-dev` rather than "whatever it was before": the xell is released back to the pool from
+// here, where the next dispatch attaches whatever that task needs, and the ONE property that must
+// hold is that a xell with no zee on it is not left pointing at production.
+export async function unbindManagerFromProdReadonly(xellId, reason = 'the dispatch failed') {
+  try {
+    const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
+    if (!xell) return { unbound: false, reason: 'no xell' };
+    if (xell.db_coupling !== 'db-prod-readonly') return { unbound: false, reason: 'not bound read-only' };
+    const dropped = await dropProdReader(xell);          // never throws; clears prod_ro_dsn
+    // Re-attach through the ordinary path so the container LINK is rebuilt too. It can legitimately
+    // fail (a project with no dev db registered throws), and the invariant must not depend on it —
+    // so fall back to writing the row directly. What has to hold when this returns is narrow and
+    // absolute: this xell is not coupled to production and holds no production DSN.
+    const db = await attachXellDb(xellId, { coupling: 'db-shared-dev' }).catch((e) => ({ error: e.message }));
+    if (db?.error) {
+      await q(`DELETE FROM xell_uses_container uc USING container c
+                WHERE uc.container_id=c.id AND uc.xell_id=$1 AND c.role='db' AND c.tier='prod'`, [xellId]);
+      await q(`UPDATE xell SET db_coupling='db-shared-dev'::db_coupling, prod_ro_dsn=NULL WHERE id=$1`, [xellId]);
+    }
+    await emitXellEnv(xellId).catch(() => {});
+    const row = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
+    if (row) broadcast('xell', row);
+    logline('prod-ro', `${xell.slug}: UNBOUND from production read-only (${reason}) — `
+      + `${dropped.dropped ? `role ${dropped.role} dropped` : `role NOT dropped (${dropped.reason || dropped.error || '?'})`}`
+      + `, db back to shared dev${db?.error ? ` (re-attach failed: ${db.error} — coupling cleared directly)` : ''}`);
+    return { unbound: true, dropped: !!dropped.dropped, role: dropped.role || null };
+  } catch (e) {
+    // Never let the compensation itself sink the caller's own error reporting.
+    logline('prod-ro', `could not unbind ${String(xellId).slice(0, 8)} from production read-only: ${e.message}`);
+    return { unbound: false, error: e.message };
+  }
 }
 
 // Create a manager zee. Everything after the type stamp is the ordinary dispatch path, so a manager

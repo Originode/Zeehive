@@ -540,6 +540,13 @@ export async function decideProdBind(id, decision, by = 'human@console') {
 // Re-seal the cxell now that this xell is bound to prod: block every prod DB EXCEPT this xell's own
 // project's — that one is now reachable, which is the whole point of the bind. Mirrors spawnCxell's
 // block-list logic (default-allow egress, drop only prod DBs).
+//
+// ⚠ Same host:port-only caveat as spawnCxell's copy, and the SAME two conditions keep it harmless:
+// an ALIAS-ONLY prod db is absent from this list because (a) it publishes no host port, so there is
+// nothing for an iptables rule to drop, AND (b) the only cage on its docker network is the
+// prod-read-only manager's, joined deliberately by connectCxellToProdNetwork(). Break either — add a
+// host_port to an alias-registered row, or join anything else to that network — and both copies of
+// this query have to change together. Read the long note in intake.js spawnCxell before touching it.
 async function resealCxellForStack(xellId) {
   const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
   const prodDbs = await q(
@@ -785,8 +792,13 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // the pool target or wait; a caged manager can do neither — it would just be told "no ready xell"
   // with no way to act on it. So provision one on demand, exactly as the claim path does when a
   // human walks up to an empty pool.
+  //
+  // A ready MANAGER xell does not count as a spare here: `zee dispatch` always spawns a WORKER, and
+  // a manager xell handed to it is refused downstream (it would otherwise be downgraded off
+  // production). If the only ready xell is a manager's, this pool IS dry — provision, don't grab it.
   const ready = await one(
-    `SELECT id FROM xell WHERE project_id=$1 AND status='ready' ORDER BY ready_at DESC NULLS LAST LIMIT 1`,
+    `SELECT id FROM xell WHERE project_id=$1 AND status='ready' AND COALESCE(zee_type,'worker') <> 'manager'
+      ORDER BY ready_at DESC NULLS LAST LIMIT 1`,
     [xell.project_id]);
   let provisioned = null;
   if (!ready) {
