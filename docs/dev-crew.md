@@ -111,7 +111,9 @@ manager). There is no folder to create.
 
 Two rules for the writing itself, both checked by the test: **no CLI verbs or flags** (refer to the
 manual, never quote it) and **no project lore** (no repo paths, container names or scripts — these
-personas work on other people's codebases).
+personas work on other people's codebases). Both are checked on every field of the bundle that
+reaches a wearer, `label` and `summary` included — those two show up in every picker, and while the
+lint read files instead they were the one place lore could be written and never flagged.
 
 ## Using them
 
