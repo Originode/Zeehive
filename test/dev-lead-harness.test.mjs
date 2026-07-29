@@ -48,8 +48,16 @@ const PID = '00000000-0000-4000-8000-0000000d1ead';
 const XOURCE = '00000000-0000-4000-8000-0000000d1eb0';
 const tmp = mkdtempSync(join(tmpdir(), 'devlead-'));
 
-const CREW = ['dev-scout', 'dev-architect', 'dev-builder', 'dev-tester',
-              'dev-reviewer', 'dev-fixer', 'dev-scribe', 'dev-shipwright'];
+// The crew this lead casts from is DERIVED, by the same structural rule as test/dev-crew.test.mjs:
+// a harness is crew if its parent chain reaches dev-base. Pasting the keys here meant a role added
+// by migration was outside this check until a human remembered it — and worse, the "invents no role"
+// assertion below would then FAIL on a roster that was perfectly correct.
+const crewKeys = async () => {
+  const rows = await q(`SELECT h.key, p.key AS parent FROM harness h LEFT JOIN harness p ON p.id=h.parent_id`);
+  const parentOf = Object.fromEntries(rows.map((r) => [r.key, r.parent]));
+  const reaches = (k) => { let c = k, n = 0; while (c && n++ < 32) { if (parentOf[c] === 'dev-base') return true; c = parentOf[c]; } return false; };
+  return rows.map((r) => r.key).filter(reaches).sort();
+};
 
 async function cleanup({ files = false } = {}) {
   try { await q(`DELETE FROM project WHERE id=$1`, [PID]); } catch { /* */ }
@@ -132,6 +140,8 @@ try {
 
   // ── 4. it casts from the REAL crew keys ──────────────────────────────────
   console.log('\n── the roster is the real crew ──');
+  const CREW = await crewKeys();
+  ok(CREW.length >= 1, `the dev-base subtree has roles to cast (${CREW.join(', ') || 'NONE — 073 not applied?'})`);
   const leafText = (bundle.skills?.[0]?.body || '') + '\n' + (bundle.memory?.[0]?.text || '');
   for (const k of CREW) ok(leafText.includes(k), `the lead knows the role key ${k}`);
   const invented = [...leafText.matchAll(/\bdev-[a-z]+\b/g)].map((m) => m[0])
