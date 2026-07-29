@@ -15,6 +15,15 @@ import { spawnSync } from 'node:child_process';
 import { q } from '../db/pool.js';
 import { logline } from './logbus.js';
 
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
+// reaper, the .zeehive.env reconcile): 'real' touches machines, anything else models. The ORPHAN
+// SWEEP below obeys it — it is a timer that deletes images by name, and the names come from fleet
+// rows (a tag is a xell slug). A xell's database is a CLONE of the meta-DB taken at provision time,
+// so a NESTED queenzee's "live xells" are a SNAPSHOT of the real fleet: every xell created after it
+// looks retired, and its images look like orphans. Hence report-only there (see the janitor's own
+// default below, which keeps IMAGE_JANITOR_DRY_RUN as the separate operator switch it always was).
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
 function docker(ctx, args, timeout = 120000) {
   const r = spawnSync('docker', ['--context', ctx, ...args],
     { encoding: 'utf8', timeout, windowsHide: true });
@@ -85,7 +94,7 @@ export async function removeXellImages(xellId, slug) {
 // ever touches repositories that this project's OWN per-xell containers use (derived from the DB,
 // never hardcoded), and only tags that match no live xell. It is not `docker image prune -a`:
 // a blanket prune on a shared NAS would eat the dev stack, prod images and anyone else's work.
-export async function sweepOrphanSpinImages({ dryRun = false } = {}) {
+export async function sweepOrphanSpinImages({ dryRun = PROVISION_MODE !== 'real' } = {}) {
   // Which image repositories are per-xell ones, and on which context? Ask the data — and count
   // BOTH the run context and any split-build context, since a split build leaves the same repo on
   // the build host too. (The UNION over docker_ctx + build_ctx keeps a failed split-build teardown
@@ -131,7 +140,12 @@ export async function sweepOrphanSpinImages({ dryRun = false } = {}) {
       return true;
     });
     if (!orphans.length) continue;
-    if (dryRun) { logline('maint', `image sweep (dry run): ${orphans.length} orphan(s) on ${ctx}: ${orphans.join(', ')}`); swept += orphans.length; continue; }
+    if (dryRun) {
+      logline('maint', `image sweep (dry run${PROVISION_MODE !== 'real' ? ', PROVISION_MODE=simulate: this '
+        + 'queenzee models the fleet — its xell list is a SNAPSHOT and would call live images orphans' : ''}): `
+        + `${orphans.length} orphan(s) on ${ctx}: ${orphans.join(', ')}`);
+      swept += orphans.length; continue;
+    }
     const r = rmi(ctx, orphans);
     swept += r.removed.length;
     if (r.removed.length) {
@@ -154,7 +168,9 @@ export function startImageJanitor() {
     return;
   }
   const interval = Number(process.env.IMAGE_JANITOR_MS) || 3600000; // hourly
-  const dryRun = process.env.IMAGE_JANITOR_DRY_RUN === 'true';
+  // Two independent reasons to only report: the operator asked for a dry run, or this queenzee is
+  // not allowed to touch machines at all (PROVISION_MODE — see the top of this file).
+  const dryRun = process.env.IMAGE_JANITOR_DRY_RUN === 'true' || PROVISION_MODE !== 'real';
   const tick = () => sweepOrphanSpinImages({ dryRun }).catch((e) => console.error('[images] sweep:', e.message));
   setTimeout(tick, 60000);          // not at boot — let the fleet settle first
   setInterval(tick, interval);

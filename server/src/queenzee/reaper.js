@@ -12,9 +12,19 @@ import { logline } from '../lib/logbus.js';
 import { resolveBash } from '../lib/bash.js';
 import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
-import { removeCxell } from '../lib/cxell.js';
+import { removeCxell, cxellName } from '../lib/cxell.js';
 import { stopAndRemoveContainer } from '../lib/docker.js';
 import { releaseXellShips } from './shipgate.js';
+
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
+// the .zeehive.env reconcile): 'real' touches machines, anything else models. A teardown is the
+// most destructive thing the queenzee does with a fleet row — worktree, branch, containers, images
+// and the cxell, all named from `xell`/`container` — and a xell's database is a CLONE of the
+// meta-DB, so a NESTED queenzee's rows are the REAL fleet's. It does not even need a human: the
+// boot janitor below walks every 'tearing-down' row it inherited in the clone, and the pool
+// maintainer trims 'ready' surplus down to POOL_TARGET_READY (0 in a xell) five xells a tick. So in
+// simulate reapXell RETIRES THE ROW and touches no machine — see the destructive block below.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 // Boot recovery: a queenzee killed mid-reap (a self-ship, a crash) strands rows at
 // 'tearing-down' — worktree possibly gone, row never 'retired', and the dashboard renders
@@ -36,7 +46,7 @@ export async function recoverOrphanTeardowns() {
   return { finished };
 }
 
-export async function reapXell(xellId, reason = 'task-done', { force = false } = {}) {
+export async function reapXell(xellId, reason = 'task-done', { force = false, mode = PROVISION_MODE } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id = $1`, [xellId]);
   if (!xell) return { ok: false, error: 'xell not found' };
   if (xell.is_production) return { ok: false, error: 'production is protected — cannot be decommissioned by a zee' };
@@ -130,12 +140,26 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
        WHERE xell_id=$1 AND status IN ('spawning','online','working','idle') RETURNING *`, [xellId]);
   if (zee) broadcast('zee', zee);
 
+  // ── FROM HERE DOWN, EVERY STEP TOUCHES A REAL MACHINE ───────────────────────
+  // …with names taken straight out of the rows above, so it is the whole point of the guard at the
+  // top of this file. In simulate the row still retires (the model stays coherent, the dashboard
+  // still shows the xell gone) and nothing on any host is removed. REPORT-ONLY, not a silent skip:
+  // a teardown that quietly did nothing would be indistinguishable from a clean one.
+  const destructive = mode === 'real';
+  if (!destructive) {
+    const owned = await q(`SELECT name FROM container WHERE owner_xell_id=$1`, [xellId]);
+    logline('reaper', `${xell.slug}: retiring the ROW ONLY — PROVISION_MODE=simulate: this queenzee `
+      + 'models the fleet, it does not tear down machines. Would have removed: worktree '
+      + `${xell.worktree_path || '(none)'}, cxell ${cxellName(xell.slug)}`
+      + `${owned.length ? `, container(s) ${owned.map((c) => c.name).join(', ')}` : ''}, and its images.`);
+  }
+
   // deterministic despawn script (purge containers, remove worktree/branch).
   // Only run it when the worktree actually exists on disk — in simulate mode the
   // worktree was never created, so there is nothing to tear down.
   const script = resolve(config.repoRoot, 'scripts', 'despawn-xell.sh');
   let despawn = { skipped: true };
-  if (existsSync(script) && xell.worktree_path && existsSync(xell.worktree_path)) {
+  if (destructive && existsSync(script) && xell.worktree_path && existsSync(xell.worktree_path)) {
     // Despawn on the xell's OWN machine — its containers' stamped context, which since machines
     // (023) can differ per xell. The project dev site and the global env default are fallbacks
     // for rows that predate stamping; purging on the wrong daemon removes nothing and leaks.
@@ -158,23 +182,27 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   // them too, but only via `spin-env.sh purge` run from INSIDE the worktree: if the worktree is
   // gone/broken (or the purge silently failed), ~2.6 GB per xell leaks with nobody watching. The
   // queenzee knows the exact tags, so it does not need the worktree to clean up after itself.
-  await removeXellImages(xellId, xell.slug).catch((e) => logline('reaper', `image cleanup failed for ${xell.slug}: ${e.message}`));
+  if (destructive) {
+    await removeXellImages(xellId, xell.slug).catch((e) => logline('reaper', `image cleanup failed for ${xell.slug}: ${e.message}`));
+  }
 
   // the xell's zee CXELL, if a cxell zee ever ran here (lib/cxell.js) — it idles sealed on the
   // queenzee's local daemon after its turn so commits stay collectible; retirement is the point
   // of no return, so it goes too. Best-effort like the rest: a leak is visible in `docker ps`
   // by its zeehive.cxell label.
-  await removeCxell({ ctx: 'default', slug: xell.slug }).catch((e) => logline('reaper', `cxell cleanup failed for ${xell.slug}: ${e.message}`));
+  if (destructive) {
+    await removeCxell({ ctx: 'default', slug: xell.slug }).catch((e) => logline('reaper', `cxell cleanup failed for ${xell.slug}: ${e.message}`));
 
-  // Physically remove owned containers the queenzee docker-ran itself (the per-xell db of a
-  // process-runner xell — spec §6.1). Compose-managed ones were already purged by the despawn
-  // script; stop+rm is idempotent, so hitting them again is a no-op, and prod containers are
-  // shared (owner_xell_id NULL) so they can never match. Best-effort like the rest.
-  const owned = await q(
-    `SELECT name, docker_ctx FROM container WHERE owner_xell_id=$1 AND docker_ctx IS NOT NULL`, [xellId]);
-  for (const c of owned) {
-    await stopAndRemoveContainer(c.docker_ctx, c.name, { removeVolumes: true })
-      .catch((e) => logline('reaper', `container cleanup failed for ${c.name}: ${e.message}`));
+    // Physically remove owned containers the queenzee docker-ran itself (the per-xell db of a
+    // process-runner xell — spec §6.1). Compose-managed ones were already purged by the despawn
+    // script; stop+rm is idempotent, so hitting them again is a no-op, and prod containers are
+    // shared (owner_xell_id NULL) so they can never match. Best-effort like the rest.
+    const owned = await q(
+      `SELECT name, docker_ctx FROM container WHERE owner_xell_id=$1 AND docker_ctx IS NOT NULL`, [xellId]);
+    for (const c of owned) {
+      await stopAndRemoveContainer(c.docker_ctx, c.name, { removeVolumes: true })
+        .catch((e) => logline('reaper', `container cleanup failed for ${c.name}: ${e.message}`));
+    }
   }
 
   // drop this xell's per-xell containers from the meta DB
@@ -189,7 +217,8 @@ export async function reapXell(xellId, reason = 'task-done', { force = false } =
   // pile up unnoticed. Say it plainly instead.
   const orphaned = xell.worktree_path && existsSync(xell.worktree_path);
   if (orphaned) {
-    logline('reaper', `retired ${xell.slug} BUT its worktree is still on disk: ${xell.worktree_path} — ${despawn.reason || 'despawn failed'}`);
+    logline('reaper', `retired ${xell.slug} BUT its worktree is still on disk: ${xell.worktree_path} — `
+      + `${despawn.reason || (destructive ? 'despawn failed' : 'PROVISION_MODE=simulate, nothing was torn down')}`);
   } else {
     logline('reaper', `retired ${xell.slug}: zee decommissioned, worktree + containers removed ✓`);
   }

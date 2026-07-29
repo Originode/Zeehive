@@ -29,14 +29,17 @@ import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
-import { setTend, tendState, setHint, hintOpen, pingWorking, briefReason,
+import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefReason,
   shipRefusalState } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          NO_PUSH_REASON } from '../lib/managers.js';
 
+// NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
+// without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
+// documented auto-clear of an open tend (zee.xell_id was undefined). Caught by tend-nudge.test.mjs.
 const liveZee = (xellId) => one(
-  `SELECT id, name, status, model FROM zee WHERE xell_id=$1
+  `SELECT id, xell_id, name, status, model FROM zee WHERE xell_id=$1
      AND status IN ('spawning','online','working','idle') ORDER BY created_at DESC LIMIT 1`, [xellId]);
 
 // ── GET /api/xell/self/status — the read model a cxell zee orients from ────────
@@ -122,6 +125,9 @@ export async function selfStatus(xell) {
           status: doneSuggestion.status, pending: doneSuggestion.status === 'pending' }
       : null,
     tend: { open: tend.open, reason: tend.reason, reason_full: tend.full, since: tend.at },
+    // One line, only when the tend is OPEN and a reply arrived SINCE it was raised — an answered
+    // ask left up is a hexagon crying wolf, and only the zee may lower it (lib/status.tendNudge).
+    tend_nudge: await tendNudge(xell.id, tend),
     zee: zee || null,
     task: task ? { id: task.id, status: task.status, done: task.status === 'done' } : null,
     awaiting_done: xell.status === 'awaiting-done',
@@ -817,8 +823,13 @@ export async function selfHint(xell, kind, { reason = null, clear = false } = {}
 export async function selfWorking(xell, { note = null } = {}) {
   const zee = await liveZee(xell.id);
   if (!zee) return { ok: false, error: 'no live zee bound to this xell to mark working' };
+  // Computed BEFORE the ping: pingWorking auto-clears an open tend, and the point of the nudge is
+  // to tell the zee its ask was ANSWERED while it was still up — so it goes and reads the reply
+  // (`zee inbox`) instead of never learning the answer existed (ticket #18).
+  const nudge = await tendNudge(xell.id);
   const res = await pingWorking(zee, { note });
-  return { ok: true, ...res, message: 'Working ping recorded — the hive shows this xell as occ-working.' };
+  return { ok: true, ...res, tend_nudge: nudge,
+    message: 'Working ping recorded — the hive shows this xell as occ-working.' };
 }
 
 // ── POST /api/xell/self/build — (re)build THIS cxell's own app tier ─────────────
@@ -1080,6 +1091,9 @@ export async function selfInbox(xell, { all = false } = {}) {
   const rows = await inboxFor(xell.id, { all });
   return {
     ok: true, count: rows.length, messages: rows,
+    // The zee is reading its replies RIGHT HERE — if one of them answered a tend that is still up,
+    // this is the moment to say so (never auto-cleared: the tend is the zee's own statement).
+    tend_nudge: await tendNudge(xell.id),
     message: rows.length
       ? `${rows.length} message(s)${all ? '' : ' unread'} — now marked read.`
       : (all ? 'Your inbox is empty.' : 'Nothing unread. `zee inbox --all` shows the history.'),

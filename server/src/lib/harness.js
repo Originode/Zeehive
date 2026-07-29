@@ -22,6 +22,11 @@ import { cleanGitEnv } from './git.js';
 
 export const HARNESS_MANIFEST = 'HARNESS.yml';
 
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, and the
+// .zeehive.env reconcile in provision.js): 'real' touches machines, anything else models. The live
+// re-injection below obeys it — see reinjectHarnessIntoLiveXells for why that matters.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
 // Keys a harness bundle may NOT define — anything that would redefine how a zee talks to
 // zeehive/queenzee, or a gate. The manual + binding rules own these; a harness that names one is
 // rejected at parse time, so "the manual is law" holds by construction, not by prompt order.
@@ -277,7 +282,7 @@ export function loadHarnessDir(dir, base = harnessBase(dir)) {
 // logged nothing a human would read, and /api/harnesses reported a harness that looked fine and
 // carried nothing. Now it screams (stdout + the queenzee log), and the read models carry
 // files_missing / bundle_empty so the console can show it.
-export async function refreshHarnesses() {
+export async function refreshHarnesses({ mode = PROVISION_MODE } = {}) {
   await refreshHarnessRoots();      // the Zeehive project's repo_root is where the folders live
   const rows = await q(`SELECT id, key, dir, bundle_hash, is_law_core, zee_type FROM harness WHERE dir IS NOT NULL`);
   const changed = [];               // harnesses whose bundle actually moved — see the loop's tail
@@ -314,7 +319,7 @@ export async function refreshHarnesses() {
     // left the running fleet briefed on nothing while a fix sat in the DB.
     changed.push(h.id);
   }
-  for (const id of changed) await reinjectHarnessIntoLiveXells(id);
+  for (const id of changed) await reinjectHarnessIntoLiveXells(id, { mode });
   await logHarnessSummary();
 }
 
@@ -326,7 +331,17 @@ export async function refreshHarnesses() {
 // running zee's worktree. And every write is logged, because a file appearing under a live zee is
 // otherwise indistinguishable from the zee having written it — which is how a "did I do that?"
 // half-hour gets spent.
-export async function reinjectHarnessIntoLiveXells(harnessId) {
+//
+// AND IT OBEYS PROVISION_MODE, exactly as the .zeehive.env reconcile does (provision.js). The
+// injection is a `docker exec` into `cxell_<slug>`, and the slug comes STRAIGHT OUT OF A FLEET ROW.
+// A xell's database is a CLONE of the meta-DB, so the rows a NESTED queenzee walks (every zee that
+// boots the server inside its own xell — PROVISION_MODE=simulate by manifest default) are the REAL
+// fleet's rows, real container names and all. Unguarded, the first zee to edit a harness folder and
+// boot the server would have written its own harness files into every OTHER zee's live cxell, over
+// the top of the personas they are actually running on. In simulate this REPORTS the xells it would
+// have injected and execs nothing; in real mode nothing about it changes.
+export async function reinjectHarnessIntoLiveXells(harnessId, { mode = PROVISION_MODE } = {}) {
+  const dryRun = mode !== 'real';
   const ids = await harnessAndDescendants(harnessId);
   // A xell counts as LIVE if it holds a cxell zee that is still running; reinjectHarnessIntoXell
   // itself re-checks and answers 'no live cxell zee' otherwise, so this query is only a narrowing.
@@ -335,6 +350,16 @@ export async function reinjectHarnessIntoLiveXells(harnessId) {
       WHERE x.harness_id = ANY($1::uuid[]) AND x.status NOT IN ('retired','tearing-down','husk')`,
     [ids]);
   if (!xells.length) return { xells: 0, injected: 0 };
+  // REPORT-ONLY, never a silent skip: name every xell this queenzee would have reached into, and say
+  // why it did not. A simulate run that logged nothing would read exactly like a fleet with nothing
+  // to inject.
+  if (dryRun) {
+    logline('harness', `harness change NOT injected into ${xells.length} live xell(s) — PROVISION_MODE=`
+      + 'simulate: this queenzee models the fleet, it does not exec into its cxells. Would have '
+      + `re-injected: ${xells.map((x) => `${x.slug} ("${x.key}")`).join(', ')}`);
+    return { xells: xells.length, injected: 0, failed: 0, skipped: 0,
+             would_inject: xells.length, dry_run: true };
+  }
   // Lazily imported: intake.js imports THIS module, so a static import would close a cycle.
   const { reinjectHarnessIntoXell } = await import('../queenzee/intake.js');
   let injected = 0, failed = 0;
