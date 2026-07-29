@@ -370,6 +370,61 @@ try {
      `a parent with no explicit progress averages its children (${byId.get(act2.id).rolled_progress}%)`);
   ok(byId.get(taskB.id).deps.includes(taskA.id), 'dependency edges ride on the row that depends');
 
+  // ── REGRESSION: a work item may not finish before it starts ──────────────
+  //
+  // The API used to accept PATCH {starts_on:'2026-08-10', due_on:'2026-08-01'} with a 200, and the
+  // gantt then reported computed 2026-08-10 → 2026-08-01. A chart cannot draw a negative bar, so it
+  // renders a stub — visually IDENTICAL to a legitimate one-day task. The schedule was wrong and the
+  // picture looked right, which is the worst pair of properties a read model can have.
+  section('the schedule cannot run backwards');
+  const sched = await W.createWorkItem({ project_id: PID, title: 'scheduled thing', kind: 'task',
+                                         starts_on: '2026-08-10', due_on: '2026-08-20' });
+  await refuses(() => W.updateWorkItem(sched.id, { starts_on: '2026-08-10', due_on: '2026-08-01' }),
+    /may not finish before it starts/, 'PATCHing an inverted pair');
+  await refuses(() => W.createWorkItem({ project_id: PID, title: 'born backwards', kind: 'task',
+                                         starts_on: '2026-08-10', due_on: '2026-08-01' }),
+    /may not finish before it starts/, 'CREATING an item already inverted');
+  // half a pair is the sneaky one: patching ONE date must be checked against the STORED other
+  await refuses(() => W.updateWorkItem(sched.id, { due_on: '2026-08-01' }),
+    /may not finish before it starts/, 'PATCHing due_on ALONE back past the stored starts_on');
+  await refuses(() => W.updateWorkItem(sched.id, { starts_on: '2026-09-01' }),
+    /may not finish before it starts/, 'PATCHing starts_on ALONE forward past the stored due_on');
+  ok((await W.getWorkItem(sched.id)).due_on === '2026-08-20', 'and none of those refusals changed the row');
+
+  // the DATABASE is the wall, not the lib: a direct UPDATE is refused too
+  try {
+    await client.query(`UPDATE work_item SET due_on='2026-01-01' WHERE id=$1`, [sched.id]);
+    ok(false, 'a direct UPDATE bypassing the lib is refused by the DB');
+  } catch (e) {
+    ok(/work_item_dates_ordered/.test(e.message), 'a direct UPDATE bypassing the lib is refused by the DB (060)');
+  }
+
+  // what remains LEGAL: equal dates (a one-day task), and either end missing
+  const oneDay = await W.updateWorkItem(sched.id, { starts_on: '2026-08-10', due_on: '2026-08-10' });
+  ok(oneDay.due_on === '2026-08-10', 'equal dates are fine — that is a real one-day task');
+  ok((await W.updateWorkItem(sched.id, { due_on: '' })).due_on === null,
+     'clearing due_on is fine — "starts then, no end yet" is an ordinary state');
+
+  // ── span: a FACT the client can clamp on, never a truncation ─────────────
+  section('the gantt states its span instead of guessing');
+  ok(W.spanDays('2026-08-01', '2026-08-01') === 1, 'a task starting and ending the same day spans 1 day, not 0');
+  ok(W.spanDays('2026-08-01', '2026-08-31') === 31, 'an inclusive month spans 31');
+  ok(W.spanDays('2026-08-01', null) === null && W.spanDays(null, null) === null, 'a missing end has no span');
+  // the absurd-but-legal schedule is returned FAITHFULLY, with its size stated
+  await W.updateWorkItem(sched.id, { starts_on: '0001-01-01', due_on: '9999-12-31' });
+  const wide = await W.ganttModel({ projectId: PID });
+  const wideRow = wide.rows.find((r) => r.id === sched.id);
+  ok(wideRow.computed_start === '0001-01-01' && wideRow.computed_end === '9999-12-31',
+     'an absurd span is returned faithfully — the year is 4-digit padded, so it actually parses');
+  ok(wideRow.span_days === 2958099, `and its size is STATED (${wideRow.span_days} days) so a chart can clamp knowingly`);
+  ok(wide.span.days === 2958099 && wide.span.start === '0001-01-01',
+     'the model states the whole chart extent too, so a client need not min/max the rows itself');
+  ok(wide.rows.filter((r) => r.unscheduled).every((r) => r.span_days === null),
+     'an unscheduled row has no span (null), never a fabricated zero');
+  await W.deleteWorkItem(sched.id);
+  const normal = await W.ganttModel({ projectId: PID });
+  ok(normal.span.days > 0 && normal.span.days < 100, `with the absurd row gone the chart is ordinary again (${normal.span.days} days)`);
+
   section('scoping a view to one branch');
   const sub = await W.ganttModel({ rootId: act2.id });
   ok(sub.rows.length === 3 && sub.rows[0].id === act2.id, 'a gantt can be rooted on any item (its own subtree)');

@@ -37,9 +37,49 @@ const pad = (n) => String(n).padStart(2, '0');
 // node-pg parses a DATE column into a local-midnight Date. Read the LOCAL components back out and
 // the day survives; toISOString() would shift it by the host's UTC offset, which is how trackers
 // end up showing a task starting the day before it starts.
+//
+// The YEAR is padded to four digits too. postgres will happily store '0001-01-01', and an unpadded
+// year handed a client '1-01-01' — which is not ISO 8601, so Date.parse gives NaN or a silently
+// different day depending on the runtime. If an absurd date is stored we return it faithfully; we
+// just return it in a format that parses.
 const asDate = (v) => (v instanceof Date
-  ? `${v.getFullYear()}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`
+  ? `${String(v.getFullYear()).padStart(4, '0')}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`
   : (v ?? null));
+
+// Whole days from one YYYY-MM-DD to another, INCLUSIVE (a task starting and ending the same day is
+// 1 day, not 0). Parsed as UTC so a DST boundary cannot add or drop a day. Null unless both ends
+// are present and parse.
+export function spanDays(startStr, endStr) {
+  if (!startStr || !endStr) return null;
+  const ms = (s) => {
+    const m = /^(-?\d{1,6})-(\d{2})-(\d{2})$/.exec(String(s));
+    return m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : NaN;
+  };
+  const a = ms(startStr);
+  const b = ms(endStr);
+  if (Number.isNaN(a) || Number.isNaN(b)) return null;
+  return Math.round((b - a) / 86400000) + 1;
+}
+
+// A work item may not finish before it starts. Enforced in the DATABASE by migration 060
+// (work_item_dates_ordered) — this is the same rule stated FIRST so the caller gets a sentence
+// instead of `new row for relation "work_item" violates check constraint "work_item_dates_ordered"`.
+//
+// NOTE the wording is load-bearing: routes.js sorts refusals into 400 vs 409 by matching the
+// message, and an inverted pair is bad INPUT (400), not a conflict with the state of the tree
+// (409). Keep it free of the 409 words — "cannot", "refused", "cycle", "root item" and friends.
+// Nothing here bounds how FAR apart the dates may be: '0001-01-01' → '9999-12-31' is legal, ordered
+// and absurd, and clamping the window is the renderer's call, not the server's (see ganttModel).
+function assertSchedule(startsOn, dueOn, what = 'this work item') {
+  const s = asDate(startsOn);
+  const d = asDate(dueOn);
+  if (!s || !d) return;
+  if (spanDays(s, d) === null) return;        // unparseable — let postgres have the last word
+  if (d < s) {
+    throw new Error(`"${what}": due_on ${d} is before starts_on ${s} — a work item may not finish `
+      + 'before it starts. Give due_on on or after starts_on, or leave it empty for "no end yet".');
+  }
+}
 const asNum = (v) => (v === null || v === undefined ? null : Number(v));
 
 // The ancestor ids a materialized path carries, oldest first ('' → []).
@@ -415,6 +455,7 @@ export async function createWorkItem(input = {}, { client = null, pending = null
     if (!parent) throw new Error(`project ${projectId} has no root work item — cannot attach "${title}"`);
   }
   if (input.status && !isWorkStatus(input.status)) throw new Error(`unknown status "${input.status}"`);
+  assertSchedule(input.starts_on, input.due_on, title);
 
   const sortOrder = input.sort_order != null ? Number(input.sort_order) : await nextSortOrder(parent?.id ?? null, client);
   const row = await db.one(
@@ -460,6 +501,13 @@ export async function updateWorkItem(id, patch = {}, { actor = null } = {}) {
   // Status is validated against nextStatuses and gets its own 'status' event.
   if ('status' in patch && patch.status !== before.status) {
     current = await setStatus(id, patch.status, { actor });
+  }
+
+  // The dates are validated as a PAIR against what the row will actually hold: a PATCH carrying
+  // only due_on must be checked against the STORED starts_on, or half of every inversion gets in.
+  const merged = (f) => (f in patch ? (patch[f] === '' ? null : patch[f]) : before[f]);
+  if ('starts_on' in patch || 'due_on' in patch) {
+    assertSchedule(merged('starts_on'), merged('due_on'), before.title);
   }
 
   const sets = [];
@@ -739,19 +787,37 @@ export async function ganttModel({ projectId, rootId } = {}) {
   };
   for (const r of forest) roll(r);
 
+  const ganttRows = ordered.map((n) => ({
+    id: n.id, parent_id: n.parent_id, depth: n.depth, kind: n.kind, title: n.title,
+    status: n.status, status_label: n.status_label,
+    starts_on: n.starts_on, due_on: n.due_on,
+    computed_start: n.computed_start || null, computed_end: n.computed_end || null,
+    progress: n.progress, rolled_progress: n.rolled_progress,
+    estimate_hours: n.estimate_hours, assignee: n.assignee, xell_id: n.xell_id,
+    unscheduled: n.unscheduled === true,
+    // How wide this bar is, in whole inclusive days (null when unscheduled). A FACT, not a verdict:
+    // migration 060 guarantees it is never negative, but nothing bounds how large it may be —
+    // '0001-01-01' → '9999-12-31' is a legal, ordered, absurd 2,958,099-day schedule, and truncating
+    // it here would invent dates exactly as inventing a start for an unscheduled row would.
+    // Stating the number lets a chart clamp its WINDOW honestly (and say that it did) instead of
+    // deriving it from dates that may be null, or discovering the scale by trying to draw it.
+    span_days: spanDays(n.computed_start, n.computed_end),
+    deps: depsBy.get(n.id) || [],
+  }));
+  // The whole chart's extent, stated once so a client does not have to min/max the rows itself —
+  // and so it can decide whether to clamp BEFORE it lays anything out, rather than discovering the
+  // scale by trying to draw it. Null when nothing in the model is scheduled at all.
+  const scheduled = ganttRows.filter((r) => r.computed_start && r.computed_end);
+  const chartStart = scheduled.reduce((a, r) => (a && a <= r.computed_start ? a : r.computed_start), null);
+  const chartEnd = scheduled.reduce((a, r) => (a && a >= r.computed_end ? a : r.computed_end), null);
+
   return {
     root: root ? shapeItem(root) : null,
     project_id: projectId || root?.project_id || null,
-    rows: ordered.map((n) => ({
-      id: n.id, parent_id: n.parent_id, depth: n.depth, kind: n.kind, title: n.title,
-      status: n.status, status_label: n.status_label,
-      starts_on: n.starts_on, due_on: n.due_on,
-      computed_start: n.computed_start || null, computed_end: n.computed_end || null,
-      progress: n.progress, rolled_progress: n.rolled_progress,
-      estimate_hours: n.estimate_hours, assignee: n.assignee, xell_id: n.xell_id,
-      unscheduled: n.unscheduled === true,
-      deps: depsBy.get(n.id) || [],
-    })),
-    unscheduled_count: ordered.filter((n) => n.unscheduled).length,
+    rows: ganttRows,
+    unscheduled_count: ganttRows.filter((r) => r.unscheduled).length,
+    span: scheduled.length
+      ? { start: chartStart, end: chartEnd, days: spanDays(chartStart, chartEnd) }
+      : null,
   };
 }

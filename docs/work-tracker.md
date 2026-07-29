@@ -1,6 +1,7 @@
 # The work tracker — tickets + a work-item hierarchy
 
-**Status:** part 1 of 4 (schema + REST API, server only). Migration `058_work_tracker.sql`,
+**Status:** part 1 of 4 (schema + REST API, server only). Migrations `058_work_tracker.sql`
+and `060_work_item_schedule_sanity.sql`,
 `server/src/lib/work-status.js`, `server/src/lib/work-items.js`, `server/src/lib/tickets.js`,
 routes in `server/src/api/routes.js`, test `test/work-tracker.test.mjs`.
 Parts 2–4 hang zee-assignment and the console (kanban + gantt) off exactly this contract.
@@ -144,6 +145,8 @@ Two consequences worth stating:
   close its children".
 - **"was: &lt;slug&gt;" is part 2/3's to build**, from the surviving `xell_id` plus the
   `work_item_event` ledger (`kind:'assigned'`). This module will not hand you a dead zee to render.
+  Part 3 keeps that contract: its tick NOTES a departed zee in the ledger (with the slug
+  denormalized into `detail`) and never nulls the column — see "The board moves itself" below.
 
 ## The schema (migration 058)
 
@@ -158,6 +161,12 @@ work_item_dep(work_item_id, depends_on_id, created_at)         -- finish→start
 work_item_event(id, work_item_id, ts, kind, from_status, to_status, actor, detail jsonb)
 task.work_item_id                                              -- added for part 2
 ```
+
+Migration **060** adds one constraint to the above: `work_item_dates_ordered` — `due_on` may
+not precede `starts_on` (see "The schedule invariant" below). It repairs any already-inverted row
+by **clearing `due_on`** rather than swapping the pair or pinning it to `starts_on`: an inverted
+pair means one of the two dates is wrong and we cannot know which, so "no end date" is the only
+thing actually true about such a row.
 
 Enums: `work_status` (above), `work_item_kind` (`project|activity|task`),
 `ticket_kind` (`bug|feature|chore|question|incident`).
@@ -325,14 +334,16 @@ table above.
 ### `GET /api/gantt?project=&root=`
 
 ```
-{ root, project_id, unscheduled_count, rows: [ { id, parent_id, depth, kind, title, status,
-  starts_on, due_on, computed_start, computed_end, progress, rolled_progress, estimate_hours,
-  assignee, xell_id, unscheduled, deps: [id…] } ] }
+{ root, project_id, unscheduled_count,
+  span: { start, end, days } | null,
+  rows: [ { id, parent_id, depth, kind, title, status, status_label,
+            starts_on, due_on, computed_start, computed_end, span_days,
+            progress, rolled_progress, estimate_hours, assignee, xell_id,
+            unscheduled, deps: [id…] } ] }
 ```
 
-Rows in **tree order** (depth-first by `sort_order`). Roll-ups:
-
-Rows include the root (see the root-inclusion table). Roll-ups:
+Rows in **tree order** (depth-first by `sort_order`), and they **include the root** (see the
+root-inclusion table). Roll-ups:
 
 - `computed_start` / `computed_end` — a parent **with no explicit dates** spans
   `min(children start) … max(children end)`. A parent **with** its own dates keeps them: someone
@@ -348,6 +359,37 @@ Rows include the root (see the root-inclusion table). Roll-ups:
 - `unscheduled: true` — no dates anywhere in the subtree. Those rows come back with **nulls** and
   the flag, and `unscheduled_count` totals them. The UI **lists** them; it does not invent dates,
   because an invented date is indistinguishable from a real one the moment it is on screen.
+- `span_days` (per row) and `span: {start, end, days}` (per model) — how wide the bar is, and how
+  wide the whole chart is, in **whole inclusive days** (a task starting and ending the same day is
+  `1`, not `0`). `null` when the row is unscheduled, and `span` is `null` when nothing is scheduled
+  at all.
+
+### The schedule invariant, and the span that is *not* one
+
+**`due_on` may never precede `starts_on`.** It is a `CHECK` constraint (`work_item_dates_ordered`,
+migration 060) *and* a lib-level refusal, so a caller gets a sentence —
+
+> `"scheduled thing": due_on 2026-08-01 is before starts_on 2026-08-10 — a work item may not finish
+> before it starts. Give due_on on or after starts_on, or leave it empty for "no end yet".`
+
+— rather than `new row for relation "work_item" violates check constraint …`. A **400**, not a 409:
+it is bad input, not a conflict with the state of the tree. Patching **one** date is validated
+against the **stored** other, which is the half that used to slip through. Still legal: equal dates
+(a real one-day task), and either end missing.
+
+Why it is an invariant and not a UI concern: a chart cannot draw a negative bar, so it renders a
+stub — **visually identical to a legitimate one-day task**. The schedule was wrong and the picture
+looked right, which is the worst pair of properties a read model can have.
+
+**Nothing bounds how far apart the two dates may be**, and that is deliberate. `0001-01-01` →
+`9999-12-31` is legal, ordered, and absurd: 2,958,099 days. The gantt returns it **faithfully** and
+**states `span_days`**. It does not clamp, because truncating a stored date would invent a date, in
+exactly the way inventing a start for an unscheduled row would — and because how much window to show
+is the renderer's decision, not the server's. The number is there so a client can clamp *knowingly*,
+and say that it clamped, instead of discovering the scale by trying to draw it.
+
+(Dates are emitted with a **4-digit-padded year**. `0001-01-01` used to come back as `1-01-01`,
+which is not ISO 8601 and gives `NaN` or a silently different day depending on the runtime.)
 
 ## The endpoints
 
@@ -391,10 +433,184 @@ The same holds for ticket ids and for `parent_id` / `depends_on_id` / `ticket_id
 unknown `?status=` or `?kind=` filter is likewise a 400 listing the legal values, never a postgres
 enum cast error.
 
+## Part 3 — putting a ZEE on a work item
+
+Parts 1 and 2 give the hive a PLAN. Part 3 is what makes the plan reach the agents, and the fleet
+reach the plan:
+
+| direction | what it means |
+|---|---|
+| **plan → fact** | a human (or a manager zee) puts a zee ON an item — `assign`, `deploy` |
+| **fact → plan** | the item then follows that zee by itself — `queenzee/worksync.js` |
+
+Nothing here is a new gate, and nothing here is a way round one. A dispatched worker still lands its
+own work through the landing gate, still ships through the ship gate, and is still marked done by a
+human. What changed is only that the board knows about it.
+
+### Assignment — `server/src/lib/work-assign.js`
+
+A separate module from `work-items.js` on purpose: `work-items.js` owns the PLAN's domain and knows
+nothing about the fleet; everything in `work-assign.js` reaches into xells, dispatch and the
+queenzee. One module per direction keeps the plan usable with no fleet at all, and puts every
+refusal in one readable place.
+
+- **`assignWorkItem(id, { xell_id, actor })`** — links an existing xell: sets `work_item.xell_id`,
+  moves `queued` → `assigned` (and *only* that transition — an item already `working` is further
+  along than this verb knows), stamps the xell's newest `task.work_item_id`, and writes the ledger
+  entry. All of it in ONE `inTransaction`, so a card is never linked without its task stamp.
+  Re-assigning the same xell is an idempotent no-op — and a *self-healing* one: if an earlier attempt
+  linked the xell but died before the status moved, the retry finishes the move.
+- **`unassignWorkItem(id, { actor })`** — clears the link and the task stamp. It deliberately does
+  **not** change the status: an item reached `working` because work happened, and taking the zee off
+  does not un-happen it. Guessing a status backwards would overwrite the one thing the history is for.
+- **`deployWorkItem(id, { task, model, mode, harness, actor, managerXellId })`** — the real verb.
+  It DISPATCHES a fresh worker for the item and assigns it, through the **existing** dispatch paths
+  (`selfDispatch` when a manager deploys, `dispatchXell` when the console does). There is
+  deliberately no second spawn path: one here would be a hole punched straight through the manager
+  layer's refusals (no prod, no manager type, no manager harness for a dispatched worker).
+- **`candidatesFor(id)`** — the xells that could take this item: the ready pool plus live workers
+  with no open item, in this project only. Never a manager, never production, never one being torn
+  down, never the xell already on the item — a picker that offers a choice the server then rejects
+  is worse than one that offers fewer.
+- **`reportItemStatus(id, { status, progress, note, actor })`** — a zee (or a manager) reporting
+  where the WORK has got to. Which moves are legal is `canTransition()`'s answer, not this file's.
+
+It borrows rather than restates: the vocabulary (`isTerminal`/`canTransition`/`nextStatuses` — the
+TERMINAL fence is *derived* from `WORK_STATUS`, not a second list), the transaction (`inTransaction`
++ `dbRunner`), the ledger (`logWorkEvent`, with part 1's own kinds and no invented seventh), the zee
+chip (`liveZees`) and the id contract (`assertId`).
+
+#### The refusals are the point
+
+Every one is a full sentence with an HTTP code (`400` you asked wrong · `404` it does not exist ·
+`409` it exists and the answer is still no), because the sentence is what a human reads:
+
+| refused | why |
+|---|---|
+| a xell from another project | a xell only ever works in its own project |
+| production | production is not a worker; it is what the work ships to |
+| a MANAGER zee | a manager writes no code and lands none — it *dispatches* one that can |
+| a xell retired or tearing down | its worktree is going away, and with it anything unlanded |
+| a xell already on another open item | one zee, one item |
+| deploying onto an item that already has a live zee | two agents on one job |
+| deploying onto a `done`/`cancelled` item | a whole worker spent on work somebody ended |
+
+#### The brief a deployed worker receives
+
+`briefForWorkItem()` is pure and exported, so it can be read and tested without dispatching
+anything. It folds the item's **title and body**, its **ancestor chain** (so the worker knows which
+project/activity it sits under), its **linked ticket including the ticket's own words** (the card's
+ticket read carries no body — the brief fetches it), its **dates/estimate/priority**, and the
+deployer's extra `--task` text into one briefing, and closes with how to report progress and the
+fact that reporting is not landing. This is why breaking a ticket down properly pays: a well-cut item
+briefs its worker for free.
+
+*(058 has no `acceptance` column; the item body and the ticket carry that substance today. If one is
+ever added, `briefForWorkItem` already renders it.)*
+
+### The board moves itself — `server/src/queenzee/worksync.js`
+
+A 30 s queenzee tick (`WORKSYNC_ENABLED=false` to stop it, `WORKSYNC_INTERVAL_MS` to retune), same
+shape as `queenzee/dbclone.js`. For every item with a live `xell_id`:
+
+```
+work_item.xell_id → liveZees() → the xell's HIVE STATUS → statusFromHive() → the item's status
+```
+
+`liveZees()` is part 1's own batched helper, used verbatim: the hive status a card is moved by must
+be the one the hexagon shows and the one the board chip already prints, or the two eventually
+disagree and nobody knows which is right.
+
+**The policy, which is the load-bearing decision of the whole part:** the tick may only move an item
+*between the in-flight statuses* — `assigned, working, blocked, review, shipping`, derived as
+"neither terminal nor `queued`". It will never
+
+- move an item to `done` or `cancelled` — **finishing is a decision**, and this repo is built on the
+  rule that a decision belongs to a human: a push is held at the landing gate, a prod deploy is a
+  request the queenzee performs only once someone approves it, a zee cannot mark even itself done.
+  This is not hypothetical: `statusFromHive` really does map `occ-done` **and `occ-doneRequest`** to
+  `done`, and both of those mean *the xell is being torn down or asking to be* — which says nothing
+  about whether the work is complete. The fence is what stands between those two facts;
+- move an item OUT of a terminal status — once a human has decided, no tick un-decides it;
+- move a `queued` item — starting work is what assignment is for;
+- touch an item nobody is on — no zee, no fact, it stays plan.
+
+When the assigned xell is **gone** (retired, or its row deleted) the tick **notes it in the ledger
+and changes nothing else** — not the status, and not the link:
+
+> **`xell_id` is history. Liveness is resolved at READ time, never by nulling the column.**
+
+That is policy 4 above, and part 3 obeys it rather than adding a second guard. `liveZees()` already
+filters `retired`/`husk`/`error` and `hive-status.js` answers `null` for a retired row, so a stale id
+cannot lie to anyone — the card comes back `zee: null, live_status: null` with the id still on it. A
+write-time guard would be exactly the cache invalidation policy 4 warns about (missed by
+`purgeDevXells`, by `recoverOrphanTeardowns` finishing a half-done reap, and by a human editing a
+row), and it would cost the board its **provenance**: which agent was actually on this work. A
+tracker that forgets that thirty seconds after a reap is less trustworthy, not more. So "was:
+&lt;slug&gt;" renders from the column, with the ledger entry — a `kind:'assigned'` row whose `detail`
+carries `zee_gone`, the id and the **denormalized slug** — as corroboration.
+
+The note is written **once per dead xell**, not once per tick: the link survives now, so the branch
+would otherwise restate itself every 30 seconds and turn an item's history into a stutter.
+
+A `husk`/`error` xell is *not* treated as gone at all — it is awaiting housekeeping and may come
+back, and `liveZees` already refuses to speak for it, so that card is left completely untouched.
+
+Every move it makes is a `work_item_event` with `actor:'queenzee'`, so the history reads honestly as
+"the board moved itself", and every move is announced as `{ kind, item }` — the shape this document
+pins — so a console can patch a self-moving card without a refresh.
+
+### The endpoints part 3 adds
+
+| route | what |
+|---|---|
+| `POST /api/work-items/:id/assign` `{ xell_id }` | link an existing xell |
+| `DELETE /api/work-items/:id/assign` | unlink (status untouched) |
+| `POST /api/work-items/:id/deploy` `{ task?, model?, mode?, harness? }` | dispatch a worker for it |
+| `GET /api/work-items/:id/candidates` | who could take it |
+
+Same error contract as the rest of the section. Refusals from `work-assign.js` carry an explicit
+`err.status` (a "that xell is a manager zee" 409 is not something a regex should have to guess at);
+anything thrown out of `work-items.js` still falls through to `workErr`'s sentence matching.
+
+### The cxell verbs (`scripts/zee` → `/api/xell/self/*`)
+
+**Scope is resolved from the caller's TOKEN, never from a parameter.** A manager may touch any item
+in its own project; a worker may touch only the item it is assigned to.
+
+- **`zee work [--board] [--item <id>]`** — a MANAGER sees its project's plan in tree order
+  (depth-first) with each item's status, assignee and live zee; `--board` drops the project root. A
+  WORKER sees the one item it is executing, with the ancestors, ticket and history it was briefed
+  from. A worker that knows which item it is executing can say so in its report.
+- **`zee assign --item <id> --task "…"`** (MANAGER only) — deploys a worker for that item through
+  the same path `zee dispatch` uses, so the worker is still stamped `manager_xell_id`, still seated
+  next to its manager, still on its own throwaway db, and a manager still cannot hand it prod, the
+  manager type or the manager harness. Returns the new worker's slug.
+- **`zee item [<id>] --status <s> [--progress N] [--note "…"]`** — reports where the WORK has got
+  to. Setting `done` is allowed (a report of fact) and explicitly does **not** touch the xell's own
+  done/land/ship state. A worker may omit the id: the server resolves it from the token.
+
+### The manuals — `db/migrations/059_work_tracker_verbs.sql`
+
+A verb that is not in the manual does not exist to a zee. 059 teaches both, following 053 exactly in
+spirit — anchored replacements inside the manual text stored in `harness.bundle`, guarded so they are
+idempotent and simply **do not fire** when an anchor has moved (a human may have edited the manual in
+the harness manager, and a half-rewritten manual is worse than an out-of-date one):
+
+- the **manager** manual — `zee work`, `zee assign`, `zee item`, plus a paragraph on what the work
+  tracker is and why a manager should break a ticket down before dispatching anybody. That harness is
+  FILE-BACKED (`harnesses/manager/`, reloaded by `refreshHarnesses()` at every boot), so
+  `harnesses/manager/memory/manager-zee-manual.md` is edited in the same commit — **edit both or they
+  drift**. The test reverse-applies the migration to the file and re-applies it, so the two are
+  proven byte-for-byte identical rather than merely similar.
+- the **worker** manual (`zee-base`, DB-owned — a migration is the only way to change it) — `zee
+  work`, `zee item`, and the fact that a worker may only touch its OWN item.
+
 ## Test
 
 ```sh
-DATABASE_URL=… node test/work-tracker.test.mjs
+DATABASE_URL=… node test/work-tracker.test.mjs    # parts 1-2: the plan itself
+DATABASE_URL=… node test/work-assign.test.mjs     # part 3: putting a zee on it
 ```
 
 Stands up two throwaway projects (and one real xell, to exercise the live-zee derivation), covers
@@ -402,6 +618,14 @@ the root rule, ticket numbering, breakdown, path/depth on move, every refusal, c
 stamp/clear, the board and the gantt — and tears **everything** down in a `finally`, including the
 `session_event` rows that would otherwise survive the project delete as orphans (house rule #1: no
 test data).
+
+`work-assign.test.mjs` does the same for part 3 on its own throwaway project and fleet (a manager, a
+worker, a ready xell, one being torn down, a production xell and a foreign project): assignment and
+its idempotence, every refusal and its code, the candidate picker, the deploy brief **with the
+dispatch path stubbed** — a test never spawns an agent — the worksync fence in both directions
+(including the `occ-done` → `done` hazard it exists for), the token-scoping of the three cxell
+verbs, the SSE payload shape, and the proof that migration 059 and the manager harness file say the
+same words. If 058 is not applied to the target database it **skips loudly** rather than passing.
 
 ## What parts 2–4 need to know
 

@@ -70,6 +70,9 @@ import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addCo
          breakdownTicket } from '../lib/tickets.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
+// WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
+import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
+import { selfWork, selfWorkAssign, selfWorkItem } from '../queenzee/self.js';
 
 export const router = Router();
 
@@ -1487,6 +1490,81 @@ router.get('/gantt', async (req, res) => {
     if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
     res.json(await ganttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
   } catch (err) { workErr(res, err); }
+});
+
+
+// ── WORK TRACKER: assignment + deployment ─────────────────────────────────────
+// The verbs that turn a plan item into a running agent (lib/work-assign.js). Everything here is a
+// HUMAN/console surface — the cxell entrances to the same verbs are the /xell/self/work* routes
+// below, which resolve the caller from its own token instead of trusting a parameter.
+//
+// The error contract is the SAME one stated at the top of this section, and it is answered by the
+// same workErr() — with one addition: work-assign.js tags its own refusals with an explicit
+// `err.status` (400 you asked wrong · 404 it does not exist · 409 it exists and the answer is still
+// no), because a refusal like "that xell is a manager zee" is a 409 no regex should have to guess at.
+// Anything thrown out of work-items.js still falls through to workErr's sentence-matching.
+const assignErr = (res, err) => (err && err.status
+  ? res.status(err.status).json({ error: err.message })
+  : workErr(res, err));
+
+// Link an EXISTING xell to this item. Refused across projects, onto production, onto a manager zee,
+// or onto a xell already carrying another open item.
+router.post('/work-items/:id/assign', async (req, res) => {
+  try {
+    res.json(await assignWorkItem(req.params.id, {
+      xell_id: req.body?.xell_id, actor: req.body?.actor || 'human@console' }));
+  } catch (err) { assignErr(res, err); }
+});
+// Take the zee off it. The STATUS is deliberately left alone — work that happened, happened.
+router.delete('/work-items/:id/assign', async (req, res) => {
+  try {
+    res.json(await unassignWorkItem(req.params.id, { actor: req.body?.actor || 'human@console' }));
+  } catch (err) { assignErr(res, err); }
+});
+// DISPATCH a fresh worker for this item and assign it. The brief is built from the item (title, body,
+// ancestor chain, linked ticket, dates) plus the caller's extra `task` text; the spawn itself goes
+// through the existing dispatch path, never a second one.
+router.post('/work-items/:id/deploy', async (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json(await deployWorkItem(req.params.id, {
+      task: b.task || null, model: b.model || null, mode: b.mode || null, harness: b.harness || null,
+      title: b.title || null, actor: b.actor || 'human@console',
+      managerXellId: b.manager_xell_id || null }));
+  } catch (err) { assignErr(res, err); }
+});
+// Which xells could take this item — so the console offers a picker instead of asking a human to
+// paste a uuid (the ready pool + live workers with no open item, in this project only).
+router.get('/work-items/:id/candidates', async (req, res) => {
+  try { res.json(await candidatesFor(req.params.id)); }
+  catch (err) { assignErr(res, err); }
+});
+
+// ── WORK TRACKER: the cxell verbs (`zee work` · `zee assign` · `zee item`) ────
+// Token-scoped, exactly like every other /xell/self/ verb: a MANAGER sees and moves its own project's
+// plan, a WORKER sees and reports on the ONE item it is assigned to. The scope is resolved in the
+// SERVER from the caller's token — never from a parameter the caller supplies.
+router.get('/xell/self/work', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfWork(x, { board: req.query.board === '1', item: req.query.item || null })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+// MANAGER only: deploy a worker for one of MY project's work items (same dispatch path as `zee dispatch`).
+router.post('/xell/self/work/assign', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    res.json(await selfWorkAssign(x, { item: b.item || null, task: b.task || null, model: b.model || null,
+      mode: b.mode || null, harness: b.harness || null, title: b.title || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Report an item's status/progress. A manager may report any item in its own project; a worker only
+// its OWN. Setting `done` reports the WORK finished — it never touches the xell's done/land/ship.
+router.post('/xell/self/work/item', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    res.json(await selfWorkItem(x, { id: b.id || null, status: b.status || null,
+      progress: b.progress ?? null, note: b.note || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ── AI-facing: report/propose the job is done, and query status ──────────────
