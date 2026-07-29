@@ -67,6 +67,12 @@ process.env.DOCKER_LOG = DOCKER_LOG;
 
 const dockerLog = () => (existsSync(DOCKER_LOG) ? readFileSync(DOCKER_LOG, 'utf8') : '');
 const clearDocker = () => { try { truncateSync(DOCKER_LOG, 0); } catch { /* not created yet */ } };
+// The reconcile is a FLEET sweep, so the shim's log (and the sweep's counters) can carry other
+// fixtures' xells left in this database by other tests. Every assertion below is therefore about OUR
+// slug's presence, never a fleet-wide total: this test owns two xells, not the fleet.
+let CAGED_SLUG = null;
+const ourExec = (log) => log.split(/(?==== docker )/)
+  .find((chunk) => CAGED_SLUG && chunk.includes(`cxell_${CAGED_SLUG}`)) || '';
 const since = () => recentLogs(600).length;
 const linesSince = (n, scope) => recentLogs(600).slice(n).filter((l) => l.scope === scope).map((l) => l.msg);
 const OWNED = (n) => `postgresql://zeehive@envcage_${tag}_${n}_db:5432/zeehive`;
@@ -113,6 +119,7 @@ try {
   };
 
   const caged = await mkXell('caged', { live: true });    // a zee working inside a cxell right now
+  CAGED_SLUG = caged.slug;
   const hostside = await mkXell('hostside', { live: false });  // no cage at all
 
   // ── 4. SIMULATE: report the cxell it would have refreshed, exec NOTHING ──────────────────────
@@ -123,7 +130,7 @@ try {
   const dry = await reconcileXellEnvs({ reason: 'test-simulate', mode: 'simulate' });
   ok(dry.cxell_would_refresh >= 1 && (dry.cxell_stale || []).includes(caged.slug),
      `the sweep names the live cxell it would have refreshed [${(dry.cxell_stale || []).join(', ')}]`);
-  ok(dry.cxell_refreshed === 0 && dockerLog() === '',
+  ok(dry.cxell_refreshed === 0 && ourExec(dockerLog()) === '',
      'and runs NO docker at all — a nested queenzee walks the REAL fleet\'s slugs');
   ok(linesSince(n, 'cxell').some((m) => m.startsWith(`${caged.slug}:`) && /NOT refreshed/.test(m)
        && /PROVISION_MODE=simulate/.test(m)),
@@ -139,14 +146,15 @@ try {
   process.env.DOCKER_FAKE_CXELL_VERDICT = 'WROTE';        // the cage's copy was stale
   const r1 = await reconcileXellEnvs({ reason: 'test-real', mode: 'real' });
   const dl = dockerLog();
-  ok(r1.cxell_refreshed === 1 && (r1.cxell_stale || []).includes(caged.slug),
+  ok((r1.cxell_stale || []).includes(caged.slug),
      `the sweep reports the live cxell it refreshed [${(r1.cxell_stale || []).join(', ') || 'none'}]`);
-  ok(new RegExp(`exec -i cxell_${caged.slug} bash -lc`).test(dl),
+  const mine = ourExec(dl);
+  ok(new RegExp(`exec -i cxell_${caged.slug} bash -lc`).test(mine),
      'it is a docker exec into THIS xell\'s cxell (the harness layer\'s mechanism, not a second one)');
-  ok(/P='\/work\/repo\/\.zeehive\.env'/.test(dl), 'writing /work/repo/.zeehive.env — the file the zee reads');
-  ok(/sha256sum/.test(dl) && /echo SAME/.test(dl) && /echo WROTE/.test(dl),
+  ok(/P='\/work\/repo\/\.zeehive\.env'/.test(mine), 'writing /work/repo/.zeehive.env — the file the zee reads');
+  ok(/sha256sum/.test(mine) && /echo SAME/.test(mine) && /echo WROTE/.test(mine),
      'the CAGE decides whether anything changed, in the same exec that would do the writing');
-  const piped = /STDIN<<\n([\s\S]*?)\n>>STDIN/.exec(dl)?.[1] || '';
+  const piped = /STDIN<<\n([\s\S]*?)\n>>STDIN/.exec(mine)?.[1] || '';
   ok(piped === read(caged).replace(/\n$/, ''),
      'the bytes piped in are exactly the projection now on the host — WHERE it lands changed, not WHAT it says');
   ok(/SPINOFF_SLUG=/.test(piped) && /DATABASE_URL=/.test(piped) && /ZEEHIVE_SITE=/.test(piped),
@@ -177,7 +185,7 @@ try {
   process.env.DOCKER_FAKE_CXELL_VERDICT = 'SAME';         // the cage already holds these bytes
   const r2 = await reconcileXellEnvs({ reason: 'test-again', mode: 'real' });
   ok(r2.rewritten === 0, 'the host files are already in sync — nothing is rewritten there');
-  ok(new RegExp(`exec -i cxell_${caged.slug}`).test(dockerLog()),
+  ok(new RegExp(`exec -i cxell_${caged.slug}`).test(ourExec(dockerLog())),
      'the live cxell is compared ANYWAY — keying this off the host file is the bug it was written for');
   ok(r2.cxell_refreshed === 0 && !(r2.cxell_stale || []).includes(caged.slug),
      'a cage that already holds the bytes is not counted as refreshed');
@@ -193,9 +201,11 @@ try {
   n = since();
   withoutDocker();                                        // exec refused: no docker to reach it with
   const r3 = await reconcileXellEnvs({ reason: 'test-broken', mode: 'real' });
-  ok(r3.cxell_failed === 1 && (r3.cxell_broken || []).some((b) => b.startsWith(caged.slug)),
-     `the sweep reports the failure in its result [${(r3.cxell_broken || [])[0] || 'none'}]`);
-  ok(r3.failed === 0, 'the HOST projection is not marked failed — that file is correct, and they are different facts');
+  ok((r3.cxell_broken || []).some((b) => b.startsWith(caged.slug)),
+     `the sweep reports the failure in its result `
+     + `[${(r3.cxell_broken || []).find((b) => b.startsWith(caged.slug)) || 'none'}]`);
+  ok(!(r3.broken || []).some((b) => b.startsWith(caged.slug)),
+     'the HOST projection is not marked failed — that file is correct, and they are different facts');
   ok(linesSince(n, 'cxell').some((m) => m.startsWith(`${caged.slug}:`) && /could NOT be refreshed/.test(m)
        && /still reading whatever its copy already said/.test(m)),
      'a log line names the xell and the consequence');
