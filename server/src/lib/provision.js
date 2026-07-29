@@ -287,7 +287,9 @@ export async function emitXellEnv(xellId, { dryRun = false } = {}) {
     return r;
   } catch (e) {
     // A pooled xell with no worktree on disk yet has nothing to project — that is its normal state,
-    // not a fault, and flagging it would bury the failures that ARE faults.
+    // not a fault, and flagging it would bury the failures that ARE faults. A dry run DOES record a
+    // failure: it wrote no file, but "this projection cannot be computed" is true either way, and
+    // the note lands in this queenzee's OWN meta-DB, which is not a side effect on the fleet.
     if (!e?.no_worktree) await noteEnvProjection(xellId, e.message);
     throw e;
   }
