@@ -44,6 +44,12 @@ COPY scripts/ scripts/
 COPY db/ db/
 COPY hooks/ hooks/
 COPY skill/ skill/
+# NO `COPY harnesses/` — deliberately. A file-backed harness (harness.dir = 'harnesses/manager') is
+# a projection of files in the ZEEHIVE PROJECT's repo (project.repo_root, the clone under /repos),
+# and lib/harness.js resolves it there; a second copy baked into this image would drift from the
+# repo the DB row claims to project — the same reasoning as the single copy of scripts/zee.
+# (Until 2026-07-29 harness.js resolved against config.repoRoot = /app instead, which is why the
+# deployed queenzee handed every manager zee an empty harness. See HANDOFF.md, ticket #1.)
 # The repo checks out CRLF on Windows and COPY preserves it; bash then reads `set -euo pipefail\r`
 # as an invalid option and every provisioning script dies (seen live: pool provision 2026-07-20).
 # Same normalization Dockerfile.zee-agent applies to its cxell scripts.

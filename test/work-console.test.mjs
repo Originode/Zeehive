@@ -305,6 +305,14 @@ ok(placement(kcol, 'a', 0 + 2).at === 1, 'Alt+Down moves a card exactly one slot
 ok(placement(kcol, 'c', 2 - 1).at === 1, 'Alt+Up moves a card exactly one slot up (gap = index − 1)');
 ok(placement(kcol, 'a', 0 + 2).sortOrder === 2.5 && placement(kcol, 'c', 2 - 1).sortOrder === 1.5,
    'and both write a midpoint, exactly as the equivalent drag would');
+// …and it is WIRED. The first cut of the keyboard path declared onCardKey on the board and wrote
+// `onKeyDown={onKey}` inside Card — a name that existed in neither, so the first card React tried to
+// render threw `ReferenceError: onKey is not defined` and the whole board came back blank. The
+// handler must be a PROP Card accepts and the board passes, per card, with its column and row.
+ok(/function Card\(\{[^}]*\bonKey\b/.test(board), 'Card DECLARES onKey as a prop (not a free identifier)');
+ok(/onKey=\{[^}]*onCardKey\(/.test(board), 'and the board PASSES it, bound to that card');
+ok(/onCardKey\(e, card, colIndex, i\)/.test(board),
+   'bound to the card\'s own column and row — the two indices the move is computed from');
 
 // ── the one place this console could corrupt a plan ───────────────────────────────────────────
 // /breakdown is ADDITIVE: pressing it twice creates a SECOND overlapping tree under one ticket, and
@@ -321,6 +329,21 @@ ok(/not one \n?\s*\+ ?'transaction|are not one/.test(tickets),
 // A response with no JSON body must still say something a human can act on.
 ok(/bareStatus/.test(read('web/src/work/workApi.js')),
    'an answer with no {error} body becomes a sentence, not a bare status code');
+
+// ── priority direction is POLICY, and the console must point at it, not re-derive it ──────────
+// docs/work-tracker.md §5 fixes 1 = MOST urgent. The console shipped that reading before it was
+// written down; a comment claiming the contract is silent is what makes the next person derive it
+// again — and derive it backwards, silently, on every card in production.
+const bits = read('web/src/work/bits.jsx');
+ok(/1 is MOST urgent|1 = most urgent/.test(bits), 'bits.jsx states the direction');
+ok(/docs\/work-tracker\.md/.test(bits), 'and cites the policy rather than claiming the API is silent');
+ok(!/API says nothing about which end/.test(bits), 'the old "the API says nothing" claim is gone');
+ok(/dev_priority/.test(bits), 'and it warns about the OPPOSITE convention this repo carries nearby');
+ok(/1 = most urgent/.test(read('web/src/work/WorkItemDrawer.jsx'))
+   && /1 = most urgent/.test(read('web/src/work/Tickets.jsx')),
+   'the fact is on the inputs where a human WRITES a priority, not only where it is read');
+const policyDoc = existsSync(path('docs/work-tracker.md')) ? read('docs/work-tracker.md') : '';
+ok(!policyDoc || /1 is MOST urgent/i.test(policyDoc), 'the policy the console cites actually says that');
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);

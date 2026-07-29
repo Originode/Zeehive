@@ -11,7 +11,7 @@
 // (law) key — a harness bundle simply has nowhere to express a land/ship/prod/gate rule. A harness
 // never ships or lands; it is only a guide (the zee is the one to ship/land).
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { parse } from 'yaml';
@@ -65,6 +65,75 @@ export function typeMismatchReason(harness, zeeType) {
 
 const hashOf = (text) => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
+// ── WHERE the harness folders actually live ──────────────────────────────────
+// A file-backed harness's `dir` ('harnesses/manager') is relative to the ZEEHIVE PROJECT's REPO —
+// the clone the queenzee manages and the DB row projects (self-onboard.js onboards it as the
+// `Zeehive` project; its repo_root is /repos/Zeehive in the container era). It is NOT relative to
+// config.repoRoot, which is merely where the running server's code sits.
+//
+// On a checkout those are the same folder, which is why every test passed while the DEPLOYED
+// queenzee was broken: Dockerfile.server copies server/ scripts/ db/ hooks/ skill/ into /app and
+// deliberately NOT harnesses/ (a second copy in the image would drift from the repo the row claims
+// to project — the same reasoning as the single copy of scripts/zee). So config.repoRoot=/app had
+// no harnesses/ at all, refreshHarnesses() found nothing, and every file-backed harness — the
+// manager's manual included — stayed EMPTY in production.
+//
+// Resolution: the project repo roots first (self project first), then config.repoRoot as the
+// fallback for host-process mode (where the runtime dir IS the repo) and for tests. A root only
+// wins if the folder is actually THERE, so a stale/unreachable repo_root falls through instead of
+// blanking a harness.
+const SELF_PROJECT = 'Zeehive';
+const ROOTS_TTL_MS = 30_000;
+let rootsCache = { at: 0, roots: [] };
+
+const normRoot = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+
+// Re-read the candidate repo roots from the DB (cheap, cached). Never throws: with no DB/schema
+// yet (a very early boot, a unit test) we simply fall back to config.repoRoot.
+export async function refreshHarnessRoots() {
+  try {
+    const rows = await q(
+      `SELECT repo_root FROM project WHERE repo_root IS NOT NULL
+        ORDER BY (lower(name) = lower($1)) DESC, created_at`, [SELF_PROJECT]);
+    rootsCache = { at: Date.now(), roots: rows.map((r) => normRoot(r.repo_root)).filter(Boolean) };
+  } catch {
+    rootsCache = { at: Date.now(), roots: [] };
+  }
+  return harnessRoots();
+}
+
+// Warm the cache only when it has gone stale — for read paths (list, avatar) that must not fire a
+// query per call.
+export async function ensureHarnessRoots() {
+  if (Date.now() - rootsCache.at > ROOTS_TTL_MS) await refreshHarnessRoots();
+  return harnessRoots();
+}
+
+// Every root a harness folder may live under, best first. config.repoRoot is ALWAYS last, never
+// absent — the fallback is what keeps a checkout-run (tests, host process) working unchanged.
+export function harnessRoots() {
+  return [...new Set([...(rootsCache.roots || []), normRoot(config.repoRoot)])];
+}
+
+// The root a given repo-relative path resolves under (the first that actually has it). Falls back
+// to config.repoRoot so error messages and hashes stay stable when nothing has it.
+export function harnessBase(rel) {
+  if (rel) for (const root of harnessRoots()) if (existsSync(resolve(root, rel))) return root;
+  return normRoot(config.repoRoot);
+}
+
+// The avatar SVG on disk for a harness's avatar_path, or null. Containment-guarded: the file must
+// live under <base>/harnesses/, so a crafted avatar_path can never read outside it. Shared by the
+// API route so the route and the loader agree on the base (they used to disagree — see above).
+export async function harnessAvatarFile(avatarPath) {
+  const rel = String(avatarPath || '').trim();
+  if (!rel) return null;
+  const base = await ensureHarnessRoots().then(() => harnessBase(rel));
+  const abs = resolve(base, rel);
+  if (!abs.startsWith(resolve(base, 'harnesses') + sep)) return null;
+  return existsSync(abs) ? abs : null;
+}
+
 // ── parse + validate a harness manifest ──────────────────────────────────────
 // Structural problems and any RESERVED law key are errors (the bundle cannot be used); an unknown
 // key is a warning. Returns { bundle, errors, warnings }.
@@ -104,7 +173,7 @@ function dirHeadCommit(repoRoot, dir) {
 // YAML frontmatter block (--- ... ---) carrying name/description; if absent we derive name from the
 // folder and use the first paragraph as the "when to use" line. Delivery is provider-neutral here —
 // the adapter decides SKILL.md-file vs prompt-injection (docs §6.2).
-function readSkill(skillDir, folderName) {
+function readSkill(skillDir, folderName, base) {
   const md = join(skillDir, 'SKILL.md');
   if (!existsSync(md)) return null;
   const raw = readFileSync(md, 'utf8');
@@ -115,14 +184,21 @@ function readSkill(skillDir, folderName) {
     body = fm[2].trim();
   }
   if (!when) when = body.split('\n\n')[0].replace(/\s+/g, ' ').slice(0, 240);
-  return { name, when, body, path: `${skillDir.replace(config.repoRoot + '/', '')}/SKILL.md` };
+  return { name, when, body, path: `${skillDir.replace(normRoot(base) + '/', '')}/SKILL.md` };
 }
 
 // Assemble a bundle object from a harness folder: HARNESS.yml (validated) + PERSONALITY.md +
 // skills/*/SKILL.md + memory/*.md + avatar. Returns { bundle, hash, errors, warnings, files }.
-export function loadHarnessDir(dir) {
-  const abs = resolve(config.repoRoot, dir);
-  if (!existsSync(abs)) return { bundle: null, hash: null, errors: [`harness dir not found: ${dir}`], warnings: [], files: [] };
+// `base` is the repo root the dir hangs off — the Zeehive project's repo_root in the deployed
+// queenzee, config.repoRoot on a checkout. Callers that already resolved it (refreshHarnesses)
+// pass it in so every read + the hash below agree on ONE base.
+export function loadHarnessDir(dir, base = harnessBase(dir)) {
+  const root = normRoot(base);
+  const abs = resolve(root, dir);
+  if (!existsSync(abs)) {
+    return { bundle: null, hash: null, missing: true, base: root, files: [], warnings: [],
+      errors: [`harness dir not found: ${dir} (looked under ${harnessRoots().join(', ')})`] };
+  }
 
   const files = [];
   let text = '{}';
@@ -150,7 +226,7 @@ export function loadHarnessDir(dir) {
   const skills = [];
   const fromFolder = (n) => {
     if (!existsSync(skillsRoot)) return;
-    const s = readSkill(join(skillsRoot, n), n);
+    const s = readSkill(join(skillsRoot, n), n, root);
     if (s) { skills.push(s); files.push(s.path); }
   };
   if (Array.isArray(bundle.skills)) {
@@ -173,38 +249,50 @@ export function loadHarnessDir(dir) {
   if (Array.isArray(bundle.memory)) {
     bundle.memory = bundle.memory.map((rel) => {
       const local = join(abs, rel);
-      const rooted = resolve(config.repoRoot, rel);
+      const rooted = resolve(root, rel);
       let p = null;
       if (existsSync(local)) p = local;
-      else if (rooted.startsWith(config.repoRoot) && existsSync(rooted)) p = rooted;
-      if (p) { files.push(p.replace(config.repoRoot + '/', '')); return { path: rel, text: readFileSync(p, 'utf8').trim() }; }
+      else if (rooted.startsWith(root) && existsSync(rooted)) p = rooted;
+      if (p) { files.push(p.replace(root + '/', '')); return { path: rel, text: readFileSync(p, 'utf8').trim() }; }
       return { path: rel, text: null, missing: true };
     });
   }
 
-  const hash = hashOf(files.map((f) => `${f}:${existsSync(resolve(config.repoRoot, f)) ? readFileSync(resolve(config.repoRoot, f), 'utf8') : ''}`).join('\0'));
-  return { bundle, hash, errors, warnings, files };
+  // The hash re-reads every collected file — against the SAME base the bundle was read from. It
+  // used to re-resolve against config.repoRoot, so in the container it hashed a list of empty
+  // strings: two different harnesses would have hashed identical.
+  const hash = hashOf(files.map((f) => `${f}:${existsSync(resolve(root, f)) ? readFileSync(resolve(root, f), 'utf8') : ''}`).join('\0'));
+  return { bundle, hash, base: root, errors, warnings, files };
 }
 
 // ── refresh: reconcile every harness row with its folder (boot / seed) ───────
 // Mirrors the manifest refresh: read the folder, re-validate, store the parsed bundle + hash +
 // anchor commit + avatar. Loud on validation errors (a broken harness stays with its LAST good
 // bundle rather than a half-parsed one), quiet when unchanged.
+//
+// An UNREADABLE folder keeps the last good bundle too — but it is no longer silent. That silence
+// is exactly how the deployed queenzee shipped manager zees with no manual for weeks: the refresh
+// logged nothing a human would read, and /api/harnesses reported a harness that looked fine and
+// carried nothing. Now it screams (stdout + the queenzee log), and the read models carry
+// files_missing / bundle_empty so the console can show it.
 export async function refreshHarnesses() {
+  await refreshHarnessRoots();      // the Zeehive project's repo_root is where the folders live
   const rows = await q(`SELECT id, key, dir, bundle_hash, is_law_core, zee_type FROM harness WHERE dir IS NOT NULL`);
   for (const h of rows) {
     if (h.is_law_core) continue;   // core's text is code-assembled; nothing to read from a folder
-    const { bundle, hash, errors, warnings } = loadHarnessDir(h.dir);
+    const base = harnessBase(h.dir);
+    const { bundle, hash, missing, errors, warnings } = loadHarnessDir(h.dir, base);
+    if (missing) { await reportMissingHarness(h); continue; }
     if (!bundle) { logline('harness', `${h.key}: INVALID (${errors.join('; ')}) — keeping last good bundle`); continue; }
     for (const w of warnings) logline('harness', `${h.key}: ${w}`);
     // The anchor commit is reconciled every refresh even when the bundle content is unchanged — the
     // folder's last-touch commit moves as OTHER commits land, and the timeline anchors the node here.
-    const head = dirHeadCommit(config.repoRoot, h.dir);
+    const head = dirHeadCommit(base, h.dir);
     if (hash === h.bundle_hash) {
       if (head && head !== h.head_commit) await q(`UPDATE harness SET head_commit=$2 WHERE id=$1`, [h.id, head]);
       continue;   // bundle unchanged
     }
-    const avatar = existsSync(resolve(config.repoRoot, h.dir, 'avatar.svg')) ? `${h.dir}/avatar.svg` : null;
+    const avatar = existsSync(resolve(base, h.dir, 'avatar.svg')) ? `${h.dir}/avatar.svg` : null;
     // resolve a declared `parent:` key → parent_id (the trigger blocks cycles). Missing parent → null.
     let parentId = null;
     if (bundle.parent) {
@@ -219,6 +307,25 @@ export async function refreshHarnesses() {
       [h.id, JSON.stringify(bundle), hash, head, avatar, bundle.label || null, parentId, declared]);
     logline('harness', `${h.key}: refreshed (${bundle.skills?.length || 0} skill(s), ${bundle.parent ? `parent ${bundle.parent}, ` : ''}hash ${hash})`);
   }
+}
+
+// A file-backed harness whose folder cannot be read. Keep the last good bundle (never blank a live
+// harness on a bad mount), but say so LOUDLY and name the cost: how many zees are wearing a harness
+// that carries nothing, and where we looked.
+async function reportMissingHarness(h) {
+  let worn = 0;
+  try {
+    worn = Number((await one(
+      `SELECT count(*)::int AS n FROM xell WHERE harness_id=$1
+         AND status NOT IN ('retired','tearing-down','husk')`, [h.id]))?.n || 0);
+  } catch { /* count is colour, not the message */ }
+  const msg = `${h.key}: FOLDER MISSING — "${h.dir}" is not under any known repo root `
+    + `(${harnessRoots().join(' , ')}). Keeping the last stored bundle`
+    + `${worn ? `, but ${worn} live xell(s) wear this harness and get whatever that bundle holds` : ''}`
+    + '. A file-backed harness lives in the ZEEHIVE PROJECT repo (project.repo_root), not in the '
+    + 'server image — check that the project is onboarded and its repo_root is mounted/readable.';
+  logline('harness', msg);
+  console.error(`[harness] ${msg}`);
 }
 
 // NOTE: the cxell manual now lives INSIDE the meta DB — seeded directly into Zee Base's
@@ -276,10 +383,13 @@ export async function assignHarness(xellId, keyOrId) {
 export async function listHarnesses({ zeeType = null } = {}) {
   const rows = await q(
     `SELECT h.id, h.key, h.label, h.is_law_core, h.enabled, h.avatar_path, h.head_commit, h.dir, h.zee_type,
-            (h.bundle->'skills') AS skills, h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
+            (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
+            h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
+            h.bundle->>'personality' AS personality,
             p.key AS parent
        FROM harness h LEFT JOIN harness p ON p.id = h.parent_id
       WHERE h.enabled ORDER BY h.is_law_core, h.key`);
+  await ensureHarnessRoots();
   // `zeeType` narrows the list to what a xell of that type may actually WEAR — what every picker
   // must offer, so an operator is never shown a choice the assign path would then refuse.
   return rows.filter((h) => !zeeType || harnessFitsType(h.zee_type, zeeType)).map((h) => ({
@@ -288,7 +398,26 @@ export async function listHarnesses({ zeeType = null } = {}) {
     avatar_path: h.avatar_path, head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
     file_backed: !!h.dir,
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
+    // HONESTY about what this harness actually carries. A file-backed harness whose folder is not
+    // readable from here, and a harness that would brief a zee with nothing, are both invisible
+    // problems otherwise — the row looks perfectly healthy while the zee wearing it gets an empty
+    // persona (the deployed-queenzee bug). Computed at read time, so it is never a stale flag.
+    ...harnessHealth(h),
   }));
+}
+
+// files_missing: a file-backed harness whose folder is not under any known repo root.
+// bundle_empty: it would brief a zee with NOTHING — no personality, no skills, no memory.
+// core is excluded from both: its text is code-assembled, so an empty bundle there is correct.
+function harnessHealth(h) {
+  if (h.is_law_core) return { files_missing: false, bundle_empty: false };
+  const skills = Array.isArray(h.skills) ? h.skills : [];
+  const memory = Array.isArray(h.memory) ? h.memory : [];
+  return {
+    files_missing: !!h.dir && !existsSync(resolve(harnessBase(h.dir), h.dir)),
+    bundle_empty: !String(h.personality || '').trim() && !skills.length
+      && !memory.some((m) => m && String(m.text || '').trim()),
+  };
 }
 
 // ── harness authoring (DB-owned personas — unlimited, created from the dashboard) ────────────────
@@ -382,11 +511,14 @@ export async function getHarnessFull(key) {
     const eff = await effectiveHarness(await one(`SELECT * FROM harness WHERE id=$1`, [h.parent_id]));
     if (eff) inherited = { skills: eff.skills, memory: eff.memory, chain: eff.chain };
   }
+  await ensureHarnessRoots();
   return {
     key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core, file_backed: !!h.dir,
     parent, zee_type: h.zee_type, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
     inherited,
+    // same honesty as the list: is the folder readable from here, and does this bundle carry anything?
+    ...harnessHealth({ ...h, ...b }),
   };
 }
 

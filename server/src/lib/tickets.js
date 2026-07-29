@@ -21,7 +21,7 @@ import { broadcast } from './events.js';
 import { workLabel, isWorkStatus, nextStatuses, canTransition, TICKET_KINDS,
          WORK_STATUS_KEYS } from './work-status.js';
 import { createWorkItem, projectRoot, logWorkEvent, nestItems, assertId, isUuid,
-         inTransaction, dbRunner } from './work-items.js';
+         inTransaction, dbRunner, bad, refuse } from './work-items.js';
 
 const COLS = `id, project_id, number, title, body, kind, status, priority, reporter, assignee,
               labels, work_item_id, created_at, updated_at, closed_at`;
@@ -45,10 +45,10 @@ function shapeTicket(row) {
 export async function listTickets({ projectId, status, kind, q: search } = {}) {
   if (projectId) assertId(projectId, 'project id');
   for (const st of [].concat(status || [])) {
-    if (!isWorkStatus(st)) throw new Error(`unknown status "${st}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
+    if (!isWorkStatus(st)) throw bad(`unknown status "${st}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
   }
   for (const k of [].concat(kind || [])) {
-    if (!TICKET_KINDS.includes(k)) throw new Error(`unknown ticket kind "${k}" — one of: ${TICKET_KINDS.join(', ')}`);
+    if (!TICKET_KINDS.includes(k)) throw bad(`unknown ticket kind "${k}" — one of: ${TICKET_KINDS.join(', ')}`);
   }
   const where = [];
   const params = [];
@@ -97,14 +97,14 @@ export async function getTicket(id) {
 
 export async function createTicket(input = {}) {
   const title = String(input.title || '').trim();
-  if (!title) throw new Error('title required');
+  if (!title) throw bad('title required');
   const projectId = input.project_id || input.project;
-  if (!projectId) throw new Error('project required');
+  if (!projectId) throw bad('project required');
   assertId(projectId, 'project id');
   if (input.kind && !TICKET_KINDS.includes(input.kind)) {
-    throw new Error(`unknown ticket kind "${input.kind}" — one of: ${TICKET_KINDS.join(', ')}`);
+    throw bad(`unknown ticket kind "${input.kind}" — one of: ${TICKET_KINDS.join(', ')}`);
   }
-  if (input.status && !isWorkStatus(input.status)) throw new Error(`unknown status "${input.status}"`);
+  if (input.status && !isWorkStatus(input.status)) throw bad(`unknown status "${input.status}"`);
 
   const row = await one(
     `INSERT INTO ticket (project_id, title, body, kind, status, priority, reporter, assignee, labels)
@@ -118,6 +118,8 @@ export async function createTicket(input = {}) {
   return shapeTicket(row);
 }
 
+// priority is 1..5 and 1 is MOST urgent (docs/work-tracker.md, policy 5). Default 3 is the
+// middle of the scale. NB: machine_pool.dev_priority is the OPPOSITE convention — higher wins.
 const TICKET_EDITABLE = ['title', 'body', 'kind', 'priority', 'reporter', 'assignee', 'labels', 'work_item_id'];
 
 export async function updateTicket(id, patch = {}, { actor = null } = {}) {
@@ -126,12 +128,12 @@ export async function updateTicket(id, patch = {}, { actor = null } = {}) {
   const before = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
   if (!before) return null;
   if (patch.kind && !TICKET_KINDS.includes(patch.kind)) {
-    throw new Error(`unknown ticket kind "${patch.kind}" — one of: ${TICKET_KINDS.join(', ')}`);
+    throw bad(`unknown ticket kind "${patch.kind}" — one of: ${TICKET_KINDS.join(', ')}`);
   }
   if ('status' in patch && patch.status !== before.status) {
-    if (!isWorkStatus(patch.status)) throw new Error(`unknown status "${patch.status}"`);
+    if (!isWorkStatus(patch.status)) throw bad(`unknown status "${patch.status}"`);
     if (!canTransition(before.status, patch.status)) {
-      throw new Error(`cannot move ticket #${before.number} from ${before.status} to ${patch.status}`
+      throw refuse(`cannot move ticket #${before.number} from ${before.status} to ${patch.status}`
         + ` — legal next statuses are: ${nextStatuses(before.status).join(', ')}`);
     }
   }
@@ -169,7 +171,7 @@ export async function deleteTicket(id) {
 export async function addComment(ticketId, { author, body } = {}) {
   assertId(ticketId, 'ticket id');
   const text = String(body || '').trim();
-  if (!text) throw new Error('body required');
+  if (!text) throw bad('body required');
   const ticket = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [ticketId]);
   if (!ticket) return null;
   const row = await one(
@@ -204,7 +206,7 @@ export async function addComment(ticketId, { author, body } = {}) {
 // the existing items the author meant to keep.
 export async function breakdownTicket(id, { items = [], actor = null } = {}) {
   assertId(id, 'ticket id');
-  if (!Array.isArray(items) || !items.length) throw new Error('items required (a non-empty array)');
+  if (!Array.isArray(items) || !items.length) throw bad('items required (a non-empty array)');
   // Cheap existence check before opening a transaction, so an unknown ticket is a plain 404 rather
   // than a rolled-back BEGIN. The authoritative read happens again inside, through the client.
   if (!(await one(`SELECT id FROM ticket WHERE id=$1`, [id]))) return null;
@@ -216,12 +218,12 @@ export async function breakdownTicket(id, { items = [], actor = null } = {}) {
     const db = dbRunner(client);
     const ticket = await db.one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);
     const root = await projectRoot(ticket.project_id, client);
-    if (!root) throw new Error(`project ${ticket.project_id} has no root work item to break this ticket down under`);
+    if (!root) throw bad(`project ${ticket.project_id} has no root work item to break this ticket down under`);
 
     const byRef = new Map();
     const created = [];
     for (const spec of items) {
-      if (!spec || !String(spec.title || '').trim()) throw new Error('every item needs a title');
+      if (!spec || !String(spec.title || '').trim()) throw bad('every item needs a title');
       // A parent named by local ref, by uuid, or (default) the project root. A ref only resolves
       // BACKWARDS — it must have been declared by an earlier entry in this same call — so anything
       // else that is not a uuid is a typo or a forward reference, and it is named as such here.
@@ -232,7 +234,7 @@ export async function breakdownTicket(id, { items = [], actor = null } = {}) {
       if (parentId && byRef.has(parentId)) parentId = byRef.get(parentId).id;
       else if (parentId && !isUuid(parentId)) {
         const known = [...byRef.keys()];
-        throw new Error(`item "${spec.title}": parent_id "${parentId}" is neither a work item id nor `
+        throw bad(`item "${spec.title}": parent_id "${parentId}" is neither a work item id nor `
           + `a ref declared by an EARLIER item in this breakdown`
           + (known.length ? ` (refs so far: ${known.join(', ')})` : ' (no refs declared yet)')
           + '. A ref must be defined before it is used. Nothing was created.');
