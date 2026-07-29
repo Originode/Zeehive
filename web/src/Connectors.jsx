@@ -68,6 +68,8 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
       const hp = harnessPos[h.id];
       if (!hp) continue;                   // HiveCanvas hasn't published this harness's cell yet
       const node = { id: h.id, color: h.color, x: hp.x - cr.left, y: hp.y - cr.top };
+      // consumer_ids, NOT wearer_ids: a MANAGER wears a harness but is never routed through its cell
+      // — its own hexagon is drawn as that persona, so its wire runs straight from the dot to it.
       for (const id of h.consumer_ids || []) consumerHarness.set(id, node);
     }
 
@@ -173,10 +175,12 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, ha
   }, [measure, layoutRef]);
 
   const hov = hoverRef ? hoverRef.current : { id: null, commit: null, harness: null };
-  // hovering a harness badge focuses every xell that wears it (its consumers) — so their
-  // through-traces light up together, the mirror of a xell hover lighting its harness.
+  // hovering a harness badge focuses every xell that WEARS it — so their through-traces light up
+  // together, the mirror of a xell hover lighting its harness. Wearers, not consumers: a manager
+  // wears a harness without routing through its cell (its own hexagon IS that persona), and its wire
+  // still belongs in the family the hover lights.
   const hovHarness = hov.harness ? (timeline?.harnesses || []).find((h) => h.id === hov.harness) : null;
-  const hovConsumers = new Set(hovHarness?.consumer_ids || []);
+  const hovConsumers = new Set(hovHarness?.wearer_ids || hovHarness?.consumer_ids || []);
   const hoverActive = !!(hov.id || hov.commit || hov.harness);
   const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit) || hovConsumers.has(p.id);
 
