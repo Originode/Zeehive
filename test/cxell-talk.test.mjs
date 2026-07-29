@@ -116,6 +116,9 @@ ok(/rm -f "\$f"\n\s*\[\[ -n/.test(attach) || /rm -f "\$f"/.test(attach),
    'a message is removed BEFORE it is typed: a crash mid-delivery loses one rather than repeating it');
 ok(/tr '\\r\\n' '  '/.test(attach),
    'newlines are collapsed — Enter SUBMITS in the TUI, so a multi-line paste would fire half-messages');
+ok(/stop_talk_drain\nexec bash -l/.test(attach),
+   'the drainer is STOPPED before the pane falls back to a login shell — `exec` skips the EXIT trap, '
+   + 'and a queued message typed at a bash prompt is not a message but a COMMAND');
 ok(/READ-ONLY feed/.test(attach),
    'and the feed banner SAYS the pane cannot hear you, and where the door is (this is how it was reported)');
 

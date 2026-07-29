@@ -88,7 +88,13 @@ drain_talk() {
 start_talk_drain() {
   drain_talk "${1:-8}" &
   TALK_PID=$!
-  trap 'kill "$TALK_PID" 2>/dev/null' EXIT
+  trap 'stop_talk_drain' EXIT
+}
+
+stop_talk_drain() {
+  [[ -n "${TALK_PID:-}" ]] || return 0
+  kill "$TALK_PID" 2>/dev/null
+  TALK_PID=''
 }
 
 follow_live() {
@@ -159,4 +165,9 @@ case "$RUNTIME" in
     fi
     ;;
 esac
+# The agent has exited and the pane falls back to a login shell. STOP the drainer first: `exec`
+# replaces this process, so its EXIT trap would never fire, and a queued message typed at a bash
+# prompt is not a message — it is a COMMAND. (This is the failure mode that makes send-keys into an
+# unknown pane dangerous, and the one place this script can close it.)
+stop_talk_drain
 exec bash -l
