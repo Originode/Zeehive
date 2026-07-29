@@ -35,6 +35,10 @@ import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, ZeeChip, statusLabel } from 
 //    same gap; the server is free to renormalise a column when it wants to, and nothing here
 //    depends on the numbers being pretty.
 //
+// AND IT IS NOT MOUSE-ONLY: Alt+arrows perform the same move as a drag (see onCardKey). HTML5 drag
+// has no keyboard equivalent, so without that the board was readable and not operable for anyone who
+// does not use a mouse — the gesture is the feature here, so it needed a second way in.
+//
 // The board is the PLAN. The hive is the FACT. When `live_status` (what the assigned zee is really
 // doing) disagrees with the stored `status`, the card carries an advisory marker and NOTHING moves
 // on its own — a human decides whether the plan or the zee is wrong. An auto-moving card would
@@ -158,6 +162,48 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     endDrag();
     if (id) move(id, key, index);
   };
+  // ── THE SAME MOVE, FROM THE KEYBOARD ───────────────────────────────────────
+  // HTML5 drag and drop has no keyboard equivalent at all: with a mouse this board is one gesture,
+  // and without one it was READ-ONLY — a card could be focused and opened, never moved. That is not
+  // a nicety, it is half the feature missing for anyone who does not drag.
+  //
+  // So Alt+arrows perform the identical action: Alt+↑/↓ reorders inside the column, Alt+←/→ carries
+  // the card to the next column (which is a status change, exactly as dropping it there would be).
+  // It funnels into the SAME move() — one implementation, one set of refusals, one optimistic
+  // rollback. Alt is required so the arrows keep scrolling the column for everyone else.
+  //
+  // Focus is restored onto the card after the board re-reads: a move that silently dumps you back at
+  // the top of the document makes the second move harder than the first, which is how a keyboard
+  // path ends up unused.
+  const refocus = useRef(null);
+  useEffect(() => {
+    if (!refocus.current) return;
+    const el = document.querySelector(`[data-item="${refocus.current}"]`);
+    refocus.current = null;
+    el?.focus();
+  }, [board]);
+
+  const onCardKey = (e, card, colIndex, cardIndex) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen?.(card.id); return; }
+    if (!e.altKey) return;
+    const here = columns[colIndex];
+    const to = e.key === 'ArrowLeft' ? columns[colIndex - 1]
+      : e.key === 'ArrowRight' ? columns[colIndex + 1] : null;
+    if (to) {
+      e.preventDefault();
+      refocus.current = card.id;
+      move(card.id, to.key, to.items.length);        // lands at the end of the column it moves into
+      return;
+    }
+    if (e.key === 'ArrowUp' && cardIndex > 0) {
+      e.preventDefault(); refocus.current = card.id;
+      move(card.id, here.key, cardIndex - 1);
+    } else if (e.key === 'ArrowDown' && cardIndex < here.items.length - 1) {
+      e.preventDefault(); refocus.current = card.id;
+      move(card.id, here.key, cardIndex + 2);        // the gap BELOW the card that is below this one
+    }
+  };
+
   const allow = (e, key, index) => {
     if (!dragRef.current) return;
     e.preventDefault();
@@ -171,7 +217,7 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     <div className="work-board" data-testid="work-board">
       <ErrLine err={err} onDismiss={() => setErr(null)} />
       <div className="work-cols">
-        {columns.map((col) => (
+        {columns.map((col, colIndex) => (
           <section key={col.key} className={`work-col${col.terminal ? ' terminal' : ''}${col.unknown ? ' unknown' : ''}`}
                    data-col={col.key}
                    onDragOver={(e) => allow(e, col.key, col.items.length)}
@@ -232,8 +278,10 @@ function Card({ card, statuses, dragging, onDragStart, onDragEnd, onDragOver, on
              onDragStart={onDragStart} onDragEnd={onDragEnd}
              onDragOver={onDragOver} onDrop={onDrop}
              onClick={onOpen}
-             onKeyDown={(e) => { if (e.key === 'Enter') onOpen?.(); }}
-             tabIndex={0} role="button">
+             onKeyDown={onKey}
+             tabIndex={0} role="button"
+             aria-label={`${card.title} — ${statusLabel(statuses, card.status)}. Enter opens it; `
+               + 'Alt with the arrow keys moves it between columns and reorders it.'}>
       <div className="work-card-top">
         <KindGlyph kind={card.kind} />
         <span className="work-card-title">{card.title}</span>

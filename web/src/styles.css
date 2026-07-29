@@ -1894,3 +1894,9 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   text-align: left; padding: 4px 8px; font-size: 12px; cursor: pointer; }
 .work-cand:hover:not(:disabled) { border-color: var(--accent); }
 .work-cand small { color: var(--muted); font-size: 11px; }
+
+/* Keyboard operability: a focused card must be as obvious as a hovered one, because the keyboard
+   path (Alt + arrows) is the only way to move a card without a mouse and an invisible focus ring
+   makes it unusable in practice. */
+.work-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.work-nrow:focus-within { background: var(--panel2); }
