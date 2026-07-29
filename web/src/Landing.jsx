@@ -59,6 +59,21 @@ function ApproachQueue({ queue }) {
 //
 // `queue` is the approach queue for THIS ref — rendered under the card, because the thing a human
 // most needs to know about a queue is which decision is holding it up.
+// ── DISMISSAL HIDES A RECEIPT; IT CANNOT HIDE A BLOCKER (#11 gap 2) ───────────
+// The gate's runwayOccupant() deliberately ignores `dismissed_at`, and that instinct is right:
+// dismissing hides a receipt, it does not free a runway, and an approved-but-hidden landing is still
+// about to move the ref. The consequence was the bug — an approved landing that never lands, dismissed,
+// occupying the runway with NOTHING on screen, while the zees queued behind it vanished with it (their
+// approach queue renders under the card that owns the runway). The stale sweep cannot rescue that: it
+// only closes PROVEN non-fast-forwards.
+//
+// The fix is not to free the runway on dismissal — that would let a human hide a landing and silently
+// let the next one through, which is worse than a stuck runway. It is that a landing WITH ZEES BEHIND IT
+// is not a receipt at all, so hiding does not apply to it. When nobody is queued a dismissed approval is
+// exactly what dismissal is for and stays hidden; the moment it actually blocks someone it is on screen,
+// with the reason, and every button it always had.
+export const holdsRunway = (r) => !!r?.runway_occupant && (r?.holders || 0) > 0;
+
 export function LandCard({ req, onDone, onDismiss, queue = req.queue }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -121,6 +136,17 @@ export function LandCard({ req, onDone, onDismiss, queue = req.queue }) {
                   title="Hide this receipt (stays hidden — the queenzee still lands it, or closes it as stale, on its own)">✕</button>
         )}
       </div>
+
+      {/* Why a hidden card is on screen: it holds the runway and zees are queued behind it. Stated in
+          words on the card itself — a human who dismissed this needs to know it came back, and why,
+          before they wonder whether the ✕ works. */}
+      {req.dismissed_at && holdsRunway(req) && (
+        <div className="land-blocker" data-testid="land-blocker">
+          ⛔ this landing HOLDS the runway — {req.holders} zee{req.holders === 1 ? '' : 's'} queued behind it,
+          so it is shown again even though it was dismissed{req.dismissed_by ? ` by ${req.dismissed_by}` : ''}.
+          Hiding it would hide them too. Decide it, or let the zee withdraw it — dismissing does not free the ref.
+        </div>
+      )}
 
       {/* The queue rides with the card in BOTH states. Collapsing an approved landing must not hide
           the fact that three zees are waiting on it — that is the moment it matters most. */}

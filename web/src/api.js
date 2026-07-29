@@ -362,6 +362,26 @@ export async function checkContainerDiff(containerId, against = null) {
   return data;
 }
 
+// Check ONE db container's ROWS against the backup it was restored from (the chip's "Check data" menu
+// item). The sibling of checkContainerDiff, and a different question: that one asks whether the SHAPE
+// matches production, this one asks whether the ROWS the source dump recorded actually arrived. Returns
+// { ok, verdict, checked, ok_count, empty, short, missing, unknown, ref_total, got_total, reference, error }.
+export async function checkContainerData(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/check-data`, { method: 'POST' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `check data failed (${r.status})`);
+  return data;
+}
+
+// Is a data check even possible for this db, and against which backup? Asked before the menu item is
+// offered, so a human is never invited to run a check whose only possible answer is "no reference".
+export async function getDataCheckReadiness(containerId) {
+  const r = await fetch(`/api/containers/${containerId}/data-check-readiness`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `readiness failed (${r.status})`);
+  return data;
+}
+
 // The db containers this one can be compared against (the "Check diff" submenu). Production comes
 // first — it is the default reference and the only one that writes the chip's drift verdict.
 export async function getDiffCandidates(containerId) {

@@ -13,8 +13,9 @@ import { logline } from '../lib/logbus.js';
 import { gitLog, diffStat, cleanGitEnv, headCommit } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
-import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway } from './nudge.js';
-import { shouldProcessNow, processPad } from './landingpad.js';
+import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway,
+         nudgeXellForLostClearance, tendForSilentClearance } from './nudge.js';
+import { shouldProcessNow, processPad, RECEIPT_MIN } from './landingpad.js';
 import { recordXourceHead } from '../lib/projects.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
@@ -467,6 +468,102 @@ export async function sweepHoldingPattern() {
   return { swept };
 }
 
+// ── A CLEARANCE NOBODY ANSWERED ───────────────────────────────────────────────────────────────────
+// clearHolder's nudge is fire-and-forget: `nudged: true` means the resume STARTED. Undeliverable is
+// handled (nudge.js tends a human and the tower calls the next holder), but DELIVERED-THEN-DIED was
+// not: the receipt says the zee was told, the row leaves the pattern (every queue read filters
+// `cleared_at IS NULL`), and nothing ever returns to it. The zee waits forever for a clearance it
+// already received and lost, with unlanded commits and no card anywhere. (#11, confirmed by #19.)
+//
+// The ruling: re-clear ONCE, then tend. Once because the cheap failure is a lost nudge; a tend rather
+// than a retry loop because a zee that ignores two clearances is a human's problem, not a schedule's.
+//
+// THE PERIOD is the landing pad's RECEIPT_MIN (5 minutes) — the only minute-scale window the runway's
+// own machinery already keeps, and the same idea: how long to wait before treating something as
+// settled. It times both stages, so a silent holder is re-called at ~5 minutes and handed to a human at
+// ~10. LAND_CLEARANCE_GRACE_MIN overrides it (the tests set 0 to exercise both stages deterministically
+// rather than sleeping through them).
+const CLEARANCE_GRACE_MIN = process.env.LAND_CLEARANCE_GRACE_MIN !== undefined
+  ? Number(process.env.LAND_CLEARANCE_GRACE_MIN) : RECEIPT_MIN;
+
+// "It never came back" — no land_request from this xell on this ref was raised after the clearance.
+// ANY status counts as coming back (pending, holding, landed, even stale): the zee acted, and what
+// happened next is the gate's business, not this sweep's. Checked in SQL against the row as the
+// database holds it, for the same reason holdingPosition is (µs vs ms round-tripping through JS).
+export async function sweepSilentClearances({ graceMin = CLEARANCE_GRACE_MIN } = {}) {
+  const rows = await q(
+    `SELECT lr.*, x.slug AS xell_slug,
+            round(EXTRACT(EPOCH FROM (now() - lr.cleared_at)) / 60)::int AS silent_min
+       FROM land_request lr JOIN xell x ON x.id = lr.xell_id
+      WHERE lr.kind='push' AND lr.status='holding'
+        AND lr.cleared_at IS NOT NULL AND lr.silence_tended_at IS NULL
+        AND x.status NOT IN ('retired','tearing-down')
+        AND COALESCE(lr.recleared_at, lr.cleared_at) <= now() - ($1 || ' minutes')::interval
+        AND NOT EXISTS (SELECT 1 FROM land_request nx
+                         WHERE nx.xell_id = lr.xell_id AND nx.ref = lr.ref AND nx.kind='push'
+                           AND nx.id <> lr.id AND nx.requested_at > lr.cleared_at)
+      ORDER BY lr.cleared_at ASC LIMIT 20`, [String(graceMin)]);
+  let recalled = 0, tended = 0;
+  for (const row of rows) {
+    const short = String(row.new_sha || '').slice(0, 8);
+    const branch = String(row.ref || '').replace('refs/heads/', '') || 'main';
+    if (!row.recleared_at) {
+      // ONE re-call. The timestamp is written FIRST and guarded, so two ticks (or two queenzees)
+      // cannot both decide they are the one re-call — the loser simply finds the row already stamped.
+      const marked = await one(
+        `UPDATE land_request SET recleared_at=now()
+           WHERE id=$1 AND status='holding' AND cleared_at IS NOT NULL AND recleared_at IS NULL
+           RETURNING *`, [row.id]).catch(() => null);
+      if (!marked) continue;
+      broadcast('land', marked);
+      logline('landgate',
+        `RE-CALLED ${row.xell_slug || 'a xell'} to land ${short} on ${branch} — it was cleared `
+        + `~${row.silent_min}m ago and has not pushed since, so the first clearance was probably lost with `
+        + 'its session. Nothing is approved and nothing has moved; it syncs and pushes for a fresh decision.');
+      const nudged = await nudgeXellForLostClearance(row.xell_id,
+        { sha: row.new_sha, ref: row.ref, minutes: row.silent_min, requestId: row.id })
+        .catch((e) => ({ nudged: false, error: e.message }));
+      // The note is OVERWRITTEN here (unlike clearHolder's write-once): the first clearance's receipt is
+      // no longer the current state of this row, and a receipt that still says "the zee was nudged" is
+      // the exact lie this whole path exists to correct. An undeliverable re-call has already written
+      // its own truthful note (nudge.js), so leave that one alone.
+      const note = `runway clear, then silence (~${row.silent_min}m) — re-called ONCE: `
+        + (nudged?.nudged ? 'the zee was resumed again to `zee sync` and land'
+          : `the zee could NOT be reached (${nudged?.reason || nudged?.error || 'no live cxell'})`);
+      if (!nudged?.tended) {
+        const noted = await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING *`, [row.id, note])
+          .catch(() => null);
+        if (noted) broadcast('land', noted);
+      }
+      recalled++;
+      continue;
+    }
+    // Re-called and STILL silent: this is a human's now. Stamp first (same race guard), then raise it.
+    const done = await one(
+      `UPDATE land_request SET silence_tended_at=now()
+         WHERE id=$1 AND recleared_at IS NOT NULL AND silence_tended_at IS NULL RETURNING *`, [row.id])
+      .catch(() => null);
+    if (!done) continue;
+    broadcast('land', done);
+    // NOT swallowed silently: the tend IS the outcome of this branch, so a failure to raise it must be
+    // said out loud. Swallowing it would recreate the very shape of bug this sweep exists to close —
+    // a row that records a human was told, and a human who was not.
+    const raised = await tendForSilentClearance(row.xell_id,
+      { sha: row.new_sha, ref: row.ref, minutes: row.silent_min, requestId: row.id })
+      .catch((e) => ({ tended: false, error: e.message }));
+    if (!raised?.tended) {
+      logline('landgate',
+        `could NOT raise a tend for ${row.xell_slug || 'a xell'}'s lost clearance `
+        + `(${raised?.error || 'the xell is gone'}) — its row is stamped, so nothing will retry this`);
+    }
+    logline('landgate',
+      `${row.xell_slug || 'a xell'} was cleared to land ${short} on ${branch} ~${row.silent_min}m ago and `
+      + 'never pushed, through TWO clearances — handed to a human (tend). Nothing further is automatic.');
+    tended++;
+  }
+  return { checked: rows.length, recalled, tended };
+}
+
 // The backstop half of the tower: every runway that has somebody waiting gets looked at once a tick,
 // so a clearance missed by a crashed/restarted process (or by a transition path added later that
 // forgets to call freeRunway) is never lost — it just happens a few seconds later.
@@ -885,9 +982,15 @@ export async function tick() {
   const runways = await driveRunways().catch((e) => {
     logline('landgate', `runway drive failed: ${e.message}`); return { runways: 0, cleared: 0 };
   });
+  // …and the holders that WERE cleared and then went quiet: re-call each one once, then hand it to a
+  // human. This is the only path that ever looks at a cleared row again — every queue read has already
+  // filtered it out — so without it a lost clearance is permanent.
+  const silent = await sweepSilentClearances().catch((e) => {
+    logline('landgate', `silent-clearance sweep failed: ${e.message}`); return { recalled: 0, tended: 0 };
+  });
   return { checked: stuck.length, landed, dry_run: dryRun, stale: stale + swept.stale,
     pending_checked: swept.checked, holding_swept: gone.swept, runways: runways.runways,
-    holders_cleared: runways.cleared };
+    holders_cleared: runways.cleared, recalled: silent.recalled, silence_tended: silent.tended };
 }
 
 // "Seen it — stop showing me." A durable fact about VISIBILITY, never about status: a dismissed

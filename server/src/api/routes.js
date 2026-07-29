@@ -56,6 +56,8 @@ import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
+import { checkContainerData, dataCheckReadiness } from '../queenzee/datadiff.js';
+import { compareBackupCounts } from '../lib/row-counts.js';
 import { applyMigrationsToXell, catchUpXellToProd } from '../queenzee/shipmigrate.js';
 import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, forceReleaseProdLock,
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
@@ -844,6 +846,22 @@ router.post('/containers/check', async (_req, res) => res.json(await checkContai
 // that answer must not overwrite the fleet's drift-from-prod colours.
 router.post('/containers/:id/check-diff', async (req, res) => {
   try { res.json(await diffOneContainerAgainstProd(req.params.id, req.body?.against || null)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// On-demand DATA check of ONE db container: does it hold the ROWS the backup it was restored from
+// recorded? The sibling of check-diff, and deliberately a different route with a different verdict —
+// one number that answered both "is my schema prod's?" and "is my data here?" is what TKT-22-4F0E was
+// about. Read-only counts, and production is refused as a subject (it is the reference).
+router.post('/containers/:id/check-data', async (req, res) => {
+  try { res.json(await checkContainerData(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// Can this db be data-checked at all, and against which backup? The console asks BEFORE offering the
+// menu item, so a human is never invited to run a check that can only answer "no reference".
+router.get('/containers/:id/data-check-readiness', async (req, res) => {
+  try { res.json(await dataCheckReadiness(req.params.id)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -1744,11 +1762,28 @@ router.get('/backups', async (req, res) => {
     `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables FROM pool_config WHERE project_id=$1`, [proj]);
   // tables = this dump's scoped selection (null = full db). toc_summary->tables = every table the
   // archive contains, so the restore picker offers exactly what can be restored out of THIS backup.
-  const backups = await q(
+  const rows = await q(
     `SELECT id, dump_path, dest_ctx, size_bytes, taken_at, source, status, error, mode, tables,
+            row_total, row_counts,
             toc_summary->'tables' AS toc_tables
        FROM db_snapshot
        WHERE project_id=$1 AND source='prod' ORDER BY taken_at DESC`, [proj]);
+  // THE TREND, computed here rather than in the browser: each FULL backup against the next older one
+  // that carries counts. A table that SHRANK between two dumps is the reading that actually speaks to
+  // "is my data fully backed up" (TKT-22-4F0E), and it is the one thing no surface could show before.
+  // row_counts itself is NOT sent — 600+ tables × 14 backups is a payload nobody reads; the verdict,
+  // the totals and the worst few are (compareBackupCounts caps that list).
+  const fullWithCounts = rows.filter((b) => b.status === 'finished' && !b.tables && b.row_counts);
+  const backups = rows.map((b) => {
+    const { row_counts, ...rest } = b;
+    if (!row_counts || b.tables) return rest;
+    const older = fullWithCounts.find((o) => new Date(o.taken_at) < new Date(b.taken_at) && o.row_counts);
+    const trend = compareBackupCounts(older?.row_counts ?? null, row_counts);
+    return { ...rest, row_tables: Object.keys(row_counts).length,
+             row_trend: trend ? { verdict: trend.verdict, counts: trend.counts, worst: trend.worst,
+                                  total_prev: trend.total_prev, total_now: trend.total_now,
+                                  compared_to: older?.taken_at ?? null } : null };
+  });
   // db containers a backup may be restored INTO. Non-prod targets plus the SHARED prod db, flagged
   // is_prod so the modal marks it and demands typed confirmation. Ordered so prod sorts LAST — the
   // modal preselects targets[0], and prod must never be the default restore target. busy_since/

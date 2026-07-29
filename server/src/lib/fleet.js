@@ -369,8 +369,23 @@ export async function getFleet(projectId) {
 
   // Pushes to main being HELD for human verification. Open ones only: this drives a blocking
   // banner, and a blocked zee is stuck until someone acts on it.
+  //
+  // Two extra facts per row, both about the RUNWAY it sits on (#11 gap 2). `runway_occupant` says this
+  // is the landing that OWNS the ref right now — the oldest open one, exactly what landgate's
+  // runwayOccupant() picks — and `holders` counts the zees queued behind it. Together they are what
+  // makes a DISMISSED approval visible again: dismissal hides a receipt, and a landing with zees stacked
+  // behind it is not a receipt, it is a blocker. Computed here, in the same SQL and the same ordering
+  // the tower uses, so the console can never disagree with the gate about who is on the runway.
   const landing = await q(
-    `SELECT lr.*, x.slug AS xell_slug
+    `SELECT lr.*, x.slug AS xell_slug,
+            lr.kind = 'push' AND NOT EXISTS (
+              SELECT 1 FROM land_request o
+                WHERE o.project_id = lr.project_id AND o.ref = lr.ref AND o.kind = 'push'
+                  AND o.status IN ('pending','approved')
+                  AND (o.requested_at, o.id) < (lr.requested_at, lr.id)) AS runway_occupant,
+            (SELECT count(*)::int FROM land_request h
+               WHERE lr.kind = 'push' AND h.project_id = lr.project_id AND h.ref = lr.ref
+                 AND h.kind = 'push' AND h.status = 'holding' AND h.cleared_at IS NULL) AS holders
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
        WHERE lr.project_id = $1 AND lr.status IN ('pending','approved')
        ORDER BY lr.requested_at DESC`, [pid]);
