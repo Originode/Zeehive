@@ -291,5 +291,20 @@ for (const f of ['DeployZee.jsx', 'Board.jsx', 'WorkConsole.jsx']) {
 ok(/xell_id/.test(dcode) && /lastAssignedSlug/.test(dcode),
    'a reaped xell leaves provenance (was: <slug>) instead of a ghost chip');
 
+// ── the board is operable WITHOUT a mouse ─────────────────────────────────────────────────────
+// HTML5 drag has no keyboard equivalent, so a board with only a drag is readable and not operable
+// for anyone who does not use one. Alt+arrows must produce the SAME move() a drop does — one
+// implementation, one set of refusals.
+ok(/altKey/.test(board) && /ArrowUp|ArrowDown/.test(board),
+   'a card can be moved with the keyboard (Alt + arrows), not only dragged');
+ok(/aria-label=/.test(board), 'a card says what it is and how to move it (aria-label)');
+// The index mapping that path uses, checked against the same pure maths the drag uses: one slot per
+// press, in both directions, with the lifted-card shift already accounted for.
+const kcol = [{ id: 'a', sort_order: 1 }, { id: 'b', sort_order: 2 }, { id: 'c', sort_order: 3 }];
+ok(placement(kcol, 'a', 0 + 2).at === 1, 'Alt+Down moves a card exactly one slot down (gap = index + 2)');
+ok(placement(kcol, 'c', 2 - 1).at === 1, 'Alt+Up moves a card exactly one slot up (gap = index − 1)');
+ok(placement(kcol, 'a', 0 + 2).sortOrder === 2.5 && placement(kcol, 'c', 2 - 1).sortOrder === 1.5,
+   'and both write a midpoint, exactly as the equivalent drag would');
+
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exit(fail ? 1 : 0);
