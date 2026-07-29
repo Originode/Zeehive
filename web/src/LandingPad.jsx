@@ -59,6 +59,20 @@ function PadRow({ item }) {
       {/* A STALE landing is the one phase whose label raises a question ("stale — and now what?").
           The note answers it in place: main moved past the sha, and whether the zee was nudged to
           sync and ask again. Tooltip, not a new line — this is a receipt, not a decision. */}
+      {/* HIDDEN, BUT STILL ON THE RUNWAY (#11 gap 2). Dismissing a landing hides a RECEIPT; it does not
+          free the ref, and the gate deliberately ignores dismissal when it decides who occupies a
+          runway. So an open item that was dismissed still belongs on this list — it is the queenzee's
+          work and it is blocking whoever is queued behind it — and it says so here rather than being
+          the invisible blocker it used to be. The holder count is the reason it matters. */}
+      {item.dismissed_at && (
+        <span className="pad-hidden" data-testid="pad-hidden"
+              title={`Dismissed${item.dismissed_by ? ` by ${item.dismissed_by}` : ''} — hiding a landing hides a receipt, `
+                + 'it does not free the runway. This one is still open, so the queenzee still has work to do on it '
+                + `and it still holds ${(item.ref || 'main').replace('refs/heads/', '')}`
+                + (item.holders ? `, with ${item.holders} zee(s) queued behind it.` : '.')}>
+          ⛔ dismissed{item.holders ? ` · ${item.holders} queued behind` : ''}
+        </span>
+      )}
       <span className={`pad-phase ${p.cls}`} title={item.note || undefined}>
         {item.processing && <span className="pad-spin" data-testid="pad-spin" aria-label="processing" />}
         {item.next && !item.processing && <span className="pad-nextdot" title="next up" />}

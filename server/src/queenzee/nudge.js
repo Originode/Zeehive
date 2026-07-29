@@ -146,6 +146,73 @@ export async function nudgeXellForClearedRunway(xellId, { sha = null, ref = null
   return { ...r, ...tended };
 }
 
+// THE RE-CALL — a clearance that was DELIVERED and then died with the session (#11).
+//
+// The clearance above is fire-and-forget: `nudged: true` means the resume STARTED, not that the zee
+// lived long enough to act. If its session ends first the row truthfully says it was nudged, the row is
+// out of the pattern (clearRunway only walks `cleared_at IS NULL`), and nothing ever returns to it —
+// the zee waits forever for a clearance it already had.
+//
+// So it is called ONCE more, and this prompt is deliberately NOT the clearance prompt. By now the
+// runway has very likely been taken by the next holder (the tower moved on within a tick), so telling
+// this zee "the runway is CLEAR, you are next" would be a lie. What is true either way is the recovery:
+// sync, push, and take whatever the gate gives you — the runway or a fresh place in the pattern.
+const RECALL_PROMPT = (ref, sha, min) => [
+  `You were CLEARED to land${sha ? ` ${String(sha).slice(0, 8)}` : ''} on ${ref ? ref.replace('refs/heads/', '') : 'main'} and never came back.`,
+  `The tower resumed your session about ${min} minute(s) ago with the go-around and no push has arrived since,`,
+  'so this is a RE-CALL: the first one was most likely lost with a session that ended before it could act.',
+  'Nothing about your work is wrong and nothing was rejected — your commits are exactly where you left them.',
+  '',
+  'Take it now — two steps, in this order:',
+  `  1. \`zee sync\` — ${ref ? ref.replace('refs/heads/', '') : 'main'} has moved since you were queued. The queenzee delivers current main INTO`,
+  '     your cxell and MERGES it into your branch (in a cage `git fetch` / `git rebase main` cannot work). A',
+  '     genuine CONFLICT is left in progress for YOU: resolve the files, `git add`, `git commit`. If the merge',
+  '     touched your change, re-verify it (`zee build <role> --wait`, in the BACKGROUND).',
+  '  2. `zee land` — pushes your sha and raises a FRESH request for a human.',
+  '',
+  'The runway may have been taken while you were quiet. If your push goes back into the HOLDING PATTERN that is',
+  'normal and nothing is wrong: you are told your position and called again when it frees. Being cleared was',
+  'never an approval — nobody has read your commits yet, and nothing lands until a human decides this sha.',
+  'This is the LAST automatic call: if nothing arrives after it, a human is raised instead.',
+].join('\n');
+
+// Re-call a holder whose clearance went unheard. Same contract as every nudge here: best-effort, never
+// throws, and an undeliverable one degrades to a TEND rather than to silence — the case this whole
+// mechanism exists to end.
+export async function nudgeXellForLostClearance(xellId, { sha = null, ref = null, minutes = null, requestId = null, by = 'queenzee', mode = PROVISION_MODE } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const r = await nudgeCxell(xellId, {
+    by, mode, prompt: RECALL_PROMPT(ref, sha, minutes ?? '?'), why: 'clearance went unanswered',
+    log: (slug, sid) => `${slug}: RE-CALLED to land ${short} — the clearance went unanswered, resuming `
+      + `cxell session ${sid} to \`zee sync\` and land`,
+    onFail: (e) => clearanceUndelivered(xellId, { short, requestId, why: e.message }).catch(() => {}),
+  });
+  if (r?.nudged || r?.dry_run) return r;
+  const tended = await clearanceUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
+  return { ...r, ...tended };
+}
+
+// …and the end of the automatic path: two clearances, no push. Hand it to a human with the whole story,
+// because the one thing this state does not need is another retry — the zee is not slow, it is gone or
+// it is ignoring the tower, and both are a human's call. Never tends a xell that is already gone.
+export async function tendForSilentClearance(xellId, { sha = null, ref = null, minutes = null, requestId = null } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const branch = ref ? String(ref).replace('refs/heads/', '') : 'main';
+  const xell = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xellId]).catch(() => null);
+  if (!xell || xell.status === 'retired') return { tended: false };
+  const reason = `Cleared to land ${short} on ${branch} and never came back — re-called once, still silent `
+    + `after ~${minutes ?? '?'} minute(s). Its commits are unlanded and no card exists for them: check whether `
+    + 'the zee\'s session is alive, then have it `zee sync` and `zee land` (or mark it done).';
+  await setTend(xellId, true, { reason, source: 'queenzee' }).catch(() => {});
+  if (requestId) {
+    await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING id`,
+      [requestId, `runway clear, then silence: ${reason}`]).catch(() => {});
+  }
+  logline('nudge',
+    `${xell.slug}: cleared to land ${short} and never re-pushed (re-called once) — raised a tend for a human`);
+  return { tended: true, reason };
+}
+
 // The go-around: nobody was home when the runway freed. Raise "needs a human in the console" and
 // correct the receipt, exactly as a stale landing does — the queue then calls the NEXT holder, so
 // one unreachable zee never leaves the runway standing empty.
