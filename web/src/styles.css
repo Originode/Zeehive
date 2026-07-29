@@ -1449,6 +1449,17 @@ a.cbox:hover { border-color: var(--accent); }
 .fx-goin:focus { outline: none; border-color: var(--accent); }
 .term-x.on { color: var(--accent); }
 
+/* ── 💬 talk: the conversation door in the zee terminal header ──
+   It is a WORD, not a bare glyph, because it is the answer to "I typed and nothing happened" and a
+   human has to find it without hovering. `.urge` fires while a live feed owns the pane — the exact
+   state in which typing into the terminal reaches nobody — so the one moment the button matters
+   most is the one moment it is impossible to miss. */
+.term-x.talk { font-size: 11.5px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px;
+  margin-right: 6px; background: var(--panel2); color: var(--text); white-space: nowrap; }
+.term-x.talk:hover { border-color: var(--accent); }
+.term-x.talk.on { border-color: var(--accent); color: var(--accent); }
+.term-x.talk.urge { border-color: #e0a53b; color: #f0c46a; background: rgba(224,165,59,.12); }
+
 /* ── live-feed chips in the zee terminal header (✱ thinking · ⚒ moves) ──
    These first shipped as bare .term-chips and came straight back as "it's too difficult to see if
    the buttons are pressed or not" — correct: .term-chip carries no COLOUR (the queenzee-log chips

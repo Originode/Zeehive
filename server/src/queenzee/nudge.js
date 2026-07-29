@@ -233,8 +233,13 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
 
     logline('message', `${zee.slug}: operator message by ${by} — ${rich ? `${written.length} file(s) to .zee-inbox, ` : ''}typing into live cxell session over SSH (:${sshPort})`);
     // Fire and forget: opening SSH, resuming the TUI and typing can take several seconds.
+    // The answer now distinguishes TYPED from QUEUED (the zee was mid-turn, so the pane was its
+    // read-only feed and the message waits in the cage for zee-attach.sh to type it in when the
+    // turn ends). Say which — this line used to claim delivery for messages that reached nobody.
     sendKeysToCxellZee({ sshPort, slug: zee.slug, text: typed, sessionId: zee.claude_session_id })
-      .then(() => logline('message', `${zee.slug}: delivered operator message to the live session`))
+      .then((r) => logline('message', r?.delivery === 'queued'
+        ? `${zee.slug}: the zee is MID-TURN — operator message QUEUED in the cxell; it is typed into its session when the turn ends`
+        : `${zee.slug}: delivered operator message to the live session`))
       .catch((e) => logline('message', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`));
 
     return { sent: true, zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written, ...(failed.length ? { failed } : {}) };
@@ -276,7 +281,9 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
     // Fire and forget: opening SSH, starting the TUI if needed, and typing can take several seconds;
     // do NOT block the caller (the flower's button) on it.
     sendKeysToCxellZee({ sshPort, slug: zee.slug, text, sessionId: zee.claude_session_id })
-      .then(() => logline('nudge', `${zee.slug}: sent ${JSON.stringify(text)} to the live session`))
+      .then((r) => logline('nudge', r?.delivery === 'queued'
+        ? `${zee.slug}: the zee is MID-TURN — ${JSON.stringify(text)} QUEUED in the cxell; typed in when the turn ends`
+        : `${zee.slug}: sent ${JSON.stringify(text)} to the live session`))
       .catch((e) => logline('nudge', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`));
 
     return { nudged: true, zee_id: zee.id, session: zee.claude_session_id, sent: text, via: 'ssh-send-keys' };

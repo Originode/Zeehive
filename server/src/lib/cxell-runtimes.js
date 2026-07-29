@@ -263,3 +263,13 @@ export const providerModels = (provider) => VENDOR_MODELS[provider] || null;
 // interactive session over SSH alike (see cxellZeeActive). Word-ish boundaries keep it from
 // matching substrings of unrelated cmdlines.
 export const AGENT_PROC_PATTERN = `(^|/| )(${[...new Set(Object.values(ADAPTERS).map((a) => a.bin))].join('|')})( |$)`;
+
+// pgrep -f pattern for the NARROWER question: "is the queenzee's HEADLESS turn in flight right
+// now?" — as opposed to AGENT_PROC_PATTERN, which also matches the interactive session a human
+// drives in the pane. The difference decides who owns the cxell's terminal, and therefore whether
+// a message can be TYPED into it at all (see cxellTalkCommand): during a headless turn the pane is
+// zee-attach.sh's read-only feed, and keystrokes sent there are swallowed.
+//
+// ⚠ MUST stay in lockstep with `live_run()` in docker/zeehive/zee-attach.sh — that script decides
+// the same thing from inside the cage, and the two disagreeing is a message delivered into a void.
+export const HEADLESS_PROC_PATTERN = 'claude --bare -p|codex exec|kimi -p';
