@@ -19,7 +19,9 @@ const commits = Array.from({ length: 12 }, (_, i) => ({
 commits[2].parents = ['h3', 'h5'];          // a merge → a second lane, to show the weave
 
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff'];
-const BASES = ['h0', 'h2', 'h4', 'h6', 'h9', 'h3'];    // six xells, six different heads (prods on h0,h2)
+// eight xells, eight different heads (prods on h0,h2; then the manager on h1 and its reaped worker on
+// h8 — a husk needs a dot of its OWN or the "a husk lends nothing" story lands on the manager's dot)
+const BASES = ['h0', 'h2', 'h4', 'h6', 'h9', 'h3', 'h1', 'h8'];
 const NAMES = ['swift-atlas', 'sunny-ember', 'calm-ridge', 'bold-harbor', 'lucid-fern', 'brave-quill'];
 
 const xells = NAMES.map((slug, i) => ({
@@ -55,6 +57,16 @@ xells[3].hive_status = 'occ-tendRequest'; xells[5].hive_status = 'occ-working';
 xells[3].tend = { open: true, at: new Date(Date.now() - 9 * 60e3).toISOString(),
   reason: 'the migration needs prod’s schema — do I ask for a db-catchup or is this a seed?' };
 xells[5].zee_status = 'working'; xells[5].cli_active = true;
+// …and a REAPED crew member, because the rule easiest to get wrong is the one worth SEEING: a husk
+// lends nothing to the highlight (hive/crew.js isLiveXell). Hover or select the manager and this one
+// stays dark — hexagon, wire and commit dot — while its two live siblings light up, and the manager's
+// hexagon counts 2 crew, not 3.
+xells.push({
+  id: 'x7', slug: 'stale-glade-7f2c', status: 'husk', hive_status: 'vac-dirty', manager_xell_id: 'x6',
+  branch: 'spinoff/stale-glade-7f2c', head_commit: 'ab5510de', remote_source: { ref: 'master' },
+  created_at: new Date(Date.now() - 26 * 3600e3).toISOString(),
+  stack: [{ role: 'db', name: 'db-stale-glade', health: 'down', docker_ctx: 'ugreen' }],
+});
 
 // x0/x1 are the two prods (gold), on h0 & h2 → the graph tracks the median of the pair
 const timeline = {
@@ -105,13 +117,16 @@ function Demo() {
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
       </section>
 
-      <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
-                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+      {/* `xells` to BOTH of these as well as the canvas: the manager↔crew relation is drawn in all
+          three layers (hive/crew.js), so a demo that withheld the fleet from two of them would show a
+          highlight that half works — exactly the state ticket #25 existed to fix. */}
+      <GraphPane timeline={timeline} xells={xells} orientation={orientation} honeySide={honeySide}
+                 hexPosRef={hexPosRef} prodIds={prodIds} expandedId={expandedId} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
                  onFlip={() => { setHoneySide((s) => s === 'a' ? 'b' : 'a'); setVersion((v) => v + 1); }}
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
-      <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
+      <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />

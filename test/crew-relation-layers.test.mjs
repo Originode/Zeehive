@@ -36,6 +36,7 @@ const SRC = {
   wires: 'web/src/Connectors.jsx',
   graph: 'web/src/GraphPane.jsx',
   app: 'web/src/App.jsx',
+  demo: 'web/src/demo.jsx',
 };
 const src = Object.fromEntries(Object.entries(SRC).map(([k, f]) => [k, readFileSync(f, 'utf8')]));
 const built = [];
@@ -91,6 +92,13 @@ ok(/xells=\{xells\}/.test(src.app.split('<GraphPane')[1].split('/>')[0])
    'App hands both of them the same fleet list the honeycomb draws from');
 ok(/expandedId=\{expandedId\}/.test(src.app.split('<GraphPane')[1].split('/>')[0]),
    'and the graph is told what is SELECTED, so a bloom marks the crew there too');
+// the demo harness is the ONE place a human can see this without a fleet, so it must be wired the same
+// way — a demo that withheld the fleet from two of the three layers would show a half-working highlight
+ok(/xells=\{xells\}/.test(src.demo.split('<GraphPane')[1].split('/>')[0])
+   && /xells=\{xells\}/.test(src.demo.split('<Connectors')[1].split('/>')[0]),
+   'the DEMO harness hands both panes the fleet too — the visual proof surface is not a special case');
+ok(/status: 'husk'[\s\S]{0,160}manager_xell_id: 'x6'/.test(src.demo),
+   'and the demo fixture carries a REAPED crew member of the demo manager, so the rule easiest to get wrong is visible');
 
 // ── 2. ONE visual idea: the dash is shared, and it is not a colour ───────────
 console.log('\n── one dash, three layers ──');
