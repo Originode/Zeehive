@@ -9,9 +9,9 @@
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
 import React, { useState, useEffect } from 'react';
-import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, getDiffCandidates, duplicateProd } from './api.js';
+import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, getDiffCandidates, checkContainerData, getDataCheckReadiness, duplicateProd } from './api.js';
 import { nick } from './nick.js';
-import { diffReportText, driftDirection, SCOPE_LINE } from './drift.js';
+import { diffReportText, driftDirection, SCOPE_LINE, dataReportText } from './drift.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 // Production is EXCLUDED from decommission entirely (not warned) — a prod container/db is never a
@@ -223,6 +223,11 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   const [picking, setPicking] = useState(false);
   const [cands, setCands] = useState(null);
   const [candErr, setCandErr] = useState(null);
+  // "Check data" is the OTHER question — did the rows arrive? — so it gets its own in-flight guard and
+  // its own readiness answer, fetched with the menu: a db with no recorded source backup cannot be
+  // checked, and the item says so instead of being offered and then refusing (TKT-22-4F0E).
+  const [dataing, setDataing] = useState(false);
+  const [dataReady, setDataReady] = useState(null);
   // "Duplicate prod" streams a fresh prod dump into THIS dev db (backup + restore in one). Guard the
   // in-flight window so a double-click can't fire two overwrites. Reset when the menu retargets.
   const [dupPending, setDupPending] = useState(false);
@@ -231,6 +236,7 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   useEffect(() => {
     setConfirming(false); setTyped(''); setBusyAct(false); setErr(null);
     setDiffing(null); setPicking(false); setCands(null); setCandErr(null); setDupPending(false);
+    setDataing(false); setDataReady(null);
   }, [cid]);
 
   // The reference dbs this container can be measured against, fetched the first time the picker is
@@ -244,6 +250,18 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
       .catch((e) => { if (live) { setCands([]); setCandErr(e?.error || e?.message || String(e)); } });
     return () => { live = false; };
   }, [picking, cid, cands]);
+
+  // Can this db's ROWS be checked, and against which backup? Asked as soon as the menu opens on a
+  // non-prod db, because the answer decides what the item says. Failure is not fatal: the item stays
+  // available and the server gives the reason if it is clicked.
+  useEffect(() => {
+    if (!cid || menu?.c?.role !== 'db' || isProdContainer(menu?.c)) return;
+    let live = true;
+    getDataCheckReadiness(cid)
+      .then((r) => { if (live) setDataReady(r || null); })
+      .catch(() => { if (live) setDataReady(null); });
+    return () => { live = false; };
+  }, [cid, menu?.c]);
 
   const buildable = c ? isBuildable(c) : false;
   const busy = c ? busyReason(c) : null;
@@ -319,6 +337,26 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
     } catch (e) {
       setDiffing(null);
       showAlert('Check diff failed: ' + (e?.error || e?.message || e), { variant: 'error' });
+    }
+  };
+
+  // Check this db's ROWS against the backup it was restored from. Deliberately NOT folded into
+  // runCheckDiff: they answer different questions, they can disagree (a perfect schema over an empty
+  // database is the exact case that started this), and a human must be able to tell which answer they
+  // are holding. Never persists onto the drift chip — the server keeps it in its own column.
+  const runCheckData = async () => {
+    if (dataing) return;
+    setDataing(true);
+    try {
+      const r = await checkContainerData(c.id);
+      onClose();
+      showAlert(dataReportText(c.name, r), {
+        title: r?.ok === false ? 'Check data failed' : 'Row-count check',
+        variant: (r?.ok === false || r?.verdict === 'incomplete') ? 'error' : 'info',
+      });
+    } catch (e) {
+      setDataing(false);
+      showAlert('Check data failed: ' + (e?.error || e?.message || e), { variant: 'error' });
     }
   };
 
@@ -530,6 +568,25 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
               ))}
             </div>
           )}
+          {/* CHECK DATA — the second question, one item down from the first and never merged into it.
+              Its sub-label carries the reference (which backup, taken when) or the reason there isn't
+              one, so the difference between "your rows are missing" and "nobody recorded what should
+              be here" is visible BEFORE the click. TKT-22-4F0E. */}
+          <button role="menuitem" data-testid="check-data-open" disabled={dataing || dataReady?.ready === false}
+                  onClick={runCheckData}
+                  title={dataReady?.ready === false
+                    ? `cannot check rows: ${dataReady.reason}`
+                    : 'count the rows in this db and compare them against the backup it was restored from'}>
+            🧮 {dataing ? 'Counting rows…' : 'Check data'}
+            <span className="ctxsub">
+              {dataReady?.ready === false
+                ? dataReady.reason
+                : dataReady?.snapshot
+                  ? `vs the backup of ${new Date(dataReady.snapshot.taken_at).toLocaleString()}`
+                    + `${dataReady.snapshot.row_total != null ? ` (~${Number(dataReady.snapshot.row_total).toLocaleString()} rows)` : ''}`
+                  : 'do the ROWS match the backup this db was restored from?'}
+            </span>
+          </button>
         </>
       ))}
 

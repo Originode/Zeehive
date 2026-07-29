@@ -22,6 +22,9 @@ import { resolveSite } from '../lib/sites.js';
 import { listContainersDetailed } from '../lib/docker.js';
 import { pickDbContainer } from '../lib/xell-db.js';
 import { refreshProdDiffAfterRestore } from './proddiff.js';
+// The DATA half of a backup's guarantee — pure functions + the catalog SQL, kept out of here so both
+// the capture and every reading of it (trend, restore check) are testable with no docker (row-counts.js).
+import { ROW_COUNT_SQL, parseRowCounts, rowTotal, compareBackupCounts } from '../lib/row-counts.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -509,8 +512,31 @@ export async function backupProd(projectId) {
   return snap;
 }
 
+// PER-TABLE ROW ESTIMATES from the SOURCE, taken next to the dump — the data half of TKT-22-4F0E.
+//
+// Three rules this obeys, and they are the reason it is shaped like this:
+//   1. It NEVER fails a backup. The dump is the product; these counts are instrumentation. Every
+//      failure path returns null and logs a line — a snapshot with no counts is a snapshot, and the
+//      surfaces read null as "not captured", never as "the database was empty".
+//   2. It NEVER extends the window production is locked for. reltuples is a pg_class read: it takes no
+//      table locks, touches no heap, and runs AFTER pg_dump has already let go.
+//   3. It is never an exact count(*) here. Minutes of I/O on a 1.3 GB production database for a number
+//      that only has to be good enough for a trend is not a trade worth making.
+async function sourceRowCounts(ctx, container, dbUser, dbName) {
+  const r = await execAsync('docker',
+    ['--context', ctx, 'exec', container, 'psql', '-U', dbUser, '-d', dbName, '-tAq', '-c', ROW_COUNT_SQL],
+    { timeout: 120000 });
+  if (r.status !== 0) {
+    logline('maint', `row-count probe of ${container}/${dbName} failed (exit ${r.status}) — the BACKUP is `
+      + `unaffected, but this dump records no row counts: ${(r.stderr || '').trim().split('\n').pop()?.slice(0, 160)}`);
+    return null;
+  }
+  const counts = parseRowCounts(r.stdout);
+  return Object.keys(counts).length ? counts : null;
+}
+
 async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, tables = [], keep }) {
-  let size = null, error = null, tocText = null, tocSummary = null;
+  let size = null, error = null, tocText = null, tocSummary = null, rowCounts = null;
   const scoped = Array.isArray(tables) && tables.length > 0;   // a partial, table-scoped dump
   const tArgs = dumpTableArgs(tables);                          // [] for a full-database dump
   try {
@@ -583,6 +609,13 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         tocText = list.stdout;
       }
 
+      // The row estimates for what was just dumped — AFTER the dump, so it cannot delay it or hold
+      // anything of prod's, and inside the same try only so a probe error is logged like any other
+      // (sourceRowCounts itself never throws). Deliberately not gated on `scoped`: a scoped dump's
+      // counts still describe the source, and the restore check reads only the tables it holds.
+      rowCounts = await sourceRowCounts(srcCtx, container, dbUser, dbName)
+        .catch((e) => { logline('maint', `row-count probe errored (backup unaffected): ${e.message}`); return null; });
+
       // ── validation common to both destinations ──────────────────────────────
       const toc = parseDumpToc(tocText);
       // The full-database table list this dump captured, as 'schema.table' strings — feeds the
@@ -639,11 +672,41 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
     return;
   }
 
-  const row = await one(`UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3, toc_summary=$4 WHERE id=$1 RETURNING *`,
-    [snap.id, size, MODE, tocSummary ? JSON.stringify(tocSummary) : null]);
+  const row = await one(
+    `UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3, toc_summary=$4,
+                            row_counts=$5::jsonb, row_total=$6 WHERE id=$1 RETURNING *`,
+    [snap.id, size, MODE, tocSummary ? JSON.stringify(tocSummary) : null,
+     rowCounts ? JSON.stringify(rowCounts) : null, rowCounts ? rowTotal(rowCounts) : null]);
   if (dbc) await clearBusy(dbc.id);
   broadcast('task', { kind: 'db_snapshot', snap: row });
   logline('maint', `backup finished (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath} (${size ?? '?'} bytes)`);
+
+  // THE TREND, which is the reading nothing in this system could give before: a table that SHRANK
+  // since the last good dump. Growth, a new table and a dropped table are all normal and are counted
+  // but never dressed as loss; only a real drop — and worst of all a populated table arriving EMPTY —
+  // is a finding, and it is said out loud HERE, in the log a human watches, as well as on the panel.
+  // Estimates on both sides, equally stale, which is exactly what makes the comparison fair.
+  if (rowCounts && !scoped) {
+    const prevRows = await one(
+      `SELECT row_counts FROM db_snapshot
+         WHERE project_id=$1 AND source='prod' AND status='finished' AND mode='real' AND id<>$2
+           AND tables IS NULL AND row_counts IS NOT NULL
+         ORDER BY taken_at DESC LIMIT 1`, [snap.project_id, snap.id]);
+    const trend = compareBackupCounts(prevRows?.row_counts ?? null, rowCounts);
+    if (!trend) {
+      logline('maint', `row counts recorded for this backup (~${rowTotal(rowCounts).toLocaleString()} rows in `
+        + `${Object.keys(rowCounts).length} tables). No earlier backup carries counts yet, so there is nothing to `
+        + 'compare against — the NEXT backup gets a trend. (Estimates, and about the DUMP SOURCE, not the archive.)');
+    } else if (trend.verdict === 'ok') {
+      logline('maint', `row counts steady vs the last backup: ~${trend.total_now.toLocaleString()} rows `
+        + `(was ~${trend.total_prev.toLocaleString()}) · ${trend.counts.grew} grew, ${trend.counts.steady} unchanged`
+        + `${trend.counts.added ? `, ${trend.counts.added} new table(s)` : ''}`);
+    } else {
+      logline('maint', `⚠ ${trend.emptied.length} table(s) went EMPTY and ${trend.shrunk.length} SHRANK since the last `
+        + `backup — ${trend.worst.map((w) => `${w.table} ${w.prev.toLocaleString()}→${w.now.toLocaleString()}`).join(', ')}`
+        + `. These are planner ESTIMATES, so a small drop can be noise — an emptied table is not. Worth a look.`);
+    }
+  }
   await housekeepBackups(snap.project_id, keep);
 }
 
@@ -794,6 +857,21 @@ export async function restoreBackup({ snapshot, container, confirmProd = false, 
   return { ok: true, status: 'started', container: c.name };
 }
 
+// Remember what a database was loaded FROM (and clear any stale data-check verdict, which described
+// the previous contents). `snapshotId` null = a live pipe with no snapshot in the middle
+// ("Duplicate prod"), which the note then names. Never throws: bookkeeping must not fail a restore.
+async function noteRestoredFrom(containerId, snapshotId, note = null) {
+  try {
+    const row = await one(
+      `UPDATE container SET restored_from=$2, restored_at=now(), restored_note=$3,
+                            data_check=NULL, data_check_at=NULL
+        WHERE id=$1 RETURNING *`, [containerId, snapshotId, note]);
+    if (row) broadcast('container', row);
+  } catch (e) {
+    logline('maint', `could not record what ${containerId} was restored from: ${e.message}`);
+  }
+}
+
 async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
   let restored = false;
   const tArgs = restoreTableArgs(tables);   // [] ⇒ restore the whole archive
@@ -831,6 +909,12 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
     }
     logline('maint', `restore finished → ${c.name}`);
     restored = true;
+    // WHICH DUMP THIS DATABASE NOW IS. Recorded, not inferred: the data check compares a restored db
+    // against the counts of ITS OWN source, and "probably the newest snapshot at the time" is exactly
+    // the kind of guess this ticket exists to stop. A table-scoped restore says so, because then only
+    // those tables came from this archive and a whole-db comparison would be meaningless.
+    await noteRestoredFrom(c.id, snap.id,
+      tables.length ? `restored ${tables.length} table(s) only: ${tables.join(', ')}` : null);
   } catch (e) {
     logline('maint', `restore FAILED → ${c.name}: ${e.message}`);
   } finally {
@@ -930,6 +1014,11 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
     }
     logline('maint', `duplicate finished → ${target.name}`);
     restored = true;
+    // No snapshot in the middle — this WAS live prod, piped. Record that rather than leaving a stale
+    // "restored from last night's dump" behind it: the data check needs to know it has no recorded
+    // reference for this db and must say so instead of grading it against the wrong dump.
+    await noteRestoredFrom(target.id, null,
+      'duplicated LIVE production (a direct pg_dump → pg_restore pipe; no snapshot, so no recorded row counts)');
   } catch (e) {
     logline('maint', `duplicate FAILED → ${target.name}: ${e.message}`);
   } finally {
