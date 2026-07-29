@@ -53,6 +53,7 @@ zee sync [--no-rebuild]                          # CATCH UP / rebase: merge curr
 zee db-catchup [--restore]                        # roll your OWN db (clone/isolated) forward to prod's schema (NOT gated)
 zee tend --reason "…" | --clear                  # raise/lower "I need a human" — the BRIEF reason is required
 zee land                                         # collect commits + gated push to main (ONLY when 100% certain)
+zee land --withdraw [--reason "…"]               # UN-ASK your held landing (withdraw the old one BEFORE landing again)
 zee ship [--targets server webapp] --reason "…"  # ask to deploy to prod   (ONLY when 100% certain)
 zee hint-land [--reason "…"] | --clear           # "looks land-ready" — light the land? button for a human, don't land
 zee hint-ship [--reason "…"] | --clear           # "looks ship-ready" — light the ship? button for a human, don't ship
@@ -60,6 +61,8 @@ zee prod --reason "…"                            # ask to be bound to the prod
 zee seed --file <seed.sql> --reason "…"          # ask a human to approve a LANDED seed file; the QUEENZEE runs it on PROD
 zee report --message "…" [--kind reflection]     # send YOUR MANAGER a note (if you have one)
 zee inbox [--all]                                 # read what other zees sent you
+zee work [--board] [--item <id>]                  # the WORK ITEM you are executing (its plan, ticket, history)
+zee item [<id>] --status <s> [--progress N] [--note "…"]   # report where YOUR work item has got to
 zee done --summary "…"                           # propose your job is done (ONLY after landed — and shipped, if shipping)
 ```
 
@@ -174,6 +177,40 @@ already approved this exact sha). Your commits are safe on your branch; nothing 
 agrees. Re-run `zee land` after approval (or poll `zee status`). Commit before you land — only
 committed work is collected. If the worktree has diverged from your cxell, land refuses rather than
 force a merge; that means something moved underneath you — check with a human.
+
+**If your landing goes STALE**, it did not land and it never will: main moved on while your push
+waited (another zee landed first), so the sha a human approved can no longer fast-forward — and an
+approval is bound to ONE exact sha. Nothing is lost; every commit is still on your branch. The
+queenzee closes the request, RESUMES YOUR SESSION to tell you, and the recovery is two steps:
+**`zee sync`** (merge current main into your branch — resolve any conflict it leaves you, `git add`,
+`git commit`, and re-verify with `zee build … --wait` if the merge touched your change), then
+**`zee land`** again, which raises a FRESH request on the new sha. A new decision on new content is
+expected, not a setback. Do NOT re-push the dead sha and do NOT amend/force to get around the gate.
+(`zee land --wait` and `zee status --wait` both exit on `stale` with the same instruction, and if
+the queenzee cannot reach you it raises a `tend` so a human picks it up instead.)
+
+**ONE open landing per zee — do NOT spam the gate.** A held landing is a QUESTION you asked a
+human, and every extra push while it is open asks the same human another one. Three cards from one
+xell, two of them obsolete, and only you know which is current: that is not urgency, it is noise,
+and it is how the real one gets ignored. If you asked to land and then kept working — you found a
+bug in what you pushed, you were handed more scope, the work was not as finished as you thought —
+**withdraw the open request first, then land again**:
+
+```
+zee land --withdraw --reason "found a bug in the migration; re-landing once it is fixed"
+zee land            # one fresh card, for the sha you actually mean
+```
+
+`POST /api/xell/self/land/withdraw` (`zee land --clear` is the same verb, for symmetry with `zee
+tend --clear` / `zee done --clear`). It **un-asks**, and that is all it does: nothing lands, nothing
+is rejected, no sha is burned and your branch is untouched — the card simply leaves the human's
+screen. `--request <id>` withdraws one specific request; with no id it lowers all of yours that are
+still pending. You may only ever withdraw your OWN.
+
+**An APPROVED landing is not yours to retract.** A human already decided it and the queenzee is
+landing it; withdraw is refused. If it genuinely must not land, `zee tend --reason "…"` and say so.
+And if you are not sure the work is landable at all, do not raise a request you will have to
+withdraw — `zee hint-land` lights the button and leaves the decision with a human.
 
 ### `zee ship` — deploy to production
 `POST /api/xell/self/ship` `{ reason, targets? }`. You only **ask**. It is **refused unless your
@@ -291,6 +328,29 @@ actually went live and report, specifically and without reassurance:
 Send it with `zee report --kind reflection --message "…"`. With a manager it lands in their inbox
 and becomes the next task; without one it is recorded for the humans in the console. If something
 is genuinely broken in production, ALSO `zee tend` — and do not start fixing it unasked.
+
+### `zee work` · `zee item` — the WORK ITEM you are executing
+`GET /api/xell/self/work` · `POST /api/xell/self/work/item`. ZEEHIVE keeps a PLAN — tickets broken
+down into a tree of work items (project → activity → task) on a board. Your xell may be assigned to
+one of those items, and if it is, the card on that board is how humans watch this job.
+
+- `zee work` shows you the item: its title and body, its ANCESTORS (which project/activity it sits
+  under), the ticket it came from and its children and its history — and, when it was cut from a ticket, that ticket's own words.
+  Read it. It is the same material your briefing was built from, and it is the answer to "is this
+  in scope?".
+- `zee item --status working --progress 40 --note "…"` reports where you have got to. The board
+  already follows your hive status by itself (working, blocked, awaiting a human), so you do not
+  have to narrate — report when the FACT changes in a way your hexagon cannot show, and when the
+  work itself is finished.
+
+**You may only ever touch YOUR OWN item.** The server resolves which one that is from your token —
+naming somebody else's id is refused, and so is the plan around yours. That is the same rule as
+everything else in the cage: your own xell, and nothing beside it.
+
+**And it is a report of FACT, not a gate.** Setting your item `done` says the WORK is finished; it
+does NOT mark your xell done, land anything or ship anything. Those are still `zee land` / `zee
+ship` / `zee done` and the humans who approve them. An item reported done with commits still only
+on your branch is a card that lies — land first.
 
 ### `zee done` — propose you are finished
 `POST /api/xell/self/done` `{ summary }`. Flags your xell `awaiting-done`. A **human** confirms with

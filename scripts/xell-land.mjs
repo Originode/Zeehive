@@ -63,7 +63,9 @@ if (statusOnly) {
 if (withdraw) {
   const cur = json(await req('GET', `/api/land/status?xell=${encodeURIComponent(x.id)}`));
   if (!cur?.id) { console.log('Nothing to withdraw — this xell has no land request on record.'); process.exit(0); }
-  if (cur.status !== 'pending') {
+  // A HOLDING request is un-askable too (066): it is this zee's own ask and nobody has decided it,
+  // so leaving the pattern is the zee's to do. A CLEARED one has already left it.
+  if (cur.status !== 'pending' && !(cur.status === 'holding' && !cur.cleared)) {
     console.log(`Nothing to withdraw — the latest land request is '${cur.status}', not pending.`);
     console.log(cur.status === 'approved'
       ? '  It is APPROVED: a human decided it and the queenzee is landing it. That is not yours to retract.' : '');
@@ -84,6 +86,21 @@ if (p.code >= 400) { console.log(`Push failed: ${r0.error || p.code}`); process.
 
 if (r0.landed) {
   console.log(`\n  ✓ LANDED on ${r0.ref} @ ${String(r0.head).slice(0, 8)} — a human had already approved this sha.\n`);
+  process.exit(0);
+}
+
+// THE HOLDING PATTERN (066) — the push was queued, not held for a human. One runway per ref: while
+// another xell's landing is open on main, a second card would be a card that can never land (the
+// first approval moves the ref and the second sha stops fast-forwarding). So we print the POSITION
+// and exit — there is nothing to poll for, and waiting here would burn the full timeout on a
+// decision nobody will ever be asked to make. That is exactly how this script used to fail on 'stale'.
+const held0 = json(await req('GET', `/api/land/status?xell=${encodeURIComponent(x.id)}`));
+if (held0?.status === 'holding' && !held0.cleared) {
+  console.log(`\n  ⏳ HOLDING at position ${held0.holding_position || '?'}`
+    + `${held0.holding_behind?.xell_slug ? ` behind ${held0.holding_behind.xell_slug}'s landing` : ''} — the runway takes ONE at a time.`);
+  console.log('    Your push was NOT rejected and NOT dropped: it is recorded and queued, and your commits are safe.');
+  console.log('    No card was raised for a human, deliberately. When the runway clears the queenzee RESUMES the zee');
+  console.log('    and tells it to `zee sync` then `zee land`. Do not poll and do not re-push.\n');
   process.exit(0);
 }
 
@@ -124,6 +141,20 @@ while (Date.now() < deadline) {
     console.log('      zee sync   # merges current main into your branch — resolve any conflict, git add/commit');
     console.log('      zee land   # raises a FRESH request on the synced sha\n');
     process.exit(1);
+  }
+
+  if (s.status === 'holding') {
+    // Queued behind another xell's landing (or just cleared to take the runway). Either way this is
+    // NOT a decision a poll can catch — stop, and say what the next move is.
+    if (s.cleared) {
+      console.log('\n  ✈ CLEARED — the runway is free and this xell is next. Nothing was approved:');
+      console.log('      zee sync   # the xell ahead landed, so main moved — merge it in');
+      console.log('      zee land   # raises the FRESH request a human decides on\n');
+      process.exit(1);
+    }
+    console.log(`\n  ⏳ HOLDING at position ${s.holding_position || '?'} — one landing per ref at a time; no card was raised.`);
+    console.log('    The queenzee resumes the zee when the runway clears (`zee sync`, then `zee land`). Not waiting.\n');
+    process.exit(0);
   }
 
   if (s.status === 'withdrawn') {

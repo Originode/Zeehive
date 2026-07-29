@@ -1,0 +1,26 @@
+-- THE RUNWAY — one open landing per ref; everyone else flies a HOLDING PATTERN.
+--
+-- The deadlock this ends: two zees finish at the same time and both push to main. Both pushes are
+-- held, so a human gets TWO cards for one runway. Whichever they approve first moves the ref — and
+-- the OTHER one is now a non-fast-forward, i.e. dead on arrival. The gate binds an approval to one
+-- exact sha, so the second card can never land; it is swept 'stale' and its zee is sent back to
+-- `zee sync`. A human was asked to decide something that already had no outcome, and a zee was left
+-- holding an ask nobody could grant. Three zees make it three cards and two go-arounds.
+--
+-- Airports solved this a century ago: ONE aircraft on the runway, everyone else holds at an assigned
+-- position and is CLEARED by the tower when it frees up. So: a push that arrives while another
+-- xell's landing is still open on that ref is not held for a human at all — it enters the holding
+-- pattern. It is a real, recorded ask (the zee's work is acknowledged, not dropped), it just is not
+-- a card yet. When the runway frees — the occupant lands, is rejected, is withdrawn, or goes stale —
+-- the queenzee CLEARS the next holder: it resumes that zee's session and tells it to `zee sync` and
+-- `zee land` again. That is the whole protocol.
+--
+-- WHAT DOES NOT CHANGE, and must not: the human gate. Clearance is a NUDGE, never an approval. A
+-- holding row is never approvable, never decided and never lands; the zee still pushes, a human
+-- still reads that exact sha, and only that approval moves the ref. The queue reorders WHO ASKS
+-- FIRST — it grants nothing.
+--
+-- ALONE IN THIS FILE ON PURPOSE: postgres refuses to USE a new enum value in the same transaction
+-- that adds it, and the migration runner wraps each file in one (the 061/062 precedent). The
+-- columns, checks and indexes that reference 'holding' therefore live in 067.
+ALTER TYPE land_status ADD VALUE IF NOT EXISTS 'holding';
