@@ -80,6 +80,22 @@ ship's own migration ledger. Those were all phantom drift once, on databases tha
 copies of prod — see `test/proddiff-extension-noise.test.mjs`. If you are looking at a difference
 that no migration owns, check whether it belongs to an extension before treating it as real.
 
+An **empty** database is also not a drifted one, and no longer reports as one: when a db holds none
+of the reference's tables and nothing extra, the payload carries `empty_db` and every surface says
+"EMPTY — never restored" instead of a difference count. That is §3.4 above, answered before you ask.
+
+## 6. What this number CANNOT tell you — it is not a data check
+
+`proddiff` reads catalogs. It counts no rows, reads no values and never opens a dump, so **a drift
+number says nothing about whether data is present or backed up** — in either direction. A green 0 is
+not reassurance and a red 12,802 is not evidence of loss (in the worked example below, the 12,802 db
+held no data because it held no *tables*; production was untouched). Every payload declares this
+(`scope`, `covers`, `data_compared: false`) and every surface repeats it, because the two questions
+arrived merged in one ticket and one number cannot answer both — TKT-22-4F0E.
+
+For what *is* verified about a backup, what is not, and the proposal for an actual row-level check,
+see [data-completeness-check.md](data-completeness-check.md).
+
 ---
 
 ### A worked example (dated observation, 2026-07-29 — not a standing fact)

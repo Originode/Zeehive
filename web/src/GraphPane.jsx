@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { computeGraph } from './hive/graph.js';
+import { crewLinks, relatedTo, focusIdOf, REL_DASH_ATTR } from './hive/crew.js';
 
 // The git graph as the centre divider — proper GitLens-style lanes (ported from GitRail), oriented
 // by aspect: a VERTICAL spine in landscape, a HORIZONTAL one in portrait. It is a fixed-step spine
@@ -30,7 +31,22 @@ const median = (a) => {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
 
-export default function GraphPane({ timeline, orientation, honeySide, hexPosRef, prodIds = [], subscribeGeom,
+// ── a commit dot's ANCHOR RING: whose xell sits here, and how it relates to the focus ──
+// The ring around a dot says "a xell is anchored at this commit" (in that xell's trace colour). On top
+// of that it carries the hive's focus vocabulary, the same one the hexes and the wires use:
+//   the focus  → a SOLID bright ring (unchanged)
+//   related    → the same ring, DASHED (hive/crew.js REL_DASH) — a manager's live crew, marked here as
+//                "related to what you are looking at", never as the thing you are looking at
+//   otherwise  → the plain anchor ring, or none at all
+// Pure so it can be asserted as data; the component below only renders it.
+export function anchorRing({ ring = null, hovered = false, related = null }) {
+  if (hovered) return { show: true, stroke: 'var(--text)', width: 2.5, dash: null };
+  if (related) return { show: true, stroke: 'var(--text)', width: 2, dash: REL_DASH_ATTR };
+  return { show: !!ring, stroke: ring, width: 2, dash: null };
+}
+
+export default function GraphPane({ timeline, xells = [], orientation, honeySide, hexPosRef, prodIds = [],
+                                   expandedId = null, subscribeGeom,
                                    hoverRef, setHover, subscribeHover, onFlip, onReposition }) {
   const groupRef = useRef(null);
   const portrait = orientation === 'portrait';
@@ -182,6 +198,17 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
     }
   }
 
+  // THE CREW RELATION in this projection (#25): the commits a manager's LIVE crew is anchored at (or,
+  // focused on a worker, the commit its manager sits on). Same helpers as the honeycomb and the wire
+  // overlay — the relationship is read from the fleet list, never re-derived here. A commit the FOCUS
+  // itself sits on stays the focus: hovCommits wins, so a shared dot is never demoted to "related".
+  const related = relatedTo(xells, focusIdOf(hov, expandedId), crewLinks(xells));
+  const relCommits = new Set();
+  for (const id of related.keys()) {
+    const b = (timeline.xells || []).find((t) => t.id === id)?.base_commit;
+    if (b && !hovCommits.has(b)) relCommits.add(b);
+  }
+
   return (
     <div className="graph-pane" data-orient={orientation} style={paneStyle}>
       <svg className="graph-svg" width={svgW} height={svgH}
@@ -197,12 +224,15 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
             const ring = anchors[c.hash]?.[0];
             const [lx, ly] = P(alongOf(row), labelRaw);
             const hovered = hovCommits.has(c.hash);
+            const rel = relCommits.has(c.hash) ? 'crew' : null;
+            const anchor = anchorRing({ ring, hovered, related: rel });
             const subj = c.subject || '';
             const shownSubj = subj.length > msgChars ? subj.slice(0, Math.max(0, msgChars - 1)) + '…' : subj;
             return (
-              <g key={c.hash}>
-                {(ring || hovered) && <circle cx={cx} cy={cy} r={DOT + 3} fill="none"
-                        stroke={hovered ? 'var(--text)' : ring} strokeWidth={hovered ? 2.5 : 2} />}
+              <g key={c.hash} data-rel={rel || undefined}>
+                {anchor.show && <circle cx={cx} cy={cy} r={DOT + 3} fill="none"
+                        stroke={anchor.stroke} strokeWidth={anchor.width}
+                        strokeDasharray={anchor.dash || undefined} />}
                 <circle cx={cx} cy={cy} r={hovered ? DOT + 1 : DOT} data-commit={c.hash} data-dot
                         fill={isMerge ? 'var(--bg)' : LANE[lane % LANE.length]}
                         stroke={LANE[lane % LANE.length]} strokeWidth={isMerge ? 2 : 0} />

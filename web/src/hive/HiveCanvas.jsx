@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
 import { hiveColor, hiveStatusLabel, hiveHeat } from './status.js';
+import { isManagerXell, crewLinks, relatedTo, focusIdOf, hexDim, relationTag, REL_DASH } from './crew.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
@@ -61,8 +62,9 @@ const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
 // head sha and its diffstat count work it can never land — noise dressed as progress. Its hexagon
 // therefore drops both and is drawn in the HARNESS BADGE's visual language instead (dashed seat +
 // the persona disc it wears), spending the space on what a manager actually IS: its crew, and its
-// read-only hold on production.
-export const isManagerXell = (x) => x?.zee_type === 'manager';
+// read-only hold on production. (The predicate itself lives in hive/crew.js with the rest of the
+// manager↔crew relation — every layer that draws the relation asks the same question of the same code.)
+export { isManagerXell } from './crew.js';
 
 // ── who WEARS a harness vs who its badge is FOR ──────────────────────────────
 // `wearer_ids` is every live xell wearing the harness; `consumer_ids` is the subset the badge is
@@ -75,69 +77,13 @@ export const isManagerXell = (x) => x?.zee_type === 'manager';
 export const wearersOf = (h) => h?.wearer_ids || h?.consumer_ids || [];   // old payloads: wearers = consumers
 export const badgedHarnesses = (harnesses = []) => (harnesses || []).filter((h) => (h?.consumer_ids || []).length > 0);
 
-// ── a manager and its CREW: the one real grouping in the honeycomb ────────────
-// seatXells already sits a manager's crew in the cells NEAREST to it, so the relationship was half
-// expressed by layout and not at all by interaction: hovering a manager told you nothing about which
-// of the cells around it were actually its own. These three pure helpers are that answer, and they
-// cost no request — `xell.manager_xell_id` already rides on the fleet payload the console polls.
-//
-// LIVE crew only, by the SAME rule the work tracker resolves a live zee with (server/src/lib/
-// work-items.js LIVE_XELL_STATUSES): 'retired' is gone and 'husk'/'error' are VACANT (lib/
-// hive-status.js classes both as vac-dirty), so no zee occupies any of them. A reaped worker lighting
-// up as though it were still there draws a crew that does not exist — worse than no highlight.
-const DEAD_XELL_STATUSES = ['retired', 'husk', 'error'];
-export const isLiveXell = (x) => !!x && !DEAD_XELL_STATUSES.includes(String(x.status || ''));
-
-// manager id → its LIVE crew, and worker id → the manager it reports to (only when that manager is
-// itself live — a husk manager cannot be "who this one reports to"). A dead manager's own hover still
-// gets a crew list: the manager row is vacant, but the workers it dispatched are real and running.
-export function crewLinks(xells = []) {
-  const byId = new Map();
-  for (const x of xells || []) if (x?.id) byId.set(x.id, x);
-  const crewOf = {};
-  const managerOf = {};
-  for (const x of xells || []) {
-    const mid = x?.manager_xell_id;
-    if (!mid || !isLiveXell(x)) continue;
-    (crewOf[mid] ||= []).push(x);
-    if (isLiveXell(byId.get(mid))) managerOf[x.id] = mid;
-  }
-  return { crewOf, managerOf };
-}
-
-// Who is RELATED to the focused (hovered or selected) xell, and HOW → Map(id → 'crew' | 'manager').
-// ONE hop, deliberately: a manager marks its crew, and a worker marks the manager it reports to
-// ("who does this one report to" is the same question asked backwards). A worker does NOT mark its
-// SIBLINGS — they are not related to it, they merely share a boss, and lighting five cells from one
-// worker's hover reads as a selection sweep rather than an answer.
-export function relatedTo(xells = [], focusId, links = null) {
-  const rel = new Map();
-  if (!focusId) return rel;
-  const focus = (xells || []).find((x) => x?.id === focusId);
-  if (!focus) return rel;
-  const l = links || crewLinks(xells);
-  if (isManagerXell(focus)) for (const w of l.crewOf[focusId] || []) rel.set(w.id, 'crew');
-  const mid = l.managerOf[focusId];
-  if (mid && mid !== focusId) rel.set(mid, 'manager');
-  return rel;
-}
-
-// A hex DIMS when the focus is elsewhere — but a RELATED hex never dims, and that is the whole
-// highlight: the focus lights its own group and the rest of the fleet recedes behind it. Pure, so the
-// decision the draw loop makes is testable without a canvas.
-export const hexDim = ({ hexId, expandedId = null, hovered = false, hoverActive = false, related = null }) =>
-  !related && ((!!expandedId && expandedId !== hexId) || (hoverActive && !hovered));
-
-// The WORD a relation mark carries. This codebase's rule is that the word is the signal and colour is
-// only reinforcement — a highlight that exists as a hue alone fails for anyone who cannot separate
-// those hues — so every relation mark says which relation it is, in words, and the long form names
-// the other end of it when there is room for it.
-export function relationTag(kind, otherSlug = null) {
-  const other = String(otherSlug || '').trim();
-  if (kind === 'crew') return { kind, glyph: '⬡', word: 'crew', long: other ? `crew of ${other}` : 'crew' };
-  if (kind === 'manager') return { kind, glyph: '⬢', word: 'manager', long: other ? `manager of ${other}` : 'manager' };
-  return null;
-}
+// ── a manager and its CREW ───────────────────────────────────────────────────
+// The relation itself — who is crew, who is live, which xell the hive is focused on, and the DASH that
+// says "related" in every layer — lives in hive/crew.js, because the honeycomb is not the only view
+// that draws it: the wire overlay (Connectors.jsx) and the git graph's dots (GraphPane.jsx) draw the
+// same relationship over the same fleet, and a second copy of the rule is exactly the bug #24 removed
+// from this file. Re-exported here so a caller that reads the honeycomb's vocabulary finds it.
+export { isLiveXell, crewLinks, relatedTo, focusIdOf, hexDim, relationTag, REL_DASH } from './crew.js';
 
 // What a manager's hexagon says, as data (pure — unit-tested; the drawing below only paints it).
 export function managerCard(x, crew = []) {
@@ -648,7 +594,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // — the SELECTED (bloomed) one, so a manager's crew stays marked while its flower is open. Its
     // live crew (or, hovering a worker, the manager it reports to) is marked as RELATED: never
     // dimmed, and drawn with the dashed tie-ring + the word, which is nothing selection uses.
-    const focusId = H.id || expandedId || null;
+    // focusIdOf is shared with the wire overlay and the graph (#25) — three views, one answer.
+    const focusId = focusIdOf(H, expandedId);
     const related = relatedTo(list, focusId, { crewOf, managerOf });
     const focus = focusId ? list.find((x) => x.id === focusId) : null;
     const relColor = focusId ? (tById[focusId]?.color || null) : null;
@@ -994,7 +941,7 @@ export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color =
   hexPath(ctx, cx, cy, size + gap);
   ctx.lineWidth = 1.6;
   ctx.strokeStyle = withAlpha(col, 0.95);
-  ctx.setLineDash([2, 4]);
+  ctx.setLineDash(REL_DASH);          // the SAME dash the related wire and the related commit dot use
   ctx.stroke();
   ctx.setLineDash([]);
   // The word rides an opaque pill INSIDE the seat (never outside it — a label in the corridor would be

@@ -172,9 +172,23 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
       // it is the union of every xell's leftovers, which is exactly why schema work now happens
       // on per-xell clones. Say which situation the zee is in instead of one generic scolding.
       const onShared = xell.db_coupling === 'db-shared-dev';
+      // ONE-DIRECTIONAL drift (everything missing, nothing extra) is not "you changed the schema" —
+      // it is "your copy is OLDER than prod": prod migrated after the dump/clone your db came from.
+      // Telling a zee to write a migration for objects prod already has sends it to write a duplicate
+      // of someone else's landed migration. Name the age, and the catch-up verb. (TKT-22-4F0E.)
+      const kv = Object.values(diff.kinds || {});
+      const behindOnly = kv.length > 0
+        && kv.every((v) => (v.extra_count || 0) === 0) && kv.some((v) => (v.missing_count || 0) > 0);
       return deny(gate('schema', 'deny',
         `Your database schema DIFFERS from production (${diff.total} difference(s) — ${kinds}) and NO `
         + `pending migration accounts for it${skipDb ? ' (and your ship is scoped to skip the db, so pending files would not run anyway)' : ''}. `
+        + (behindOnly
+          ? `EVERY difference is one-directional (prod HAS it, your db does not — nothing is extra here), `
+            + `so your database is almost certainly just OLDER than prod: it is a point-in-time restore/clone `
+            + `and prod migrated after it was cut. Do NOT write a migration for objects prod already has — `
+            + `CATCH UP first (\`zee db-catchup\`, or restore a fresh dump), then re-run this check. If the `
+            + `drift survives a catch-up, it is genuinely yours and the rest of this applies.\n`
+          : '')
         + `Your code was verified against a schema prod will not `
         + `have. Write the change as a file under server/sql/migrations/ (idempotent DDL — ADD COLUMN `
         + `IF NOT EXISTS and friends), land it, and it ships with you: the queenzee applies it to prod `
@@ -195,7 +209,10 @@ export async function ooneyCheck({ xellId, targets = null, reason = null, zeeId 
           : ''), diff));
     }
   } else {
-    steps.push(gate('schema', 'pass', 'tables, columns and triggers are identical to prod.'));
+    // Say the scope even on a PASS: this gate compares catalog shape, never rows. A green schema step
+    // is not a statement that prod's data is intact or backed up (TKT-22-4F0E).
+    steps.push(gate('schema', 'pass',
+      'tables, columns and triggers are identical to prod (schema shape only — no rows are compared).'));
   }
 
   // ── 3. BUILDS — each target must be built from the commit that is about to ship ─────────────

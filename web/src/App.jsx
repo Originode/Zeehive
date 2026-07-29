@@ -653,13 +653,15 @@ export default function App() {
         )}
       </section>
 
-      <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
-                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+      {/* `xells` rides along to BOTH the graph and the wires so the manager↔crew relation is drawn
+          from the same fleet list the honeycomb uses (hive/crew.js) — three views, one grouping. */}
+      <GraphPane timeline={timeline} xells={xells} orientation={orientation} honeySide={honeySide}
+                 hexPosRef={hexPosRef} prodIds={prodIds} expandedId={expandedId} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
                  onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
-      <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
+      <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />

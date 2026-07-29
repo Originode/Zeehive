@@ -10,6 +10,15 @@
 //
 // The chip tooltip (driftText, in Container.jsx) is the GLANCE; this is the INVESTIGATION.
 
+// WHAT A DRIFT NUMBER COVERS, in one place, because both readings must carry it — TKT-22-4F0E:
+// "check diff says a massive gap. and im afraid the data might not be fully backed up." Those are two
+// questions and this comparison only answers the first. It reads catalogs: it counts no rows, opens
+// no dump, and so can neither confirm nor deny that production's data is safe. A green 0 is not
+// reassurance about data and a red 12,802 is not evidence of data loss. (docs/data-completeness-check.md)
+export const SCOPE_LINE = 'What this covers: SCHEMA only — tables, columns, triggers.'
+  + '\nWhat it does NOT: row data. It counts no rows and reads no backup, so it can neither confirm'
+  + '\nnor deny that production data is fully backed up. (Backups panel → a dump\'s own table list.)';
+
 // WHICH WAY the drift runs, which is the first thing worth knowing and the thing a total hides.
 // Both counts are exact (never sampled), so this reading is safe:
 //
@@ -50,11 +59,26 @@ export function diffReportText(name, r) {
   if (r?.same_db) return `${head}\nThese are the same database — there is nothing to diff.`;
   if (r?.ok === false) return `${head}\n⚠ could not compare:\n${r.error || 'unknown error'}`;
 
+  // EMPTY is not DRIFTED. A db holding none of the reference's tables was never loaded at all, and
+  // reporting that as "12,802 differences" is how an unused dev clone came to look like a data-loss
+  // event (TKT-22-4F0E). Say the true thing, and stop — a per-object list of "everything" helps nobody.
+  if (r?.empty_db) {
+    const t = r.kinds?.table || {};
+    return `${head}\n⚠ this database is EMPTY — it has NO application tables at all.`
+      + `\n${refName} has ${t.ref_count ?? '?'}; this db has ${t.mine_count ?? 0}.`
+      + '\nIt was never restored, or its restore failed. That is not drift, and it says nothing'
+      + `\nabout ${ref?.is_prod === false ? 'the reference' : 'production'} or its backups.`
+      + `\n\n${SCOPE_LINE}`;
+  }
+
   const total = r?.total || 0;
   const out = [head];
   out.push(total === 0
     ? `\n✓ schema MATCHES ${ref?.is_prod === false ? 'this reference' : 'production'} — 0 differences.`
     : `\n⚠ DRIFTED — ${total} difference(s).`);
+  // On EVERY outcome, including the green one: a 0 here is the sentence most likely to be quoted
+  // back as "so the backup is fine".
+  out.push(`\n\n${SCOPE_LINE}`);
 
   if (total) {
     out.push('\n\n− = the reference has it, this db does not (code may expect it)');
