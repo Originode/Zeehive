@@ -129,6 +129,11 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .docgen-t .mono { font-family: var(--mono, ui-monospace, Menlo, monospace); white-space: nowrap; }
 .docgen-t .pc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .docgen-t input { margin: 0; flex: none; }
+/* the preview: what the queenzee really writes, stamp and stack included */
+.docpv { margin-top: 6px; }
+.docpv pre { margin: 2px 0 0; padding: 8px; max-height: 320px; overflow: auto; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 11px; line-height: 1.4;
+  white-space: pre-wrap; word-break: break-word; color: var(--muted); }
 .setup-sub { margin: 8px 0; padding: 8px; background: var(--panel2); border: 1px solid var(--line);
   border-radius: 8px; }
 .setup-sub.off { opacity: 0.55; }

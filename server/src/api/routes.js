@@ -14,7 +14,8 @@ import { listHarnesses, assignHarness, getBridge, setBridge, probeBridge,
          createHarness, updateHarness, deleteHarness, getHarnessFull,
          harnessAvatarSvg } from '../lib/harness.js';
 import { bridgeBySlug, bridgeInboundConfig } from '../lib/harness-bridge.js';
-import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc } from '../lib/project-docs.js';
+import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
+         previewProjectDoc } from '../lib/project-docs.js';
 import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
 import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, duplicateProdInto } from '../queenzee/maintenance.js';
@@ -404,6 +405,12 @@ router.post('/projects/:id/docs', async (req, res) => {
 });
 router.put('/project-docs/:docId', async (req, res) => {
   try { res.json(await updateProjectDoc(req.params.docId, req.body || {})); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+// The generated file itself, for the console's preview — the only place an operator sees the stamp,
+// the sibling list and the xell stack they did not type. Read-only, and it runs the real generator.
+router.get('/project-docs/:docId/preview', async (req, res) => {
+  try { res.json(await previewProjectDoc(req.params.docId, { xellId: req.query.xell || null })); }
   catch (e) { res.status(400).json({ error: e.message }); }
 });
 router.delete('/project-docs/:docId', async (req, res) => {

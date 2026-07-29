@@ -195,6 +195,31 @@ try {
   ok(!at('CLAUDE.md').text.includes('Your xell'),
      'and with no xell named, the instructions still generate — only the appendix is absent');
 
+  // ── 2c. the PREVIEW an operator reads before saving ────────────────────────────────────────
+  // Everything an author cannot see, they cannot trust: the stamp, the siblings and the stack are all
+  // added below their textbox. The preview runs the REAL generator (a second renderer would drift).
+  console.log('\n── the console can show what will really be written ──');
+  const pv = await P.previewProjectDoc(src.id);
+  ok(pv.xell?.id === stackXell.id, `it previews against a real xell of the project (${pv.xell?.slug})`);
+  ok(pv.files.length === 4 && pv.files.every((f) => f.text.includes(stackXell.slug)),
+     'showing all four provider files, each with the stack the queenzee would append');
+  ok(!pv.files.some((f) => f.relPath === 'docs/agents/ONBOARDING.md'),
+     "and only THIS row's files — not the other doc's");
+  ok(/stack section is that xell's own/.test(pv.note), 'and it says which xell it is showing');
+  let foreign = null;
+  const other = (await one(`INSERT INTO project (name, repo_root, main_branch) VALUES ($1,'/tmp/other','master') RETURNING id`,
+    [`zt-other-${tag}`]));
+  const otherXource = await one(`INSERT INTO xource (project_id, ref) VALUES ($1,'master') RETURNING id`, [other.id]);
+  const otherXell = await one(
+    `INSERT INTO xell (project_id, xource_id, slug, branch, worktree_path, status, is_pooled)
+       VALUES ($1,$2,$3,'spinoff/zt-other','/tmp/zt-other','working',false) RETURNING id`,
+    [other.id, otherXource.id, `zt-other-${tag}`]);
+  try { await P.previewProjectDoc(src.id, { xellId: otherXell.id }); }
+  catch (e) { foreign = e.message; }
+  ok(/not this project/.test(foreign || ''),
+     'naming another project\'s xell is refused — a preview is a read, but not of somebody else\'s container names');
+  await q(`DELETE FROM project WHERE id=$1`, [other.id]);
+
   await P.updateProjectDoc(custom.id, { enabled: false });
   ok((await P.projectDocFiles(projId)).length === 4, 'disabling a row takes its file out');
   await P.updateProjectDoc(custom.id, { enabled: true, body: '' });

@@ -220,6 +220,9 @@ export const getAgentDocTargets = () => fetch('/api/agent-doc-targets').then((r)
 export const getProjectDocs = (projectId) => fetch(`/api/projects/${projectId}/docs`).then((r) => (r.ok ? r.json() : []));
 export const createProjectDoc = (projectId, body) => siteCall(`/api/projects/${projectId}/docs`, 'POST', body);
 export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${docId}`, 'PUT', body);
+// What will REALLY be written, run through the real generator: the stamp, the sibling list and the
+// stack section an operator never typed and would otherwise first see inside a cage.
+export const previewProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}/preview`, 'GET');
 export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
 
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));

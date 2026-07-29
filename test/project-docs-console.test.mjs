@@ -139,6 +139,14 @@ for (const [re, what] of [
 ]) {
   ok(re.test(section), `the section says ${what}`);
 }
+// And the preview, because the stamp/siblings/stack are the parts an operator did NOT type: without a
+// way to see them, the first person to read the real file is a zee in a cage.
+ok(/preview<\/button>|preview what gets written/.test(html),
+   'the editor offers a preview of what the queenzee will really write');
+ok(/previewProjectDoc = \(docId\) => siteCall\(`\/api\/project-docs\/\$\{docId\}\/preview`/.test(api)
+   && /router\.get\('\/project-docs\/:docId\/preview'/.test(read('server/src/api/routes.js')),
+   'served by a read-only route that runs the real generator');
+
 ok(/＋ Project instructions/.test(section),
    'the primary action is "write the instructions", not "add a file"');
 ok(/custom path/.test(section), 'with the custom-path escape hatch demoted to a secondary row');

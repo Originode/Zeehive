@@ -11,6 +11,7 @@ import {
   getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
   getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
   getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
+  previewProjectDoc,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -834,12 +835,16 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
   const [body, setBody] = useState(doc.body || '');
   const [title, setTitle] = useState(doc.title || '');
   const [path, setPath] = useState(doc.rel_path || '');
+  // The generated file as the queenzee would write it — fetched on demand (it runs the real generator
+  // against a real xell) and dropped whenever the row changes, so a stale preview can never be read as
+  // the current one.
+  const [preview, setPreview] = useState(null);
   const custom = !(doc.targets || []).length;
   const dirty = body !== (doc.body || '') || title !== (doc.title || '')
     || (custom && path !== (doc.rel_path || ''));
   useEffect(() => {
-    setBody(doc.body || ''); setTitle(doc.title || ''); setPath(doc.rel_path || '');
-  }, [doc.id, doc.body, doc.title, doc.rel_path]);
+    setBody(doc.body || ''); setTitle(doc.title || ''); setPath(doc.rel_path || ''); setPreview(null);
+  }, [doc.id, doc.body, doc.title, doc.rel_path, (doc.targets || []).join(',')]);
   const on = new Set(doc.targets || []);
   const generated = custom ? [doc.rel_path] : targets.filter((t) => on.has(t.key)).map((t) => t.path);
   // Toggling a provider SAVES immediately (like `enabled`): it is one fact, and the pending-edit
@@ -882,6 +887,21 @@ export function ProjectDocEditor({ doc, targets = [], run, busy }) {
       <textarea className="setup-md" rows={12} value={body} spellCheck={false}
                 placeholder="# How this project works&#10;&#10;What an agent arriving with no context needs to know: what the project IS, how to run and test it, the house rules it must not relearn."
                 onChange={(e) => setBody(e.target.value)} />
+      <div className="setup-row">
+        <button type="button" className="pill" disabled={busy}
+                onClick={() => (preview ? setPreview(null)
+                  : previewProjectDoc(doc.id).then(setPreview).catch((e) => setPreview({ error: e.message })))}>
+          {preview ? 'hide' : 'preview'} what gets written
+        </button>
+        {preview?.note && <span className="pc">{preview.note}</span>}
+        {preview?.error && <span className="pc">could not preview: {preview.error}</span>}
+      </div>
+      {preview?.files?.map((f) => (
+        <div key={f.relPath} className="docpv">
+          <div className="pc mono">{f.relPath}</div>
+          <pre>{f.text}</pre>
+        </div>
+      ))}
       {!custom && (
         <div className="docgen">
           <div className="pc">Generate for <b>{generated.length}</b> provider

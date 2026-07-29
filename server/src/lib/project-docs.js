@@ -212,9 +212,49 @@ function docTargets(row) {
     : [];
 }
 
+// WHAT WILL ACTUALLY BE WRITTEN — the console's preview, and the only place an operator can see the
+// difference between what they typed and what an agent reads. Everything an author cannot see, they
+// cannot trust: the stamp, the sibling list and the stack appendix are all added below the textbox,
+// and until this existed the first person to lay eyes on the real file was a zee in a cage.
+//
+// It runs the REAL generator (no second renderer to drift), for a real xell when one is named. The
+// xell must belong to this project — a preview is a read, but a read that could name any xell in the
+// fleet is still a way to learn another project's container names.
+export async function previewProjectDoc(docId, { xellId = null } = {}) {
+  const row = await one(`SELECT * FROM project_doc WHERE id=$1`, [docId]);
+  if (!row) throw new Error('no such project doc');
+  let xell = null;
+  if (xellId) {
+    xell = await one(`SELECT id, slug FROM xell WHERE id=$1 AND project_id=$2`, [xellId, row.project_id]);
+    if (!xell) throw new Error('that xell is not this project\'s');
+  } else {
+    // Default to a real xell of this project, newest first, so the preview shows a live stack section
+    // rather than the emptier file a project with no xells would get.
+    xell = await one(
+      `SELECT id, slug FROM xell WHERE project_id=$1 AND status NOT IN ('retired','husk','tearing-down')
+        ORDER BY created_at DESC LIMIT 1`, [row.project_id]);
+  }
+  const files = await projectDocFiles(row.project_id, { xellId: xell?.id || null });
+  const mine = new Set(docTargets(row).map((t) => t.path));
+  return {
+    doc_id: row.id,
+    xell: xell ? { id: xell.id, slug: xell.slug } : null,
+    // Said plainly: with no xell there is no stack section, and an operator comparing two previews
+    // must know which of the two they are looking at.
+    note: xell
+      ? `Generated as it would land in xell ${xell.slug} — the stack section is that xell's own.`
+      : 'This project has no live xell, so the preview carries no stack section. A real injection into '
+        + 'a xell appends its containers, ports, database and build verbs.',
+    files: files.filter((f) => mine.has(f.relPath)),
+  };
+}
+
 export async function deleteProjectDoc(id) {
-  const row = await one(`DELETE FROM project_doc WHERE id=$1 RETURNING rel_path`, [id]);
-  if (row) logline('project-doc', `${row.rel_path}: deleted`);
+  // RETURNING the whole row, not just rel_path: a source row's path is NULL (its filenames come from
+  // `targets`), and "null: deleted" in the queenzee log names nothing a human can act on.
+  const row = await one(`DELETE FROM project_doc WHERE id=$1 RETURNING *`, [id]);
+  if (row) logline('project-doc', `${docLabel(row)}: deleted — new xells stop receiving it, and a zee `
+    + 'already working keeps the copy it was given');
   return { deleted: !!row };
 }
 
