@@ -2134,3 +2134,32 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-nrow:focus-within { background: var(--panel2); }
 .work-btn.danger { border-color: var(--down); color: var(--down); }
 .work-btn.danger:hover:not(:disabled) { background: rgba(229,85,78,.14); }
+
+/* ── a xell's ENVIRONMENT: what it resolved to, and the picker that changes it (ticket #20) ──
+   The three states must not look alike: absent, empty and populated are three different sentences,
+   because a correct injection into an EMPTY environment writes nothing and reads exactly like a
+   bug (ticket #15 lost an afternoon to that). Colour reinforces; the words carry it. */
+.disp.xenv { width: min(560px, 96vw); }
+.xenv-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 14px; max-height: 66vh; overflow-y: auto; }
+.xenv-now { border-left: 2px solid var(--line); padding-left: 10px; }
+.xenv-head { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.xenv-why { color: var(--muted); font-size: 12px; }
+.xenv-count { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.xenv-empty { margin-top: 5px; font-size: 12px; line-height: 1.5; color: var(--text);
+  border: 1px solid rgba(224,165,59,.45); background: rgba(224,165,59,.10); border-radius: 8px; padding: 8px 10px; }
+.xenv-vars { margin: 4px 0 0; padding-left: 18px; font-size: 12px; columns: 2; }
+.xenv-secret { opacity: .8; }
+.xenv-owned { color: var(--warn, #e0a53b); font-size: 11px; }
+.xenv-pick { display: flex; flex-direction: column; gap: 5px; }
+.xenv-opt { display: flex; align-items: center; gap: 8px; text-align: left; padding: 7px 9px; border-radius: 7px;
+  background: var(--panel2); border: 1px solid transparent; color: var(--text); cursor: pointer; font-size: 13px; }
+.xenv-opt:hover { border-color: var(--line); }
+.xenv-opt.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel2)); }
+.xenv-def { color: var(--muted); font-size: 11px; }
+.xenv-n { margin-left: auto; font-size: 11px; color: var(--muted); }
+.xenv-n.zero { color: var(--warn, #e0a53b); }
+.xenv-clear { align-self: flex-start; margin-top: 2px; padding: 5px 10px; border-radius: 6px;
+  border: 1px dashed var(--line); background: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+.xenv-clear:hover { color: var(--text); border-color: var(--accent); }
+/* the card chip's third face: nothing resolved at all */
+.envchip.env-absent { color: var(--muted); border-style: dashed; }

@@ -464,6 +464,25 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
   ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
   rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
+- **Inject a project environment into a xell, from the console** (2026-07-29, ticket #20). The server
+  half already existed — `resolveEnvironmentFor` (pin → on-production → dev), `resolvedEnvView`,
+  `setXellEnvironment` — and none of it was reachable without curl. `web/src/XellEnvironment.jsx` is
+  that surface: what the xell resolved to and WHY (pinned vs by tier), its var names, and a picker
+  over the project's environments with a clear-the-pin. It is a picker, not a second editor;
+  environments are still authored in Project setup.
+  **The trap it is built around:** on this project both Zeehive environments hold ZERO vars, so a
+  correct injection writes nothing and reads exactly like a bug (ticket #15 lost an afternoon to it).
+  So absent / empty / populated are three different sentences, in the panel AND on the card chip —
+  which now renders a third face (`no env`) instead of vanishing when nothing resolves, because an
+  absent chip read as "fine". A var the projection owns (`DATABASE_URL`, the slug, …) is LABELLED
+  "not injected (queenzee-owned)" rather than silently dropped.
+  Pinning asks first (it rewrites a file in a live xell) and says the thing people get wrong: a
+  process already running keeps the environment it started with.
+  Test: `node test/xell-environment-inject.test.mjs` — pin → re-read `.zeehive.env` off disk → clear
+  → re-read, against a real xell row with a real worktree; a `db-shared-prod` xell resolving to the
+  PROD environment with no pin; the reserved names refused at projection time even when the
+  environment sets them; and a secret's value absent from the picker payload (a NON-secret value is
+  not a secret and does come through — the panel says so accurately rather than overclaiming).
 - **Compose a long body the shell will not execute** (2026-07-29, ticket #21 — migration 079).
   Three incidents in one afternoon across three zees: backticks inside a DOUBLE-quoted shell string
   are a command substitution, so composing a report body that way RUNS what it meant to name (it

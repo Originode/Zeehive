@@ -229,6 +229,13 @@ export const deleteEnvVar = (envId, name) => siteCall(`/api/environments/${envId
 export const importEnv = (envId, text, is_secret = true) => siteCall(`/api/environments/${envId}/import`, 'POST', { text, is_secret });
 export const exportEnv = (envId) => siteCall(`/api/environments/${envId}/export`, 'GET');
 export const lintEnv = (envId) => fetch(`/api/environments/${envId}/lint`).then((r) => r.json());
+// …and the XELL side of the same fact (ticket #20): which environment a xell RESOLVED to (pinned or
+// by tier), its var NAMES and counts — never values — and the pin/clear that re-projects
+// .zeehive.env. Names-and-counts only: full values leave the meta-DB through exactly two doors
+// (the .zeehive.env projection and the deploy materializer) and a picker must not become a third.
+export const getXellEnvironment = (xellId) => siteCall(`/api/xells/${xellId}/environment`, 'GET');
+export const setXellEnvironment = (xellId, environmentId) =>
+  siteCall(`/api/xells/${xellId}/environment`, 'POST', { environment_id: environmentId || null });
 // Extract a xell's CURRENT environment (its live .zeehive.env, else the resolved meta-DB env) as
 // full .env text — the "pull out what this xell is running with" reveal.
 export const extractXellEnv = (xellId) => siteCall(`/api/xells/${xellId}/env/export`, 'GET');
