@@ -11,6 +11,7 @@ import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { startWorkSync } from './queenzee/worksync.js';
 import { recoverOrphanBuilds } from './lib/build.js';
+import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
 import { refreshHarnesses } from './lib/harness.js';
@@ -131,6 +132,14 @@ const server = app.listen(config.port, () => {
         AND x.status NOT IN ('retired', 'tearing-down')`
   )).map((r) => ({ ctx: 'default', name: cxellName(r.slug) })))
     .catch((e) => console.error('[cxell] live-feed renderer sweep failed:', e.message));
+  // Same shape, for the OTHER file the queenzee projects into a worktree: .zeehive.env is written
+  // from the meta-DB at provision time and never re-emitted on its own, so a fix to the projection
+  // RULE (ticket #15: a xell holding production read-only kept its dev vars and its own spinoff db)
+  // left every xell provisioned before it wrong forever, with a human expected to remember. Boot is
+  // exactly when a rule change arrives, so recompute every non-retired xell here and write only the
+  // ones that are provably stale (lib/provision.reconcileXellEnvs).
+  reconcileXellEnvs({ reason: 'boot' })
+    .catch((e) => console.error('[env] .zeehive.env reconcile failed:', e.message));
   startPool();
   startMonitor();
   startContainerMonitor();
