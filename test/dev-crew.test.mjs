@@ -137,9 +137,11 @@ try {
   const unknownToLead = roles.map((r) => r.key).filter((k) => !named.includes(k));
   const leadInvents = named.filter((k) => !roles.some((r) => r.key === k));
   ok(!unknownToLead.length,
-     `every role in the meta-DB is on the lead's roster (missing: ${unknownToLead.join(', ') || 'none'})`);
+     `every role in the meta-DB is on the lead's roster — a role it cannot name, it cannot cast; add it `
+     + `to ${LEAD}'s memory/dev-role-roster.md (missing: ${unknownToLead.join(', ') || 'none'})`);
   ok(!leadInvents.length,
-     `and the roster names no role that does not exist (${leadInvents.join(', ') || 'none'})`);
+     `and the roster names no role outside the crew — either the row is gone, or it was RE-PARENTED off `
+     + `${CREW_ROOT} and silently left the crew (${leadInvents.join(', ') || 'none'})`);
 
   console.log('\n── the manual is INHERITED, exactly once, and copied nowhere ──');
   const baseEff = await H.effectiveHarness(base);
