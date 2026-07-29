@@ -73,6 +73,23 @@ The buttons follow the same rule (`petalVerbs`, pure and unit-tested): **pull, l
 absent** — offering them would offer a human three clicks that can only return the refusal above —
 while build, terminal, nudge, env, message, done and **ship** remain.
 
+### Talking to it — the terminal is NOT read-only (2026-07-29)
+
+A manager is the zee you most need to CONVERSE with: it writes no code, so everything it does for you
+it does through a conversation. And it was the zee you could least reach. While its headless turn
+ran, its cxell pane was the transcript feed — read-only in both directions — so anything typed at it
+in the dashboard terminal was swallowed, and the 📨 button reported "typed into its live session" for
+a message that reached nobody. Reported exactly as it felt: *"when i said readonly i didnt mean the
+terminal was readonly"* (the read-only stance was about production and the fleet views, never this).
+
+Now a message to a zee that is mid-turn is **queued in its cage and typed into its session the moment
+the turn ends**, and the terminal carries a 💬 **talk** composer that says which of the two happened.
+Nothing here is manager-specific — it is the same door for every cxell zee — but the manager is the
+one whose job it was breaking. The mechanism is the TALK QUEUE in HANDOFF.md (`cxellTalkCommand` in
+`server/src/lib/cxell.js`, drained by `docker/zeehive/zee-attach.sh`);
+`zee say` between a manager and its crew rides the same path, so a worker that is mid-turn now
+hears its manager too.
+
 ### Its harness takes no cell of its own
 
 A harness normally seats itself in the grid as its **own hexagon cell** (docs/harness-proposal.md §5)

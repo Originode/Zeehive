@@ -37,6 +37,9 @@ COMMENT ON COLUMN harness.parent_id IS
 -- Zee Base incorporates the full cxell-zee manual (its memory references docs/cxell-zee-manual.md,
 -- read live by loadHarnessDir — no duplication). zeetest inherits it. Both are file-backed; boot
 -- refreshHarnesses() fills their bundle + resolves zeetest.parent_id from HARNESS.yml `parent:`.
+-- SUPERSEDED BY 047 (kept as the record of what this migration did): the manual was moved INTO the
+-- meta DB and Zee Base made DB-owned (dir=NULL), and docs/cxell-zee-manual.md was deleted. Nothing
+-- in the repo carries the manual today — do not go looking for that path.
 INSERT INTO harness (key, label, dir, is_law_core, enabled)
 VALUES ('zee-base', 'Zee Base', 'harnesses/zee-base', false, true)
 ON CONFLICT (key) DO NOTHING;

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { getDispatchModes, getDispatchModels, getHarnesses } from './api.js';
+import { emptyWarning } from './harnessHealth.js';
 
 // The "+" composer. A human writes a prompt (rich text, paste-friendly, images welcome) and picks
 // the autonomy mode / model / attended flag — then SUBMIT dispatches it exactly like a /xell
@@ -280,13 +281,20 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
                       Core only
                     </button>
                   )}
-                  {harnesses.map((h) => (
-                    <button key={h.key} className={`disp-seg ${harness === h.key ? 'on' : ''}`}
+                  {/* A harness that carries NOTHING is offered here exactly like a full one, and the
+                      zee you dispatch is the one who pays for it — so say so at the point of choice.
+                      files_missing/bundle_empty come from GET /api/harnesses. */}
+                  {harnesses.map((h) => {
+                    const warn = emptyWarning(h);
+                    return (
+                    <button key={h.key} className={`disp-seg ${harness === h.key ? 'on' : ''} ${warn ? 'seg-hollow' : ''}`}
                             data-testid={`dispatch-harness-${h.key}`}
-                            title={h.summary || h.label} onClick={() => setHarness(h.key)}>
-                      {h.label}{h.skill_count ? ` ·${h.skill_count}` : ''}
+                            title={warn ? `${warn.chip.replace('⚠ ', '')} — ${warn.why}` : (h.summary || h.label)}
+                            onClick={() => setHarness(h.key)}>
+                      {h.label}{warn ? ` ${warn.chip}` : (h.skill_count ? ` ·${h.skill_count}` : '')}
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}

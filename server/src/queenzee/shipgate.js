@@ -21,6 +21,7 @@ import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
 import { pendingMigrations, applyMigrations } from './shipmigrate.js';
 import { materializeEnvFile } from '../lib/environments.js';
 import { shouldProcessNow, processPad } from './landingpad.js';
+import { setShipRefusal, clearShipRefusal } from '../lib/status.js';
 import { nudgeXellForReflection } from './nudge.js';
 
 // Real deploys are gated on a human anyway; SHIP_MODE=simulate exists to verify ZEEHIVE itself.
@@ -49,7 +50,14 @@ function landedState(worktreePath, mainBranch) {
   const dirty = gitDirty(worktreePath);
   if (ahead === null) return { landed: false, reason: 'cannot read the worktree' };
   if (ahead > 0) return { landed: false, reason: `${ahead} commit(s) not landed on ${mainBranch} yet — land them first (a ship builds from ${mainBranch}, so unlanded work would NOT be in it)` };
-  if (dirty > 0) return { landed: false, reason: `${dirty} uncommitted file(s) — commit and land them first, or they will not be in the ship` };
+  // NAME the dirty files. "3 uncommitted file(s)" sends a zee hunting through its own worktree for
+  // work it may not have done: the queenzee itself writes files in there (generated env, injected
+  // harness), and a refusal that will not say WHICH files reads as a mystery rather than an
+  // instruction. Naming them costs one line of git output we already have.
+  if (dirty.count > 0) {
+    return { landed: false, reason: `${dirty.count} uncommitted file(s) — commit and land them first, or `
+      + `they will not be in the ship: ${dirty.files.join(', ')}` };
+  }
   return { landed: true };
 }
 
@@ -58,10 +66,15 @@ function gitCount(cwd, range) {
     { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
   return r.status === 0 ? Number(r.stdout.trim()) || 0 : null;
 }
+// { count, files } — the count as before, plus up to 6 named paths for the refusal message.
 function gitDirty(cwd) {
   const r = spawnSync('git', ['-C', cwd, 'status', '--porcelain'],
     { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
-  return r.status === 0 ? r.stdout.split('\n').filter(Boolean).length : 0;
+  if (r.status !== 0) return { count: 0, files: [] };
+  const lines = r.stdout.split('\n').filter(Boolean);
+  const files = lines.slice(0, 6).map((l) => l.slice(3).trim());
+  if (lines.length > files.length) files.push(`… +${lines.length - files.length} more`);
+  return { count: lines.length, files };
 }
 
 // Which prod SITE a ship (or lock) is about (spec §5). Named key → that site, error if unknown;
@@ -120,19 +133,52 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   const shipSite = await resolveShipSite(project.id, site);
   const main = project.main_branch || 'main';
 
-  const state = landedState(xell.worktree_path, main);
-  if (!state.landed) {
-    logline('ship', `REFUSED ship from ${xell.slug}: ${state.reason}`);
-    return { ok: false, reason: state.reason, request: null };
-  }
+  // A refusal is the one outcome that leaves NO ship_request row — so it must leave something
+  // else, or it leaves nothing at all. refuse() records it on the xell (session_event, latest
+  // wins) so the console can show "this zee asked and was refused, here is why" instead of an
+  // empty production panel, and hands the caller an unambiguous shape: ok:false + refused:true.
+  const refuse = async (why) => {
+    logline('ship', `REFUSED ship from ${xell.slug}: ${why}`);
+    await setShipRefusal(xellId, why, { zeeId });
+    return {
+      ok: false, refused: true, reason: why, request: null,
+      message: `SHIP REFUSED — NO request was raised, so there is NOTHING for a human to approve: ${why}. `
+        + 'Do not report a ship as requested; fix the reason and ask again. The console now shows this '
+        + 'refused ask on your xell so your human can see it too.',
+    };
+  };
 
+  const state = landedState(xell.worktree_path, main);
+  if (!state.landed) return refuse(state.reason);
+
+  // Open request already? Note the deliberate absence of a dismissed_at filter here — and the
+  // presence of one in every HUMAN-facing view (fleet.js, listShipRequests). That mismatch is how a
+  // ship ask became a ghost: a dismissed-but-open request kept answering the zee "you already have
+  // an open ship request" while rendering nowhere a human could see it, and the partial unique
+  // index made a fresh one impossible. So an open request that was dismissed is UN-dismissed here:
+  // if the zee is still asking, the ask is still live, and it belongs back on the screen.
   const existing = await one(
     `SELECT * FROM ship_request WHERE project_id=$1 AND xell_id=$2
        AND status IN ('pending','approved','shipping')`, [project.id, xellId]);
-  if (existing) return { ok: true, request: existing,
-    note: existing.deferred_at
-      ? 'you already have a ship request — a human DEFERRED it to batch it into a combined ship; it will go when they resume it'
-      : 'you already have an open ship request' };
+  if (existing) {
+    await clearShipRefusal(xellId, { zeeId });
+    let row = existing;
+    let restored = false;
+    if (existing.dismissed_at) {
+      row = await one(
+        `UPDATE ship_request SET dismissed_at=NULL, dismissed_by=NULL WHERE id=$1 RETURNING *`, [existing.id]);
+      restored = true;
+      logline('ship', `RESTORED dismissed ship request from ${xell.slug} @ ${String(row.commit).slice(0, 8)}`
+        + ' — its zee asked again, so it is back on the console instead of held invisibly');
+      broadcast('ship', row);
+    }
+    return { ok: true, request: row, restored,
+      note: row.deferred_at
+        ? 'you already have a ship request — a human DEFERRED it to batch it into a combined ship; it will go when they resume it'
+        : restored
+          ? 'you already had an open ship request that had been dismissed from the console — it is visible to a human again'
+          : 'you already have an open ship request' };
+  }
 
   // WHERE the ship's code comes from: local main by default (the anti-band-aid rule); a project
   // whose integration truth is remote (ship_ref like 'origin/main') gets that remote fetched
@@ -140,13 +186,28 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // rides along is decided NOW too, so the human approves code and migrations as one thing.
   let commit, migrations;
   try { ({ commit, migrations } = await resolveShipCommit(project, shipSite, main)); }
-  catch (e) { return { ok: false, reason: e.message, request: null }; }
-  const row = await one(
-    `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id,
-                               skip_migrations, db_note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10) RETURNING *`,
-    [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(migrations), shipSite?.id || null,
-     !!skipDb, dbNote]);
+  catch (e) { return refuse(e.message); }
+  let row;
+  try {
+    row = await one(
+      `INSERT INTO ship_request (project_id, xell_id, zee_id, commit, reason, targets, migrations, site_id,
+                                 skip_migrations, db_note)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10) RETURNING *`,
+      [project.id, xellId, zeeId, commit, reason, t, JSON.stringify(migrations), shipSite?.id || null,
+       !!skipDb, dbNote]);
+  } catch (e) {
+    // ship_request_open_uq (one open ship per xell) — two asks raced, or a row appeared between the
+    // check above and here. The zee's ask IS satisfied by the winner, so hand that back rather than
+    // a raw postgres constraint name: "duplicate key value violates…" reads like a broken gate.
+    if (e.code !== '23505') throw e;
+    const won = await one(
+      `SELECT * FROM ship_request WHERE project_id=$1 AND xell_id=$2
+         AND status IN ('pending','approved','shipping')`, [project.id, xellId]);
+    if (!won) throw e;
+    return { ok: true, request: won, note: 'you already have an open ship request (raised a moment ago)' };
+  }
+  // The ask is now a row a human can see, so any earlier refusal on this xell is history.
+  await clearShipRefusal(xellId, { zeeId });
   broadcast('ship', row);
 
   // Operator policy: auto-approve ships for this project → the queenzee approves and deploys with
@@ -169,7 +230,19 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
 // "Seen it — stop showing me." View-only, like the landing equivalent: a dismissed ship still
 // shipped/failed on its own, it just stops rendering in the PRODUCTION panel (fleet.js filters
 // dismissed_at IS NULL). Never touches status.
+//
+// It is a RECEIPT-clearing act, and only that: dismissing a still-OPEN request is refused. Hiding a
+// pending ask does not decide it — the zee still holds it (and the partial unique index still
+// blocks a replacement), so the only thing that changes is that the human can no longer see what
+// the zee is waiting on. An open ship is decided with Reject, or set aside with Defer.
 export async function dismissShipRequest(id, by = 'human@console') {
+  const open = await one(
+    `SELECT status FROM ship_request WHERE id=$1 AND status IN ('pending','approved','shipping')`, [id]);
+  if (open) {
+    throw new Error(`this ship request is still ${open.status} — dismiss only clears the receipt of a `
+      + 'decided ship. Reject it (or Defer it) instead; hiding an open ask leaves the zee waiting on '
+      + 'something nobody can see.');
+  }
   const row = await one(
     `UPDATE ship_request SET dismissed_at=now(), dismissed_by=$2 WHERE id=$1 RETURNING *`, [id, by]);
   if (!row) throw new Error('no such ship request');

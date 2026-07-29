@@ -5,6 +5,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import FileExplorer from './FileExplorer.jsx';
 import FeedChips from './FeedChips.jsx';
+import MessageComposer from './MessageComposer.jsx';
 
 // A path-ish token a zee tends to "present" in the terminal: web/src/App.jsx, ./server/x.js,
 // /work/repo/…, package.json. Used to offer "show file" on a selection and to strip a pasted
@@ -37,7 +38,9 @@ const CTRL_PREFIX = '\u0000ZH';
 // and the status pill. The flavors differ only in title, footer, and prod styling.
 // `explorerZeeId` (cxell zees only) lights up the single 📁 file-explorer button (toggles the panel;
 // with a path-shaped selection it opens that file instead).
-export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, onClose }) {
+// `xell` ({ id, slug }, cxell zees only) lights up 💬 talk — the composer that CONVERSES with the
+// zee whether or not it is mid-turn (see the talk block below).
+export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, xell = null, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
   const wsRef = useRef(null);
@@ -50,6 +53,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   const [clip, setClip] = useState('');              // the IN-APP clipboard: last selection captured here
   const [clipOpen, setClipOpen] = useState(false);   // the clipboard tray visible?
   const [flash, setFlash] = useState('');
+  const [talkOpen, setTalkOpen] = useState(false);   // the 💬 talk composer open?
   // The zee's LIVE FEED view (the ✱/⚒ chips). `live` is what the bridge last told us about the
   // cage: true = a feed is running and a chip repaints it now, false = the feed is not up (the
   // turn ended and the interactive session owns the pane), null = we have not been told yet.
@@ -227,6 +231,32 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'v', thinking: next.thinking, moves: next.moves }));
     termRef.current?.focus();
   };
+  // ── 💬 TALK: converse with the zee, whether or not it is mid-turn ────────────────────────────
+  //
+  // The pane has two owners and only one of them can hear you. Between turns the interactive
+  // session holds it and typing here IS the conversation. While the zee works, the pane is the
+  // read-only transcript feed: it renders and reads nothing, so keystrokes are swallowed — which
+  // is exactly how "the terminal is read-only" was reported, and why a MANAGER (whose whole job is
+  // conversation) was unreachable in the one place a human goes to talk to it.
+  //
+  // So the composer is always available, and the queenzee decides delivery per the cage's actual
+  // state: TYPED into the live session, or QUEUED and typed in the moment the turn ends
+  // (server/src/lib/cxell.js → cxellTalkCommand; drained by docker/zeehive/zee-attach.sh). We
+  // already know which of the two it will be — `feed.live` is the bridge telling us who owns the
+  // pane — so the receipt printed into the terminal says the true one instead of a hopeful one.
+  const talkReceipt = (r) => {
+    const queued = feed.live === true;
+    const parts = [
+      queued
+        ? '── the zee is MID-TURN, so this pane is a read-only feed: your message is QUEUED in its cxell and typed into its session the moment the turn ends ──'
+        : "── your message was typed into the zee's live session — its reply appears in this pane ──",
+    ];
+    if (r?.attachments?.length) parts.push(`   ${r.attachments.length} attachment(s) handed over in its .zee-inbox`);
+    // Dim, and on its own lines, so a receipt is never mistaken for something the zee said.
+    termRef.current?.write(`\r\n\x1b[2m${parts.join('\r\n')}\x1b[0m\r\n`);
+    termRef.current?.focus();
+  };
+
   const toggleExplorer = () => {
     const term = termRef.current;
     const p = pathFromSelection(term?.getSelection?.() || '');
@@ -250,6 +280,18 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
           {/* Only the zee door has a feed to filter — a container shell is just a shell. */}
           {explorerZeeId && <FeedChips feed={feed} onToggle={setFeedFlag} />}
           <span>
+            {/* 💬 TALK — the one door that works in BOTH pane states. Highlighted while a live feed
+                owns the pane, because that is precisely when typing into the terminal does nothing
+                and a human needs to be shown where to speak instead. */}
+            {xell?.id && (
+              <button className={`term-x talk${talkOpen ? ' on' : ''}${feed.live === true ? ' urge' : ''}`}
+                      data-testid="talk-toggle" onClick={() => setTalkOpen((v) => !v)}
+                      title={feed.live === true
+                        ? 'Talk to this zee — it is MID-TURN, so this pane is a read-only feed: your message is queued and typed into its session the moment the turn ends'
+                        : "Talk to this zee — typed straight into its live session (long text and images are handed over as files in its .zee-inbox)"}>
+                💬 talk
+              </button>
+            )}
             <button className={`term-x${clipOpen ? ' on' : ''}${clip && !clipOpen ? ' dot' : ''}`} data-testid="clip-toggle"
                     onClick={() => setClipOpen((v) => !v)}
                     title="Clipboard — selections you Shift+drag land here (works even when the OS clipboard is blocked)">📋</button>
@@ -269,6 +311,13 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
                           onClose={() => setShowFx(false)} />
           )}
           <div className="zeeterm-body" ref={holder} onContextMenu={onContextMenu} />
+          {/* The SAME composer the hexagon's 📨 button opens (one delivery path, one set of rules
+              about long text and images) — rendered INSIDE the terminal, because the terminal is
+              where a human is standing when they want to say something to this zee. */}
+          {talkOpen && xell?.id && (
+            <MessageComposer xell={xell} onClose={() => { setTalkOpen(false); termRef.current?.focus(); }}
+                             onSent={(r) => { setTalkOpen(false); talkReceipt(r); }} />
+          )}
           {clipOpen && (
             <div className="term-clip" data-testid="term-clip" onClick={(e) => e.stopPropagation()}>
               <div className="tc-head">
@@ -298,7 +347,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 // cxell — so this is the same interactive `claude` you'd get over SSH, prompt by prompt, and
 // disconnecting leaves the session running (tmux). The SSH line below is that exact door for
 // Claude Code desktop's "Add SSH host" — the deeplink IS the SSH connection.
-export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
+export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, onClose }) {
   const [copied, setCopied] = useState(false);
 
   // ssh://zee@127.0.0.1:PORT → a copy-pasteable ssh command (external attach)
@@ -318,6 +367,7 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
           Surface it so nobody has to guess (reported: "I can't copy text"). */}
       <span className="pc kbd-hint" title="A plain drag goes to the app; Shift+drag makes a selection, captured into the 📋 clipboard tray">
         <b>Shift+drag</b> → 📋 clipboard · click a <b>path</b> to open it · <b>✱ ⚒</b> filter the live feed
+        {' · '}<b>💬 talk</b> to it (works mid-turn)
       </span>
       <input className="mono" readOnly value={sshCmd || ''} onFocus={(e) => e.target.select()} />
       <button type="button" onClick={copy}>{copied ? '✓ copied' : '⧉ copy'}</button>
@@ -325,7 +375,8 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, onClose }) {
   );
 
   return <TerminalModal wsPath={`/api/zees/${zeeId}/terminal`} title={slug} foot={foot}
-                        explorerZeeId={zeeId} onClose={onClose} />;
+                        explorerZeeId={zeeId} xell={xellId ? { id: xellId, slug } : null}
+                        onClose={onClose} />;
 }
 
 // A shell inside a fleet container, opened from the chip's context menu. The bridge runs a

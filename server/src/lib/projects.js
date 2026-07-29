@@ -33,10 +33,22 @@ export async function dbIdentity(projectId) {
   };
 }
 
+// Every project, with what is WAITING ON A HUMAN in each. The counts matter because the console is
+// per-project: the production panel, the landing banner and the honeycomb all show the SELECTED
+// project only, so a ship awaiting approval in the other one is invisible until you happen to
+// switch to it. A zee that asked would keep saying "it is waiting for you" while the operator, on
+// the other project, saw an empty panel — the same "i see zero" this whole change is about, one
+// level up. Two cheap correlated counts on indexed columns, on a menu that opens rarely.
 export async function listProjects() {
   return q(
     `SELECT p.*,
-            (SELECT count(*) FROM xell x WHERE x.project_id = p.id AND x.status <> 'retired') AS xell_count
+            (SELECT count(*) FROM xell x WHERE x.project_id = p.id AND x.status <> 'retired') AS xell_count,
+            (SELECT count(*) FROM ship_request s
+               WHERE s.project_id = p.id AND s.status = 'pending'
+                 AND s.dismissed_at IS NULL AND s.deferred_at IS NULL)::int AS ships_waiting,
+            (SELECT count(*) FROM land_request lr
+               WHERE lr.project_id = p.id AND lr.status = 'pending'
+                 AND lr.dismissed_at IS NULL)::int AS landings_waiting
        FROM project p ORDER BY p.created_at`);
 }
 

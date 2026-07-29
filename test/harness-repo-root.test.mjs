@@ -142,7 +142,9 @@ try {
   ok(await H.harnessAvatarFile('../../etc/passwd') === null, 'an escaping avatar_path is refused');
   ok(await H.harnessAvatarFile('harnesses/manager/../../../etc/passwd') === null,
      'and so is one that climbs out of harnesses/');
-  ok(await H.harnessAvatarFile('docs/cxell-zee-manual.md') === null, 'a path outside harnesses/ is refused');
+  // a real, existing file OUTSIDE harnesses/ — so this proves the CONTAINMENT guard, not that the
+  // path happened not to exist
+  ok(await H.harnessAvatarFile('docs/manager-zees.md') === null, 'a real file outside harnesses/ is refused too');
 
   console.log('\n── an unreadable harness folder is LOUD ──');
   const ghost = (await H.listHarnesses()).find((x) => x.key === ghostKey);

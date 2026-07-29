@@ -180,8 +180,31 @@ function req(method, path, body) {
   });
 }
 
-function out(r) {
+// Print the queenzee's answer — and, when the answer is "no", SAY SO and exit non-zero.
+//
+// Every verb here is a request that can be declined, and a decline comes back HTTP 200 with
+// `ok:false` (the call worked; the thing you asked for did not happen). The old out() printed that
+// JSON and exited 0, so a refusal looked exactly like a success: same shape, same green exit. A zee
+// whose `zee ship` was refused for unlanded work would relay "the ship request is waiting for your
+// approval" to a human who had nothing on their screen, because nothing had been raised. Reported
+// as "xells insist they have ship requests… i see zero".
+//
+// So: `ok:false` is a FAILED command. It prints the full JSON (nothing is hidden), then one
+// unambiguous line naming what did not happen, and exits 1 — which is also what makes `zee x || …`
+// and a harness's exit-code nudge tell the truth.
+function out(r, what = cmd) {
   console.log(JSON.stringify(r.json, null, 2));
+  const j = r.json || {};
+  if (r.code < 400 && j.ok === false) {
+    const why = j.reason || j.error || j.message || 'the queenzee declined it';
+    console.error(`\n  ✗ ${String(what).toUpperCase()} DID NOT HAPPEN: ${why}`);
+    if (j.refused) {
+      console.error('    NOTHING was raised and NOTHING is awaiting a human — there is no request in the');
+      console.error('    console for anyone to approve. Do not report this as pending: fix the reason above,');
+      console.error('    then ask again.');
+    }
+    process.exit(1);
+  }
   process.exit(r.code >= 400 ? 1 : 0);
 }
 
@@ -197,7 +220,7 @@ function usage() {
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
-                                     ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then `zee sync`, then `zee land`
+                                     ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
   zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
@@ -362,7 +385,17 @@ switch (cmd) {
   case 'ship': {
     const reason = flag('reason'); const targets = multi('targets');
     if (!reason) { console.error('ship needs --reason "what you are shipping"'); process.exit(1); }
-    out(await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) }));
+    const r = await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) });
+    // Say in ONE plain sentence whether a request now exists, before out() decides the exit code.
+    // The whole failure this fixes was a zee reading a JSON blob and telling its human the opposite
+    // of what it said — so the sentence a zee is most likely to relay is printed for it.
+    if (r.code < 400 && r.json?.ok !== false && r.json?.request) {
+      const q = r.json.request;
+      console.log(`\n  ✓ ship request ${String(q.id).slice(0, 8)} is ${q.status} @ ${String(q.commit).slice(0, 8)}`
+        + ' — a human decides it in the ZEEHIVE console.');
+      if (r.json.note) console.log(`    (${r.json.note})`);
+    }
+    out(r, 'ship');
     break;
   }
   case 'hint-land': case 'hint-ship': {

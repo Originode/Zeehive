@@ -94,7 +94,7 @@ all projects" means at the schema level; every enabled harness shows in every pr
 ```
 harnesses/
   core/                 # the manual harness (§4) — the law layer, undeletable
-    MANUAL.md           # docs/cxell-zee-manual.md is sourced/linked here
+    HARNESS.yml         # a marker only: core's TEXT is not a file (see below)
   hermes/
     HARNESS.yml         # bundle manifest: personality, skills list, tools, avatar, bridge config
     PERSONALITY.md
@@ -105,7 +105,18 @@ harnesses/
 ```
 
 `bundle`/`bundle_hash` on the row is the parsed, validated projection of `HARNESS.yml` + that folder,
-refreshed on pull exactly like `project.manifest`.
+refreshed on pull exactly like `project.manifest`. Two amendments this section predates:
+
+- **The folders are read from the ZEEHIVE PROJECT's repo** (`project.repo_root`), not from wherever
+  the server's code happens to sit — the deployed image deliberately carries no copy of them
+  (`lib/harness.js`, 2026-07-29).
+- **`core` and `zee-base` are DB-OWNED (`dir IS NULL`), and the manual is NOT a file.** Migration 047
+  moved the cxell-zee manual into the meta DB (`harness.bundle.memory`, entry `cxell-zee-manual.md`)
+  and deleted the repo copy; every amendment since — 050, 053, 056, 063, 065 — is a migration against
+  that row. `refreshHarnesses()` never touches a `dir IS NULL` harness. **Do not add a repo copy**: it
+  would drift from the row the instant the next migration lands. Read it in the console's harness
+  manager, or in any cxell at `.zeehive/harness/memory/cxell-zee-manual.md` (injected per xell,
+  git-ignored — an artefact, never a source).
 
 ### 3.2 A xell is ASSIGNED one harness; a human may switch it
 

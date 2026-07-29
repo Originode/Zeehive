@@ -404,6 +404,38 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   harness that briefs a zee with nothing is visible instead of looking healthy.
   Test: `node test/harness-repo-root.test.mjs` (reproduces the container: a `config.repoRoot` with
   no `harnesses/` + a project `repo_root` that has them).
+- **An unloaded harness is impossible to miss** (2026-07-29, the follow-up to the above). Two halves:
+  (1) `refreshHarnesses()` ends with ONE summary line — `harnesses: 3 loaded, 1 EMPTY — <keys> · N
+  live xell(s) are wearing an EMPTY harness` — logged always, `console.error` when any are empty
+  (`logHarnessSummary()` is exported and callable on its own). The per-harness loglines were each
+  true and each easy to miss; a boot is not clean if a zee's persona is a blank page.
+  (2) The console SAYS it, in words: `web/src/harnessHealth.js` (`emptyWarning()`) is the one place
+  `files_missing`/`bundle_empty` become `⚠ no files` / `⚠ empty`, used by the harness manager
+  (`HarnessRow` + `HarnessEmptyBanner`, both exported so they can be RENDERED in a test), the
+  dispatch picker (where a human chooses what a zee will wear), and the honeycomb —
+  `harnessWarning()` in HiveCanvas writes the word under the badge in place of `×N`, and rings +
+  labels a MANAGER hexagon, which IS its persona. `getTimeline()` carries the two fields for that.
+  Colour is reinforcement; the WORD is the signal (same rule as the feed chips).
+  Test: `node test/harness-empty-visible.test.mjs` — the boot line against real rows, plus the real
+  components rendered (react-dom/server) and the real canvas functions DRAWN against a recording
+  2D context, so a regex over the source can't fake it.
+- **INJECTED artefacts are not source: nothing under `.zeehive/` is tracked** (2026-07-29, ticket #6).
+  `.gitignore` has ignored `.zeehive/` since it was first swept into a commit, but ignore rules do
+  not apply to a file already in the index — and `.zeehive/harness/memory/cxell-zee-manual.md` was.
+  So every cxell's injected copy read as a modification to a tracked file: two zees wrote commits
+  whose only purpose was undoing it (7c00642, cad07a8), one swept it in (28ff5c3), and one hit it as
+  a merge CONFLICT mid-land. The version that had not happened yet is the bad one — a zee lands its
+  injected copy and silently overwrites the repo's manual with a stale injection. `git rm --cached`
+  now makes the ignore rule bite; the file stays on disk, injected per xell, and a fresh injection
+  leaves `git status` clean. **Never re-add it, and never `git add -f` anything under `.zeehive/`
+  or `.claude/`.**
+  The manual's home is the META DB (harness `zee-base`, memory `cxell-zee-manual.md`, seeded by 047
+  and amended by 050/053/056/063/065 — every edit is a migration). There is **no `docs/cxell-zee-manual.md`**
+  and there must not be: a file copy drifts from the row the next migration lands, exactly as the
+  duplicated `scripts/zee` did. The four references that still pointed at that dead path
+  (`docs/harness-proposal.md`, `docs/schema-catchup-plan.md`, `harnesses/core/HARNESS.yml`,
+  `lib/harness.js`) now say where it actually lives; 046's comment carries a SUPERSEDED-BY-047 note
+  rather than being rewritten (an applied migration is a record, not a document).
 - Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
   messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
   over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
@@ -637,8 +669,10 @@ into every xell at `.zeehive/harness/memory/cxell-zee-manual.md`.
   the ship gate (see "Shipping"), and this line contradicted that section for a while. Read the
   tool list from `mcp/server.js`, not from here.
 
-The web app is **read-only** (no prompting there); the **▚_ terminal** button by "Status" opens a
-live queenzee activity log.
+The web app is **read-only** about the FLEET (no prompting there); the **▚_ terminal** button by
+"Status" opens a live queenzee activity log. ⚠ That stance was never about the zee TERMINAL —
+"when i said readonly i didnt mean the terminal was readonly". You can converse with any cxell zee
+from its terminal, mid-turn included: see the TALK QUEUE below.
 
 **Attending a cxell zee** (`⌨` on its card) opens the live terminal: while the headless turn runs
 you get its transcript feed (`docker/zeehive/zee-live.mjs` — ✱ thinking, ● what it says, ⚒ tool
@@ -649,3 +683,33 @@ belongs to `claude` after the turn), and the renderer watches the file and REPAI
 also removes what already scrolled past. The queenzee installs its own zee-live.mjs into every
 cxell at spawn, exactly as it does `scripts/zee`, or a stale image would leave the chips dead.
 Tests: `test/zee-live-view.test.mjs`, `test/terminal-feed-filter.test.mjs`.
+
+**The TALK QUEUE — conversing with a zee that is MID-TURN** (2026-07-29). That feed is read-only in
+BOTH directions: it renders the transcript and reads nothing from the terminal. So while a zee
+worked, every keystroke aimed at it vanished — a human's in the browser, and the queenzee's
+`send-keys` behind the 📨 message button, the 💬 nudge and a manager's `zee say` — while the console
+reported "typed into its live session". Worst for a **manager zee**, whose whole job is conversation,
+in the one place a human goes to talk to it.
+
+- **The queenzee decides, from the cage's real state.** `cxellTalkCommand` (`lib/cxell.js`, pure)
+  attaches-or-creates the pane session, then TYPES when the interactive session owns it and QUEUES a
+  file in `/tmp/zee-talk` when a headless turn (or its feed) does. `sendKeysToCxellZee` resolves
+  `{ sent, delivery: 'typed' | 'queued' }` and every caller passes that word on — "delivered" and
+  "will be delivered" are different promises.
+- **The cage drains it.** `zee-attach.sh` starts `drain_talk` AFTER the feed hands over and before
+  the vendor's resume takes the pane: oldest first, newlines collapsed (Enter SUBMITS in the TUI),
+  each file removed BEFORE it is typed (a crash loses a message rather than repeating it), and the
+  drainer is STOPPED before the pane falls back to a login shell — a queued message typed at a bash
+  prompt is a COMMAND, not a message.
+- **One pattern, two places.** `HEADLESS_PROC_PATTERN` (`lib/cxell-runtimes.js`) IS `live_run()` in
+  `zee-attach.sh`; they disagreeing means a message queued that nothing drains. Its brackets are
+  load-bearing: `pgrep -f` reads whole cmdlines and the pattern rides inside the command the
+  queenzee execs, so unbracketed it matched its OWN wrapper and made every cxell look mid-turn
+  forever (caught live). Same trick, same reason, as `zee-live[.]mjs`.
+- **zee-attach.sh now joins the CLI/renderer refresh** (spawn + the boot sweep), or the drainer would
+  exist only in cages built after the next image rebuild while the queue filled in every cxell alive.
+- **The terminal grew 💬 talk** — the same composer 📨 opens (one delivery path, one set of rules for
+  long text and images), highlighted while a feed owns the pane, printing a receipt into the pane
+  that says *typed* or *queued*. The feed banner now says the pane is read-only and where the door is.
+- Tests: `test/cxell-talk.test.mjs` (runs the REAL `drain_talk` against a REAL tmux pane, and the real
+  `sendKeysToCxellZee` against a throwaway sshd) and `test/terminal-talk-button.test.mjs`.
