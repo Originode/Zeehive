@@ -140,7 +140,9 @@ export async function claimMigrationNumber(project, xell, { name = null, again =
     const scanned = xells.map((x) => {
       const files = worktreeMigrationFiles(x.worktree_path);
       const nums = files ? numbersIn(files) : [];
-      return { xell_slug: x.slug, readable: files != null, count: nums.length, max: highest(nums), numbers: nums };
+      // count is FILES (what the zee would see in the folder), max is the highest number among them.
+      return { xell_slug: x.slug, readable: files != null, count: files ? files.length : 0,
+               max: highest(nums), numbers: nums };
     });
     // What the zee is shown: every worktree that CONTRIBUTED, plus every one that could not be read —
     // an unreadable sibling is a hole in the answer, so it is reported rather than silently dropped.
