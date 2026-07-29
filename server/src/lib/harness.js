@@ -244,8 +244,10 @@ export function loadHarnessDir(dir, base = harnessBase(dir)) {
   bundle.skills = skills;
 
   // memory files → inline text. A path resolves against the harness folder first, then the REPO ROOT
-  // (containment-guarded) — so a harness like Zee Base can incorporate docs/cxell-zee-manual.md live,
-  // no copy, no drift.
+  // (containment-guarded) — so a file-backed harness can incorporate a repo doc live, no copy, no
+  // drift. (Zee Base used to do exactly that with a repo copy of the cxell-zee manual; migration 047
+  // moved that manual INTO the meta DB and made Zee Base DB-owned, so it no longer comes through
+  // here — but the mechanism stands for any other harness that wants a live repo doc.)
   if (Array.isArray(bundle.memory)) {
     bundle.memory = bundle.memory.map((rel) => {
       const local = join(abs, rel);

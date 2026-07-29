@@ -36,10 +36,12 @@ the cage is the product working.
 
 ## 2. If you are a cxell zee
 
-**Your manual is [`.zeehive/harness/memory/cxell-zee-manual.md`](.zeehive/harness/memory/cxell-zee-manual.md)**
-— every verb, its gate, and the golden rules. It is authoritative and it is delivered to your xell
-from the meta-DB (harness `zee-base`), so it is always current for the queenzee you are talking to.
-It is deliberately **not** a file in `docs/`: a checked-in copy would rot the day the API moved.
+**Your manual is `.zeehive/harness/memory/cxell-zee-manual.md`, in your own workspace** — every verb,
+its gate, and the golden rules. It is authoritative and it is delivered to your xell from the meta-DB
+(harness `zee-base`), so it is always current for the queenzee you are talking to. It is deliberately
+**not** a file in `docs/`: a checked-in copy would rot the day the API moved. That path is INJECTED,
+not tracked (`.gitignore`) — it is there when you Read it and it is not part of any diff you land, so
+never commit it and never "restore" it if a merge disagrees with it.
 
 The shape of it:
 

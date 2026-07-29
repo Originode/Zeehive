@@ -419,6 +419,23 @@ a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manag
   Test: `node test/harness-empty-visible.test.mjs` — the boot line against real rows, plus the real
   components rendered (react-dom/server) and the real canvas functions DRAWN against a recording
   2D context, so a regex over the source can't fake it.
+- **INJECTED artefacts are not source: nothing under `.zeehive/` is tracked** (2026-07-29, ticket #6).
+  `.gitignore` has ignored `.zeehive/` since it was first swept into a commit, but ignore rules do
+  not apply to a file already in the index — and `.zeehive/harness/memory/cxell-zee-manual.md` was.
+  So every cxell's injected copy read as a modification to a tracked file: two zees wrote commits
+  whose only purpose was undoing it (7c00642, cad07a8), one swept it in (28ff5c3), and one hit it as
+  a merge CONFLICT mid-land. The version that had not happened yet is the bad one — a zee lands its
+  injected copy and silently overwrites the repo's manual with a stale injection. `git rm --cached`
+  now makes the ignore rule bite; the file stays on disk, injected per xell, and a fresh injection
+  leaves `git status` clean. **Never re-add it, and never `git add -f` anything under `.zeehive/`
+  or `.claude/`.**
+  The manual's home is the META DB (harness `zee-base`, memory `cxell-zee-manual.md`, seeded by 047
+  and amended by 050/053/056/063/065 — every edit is a migration). There is **no `docs/cxell-zee-manual.md`**
+  and there must not be: a file copy drifts from the row the next migration lands, exactly as the
+  duplicated `scripts/zee` did. The four references that still pointed at that dead path
+  (`docs/harness-proposal.md`, `docs/schema-catchup-plan.md`, `harnesses/core/HARNESS.yml`,
+  `lib/harness.js`) now say where it actually lives; 046's comment carries a SUPERSEDED-BY-047 note
+  rather than being rewritten (an applied migration is a record, not a document).
 - Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
   messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
   over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
