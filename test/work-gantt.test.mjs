@@ -216,11 +216,12 @@ ok(ts.dayKey(ts.addMonthsKeepingDay(D(2026, 1, 31), 1)) === '2026-02-28',
   ok(ts.clampSpan({ x: 20, w: 50 }, 1000).cutRight === false, 'an ordinary bar is untouched');
   ok(ts.clampSpan(null, 1000) === null, 'and an undated row is still no bar at all');
 }
-// an INVERTED row (due before start — the API accepts it) spans the contradiction, it does not hide
+// an INVERTED row (due before start) spans the contradiction rather than hiding as a 6px stub.
+// Migration 060 now forbids storing one; this stays as the defence that made the case visible.
 {
   const w = ts.windowFor([D(2026, 7, 20), D(2026, 8, 10)], { today: D(2026, 7, 29), zoom: 'day' });
   const inv = ts.barSpan(D(2026, 8, 10), D(2026, 7, 20), w.start, 30);
-  ok(inv.inverted === true, 'an inverted row is FLAGGED');
+  ok(inv.inverted === true, 'an inverted row is FLAGGED (060 now forbids storing one — this is the belt)');
   ok(inv.w === 22 * 30, `and drawn across both dates (${inv.w}px = 22 days), not collapsed to the 6px minimum`);
   ok(ts.barSpan(D(2026, 7, 20), D(2026, 7, 20), w.start, 30).inverted === false, 'an honest one-day bar is not');
 }

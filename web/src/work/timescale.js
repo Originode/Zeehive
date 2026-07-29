@@ -133,10 +133,13 @@ export const daysAt = (dx, px) => Math.round(dx / (px || 1));
 // A bar's rectangle. `end` may be missing (a row with a start and no due date, which the server
 // reports honestly rather than filling in) — that draws as a single unit, marked open-ended.
 //
-// An INVERTED row (due_on before starts_on) is a real state: the API accepts it today, so the chart
-// meets it. It used to collapse to the 6px minimum at the start date — pixel-identical to an
-// ordinary one-day bar, which is how a contradiction hides in plain sight. It now spans the
-// contradiction (due → start) and says `inverted`, so the caller can paint it as the mistake it is.
+// An INVERTED row (due_on before starts_on) can no longer be STORED — migration 060 made
+// due_on >= starts_on an invariant, and the library refuses it with a sentence — but this stays,
+// deliberately: it costs three lines, it is what made the case visible in the first place (the bar
+// used to collapse to the 6px minimum at the start date, pixel-identical to an ordinary one-day
+// task, which is how a contradiction hides in plain sight), and a read model is not the only way
+// rows arrive. If one ever does, it spans the contradiction (due → start) and says `inverted` so
+// the caller can paint it as the mistake it is, instead of drawing a tidy little lie.
 export function barSpan(start, end, winStart, px, minW = 6) {
   if (!start && !end) return null;
   const s = start || end;
