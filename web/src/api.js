@@ -211,6 +211,14 @@ export const deleteSite = (siteId, force = false) => siteCall(`/api/sites/${site
 
 // ── environments (masked — the server never returns a secret value, only a hint). The meta-DB
 // source of truth for the untracked .env; resolved onto a xell by tier (lib/environments.js). ──
+// ── the project's ENTRY-POINT DOCS (AGENTS.md / CLAUDE.md …) ──────────────────────────────────
+// Owned by the meta-DB and generated into every xell when a zee is assigned. The console's Docs tab
+// is the authoring surface; the queenzee refuses to write one over a path the project has committed.
+export const getProjectDocs = (projectId) => fetch(`/api/projects/${projectId}/docs`).then((r) => (r.ok ? r.json() : []));
+export const createProjectDoc = (projectId, body) => siteCall(`/api/projects/${projectId}/docs`, 'POST', body);
+export const updateProjectDoc = (docId, body) => siteCall(`/api/project-docs/${docId}`, 'PUT', body);
+export const deleteProjectDoc = (docId) => siteCall(`/api/project-docs/${docId}`, 'DELETE');
+
 export const getEnvironments = (projectId) => fetch(`/api/projects/${projectId}/environments`).then((r) => (r.ok ? r.json() : []));
 export const createEnvironment = (projectId, body) => siteCall(`/api/projects/${projectId}/environments`, 'POST', body);
 export const updateEnvironment = (envId, body) => siteCall(`/api/environments/${envId}`, 'PATCH', body);

@@ -1093,6 +1093,45 @@ export async function writeFileIntoCxell({ ctx = 'default', slug, relPath, base6
   return { path: full, rel: safe };
 }
 
+// Write a GENERATED file into a cxell — but never over a git-TRACKED path.
+//
+// This is the injector for the project entry-point docs (lib/project-docs.js): markdown the meta-DB
+// owns and the queenzee materializes into a xell, exactly like the harness files. The difference is
+// WHERE they land — a repo-relative path like AGENTS.md, which the project itself may already have
+// committed. Writing over that would replace the project's own instructions with an operator's, dirty
+// the worktree of every xell, and put a file nobody wrote into a landing diff for a human to approve.
+//
+// So git decides, inside the cage, in the same exec that would do the writing: tracked → nothing is
+// written and the caller is told why; untracked → written AND added to .git/info/exclude, so the
+// artefact can never travel into a commit either. The payload is buffered to a temp file first so the
+// decision cannot half-happen (and so a skip does not break the pipe mid-write).
+export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPath, text, timeoutMs = 30000 }) {
+  const name = cxellName(slug);
+  const safe = String(relPath).replace(/\\/g, '/').split('/')
+    .filter((seg) => seg && seg !== '.' && seg !== '..').join('/');
+  if (!safe) throw new Error('empty target path');
+  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const script = [
+    'set -e',
+    'cd /work/repo',
+    `P=${sq(safe)}`,
+    'tmp="$(mktemp)"',
+    'cat > "$tmp"',
+    'if git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then rm -f "$tmp"; echo TRACKED; exit 0; fi',
+    'mkdir -p "$(dirname "$P")"',
+    'mv "$tmp" "$P"',
+    'if [ -d .git ]; then grep -qxF "$P" .git/info/exclude 2>/dev/null || echo "$P" >> .git/info/exclude; fi',
+    'echo WROTE',
+  ].join('\n');
+  const out = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script], { input: String(text ?? ''), timeoutMs });
+  const verdict = String(out || '').trim().split('\n').pop();
+  if (verdict === 'TRACKED') {
+    return { written: false, skipped: 'tracked', rel: safe,
+      reason: `${safe} is tracked by git in this xell — the project's own committed copy is left alone` };
+  }
+  return { written: verdict === 'WROTE', rel: safe, path: `/work/repo/${safe}` };
+}
+
 export async function removeCxell({ ctx, slug }) {
   await dk(ctx, ['rm', '-f', cxellName(slug)]).catch(() => {});
   // pre-rename containers (zee_cage_<slug>) from the old-vocabulary era — idempotent, so this

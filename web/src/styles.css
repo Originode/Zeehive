@@ -117,6 +117,18 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .setup-grid input:focus, .setup-row input:focus { outline: none; border-color: var(--accent); }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
 
+/* Docs tab: one editor per entry-point doc (AGENTS.md / CLAUDE.md …). A DISABLED doc is dimmed but
+   still readable — it is text somebody wrote, not a deleted thing. */
+.setup-sub { margin: 8px 0; padding: 8px; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 8px; }
+.setup-sub.off { opacity: 0.55; }
+.setup-md { width: 100%; box-sizing: border-box; margin-top: 6px; background: var(--bg);
+  border: 1px solid var(--line); color: var(--text); border-radius: 6px; padding: 8px;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px;
+  line-height: 1.45; resize: vertical; }
+.setup-md:focus { outline: none; border-color: var(--accent); }
+.setup-row button.pill { background: var(--panel2); color: var(--muted); }
+
 /* onboard folder picker — walks the queenzee's filesystem one level at a time */
 .fsbrowse { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; padding: 8px;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; }

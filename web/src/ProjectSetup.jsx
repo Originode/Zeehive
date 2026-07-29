@@ -10,6 +10,7 @@ import {
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
   getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
   getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
+  getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -360,6 +361,7 @@ function ProbeChips({ probe }) {
 const SETUP_TABS = [
   { key: 'project', label: 'Project', gates: ['repo', 'main_branch', 'env', 'manifest'] },
   { key: 'deploy', label: 'Deploy', gates: ['dev_site', 'prod_site', 'shippable'] },
+  { key: 'docs', label: 'Docs', gates: [] },
   { key: 'env', label: 'Environments', gates: [] },
   { key: 'providers', label: 'Providers', gates: [] },
   { key: 'pool', label: 'Pool', gates: ['pool'] },
@@ -404,6 +406,7 @@ function EditSections({ project, onChanged, onProject }) {
         <SitesSection project={project} run={run} busy={busy} />
         <InventorySection project={project} run={run} busy={busy} />
       </>}
+      {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'pool' && <SpawnSection project={project} run={run} />}
@@ -756,6 +759,75 @@ function SiteEditor({ site, run, busy }) {
 // stored in the meta-DB, masked here (a secret's value is never returned — only a hint). A xell is
 // loaded with one by TIER: a live-prod / production xell gets the default prod env, a dev/spinoff
 // xell the default dev env — merged into its .zeehive.env by emitXellEnv.
+// ── the project's ENTRY-POINT DOCS ────────────────────────────────────────────
+// The AGENTS.md / CLAUDE.md a zee opens before it designs anything, owned by the meta-DB and
+// GENERATED into every xell when a zee is assigned (lib/project-docs.js) — the same rule the
+// harnesses moved to: one source, and the file in the workspace is an artefact of it.
+//
+// The two things this surface has to SAY, because they are the two ways an operator gets surprised:
+// a generated doc is never written over a path the project has committed (git decides, in the cage),
+// and it is git-excluded there — so it can carry fleet-wide instructions without ever appearing in a
+// landing diff.
+export function ProjectDocsSection({ project, run, busy }) {
+  const [docs, setDocs] = useState(null);
+  const [add, setAdd] = useState('');
+  const load = useCallback(() => getProjectDocs(project.id).then(setDocs).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  const suggestions = ['AGENTS.md', 'CLAUDE.md'].filter((p) => !(docs || []).some((d) => d.rel_path.toLowerCase() === p.toLowerCase()));
+  return (
+    <div className="setup-sec" data-testid="project-docs-section">
+      <h3>Docs <span className="pc">(the entry-point markdown a zee reads first — kept in the meta-DB and written into every xell when a zee is assigned)</span></h3>
+      <div className="pc">
+        A doc is <b>generated</b> into the xell at its path, stamped as generated, and added to the
+        xell's git excludes — so it never lands in a diff. If the project has <b>committed</b> a file
+        at that path, the repo's own copy wins and nothing is written.
+      </div>
+      {(docs || []).map((d) => <ProjectDocEditor key={d.id} doc={d} run={wrapped} busy={busy} />)}
+      {docs && docs.length === 0 && <div className="pc">No docs yet — add an <code>AGENTS.md</code> to tell every zee on this project how it works.</div>}
+      <div className="setup-row">
+        <input value={add} placeholder="path (e.g. AGENTS.md)" onChange={(e) => setAdd(e.target.value)}
+               title="repo-relative, markdown only; .git/ and .zeehive/ are refused" />
+        {suggestions.map((p) => (
+          <button key={p} type="button" className="pill" disabled={busy} onClick={() => setAdd(p)}>{p}</button>
+        ))}
+        <button type="button" disabled={busy || !add.trim()}
+                onClick={() => wrapped(() => createProjectDoc(project.id, { rel_path: add.trim(), body: '' }))
+                  .then(() => setAdd(''))}>＋ Add doc</button>
+      </div>
+    </div>
+  );
+}
+
+export function ProjectDocEditor({ doc, run, busy }) {
+  const [body, setBody] = useState(doc.body || '');
+  const [path, setPath] = useState(doc.rel_path);
+  const dirty = body !== (doc.body || '') || path !== doc.rel_path;
+  useEffect(() => { setBody(doc.body || ''); setPath(doc.rel_path); }, [doc.id, doc.body, doc.rel_path]);
+  return (
+    <div className={`setup-sub${doc.enabled ? '' : ' off'}`} data-testid={`project-doc-${doc.rel_path}`}>
+      <div className="setup-row">
+        <input value={path} onChange={(e) => setPath(e.target.value)} style={{ minWidth: 220 }} />
+        <label className="pc" title="an injected-but-disabled doc is not written into new xells">
+          <input type="checkbox" checked={!!doc.enabled} disabled={busy}
+                 onChange={(e) => run(() => updateProjectDoc(doc.id, { enabled: e.target.checked }))} /> enabled
+        </label>
+        <span className="pc">{(doc.body || '').length} chars</span>
+        <button type="button" disabled={busy || !dirty}
+                onClick={() => run(() => updateProjectDoc(doc.id, { rel_path: path.trim(), body }))}>Save</button>
+        <button type="button" className="hm-del" disabled={busy}
+                onClick={async () => {
+                  if (!await showConfirm(`Delete ${doc.rel_path}? New xells stop receiving it.`)) return;
+                  run(() => deleteProjectDoc(doc.id));
+                }} title="Delete this doc">🗑</button>
+      </div>
+      <textarea className="setup-md" rows={10} value={body} spellCheck={false}
+                placeholder="# How this project works&#10;&#10;What a zee arriving with no context needs to know."
+                onChange={(e) => setBody(e.target.value)} />
+    </div>
+  );
+}
+
 function EnvironmentsSection({ project, run, busy }) {
   const [envs, setEnvs] = useState(null);
   const [add, setAdd] = useState({ key: '', tier: 'dev', label: '' });
