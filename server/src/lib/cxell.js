@@ -315,15 +315,62 @@ export async function deliverXourceIntoCxell({ ctx = 'default', slug, worktree, 
 // current xource, so the eventual cxell→worktree fast-forward succeeds and a push lands.
 //
 // The division of labour the task requires: this attempt is script-only. Its JUDGMENT call — a real
-// CONTENT conflict — is the one thing handed back to the model. We classify the merge output with the
-// SAME predicate the host-side catch-up uses (classifyMergeOutput), so a genuine conflict reads
-// 'conflict' (the zee's to resolve, in place — MERGE_HEAD is left set) and an operational failure
-// reads 'error' (nothing for the zee to fix in code). Returns { state, ... } where state is:
+// CONTENT conflict — is the one thing handed back to the model, so a genuine conflict reads 'conflict'
+// (the zee's to resolve, in place — MERGE_HEAD is left set) and an operational failure reads 'error'
+// (nothing for the zee to fix in code). Returns { state, ... } where state is:
 //   'up-to-date' — the cxell already contains the xource tip; nothing to do.
 //   'merged'     — merged origin/main in cleanly; head is the new merge commit.
-//   'conflict'   — a genuine content conflict; the merge is LEFT in progress for the zee to resolve.
-//   'error'      — an operational failure (delivery or a non-conflict merge failure).
+//   'conflict'   — a merge is in progress in the cxell for the zee to resolve (a content conflict this
+//                  sync hit, or one an EARLIER sync left and the zee has not concluded).
+//   'error'      — an operational failure (delivery, or a merge that could not start).
+//   'unknown'    — the cxell did not say what its merge did. The tree is left EXACTLY as it is.
+//
+// ⚠ THE DATA-LOSS RULE THIS FUNCTION IS BUILT AROUND. `git merge --abort` throws away a working tree
+// and an index, so it may only ever run when we KNOW there is nothing of the zee's in them. A caged
+// zee resolving a conflict by hand has its whole resolution in exactly those two places, and nothing
+// of it is committed until it says so — `merge --abort` deletes it with no way back (verified: a
+// staged resolution reverts to the pre-merge blob and `git status` goes clean). So the abort is gated
+// on the SCRIPT'S OWN STATEMENT of what it just did, never on a classified message, and every path
+// where the outcome is not known leaves the tree untouched. See the abort below for the one path that
+// survives, and dk-verdict-contract.test.mjs / cxell-sync-abort-safety.test.mjs for the fence.
 const CX_IDENTITY = `-c user.name='Zeehive queenzee' -c user.email=queenzee@zeehive.local`;
+
+// The merge, as a script that SAYS WHAT IT DID on stdout — the shape dkVerdict exists for (see there:
+// three callers lost the same value in one day by deciding from something other than the verdict).
+// Exported with a repoDir like warmInstallScript so a test can run the real thing against a real
+// throwaway repo, which is the only way to prove the four git states below are told apart.
+//
+// It answers with exactly one marker, and each one is a FACT the script observed, not an inference:
+//   MERGE_HELD    — a merge was ALREADY in progress before we touched anything, so we ran no merge at
+//                   all. This is the zee mid-resolution (git refuses with "You have not concluded your
+//                   merge", whose text classifies as an operational error — which is precisely how an
+//                   abort used to eat the resolution).
+//   MERGE_OK      — merged cleanly.
+//   MERGE_CONFLICT— unmerged paths in the index: a real content conflict, the zee's to resolve.
+//   MERGE_STOPPED — the merge WE started is in progress with NO unmerged path (e.g. a hook declined
+//                   the merge commit): nothing to resolve, and nothing of the zee's inside it.
+//   MERGE_FAILED  — the merge never started (bad ref, unreadable object, local changes in the way),
+//                   so there is no merge in progress and nothing to abort.
+// `2>&1` keeps git's own lines (including "CONFLICT …") on stdout, where the verdict is read from and
+// where they can be reported to the zee verbatim.
+export function syncMergeScript(repoDir = '/work/repo') {
+  return [
+    `cd ${repoDir} || { echo "cannot enter ${repoDir}"; echo MERGE_FAILED; exit 0; }`,
+    // NEVER start a merge on top of one we did not start, and never touch it. A zee halfway through a
+    // resolution has staged files and no commit; git would refuse anyway, and the refusal is what used
+    // to be classified as operational and aborted.
+    'if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then',
+    '  echo "a merge was already in progress in this cxell — left untouched:"',
+    '  git status --porcelain | head -40',
+    '  echo MERGE_HELD; exit 0',
+    'fi',
+    `git ${CX_IDENTITY} merge --no-edit refs/remotes/origin/main 2>&1; rc=$?`,
+    'if [ "$rc" = 0 ]; then echo MERGE_OK',
+    'elif [ -n "$(git ls-files --unmerged)" ]; then echo MERGE_CONFLICT',
+    'elif git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then echo MERGE_STOPPED',
+    'else echo MERGE_FAILED; fi',
+  ].join('\n');
+}
 export async function syncCxellWithXource({ ctx = 'default', slug, worktree, ref }) {
   const name = cxellName(slug);
   let delivery;
@@ -342,33 +389,65 @@ export async function syncCxellWithXource({ ctx = 'default', slug, worktree, ref
     return { state: 'up-to-date', head, tip: delivery.tip, ref };
   } catch { /* not yet an ancestor → merge it */ }
 
-  // MERGE. --no-edit so the script needs no editor; the queenzee identity so the merge commit never
-  // depends on the container's (absent) git config. On failure DO NOT abort: leaving MERGE_HEAD set
-  // is what lets the zee resolve a genuine conflict in place, then just commit. Capture the FULL merge
-  // output (2>&1) and the REAL exit code inline — git writes its "CONFLICT …/Automatic merge failed"
-  // lines to stdout, and we must classify on the whole text, not a truncated docker-error slice.
-  let out = '', code = 1;
+  // MERGE, through dkVerdict — the ONE runner for an exec whose script states its own outcome. It
+  // reads the verdict off STDOUT whatever the exec exited with, so the classification can never again
+  // come from a REJECTION MESSAGE: that message is built for a human (both streams, each capped at 400
+  // chars), and reading a merge's state out of it made a truncated conflict look operational — which
+  // ran `git merge --abort` on a tree that had a conflict in it.
+  let r = null, failure = null;
   try {
-    const r = await dk(ctx, ['exec', name, 'bash', '-lc',
-      `cd /work/repo && git ${CX_IDENTITY} merge --no-edit refs/remotes/origin/main 2>&1; echo "__MERGE_RC__:$?"`],
-      { timeoutMs: 180000 });
-    out = r.out;
-    code = Number((out.match(/__MERGE_RC__:(\d+)/) || [])[1] ?? 1);
-  } catch (e) {
-    code = 1; out = String(e.message);
+    r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc', syncMergeScript()], {
+      markers: ['MERGE_OK', 'MERGE_CONFLICT', 'MERGE_STOPPED', 'MERGE_FAILED', 'MERGE_HELD'],
+      label: `${slug}: sync merge of ${ref}`, timeoutMs: 180000,
+    });
+  } catch (e) { failure = e; }
+
+  // UNKNOWN — either the exec never ran (spawn failure, timeout: the merge may still be running in
+  // there) or it ran and did not state an outcome we declared. Both mean we do not know what is in
+  // that tree, so we DO NOT TOUCH IT and we say so loudly: a zee can resolve a conflict it was told
+  // about, and cannot recover work an abort deleted.
+  if (failure || !r.verdict) {
+    const said = failure ? String(failure.message) : dkSaid(r, 1200);
+    logline('cxell', `${slug}: sync merge of ${ref} → UNKNOWN — the cxell did not report what the merge did, `
+      + `so its tree was LEFT EXACTLY AS IT IS (no abort, no reset). A human should look inside `
+      + `/work/repo (\`git status\`): ${said.slice(0, 300)}`);
+    return { state: 'unknown', stage: 'merge', output: said.slice(-1200), tip: delivery.tip, ref };
   }
-  if (code === 0) {
+
+  if (r.verdict === 'MERGE_OK') {
     const head = (await dk(ctx, ['exec', name, 'bash', '-lc', 'cd /work/repo && git rev-parse HEAD'], { timeoutMs: 15000 })).out.trim();
     logline('cxell', `${slug}: merged ${ref} into the cxell cleanly → ${String(head).slice(0, 8)}`);
     return { state: 'merged', head, tip: delivery.tip, ref };
   }
-  // Failed. Classify: a real content conflict is the zee's; anything else is operational.
-  const cls = classifyMergeOutput(out);
-  if (cls.state === 'error') {
-    // Not a content conflict → nothing for the zee to resolve. Abort so we don't leave a stuck merge.
-    await dk(ctx, ['exec', name, 'bash', '-lc', 'cd /work/repo && git merge --abort'], { timeoutMs: 15000 }).catch(() => {});
+  const out = String(r.out || '');
+  // A merge in progress is the zee's, whether this sync made it (MERGE_CONFLICT: unmerged paths) or an
+  // earlier one did and the zee is mid-resolution (MERGE_HELD: we ran no merge at all). Left in place,
+  // reported as theirs.
+  if (r.verdict === 'MERGE_CONFLICT' || r.verdict === 'MERGE_HELD') {
+    const held = r.verdict === 'MERGE_HELD';
+    logline('cxell', `${slug}: sync merge of ${ref} → conflict`
+      + (held ? ' — a merge was ALREADY in progress in the cxell, so nothing was merged and nothing touched'
+              : ' — left in progress in the cxell for the zee to resolve'));
+    return { state: 'conflict', held, output: out.slice(-1200), tip: delivery.tip, ref };
   }
-  logline('cxell', `${slug}: sync merge of ${ref} → ${cls.state}`);
+  if (r.verdict === 'MERGE_STOPPED') {
+    // THE ONLY ABORT LEFT, and the only one that can be safe: the script itself observed that (a) no
+    // merge was in progress before it ran, (b) the merge it started is in progress, and (c) there are
+    // ZERO unmerged paths — so there is no conflict resolution to destroy and the merge being undone is
+    // one the queenzee made seconds ago (a declined pre-merge-commit hook, say). Nothing else aborts.
+    await dk(ctx, ['exec', name, 'bash', '-lc', 'cd /work/repo && git merge --abort'], { timeoutMs: 15000 }).catch(() => {});
+    logline('cxell', `${slug}: sync merge of ${ref} → error (the merge stopped with no conflicted file — `
+      + `nothing for the zee to resolve, so the merge WE started was aborted)`);
+    return { state: 'error', stage: 'merge', output: out.slice(-1200), tip: delivery.tip, ref };
+  }
+  // MERGE_FAILED — the merge never started, so there is nothing in progress and nothing to abort. What
+  // KIND of failure it was still comes from git's own words, with the SAME predicate the host-side
+  // catch-up uses (classifyMergeOutput): "local changes would be overwritten by merge" is the zee's to
+  // sort out, an unreadable object or a bad ref is not. Reading that from the script's captured stdout
+  // is safe; reading it from a rejection message was not.
+  const cls = classifyMergeOutput(out);
+  logline('cxell', `${slug}: sync merge of ${ref} → ${cls.state} (the merge did not start; nothing in `
+    + `progress, so nothing was aborted)`);
   return { ...cls, tip: delivery.tip, ref };
 }
 
@@ -1197,6 +1276,13 @@ export function cxellTalkCommand({ text, session = 'zee', sessionId = '', enter 
 export async function sendKeysToCxellZee({ sshPort, slug, text, sessionId, session = 'zee', enter = true, timeoutMs = 30000 }) {
   if (!sshPort && !slug) throw new Error('no SSH port or slug for this cxell');
   const sh = cxellTalkCommand({ text, session, sessionId, enter });
+  // This reads markers off a script's stdout, like the dkVerdict sites — but through sshExecInCxell, a
+  // different transport, and it is DELIBERATELY not routed through dkVerdict. The bug dkVerdict exists
+  // to prevent is a verdict destroyed by a non-zero exit; sshExecInCxell resolves { code, out, err } on
+  // ANY exit code and never rejects on one, so there is no rejection here to lose a marker in — the
+  // property, not a second helper, is what makes it safe, and dk-verdict-contract.test.mjs asserts that
+  // property at source so it cannot be quietly changed. Teaching dkVerdict a second transport to reach
+  // one call site would add the shape it guards against (two runners with the same job) for no defect.
   const r = await sshExecInCxell({ sshPort, slug, cmd: sh, timeoutMs });
   if (/__ZEE_TALK_QUEUED__/.test(r.out)) return { sent: true, text, delivery: 'queued' };
   if (!/__ZEE_KEYS_SENT__/.test(r.out)) {
