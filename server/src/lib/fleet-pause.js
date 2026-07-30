@@ -1,10 +1,13 @@
 // FLEET PAUSE — the state half of the operator's pause/play switch (the fan-out is
 // queenzee/pause.js; the table and the argument for a durable flag are in migration 100).
 //
-// This module is deliberately a LEAF: it imports the db and the log bus and nothing else. Everything
-// that can start or continue a zee's turn has to ask it — nudge.js (landing/clearance/reflection
-// resumes, operator messages, manager→worker talk), intake.js (dispatch/spawn), the console read
-// models — and a leaf is what makes that safe to import from all of them without an import cycle.
+// This module manages THREE levels of pause:
+//   1. FLEET-WIDE (fleet_pause table, migration 100) — stops EVERY xell in every project.
+//   2. PER-PROJECT (project_pause table, migration 101) — stops every xell in ONE project.
+//   3. PER-XELL (session_event 'xell-pause'/'xell-resume', migration 101) — stops ONE xell.
+//
+// A xell is "paused" if ANY of these three levels says so. The hive_status derivation AND every
+// gate (dispatch, nudge, ...) check all three.
 //
 // WHY A CACHE. `paused` is read on hot paths (every spawn, every nudge, every fleet snapshot) and the
 // meta-DB is on a NAS: a blocking round-trip per read is exactly the kind of cost that gets a guard
@@ -142,6 +145,126 @@ export function forgetPauseCache() { cached = { paused: cached.paused, at: 0 }; 
 // tend and the inbox as they are NOW rather than as they were when the nudge was refused.
 export const NUDGE_HELD = 'nudge-held';
 export const NUDGE_HELD_CLEAR = 'nudge-held-clear';
+
+// ── PER-PROJECT PAUSE (project_pause table) ────────────────────────────────────────────────────────
+
+// Read the project pause row. A missing row reads as "not paused".
+export async function projectPauseState(projectId) {
+  if (!projectId) return { paused: false, by: null, reason: null };
+  try {
+    const r = await one(`SELECT * FROM project_pause WHERE project_id = $1`, [projectId]);
+    if (!r) return { paused: false, by: null, reason: null };
+    return {
+      paused: !!r.paused,
+      since: r.paused ? r.paused_at : null,
+      by: r.paused ? r.paused_by : null,
+      reason: r.paused ? r.reason : null,
+      interrupted: r.interrupted || 0,
+      unreachable: r.unreachable || 0,
+      nudged: r.nudged || 0,
+    };
+  } catch (e) {
+    logline('pause', `could not read project pause (${String(e.message).slice(0, 120)}) — answering not paused`);
+    return { paused: false, by: null, reason: null };
+  }
+}
+
+// Set the project pause flag. Returns the updated row.
+export async function setProjectPaused(projectId, paused, { by = 'human@console', reason = null } = {}) {
+  if (!projectId) throw new Error('projectId is required');
+  const r = await one(
+    `INSERT INTO project_pause (project_id, paused, paused_at, paused_by, reason, resumed_at, resumed_by)
+          VALUES ($1, $2,
+                  CASE WHEN $2 THEN now() ELSE NULL END,
+                  CASE WHEN $2 THEN $3::text ELSE NULL END,
+                  CASE WHEN $2 THEN $4::text ELSE NULL END,
+                  CASE WHEN $2 THEN NULL ELSE now() END,
+                  CASE WHEN $2 THEN NULL ELSE $3::text END)
+     ON CONFLICT (project_id) DO UPDATE SET
+       paused     = EXCLUDED.paused,
+       paused_at  = CASE WHEN EXCLUDED.paused THEN COALESCE(project_pause.paused_at, now()) ELSE NULL END,
+       paused_by  = CASE WHEN EXCLUDED.paused THEN $3::text ELSE NULL END,
+       reason     = CASE WHEN EXCLUDED.paused THEN $4::text ELSE NULL END,
+       resumed_at = CASE WHEN EXCLUDED.paused THEN NULL ELSE now() END,
+       resumed_by = CASE WHEN EXCLUDED.paused THEN NULL ELSE $3::text END
+     RETURNING *`,
+    [!!paused, by, reason]);
+  return r;
+}
+
+// Record what a project pause fan-out actually reached.
+export async function setProjectPauseCounts(projectId, { interrupted = null, unreachable = null, nudged = null } = {}) {
+  if (!projectId) return null;
+  return one(
+    `UPDATE project_pause SET
+       interrupted = COALESCE($2, interrupted),
+       unreachable = COALESCE($3, unreachable),
+       nudged      = COALESCE($4, nudged)
+     WHERE project_id = $1 RETURNING *`, [projectId, interrupted, unreachable, nudged]).catch(() => null);
+}
+
+// ── PER-XELL PAUSE (session_event 'xell-pause' / 'xell-resume') ────────────────────────────────────
+// Latest-event-wins, exactly like tend/hints. No schema change needed.
+
+// Whether a specific xell is individually paused. Reads the latest event for that xell.
+export async function isXellPaused(xellId) {
+  if (!xellId) return false;
+  try {
+    const r = await one(
+      `SELECT hook_event_name FROM session_event
+        WHERE xell_id = $1 AND hook_event_name IN ('xell-pause','xell-resume')
+        ORDER BY ts DESC LIMIT 1`, [xellId]);
+    return r?.hook_event_name === 'xell-pause';
+  } catch (e) {
+    logline('pause', `could not read xell pause for ${String(xellId).slice(0, 8)} (${String(e.message).slice(0, 100)})`);
+    return false;
+  }
+}
+
+// Record a xell pause or resume event. Best-effort, never throws.
+export async function setXellPaused(xellId, paused, { by = 'human@console' } = {}) {
+  if (!xellId) return;
+  try {
+    const { recordEvent } = await import('./status.js');
+    await recordEvent({
+      source: 'queenzee',
+      hook_event_name: paused ? 'xell-pause' : 'xell-resume',
+      xell_id: xellId,
+      raw: { by },
+    });
+  } catch (e) {
+    logline('pause', `could not record ${paused ? 'xell-pause' : 'xell-resume'} for ${String(xellId).slice(0, 8)} (${String(e.message).slice(0, 100)})`);
+  }
+}
+
+// ── COMBINED CHECK ─────────────────────────────────────────────────────────────────────────────────
+// Is a SPECIFIC xell paused? Checks all three levels: fleet-wide, project-scoped, and per-xell.
+// The `xellPausedHint` parameter is an optional pre-resolved per-xell flag (from the fleet query's
+// lateral join) to avoid a second round-trip when the caller already has the row.
+export async function xellPaused(xell, { xellPausedHint = null } = {}) {
+  if (!xell) return false;
+  const fleet = await fleetPaused();                           // level 1: fleet-wide
+  if (fleet) return true;
+  const project = await isProjectPaused(xell.project_id);      // level 2: project-scoped
+  if (project) return true;
+  if (xellPausedHint === true) return true;                    // level 3: per-xell (pre-resolved)
+  if (xellPausedHint === false) return false;
+  return await isXellPaused(xell.id);
+}
+
+// Quick check: is a project paused? (no caching — called from non-hot paths)
+async function isProjectPaused(projectId) {
+  if (!projectId) return false;
+  try {
+    const r = await one(`SELECT paused FROM project_pause WHERE project_id = $1`, [projectId]);
+    return !!r?.paused;
+  } catch { return false; }
+}
+
+// The single human-readable sentence for "the project is paused". Used by every gate that refuses.
+export function projectPausedReason(projectName) {
+  return `the project ${projectName || 'this project'} is PAUSED — press play to resume.`;
+}
 
 // Record that a wake-up for this xell was refused because the fleet is paused. Best-effort and never
 // throws: this is bookkeeping on a path that must not fail (nudges are fire-and-forget by contract).

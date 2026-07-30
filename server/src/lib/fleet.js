@@ -4,7 +4,7 @@ import { q, one } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
-import { pauseState, PAUSED_STOP_REASON } from './fleet-pause.js';
+import { pauseState, projectPauseState, PAUSED_STOP_REASON } from './fleet-pause.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { deviceConfig } from './devices.js';
 import { reasonPair } from './status.js';
@@ -113,6 +113,10 @@ async function fetchXellRows(pid) {
             tnd.reason AS tend_reason, tnd.ts AS tend_at,
             -- readiness HINTS (zee said "this looks land/ship-ready" without calling the gated verb):
             -- same latest-event-wins ride as tend, one per kind.
+            -- per-xell individual pause (session_event, latest-event-wins, migration 101)
+            (SELECT se.hook_event_name FROM session_event se
+               WHERE se.xell_id = x.id AND se.hook_event_name IN ('xell-pause','xell-resume')
+               ORDER BY se.ts DESC LIMIT 1) = 'xell-pause' AS xell_paused,
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('landhint-request','landhint-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'landhint-request' AS land_hint,
@@ -192,7 +196,7 @@ function containerShellable(project, c) {
 
 // Attach a xell's resolved container stack + xource/deploy heads. Mutates and returns `x`. One
 // stack query per xell — the streamable unit of work.
-async function decorateXell(x, heads, deployed, project, { paused = false } = {}) {
+async function decorateXell(x, heads, deployed, project, { paused = false, projectPaused = false } = {}) {
   const stack = await q(
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id, c.isolation,
             c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
@@ -232,11 +236,12 @@ async function decorateXell(x, heads, deployed, project, { paused = false } = {}
     seedPending: x.seed_pending === true,
     doneSuggested: x.done_suggested === true,
     landHolding: x.land_holding === true,
-    // PAUSED is the AND of a fleet-wide flag and a per-zee fact: the fleet is paused AND this zee's
-    // turn is the one the pause stopped. Not the flag alone — a zee that was already between turns
-    // when the button was pressed was not interrupted, and painting it 'paused' would tell the
-    // operator they stopped work that had already finished.
-    paused: paused && x.zee_last_stop_reason === PAUSED_STOP_REASON,
+    // PAUSED — three levels (migration 101):
+    //   1. fleet-wide: fleet_pause.paused AND this zee was the one the fleet sweep stopped
+    //   2. project-scoped: project_pause.paused AND this zee was the one the project sweep stopped
+    //   3. per-xell: session_event 'xell-pause' flag on this xell
+    paused: (paused || projectPaused) && x.zee_last_stop_reason === PAUSED_STOP_REASON,
+    xellPaused: x.xell_paused === true,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
@@ -287,8 +292,10 @@ export async function streamXells(projectId, onXell) {
   const { heads, deployed } = await fleetGitContext(project);
   const rows = await fetchXellRows(project.id);
   const { paused } = await pauseState();
+  const projPause = await projectPauseState(project.id);
+  const projectPaused = projPause.paused;
   for (const x of rows) {
-    await decorateXell(x, heads, deployed, project, { paused });
+    await decorateXell(x, heads, deployed, project, { paused, projectPaused });
     await onXell(x);
   }
   return project;
@@ -338,7 +345,9 @@ export async function getFleet(projectId) {
   // The fleet PAUSE, read ONCE for the whole snapshot: it is a single fleet-wide flag, so asking per
   // xell would be one round-trip per hexagon for one boolean.
   const pause = await pauseState();
-  for (const x of xells) await decorateXell(x, heads, deployed, project, { paused: pause.paused });
+  const projPause = await projectPauseState(project.id);
+  const projectPaused = projPause.paused;
+  for (const x of xells) await decorateXell(x, heads, deployed, project, { paused: pause.paused, projectPaused });
 
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
@@ -504,6 +513,8 @@ export async function getFleet(projectId) {
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,
+    // Per-project pause state (migration 101) — alongside the fleet-wide `pause` above.
+    project_pause: projPause,
   };
 }
 

@@ -121,6 +121,7 @@ const fmtUsd = (n) => '$' + (n >= 100 ? Math.round(n) : (n || 0).toFixed(2));
 // The honeycomb shows that with a yellow blinking dot beside the diff; the animation loop that makes
 // it blink only runs while at least one xell is busy (see the effect in HiveCanvas).
 const isBusyZee = (x) => !x.is_production && (x.cli_active === true || x.zee_status === 'working');
+const isPaused = (x) => !x.is_production && x.hive_status === 'occ-paused';
 function drawBusyDot(ctx, x, y, r) {
   const a = 0.2 + 0.8 * (0.5 + 0.5 * Math.sin(performance.now() / 300));   // blink
   ctx.save();
@@ -129,6 +130,21 @@ function drawBusyDot(ctx, x, y, r) {
   ctx.fillStyle = withAlpha('#ffd93b', a);
   ctx.shadowColor = '#ffd93b'; ctx.shadowBlur = r * 1.6 * a;
   ctx.fill();
+  ctx.restore();
+}
+// Red pause icon (two vertical bars) drawn where the yellow "working" dot would be — used when a xell
+// is paused (fleet-wide, project-scoped or per-xell). The ⏸ character is clear enough at hex scales.
+function drawPausedIcon(ctx, x, y, r) {
+  ctx.save();
+  ctx.font = `600 ${r * 2}px 'Segoe UI', sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = COL.error;
+  ctx.globalAlpha = 0.8;
+  // Two vertical bars (⏸ pause symbol) — drawn as actual bars for crispness at any size
+  const bw = r * 0.3, gap = r * 0.4, h = r * 1.5;
+  const x0 = x - (bw * 2 + gap) / 2;
+  ctx.fillRect(x0, y - h / 2, bw, h);
+  ctx.fillRect(x0 + bw + gap, y - h / 2, bw, h);
   ctx.restore();
 }
 const nick = (name) => {
@@ -619,7 +635,9 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         drawManagerHex(ctx, hx, { hover: hovered, dim, crew: crewOf[hx.id] || [],
           harness: h, img: getImg(h?.avatar_url), ...relArgs });
       } else {
-        drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines, ...relArgs });
+        const workerHarness = harnessOf(hx.id);
+        drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines,
+          harness: workerHarness, harnessImg: getImg(workerHarness?.avatar_url), ...relArgs });
       }
     }
     geomRef.current.flower = null;
@@ -1020,7 +1038,8 @@ export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color =
 // reaches it: drawManagerHex draws that one instead (no sha, no diffstat, a persona and its crew).
 // exported for the same reason drawManagerHex is: the crew highlight is a DRAWN state (there is no DOM
 // per cell), so the only honest way to assert it is to run this against a recording 2D context
-export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = null, relatedTo = null, relColor = null }) {
+export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = null, relatedTo = null, relColor = null,
+                                          harness = null, harnessImg = null }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);
   // The commit head reads in the SAME colour the git graph traces this xell with — its connector
@@ -1063,6 +1082,17 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
 
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   const full = size >= 52;             // the two-half card needs room; else degrade
+
+  // ── harness avatar badge (upper-left corner) ──
+  // Small persona disc for the harness this worker wears, matching the manager's avatar style but
+  // much smaller: a ringed disc ~18% of the hex radius, sitting in the upper-left quadrant.
+  if (full && harness && size >= 48) {
+    const avatarR = Math.max(5, size * 0.12);
+    const ax = cx - size * 0.52 + avatarR;
+    const ay = cy - size * 0.68 + avatarR;
+    drawAvatarDisc(ctx, ax, ay, avatarR, harness.color || col,
+      { img: harnessImg, glyph: harness.glyph || null, letter: String(harness.label || '?')[0] });
+  }
 
   // ── upper half ──
   // Machine line, prefixed with the cxell lock (🔒 cxell / 🔓 uncxell) so protocol-compliance reads
@@ -1164,9 +1194,11 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
       ];
       // fill the card width (capped so it clears the sha above and the status pill below)
       const row = drawDiffFilled(ctx, cx, y, parts, { maxW: w * 0.82, minPx: 9, maxPx: size * 0.17 });
-      // yellow blinking "actively working" dot, just left of the diff row
+      // yellow blinking "actively working" dot, or red pause icon when paused
       if (isBusyZee(x)) {
         drawBusyDot(ctx, cx - row.width / 2 - size * 0.11, y, Math.max(2.4, size * 0.055));
+      } else if (isPaused(x)) {
+        drawPausedIcon(ctx, cx - row.width / 2 - size * 0.11, y, Math.max(2.4, size * 0.055));
       }
     }
     // status pill — the DISPLAY status (occ-working / occ-tendRequest / live-protected / …)
@@ -1383,8 +1415,12 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     const shown = fit(ctx, line, w * 0.82);
     ctx.fillText(shown, cx, cy + size * 0.35);
     // and the yellow "actively working" dot rides beside it, exactly as it does on a worker
+    // — or the red pause icon when the xell is paused
     if (isBusyZee(x)) {
       drawBusyDot(ctx, cx - ctx.measureText(shown).width / 2 - size * 0.11, cy + size * 0.35,
+        Math.max(2.4, size * 0.055));
+    } else if (isPaused(x)) {
+      drawPausedIcon(ctx, cx - ctx.measureText(shown).width / 2 - size * 0.11, cy + size * 0.35,
         Math.max(2.4, size * 0.055));
     }
   }
@@ -1546,7 +1582,12 @@ export function petalVerbs(x, diff) {
     || st === 'occ-shipRequest' || st === 'occ-shipHint';         // …or a ship request/hint standing
   const v = {};
   if (buildable) v[3] = ['build'];                                // CONTAINERS petal
-  v[2] = cxell ? ['terminal', 'nudge'] : [];                      // SESSION petal (a live cxell zee)
+  // SESSION petal (2): pause/play per-xell control, then terminal/nudge for live cxells
+  const xellHive = x.hive_status;
+  const xPaused = xellHive === 'occ-paused';
+  v[2] = cxell
+    ? (xPaused ? ['resume', 'terminal', 'nudge'] : ['pause', 'terminal', 'nudge'])
+    : (xPaused ? ['resume'] : ['pause']);
   v[4] = cxell ? ['env', 'message'] : ['env'];                    // MACHINE petal
   // BRANCH petal — the two ways a xell's current job ENDS, side by side, because they are each
   // other's alternative: SWAP keeps the xell and changes who is in it (same branch, same commits,
@@ -1576,9 +1617,10 @@ export function petalVerbs(x, diff) {
 const VERB_LABEL = {
   build: '🔨 build', terminal: '⌨ terminal', nudge: '💬 nudge', env: '❖ env', message: '📨 message',
   pull: '↓ pull', land: '⬆ land', pr: 'PR', ship: '🚀 ship', swap: '♻ swap zee',
+  pause: '⏸ pause', resume: '▶ play',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
-  done: 'error', swap: 'working' };
+  done: 'error', swap: 'working', pause: 'error', resume: 'working' };
 
 function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];
@@ -1852,9 +1894,11 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor, { hov
       const maxW = hexHalfWidthAt(size, size * 0.05) * 2 * 0.9;
       const row = drawDiffFilled(ctx, cx, cy - size * 0.04, parts,
         { maxW, minPx: 9, maxPx: size * 0.34, split: 2 });
-      // yellow blinking "actively working" dot, just left of the (first) diff row
+      // yellow blinking "actively working" dot, just left of the (first) diff row, or red pause icon
       if (isBusyZee(x)) {
         drawBusyDot(ctx, cx - row.width / 2 - size * 0.14, row.y, Math.max(3, size * 0.06));
+      } else if (isPaused(x)) {
+        drawPausedIcon(ctx, cx - row.width / 2 - size * 0.14, row.y, Math.max(3, size * 0.06));
       }
       // clickable, exactly like the source stat above → 'owndiff' (see onPointerUp)
       drawStatLink(ctx, cx, { ...row, y: row.wrapped ? row.y + size * 0.2 : row.y }, 'read the diff');

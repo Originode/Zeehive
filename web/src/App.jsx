@@ -3,7 +3,8 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
-         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee } from './api.js';
+         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
+         pauseXell, resumeXell } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
 import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
@@ -594,6 +595,34 @@ export default function App() {
         setTimeout(() => dismissToast(id), 7000); });
       return;
     }
+    if (kind === 'pause') {
+      const id = `xpause-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Pausing ${x.slug}…` });
+      pauseXell(x.id).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: `Paused ${x.slug}`, onRetry: null,
+          body: r?.counts?.interrupted ? `${r.counts.interrupted} turn(s) interrupted` : 'marked as paused' });
+        else updateToast(id, { kind: 'error', title: 'Pause not delivered', onRetry: null,
+          body: r?.reason || 'server refused' });
+        setTimeout(() => dismissToast(id), 6000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Pause failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
+      return;
+    }
+    if (kind === 'resume') {
+      const id = `xresume-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Resuming ${x.slug}…` });
+      resumeXell(x.id).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: `Resumed ${x.slug}`, onRetry: null,
+          body: r?.counts?.nudged ? `${r.counts.nudged} zee(s) called back` : 'marked as active' });
+        else updateToast(id, { kind: 'error', title: 'Resume not delivered', onRetry: null,
+          body: r?.reason || 'server refused' });
+        setTimeout(() => dismissToast(id), 6000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Resume failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
+      return;
+    }
     if (kind === 'nudge') {
       const id = `nudge-${x.id}-${Date.now()}`;
       pushToast({ id, kind: 'progress', title: `Nudging ${x.slug}…`, body: 'typing “status?” into its live session' });
@@ -738,7 +767,8 @@ export default function App() {
         {/* FIRST in the line, before anything that starts work: the one control that stops all of it.
             Its own state is also the answer to "why is nothing happening?", which is the question the
             rest of this line cannot answer while the fleet is paused. */}
-        <FleetPause pause={fleet.pause} onChanged={refresh}
+        <FleetPause pause={fleet.project_pause?.paused ? fleet.project_pause : fleet.pause}
+                    projectId={projectId || project.id} onChanged={refresh}
                     pushToast={pushToast} dismissToast={dismissToast} />
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use

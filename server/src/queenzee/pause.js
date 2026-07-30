@@ -23,7 +23,9 @@ import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
 import { cxellName, interruptCxellZee, cxellHeadlessActive } from '../lib/cxell.js';
 import { setPaused, setPauseCounts, pauseState, PAUSED_STOP_REASON,
-         NUDGE_HELD, NUDGE_HELD_CLEAR } from '../lib/fleet-pause.js';
+         NUDGE_HELD, NUDGE_HELD_CLEAR,
+         setProjectPaused, setProjectPauseCounts, projectPauseState,
+         setXellPaused } from '../lib/fleet-pause.js';
 import { recordEvent } from '../lib/status.js';
 import { nudgeXellForFleetResume } from './nudge.js';
 
@@ -36,10 +38,17 @@ import { nudgeXellForFleetResume } from './nudge.js';
 // instance's own behaviour, which is real either way.
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
-// Every xell with a LIVE cxell zee, across every project. `viewer_kind='ssh-terminal'` is this repo's
-// definition of "the cage is still up" (nudge.js uses the same test), and the newest zee per xell is
-// the one that owns it.
-async function liveCxellZees() {
+// Every xell with a LIVE cxell zee, optionally filtered by project or by xell id.
+// `viewer_kind='ssh-terminal'` is this repo's definition of "the cage is still up" (nudge.js uses the
+// same test), and the newest zee per xell is the one that owns it.
+// Passing neither returns ALL live cxell zees (fleet-wide).
+async function liveCxellZees(projectId = null, xellId = null) {
+  const conditions = ['z.entrypoint = \'cxell-cli\'', 'z.viewer_kind = \'ssh-terminal\'',
+                      'z.decommissioned_at IS NULL', 'x.status NOT IN (\'retired\',\'tearing-down\')'];
+  const params = [];
+  let pIdx = 1;
+  if (projectId) { conditions.push(`x.project_id = $${pIdx++}`); params.push(projectId); }
+  if (xellId) { conditions.push(`x.id = $${pIdx++}`); params.push(xellId); }
   return q(
     `SELECT DISTINCT ON (x.id)
             x.id AS xell_id, x.slug, x.status AS xell_status, x.project_id,
@@ -53,11 +62,8 @@ async function liveCxellZees() {
                WHERE se.xell_id = x.id AND se.hook_event_name IN ($1, $2)
                ORDER BY se.ts DESC LIMIT 1) = $1 AS nudge_held
        FROM zee z JOIN xell x ON x.id = z.xell_id
-      WHERE z.entrypoint = 'cxell-cli'
-        AND z.viewer_kind = 'ssh-terminal'
-        AND z.decommissioned_at IS NULL
-        AND x.status NOT IN ('retired', 'tearing-down')
-      ORDER BY x.id, z.created_at DESC`, [NUDGE_HELD, NUDGE_HELD_CLEAR]);
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY x.id, z.created_at DESC`, [NUDGE_HELD, NUDGE_HELD_CLEAR, ...params]);
 }
 
 // Run `fn` over `items` a few at a time. A fleet can hold dozens of cages and each interrupt is a
@@ -76,6 +82,127 @@ async function inBatches(items, size, fn) {
 // it. `interrupted` counts zees that were genuinely mid-turn; `idle` ones had no turn to stop (a
 // success — they are not working); `stuck` and `failed` are the ones an operator must know about,
 // because a pause that quietly left a zee running is the one outcome this must never claim.
+// ── PROJECT-SCOPED PAUSE ───────────────────────────────────────────────────────────────────────────
+// Like pauseFleet but scoped to ONE project's xells. Same interrupt mechanism, same receipt shape.
+export async function pauseProject(projectId, { by = 'human@console', reason = null } = {}) {
+  const row = await setProjectPaused(projectId, true, { by, reason });
+  logline('pause', `PROJECT ${String(projectId).slice(0, 8)} PAUSED by ${by}${reason ? ` — ${reason}` : ''}: no new work in this project`);
+
+  const zees = await liveCxellZees(projectId);
+  const results = await inBatches(zees, 6, async (z) => {
+    if (PROVISION_MODE !== 'real') {
+      return { ...zeeBrief(z), stopped: false, dry_run: true };
+    }
+    try {
+      const r = await interruptCxellZee({ slug: z.slug });
+      if (!r.idle) await markPaused(z);
+      return { ...zeeBrief(z), stopped: r.stopped, idle: r.idle, gone: !!r.gone, how: r.how };
+    } catch (e) {
+      return { ...zeeBrief(z), stopped: false, error: e.message };
+    }
+  });
+
+  const interrupted = results.filter((r) => r.stopped && !r.idle).length;
+  const unreachable = results.filter((r) => !r.stopped && !r.dry_run).length;
+  await setProjectPauseCounts(projectId, { interrupted, unreachable });
+  broadcast('fleet-pause', { project_id: projectId, paused: true, by, reason, interrupted, unreachable });
+  logline('pause', `project pause swept ${results.length} cxell(s): ${interrupted} interrupted, ${unreachable} unreachable`);
+
+  return {
+    ok: true, paused: true, project_id: projectId, by, reason,
+    dry_run: PROVISION_MODE !== 'real',
+    counts: { live: results.length, interrupted, idle: results.filter((r) => r.idle).length,
+              gone: results.filter((r) => r.gone).length, unreachable },
+    state: await projectPauseState(projectId),
+    since: row?.paused_at || null,
+  };
+}
+
+export async function resumeProject(projectId, { by = 'human@console' } = {}) {
+  const before = await projectPauseState(projectId);
+  const minutes = before.since ? Math.max(0, Math.round((Date.now() - new Date(before.since).getTime()) / 60000)) : null;
+  await setProjectPaused(projectId, false, { by });
+  logline('pause', `PROJECT ${String(projectId).slice(0, 8)} RESUMED by ${by} — calling back zees`);
+
+  const zees = (await liveCxellZees(projectId))
+    .filter((z) => z.last_stop_reason === PAUSED_STOP_REASON || z.nudge_held === true);
+  const results = await inBatches(zees, 4, async (z) => {
+    try {
+      if (PROVISION_MODE === 'real' && await cxellHeadlessActive({ slug: z.slug })) {
+        return { ...zeeBrief(z), nudged: false, skipped: 'already running' };
+      }
+      const r = await nudgeXellForFleetResume(z.xell_id, { minutes, reason: before.reason, by });
+      if (r?.nudged) { await clearPausedMark(z); await clearHeldNudge(z); }
+      return { ...zeeBrief(z), nudged: !!r?.nudged, dry_run: !!r?.dry_run,
+               why: z.last_stop_reason === PAUSED_STOP_REASON ? 'interrupted' : 'a wake-up was held' };
+    } catch (e) {
+      return { ...zeeBrief(z), nudged: false, error: e.message };
+    }
+  });
+
+  const nudged = results.filter((r) => r.nudged).length;
+  await setProjectPauseCounts(projectId, { nudged });
+  broadcast('fleet-pause', { project_id: projectId, paused: false, by, nudged });
+
+  return {
+    ok: true, paused: false, project_id: projectId, by,
+    counts: { paused_zees: results.length, nudged,
+              skipped: results.filter((r) => r.skipped).length,
+              dry_run: results.filter((r) => r.dry_run).length,
+              failed: results.filter((r) => r.error || (!r.nudged && !r.skipped && !r.dry_run)).length },
+    state: await projectPauseState(projectId),
+  };
+}
+
+// ── PER-XELL PAUSE ─────────────────────────────────────────────────────────────────────────────────
+// Pause ONE xell: mark it in session_event and interrupt its zee if active.
+export async function pauseXell(xellId, { by = 'human@console' } = {}) {
+  await setXellPaused(xellId, true, { by });
+  logline('pause', `XELL ${String(xellId).slice(0, 8)} PAUSED by ${by}`);
+
+  // Interrupt the zee if it has a live cxell
+  const zees = await liveCxellZees(null, xellId);
+  const results = await inBatches(zees, 6, async (z) => {
+    if (PROVISION_MODE !== 'real') return { ...zeeBrief(z), stopped: false, dry_run: true };
+    try {
+      const r = await interruptCxellZee({ slug: z.slug });
+      if (!r.idle) await markPaused(z);
+      return { ...zeeBrief(z), stopped: r.stopped, idle: r.idle, gone: !!r.gone, how: r.how };
+    } catch (e) {
+      return { ...zeeBrief(z), stopped: false, error: e.message };
+    }
+  });
+
+  const interrupted = results.filter((r) => r.stopped && !r.idle).length;
+  logline('pause', `xell pause: ${interrupted} interrupted`);
+
+  return { ok: true, paused: true, xell_id: xellId, by, counts: { live: results.length, interrupted } };
+}
+
+// Resume ONE xell: mark it in session_event and nudge the zee back.
+export async function resumeXell(xellId, { by = 'human@console' } = {}) {
+  await setXellPaused(xellId, false, { by });
+  logline('pause', `XELL ${String(xellId).slice(0, 8)} RESUMED by ${by}`);
+
+  const zees = (await liveCxellZees(null, xellId))
+    .filter((z) => z.last_stop_reason === PAUSED_STOP_REASON || z.nudge_held === true);
+  const results = await inBatches(zees, 4, async (z) => {
+    try {
+      if (PROVISION_MODE === 'real' && await cxellHeadlessActive({ slug: z.slug })) {
+        return { ...zeeBrief(z), nudged: false, skipped: 'already running' };
+      }
+      const r = await nudgeXellForFleetResume(z.xell_id, { minutes: 0, reason: 'resumed individually', by });
+      if (r?.nudged) { await clearPausedMark(z); await clearHeldNudge(z); }
+      return { ...zeeBrief(z), nudged: !!r?.nudged, dry_run: !!r?.dry_run };
+    } catch (e) {
+      return { ...zeeBrief(z), nudged: false, error: e.message };
+    }
+  });
+
+  const nudged = results.filter((r) => r.nudged).length;
+  return { ok: true, paused: false, xell_id: xellId, by, counts: { nudged } };
+}
+
 export async function pauseFleet({ by = 'human@console', reason = null } = {}) {
   const row = await setPaused(true, { by, reason });
   logline('pause', `FLEET PAUSED by ${by}${reason ? ` — ${reason}` : ''}: nothing new will be dispatched, `
