@@ -1240,9 +1240,14 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
   // The manager the xell reports to — the one a HUMAN swap must not leave unmentioned (a worker
   // briefed without the manager block has no idea a manager exists at all). For a manager-run swap
   // this IS the caller; for a human-run one it is whoever the xell already reported to, or nobody.
+  // The WHOLE row, not the two columns the brief prints. This is also what gets handed to
+  // notifyManagerOfSwap → postMessage, which writes zee_message.project_id from `to.project_id` —
+  // so a two-column watcher made every notification of a human swap die on a NOT NULL constraint,
+  // silently, because that call is best-effort. It was invisible for exactly one reason: the
+  // notification sits after the dispatch, and no test had ever got a spawn to succeed.
   const watcher = manager
     || (target.manager_xell_id
-      ? await one(`SELECT id, slug FROM xell WHERE id=$1 AND status <> 'retired'`, [target.manager_xell_id])
+      ? await one(`SELECT * FROM xell WHERE id=$1 AND status <> 'retired'`, [target.manager_xell_id])
       : null);
 
   const handover = [

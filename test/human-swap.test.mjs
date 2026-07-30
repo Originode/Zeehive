@@ -28,12 +28,24 @@
 //   6. the HANDOVER says a HUMAN swapped it in (not "your manager"), and still carries the manager
 //      block when the xell reports to one;
 //   7. the manager of a swapped worker is TOLD (lib/managers.js notifyManagerOfSwap), so it never
-//      finds a persona it did not ask for. Asserted on the message ROW and its text.
+//      finds a persona it did not ask for. Asserted on the message ROW and its text;
+//   8. THE HALF-SWAPPED STATE — the dispatch fails AFTER the outgoing zee is retired (the spawn is
+//      the flakiest step there is). The manager is told in swap-specific wording, the xell stops
+//      reading as a working crew member in `zee zees` and on the honeycomb, it is forced back OUT of
+//      the pool (spawnCxell's own failure path releases it INTO the pool, where the next dispatch
+//      could clone a stranger onto this branch), and the human's answer is unchanged;
+//   9. ONE FULL SWAP, END TO END, with a STUBBED RUNTIME — the new zee actually comes up, the
+//      work-item re-link happens and the manager notification fires. Everything after the spawn had
+//      never been observed running: every other assertion in this suite reads the ordering out of a
+//      docker call log and stops at the spawn, because a cxell has no docker.
 //
 // Docker is faked on PATH (the collect is `docker exec`/`docker cp`) and every invocation is
-// RECORDED, PROVISION_MODE/PRODRO_MODE are simulate, and the throwaway project has no provider
-// account — so every dispatch dies AT THE SPAWN, which is the marker this suite's siblings use for
-// "everything before the spawn succeeded". Nothing here goes near a real cage, cluster or fleet row.
+// RECORDED, and PROVISION_MODE/PRODRO_MODE are simulate. For §1–§8 the throwaway project has no
+// provider account — so every dispatch dies AT THE SPAWN, which is the marker this suite's siblings
+// use for "everything before the spawn succeeded". §9 then connects a stub account and teaches the
+// SAME fake docker to answer the agent exec with the claude stream-json events intake.js waits for
+// (`system/init` then `result`), which is what makes a whole swap completable in a cage. Nothing
+// here goes near a real cage, cluster or fleet row.
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -68,8 +80,20 @@ if (i >= 0) {                                   // cxellRunning(): is the cage u
   process.stdout.write((st.running[n] ? 'true' : 'false') + '\\n'); process.exit(0);
 }
 if (a[0] === 'exec') {                          // exportCxellDiff(): probe + bundle create
-  if (st.execFail) { process.stderr.write('Error: No such container: ' + a[1] + '\\n'); process.exit(1); }
   const script = a[a.length - 1];
+  // THE STUBBED RUNTIME (§9). This is the vendor CLI being run inside the cage (lib/cxell.js
+  // runZee → adapterFor('claude-code-cxell').execCmd), and it is the ONE docker call whose OUTPUT
+  // decides whether a spawn succeeds: intake.js awaits a system/init event before it will claim a
+  // zee started, and takes the result event as end-of-turn. Answer both and the whole
+  // post-dispatch third of a swap becomes observable in a cxell that has no docker at all.
+  if (/--output-format stream-json/.test(script)) {
+    if (st.spawnFail) { process.stderr.write('stub runtime: ' + st.spawnFail + '\\n'); process.exit(1); }
+    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: st.session || 'stub-session' }) + '\\n');
+    process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: 'stub zee: inherited the xell',
+      total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 } }) + '\\n');
+    process.exit(0);
+  }
+  if (st.execFail) { process.stderr.write('Error: No such container: ' + a[1] + '\\n'); process.exit(1); }
   if (/rev-list/.test(script)) { process.stdout.write(String(st.commits ?? 1) + '\\n'); process.exit(0); }
   process.exit(0);
 }
@@ -84,6 +108,9 @@ chmodSync(join(bin, 'docker'), 0o755);
 process.env.FAKE_DOCKER_STATE = stateFile;
 process.env.FAKE_DOCKER_LOG = callLog;
 process.env.PATH = `${bin}:${process.env.PATH}`;
+// The cage build authorizes the fleet SSH key inside the container, minting the keypair on first
+// use. Point it at this run's throwaway dir so the suite neither reads nor writes the real one.
+process.env.ZEEHIVE_SSH_DIR = join(bin, 'ssh');
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -291,6 +318,67 @@ try {
      `no cage was removed before the collect (cp@${cpAt}, rm@${rmAt === -1 ? 'never' : rmAt})`);
   ok(log.slice(0, cpAt).every((c) => /^(inspect|exec)/.test(c)),
      'and everything the swap did before that collect was read-only (inspect/exec only)');
+
+  // ── 4b. THE HALF-SWAPPED STATE — that dispatch failed AFTER the outgoing zee was retired ───
+  // The swap above is not just "a swap that did not happen": it got past the retire. The previous
+  // zee is stopped, the xell already wears the incoming persona, and nothing is running in it. Every
+  // assertion here is about a xell in exactly that state, because it is the state a transient spawn
+  // failure actually leaves behind — and until this existed, the only person who knew was whoever
+  // clicked. (Nothing is re-run: these read the xell the swap above left.)
+  console.log('\nthe dispatch failed after the retire — and the half-swapped xell says so');
+  const { tendState } = await import('../server/src/lib/status.js');
+  const { crewFor } = await import('../server/src/lib/managers.js');
+
+  ok((await readZee(outgoing.id)).status === 'stopped',
+     'the outgoing zee is already retired — this really is the half-swapped state, not a refusal');
+  const halfXell = await readXell(worker.id);
+  ok(halfXell.harness_key === 'dev-builder' && halfXell.status === 'idle',
+     `the xell wears the new persona with NO zee in it, and reads 'idle' rather than 'working' [${halfXell.status}]`);
+  ok(halfXell.is_pooled === false,
+     'and it is OUT of the pool — spawnCxell\'s own failure path releases a xell back INTO it, which '
+     + 'would offer this branch, its commits and its card to the next dispatch that asked for a xell');
+
+  const tend = await tendState(worker.id);
+  ok(tend.open === true, 'a TEND is open on it — the existing, honest way this system says "a human is needed"');
+  ok(/SWAP HALF-DONE/.test(tend.reason || '') && /NO zee in this xell/.test(tend.full || tend.reason || ''),
+     `whose reason leads with what happened [${(tend.reason || '').slice(0, 80)}]`);
+  ok(/dev-builder/.test(tend.full || tend.reason || '') && /spinoff\/crew-work-aa11bb/.test(tend.full || tend.reason || ''),
+     'and names the persona it was left wearing and the branch the commits are on');
+  ok(swap.half_swapped?.ok === true && swap.half_swapped.tend_raised === true
+     && swap.half_swapped.xell_status === 'idle' && swap.half_swapped.is_pooled === false,
+     'the answer carries what was done about it (half_swapped), so the route and the console need not guess');
+
+  // …and that it READS honestly through the two surfaces that matter: `zee zees` (a manager has no
+  // console) and the honeycomb. Both project hiveStatus(), which without a signal reads a 'working'
+  // row as `working` — a busy-looking hexagon over an empty cage.
+  const crewNow = (await crewFor(manager.id)).find((c) => c.slug === 'crew-work-aa11bb');
+  ok(crewNow?.hive_status === 'occ-tendRequest' && crewNow.hive_status_label === 'tend?',
+     `\`zee zees\` shows it as tend?, not working [${crewNow?.hive_status}]`);
+  ok(crewNow?.working === false, 'and not as a working crew member — there is no zee to be working');
+  ok((crewNow?.waiting_on_human || []).some((w) => /TEND/.test(w) && /SWAP HALF-DONE/.test(w)),
+     'its waiting-on-human line says a human is needed, and what for');
+  const { hiveStatus } = await import('../server/src/lib/hive-status.js');
+  ok(hiveStatus({ ...halfXell, is_production: false }, { tendPending: true }) === 'occ-tendRequest',
+     'the honeycomb derives the same key from the same row (one status vocabulary, two surfaces)');
+
+  // THE MANAGER IS TOLD — on the path where it matters most. It is not the clicking human; all it
+  // would otherwise see is one of its crew going permanently quiet.
+  ok(swap.manager_notified?.ok === true, 'the manager of the half-swapped worker was notified');
+  const told = (await client.query(
+    `SELECT body FROM zee_message WHERE to_xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [manager.id])).rows[0];
+  ok(/tried to swap the zee in your worker crew-work-aa11bb and THE NEW ZEE DID NOT START/.test(told?.body || ''),
+     'in wording written for a swap that HALF-happened — not the success sentence');
+  ok(/NO zee in that xell now/.test(told.body) && /do not wait for it to report/.test(told.body),
+     'it says plainly what state the xell is in: nobody is in it, and nothing will report from it');
+  ok(/commits were collected onto the host worktree first \(HEAD [0-9a-f]{8}\)/.test(told.body),
+     'and what happened to the COMMITS — the one fact a manager cannot see for itself');
+  ok(/`tend\?`/.test(told.body) && /zee swap --to crew-work-aa11bb --harness dev-builder/.test(told.body),
+     'plus who has been asked to look, and the exact retry');
+
+  // THE HUMAN'S ANSWER IS UNCHANGED — the notification and the state repair ride alongside it.
+  ok(/^the swap could not start the new zee in crew-work-aa11bb:/.test(swap.error || ''),
+     'the clicking human still gets the same sentence they always did');
+  ok(/Fix the reason and swap again\.$/.test(swap.error || ''), 'ending in what to do about it');
 
   // ── 5. WHAT SURVIVES: the xell is the same xell, and it is still that manager's ────────────
   console.log('\nthe xell is the SAME xell — only the zee changed');
