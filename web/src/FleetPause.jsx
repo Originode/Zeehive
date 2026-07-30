@@ -77,7 +77,7 @@ export default function FleetPause({ pause, onChanged, pushToast, dismissToast }
                   + 'interrupted where they stand (nothing is lost: no commit, no branch, no request, no gate), '
                   + 'and until you press play nothing is dispatched, no landing/clearance nudge is delivered and '
                   + 'no message reaches a session.\n\nRight-click to pause with a reason.'}>
-        {busy ? '…' : paused ? '▶ play' : '⏸ pause'}
+        {busy ? '…' : paused ? '▶' : '⏸'}
       </button>
       {paused && (
         <span className="fp-banner" data-testid="fleet-paused-banner">
