@@ -82,14 +82,16 @@ export async function pauseFleet({ by = 'human@console', reason = null } = {}) {
     try {
       const r = await interruptCxellZee({ slug: z.slug });
       if (!r.idle) await markPaused(z);
-      logline('pause', r.idle
-        ? `${z.slug}: no turn to interrupt (${z.zee_type} zee was between turns)`
-        : `${z.slug}: ${z.zee_type} zee INTERRUPTED (${r.how})`);
+      logline('pause', r.gone
+        ? `${z.slug}: its cage is gone — nothing to interrupt (the zee row outlived the container)`
+        : r.idle
+          ? `${z.slug}: no turn to interrupt (${z.zee_type} zee was between turns)`
+          : `${z.slug}: ${z.zee_type} zee INTERRUPTED (${r.how})`);
       if (!r.stopped) {
         logline('pause', `${z.slug}: ⚠ the ${z.zee_type} zee did NOT stop — it survived SIGINT and SIGTERM. `
           + 'It is still working; a human needs to look at that cage.');
       }
-      return { ...zeeBrief(z), stopped: r.stopped, idle: r.idle, how: r.how };
+      return { ...zeeBrief(z), stopped: r.stopped, idle: r.idle, gone: !!r.gone, how: r.how };
     } catch (e) {
       // A cage we could not reach is NOT a stopped zee. Say so per xell rather than failing the whole
       // pause: the other twenty zees still need stopping, and the operator needs the list.
@@ -111,6 +113,9 @@ export async function pauseFleet({ by = 'human@console', reason = null } = {}) {
     dry_run: PROVISION_MODE !== 'real',
     counts: {
       live: results.length, interrupted, idle: results.filter((r) => r.idle).length,
+      // Cages whose container is already gone: counted, and NOT as a failure — see CAGE_GONE in
+      // lib/cxell.js. They are reported so a fleet quietly accumulating stale zee rows is visible.
+      gone: results.filter((r) => r.gone).length,
       stuck: results.filter((r) => r.how === 'stuck').length,
       failed: results.filter((r) => r.error).length, unreachable,
     },

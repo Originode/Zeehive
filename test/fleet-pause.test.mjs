@@ -21,9 +21,11 @@
 //   5. GO QUIET. A paused fleet looks exactly like a quiet one, so `idle` hexagons and a silent
 //      `zee status` are how an operator loses track of what they stopped.
 //
-// §1 runs the REAL escalation script in bash against REAL processes (no docker needed: the script is
-// pure shell and the pattern is the whole point). §2–§7 run against DATABASE_URL with real rows, torn
-// down in a finally. PROVISION_MODE stays 'simulate', so nothing here can touch a machine.
+// Nothing here is mocked where it could be run. §1 executes the REAL escalation script in bash against
+// REAL processes; §1b runs the REAL driver against a stub `docker` first on PATH, so a live cage's
+// script runs locally and the SIGINT is genuine; §2–§7 run against DATABASE_URL with real rows, torn
+// down in a finally; §8 renders the real component through esbuild + SSR. PROVISION_MODE stays
+// 'simulate' throughout, so nothing here can reach a machine.
 import { execFileSync, spawn } from 'node:child_process';
 import { build as esbuild } from 'esbuild';
 import React from 'react';
@@ -127,6 +129,57 @@ if (!haveProcps) {
     await sleep(200);
     ok(!alive(), 'test cleanup: the signal-ignoring process is killed');
   }
+}
+
+// ── 1b. interruptCxellZee, end to end, against a FAKE docker on PATH ──────────────────────────────
+// The one hop §1 cannot reach from inside a cage (there is no docker CLI in here, by design) is the
+// exec itself: which verdict the driver returns, and — the part with real teeth — how it classifies an
+// exec that returned NO verdict. A cage whose container is already gone must count as "no turn to
+// stop"; anything else uninterpretable must NOT be reported as a stopped zee. dk() spawns docker BY
+// NAME, so a stub first on PATH exercises the whole function for real: for a live cage the stub simply
+// runs the script locally, which makes the SIGINT below a genuine signal against a genuine process.
+console.log('\n── interruptCxellZee: the verdict, and what an unreadable answer must NOT become ──');
+const bin = join(tmp, 'bin');
+mkdirSync(bin);
+writeFileSync(join(bin, 'docker'),
+  '#!/bin/sh\n'
+  + '# $1=exec  $2=container  $3..=bash -lc <script>\n'
+  + 'case "$2" in\n'
+  + '  gone_*)  echo "Error response from daemon: No such container: $2" >&2; exit 1 ;;\n'
+  + '  weird_*) echo "something nobody has seen before" >&2; exit 1 ;;\n'
+  + 'esac\n'
+  + 'shift 2\n'
+  + 'exec "$@"\n', { mode: 0o755 });
+const realPath = process.env.PATH;
+process.env.PATH = bin + ':' + realPath;
+const { interruptCxellZee } = await import('../server/src/lib/cxell.js');
+try {
+  if (!haveProcps) {
+    skip('no pgrep/pkill — the driver half needs them to have anything to interrupt');
+  } else {
+    let r = await interruptCxellZee({ slug: 'live-1', graceMs: 1500 });
+    ok(r.stopped && r.idle && !r.gone, 'a live cage with no turn running → stopped, idle, not gone');
+
+    const c2 = spawn('bash', [fakeAgent], { detached: true, stdio: 'ignore' });
+    c2.unref();
+    await sleep(400);
+    r = await interruptCxellZee({ slug: 'live-1', graceMs: 1500 });
+    ok(r.stopped && !r.idle && r.how === 'sigint', 'a live cage mid-turn → stopped by SIGINT, reported as such');
+    ok(!alive(), 'and the process really did die (a real signal, not a mocked one)');
+  }
+
+  const gone = await interruptCxellZee({ slug: 'gone-1', name: 'gone_cxell', graceMs: 500 });
+  ok(gone.stopped && gone.idle && gone.gone === true,
+     'a cage the daemon says does not EXIST counts as "no turn to stop", not as a failure to stop — '
+     + 'otherwise one stale zee row makes every pause on a healthy fleet cry wolf');
+
+  let threw = null;
+  try { await interruptCxellZee({ slug: 'weird-1', name: 'weird_cxell', graceMs: 500 }); }
+  catch (e) { threw = e.message; }
+  ok(threw !== null,
+     'an answer nobody can interpret THROWS rather than reporting a stop: ' + String(threw).slice(0, 60));
+} finally {
+  process.env.PATH = realPath;
 }
 
 // ── the db-backed half ────────────────────────────────────────────────────────────────────────────

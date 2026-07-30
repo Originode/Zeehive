@@ -1261,11 +1261,20 @@ export function cxellInterruptCommand({ pattern = HEADLESS_PROC_PATTERN, graceMs
   ].join('; ');
 }
 
+// A cage that is not there. `docker exec` on a removed or stopped container exits non-zero with the
+// daemon's own words and no verdict on stdout — and that is NOT the same failure as "we could not tell
+// whether the zee stopped". There is provably no turn running in a container that does not exist, so it
+// belongs with IDLE. Classifying it as unreachable instead would make every pause on a fleet carrying
+// one stale zee row cry "⚠ NOT confirmed stopped", and a warning that fires on a healthy fleet is a
+// warning nobody reads the day it matters.
+const CAGE_GONE = /no such container|is not running|no such object|container .* is not running/i;
+
 // Interrupt the headless turn running in ONE cxell. Resolves
-// { stopped, how: 'sigint'|'sigterm'|'stuck'|null, idle } — `idle:true` meaning there was no turn to
-// stop, which is a success for a pause (the zee is already not working) and is counted separately so
-// the receipt can say how many zees were actually mid-turn. Rejects only when the cage could not be
-// reached at all; the caller reports that per xell rather than failing the whole pause.
+// { stopped, how: 'sigint'|'sigterm'|'stuck'|null, idle, gone? } — `idle:true` meaning there was no
+// turn to stop, which is a success for a pause (the zee is already not working) and is counted
+// separately so the receipt can say how many zees were actually mid-turn. Rejects only when the cage
+// could not be reached in a way we cannot interpret; the caller reports that per xell rather than
+// failing the whole pause.
 export async function interruptCxellZee({ ctx = 'default', slug, name = null, graceMs = 4000, timeoutMs = 30000 } = {}) {
   const cname = name || cxellName(slug);
   const r = await dkVerdict(ctx, ['exec', cname, 'bash', '-lc', cxellInterruptCommand({ graceMs })],
@@ -1275,8 +1284,13 @@ export async function interruptCxellZee({ ctx = 'default', slug, name = null, gr
     case '__ZEE_INT_SIGINT__':  return { stopped: true,  idle: false, how: 'sigint',   verdict: r.verdict };
     case '__ZEE_INT_SIGTERM__': return { stopped: true,  idle: false, how: 'sigterm',  verdict: r.verdict };
     case '__ZEE_INT_STUCK__':   return { stopped: false, idle: false, how: 'stuck',    verdict: r.verdict };
-    // No marker at all: the exec ran but said nothing we declared. Do NOT read that as stopped.
-    default: throw new Error(`interrupt gave no verdict (exit ${r.code}): ${(r.err || r.out || '').slice(0, 160) || 'no output'}`);
+    default:
+      // No marker at all: the exec ran but said nothing we declared. Do NOT read that as stopped —
+      // unless the daemon says the container is gone, which is its own answer (above).
+      if (CAGE_GONE.test(`${r.err || ''} ${r.out || ''}`)) {
+        return { stopped: true, idle: true, gone: true, how: null, verdict: null };
+      }
+      throw new Error(`interrupt gave no verdict (exit ${r.code}): ${(r.err || r.out || '').slice(0, 160) || 'no output'}`);
   }
 }
 
