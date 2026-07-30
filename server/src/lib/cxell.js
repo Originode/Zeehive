@@ -1276,6 +1276,13 @@ export function cxellTalkCommand({ text, session = 'zee', sessionId = '', enter 
 export async function sendKeysToCxellZee({ sshPort, slug, text, sessionId, session = 'zee', enter = true, timeoutMs = 30000 }) {
   if (!sshPort && !slug) throw new Error('no SSH port or slug for this cxell');
   const sh = cxellTalkCommand({ text, session, sessionId, enter });
+  // This reads markers off a script's stdout, like the dkVerdict sites — but through sshExecInCxell, a
+  // different transport, and it is DELIBERATELY not routed through dkVerdict. The bug dkVerdict exists
+  // to prevent is a verdict destroyed by a non-zero exit; sshExecInCxell resolves { code, out, err } on
+  // ANY exit code and never rejects on one, so there is no rejection here to lose a marker in — the
+  // property, not a second helper, is what makes it safe, and dk-verdict-contract.test.mjs asserts that
+  // property at source so it cannot be quietly changed. Teaching dkVerdict a second transport to reach
+  // one call site would add the shape it guards against (two runners with the same job) for no defect.
   const r = await sshExecInCxell({ sshPort, slug, cmd: sh, timeoutMs });
   if (/__ZEE_TALK_QUEUED__/.test(r.out)) return { sent: true, text, delivery: 'queued' };
   if (!/__ZEE_KEYS_SENT__/.test(r.out)) {

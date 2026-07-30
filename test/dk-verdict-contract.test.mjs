@@ -13,6 +13,13 @@
 //              whenever the child wrote any (npm always does), so the WARM_CI_FAILED marker sitting on
 //              stdout never reached the classifier and lock drift was reported as a network hiccup.
 //
+// The guard then found the same shape twice more, which is the point of writing it: the npm-cache fixup
+// in ensureCxell (sibling #4, warning falsely off a rejection), and syncCxellWithXource's SYNC MERGE —
+// #5 and the worst of them, because that verdict decides whether the queenzee runs `git merge --abort`
+// inside a live cage. It classified from dk's rejection message, so a conflict whose text the message
+// truncated read as operational, and the operational branch deleted a caged zee's in-progress conflict
+// resolution (working tree + index, nothing committed, no way back).
+//
 // What this file pins is therefore the CONTRACT, not three fixes:
 //   1. dkVerdict — never lets the exit code decide, always reads stdout, hands back a STRING verdict,
 //      rejects only when the exec never ran, and says the oddity out loud when a verdict arrives with
@@ -24,7 +31,7 @@
 //   4. and the structural guard: every marker any cage script prints must be DECLARED at the exec that
 //      runs it, `allowNonZero` no longer exists (dkVerdict is the only way to survive a non-zero
 //      exit), nobody hand-rolls verdict parsing, and the guard table below must cover every declared
-//      marker set — so a FOURTH marker-based exec cannot be added without a row here.
+//      marker set — so a NEW marker-based exec cannot be added without a row here.
 //
 // HOW IT IS DRIVEN. dk() spawns `docker` off PATH, so a shim on PATH is the REAL code path: real
 // spawn, real stream split, real stdin pipe, real parse. WHAT THIS CANNOT EXERCISE: the docker hop
@@ -32,6 +39,7 @@
 // A cxell has no docker socket, so that half is unexercised here by construction (the same limit the
 // three commits above worked under; 45d3ebe verified the script half by hand in a real container).
 // Everything it creates lives in one temp dir, deleted in a finally.
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -55,6 +63,17 @@ writeFileSync(join(bin, 'docker'), [
   // Only an EXEC gets the answer under test. Everything else (network create, run, rm) succeeds
   // quietly, so a caller that does other docker work on the way to its exec still gets there.
   'if [ "$1" != "exec" ]; then exit 0; fi',
+  // A caller that runs SEVERAL execs on the way to the one under test (syncCxellWithXource: fetch the
+  // delivered bundle, ask whether main is already an ancestor, then MERGE) needs the scripted answer
+  // to reach only its verdict exec. With FAKE_ONLY_MERGE set, everything else succeeds silently and
+  // the ancestor check refuses, so the caller actually reaches its merge.
+  'if [ -n "$FAKE_ONLY_MERGE" ]; then',
+  '  case "$*" in',
+  '    *"merge --no-edit"*) : ;;',
+  '    *"merge-base --is-ancestor"*) exit 1 ;;',
+  '    *) exit 0 ;;',
+  '  esac',
+  'fi',
   'if [ ! -t 0 ]; then cat > /dev/null; fi',      // drain the piped payload like a real exec does
   'if [ -n "$FAKE_STDERR" ]; then printf "%s\\n" "$FAKE_STDERR" >&2; fi',
   'if [ -n "$FAKE_STDOUT" ]; then printf "%s\\n" "$FAKE_STDOUT"; fi',
@@ -77,6 +96,14 @@ try {
   // changed ("read `String(await dk(...))`", "the message used to be `(err || out)`"). A naive grep for
   // the mistake therefore finds the EXPLANATION of the mistake, so the structural checks read code.
   const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+  // A real (tiny) xource repo: the sync row's caller BUNDLES from it with real git before it ever gets
+  // to its exec, and refuses outright if the worktree is not on disk.
+  const XOURCE = join(tmp, 'xource');
+  mkdirSync(XOURCE, { recursive: true });
+  const rungit = (...a) => execFileSync('git', ['-C', XOURCE, '-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { encoding: 'utf8' });
+  rungit('init', '-q', '-b', 'master');
+  writeFileSync(join(XOURCE, 'f.txt'), 'base\n');
+  rungit('add', '-A'); rungit('commit', '-qm', 'base');
 
   // ── 1. THE GUARD TABLE — every marker-based caller decides from the VERDICT ────────────────────
   //
@@ -84,7 +111,7 @@ try {
   // stderr. That is production's own shape (45d3ebe) plus the stderr that hid the marker (28fa29f).
   // A caller that consults the exit code, or the rejection message, or stringifies dk's result, fails
   // its row. It cannot be passed by accident: §4 asserts this table covers every marker set declared
-  // in cxell.js, so a fourth marker-based exec without a row here fails the suite.
+  // in cxell.js, so a NEW marker-based exec without a row here fails the suite.
   const SITES = [
     {
       name: 'writeFileIntoCxellIfChanged',
@@ -172,12 +199,45 @@ try {
           want: (r, logs) => logs.some((m) => /NOT writable/.test(m) && /No such container/.test(m)) },
       ],
     },
+    {
+      // THE SYNC MERGE — the fifth site, and the one this table caught. It is the highest-stakes of the
+      // five: its verdict decides whether the queenzee runs `git merge --abort` inside a live cage, so a
+      // verdict lost here is not a wrong log line, it is a caged zee's half-finished conflict resolution
+      // deleted (working tree + index, nothing committed, no way back). It used to classify from dk's
+      // REJECTION MESSAGE — two streams capped at 400 chars each — and was correct only by accident.
+      // Driven end to end against real git, with every abort recorded, in
+      // test/cxell-sync-abort-safety.test.mjs; the rows here pin the rule this table pins for every
+      // other site, plus the one policy that is this site's own: an outcome it cannot read means the
+      // tree is not touched ('unknown'), never 'error'.
+      name: 'syncCxellWithXource (the sync merge)',
+      markers: ['MERGE_OK', 'MERGE_CONFLICT', 'MERGE_STOPPED', 'MERGE_FAILED', 'MERGE_HELD'],
+      onlyMerge: true,
+      cases: [
+        { what: 'MERGE_CONFLICT + exit 1 is the zee\'s conflict, left in progress',
+          out: 'CONFLICT (content): Merge conflict in shared.txt\nMERGE_CONFLICT', err: 'docker: connection reset', code: 1,
+          run: () => C.syncCxellWithXource({ ctx: 'default', slug: 'zt-v', worktree: XOURCE, ref: 'master' }),
+          want: (r) => r?.state === 'conflict' && r?.held === false },
+        { what: 'MERGE_HELD + exit 1 means a merge was ALREADY in progress — the sync touched nothing',
+          out: 'a merge was already in progress in this cxell — left untouched:\nMERGE_HELD', err: 'docker: connection reset', code: 1,
+          run: () => C.syncCxellWithXource({ ctx: 'default', slug: 'zt-v', worktree: XOURCE, ref: 'master' }),
+          want: (r) => r?.state === 'conflict' && r?.held === true },
+        { what: 'MERGE_OK + exit 1 is still a merge',
+          out: 'Merge made by the ort strategy.\nMERGE_OK', err: 'docker: connection reset', code: 1,
+          run: () => C.syncCxellWithXource({ ctx: 'default', slug: 'zt-v', worktree: XOURCE, ref: 'master' }),
+          want: (r) => r?.state === 'merged' },
+        { what: 'and NO verdict is \'unknown\' — NOT \'error\', because an error would license the abort',
+          out: '', err: 'Error response from daemon: cannot exec in a stopped container', code: 1,
+          run: () => C.syncCxellWithXource({ ctx: 'default', slug: 'zt-v', worktree: XOURCE, ref: 'master' }),
+          want: (r) => r?.state === 'unknown' && /stopped container/.test(String(r?.output || '')) },
+      ],
+    },
   ];
 
   for (const site of SITES) {
     console.log(`\n── ${site.name} — the verdict decides, whatever the exit code said ──`);
     for (const c of site.cases) {
       say(c);
+      if (site.onlyMerge) process.env.FAKE_ONLY_MERGE = '1'; else delete process.env.FAKE_ONLY_MERGE;
       const n0 = since();
       const got = await c.run().catch((e) => e);
       // some sites' whole observable IS a logline (ensureCxell warns rather than returning), so the
@@ -186,6 +246,7 @@ try {
          `${c.what} [${JSON.stringify(got instanceof Error ? got.message : got).slice(0, 120)}]`);
     }
   }
+  delete process.env.FAKE_ONLY_MERGE;   // the shim answers every exec again for the sections below
 
   // ── 2. the oddity is TRUSTED AND SAID — once, from one place ───────────────────────────────────
   // Believing the verdict over the exit code must not mean swallowing the disagreement: that is the
@@ -265,8 +326,12 @@ try {
   // Exemptions, each with the reason it is not a verdict-vs-exit-code case. An exemption is a claim,
   // so the claim is asserted below, not just written down.
   const EXEMPT = {
-    __MERGE_RC__: 'not a verdict: an inline `$?` capture, and the script redirects 2>&1 so git\'s own '
-      + 'output is on stdout either way (asserted below)',
+    // __MERGE_RC__ used to be exempted here, on the grounds that an inline `$?` capture is not a verdict
+    // and the 2>&1 kept git's own output on stdout anyway. Both halves were true and the conclusion was
+    // wrong: the exit code it captured was read in the CATCH, off dk's rejection message, so a conflict
+    // the message truncated became an operational error and ran `git merge --abort` on a zee's
+    // in-progress resolution. The site is now a real dkVerdict caller with a row in the table above —
+    // the last exemption of that kind, and the reason none is left.
     __ZEE_TALK_QUEUED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_TALK_FAILED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_KEYS_SENT__: 'not run by dk at all — sshExecInCxell (asserted below)',
@@ -278,9 +343,11 @@ try {
   ok([...declared].every((t) => printed.has(t)),
      `and no declared marker is a ghost — each one is really printed by a script `
      + `[declared ${JSON.stringify([...declared])}]`);
-  // the exemptions' own claims
+  // the sync merge's own claim: git's conflict lines must stay on STDOUT, where the verdict is read and
+  // where they can be reported to the zee verbatim (its stderr would be a second place to lose them).
   ok(/git \$\{CX_IDENTITY\} merge --no-edit refs\/remotes\/origin\/main 2>&1/.test(src),
-     '__MERGE_RC__: the sync merge still redirects 2>&1, which is what keeps git\'s conflict lines on stdout');
+     'the sync merge still redirects 2>&1, which is what keeps git\'s conflict lines on stdout');
+  // the exemptions' own claims
   ok(/stream\.on\('close', \(code\) => \{[^}]*done\(resolve, \{ code, out, err: errOut \}\)/.test(src),
      '__ZEE_*__: sshExecInCxell resolves { code, out, err } on ANY exit code, so its markers cannot be lost');
 
@@ -288,7 +355,7 @@ try {
   const tabled = new Set(SITES.flatMap((s) => s.markers));
   const uncovered = [...declared].filter((t) => !tabled.has(t));
   ok(uncovered.length === 0,
-     `every declared marker is exercised by a row in the guard table above — a fourth marker-based `
+     `every declared marker is exercised by a row in the guard table above — a NEW marker-based `
      + `exec cannot be added without one (uncovered: ${JSON.stringify(uncovered)})`);
   const callSites = (src.match(/markers:/g) || []).length;
   ok(callSites === SITES.length,
@@ -300,7 +367,7 @@ try {
   fail++;
 } finally {
   process.env.PATH = REAL_PATH;
-  delete process.env.FAKE_STDOUT; delete process.env.FAKE_STDERR; delete process.env.FAKE_CODE;
+  delete process.env.FAKE_STDOUT; delete process.env.FAKE_STDERR; delete process.env.FAKE_CODE; delete process.env.FAKE_ONLY_MERGE;
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
 }
 process.exit(fail ? 1 : 0);
