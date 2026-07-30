@@ -3,8 +3,9 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
-         extractXellEnv, attachXellDevice, detachXellDevice } from './api.js';
+         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
+import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import { showDiff } from './DiffViewer.jsx';
@@ -187,6 +188,10 @@ export default function App() {
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
   const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
+  // ♻ swap composer, opened from the flower's BRANCH petal: replace the ZEE working this xell and
+  // keep the xell (same branch, commits, containers, database, card). It carries the xell's diff so the
+  // composer can warn about uncommitted work — the collect saves COMMITS, and only commits.
+  const [swapXell, setSwapXell] = useState(null);
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
@@ -560,6 +565,10 @@ export default function App() {
       markXellDone(x, diff, refresh, { landing: landingByXell[x.id], prs: prsFor(x), ship: shipByXell[x.id] });
       return;
     }
+    // ♻ SWAP — done's cheaper neighbour: keep the xell, change who is in it. The composer collects
+    // the persona (and an optional brief); the server owns every refusal, so nothing is pre-checked
+    // here beyond opening the right modal.
+    if (kind === 'swap') { setSwapXell({ ...x, diff }); return; }
     if (kind === 'push' || kind === 'land') {
       if (!(await showConfirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
@@ -662,6 +671,35 @@ export default function App() {
                              pushToast({ id, kind: 'success', title: `Message sent to ${msgXell.slug}`, onRetry: null,
                                body: r?.attachments?.length ? `${r.attachments.length} attachment(s) delivered to its .zee-inbox` : 'typed into its live session' });
                              setTimeout(() => dismissToast(id), 6000); }} />
+        )}
+        {/* ♻ SWAP THE ZEE — the console half of `zee swap`. FIRE-AND-FORGET, like the dispatch
+            composer: the swap collects the outgoing cage's commits, recreates the cage and spawns a
+            zee, which takes seconds, so the modal closes at once and a toast carries the outcome.
+            A REFUSAL is the server's own sentence, verbatim — "swap refused" with no reason would
+            send a human hunting for a rule (an open landing card, a persona of the wrong type) that
+            the answer already named. */}
+        {swapXell && (
+          <SwapZee xell={swapXell} projectId={projectId} diff={swapXell.diff || null}
+                   onClose={() => setSwapXell(null)}
+                   onSwap={(payload) => {
+                     const x = swapXell;
+                     setSwapXell(null);
+                     const id = `swap-${x.id}-${Date.now()}`;
+                     pushToast({ id, kind: 'progress', title: `Swapping the zee in ${x.slug}…`,
+                       body: `collecting its commits, then caging a ${payload.harness} zee on the same branch` });
+                     swapXellZee(x.id, payload).then((r) => {
+                       updateToast(id, { kind: 'success', onRetry: null,
+                         title: `${x.slug} now wears ${r?.harness?.key || payload.harness}`,
+                         body: r?.message || 'the incoming zee was briefed that it inherited this xell' });
+                       setTimeout(() => dismissToast(id), 9000);
+                       refresh();
+                     }).catch((e) => {
+                       updateToast(id, { kind: 'error', title: `Swap refused · ${x.slug}`,
+                         body: e?.message || String(e), onRetry: null });
+                       setTimeout(() => dismissToast(id), 14000);
+                       refresh();
+                     });
+                   }} />
         )}
       </section>
 

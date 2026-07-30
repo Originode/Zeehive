@@ -1548,7 +1548,15 @@ export function petalVerbs(x, diff) {
   if (buildable) v[3] = ['build'];                                // CONTAINERS petal
   v[2] = cxell ? ['terminal', 'nudge'] : [];                      // SESSION petal (a live cxell zee)
   v[4] = cxell ? ['env', 'message'] : ['env'];                    // MACHINE petal
-  v[1] = ['done'];                                                // BRANCH petal (the teardown verb)
+  // BRANCH petal — the two ways a xell's current job ENDS, side by side, because they are each
+  // other's alternative: SWAP keeps the xell and changes who is in it (same branch, same commits,
+  // same containers, same db, same card), DONE tears it down. A human reaching for "mark done"
+  // because the persona in there is wrong should see the cheaper verb in the same breath.
+  //
+  // Not on a MANAGER: re-dispatching a manager re-mints its production read-only role (a live
+  // CREATE/ALTER ROLE + password rotation), so the server refuses to re-crew one — and a button that
+  // can only ever return a refusal is the same mistake as drawing `land` on a manager.
+  v[1] = manager ? ['done'] : ['swap', 'done'];
   // The GIT verbs — pull, land and PR — exist only for a xell that can write to the xource. A MANAGER
   // cannot: xellgit's ctx() refuses every git write verb for it, and the landgate declines its push
   // without even raising a request. Drawing those buttons on a manager offers a human three clicks
@@ -1567,9 +1575,10 @@ export function petalVerbs(x, diff) {
 // kind → the label and accent it is drawn with (the verb list above stays pure/testable).
 const VERB_LABEL = {
   build: '🔨 build', terminal: '⌨ terminal', nudge: '💬 nudge', env: '❖ env', message: '📨 message',
-  pull: '↓ pull', land: '⬆ land', pr: 'PR', ship: '🚀 ship',
+  pull: '↓ pull', land: '⬆ land', pr: 'PR', ship: '🚀 ship', swap: '♻ swap zee',
 };
-const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod', done: 'error' };
+const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
+  done: 'error', swap: 'working' };
 
 function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];

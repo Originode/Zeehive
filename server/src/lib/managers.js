@@ -21,7 +21,10 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
-import { reasonPair } from './status.js';
+// briefReason is the house's one-line normaliser (collapse whitespace, ELIDE with …). Quoting an
+// error inside our own prose needs exactly that: a hard slice ends the quote mid-word, which reads
+// as a truncated MESSAGE rather than a quoted one ("…so a spawn there would fail. Do ").
+import { reasonPair, briefReason } from './status.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
 
@@ -188,6 +191,84 @@ export async function inboxFor(xellId, { all = false, limit = 50 } = {}) {
     id: r.id, from: r.from_slug, kind: r.kind, body: r.body,
     at: r.created_at, was_unread: unread.includes(r.id),
   }));
+}
+
+// ── a HUMAN changed a manager's crew underneath it ───────────────────────────
+//
+// A manager plans around WHO is in each of its xells: it dispatched a Scout there, so it says
+// `zee say --to <slug>` expecting a Scout. When a human swaps that zee from the console
+// (POST /api/xells/:id/swap) the persona changes and the manager asked for none of it — and until
+// this existed, nothing told it. It would keep briefing an agent that had left, and the next thing
+// it heard from that xell would arrive in a voice it did not recognise.
+//
+// So the swap lands in the manager's own inbox, through the same store-then-deliver path a worker's
+// report takes: the row is durable (it reads it with `zee inbox` on its next turn) and it is typed
+// into its live session if it has one. It is a REPORT, not a directive — nothing is being asked of
+// it, and the swap has already happened.
+//
+// Lives here, beside postMessage, for the same reason the done-suggestion notifications do: what a
+// manager is TOLD about its crew is one subject, and the swap path should not be the place that
+// invents its own wording for it.
+export async function notifyManagerOfSwap({ manager, target, harness, previous = null, by = 'human@console' }) {
+  if (!manager || !target || !harness) throw new Error('a swap notification needs a manager, a target xell and a harness');
+  const was = previous?.harness_key || previous?.harness_label || null;
+  return postMessage({
+    from: null, to: manager, kind: 'report', by,
+    body: `A HUMAN swapped the zee in your worker ${target.slug}: it now wears "${harness.key}"`
+      + `${harness.label ? ` (${harness.label})` : ''}${was ? `, replacing ${was}` : ''}. `
+      + `The xell is otherwise untouched — same branch (${target.branch}), same commits, same containers, `
+      + 'same database, same work-item card, and it still reports to you. The incoming zee was briefed '
+      + 'that it INHERITED the xell: what the previous zee was asked to do, what it last reported, and '
+      + 'what is on the branch. You did not ask for this and nothing of yours was lost — re-brief it '
+      + `with \`zee say --to ${target.slug} --message "…"\` if your plan for that work has changed.`,
+  });
+}
+
+// ── a swap that HALF-HAPPENED — the outgoing zee is gone and the new one never started ──────
+//
+// notifyManagerOfSwap above is the SUCCESS sentence, and for a long time it was the only one: the
+// swap core told the manager after the dispatch returned, so the one path where a manager most
+// needs telling — the dispatch THREW — said nothing at all. That is not a hypothetical failure
+// mode; the spawn is the flakiest step in this system (a transient upstream 529 killed a zee on
+// this very feature), and the state it leaves behind is the worst kind: the previous zee is already
+// retired, the xell already wears the new persona, and NOTHING is running in it. The human who
+// clicked gets an error back. The manager, until now, just watched a crew member go quiet — and a
+// quiet worker is the one thing a manager is built to wait patiently for.
+//
+// So this is its own wording, deliberately not a variation on the success one. It must answer the
+// three questions a manager will otherwise burn a turn on: what happened to the COMMITS, what state
+// the XELL is in now, and what (if anything) it should do about it.
+export async function notifyManagerOfHalfSwap({ manager, target, harness, previous = null,
+                                                by = 'human@console', error = null, collected = null }) {
+  if (!manager || !target || !harness) throw new Error('a half-swap notification needs a manager, a target xell and a harness');
+  const was = previous?.harness_key || previous?.harness_label || null;
+  const head = collected?.collected && collected.head ? String(collected.head).slice(0, 8) : null;
+  return postMessage({
+    from: null, to: manager, kind: 'report', by,
+    body: `A HUMAN tried to swap the zee in your worker ${target.slug} and THE NEW ZEE DID NOT START: `
+      + `${briefReason(error || 'the dispatch failed', 300)}\n\n`
+      + `That leaves ${target.slug} HALF-SWAPPED, and this is the part you cannot see from \`zee zees\` `
+      + `alone: the previous zee${was ? ` (${was})` : ''} was already retired before the spawn was `
+      + `attempted, so there is NO zee in that xell now. It wears "${harness.key}"`
+      + `${harness.label ? ` (${harness.label})` : ''} and nothing is running in it — do not wait for it `
+      + 'to report; it has no agent to report with.\n\n'
+      // WHAT HAPPENED TO THE COMMITS, and only what is actually known. The no-collect branch must
+      // not borrow the reassuring half of the other one: "the branch is as the worktree last saw it"
+      // is a sentence about a worktree, and one of the ways to reach this path is that there is no
+      // worktree at all (the failure text then contradicts itself in the same paragraph).
+      + (head
+        ? `Nothing was lost. The outgoing zee's commits were collected onto the host worktree first `
+          + `(HEAD ${head}), so the branch (${target.branch}), its commits, the containers, the database `
+          + 'and the work-item card are all exactly where they were.'
+        : `Nothing was collected from the old cage (${briefReason(collected?.reason || 'no reason recorded', 200)}). `
+          + 'The swap destroyed nothing either — it never got as far as recreating a cage — but do not '
+          + 'assume anything that zee committed INSIDE its cage is on the branch: it was not collected, '
+          + 'and a cage that is recreated later takes its uncollected commits with it.')
+      + '\n\nThe xell is flagged for a human in the console (it shows `tend?` with this same reason), so '
+      + 'somebody has been asked to look. If it is your crew you can retry it yourself once the reason '
+      + `is fixed: \`zee swap --to ${target.slug} --harness ${harness.key}\`. Re-planning around a xell `
+      + 'with nobody in it is the mistake this message exists to prevent.',
+  });
 }
 
 // ── done suggestions (a manager proposes SOMEONE ELSE is finished) ───────────

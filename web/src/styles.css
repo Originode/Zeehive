@@ -1295,6 +1295,22 @@ a.cbox:hover { border-color: var(--accent); }
 .disp.disp-mgr .disp-title { color: var(--prod, #f0913b); }
 .disp.disp-mgr .disp-submit { background: var(--prod, #f0913b); border-color: var(--prod, #f0913b); color: #1b1206; }
 
+/* ── ♻ SWAP THE ZEE (SwapZee.jsx) ──────────────────────────────────────────────────────────────
+   The same composer chrome as a dispatch, marked in the WORKING colour rather than the accent: a
+   swap is not a new job (accent) and not a production act (orange) — it hands the job that is
+   already running to somebody else. `.swap-now` is the one-line "what is in there right now", so a
+   human sees the persona they are replacing at the moment they pick the replacement. */
+.disp.disp-swap { border-color: var(--working, #35c46b); }
+.disp.disp-swap .disp-head { border-bottom-color: var(--working, #35c46b); }
+.disp.disp-swap .disp-title { color: var(--working, #35c46b); }
+.disp.disp-swap .disp-title code { font-family: 'Cascadia Code', monospace; font-size: 13px; }
+.disp.disp-swap .disp-submit { background: var(--working, #35c46b); border-color: var(--working, #35c46b);
+  color: #04210f; }
+.disp.disp-swap .disp-editor { min-height: 92px; }
+.swap-now { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px; }
+.swap-now b { color: var(--text); }
+
 /* harness web-UI bridge setup */
 .disp-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }
 .disp-input { background: var(--panel2); border: 1px solid var(--line); color: var(--text);

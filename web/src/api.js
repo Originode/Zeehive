@@ -99,6 +99,27 @@ export async function getHarnesses(zeeType = null, projectId = null) {
   const r = await fetch(`/api/harnesses${qs ? `?${qs}` : ''}`);
   return r.ok ? r.json() : [];
 }
+// SWAP THE ZEE working a xell: keep the xell (branch, commits, containers, database, work-item
+// card) and put a NEW zee in it wearing a different persona — the console half of `zee swap`.
+//
+// This is NOT assignXellHarness below: that changes the row a running zee's cage was built from, so
+// the agent in there keeps the manual it started with until something re-cages it. A swap collects
+// the outgoing zee's commits onto the worktree FIRST, then re-cages, and briefs the incoming zee that
+// it INHERITED the branch.
+//
+// A refusal (an open landing/ship/done card on that xell, a persona of the wrong type, a retired
+// xell) comes back 409 with the server's own sentence — throw it verbatim: the whole point is that
+// the human reads the real reason instead of "swap failed".
+export async function swapXellZee(xellId, { harness, task = null, model = null, mode = null, title = null } = {}) {
+  const r = await fetch(`/api/xells/${xellId}/swap`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ harness, task, model, mode, title }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data?.ok === false) throw new Error(data?.error || `swap failed (${r.status})`);
+  return data;
+}
+
 // Assign/switch a xell's harness (a human action). `harness` is a key/id, or null to clear to core.
 export async function assignXellHarness(xellId, harness) {
   const r = await fetch(`/api/xells/${xellId}/harness`, {

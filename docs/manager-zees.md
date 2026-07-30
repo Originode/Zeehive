@@ -226,6 +226,36 @@ harness, another project's persona — and any xell with a **human gate open** o
 holding `land_request`, a pending ship, an open done suggestion), because swapping under an open card
 points a human's decision at a zee that no longer exists.
 
+#### …and the same thing from the CONSOLE (`POST /api/xells/:id/swap`)
+
+A human swaps from the honeycomb: the flower's **branch petal** carries `♻ swap zee` beside
+`✓ mark done` — deliberately side by side, because they are each other's alternative (swap keeps the
+xell and changes who is in it; done tears it down), and "the persona in this xell is wrong" used to
+have only the destructive answer. `web/src/SwapZee.jsx` picks the persona (only ones valid for that
+xell's `zee_type`), optionally a brief/model/mode, and the refusal is shown as **the server's own
+sentence** in a toast.
+
+**Both callers run ONE function**: `swapZeeInXell()` in `server/src/queenzee/self.js`. `selfSwap` is
+the manager's *authorisation* in front of it (my crew, a worker target, a worker persona of my
+project); `swapXellZeeAsHuman()` is the human's (any non-retired xell in the project, crew or not — a
+human already dispatches into any xell, so this grants no new authority and opens no gate). The
+collect-before-recreate ordering, the open-gate refusal, the retire, the `rename:false` re-dispatch and
+the handover live in the core, once — a second copy in a route would be a second path to
+`docker rm -f` with no collect in front of it. `test/human-swap.test.mjs` asserts that ordering
+through the HUMAN entry point and that neither caller collects or dispatches on its own.
+
+Two rules the core adds for both: the persona's `zee_type` must **match the xell's** (a swap changes
+who is in a xell, never what the xell is), and a **manager xell is refused** — re-dispatching one
+re-mints its production read-only role (a live `CREATE/ALTER ROLE` + password rotation), which must
+not ride behind a re-crewing click.
+
+And when a human swaps a xell that **has** a manager, that manager is **told**
+(`notifyManagerOfSwap()` in `lib/managers.js` — a report in its inbox, typed into its live session if
+it has one). Otherwise it goes on briefing a persona that left: it says
+`zee say --to <slug>` expecting the Scout it dispatched and a Reviewer answers. The incoming zee's
+handover says a **human** put it there, and still carries the manager block so it knows who is
+watching.
+
 ### `zee harness` — minting the crew's ROLES (migration 084)
 
 A crew needs roles, and until 084 every persona was system-wide and only a human could add one: a
