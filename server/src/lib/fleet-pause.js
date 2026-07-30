@@ -203,37 +203,45 @@ export async function setProjectPauseCounts(projectId, { interrupted = null, unr
      WHERE project_id = $1 RETURNING *`, [projectId, interrupted, unreachable, nudged]).catch(() => null);
 }
 
-// ── PER-XELL PAUSE (session_event 'xell-pause' / 'xell-resume') ────────────────────────────────────
-// Latest-event-wins, exactly like tend/hints. No schema change needed.
+// ── PER-XELL PAUSE (xell_pause_state table, migration 102) ─────────────────────────────────────────
+// One row per xell, proper columns (who paused, when, why), readable in a single
+// column check. Replaces the session_event approach from migration 101.
 
-// Whether a specific xell is individually paused. Reads the latest event for that xell.
+// Whether a specific xell is individually paused. Reads the table directly.
 export async function isXellPaused(xellId) {
   if (!xellId) return false;
   try {
-    const r = await one(
-      `SELECT hook_event_name FROM session_event
-        WHERE xell_id = $1 AND hook_event_name IN ('xell-pause','xell-resume')
-        ORDER BY ts DESC LIMIT 1`, [xellId]);
-    return r?.hook_event_name === 'xell-pause';
+    const r = await one(`SELECT paused FROM xell_pause_state WHERE xell_id = $1`, [xellId]);
+    return !!r?.paused;
   } catch (e) {
     logline('pause', `could not read xell pause for ${String(xellId).slice(0, 8)} (${String(e.message).slice(0, 100)})`);
     return false;
   }
 }
 
-// Record a xell pause or resume event. Best-effort, never throws.
-export async function setXellPaused(xellId, paused, { by = 'human@console' } = {}) {
+// Set a xell's pause state in the meta-DB table. Best-effort, never throws.
+export async function setXellPaused(xellId, paused, { by = 'human@console', reason = null } = {}) {
   if (!xellId) return;
   try {
-    const { recordEvent } = await import('./status.js');
-    await recordEvent({
-      source: 'queenzee',
-      hook_event_name: paused ? 'xell-pause' : 'xell-resume',
-      xell_id: xellId,
-      raw: { by },
-    });
+    await one(
+      `INSERT INTO xell_pause_state (xell_id, paused, paused_at, paused_by, reason, resumed_at, resumed_by)
+            VALUES ($1, $2,
+                    CASE WHEN $2 THEN now() ELSE NULL END,
+                    CASE WHEN $2 THEN $3::text ELSE NULL END,
+                    CASE WHEN $2 THEN $4::text ELSE NULL END,
+                    CASE WHEN $2 THEN NULL ELSE now() END,
+                    CASE WHEN $2 THEN NULL ELSE $3::text END)
+       ON CONFLICT (xell_id) DO UPDATE SET
+         paused     = EXCLUDED.paused,
+         paused_at  = CASE WHEN EXCLUDED.paused THEN COALESCE(xell_pause_state.paused_at, now()) ELSE NULL END,
+         paused_by  = CASE WHEN EXCLUDED.paused THEN $3::text ELSE NULL END,
+         reason     = CASE WHEN EXCLUDED.paused THEN $4::text ELSE NULL END,
+         resumed_at = CASE WHEN EXCLUDED.paused THEN NULL ELSE now() END,
+         resumed_by = CASE WHEN EXCLUDED.paused THEN NULL ELSE $3::text END
+       RETURNING *`,
+      [xellId, !!paused, by, reason]);
   } catch (e) {
-    logline('pause', `could not record ${paused ? 'xell-pause' : 'xell-resume'} for ${String(xellId).slice(0, 8)} (${String(e.message).slice(0, 100)})`);
+    logline('pause', `could not write xell pause for ${String(xellId).slice(0, 8)} (${String(e.message).slice(0, 100)})`);
   }
 }
 

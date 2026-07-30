@@ -113,10 +113,8 @@ async function fetchXellRows(pid) {
             tnd.reason AS tend_reason, tnd.ts AS tend_at,
             -- readiness HINTS (zee said "this looks land/ship-ready" without calling the gated verb):
             -- same latest-event-wins ride as tend, one per kind.
-            -- per-xell individual pause (session_event, latest-event-wins, migration 101)
-            (SELECT se.hook_event_name FROM session_event se
-               WHERE se.xell_id = x.id AND se.hook_event_name IN ('xell-pause','xell-resume')
-               ORDER BY se.ts DESC LIMIT 1) = 'xell-pause' AS xell_paused,
+            -- per-xell individual pause (xell_pause_state table, migration 102)
+            COALESCE(xps.paused, false) AS xell_paused,
             (SELECT se.hook_event_name FROM session_event se
                WHERE se.xell_id = x.id AND se.hook_event_name IN ('landhint-request','landhint-clear')
                ORDER BY se.ts DESC LIMIT 1) = 'landhint-request' AS land_hint,
@@ -135,6 +133,7 @@ async function fetchXellRows(pid) {
             dl.container IS NOT NULL AS holds_prod_lock, dl.phase AS prod_lock_phase
        FROM xell x
        LEFT JOIN deploy_lock dl ON dl.xell_id = x.id AND dl.container = 'prod'
+       LEFT JOIN xell_pause_state xps ON xps.xell_id = x.id
        -- the xell's LATEST tend event (raise or clear): its OPEN state and, when open, the brief
        -- reason the zee gave. One lateral instead of two correlated scans of the same rows.
        LEFT JOIN LATERAL (
@@ -236,10 +235,10 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     seedPending: x.seed_pending === true,
     doneSuggested: x.done_suggested === true,
     landHolding: x.land_holding === true,
-    // PAUSED — three levels (migration 101):
-    //   1. fleet-wide: fleet_pause.paused AND this zee was the one the fleet sweep stopped
-    //   2. project-scoped: project_pause.paused AND this zee was the one the project sweep stopped
-    //   3. per-xell: session_event 'xell-pause' flag on this xell
+    // PAUSED — three levels (migrations 100–102):
+    //   1. fleet-wide: fleet_pause.paused AND this zee was interrupted by the fleet sweep
+    //   2. project-scoped: project_pause.paused AND this zee was interrupted by the project sweep
+    //   3. per-xell personal: xell_pause_state.paused (self-contained state, no stop_reason check)
     paused: (paused || projectPaused) && x.zee_last_stop_reason === PAUSED_STOP_REASON,
     xellPaused: x.xell_paused === true,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
