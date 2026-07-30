@@ -1190,7 +1190,13 @@ async function branchHandover(target, mainBranch = 'main') {
 // Exported so it can be exercised directly (test/manager-swap.test.mjs): the brief is built long
 // before the spawn, and it is the artefact that decides whether a swap is cheap or wasteful, so it
 // deserves an assertion on its TEXT rather than on the fact that a function ran.
-export async function swapBrief({ manager, target, harness: h, task = null }) {
+//
+// WHO swapped changes two sentences and nothing else. `manager` is the manager xell when a manager
+// ran `zee swap`; it is NULL when a HUMAN swapped from the console, and then the handover says so —
+// an incoming zee told "your manager swapped you in" when no manager asked for it would go looking
+// for a conversation that never happened. Either way, if the xell HAS a manager the standard manager
+// block still rides along: who is watching it, and what that manager may not ask of it.
+export async function swapBrief({ manager = null, target, harness: h, task = null, by = null }) {
   const prevTask = await one(`SELECT prompt_text FROM task WHERE xell_id=$1 ORDER BY created_at DESC LIMIT 1`, [target.id]);
   const prevZee = await one(
     `SELECT z.id, z.status, z.title, z.model, z.last_stop_reason, h.key AS harness_key, h.label AS harness_label
@@ -1203,10 +1209,20 @@ export async function swapBrief({ manager, target, harness: h, task = null }) {
   const branchInfo = await branchHandover(target, project?.main_branch || 'main');
   const firstLines = (t, n) => String(t || '').split('\n').filter((l) => l.trim()).slice(0, n).join('\n');
 
+  // The manager the xell reports to — the one a HUMAN swap must not leave unmentioned (a worker
+  // briefed without the manager block has no idea a manager exists at all). For a manager-run swap
+  // this IS the caller; for a human-run one it is whoever the xell already reported to, or nobody.
+  const watcher = manager
+    || (target.manager_xell_id
+      ? await one(`SELECT id, slug FROM xell WHERE id=$1 AND status <> 'retired'`, [target.manager_xell_id])
+      : null);
+
   const handover = [
     '## YOU ARE INHERITING THIS XELL — it is not a fresh start',
     '',
-    `Your manager swapped the previous zee out of \`${target.slug}\` and put YOU in, wearing the`,
+    manager
+      ? `Your manager swapped the previous zee out of \`${target.slug}\` and put YOU in, wearing the`
+      : `A HUMAN in the ZEEHIVE console swapped the previous zee out of \`${target.slug}\` and put YOU in, wearing the`,
     `**${h.label || h.key}** harness. Everything the previous zee produced is still here: the same branch,`,
     'the same commits, the same containers, the same database, the same card on the board. Nothing was',
     'reset. **Read what is already on the branch before you write anything** — re-reading the whole repo',
@@ -1239,10 +1255,14 @@ export async function swapBrief({ manager, target, harness: h, task = null }) {
     '',
     handover,
     '',
-    managerBriefBlock(manager.slug, 'swapped you INTO this xell (it was already running work) and is watching it'),
+    ...(watcher
+      ? [managerBriefBlock(watcher.slug, manager
+        ? 'swapped you INTO this xell (it was already running work) and is watching it'
+        : `is watching this xell — a HUMAN${by && by !== 'human@console' ? ` (${by})` : ''} swapped you into it, not your manager`)]
+      : []),
   ].join('\n');
 
-  return { brief, handover, item, prevZee, prevTask, lastReport, branch: branchInfo };
+  return { brief, handover, item, prevZee, prevTask, lastReport, branch: branchInfo, manager: watcher || null };
 }
 
 // POST /api/xell/self/swap — replace the ZEE working one of my crew xells (`zee swap`).
@@ -1314,10 +1334,67 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
       + "visible to its own project only. Use a system-wide harness, or one of your project's own." };
   }
 
-  // ── 3. Is a HUMAN mid-decision on this xell? ────────────────────────────────────────────────
+  // ── 3. …and from here the swap is the SAME act however it was asked for ─────────────────────
+  // Everything above is AUTHORISATION (is this xell yours to swap, is that persona yours to hand
+  // out?). Everything below — the gate check, the collect-before-recreate, the retire, the
+  // re-dispatch — is the swap itself, and it lives in ONE function that the human console route
+  // calls too. See swapZeeInXell.
+  return swapZeeInXell({ target, harness: h, task, model, mode, runtime, title, manager: xell });
+}
+
+// ── THE SHARED CORE OF A SWAP — one copy, two callers ────────────────────────────────────────────
+//
+// `zee swap` (a MANAGER re-crewing one of its own workers) and POST /api/xells/:id/swap (a HUMAN
+// doing the same thing from the honeycomb) are the SAME act, and the ORDER of the steps below is the
+// entire safety property of it — so there is exactly one copy of them. A second copy inside a route
+// is precisely the bug this function exists to prevent:
+//
+//   dispatchXell → spawnCxell → ensureCxell runs `docker rm -f <cage>` and cloneIntoCxell re-clones
+//   /work/repo from the HOST WORKTREE. A caged zee's commits live INSIDE its cage until something
+//   collects them (only land/build/sync do), so a zee that committed and never landed has work that
+//   exists in exactly one place — and the recreate DESTROYS it. Nothing on the dispatch path
+//   collects. So: COLLECT FIRST, and REFUSE THE WHOLE SWAP if the collect fails on a running cage.
+//   Losing a zee's commits is the one outcome nobody can undo; a swap that did not happen costs a
+//   message.
+//
+// WHO asked changes the record and the handover, never the contract: `manager` is the manager xell
+// when a manager asked, NULL when a human did (and then `by` names the operator, and the xell's own
+// manager — if it has one — is TOLD, so a manager is never surprised by a crew member changing
+// persona underneath it). The refusals are identical either way.
+export async function swapZeeInXell({ target, harness: h, task = null, model = null, mode = null,
+                                     runtime = null, title = null, manager = null,
+                                     by = 'human@console' } = {}) {
+  const who = manager ? manager.slug : (by || 'a human');
+  const asked = manager ? `manager ${manager.slug}` : `human ${by || 'human@console'}`;
+
+  // A RETIRED xell has no cage to collect from, no worktree to clone from and no zee to replace —
+  // "swap" on it would silently mean "resurrect", which is a different (and unbuilt) verb.
+  if (target.status === 'retired') {
+    return { ok: false, status: 'refused', error:
+      `${target.slug} is RETIRED — its cxell is torn down and its worktree is gone, so there is no zee `
+      + 'to replace and nothing for a new one to inherit. A swap keeps a LIVE xell and changes who is '
+      + 'in it; starting fresh work is a dispatch.' };
+  }
+
+  // A harness IS a type's manual, and 054's DB guard pairs the two. The type may not CHANGE in a
+  // swap (that would strip a manager off production read-only, or hand a worker the crew verbs),
+  // so the persona must already match the xell — checked here, in the one place both callers pass
+  // through, rather than trusted to whichever picker was on screen.
+  const xellType = normalizeZeeType(target.zee_type) || 'worker';
+  const hType = normalizeZeeType(h.zee_type) || 'worker';
+  if (hType !== xellType) {
+    return { ok: false, status: 'refused', error:
+      `"${h.key}" is a ${hType.toUpperCase()} harness and ${target.slug} is a ${xellType.toUpperCase()} xell — `
+      + 'a harness carries that type\'s manual, and a swap changes only WHO is in the xell, never what '
+      + `the xell IS. Pick a ${xellType} persona (the picker lists the ones this xell may wear).` };
+  }
+
+  // ── Is a HUMAN mid-decision on this xell? ───────────────────────────────────────────────────
   // A held landing, a pending ship and an open done suggestion are all cards on a human's screen
   // that NAME this xell and its zee. Swapping underneath one points that card at an agent that no
-  // longer exists — and in the landing case at a sha nobody in the cage will recognise.
+  // longer exists — and in the landing case at a sha nobody in the cage will recognise. This holds
+  // for a human-run swap too: the operator swapping is not necessarily the one holding the card, and
+  // "decide it, then swap" is one extra click against a decision that would otherwise be meaningless.
   const gates = await openHumanGatesOn(target.id);
   if (gates.length) {
     return { ok: false, status: 'refused', error:
@@ -1326,7 +1403,7 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
       + '`zee land --withdraw`, and only the worker itself can do that). Nothing was changed.' };
   }
 
-  // ── 4. COLLECT THE OUTGOING ZEE'S COMMITS — BEFORE anything can recreate the cage ────────────
+  // ── COLLECT THE OUTGOING ZEE'S COMMITS — BEFORE anything can recreate the cage ──────────────
   // The order here is the whole safety property of this verb (see the hazard note above). A running
   // cage whose commits cannot be collected is a HARD STOP: we would rather refuse a swap than take
   // an irreversible step over work that exists in exactly one place.
@@ -1356,35 +1433,38 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
       + 'commits have nowhere to be collected to and the new cage would have nothing to clone from. '
       + 'Refused; nothing was touched. This needs a human.' };
   }
-  logline('crew', `${xell.slug} swapping ${target.slug} → harness ${h.key}: `
+  logline('crew', `${asked} swapping ${target.slug} → harness ${h.key}: `
     + `commits ${collected?.collected ? `collected (HEAD ${String(collected.head).slice(0, 8)})` : `not collected (${collected?.reason || 'n/a'})`}`);
 
-  // ── 5. The HANDOVER — what the incoming zee is told it walked into ───────────────────────────
-  const { brief, item, prevZee } = await swapBrief({ manager: xell, target, harness: h, task });
+  // ── The HANDOVER — what the incoming zee is told it walked into ──────────────────────────────
+  const { brief, item, prevZee, manager: watcher } = await swapBrief({ manager, target, harness: h, task, by });
 
-  // ── 6. RETIRE the outgoing zee row — honestly, not by deleting it ────────────────────────────
+  // ── RETIRE the outgoing zee row — honestly, not by deleting it ───────────────────────────────
   // The row is the record that this agent existed, what it cost and why it stopped. The reason names
-  // the manager and the incoming persona, so "why did this zee stop?" answers itself in the console.
+  // WHO swapped it out and the incoming persona, so "why did this zee stop?" answers itself in the
+  // console — including when the answer is "a human did it", which used to be unrecorded anywhere.
   const liveRows = await q(
     `SELECT id, xell_id, name, status FROM zee WHERE xell_id=$1 AND status IN ('spawning','online','working','idle')`,
     [target.id]);
   for (const z of liveRows) {
-    await setZeeStatus(z, 'stopped', { stopReason: `swapped out by ${xell.slug} → ${h.key}` }).catch(() => {});
+    await setZeeStatus(z, 'stopped', { stopReason: `swapped out by ${who} → ${h.key}` }).catch(() => {});
   }
 
-  // ── 7. RE-DISPATCH into the SAME xell ────────────────────────────────────────────────────────
+  // ── RE-DISPATCH into the SAME xell ──────────────────────────────────────────────────────────
   // dispatchXell already knows how to dispatch into an existing xell and how to re-assign a harness;
   // this passes it exactly the things that must change and nothing else. No `db`/`dump` (the coupling
-  // stays), no `zee_type` (a bare dispatch keeps the xell's own type), the SAME manager_xell_id, and
-  // rename:false — a rename moves the branch, the worktree folder and the container names, which is
-  // precisely what a swap promises not to do.
+  // stays), no `zee_type` (a bare dispatch keeps the xell's own type), the xell's OWN manager_xell_id
+  // (whatever it already was — a human swap must not adopt the xell, and a manager swap is that
+  // manager anyway), and rename:false — a rename moves the branch, the worktree folder and the
+  // container names, which is precisely what a swap promises not to do.
   const { dispatchXell } = await import('./intake.js');
   let out;
   try {
     out = await dispatchXell({
       xell_id: target.id, project: target.project_id, task: brief, harness: h.key,
       title: title || prevZee?.title?.replace(/^xell\s*:\s*/i, '') || target.slug,
-      rename: false, manager_xell_id: xell.id,
+      rename: false,
+      ...(target.manager_xell_id ? { manager_xell_id: target.manager_xell_id } : {}),
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
     });
   } catch (e) {
@@ -1404,19 +1484,86 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
             [target.id, item.id]).catch(() => {});
   }
 
-  logline('crew', `${xell.slug} SWAPPED the zee in ${target.slug} → ${h.key} (same branch ${target.branch})`);
+  // ── TELL THE MANAGER, when it was not the one who asked ──────────────────────────────────────
+  // A manager watches its crew and plans around who is in each xell. A human re-crewing one of its
+  // workers from the console is exactly the kind of change that, unrecorded, turns into a manager
+  // talking to a persona that left: it says `zee say --to <slug>` expecting the Scout it dispatched
+  // and gets a Reviewer mid-brief. So the swap lands in that manager's inbox (and its live session,
+  // if it has one). Best-effort by construction: a swap that WORKED must not report failure because
+  // a notification row could not be written.
+  let notified = null;
+  if (!manager && watcher) {
+    notified = await postMessage({
+      from: null, to: watcher, kind: 'report', by: by || 'human@console',
+      body: `A HUMAN swapped the zee in your worker ${target.slug}: it now wears "${h.key}"`
+        + `${h.label ? ` (${h.label})` : ''} instead of ${prevZee?.harness_key || prevZee?.harness_label || 'its previous persona'}. `
+        + `The xell is otherwise untouched — same branch (${target.branch}), same commits, same containers, `
+        + 'same database, same card, and it still reports to you. The incoming zee was briefed that it '
+        + 'INHERITED the xell and what is already on the branch. You did not ask for this and nothing of '
+        + `yours was lost: re-brief it with \`zee say --to ${target.slug} --message "…"\` if your plan for `
+        + 'that work has changed.',
+    }).then((r) => ({ ok: true, delivered: !!r.delivered })).catch((e) => ({ ok: false, error: e.message }));
+  }
+
+  logline('crew', `${asked} SWAPPED the zee in ${target.slug} → ${h.key} (same branch ${target.branch})`
+    + `${notified ? `; its manager ${watcher.slug} was told` : ''}`);
   return {
     ok: true, ...out, swapped: true, slug: target.slug, xell_id: target.id, branch: target.branch,
     harness: { key: h.key, label: h.label || null },
     previous: { harness: prevZee?.harness_key || null, status: prevZee?.status || null, zee_id: prevZee?.id || null },
     collected, work_item: item ? { id: item.id, title: item.title } : null,
+    by: manager ? manager.slug : (by || 'human@console'), manager_notified: notified,
     message: `Swapped the zee in ${target.slug} — it now wears "${h.key}" on the SAME xell: same branch `
       + `(${target.branch}), same commits, same containers, same database, same card. `
       + `${collected?.collected ? `The outgoing zee's commits were collected onto the worktree first (HEAD ${String(collected.head).slice(0, 8)}), so nothing it committed was lost.`
                                 : `Nothing was collected from the old cage (${collected?.reason || 'n/a'}).`} `
-      + `The incoming zee is briefed that it INHERITED this xell. Watch it with \`zee zees\`, talk to it `
-      + `with \`zee say --to ${target.slug} --message "…"\`.`,
+      + 'The incoming zee is briefed that it INHERITED this xell. '
+      + (manager
+        ? `Watch it with \`zee zees\`, talk to it with \`zee say --to ${target.slug} --message "…"\`.`
+        : `${watcher ? `Its manager (${watcher.slug}) has been told${notified?.delivered ? ' in its live session' : ' (it will read it with `zee inbox`)'}.`
+                     : 'It has no manager zee — it reports to you in the console.'}`),
   };
+}
+
+// POST /api/xells/:id/swap — a HUMAN in the console replaces the zee working a xell.
+//
+// The console half of `zee swap`, and deliberately the same act: it resolves the xell and the
+// persona, and hands both to swapZeeInXell — the one copy of the collect-before-recreate ordering.
+// It grants no new authority (a human already dispatches into any xell in the project from the
+// honeycomb) and it opens no gate: what comes out is an ordinary caged zee whose every irreversible
+// act still meets the same gates it always did.
+//
+// WIDER than the manager verb in exactly one way — the xell does not have to be anybody's crew, so a
+// human can re-crew a worker a human dispatched — and NARROWER in none: every refusal the manager
+// verb makes about the SWAP itself (an open human gate, a retired xell, a persona of the wrong type)
+// is made here, by the same code.
+export async function swapXellZeeAsHuman({ xellId, harness = null, task = null, model = null,
+                                          mode = null, runtime = null, title = null,
+                                          by = 'human@console' } = {}) {
+  const target = xellId
+    ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId]).catch(() => null)
+    : null;
+  if (!target) return { ok: false, status: 'not_found', error: `no xell ${xellId || ''}` };
+
+  const key = String(harness || '').trim();
+  if (!key) {
+    return { ok: false, error: 'a swap needs a harness — the persona the INCOMING zee wears. That is the '
+      + `whole point of a swap; to re-brief the zee already in ${target.slug}, send it a message instead.` };
+  }
+  const h = await resolveHarness(key).catch(() => null);
+  if (!h) {
+    return { ok: false, status: 'refused', error:
+      `no harness "${key}" — the harness manager lists the personas this project may use.` };
+  }
+  // A persona SCOPED to another project is not this project's to wear (084) — the DB refuses it at
+  // assign time, so refuse it here where the reason can name the owner.
+  if (h.project_id && String(h.project_id) !== String(target.project_id)) {
+    const owner = await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]);
+    return { ok: false, status: 'refused', error:
+      `"${h.key}" belongs to project "${owner?.name || h.project_id}" — a project-scoped persona is `
+      + "visible to its own project only. Use a system-wide harness, or one of this project's own." };
+  }
+  return swapZeeInXell({ target, harness: h, task, model, mode, runtime, title, manager: null, by });
 }
 
 // POST /api/xell/self/say — type a message into a worker's live session (`zee say`).

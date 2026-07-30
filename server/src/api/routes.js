@@ -65,7 +65,8 @@ import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, selfCatchup, selfMigrationNumber,
          listProdBindRequests, decideProdBind,
-         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSwap, selfSay, selfReport, selfInbox,
+         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
+         selfSay, selfReport, selfInbox,
          selfSuggestDone, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
@@ -1435,6 +1436,32 @@ router.post('/done-suggestions/:id/dismiss', async (req, res) => {
   try { res.json(await dismissDoneSuggestion(req.params.id, req.body?.by || 'human@console')); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// SWAP THE ZEE WORKING A XELL — the console half of `zee swap` (self.js). A human picks a xell and a
+// persona, and the xell comes back with a new zee on the SAME row: same branch, same commits, same
+// containers, same database, same card. Only WHO is in it changes.
+//
+// It calls the SAME function the manager verb calls (swapZeeInXell), which is the whole point: the
+// collect-before-recreate ordering that protects the outgoing zee's uncollected commits — and every
+// refusal around it (an open human gate on that xell, a retired xell, a persona whose zee_type does
+// not match the xell's) — exists once, not once per caller.
+//
+// No new gate, and no new authority: a human already dispatches into any xell in the project from
+// this console. Unlike the manager verb it is not scoped to one crew (a human owns every xell), and
+// when the xell DOES have a manager that manager is told, so it never finds a persona it did not ask
+// for. A refusal answers 409 with the server's own sentence — the console shows that sentence.
+router.post('/xells/:id/swap', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const out = await swapXellZeeAsHuman({
+      xellId: req.params.id, harness: b.harness, task: b.task || null,
+      model: b.model || null, mode: b.mode ?? null, runtime: b.runtime || null,
+      title: b.title || null, by: b.by || 'human@console',
+    });
+    if (out?.ok) return res.json(out);
+    res.status(out?.status === 'not_found' ? 404 : out?.status === 'refused' ? 409 : 400).json(out);
+  } catch (err) { res.status(400).json({ error: err.message, detail: err.detail || null }); }
+});
+
 // An operator filing a done suggestion on a manager's behalf (still only a suggestion — it lands on
 // the same human gate, which is the point: this cannot become a shortcut to marking things done).
 router.post('/xells/:id/suggest-done', async (req, res) => {
