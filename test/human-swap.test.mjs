@@ -409,6 +409,18 @@ try {
      'and it says plainly that nothing was collected (the cage was not running) rather than implying a rescue');
   ok((await readXell(solo.id)).harness_key === 'dev-builder', 'the persona was re-assigned on it');
   ok((await readXell(solo.id)).manager_xell_id === null, 'and it still has no manager');
+  // …and the half-swap repair still runs — the SIGNAL does not depend on there being a manager to
+  // message. It is the console's only notice for a xell that reports to nobody.
+  ok(soloSwap.manager_notified === null && soloSwap.half_swapped?.tend_raised === true,
+     'there is nobody to notify, but the xell is still flagged and repaired');
+  const soloTend = await tendState(solo.id);
+  ok(/Nothing was collected from the old cage/.test(soloTend.full || soloTend.reason || ''),
+     'and its tend says nothing was collected…');
+  ok(!/carries them/.test(soloTend.full || soloTend.reason || '')
+     && /do not assume the branch .* carries what that zee committed inside it/.test(soloTend.full || soloTend.reason || ''),
+     '…rather than borrowing the collected branch\'s reassurance — one route here is a xell with no '
+     + 'worktree at all, and "its commits are on the host worktree" would then be a sentence about a '
+     + 'directory that does not exist');
 
   // ── 7. THE HANDOVER — it says a HUMAN swapped you in, and still names the manager ──────────
   console.log('\nthe handover brief is honest about WHO swapped the zee in');

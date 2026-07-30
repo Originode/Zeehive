@@ -221,6 +221,14 @@ export async function notifyManagerOfSwap({ manager, target, harness, previous =
   });
 }
 
+// One line of somebody else's prose, quoted inside ours. Whitespace collapsed (an error can be
+// three paragraphs) and ELIDED rather than chopped: a hard slice ends the quote mid-word, which
+// reads as a truncated MESSAGE rather than a quoted one ("…so a spawn there would fail. Do ").
+const clip = (s, max) => {
+  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+  return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
+};
+
 // ── a swap that HALF-HAPPENED — the outgoing zee is gone and the new one never started ──────
 //
 // notifyManagerOfSwap above is the SUCCESS sentence, and for a long time it was the only one: the
@@ -239,22 +247,28 @@ export async function notifyManagerOfHalfSwap({ manager, target, harness, previo
                                                 by = 'human@console', error = null, collected = null }) {
   if (!manager || !target || !harness) throw new Error('a half-swap notification needs a manager, a target xell and a harness');
   const was = previous?.harness_key || previous?.harness_label || null;
-  const head = collected?.head ? String(collected.head).slice(0, 8) : null;
+  const head = collected?.collected && collected.head ? String(collected.head).slice(0, 8) : null;
   return postMessage({
     from: null, to: manager, kind: 'report', by,
     body: `A HUMAN tried to swap the zee in your worker ${target.slug} and THE NEW ZEE DID NOT START: `
-      + `${String(error || 'the dispatch failed').replace(/\s+/g, ' ').slice(0, 300)}\n\n`
+      + `${clip(error || 'the dispatch failed', 300)}\n\n`
       + `That leaves ${target.slug} HALF-SWAPPED, and this is the part you cannot see from \`zee zees\` `
       + `alone: the previous zee${was ? ` (${was})` : ''} was already retired before the spawn was `
       + `attempted, so there is NO zee in that xell now. It wears "${harness.key}"`
       + `${harness.label ? ` (${harness.label})` : ''} and nothing is running in it — do not wait for it `
       + 'to report; it has no agent to report with.\n\n'
+      // WHAT HAPPENED TO THE COMMITS, and only what is actually known. The no-collect branch must
+      // not borrow the reassuring half of the other one: "the branch is as the worktree last saw it"
+      // is a sentence about a worktree, and one of the ways to reach this path is that there is no
+      // worktree at all (the failure text then contradicts itself in the same paragraph).
       + (head
         ? `Nothing was lost. The outgoing zee's commits were collected onto the host worktree first `
           + `(HEAD ${head}), so the branch (${target.branch}), its commits, the containers, the database `
           + 'and the work-item card are all exactly where they were.'
-        : `Nothing was lost here either, but nothing was RESCUED: ${collected?.reason || 'nothing was collected from the old cage'}`
-          + `, so the branch (${target.branch}) is exactly as the host worktree last saw it — no more, no less.`)
+        : `Nothing was collected from the old cage (${clip(collected?.reason || 'no reason recorded', 200)}). `
+          + 'The swap destroyed nothing either — it never got as far as recreating a cage — but do not '
+          + 'assume anything that zee committed INSIDE its cage is on the branch: it was not collected, '
+          + 'and a cage that is recreated later takes its uncollected commits with it.')
       + '\n\nThe xell is flagged for a human in the console (it shows `tend?` with this same reason), so '
       + 'somebody has been asked to look. If it is your crew you can retry it yourself once the reason '
       + `is fixed: \`zee swap --to ${target.slug} --harness ${harness.key}\`. Re-planning around a xell `

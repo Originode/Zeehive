@@ -1404,11 +1404,23 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
 // it never touches a xell that is being torn down or is already retired.
 export async function markXellHalfSwapped({ target, harness: h, error = null, collected = null,
                                             asked = 'a swap' } = {}) {
+  // ELIDED, not chopped (a hard slice ends mid-word and reads as a broken sentence), and the
+  // commits half says only what is KNOWN: "its commits are on the host worktree" is a claim about a
+  // worktree, and one route to this path is that there is no worktree at all — which is precisely
+  // the shape of dishonesty the failure sentence itself was fixed for a commit earlier.
+  const clip = (s, max) => {
+    const t = String(s ?? '').replace(/\s+/g, ' ').trim();
+    return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
+  };
   const why = `SWAP HALF-DONE — there is NO zee in this xell: the previous one was retired and the new `
-    + `"${h.key}" zee could not start (${String(error?.message || error || 'the dispatch failed').replace(/\s+/g, ' ').slice(0, 160)}). `
-    + `Nothing is running here. The branch (${target.branch}) and its commits are on the host worktree`
-    + `${collected?.collected ? ` (collected up to HEAD ${String(collected.head).slice(0, 8)})` : ''}; `
-    + 'swap or dispatch again once the reason is fixed.';
+    + `"${h.key}" zee could not start (${clip(error?.message || error || 'the dispatch failed', 160)}). `
+    + 'Nothing is running here. '
+    + (collected?.collected
+      ? `The outgoing zee's commits were collected onto the host worktree first (HEAD ${String(collected.head).slice(0, 8)}), `
+        + `so the branch (${target.branch}) carries them. `
+      : `Nothing was collected from the old cage (${clip(collected?.reason || 'no reason recorded', 120)}), `
+        + `so do not assume the branch (${target.branch}) carries what that zee committed inside it. `)
+    + 'Swap or dispatch again once the reason is fixed.';
   const row = await one(
     `UPDATE xell SET status='idle', is_pooled=false WHERE id=$1
        AND status NOT IN ('tearing-down','retired') RETURNING *`, [target.id]).catch(() => null);
