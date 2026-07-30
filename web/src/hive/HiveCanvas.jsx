@@ -931,7 +931,16 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       return;
     }
     const hx = hitHex(wx, wy);
-    if (hx) setExpandedId(hx.id);
+    if (hx) {
+      if (e.shiftKey) {
+        const x = (xells || []).find((xx) => xx.id === hx.id);
+        if (x?.viewer_url && !x.is_production) {
+          onOpenSession?.(x);
+          return;
+        }
+      }
+      setExpandedId(hx.id);
+    }
   };
 
   const onWheel = (e) => {

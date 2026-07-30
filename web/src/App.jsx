@@ -523,9 +523,9 @@ export default function App() {
   // drawer card's. Web sessions open a tab; desktop-protocol sessions deep-link into Claude Desktop.
   const openSession = (x) => {
     if (!x?.viewer_url || x.is_production) return;
-    // A cxell zee's viewer is an ssh:// terminal, not a URL a browser can open — its card
-    // carries the ⌨ terminal button instead, so ignore the generic open here.
-    if (x.viewer_kind === 'ssh-terminal') return;
+    // A cxell zee's viewer is an ssh:// terminal, not a URL a browser can open — open the
+    // in-house terminal modal directly (the bloom center and shift+click both land here).
+    if (x.viewer_kind === 'ssh-terminal') { setTermXell(x); return; }
     if (x.viewer_kind === 'desktop-protocol') openProtocol(x.viewer_url);
     else window.open(x.viewer_url, '_blank', 'noopener');
   };
