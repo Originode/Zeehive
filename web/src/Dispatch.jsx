@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { dispatchOverlap } from './api.js';
 import { createPortal } from 'react-dom';
 import { getDispatchModes, getDispatchModels, getHarnesses } from './api.js';
 import { emptyWarning } from './harnessHealth.js';
@@ -56,6 +57,11 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
   const [images, setImages] = useState([]);       // [{ id, name, data(dataURL), size }]
   const [err, setErr] = useState(null);
   const [empty, setEmpty] = useState(true);       // drives the placeholder + submit-disabled state
+  // WHO ELSE IS IN THIS WORK (#33). Debounced while the prompt is written, so the warning is on screen
+  // at the moment of the decision instead of in the receipt afterwards. Purely informational: it never
+  // disables the button and a failed check simply says nothing — two zees on one file is ordinary work,
+  // and the failure this closes was not KNOWING.
+  const [overlap, setOverlap] = useState(null);
 
   useEffect(() => {
     getDispatchModes().then((ms) => setModes(ms)).catch(() => {});
@@ -90,7 +96,24 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
     setImages((prev) => [...prev, { id: `${Date.now()}-${prev.length}`, ...img }]);
   const removeImage = (id) => setImages((prev) => prev.filter((im) => im.id !== id));
 
-  const syncEmpty = () => setEmpty(!(editorRef.current?.innerText || '').trim());
+  const syncEmpty = () => {
+    setEmpty(!(editorRef.current?.innerText || '').trim());
+    scheduleOverlap();
+  };
+  // One check per pause in typing, and only for a WORKER dispatch: a manager's programme names the whole
+  // project by design, so every word of it would "overlap" everything and the signal would be noise.
+  const overlapTimer = useRef(null);
+  const scheduleOverlap = () => {
+    if (manager) return;
+    clearTimeout(overlapTimer.current);
+    overlapTimer.current = setTimeout(async () => {
+      const task = (editorRef.current?.innerText || '').trim();
+      if (task.length < 12) { setOverlap(null); return; }
+      const o = await dispatchOverlap({ project: projectId, task }).catch(() => null);
+      setOverlap(o && o.warnings?.length ? o : null);
+    }, 700);
+  };
+  useEffect(() => () => clearTimeout(overlapTimer.current), []);
 
   // Paste: capture image FILES (a pasted screenshot) as attachments rather than letting the browser
   // dump a giant base64 blob into the editor; let text/HTML paste through so formatted text lands
@@ -200,6 +223,31 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
                  data-testid="dispatch-editor" role="textbox" aria-multiline="true"
                  onInput={syncEmpty} onPaste={onPaste} onKeyDown={onKeyDown} />
           </div>
+
+          {/* Who else is already in this work — stated, never enforced. It names the xell and the overlap
+              so the decision can be made with it in view: re-brief, talk to that xell, or carry on. */}
+          {overlap?.warnings?.length > 0 && (
+            <div className="disp-overlap" data-testid="dispatch-overlap">
+              <b>⚠ {new Set(overlap.warnings.map((w) => w.xell_slug)).size} live xell(s) may already be in this work.</b>
+              <ul>
+                {[...new Map(overlap.warnings.map((w) => [w.xell_slug, w])).values()].map((w) => (
+                  <li key={w.xell_slug}>
+                    <code>{w.xell_slug}</code>
+                    {w.title ? <> — “{w.title}”</> : null}:{' '}
+                    {overlap.warnings.filter((x) => x.xell_slug === w.xell_slug).map((x) => (
+                      x.kind === 'ticket'
+                        ? `ticket ${x.tickets.join(', ')} (${x.detail})`
+                        : `${x.paths.join(', ')}${x.more ? ` +${x.more} more` : ''} (${x.via})`
+                    )).join('; ')}
+                  </li>
+                ))}
+              </ul>
+              <span className="disp-overlap-note">
+                Two zees on one file is ordinary. Two zees on one PROBLEM is a duplicate nobody sees until it
+                lands — dispatch anyway if you meant to.
+              </span>
+            </div>
+          )}
 
           {images.length > 0 && (
             <div className="disp-imgs" data-testid="dispatch-images">
