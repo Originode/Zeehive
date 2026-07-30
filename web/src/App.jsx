@@ -766,8 +766,9 @@ export default function App() {
       <div className="statusline" data-testid="statusline">
         {/* FIRST in the line, before anything that starts work: the one control that stops all of it.
             Its own state is also the answer to "why is nothing happening?", which is the question the
-            rest of this line cannot answer while the fleet is paused. */}
-        <FleetPause pause={fleet.project_pause?.paused ? fleet.project_pause : fleet.pause}
+            rest of this line cannot answer while the fleet is paused.
+            With a project selected, this operates on the PROJECT (project_pause), not the whole fleet. */}
+        <FleetPause pause={fleet.project_pause || fleet.pause}
                     projectId={projectId || project.id} onChanged={refresh}
                     pushToast={pushToast} dismissToast={dismissToast} />
         <span className="k">Status:</span>{' '}

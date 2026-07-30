@@ -46,7 +46,9 @@ async function liveCxellZees(projectId = null, xellId = null) {
   const conditions = ['z.entrypoint = \'cxell-cli\'', 'z.viewer_kind = \'ssh-terminal\'',
                       'z.decommissioned_at IS NULL', 'x.status NOT IN (\'retired\',\'tearing-down\')'];
   const params = [];
-  let pIdx = 1;
+  // $1 and $2 are always NUDGE_HELD / NUDGE_HELD_CLEAR (see the subquery in the SELECT),
+  // so dynamic conditions start at $3.
+  let pIdx = 3;
   if (projectId) { conditions.push(`x.project_id = $${pIdx++}`); params.push(projectId); }
   if (xellId) { conditions.push(`x.id = $${pIdx++}`); params.push(xellId); }
   return q(
