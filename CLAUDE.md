@@ -178,6 +178,8 @@ docs/            specs and rationale (see the doc map)
 | a db chip says DRIFTED and you need to know why | [docs/schema-drift-triage.md](docs/schema-drift-triage.md) |
 | why a fresh restore still shows drift, and what a backup does **not** prove | [docs/data-completeness-check.md](docs/data-completeness-check.md) |
 | projects, manifests, deploy sites | [docs/deploy-topology-spec.md](docs/deploy-topology-spec.md) |
+| what a NESTED queenzee can actually reach (loop by loop, read vs write) | [docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md) |
+| `config.repoRoot` = the server's OWN tree, never a project's files | [docs/repo-root-audit.md](docs/repo-root-audit.md) |
 | what runs where in production, and the cutover | [docker/zeehive/README.md](docker/zeehive/README.md) |
 | **why** a gate is shaped the way it is; traps already paid for | [HANDOFF.md](HANDOFF.md) — **history, not instructions** |
 
