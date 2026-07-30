@@ -212,7 +212,14 @@ try {
   say({ out: 'A_MARKER_ON_STDOUT', err: 'noise on stderr', code: 3 });
   const rej = await C.warmCxell({ ctx: 'default', name: 'cxell_zt-v' });   // reaches dk through dkVerdict
   ok(rej.warmed === false, 'an unrecognised answer is not a warm');
-  // the message dk itself builds, read through the one public caller that surfaces it verbatim
+  // dk's OWN message, through a plain (non-verdict) exec that surfaces it verbatim — this is the half
+  // that protects the ~40 call sites here which never reach dkVerdict: even they cannot see
+  // stderr-only any more, so a marker on stdout survives being reported as a failure.
+  say({ out: 'A_MARKER_ON_STDOUT', err: 'noise on stderr', code: 3 });
+  const sealed = await C.sealCxell({ ctx: 'default', name: 'cxell_zt-v' }).catch((e) => e);
+  ok(sealed instanceof Error && /A_MARKER_ON_STDOUT/.test(sealed.message) && /noise on stderr/.test(sealed.message)
+     && /exited 3/.test(sealed.message),
+     `dk's own rejection names the exit code and BOTH streams [${String(sealed?.message).slice(0, 110)}]`);
   say({ out: 'A_MARKER_ON_STDOUT', err: 'noise on stderr', code: 3 });
   const thrown = await C.writeGeneratedDocIntoCxell({ slug: 'zt-v', relPath: 'AGENTS.md', text: 'x' })
     .catch((e) => e);
