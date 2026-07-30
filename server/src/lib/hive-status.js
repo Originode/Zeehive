@@ -64,7 +64,7 @@ export function hiveStatus(x, sig = {}) {
   const {
     landPending = false, shipPending = false, tendPending = false, prodUnprotected = false,
     landHint = false, shipHint = false, prodBindPending = false, seedPending = false,
-    doneSuggested = false, landHolding = false, paused = false,
+    doneSuggested = false, landHolding = false, paused = false, xellPaused = false,
   } = sig;
 
   // ── production ──
@@ -155,7 +155,10 @@ export function hiveStatus(x, sig = {}) {
   // on. But it outranks working/idle, because it is the only thing that answers "why has this zee
   // gone quiet?" — and answering that with `idle` is how an operator loses track of what their own
   // pause stopped.
-  if (paused)                            return 'occ-paused';
+  //
+  // `paused` is the fleet-wide OR project-level pause. `xellPaused` is the per-xell individual pause.
+  // Either one produces the same visual state; the console shows which one applied.
+  if (paused || xellPaused)              return 'occ-paused';
 
   // WORKING is decided by the ZEE'S OWN STATUS, and by nothing else.
   //

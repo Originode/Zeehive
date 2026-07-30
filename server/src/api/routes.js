@@ -55,8 +55,9 @@ import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, lan
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
-import { pauseFleet, resumeFleet } from '../queenzee/pause.js';
-import { pauseState } from '../lib/fleet-pause.js';
+import { pauseFleet, resumeFleet, pauseProject, resumeProject,
+         pauseXell, resumeXell } from '../queenzee/pause.js';
+import { pauseState, projectPauseState } from '../lib/fleet-pause.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { checkContainerData, dataCheckReadiness } from '../queenzee/datadiff.js';
 import { compareBackupCounts } from '../lib/row-counts.js';
@@ -257,10 +258,16 @@ router.get('/fleet/pause', async (_req, res) => {
   catch (err) { res.status(503).json({ error: `pause state unavailable: ${err.message}` }); }
 });
 
-// 409, not 200-with-a-flag, when the fleet is already in the state asked for: pressing pause twice is
-// a double-click, and the second press must not re-sweep and re-stamp zees the first one stopped.
+// When a `project` parameter is provided, this acts on THAT project only (project-scoped pause).
+// Without it, the original fleet-wide behaviour is preserved (backward-compatible).
 router.post('/fleet/pause', async (req, res) => {
   try {
+    const projectId = req.body?.project || req.query?.project || null;
+    if (projectId) {
+      const state = await projectPauseState(projectId);
+      if (state.paused) return res.status(409).json({ error: 'this project is already paused', ...state });
+      return res.json(await pauseProject(projectId, { by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
+    }
     const state = await pauseState();
     if (state.paused) return res.status(409).json({ error: 'the fleet is already paused', ...state });
     res.json(await pauseFleet({ by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
@@ -269,9 +276,30 @@ router.post('/fleet/pause', async (req, res) => {
 
 router.post('/fleet/resume', async (req, res) => {
   try {
+    const projectId = req.body?.project || req.query?.project || null;
+    if (projectId) {
+      const state = await projectPauseState(projectId);
+      if (!state.paused) return res.status(409).json({ error: 'this project is not paused', ...state });
+      return res.json(await resumeProject(projectId, { by: req.body?.by || 'human@console' }));
+    }
     const state = await pauseState();
     if (!state.paused) return res.status(409).json({ error: 'the fleet is not paused', ...state });
     res.json(await resumeFleet({ by: req.body?.by || 'human@console' }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── PER-XELL PAUSE / RESUME (migration 101) ────────────────────────────────────
+// Pause one individual xell: marks it in session_event and interrupts its zee.
+router.post('/xells/:id/pause', async (req, res) => {
+  try {
+    res.json(await pauseXell(req.params.id, { by: req.body?.by || 'human@console' }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Resume one individual xell: marks it in session_event and nudges the zee back.
+router.post('/xells/:id/resume', async (req, res) => {
+  try {
+    res.json(await resumeXell(req.params.id, { by: req.body?.by || 'human@console' }));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

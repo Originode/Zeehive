@@ -9,31 +9,53 @@ export async function getFleet(projectId) {
   return r.json();
 }
 
-// ── PAUSE / PLAY ────────────────────────────────────────────────────────────────────────────────
-// The fleet-wide stop button. NOT project-scoped, on purpose: one press stops every zee in every
-// xell, managers included, and a per-project pause would leave another project's managers dispatching
-// into a fleet the operator believes is still. The current flag also rides the /fleet snapshot
-// (fleet.pause), so the button re-renders on the ordinary poll without a second request.
+// ── PAUSE / PLAY — fleet-wide and project-scoped ─────────────────────────────────────────────────
+// The fleet-wide stop button. Now ALSO accepts a `project` parameter for project-scoped pause.
+// Without `projectId`, pauses the ENTIRE fleet (every project). With `projectId`, pauses only that
+// project's xells while the rest of the fleet keeps working.
 //
 // Both verbs answer with the RECEIPT (counts + one row per xell), and the caller is expected to show
 // it: "paused" that silently left three zees running is the failure this UI must not hide.
-export async function pauseFleet(reason = null) {
+export async function pauseFleet(reason = null, projectId = null) {
   const r = await fetch('/api/fleet/pause', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ reason, by: 'human@console' }),
+    body: JSON.stringify({ reason, by: 'human@console', project: projectId }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `pause failed (${r.status})`);
   return data;
 }
 
-export async function resumeFleet() {
+export async function resumeFleet(projectId = null) {
   const r = await fetch('/api/fleet/resume', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console', project: projectId }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `resume failed (${r.status})`);
+  return data;
+}
+
+// ── PER-XELL PAUSE / PLAY (migration 101) ──────────────────────────────────────────────────────
+// Pause ONE xell: marks it in session_event and interrupts its zee.
+export async function pauseXell(xellId) {
+  const r = await fetch(`/api/xells/${xellId}/pause`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ by: 'human@console' }),
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || `resume failed (${r.status})`);
+  if (!r.ok) throw new Error(data.error || `pause xell failed (${r.status})`);
+  return data;
+}
+
+// Resume ONE xell: marks it un-paused and nudges its zee back.
+export async function resumeXell(xellId) {
+  const r = await fetch(`/api/xells/${xellId}/resume`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console' }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `resume xell failed (${r.status})`);
   return data;
 }
 
