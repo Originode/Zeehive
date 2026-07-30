@@ -5,12 +5,16 @@
 // deploy, so the new process must bring its own schema up before serving) and as the
 // `npm run db:migrate` CLI, which additionally closes the pool so the script exits.
 import { readdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { pool } from './pool.js';
 import { config } from '../config.js';
 // one parse of "what number is this file", shared with the allocator and the lint's own reasoning
 import { numberOf } from '../lib/migration-numbers.js';
+// which of two colliding files is SAFE to rename — shared with the lint, because "renumber it" is only
+// good advice when it names the file no database has run (#35)
+import { renameAdvice, RERUN_WARNING } from './rename-advice.js';
 
 const migrationsDir = resolve(config.repoRoot, 'db', 'migrations');
 
@@ -40,7 +44,20 @@ export function duplicatePrefixesSplitByLedger(files = [], applied = new Set()) 
 
 // What a human reads. It names both sides of the split, because which file is already in is the whole
 // point: that one's position is fixed, so the fix can only be the other one.
-export function splitPrefixRefusal(groups = []) {
+// What MAIN carries, for the same reason the lint reads it: a collision whose files are both landed is
+// history and must not be renamed by anybody. Best-effort — no repo or no branch answers null, and the
+// advice falls back to the ledger alone.
+export function landedMigrationNames(repoRoot, ref = 'origin/main') {
+  if (!repoRoot) return null;
+  const r = spawnSync('git', ['-C', repoRoot, 'ls-tree', '--name-only', '-r', ref, '--', 'db/migrations'],
+    { encoding: 'utf8', timeout: 4000, windowsHide: true });
+  if (r.error || r.status !== 0) return null;
+  const names = r.stdout.split('\n').map((s) => s.trim().replace(/^db\/migrations\//, ''))
+    .filter((s) => s.endsWith('.sql'));
+  return names.length ? new Set(names) : null;
+}
+
+export function splitPrefixRefusal(groups = [], landed = null) {
   const lines = ['Refusing to migrate: a migration number this database has already used is claimed by a'
     + ' file it has never applied.', ''];
   for (const g of groups) {
@@ -49,13 +66,18 @@ export function splitPrefixRefusal(groups = []) {
     for (const f of g.unapplied) lines.push(`    ${f}   ← NEW, not applied`);
   }
   lines.push('',
-    'Filename order IS apply order, so these two were never sequenced by anyone — and the applied one',
-    'cannot move: schema_migrations keys on the FILENAME, so renaming it would make it look new and run',
-    'it a second time. NOTHING HAS BEEN APPLIED by this run.',
-    '',
-    '  • Renumber the NEW file to a free number, content unchanged, and get that number from the',
-    '    queenzee: `zee migration-number` sees what is landed AND what every live xell has claimed,',
-    '    which your own worktree cannot (server/src/lib/migration-numbers.js).',
+    'Filename order IS apply order, so these were never sequenced by anyone. NOTHING HAS BEEN APPLIED by',
+    'this run.',
+    '');
+  // WHICH file to move is the whole of the advice, and it is decided by the ledger rather than by the
+  // reader's guess: the applied one cannot move (#35). renameAdvice owns that rule for both guards.
+  for (const g of groups) {
+    const adv = renameAdvice([...g.applied, ...g.unapplied], new Set(g.applied), landed);
+    lines.push(`  ${String(g.number).padStart(3, '0')}: ${adv.advice}`);
+  }
+  lines.push('',
+    '  • Take the new number from the queenzee: `zee migration-number` sees what is landed AND what every',
+    '    live xell has claimed, which your own worktree cannot (server/src/lib/migration-numbers.js).',
     '  • test/migration-numbers.test.mjs is the same rule at landing time, with the whole tree in view.',
     '',
     'MIGRATE_ALLOW_DUPLICATE_NUMBERS=true migrates anyway — for a human who has decided the order is',
@@ -96,7 +118,8 @@ export async function runMigrations() {
     // migrate exactly as they always have; the lint owns that case, with the whole tree in view.
     const split = duplicatePrefixesSplitByLedger(files, applied);
     if (split.length && process.env.MIGRATE_ALLOW_DUPLICATE_NUMBERS !== 'true') {
-      throw new Error(splitPrefixRefusal(split));
+      // main's list is read only when there is something to refuse — a clean migrate spends nothing on it
+      throw new Error(splitPrefixRefusal(split, landedMigrationNames(config.repoRoot)));
     }
     if (split.length) {
       console.log('[migrate] MIGRATE_ALLOW_DUPLICATE_NUMBERS=true — applying a duplicate number anyway: '
