@@ -101,10 +101,15 @@ const GRANDFATHERED = {
   // (The EIGHTH collision was here — 090 twice, created BY a renumber escaping a different one — and it
   // is gone because somebody moved 090_restore_report.sql to 095. Its line is DELETED rather than left:
   // a grandfather entry that no longer describes a real duplicate is a standing permit for the next
-  // collision on that number, which is why this list is checked in both directions. What the episode
-  // cost is worth remembering: that file had ALREADY applied under its old name, so the rename made it
-  // run a second time on every database that had it — harmless only because it happens to be
-  // ADD COLUMN IF NOT EXISTS. That is the trap both guards' messages warn about, paid in public.)
+  // collision on that number, which is why this list is checked in both directions. And this rename
+  // was SAFE, which is the part worth recording accurately: that file never sat on a deployable tip
+  // under either earlier name. Checked, not assumed — no first-parent commit of master contains
+  // db/migrations/087_restore_report.sql or 090_restore_report.sql, and a clone of the production
+  // ledger holds 095_restore_report.sql and neither of the others, so no shared database re-ran it.
+  // The renumber was done on its author's own branch, before landing, which is exactly where a number
+  // may still be changed. The hazard the grandfather rule exists for is real — schema_migrations keys
+  // on FILENAME, so renaming a file that HAS applied re-runs it — it simply was not paid here, and the
+  // way to tell the two cases apart is the check above, not the number's history.)
 };
 
 // The whole check, as a function of a FILE LIST — so the samples below run through the identical
