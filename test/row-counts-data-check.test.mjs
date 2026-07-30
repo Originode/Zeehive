@@ -153,11 +153,11 @@ try {
   // ── 5. the CAPTURE never endangers the backup ─────────────────────────────────────────────────
   console.log('\n── the dump is the product; the counts are instrumentation ──');
   const maint = read('server/src/queenzee/maintenance.js');
-  ok(/rowCounts = await sourceRowCounts[\s\S]{0,200}catch/.test(maint),
+  ok(/await sourceRowCounts\([\s\S]{0,240}catch/.test(maint),
      'the probe is wrapped so a failure cannot fail the backup');
   ok(/the BACKUP is `\s*\+\s*`unaffected/.test(maint) || /BACKUP is/.test(maint),
      'and it says out loud that the backup is unaffected when it fails');
-  const capture = maint.indexOf('rowCounts = await sourceRowCounts');
+  const capture = maint.indexOf('await sourceRowCounts(srcCtx');
   ok(capture > maint.indexOf("'pg_dump'"),
      'counts are taken AFTER the dump — they must never delay it or extend the window prod is locked for');
   ok(/row_counts=\$5::jsonb, row_total=\$6/.test(maint), 'and they are recorded on the finished snapshot');
@@ -221,17 +221,52 @@ try {
   await q(`ALTER EXTENSION plpgsql DROP TABLE zt_rc_ext_probe`).catch(() => {});
   await q(`DROP TABLE IF EXISTS zt_rc_ext_probe`);
 
-  // The two sides of a REAL comparison: estimates vs exact counts of the same live database. They must
-  // land inside the tolerance — this is the measurement that justifies the tolerance existing.
-  const exact = RC.parseRowCounts((await q(RC.exactCountSql(Object.keys(est)))).map((r) => Object.values(r)[0]).join('\n'));
-  const live = RC.compareRestoreCounts(est, exact);
+  // THE CALIBRATION, and the precondition it depends on — which another zee found the hard way.
+  //
+  // The tolerance is a claim about how far a planner ESTIMATE sits from an EXACT count. That claim only
+  // holds for a table whose statistics are CURRENT: reltuples is refreshed by ANALYZE, so a database
+  // that has taken a day of churn without one can be 25% out and this comparison would go red on a
+  // perfectly healthy database. swift-ridge-1433ab hit exactly that (est ~302 vs exact 341) and left it
+  // rather than widening the number — correctly, because the tolerance is load-bearing for the feature.
+  //
+  // So: ANALYZE first, and say why. Widening the tolerance until the test stops failing would have
+  // thrown away the one guarantee the whole check rests on. And the decay itself is not swept up — it
+  // is asserted immediately below, as product behaviour.
+  await q('ANALYZE');
+  const est2b = RC.parseRowCounts((await q(RC.ROW_COUNT_SQL)).map((r) => Object.values(r)[0]).join('\n'));
+  const exact = RC.parseRowCounts((await q(RC.exactCountSql(Object.keys(est2b)))).map((r) => Object.values(r)[0]).join('\n'));
+  const live = RC.compareRestoreCounts(est2b, exact);
   ok(live.empty.length === 0 && live.short.length === 0,
-     `estimate-vs-exact on the SAME database reports no empty and no short table `
+     `with CURRENT statistics, estimate-vs-exact on the same database reports no empty and no short table `
      + `(est ~${live.ref_total.toLocaleString()} vs exact ${live.got_total.toLocaleString()}) — the tolerance is calibrated, not decorative`);
   ok(live.verdict !== 'incomplete',
      'so a faithful database is never told its data is missing (the whole failure mode this check must not have)');
-  ok(live.unknown.every((x) => est[x.table] === -1),
-     'and the only unverifiable tables are the ones the source itself never analyzed');
+
+  // ── AND THE DECAY, as product behaviour rather than a test annoyance ──────────────────────────
+  // The same mechanism that reddened that test would, in production, turn a bulk delete before a dump
+  // into a FALSE "data is missing" on a faithful restore. postgres knows: n_mod_since_analyze counts
+  // the rows that moved since anyone measured. A shortfall inside that movement is unjudgeable, and is
+  // now reported as such — never as a finding, and never as a pass.
+  console.log('\n── a decayed reference estimate cannot claim "short" ──');
+  ok(Object.keys(RC.parseRowStats((await q(RC.ROW_COUNT_SQL)).map((r) => Object.values(r)[0]).join('\n'))).length > 0,
+     'the probe records how stale every estimate is, from the same read');
+  const trusted = RC.compareRestoreCounts({ 'public.t': 1000 }, { 'public.t': 850 }, { 'public.t': 5 });
+  ok(trusted.short.length === 1,
+     'a 15% shortfall against a FRESH estimate is still a finding — staleness must not become an excuse');
+  const decayed = RC.compareRestoreCounts({ 'public.t': 1000 }, { 'public.t': 850 }, { 'public.t': 400 });
+  ok(decayed.short.length === 0 && decayed.stale.length === 1,
+     'the same shortfall against an estimate that moved by 400 rows is UNJUDGEABLE, not data loss');
+  ok(decayed.verdict === 'unverified',
+     'and the verdict says so: "unverified" is neither an alarm nor a clean bill');
+  ok(decayed.unknown.some((x) => x.table === 'public.t'),
+     'it lands in the unknown bucket, where the report prints it with the number that made it unjudgeable');
+  const emptyStale = RC.compareRestoreCounts({ 'public.t': 5000 }, { 'public.t': 0 }, { 'public.t': 999999 });
+  ok(emptyStale.empty.length === 1 && emptyStale.verdict === 'incomplete',
+     'but an EMPTY table is reported however stale the estimate — no decay turns "had rows" into "has none"');
+  ok(RC.referenceIsStale(1000, 5) === false && RC.referenceIsStale(1000, 400) === true,
+     'the rule itself: stale when the table moved by more than the tolerance since it was measured');
+  ok(RC.compareRestoreCounts({ 'public.t': 1000 }, { 'public.t': 850 }, null).short.length === 1,
+     'and an older snapshot with no staleness recorded behaves exactly as before (no silent leniency)');
 
 
   // ── 8. the two regressions running it end-to-end exposed ──────────────────────────────────────

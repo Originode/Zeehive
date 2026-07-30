@@ -144,8 +144,20 @@ export function dataReportText(name, r) {
   list('EMPTY here, populated in the backup', r.empty, (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here 0`);
   list('short of the backup', r.short, (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here ${x.got.toLocaleString()}`);
   list('ABSENT from this database (schema, not rows — run Check diff)', r.missing, (x) => `${x.table}`);
-  list('no reference count (never analyzed in the source)', r.unknown, (x) => `${x.table} — here ${x.got.toLocaleString()}`);
+  // The two ways a table can be unjudgeable, listed apart because they mean different things: nobody
+  // ever measured it, versus the measurement has since decayed past the tolerance.
+  list('reference estimate too STALE to judge (the source table moved since its last ANALYZE)', r.stale,
+       (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here ${x.got.toLocaleString()} `
+            + `(${(x.mod_since_analyze ?? 0).toLocaleString()} rows had changed since it was measured)`);
+  list('no reference count (never analyzed in the source)',
+       (r.unknown || []).filter((x) => x.state !== 'stale-reference'),
+       (x) => `${x.table} — here ${x.got.toLocaleString()}`);
 
+  if (r.stale?.length) {
+    out.push('\n\nA STALE reference is not a finding and not a pass: the source table changed by more than'
+      + '\nthe tolerance since anyone measured it, so a shortfall inside that movement says nothing. An'
+      + '\nEMPTY table is still reported however stale the estimate — no decay turns "had rows" into "has none".');
+  }
   out.push('\n\nThe reference is the planner\'s row ESTIMATE taken from the source when the dump was made;'
     + `\nthis side is an exact count. Expect a few percent either way — a shortfall under `
     + `${Math.round((ref.tolerance ?? 0.1) * 100)}% is not\nreported, and a table with MORE rows than the backup is `
@@ -196,7 +208,13 @@ export function dataText(c) {
         out.push(`\n  · ${x.table} — backup ~${x.ref?.toLocaleString?.() ?? x.ref}, here ${x.got?.toLocaleString?.() ?? x.got}`);
       }
     } else if (d.verdict === 'unverified') {
-      out.push(`\n\nrow check${when}: ${d.ok_count}/${d.checked} table(s) match; the rest could not be judged`);
+      const why = [];
+      if (d.stale?.length) why.push(`${d.stale.length} with a reference too stale to judge`);
+      if (d.missing?.length) why.push(`${d.missing.length} absent (schema, not rows)`);
+      const never = (d.unknown || []).filter((x) => x.state !== 'stale-reference').length;
+      if (never) why.push(`${never} never analyzed in the source`);
+      out.push(`\n\nrow check${when}: ${d.ok_count}/${d.checked} table(s) match`
+        + (why.length ? `; ${why.join(', ')}` : '; the rest could not be judged'));
     } else {
       out.push(`\n\n✓ rows match the backup this db was restored from${when} (${d.ok_count}/${d.checked} tables)`);
     }

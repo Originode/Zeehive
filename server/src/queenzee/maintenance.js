@@ -24,7 +24,7 @@ import { pickDbContainer } from '../lib/xell-db.js';
 import { refreshProdDiffAfterRestore } from './proddiff.js';
 // The DATA half of a backup's guarantee — pure functions + the catalog SQL, kept out of here so both
 // the capture and every reading of it (trend, restore check) are testable with no docker (row-counts.js).
-import { ROW_COUNT_SQL, parseRowCounts, rowTotal, compareBackupCounts } from '../lib/row-counts.js';
+import { ROW_COUNT_SQL, parseRowCounts, parseRowStats, rowTotal, compareBackupCounts } from '../lib/row-counts.js';
 // WHEN the next backup is due (a failure shortens the window, it does not consume it) and WHEN a human
 // is told the restore point is stale — pure decisions, so the TIMING is asserted by a test (#26).
 import { backupDecision, staleAlertDecision } from '../lib/backup-schedule.js';
@@ -539,11 +539,14 @@ async function sourceRowCounts(ctx, container, dbUser, dbName) {
     return null;
   }
   const counts = parseRowCounts(r.stdout);
-  return Object.keys(counts).length ? counts : null;
+  if (!Object.keys(counts).length) return null;
+  // …and how far each of those estimates has decayed, from the same read. An estimate without its
+  // staleness is a number you cannot argue with later.
+  return { counts, stats: parseRowStats(r.stdout) };
 }
 
 async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, tables = [], keep }) {
-  let size = null, error = null, tocText = null, tocSummary = null, rowCounts = null;
+  let size = null, error = null, tocText = null, tocSummary = null, rowCounts = null, rowStats = null;
   const scoped = Array.isArray(tables) && tables.length > 0;   // a partial, table-scoped dump
   const tArgs = dumpTableArgs(tables);                          // [] for a full-database dump
   try {
@@ -620,8 +623,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       // anything of prod's, and inside the same try only so a probe error is logged like any other
       // (sourceRowCounts itself never throws). Deliberately not gated on `scoped`: a scoped dump's
       // counts still describe the source, and the restore check reads only the tables it holds.
-      rowCounts = await sourceRowCounts(srcCtx, container, dbUser, dbName)
+      const probed = await sourceRowCounts(srcCtx, container, dbUser, dbName)
         .catch((e) => { logline('maint', `row-count probe errored (backup unaffected): ${e.message}`); return null; });
+      rowCounts = probed?.counts ?? null;
+      rowStats = probed?.stats ?? null;
 
       // ── validation common to both destinations ──────────────────────────────
       const toc = parseDumpToc(tocText);
@@ -681,9 +686,11 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
 
   const row = await one(
     `UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3, toc_summary=$4,
-                            row_counts=$5::jsonb, row_total=$6 WHERE id=$1 RETURNING *`,
+                            row_counts=$5::jsonb, row_total=$6, row_stats=$7::jsonb
+      WHERE id=$1 RETURNING *`,
     [snap.id, size, MODE, tocSummary ? JSON.stringify(tocSummary) : null,
-     rowCounts ? JSON.stringify(rowCounts) : null, rowCounts ? rowTotal(rowCounts) : null]);
+     rowCounts ? JSON.stringify(rowCounts) : null, rowCounts ? rowTotal(rowCounts) : null,
+     rowStats ? JSON.stringify(rowStats) : null]);
   if (dbc) await clearBusy(dbc.id);
   broadcast('task', { kind: 'db_snapshot', snap: row });
   logline('maint', `backup finished (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath} (${size ?? '?'} bytes)`);

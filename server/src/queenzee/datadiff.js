@@ -75,7 +75,7 @@ export async function checkContainerData(containerId, { persist = true, only = n
         + 'Restore a backup into it (the restore records which one), then run this check.',
       { needs_restore: true });
   }
-  const snap = await one(`SELECT id, taken_at, dump_path, row_counts, row_total, toc_summary, tables FROM db_snapshot WHERE id=$1`,
+  const snap = await one(`SELECT id, taken_at, dump_path, row_counts, row_stats, row_total, toc_summary, tables FROM db_snapshot WHERE id=$1`,
     [c.restored_from]);
   if (!snap) return fail('the backup this database was restored from has been deleted — nothing to compare against');
   if (!snap.row_counts) {
@@ -130,7 +130,9 @@ export async function checkContainerData(containerId, { persist = true, only = n
   }
 
   const got = parseRowCounts(r.out);
-  const cmp = compareRestoreCounts(reference, got);
+  // The staleness map rides along so a shortfall inside a decayed estimate is reported as
+  // unverifiable rather than as data loss (see lib/row-counts.js referenceIsStale).
+  const cmp = compareRestoreCounts(reference, got, snap.row_stats || null);
   const report = {
     ok: true, error: null,
     ...cmp,
@@ -140,7 +142,7 @@ export async function checkContainerData(containerId, { persist = true, only = n
     reference: {
       kind: 'snapshot', id: snap.id, taken_at: snap.taken_at,
       scoped_to: scope ? [...scope] : null,
-      estimated: true, tolerance: SHORTFALL_TOLERANCE,
+      estimated: true, tolerance: SHORTFALL_TOLERANCE, has_staleness: !!snap.row_stats,
       note: 'the reference is the planner\'s row ESTIMATE from the source at dump time; this side is an exact count',
     },
     restored_note: c.restored_note || null,
