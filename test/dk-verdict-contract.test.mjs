@@ -51,6 +51,10 @@ mkdirSync(bin, { recursive: true });
 writeFileSync(join(bin, 'docker'), [
   '#!/usr/bin/env bash',
   '# stand-in for the docker CLI (see the header of dk-verdict-contract.test.mjs)',
+  'if [ "$1" = "--context" ]; then shift 2; fi',
+  // Only an EXEC gets the answer under test. Everything else (network create, run, rm) succeeds
+  // quietly, so a caller that does other docker work on the way to its exec still gets there.
+  'if [ "$1" != "exec" ]; then exit 0; fi',
   'if [ ! -t 0 ]; then cat > /dev/null; fi',      // drain the piped payload like a real exec does
   'if [ -n "$FAKE_STDERR" ]; then printf "%s\\n" "$FAKE_STDERR" >&2; fi',
   'if [ -n "$FAKE_STDOUT" ]; then printf "%s\\n" "$FAKE_STDOUT"; fi',
@@ -147,14 +151,39 @@ try {
           want: (r) => r?.warmed === false && !r?.lockDrift && /No such container/.test(String(r?.error || '')) },
       ],
     },
+    {
+      // The npm-cache fixup in ensureCxell — the sibling this file found. It has no return value: the
+      // cage's answer is only ever a WARNING, which is exactly why nobody noticed it was reading the
+      // marker out of a rejection and warning falsely.
+      name: 'ensureCxell (npm cache fixup)',
+      markers: ['CACHE_RW', 'CACHE_RO'],
+      cases: [
+        { what: 'CACHE_RW + exit 1 is a WRITABLE cache — no false "NOT writable" warning',
+          out: 'CACHE_RW', err: 'docker: connection reset', code: 1,
+          run: () => C.ensureCxell({ ctx: 'default', slug: 'zt-v', xellId: null }),
+          want: (r, logs) => r?.name === 'cxell_zt-v' && !logs.some((m) => /NOT writable/.test(m)) },
+        { what: 'CACHE_RO is still warned about, quoting what the cage said',
+          out: 'CACHE_RO', err: '', code: 0,
+          run: () => C.ensureCxell({ ctx: 'default', slug: 'zt-v', xellId: null }),
+          want: (r, logs) => logs.some((m) => /NOT writable/.test(m) && /CACHE_RO/.test(m)) },
+        { what: 'and an exec that says nothing is warned about too, quoting docker',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.ensureCxell({ ctx: 'default', slug: 'zt-v', xellId: null }),
+          want: (r, logs) => logs.some((m) => /NOT writable/.test(m) && /No such container/.test(m)) },
+      ],
+    },
   ];
 
   for (const site of SITES) {
     console.log(`\n── ${site.name} — the verdict decides, whatever the exit code said ──`);
     for (const c of site.cases) {
       say(c);
+      const n0 = since();
       const got = await c.run().catch((e) => e);
-      ok(c.want(got), `${c.what} [${JSON.stringify(got instanceof Error ? got.message : got).slice(0, 120)}]`);
+      // some sites' whole observable IS a logline (ensureCxell warns rather than returning), so the
+      // lines this call produced are handed to the expectation alongside its result
+      ok(c.want(got, linesSince(n0)),
+         `${c.what} [${JSON.stringify(got instanceof Error ? got.message : got).slice(0, 120)}]`);
     }
   }
 
@@ -234,13 +263,6 @@ try {
     __ZEE_TALK_QUEUED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_TALK_FAILED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_KEYS_SENT__: 'not run by dk at all — sshExecInCxell (asserted below)',
-    // KNOWN SIBLING, REPORTED, NOT FIXED IN THIS COMMIT: ensureCxell's npm-cache fixup reads CACHE_RW
-    // out of a rejection (`.catch((e) => ({ out: `CACHE_ERR ${e.message}` }))`), so a non-zero exit
-    // with a good CACHE_RW on stdout logs a FALSE "cache is NOT writable". Same class as 45d3ebe, in a
-    // logline instead of a db column. Routing it through dkVerdict moves that site's behaviour, so it
-    // is a separate change — see the report and the commit that removes these two lines.
-    CACHE_RW: 'sibling #4 — read out of a rejection in ensureCxell; reported, fixed separately',
-    CACHE_RO: 'sibling #4 — see CACHE_RW',
   };
   const undeclared = [...printed].filter((t) => !declared.has(t) && !(t in EXEMPT));
   ok(undeclared.length === 0,

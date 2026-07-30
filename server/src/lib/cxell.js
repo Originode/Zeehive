@@ -504,9 +504,15 @@ export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image }
       // failure a human would otherwise have to guess at. Best-effort: never fails the create.
       const fixup = cxellCacheFixupCommand(name);
       if (fixup) {
-        const r = await dk(ctx, fixup).catch((e) => ({ out: `CACHE_ERR ${e.message}` }));
-        if (!/CACHE_RW/.test(r.out || '')) {
-          logline('cxell', `${name}: shared npm cache is NOT writable (${String(r.out).trim().slice(0, 120)}) — npm in this cage falls back to its own cache; set CXELL_NPM_CACHE_VOLUME=off if this persists`);
+        // The fixup SAYS whether the cache came out writable (CACHE_RW / CACHE_RO on stdout), so it is
+        // a verdict exec and goes through dkVerdict. It used to read the marker out of a REJECTION —
+        // `.catch((e) => ({ out: `CACHE_ERR ${e.message}` }))` — which threw the cage's own CACHE_RW
+        // away whenever the exec exited non-zero and logged a FALSE "cache is NOT writable" instead.
+        // Same class as the SAME-recorded-as-an-error bug, in a logline rather than a db column.
+        const r = await dkVerdict(ctx, fixup, { markers: ['CACHE_RW', 'CACHE_RO'], label: `${name}: npm cache` })
+          .catch((e) => ({ verdict: null, code: null, out: '', err: e.message }));   // exec never ran
+        if (r.verdict !== 'CACHE_RW') {
+          logline('cxell', `${name}: shared npm cache is NOT writable (${dkSaid(r, 120)}) — npm in this cage falls back to its own cache; set CXELL_NPM_CACHE_VOLUME=off if this persists`);
         }
       }
       return { name, sshPort: port };
