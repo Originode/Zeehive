@@ -28,7 +28,14 @@
 //      manager_xell_id — plus the outgoing zee row retired honestly (status + last_stop_reason)
 //      rather than deleted;
 //   7. the incoming zee is briefed as an INHERITOR (the handover text is asserted on the task brief
-//      selfSwap hands dispatchXell).
+//      selfSwap hands dispatchXell);
+//   8. THE HALF-SWAPPED STATE — the dispatch that dies AFTER the retire (the spawn is the flakiest
+//      step in this system). The xell stops reading as a working crew member in `zee zees`, is
+//      forced back OUT of the pool (spawnCxell's own failure path releases it INTO it, where the
+//      next dispatch could clone a stranger onto this branch), and carries a tend with the reason —
+//      while the manager that ASKED is not messaged about it, because it is holding the answer.
+//      (The human route's half of that rule — the WATCHING manager IS told — is asserted in
+//      human-swap.test.mjs, alongside one full swap run end to end on a stubbed runtime.)
 //
 // Docker is faked on PATH (the collect is `docker exec`/`docker cp`), PROVISION_MODE/PRODRO_MODE are
 // simulate, and the throwaway project has no provider account — so every dispatch dies AT THE SPAWN,
@@ -300,6 +307,37 @@ try {
      `no cage was removed before the collect (cp@${cpAt}, rm@${rmAt === -1 ? 'never' : rmAt})`);
   ok(log.slice(0, cpAt).every((c) => /^(inspect|exec)/.test(c)),
      'and everything the swap did before that collect was read-only (inspect/exec only)');
+
+  // ── 4b. THE HALF-SWAPPED STATE — the dispatch died AFTER the outgoing zee was retired ─────
+  // The swap above is past the retire: the previous zee is stopped, the xell already wears the new
+  // persona, and the spawn threw. The xell must not go on reading as a working crew member with
+  // nobody in it — that is the state a transient spawn failure really leaves, and a manager planning
+  // around a busy-looking worker with no agent in it is the waste this repairs.
+  //
+  // The asymmetry with the human route is deliberate and asserted here: a manager that ran `zee swap`
+  // is reading this failure in the answer to its OWN verb, so it is not also messaged about it.
+  console.log('\nthe dispatch failed after the retire — the xell says so, and the caller is not told twice');
+  const { tendState } = await import('../server/src/lib/status.js');
+  ok((await readZee(outgoing.id)).status === 'stopped',
+     'the outgoing zee is already retired — this is the half-swapped state, not a refusal');
+  const halfXell = await readXell(worker.id);
+  ok(halfXell.status === 'idle' && halfXell.is_pooled === false,
+     `it reads 'idle' (nothing is running) and is OUT of the pool, so no dispatch can be handed this `
+     + `branch [${halfXell.status}/pooled=${halfXell.is_pooled}]`);
+  const halfTend = await tendState(worker.id);
+  ok(halfTend.open === true && /SWAP HALF-DONE/.test(halfTend.reason || ''),
+     `a TEND carries the reason to the console [${(halfTend.reason || '').slice(0, 70)}]`);
+  ok(swap.half_swapped?.tend_raised === true && swap.half_swapped.xell_status === 'idle',
+     'and the answer says what was done about it, on both callers — the repair lives in the shared core');
+  const crewHalf = await (await import('../server/src/queenzee/self.js')).selfCrew(manager);
+  ok(crewHalf.crew[0]?.hive_status === 'occ-tendRequest',
+     `\`zee zees\` shows tend?, not working [${crewHalf.crew[0]?.hive_status}]`);
+  ok((crewHalf.crew[0]?.waiting_on_human || []).some((w) => /SWAP HALF-DONE/.test(w)),
+     'with the reason on the waiting-on-human line — the manager is not left guessing why it went quiet');
+  const mgrMsgs = (await client.query(
+    `SELECT body FROM zee_message WHERE to_xell_id=$1`, [manager.id])).rows;
+  ok(swap.manager_notified === null && !mgrMsgs.some((m) => /THE NEW ZEE DID NOT START/.test(m.body)),
+     'and the manager that ASKED is not also sent a message about it — it is holding the answer');
 
   // ── 5. WHAT SURVIVES: the xell is the same xell ───────────────────────────
   console.log('\nthe xell is the SAME xell — only the zee changed');
