@@ -116,3 +116,40 @@ export async function setPauseCounts({ interrupted = null, unreachable = null, n
 
 // Test/boot hook: forget the cached answer so the next read hits the row.
 export function forgetPauseCache() { cached = { paused: cached.paused, at: 0 }; }
+
+// ── A HELD WAKE-UP IS NOT A DISCARDED ONE ─────────────────────────────────────────────────────────
+//
+// The hole this closes, found reading the diff back rather than in the field: a zee's turn ENDS at
+// `zee land`, so a zee waiting on a landing is not mid-turn and the pause does not interrupt it — it
+// has nothing to interrupt. But a human at the console can keep deciding while the fleet is stopped,
+// and every one of those decisions reaches its zee through a NUDGE, which the pause refuses. So:
+// approve zee A's landing during a pause and its "you are on main, carry on" is refused; main moves,
+// zee B's approved sha can no longer fast-forward and goes stale, and its recovery nudge is refused
+// too — and neither zee is marked as interrupted, so play would not call either of them back. Two
+// zees stranded, silently, by a button whose entire promise is that nothing is lost.
+//
+// So a refused nudge is RECORDED against the xell, and play calls back everything with one. It rides
+// the append-only session_event log like tend / the hints / a refused ship (the dev schema is frozen,
+// and this is the same shape: an open state, latest-event-wins) rather than adding a table.
+//
+// It does NOT store the prompt. Re-delivering four different held prompts per xell would be a second,
+// divergent copy of the ones in nudge.js — and the resume prompt already answers all of them the only
+// way that cannot go stale: it sends the zee to `zee status`, which reports the landing, the ship, the
+// tend and the inbox as they are NOW rather than as they were when the nudge was refused.
+export const NUDGE_HELD = 'nudge-held';
+export const NUDGE_HELD_CLEAR = 'nudge-held-clear';
+
+// Record that a wake-up for this xell was refused because the fleet is paused. Best-effort and never
+// throws: this is bookkeeping on a path that must not fail (nudges are fire-and-forget by contract).
+export async function noteHeldNudge(xellId, why = 'nudge') {
+  if (!xellId) return false;
+  try {
+    const { recordEvent } = await import('./status.js');
+    await recordEvent({ source: 'queenzee', hook_event_name: NUDGE_HELD, xell_id: xellId, raw: { why } });
+    return true;
+  } catch (e) {
+    logline('pause', `could not record the held nudge for xell ${String(xellId).slice(0, 8)} (${String(e.message).slice(0, 100)}) `
+      + '— play may not call that zee back; `zee status` from the zee is still authoritative');
+    return false;
+  }
+}

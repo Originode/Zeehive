@@ -1242,7 +1242,9 @@ export async function sendKeysToCxellZee({ sshPort, slug, text, sessionId, sessi
 // interpolated into the shell command, so a pattern that could match its own `bash -lc` wrapper would
 // have pkill SIGINT the wrapper — killing the probe and leaving the agent running, which reads as a
 // successful pause. `[-]p` cannot match the literal text `[-]p`, so it cannot see itself.
-const INTERRUPT_MARKERS = ['__ZEE_INT_IDLE__', '__ZEE_INT_SIGINT__', '__ZEE_INT_SIGTERM__', '__ZEE_INT_STUCK__'];
+// EXPORTED for the same reason WARM_MARKERS is: the verdict-contract guard drives every marker-based
+// exec through a shim and needs the set the script declares (test/dk-verdict-contract.test.mjs).
+export const INTERRUPT_MARKERS = ['__ZEE_INT_IDLE__', '__ZEE_INT_SIGINT__', '__ZEE_INT_SIGTERM__', '__ZEE_INT_STUCK__'];
 
 // The exact remote command behind "stop this zee now" — PURE, so the whole escalation is testable
 // without a container (the same contract as cxellTalkCommand).

@@ -22,7 +22,9 @@ import { q, one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { broadcast } from '../lib/events.js';
 import { cxellName, interruptCxellZee, cxellHeadlessActive } from '../lib/cxell.js';
-import { setPaused, setPauseCounts, pauseState, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
+import { setPaused, setPauseCounts, pauseState, PAUSED_STOP_REASON,
+         NUDGE_HELD, NUDGE_HELD_CLEAR } from '../lib/fleet-pause.js';
+import { recordEvent } from '../lib/status.js';
 import { nudgeXellForFleetResume } from './nudge.js';
 
 // Same switch every other real-side-effect module reads (nudge, landgate, xellgit, harness, reaper):
@@ -42,13 +44,20 @@ async function liveCxellZees() {
     `SELECT DISTINCT ON (x.id)
             x.id AS xell_id, x.slug, x.status AS xell_status, x.project_id,
             COALESCE(x.zee_type, 'worker') AS zee_type,
-            z.id AS zee_id, z.status AS zee_status, z.last_stop_reason
+            z.id AS zee_id, z.status AS zee_status, z.last_stop_reason,
+            -- Did a wake-up for this xell get REFUSED while the flag was up? (lib/fleet-pause.js
+            -- noteHeldNudge — a landing approved, a sha gone stale, a runway cleared, a ship to
+            -- reflect on, all decided by a human during the pause.) Latest-event-wins, the same ride
+            -- tend and the hints take.
+            (SELECT se.hook_event_name FROM session_event se
+               WHERE se.xell_id = x.id AND se.hook_event_name IN ($1, $2)
+               ORDER BY se.ts DESC LIMIT 1) = $1 AS nudge_held
        FROM zee z JOIN xell x ON x.id = z.xell_id
       WHERE z.entrypoint = 'cxell-cli'
         AND z.viewer_kind = 'ssh-terminal'
         AND z.decommissioned_at IS NULL
         AND x.status NOT IN ('retired', 'tearing-down')
-      ORDER BY x.id, z.created_at DESC`);
+      ORDER BY x.id, z.created_at DESC`, [NUDGE_HELD, NUDGE_HELD_CLEAR]);
 }
 
 // Run `fn` over `items` a few at a time. A fleet can hold dozens of cages and each interrupt is a
@@ -126,18 +135,26 @@ export async function pauseFleet({ by = 'human@console', reason = null } = {}) {
 }
 
 // ── PLAY ──────────────────────────────────────────────────────────────────────────────────────────
-// Lower the flag, then call back ONLY the zees this pause interrupted (see PAUSED_STOP_REASON). A zee
-// that is somehow already running is SKIPPED rather than resumed: forking a second headless turn onto
-// one session is how you get two agents writing the same files, and a human who attached to a cage
-// and started it by hand does not need the queenzee racing them.
+// Lower the flag, then call back the zees this pause left waiting — the ones it INTERRUPTED, and the
+// ones whose wake-up it REFUSED (see the selection below; both, or the second class strands silently).
+// A zee that is somehow already running is SKIPPED rather than resumed: forking a second headless turn
+// onto one session is how you get two agents writing the same files, and a human who attached to a
+// cage and started it by hand does not need the queenzee racing them.
 export async function resumeFleet({ by = 'human@console' } = {}) {
   const before = await pauseState();
   const minutes = before.since ? Math.max(0, Math.round((Date.now() - new Date(before.since).getTime()) / 60000)) : null;
   await setPaused(false, { by });
   logline('pause', `FLEET RESUMED by ${by}${minutes != null ? ` after ~${minutes} minute(s)` : ''} — `
-    + 'calling back every zee the pause interrupted');
+    + 'calling back every zee the pause interrupted or left a held wake-up for');
 
-  const zees = (await liveCxellZees()).filter((z) => z.last_stop_reason === PAUSED_STOP_REASON);
+  // TWO reasons to call a zee back, and the second is not optional. It was INTERRUPTED (its turn was
+  // cut off — the obvious one), or a wake-up it needed was REFUSED while the flag was up: a zee that
+  // asked to land had already ended its turn, so nothing interrupted it, and the landing a human
+  // approved during the pause reached it only through a nudge this feature refuses. Without the second
+  // clause that zee waits forever for a message that was thrown away. Anything else is left alone —
+  // resuming a zee that had legitimately finished is a pause with side effects.
+  const zees = (await liveCxellZees())
+    .filter((z) => z.last_stop_reason === PAUSED_STOP_REASON || z.nudge_held === true);
   const results = await inBatches(zees, 4, async (z) => {
     try {
       if (PROVISION_MODE === 'real' && await cxellHeadlessActive({ slug: z.slug })) {
@@ -145,10 +162,12 @@ export async function resumeFleet({ by = 'human@console' } = {}) {
         return { ...zeeBrief(z), nudged: false, skipped: 'already running' };
       }
       const r = await nudgeXellForFleetResume(z.xell_id, { minutes, reason: before.reason, by });
-      // Clear the marker only on a delivered resume, so a zee we could not reach stays in the list and
-      // a second press of play tries it again (the receipt must not claim a call that never happened).
-      if (r?.nudged) await clearPausedMark(z);
-      return { ...zeeBrief(z), nudged: !!r?.nudged, dry_run: !!r?.dry_run, reason: r?.reason || null };
+      // Clear the marks only on a DELIVERED resume, so a zee we could not reach stays in the list and a
+      // second press of play tries it again (the receipt must not claim a call that never happened).
+      if (r?.nudged) { await clearPausedMark(z); await clearHeldNudge(z); }
+      return { ...zeeBrief(z), nudged: !!r?.nudged, dry_run: !!r?.dry_run,
+               why: z.last_stop_reason === PAUSED_STOP_REASON ? 'interrupted' : 'a wake-up was held',
+               reason: r?.reason || null };
     } catch (e) {
       return { ...zeeBrief(z), nudged: false, error: e.message };
     }
@@ -191,6 +210,14 @@ async function markPaused(z) {
                     last_stop_reason = $2
        WHERE id = $1 RETURNING *`, [z.zee_id, PAUSED_STOP_REASON]).catch(() => null);
   if (row) broadcast('zee', row);
+}
+
+// Lower the "a wake-up for this xell was refused" flag. Append-only, latest-event-wins — the same
+// shape tend/hint clears take, so nothing is ever deleted from the event log.
+async function clearHeldNudge(z) {
+  if (!z.nudge_held) return;
+  await recordEvent({ source: 'queenzee', hook_event_name: NUDGE_HELD_CLEAR, xell_id: z.xell_id,
+                      raw: { why: 'resumed by play' } }).catch(() => {});
 }
 
 async function clearPausedMark(z) {

@@ -327,6 +327,48 @@ try {
   ok(stillMarked.rows[0].last_stop_reason === PAUSED_STOP_REASON,
      'and the zee keeps its paused mark, so a second press of play tries it again rather than losing it');
 
+  // ── 4b. THE ZEE THE PAUSE NEVER INTERRUPTED, AND WOULD HAVE STRANDED ───────────────────────────
+  // A zee's turn ENDS at `zee land`, so a zee waiting on a landing is between turns: the pause has
+  // nothing to interrupt and does not mark it. But a human at the console keeps deciding while the
+  // fleet is stopped, and every one of those decisions reaches its zee through a NUDGE — which the
+  // pause refuses. Approve a landing during a pause and, without this, the "you are on main, carry on"
+  // is dropped and play does not call that zee back either: it waits forever for a message that was
+  // thrown away. So a refused wake-up is RECORDED, and play treats it as a second reason to resume.
+  console.log('\n── a wake-up refused during the pause is not a wake-up lost ──');
+  await setPaused(true, { by: 'test@console', reason: 'held-nudge check' });
+  // the manager is deliberately the subject here: between turns, never interrupted, nothing marked
+  await client.query(`UPDATE zee SET last_stop_reason='end_turn', status='idle' WHERE id=$1`, [mz.id]);
+  await client.query(`UPDATE zee SET last_stop_reason='end_turn', status='idle' WHERE id=$1`, [wz.id]);
+  // §3 refused half a dozen nudges at the WORKER, and every one of those legitimately recorded a held
+  // wake-up for it — so clear the worker's record here to get back to the case being tested: one zee
+  // owed a call, one zee owed nothing. (That §3 left a record at all is the mechanism working.)
+  await client.query(
+    `INSERT INTO session_event (source, hook_event_name, xell_id) VALUES ('test','nudge-held-clear',$1)`, [w.id]);
+  const landNudge = await nudge.nudgeXellAfterLand(m.id, { by: 'test@console' });
+  ok(landNudge.paused === true && landNudge.held === true,
+     'a landing-approved nudge during the pause is HELD — and says it was held, not merely refused');
+  const heldRows = await client.query(
+    `SELECT hook_event_name FROM session_event WHERE xell_id=$1 AND hook_event_name='nudge-held'`, [m.id]);
+  ok(heldRows.rowCount === 1, 'and it is RECORDED against the xell (append-only, like tend and the hints)');
+
+  const resumed2 = await resumeFleet({ by: 'test@console' });
+  const called = resumed2.xells.map((x) => x.slug);
+  ok(called.includes('fleetpause-mgr'),
+     'play calls that zee back even though the pause never interrupted it — this is the stranding the '
+     + 'record exists to prevent');
+  ok(!called.includes('fleetpause-w1'),
+     'and still leaves alone the zee with neither a mark nor a held wake-up (a pause must not wake a '
+     + 'zee that had legitimately finished)');
+  ok(resumed2.xells.find((x) => x.slug === 'fleetpause-mgr')?.why === 'a wake-up was held',
+     'the receipt says WHICH of the two reasons called it back');
+  // Not delivered (simulate) → the record must SURVIVE, so the next press tries again.
+  const stillHeld = await client.query(
+    `SELECT hook_event_name FROM session_event WHERE xell_id=$1
+        AND hook_event_name IN ('nudge-held','nudge-held-clear') ORDER BY ts DESC LIMIT 1`, [m.id]);
+  ok(stillHeld.rows[0].hook_event_name === 'nudge-held',
+     'a resume that was only modelled does NOT clear the record — it is cleared by delivery, so nothing '
+     + 'is dropped on a queenzee that stops no real cage');
+
   // ── 5. the hexagon: a paused zee must not read as idle ──────────────────────────────────────────
   console.log('\n── the hive vocabulary: paused is its own word ──');
   ok(!!HIVE_STATUS['occ-paused'] && hiveLabel('occ-paused') === 'paused',

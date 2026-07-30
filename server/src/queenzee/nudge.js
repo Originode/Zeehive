@@ -17,7 +17,7 @@ import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from
 import { adapterFor } from '../lib/cxell-runtimes.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
-import { fleetPaused, PAUSED_REASON } from '../lib/fleet-pause.js';
+import { fleetPaused, PAUSED_REASON, noteHeldNudge } from '../lib/fleet-pause.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, harness, reaper, the
 // .zeehive.env reconcile): 'real' touches machines, anything else models. A nudge is a
@@ -522,8 +522,13 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
                                     mode = PROVISION_MODE, allowWhilePaused = false } = {}) {
   try {
     if (!allowWhilePaused && await fleetPaused()) {
-      logline('nudge', `xell ${String(xellId).slice(0, 8)}: ${why} — HELD, ${PAUSED_REASON}`);
-      return { nudged: false, paused: true, reason: PAUSED_REASON };
+      // RECORDED, not discarded: a zee waiting on a landing is between turns, so the pause never
+      // interrupted it and would not call it back — yet the decision a human just made during the
+      // pause reaches it only through this nudge. See noteHeldNudge for the two zees that stranded.
+      await noteHeldNudge(xellId, why);
+      logline('nudge', `xell ${String(xellId).slice(0, 8)}: ${why} — HELD, ${PAUSED_REASON} `
+        + '(recorded: play will resume this zee, and `zee status` is where it reads what changed)');
+      return { nudged: false, paused: true, held: true, reason: PAUSED_REASON };
     }
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
