@@ -75,6 +75,7 @@ const clip = (s, n = 60) => {
   const t = String(s || '').replace(/\s+/g, ' ').trim();
   return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t;
 };
+const capitalise = (s) => String(s || '').charAt(0).toUpperCase() + String(s || '').slice(1);
 
 // FLEET BURN formatters. Compact token counts (1.2M, 890K, 4.2k → keep it short on a card) and a
 // dollar figure that keeps cents but never a distracting tail of zeros. These render fleet-OWN
@@ -302,9 +303,48 @@ export default function App() {
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
-  const pushToast = useCallback((t) => setToasts((ts) => [...ts, t]), []);
+  // Upsert: create or update a toast by id. Used for progress where the same id emits
+  // multiple events, and for one-shot notifications (dispatch, pause, etc.) whose ids
+  // are always unique — so this single verb replaces the old "push then update" pattern.
+  const upsertToast = useCallback((id, props) => {
+    setToasts((ts) => {
+      const idx = ts.findIndex((t) => t.id === id);
+      if (idx >= 0) {
+        const updated = [...ts];
+        updated[idx] = { ...updated[idx], ...props };
+        return updated;
+      }
+      return [...ts, { id, ...props }];
+    });
+  }, []);
+  // Convenience for callers that pass { id, … } as one object (dispatch, pause, nudge, …).
+  // Unpacks to upsertToast(id, rest) so the upsert pattern is shared.
+  const pushToast = useCallback((t) => {
+    if (t?.id) upsertToast(t.id, t);
+  }, [upsertToast]);
+  // Update-only for cases where the toast is guaranteed to already exist.
   const updateToast = useCallback((id, patch) =>
     setToasts((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t))), []);
+
+  // Live progress of db backup / restore / copy operations — maps SSE events to progress toasts.
+  // The toast id is `dbop-<op>-<id>` so all events for the same operation update the same toast.
+  const onDbOpProgress = useCallback((p) => {
+    if (!p?.op || !p?.id) return;
+    const tid = `dbop-${p.op}-${p.id}`;
+    if (p.status === 'finished') {
+      upsertToast(tid, { kind: 'success', title: `${capitalise(p.op)} complete`, body: p.msg, pct: 100, onRetry: null });
+      setTimeout(() => dismissToast(tid), 6000);
+    } else if (p.status === 'failed') {
+      upsertToast(tid, { kind: 'error', title: `${capitalise(p.op)} failed`, body: p.error || p.msg, pct: 0, onRetry: null });
+      setTimeout(() => dismissToast(tid), 12000);
+    } else {
+      // running — upsert with progress
+      const title = p.label
+        ? `${capitalise(p.op)} — ${p.label}`
+        : `${capitalise(p.op)} in progress`;
+      upsertToast(tid, { kind: 'progress', title, body: p.msg, pct: p.pct ?? 0 });
+    }
+  }, [upsertToast, dismissToast]);
 
   // Fire-and-forget dispatch. The composer hands us the whole payload and closes IMMEDIATELY; the
   // slow bits (uploading a pasted image, renaming the worktree, spawning + awaiting the zee) run
@@ -435,9 +475,11 @@ export default function App() {
       onLog: (l) => setLogs((prev) => [...prev.slice(-1999), l]),
       // Per-ship build feed, keyed by ship id, capped so a chatty build can't eat the tab.
       onShipLog: (l) => setShipLogs((prev) => ({ ...prev, [l.id]: [...(prev[l.id] || []).slice(-399), l] })),
+      // Live progress of db backup / restore / copy — drives progress toasts.
+      onDbOpProgress,
     });
     return unsub;
-  }, [projectId, refresh, applyFleet]);
+  }, [projectId, refresh, applyFleet, onDbOpProgress]);
 
   const selectProject = useCallback((id) => {
     setProjectId(id);

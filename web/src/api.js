@@ -373,7 +373,7 @@ export const draftProjectManifest = (projectId, write = false) => siteCall(`/api
 
 // Subscribe to /api/stream for the selected project. Calls onSnapshot(fleet) on the
 // initial snapshot and onChange() on every subsequent event (the app re-fetches on change).
-export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork }) {
+export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork, onDbOpProgress }) {
   const es = new EventSource(`/api/stream${pq(projectId)}`);
   es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
   // 'fleet-pause' rides this list because a pause is the one change that can move NOTHING else: a
@@ -393,6 +393,11 @@ export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, on
   if (onLog) es.addEventListener('log', (e) => onLog(JSON.parse(e.data)));
   // Per-ship build feed ({id, role, line}) — rendered live on that ship's own card.
   if (onShipLog) es.addEventListener('ship-log', (e) => onShipLog(JSON.parse(e.data)));
+  // Live progress of db backup / restore / copy operations ({op, id, project_id, label, msg, pct, status, error}).
+  // Shown as a progress toast that updates as the operation moves through its phases.
+  if (onDbOpProgress) es.addEventListener('db-op-progress', (e) => {
+    try { onDbOpProgress(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
+  });
   es.onopen = () => onStatus?.('live');
   es.onerror = () => onStatus?.('reconnecting');
   return () => es.close();

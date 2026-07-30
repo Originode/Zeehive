@@ -39,6 +39,19 @@ const DEFAULT_INTERVAL_SEC = 86400;
 const SIM_BACKUP_MS = Number(process.env.SIM_BACKUP_MS) || 5000;
 const SIM_RESTORE_MS = Number(process.env.SIM_RESTORE_MS) || 6000;
 
+// Broadcast a progress update for a db operation (backup, restore, duplicate) over SSE
+// so the UI can show live progress in the notification pane. Payload is self-describing:
+//   op: 'backup' | 'restore' | 'duplicate'
+//   id: the primary identifier (snapshot id for backup, container id for restore/duplicate)
+//   label: human-readable label for the affected resource
+//   msg: the current phase description (e.g. "Dumping database…")
+//   pct: estimated percentage complete (0–100)
+//   status: 'running' | 'finished' | 'failed'
+//   error: error message when failed
+function broadcastDbOpProgress({ op, id, project_id, label, msg, pct, status, error }) {
+  broadcast('db-op-progress', { op, id, project_id, label, msg, pct, status, error: error || null });
+}
+
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Non-blocking child process → { status, stdout, stderr }. Never rejects (resolves status=-1 on
@@ -557,10 +570,19 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       const src = await resolveRunningContainer({ ...dbc, docker_ctx: srcCtx });
       const container = src.name;
 
+      broadcastDbOpProgress({
+        op: 'backup', id: snap.id, project_id: snap.project_id,
+        label: `${project.name} prod`, msg: 'Starting dump…', pct: 5, status: 'running',
+      });
+
       if (destCtx) {
         // ── NETWORK destination: STREAM src → dst, never staging the dump on the queenzee host ──
         // pg_dump writes to stdout; a throwaway container on the destination context reads stdin
         // and writes it to the bind-mounted backup dir, then prints the byte count it wrote.
+        broadcastDbOpProgress({
+          op: 'backup', id: snap.id, project_id: snap.project_id,
+          label: `${project.name} prod`, msg: 'Dumping database to remote host…', pct: 30, status: 'running',
+        });
         const writer = `cat > '/out/${file}' && wc -c < '/out/${file}'`;
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName] },
@@ -574,6 +596,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         }
         size = parseInt(String(piped.dstStdout).trim(), 10);
         if (!Number.isFinite(size)) throw new Error(`destination did not report a written size (got ${JSON.stringify(String(piped.dstStdout).slice(0, 80))})`);
+        broadcastDbOpProgress({
+          op: 'backup', id: snap.id, project_id: snap.project_id,
+          label: `${project.name} prod`, msg: 'Validating dump content…', pct: 65, status: 'running',
+        });
         // Content/magic check: run pg_restore --list on the WRITTEN file, on the destination host
         // (local disk read there — the TOC is tiny and comes back over the wire, not the 1.2 GB).
         const toolsImage = src.image || PG_TOOLS_IMAGE;
@@ -589,6 +615,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       } else {
         // ── LOCAL destination (backup_ctx NULL): today's behavior — dump to the container's /tmp,
         //    list it there, copy to the host volume, then rm whatever happened. ──
+        broadcastDbOpProgress({
+          op: 'backup', id: snap.id, project_id: snap.project_id,
+          label: `${project.name} prod`, msg: 'Dumping database…', pct: 30, status: 'running',
+        });
         const remoteTmp = `/tmp/${file}`;
         const dump = await execAsync('docker',
           ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName, '-f', remoteTmp],
@@ -612,6 +642,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         }
         try { size = statSync(fullPath).size; } catch { size = null; }
         assertDumpMagic(fullPath, size);
+        broadcastDbOpProgress({
+          op: 'backup', id: snap.id, project_id: snap.project_id,
+          label: `${project.name} prod`, msg: 'Reading table of contents…', pct: 70, status: 'running',
+        });
         if (list.status !== 0) {
           throw new Error(`pg_restore --list of the dump failed (exit ${list.status}) — the file is not a usable archive: `
             + `${((list.stderr || list.stdout) || '(no output)').slice(-300)}`);
@@ -619,6 +653,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         tocText = list.stdout;
       }
 
+      broadcastDbOpProgress({
+        op: 'backup', id: snap.id, project_id: snap.project_id,
+        label: `${project.name} prod`, msg: 'Recording row counts…', pct: 88, status: 'running',
+      });
       // The row estimates for what was just dumped — AFTER the dump, so it cannot delay it or hold
       // anything of prod's, and inside the same try only so a probe error is logged like any other
       // (sourceRowCounts itself never throws). Deliberately not gated on `scoped`: a scoped dump's
@@ -629,6 +667,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       rowStats = probed?.stats ?? null;
 
       // ── validation common to both destinations ──────────────────────────────
+      broadcastDbOpProgress({
+        op: 'backup', id: snap.id, project_id: snap.project_id,
+        label: `${project.name} prod`, msg: 'Validating content…', pct: 80, status: 'running',
+      });
       const toc = parseDumpToc(tocText);
       // The full-database table list this dump captured, as 'schema.table' strings — feeds the
       // restore picker (exactly what can be restored) and, for a scoped dump, records the selection.
@@ -660,7 +702,16 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
           + `${sizeVerdict.compared ? '' : ` · ${sizeVerdict.note}`}${contentVerdict.comparedSchemas ? ' · schema-continuity ok' : ''}`);
       }
     } else {
-      await wait(SIM_BACKUP_MS);   // simulate: hold 'running' briefly so the spinner is visible
+      broadcastDbOpProgress({
+        op: 'backup', id: snap.id, project_id: snap.project_id,
+        label: `${project.name} prod`, msg: 'Simulating backup…', pct: 10, status: 'running',
+      });
+      await wait(Math.round(SIM_BACKUP_MS * 0.6));   // simulate: hold 'running' briefly so the spinner is visible
+      broadcastDbOpProgress({
+        op: 'backup', id: snap.id, project_id: snap.project_id,
+        label: `${project.name} prod`, msg: 'Writing simulated dump…', pct: 60, status: 'running',
+      });
+      await wait(Math.round(SIM_BACKUP_MS * 0.4));
       const body = `-- ZEEHIVE simulated backup of ${project.name} PRODUCTION database\n`
         + `-- target: ${dbc?.name || '(prod db container)'} / db=${dbName} user=${dbUser}\n`
         + `-- destination: ${destCtx ? `[${destCtx}] ` : '(local) '}${fullPath}\n`
@@ -680,6 +731,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       [snap.id, String(error).slice(0, 500), MODE]);
     if (dbc) await clearBusy(dbc.id);
     broadcast('task', { kind: 'db_snapshot', snap: row });
+    broadcastDbOpProgress({
+      op: 'backup', id: snap.id, project_id: snap.project_id,
+      label: `${project.name} prod`, msg: 'Backup failed', pct: 0, status: 'failed', error,
+    });
     logline('maint', `backup FAILED → ${error}`);
     return;
   }
@@ -693,6 +748,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
      rowStats ? JSON.stringify(rowStats) : null]);
   if (dbc) await clearBusy(dbc.id);
   broadcast('task', { kind: 'db_snapshot', snap: row });
+  broadcastDbOpProgress({
+    op: 'backup', id: snap.id, project_id: snap.project_id,
+    label: `${project.name} prod`, msg: 'Backup complete', pct: 100, status: 'finished',
+  });
   logline('maint', `backup finished (${MODE}) → ${destCtx ? `[${destCtx}] ` : ''}${fullPath} (${size ?? '?'} bytes)`);
 
   // THE TREND, which is the reading nothing in this system could give before: a table that SHRANK
@@ -721,6 +780,10 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         + `. These are planner ESTIMATES, so a small drop can be noise — an emptied table is not. Worth a look.`);
     }
   }
+  broadcastDbOpProgress({
+    op: 'backup', id: snap.id, project_id: snap.project_id,
+    label: `${project.name} prod`, msg: 'Housekeeping…', pct: 95, status: 'running',
+  });
   await housekeepBackups(snap.project_id, keep);
 }
 
@@ -890,15 +953,19 @@ async function noteRestoredFrom(containerId, snapshotId, note = null, report = n
 async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
   let restored = false, report = null;
   const tArgs = restoreTableArgs(tables);   // [] ⇒ restore the whole archive
+  const opLabel = c.name || c.id;
+  const progressBase = { op: 'restore', id: c.id, project_id: c.project_id, label: opLabel };
   try {
     if (MODE === 'real') {
       const ctx = c.docker_ctx;
       const t = await resolveRunningContainer({ ...c });   // identity resolution (ctx + host_port)
       const target = t.name;
+      broadcastDbOpProgress({ ...progressBase, msg: 'Starting restore…', pct: 5, status: 'running' });
       if (snap.dest_ctx) {
         // The dump lives on ANOTHER host (the NAS). Stream it straight into the target's pg_restore
         // stdin — same "never stage 1.2 GB on the queenzee host" principle as the backup. A reader
         // container on the destination cats the file; pg_restore reads the archive from stdin.
+        broadcastDbOpProgress({ ...progressBase, msg: 'Reading backup archive…', pct: 15, status: 'running' });
         const i = Math.max(snap.dump_path.lastIndexOf('/'), snap.dump_path.lastIndexOf('\\'));
         const dir = snap.dump_path.slice(0, i), file = snap.dump_path.slice(i + 1);
         const piped = await execPipe(
@@ -921,6 +988,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         const remoteTmp = `/tmp/restore_${randomBytes(3).toString('hex')}.dump`;
         const cp = await execAsync('docker', ['--context', ctx, 'cp', resolve(snap.dump_path), `${target}:${remoteTmp}`], { timeout: 1200000 });
         if (cp.status !== 0) throw new Error(`docker cp into ${target} failed: ${(cp.stderr || '').slice(-300)}`);
+        broadcastDbOpProgress({ ...progressBase, msg: 'Restoring database…', pct: 40, status: 'running' });
         const rest = await execAsync('docker',
           ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...tArgs, '-d', dbName, remoteTmp],
           { timeout: 1800000 });
@@ -931,8 +999,12 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         }
       }
     } else {
-      await wait(SIM_RESTORE_MS);   // simulate: hold the busy state briefly so the spinner is visible
+      broadcastDbOpProgress({ ...progressBase, msg: 'Simulating restore…', pct: 30, status: 'running' });
+      await wait(Math.round(SIM_RESTORE_MS * 0.7));   // simulate: show progress stepping
+      broadcastDbOpProgress({ ...progressBase, msg: 'Restoring database…', pct: 65, status: 'running' });
+      await wait(Math.round(SIM_RESTORE_MS * 0.3));
     }
+    broadcastDbOpProgress({ ...progressBase, msg: 'Finalizing restore…', pct: 85, status: 'running' });
     // WHAT pg_restore SAID. A clean restore logs the plain line it always did; one that ignored errors
     // says so, with the first cause named — that is the half of #30 the row comparison cannot answer,
     // because a table can pass its counts and still have lost its indexes, its constraints or a trigger.
@@ -950,8 +1022,12 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
       report ? { ...report, at: new Date().toISOString(), snapshot_id: snap.id, scoped: tables.length > 0 } : null);
   } catch (e) {
     logline('maint', `restore FAILED → ${c.name}: ${e.message}`);
+    broadcastDbOpProgress({ ...progressBase, msg: 'Restore failed', pct: 0, status: 'failed', error: e.message });
   } finally {
     await clearBusy(c.id);
+  }
+  if (restored) {
+    broadcastDbOpProgress({ ...progressBase, msg: 'Restore complete', pct: 100, status: 'finished' });
   }
   // The catalog just changed under this db, so its prod_diff chip is stale. Re-measure it against
   // prod now that busy is cleared (the drift tick skips a mid-restore container, so it would not
@@ -1063,6 +1139,7 @@ export async function duplicateProdInto({ container }) {
 
 async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
   let restored = false, report = null;
+  const progressBase = { op: 'duplicate', id: target.id, project_id: target.project_id, label: `${target.name} ← prod` };
   try {
     if (MODE === 'real') {
       // Resolve BOTH endpoints by IDENTITY (ctx + host_port), never name shape — the same rule the
@@ -1071,6 +1148,7 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
       const src = await resolveRunningContainer({ ...prodDbc, docker_ctx: srcCtx });
       const dstCtx = target.docker_ctx;
       const dst = await resolveRunningContainer({ ...target });
+      broadcastDbOpProgress({ ...progressBase, msg: 'Dumping production…', pct: 20, status: 'running' });
       // Stream pg_dump (prod) straight into pg_restore (dev). --clean --if-exists --no-owner mirror
       // the restore job: drop-and-recreate every object, ignore prod's role grants on the dev server.
       const piped = await execPipe(
@@ -1091,8 +1169,12 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
         throw new Error(`duplicate prod → ${target.name} failed: ${report.reason}: `
           + `${((piped.dstStderr || piped.srcStderr) || '(no output)').slice(-300)}`);
       }
+      broadcastDbOpProgress({ ...progressBase, msg: 'Copy complete, validating…', pct: 85, status: 'running' });
     } else {
-      await wait(SIM_RESTORE_MS);   // simulate: hold the busy state so the spinner is visible
+      broadcastDbOpProgress({ ...progressBase, msg: 'Simulating duplicate…', pct: 35, status: 'running' });
+      await wait(Math.round(SIM_RESTORE_MS * 0.6));
+      broadcastDbOpProgress({ ...progressBase, msg: 'Piping production to target…', pct: 70, status: 'running' });
+      await wait(Math.round(SIM_RESTORE_MS * 0.4));
     }
     const trouble = restoreErrorLine(report);
     logline('maint', trouble ? `duplicate finished → ${target.name}, BUT ${trouble}`
@@ -1108,9 +1190,13 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
       report ? { ...report, at: new Date().toISOString(), snapshot_id: null, scoped: false } : null);
   } catch (e) {
     logline('maint', `duplicate FAILED → ${target.name}: ${e.message}`);
+    broadcastDbOpProgress({ ...progressBase, msg: 'Duplicate failed', pct: 0, status: 'failed', error: e.message });
   } finally {
     await clearBusy(target.id);
     if (prodDbc) await clearBusy(prodDbc.id);
+  }
+  if (restored) {
+    broadcastDbOpProgress({ ...progressBase, msg: 'Duplicate complete', pct: 100, status: 'finished' });
   }
   // The target's catalog just changed — its prod_diff chip is stale. Re-measure now that busy is
   // cleared (a fresh copy of prod SHOULD read as in-sync). Best-effort and fire-and-forget: a failed
