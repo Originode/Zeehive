@@ -65,7 +65,7 @@ import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfDevice, selfCatchup, selfMigrationNumber,
          listProdBindRequests, decideProdBind,
-         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
+         selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSwap, selfSay, selfReport, selfInbox,
          selfSuggestDone, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
@@ -662,10 +662,39 @@ router.post('/xell/claim', async (req, res) => {
   }
 });
 
+// ── IS SOMEBODY ALREADY IN THIS WORK? (#33) ────────────────────────────────────
+// A PREFLIGHT: read-only, no side effects, and it exists so the human sees the answer BEFORE they
+// press dispatch rather than in the receipt afterwards. The console's dispatch dialog calls it as the
+// prompt is written (debounced). Advisory — it cannot refuse anything, and a failure inside it answers
+// "no warnings" rather than an error, because a coordination hint must never stand between a human and
+// a dispatch.
+router.post('/xell/dispatch/overlap', async (req, res) => {
+  const { project, task } = req.body || {};
+  try {
+    const { overlapForBrief, overlapNote } = await import('../lib/work-overlap.js');
+    const projectId = project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id || null;
+    const overlap = await overlapForBrief({ projectId, brief: task || '' });
+    res.json({ ...overlap, note: overlapNote(overlap) });
+  } catch (err) {
+    res.json({ warnings: [], note: null, degraded: [`overlap check unavailable: ${err.message}`] });
+  }
+});
+
 // ── /xell dispatch → queenzee spawns a zee INTO a ready worktree (confirmed) ───
 router.post('/xell/dispatch', async (req, res) => {
-  try { res.json(await dispatchXell(req.body || {})); }
-  catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
+  try {
+    const out = await dispatchXell(req.body || {});
+    // …and the same facts in the receipt, for a caller that did not preflight (a script, or a human who
+    // typed fast). After the fact is weaker than before it, which is why the preflight above exists.
+    let overlap = null;
+    try {
+      const { overlapForBrief, overlapNote } = await import('../lib/work-overlap.js');
+      const o = await overlapForBrief({ projectId: out.project_id || null, brief: req.body?.task || '',
+        excludeXellId: out.xell_id || out.id || null });
+      overlap = { ...o, note: overlapNote(o) };
+    } catch { /* advisory: a dispatch that happened is not undone by a hint that did not */ }
+    res.json({ ...out, ...(overlap?.warnings?.length ? { overlap } : {}) });
+  } catch (err) { res.status(400).json({ ...(err.detail || {}), error: err.message }); }
 });
 // Re-point a xell's database: { coupling: db-shared-dev|db-clone|db-shared-prod|db-isolated,
 // container: <name|id>, dump: <snapshot id|'latest'> }. db-shared-prod is LIVE production;
@@ -1310,6 +1339,20 @@ router.post('/xell/self/dispatch', async (req, res) => {
     const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfDispatch(x, req.body || {}));
   } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Replace the ZEE inside one of MY crew's xells, KEEPING the xell (`zee swap`). Not human-gated for
+// the same reason `dispatch` is not: what comes out the other side is an ordinary caged worker whose
+// every irreversible act still meets the same gates. The refusals (not my crew, a manager target, a
+// manager harness, an open human gate on that xell) and the collect-before-recreate ordering that
+// protects the outgoing zee's uncollected commits both live in selfSwap.
+router.post('/xell/self/swap', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfSwap(x, {
+      to: req.body?.to, harness: req.body?.harness, task: req.body?.task || null,
+      model: req.body?.model || null, mode: req.body?.mode || null,
+      runtime: req.body?.runtime || null, title: req.body?.title || null,
+    })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/xell/self/say', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;

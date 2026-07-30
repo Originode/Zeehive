@@ -55,6 +55,14 @@ const GRANDFATHERED = {
   // And one more, landed in the minutes between this lint being written and being landed. Both files
   // were already on main, so neither was mine to renumber — the repair is forward, i.e. this line.
   '088': ['088_manager_manual_harness_key.sql', '088_manager_manual_scratch_resolution.sql'],
+  // THE EIGHTH, and the sharpest one: it was created BY a renumber that was escaping a different
+  // collision. 090_manager_manual_swap_verb landed at 00:04; three minutes later another xell moved its
+  // own file off a colliding 087 and onto 090 — reading its worktree's max, which could not see the
+  // first one. Its commit says why it could not do better: `zee migration-number` exists in main but
+  // the route is not live on the queenzee yet, so the verb the lint points at 404s. Both files were on
+  // main before either could be renamed (the ledger keys on FILENAME, so renaming an applied file
+  // re-runs it), which makes this line the repair — and the argument for deploying the allocator.
+  '090': ['090_manager_manual_swap_verb.sql', '090_restore_report.sql'],
 };
 
 // The whole check, as a function of a FILE LIST — so the samples below run through the identical

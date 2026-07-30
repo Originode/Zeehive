@@ -188,10 +188,43 @@ Model, autonomy mode, supervision (headless/attended) and pasted images are the 
 
 ## The verbs
 
-Manager-only: `zee zees` (the crew read model), `zee dispatch`, `zee say`, `zee suggest-done`,
-`zee harness`. Open to any zee that has a manager: `zee report` (including the reflection) and
-`zee inbox`. All of them are `/api/xell/self/*` calls scoped by the caller's own token, so a manager can
-only ever reach **its own** crew, and a worker only its own manager.
+Manager-only: `zee zees` (the crew read model), `zee dispatch`, `zee swap`, `zee say`,
+`zee suggest-done`, `zee harness`. Open to any zee that has a manager: `zee report` (including the
+reflection) and `zee inbox`. All of them are `/api/xell/self/*` calls scoped by the caller's own token,
+so a manager can only ever reach **its own** crew, and a worker only its own manager.
+
+### `zee swap` — a different zee, the SAME xell
+
+`POST /api/xell/self/swap` `{ to, harness, task?, model?, mode? }`. Replaces the zee working one of the
+manager's own crew xells with a fresh one wearing a different **worker** harness, and keeps the xell:
+same branch, same commits, same containers, same database, same work-item card, same
+`manager_xell_id`. `zee dispatch` can only ever open a NEW xell, so before this the only way to change
+the persona on a job was to abandon the job — which is why no manager ever ran a Scout, then a
+Builder, then a Reviewer over one piece of work.
+
+**Why it is a verb in the server and not "re-dispatch into the same xell".** `dispatchXell` →
+`spawnCxell` → `ensureCxell` runs `docker rm -f <cage>`, and `cloneIntoCxell` re-clones `/work/repo`
+from the **host worktree**. A caged zee's commits live inside its container until something collects
+them, and only the land/build/sync paths do — so a zee that committed and never landed has work that
+exists in exactly one place, and the recreate destroys it. `selfSwap` therefore calls
+`collectCxellDiffToWorktree()` **first** and **refuses the whole swap** when the collect fails on a
+running cage. `test/manager-swap.test.mjs` reads that ordering out of a recorded docker call log
+rather than trusting the comment.
+
+It dispatches with `rename: false` (added to `dispatchXell` for this): a rename moves the branch, the
+worktree folder, the container names and the ports, which is exactly what a swap promises not to do.
+The outgoing `zee` row is retired (`status='stopped'`, `last_stop_reason` naming the manager and the
+incoming persona), never deleted — it is the record of what that agent did.
+
+The incoming zee is briefed as an **inheritor** (`swapBrief()`): the branch already carries work, what
+the previous zee was asked to do, what it last reported, a git summary of the branch, and the card it
+is on. A fresh zee that re-reads the whole repo and re-does the previous phase is the failure mode the
+verb exists to remove.
+
+Refused, each with a sentence: a xell that is not this manager's crew, a manager target, a manager
+harness, another project's persona — and any xell with a **human gate open** on it (a pending/approved/
+holding `land_request`, a pending ship, an open done suggestion), because swapping under an open card
+points a human's decision at a zee that no longer exists.
 
 ### `zee harness` — minting the crew's ROLES (migration 084)
 

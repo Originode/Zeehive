@@ -2250,3 +2250,14 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .xenv-clear:hover { color: var(--text); border-color: var(--accent); }
 /* the card chip's third face: nothing resolved at all */
 .envchip.env-absent { color: var(--muted); border-style: dashed; }
+
+/* WHO ELSE IS IN THIS WORK (#33) — the dispatch dialog's coordination advisory. Deliberately styled as
+   INFORMATION and not as an error: it never disables the button, and two zees touching one file is
+   ordinary work. Amber rather than red, and a dashed edge — the same "related, not wrong" language the
+   honeycomb uses for a crew mark. */
+.disp-overlap { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.5;
+  color: var(--fg); background: rgba(224,165,59,0.08); border: 1px dashed var(--idle, #e0a53b); }
+.disp-overlap ul { margin: 4px 0 0; padding-left: 18px; }
+.disp-overlap li { margin: 2px 0; }
+.disp-overlap code { font-size: 11px; }
+.disp-overlap-note { display: block; margin-top: 5px; color: var(--muted); }
