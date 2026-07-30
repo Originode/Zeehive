@@ -503,7 +503,7 @@ const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
                                     expandedId, onExpand, hexPosRef, harnessPosRef, onGeometry, onAction, onContainerMenu,
-                                    hoverRef, setHover, subscribeHover }) {
+                                    hoverRef, setHover, subscribeHover, redrawKey }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], harnesses: [], flower: null, buttons: null, containers: null });
@@ -737,7 +737,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     onGeometry && onGeometry();
     // honeySide is a dep so a flip (which moves this pane on screen) re-runs draw and republishes the
     // hexes' fresh client-space positions — otherwise <Connectors> would trace to their old spots.
-  }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, expanded, machines, hexPosRef, onGeometry, baseOf]);
+  }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, expanded, machines, hexPosRef, onGeometry, baseOf, redrawKey]);
 
   useLayoutEffect(() => { drawRef.current = draw; draw(); }, [draw]);
 
@@ -1629,9 +1629,10 @@ export function petalVerbs(x, diff) {
     || st === 'occ-shipRequest' || st === 'occ-shipHint';         // …or a ship request/hint standing
   const v = {};
   if (buildable) v[3] = ['build'];                                // CONTAINERS petal
-  // SESSION petal (2): pause/play per-xell control, then terminal/nudge for live cxells
-  const xellHive = x.hive_status;
-  const xPaused = xellHive === 'occ-paused';
+  // SESSION petal (2): pause/play toggle — depends on the xell's actual paused state.
+  // Checks both hive_status (for fleet-wide and project pauses) and xell_paused (for
+  // per-xell individual pauses from the xell_pause_state table).
+  const xPaused = x.hive_status === 'occ-paused' || x.xell_paused === true;
   v[2] = cxell
     ? (xPaused ? ['resume', 'terminal', 'nudge'] : ['pause', 'terminal', 'nudge'])
     : (xPaused ? ['resume'] : ['pause']);

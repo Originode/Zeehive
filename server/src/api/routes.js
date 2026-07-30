@@ -292,7 +292,7 @@ router.post('/fleet/resume', async (req, res) => {
 // Pause one individual xell: marks it in session_event and interrupts its zee.
 router.post('/xells/:id/pause', async (req, res) => {
   try {
-    res.json(await pauseXell(req.params.id, { by: req.body?.by || 'human@console' }));
+    res.json(await pauseXell(req.params.id, { by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

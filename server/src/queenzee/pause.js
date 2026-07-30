@@ -158,8 +158,8 @@ export async function resumeProject(projectId, { by = 'human@console' } = {}) {
 
 // ── PER-XELL PAUSE ─────────────────────────────────────────────────────────────────────────────────
 // Pause ONE xell: mark it in session_event and interrupt its zee if active.
-export async function pauseXell(xellId, { by = 'human@console' } = {}) {
-  await setXellPaused(xellId, true, { by });
+export async function pauseXell(xellId, { by = 'human@console', reason = null } = {}) {
+  await setXellPaused(xellId, true, { by, reason });
   logline('pause', `XELL ${String(xellId).slice(0, 8)} PAUSED by ${by}`);
 
   // Interrupt the zee if it has a live cxell
