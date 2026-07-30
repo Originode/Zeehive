@@ -1083,14 +1083,15 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   const full = size >= 52;             // the two-half card needs room; else degrade
 
-  // ── harness avatar badge (10 o'clock corner) ──
-  // The upper-left sloping edge of a pointy-top hex runs from 210° (left flat point) to
-  // 270° (top vertex). The midpoint of that edge — the true "upper-left corner" — is at
-  // 240° math angle in screen coordinates (y-down). Positioned near the edge, not inside.
+  // ── harness avatar badge (10 o'clock / upper-left vertex) ──
+  // The upper-left vertex of a pointy-top hex is at 210° math angle (vertex i=4 in hexCorners:
+  // cos=‑√3/2, sin=‑½). The badge sits at 75% of the distance from center to that vertex
+  // (i.e. 25% from the vertex back toward center), so it stays on the hex body and never
+  // overflows the stroke.
   if (full && harness && size >= 48) {
     const avatarR = Math.max(5, size * 0.12);
-    const angle = (240 * Math.PI) / 180;   // 240° math = upper-left sloping edge
-    const dist = size * 0.72;               // near the edge (0.866 = boundary at this angle)
+    const angle = (210 * Math.PI) / 180;   // 210° math = upper-left vertex
+    const dist = size * 0.75;               // 75% from center to vertex (25% from vertex inward)
     const ax = cx + dist * Math.cos(angle);
     const ay = cy + dist * Math.sin(angle);
     drawAvatarDisc(ctx, ax, ay, avatarR, harness.color || col,
