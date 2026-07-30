@@ -80,9 +80,12 @@ Concretely, and each of these is small:
    disagree. That alone converts this class of bug from "found by accident eight documents later" into a
    red run.
 2. **Make the sync an action rather than a migration.** Tonight's repair is migration
-   `097_project_doc_sync_claude_md.sql` — 18 KB of embedded document, which works exactly once. A
-   `POST /api/projects/:id/docs/sync-from-repo` (host-side, reading `repo_root`) would make the next one
-   a click, and the check above would say when it is needed.
+   `097_project_doc_sync_claude_md.sql` — 18 KB of embedded document, which works exactly once, and the
+   next `CLAUDE.md` edit turns the check above red through nobody's fault. Until the decision here is
+   made, [`scripts/sync-project-doc.mjs`](../scripts/sync-project-doc.mjs) keeps that remedy to one
+   command (`zee migration-number`, then generate). The standing fix is a
+   `POST /api/projects/:id/docs/sync-from-repo` (host-side, reading `repo_root`) so the next one is a
+   click rather than a migration — the check says when it is needed either way.
 3. **Say it in the Docs tab.** When a project has a committed file for a ticked provider, the editor
    should show that the committed copy wins and this text is a projection — the console currently invites
    an edit whose effect is invisible for that provider, which is how the wrong copy gets edited.

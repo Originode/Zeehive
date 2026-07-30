@@ -83,7 +83,8 @@ try {
     for (const r of mine) {
       ok(String(r.body).trim() === COMMITTED,
          `${r.project}: project_doc.body is byte-identical to the committed CLAUDE.md `
-         + `(edit CLAUDE.md and re-sync by migration — an edit that exists only in the row is an edit to the wrong copy)`);
+         + `— if this is red, the fix is one command: \`zee migration-number\` then \`node scripts/sync-project-doc.mjs <NNN>\`. `
+         + `Never the other direction: an edit that exists only in the row is an edit to the copy nobody reviews, which IS ticket #38`);
       ok(!String(r.body).includes(FALSE_CLAIM),
          `${r.project}: and it does not carry the containment claim removed on 2026-07-29 at 23:30 as false`);
     }
