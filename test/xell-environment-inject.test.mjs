@@ -233,19 +233,27 @@ try {
     // the chip a human would see, for a xell whose only difference is its env_* columns. Reported as
     // class + visible text: the title is three paragraphs long and a failure has to be readable.
     const chipOf = (env) => {
-      const html = cardUi.renderToStaticMarkup(cardUi.React.createElement(cardUi.XellCard, {
-        x: { id: '00000000-0000-4000-8000-00000000e2c1', slug: 'xenv-card', status: 'claimed',
-             hive_status: 'occ-working', hive_status_label: 'working', head_commit: 'abc123def456',
-             branch: 'spinoff/xenv-card', stack: [], burn: { tokens: 0, cost: 0 }, ...env },
-        diff: null, onDone: () => {}, onMenu: () => {}, prodLock: null, projectId: PID,
-        landing: [], prs: [], ship: null, onDismiss: () => {}, machines: [], onEnv: () => {} }));
+      let html;
+      try {
+        html = cardUi.renderToStaticMarkup(cardUi.React.createElement(cardUi.XellCard, {
+          x: { id: '00000000-0000-4000-8000-00000000e2c1', slug: 'xenv-card', status: 'claimed',
+               hive_status: 'occ-working', hive_status_label: 'working', head_commit: 'abc123def456',
+               branch: 'spinoff/xenv-card', stack: [], burn: { tokens: 0, cost: 0 }, ...env },
+          diff: null, onDone: () => {}, onMenu: () => {}, prodLock: null, projectId: PID,
+          landing: [], prs: [], ship: null, onDismiss: () => {}, machines: [], onEnv: () => {} }));
+      } catch (e) {
+        // a card that throws is a failed assertion with a reason, not a dead test run
+        return { cls: '', text: '', threw: e?.message || String(e) };
+      }
       const at = html.indexOf('data-testid="env-chip"');
       if (at < 0) return null;
       const span = html.slice(html.lastIndexOf('<span', at), html.indexOf('</span>', at) + 7);
       return { cls: (span.match(/class="([^"]*)"/) || [, ''])[1], text: span.replace(/<[^>]*>/g, '') };
     };
     const NO_CHIP = 'NO env chip in the rendered card at all';
-    const chipSaw = (chip) => (chip === null ? NO_CHIP : `class="${chip.cls}" text="${chip.text}"`);
+    const chipSaw = (chip) => (chip === null ? NO_CHIP
+      : chip.threw ? `XellCard THREW while rendering: ${chip.threw}`
+        : `class="${chip.cls}" text="${chip.text}"`);
     const populated = chipOf({ env_key: 'staging', env_tier: 'dev', env_var_count: 5, env_pinned: true });
     ok(populated?.text === '❖ staging ·5 📌',
        `a resolved environment renders its key, var count and pin — expected text "❖ staging ·5 📌", `
