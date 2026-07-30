@@ -399,14 +399,28 @@ try {
      'the HUMAN route delegates to the same core and neither collects nor dispatches itself');
   ok(/openHumanGatesOn\(/.test(core) && !/openHumanGatesOn\(/.test(mgrVerb) && !/openHumanGatesOn\(/.test(humanVerb),
      'and the open-gate refusal lives in the core too — one copy, so it cannot drift between callers');
+  // The notification's CALL SITE. The message itself is asserted above (§8); this is the part a
+  // project with no provider account cannot reach at runtime, because the dispatch dies first — so it
+  // is read from the source instead of left unclaimed: only a HUMAN swap notifies, it is the shared
+  // helper rather than a second wording, and it is best-effort (a notification row must never turn a
+  // completed swap into a reported failure).
+  ok(/notifyManagerOfSwap\(/.test(core), 'the core notifies through lib/managers.js, not its own wording');
+  ok(/if \(!manager && watcher\)/.test(core),
+     'and only when a HUMAN asked and the xell HAS a manager — a manager is not told about its own swap');
+  ok(/notifyManagerOfSwap\([\s\S]{0,220}\.catch\(/.test(core),
+     'best-effort: a swap that WORKED is not reported as failed because a message row could not be written');
+  ok(core.indexOf('notifyManagerOfSwap(') > core.indexOf('dispatchXell('),
+     'and it is told AFTER the new zee is in — never about a swap that did not happen');
+
   const routes = readFileSync(new URL('../server/src/api/routes.js', import.meta.url), 'utf8');
   ok(/router\.post\('\/xells\/:id\/swap'/.test(routes),
      'the console route POST /api/xells/:id/swap exists');
   const route = routes.slice(routes.indexOf("router.post('/xells/:id/swap'"), routes.indexOf("router.post('/xells/:id/suggest-done'"));
   ok(/swapXellZeeAsHuman\(/.test(route) && !/collectCxellDiffToWorktree|dispatchXell|docker/.test(route),
      'and the ROUTE only calls it — no second copy of the collect/recreate ordering in an express handler');
-  ok(/409/.test(route) && /404/.test(route),
-     "a refusal answers 409 (and an unknown xell 404) carrying the server's own sentence");
+  ok(/409/.test(route) && /404/.test(route) && /502/.test(route),
+     "a refusal answers 409, an unknown xell 404, and a swap the queenzee could not finish 502 — each "
+     + "carrying the server's own sentence");
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {

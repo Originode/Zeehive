@@ -1484,10 +1484,17 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
     });
   } catch (e) {
+    // Say what actually happened to the commits. This used to claim "the swap collected …'s commits"
+    // unconditionally — including when the cage was not running and there was nothing to collect,
+    // which is a sentence that tells a human their work was rescued when nothing was.
     return { ok: false, status: 'error', stage: 'dispatch', collected,
-      error: `the swap collected ${target.slug}'s commits but could not start the new zee: ${e.message} `
-        + 'The xell, its branch and its commits are untouched (the collect is what protects them) — '
-        + 'fix the reason and swap again.', detail: e.detail || null };
+      error: `the swap could not start the new zee in ${target.slug}: ${e.message} `
+        + (collected?.collected
+          ? `Its commits were collected onto the worktree first (HEAD ${String(collected.head).slice(0, 8)}), so `
+            + 'the xell, its branch and its commits are untouched. '
+          : `Nothing was collected from the old cage (${collected?.reason || 'n/a'}), and the xell, its branch `
+            + 'and its commits are untouched. ')
+        + 'Fix the reason and swap again.', detail: e.detail || null };
   }
 
   // The board's link is on the xell (work_item.xell_id), so it survives by itself — but the TASK row

@@ -1458,7 +1458,14 @@ router.post('/xells/:id/swap', async (req, res) => {
       title: b.title || null, by: b.by || 'human@console',
     });
     if (out?.ok) return res.json(out);
-    res.status(out?.status === 'not_found' ? 404 : out?.status === 'refused' ? 409 : 400).json(out);
+    // 404 a xell that does not exist · 409 a REFUSAL (a rule said no, and the answer says which) ·
+    // 502 the swap was allowed and the queenzee could not finish it (the dispatch died; the answer
+    // says what happened to the commits) · 400 bad input (no harness named). Distinct on purpose:
+    // "you asked for something we refuse" and "we tried and could not" are different facts, and only
+    // the second one is worth retrying unchanged.
+    res.status(out?.status === 'not_found' ? 404
+      : out?.status === 'refused' ? 409
+      : out?.status === 'error' ? 502 : 400).json(out);
   } catch (err) { res.status(400).json({ error: err.message, detail: err.detail || null }); }
 });
 
