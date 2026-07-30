@@ -32,10 +32,53 @@
 import { readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// WHICH of two colliding files is safe to rename (#35). This lint told authors to RENUMBER without
+// knowing which one a database had already applied — and renaming an applied migration re-runs it, which
+// is what happened to 090_restore_report.sql within twenty minutes of the guard landing. The rule is
+// shared with the runtime refusal in server/src/db/migrate.js so the two can never give different advice.
+import { renameAdvice, RERUN_WARNING } from '../server/src/db/rename-advice.js';
 
 const DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'db', 'migrations');
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
+
+// THE LEDGER, if there is one to read. Opportunistic on purpose: this lint has always run in a fresh
+// clone with no database and must keep doing so, so a missing/unreachable DATABASE_URL is answered with
+// NULL — "nobody could tell me", which renameAdvice treats differently from "nothing is applied". It
+// never fails the lint: the duplicate check itself needs no database.
+async function readLedger() {
+  if (!process.env.DATABASE_URL) return null;
+  try {
+    const pg = (await import('pg')).default;
+    const c = new pg.Client({ connectionString: process.env.DATABASE_URL,
+      connectionTimeoutMillis: 2500, query_timeout: 2500 });
+    await c.connect();
+    try {
+      const r = await c.query('SELECT filename FROM schema_migrations');
+      return new Set(r.rows.map((x) => x.filename));
+    } finally { await c.end().catch(() => {}); }
+  } catch { return null; }
+}
+const applied = await readLedger();
+
+// WHAT MAIN CARRIES — the fact that makes a collision permanent (#35). Both files landed means every
+// database following main has run both, so a rename can only re-run one of them for everybody and the
+// honest resolution is to RECORD the pair. One git call, best-effort: no repo, no branch, no answer, and
+// the advice then falls back to the ledger alone rather than inventing a certainty it does not have.
+async function readLanded() {
+  try {
+    const { spawnSync } = await import('node:child_process');
+    const { execPath } = process;   // (unused — kept explicit that this shells out to git, not to node)
+    void execPath;
+    const r = spawnSync('git', ['-C', resolve(DIR, '..', '..'), 'ls-tree', '--name-only', '-r',
+      'origin/main', '--', 'db/migrations'], { encoding: 'utf8', timeout: 4000 });
+    if (r.status !== 0) return null;
+    const names = r.stdout.split('\n').map((s) => s.trim().replace(/^db\/migrations\//, ''))
+      .filter((s) => s.endsWith('.sql'));
+    return names.length ? new Set(names) : null;
+  } catch { return null; }
+}
+const landed = await readLanded();
 
 // The shape the runner's sort depends on: NNN_snake_case.sql. A file that does not match has no
 // number to police, which is the one way a collision could hide from this lint.
@@ -55,6 +98,18 @@ const GRANDFATHERED = {
   // And one more, landed in the minutes between this lint being written and being landed. Both files
   // were already on main, so neither was mine to renumber — the repair is forward, i.e. this line.
   '088': ['088_manager_manual_harness_key.sql', '088_manager_manual_scratch_resolution.sql'],
+  // (The EIGHTH collision was here — 090 twice, created BY a renumber escaping a different one — and it
+  // is gone because somebody moved 090_restore_report.sql to 095. Its line is DELETED rather than left:
+  // a grandfather entry that no longer describes a real duplicate is a standing permit for the next
+  // collision on that number, which is why this list is checked in both directions. And this rename
+  // was SAFE, which is the part worth recording accurately: that file never sat on a deployable tip
+  // under either earlier name. Checked, not assumed — no first-parent commit of master contains
+  // db/migrations/087_restore_report.sql or 090_restore_report.sql, and a clone of the production
+  // ledger holds 095_restore_report.sql and neither of the others, so no shared database re-ran it.
+  // The renumber was done on its author's own branch, before landing, which is exactly where a number
+  // may still be changed. The hazard the grandfather rule exists for is real — schema_migrations keys
+  // on FILENAME, so renaming a file that HAS applied re-runs it — it simply was not paid here, and the
+  // way to tell the two cases apart is the check above, not the number's history.)
 };
 
 // The whole check, as a function of a FILE LIST — so the samples below run through the identical
@@ -74,11 +129,20 @@ function collisions(files) {
 }
 
 // The sentence a future author reads when the suite goes red. It names the verb, because "pick
-// another number" is exactly the instruction that produced every one of these collisions.
-const FIX = 'RENUMBER it before landing, and get the number from the queenzee — `zee migration-number` '
-  + 'accounts for what is landed AND what every other live xell has claimed, which your own worktree cannot.';
+// another number" is exactly the instruction that produced every one of these collisions — and it names
+// the FILE, because "renumber it" is only safe advice about the file no database has run (#35).
+const VERB = 'Get the new number from the queenzee — `zee migration-number` accounts for what is landed '
+  + 'AND what every other live xell has claimed, which your own worktree cannot.';
+const FIX = (files) => {
+  const adv = renameAdvice(files, applied, landed);
+  // A collision that is already HISTORY has no rename to get right, so the verb that hands out a fresh
+  // number is not the instruction — recording it is.
+  return adv.grandfather ? adv.advice : `${adv.advice} ${VERB}`;
+};
 
-console.log('\n── the ledger is well-formed ──');
+console.log('\n── the ledger is well-formed'
+  + ` (rename advice: ${applied ? `${applied.size} applied on DATABASE_URL` : 'no database readable'}, `
+  + `${landed ? `${landed.size} landed on origin/main` : 'main not readable'}) ──`);
 const files = readdirSync(DIR).filter((f) => f.endsWith('.sql')).sort();
 ok(files.length > 0, `db/migrations/ has migrations to check (${files.length})`);
 const malformed = files.filter((f) => !NAME.test(f));
@@ -90,7 +154,7 @@ const found = collisions(files);
 const known = new Set(Object.keys(GRANDFATHERED));
 for (const c of found.filter((c) => !known.has(c.number))) {
   ok(false, `${c.number} is claimed by ${c.files.length} migrations: ${c.files.join(' + ')} — the ledger's only `
-    + `ordering is the filename, so postgres would apply these in whatever order a string sort gives. ${FIX}`);
+    + `ordering is the filename, so postgres would apply these in whatever order a string sort gives. ${FIX(c.files)}`);
 }
 ok(found.every((c) => known.has(c.number)),
    `no migration number is claimed twice, apart from the ${known.size} landed collisions below`);

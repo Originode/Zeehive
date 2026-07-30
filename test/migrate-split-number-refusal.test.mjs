@@ -33,6 +33,8 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 
 const { duplicatePrefixesSplitByLedger: split, splitPrefixRefusal } =
   await import('../server/src/db/migrate.js');
+// the shared sentence both guards must carry verbatim (#35) — asserted from the module, not retyped
+const { RERUN_WARNING } = await import('../server/src/db/rename-advice.js');
 
 // ── the rule, as data (no database needed — the applied set is an argument) ───
 console.log('\n── the one shape it refuses ──');
@@ -71,11 +73,17 @@ console.log('\n── what it says when it fires ──');
 const msg = splitPrefixRefusal(s1);
 ok(/086_first\.sql\s+← already applied here/.test(msg) && /086_second\.sql\s+← NEW, not applied/.test(msg),
    'it separates the file that is already in from the one that is not');
-ok(/NOTHING HAS BEEN APPLIED by this run/.test(msg),
+// Asserted on the CLAIM rather than the line-wrap: #35 rewrote these sentences and three assertions here
+// failed on where the paragraph happened to break, not on anything a reader would notice. A message this
+// long is wrapped to the file's width, so a test that pins the wrapping fails every time it is improved.
+const flat = msg.replace(/\s+/g, ' ');
+ok(flat.includes('NOTHING HAS BEEN APPLIED by this run'),
    'it says nothing was applied — because it is thrown before the loop, not during it');
-ok(/renaming it would make it look new and run\s*\n?\s*it a second time/.test(msg),
-   'it warns why the APPLIED file cannot be the one renamed (the ledger keys on filename)');
-ok(/`zee migration-number`/.test(msg) && /every live xell has claimed/.test(msg),
+ok(flat.includes(RERUN_WARNING.replace(/\s+/g, ' ')),
+   'it warns why the APPLIED file cannot be the one renamed, in the shared wording (#35 rename-advice.js)');
+ok(/Rename 086_second\.sql/.test(flat) && /Do NOT rename 086_first\.sql/.test(flat),
+   'and it names WHICH file to move — the unapplied one — instead of leaving the choice to the reader');
+ok(flat.includes('`zee migration-number`') && flat.includes('every live xell has claimed'),
    'it points at the verb that prevents the collision rather than just complaining');
 ok(/test\/migration-numbers\.test\.mjs/.test(msg), 'and names the lint, so the three layers read as one idea');
 ok(/MIGRATE_ALLOW_DUPLICATE_NUMBERS=true/.test(msg) && /It does not make it fine/.test(msg),

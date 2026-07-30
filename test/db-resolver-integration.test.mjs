@@ -3,7 +3,7 @@
 // Proves the shipped resolveRealDbContainer / resolveRealDbContainerCached and shipmigrate's new
 // assertProdDbTarget behave correctly over the real registry (container rows) with docker faked on
 // PATH. Complements db-resolver-registry.test.mjs (pure logic) with the full I/O path.
-import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -20,9 +20,12 @@ const stateFile = join(bin, 'state.json');
 const setState = (s) => writeFileSync(stateFile, JSON.stringify(s));
 const shim = join(bin, 'fake-docker.mjs');
 writeFileSync(shim, `#!/usr/bin/env node
-import { readFileSync } from 'node:fs';
+import { readFileSync, appendFileSync } from 'node:fs';
 const a = process.argv.slice(2);
 const st = JSON.parse(readFileSync(process.env.FAKE_DOCKER_STATE, 'utf8'));
+// Record every invocation. That is what lets a test ask "had the docker probe RUN yet?" instead of
+// "did this return inside 50ms?" — a fact about the code rather than about how busy the box is.
+try { appendFileSync(process.env.FAKE_DOCKER_LOG, a.join(' ') + '\\n'); } catch { /* log optional */ }
 if (a.includes('ps')) { process.stdout.write((st.ps||[]).map(c=>c.name+'\\t'+(c.ports||'')).join('\\n')+'\\n'); process.exit(0); }
 if (a.includes('inspect')) { const n=a[a.length-1]; const p=(st.inspect||{})[n];
   if (p===undefined){process.stderr.write('No such object: '+n+'\\n');process.exit(1);} process.stdout.write(JSON.stringify(p)+'\\n'); process.exit(0); }
@@ -31,6 +34,9 @@ process.exit(0);
 writeFileSync(join(bin, 'docker'), `#!/usr/bin/env bash\nexec node "${shim}" "$@"\n`);
 chmodSync(join(bin, 'docker'), 0o755);
 process.env.FAKE_DOCKER_STATE = stateFile;
+const dockerLog = join(bin, 'docker-calls.log');
+process.env.FAKE_DOCKER_LOG = dockerLog;
+const dockerCalls = () => { try { return readFileSync(dockerLog, 'utf8').split('\n').filter(Boolean); } catch { return []; } };
 process.env.PATH = `${bin}:${process.env.PATH}`;
 
 let failures = 0;
@@ -67,10 +73,18 @@ try {
 
   // ── 2. Cached hot-path answers WITHOUT blocking on a cold miss ──────────────────────────────────
   console.log('resolveRealDbContainerCached: cold miss is non-blocking');
-  const t0 = Date.now();
+  // WHAT "NON-BLOCKING" ACTUALLY MEANS, asserted directly (ticket #36). This used to be
+  // `Date.now() - t0 < 50`, which measures the BOX: it failed once at 90ms on a loaded machine and
+  // passed at 11ms and 5ms minutes later, so a real regression here would have read as intermittency —
+  // and intermittency is what gets a genuine red waved through. The threshold was not raised; it was
+  // replaced by the two facts it was standing in for.
+  const callsBefore = dockerCalls().length;
   const cold = resolveRealDbContainerCached(ctx, LOGICAL);
-  const dt = Date.now() - t0;
-  ok(dt < 50, `cold miss returned in ${dt}ms (no blocking docker ps on the hot path)`);
+  ok(typeof cold?.then !== 'function',
+     'the hot path returns a VALUE, not a promise — it cannot have awaited a docker probe');
+  ok(dockerCalls().length === callsBefore,
+     `and no docker call had run when it returned (${callsBefore} before, ${dockerCalls().length} after) — `
+     + 'the probe is behind it, not in front of it');
   ok(cold === LOGICAL, `cold miss serves the logical name (${cold}) — guard-tolerated`);
   // background refresh should sharpen it to the real name shortly
   let sharpened = LOGICAL;
