@@ -188,7 +188,7 @@ export async function setProjectPaused(projectId, paused, { by = 'human@console'
        resumed_at = CASE WHEN EXCLUDED.paused THEN NULL ELSE now() END,
        resumed_by = CASE WHEN EXCLUDED.paused THEN NULL ELSE $3::text END
      RETURNING *`,
-    [!!paused, by, reason]);
+    [projectId, !!paused, by, reason]);
   return r;
 }
 
