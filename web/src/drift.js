@@ -144,13 +144,81 @@ export function dataReportText(name, r) {
   list('EMPTY here, populated in the backup', r.empty, (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here 0`);
   list('short of the backup', r.short, (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here ${x.got.toLocaleString()}`);
   list('ABSENT from this database (schema, not rows — run Check diff)', r.missing, (x) => `${x.table}`);
-  list('no reference count (never analyzed in the source)', r.unknown, (x) => `${x.table} — here ${x.got.toLocaleString()}`);
+  // The two ways a table can be unjudgeable, listed apart because they mean different things: nobody
+  // ever measured it, versus the measurement has since decayed past the tolerance.
+  list('reference estimate too STALE to judge (the source table moved since its last ANALYZE)', r.stale,
+       (x) => `${x.table} — backup ~${x.ref.toLocaleString()}, here ${x.got.toLocaleString()} `
+            + `(${(x.mod_since_analyze ?? 0).toLocaleString()} rows had changed since it was measured)`);
+  list('no reference count (never analyzed in the source)',
+       (r.unknown || []).filter((x) => x.state !== 'stale-reference'),
+       (x) => `${x.table} — here ${x.got.toLocaleString()}`);
 
+  if (r.stale?.length) {
+    out.push('\n\nA STALE reference is not a finding and not a pass: the source table changed by more than'
+      + '\nthe tolerance since anyone measured it, so a shortfall inside that movement says nothing. An'
+      + '\nEMPTY table is still reported however stale the estimate — no decay turns "had rows" into "has none".');
+  }
   out.push('\n\nThe reference is the planner\'s row ESTIMATE taken from the source when the dump was made;'
     + `\nthis side is an exact count. Expect a few percent either way — a shortfall under `
     + `${Math.round((ref.tolerance ?? 0.1) * 100)}% is not\nreported, and a table with MORE rows than the backup is `
     + 'normal (rows kept arriving, or this db\nhas been written to since).');
   out.push('\n\nWhat this covers: ROW COUNTS per table.'
     + '\nWhat it does NOT: the contents of a row, and the SCHEMA (that is Check diff).');
+  return out.join('');
+}
+
+// ── the chip's DATA lines: what the last restore reported, and how its rows graded ────────────────
+// Two facts, adjacent and separate, because they answer different questions and neither substitutes for
+// the other (#30): the TALLY says "this restore had trouble, and here is the cause", the GRADE says
+// "and here is what is missing". A restore can ignore 400 errors while every table it loaded still
+// passes its counts — indexes, constraints and triggers are not rows.
+//
+// And the schema drift lines above are a THIRD question. All three live on one chip, so each says which
+// it is; that separation is the whole of TKT-22-4F0E.
+export function dataText(c) {
+  const out = [];
+  const r = c.restore_report;
+  if (r) {
+    const when = c.restored_at ? new Date(c.restored_at).toLocaleString() : '';
+    if (r.ok === false) {
+      out.push(`\n\n⚠ last restore FAILED${when ? ` (${when})` : ''}\n${r.reason || ''}`);
+    } else if (r.ignored) {
+      out.push(`\n\n⚠ last restore IGNORED ${r.ignored} error(s)${when ? ` (${when})` : ''}`);
+      out.push('\nThe data loaded, with holes in it. pg_restore continued past these:');
+      for (const e of (r.errors || []).slice(0, 5)) out.push(`\n  · ${e}`);
+      if (r.truncated || (r.error_count || 0) > (r.errors || []).length) {
+        out.push(`\n  … ${(r.error_count || 0) - (r.errors || []).length} more distinct error(s)`);
+      }
+      out.push('\nRows are a separate question — see the row check below.');
+    } else {
+      // Clean restores get ONE quiet line. A pool refresh restores databases all day.
+      out.push(`\n\n✓ last restore clean${when ? ` (${when})` : ''} — pg_restore ignored no errors`);
+    }
+  }
+
+  const d = c.data_check;
+  if (d) {
+    const when = c.data_check_at ? ` (${new Date(c.data_check_at).toLocaleString()})` : '';
+    if (d.ok === false) {
+      out.push(`\n\nrow check: not run${when} — ${d.error || 'unknown reason'}`);
+    } else if (d.verdict === 'incomplete') {
+      out.push(`\n\n⚠ ROWS MISSING vs the backup this db was restored from${when}`);
+      out.push(`\n${d.empty?.length || 0} table(s) EMPTY, ${d.short?.length || 0} short (${d.ok_count}/${d.checked} verified)`);
+      for (const x of [...(d.empty || []), ...(d.short || [])].slice(0, 5)) {
+        out.push(`\n  · ${x.table} — backup ~${x.ref?.toLocaleString?.() ?? x.ref}, here ${x.got?.toLocaleString?.() ?? x.got}`);
+      }
+    } else if (d.verdict === 'unverified') {
+      const why = [];
+      if (d.stale?.length) why.push(`${d.stale.length} with a reference too stale to judge`);
+      if (d.missing?.length) why.push(`${d.missing.length} absent (schema, not rows)`);
+      const never = (d.unknown || []).filter((x) => x.state !== 'stale-reference').length;
+      if (never) why.push(`${never} never analyzed in the source`);
+      out.push(`\n\nrow check${when}: ${d.ok_count}/${d.checked} table(s) match`
+        + (why.length ? `; ${why.join(', ')}` : '; the rest could not be judged'));
+    } else {
+      out.push(`\n\n✓ rows match the backup this db was restored from${when} (${d.ok_count}/${d.checked} tables)`);
+    }
+    out.push('\nRow COUNTS only — not the contents of a row, and not the schema.');
+  }
   return out.join('');
 }
