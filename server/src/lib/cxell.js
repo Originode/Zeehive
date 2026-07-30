@@ -81,7 +81,14 @@ export function cxellSshPort(slug) {
 
 // docker CLI runner. `--context` (not env) so a queenzee env leak can never re-aim a cxell;
 // input is piped to stdin; onLine streams stdout lines (for the NDJSON event stream).
-function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
+//
+// `allowNonZero` resolves instead of rejecting on a non-zero exit, handing the caller {code,out,err}
+// to judge. Opt-in, because rejecting is the right default — but a command that REPORTS its own
+// outcome on stdout must be believed over its exit status, and rejecting first threw that report
+// away: see writeFileIntoCxellIfChanged, where `docker exec` returned 1 while the container said
+// SAME, and the fleet's healthy no-ops were recorded as failures. A truncated stdin still rejects
+// either way (below): a payload we could not deliver is not an outcome to interpret.
+function dk(ctx, args, { input, onLine, timeoutMs = 120000, allowNonZero = false } = {}) {
   return new Promise((resolve, reject) => {
     const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...args];
     const p = spawn('docker', full, { windowsHide: true });
@@ -104,7 +111,7 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
       // exits 0 (base64 -d / cat happily decode a partial stream). Surfacing this is what stops a
       // half-written image attachment from being reported as a clean success. See writeFileIntoCxell.
       if (stdinErr) { reject(new Error(`docker ${args.slice(0, 2).join(' ')} stdin write failed: ${stdinErr.code || stdinErr.message} — payload likely truncated`)); return; }
-      if (code === 0) resolve({ code, out, err });
+      if (code === 0 || allowNonZero) resolve({ code, out, err });
       else reject(new Error(`docker ${args.slice(0, 2).join(' ')} exited ${code}: ${(err || out).slice(0, 400)}`));
     });
     if (input !== undefined) {
@@ -1114,29 +1121,52 @@ export async function writeFileIntoCxellIfChanged({ ctx = 'default', slug, relPa
   if (!safe) throw new Error('empty target path');
   const full = `/work/repo/${safe}`;
   const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  // ONE exit path, and no early `exit` in the SAME branch. The first version exited the moment the
+  // comparison matched — immediately after `cat` drained stdin — and production answered with exit 1
+  // and a perfectly good SAME on stdout, while the WROTE branch (which does more work before
+  // finishing) exited 0. That smells like the shell exiting out from under the CLI's stdin copy, and
+  // it is not worth proving: a single exit that always falls off the end removes the difference,
+  // and the verdict below no longer depends on the exit code either way.
   const script = [
     'set -e',
     `P=${sq(full)}`,
     'tmp="$(mktemp)"',
     'cat > "$tmp"',
+    'V=WROTE',
     // sha256sum (coreutils, same package as the base64/mktemp already relied on here) rather than
     // cmp/diff: a byte-exact comparison with no diffutils dependency on the agent image.
     'if [ -f "$P" ] && [ "$(sha256sum < "$tmp" | cut -d" " -f1)" = "$(sha256sum < "$P" | cut -d" " -f1)" ]; then',
-    '  rm -f "$tmp"; echo SAME; exit 0',
+    '  V=SAME',
+    'else',
+    '  mkdir -p "$(dirname "$P")"',
+    '  cat "$tmp" > "$P"',
     'fi',
-    'mkdir -p "$(dirname "$P")"',
-    'cat "$tmp" > "$P"',
     'rm -f "$tmp"',
-    'echo WROTE',
+    'echo "$V"',
   ].join('\n');
-  const r = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script], { input: String(text ?? ''), timeoutMs });
+  // THE CONTAINER SAYS WHAT IT DID, and that outranks its exit status. `allowNonZero` is the whole
+  // point: dk used to reject on a non-zero exit before the verdict was ever read, so `docker exec`
+  // returning 1 alongside SAME — the healthy no-op — was recorded as "the cage is stale" on every
+  // unchanged xell in the fleet. A false failure on the success path is worse than the silence this
+  // mechanism replaced, and it flew a broken badge in the console to prove it.
+  const r = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script],
+                     { input: String(text ?? ''), timeoutMs, allowNonZero: true });
   const verdict = String(r?.out || '').trim().split('\n').pop();
   if (verdict !== 'SAME' && verdict !== 'WROTE') {
-    // Never guess: an exec that exited 0 without printing its verdict wrote something unknown, and
-    // reporting that as "unchanged" is the lie this whole helper exists to avoid.
-    throw new Error(`the cxell did not report what it did with ${safe} (said "${verdict}")`);
+    // The ONE real failure: no verdict. Then we do not know what is in the file, and guessing
+    // "unchanged" is the lie this helper exists to avoid. The exit code and stderr ride along —
+    // they are diagnosis now, rather than the thing that decided the outcome.
+    throw new Error(`the cxell did not report what it did with ${safe} (exit ${r?.code}, said `
+      + `"${verdict}")${r?.err ? `: ${String(r.err).trim().slice(0, 200)}` : ''}`);
   }
-  return { changed: verdict === 'WROTE', path: full, rel: safe };
+  // Trusted, never hidden. A verdict that arrives with a non-zero exit is still an oddity worth one
+  // line — swallowing it would be the same mistake in the other direction.
+  if (r.code !== 0) {
+    logline('cxell', `${name}: ${safe} — the container reported ${verdict} but the exec exited `
+      + `${r.code}. Trusting the verdict: it says what actually happened to the file, and only a `
+      + 'MISSING verdict is a failure.');
+  }
+  return { changed: verdict === 'WROTE', path: full, rel: safe, exit_code: r.code };
 }
 
 // Write a GENERATED file into a cxell — but never over a git-TRACKED path.

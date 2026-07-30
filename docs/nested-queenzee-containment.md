@@ -10,6 +10,34 @@ today, and which reach the real fleet.**
 It is an audit, not a remedy. Nothing here changes gating — the fix for proddiff (gate it / scope it
 to owned databases / leave it exempt and correct the docs) is a human's decision on ticket #27.
 
+## ⚠ AMENDED THE SAME NIGHT — the write side is now closed
+
+This audit landed at 8d527615. Between writing it and landing it, another zee landed the FIX for its
+second finding and a great deal more, so the table below was stale within the hour. Corrected here
+rather than left to read as an open hole (an audit that describes a closed hole misleads exactly as
+much as one that denies an open one):
+
+- **The ship's migration step is GATED now.** `runShip` has an `else if (ok && mode !== 'real')` branch
+  that lists the pending files and applies none, with a logline saying so — a REPORTED skip, not a
+  silent one. `shipgate.js`, covered by `test/nested-queenzee-land-ship-guard.test.mjs`.
+- **So are the other ungated write paths this audit listed as "inert by accident".** They no longer
+  depend on the cage: `landApproved` (the `update-ref` into the xource), every verb in `xellgit.js`,
+  every `nudge.js` continuation, `refreshZeeLiveInLiveCxells`, the image janitor and the harness
+  re-injection all take `mode = PROVISION_MODE` and report instead of acting when it is not `real`.
+  Two tests pin the class: `nested-queenzee-fleet-guard` and `nested-queenzee-land-ship-guard`.
+- **What is still ungated is READ, and it is the open half of ticket #27**: `proddiff` (a loop) and
+  `datadiff` + `shipmigrate`'s ledger reads (human-triggered routes) all reach real production
+  databases with no mode consult. All three are read-only by construction and say so in their own
+  headers. Whether they should be gated, scoped to owned databases, or left exempt is the decision
+  #27 exists for.
+- **A sweep for the underlying pattern** — a multi-stage path where some stages consult MODE and one
+  does not — found no remaining ungated WRITE in `server/src/queenzee/` or the `lib/` paths its loops
+  reach. That pattern is what made finding 2 invisible: the prod `.env` write above it was gated and
+  the container build below it was gated, so the SQL apply between them read as safe by association.
+
+The table below is the state at the time of the audit. Where it says a write path is "inert by
+accident", read the bullets above: it is gated now.
+
 ## How to read it
 
 **Read-only reach and write reach are different facts** and are never merged below. A nested

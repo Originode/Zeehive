@@ -35,6 +35,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
+import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
@@ -610,6 +611,45 @@ export async function selfCatchup(xell, { restore = false } = {}) {
         + `migrations on top, then re-verify.${tail}`
       : `${r.note || 'Nothing to catch up.'}${tail}`,
   };
+}
+
+// ── POST /api/xell/self/migration-number — hand out the next free db/migrations number ──
+// The one question a caged zee genuinely cannot answer: its worktree shows what is LANDED plus what
+// it wrote, and nothing about the siblings writing migrations on branches it cannot see. Numbers have
+// been claimed twice — and three ways — repeatedly because of that (ticket #9; the landed collisions
+// are listed in test/migration-numbers.test.mjs). The queenzee can see main AND every live xell's
+// worktree, so it answers — see lib/migration-numbers.js for the three sources it unions.
+//
+// NOT gated, and ADVISORY: it hands out a number, it does not gate a landing (the lint in
+// test/migration-numbers.test.mjs is what fails the build if a duplicate lands anyway). Same class as
+// `zee build` and `zee db-catchup` — a zee helping itself do the work right.
+export async function selfMigrationNumber(xell, { name = null, again = false } = {}) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+  if (!project) return { ok: false, error: `${xell.slug} has no project row to read a ledger from` };
+
+  let r;
+  try { r = await claimMigrationNumber(project, xell, { name, again }); }
+  catch (e) { return { ok: false, error: `could not claim a migration number: ${e.message}` }; }
+
+  const others = r.claims.filter((c) => c.xell_slug !== xell.slug);
+  const create = r.filename ? `create ${r.filename}` : `name the file ${r.dir}/${r.prefix}_<what_it_does>.sql`;
+  if (r.reused) {
+    return { ...r, message: `You already hold ${r.prefix} (claimed ${r.claim.claimed_at.toISOString?.() || r.claim.claimed_at}) — `
+      + `same number back, deliberately: the usual repeat is a re-run, and being handed the NEXT number after you have `
+      + `already written this one is the collision this verb exists to prevent. So: ${create}. If you genuinely need a `
+      + `SECOND migration in this landing, ask again with \`--again\`.` };
+  }
+  const counted = [
+    `${r.landed.count} landed on ${r.landed.ref}${r.landed.commit ? ` @ ${String(r.landed.commit).slice(0, 8)}` : ''} (max ${formatNumber(r.landed.max)})`,
+    `${r.worktrees.filter((w) => w.count).length} live xell worktree(s) holding migrations`
+      + (r.worktrees.some((w) => !w.readable) ? ` (⚠ ${r.worktrees.filter((w) => !w.readable).length} unreadable)` : ''),
+    `${others.length} live claim(s) by other zees${others.length ? ` (${others.map((c) => `${c.prefix}→${c.xell_slug}`).join(', ')})` : ''}`,
+  ].join(', ');
+  return { ...r, message: `Migration number ${r.prefix} is yours — ${create}. Counted: ${counted}. Your claim is `
+    + `RECORDED, so the next zee to ask gets a higher number even if you have not written the file yet; it lapses in `
+    + `${CLAIM_TTL_DAYS} days or when this xell is retired. Asking again returns THIS number (\`--again\` for a second one). `
+    + `It is ADVISORY — nothing gates your landing on it, but test/migration-numbers.test.mjs FAILS the build on a new `
+    + `duplicate, so use it.` };
 }
 
 // ── POST /api/xell/self/ship — file a ship request (shipgate) ──────────────────

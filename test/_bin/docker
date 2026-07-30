@@ -30,9 +30,12 @@ fi
 # whether those bytes differ from the file already there, and REFUSES to guess when no verdict comes
 # back. A fake container cannot run that script (and must not — the script's target is a real
 # /work/repo), so a test states the answer it wants: WROTE (the copy was stale) or SAME (identical).
+# DOCKER_FAKE_CXELL_EXIT is the other half, and it is the knob that was missing: production returned
+# exit 1 while printing the healthy SAME verdict, and a shim that always exited 0 could never have
+# caught the caller treating that as a failure. NONE prints no verdict at all (the one real error).
 if [ -n "${DOCKER_FAKE_CXELL_VERDICT:-}" ]; then
-  printf '%s\n' "$DOCKER_FAKE_CXELL_VERDICT"
-  exit 0
+  [ "$DOCKER_FAKE_CXELL_VERDICT" = "NONE" ] || printf '%s\n' "$DOCKER_FAKE_CXELL_VERDICT"
+  exit "${DOCKER_FAKE_CXELL_EXIT:-0}"
 fi
 for a in "$@"; do
   if [ "$a" = "/etc/environment" ]; then
