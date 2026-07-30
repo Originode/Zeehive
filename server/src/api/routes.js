@@ -55,6 +55,8 @@ import { checkPush, listLandRequests, decideLandRequest, dismissLandRequest, lan
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { pushToXource, pullFromXource, requestPullIn, acceptPullIn } from '../queenzee/xellgit.js';
 import { nudgeXellForStatus, sendMessageToXell } from '../queenzee/nudge.js';
+import { pauseFleet, resumeFleet } from '../queenzee/pause.js';
+import { pauseState } from '../lib/fleet-pause.js';
 import { ooneyCheck } from '../queenzee/ooney.js';
 import { checkContainerData, dataCheckReadiness } from '../queenzee/datadiff.js';
 import { compareBackupCounts } from '../lib/row-counts.js';
@@ -238,6 +240,39 @@ router.post('/prod-lock/force-release', async (req, res) => {
   if (!req.body?.project) return res.status(400).json({ error: 'project required' });
   try { res.json(await forceReleaseProdLock(req.body.project, req.body.by || 'human@console', req.body.site || null)); }
   catch (err) { res.status(409).json({ error: err.message }); }
+});
+
+// ── PAUSE / PLAY — the fleet-wide stop button ────────────────────────────────
+// One switch, deliberately FLEET-WIDE and not per project: it interrupts every zee in every xell,
+// managers included, and holds the queenzee's own turn-starting loops down until play. The state also
+// rides the /fleet snapshot (fleet.pause) — this pair is for acting on it, and the GET for a client
+// that wants just the flag.
+//
+// A HUMAN's verb only. There is no /api/xell/self/pause and there must never be one: a zee that can
+// stop the fleet can stop the zee that would land its rival's work, and every gate in this system is
+// built on a zee being able to ASK and never to ACT. (A zee that needs everything stopped has
+// `zee tend`.)
+router.get('/fleet/pause', async (_req, res) => {
+  try { res.json(await pauseState()); }
+  catch (err) { res.status(503).json({ error: `pause state unavailable: ${err.message}` }); }
+});
+
+// 409, not 200-with-a-flag, when the fleet is already in the state asked for: pressing pause twice is
+// a double-click, and the second press must not re-sweep and re-stamp zees the first one stopped.
+router.post('/fleet/pause', async (req, res) => {
+  try {
+    const state = await pauseState();
+    if (state.paused) return res.status(409).json({ error: 'the fleet is already paused', ...state });
+    res.json(await pauseFleet({ by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/fleet/resume', async (req, res) => {
+  try {
+    const state = await pauseState();
+    if (!state.paused) return res.status(409).json({ error: 'the fleet is not paused', ...state });
+    res.json(await resumeFleet({ by: req.body?.by || 'human@console' }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── read models ──────────────────────────────────────────────────────────────

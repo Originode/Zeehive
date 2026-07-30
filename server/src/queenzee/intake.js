@@ -33,6 +33,7 @@ import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
+import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -1042,6 +1043,13 @@ export function listDispatchModels(provider = 'claude') {
 // in tasks.js, a dispatch whose pool was dry) is spawning a worker. Without it the dispatch path's
 // type-aware pick would be undone one function later by an unfiltered "take the freshest ready".
 export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true, provider = 'claude', providerTokenId = null, zeeType = 'worker' }) {
+  // THE FLEET PAUSE stops turns from STARTING as well as from continuing. Every spawn path funnels
+  // through here — the console's prompt buttons, a manager dispatching a worker, an MCP dispatch — so
+  // this one check is what makes "paused" mean the fleet is still, rather than "the zees that existed
+  // when I pressed it are still". Refused loudly (the reason reaches the operator's dialog), never
+  // queued: a dispatch that fires by itself when somebody presses play is a surprise nobody asked for,
+  // and the prompt is one click to re-send.
+  if (await fleetPaused()) throw new Error(`cannot spawn a zee: ${PAUSED_REASON}`);
   const m = resolveMode(mode);
   const pid = projectId || (await defaultProjectId());
   const xell = xellId
@@ -1542,6 +1550,19 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       // not just cost_usd. The cxell CLI's final result event carries usage.{input,output,
       // cache_read_input,cache_creation_input}_tokens alongside total_cost_usd.
       const b = usageFrom(result);
+      // A turn the FLEET PAUSE cut short is not an error, and must not be filed as one. The interrupt
+      // is a SIGINT to this very process, so this handler is what runs as it dies — and 'errored' on
+      // eleven hexagons is how an operator's own deliberate pause reads as the fleet breaking. See
+      // queenzee/pause.js (markPaused), which writes the same pair from the other side.
+      if (await fleetPaused()) {
+        await q(`UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                                cache_read_tokens=$5, cache_write_tokens=$6,
+                                status='idle', last_stop_reason=$7 WHERE id=$1`,
+          [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, PAUSED_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
+        return;
+      }
       const errored = result?.is_error;
       await q(
         `UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
@@ -1555,6 +1576,15 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       logline('intake', `cxell zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})`);
     })
     .catch(async (err) => {
+      // Same reasoning as the resolve path above: while the fleet is paused, a headless run that ends
+      // ended because WE stopped it. Killing a process makes the exec reject, so this is the branch a
+      // pause usually lands in.
+      if (await fleetPaused()) {
+        await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, PAUSED_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
+        return;
+      }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, String(err.message).slice(0, 200)]);
       logline('intake', `cxell zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
     });

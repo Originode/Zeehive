@@ -20,6 +20,9 @@
 // truncated read as operational, and the operational branch deleted a caged zee's in-progress conflict
 // resolution (working tree + index, nothing committed, no way back).
 //
+// …and then it caught a #6 the cheap way, before it could cost anything: the fleet PAUSE's interrupt
+// arrived with no row here, and the count assertion at the bottom of this file is what said so.
+//
 // What this file pins is therefore the CONTRACT, not three fixes:
 //   1. dkVerdict — never lets the exit code decide, always reads stdout, hands back a STRING verdict,
 //      rejects only when the exec never ran, and says the oddity out loud when a verdict arrives with
@@ -200,8 +203,41 @@ try {
       ],
     },
     {
-      // THE SYNC MERGE — the fifth site, and the one this table caught. It is the highest-stakes of the
-      // five: its verdict decides whether the queenzee runs `git merge --abort` inside a live cage, so a
+      // The fleet PAUSE's interrupt (lib/fleet-pause.js / queenzee/pause.js). Its verdict decides
+      // whether a HUMAN is told something is wrong, and both directions are expensive: read a stuck run
+      // as stopped and an operator believes the fleet is still while a zee keeps writing; read a stopped
+      // one as unconfirmed and every pause cries wolf until nobody reads the warning. Note the exit code
+      // is genuinely uninformative here — pkill and pgrep both exit non-zero for ordinary states — so
+      // this site is the clearest case in the file for the rule.
+      name: 'interruptCxellZee (fleet pause)',
+      markers: C.INTERRUPT_MARKERS,
+      cases: [
+        { what: 'SIGINT + exit 1 + stderr noise is a STOPPED zee (the verdict, not the exit code)',
+          out: '__ZEE_INT_SIGINT__', err: 'docker: connection reset', code: 1,
+          run: () => C.interruptCxellZee({ slug: 'zt-v', graceMs: 500 }),
+          want: (r) => r?.stopped === true && r?.idle === false && r?.how === 'sigint' },
+        { what: 'IDLE is a success, and says there was no turn to stop',
+          out: '__ZEE_INT_IDLE__', err: '', code: 0,
+          run: () => C.interruptCxellZee({ slug: 'zt-v', graceMs: 500 }),
+          want: (r) => r?.stopped === true && r?.idle === true && !r?.how },
+        { what: 'STUCK is NOT a stop, however the exec exited — a zee still working must be reportable',
+          out: '__ZEE_INT_STUCK__', err: '', code: 0,
+          run: () => C.interruptCxellZee({ slug: 'zt-v', graceMs: 500 }),
+          want: (r) => r?.stopped === false && r?.how === 'stuck' },
+        { what: 'a cage the daemon says is GONE counts with idle (there is provably no turn in it)',
+          out: '', err: 'Error response from daemon: No such container: cxell_zt-v', code: 1,
+          run: () => C.interruptCxellZee({ slug: 'zt-v', graceMs: 500 }),
+          want: (r) => r?.stopped === true && r?.idle === true && r?.gone === true },
+        { what: 'and any OTHER answer with no verdict throws rather than claiming a stop',
+          out: '', err: 'something nobody has seen before', code: 1,
+          run: () => C.interruptCxellZee({ slug: 'zt-v', graceMs: 500 }),
+          want: (e) => e instanceof Error && /no verdict/.test(e.message) && /exit 1/.test(e.message)
+                       && /nobody has seen/.test(e.message) },
+      ],
+    },
+    {
+      // THE SYNC MERGE — the fifth site, and the one this table caught. It is the highest-stakes of them
+      // all: its verdict decides whether the queenzee runs `git merge --abort` inside a live cage, so a
       // verdict lost here is not a wrong log line, it is a caged zee's half-finished conflict resolution
       // deleted (working tree + index, nothing committed, no way back). It used to classify from dk's
       // REJECTION MESSAGE — two streams capped at 400 chars each — and was correct only by accident.
@@ -307,7 +343,7 @@ try {
      'the verdict comes back as its own STRING field, so there is no object left to read as one');
 
   // EVERY marker a cage script prints must be DECLARED at the exec that runs it. This is the guard
-  // that fires on a FOURTH instance: add `echo NEW_MARKER` to a script and read it off the exit code,
+  // that fires on the NEXT instance: add `echo NEW_MARKER` to a script and read it off the exit code,
   // and the token is undeclared and this fails.
   const scriptSources = ['server/src/lib/cxell.js', 'server/src/lib/npm-cache.js'];
   const printed = new Set();

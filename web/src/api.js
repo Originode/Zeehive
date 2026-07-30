@@ -9,6 +9,34 @@ export async function getFleet(projectId) {
   return r.json();
 }
 
+// ── PAUSE / PLAY ────────────────────────────────────────────────────────────────────────────────
+// The fleet-wide stop button. NOT project-scoped, on purpose: one press stops every zee in every
+// xell, managers included, and a per-project pause would leave another project's managers dispatching
+// into a fleet the operator believes is still. The current flag also rides the /fleet snapshot
+// (fleet.pause), so the button re-renders on the ordinary poll without a second request.
+//
+// Both verbs answer with the RECEIPT (counts + one row per xell), and the caller is expected to show
+// it: "paused" that silently left three zees running is the failure this UI must not hide.
+export async function pauseFleet(reason = null) {
+  const r = await fetch('/api/fleet/pause', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ reason, by: 'human@console' }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `pause failed (${r.status})`);
+  return data;
+}
+
+export async function resumeFleet() {
+  const r = await fetch('/api/fleet/resume', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console' }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `resume failed (${r.status})`);
+  return data;
+}
+
 // Lazily stream the xell list as NDJSON so hexagons paint as their data arrives instead of waiting
 // for the whole fleet. Calls onXell(xell) per line; resolves with {count} when the stream ends.
 // Abortable via an AbortController signal (the caller cancels a stale stream on project switch).
@@ -325,7 +353,10 @@ export const draftProjectManifest = (projectId, write = false) => siteCall(`/api
 export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork }) {
   const es = new EventSource(`/api/stream${pq(projectId)}`);
   es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
-  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work']) {
+  // 'fleet-pause' rides this list because a pause is the one change that can move NOTHING else: a
+  // fleet with no live cage broadcasts no zee/xell event, so without it the button would stay on
+  // 'pause' in every other open tab (and in this one, if the press came from elsewhere).
+  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work', 'fleet-pause']) {
     es.addEventListener(type, () => onChange());
   }
   // The WORK channel, delivered WITH its payload as well as counted as a change. Every other

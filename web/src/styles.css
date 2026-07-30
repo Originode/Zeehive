@@ -647,6 +647,26 @@ a.cbox:hover { border-color: var(--accent); }
 .pooltarget .step:hover:not(:disabled) { border-color: var(--accent); }
 .pooltarget .step:disabled { opacity: .35; cursor: not-allowed; }
 
+/* ── PAUSE / PLAY: the fleet-wide stop button ────────────────────────────────
+   Loud on purpose when it is ON. A paused fleet looks exactly like a quiet one — no zee moves, no
+   card changes — so the only thing telling an operator (or the next person to walk up to the screen)
+   why nothing is happening is this. Hence a red pulsing button AND a banner, not a subtle toggle. */
+.fleetpause { display: inline-flex; align-items: center; gap: 10px; margin-right: 18px; vertical-align: middle; }
+.fp-btn { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 7px; padding: 4px 12px; font-size: 14px; cursor: pointer; white-space: nowrap; }
+.fp-btn:hover:not(:disabled) { border-color: var(--accent); }
+.fp-btn:disabled { opacity: .5; cursor: progress; }
+.fleetpause.paused .fp-btn { background: #3a1414; border-color: #e5554e; color: #ffd9d2;
+  animation: fp-pulse 1.8s ease-in-out infinite; }
+.fp-banner { font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: #ffb3a7;
+  border: 1px solid #e5554e; border-radius: 6px; padding: 2px 8px; background: #2a0f0f; }
+@keyframes fp-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(229, 85, 78, .55); }
+  50%      { box-shadow: 0 0 0 5px rgba(229, 85, 78, 0); }
+}
+/* Motion is decoration here; the colour and the banner carry the meaning on their own. */
+@media (prefers-reduced-motion: reduce) { .fleetpause.paused .fp-btn { animation: none; } }
+
 /* ── the container MATRIX: role rows × machine columns ─────────────────────── */
 .matrix { display: grid; gap: 4px 14px; align-items: start; margin: 10px 0 4px;
   padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }

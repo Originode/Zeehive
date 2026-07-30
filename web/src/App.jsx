@@ -32,6 +32,7 @@ import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.j
 import MachineMatrix from './Machines.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
+import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
 import WorkConsole from './work/WorkConsole.jsx';
 import Toasts from './Toasts.jsx';
@@ -734,6 +735,11 @@ export default function App() {
       </header>
 
       <div className="statusline" data-testid="statusline">
+        {/* FIRST in the line, before anything that starts work: the one control that stops all of it.
+            Its own state is also the answer to "why is nothing happening?", which is the question the
+            rest of this line cannot answer while the fleet is paused. */}
+        <FleetPause pause={fleet.pause} onChanged={refresh}
+                    pushToast={pushToast} dismissToast={dismissToast} />
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>

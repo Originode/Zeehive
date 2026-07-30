@@ -4,6 +4,7 @@ import { q, one } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
+import { pauseState, PAUSED_STOP_REASON } from './fleet-pause.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { deviceConfig } from './devices.js';
 import { reasonPair } from './status.js';
@@ -55,6 +56,10 @@ async function fetchXellRows(pid) {
             z.claude_session_id, z.session_name, z.viewer_url, z.viewer_kind,
             z.cost_usd, z.attach_mode, z.cli_active, z.monitor_source, z.last_monitor_at,
             z.permission_mode, z.kind AS zee_kind,
+            -- WHY this zee's last turn ended. Carried for one derivation: the fleet PAUSE marks the
+            -- zees it interrupted here (lib/fleet-pause.PAUSED_STOP_REASON), and that is what tells a
+            -- paused hexagon apart from a merely idle one.
+            z.last_stop_reason AS zee_last_stop_reason,
             r.label AS runtime_label, r.key AS runtime_key,
             -- the harness this xell wears (config layer — persona/skills), NULL = core only
             hn.key AS harness_key, hn.label AS harness_label,
@@ -187,7 +192,7 @@ function containerShellable(project, c) {
 
 // Attach a xell's resolved container stack + xource/deploy heads. Mutates and returns `x`. One
 // stack query per xell — the streamable unit of work.
-async function decorateXell(x, heads, deployed, project) {
+async function decorateXell(x, heads, deployed, project, { paused = false } = {}) {
   const stack = await q(
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id, c.isolation,
             c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
@@ -227,6 +232,11 @@ async function decorateXell(x, heads, deployed, project) {
     seedPending: x.seed_pending === true,
     doneSuggested: x.done_suggested === true,
     landHolding: x.land_holding === true,
+    // PAUSED is the AND of a fleet-wide flag and a per-zee fact: the fleet is paused AND this zee's
+    // turn is the one the pause stopped. Not the flag alone — a zee that was already between turns
+    // when the button was pressed was not interrupted, and painting it 'paused' would tell the
+    // operator they stopped work that had already finished.
+    paused: paused && x.zee_last_stop_reason === PAUSED_STOP_REASON,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
@@ -276,8 +286,9 @@ export async function streamXells(projectId, onXell) {
   if (!project) return null;
   const { heads, deployed } = await fleetGitContext(project);
   const rows = await fetchXellRows(project.id);
+  const { paused } = await pauseState();
   for (const x of rows) {
-    await decorateXell(x, heads, deployed, project);
+    await decorateXell(x, heads, deployed, project, { paused });
     await onXell(x);
   }
   return project;
@@ -324,7 +335,10 @@ export async function getFleet(projectId) {
   // xells with their resolved container stack + live zee + runtime label. Same rows + decoration
   // the streaming path emits — just collected into an array here rather than flushed one by one.
   const xells = await fetchXellRows(pid);
-  for (const x of xells) await decorateXell(x, heads, deployed, project);
+  // The fleet PAUSE, read ONCE for the whole snapshot: it is a single fleet-wide flag, so asking per
+  // xell would be one round-trip per hexagon for one boolean.
+  const pause = await pauseState();
+  for (const x of xells) await decorateXell(x, heads, deployed, project, { paused: pause.paused });
 
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
@@ -487,6 +501,9 @@ export async function getFleet(projectId) {
     prod_lock: prodLock || null,
     landing_pad: landingPad,
     done_suggestions: doneSuggestions,
+    // The pause/play switch, so the console's button and banner ride the poll every other control
+    // already rides (there is no second endpoint to keep in step with the hexagons it explains).
+    pause,
   };
 }
 
