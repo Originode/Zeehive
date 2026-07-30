@@ -78,6 +78,20 @@ human's click.**
   (commits are collected first). A **manager zee** may only *suggest* that another xell is done —
   the same human click, with a typed confirmation, is still what ends it.
 
+And one control that is the opposite of a gate — a gate holds ONE act until a human agrees; this
+stops everything until they say otherwise:
+
+- **Pause / play** — one button in the console statusline, fleet-wide across every project. **Pause**
+  interrupts the running turn in every live cxell (workers *and* manager zees) with a SIGINT, and
+  holds down everything that would start another: no dispatch, no landing/clearance/reflection nudge,
+  no operator or manager message reaching a session. It touches nothing else — no commit, no branch,
+  no request, no gate — so a paused zee loses the remainder of its turn and nothing more, and the
+  paused hexagons say `paused` rather than going quiet. **Play** lowers the flag and calls back
+  exactly the zees the pause interrupted, each with a prompt telling it what happened (an interrupted
+  turn is otherwise indistinguishable from a crash) and sending it to `zee status` for anything that
+  changed while it was stopped. It is a HUMAN verb only: there is no `zee pause`, because a zee that
+  could stop the fleet could stop the zee about to land a rival change.
+
 ## GitHub-centric, inbound by default — outbound opt-in
 
 The code lives on GitHub; every instance is born from it (self-onboard) and refreshed from it

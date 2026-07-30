@@ -25,10 +25,13 @@
 // pure shell and the pattern is the whole point). §2–§7 run against DATABASE_URL with real rows, torn
 // down in a finally. PROVISION_MODE stays 'simulate', so nothing here can touch a machine.
 import { execFileSync, spawn } from 'node:child_process';
+import { build as esbuild } from 'esbuild';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
 
 const url = process.env.DATABASE_URL;
@@ -329,7 +332,10 @@ try {
   const app = read('web/src/App.jsx');
   ok(/<FleetPause\s/.test(app) && /pause=\{fleet\.pause\}/.test(app),
      'the console renders the button from the fleet snapshot');
-  ok(/data-testid="fleet-pause-btn"/.test(app) && /data-testid="fleet-paused-banner"/.test(app),
+  // The control is its OWN component file (like ModeChip/CrewChip), not another few hundred lines of
+  // App.jsx — which is also what lets §8 below render it.
+  const ctl = read('web/src/FleetPause.jsx');
+  ok(/data-testid="fleet-pause-btn"/.test(ctl) && /data-testid="fleet-paused-banner"/.test(ctl),
      'as a button AND, while paused, a banner — a paused fleet looks exactly like a quiet one');
   const api = read('web/src/api.js');
   ok(/export async function pauseFleet/.test(api) && /export async function resumeFleet/.test(api),
@@ -337,6 +343,45 @@ try {
   ok(/'fleet-pause'\]/.test(api),
      "and 'fleet-pause' rides the SSE change list — a pause on an empty fleet moves nothing else, so "
      + 'without it every other tab keeps showing the wrong button');
+
+  // ── 8. the control, RENDERED ────────────────────────────────────────────────────────────────────
+  // Static greps prove the props are passed; they cannot prove the thing draws. Both states are
+  // rendered through the same esbuild+SSR seam the board test uses, because the paused state is the
+  // one an operator has to read at a glance and it is the one that only appears when things are wrong.
+  console.log('\n── the control, rendered in both states ──');
+  const outDir = mkdtempSync(join(ROOT, '.fleetpause-render-'));
+  try {
+    const bundle = join(outDir, 'bundle.mjs');
+    await esbuild({
+      stdin: { contents: "export { default as FleetPause } from './web/src/FleetPause.jsx';\n",
+               resolveDir: ROOT, sourcefile: 'render-entry.js', loader: 'js' },
+      bundle: true, format: 'esm', outfile: bundle, jsx: 'automatic', logLevel: 'silent',
+      external: ['react', 'react-dom', 'react/jsx-runtime'],
+    });
+    const { FleetPause } = await import(pathToFileURL(bundle).href);
+    const render = (pause) => renderToStaticMarkup(
+      React.createElement(FleetPause, { pause, onChanged: () => {}, pushToast: () => {}, dismissToast: () => {} }));
+
+    const running = render({ paused: false });
+    ok(/⏸ pause/.test(running), 'running: the button offers PAUSE');
+    ok(!/fleet-paused-banner/.test(running), 'and there is no banner (nothing to warn about)');
+    ok(/every zee/i.test(running) && /managers included/i.test(running),
+       'its tooltip says what it will actually do — every zee, managers included');
+
+    const paused = render({ paused: true, by: 'mark@console', reason: 'rate limit', interrupted: 7 });
+    ok(/▶ play/.test(paused), 'paused: the same button offers PLAY');
+    ok(/class="fleetpause paused"/.test(paused), 'and carries the paused class the loud styling hangs off');
+    ok(/FLEET PAUSED by mark@console/.test(paused) && /7 zee\(s\) stopped/.test(paused) && /rate limit/.test(paused),
+       'the banner says who stopped it, how many zees, and why');
+
+    // A snapshot from a server too old to carry fleet.pause must not blank the console.
+    ok(/⏸ pause/.test(renderToStaticMarkup(React.createElement(FleetPause,
+        { pause: undefined, onChanged: () => {}, pushToast: () => {}, dismissToast: () => {} }))),
+       'and with no pause in the snapshot at all it renders as running rather than throwing');
+  } finally {
+    rmSync(outDir, { recursive: true, force: true });
+  }
+
 } finally {
   await cleanup({ files: true });
   await client.end().catch(() => {});

@@ -57,6 +57,10 @@ export const TICKET_KINDS = ['bug', 'feature', 'chore', 'question', 'incident'];
 // Null is a real answer and the common one: 'vac-ready', 'live-protected', 'occ-seedRequest' and
 // friends say nothing about the work item a zee happens to be holding, and inventing a status from
 // them would be worse than silence. Callers treat null as "no live hint".
+//
+// 'occ-paused' is deliberately among them. An operator stopping the fleet says nothing about whether
+// the WORK is queued, in review or blocked — it is the same item, mid-flight, with the agent switched
+// off — so the card keeps the status it had and does not flicker to 'blocked' and back on a press.
 export function statusFromHive(hiveStatusKey) {
   switch (hiveStatusKey) {
     case 'occ-working':      return 'working';
