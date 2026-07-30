@@ -499,6 +499,12 @@ try {
      'best-effort: a swap that WORKED is not reported as failed because a message row could not be written');
   ok(core.indexOf('notifyManagerOfSwap(') > core.indexOf('dispatchXell('),
      'and it is told AFTER the new zee is in — never about a swap that did not happen');
+  // …and the OTHER end of that same rule: after the retire there is a second outcome, and it has
+  // its own wording. Both live in the core, so neither caller can have one without the other.
+  ok(/notifyManagerOfHalfSwap\(/.test(core) && /markXellHalfSwapped\(/.test(core),
+     'the FAILURE path after the retire both tells the manager and repairs the xell state — in the core');
+  ok(/markXellHalfSwapped\([\s\S]{0,200}\.catch\(/.test(core) && /notifyManagerOfHalfSwap\([\s\S]{0,320}\.catch\(/.test(core),
+     'and both are best-effort — neither may sink the answer the clicking human is waiting for');
 
   const routes = readFileSync(new URL('../server/src/api/routes.js', import.meta.url), 'utf8');
   ok(/router\.post\('\/xells\/:id\/swap'/.test(routes),
@@ -509,6 +515,79 @@ try {
   ok(/409/.test(route) && /404/.test(route) && /502/.test(route),
      "a refusal answers 409, an unknown xell 404, and a swap the queenzee could not finish 502 — each "
      + "carrying the server's own sentence");
+
+  // ── 10. ONE FULL SWAP, END TO END — with a STUBBED RUNTIME ────────────────────────────────
+  // Everything above this line stops at the spawn. That is not a gap in the assertions, it is a
+  // property of where the suite runs: a cxell has no docker, and the success path ends in a real
+  // cage spawn — so the LAST THIRD of the verb (the new zee coming up, the work-item re-link, the
+  // manager notification) had never been observed running at all. It is also where the one bug this
+  // file has caught by execution was hiding: notifyManagerOfSwap died on a NOT NULL constraint for
+  // every human swap, silently, because it is best-effort and nothing ever reached it.
+  //
+  // So: connect a stub account, and let the same fake docker answer the ONE call that decides a
+  // spawn — the vendor CLI exec — with the two stream-json events intake.js waits for. Nothing else
+  // changes; the cage build runs its real sequence against the same fake daemon.
+  console.log('\none whole swap, end to end: the new zee comes up, the card is re-linked, the manager is told');
+  await client.query(
+    `INSERT INTO provider_token (project_id, provider, label, token, token_hint)
+       VALUES ($1,'claude','stub account for the swap e2e','sk-ant-stub-not-a-real-token','stub')`, [PID]);
+  setState({ running: { 'cxell_crew-work-aa11bb': true }, bundle, commits: 1, session: 'stub-session-e2e' });
+  writeFileSync(callLog, '');
+  const tasksBefore = (await client.query(`SELECT count(*)::int AS n FROM task WHERE xell_id=$1`, [worker.id])).rows[0].n;
+
+  const done = await swapXellZeeAsHuman({ xellId: worker.id, harness: 'dev-reviewer',
+                                          task: 'REVIEW what the builder wrote.', by: 'mark@console' });
+  ok(done.ok === true && done.swapped === true,
+     `the swap COMPLETED [${done.ok ? done.message.slice(0, 90) : (done.error || '').slice(0, 140)}]`);
+  ok(done.harness?.key === 'dev-reviewer' && done.slug === 'crew-work-aa11bb' && done.branch === worker.branch,
+     'the same xell, on the same branch, now wearing the incoming persona');
+
+  // THE NEW ZEE IS REALLY IN THERE — a row of its own, live, holding the session the runtime gave it.
+  const zees = (await client.query(
+    `SELECT * FROM zee WHERE xell_id=$1 ORDER BY created_at DESC`, [worker.id])).rows;
+  const fresh = zees[0];
+  ok(fresh.id !== outgoing.id && fresh.entrypoint === 'cxell-cli',
+     'a NEW zee row exists for this xell, caged (entrypoint cxell-cli)');
+  ok(fresh.claude_session_id === 'stub-session-e2e',
+     `carrying the session id the runtime announced — the spawn was OBSERVED, not assumed [${fresh.claude_session_id}]`);
+  // The stub answers and exits, so its turn ends immediately: 'working' at init, 'idle' at the
+  // result event. Either is a zee that started; what would fail here is 'errored' or no row at all.
+  ok(['working', 'idle'].includes(fresh.status), `and it started (status ${fresh.status})`);
+  ok(zees.filter((z) => ['spawning', 'online', 'working', 'idle'].includes(z.status)).length === 1,
+     'exactly ONE live zee in the xell — the outgoing one stays retired, not resurrected');
+  ok(calls().some((c) => /^exec -i .*claude --bare -p --output-format stream-json/.test(c)),
+     'and the vendor CLI really was run inside this cage (the agent exec is in the docker call log)');
+
+  // THE WORK-ITEM RE-LINK — the board's thread through a swap. work_item.xell_id survives by itself,
+  // but the TASK row is new and it is the task that carries work_item_id.
+  const taskRows = (await client.query(
+    `SELECT * FROM task WHERE xell_id=$1 ORDER BY created_at DESC`, [worker.id])).rows;
+  ok(taskRows.length === tasksBefore + 1, 'the swap recorded a new task row for the incoming zee');
+  ok(taskRows[0].work_item_id === item.id,
+     're-linked to the SAME work item — without this the card loses its history at every swap');
+  ok(done.work_item?.id === item.id, 'and the answer names the card that came along');
+  ok(/YOU ARE INHERITING THIS XELL/.test(taskRows[0].prompt_text || '')
+     && /REVIEW what the builder wrote\./.test(taskRows[0].prompt_text || ''),
+     'the task the new zee was actually dispatched with is the HANDOVER brief, not a bare re-task');
+
+  // THE MANAGER NOTIFICATION, fired by the swap itself rather than called by hand (§8 asserts the
+  // wording; this asserts that the swap REACHES it).
+  ok(done.manager_notified?.ok === true, 'the swap notified the watching manager (best-effort, and it worked)');
+  const mgrInbox = await inboxFor(manager.id, { all: true });
+  ok(/A HUMAN swapped the zee in your worker crew-work-aa11bb: it now wears "dev-reviewer"/.test(mgrInbox[0]?.body || ''),
+     'and the newest message in its inbox is that swap, in the SUCCESS wording');
+  ok(/replacing dev-builder/.test(mgrInbox[0].body),
+     'naming the persona that was replaced — read from the xell, so a swap chain stays traceable');
+
+  // AND THE HALF-SWAP TEND IS LOWERED. It said "there is NO zee in this xell"; there is one now, and
+  // a stale "needs a human" competing with a real one is the failure the manual warns zees about.
+  const after = await tendState(worker.id);
+  ok(after.open === false, 'the tend the earlier HALF-swap raised is lowered — that ask has been answered');
+  const crewAfter = (await crewFor(manager.id)).find((c) => c.slug === 'crew-work-aa11bb');
+  ok(crewAfter?.hive_status !== 'occ-tendRequest' && (crewAfter?.waiting_on_human || []).length === 0,
+     `\`zee zees\` shows a crewed xell again, waiting on nobody [${crewAfter?.hive_status}]`);
+  ok((await readXell(worker.id)).is_pooled === false,
+     'and it is still out of the pool — a swap never offers a working xell to the next dispatch');
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
