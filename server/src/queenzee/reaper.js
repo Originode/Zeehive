@@ -252,7 +252,29 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
   // Only run it when the worktree actually exists on disk — in simulate mode the
   // worktree was never created, so there is nothing to tear down.
   const script = resolve(config.repoRoot, 'scripts', 'despawn-xell.sh');
-  let despawn = { skipped: true };
+  // WHY THE DESPAWN DID NOT RUN, named — because four different reasons used to drop out of one `&&`
+  // chain into the same three words, "despawn failed", and a human reading that goes hunting a docker
+  // fault that does not exist. The four need different responses: a missing SCRIPT is a broken
+  // queenzee deployment (every teardown after this one is degraded too); no worktree PATH is a pooled
+  // xell that never had one; a path that is already gone is nothing to do and is fine; and simulate is
+  // the mode working. Behaviour is unchanged — a missing script still never blocks a teardown.
+  const skipReason = !destructive
+    ? 'PROVISION_MODE=simulate, nothing was torn down'
+    : !existsSync(script)
+      ? `the despawn script is MISSING from this queenzee's own tree (${script}) — nothing was purged and `
+        + 'nothing here is a docker fault; every teardown on this queenzee is degraded until the file is back'
+      : !xell.worktree_path
+        ? 'this xell has no worktree_path recorded — there was nothing on disk to tear down'
+        : !existsSync(xell.worktree_path)
+          ? `its worktree was already gone from disk (${xell.worktree_path}) — nothing left to purge`
+          : null;
+  // The missing-script case is a DEPLOYMENT fault, not a per-xell one: say it once, loudly, on the
+  // channel a human actually reads. The same stance as the cxell file installs.
+  if (destructive && !existsSync(script)) {
+    logline('reaper', `!!! ${xell.slug}: ${skipReason}`);
+    console.error(`[reaper] !!! despawn script missing: ${script} — teardowns purge nothing until it is restored`);
+  }
+  let despawn = { skipped: true, ...(skipReason ? { reason: skipReason } : {}) };
   if (destructive && existsSync(script) && xell.worktree_path && existsSync(xell.worktree_path)) {
     // Despawn on the xell's OWN machine — its containers' stamped context, which since machines
     // (023) can differ per xell. The project dev site and the global env default are fallbacks
@@ -269,6 +291,13 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
     const line = (r.stdout || '').trim().split('\n').filter(Boolean).pop();
     let verdict = null; try { verdict = JSON.parse(line); } catch { /* no JSON line */ }
     despawn = { code: r.status, ...(verdict || {}), stderr: (r.stderr || '').slice(-600) };
+    // "the script RAN and failed" is a different fact from "the script was not there", and the log
+    // below prints whichever `reason` it is given. Say which, with the exit code and the tail of the
+    // script's own complaint — that is the line a human can act on.
+    if (!despawn.reason && (r.status !== 0 || verdict?.ok === false)) {
+      const tail = (r.stderr || r.stdout || '').trim().split('\n').filter(Boolean).pop() || 'no output';
+      despawn.reason = `the despawn script RAN and failed (exit ${r.status ?? '?'}): ${tail.slice(0, 200)}`;
+    }
   }
 
   // --rm SEMANTICS: reclaim this xell's built images BEFORE dropping the container rows — those
@@ -312,7 +341,10 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
   const orphaned = xell.worktree_path && existsSync(xell.worktree_path);
   if (orphaned) {
     logline('reaper', `retired ${xell.slug} BUT its worktree is still on disk: ${xell.worktree_path} — `
-      + `${despawn.reason || (destructive ? 'despawn failed' : 'PROVISION_MODE=simulate, nothing was torn down')}`);
+      // every path above now sets a reason (missing script / no path / already gone / ran-and-failed /
+      // simulate), so this no longer has to guess "despawn failed" and send a human after a phantom
+      // docker fault. The bare fallback stays only for a future branch that forgets to set one.
+      + `${despawn.reason || 'despawn did not run and did not say why — that is a bug in reaper.js'}`);
   } else {
     logline('reaper', `retired ${xell.slug}: zee decommissioned, worktree + containers removed ✓`);
   }
