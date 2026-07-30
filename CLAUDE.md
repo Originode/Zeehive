@@ -28,11 +28,30 @@ test -n "$ZEEHIVE_XELL_TOKEN" && echo "CXELL (caged zee)" || echo "HOST (or plai
 | network | default-DROP egress: `api.anthropic.com`, your own containers, the queenzee API | whatever the machine has |
 | verbs | the **`zee`** CLI (§2) | `scripts/xell-*.mjs`, `skill/`, the console, MCP |
 | main/master | **not a ref in here** — `git fetch`/`git rebase main` cannot work; use `zee sync` | normal git |
+| the API | **TWO servers answer the same paths** — see below | one server, no ambiguity |
 
 If you are in a cxell, **the host column does not exist for you**. `docker`, `docker --context …`,
 `scripts/provision-xell.sh`, the `/xell` slash-commands and the MCP server are all real code in this
 repo and all unreachable from your cage — by design, not by outage. Do not try to route around it;
 the cage is the product working.
+
+### ⚠ Two servers answer the same paths — ask the right one
+
+Same failure family as running the other surface's verbs, and harder to catch, because **nothing
+fails**: you get a well-formed answer from a real server that is answering a different question.
+
+| you reach | at | it answers |
+|---|---|---|
+| **your OWN build** | the app-tier host:port in your binding | *does MY BRANCH have this?* |
+| **the real queenzee** | `zee` (→ `host.docker.internal:4700`) | *does the FLEET have this?* |
+
+`zee build` puts YOUR code on your own server, so it has every route your branch adds — including
+routes production has never seen. So a `200`, or an auth `401`, from your own server is **not**
+evidence that the fleet has shipped anything. One zee reported that a queenzee route 404s, re-probed
+its own server, got a well-formed `401`, and was one message from "correcting" a true report into a
+false one. If the question is *"does the fleet have this yet"*, probe through `zee` or
+`host.docker.internal:4700`, **and send a known-good path alongside as a control** — a bare 404 with
+nothing to compare it against cannot tell a missing route from an unreachable server.
 
 ## 2. If you are a cxell zee
 
