@@ -1108,6 +1108,15 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
     }
   }
 
+  // IS SOMEBODY ALREADY IN THIS WORK? (#33) Read BEFORE the dispatch, so the answer describes the fleet
+  // as it was when the decision was made — and read best-effort: overlapForBrief never throws, and a
+  // failure inside it degrades to fewer warnings, never to a dispatch that did not happen. Advisory by
+  // construction: nothing below branches on it. The manager is the one party who can act on it.
+  const { overlapForBrief, overlapNote } = await import('../lib/work-overlap.js');
+  const overlap = await overlapForBrief({ projectId: xell.project_id, brief: text, excludeXellId: xell.id });
+  const note = overlapNote(overlap);
+  if (note) logline('crew', `${xell.slug}: dispatching into work ${overlap.warnings.length} other live xell(s) already touch`);
+
   const { dispatchXell } = await import('./intake.js');
   let out;
   try {
@@ -1123,10 +1132,11 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   }
   logline('crew', `${xell.slug} dispatched a worker into ${out.slug}`);
   return {
-    ok: true, ...out,
+    ok: true, ...out, overlap,
     message: `Dispatched a worker into ${out.slug} — it reports to you and is seated next to you in the `
       + 'honeycomb. Watch it with `zee zees`, talk to it with `zee say --to ' + out.slug + ' --message "…"`. '
-      + 'It lands its OWN work (a human approves); you cannot land for it.',
+      + 'It lands its OWN work (a human approves); you cannot land for it.'
+      + (note ? `\n\n${note}` : ''),
   };
 }
 
