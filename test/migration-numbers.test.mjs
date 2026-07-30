@@ -55,17 +55,18 @@ const GRANDFATHERED = {
   // And one more, landed in the minutes between this lint being written and being landed. Both files
   // were already on main, so neither was mine to renumber — the repair is forward, i.e. this line.
   '088': ['088_manager_manual_harness_key.sql', '088_manager_manual_scratch_resolution.sql'],
-  // 090 was here and is deliberately NOT: it is the one collision that got renumbered instead, and a
-  // line for it would license the next one. 090_manager_manual_swap_verb landed at 00:04; three
-  // minutes later a second xell moved its own file off a colliding 087 and onto 090, reading its
-  // worktree's max — which cannot see a sibling's branch. But 090_restore_report.sql never sat on a
-  // main TIP: its author caught the clash on its own branch and landed the add and the 090→095
-  // rename together (32250d0 then 6139df6, one merge), so no database ever ran that filename and the
-  // rename cost nothing — the case the grandfather rule exists to avoid never happened here. The
-  // entry that briefly recorded it was written 66 seconds after the rename landed, from a sync that
-  // predated it: stale from birth, and caught by the re-verification below rather than by anyone
-  // noticing. The lesson is not in this list, it is that `zee migration-number` is in main and its
-  // route still 404s on the live queenzee, so the verb this lint points at cannot be used yet.
+  // (The EIGHTH collision was here — 090 twice, created BY a renumber escaping a different one — and it
+  // is gone because somebody moved 090_restore_report.sql to 095. Its line is DELETED rather than left:
+  // a grandfather entry that no longer describes a real duplicate is a standing permit for the next
+  // collision on that number, which is why this list is checked in both directions. And this rename
+  // was SAFE, which is the part worth recording accurately: that file never sat on a deployable tip
+  // under either earlier name. Checked, not assumed — no first-parent commit of master contains
+  // db/migrations/087_restore_report.sql or 090_restore_report.sql, and a clone of the production
+  // ledger holds 095_restore_report.sql and neither of the others, so no shared database re-ran it.
+  // The renumber was done on its author's own branch, before landing, which is exactly where a number
+  // may still be changed. The hazard the grandfather rule exists for is real — schema_migrations keys
+  // on FILENAME, so renaming a file that HAS applied re-runs it — it simply was not paid here, and the
+  // way to tell the two cases apart is the check above, not the number's history.)
 };
 
 // The whole check, as a function of a FILE LIST — so the samples below run through the identical
