@@ -92,10 +92,14 @@ export async function setPaused(paused, { by = 'human@console', reason = null } 
      ON CONFLICT (id) DO UPDATE SET
        paused     = EXCLUDED.paused,
        paused_at  = CASE WHEN EXCLUDED.paused THEN COALESCE(fleet_pause.paused_at, now()) ELSE NULL END,
-       paused_by  = CASE WHEN EXCLUDED.paused THEN EXCLUDED.paused_by ELSE NULL END,
-       reason     = CASE WHEN EXCLUDED.paused THEN EXCLUDED.reason ELSE NULL END,
+       paused_by  = CASE WHEN EXCLUDED.paused THEN $2::text ELSE NULL END,
+       reason     = CASE WHEN EXCLUDED.paused THEN $3::text ELSE NULL END,
        resumed_at = CASE WHEN EXCLUDED.paused THEN NULL ELSE now() END,
-       resumed_by = CASE WHEN EXCLUDED.paused THEN NULL ELSE EXCLUDED.paused_by END
+       -- $2 DIRECTLY, not EXCLUDED.paused_by. EXCLUDED carries the row this statement would have
+       -- INSERTED, and that row's paused_by is itself "CASE WHEN paused THEN $2 ELSE NULL" — so on a
+       -- resume it is NULL, and reading it back here recorded every play as done by nobody. The
+       -- parameters are in scope in ON CONFLICT; the derived column is the wrong place to read them from.
+       resumed_by = CASE WHEN EXCLUDED.paused THEN NULL ELSE $2::text END
      RETURNING *`,
     [!!paused, by, reason]);
   cached = { paused: !!r?.paused, at: Date.now() };

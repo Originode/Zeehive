@@ -252,8 +252,12 @@ try {
   forgetPauseCache();
   ok(await fleetPaused() === true, 'the hot-path read agrees with the row (and re-reads it after the cache is dropped)');
   await setPaused(false, { by: 'test@console' });
-  ok((await pauseState()).paused === false && (await pauseState()).reason === null,
+  const st2 = await pauseState();
+  ok(st2.paused === false && st2.reason === null,
      'lowering it clears the reason too — a stale "why" outliving the pause is a lie on the banner');
+  ok(st2.resumed_by === 'test@console' && !!st2.resumed_at,
+     'and records who pressed PLAY (the first cut read this back off EXCLUDED, whose value on a resume '
+     + 'is already NULL — so every play was recorded as done by nobody)');
 
   // ── 3. the gates: while paused, NOTHING starts a turn ───────────────────────────────────────────
   console.log('\n── the gates: every door that starts a turn is shut ──');
