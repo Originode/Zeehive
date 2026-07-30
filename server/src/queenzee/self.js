@@ -1341,7 +1341,8 @@ export async function swapBrief({ manager = null, target, harness: h, task = nul
 // worker's commits is the one outcome that cannot be undone, and a swap that did not happen costs
 // nothing but a message.
 export async function selfSwap(xell, { to = null, harness = null, task = null, model = null,
-                                       mode = null, runtime = null, title = null } = {}) {
+                                       mode = null, runtime = null, title = null,
+                                       provider = null, provider_token_id = null } = {}) {
   const guard = requireManager(xell, 'swap');
   if (guard) return guard;
 
@@ -1393,7 +1394,8 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
   // out?). Everything below — the gate check, the collect-before-recreate, the retire, the
   // re-dispatch — is the swap itself, and it lives in ONE function that the human console route
   // calls too. See swapZeeInXell.
-  return swapZeeInXell({ target, harness: h, task, model, mode, runtime, title, manager: xell });
+  return swapZeeInXell({ target, harness: h, task, model, mode, runtime, title, manager: xell,
+                          provider, provider_token_id });
 }
 
 // ── THE HALF-SWAPPED XELL, MADE HONEST ───────────────────────────────────────────────────────────
@@ -1471,7 +1473,8 @@ export async function markXellHalfSwapped({ target, harness: h, error = null, co
 // persona underneath it). The refusals are identical either way.
 export async function swapZeeInXell({ target, harness: h, task = null, model = null, mode = null,
                                      runtime = null, title = null, manager = null,
-                                     by = 'human@console' } = {}) {
+                                     by = 'human@console',
+                                     provider = null, provider_token_id = null } = {}) {
   const who = manager ? manager.slug : (by || 'a human');
   const asked = manager ? `manager ${manager.slug}` : `human ${by || 'human@console'}`;
 
@@ -1589,6 +1592,8 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
       rename: false,
       ...(target.manager_xell_id ? { manager_xell_id: target.manager_xell_id } : {}),
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
+      ...(provider ? { provider } : {}),
+      ...(provider_token_id ? { provider_token_id } : {}),
     });
   } catch (e) {
     // ── THE HALF-SWAPPED STATE ────────────────────────────────────────────────────────────────
@@ -1695,7 +1700,8 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
 // is made here, by the same code.
 export async function swapXellZeeAsHuman({ xellId, harness = null, task = null, model = null,
                                           mode = null, runtime = null, title = null,
-                                          by = 'human@console' } = {}) {
+                                          by = 'human@console',
+                                          provider = null, provider_token_id = null } = {}) {
   const target = xellId
     ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId]).catch(() => null)
     : null;
@@ -1719,7 +1725,8 @@ export async function swapXellZeeAsHuman({ xellId, harness = null, task = null, 
       `"${h.key}" belongs to project "${owner?.name || h.project_id}" — a project-scoped persona is `
       + "visible to its own project only. Use a system-wide harness, or one of this project's own." };
   }
-  return swapZeeInXell({ target, harness: h, task, model, mode, runtime, title, manager: null, by });
+  return swapZeeInXell({ target, harness: h, task, model, mode, runtime, title, manager: null, by,
+                          provider, provider_token_id });
 }
 
 // POST /api/xell/self/say — type a message into a worker's live session (`zee say`).

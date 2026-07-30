@@ -515,6 +515,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
   const rafRef = useRef(0);
   const setExpandedId = onExpand || (() => {});
   const emitHover = setHover || (() => {});
+  // ── canvas button tooltip: DOM overlay created imperatively so onPointerMove never re-renders ──
+  const tipRef = useRef({ el: null, kind: null });  // .el = DOM element, .kind = current verb kind
   // the base commit a xell sits on (for tying a hex hover to its commit dot, and vice-versa)
   const baseOf = useCallback((id) => (timeline?.xells || []).find((t) => t.id === id)?.base_commit || null, [timeline]);
 
@@ -851,6 +853,29 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       const f = cw ? null : hitFlower(wx, wy);
       cursor = cw || b || (f && ((f.cell === 0 && f.openable) || diffPetal(expanded, f.cell))) ? 'pointer'
         : hitContainer(wx, wy) ? 'context-menu' : 'default';   // right-click hint on an icon
+      // Button tooltip — update the persistent DOM element directly on pointer move.
+      const tooltip = tipRef.current;
+      if (b && VERB_TOOLTIP[b.kind]) {
+        if (!tooltip.el) {
+          tooltip.el = document.createElement('div');
+          tooltip.el.className = 'hive-tooltip';
+          tooltip.el.innerHTML = '<span class="hive-tooltip-k"></span><span class="hive-tooltip-t"></span>';
+          wrapRef.current?.appendChild(tooltip.el);
+        }
+        if (tooltip.kind !== b.kind) {
+          tooltip.kind = b.kind;
+          const k = tooltip.el.children[0], t = tooltip.el.children[1];
+          k.textContent = b.kind;
+          t.textContent = VERB_TOOLTIP[b.kind];
+        }
+        const bb = wrapRef.current.getBoundingClientRect();
+        tooltip.el.style.left = `${e.clientX - bb.left + 14}px`;
+        tooltip.el.style.top = `${e.clientY - bb.top - 32}px`;
+        tooltip.el.style.display = 'flex';
+      } else if (tooltip.el) {
+        tooltip.kind = null;
+        tooltip.el.style.display = 'none';
+      }
       emitHover({ id: cw?.id || null, commit: null, harness: null });
     } else {
       const hx = hitHex(wx, wy);
@@ -863,6 +888,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         emitHover({ id: null, commit: null, harness: hb?.id || null });
         cursor = hb ? 'pointer' : 'default';
       }
+      const tooltip = tipRef.current;                                  // no bloom → no button tooltip
+      if (tooltip.el) { tooltip.kind = null; tooltip.el.style.display = 'none'; }
     }
     canvasRef.current.style.cursor = cursor;
   };
@@ -933,7 +960,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     onContainerMenu?.(e, c);
   };
 
-  const onLeave = () => { emitHover({ id: null, commit: null }); dragRef.current = null; };
+  const onLeave = () => {
+    emitHover({ id: null, commit: null }); dragRef.current = null;
+    if (tipRef.current.el) { tipRef.current.kind = null; tipRef.current.el.style.display = 'none'; }
+  };
 
   useEffect(() => {
     const onKey = (e) => {
@@ -953,6 +983,10 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
   });
+  // Clean up the imperative tooltip element on unmount
+  useEffect(() => {
+    return () => { if (tipRef.current.el) { tipRef.current.el.remove(); tipRef.current.el = null; } };
+  }, []);
 
   return (
     <div ref={wrapRef} className="hive-canvas-wrap">
@@ -1619,12 +1653,28 @@ export function petalVerbs(x, diff) {
 
 // kind → the label and accent it is drawn with (the verb list above stays pure/testable).
 const VERB_LABEL = {
-  build: '🔨 build', terminal: '⌨ terminal', nudge: '💬 nudge', env: '❖ env', message: '📨 message',
+  build: '🔨 build', terminal: '⌨', nudge: '💬', env: '❖ env', message: '📨 message',
   pull: '↓ pull', land: '⬆ land', pr: 'PR', ship: '🚀 ship', swap: '♻ swap zee',
-  pause: '⏸ pause', resume: '▶ play',
+  pause: '⏸', resume: '▶',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
   done: 'error', swap: 'working', pause: 'error', resume: 'working' };
+// Verb tooltips shown when hovering an icon-only button on the canvas flower.
+const VERB_TOOLTIP = {
+  terminal: 'Open a live terminal into this cxell zee',
+  nudge: 'Nudge the zee back into its session — calls it after a pause or inactivity',
+  build: 'Build the app tier containers',
+  env: 'View this xell\'s environment variables',
+  message: 'Send a message to this zee',
+  pull: 'Pull latest from the remote source',
+  land: 'Land your committed work on main',
+  pr: 'Open a pull request',
+  ship: 'Ship to production',
+  swap: 'Swap the zee for a different persona',
+  done: 'Mark this xell done',
+  pause: 'Pause this xell — interrupts its zee mid-turn',
+  resume: 'Resume this xell — calls the zee back',
+};
 
 function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];

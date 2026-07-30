@@ -1415,6 +1415,7 @@ router.post('/xell/self/swap', async (req, res) => {
       to: req.body?.to, harness: req.body?.harness, task: req.body?.task || null,
       model: req.body?.model || null, mode: req.body?.mode || null,
       runtime: req.body?.runtime || null, title: req.body?.title || null,
+      provider: req.body?.provider || null, provider_token_id: req.body?.provider_token_id || null,
     })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -1519,6 +1520,7 @@ router.post('/xells/:id/swap', async (req, res) => {
       xellId: req.params.id, harness: b.harness, task: b.task || null,
       model: b.model || null, mode: b.mode ?? null, runtime: b.runtime || null,
       title: b.title || null, by: b.by || 'human@console',
+      provider: b.provider || null, provider_token_id: b.provider_token_id || null,
     });
     if (out?.ok) return res.json(out);
     // 404 a xell that does not exist · 409 a REFUSAL (a rule said no, and the answer says which) ·

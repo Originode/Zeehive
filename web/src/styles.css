@@ -1507,6 +1507,19 @@ a.cbox:hover { border-color: var(--accent); }
 .hive-canvas { position: absolute; inset: 0; }
 .hive-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
   color: var(--muted); font-size: 13px; }
+/* Tooltip for icon-only canvas flower buttons — a DOM overlay so text is crisp and can wrap.
+   Appears near the cursor when hovering a verb button that shows an icon without text. */
+.hive-tooltip {
+  position: absolute; z-index: 30; pointer-events: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px; border-radius: 6px;
+  background: #1a1f2a; color: #e6ebf2;
+  font-size: 12px; line-height: 1.3; white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  border: 1px solid #2a3242;
+}
+.hive-tooltip-k { font-weight: 700; color: #5b8cff; text-transform: uppercase; font-size: 10px; }
+.hive-tooltip-t { font-weight: 400; color: #e6ebf2; }
 
 /* the panels half scrolls independently; drop the old flex/rail padding assumptions */
 .hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }

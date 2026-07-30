@@ -16,7 +16,7 @@
 // second copy of those rules in here would be a second thing to keep true.
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { getDispatchModes, getDispatchModels, getHarnesses } from './api.js';
+import { getDispatchModes, getDispatchModels, getHarnesses, getProviderTokens } from './api.js';
 import { emptyWarning } from './harnessHealth.js';
 
 export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap }) {
@@ -29,6 +29,14 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
   const [model, setModel] = useState('opus');          // replaced by the server's default once loaded
   const [err, setErr] = useState(null);
 
+  // ── provider accounts (providers) and the currently selected account ────────
+  // A project can hold several accounts of one provider type (e.g. two Claude subs).
+  // The user picks one; the model list then shows that provider's models.
+  const [providers, setProviders] = useState([]);       // the provider read-model from the server
+  // accounts = flattened [{ id, provider, name, typeLabel }] — one entry per account row
+  const [accounts, setAccounts] = useState([]);
+  const [acct, setAcct] = useState(null);               // the currently selected account
+
   // A xell may only wear a harness of its OWN type (054's DB guard), and a swap never changes a
   // xell's type — so the picker asks for exactly the personas this xell may wear: manager personas
   // for a manager xell, worker ones for a worker. Anything else the server refuses by name.
@@ -38,13 +46,39 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
     getHarnesses(zeeType, projectId)
       .then((hs) => setHarnesses((hs || []).filter((h) => !h.is_law_core))).catch(() => {});
     getDispatchModes().then(setModes).catch(() => {});
-    getDispatchModels('claude').then((ms) => {
+    // Load the provider-token read model for this project so the user can pick
+    // which AI account the incoming zee runs on.
+    if (projectId) {
+      getProviderTokens(projectId).then((ps) => {
+        const list = Array.isArray(ps) ? ps : [];
+        setProviders(list);
+        const flat = list
+          .filter((p) => p.provider !== 'github' && p.dispatch)
+          .flatMap((p) => (p.accounts || []).map((a) => ({
+            id: a.id,
+            provider: p.provider,
+            name: a.label || (p.accounts.length > 1 ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label),
+            typeLabel: p.label,
+          })));
+        setAccounts(flat);
+        // Default: select the first account so the model picker has a provider to
+        // query; if there are none, models will be fetched for the default provider.
+        if (flat.length) setAcct(flat[0]);
+      }).catch(() => {});
+    }
+    setTimeout(() => editorRef.current?.focus(), 30);
+  }, [zeeType, projectId]);
+
+  // When the selected account changes, re-fetch the model list for that provider.
+  const activeProvider = acct?.provider || 'claude';
+  const activeTokenId = acct ? acct.id : null;
+  useEffect(() => {
+    getDispatchModels(activeProvider).then((ms) => {
       setModels(ms);
       const def = (ms || []).find((m) => m.default) || (ms || [])[0];
       if (def) setModel(def.key);
     }).catch(() => {});
-    setTimeout(() => editorRef.current?.focus(), 30);
-  }, [zeeType, projectId]);
+  }, [activeProvider]);
 
   // Esc closes only while nothing has been composed, exactly as the dispatch composer does — a
   // half-written brief is real work.
@@ -65,7 +99,14 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
     const task = (editorRef.current?.innerText || '').trim();
     // Fire-and-forget, like the dispatch composer: re-caging a zee is slow (collect → recreate →
     // spawn), and the parent reports it through a toast that carries the server's own sentence.
-    onSwap?.({ harness, ...(task ? { task } : {}), model, mode });
+    onSwap?.({
+      harness,
+      ...(task ? { task } : {}),
+      model,
+      mode,
+      provider: activeProvider,
+      provider_token_id: activeTokenId,
+    });
   };
 
   return createPortal((
@@ -139,6 +180,43 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
           </div>
 
           <div className="disp-controls">
+            {/* ── WHICH AI ACCOUNT runs the incoming zee — only if there are multiple accounts ── */}
+            {accounts.length > 1 && (
+              <div className="disp-field">
+                <label className="disp-label">AI provider account</label>
+                <div className="disp-models" role="group" aria-label="AI provider account">
+                  {accounts.map((a) => (
+                    <button key={a.id} className={`disp-seg ${acct?.id === a.id ? 'on' : ''}`}
+                            data-testid={`swap-account-${a.id}`}
+                            title={`Run the incoming zee on ${a.name} (${a.typeLabel})`}
+                            onClick={() => setAcct(a)}>
+                      {a.name}
+                    </button>
+                  ))}
+                </div>
+                <div className="disp-hint">Each account runs its vendor's own CLI inside the cxell (claude / codex / kimi)</div>
+              </div>
+            )}
+
+            {/* Only show the account label inside the picker when there's exactly one */}
+            {accounts.length === 1 && (
+              <div className="disp-field">
+                <label className="disp-label">Provider</label>
+                <div className="swap-now">
+                  <span>{accounts[0].name} ({accounts[0].typeLabel})</span>
+                </div>
+              </div>
+            )}
+
+            {accounts.length === 0 && (
+              <div className="disp-field">
+                <label className="disp-label">Provider</label>
+                <div className="disp-hint" data-testid="swap-no-accounts">
+                  No AI provider is connected to this project — add one in Project setup to dispatch a zee.
+                </div>
+              </div>
+            )}
+
             <div className="disp-field">
               <label className="disp-label">Autonomy mode</label>
               <div className="disp-modes" role="group" aria-label="Autonomy mode">
@@ -152,7 +230,7 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
               <div className="disp-hint">{modes.find((m) => m.mode === mode)?.label || ''}</div>
             </div>
             <div className="disp-field">
-              <label className="disp-label">Model</label>
+              <label className="disp-label">Model · {activeProvider}</label>
               <div className="disp-models" role="group" aria-label="Model">
                 {models.map((m) => (
                   <button key={m.key} className={`disp-seg ${model === m.key ? 'on' : ''}`}
@@ -162,6 +240,22 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
                   </button>
                 ))}
               </div>
+            </div>
+          </div>
+
+          {/* Handover guidance — messages are the way to pass context between zees
+              without polluting the branch with tracked handover files. */}
+          <div className="disp-field">
+            <label className="disp-label">Handing work over</label>
+            <div className="disp-hint" data-testid="swap-handover-hint">
+              The swap brief already tells the incoming zee what the previous one was asked to do and
+              what it last reported. If the outgoing zee has <b>detailed context</b> that should not go
+              into a tracked file on the branch, send it as a <b>message</b>: open the xell's
+              <b> message composer</b> (the 💬 button on the flower) or use
+              <code> zee say --to {xell?.slug || '&lt;slug&gt;'} --message "…"</code> from another
+              zee. Messages land as real files in the recipient's <code>.zee-inbox</code> — they are
+              never committed to the branch, and they survive a swap because the inbox lives inside the
+              cage and the swap brief carries the previous zee's report.
             </div>
           </div>
 

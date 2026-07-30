@@ -67,7 +67,7 @@ export default function FleetPause({ pause, projectId, onChanged, pushToast, dis
                 ? `PLAY — resume ${projectId ? 'this project' : 'the fleet'}. Every zee the pause stopped is called back.`
                 : `${projectId ? 'PAUSE THIS PROJECT' : 'PAUSE EVERY ZEE, in every xell of every project'} — managers included. `
                   + 'Right-click to pause with a reason.'}>
-        {busy ? '…' : paused ? '▶ play' : '⏸ pause'}
+        {busy ? '…' : paused ? '▶' : '⏸'}
       </button>
       {paused && (
         <span className="fp-banner" data-testid="fleet-paused-banner">
