@@ -312,6 +312,11 @@ try {
   ok(now.zee_type === 'worker', 'and it is still a worker xell');
   const card = (await client.query(`SELECT * FROM work_item WHERE id=$1`, [item.id])).rows[0];
   ok(card.xell_id === worker.id, 'the work-item card is still on this xell — the board did not lose it');
+  // `zee zees` shows the new zee on the SAME row — a swap must not look like a second worker.
+  const { selfCrew } = await import('../server/src/queenzee/self.js');
+  const crew = await selfCrew(manager);
+  ok(crew.ok && crew.count === 1 && crew.crew[0].slug === worker.slug && crew.crew[0].branch === worker.branch,
+     `\`zee zees\` still shows ONE worker, on the same row (${crew.count} row(s))`);
 
   // ── 6. THE OUTGOING ZEE IS RETIRED HONESTLY ───────────────────────────────
   const gone = await readZee(outgoing.id);
