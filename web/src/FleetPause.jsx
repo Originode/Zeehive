@@ -70,8 +70,9 @@ export default function FleetPause({ pause, onChanged, pushToast, dismissToast }
       <button className="fp-btn" data-testid="fleet-pause-btn" disabled={busy}
               onClick={() => go(!paused)} onContextMenu={withReason}
               title={paused
-                ? 'PLAY — resume the fleet. Every zee the pause interrupted is called back into its session with '
-                  + 'a prompt telling it what happened; dispatch, nudges and messages start working again.'
+                ? 'PLAY — resume the fleet. Every zee the pause stopped, or left waiting on a decision made '
+                  + 'while it was down, is called back into its session with a prompt telling it what happened; '
+                  + 'dispatch, nudges and messages start working again.'
                 : 'PAUSE EVERY ZEE, in every xell of every project — managers included. Their turns are '
                   + 'interrupted where they stand (nothing is lost: no commit, no branch, no request, no gate), '
                   + 'and until you press play nothing is dispatched, no landing/clearance nudge is delivered and '
