@@ -320,6 +320,9 @@ try {
      'and calls back ONLY the zee the pause interrupted — a zee that had finished its turn is left alone');
   ok(resumed.counts.nudged === 0 && resumed.xells[0].dry_run === true,
      'a resume that was only modelled counts as 0 called back (it must not claim delivery it did not get)');
+  ok(resumed.counts.dry_run === 1 && resumed.counts.failed === 0,
+     'and it is counted as MODELLED, not FAILED — a resume that went exactly as designed must not put a '
+     + 'red warning on the operator\'s receipt (the same cry-wolf rule as a gone cage)');
   const stillMarked = await client.query(`SELECT last_stop_reason FROM zee WHERE id=$1`, [wz.id]);
   ok(stillMarked.rows[0].last_stop_reason === PAUSED_STOP_REASON,
      'and the zee keeps its paused mark, so a second press of play tries it again rather than losing it');
@@ -390,6 +393,11 @@ try {
   const ctl = read('web/src/FleetPause.jsx');
   ok(/data-testid="fleet-pause-btn"/.test(ctl) && /data-testid="fleet-paused-banner"/.test(ctl),
      'as a button AND, while paused, a banner — a paused fleet looks exactly like a quiet one');
+  // `unreachable` is already every cage not confirmed stopped, stuck ones included. Adding `stuck` to
+  // it reports one zee twice, and a figure a human cannot reconcile against the log is worse than none.
+  ok(/const bad = kind === 'pause' \? \(c\.unreachable \|\| 0\) :/.test(ctl),
+     'and its "not confirmed stopped" figure is `unreachable` alone — never unreachable + stuck, which '
+     + 'would count the same zee twice');
   const api = read('web/src/api.js');
   ok(/export async function pauseFleet/.test(api) && /export async function resumeFleet/.test(api),
      'the client has both calls');

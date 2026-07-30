@@ -162,8 +162,13 @@ export async function resumeFleet({ by = 'human@console' } = {}) {
 
   return {
     ok: true, paused: false, by,
+    // `failed` is "a zee we meant to call back and could not" — deliberately NOT counting a dry_run
+    // (nothing was attempted, because this queenzee models the fleet) nor a skip (already running, so
+    // it needs no call). Counting either would put a red warning on the operator's toast for a resume
+    // that went exactly as designed, which is the same cry-wolf failure as the gone-cage case.
     counts: { paused_zees: results.length, nudged, skipped: results.filter((r) => r.skipped).length,
-              failed: results.filter((r) => r.error || (!r.nudged && !r.skipped)).length },
+              dry_run: results.filter((r) => r.dry_run).length,
+              failed: results.filter((r) => r.error || (!r.nudged && !r.skipped && !r.dry_run)).length },
     xells: results,
     state: await pauseState(),
   };

@@ -28,13 +28,18 @@ export default function FleetPause({ pause, onChanged, pushToast, dismissToast }
   const report = (r, kind) => {
     const c = r?.counts || {};
     const id = `fleet-${kind}-${Date.now()}`;
-    const bad = kind === 'pause' ? (c.unreachable || 0) + (c.stuck || 0) : (c.failed || 0);
+    // `unreachable` is ALREADY every cage not confirmed stopped — a stuck run is one of them. Adding
+    // `stuck` on top would report one zee twice, and a number a human cannot reconcile with the log is
+    // worse than no number. The server owns both definitions; this only renders them.
+    const bad = kind === 'pause' ? (c.unreachable || 0) : (c.failed || 0);
     const body = kind === 'pause'
       ? `${c.interrupted || 0} zee(s) interrupted mid-turn · ${c.idle || 0} were already between turns`
+        + (c.gone ? ` · ${c.gone} cage(s) already gone` : '')
         + (r?.dry_run ? ' · SIMULATE mode: this queenzee models the fleet, no real cage was stopped' : '')
-        + (bad ? ` · ⚠ ${bad} NOT confirmed stopped — check the queenzee log` : '')
+        + (bad ? ` · ⚠ ${bad} NOT confirmed stopped${c.stuck ? ` (${c.stuck} still running)` : ''} — check the queenzee log` : '')
       : `${c.nudged || 0} of ${c.paused_zees || 0} paused zee(s) called back`
         + (c.skipped ? ` · ${c.skipped} already running` : '')
+        + (c.dry_run ? ` · ${c.dry_run} modelled only (SIMULATE mode)` : '')
         + (bad ? ` · ⚠ ${bad} could not be resumed` : '');
     pushToast({ id, kind: bad ? 'error' : 'success', onRetry: null,
       title: kind === 'pause' ? 'Fleet PAUSED — every zee stopped' : 'Fleet resumed', body });
