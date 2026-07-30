@@ -110,10 +110,11 @@ export async function getHarnesses(zeeType = null, projectId = null) {
 // A refusal (an open landing/ship/done card on that xell, a persona of the wrong type, a retired
 // xell) comes back 409 with the server's own sentence — throw it verbatim: the whole point is that
 // the human reads the real reason instead of "swap failed".
-export async function swapXellZee(xellId, { harness, task = null, model = null, mode = null, title = null } = {}) {
+export async function swapXellZee(xellId, { harness, task = null, model = null, mode = null, title = null,
+                                            provider = null, provider_token_id = null } = {}) {
   const r = await fetch(`/api/xells/${xellId}/swap`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ harness, task, model, mode, title }),
+    body: JSON.stringify({ harness, task, model, mode, title, provider, provider_token_id }),
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok || data?.ok === false) throw new Error(data?.error || `swap failed (${r.status})`);

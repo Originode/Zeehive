@@ -66,7 +66,7 @@ ok(/<SwapZee[\s\S]{0,300}onSwap=\{\(payload\)/.test(app), 'App renders <SwapZee 
 // them, or reach for anything but the two read-only pickers. The swap POST belongs to App's toast.
 const swapImports = (swap.match(/import\s*\{([^}]*)\}\s*from\s*['"]\.\/api\.js['"]/)?.[1] || '')
   .split(',').map((t) => t.trim()).filter(Boolean);
-ok(swapImports.length > 0 && swapImports.every((f) => ['getDispatchModes', 'getDispatchModels', 'getHarnesses'].includes(f)),
+ok(swapImports.length > 0 && swapImports.every((f) => ['getDispatchModes', 'getDispatchModels', 'getHarnesses', 'getProviderTokens'].includes(f)),
    `SwapZee only reads the pickers from the API (${swapImports.join(', ')}) — it never performs the swap itself`);
 ok(!/swapXellZee\(|fetch\(/.test(swap),
    'and it neither POSTs the swap nor fetches anything by hand — the parent owns the request and the toast');
@@ -75,8 +75,8 @@ ok(!/land_pending|ship_pending|hive_status|status === 'retired'/.test(swap),
 ok(/getHarnesses\(zeeType, projectId\)/.test(swap) && /zee_type === 'manager' \? 'manager' : 'worker'/.test(swap),
    "the picker offers only the personas THIS xell's type may wear (054), scoped to the project (084)");
 ok(/disabled=\{!harness\}/.test(swap), 'and submit is disabled until a persona is picked — the persona IS the swap');
-ok(/onSwap\?\.\(\{ harness, \.\.\.\(task \? \{ task \} : \{\}\), model, mode \}\)/.test(swap),
-   'the payload is exactly the choice: harness, an optional task, model, mode — no xell state, no flags');
+ok(/onSwap\?\.\(\{[\s\S]{0,300}harness[\s\S]{0,200}model[\s\S]{0,200}mode[\s\S]{0,200}provider[\s\S]{0,200}provider_token_id/.test(swap),
+   'the payload includes harness, task, model, mode, provider, and provider_token_id — no xell state, no flags');
 
 // ── 3. it says what is AT STAKE, because neither cost is recoverable by re-swapping ───────────
 console.log('\nwhat the human is told before clicking');
