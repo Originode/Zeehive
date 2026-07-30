@@ -79,16 +79,36 @@ export function cxellSshPort(slug) {
   return 22000 + (h % 2000);
 }
 
+// What the child SAID, for a message a human reads — BOTH streams, always. Never `err || out`: that
+// expression is stderr ALONE whenever the child wrote any (npm always does), and it is how warmCxell
+// lost a WARM_CI_FAILED marker that was sitting on stdout the whole time and reported a broken
+// lockfile as a network hiccup. A verdict must survive being put in an error message.
+function dkSaid({ out, err }, cap = 400) {
+  const parts = [];
+  const e = String(err || '').trim(), o = String(out || '').trim();
+  if (e) parts.push(`stderr: ${e.slice(0, cap)}`);
+  if (o) parts.push(`stdout: ${o.slice(0, cap)}`);
+  return parts.length ? parts.join(' | ') : 'no output on either stream';
+}
+
 // docker CLI runner. `--context` (not env) so a queenzee env leak can never re-aim a cxell;
 // input is piped to stdin; onLine streams stdout lines (for the NDJSON event stream).
 //
-// `allowNonZero` resolves instead of rejecting on a non-zero exit, handing the caller {code,out,err}
-// to judge. Opt-in, because rejecting is the right default — but a command that REPORTS its own
-// outcome on stdout must be believed over its exit status, and rejecting first threw that report
-// away: see writeFileIntoCxellIfChanged, where `docker exec` returned 1 while the container said
-// SAME, and the fleet's healthy no-ops were recorded as failures. A truncated stdin still rejects
-// either way (below): a payload we could not deliver is not an outcome to interpret.
-function dk(ctx, args, { input, onLine, timeoutMs = 120000, allowNonZero = false } = {}) {
+// A NON-ZERO EXIT REJECTS, and that stays the default: for nearly every call here the exit code IS
+// the answer (pgrep finds no agent, inspect finds no container, a port is already allocated), and
+// the callers are written around the rejection. What the rejection now CARRIES is the fix: both
+// streams in the message (dkSaid) and the raw `{ code, out, err }` on `err.dk`, so an exec's own
+// statement of what it did can no longer be destroyed by the way its failure is reported.
+//
+// AN EXEC THAT STATES ITS OWN OUTCOME ON STDOUT DOES NOT COME THROUGH HERE — it uses dkVerdict
+// (below). Three separate callers lost their verdict to this function's contract in one day: one
+// rejected before the verdict was read (writeFileIntoCxellIfChanged, a healthy SAME recorded as a
+// fleet-wide error), one read `String(result)` and got '[object Object]' (writeGeneratedDocIntoCxell,
+// every written doc reported skipped), and one read the rejection MESSAGE and saw stderr only
+// (warmCxell, lock drift reported as a network hiccup). dkVerdict is the one door for that shape.
+// A truncated stdin still rejects either way (below): a payload we could not deliver is not an
+// outcome to interpret.
+function dk(ctx, args, { input, onLine, timeoutMs = 120000 } = {}) {
   return new Promise((resolve, reject) => {
     const full = [...(ctx && ctx !== 'default' ? ['--context', ctx] : []), ...args];
     const p = spawn('docker', full, { windowsHide: true });
@@ -111,8 +131,12 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000, allowNonZero = false
       // exits 0 (base64 -d / cat happily decode a partial stream). Surfacing this is what stops a
       // half-written image attachment from being reported as a clean success. See writeFileIntoCxell.
       if (stdinErr) { reject(new Error(`docker ${args.slice(0, 2).join(' ')} stdin write failed: ${stdinErr.code || stdinErr.message} — payload likely truncated`)); return; }
-      if (code === 0 || allowNonZero) resolve({ code, out, err });
-      else reject(new Error(`docker ${args.slice(0, 2).join(' ')} exited ${code}: ${(err || out).slice(0, 400)}`));
+      if (code === 0) { resolve({ code, out, err }); return; }
+      // Both streams in the message, and the streams themselves on the Error: an exec that FAILED may
+      // still have said what it did, and dkVerdict reads `err.dk` rather than re-running anything.
+      const e = new Error(`docker ${args.slice(0, 2).join(' ')} exited ${code}: ${dkSaid({ out, err })}`);
+      e.dk = { code, out, err };
+      reject(e);
     });
     if (input !== undefined) {
       // Catch stdin errors (EPIPE etc.) rather than letting them bubble to an UNCAUGHT exception:
@@ -126,6 +150,69 @@ function dk(ctx, args, { input, onLine, timeoutMs = 120000, allowNonZero = false
       p.stdin.end();
     }
   });
+}
+
+// ── dkVerdict — the ONE runner for an exec whose SCRIPT SAYS WHAT IT DID ──────────────────────────
+//
+// Some of the execs here are not "run a command and check it worked": the script INSIDE the cage
+// makes the decision (did the bytes change? is the path tracked? did `npm ci` refuse the lockfile?)
+// and prints its verdict on stdout. For those, the container's statement is the outcome and the exit
+// code is diagnosis — and getting that backwards shipped three separate bugs in ONE DAY, all three
+// found only in production, each by a different zee:
+//
+//   • writeFileIntoCxellIfChanged — dk rejected on the non-zero exit before the verdict was read, so
+//     the healthy no-op SAME became env_cxell_error on every unchanged xell in the fleet (45d3ebe);
+//   • writeGeneratedDocIntoCxell — read `String(result)` where dk resolves an OBJECT, so the verdict
+//     was the literal '[object Object]' and every doc the cage really wrote reported skipped (7339182);
+//   • warmCxell — read the REJECTION message, which was stderr alone, so the WARM_CI_FAILED marker on
+//     stdout never reached the classifier and lock drift was reported as a network hiccup (28fa29f).
+//
+// One shape, three ways to lose the same value. So the shape gets one door, and the door cannot be
+// walked through wrongly: this helper NEVER lets the exit code decide, ALWAYS reads stdout, and hands
+// back the verdict as a STRING (never an object to stringify by accident). The caller declares the
+// markers its script prints — required, not optional, because that declaration is what a guard test
+// can enumerate, and an undeclared marker is a fourth instance waiting to happen.
+//
+// Resolves { verdict, verdicts, code, out, err }:
+//   verdict  — the LAST declared marker on stdout (a script prints its decision last), or null;
+//   verdicts — every declared marker seen, in order, for a script that prints more than one
+//              (warmCxell's WARM_LOCK_DIRTY rides alongside its WARM_OK / WARM_CI_FAILED).
+// It rejects ONLY when the exec never ran at all — spawn failure, timeout, truncated stdin. There is
+// no verdict to read then, and "we could not ask" is not an outcome to interpret.
+//
+// WHAT IT DELIBERATELY DOES NOT DO: decide what a MISSING verdict means. That is caller policy and it
+// differs — the env write throws (it must never guess at file contents), the doc injector reports
+// `skipped:'unknown'`, the warm classifies and carries on. Centralising that would have been the same
+// mistake in a new place.
+async function dkVerdict(ctx, args, { markers, label = null, ...opts } = {}) {
+  const want = (Array.isArray(markers) ? markers : []).filter(Boolean);
+  if (!want.length) throw new Error('dkVerdict: the caller must declare the markers its script prints');
+  let r;
+  try {
+    r = await dk(ctx, args, opts);
+  } catch (e) {
+    // `e.dk` is set only for an exec that RAN and exited non-zero — the case whose stdout we must
+    // still read. Anything else (spawn, timeout, truncated payload) has no verdict in it: rethrow.
+    if (!e?.dk) throw e;
+    r = e.dk;
+  }
+  const verdicts = [];
+  for (const line of String(r.out || '').split('\n')) {
+    for (const m of want) {
+      // whole-token match, so WARM_OK is never found inside a longer marker or a path
+      if (new RegExp(`(^|[^A-Za-z0-9_])${m}([^A-Za-z0-9_]|$)`).test(line)) verdicts.push(m);
+    }
+  }
+  const verdict = verdicts.length ? verdicts[verdicts.length - 1] : null;
+  // TRUSTED, NEVER HIDDEN. Believing the verdict over the exit code must not mean swallowing the
+  // disagreement — that is the same bug facing the other way, and it would hide on the success path
+  // where nobody looks. One line, from one place, for every caller of this shape.
+  if (verdict && r.code !== 0) {
+    logline('cxell', `${label || `docker ${args.slice(0, 2).join(' ')}`}: reported ${verdict} but the exec `
+      + `exited ${r.code} — trusting the verdict (it is the container's own statement of what happened) `
+      + `and saying so rather than hiding it: ${dkSaid(r, 120)}`);
+  }
+  return { ...r, verdict, verdicts };
 }
 
 // Is a cxell zee ACTUALLY working right now? True iff an agent CLI process (claude/codex/kimi —
@@ -736,6 +823,12 @@ export async function sealCxell({ ctx, name, blockTcp = [] }) {
 // So a failing `ci` in a fresh cage is now the SIGNAL, not something to paper over: the warm fails,
 // says why, and the tree is left exactly as the clone left it. A worktree with genuinely NO lockfile
 // still installs — `npm ci` requires one, and there is no lock to damage.
+// Every marker warmInstallScript prints on stdout, declared here so the exec that runs it can name
+// them (dkVerdict requires that) and so a guard test can check no marker is left undeclared. Order is
+// not significance: warmCxell reads the SET, because WARM_LOCK_DIRTY rides alongside whichever of the
+// other three the run produced.
+export const WARM_MARKERS = ['WARM_OK', 'WARM_CI_FAILED', 'WARM_INSTALL_FAILED', 'WARM_LOCK_DIRTY'];
+
 export function warmInstallScript(repoDir = '/work/repo') {
   return `cd ${repoDir} && echo "npm cache: $(npm config get cache)" && `
     // ONE definition of "is the lockfile still as we found it?", called on BOTH ways out of the
@@ -765,15 +858,14 @@ export async function warmCxell({ ctx, name }) {
     // local content-addressed storage rather than a registry download — the same work, without the
     // network. It reports the cache it used so a slow warm can be told apart from a cold cache.
     //
-    // THE SCRIPT'S MARKERS DECIDE THE OUTCOME, NOT THE EXEC'S EXIT STATUS — hence `allowNonZero`
-    // (the same rule as writeFileIntoCxellIfChanged, see dk()). Without it a failing `npm ci` made
-    // dk REJECT, and dk's rejection message is `(err || out).slice(0, 400)`: stderr ALONE whenever
-    // the child wrote any, which npm always does. Every marker this script prints goes to STDOUT, so
-    // rejecting first threw the verdict away and the drift branch below could never be true — a
-    // broken lockfile was reported as "warm incomplete — the zee will install as needed", which is
-    // the one thing that will NOT fix it. Ticket #14.
-    r = await dk(ctx, ['exec', name, 'bash', '-lc', warmInstallScript()],
-                 { timeoutMs: 900000, allowNonZero: true });
+    // THE SCRIPT'S MARKERS DECIDE THE OUTCOME, NOT THE EXEC'S EXIT STATUS — hence dkVerdict (see
+    // there). Through plain dk a failing `npm ci` REJECTED, and dk's rejection message used to be
+    // `(err || out)`: stderr ALONE whenever the child wrote any, which npm always does. Every marker
+    // this script prints goes to STDOUT, so the drift branch below could never be true — a broken
+    // lockfile was reported as "warm incomplete — the zee will install as needed", which is the one
+    // thing that will NOT fix it. Ticket #14.
+    r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc', warmInstallScript()],
+                        { markers: WARM_MARKERS, label: `${name}: warm`, timeoutMs: 900000 });
   } catch (e) {
     // No verdict at all because the exec never ran (no such container, docker gone, timeout).
     // Nothing to classify: the zee simply starts cold.
@@ -781,22 +873,17 @@ export async function warmCxell({ ctx, name }) {
     return { warmed: false, error: e.message };
   }
   const sharedCache = new RegExp(`npm cache: ${CXELL_NPM_CACHE_DIR}`).test(r.out);
-  const lockDirty = /WARM_LOCK_DIRTY/.test(r.out);
+  const lockDirty = r.verdicts.includes('WARM_LOCK_DIRTY');
   if (lockDirty) {
     // Should be unreachable now that nothing in the warm writes the lock. Loud anyway: a dirty
     // lockfile at dispatch is a change the zee did not make and would land without noticing.
     logline('cxell', `${name}: !!! the warm left package-lock.json MODIFIED — the zee starts on a dirty tree it did not dirty; `
       + 'do not let it land that file without deciding to');
   }
-  if (/WARM_OK/.test(r.out)) {
-    // Trusting the verdict over the exit code must not mean HIDING the disagreement — that is how
-    // 45d3ebe's bug hid on the success path. The warm did finish; say that it exited oddly.
-    if (r.code !== 0) {
-      logline('cxell', `${name}: warm reported WARM_OK but the exec exited ${r.code} — trusting the container's `
-        + `verdict, noting the oddity: ${(r.err || '').trim().slice(0, 120)}`);
-    }
-    return { warmed: true, sharedCache, lockDirty };
-  }
+  // WARM_OK anywhere in the markers wins, whatever else the script printed and whatever the exec
+  // exited with. (The "trusted but said out loud" line for a non-zero exit is dkVerdict's job now —
+  // it was written by hand here and in writeFileIntoCxellIfChanged, which is two copies of one rule.)
+  if (r.verdicts.includes('WARM_OK')) return { warmed: true, sharedCache, lockDirty };
 
   // Failed, and the script said which failure it was. Lock drift is a repo problem a human or the
   // zee must fix deliberately, and it reads nothing like a registry timeout — so it gets its own
@@ -806,7 +893,7 @@ export async function warmCxell({ ctx, name }) {
   // first ("code EUSAGE", "can only install packages when…", "Missing: x from lock file") and the
   // path of its debug log — which nobody can read from outside the cage — last.
   const error = `warm exited ${r.code}: ${(r.err || r.out).trim().slice(0, 400)}`;
-  const drift = /WARM_CI_FAILED/.test(r.out)
+  const drift = r.verdicts.includes('WARM_CI_FAILED')
     && /can only install packages when your package\.json and package-lock\.json|EUSAGE|Missing:|Invalid: lock/i.test(said);
   if (drift) {
     logline('cxell', `${name}: warm FAILED — package-lock.json disagrees with package.json at this commit, so \`npm ci\` `
@@ -1178,29 +1265,22 @@ export async function writeFileIntoCxellIfChanged({ ctx = 'default', slug, relPa
     'rm -f "$tmp"',
     'echo "$V"',
   ].join('\n');
-  // THE CONTAINER SAYS WHAT IT DID, and that outranks its exit status. `allowNonZero` is the whole
-  // point: dk used to reject on a non-zero exit before the verdict was ever read, so `docker exec`
-  // returning 1 alongside SAME — the healthy no-op — was recorded as "the cage is stale" on every
-  // unchanged xell in the fleet. A false failure on the success path is worse than the silence this
-  // mechanism replaced, and it flew a broken badge in the console to prove it.
-  const r = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script],
-                     { input: String(text ?? ''), timeoutMs, allowNonZero: true });
-  const verdict = String(r?.out || '').trim().split('\n').pop();
-  if (verdict !== 'SAME' && verdict !== 'WROTE') {
+  // THE CONTAINER SAYS WHAT IT DID, and that outranks its exit status — which is why this goes
+  // through dkVerdict and not dk. dk used to reject on a non-zero exit before the verdict was ever
+  // read, so `docker exec` returning 1 alongside SAME — the healthy no-op — was recorded as "the cage
+  // is stale" on every unchanged xell in the fleet. A false failure on the success path is worse than
+  // the silence this mechanism replaced, and it flew a broken badge in the console to prove it.
+  const r = await dkVerdict(ctx, ['exec', '-i', name, 'bash', '-lc', script],
+                            { markers: ['SAME', 'WROTE'], label: `${name}: ${safe}`,
+                              input: String(text ?? ''), timeoutMs });
+  if (!r.verdict) {
     // The ONE real failure: no verdict. Then we do not know what is in the file, and guessing
-    // "unchanged" is the lie this helper exists to avoid. The exit code and stderr ride along —
+    // "unchanged" is the lie this helper exists to avoid. The exit code and BOTH streams ride along —
     // they are diagnosis now, rather than the thing that decided the outcome.
-    throw new Error(`the cxell did not report what it did with ${safe} (exit ${r?.code}, said `
-      + `"${verdict}")${r?.err ? `: ${String(r.err).trim().slice(0, 200)}` : ''}`);
+    throw new Error(`the cxell did not report what it did with ${safe} (exit ${r.code}, `
+      + `${dkSaid(r, 200)})`);
   }
-  // Trusted, never hidden. A verdict that arrives with a non-zero exit is still an oddity worth one
-  // line — swallowing it would be the same mistake in the other direction.
-  if (r.code !== 0) {
-    logline('cxell', `${name}: ${safe} — the container reported ${verdict} but the exec exited `
-      + `${r.code}. Trusting the verdict: it says what actually happened to the file, and only a `
-      + 'MISSING verdict is a failure.');
-  }
-  return { changed: verdict === 'WROTE', path: full, rel: safe, exit_code: r.code };
+  return { changed: r.verdict === 'WROTE', path: full, rel: safe, exit_code: r.code };
 }
 
 // Write a GENERATED file into a cxell — but never over a git-TRACKED path.
@@ -1233,22 +1313,28 @@ export async function writeGeneratedDocIntoCxell({ ctx = 'default', slug, relPat
     'if [ -d .git ]; then grep -qxF "$P" .git/info/exclude 2>/dev/null || echo "$P" >> .git/info/exclude; fi',
     'echo WROTE',
   ].join('\n');
-  // dk resolves { code, out, err } — destructure it. Reading the whole object as a string is exactly
-  // the bug this shipped with: `String(result)` is '[object Object]', which matches no verdict, so
-  // every doc the container really DID write was reported as skipped. The write worked and the report
-  // lied, which is the worse half.
-  const { out } = await dk(ctx, ['exec', '-i', name, 'bash', '-lc', script], { input: String(text ?? ''), timeoutMs });
-  const verdict = String(out || '').split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
-  if (verdict === 'TRACKED') {
+  // Through dkVerdict, like every other exec that states its own outcome. This site is where the
+  // verdict was read as `String(await dk(...))` — '[object Object]', matching nothing — so every doc
+  // the container really DID write was reported as skipped: the write worked and the report lied. The
+  // helper hands back a STRING there is no object to stringify by accident.
+  const r = await dkVerdict(ctx, ['exec', '-i', name, 'bash', '-lc', script],
+                            { markers: ['WROTE', 'TRACKED'], label: `${name}: ${safe}`,
+                              input: String(text ?? ''), timeoutMs });
+  if (r.verdict === 'TRACKED') {
     return { written: false, skipped: 'tracked', rel: safe,
       reason: `${safe} is tracked by git in this xell — the project's own committed copy is left alone` };
   }
-  if (verdict === 'WROTE') return { written: true, rel: safe, path: `/work/repo/${safe}` };
+  if (r.verdict === 'WROTE') return { written: true, rel: safe, path: `/work/repo/${safe}` };
+  // No verdict AND a failed exec: the container never got to speak (no such container, the script died
+  // before its echo). This site still REJECTS on that, exactly as it did when dk did the rejecting —
+  // a caller of the doc injector treats a broken exec as a broken exec, not as a skip.
+  if (r.code !== 0) throw new Error(`docker exec exited ${r.code}: ${dkSaid(r)}`);
   // ANYTHING ELSE IS LOUD. An unrecognised verdict used to be indistinguishable from a deliberate
-  // skip — that silence is what let the parse bug survive a ship. The raw tail rides back so the log
+  // skip — that silence is what let the parse bug survive a ship. The raw output rides back so the log
   // names what actually came out of the container.
   return { written: false, skipped: 'unknown', rel: safe,
-    reason: `${safe}: the injector could not read the container's answer (got ${JSON.stringify(verdict.slice(0, 60))})` };
+    reason: `${safe}: the injector could not read the container's answer `
+      + `(got ${JSON.stringify(String(r.out || '').trim().slice(0, 60))})` };
 }
 
 export async function removeCxell({ ctx, slug }) {
