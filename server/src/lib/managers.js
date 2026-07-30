@@ -190,6 +190,37 @@ export async function inboxFor(xellId, { all = false, limit = 50 } = {}) {
   }));
 }
 
+// ── a HUMAN changed a manager's crew underneath it ───────────────────────────
+//
+// A manager plans around WHO is in each of its xells: it dispatched a Scout there, so it says
+// `zee say --to <slug>` expecting a Scout. When a human swaps that zee from the console
+// (POST /api/xells/:id/swap) the persona changes and the manager asked for none of it — and until
+// this existed, nothing told it. It would keep briefing an agent that had left, and the next thing
+// it heard from that xell would arrive in a voice it did not recognise.
+//
+// So the swap lands in the manager's own inbox, through the same store-then-deliver path a worker's
+// report takes: the row is durable (it reads it with `zee inbox` on its next turn) and it is typed
+// into its live session if it has one. It is a REPORT, not a directive — nothing is being asked of
+// it, and the swap has already happened.
+//
+// Lives here, beside postMessage, for the same reason the done-suggestion notifications do: what a
+// manager is TOLD about its crew is one subject, and the swap path should not be the place that
+// invents its own wording for it.
+export async function notifyManagerOfSwap({ manager, target, harness, previous = null, by = 'human@console' }) {
+  if (!manager || !target || !harness) throw new Error('a swap notification needs a manager, a target xell and a harness');
+  const was = previous?.harness_key || previous?.harness_label || null;
+  return postMessage({
+    from: null, to: manager, kind: 'report', by,
+    body: `A HUMAN swapped the zee in your worker ${target.slug}: it now wears "${harness.key}"`
+      + `${harness.label ? ` (${harness.label})` : ''}${was ? `, replacing ${was}` : ''}. `
+      + `The xell is otherwise untouched — same branch (${target.branch}), same commits, same containers, `
+      + 'same database, same work-item card, and it still reports to you. The incoming zee was briefed '
+      + 'that it INHERITED the xell: what the previous zee was asked to do, what it last reported, and '
+      + 'what is on the branch. You did not ask for this and nothing of yours was lost — re-brief it '
+      + `with \`zee say --to ${target.slug} --message "…"\` if your plan for that work has changed.`,
+  });
+}
+
 // ── done suggestions (a manager proposes SOMEONE ELSE is finished) ───────────
 // Deliberately not `zee done`: that is a zee proposing its own completion. This proposes another
 // xell's, so it can never be self-serviceable — it raises a card and a `done?` prompt, and a HUMAN

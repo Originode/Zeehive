@@ -44,6 +44,7 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
   shipRefusalState, setZeeStatus } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
+         notifyManagerOfSwap,
          NO_PUSH_REASON } from '../lib/managers.js';
 // The harness DOMAIN (lib/harness.js) — listed/authored here for the manager harness verbs at the
 // bottom of this file, and read on the dispatch path. Same one-rule-one-place discipline as the type
@@ -1508,16 +1509,9 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
   // a notification row could not be written.
   let notified = null;
   if (!manager && watcher) {
-    notified = await postMessage({
-      from: null, to: watcher, kind: 'report', by: by || 'human@console',
-      body: `A HUMAN swapped the zee in your worker ${target.slug}: it now wears "${h.key}"`
-        + `${h.label ? ` (${h.label})` : ''} instead of ${prevZee?.harness_key || prevZee?.harness_label || 'its previous persona'}. `
-        + `The xell is otherwise untouched — same branch (${target.branch}), same commits, same containers, `
-        + 'same database, same card, and it still reports to you. The incoming zee was briefed that it '
-        + 'INHERITED the xell and what is already on the branch. You did not ask for this and nothing of '
-        + `yours was lost: re-brief it with \`zee say --to ${target.slug} --message "…"\` if your plan for `
-        + 'that work has changed.',
-    }).then((r) => ({ ok: true, delivered: !!r.delivered })).catch((e) => ({ ok: false, error: e.message }));
+    notified = await notifyManagerOfSwap({ manager: watcher, target, harness: h, previous: prevZee, by })
+      .then((r) => ({ ok: true, delivered: !!r.delivered }))
+      .catch((e) => ({ ok: false, error: e.message }));
   }
 
   logline('crew', `${asked} SWAPPED the zee in ${target.slug} → ${h.key} (same branch ${target.branch})`

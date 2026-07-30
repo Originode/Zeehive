@@ -353,12 +353,29 @@ try {
   ok(built.item?.id === item.id && built.prevZee?.id === outgoing.id,
      'the brief builder resolved the same card and the same outgoing zee the swap did');
 
-  // …and the ORDER is structural in the source too, not just incidental to this run.
+  // …and the ORDER is structural in the source too, not just incidental to this run — in the ONE
+  // function that owns it. selfSwap is now only the manager's AUTHORISATION (my crew, a worker
+  // target, a worker persona of my project) in front of swapZeeInXell, which the console's human
+  // route calls as well; test/human-swap.test.mjs asserts the same ordering through that entry point.
+  // Sliced per function, so "the collect comes first" can never be satisfied by a NEIGHBOUR's collect.
   const src = readFileSync(new URL('../server/src/queenzee/self.js', import.meta.url), 'utf8');
-  const body = src.slice(src.indexOf('export async function selfSwap'), src.indexOf('// POST /api/xell/self/say'));
-  ok(body.indexOf('collectCxellDiffToWorktree(') < body.indexOf('dispatchXell('),
+  const fnBody = (name) => {
+    const start = src.indexOf(`export async function ${name}(`);
+    if (start < 0) throw new Error(`${name} not found in server/src/queenzee/self.js`);
+    let i = src.indexOf('{', src.indexOf(')', start));
+    for (let depth = 0; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
+    }
+    throw new Error(`could not bracket-match ${name}`);
+  };
+  const core = fnBody('swapZeeInXell');
+  const body = fnBody('selfSwap');
+  ok(core.indexOf('collectCxellDiffToWorktree(') < core.indexOf('dispatchXell('),
      'in the source, the collect is written BEFORE the dispatch — the ordering is structural, not incidental');
-  ok(/rename: false/.test(body), 'and it dispatches with rename:false so the branch cannot move');
+  ok(/rename: false/.test(core), 'and it dispatches with rename:false so the branch cannot move');
+  ok(/swapZeeInXell\(/.test(body) && !/collectCxellDiffToWorktree\(|dispatchXell\(/.test(body),
+     '…and `zee swap` runs THAT function rather than a copy of it — one swap, two callers');
 
   console.log(fail ? `\n${fail} FAILED` : '\nall good');
 } catch (e) {
