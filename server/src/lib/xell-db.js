@@ -246,6 +246,25 @@ function projectDbId(project) {
   };
 }
 
+// A TCP DSN derived from a db container row that records NO conn_ref but IS published on the
+// network (host + host_port). This is how the omnibiz prod db bug happened: `omnibiz_db_prod`
+// carries host=10.2.0.16, host_port=5432 and an EMPTY conn_ref, so every path that answers "how do
+// I reach my database" fell through to `docker --context mardale-prod exec -i … psql` — a verb a
+// CXELL zee cannot run (no docker CLI), while the address itself was reachable the whole time (the
+// cage firewall deliberately leaves a prod-bound xell's own prod db unblocked). The zee reported
+// "cannot reach production db" about a database that was online and one TCP dial away.
+//
+// Passwordless by design — conn_refs are "parameters, not secrets" (see provision.js): the
+// credential, when one is needed over TCP, arrives through the project's PROD environment vars
+// merged into the same .zeehive.env, never through a DSN stored in the inventory.
+// Returns null when the row has no published address: no address is a fixable state, a guessed
+// one is a silent wrong database.
+export function derivedTcpDsn(row, dbid = {}, database = null) {
+  if (!row?.host || !row?.host_port) return null;
+  const user = dbid.user ? `${encodeURIComponent(dbid.user)}@` : '';
+  return `postgresql://${user}${row.host}:${row.host_port}/${database || dbid.name || ''}`;
+}
+
 // A postgres identifier from the slug: zee_<slug>, [a-z0-9_] only, inside the 63-char limit.
 // Recorded as a db_instance row at creation, so a later xell RENAME cannot orphan the database.
 export function cloneDbNameFor(slug) {

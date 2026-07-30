@@ -67,16 +67,24 @@ export async function attachProdStack(xellId, { by = 'human@console' } = {}) {
   // anyone ever starts it — a silent write to the WRONG database. resolveRealDbContainer picks the
   // running versioned one; proddiff.js already does this, the zee-facing binding did not.
   const dbRow = await one(
-    `SELECT c.name, c.docker_ctx, c.conn_ref, c.host_port FROM container c
+    `SELECT c.name, c.docker_ctx, c.conn_ref, host(c.host) AS host, c.host_port FROM container c
        JOIN xell_uses_container uc ON uc.container_id=c.id
       WHERE uc.xell_id=$1 AND c.role='db' LIMIT 1`, [xellId]);
   const realDb = dbRow
     ? await resolveRealDbContainer(dbRow.docker_ctx, dbRow.name, { row: dbRow }).catch(() => dbRow.name)
     : null;
+  // The DSN this bind actually means, reachable over TCP: the row's conn_ref, or — when the row
+  // records none but publishes an address (the omnibiz prod db: host 10.2.0.16, port 5432, EMPTY
+  // conn_ref) — one derived from host:host_port. It is what emitXellEnv writes as DATABASE_URL and
+  // what a CXELL zee (no docker CLI) dials; without it the psql below fell back to a docker-exec
+  // form a caged zee cannot run, and the zee reported an online production db as unreachable.
+  const dbid = { user: project.db_user || config.prodDbUser || 'postgres',
+                 name: project.db_name || config.prodDbName || 'omnibiz' };
+  const dsn = dbRow ? (dbRow.conn_ref || derivedTcpDsn(dbRow, dbid)) : null;
   const psql = dbRow
-    ? (dbRow.conn_ref
-      ? `psql "${dbRow.conn_ref}"`
-      : `docker --context ${dbRow.docker_ctx} exec -i ${realDb} psql -U ${project.db_user || config.prodDbUser || 'postgres'} -d ${project.db_name || config.prodDbName || 'omnibiz'}`)
+    ? (dsn
+      ? `psql "${dsn}"`
+      : `docker --context ${dbRow.docker_ctx} exec -i ${realDb} psql -U ${dbid.user} -d ${dbid.name}`)
     : null;
 
   const app = [];
@@ -96,7 +104,7 @@ export async function attachProdStack(xellId, { by = 'human@console' } = {}) {
 
   return {
     ok: true, xell: row.slug, db_coupling: row.db_coupling,
-    db: realDb || db?.container || null, psql, app,
+    db: realDb || db?.container || null, psql, dsn, app,
     warning: 'The prod DATABASE is now this xell\'s. Writes are real and irreversible, and are '
       + 'prompt-gated only — state what you will change and get a human to agree BEFORE any write.',
     still_denied: [

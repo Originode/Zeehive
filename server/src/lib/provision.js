@@ -15,6 +15,7 @@ import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
 import { dbIdentity } from './projects.js';
+import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
 import { warmWorktree } from './npm-cache.js';
 import { logline } from './logbus.js';
@@ -139,16 +140,27 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
   let bindingIsProd = false;                 // linked to prod → the owned container is NOT a fallback
   if (xell.db_coupling === 'db-shared-prod' || xell.db_coupling === 'db-prod-readonly') {
     const linkedProd = await one(
-      `SELECT c.conn_ref FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+      `SELECT c.conn_ref, host(c.host) AS host, c.host_port
+         FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
         WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [xellId]);
     bindingIsProd = !!linkedProd || !!xell.prod_ro_dsn;
+    // db-shared-prod with a conn_ref-less prod row falls back to the row's PUBLISHED ADDRESS
+    // (host:host_port). This is the omnibiz bug: its prod db records no conn_ref (only host +
+    // host_port, on another machine's docker context), so the projection emitted NO DATABASE_URL,
+    // the binding's psql said `docker exec` — impossible in a cage — and a prod-bound cxell zee
+    // concluded the online production db was unreachable. The address was reachable over TCP all
+    // along; the file just never said so. db-prod-readonly is deliberately NOT widened: the minted
+    // SELECT-only DSN or nothing — following the binding must never turn a reader into a writer.
     dbUrl = xell.db_coupling === 'db-prod-readonly'
       ? (xell.prod_ro_dsn || null)
-      : (linkedProd?.conn_ref || xell.prod_ro_dsn || null);
+      : (linkedProd?.conn_ref
+        || derivedTcpDsn(linkedProd, await dbIdentity(xell.project_id))
+        || xell.prod_ro_dsn || null);
     if (bindingIsProd && !dbUrl) {
       logline('prod-ro', `${xell.slug}: coupled ${xell.db_coupling} but no usable production DSN `
-        + '(no minted reader / the prod container row records no conn_ref) — .zeehive.env is emitted '
-        + 'with NO DATABASE_URL rather than a database the binding does not mean');
+        + '(no minted reader / the prod container row records no conn_ref and publishes no '
+        + 'host:host_port) — .zeehive.env is emitted with NO DATABASE_URL rather than a database '
+        + 'the binding does not mean');
     }
   }
   // …else the xell's OWN db container, when it has one.

@@ -169,6 +169,48 @@ try {
   ok(prodFile.vars.API_BASE === 'https://prod.example',
      'a read-only prod xell gets the PROD api base, which is the whole of ticket #15');
 
+  // ── 2b. a conn_ref-less prod db that IS published: host:host_port becomes the DSN ───────────
+  // The omnibiz shape: the prod db container records NO conn_ref (it lives on another machine's
+  // docker context) but publishes host + host_port — and the cage firewall deliberately leaves a
+  // prod-bound xell's own prod db unblocked. Before the fallback, .zeehive.env carried no
+  // DATABASE_URL at all and the binding's psql said `docker exec`, which a cxell cannot run — so
+  // the zee reported an ONLINE production database as unreachable.
+  console.log('db-shared-prod + published, conn_ref-less prod db → derived TCP DSN');
+  const mkProdDb = async (name, { conn = null, host = null, port = null }) => (await one(
+    `INSERT INTO container (project_id, role, tier, isolation, name, docker_ctx, internal_port,
+                            conn_ref, host, host_port)
+       VALUES ($1,'db','prod','shared',$2,'mardale-prod',5432,$3,$4,$5) RETURNING id`,
+    [pid, `env15_${tag}_${name}`, conn, host, port])).id;
+  const link = (xellId, cid) => q(
+    `INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'uses')`,
+    [xellId, cid]);
+
+  const tcpDb = await mkProdDb('prod_tcp', { host: '10.9.9.9', port: 5433 });
+  const rwtcp = await mkXell('rwtcp', { coupling: 'db-shared-prod' });
+  await link(rwtcp.id, tcpDb);
+  await emitXellEnv(rwtcp.id);
+  ok(readEmitted(rwtcp.wt).vars.DATABASE_URL === 'postgresql://zeehive@10.9.9.9:5433/zeehive',
+     `db-shared-prod with a published conn_ref-less prod db gets the derived TCP DSN `
+     + `[${readEmitted(rwtcp.wt).vars.DATABASE_URL ?? '(none)'}]`);
+
+  // a recorded conn_ref still wins over the published address — derivation is a fallback, not a preference
+  const refDb = await mkProdDb('prod_ref', {
+    conn: 'postgresql://owner@prod-ref-host:5432/refdb', host: '10.9.9.9', port: 5434 });
+  const rwref = await mkXell('rwref', { coupling: 'db-shared-prod' });
+  await link(rwref.id, refDb);
+  await emitXellEnv(rwref.id);
+  ok(readEmitted(rwref.wt).vars.DATABASE_URL === 'postgresql://owner@prod-ref-host:5432/refdb',
+     'a prod db WITH a conn_ref keeps it — the derived DSN never overrides the recorded one');
+
+  // db-prod-readonly is NOT widened by the fallback: the minted SELECT-only DSN or nothing. The
+  // derived DSN is the OWNER's address — following a read-only binding must never mint a writer.
+  const rotcp = await mkXell('rotcp', { coupling: 'db-prod-readonly', ownedDb: OWNED('rotcp') });
+  await link(rotcp.id, tcpDb);
+  await emitXellEnv(rotcp.id);
+  ok((readEmitted(rotcp.wt).vars.DATABASE_URL ?? null) === null,
+     `db-prod-readonly with no minted reader stays DSN-less — the published address never widens a `
+     + `reader into a writer [${readEmitted(rotcp.wt).vars.DATABASE_URL ?? '(none)'}]`);
+
   // ── 3. §6.2 — the refusal, and its ONE exemption ────────────────────────────────────────────
   // The guard exists so a nested queenzee never OPERATES on the managing instance's meta-DB (two
   // reconcilers reap each other's xells). That needs writes. A minted read-only reader has none —

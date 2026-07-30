@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { runtimeById, runtimeByKey, viewerUrlFor } from '../lib/runtimes.js';
-import { resolveRealDbContainerCached } from '../lib/xell-db.js';
+import { resolveRealDbContainerCached, derivedTcpDsn } from '../lib/xell-db.js';
 import { broadcast } from '../lib/events.js';
 import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
 import { provisionXell } from '../lib/provision.js';
@@ -511,7 +511,8 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
   const xell = await one(`SELECT x.*, xo.ref AS xource_ref FROM xell x JOIN xource xo ON xo.id=x.xource_id WHERE x.id=$1`, [xellId]);
   const dbid = await dbIdentity(xell.project_id);
   const rows = await q(
-    `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, c.docker_ctx, uc.relation
+    `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, c.docker_ctx, host(c.host) AS host,
+            c.host_port, uc.relation
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xellId]);
 
@@ -530,15 +531,25 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
     : c));
 
   // HOW TO REACH YOUR DATABASE — spelled out, because guessing is how a zee ends up running
-  // docker against a container it was never given (and getting denied by the prod guard). The db
-  // has no conn_ref and prod's postgres isn't exposed on the network, so `docker exec` IS the
-  // sanctioned path for data work — the prod guard allows it for exactly the xell whose assigned
+  // docker against a container it was never given (and getting denied by the prod guard). In
+  // preference order: the row's conn_ref; else, when the row publishes an address (host +
+  // host_port) and the zee is CAGED, a TCP DSN derived from it; else `docker exec`, the
+  // sanctioned host-side path — the prod guard allows it for exactly the xell whose assigned
   // database this is, and denies it for everyone else.
+  //
+  // The cxell branch is the omnibiz lesson: its prod db row has NO conn_ref but IS published
+  // (host 10.2.0.16, port 5432 on another machine), and a caged zee handed the docker-exec form
+  // read the inevitable failure as "production db unreachable" — about a database that was online
+  // and deliberately left unblocked by its own cage firewall. A cage has no docker AT ALL, so for
+  // a cxell the docker-exec form is never the answer when a TCP address exists; raw `psql "<dsn>"`
+  // stays inside the prod guard's sight exactly like the exec form (it inspects any psql).
   const dbc = stack.find((c) => c.role === 'db');   // already resolved at the boundary above
   // db-clone: the CONTAINER is shared, but this DATABASE inside it is the xell's own (its
   // db_instance row). The container's conn_ref names the SHARED database, so a clone must never
   // inherit it — every handle below carries the clone's name instead.
   const clone = xell.db_coupling === 'db-clone' ? (await cloneInstanceFor(xellId))?.name || null : null;
+  const tcpDsn = dbc && !clone && xell.db_coupling !== 'db-prod-readonly'
+    ? derivedTcpDsn(dbc, dbid) : null;
   const db = dbc ? {
     container: dbc.name,
     coupling: xell.db_coupling,
@@ -546,7 +557,9 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
     is_production: dbc.tier === 'prod',
     psql: (dbc.conn_ref && !clone)
       ? `psql "${dbc.conn_ref}"`
-      : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U ${dbid.user} -d ${clone || dbid.name}`,
+      : (cxell && tcpDsn)
+        ? `psql "${tcpDsn}"`
+        : `docker --context ${dbc.docker_ctx} exec -i ${dbc.name} psql -U ${dbid.user} -d ${clone || dbid.name}`,
     ...(xell.db_coupling === 'db-prod-readonly' ? { readonly: true } : {}),
     note: xell.db_coupling === 'db-prod-readonly'
       ? 'This IS the live production database, and you hold it READ-ONLY: your DATABASE_URL carries a '
