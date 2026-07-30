@@ -152,8 +152,10 @@ try {
   ok(new RegExp(`exec -i cxell_${caged.slug} bash -lc`).test(mine),
      'it is a docker exec into THIS xell\'s cxell (the harness layer\'s mechanism, not a second one)');
   ok(/P='\/work\/repo\/\.zeehive\.env'/.test(mine), 'writing /work/repo/.zeehive.env — the file the zee reads');
-  ok(/sha256sum/.test(mine) && /echo SAME/.test(mine) && /echo WROTE/.test(mine),
+  ok(/sha256sum/.test(mine) && /V=SAME/.test(mine) && /V=WROTE/.test(mine) && /echo "\$V"/.test(mine),
      'the CAGE decides whether anything changed, in the same exec that would do the writing');
+  ok(!/exit 0/.test(mine),
+     'and the script has ONE exit path — an early exit in the SAME branch is what returned 1 in prod');
   const piped = /STDIN<<\n([\s\S]*?)\n>>STDIN/.exec(mine)?.[1] || '';
   ok(piped === read(caged).replace(/\n$/, ''),
      'the bytes piped in are exactly the projection now on the host — WHERE it lands changed, not WHAT it says');
@@ -226,6 +228,53 @@ try {
   ok(healed.env_cxell_error === null && healed.env_cxell_refreshed_at !== null,
      'once the cage is reachable the next sweep clears the error and re-stamps the refresh');
 
+  // ── 7. THE VERDICT IS AUTHORITATIVE — a non-zero exit with a good verdict is NOT a failure ───
+  //
+  // The defect this section exists for, found in PRODUCTION by the manager zee minutes after the
+  // first ship: `docker exec` returned 1 while the script's stdout said SAME — the healthy no-op —
+  // and dk rejects on a non-zero exit BEFORE the verdict is ever read. So the whole fleet's
+  // UNCHANGED refreshes stamped env_cxell_error="docker exec -i exited 1: SAME" and flew a broken
+  // env badge on the success path. A false failure is worse than the silence this mechanism replaced.
+  //
+  // The rule, which the first version stated in a comment and did not implement: the CONTAINER says
+  // what it did. If a verdict comes back it is the outcome, whatever the exit code; only a MISSING
+  // verdict is an error. The original test could never have caught this — the shim always exited 0,
+  // which is exactly why the exit code is now a knob.
+  console.log('\nthe cage\'s verdict outranks the exec\'s exit code (a SAME that exits 1 is still a no-op)');
+  clearDocker();
+  n = since();
+  process.env.DOCKER_FAKE_CXELL_VERDICT = 'SAME';
+  process.env.DOCKER_FAKE_CXELL_EXIT = '1';               // …exactly what production did
+  const sameNonZero = await emitXellEnv(caged.id);
+  ok(sameNonZero.cxell?.refreshed === true && sameNonZero.cxell?.changed === false,
+     `a SAME verdict on a non-zero exec is a verified no-op, not a failure `
+     + `[${JSON.stringify(sameNonZero.cxell)}]`);
+  const sameRow = await one(`SELECT env_cxell_error FROM xell WHERE id=$1`, [caged.id]);
+  ok(sameRow.env_cxell_error === null,
+     `and it leaves NO error on the xell row — the bug was a broken badge on the success path `
+     + `[${(sameRow.env_cxell_error || 'null').slice(0, 40)}]`);
+  ok(linesSince(n, 'cxell').some((m) => /exited 1/.test(m) && /[Tt]rusting the verdict/.test(m)),
+     'the odd exit code is still SAID OUT LOUD — trusted, not hidden');
+  ok(!linesSince(n, 'cxell').some((m) => /REFRESHED inside the LIVE cxell/.test(m)),
+     'and a no-op is still not logged as a write');
+
+  process.env.DOCKER_FAKE_CXELL_VERDICT = 'WROTE';
+  const wroteNonZero = await emitXellEnv(caged.id);
+  ok(wroteNonZero.cxell?.refreshed === true && wroteNonZero.cxell?.changed === true,
+     'a WROTE verdict on a non-zero exec is a write, for the same reason');
+
+  // …and the one thing that IS a failure: a cage that reports nothing. Now with the exit code and
+  // stderr in the message, which is what a human needs and what the old error threw away.
+  process.env.DOCKER_FAKE_CXELL_VERDICT = 'NONE';         // prints no verdict at all
+  const mute = await emitXellEnv(caged.id);
+  ok(!!mute.cxell?.error && /did not report/.test(mute.cxell.error),
+     `an exec that reports NO verdict is still an error [${(mute.cxell?.error || 'none').slice(0, 52)}…]`);
+  ok(/exit 1/.test(mute.cxell?.error || ''),
+     'and the error now carries the exit code, instead of only the exit code carrying the error');
+  delete process.env.DOCKER_FAKE_CXELL_EXIT;
+  process.env.DOCKER_FAKE_CXELL_VERDICT = 'WROTE';
+  await emitXellEnv(caged.id);                            // leave the fixture healthy for teardown
+
   // ── the wiring is the SAME mechanism, not a second one ──────────────────────────────────────
   console.log('\nthe injector reuses the harness layer\'s path');
   const prov = readFileSync('server/src/lib/provision.js', 'utf8');
@@ -241,6 +290,7 @@ try {
   fail++;
 } finally {
   delete process.env.DOCKER_FAKE_CXELL_VERDICT;
+  delete process.env.DOCKER_FAKE_CXELL_EXIT;
   process.env.PATH = BARE_PATH;
   for (const id of madeXells) await q(`DELETE FROM zee WHERE xell_id=$1`, [id]).catch(() => {});
   if (pid) await q(`DELETE FROM project WHERE id=$1`, [pid]).catch(() => {});

@@ -5,6 +5,13 @@
 -- start a server — fails at postgres in a way the manual never predicted, and reads as a broken
 -- environment instead of the guarantee working.
 --
+-- SUPERSEDED BY 080 (kept as the record of what this migration did, and of what was true when it ran):
+-- the paragraph below is why this was BOTH a migration and a repo file edit. 080 moved every harness
+-- into the meta-DB — `harnesses/` is gone, `harness.dir` is NULL, `lib/harness.js` reads no filesystem
+-- (CLAUDE.md house rule 10) — so there is no folder to keep in step and no boot refresh to lose to. A
+-- manager-manual edit today is a migration and nothing else. The stale wording here (and in
+-- 079_manual_shell_safe_bodies) misled a reader in ticket #31.
+--
 -- WHY THIS IS A MIGRATION AS WELL AS A FILE EDIT. `manager` is file-backed (harness.dir =
 -- 'harnesses/manager'), so refreshHarnesses() reloads its bundle from the folder at every boot on a
 -- machine that HAS the repo — and `harnesses/manager/memory/manager-zee-manual.md` carries this same

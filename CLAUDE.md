@@ -83,7 +83,17 @@ in a header comment, and that header is part of the deliverable.
 
 A Zeehive xell inherits **simulate-mode safety defaults** (`zeehive.yml` → `BUILD_MODE`,
 `PROVISION_MODE`, `SHIP_MODE` = `simulate`, `POOL_TARGET_READY=0`): the nested queenzee you run is a
-subject under test and can never touch the real fleet. That is why your local run provisions nothing.
+subject under test, and every PROVISION, TEARDOWN, BUILD, DEPLOY-FILE and BACKUP path is mode-gated.
+That is why your local run provisions nothing.
+
+⚠ It does **not** follow that it "can never touch the real fleet" — that sentence used to be here and
+it was not true. Your nested meta-DB is a **CLONE of the real one** (real slugs, container names,
+docker contexts, host repo paths), the flags gate ACTIONS and not READS, and in a cxell much of the
+rest is inert only because a cage has no docker binary and no host paths — a property of the cage,
+not of the code. `proddiff` reads real production databases with no mode gate at all, and one write
+path (the ship's migration apply) has none either. The audit, loop by loop, with the read-only versus
+write distinction kept separate:
+[docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md).
 
 **"I wrote it" is not verification.** Exercise the real thing in your own containers before you call
 the work done.

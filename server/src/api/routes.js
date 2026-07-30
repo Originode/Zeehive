@@ -63,7 +63,8 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
   dismissShipRequest, deferShip, resumeShip, unlockAndShip, bundleDeferredShips } from '../queenzee/shipgate.js';
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
-         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, listProdBindRequests, decideProdBind,
+         selfTend, selfHint, selfWorking, selfDevice, selfCatchup, selfMigrationNumber,
+         listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfCrew, selfDispatch, selfSay, selfReport, selfInbox,
          selfSuggestDone, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete } from '../queenzee/self.js';
@@ -1186,6 +1187,14 @@ router.post('/xell/self/sync', async (req, res) => {
 router.post('/xell/self/catchup', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfCatchup(x, { restore: !!req.body?.restore })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Hand out the next free db/migrations number, counting what is LANDED, what every live xell's
+// worktree holds and what other zees have claimed — the one thing a caged zee cannot see for itself.
+// NOT gated and advisory (it hands out a number, it does not gate a landing). `zee migration-number`.
+router.post('/xell/self/migration-number', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfMigrationNumber(x, { name: req.body?.name || null, again: !!req.body?.again })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // File a ship request (shipgate) — the zee asks, a human approves, the queenzee deploys from main.
