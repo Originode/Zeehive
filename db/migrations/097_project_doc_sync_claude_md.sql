@@ -1,4 +1,45 @@
-# CLAUDE.md — start here
+-- AGENTS.md WAS TELLING EIGHTEEN OTHER TOOLS THE OPPOSITE OF WHAT CLAUDE.md SAYS — ticket #38.
+--
+-- One document, two copies, kept in step by hand. `project_doc.body` in this meta-DB generates
+-- AGENTS.md (and every other provider file — Codex, Cursor, Gemini CLI, Copilot's coding agent, Zed,
+-- Aider, goose, opencode, Warp, Junie, Roo, Amp and the rest, per lib/agent-docs.js). The repo's
+-- CLAUDE.md is COMMITTED, so generation never writes over it (house rule 11, and rightly). The result
+-- is that the row and the file are two hand-synced copies of one text, and hand-syncing is a thing
+-- people stop doing.
+--
+-- MEASURED, FIRST-HAND, 2026-07-30 00:47, against the live queenzee (GET /api/projects/:id/docs) —
+-- not from the AGENTS.md in one cxell, which is a spawn-time snapshot and cannot answer this:
+--   • the body still contained "subject under test and can never touch the real fleet". That exact
+--     sentence was removed from CLAUDE.md at 23:30 (ad13d77) as FALSE, after a nested queenzee was
+--     found probing real production databases with no mode gate and the ship's migration step was
+--     found writing to prod. So Claude Code read the correction and eighteen other tools read a
+--     containment claim this repo had just disproved. An agent that believes a nested queenzee cannot
+--     touch the real fleet is exactly the agent that will act on it.
+--   • the body also lacked the containment warning that replaced it, four doc-map rows added over the
+--     evening (schema-drift-triage, data-completeness-check, nested-queenzee-containment,
+--     repo-root-audit) and CLAUDE.md §1's "two servers answer the same paths" subsection.
+--
+-- WHY THIS SETS THE WHOLE BODY rather than patching the sentence. A partial sync leaves a document
+-- that is wrong in a NEW way and looks freshly maintained, which is worse than one that is visibly
+-- stale. The two texts are copies of ONE document, and the committed file is the copy that gets read,
+-- reviewed and landed — so an edit that exists only in the body is, by definition, an edit made to the
+-- wrong copy. Verified before writing this: diffing the live body against the committed file, the ONLY
+-- line the body held that the file did not was the false sentence itself. Nothing is lost here.
+--
+-- THE RISK, NAMED: if someone edits the body in the console's Docs tab between this landing and this
+-- migration being applied, this overwrites it. The check added alongside (test/project-doc-drift.test.mjs)
+-- makes that loud instead of silent, and the answer is to edit CLAUDE.md and re-sync — not to edit the
+-- body, which is the habit that produced this ticket.
+--
+-- Idempotent: it sets a known text. A database with no project_doc row is a no-op, and correctly so —
+-- with no row, lib/project-docs.js generates nothing at all, so there is no second copy to diverge.
+--
+-- AND THIS IS A SNAPSHOT, WHICH IS THE POINT OF THE FOLLOW-UP. Syncing by migration works and does not
+-- scale: the next CLAUDE.md edit re-opens the gap. Which copy should be the SOURCE is a human's call,
+-- written up with both options and their costs in docs/entry-point-doc-source.md. Read that before
+-- reaching for a 098.
+UPDATE project_doc
+   SET body = $doc$# CLAUDE.md — start here
 
 **ZEEHIVE** is a deterministic agent-environment orchestrator: it cuts isolated environments
 (**xells**), runs agents (**zees**) inside caged containers (**cxells**), and puts a human gate in
@@ -209,3 +250,7 @@ it. But it was written for a **host** session on one Windows machine in an earli
 and zees have repeatedly read it as their orientation and gone chasing paths, containers and verbs
 that do not exist here. **This file is your orientation; HANDOFF.md is background reading.** Anything
 in it that names a drive letter, a docker context or a machine is history — check before you trust.
+$doc$,
+       updated_at = now()
+ WHERE project_id = (SELECT id FROM project WHERE lower(name) = 'zeehive' ORDER BY created_at LIMIT 1)
+   AND cardinality(targets) > 0;
