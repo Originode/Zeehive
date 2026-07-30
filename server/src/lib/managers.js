@@ -21,7 +21,10 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
-import { reasonPair } from './status.js';
+// briefReason is the house's one-line normaliser (collapse whitespace, ELIDE with …). Quoting an
+// error inside our own prose needs exactly that: a hard slice ends the quote mid-word, which reads
+// as a truncated MESSAGE rather than a quoted one ("…so a spawn there would fail. Do ").
+import { reasonPair, briefReason } from './status.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
 
@@ -221,14 +224,6 @@ export async function notifyManagerOfSwap({ manager, target, harness, previous =
   });
 }
 
-// One line of somebody else's prose, quoted inside ours. Whitespace collapsed (an error can be
-// three paragraphs) and ELIDED rather than chopped: a hard slice ends the quote mid-word, which
-// reads as a truncated MESSAGE rather than a quoted one ("…so a spawn there would fail. Do ").
-const clip = (s, max) => {
-  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
-  return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
-};
-
 // ── a swap that HALF-HAPPENED — the outgoing zee is gone and the new one never started ──────
 //
 // notifyManagerOfSwap above is the SUCCESS sentence, and for a long time it was the only one: the
@@ -251,7 +246,7 @@ export async function notifyManagerOfHalfSwap({ manager, target, harness, previo
   return postMessage({
     from: null, to: manager, kind: 'report', by,
     body: `A HUMAN tried to swap the zee in your worker ${target.slug} and THE NEW ZEE DID NOT START: `
-      + `${clip(error || 'the dispatch failed', 300)}\n\n`
+      + `${briefReason(error || 'the dispatch failed', 300)}\n\n`
       + `That leaves ${target.slug} HALF-SWAPPED, and this is the part you cannot see from \`zee zees\` `
       + `alone: the previous zee${was ? ` (${was})` : ''} was already retired before the spawn was `
       + `attempted, so there is NO zee in that xell now. It wears "${harness.key}"`
@@ -265,7 +260,7 @@ export async function notifyManagerOfHalfSwap({ manager, target, harness, previo
         ? `Nothing was lost. The outgoing zee's commits were collected onto the host worktree first `
           + `(HEAD ${head}), so the branch (${target.branch}), its commits, the containers, the database `
           + 'and the work-item card are all exactly where they were.'
-        : `Nothing was collected from the old cage (${clip(collected?.reason || 'no reason recorded', 200)}). `
+        : `Nothing was collected from the old cage (${briefReason(collected?.reason || 'no reason recorded', 200)}). `
           + 'The swap destroyed nothing either — it never got as far as recreating a cage — but do not '
           + 'assume anything that zee committed INSIDE its cage is on the branch: it was not collected, '
           + 'and a cage that is recreated later takes its uncollected commits with it.')
