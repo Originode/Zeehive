@@ -55,6 +55,13 @@ const GRANDFATHERED = {
   // And one more, landed in the minutes between this lint being written and being landed. Both files
   // were already on main, so neither was mine to renumber — the repair is forward, i.e. this line.
   '088': ['088_manager_manual_harness_key.sql', '088_manager_manual_scratch_resolution.sql'],
+  // (The EIGHTH collision was here — 090 twice, created BY a renumber escaping a different one — and it
+  // is gone because somebody moved 090_restore_report.sql to 095. Its line is DELETED rather than left:
+  // a grandfather entry that no longer describes a real duplicate is a standing permit for the next
+  // collision on that number, which is why this list is checked in both directions. What the episode
+  // cost is worth remembering: that file had ALREADY applied under its old name, so the rename made it
+  // run a second time on every database that had it — harmless only because it happens to be
+  // ADD COLUMN IF NOT EXISTS. That is the trap both guards' messages warn about, paid in public.)
 };
 
 // The whole check, as a function of a FILE LIST — so the samples below run through the identical

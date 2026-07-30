@@ -16,6 +16,21 @@ dotenv.config({ path: resolve(repoRoot, '.env') });
 const int = (v, d) => (v == null || v === '' ? d : parseInt(v, 10));
 
 export const config = {
+  // THE SERVER'S OWN TREE — where THIS process's code lives, and nothing else. In the image that is
+  // /app; in a checkout it is the repo. Use it to resolve things the server SHIPS WITH:
+  // scripts/*.sh|mjs, db/migrations/, docker/zeehive/*.
+  //
+  // A PROJECT'S FILES ARE `project.repo_root`, NEVER THIS. The two coincide in a checkout and diverge
+  // in a container, which is why the distinction has to be remembered rather than observed: harnesses
+  // were read from `resolve(config.repoRoot, harness.dir)`, so the deployed queenzee looked under /app
+  // (which deliberately carries no harnesses/) instead of the project's clone under /repos — found
+  // nothing, kept an empty bundle, and dispatched manager zees with no manual for weeks while every
+  // test on a checkout passed. Migration 080 removed that class by moving harnesses into the meta-DB;
+  // the naming trap it came from is still here. Audit + why the rename was NOT done:
+  // docs/repo-root-audit.md (ticket #4).
+  //
+  // The one place both meanings are meant at once is self-onboard's third fallback ("the tree I am
+  // running from IS a project"), and it says so where it happens.
   repoRoot,
   databaseUrl: process.env.DATABASE_URL || 'postgres://zeehive:zeehive@localhost:5433/zeehive',
   port: int(process.env.PORT, 4700),

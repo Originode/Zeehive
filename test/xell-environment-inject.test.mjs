@@ -203,7 +203,9 @@ try {
     const app = readFileSync(join(ROOT, 'web/src/App.jsx'), 'utf8');
     ok(/env-absent/.test(app) && /'no env'/.test(app),
        "the card chip renders a third face when nothing resolves — an absent chip read as 'fine'");
-    ok(/onEnv\?\.\(x\)/.test(app) && /onEnv }\) \{/.test(app),
+    // the CONTRACT is "XellCard takes onEnv and calls it" — not where in the parameter list it sits.
+    // Pinning the position made this fail the moment another zee added a prop after it.
+    ok(/function XellCard\(\{[^}]*\bonEnv\b/.test(app) && /onEnv\?\.\(x\)/.test(app),
        'the card chip signals through a PROP rather than reaching for a parent state setter');
     ok(/if \(kind === 'env'\) \{[\s\S]{0,400}setEnvXell\(x\)/.test(app),
        "and the flower's ❖ button opens the panel, which is the live surface a human uses");

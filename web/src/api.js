@@ -89,6 +89,17 @@ export const deleteHarness = (key) => fetch(`/api/harnesses/${key}`, { method: '
 // for this project and spawns a zee into its worktree with the task (and any pasted images).
 // `images` is [{ name, data }] where data is a base64 data URL. Throws with the server's message
 // (e.g. "no ready xell available") so the composer can surface it without losing the prompt.
+// IS SOMEBODY ALREADY IN THIS WORK? (#33) A read-only preflight the dispatch dialog calls as the prompt
+// is written, so the answer is in front of you BEFORE the button rather than in the receipt after it.
+// Advisory: it never refuses a dispatch, and a failure answers "no warnings" rather than throwing.
+export async function dispatchOverlap(body) {
+  const r = await fetch('/api/xell/dispatch/overlap', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!r.ok) return { warnings: [], note: null };
+  return r.json().catch(() => ({ warnings: [], note: null }));
+}
+
 export async function dispatchTask(body) {
   const r = await fetch('/api/xell/dispatch', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),

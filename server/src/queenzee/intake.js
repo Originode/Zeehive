@@ -276,6 +276,13 @@ function saveDispatchImages(worktreePath, images) {
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
                                      headless = true, model, db, db_container, dump, images, harness,
                                      provider = 'claude', provider_token_id = null,
+                                     // A re-dispatch that must KEEP the xell exactly where it is —
+                                     // `zee swap` (self.js), which replaces the zee inside a live
+                                     // xell. The rename below moves the branch, the worktree folder,
+                                     // the container names and the ports; a swap promises none of
+                                     // those change, so it opts out. Default true: every other
+                                     // caller keeps the naming behaviour it has always had.
+                                     rename = true,
                                      // NULL, not 'worker': "the caller said nothing" and "the caller
                                      // said worker" are different inputs, and the old default made
                                      // them indistinguishable. See the effective-type block below.
@@ -348,7 +355,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // zee's cwd is the final path and Claude Code's sidebar (which names a worktree by its folder)
   // shows something findable instead of "calm-summit-403da6". Best-effort: if it can't rename
   // (already built, name taken), the xell just keeps its pooled slug and the dispatch proceeds.
-  if (targetId && from) await renameXellForTask(targetId, from);
+  if (targetId && from && rename !== false) await renameXellForTask(targetId, from);
 
   // ROLE + CREW, stamped BEFORE the zee starts: the honeycomb seats a worker next to its manager and
   // the briefing tells it who it reports to, so both must be true from the first frame. The DB guard
@@ -1435,6 +1442,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       'You are a MANAGER zee — you also have the CREW verbs, and you are REFUSED the repo ones:',
       '  - `zee zees`                 → YOUR CREW: every worker you dispatched, with its hive status, what it is waiting on, and its last message to you. Read this before you interrupt anyone.',
       '  - `zee dispatch --task "…"`  → spawn a WORKER zee into a fresh xell, stamped as yours (the honeycomb seats it next to you). Options that would widen a worker beyond its own xell are refused: no db choice, no manager type, no manager harness.',
+      '  - `zee swap --to <slug> --harness <key> [--task "…"]` → replace the ZEE working one of your xells with a fresh one wearing a different worker harness, KEEPING the xell: same branch, same commits, same containers, same db, same card. This is how one piece of work gets a Scout, then a Builder, then a Reviewer. The outgoing zee\'s commits are collected out of its cage first (the swap is REFUSED rather than risk them), and the incoming zee is briefed that it INHERITED the branch. Refused while a human gate (a landing, a ship, a done suggestion) is open on that xell.',
       '  - `zee say --to <slug> --message "…"` → type a message straight into that worker\'s LIVE session; it answers there. Stored either way, so a worker mid-turn still finds it.',
       '  - `zee inbox [--all]`        → what your workers sent you — including their POST-SHIP REFLECTIONS (what they would improve, what they found broken). Act on those by cutting the next task.',
       '  - `zee suggest-done --to <slug> --reason "…"` → ask a HUMAN to mark that worker done. A suggestion only: they confirm (typed), and that is what reaps it. Never suggest done over unlanded work.',

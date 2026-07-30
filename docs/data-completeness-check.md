@@ -156,10 +156,22 @@ Revisit once P1 has a few days of trend, not before.
    unreachable prod context). The console now shows **⚠ overdue** and **⚠ last attempt failed**
    instead of nothing, but nothing yet *retries sooner* than the next window.
 2. **Nothing alerts.** Backup freshness is a chip a human must look at. There is no notification.
-3. **A restore's own ignored errors are still unread.** `pg_restore` runs without `--exit-on-error`;
-   it counts ignored errors and we do not read that count. "Check data" (§4) now catches the
-   CONSEQUENCE — a table that came back short or empty — which is the outcome that matters, but the
-   restore's own error tally would name the cause on the spot and is still on the floor.
-4. **Nobody runs "Check data" for you.** It is on demand, deliberately (it counts rows). Running it
-   automatically off a finished restore is the obvious next step and is not done: a restore that
-   quietly dropped a table would still wait for a human to ask.
+3. ~~A restore's own ignored errors are unread~~ — **fixed (TKT-30)**, and it was worse than "unread":
+   `pg_restore` EXITS 1 when it merely ignored errors (verified against a real restore), and both
+   restore paths treated any non-zero exit as a throw. A restore that COMPLETED, with data on disk,
+   was logged "restore FAILED", never recorded as having happened, and never graded — the omnibiz dev
+   db missing `core.location` is exactly that shape. The decision now comes from pg_restore's own
+   tally (`lib/restore-errors.js`): a tally means it ran to the end, which is a restore that completed
+   *with holes* — recorded in `container.restore_report`, graded, and logged with the first cause
+   named. Non-zero with no tally is still a genuine failure and still throws.
+4. ~~Nobody runs "Check data" for you~~ — **fixed (TKT-30)**. A finished restore grades itself: that is
+   the one instant when the source snapshot, the target database and the reason for both are all known
+   at once. Fire-and-forget, after `busy` clears, every failure swallowed; production still refused as
+   a subject; a table-scoped restore graded only over the tables it loaded. A clean result logs one
+   quiet line and nothing else — the pool restores databases all day, and a green announcement on each
+   is how the line that matters becomes invisible. It is still persisted, so the chip shows it without
+   re-counting: quiet is not unrecorded.
+5. **A restore over the metadata store rewinds its own fixture.** Not a defect, but worth knowing
+   before debugging one: restoring ZEEHIVE's own meta-DB from a dump of itself reverts every row the
+   test just set up, including the container's own tier — which is how a real end-to-end run ended with
+   the automatic grade correctly *refusing* a now-prod-tier subject. The guard held; the fixture did not.

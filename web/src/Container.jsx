@@ -11,7 +11,7 @@
 import React, { useState, useEffect } from 'react';
 import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, getDiffCandidates, checkContainerData, getDataCheckReadiness, duplicateProd } from './api.js';
 import { nick } from './nick.js';
-import { diffReportText, driftDirection, SCOPE_LINE, dataReportText } from './drift.js';
+import { diffReportText, driftDirection, SCOPE_LINE, dataReportText, dataText } from './drift.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
 
 // Production is EXCLUDED from decommission entirely (not warned) — a prod container/db is never a
@@ -132,7 +132,8 @@ function tooltip(c, buildable, busy) {
   const host = bh
     ? (bh.split ? `\ncompiles on ${bh.build} → runs on ${bh.run}` : (bh.run ? `\nbuilds & runs on ${bh.run}` : ''))
     : '';
-  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${host}${driftText(c)}${instancesText(c)}`;
+  return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${host}`
+    + `${driftText(c)}${dataText(c)}${instancesText(c)}`;
 }
 
 // onMenu  → the chip is right-clickable (context menu). Passed by BOTH the inventory and the

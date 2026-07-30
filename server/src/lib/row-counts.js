@@ -25,8 +25,17 @@
 //
 // -1 is postgres's own "never analyzed"; it is preserved rather than coerced to 0, because "unknown"
 // and "empty" are different answers and one of them is an alarm.
+// The third field is HOW FAR THE ESTIMATE HAS DECAYED: n_mod_since_analyze, postgres's own count of
+// rows inserted/updated/deleted since anyone last analyzed the table. An estimate is only as good as
+// its last ANALYZE, and a table that has changed by more than the tolerance since then cannot support
+// a "this is short" claim at all. Without this, a bulk delete before a dump would make a perfectly
+// faithful restore look like data loss — the one failure this whole feature cannot afford.
+// (Found on a live database: public.project est 8 vs exact 6 = 25% "short", entirely because 32 rows
+// had moved since the last analyze.)
 export const ROW_COUNT_SQL = `SELECT n.nspname||'.'||c.relname||'\x1e'||c.reltuples::bigint
+       ||'\x1e'||coalesce(s.n_mod_since_analyze, 0)::bigint
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
  WHERE c.relkind = 'r'
    AND n.nspname NOT IN ('pg_catalog','information_schema')
    AND n.nspname NOT LIKE 'pg_toast%'
@@ -54,13 +63,40 @@ export function parseRowCounts(out) {
   for (const line of String(out || '').split('\n')) {
     const s = line.trim();
     if (!s) continue;
-    const i = s.indexOf('\x1e');
-    if (i <= 0) continue;
-    const n = Number(s.slice(i + 1).trim());
+    // name \x1e count [\x1e mod_since_analyze] — field 1 only, so the estimate probe (three fields)
+    // and the exact-count probe (two) share one parser and neither can poison the other.
+    const parts = s.split('\x1e');
+    if (parts.length < 2 || !parts[0]) continue;
+    const n = Number(parts[1].trim());
     if (!Number.isFinite(n)) continue;
-    counts[s.slice(0, i)] = n;
+    counts[parts[0]] = n;
   }
   return counts;
+}
+
+// The staleness map from the same output: { 'schema.table': rows changed since the last ANALYZE }.
+// Absent for the exact-count probe, which has no third field and needs none.
+export function parseRowStats(out) {
+  const stats = {};
+  for (const line of String(out || '').split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    const parts = s.split('\x1e');
+    if (parts.length < 3 || !parts[0]) continue;
+    const n = Number(parts[2].trim());
+    if (Number.isFinite(n)) stats[parts[0]] = n;
+  }
+  return stats;
+}
+
+// Can this reference estimate support a "short by N" claim? Only if the table has not moved by more
+// than the tolerance since anyone measured it. Conservative on purpose: when the estimate cannot be
+// trusted the finding becomes UNKNOWN, never a pass — "could not be judged" is a different sentence
+// from "fine", and the report prints it as such.
+export function referenceIsStale(refCount, modSinceAnalyze) {
+  if (modSinceAnalyze == null) return false;                 // no statistics recorded → assume usable
+  const noise = Math.max(SMALL_TABLE, Math.abs(refCount) * SHORTFALL_TOLERANCE);
+  return modSinceAnalyze >= noise;
 }
 
 // Sum of the KNOWN estimates (-1 = never analyzed is not a row count and is not summed).
@@ -122,26 +158,40 @@ export function compareBackupCounts(prev, now) {
 //                  rows were still arriving, or a db that has been written to since).
 //   no-reference — the source never analyzed that table, so there is nothing to compare against.
 //                  Reported as unknown, never as a pass.
-export function compareRestoreCounts(ref, got) {
+// `refStats` = rows-changed-since-ANALYZE per table, recorded beside the reference counts. Optional:
+// an older snapshot has none, and then the comparison behaves exactly as it did before.
+export function compareRestoreCounts(ref, got, refStats = null) {
   if (!ref || !got) return null;
   const rows = [];
   for (const [t, r] of Object.entries(ref)) {
     const g = got[t];
     if (g === undefined) { rows.push({ table: t, ref: r, got: null, state: 'missing' }); continue; }
     if (r < 0) { rows.push({ table: t, ref: r, got: g, state: 'no-reference' }); continue; }
+    // EMPTY is still EMPTY however stale the estimate is: no amount of statistical decay turns "the
+    // reference had rows" into "this table has none of them". That claim survives everything.
     if (r > 0 && g === 0) { rows.push({ table: t, ref: r, got: g, state: 'empty' }); continue; }
     if (r >= SMALL_TABLE && g < r * (1 - SHORTFALL_TOLERANCE)) {
-      rows.push({ table: t, ref: r, got: g, state: 'short' }); continue;
+      const mod = refStats ? refStats[t] : null;
+      if (referenceIsStale(r, mod)) {
+        // The estimate moved more than the tolerance since it was measured, so a shortfall inside that
+        // movement says nothing. Reported as UNVERIFIABLE, with the number that made it so.
+        rows.push({ table: t, ref: r, got: g, state: 'stale-reference', mod_since_analyze: mod });
+      } else {
+        rows.push({ table: t, ref: r, got: g, state: 'short' });
+      }
+      continue;
     }
     rows.push({ table: t, ref: r, got: g, state: 'ok' });
   }
   const by = (s) => rows.filter((x) => x.state === s);
-  const empty = by('empty'), short = by('short'), missing = by('missing'), unknown = by('no-reference');
+  const empty = by('empty'), short = by('short'), missing = by('missing');
+  const stale = by('stale-reference');
+  const unknown = [...by('no-reference'), ...stale];
   const extra = Object.keys(got).filter((t) => !(t in ref));
   return {
     checked: rows.length,
     ok_count: by('ok').length,
-    empty, short, missing, unknown, extra,
+    empty, short, missing, unknown, stale, extra,
     ref_total: rowTotal(ref),
     got_total: rowTotal(got),
     // 'incomplete' is the only verdict that says data did not arrive, and it takes an EMPTY or SHORT
