@@ -788,7 +788,15 @@ export async function warmCxell({ ctx, name }) {
     logline('cxell', `${name}: !!! the warm left package-lock.json MODIFIED — the zee starts on a dirty tree it did not dirty; `
       + 'do not let it land that file without deciding to');
   }
-  if (/WARM_OK/.test(r.out)) return { warmed: true, sharedCache, lockDirty };
+  if (/WARM_OK/.test(r.out)) {
+    // Trusting the verdict over the exit code must not mean HIDING the disagreement — that is how
+    // 45d3ebe's bug hid on the success path. The warm did finish; say that it exited oddly.
+    if (r.code !== 0) {
+      logline('cxell', `${name}: warm reported WARM_OK but the exec exited ${r.code} — trusting the container's `
+        + `verdict, noting the oddity: ${(r.err || '').trim().slice(0, 120)}`);
+    }
+    return { warmed: true, sharedCache, lockDirty };
+  }
 
   // Failed, and the script said which failure it was. Lock drift is a repo problem a human or the
   // zee must fix deliberately, and it reads nothing like a registry timeout — so it gets its own

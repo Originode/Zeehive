@@ -69,6 +69,9 @@ try {
     'if [ "$FAKE_WARM_MODE" = nocontainer ]; then',
     '  echo "Error: No such container: $2" >&2; exit 1',
     'fi',
+    'if [ "$FAKE_WARM_MODE" = oddexit ]; then',
+    '  echo "npm cache: /npm-cache"; echo WARM_OK; echo "docker: connection reset" >&2; exit 1',
+    'fi',
     '[ "$1" = exec ] || { echo "unexpected docker argv: $*" >&2; exit 64; }',
     'shift 2; [ "$1" = bash ] && shift; [ "$1" = -lc ] && shift',
     'script=${1//\\/work\\/repo/$FAKE_WARM_REPO}',
@@ -127,6 +130,16 @@ try {
      `the docker failure itself is carried (${JSON.stringify(String(gone.error || '').slice(0, 60))})`);
   ok(said(before3).some((m) => /install as needed/.test(m)),
      'and THIS is the case the generic "the zee will install as needed" line belongs to');
+
+  console.log('\n── 3b. a verdict with a non-zero exit is TRUSTED, and the disagreement is still said ──');
+  // Trusting the container over its exit code must not mean hiding the mismatch — that is how the
+  // same bug hid on the success path in 45d3ebe.
+  process.env.FAKE_WARM_MODE = 'oddexit';
+  const before3b = recentLogs(400).length;
+  const odd = await warmCxell({ ctx: 'default', name: 'cxell_zt_odd' });
+  delete process.env.FAKE_WARM_MODE;
+  ok(odd.warmed === true, 'WARM_OK on stdout with exit 1 is still a warm (the verdict decides)');
+  ok(said(before3b).some((m) => /WARM_OK but the exec exited 1/.test(m)), 'and the oddity is logged rather than swallowed');
 
   console.log('\n── 4. the lockfile\'s state is reported on the FAILING path too, not only the happy one ──');
   // The guarantee is "the warm never dirties the lockfile", so the check that proves it must not be
