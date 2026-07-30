@@ -504,7 +504,10 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
 // merge, no model) and turns its state into a uniform result. A CLEAN merge (or already-up-to-date)
 // is { ok: true }; a genuine CONFLICT or an operational ERROR is { ok: false, status:'needs-resolution' }
 // carrying the honest message (Change 4: the zee is told WHICH kind of failure it hit, so it does not
-// hunt a phantom conflict). On conflict the merge is LEFT in the cxell for the zee to resolve in place.
+// hunt a phantom conflict). On conflict the merge is LEFT in the cxell for the zee to resolve in place,
+// and an outcome the container never stated is reported as exactly that ('unknown') rather than as an
+// operational error — the queenzee did not read that tree and did not touch it, so it cannot promise
+// there is nothing in it to resolve.
 async function selfHealSync(xell, ref) {
   const s = await syncCxellWithXource({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref });
   if (s.state === 'merged' || s.state === 'up-to-date') return { ok: true, ...s };
@@ -512,9 +515,33 @@ async function selfHealSync(xell, ref) {
     return {
       ok: false, status: 'needs-resolution', stage: 'sync', state: 'conflict', ref, sync: s,
       conflict: s.output || null,
-      message: `Merging current ${ref} into your cxell hit a real CONTENT CONFLICT — this one is YOURS to resolve. `
-        + `The merge is left in progress in your cxell (/work/repo): run \`git status\`, fix the conflicted files, `
-        + `\`git add\` them and \`git commit\`, then \`zee land\` again. If you truly cannot resolve it, \`zee tend\` a human.`,
+      // `held` = a merge was ALREADY in progress when the sync ran, so it merged nothing and touched
+      // nothing. Same instruction (conclude the merge), different fact — and telling the zee it "hit a
+      // conflict" for a merge that never ran sends it looking for a conflict this sync did not cause.
+      message: s.held
+        ? `A merge is ALREADY IN PROGRESS in your cxell (/work/repo), so this sync did not merge anything and `
+          + `did not touch your tree — your resolution is exactly where you left it. Conclude that merge first: `
+          + `\`git status\`, fix any conflicted files, \`git add\` them and \`git commit\` (or \`git merge --abort\` `
+          + `if you want to drop YOUR OWN half-done merge), then re-run \`zee sync\`.`
+        : `Merging current ${ref} into your cxell hit a real CONTENT CONFLICT — this one is YOURS to resolve. `
+          + `The merge is left in progress in your cxell (/work/repo): run \`git status\`, fix the conflicted files, `
+          + `\`git add\` them and \`git commit\`, then \`zee land\` again. If you truly cannot resolve it, \`zee tend\` a human.`,
+    };
+  }
+  // The cxell did not say what its merge did (the exec never ran, or it reported nothing we recognise).
+  // NOTHING was aborted or reset, so the tree is whatever the merge left — which is the one honest thing
+  // to say. Never dressed up as an operational error: "nothing for you to resolve" would be a guess
+  // about a tree we did not read, and the zee is the only one who can look.
+  if (s.state === 'unknown') {
+    return {
+      ok: false, status: 'needs-resolution', stage: 'sync', state: 'unknown', ref, sync: s,
+      error: s.output || null,
+      message: `Could not tell what the sync merge of ${ref} did inside your cxell — the container did not report an `
+        + `outcome. NOTHING was aborted or reset, so /work/repo is exactly as the merge left it: run \`git status\` `
+        + `there and see. If a merge is in progress, it is yours to finish (\`git add\` + \`git commit\`); if the tree `
+        + `is clean, re-run \`zee sync\`. Raise a human (\`zee tend\`) if it looks wrong — this state means the `
+        + `queenzee lost sight of your container, not that your work is gone: `
+        + `${String(s.output || 'no detail').split('\n').filter(Boolean).pop()}`,
     };
   }
   // operational error (delivery failed, or a non-conflict merge failure) — nothing to fix in code.
