@@ -596,6 +596,11 @@ export default function App() {
       return;
     }
     if (kind === 'pause') {
+      // Optimistic update: set local state immediately so the flower shows play
+      x.hive_status = 'occ-paused';
+      x.hive_status_label = 'paused';
+      x.xell_paused = true;
+      setVersion((v) => v + 1);
       const id = `xpause-${x.id}-${Date.now()}`;
       pushToast({ id, kind: 'progress', title: `Pausing ${x.slug}…` });
       pauseXell(x.id).then((r) => {
@@ -610,6 +615,11 @@ export default function App() {
       return;
     }
     if (kind === 'resume') {
+      // Optimistic update: set local state immediately so the flower shows pause
+      x.hive_status = 'occ-working';
+      x.hive_status_label = 'working';
+      x.xell_paused = false;
+      setVersion((v) => v + 1);
       const id = `xresume-${x.id}-${Date.now()}`;
       pushToast({ id, kind: 'progress', title: `Resuming ${x.slug}…` });
       resumeXell(x.id).then((r) => {
@@ -663,7 +673,8 @@ export default function App() {
                     onContainerMenu={openMenu}
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} onGeometry={fireGeom}
-                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                    redrawKey={version} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs
             DOM, so it opens as a modal from the flower's ⌨ button. */}
