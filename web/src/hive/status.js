@@ -32,6 +32,11 @@ export const HIVE_COLORS = {
   // NOTHING. It is a waiting state that explains a quiet zee, so it should read as "parked", not
   // as another thing on fire.
   'occ-landHolding':  '#6f8fbf',   // slate blue — queued for the runway, nothing to decide
+  // STOPPED BY THE OPERATOR (the pause button). Grey on purpose, and the only grey on the scale: a
+  // paused zee is not warm (nothing is happening) and not cold (it is mid-job, not pooled) — it is
+  // OUT. Reading a paused fleet should look like a screen that has been switched off, not like a
+  // hive with something wrong in it.
+  'occ-paused':       '#8b93a1',   // grey — interrupted by a human; nothing to decide, nothing wrong
   // ── hot: something irreversible is being touched ────────────────────────────
   'occ-landHint':     '#ef8f6a',   // soft red-orange — land looks ready (a softer ask)
   'occ-shipHint':     '#f2a06a',   // soft orange — ship looks ready
@@ -58,6 +63,7 @@ export const HIVE_HEAT = {
   'occ-tendRequest':  0.72,
   'occ-doneSuggest':  0.30,
   'occ-landHolding':  0.34,
+  'occ-paused':       0.10,        // coldest of the occupied keys: deliberately stopped, so it recedes
   'occ-landHint':     0.80,
   'occ-shipHint':     0.82,
   'live-protected':   0.86,
@@ -78,6 +84,7 @@ export const HIVE_LABELS = {
   'occ-claimed':      'claimed',
   'occ-working':      'working',
   'occ-idle':         'idle',
+  'occ-paused':       'paused',
   'occ-tendRequest':  'tend?',
   'occ-landRequest':  'land?',
   'occ-shipRequest':  'ship?',

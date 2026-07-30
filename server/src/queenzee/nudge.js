@@ -17,6 +17,7 @@ import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from
 import { adapterFor } from '../lib/cxell-runtimes.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
+import { fleetPaused, PAUSED_REASON } from '../lib/fleet-pause.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, harness, reaper, the
 // .zeehive.env reconcile): 'real' touches machines, anything else models. A nudge is a
@@ -90,7 +91,10 @@ export async function nudgeXellForStaleLanding(xellId, { sha = null, ref = null,
   // A dry-run nudge is not an UNDELIVERED one: nothing was attempted, because this queenzee is not
   // allowed to reach the cage at all. Raising a tend here would summon a human to a xell that is not
   // this instance's, over a landing it is only modelling.
-  if (r?.dry_run) return r;
+  // A PAUSED fleet is the same shape for the same reason: nothing was attempted, and the human who
+  // pressed pause is the last person who needs a "needs you" chip about it. The recovery is not lost
+  // — the play prompt sends every resumed zee to `zee status`, which is where a dead sha is reported.
+  if (r?.dry_run || r?.paused) return r;
   const tended = await staleNudgeUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
   return { ...r, ...tended };
 }
@@ -141,7 +145,9 @@ export async function nudgeXellForClearedRunway(xellId, { sha = null, ref = null
   // A dry-run nudge is not an UNDELIVERED one: nothing was attempted, because this queenzee is not
   // allowed to reach the cage at all. Raising a tend here would summon a human to a xell that is not
   // this instance's, over a landing it is only modelling.
-  if (r?.dry_run) return r;
+  // …and a PAUSED fleet, for the same reason (see the stale-landing note above): nothing was
+  // attempted, so there is nothing to summon a human about.
+  if (r?.dry_run || r?.paused) return r;
   const tended = await clearanceUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
   return { ...r, ...tended };
 }
@@ -187,7 +193,7 @@ export async function nudgeXellForLostClearance(xellId, { sha = null, ref = null
       + `cxell session ${sid} to \`zee sync\` and land`,
     onFail: (e) => clearanceUndelivered(xellId, { short, requestId, why: e.message }).catch(() => {}),
   });
-  if (r?.nudged || r?.dry_run) return r;
+  if (r?.nudged || r?.dry_run || r?.paused) return r;
   const tended = await clearanceUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
   return { ...r, ...tended };
 }
@@ -298,6 +304,60 @@ export async function nudgeXellForReflection(xellId, { commit = null, by = 'quee
   });
 }
 
+// PLAY — the other half of the pause button (queenzee/pause.js does the fan-out).
+//
+// A paused zee was SIGINT'd mid-turn: its tool call stopped in flight, its transcript ends in the
+// middle of a thought, and nothing in the session says why. Left to work it out, an agent's most
+// reasonable reading is that something FAILED — a build died, a request was rejected, it crashed —
+// and the recovery it would then attempt (re-running a land, re-asking a gate, chasing a phantom
+// error) is worse than the pause was. So the prompt says, in order: nothing of yours failed, here is
+// what could genuinely have changed while you were stopped, and `zee status` is how you find out
+// rather than by guessing.
+//
+// It deliberately does NOT re-issue the specific continuation the zee might have missed (a landing
+// approved, a runway cleared, a stale sha, a ship to reflect on). Those nudges were HELD while the
+// flag was up, and re-deriving each of them per xell here would be a second, divergent copy of four
+// different prompts. `zee status` is the one authoritative answer to all of them — it reports the
+// landing state, the ship state, the tend, the inbox — so the prompt points there and says what to do
+// with each outcome.
+const RESUMED_PROMPT = (min, why) => [
+  'RESUMED — a human pressed PLAY. The whole fleet was PAUSED'
+    + (min != null ? ` about ${min} minute(s) ago` : '')
+    + (why ? ` (reason given: ${why})` : '') + ', which interrupted every zee mid-turn, managers included.',
+  '',
+  'That interrupt was a SIGINT to your turn and NOTHING ELSE. Read that carefully before you react:',
+  'nothing of yours failed, nothing was rejected, no gate moved and no work was lost. Your commits are',
+  'exactly where you left them; a landing or ship you had already asked for is still asked for. If your',
+  'last turn stopped in the middle of a tool call, that is the pause and not a crash — do not go hunting',
+  'for the error.',
+  '',
+  'Pick up where you were, in this order:',
+  '  1. `zee status` — the authoritative answer to "what happened while I was stopped?". Decisions kept',
+  '     arriving while the fleet was still: your landing may have been APPROVED (then carry on: ship if',
+  '     this work ships, else keep going), gone STALE or been CLEARED for the runway (then `zee sync`,',
+  '     resolve any conflict, and `zee land` again). It also carries your tend, your ship state and your',
+  '     inbox — and a message somebody sent you during the pause was REFUSED rather than queued, so ask',
+  '     for it again if you were expecting one.',
+  '  2. `zee work` if you are on a work item — re-read it rather than trusting your memory of it.',
+  '  3. Re-verify ONLY what the interrupt actually cut: if a `zee build … --wait` was in flight, run it',
+  '     again (in the BACKGROUND). A test run that was killed mid-way proves nothing either way.',
+  '  4. Then continue the job.',
+  '',
+  'Do NOT re-raise a request you had already made (check `zee status` first — a second card from you is',
+  'noise a human has to disambiguate), and do NOT `zee tend` about having been paused: a human did it',
+  'deliberately and has just undone it.',
+].join('\n');
+
+// Call one zee back after a pause. Same contract as every nudge here — fire-and-forget, best-effort,
+// NEVER throws. `allowWhilePaused` because this IS the unpause: the fan-out clears the flag first, but
+// saying so at the call site is what stops a future refactor from making play un-pressable.
+export async function nudgeXellForFleetResume(xellId, { minutes = null, reason = null, by = 'human@console', mode = PROVISION_MODE } = {}) {
+  return nudgeCxell(xellId, {
+    by, mode, allowWhilePaused: true, prompt: RESUMED_PROMPT(minutes, reason), why: 'fleet resumed',
+    log: (slug, sid) => `${slug}: fleet RESUMED by ${by} — resuming cxell session ${sid} to continue`,
+  });
+}
+
 // An OPERATOR-initiated nudge: poke the running zee for a status update, WITHOUT changing anything.
 // The word the operator wants the agent to actually SEE, typed into the live session as-is.
 const STATUS_KEYS = 'status?';
@@ -331,6 +391,13 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
     const body = String(text || '').trim();
     const imgs = (Array.isArray(images) ? images : []).filter((i) => i && i.data);
     if (!body && !imgs.length) return { sent: false, reason: 'empty message (no text or images)' };
+    // PAUSED: refused, and refused HONESTLY. This is the door the 📨 button, the Hermes inbound
+    // bridge and a manager's `zee say` all come through, and every one of them ends in a message
+    // TYPED into a session — i.e. a zee starting a turn. Queueing it into the cage instead would be
+    // worse than refusing: the drainer types it the moment a session takes the pane, so a "queued"
+    // message would restart the very zee the operator just stopped, minutes later, with nothing on
+    // screen to explain it. The sender is told, and can re-send after pressing play.
+    if (await fleetPaused()) return { sent: false, paused: true, reason: PAUSED_REASON };
 
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.viewer_url, x.slug
@@ -410,6 +477,10 @@ function msgImageExt(name = '', type = '') {
 // (typing + the reply can take a beat), best-effort, NEVER throws.
 async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = {}) {
   try {
+    // A keystroke is the OTHER way to start a turn — typed into the pane, the zee answers. So it is
+    // gated by the pause exactly like a session resume; a pause that a `status?` poke can undo is
+    // not a pause. Reported, not swallowed: the caller says so in the UI.
+    if (await fleetPaused()) return { nudged: false, paused: true, reason: PAUSED_REASON };
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.viewer_url, x.slug
          FROM zee z JOIN xell x ON x.id = z.xell_id
@@ -440,9 +511,20 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
 
 // The shared delivery: resolve this xell's live cxell zee and resume its claude session with
 // `prompt`. Fire-and-forget (the turn can run for minutes), best-effort, NEVER throws.
+//
+// `allowWhilePaused` exists for exactly ONE caller — the fleet PLAY fan-out, which is itself the act
+// of unpausing (queenzee/pause.js). Everything else must be refused while the fleet is paused: this
+// function's whole job is to START A TURN, and a pause that any queenzee loop can undo on its next
+// tick is not a pause. See the `paused` handling in the callers above: they treat it like `dry_run`
+// (report it, raise NOTHING) rather than as an undelivered nudge, because a paused fleet must not
+// spray tends at a human who is deliberately holding the fleet still.
 async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, onFail = null,
-                                    mode = PROVISION_MODE } = {}) {
+                                    mode = PROVISION_MODE, allowWhilePaused = false } = {}) {
   try {
+    if (!allowWhilePaused && await fleetPaused()) {
+      logline('nudge', `xell ${String(xellId).slice(0, 8)}: ${why} — HELD, ${PAUSED_REASON}`);
+      return { nudged: false, paused: true, reason: PAUSED_REASON };
+    }
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
               x.slug, x.project_id, rt.key AS runtime_key

@@ -39,6 +39,12 @@ export const HIVE_STATUS = {
   // and will be cleared by a nudge when the runway frees. Showing it as a held landing would put a
   // question on a human's screen that has no card and no button behind it.
   'occ-landHolding':  { label: 'holding',      group: 'occ' },
+  // STOPPED BY THE OPERATOR — a human pressed pause and the queenzee SIGINT'd this zee's turn
+  // (lib/fleet-pause.js, queenzee/pause.js). Its own word for the same reason `holding` has one: a
+  // paused zee is quiet, and without this it renders `idle`, which is indistinguishable from a zee
+  // that finished — so a human scanning the hive during a pause cannot tell what they actually
+  // stopped, and after a play cannot tell what came back.
+  'occ-paused':       { label: 'paused',       group: 'occ' },
   'occ-doneRequest':  { label: 'done?',        group: 'occ' },
   'occ-done':         { label: 'done',         group: 'occ' },
   'live-protected':   { label: 'protected',    group: 'live' },
@@ -58,7 +64,7 @@ export function hiveStatus(x, sig = {}) {
   const {
     landPending = false, shipPending = false, tendPending = false, prodUnprotected = false,
     landHint = false, shipHint = false, prodBindPending = false, seedPending = false,
-    doneSuggested = false, landHolding = false,
+    doneSuggested = false, landHolding = false, paused = false,
   } = sig;
 
   // ── production ──
@@ -141,6 +147,15 @@ export function hiveStatus(x, sig = {}) {
   // to land?" — without it, a queued zee is indistinguishable from an idle one, which is exactly the
   // invisibility this protocol would otherwise introduce.
   if (landHolding)                       return 'occ-landHolding';
+
+  // PAUSED — below every ask and below holding, above plain activity, and the placement is the same
+  // argument as `holding` made: it asks a human for NOTHING (the human who caused it is the one
+  // reading the screen), so it must never cover something that does. A held landing still needs
+  // deciding while the fleet is still, and a tend raised before the pause is still the thing to act
+  // on. But it outranks working/idle, because it is the only thing that answers "why has this zee
+  // gone quiet?" — and answering that with `idle` is how an operator loses track of what their own
+  // pause stopped.
+  if (paused)                            return 'occ-paused';
 
   // WORKING is decided by the ZEE'S OWN STATUS, and by nothing else.
   //

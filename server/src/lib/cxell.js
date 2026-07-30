@@ -231,6 +231,21 @@ export async function cxellZeeActive({ ctx = 'default', slug }) {
   }
 }
 
+// Is the QUEENZEE'S OWN headless turn in flight in this cxell right now? The narrower sibling of
+// cxellZeeActive, which also matches the interactive `claude --resume` zee-attach.sh leaves sitting in
+// the pane — an agent nobody is driving. The distinction decides whether it is safe to START a turn
+// (fleet PLAY asks this before resuming a zee: two headless runs on one session double-drive it),
+// where the broad probe would answer "busy" for every cage anyone has ever opened a terminal on.
+// pgrep exits 1 → dk rejects → false, the same contract as cxellZeeActive.
+export async function cxellHeadlessActive({ ctx = 'default', slug }) {
+  try {
+    await dk(ctx, ['exec', cxellName(slug), 'pgrep', '-f', HEADLESS_PROC_PATTERN], { timeoutMs: 8000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Does this xell HAVE a live cxell container right now? (Distinct from cxellZeeActive, which asks
 // whether an AGENT PROCESS is running: a zee that just called `zee land` is BETWEEN turns, so no
 // agent is alive, yet its container is up and its uncollected work lives inside it.) This is the
@@ -1203,6 +1218,66 @@ export async function sendKeysToCxellZee({ sshPort, slug, text, sessionId, sessi
     throw new Error(`send-keys did not confirm (exit ${r.code}): ${(r.err || r.out || '').slice(0, 200)}`);
   }
   return { sent: true, text, delivery: 'typed' };
+}
+
+// ── INTERRUPT: STOP a zee mid-turn (the fleet PAUSE button) ───────────────────────────────────────
+//
+// Every other verb here starts or continues a turn. This one ENDS one, on purpose, while it is still
+// running — the fan-out behind the console's pause button (lib/fleet-pause.js).
+//
+// It is a SIGINT to the headless run inside the cage, i.e. exactly the Ctrl-C a human would type, and
+// that choice is the whole design:
+//   • the transcript JSONL is appended as the turn goes, so the session is intact and RESUMABLE the
+//     moment the operator presses play (nudgeCxellZee --resume picks it up mid-conversation);
+//   • nothing in the workspace is touched — no commits, no branch, no gate, no request. A paused zee
+//     loses the rest of its turn and nothing else.
+// TERM is the escalation for a run that ignores the interrupt, and a run that survives BOTH is
+// reported as stuck rather than papered over: "paused" that left a zee working is the one outcome
+// this must never claim (an operator who thinks the fleet is stopped will do things that assume it).
+//
+// HEADLESS_PROC_PATTERN, not AGENT_PROC_PATTERN: the headless run is the queenzee's turn, which is
+// what a pause means. A human's own interactive `claude --resume` in the pane is THEIR session — a
+// pause must not kill the terminal somebody is typing in. The BRACKETS in that pattern are load-
+// bearing here for a second reason on top of the one documented at its definition: this string is
+// interpolated into the shell command, so a pattern that could match its own `bash -lc` wrapper would
+// have pkill SIGINT the wrapper — killing the probe and leaving the agent running, which reads as a
+// successful pause. `[-]p` cannot match the literal text `[-]p`, so it cannot see itself.
+const INTERRUPT_MARKERS = ['__ZEE_INT_IDLE__', '__ZEE_INT_SIGINT__', '__ZEE_INT_SIGTERM__', '__ZEE_INT_STUCK__'];
+
+// The exact remote command behind "stop this zee now" — PURE, so the whole escalation is testable
+// without a container (the same contract as cxellTalkCommand).
+export function cxellInterruptCommand({ pattern = HEADLESS_PROC_PATTERN, graceMs = 4000 } = {}) {
+  const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const p = sq(pattern);
+  const tries = Math.max(1, Math.ceil(graceMs / 500));
+  return [
+    // Nothing running is a legitimate, common answer (a zee between turns) — not a failure.
+    `if ! pgrep -f ${p} >/dev/null 2>&1; then echo __ZEE_INT_IDLE__; exit 0; fi`,
+    `pkill -INT -f ${p} 2>/dev/null || true`,
+    `for i in $(seq 1 ${tries}); do pgrep -f ${p} >/dev/null 2>&1 || { echo __ZEE_INT_SIGINT__; exit 0; }; sleep 0.5; done`,
+    `pkill -TERM -f ${p} 2>/dev/null || true`,
+    `for i in $(seq 1 4); do pgrep -f ${p} >/dev/null 2>&1 || { echo __ZEE_INT_SIGTERM__; exit 0; }; sleep 0.5; done`,
+    `echo __ZEE_INT_STUCK__`,
+  ].join('; ');
+}
+
+// Interrupt the headless turn running in ONE cxell. Resolves
+// { stopped, how: 'sigint'|'sigterm'|'stuck'|null, idle } — `idle:true` meaning there was no turn to
+// stop, which is a success for a pause (the zee is already not working) and is counted separately so
+// the receipt can say how many zees were actually mid-turn. Rejects only when the cage could not be
+// reached at all; the caller reports that per xell rather than failing the whole pause.
+export async function interruptCxellZee({ ctx = 'default', slug, name = null, graceMs = 4000, timeoutMs = 30000 } = {}) {
+  const cname = name || cxellName(slug);
+  const r = await dkVerdict(ctx, ['exec', cname, 'bash', '-lc', cxellInterruptCommand({ graceMs })],
+    { markers: INTERRUPT_MARKERS, label: `${slug || cname}: interrupt`, timeoutMs });
+  switch (r.verdict) {
+    case '__ZEE_INT_IDLE__':    return { stopped: true,  idle: true,  how: null,       verdict: r.verdict };
+    case '__ZEE_INT_SIGINT__':  return { stopped: true,  idle: false, how: 'sigint',   verdict: r.verdict };
+    case '__ZEE_INT_SIGTERM__': return { stopped: true,  idle: false, how: 'sigterm',  verdict: r.verdict };
+    case '__ZEE_INT_STUCK__':   return { stopped: false, idle: false, how: 'stuck',    verdict: r.verdict };
+    // No marker at all: the exec ran but said nothing we declared. Do NOT read that as stopped.
+    default: throw new Error(`interrupt gave no verdict (exit ${r.code}): ${(r.err || r.out || '').slice(0, 160) || 'no output'}`);
+  }
 }
 
 // WRITE a file INTO a live cxell's /work/repo — the delivery path for an operator's rich message

@@ -40,6 +40,7 @@ import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
+import { pauseState, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefReason,
   shipRefusalState, setZeeStatus } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
@@ -54,8 +55,12 @@ import { normalizeZeeType, resolveHarness, listHarnesses, createHarness, updateH
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
 // documented auto-clear of an open tend (zee.xell_id was undefined). Caught by tend-nudge.test.mjs.
+// last_stop_reason rides along for the FLEET PAUSE: it is where the pause marks the zees it
+// interrupted (lib/fleet-pause.PAUSED_STOP_REASON), and `zee status` is where a resumed zee is sent to
+// find out what happened to it — so this read has to be able to tell "you were paused" from
+// "somebody else was".
 const liveZee = (xellId) => one(
-  `SELECT id, xell_id, name, status, model FROM zee WHERE xell_id=$1
+  `SELECT id, xell_id, name, status, model, last_stop_reason FROM zee WHERE xell_id=$1
      AND status IN ('spawning','online','working','idle') ORDER BY created_at DESC LIMIT 1`, [xellId]);
 
 // ── GET /api/xell/self/status — the read model a cxell zee orients from ────────
@@ -85,9 +90,16 @@ export async function selfStatus(xell) {
   const shipRefused = await shipRefusalState(xell.id);
   // The DISPLAY status the hive shows for this xell — the same derivation the dashboard renders, so
   // a cxell zee sees itself exactly as a human does (and can tell its tend/hint/land/ship pings landed).
+  // The fleet PAUSE. A zee resumed by the play button is told to run `zee status` first, so this has
+  // to answer honestly: whether the fleet is (still) paused, and whether THIS zee is one the pause
+  // interrupted. Without it the one command the resume prompt sends a zee to would be silent about the
+  // very thing that stopped it.
+  const pause = await pauseState();
+  const pausedHere = pause.paused && zee?.last_stop_reason === PAUSED_STOP_REASON;
   const hive = hiveStatus(
     { ...xell, zee_status: zee?.status },
     {
+      paused: pausedHere,
       landPending: land ? ['pending', 'approved'].includes(land.status) : false,
       // Queued for the runway (067) — the zee sees the same `holding` hexagon a human does, which is
       // how it can tell its push really did land in the pattern rather than vanish.
@@ -141,6 +153,15 @@ export async function selfStatus(xell) {
           status: doneSuggestion.status, pending: doneSuggestion.status === 'pending' }
       : null,
     tend: { open: tend.open, reason: tend.reason, reason_full: tend.full, since: tend.at },
+    // FLEET PAUSE — `paused_here` is the one a zee should act on: the fleet is still, and YOUR turn is
+    // the one it stopped. `fleet` alone is a fact about everyone (a zee reading it after a play sees
+    // paused:false, which is the answer to "am I clear to work?").
+    fleet_pause: { paused: pause.paused, since: pause.since, by: pause.by, reason: pause.reason,
+                   paused_here: pausedHere,
+                   note: pause.paused
+                     ? 'A human PAUSED the whole fleet. Nothing of yours failed and nothing was rejected — '
+                       + 'the queenzee will not deliver messages or nudges until they press play. Do not raise a tend for it.'
+                     : null },
     // One line, only when the tend is OPEN and a reply arrived SINCE it was raised — an answered
     // ask left up is a hexagon crying wolf, and only the zee may lower it (lib/status.tendNudge).
     tend_nudge: await tendNudge(xell.id, tend),
