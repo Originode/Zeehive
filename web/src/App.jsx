@@ -4,7 +4,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
          extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
-         pauseXell, resumeXell } from './api.js';
+         pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject } from './api.js';
 import MessageComposer from './MessageComposer.jsx';
 import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
@@ -174,6 +174,8 @@ export default function App() {
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
+  const [githubAccessState, setGithubAccessState] = useState(null); // {can_push, can_pr, default_branch, reason}
+  const [githubOut, setGithubOut] = useState(null); // last push/PR outcome {kind, busy, pushed, opened, url, reason}
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
   const [loadBackupFor, setLoadBackupFor] = useState(null); // db container to restore a backup INTO
   const [shellFor, setShellFor] = useState(null); // container to open a docker-exec shell into
@@ -262,6 +264,16 @@ export default function App() {
     if (!pid) return;
     getProviderTokens(pid).then((t) => setProviders(Array.isArray(t) ? t : [])).catch(() => setProviders([]));
   }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
+  // GitHub access check: does the stored token let us push / open PRs to the remote?
+  // Re-fetches when the project or the setup modal closes (the operator may have added a token there).
+  useEffect(() => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid) { setGithubAccessState(null); return; }
+    let live = true;
+    githubAccess(pid).then((a) => { if (live) setGithubAccessState(a); })
+      .catch(() => { if (live) setGithubAccessState(null); });
+    return () => { live = false; };
+  }, [projectId, fleet?.project?.id, showSetup]);
   // Latest project list, read from callbacks with stable identities (e.g. selectProject) so they
   // can resolve an id → project row for the URL without re-binding on every list change.
   const projectsRef = useRef([]);
@@ -348,6 +360,52 @@ export default function App() {
     // fix either — it sits after an early return, and hooks must run unconditionally. `fleet` is
     // state declared at the top of the component, so it is always safe to reference here.
   }, [pushToast, updateToast, dismissToast, refresh, projectId, fleet]);
+
+  // ── GitHub outbound (push / open PR) ───────────────────────────────────────
+  // Same flow as ProjectSetup's BasicsSection — confirm, call API, report the outcome.
+  const doGitHubPush = useCallback(async () => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid || !githubAccessState?.can_push) return;
+    if (!(await showConfirm(
+      `Push local ${fleet?.project?.main_branch || 'main'} of ${fleet?.project?.name} to the GitHub remote?\n\n`
+      + `${fleet?.project?.remote_url || ''}\n\nThis publishes your local history to the remote (fast-forward only — a `
+      + `diverged remote is refused, never force-pushed).`,
+      { title: 'Push to remote?', okLabel: 'Push' }))) return;
+    setGithubOut({ busy: true, kind: 'push' });
+    try {
+      const r = await pushProject(pid);
+      setGithubOut({ ...r, kind: 'push' });
+    } catch (e) { setGithubOut({ kind: 'push', reason: e.message }); }
+  }, [projectId, fleet?.project?.id, fleet?.project?.main_branch, fleet?.project?.name, fleet?.project?.remote_url, githubAccessState]);
+
+  // Pull is fetch + fast-forward ONLY from the GitHub remote.
+  const doGitHubPull = useCallback(async () => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid) return;
+    setGithubOut({ busy: true, kind: 'pull' });
+    try {
+      const r = await pullProject(pid);
+      setGithubOut({ ...r, kind: 'pull' });
+    } catch (e) { setGithubOut({ kind: 'pull', reason: e.message }); }
+  }, [projectId, fleet?.project?.id]);
+
+  const doGitHubPR = useCallback(async (merge = false) => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid || !githubAccessState?.can_pr) return;
+    const headBranch = await showPrompt(
+      `${merge ? 'Open a pull request and MERGE it' : 'Open a pull request'} from local ${fleet?.project?.main_branch || 'main'}.\n\n`
+      + `A side branch is pushed to the remote and a PR is opened against ${githubAccessState?.default_branch || 'the default branch'}`
+      + `${merge ? ', then merged into it on GitHub' : ''}. `
+      + `Name the head branch (leave as-is for a generated name):`,
+      { title: merge ? 'Open a pull request and merge?' : 'Open a pull request?',
+        defaultValue: `zeehive/${fleet?.project?.main_branch || 'main'}`, okLabel: merge ? 'Open & merge' : 'Open PR' });
+    if (headBranch === null) return;
+    setGithubOut({ busy: true, kind: 'pr', merge });
+    try {
+      const r = await pullRequestProject(pid, { headBranch: headBranch.trim() || undefined, merge });
+      setGithubOut({ ...r, kind: 'pr', merge });
+    } catch (e) { setGithubOut({ kind: 'pr', merge, reason: e.message }); }
+  }, [projectId, fleet?.project?.id, fleet?.project?.main_branch, githubAccessState]);
 
   // once: global logs, and pick the active project (persisted → first)
   useEffect(() => {
@@ -767,6 +825,43 @@ export default function App() {
           <span className="k folder">Folder:</span> <span className="mono">{project.repo_root}</span>
         </div>
         <div className="right">
+          {/* GitHub remote: push / PR buttons — only surface when the token allows outbound. */}
+          {(fleet?.project?.remote_url) && (
+            <span className="gh-btns" title={`GitHub: ${fleet?.project?.remote_url}`}>
+              <a className="gh-link" href={fleet?.project?.remote_url} target="_blank" rel="noreferrer"
+                 title="Open the GitHub remote in your browser">⑂</a>
+              <button className={`gh-btn ${githubOut?.kind === 'pull' && githubOut?.busy ? 'busy' : ''}`}
+                      disabled={githubOut?.busy}
+                      onClick={doGitHubPull}
+                      title="Fetch + fast-forward from the GitHub remote">↓ Pull</button>
+              {githubAccessState?.can_push && (
+                <button className={`gh-btn ${githubOut?.kind === 'push' && githubOut?.busy ? 'busy' : ''}`}
+                        disabled={githubOut?.busy}
+                        onClick={doGitHubPush}
+                        title="Push local main to the GitHub remote (fast-forward only)">↑ Push</button>
+              )}
+              {githubAccessState?.can_pr && (
+                <button className={`gh-btn ${githubOut?.kind === 'pr' && githubOut?.busy ? 'busy' : ''}`}
+                        disabled={githubOut?.busy}
+                        onClick={() => doGitHubPR(false)}
+                        title="Push a side branch and open a pull request on GitHub">⇅ PR</button>
+              )}
+              {githubAccessState?.can_pr && (
+                <button className={`gh-btn ${githubOut?.kind === 'pr' && githubOut?.busy ? 'busy' : ''}`}
+                        disabled={githubOut?.busy}
+                        onClick={() => doGitHubPR(true)}
+                        title="Open a PR AND merge it into the default branch on GitHub">⇅ PR ⟳</button>
+              )}
+              {githubOut && !githubOut.busy && (
+                <a className="gh-out" href={githubOut?.url || null} target="_blank" rel="noreferrer"
+                   title={githubOut?.pushed ? 'Pushed successfully'
+                     : githubOut?.opened ? (githubOut?.merge?.merged ? 'PR opened & merged' : 'PR opened')
+                     : githubOut?.reason || 'result'}>
+                  {githubOut?.pushed ? '✓' : githubOut?.opened ? `#${githubOut?.number || '✓'}` : '✗'}
+                </a>
+              )}
+            </span>
+          )}
           {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided by clicking that
               account's own prompt button in the status line — one click, no second choice. */}
