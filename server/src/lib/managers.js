@@ -221,6 +221,47 @@ export async function notifyManagerOfSwap({ manager, target, harness, previous =
   });
 }
 
+// ── a swap that HALF-HAPPENED — the outgoing zee is gone and the new one never started ──────
+//
+// notifyManagerOfSwap above is the SUCCESS sentence, and for a long time it was the only one: the
+// swap core told the manager after the dispatch returned, so the one path where a manager most
+// needs telling — the dispatch THREW — said nothing at all. That is not a hypothetical failure
+// mode; the spawn is the flakiest step in this system (a transient upstream 529 killed a zee on
+// this very feature), and the state it leaves behind is the worst kind: the previous zee is already
+// retired, the xell already wears the new persona, and NOTHING is running in it. The human who
+// clicked gets an error back. The manager, until now, just watched a crew member go quiet — and a
+// quiet worker is the one thing a manager is built to wait patiently for.
+//
+// So this is its own wording, deliberately not a variation on the success one. It must answer the
+// three questions a manager will otherwise burn a turn on: what happened to the COMMITS, what state
+// the XELL is in now, and what (if anything) it should do about it.
+export async function notifyManagerOfHalfSwap({ manager, target, harness, previous = null,
+                                                by = 'human@console', error = null, collected = null }) {
+  if (!manager || !target || !harness) throw new Error('a half-swap notification needs a manager, a target xell and a harness');
+  const was = previous?.harness_key || previous?.harness_label || null;
+  const head = collected?.head ? String(collected.head).slice(0, 8) : null;
+  return postMessage({
+    from: null, to: manager, kind: 'report', by,
+    body: `A HUMAN tried to swap the zee in your worker ${target.slug} and THE NEW ZEE DID NOT START: `
+      + `${String(error || 'the dispatch failed').replace(/\s+/g, ' ').slice(0, 300)}\n\n`
+      + `That leaves ${target.slug} HALF-SWAPPED, and this is the part you cannot see from \`zee zees\` `
+      + `alone: the previous zee${was ? ` (${was})` : ''} was already retired before the spawn was `
+      + `attempted, so there is NO zee in that xell now. It wears "${harness.key}"`
+      + `${harness.label ? ` (${harness.label})` : ''} and nothing is running in it — do not wait for it `
+      + 'to report; it has no agent to report with.\n\n'
+      + (head
+        ? `Nothing was lost. The outgoing zee's commits were collected onto the host worktree first `
+          + `(HEAD ${head}), so the branch (${target.branch}), its commits, the containers, the database `
+          + 'and the work-item card are all exactly where they were.'
+        : `Nothing was lost here either, but nothing was RESCUED: ${collected?.reason || 'nothing was collected from the old cage'}`
+          + `, so the branch (${target.branch}) is exactly as the host worktree last saw it — no more, no less.`)
+      + '\n\nThe xell is flagged for a human in the console (it shows `tend?` with this same reason), so '
+      + 'somebody has been asked to look. If it is your crew you can retry it yourself once the reason '
+      + `is fixed: \`zee swap --to ${target.slug} --harness ${harness.key}\`. Re-planning around a xell `
+      + 'with nobody in it is the mistake this message exists to prevent.',
+  });
+}
+
 // ── done suggestions (a manager proposes SOMEONE ELSE is finished) ───────────
 // Deliberately not `zee done`: that is a zee proposing its own completion. This proposes another
 // xell's, so it can never be self-serviceable — it raises a card and a `done?` prompt, and a HUMAN

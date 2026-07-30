@@ -44,7 +44,7 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
   shipRefusalState, setZeeStatus } from '../lib/status.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
-         notifyManagerOfSwap,
+         notifyManagerOfSwap, notifyManagerOfHalfSwap,
          NO_PUSH_REASON } from '../lib/managers.js';
 // The harness DOMAIN (lib/harness.js) — listed/authored here for the manager harness verbs at the
 // bottom of this file, and read on the dispatch path. Same one-rule-one-place discipline as the type
@@ -1370,6 +1370,52 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
   return swapZeeInXell({ target, harness: h, task, model, mode, runtime, title, manager: xell });
 }
 
+// ── THE HALF-SWAPPED XELL, MADE HONEST ───────────────────────────────────────────────────────────
+//
+// A swap whose dispatch throws AFTER the retire leaves a xell that is nobody's: the previous zee is
+// stopped, the new one never started, and the row still says whatever it said while a zee was
+// working in it. Two separate lies come out of that, and this function is the one place both are
+// corrected:
+//
+//   1. IT LOOKS OCCUPIED. `crewFor()` and the honeycomb read hiveStatus(), which — with no signal to
+//      the contrary — projects a 'working' xell as `working`. A manager scanning `zee zees` sees a
+//      busy crew member; a human scanning the hive sees a busy hexagon. Both are looking at an empty
+//      cage. So the row is put back to 'idle' (nothing is running) and a TEND is raised, which is
+//      the existing, honest way this system says "a human is needed here" — it outranks activity in
+//      hiveStatus, carries its own reason to the hexagon chip, the console card and `zee zees`'s
+//      waiting_on_human, and is auto-cleared the moment a zee reports working here again.
+//
+//   2. IT CAN LOOK FREE. Worse and less obvious: when the dispatch died inside spawnCxell, that path
+//      already ran releaseXell() — `status='ready', is_pooled=true` — which is right for a POOL xell
+//      whose spawn failed and catastrophic for a swap, because this xell carries a branch, commits,
+//      containers and a work-item card. Left alone it is a candidate the very next dispatch can pick
+//      up (readyXells takes pooled+ready rows), and a stranger's zee would be cloned onto somebody
+//      else's unlanded work. So the pool flag is forced back off, unconditionally.
+//
+// The tend is stamped `source='swap'` so the swap that eventually succeeds can lower ITS OWN tend
+// without ever touching one a zee raised for a real reason.
+//
+// Best-effort by contract: it never throws out (the caller still has an answer to give a human), and
+// it never touches a xell that is being torn down or is already retired.
+export async function markXellHalfSwapped({ target, harness: h, error = null, collected = null,
+                                            asked = 'a swap' } = {}) {
+  const why = `SWAP HALF-DONE — there is NO zee in this xell: the previous one was retired and the new `
+    + `"${h.key}" zee could not start (${String(error?.message || error || 'the dispatch failed').replace(/\s+/g, ' ').slice(0, 160)}). `
+    + `Nothing is running here. The branch (${target.branch}) and its commits are on the host worktree`
+    + `${collected?.collected ? ` (collected up to HEAD ${String(collected.head).slice(0, 8)})` : ''}; `
+    + 'swap or dispatch again once the reason is fixed.';
+  const row = await one(
+    `UPDATE xell SET status='idle', is_pooled=false WHERE id=$1
+       AND status NOT IN ('tearing-down','retired') RETURNING *`, [target.id]).catch(() => null);
+  if (row) broadcast('xell', row);
+  const tend = await setTend(target.id, true, { reason: why, source: 'swap' }).catch(() => null);
+  logline('crew', `${asked} left ${target.slug} HALF-SWAPPED — retired zee gone, no new zee `
+    + `(${String(error?.message || error || 'dispatch failed').replace(/\s+/g, ' ').slice(0, 120)}); `
+    + 'the xell reads idle + tend? and is out of the pool');
+  return { ok: true, xell_status: row?.status || null, is_pooled: row?.is_pooled ?? null,
+           tend_raised: !!tend, reason: why };
+}
+
 // ── THE SHARED CORE OF A SWAP — one copy, two callers ────────────────────────────────────────────
 //
 // `zee swap` (a MANAGER re-crewing one of its own workers) and POST /api/xells/:id/swap (a HUMAN
@@ -1511,10 +1557,29 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
     });
   } catch (e) {
+    // ── THE HALF-SWAPPED STATE ────────────────────────────────────────────────────────────────
+    // We are PAST the retire. The outgoing zee is stopped, the xell wears the incoming persona, and
+    // the spawn — the flakiest step in this system — just threw. Everything below exists because
+    // that state used to be invisible to everyone except the person who clicked: the manager was
+    // told only on the success path, and the xell went on reading as a working crew member with
+    // nobody in it. See markXellHalfSwapped + notifyManagerOfHalfSwap; neither may sink this answer,
+    // so both are best-effort by construction.
+    const half = await markXellHalfSwapped({ target, harness: h, error: e, collected, asked })
+      .catch((err) => ({ ok: false, error: err.message }));
+    // The manager is told on the SAME condition as a successful swap: a manager that ran `zee swap`
+    // itself is reading this failure in the answer to its own verb, and does not need it twice.
+    let notified = null;
+    if (!manager && watcher) {
+      notified = await notifyManagerOfHalfSwap({ manager: watcher, target, harness: h,
+                                                 previous: prevZee, by, error: e.message, collected })
+        .then((r) => ({ ok: true, delivered: !!r.delivered }))
+        .catch((err) => ({ ok: false, error: err.message }));
+    }
     // Say what actually happened to the commits. This used to claim "the swap collected …'s commits"
     // unconditionally — including when the cage was not running and there was nothing to collect,
     // which is a sentence that tells a human their work was rescued when nothing was.
     return { ok: false, status: 'error', stage: 'dispatch', collected,
+      half_swapped: half, manager_notified: notified,
       error: `the swap could not start the new zee in ${target.slug}: ${e.message} `
         + (collected?.collected
           ? `Its commits were collected onto the worktree first (HEAD ${String(collected.head).slice(0, 8)}), so `
@@ -1522,6 +1587,20 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
           : `Nothing was collected from the old cage (${collected?.reason || 'n/a'}), and the xell, its branch `
             + 'and its commits are untouched. ')
         + 'Fix the reason and swap again.', detail: e.detail || null };
+  }
+
+  // ── LOWER THE TEND A PREVIOUS HALF-SWAP RAISED ──────────────────────────────────────────────
+  // markXellHalfSwapped stamps its tend `source='swap'` and says "there is NO zee in this xell".
+  // There is one now, so that ask is answered and must come down — a stale "needs you" competing
+  // with a real one is the exact failure the manual warns zees about, and this one nobody could
+  // clear (the zee it belonged to no longer exists). Scoped by SOURCE, so a tend the outgoing zee
+  // raised for a real reason is left standing for a human, which is what it was raised for.
+  const lastTend = await one(
+    `SELECT source, hook_event_name FROM session_event
+       WHERE xell_id=$1 AND hook_event_name IN ('tend-request','tend-clear')
+       ORDER BY ts DESC LIMIT 1`, [target.id]).catch(() => null);
+  if (lastTend?.hook_event_name === 'tend-request' && lastTend.source === 'swap') {
+    await setTend(target.id, false, { source: 'swap' }).catch(() => {});
   }
 
   // The board's link is on the xell (work_item.xell_id), so it survives by itself — but the TASK row
