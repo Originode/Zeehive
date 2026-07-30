@@ -1376,6 +1376,21 @@ export async function swapZeeInXell({ target, harness: h, task = null, model = n
       + 'in it; starting fresh work is a dispatch.' };
   }
 
+  // A MANAGER xell is not re-crewed by anybody — not by its own kind (`zee swap` refuses it upstream
+  // as "nobody's crew") and not from the console either, and the reason is one line down the dispatch
+  // path rather than a matter of taste: dispatching into a manager xell re-runs
+  // bindManagerToProdReadonly, which in PRODRO_MODE=real runs CREATE/ALTER ROLE against the LIVE
+  // production database and ROTATES the DSN. "Give this crew a different lead" must not quietly be a
+  // production write. A manager is added by a human (POST /api/managers) and ended by marking it done.
+  if (normalizeZeeType(target.zee_type) === 'manager') {
+    return { ok: false, status: 'refused', error:
+      `${target.slug} is a MANAGER xell, and a swap does not re-crew one. Re-dispatching a manager `
+      + 're-mints its production READ-ONLY role (a live CREATE/ALTER ROLE + password rotation), which '
+      + 'is not something a re-crewing should do behind a click — and its crew reports to the xell, not '
+      + 'to the agent in it. A manager is added by a human and ended by marking it done; to re-task the '
+      + 'one that is there, send it a message.' };
+  }
+
   // A harness IS a type's manual, and 054's DB guard pairs the two. The type may not CHANGE in a
   // swap (that would strip a manager off production read-only, or hand a worker the crew verbs),
   // so the persona must already match the xell — checked here, in the one place both callers pass
