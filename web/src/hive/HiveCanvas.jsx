@@ -1083,13 +1083,15 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   const full = size >= 52;             // the two-half card needs room; else degrade
 
-  // ── harness avatar badge (upper-left corner) ──
-  // Small persona disc for the harness this worker wears, matching the manager's avatar style but
-  // much smaller: a ringed disc ~18% of the hex radius, sitting in the upper-left quadrant.
+  // ── harness avatar badge (10 o'clock / 300°/210° corner) ──
+  // Small persona disc for the harness this worker wears, sitting near the upper-left vertex
+  // of the hexagon. Positioned along the 210° math angle (10 o'clock in UI convention).
   if (full && harness && size >= 48) {
     const avatarR = Math.max(5, size * 0.12);
-    const ax = cx - size * 0.52 + avatarR;
-    const ay = cy - size * 0.68 + avatarR;
+    const angle = (210 * Math.PI) / 180;   // 210° math = upper-left = 10 o'clock
+    const dist = size * 0.52;               // radius from center, inset from vertex
+    const ax = cx + dist * Math.cos(angle);
+    const ay = cy + dist * Math.sin(angle);
     drawAvatarDisc(ctx, ax, ay, avatarR, harness.color || col,
       { img: harnessImg, glyph: harness.glyph || null, letter: String(harness.label || '?')[0] });
   }
