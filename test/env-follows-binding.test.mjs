@@ -147,6 +147,27 @@ try {
   ok(released.vars.DATABASE_URL !== SHARED_PROD,
      `and no longer names production (${released.vars.DATABASE_URL ?? '(none)'})`);
 
+  // ── 2b. the omnibiz shape: a prod db with NO conn_ref but a PUBLISHED address ───────────────
+  // omnibiz_db_prod records no conn_ref (it lives on another machine's docker context) but
+  // publishes host + host_port — and the cage firewall deliberately leaves a prod-bound xell's own
+  // prod db unblocked. The bind used to answer with a docker-exec psql a CXELL cannot run and an
+  // env file with no DATABASE_URL, so the zee reported an ONLINE production db as unreachable.
+  console.log('a conn_ref-less but published prod db still yields a reachable DSN (the omnibiz bug)');
+  await q(`UPDATE container SET conn_ref=NULL, host='10.9.9.9', host_port=6543
+            WHERE project_id=$1 AND role='db' AND tier='prod'`, [pid]);
+  const t = await mkXell('tcp');
+  const tcpBind = await attachProdStack(t.id, { by: 'test' });
+  const TCP_DSN = 'postgresql://zeehive@10.9.9.9:6543/zeehive';
+  ok(tcpBind.dsn === TCP_DSN,
+     `the bind answers with the DSN derived from host:host_port (${tcpBind.dsn ?? '(none)'})`);
+  ok(tcpBind.psql === `psql "${TCP_DSN}"`,
+     `…and its psql dials that DSN, not a docker exec a cage cannot run (${tcpBind.psql})`);
+  ok(projection(t.wt).vars.DATABASE_URL === TCP_DSN,
+     `…and .zeehive.env carries the address (${projection(t.wt).vars.DATABASE_URL ?? '(none)'})`);
+  await detachProdStack(t.id, { by: 'test' });
+  await q(`UPDATE container SET conn_ref=$2, host=NULL, host_port=NULL
+            WHERE project_id=$1 AND role='db' AND tier='prod'`, [pid, SHARED_PROD]);
+
   // ── 3. the choke point: any db re-target ────────────────────────────────────────────────────
   console.log('attachXellDb: the projection follows every re-target');
   await attachXellDb(w.id, { coupling: 'db-shared-prod' });

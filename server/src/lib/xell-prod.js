@@ -20,7 +20,8 @@ import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
-import { attachXellDb, resolveRealDbContainer, resolveRealDbContainerCached } from './xell-db.js';
+import { attachXellDb, resolveRealDbContainer, resolveRealDbContainerCached, derivedTcpDsn }
+  from './xell-db.js';
 
 const APP_ROLES = ['server', 'webapp'];
 
