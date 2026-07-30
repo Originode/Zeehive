@@ -51,7 +51,11 @@ const fail = (error, extra = {}) => ({ ok: false, error, verdict: null, ...extra
 // Check ONE db container's row counts against the backup it was restored from.
 // Returns the report and (unless `persist` is false) writes it onto container.data_check — a column of
 // its own, never prod_diff: two questions, two verdicts, so neither can be read as the other.
-export async function checkContainerData(containerId, { persist = true } = {}) {
+// `only` restricts the comparison to a named subset of tables — what a TABLE-SCOPED restore actually
+// loaded (#30). Without it, auto-grading a scoped restore would compare the whole reference against the
+// whole database and report every untouched table as missing: a false alarm on a correct operation, and
+// the fastest way to teach a human to ignore this check.
+export async function checkContainerData(containerId, { persist = true, only = null } = {}) {
   const c = await one(`SELECT * FROM container WHERE id=$1 AND role='db'`, [containerId]);
   if (!c) return fail('no such db container');
   // Refusal with a reason, not a silent skip: this is the P3 that was deliberately not built.
@@ -71,7 +75,7 @@ export async function checkContainerData(containerId, { persist = true } = {}) {
         + 'Restore a backup into it (the restore records which one), then run this check.',
       { needs_restore: true });
   }
-  const snap = await one(`SELECT id, taken_at, dump_path, row_counts, row_total, toc_summary, tables FROM db_snapshot WHERE id=$1`,
+  const snap = await one(`SELECT id, taken_at, dump_path, row_counts, row_stats, row_total, toc_summary, tables FROM db_snapshot WHERE id=$1`,
     [c.restored_from]);
   if (!snap) return fail('the backup this database was restored from has been deleted — nothing to compare against');
   if (!snap.row_counts) {
@@ -98,12 +102,21 @@ export async function checkContainerData(containerId, { persist = true } = {}) {
       + `${(present.err || 'psql failed').trim().split('\n').filter(Boolean)[0]?.slice(0, 200)}`);
   }
   const here = new Set(Object.keys(parseRowCounts(present.out)));
-  const countable = Object.keys(snap.row_counts).filter((t) => here.has(t));
+  // The reference, narrowed to the scope actually loaded when the caller names one.
+  const scope = Array.isArray(only) && only.length ? new Set(only) : null;
+  const reference = scope
+    ? Object.fromEntries(Object.entries(snap.row_counts).filter(([t]) => scope.has(t)))
+    : snap.row_counts;
+  if (scope && !Object.keys(reference).length) {
+    return fail(`this database was restored with a table selection (${only.join(', ')}) and the backup `
+      + 'records no counts for any of those tables — nothing to compare');
+  }
+  const countable = Object.keys(reference).filter((t) => here.has(t));
 
   // Nothing the backup carries exists here at all: that is an EMPTY (or wrong) database, not a row
   // shortfall, and pretending to count it would say "every table is missing" in 600 lines.
   if (!countable.length) {
-    return fail(`none of the ${Object.keys(snap.row_counts).length} table(s) this backup recorded exist in `
+    return fail(`none of the ${Object.keys(reference).length} table(s) this backup recorded exist in `
       + `${c.name} — this database is empty, or it is not the database that was restored. That is a SCHEMA `
       + `finding, not a row shortfall: run "Check diff" first.`, { empty_db: true });
   }
@@ -117,7 +130,9 @@ export async function checkContainerData(containerId, { persist = true } = {}) {
   }
 
   const got = parseRowCounts(r.out);
-  const cmp = compareRestoreCounts(snap.row_counts, got);
+  // The staleness map rides along so a shortfall inside a decayed estimate is reported as
+  // unverifiable rather than as data loss (see lib/row-counts.js referenceIsStale).
+  const cmp = compareRestoreCounts(reference, got, snap.row_stats || null);
   const report = {
     ok: true, error: null,
     ...cmp,
@@ -126,7 +141,8 @@ export async function checkContainerData(containerId, { persist = true } = {}) {
     not_covered: 'the CONTENTS of a row. Equal counts do not prove equal data, and nothing here reads a value.',
     reference: {
       kind: 'snapshot', id: snap.id, taken_at: snap.taken_at,
-      estimated: true, tolerance: SHORTFALL_TOLERANCE,
+      scoped_to: scope ? [...scope] : null,
+      estimated: true, tolerance: SHORTFALL_TOLERANCE, has_staleness: !!snap.row_stats,
       note: 'the reference is the planner\'s row ESTIMATE from the source at dump time; this side is an exact count',
     },
     restored_note: c.restored_note || null,

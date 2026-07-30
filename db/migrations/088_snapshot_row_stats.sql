@@ -1,0 +1,17 @@
+-- HOW FAR EACH RECORDED ESTIMATE HAD DECAYED — the honesty column for P1's counts (TKT-30 follow-up).
+--
+-- row_counts holds pg_class.reltuples, which is only as good as the table's last ANALYZE. A table that
+-- was bulk-deleted just before a dump still reports its old count, so a perfectly faithful restore of
+-- that dump would read as "short" — a FALSE "data is missing", which is the one failure this feature
+-- cannot afford. Found on a live database, twice over: public.project estimated 8 against an exact 6
+-- (25% "short") purely because 32 rows had moved since the last analyze, and another zee's test run went
+-- red on exactly the same mechanism at a bigger scale.
+--
+-- row_stats: { "schema.table": <rows inserted/updated/deleted since the last ANALYZE> }, from
+-- pg_stat_all_tables.n_mod_since_analyze — postgres's own answer to "can you trust that number?".
+-- When a shortfall sits inside that movement, the comparison reports it as UNVERIFIABLE rather than as a
+-- finding: "could not be judged" is a different sentence from "fine", and neither is "data is missing".
+--
+-- Never used to excuse an EMPTY table. No amount of statistical decay turns "the reference had rows"
+-- into "this table has none of them" — that claim survives everything.
+ALTER TABLE db_snapshot ADD COLUMN IF NOT EXISTS row_stats jsonb;
