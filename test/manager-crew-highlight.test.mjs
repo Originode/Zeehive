@@ -107,6 +107,14 @@ ok(hexDim({ hexId: 'w1', expandedId: 'M', related: 'crew' }) === false
    'SELECTING a manager (its flower open) keeps its crew lit and dims everyone else');
 ok(hexDim({ hexId: 'M', expandedId: 'M' }) === false && hexDim({ hexId: 'w1', hovered: true, hoverActive: true }) === false,
    'and the focused hex itself never dims');
+ok(hexDim({ hexId: 'L', expandedId: 'M', hovered: true, hoverActive: true, related: null }) === false,
+   'HOVERING another xell while one is bloomed keeps that hex lit — the hover overrides the bloom');
+ok(hexDim({ hexId: 'L', expandedId: 'M', hovered: false, hoverActive: true, related: null }) === true,
+   'and a non-hovered, non-related xell still recedes behind the bloom');
+ok(hexDim({ hexId: 'w1', expandedId: 'M', hovered: true, hoverActive: true, related: 'crew' }) === false,
+   'a hovered hex that is ALSO crew stays lit (related already never dims; hover must not fight it)');
+ok(hexDim({ hexId: 'w1', expandedId: 'M', hovered: true, hoverActive: false, related: null }) === false,
+   'hover alone is enough to un-dim a hex — even before hoverActive is set, the hovered one is the highlight');
 
 // ── 5. the WORD, before any colour ───────────────────────────────────────────
 console.log('\n── the word is the signal, colour is reinforcement ──');
@@ -235,6 +243,12 @@ ok(/const related = relatedTo\(list, focusId, \{ crewOf, managerOf \}\)/.test(sr
    'and the marks come from relatedTo, not from a second copy of the rule');
 ok(/const dim = hexDim\(\{ hexId: hx\.id, expandedId, hovered, hoverActive, related: rel \}\)/.test(src),
    'the dim decision goes through the tested hexDim');
+ok(/const hxRaw = \(!cw && !b && !flowerHit && !cont\) \? hitHex\(wx, wy\) : null;/.test(src)
+   && /const hx = hxRaw && hxRaw\.id !== expandedId \? hxRaw : null;/.test(src)
+   && /const hb = \(!cw && !b && !flowerHit && !cont && !hx\) \? hitHarness\(wx, wy\) : null;/.test(src),
+   'while a bloom is open the pointer STILL hit-tests the rest of the fleet — a hex or harness under the cursor is a hover target');
+ok(/emitHover\(\{ id: hx\?\.id \?\? cw\?\.id \?\? null, commit: null, harness: hb\?\.id \|\| null \}\)/.test(src),
+   'and emits THAT hex’s id — so the hovered xell lights up (hexDim: hovered is never dimmed) and is click-to-select');
 ok(/drawManagerHex\(ctx, hx, \{[\s\S]{0,220}\.\.\.relArgs \}\)/.test(src)
    && /drawCompactHex\(ctx, hx, \{[\s\S]{0,160}\.\.\.relArgs \}\)/.test(src),
    'BOTH hexagons are handed the mark — a manager can be the related one too');

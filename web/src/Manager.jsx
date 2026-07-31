@@ -42,15 +42,18 @@ export function AddManagerButton({ projectId, projectName, providers = [], onAdd
 
   // Every connected AI ACCOUNT that can run a zee — the same list the "+ prompt" buttons are built
   // from in App.jsx, flattened into one picker because a manager has one button, not one per
-  // account. Empty (no provider connected) → the composer simply shows no Account field and the
-  // server picks the project's newest claude token, exactly as before.
+  // account. PAUSED accounts are excluded — a manager must not deploy a worker on a paused
+  // provider, and the server refuses it anyway (spawnCreds → tokenForSpawn). Empty (no provider
+  // connected) → the composer simply shows no Account field and the server picks the project's
+  // newest claude token, exactly as before.
   const accounts = (providers || [])
     .filter((p) => p.provider !== 'github' && p.dispatch)
-    .flatMap((p) => (p.accounts || []).map((a) => {
-      const dupes = (p.accounts || []).length > 1;
-      return { id: a.id, provider: p.provider, typeLabel: p.label,
-               name: a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label) };
-    }));
+    .flatMap((p) => (p.accounts || []).filter((a) => !a.paused)
+      .map((a) => {
+        const dupes = (p.accounts || []).length > 1;
+        return { id: a.id, provider: p.provider, typeLabel: p.label,
+                 name: a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label) };
+      }));
 
   const add = async (payload) => {
     setOpen(false);

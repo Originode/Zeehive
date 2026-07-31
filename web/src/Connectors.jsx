@@ -15,15 +15,17 @@ const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
 //   the focus  → full opacity, THICK, solid   (unchanged: this is the thing you pointed at)
 //   receded    → faded (0.1, or 0.12 behind an open bloom), as before
 //
-// Everything below `related` is the ORIGINAL ladder, untouched — including the bloom's 0.12 outranking
-// a hover, which is how an open flower keeps the pane to itself. Only "related" is new, and it sits at
-// the top because it is the one case that must survive a bloom: a manager whose flower is open is
+// The hover rung sits ABOVE the bloom's 0.12: a hexagon the pointer is on lights up (see hive/crew.js
+// hexDim — a hovered hex is never dimmed, even while another xell's flower is open), so its WIRE must
+// light up with it or the three layers contradict each other — the hex says "look at me" and the trace
+// to its commit says "no". The bloom still recedes everything the pointer is NOT on; it only yields to
+// the thing being pointed at. Only "related" sits higher, because a manager whose flower is open is
 // exactly when a human is asking "which of these are yours?".
 // Pure, so what a human ends up seeing is asserted as data rather than grepped for.
 export function wireStyle({ hovered = false, related = null, dim = false, bloomDim = false } = {}) {
   if (related) return { opacity: 0.85, width: 2, dash: REL_DASH_ATTR };
-  if (bloomDim) return { opacity: 0.12, width: hovered ? 3.2 : 2, dash: null };
   if (hovered) return { opacity: 1, width: 3.2, dash: null };
+  if (bloomDim) return { opacity: 0.12, width: 2, dash: null };
   if (dim) return { opacity: 0.1, width: 2, dash: null };
   return { opacity: 0.92, width: 2, dash: null };
 }

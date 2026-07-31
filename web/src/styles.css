@@ -1424,6 +1424,12 @@ a.cbox:hover { border-color: var(--accent); }
 @keyframes toast-spin { to { transform: rotate(360deg); } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
+/* ── progress bar inside progress toasts (db backup / restore / copy) ──────────── */
+.toast-progress-bar { margin-top: 8px; height: 4px; border-radius: 2px; overflow: hidden;
+  background: var(--bg); border: 1px solid var(--line); }
+.toast-progress-fill { height: 100%; background: var(--accent); border-radius: 2px;
+  transition: width .35s ease; min-width: 2px; }
+
 /* ── modal dialog: the non-blocking replacement for window.alert() ─────────────────
    A real overlay (z above everything) instead of the native alert box that froze the
    whole page. Click the scrim, click OK, or hit Enter/Esc to dismiss. */

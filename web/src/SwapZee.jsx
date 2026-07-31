@@ -54,12 +54,13 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
         setProviders(list);
         const flat = list
           .filter((p) => p.provider !== 'github' && p.dispatch)
-          .flatMap((p) => (p.accounts || []).map((a) => ({
-            id: a.id,
-            provider: p.provider,
-            name: a.label || (p.accounts.length > 1 ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label),
-            typeLabel: p.label,
-          })));
+          .flatMap((p) => (p.accounts || []).filter((a) => !a.paused)   // paused accounts are disabled for dispatch
+            .map((a) => ({
+              id: a.id,
+              provider: p.provider,
+              name: a.label || (p.accounts.length > 1 ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label),
+              typeLabel: p.label,
+            })));
         setAccounts(flat);
         // Default: select the first account so the model picker has a provider to
         // query; if there are none, models will be fetched for the default provider.
