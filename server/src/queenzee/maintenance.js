@@ -970,7 +970,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         const dir = snap.dump_path.slice(0, i), file = snap.dump_path.slice(i + 1);
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', snap.dest_ctx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'cat', `/out/${file}`] },
-          { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...tArgs, '-d', dbName] },
+          { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '--no-privileges', ...tArgs, '-d', dbName] },
           { timeout: 1800000 });
         // The READER is unconditional: if cat/the mount failed, no archive reached pg_restore at all.
         if (piped.srcStatus !== 0) {
@@ -990,7 +990,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         if (cp.status !== 0) throw new Error(`docker cp into ${target} failed: ${(cp.stderr || '').slice(-300)}`);
         broadcastDbOpProgress({ ...progressBase, msg: 'Restoring database…', pct: 40, status: 'running' });
         const rest = await execAsync('docker',
-          ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...tArgs, '-d', dbName, remoteTmp],
+          ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '--no-privileges', ...tArgs, '-d', dbName, remoteTmp],
           { timeout: 1800000 });
         await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000 });
         report = restoreOutcome({ status: rest.status, stderr: rest.stderr });
@@ -1149,11 +1149,15 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
       const dstCtx = target.docker_ctx;
       const dst = await resolveRunningContainer({ ...target });
       broadcastDbOpProgress({ ...progressBase, msg: 'Dumping production…', pct: 20, status: 'running' });
-      // Stream pg_dump (prod) straight into pg_restore (dev). --clean --if-exists --no-owner mirror
-      // the restore job: drop-and-recreate every object, ignore prod's role grants on the dev server.
+      // Stream pg_dump (prod) straight into pg_restore (dev). --clean --if-exists --no-owner
+      // --no-privileges mirror the restore job: drop-and-recreate every object, ignore prod's role
+      // grants on the dev server. (The --no-privileges half is the actual point: prod's custom
+      // roles — read-only managers' `zee_ro_*`, etc. — do not exist on a dev server, so replaying
+      // their GRANTs makes pg_restore exit 1 with "role does not exist" and the restore reports
+      // itself "completed with holes" for ACL objects that are meaningless on the copy.)
       const piped = await execPipe(
         { cmd: 'docker', args: ['--context', srcCtx, 'exec', src.name, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName] },
-        { cmd: 'docker', args: ['--context', dstCtx, 'exec', '-i', dst.name, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '-d', dbName] },
+        { cmd: 'docker', args: ['--context', dstCtx, 'exec', '-i', dst.name, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '--no-privileges', '-d', dbName] },
         { timeout: 1800000 });
       // The SOURCE side is unconditional: a failed pg_dump means nothing reached the target.
       if (piped.srcStatus !== 0 || piped.timedOut) {

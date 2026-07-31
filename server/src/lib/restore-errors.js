@@ -1,6 +1,7 @@
 // WHAT pg_restore ACTUALLY TOLD US — ticket #30.
 //
-// pg_restore here runs `--clean --if-exists --no-owner` and WITHOUT `--exit-on-error`, so it continues
+// pg_restore here runs `--clean --if-exists --no-owner --no-privileges` and WITHOUT `--exit-on-error`,
+// so it continues
 // past an object it cannot create and prints a tally at the end. We produced that output and threw it
 // away, which cost us twice:
 //

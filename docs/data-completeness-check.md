@@ -72,6 +72,35 @@ Two corollaries that were mis-reading as data loss:
   `extra`, the db is behind prod — so the /ooney gate now says "catch up first" instead of telling a
   zee to write a migration for objects prod already has.
 
+### 2a. A restore that loads everything can still report "completed with holes" — prod ROLES
+
+A second, subtler cause of a "this dev db isn't fully copied" report is not in the catalog at all: it
+is in the ACLs. A production dump records `GRANT` statements for the roles production actually has —
+including per-xell **read-only manager roles** (`zee_ro_<slug>`, minted by `lib/prod-readonly.js`).
+A dev database has none of those roles. `pg_restore` replays the GRANTs by default, and each one that
+names a role the dev server does not have is an ignored error:
+
+```
+pg_restore: error: could not execute query: ERROR:  role "zee_ro_quiet_meadow_6174f7" does not exist
+Command was: GRANT SELECT ON TABLE public.land_request TO zee_ro_quiet_meadow_6174f7;
+…
+pg_restore: warning: errors ignored on restore: 43
+```
+
+Because pg_restore **exits 1** when it ignored errors (TKT-30), a restore that loaded **every table,
+every row** reported itself as failed-and-with-holes — and the data check graded `unverified` for the
+tables whose source estimates were never analyzed, compounding the "not fully copied" reading. Measured
+on the live Zeehive fleet 2026-07-31: `bold-grove` and `calm-summit`, two databases freshly restored
+from the newest prod dump, both carried 39/39 tables and schema-drift `0` — yet both logged
+`pg_restore completed but IGNORED 43 error(s)` whose only causes were the two `zee_ro_*` roles.
+
+**The fix:** every restore path (`runRestoreJob` streamed + docker-cp, `duplicateProdInto`, and
+`provision-xell-db.sh`) now passes `--no-privileges` to pg_restore, so ACL/GRANT statements from prod
+are not replayed onto a copy that cannot satisfy them. Ownership was already ignored (`--no-owner`);
+the privileges half was the missing piece. This makes a restore's tally mean what a human reads it to
+mean — if it says `ignored 0`, the copy is complete; if it says `ignored N`, those are objects that
+genuinely did not load.
+
 ## 3. What IS known about data completeness (and its limits)
 
 Verified today, at backup time (`queenzee/maintenance.js`) — all of it about the **dump**, none of

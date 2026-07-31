@@ -117,6 +117,28 @@ try {
   ok(/gradeRestore\(c, tables\)\s*\n\s*\.catch/.test(m),
      'and the grade is fire-and-forget: a restore is never awaited on its own grading');
 
+  // ── 3.5 PROD ROLES ARE NEVER REPLAYED ON A DEV COPY ───────────────────────────────────────────
+  // A prod dump carries GRANT/ACL statements naming prod-only roles (read-only managers' `zee_ro_*`,
+  // etc.). pg_restore replays those by default, so restoring into a dev server that lacks the roles
+  // makes it exit 1 with "role does not exist" and the restore reports itself "completed with holes"
+  // for ACL objects that have no meaning on the copy. Every restore path must pass --no-privileges
+  // so the data loads cleanly and the restore's tally means what a human reads it to mean.
+  console.log('\n── prod roles are never replayed on a dev copy (--no-privileges) ──');
+  const pgRestoreCalls = [...m.matchAll(/'pg_restore',[^\]]*?\]/g)].map((mm) => mm[0])
+    .filter((s) => s.includes('--clean'));   // only actual restores — the two `--list` TOC probes carry no flags
+  ok(pgRestoreCalls.length >= 3, `every pg_restore restore path is present (${pgRestoreCalls.length} call sites)`);
+  ok(pgRestoreCalls.every((s) => s.includes('--no-privileges')),
+     `and every one carries --no-privileges (${pgRestoreCalls.map((s) => s.includes('--no-privileges') ? '✓' : '✗').join(', ')})`);
+  ok(/--no-owner', '--no-privileges', \.\.\.tArgs, '-d', dbName\]/.test(m),
+     'the streamed restore path carries the flag');
+  ok(/--no-owner', '--no-privileges', \.\.\.tArgs, '-d', dbName, remoteTmp\]/.test(m),
+     'the docker-cp restore path carries the flag');
+  ok(/--no-owner', '--no-privileges', '-d', dbName\]/.test(m),
+     'the duplicate-prod path carries the flag');
+  const sh = read('scripts/provision-xell-db.sh');
+  ok(/pg_restore -U "\$DBUSER" --clean --if-exists --no-owner --no-privileges/.test(sh),
+     'and the isolated-db provision script carries it too');
+
   console.log('\n── neither may fail a restore ──');
   const job = m.slice(m.indexOf('async function runRestoreJob'), m.indexOf('// ── DUPLICATE PROD'));
   ok(/restored = true;/.test(job) && job.indexOf('gradeRestore') > job.indexOf('clearBusy'),

@@ -55,12 +55,15 @@ This is the control experiment, and it is the fastest way to stop chasing a data
    `toc_summary.scoped = true` and only its own tables; everything else in the target keeps whatever
    it had. This produces enormous, permanent "missing" counts that look nothing like a bad restore.
 3. **Did the restore skip an object and carry on?** `pg_restore` here runs
-   `--clean --if-exists --no-owner` without `--exit-on-error`: it continues past a failed object and
-   reports the count at the end. The usual reason one specific table fails while 600 land is a TYPE
-   the target cannot create — a PostGIS/extension build that differs between the production image
-   and the dev image is the classic (a `USER-DEFINED` column type in the missing object's column
-   list is the tell). The reason is only ever printed in the restore's log line, and the queenzee's
-   log is an in-memory ring — so **read it while it is there**, or restore again and watch.
+   `--clean --if-exists --no-owner --no-privileges` without `--exit-on-error`: it continues past a
+   failed object and reports the count at the end. The usual reason one specific table fails while 600
+   land is a TYPE the target cannot create — a PostGIS/extension build that differs between the
+   production image and the dev image is the classic (a `USER-DEFINED` column type in the missing
+   object's column list is the tell). The reason is only ever printed in the restore's log line, and
+   the queenzee's log is an in-memory ring — so **read it while it is there**, or restore again and
+   watch. (The `--no-privileges` half keeps prod's custom ROLEs — read-only managers' `zee_ro_*` and
+   the like — from being replayed as GRANTs the dev server cannot satisfy; before it was added, a
+   restore that loaded every table still reported itself "completed with holes" for a missing role.)
 4. **Is this database the one that was restored at all?** The chip measures the database named by
    `project.db_name` inside that container. A container whose real payload lives under a different
    database name will faithfully report an empty one. `container.instances` (the chip tooltip) lists
