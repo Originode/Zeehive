@@ -69,8 +69,11 @@ export const focusIdOf = (hover, expandedId = null) => (hover?.id || expandedId 
 
 // A hex/trace/dot DIMS when the focus is elsewhere — but a RELATED one never dims, and that is the
 // whole highlight: the focus lights its own group and the rest of the fleet recedes behind it.
+// A HOVERED hex is never dimmed either, even while another xell's bloom is open: the hover IS the
+// highlight (a human inspecting that xell, or about to click to select it), so it must override the
+// bloom — the whole point of "when one xell is selected, others dim but can still be highlighted".
 export const hexDim = ({ hexId, expandedId = null, hovered = false, hoverActive = false, related = null }) =>
-  !related && ((!!expandedId && expandedId !== hexId) || (hoverActive && !hovered));
+  !related && !hovered && ((!!expandedId && expandedId !== hexId) || (hoverActive && !hovered));
 
 // ── the shared VOCABULARY of "related" ───────────────────────────────────────
 // DASHED means related-to-the-focus, in all three layers: the hexagon's tie-ring, the connector wire's

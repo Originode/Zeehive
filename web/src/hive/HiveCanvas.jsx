@@ -847,12 +847,24 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     if (expandedId) {
       // A CREW dot answers first: it is the smallest target in the bloom and the only one that means
       // another xell, so hovering it emits THAT worker's id — which is how the crew list leads back to
-      // its hexagons (and its wires, and its commit dots). Everything else in a bloom clears the hover.
+      // its hexagons (and its wires, and its commit dots).
       const cw = hitCrew(wx, wy);
       const b = cw ? null : hitButton(wx, wy);
       const f = cw ? null : hitFlower(wx, wy);
-      cursor = cw || b || (f && ((f.cell === 0 && f.openable) || diffPetal(expanded, f.cell))) ? 'pointer'
-        : hitContainer(wx, wy) ? 'context-menu' : 'default';   // right-click hint on an icon
+      const flowerHit = f && ((f.cell === 0 && f.openable) || diffPetal(expanded, f.cell));
+      const cont = (!cw && !b && !flowerHit) ? hitContainer(wx, wy) : null;
+      // …and the rest of the fleet still answers the cursor while a bloom is open: with nothing in
+      // the flower (or a container icon) under the cursor, a plain hex becomes the hover target so
+      // it LIGHTS UP (see hexDim: a hovered hex is never dimmed) and reads as click-to-select; a
+      // harness badge lights its wearers the same way it does with no bloom open.
+      const hxRaw = (!cw && !b && !flowerHit && !cont) ? hitHex(wx, wy) : null;
+      // the expanded hex's own cell is under the flower's centre petal — hovering it must not light
+      // it as "another xell" (it is already the selection), so it only counts when it is a DIFFERENT one
+      const hx = hxRaw && hxRaw.id !== expandedId ? hxRaw : null;
+      const hb = (!cw && !b && !flowerHit && !cont && !hx) ? hitHarness(wx, wy) : null;
+      cursor = cw || b || flowerHit ? 'pointer'
+        : cont ? 'context-menu'                                    // right-click hint on an icon
+        : (hx || hb) ? 'pointer' : 'default';
       // Button tooltip — update the persistent DOM element directly on pointer move.
       const tooltip = tipRef.current;
       if (b && VERB_TOOLTIP[b.kind]) {
@@ -876,7 +888,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         tooltip.kind = null;
         tooltip.el.style.display = 'none';
       }
-      emitHover({ id: cw?.id || null, commit: null, harness: null });
+      emitHover({ id: hx?.id ?? cw?.id ?? null, commit: null, harness: hb?.id || null });
     } else {
       const hx = hitHex(wx, wy);
       if (hx) {
