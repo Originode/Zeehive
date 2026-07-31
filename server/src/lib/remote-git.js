@@ -101,6 +101,18 @@ export function parseGitProgress(line) {
 const looksLikeAuthFailure = (err) =>
   /authentication failed|could not read Username|terminal prompts disabled|403|invalid credentials|Password authentication is not supported/i.test(err || '');
 
+// A PAT push that adds or updates `.github/workflows/*` is REFUSED by GitHub unless the token
+// carries the `workflow` scope — a Contents:write fine-grained token is NOT enough for a repo
+// that has Actions workflows (this one does: `.github/workflows/publish-images.yml`). Git's raw
+// sentence ("[remote rejected] … refusing to allow a Personal Access Token to create or update
+// workflow … without `workflow` scope") is unhelpful, and worse, it CONTAINS the word "rejected",
+// so it used to trip the divergence regex below and tell the human "pull or reconcile first" —
+// the exact wrong instruction. Detect it before the divergence check and say what is actually
+// fixable: the token's scope, not the branch's state.
+const looksLikeWorkflowScope = (err) =>
+  /(refusing to allow|create or update workflow|without `?workflow`? scope|workflow scope)/i.test(err || '');
+const WORKFLOW_SCOPE_HINT = 'this repo has GitHub Actions workflow files, and the connected token lacks the `workflow` scope — GitHub refuses PAT pushes that touch .github/workflows/. Add the `workflow` scope to the token (Project setup → Tokens) and push again; no local changes are needed';
+
 // What's at the other end of this URL? Read-only ls-remote: default branch (via --symref HEAD)
 // and the branch list. Never touches the local repo. auth_required=true when an anonymous try
 // smells like a credential wall (a private repo probed without a token).
@@ -326,14 +338,20 @@ export async function pushRemote({ repoRoot, branch = 'main', remoteUrl, token }
   if (pr.status !== 0) {
     const err = (pr.err || '').trim();
     const nonff = /non-fast-forward|fetch first|rejected|failed to push/i.test(err);
+    // workflow-scope BEFORE the divergence check: git's rejection sentence contains "rejected",
+    // which nonff would misread as a divergence — the wrong instruction entirely.
     return {
       pushed: false,
-      state: looksLikeAuthFailure(err) ? 'refused-auth' : nonff ? 'refused-diverged' : 'error',
-      reason: looksLikeAuthFailure(err)
-        ? 'authentication failed — the connected GitHub token cannot write to this repo'
-        : nonff
-          ? `remote ${branch} has commits local ${branch} does not — Zeehive only fast-forwards; pull or reconcile first`
-          : `push failed: ${err.slice(-300)}`,
+      state: looksLikeWorkflowScope(err) ? 'refused-workflow-scope'
+        : looksLikeAuthFailure(err) ? 'refused-auth'
+        : nonff ? 'refused-diverged'
+        : 'error',
+      reason: looksLikeWorkflowScope(err) ? WORKFLOW_SCOPE_HINT
+        : looksLikeAuthFailure(err)
+          ? 'authentication failed — the connected GitHub token cannot write to this repo'
+          : nonff
+            ? `remote ${branch} has commits local ${branch} does not — Zeehive only fast-forwards; pull or reconcile first`
+            : `push failed: ${err.slice(-300)}`,
     };
   }
   const upToDate = /up-to-date|Everything up-to-date/i.test(pr.err || '');
@@ -371,9 +389,11 @@ export async function openPullRequest({ repoRoot, remoteUrl, token, branch = 'ma
   const pushRes = await g([...credArgs(token), 'push', 'origin', `+refs/heads/${branch}:refs/heads/${head}`], { token, timeout: 5 * 60 * 1000 });
   if (pushRes.status !== 0) {
     const err = (pushRes.err || '').trim();
-    return { opened: false, reason: looksLikeAuthFailure(err)
-      ? 'authentication failed — the connected GitHub token cannot write to this repo'
-      : `could not push PR branch: ${err.slice(-300)}` };
+    return { opened: false, reason: looksLikeWorkflowScope(err)
+      ? WORKFLOW_SCOPE_HINT
+      : looksLikeAuthFailure(err)
+        ? 'authentication failed — the connected GitHub token cannot write to this repo'
+        : `could not push PR branch: ${err.slice(-300)}` };
   }
 
   const prTitle = String(title || '').trim() || `Zeehive: ${branch} → ${baseBranch}`;
