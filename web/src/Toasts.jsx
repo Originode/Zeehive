@@ -22,6 +22,11 @@ export default function Toasts({ toasts, onDismiss }) {
           <div className="toast-main">
             <div className="toast-title">{t.title}</div>
             {t.body && <div className="toast-body">{t.body}</div>}
+            {t.kind === 'progress' && t.pct != null && (
+              <div className="toast-progress-bar" title={`${t.pct}%`}>
+                <div className="toast-progress-fill" style={{ width: `${Math.max(2, Math.min(100, t.pct))}%` }} />
+              </div>
+            )}
             {t.onRetry && (
               <button className="toast-retry" data-testid="toast-retry"
                       onClick={() => t.onRetry(t)}>Retry</button>

@@ -27,38 +27,20 @@ emit() { printf '{"ok":%s,"head":"%s","method":"%s","service":"%s"}\n' "$1" "$HE
 
 # ── GAP 2: rebuild the CXELL IMAGE as part of the approved Zeehive deploy ─────────────────────────
 # New cxell-zee capabilities (the `zee` CLI, cxell-sshd/seed/attach scripts) ship INSIDE
-# zeehive/zee-agent (docker/zeehive/Dockerfile.zee-agent). Deploying Zeehive must rebuild that image
-# so freshly-provisioned cxells carry the current code — otherwise the fleet silently stays on an old
-# image and a shipped capability never actually reaches a zee. This lives HERE, not in shipgate.js,
-# on purpose: self-ship.sh is Zeehive's OWN build_script, so the rebuild is automatically scoped to
-# the self-hosting project and CANNOT touch OmniBiz's container-build ship path (which shares
-# shipgate.js). Cxells run on the `default` docker context (server/src/queenzee/intake.js: `const ctx
-# = 'default'`), so the image must exist there; CXELL_IMAGE_CTX overrides for an operator who moves
-# the fleet's daemon. Best-effort with LOUD failure: a build failure is reported on the ship card
-# (this stdout/stderr is captured into the ship_request row + streamed to the console) but does NOT
-# abort the code deploy — a running queenzee on new code with a stale cxell image beats a blocked
-# ship, and the warning is anything but silent.
-CXELL_IMAGE="${CXELL_IMAGE:-zeehive/zee-agent}"
-CXELL_IMAGE_CTX="${CXELL_IMAGE_CTX:-}"   # empty = the default docker context, where cxells actually run
-cxell_build_cmd() {
-  local ctxargs=""
-  [ -n "$CXELL_IMAGE_CTX" ] && ctxargs="--context $CXELL_IMAGE_CTX "
-  echo "docker ${ctxargs}build -f \"$SRC/docker/zeehive/Dockerfile.zee-agent\" -t \"$CXELL_IMAGE\" \"$SRC/docker/zeehive\""
-}
-rebuild_cxell_image() {
-  echo "self-ship: rebuilding cxell image $CXELL_IMAGE @ $HEAD so new cxells carry this code" >&2
-  local ctxargs=()
-  [ -n "$CXELL_IMAGE_CTX" ] && ctxargs=(--context "$CXELL_IMAGE_CTX")
-  if docker "${ctxargs[@]}" build -f "$SRC/docker/zeehive/Dockerfile.zee-agent" \
-        -t "$CXELL_IMAGE" "$SRC/docker/zeehive" >&2; then
-    echo "self-ship: CXELL-IMAGE ok — $CXELL_IMAGE rebuilt at $HEAD; new cxells will carry this code" >&2
-  else
-    echo "self-ship: !!! CXELL-IMAGE FAILED — could NOT rebuild $CXELL_IMAGE; the fleet stays on the OLD" >&2
-    echo "self-ship: !!! cxell image and newly-provisioned cxells will run STALE cxell-zee code. The" >&2
-    echo "self-ship: !!! queenzee restart proceeds (code deploy is the priority); rebuild the cxell" >&2
-    echo "self-ship: !!! image by hand or re-ship: $(cxell_build_cmd)" >&2
-  fi
-}
+# zeehive/zee-agent (docker/zeehive/Dockerfile.zee-agent), so deploying Zeehive must rebuild that
+# image or the fleet silently stays on an old one and a shipped capability never reaches a zee.
+# This lives HERE, not in shipgate.js, on purpose: self-ship.sh is Zeehive's OWN build_script, so
+# the rebuild is scoped to the self-hosting project and CANNOT touch OmniBiz's container-build ship
+# path (which shares shipgate.js). Cxells run on the `default` docker context
+# (server/src/queenzee/intake.js: `const ctx = 'default'`), so the image must exist there;
+# CXELL_IMAGE_CTX overrides for an operator who moves the fleet's daemon.
+#
+# The implementation is SHARED with self-ship-container.sh (scripts/lib/cxell-image.sh) — it used to
+# be copied into both and they had already drifted. Read that file for the two defects it fixes:
+# the context is now materialized from the SHIP REF (this script runs BEFORE self-ship-sync.sh, so
+# the working tree here is still pre-landing code), and a failed rebuild now FAILS THE SHIP instead
+# of being reported into a log nobody opens. CXELL_IMAGE_REQUIRED=0 is the escape hatch.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/cxell-image.sh"
 
 if [ "$MODE" = "simulate" ]; then
   # Prove the new steps WITHOUT touching any process/daemon (Zeehive's own test path). Mirror REAL
@@ -66,6 +48,9 @@ if [ "$MODE" = "simulate" ]; then
   # along as a no-op restart), so only the server role asserts the commands a real deploy would run.
   if [ "$ROLE" = "server" ]; then
     echo "self-ship: [simulate] would rebuild cxell image with: $(cxell_build_cmd)" >&2
+    echo "self-ship: [simulate] a cxell-image failure would $(cxell_image_required \
+            && echo 'FAIL THE SHIP (CXELL_IMAGE_REQUIRED=0 to override)' \
+            || echo 'be reported but NOT fail the ship (escape hatch CXELL_IMAGE_REQUIRED=0 is set)')" >&2
     echo "self-ship: [simulate] would sync working tree with: bash \"$SRC/scripts/self-ship-sync.sh\" \"$SRC\" \"$REF\"" >&2
   else
     echo "self-ship: [simulate] role $ROLE is a no-op restart (rides with the server); no cxell/sync steps" >&2
@@ -76,8 +61,21 @@ if [ "$ROLE" = "webapp" ]; then emit true "noop-rides-with-server"; exit 0; fi
 
 # Real server ship: rebuild the cxell image NOW, while this (soon-to-die) queenzee is still alive,
 # its docker context reachable, and its output still captured by the ship record. Runs before the
-# detached restart is scheduled so a cxell-image failure lands on the ship card, not into the void.
-rebuild_cxell_image
+# detached restart is scheduled so a cxell-image failure lands on the ship card, not into the void —
+# and, since the restart is scheduled BELOW, a fatal failure here means the deploy never starts.
+# That ordering is the point: "ship failed, nothing changed" is recoverable and visible; "ship
+# succeeded, fleet image silently stale" is neither (it cost two zees a forensics detour on cad07a8).
+if ! rebuild_cxell_image; then
+  if cxell_image_required; then
+    echo "self-ship: !!! ABORTING THE SHIP — the queenzee is NOT being restarted and prod still runs" >&2
+    echo "self-ship: !!! the previous code. Nothing is half-applied. Fix the cxell image (or re-run" >&2
+    echo "self-ship: !!! this ship with CXELL_IMAGE_REQUIRED=0 to accept a knowingly stale fleet" >&2
+    echo "self-ship: !!! image), then approve the ship again." >&2
+    emit false "cxell-image-failed"; exit 1
+  fi
+  echo "self-ship: CXELL_IMAGE_REQUIRED=0 — proceeding with a KNOWINGLY STALE cxell image; every" >&2
+  echo "self-ship: cxell spawned from now on runs the OLD image until someone rebuilds it." >&2
+fi
 
 # Detached restart helper. Grace period 3s: long enough for runShip to write 'shipped' and start
 # the lock countdown; short enough that the port frees before anyone notices. The new process

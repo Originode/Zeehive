@@ -86,10 +86,13 @@ fi
 [ -z "$DUMP" ] && { emit true "started (no dump requested)"; exit 0; }
 [ -f "$DUMP" ] || { emit false "dump not found: $DUMP"; exit 1; }
 
-# Copy the dump in and restore. --clean --if-exists so a re-run is idempotent.
+# Copy the dump in and restore. --clean --if-exists so a re-run is idempotent. --no-privileges so a
+# prod dump's ACL/GRANT statements (which reference prod-only roles) do not make pg_restore exit 1
+# with "role does not exist" and misreport a completed-with-holes restore for objects that have no
+# meaning on the throwaway copy — the same flag the queenzee's own restore paths use.
 REMOTE="/tmp/$(basename "$DUMP")"
 d cp "$DUMP" "${NAME}:${REMOTE}" >&2 2>&1 || { emit false "docker cp of dump failed"; exit 1; }
-if d exec "$NAME" pg_restore -U "$DBUSER" --clean --if-exists --no-owner -d "$DBNAME" "$REMOTE" >&2 2>&1; then
+if d exec "$NAME" pg_restore -U "$DBUSER" --clean --if-exists --no-owner --no-privileges -d "$DBNAME" "$REMOTE" >&2 2>&1; then
   d exec "$NAME" rm -f "$REMOTE" >&2 2>&1 || true
   emit true restored true
 else

@@ -6,11 +6,12 @@
 //   zee status [--wait]
 //   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]
 //   zee working [--note "what you are doing"]
-//   zee tend --reason "why you need a human"   |   zee tend --clear
-//   zee land [--wait]
+//   zee tend --reason "why you need a human"   |   zee tend --clear      (the reason is required: it is what the console shows)
+//   zee sync [--no-rebuild]
+//   zee land [--wait]   |   zee land --withdraw [--reason "…"]   (un-ask a held landing)
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
-//   zee done --summary "what you finished"
+//   zee done --summary "what you finished"   |   zee done --clear   (withdraw the proposal)
 //
 // --wait (on `land` and `status`) BLOCKS, polling until the landing is decided (landed/rejected/
 // stale), and exits with that verdict — its exit is your nudge, so run it in the BACKGROUND. The
@@ -27,12 +28,20 @@
 // built commit/hot flag/health all stay truthful — COMMIT before you build.
 import http from 'node:http';
 import https from 'node:https';
+// `zee harness` takes persona TEXT, and text belongs in a file rather than a shell flag (--spec /
+// --personality-file). Nothing else here reads the filesystem.
+import { readFileSync } from 'node:fs';
 
 const api = process.env.ZEEHIVE_API || 'http://host.docker.internal:4700';
 const token = process.env.ZEEHIVE_XELL_TOKEN || '';
 const [cmd, ...rest] = process.argv.slice(2);
 
 function flag(name) { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : null; }
+// The bare first argument (`zee item <id> --status working`), and ONLY that. Hunting the argv for
+// "the first thing without a leading --" reads the VALUE of a flag as a positional the moment the
+// caller puts a flag first: `zee item --status working` swallowed "working" as the item id and asked
+// the server for a work item called working. A positional is argv[0] or it does not exist.
+function positional() { return rest.length && !rest[0].startsWith('--') ? rest[0] : null; }
 // --wait is a boolean flag with an optional =<secs> (default 1h). `--wait 30` is NOT supported —
 // the value form is `--wait=30`, so a bare `--wait` never eats the next positional.
 function waitFlag() {
@@ -42,8 +51,30 @@ function waitFlag() {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// THE HOLDING PATTERN (067). Another xell's landing is open on this ref, so the gate queued this
+// push instead of raising a second card — one runway, one card, no races. There is NOTHING to wait
+// for here: no human has been asked, and the clearance arrives as a nudge (the queenzee resumes the
+// session). So both waiters PRINT THE POSITION AND STOP rather than burn their timeout on a card
+// that does not exist — the exact failure `xell-land.mjs` used to have on 'stale'.
+function printHolding(land) {
+  if (land.cleared) {
+    console.error(`\n  ✈ CLEARED — the runway is free and you are next${land.new_sha ? ` (${String(land.new_sha).slice(0, 8)})` : ''}.`);
+    console.error('    Nothing of yours was approved; nobody has read your commits yet. Take it:');
+    console.error('      zee sync   # the xell ahead landed, so main moved — merge it in (resolve any conflict, git add/commit)');
+    console.error('      zee land   # raises the FRESH request a human actually decides on\n');
+    return;
+  }
+  console.error(`\n  ⏳ HOLDING at position ${land.position || '?'}${land.behind?.xell_slug ? ` behind ${land.behind.xell_slug}'s landing` : ''}`
+    + `${land.new_sha ? ` (your sha ${String(land.new_sha).slice(0, 8)})` : ''}.`);
+  console.error('    Your push was NOT rejected and NOT dropped — it is recorded and queued. No card was raised');
+  console.error('    for a human: one landing per ref at a time is what stops two zees racing and one going stale.');
+  console.error('    Do NOT poll and do NOT re-push. When the runway clears the queenzee RESUMES your session and');
+  console.error('    tells you to `zee sync` then `zee land`. To leave the pattern: `zee land --withdraw --reason "…"`.\n');
+}
+
 // Poll self/status until the landing is decided. Exit is the caller's nudge: landed=0, rejected/
 // stale/timeout=1. 'approved' just keeps waiting — the queenzee lands an approval itself now.
+// 'holding' does NOT wait: see printHolding.
 async function pollLanding(secs) {
   const deadline = Date.now() + secs * 1000;
   let last = '';
@@ -58,7 +89,19 @@ async function pollLanding(secs) {
     if (land.status !== last) { console.error(`  … ${land.status || 'unknown'}`); last = land.status; }
     if (land.status === 'landed') { console.error(`\n  ✓ LANDED on main${land.new_sha ? ` @ ${String(land.new_sha).slice(0, 8)}` : ''}.\n`); process.exit(0); }
     if (land.status === 'rejected') { console.error('\n  ✗ REJECTED by a human — re-pushing this sha will not help; talk to them.\n'); process.exit(1); }
-    if (land.status === 'stale') { console.error('\n  ✗ STALE — main moved past this sha; make a fresh commit and `zee land` again.\n'); process.exit(1); }
+    if (land.status === 'stale') {
+      // Dead, not rejected: main moved past this sha, so no approval could ever fast-forward it. A
+      // fresh COMMIT is not enough — the branch has to contain current main first, and in the cage
+      // only `zee sync` can do that. (The queenzee nudges you with the same instruction; this is
+      // the backup signal for it.)
+      console.error(`\n  ✗ STALE — main moved past ${land.new_sha ? String(land.new_sha).slice(0, 8) : 'this sha'} while it waited; it can never fast-forward.`);
+      console.error('    Your commits are safe on your branch. Catch up, then ask again:');
+      console.error('      zee sync   # merge current main into your branch (resolve any conflict, git add/commit)');
+      console.error('      zee land   # raises a FRESH request on the new sha\n');
+      process.exit(1);
+    }
+    if (land.status === 'withdrawn') { console.error('\n  ✗ WITHDRAWN — this landing was un-asked (by you, or by a human on your behalf); nothing is waiting on anyone.\n'); process.exit(1); }
+    if (land.status === 'holding') { printHolding(land); process.exit(land.cleared ? 1 : 0); }
     // 'pending' / 'approved' → keep waiting (an approval lands automatically).
   }
   console.error(`\n  ✗ TIMEOUT after ${secs}s — still waiting on a human. Your work is safe on your branch.\n`);
@@ -140,8 +183,31 @@ function req(method, path, body) {
   });
 }
 
-function out(r) {
+// Print the queenzee's answer — and, when the answer is "no", SAY SO and exit non-zero.
+//
+// Every verb here is a request that can be declined, and a decline comes back HTTP 200 with
+// `ok:false` (the call worked; the thing you asked for did not happen). The old out() printed that
+// JSON and exited 0, so a refusal looked exactly like a success: same shape, same green exit. A zee
+// whose `zee ship` was refused for unlanded work would relay "the ship request is waiting for your
+// approval" to a human who had nothing on their screen, because nothing had been raised. Reported
+// as "xells insist they have ship requests… i see zero".
+//
+// So: `ok:false` is a FAILED command. It prints the full JSON (nothing is hidden), then one
+// unambiguous line naming what did not happen, and exits 1 — which is also what makes `zee x || …`
+// and a harness's exit-code nudge tell the truth.
+function out(r, what = cmd) {
   console.log(JSON.stringify(r.json, null, 2));
+  const j = r.json || {};
+  if (r.code < 400 && j.ok === false) {
+    const why = j.reason || j.error || j.message || 'the queenzee declined it';
+    console.error(`\n  ✗ ${String(what).toUpperCase()} DID NOT HAPPEN: ${why}`);
+    if (j.refused) {
+      console.error('    NOTHING was raised and NOTHING is awaiting a human — there is no request in the');
+      console.error('    console for anyone to approve. Do not report this as pending: fix the reason above,');
+      console.error('    then ask again.');
+    }
+    process.exit(1);
+  }
   process.exit(r.code >= 400 ? 1 : 0);
 }
 
@@ -151,14 +217,40 @@ function usage() {
   zee status [--wait]                where you stand (hive status + task + pending land/ship/prod/done); --wait blocks until a landing is decided
   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]   (re)build your OWN app tier to run e2e tests (NOT gated; acts now). --wait blocks until it serves your HEAD (run in background); --watch reports without building; --hot bounces the old image (no code change)
   zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
+  zee env [--export]                  which ENVIRONMENT your xell is loaded with (its key + var names; values live in .zeehive.env, never echoed). --export dumps the FULL current env text. Read-only. A live-prod/production xell gets the prod env, else the dev env
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
-  zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. --clear lowers it
-  zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); --wait blocks until decided (run in background)
+  zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
+  zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
+  zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
+  zee migration-number [--name "..."] [--again]   ASK for the next free db/migrations number: the queenzee counts what is LANDED plus what every other LIVE xell's worktree and claims already hold — the sibling branches you cannot see (ticket #9). NOT gated. Advisory: it hands out a number, it does not gate your landing. Asking twice returns the SAME number; --again gets a second one
+  zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
+                                     ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
+  zee land --withdraw [--reason "..."]   UN-ASK your held landing(s): takes the card off the human's screen without landing, rejecting or reverting anything. NEVER stack land requests — withdraw the previous one, then land again
   zee ship [--targets server webapp] --reason "..."   ask to deploy to prod (must be landed first)
   zee hint-land [--reason "..."] | --clear   flag "this looks land-ready" — lights the land? button for a human WITHOUT landing. Use when NOT 100% certain the job is done
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
-  zee prod --reason "..."            ASK to be bound to the prod database (a human confirms)
-  zee done --summary "..."           propose done (a human confirms with "Mark done")
+  zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
+  zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
+  zee done --summary "..." | --clear   propose done (a human confirms with "Mark done"); --clear WITHDRAWS the proposal if you are back at work
+
+ crew (a zee that has a manager, or IS one):
+  zee report --message "..." [--kind reflection]   send your MANAGER a note (a question, a blocker, or your post-ship REFLECTION). The one reach outside your xell a worker is meant to have
+  zee inbox [--all]                  read what other zees sent you (reading marks them read); --all shows the history
+
+ the work tracker (the PLAN this job is part of):
+  zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
+  zee item [<id>] --status <s> [--progress N] [--note "..."]   report where the WORK has got to. A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
+
+ MANAGER-only (refused for a worker, with an explanation):
+  zee zees                           YOUR CREW: every worker you dispatched — hive status, what it waits on, its last message
+  zee dispatch --task "..." [--model m] [--mode 1..5] [--harness key] [--title "..."]   spawn a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness
+  zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key]   DEPLOY a worker for a WORK ITEM: same dispatch path as "zee dispatch", but the brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text. Returns the new worker's slug
+  zee swap --to <slug> --harness <key> [--task "..."] [--model m] [--mode 1..5]   replace the ZEE working one of YOUR xells with a fresh one wearing a different worker harness, KEEPING the xell: same branch, same commits, same containers, same db, same card. How one piece of work gets a Scout, then a Builder, then a Reviewer. The outgoing zee's commits are collected out of its cage FIRST (refused rather than risked) and the incoming zee is briefed on what it INHERITED. REFUSED: a xell that is not your crew, a manager target, a manager harness, and any xell with a human gate open on it (a landing, a ship, a done suggestion)
+  zee say --to <slug> --message "..."   type a message straight into that worker's LIVE session
+  zee harness [<key>] [--delete] [--label "..."] [--parent <key>] [--summary "..."] [--glyph x] [--personality "..." | --personality-file <path>] [--spec <file.json>] [--enabled on|off] [--full|--json]   ·   zee harness --new --label "..." [same persona flags]
+                                     YOUR PROJECT'S WORKER PERSONAS: bare LISTS what you may use (the system-wide harnesses, plus your own project's — only the latter are yours to edit); "zee harness <key>" READS one (--full for the raw JSON). --new mints one scoped to YOUR project and its KEY is DERIVED from your project + label — you do not pass one, and a key you send is refused. --parent inherits a global worker harness (zee-base carries the cxell manual, dev-base the dev craft), --spec loads {personality,summary,skills[],memory[]} from a JSON file, --delete removes one of yours. Then "zee dispatch --harness <key>". REFUSED: a manager persona, any system-wide harness, another project's, and deleting or DISABLING one a live zee wears or inherits
+  zee suggest-done --to <slug> --reason "..."   ask a HUMAN to mark that worker done (they confirm; that is what reaps it)
+  NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — dispatch a worker instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused.
 
 env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (default host.docker.internal:4700)`);
   process.exit(cmd ? 1 : 0);
@@ -176,20 +268,41 @@ switch (cmd) {
     const w = waitFlag();
     if (!w.on) process.exit(r.code >= 400 ? 1 : 0);
     const land = r.json?.landing;
+    // A landing in the HOLDING PATTERN is not waiting on a human, so there is nothing to poll for —
+    // say where it stands and exit (0 while holding: the ask is alive; 1 once cleared: it needs you
+    // to act now).
+    if (land?.status === 'holding') { printHolding(land); process.exit(land.cleared ? 1 : 0); }
     // Nothing pending to wait on → answer now (landed=0, decided-otherwise=1, no landing=0).
     if (!land || !['pending', 'approved'].includes(land.status)) {
-      process.exit(land && land.status !== 'landed' ? (['rejected', 'stale'].includes(land.status) ? 1 : 0) : 0);
+      process.exit(land && land.status !== 'landed' ? (['rejected', 'stale', 'withdrawn'].includes(land.status) ? 1 : 0) : 0);
     }
     await pollLanding(w.secs); // exits
     break;
   }
   case 'land': {
+    // --withdraw (--clear is the same thing, for symmetry with tend/hint/done) UN-ASKS your held
+    // landing instead of raising one: the card leaves the human's screen, nothing lands, nothing is
+    // rejected and your commits are untouched. Use it BEFORE landing again — a second push while the
+    // first is still held leaves two cards for one job and only you know which one you still mean.
+    if (rest.includes('--withdraw') || rest.includes('--clear')) {
+      const r = await req('POST', '/api/xell/self/land/withdraw', {
+        reason: flag('reason') || null, request: flag('request') || null });
+      console.log(JSON.stringify(r.json, null, 2));
+      process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    }
     const r = await req('POST', '/api/xell/self/land', {});
     console.log(JSON.stringify(r.json, null, 2));
     const w = waitFlag();
     const status = r.json?.status;
     if (r.code >= 400 || status === 'needs-resolution' || status === 'error') process.exit(1);
     if (status === 'landed') process.exit(0);
+    // HOLDING: queued behind another xell's landing on this ref. Print the position and exit cleanly
+    // even under --wait — waiting would burn the whole timeout on a card no human will ever see, and
+    // the clearance comes as a session nudge, not as a status a poll could catch.
+    if (status === 'holding') {
+      printHolding({ status, position: r.json?.position, behind: r.json?.behind, new_sha: r.json?.request?.new_sha });
+      process.exit(0);
+    }
     if (!w.on) process.exit(0); // held, but not asked to wait — the queenzee will nudge on approval
     if (status === 'held') { await pollLanding(w.secs); } // exits
     process.exit(0);
@@ -217,10 +330,49 @@ switch (cmd) {
     process.exit(0);
     break;
   }
+  case 'sync': {
+    // Reconcile with main on your own: deliver current main INTO your cxell, merge it (pure script),
+    // and rebuild your app tier. NOT gated. On a genuine content conflict the merge is left in your
+    // cxell for YOU to resolve (git status → fix → add → commit), then `zee land`.
+    const r = await req('POST', '/api/xell/self/sync', { rebuild: !rest.includes('--no-rebuild') });
+    console.log(JSON.stringify(r.json, null, 2));
+    process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
   case 'working': {
     // Ping "I am actively working" — asserts live activity the passive poller can't see for a cxell,
     // and clears any open tend. NOT gated; acts immediately.
     out(await req('POST', '/api/xell/self/working', { note: flag('note') || null }));
+    break;
+  }
+  case 'db-catchup': {
+    // Roll your OWN db (clone/isolated) FORWARD to prod's current schema — apply the prod-ledger
+    // migrations it doesn't yet reflect. NOT gated (writes only your throwaway db; reads prod
+    // read-only). `--restore` (isolated only) rebuilds from the latest full prod snapshot instead:
+    // exact schema+data, but it DISCARDS your db's current contents.
+    const r = await req('POST', '/api/xell/self/catchup', { restore: rest.includes('--restore') });
+    console.log(JSON.stringify(r.json, null, 2));
+    process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'migration-number': {
+    // ASK for the next free db/migrations number. Your worktree can only show you what is LANDED plus
+    // what you wrote — never a sibling's unlanded migration on a branch you cannot see, which is how
+    // several numbers came to be claimed twice or more (ticket #9). The queenzee counts main + every
+    // live xell's worktree + the claims other zees hold, and RECORDS yours. NOT gated, and advisory: it hands out
+    // a number, it does not gate your landing. Asking twice returns the SAME number (--again for a
+    // second one, when one landing carries two migrations).
+    const r = await req('POST', '/api/xell/self/migration-number', {
+      name: flag('name'), again: rest.includes('--again') });
+    console.log(JSON.stringify(r.json, null, 2));
+    process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'env': {
+    // Which environment this xell resolves to (the meta-DB set merged into .zeehive.env). Masked —
+    // var NAMES only. `--export` extracts the FULL current env (.zeehive.env values), for piping to
+    // a file. Read-only, opens no gate.
+    out(await req('GET', rest.includes('--export') ? '/api/xell/self/env/export' : '/api/xell/self/env'));
     break;
   }
   case 'device': {
@@ -232,16 +384,38 @@ switch (cmd) {
   }
   case 'tend': {
     // Flag (or --clear) "I need a human in the console". Opens no gate and blocks nothing.
+    //
+    // Raising REQUIRES a brief reason, because the reason is the whole message: the console shows
+    // it on the xell's card and in the "waiting on you" line, and a tend without one summons a
+    // human who then has to open your session to find out what they were called for. One line —
+    // its first ~200 chars are the glance form on the chip/card, and the console keeps the whole
+    // text for the human who opens the ask, so LEAD with the decision and do not pre-truncate.
+    // `zee tend "why"` (bare, no --reason) is accepted too; it is the same ask.
     const clear = rest.includes('--clear');
-    const reason = flag('reason');
-    if (!clear && !reason) { console.error('tend needs --reason "why you need a human" (or --clear to lower it)'); process.exit(1); }
+    const reason = flag('reason') || rest.find((a) => !a.startsWith('--')) || null;
+    if (!clear && !reason) {
+      console.error('tend needs a BRIEF reason — say why you need a human, in one line:');
+      console.error('  zee tend --reason "stuck: the landing gate declined twice, need a human to look"');
+      console.error('(or --clear to lower an open tend)');
+      process.exit(1);
+    }
     out(await req('POST', '/api/xell/self/tend', { reason: reason || null, clear }));
     break;
   }
   case 'ship': {
     const reason = flag('reason'); const targets = multi('targets');
     if (!reason) { console.error('ship needs --reason "what you are shipping"'); process.exit(1); }
-    out(await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) }));
+    const r = await req('POST', '/api/xell/self/ship', { reason, ...(targets ? { targets } : {}) });
+    // Say in ONE plain sentence whether a request now exists, before out() decides the exit code.
+    // The whole failure this fixes was a zee reading a JSON blob and telling its human the opposite
+    // of what it said — so the sentence a zee is most likely to relay is printed for it.
+    if (r.code < 400 && r.json?.ok !== false && r.json?.request) {
+      const q = r.json.request;
+      console.log(`\n  ✓ ship request ${String(q.id).slice(0, 8)} is ${q.status} @ ${String(q.commit).slice(0, 8)}`
+        + ' — a human decides it in the ZEEHIVE console.');
+      if (r.json.note) console.log(`    (${r.json.note})`);
+    }
+    out(r, 'ship');
     break;
   }
   case 'hint-land': case 'hint-ship': {
@@ -258,8 +432,244 @@ switch (cmd) {
     out(await req('POST', '/api/xell/self/prod-request', { reason }));
     break;
   }
+  case 'seed': {
+    // ASK the queenzee to run LANDED seed file(s) against PRODUCTION. The narrow prod-DATA verb:
+    // where `zee prod` hands you the whole live database, this hands ONE reviewed .sql file to the
+    // queenzee, which runs it for you. Refused unless the file is on main — a seed runs FROM main,
+    // never from your worktree. `--status` reports where your request got to.
+    if (rest.includes('--status')) { out(await req('GET', '/api/xell/self/seed-request')); break; }
+    const files = multi('file') || multi('files');
+    const reason = flag('reason');
+    if (!files) { console.error('seed needs --file server/sql/seeds/<name>.sql (repeatable), or --status'); process.exit(1); }
+    if (!reason) { console.error('seed needs --reason "what this seeds into production and why"'); process.exit(1); }
+    const r = await req('POST', '/api/xell/self/seed-request', { files, reason });
+    console.log(JSON.stringify(r.json, null, 2));
+    process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'zees': {
+    // YOUR CREW (manager only). Read this before interrupting anyone: a worker showing occ-working
+    // is working, and 'waiting_on_human' is the list that actually needs you.
+    const r = await req('GET', '/api/xell/self/zees');
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    console.log(`crew of ${j.manager?.slug || '?'} — ${j.count} worker(s)`);
+    for (const c of j.crew || []) {
+      console.log(`  ${c.slug.padEnd(28)} ${String(c.hive_status_label).padEnd(10)} ${c.working ? 'working' : (c.zee_status || '—')}`);
+      if (c.task) console.log(`      task: ${c.task}`);
+      if (c.waiting_on_human?.length) console.log(`      ⚠ waiting: ${c.waiting_on_human.join('; ')}`);
+      if (c.last_message) console.log(`      last message: ${c.last_message.replace(/\s+/g, ' ').slice(0, 120)}`);
+    }
+    if (j.message) console.log(`\n${j.message}`);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'dispatch': {
+    // Spawn a WORKER that reports to you. Brief it properly — it gets ONE briefing and then works
+    // alone (your dispatch-brief skill is the shape to use).
+    const task = flag('task');
+    if (!task) { console.error('dispatch needs --task "the brief the worker works from"'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/dispatch', {
+      task, model: flag('model') || null, mode: flag('mode') || null,
+      harness: flag('harness') || null, title: flag('title') || null,
+    }));
+    break;
+  }
+  case 'swap': {
+    // MANAGER only: change WHO is in one of your xells without changing the xell. The work stays
+    // exactly where it is (branch, commits, containers, db, work-item card); only the zee and its
+    // harness change, and the incoming zee is told it INHERITED the branch rather than started it.
+    // The queenzee collects the outgoing zee's cage commits before anything recreates the cage —
+    // and refuses the whole swap if it cannot, because those commits exist in one place only.
+    const to = flag('to');
+    const harness = flag('harness');
+    if (!to) { console.error('swap needs --to <worker-slug> (`zee zees` lists your crew)'); process.exit(1); }
+    if (!harness) { console.error('swap needs --harness <key> — the persona the INCOMING zee wears (`zee harness` lists them)'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/swap', {
+      to, harness, task: flag('task') || null, model: flag('model') || null,
+      mode: flag('mode') || null, title: flag('title') || null,
+    }));
+    break;
+  }
+  case 'harness': {
+    // MANAGER only: the WORKER PERSONAS your project can use, and the ones you may author.
+    //
+    // A persona is text, and text does not fit in a shell flag: a 3k personality or a memory file
+    // typed into --personality is how a quoting mistake becomes a mangled briefing. So the body may
+    // come from FILES — --personality-file for the voice, --spec <file.json> for the whole bundle
+    // ({personality, summary, glyph, skills:[{name,when,body}], memory:[{path,text}]}) — and the
+    // inline flags stay for the one-liners. Anything the server does not accept as persona is
+    // refused BY NAME, not quietly dropped.
+    const key = positional();
+    const spec = flag('spec');
+    let body = {};
+    if (spec) {
+      try { body = JSON.parse(readFileSync(spec, 'utf8')); }
+      catch (e) { console.error(`--spec ${spec}: ${e.message}`); process.exit(1); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        console.error(`--spec ${spec} must contain a JSON object (personality/summary/skills/memory)`); process.exit(1);
+      }
+    }
+    const pfile = flag('personality-file');
+    if (pfile) {
+      try { body.personality = readFileSync(pfile, 'utf8'); }
+      catch (e) { console.error(`--personality-file ${pfile}: ${e.message}`); process.exit(1); }
+    }
+    for (const f of ['label', 'summary', 'glyph', 'personality', 'parent']) {
+      const v = flag(f);
+      if (v !== null) body[f] = v;
+    }
+    if (rest.includes('--enabled')) body.enabled = flag('enabled') !== 'off';
+
+    if (rest.includes('--delete')) {
+      if (!key) { console.error('which one? `zee harness <key> --delete`'); process.exit(1); }
+      out(await req('DELETE', `/api/xell/self/harness/${encodeURIComponent(key)}`));
+      break;
+    }
+    if (rest.includes('--new')) {
+      if (!body.label) { console.error('a new harness needs --label "…" (and usually --parent zee-base)'); process.exit(1); }
+      out(await req('POST', '/api/xell/self/harness', { ...body, ...(key ? { key } : {}) }));
+      break;
+    }
+    if (Object.keys(body).length) {
+      if (!key) { console.error('which one? `zee harness <key> --label "…"` (or --new to create one)'); process.exit(1); }
+      out(await req('PUT', `/api/xell/self/harness/${encodeURIComponent(key)}`, body));
+      break;
+    }
+    if (key) {
+      // READ one: its own text, and the chain it inherits DESCRIBED rather than recited (a persona's
+      // inherited manual is 30k+ characters you are already carrying). --full prints the raw JSON.
+      const r = await req('GET', `/api/xell/self/harness/${encodeURIComponent(key)}`);
+      if (rest.includes('--full') || rest.includes('--json')) { out(r); break; }
+      const j = r.json || {};
+      if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+      const h = j.harness;
+      console.log(`${h.label} (${h.key})   ${h.scope === 'project' ? `yours — project ${h.project_name}` : 'system-wide (the fleet\'s)'}`
+        + `${j.editable ? '' : ' · read-only for you'}`);
+      if (h.parent) console.log(`  inherits: ${h.inherited.chain.join(' → ')}`);
+      if (h.summary) console.log(`  summary: ${h.summary}`);
+      console.log(`  briefed with ${h.briefing_chars.toLocaleString()} chars in total (its own + inherited)`);
+      if (h.personality) console.log(`\n— personality (${h.personality_chars} chars) —\n${h.personality}`);
+      for (const s of h.skills || []) console.log(`\n— skill: ${s.name} (${s.chars} chars) — when: ${s.when}`);
+      for (const m of h.memory || []) console.log(`\n— memory: ${m.path} (${m.chars} chars)`);
+      for (const s of h.inherited.skills || []) console.log(`  ↳ inherited skill: ${s}`);
+      for (const m of h.inherited.memory || []) console.log(`  ↳ inherited memory: ${m}`);
+      if (j.message) console.log(`\n${j.message}`);
+      process.exit(r.code >= 400 ? 1 : 0);
+    }
+    // no key, no fields → LIST
+    const r = await req('GET', '/api/xell/self/harnesses');
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    for (const h of j.harnesses || []) {
+      console.log(`  ${h.key.padEnd(24)} ${(h.scope === 'project' ? 'yours' : 'fleet').padEnd(6)}`
+        + `${h.parent ? `↳ ${h.parent}`.padEnd(20) : ''.padEnd(20)} ${h.summary || h.label}`);
+    }
+    if (j.message) console.log(`\n${j.message}`);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'say': {
+    const to = flag('to'); const message = flag('message');
+    if (!to || !message) { console.error('say needs --to <worker-slug> and --message "…"'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/say', { to, message }));
+    break;
+  }
+  case 'report': {
+    // Your note to your MANAGER — including the post-ship reflection (--kind reflection).
+    const message = flag('message');
+    if (!message) { console.error('report needs --message "what you want your manager to know"'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/report', { message, kind: flag('kind') || 'report' }));
+    break;
+  }
+  case 'inbox': {
+    const r = await req('GET', `/api/xell/self/inbox${rest.includes('--all') ? '?all=1' : ''}`);
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    for (const m of j.messages || []) {
+      console.log(`— ${m.at} ${m.kind.toUpperCase()} from ${m.from || '?'}`);
+      console.log(m.body);
+      console.log('');
+    }
+    if (j.message) console.log(j.message);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'work': {
+    // THE PLAN you are part of. A MANAGER sees its project's work items in tree order (--board drops
+    // the project root, which is not a card); a WORKER sees the ONE item it is assigned to, with the
+    // ancestors, ticket and history it was briefed from. --item <id> reads one item.
+    const item = flag('item') || positional();
+    const r = await req('GET', `/api/xell/self/work?${item ? `item=${encodeURIComponent(item)}&` : ''}${rest.includes('--board') ? 'board=1' : ''}`);
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    if (Array.isArray(j.items)) {
+      // manager view: the plan, indented by depth, with who is on each item
+      for (const i of j.items) {
+        const who = i.zee ? `  ← ${i.zee.slug} (${i.zee.hive_status_label || i.zee.hive_status})` : '';
+        console.log(`${'  '.repeat(i.depth)}${String(i.status).padEnd(9)} ${i.title}${who}`);
+        console.log(`${'  '.repeat(i.depth)}          ${i.id}`);
+      }
+    } else if (j.item) {
+      // one item: yours, or the one you asked for (the same read model /api/work-items/:id serves)
+      const i = j.item;
+      console.log(`${i.title}   [${i.status}${i.progress ? ` ${i.progress}%` : ''}]`);
+      console.log(`  id: ${i.id}   (${i.kind})`);
+      if (i.breadcrumb?.length) console.log(`  under: ${i.breadcrumb.join(' → ')}`);
+      if (i.ticket) console.log(`  ticket: ${i.ticket.number ? `#${i.ticket.number} ` : ''}${i.ticket.title || ''}`);
+      if (i.due_on) console.log(`  due: ${i.due_on}`);
+      if (i.body) console.log(`\n${i.body}\n`);
+      if (i.zee) console.log(`  zee: ${i.zee.slug} (${i.zee.hive_status_label || i.zee.hive_status})`);
+      for (const c of i.children || []) console.log(`  ├ ${String(c.status).padEnd(9)} ${c.title}`);
+      for (const e of (i.events || []).slice(0, 8)) {
+        console.log(`  · ${e.ts} ${e.kind}${e.to_status ? ` → ${e.to_status}` : ''} by ${e.actor || '—'}`);
+      }
+    }
+    if (j.message) console.log(`\n${j.message}`);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
+  case 'assign': {
+    // MANAGER only: DEPLOY a worker for a work item. Same dispatch path as `zee dispatch` (the worker
+    // is stamped as your crew, seated beside you, on its own throwaway db) — what this adds is the
+    // brief, built from the ITEM: its title, body, ancestors, ticket and dates, plus your
+    // --task text. Break the ticket down first; a well-cut item briefs the worker for free.
+    const item = flag('item');
+    if (!item) { console.error('assign needs --item <work-item-id> (run `zee work` to list them)'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/work/assign', {
+      item, task: flag('task') || null, model: flag('model') || null, mode: flag('mode') || null,
+      harness: flag('harness') || null, title: flag('title') || null,
+    }));
+    break;
+  }
+  case 'item': {
+    // Report where the WORK has got to. A manager may report any item in its own project; a worker
+    // only the one it is assigned to (and may omit the id — the server resolves it from your token).
+    // This moves the CARD. It never marks your xell done, lands anything or ships anything.
+    const id = flag('item') || positional();
+    const progress = flag('progress');
+    out(await req('POST', '/api/xell/self/work/item', {
+      id, status: flag('status') || null,
+      progress: progress == null ? null : Number(progress), note: flag('note') || null,
+    }));
+    break;
+  }
+  case 'suggest-done': {
+    const to = flag('to');
+    if (!to) { console.error('suggest-done needs --to <worker-slug> (and --reason "why it is finished")'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/suggest-done', { to, reason: flag('reason') || null }));
+    break;
+  }
   case 'done': {
+    // --clear WITHDRAWS a done proposal. Symmetric with tend/hint clearing, and the half that was
+    // missing: a zee handed more work after proposing done was stuck asking to be reaped, and until
+    // the hive precedence was fixed that stale proposal masked every later signal it raised.
+    if (rest.includes('--clear')) { out(await req('POST', '/api/xell/self/done', { clear: true })); break; }
     const summary = flag('summary');
+    if (!summary) { console.error('done needs --summary "what you finished" (or --clear to withdraw a proposal)'); process.exit(1); }
     out(await req('POST', '/api/xell/self/done', { summary }));
     break;
   }

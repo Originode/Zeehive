@@ -13,6 +13,7 @@ import { broadcast } from '../lib/events.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
+import { npmCacheEnv } from '../lib/npm-cache.js';
 
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
@@ -202,7 +203,9 @@ function startProcessRole(c, xell, project) {
         const script = resolve(config.repoRoot, 'scripts', 'start-xell-process.sh');
         const p = spawn(resolveBash(),
           [script, String(xell.worktree_path).replace(/\\/g, '/'), c.role, String(c.host_port), MODE, ...startCmd.split(/\s+/)],
-          { env: cleanGitEnv(), windowsHide: true });
+          // npmCacheEnv points the script's own `npm ci` at the SHARED cache (ticket #7) — the
+          // script needs no change for it, and with no repos volume it is a no-op.
+          { env: npmCacheEnv(cleanGitEnv()), windowsHide: true });
         let out = '', errBuf = '';
         p.stdout.on('data', (d) => (out += d));
         p.stderr.on('data', (d) => (errBuf += d));

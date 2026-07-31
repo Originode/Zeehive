@@ -6,10 +6,10 @@
 // The git tests run against a real local bare repo (no network); remoteAccess runs against a
 // stubbed global fetch so no live GitHub call is made.
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseGitHubSlug, remoteAccess, pushRemote } from '../server/src/lib/remote-git.js';
+import { parseGitHubSlug, remoteAccess, pushRemote, mergePullRequest } from '../server/src/lib/remote-git.js';
 
 let failures = 0;
 const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`); if (!cond) failures++; };
@@ -101,6 +101,82 @@ console.log('pushRemote: ff push succeeds; a diverged remote is refused (never f
     r = await pushRemote({ repoRoot: work, branch: 'nope', remoteUrl: bare, token: 'ghp_dummy' });
     ok(r.pushed === false && /does not exist/.test(r.reason || ''), 'missing local branch → refused');
   } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+// ── pushRemote: GitHub's `workflow`-scope refusal ──────────────────────────────
+// A repo that has `.github/workflows/*` refuses a PAT push without the `workflow` scope. Git's
+// rejection sentence contains "rejected", which the divergence regex would misread as a
+// "pull or reconcile first" — the wrong instruction. The refusal must surface the scope fix.
+console.log('pushRemote: workflow-scope refusal is surfaced as the token\'s scope, not a divergence');
+{
+  const root = mkdtempSync(join(tmpdir(), 'gho-wf-'));
+  const bare = join(root, 'remote.git');
+  const work = join(root, 'work');
+  try {
+    spawnSync('git', ['init', '--bare', '-b', 'main', bare]);
+    spawnSync('git', ['clone', bare, work]);
+    const cfg = (d) => { git(d, ['config', 'user.email', 't@t']); git(d, ['config', 'user.name', 't']); };
+    cfg(work);
+    spawnSync('bash', ['-c', `echo one > ${work}/a.txt`]);
+    git(work, ['add', '-A']); git(work, ['commit', '-m', 'one']);
+
+    // A pre-receive hook that rejects EVERY push with GitHub's workflow-scope sentence —
+    // byte-for-byte the shape a real GitHub rejection has (contains "rejected" + "workflow").
+    const hook = join(bare, 'hooks', 'pre-receive');
+    writeFileSync(hook,
+      '#!/bin/sh\n'
+      + "echo \"! [remote rejected] main -> zeehive/main (refusing to allow a Personal Access Token to create or update workflow \\`.github/workflows/publish-images.yml\\` without \\`workflow\\` scope)\" >&2\n"
+      + 'exit 1\n');
+    chmodSync(hook, 0o755);
+
+    const r = await pushRemote({ repoRoot: work, branch: 'main', remoteUrl: bare, token: 'ghp_dummy' });
+    ok(r.pushed === false, 'workflow-scope refusal → not pushed');
+    ok(r.state === 'refused-workflow-scope', 'state is refused-workflow-scope (not refused-diverged)');
+    ok(/workflow` scope/.test(r.reason || ''), 'reason names the `workflow` scope, not a divergence');
+    ok(!/pull or reconcile|has commits/.test(r.reason || ''), 'reason does NOT send the human down the divergence path');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+// ── mergePullRequest (stubbed fetch) ────────────────────────────────────────────
+console.log('mergePullRequest: merges via PUT /pulls/:n/merge; refusals surface loud, never forced');
+{
+  const realFetch = globalThis.fetch;
+  let last = null;
+  const stub = ({ ok: httpOk = true, status = 200, body = {} } = {}) => {
+    globalThis.fetch = async (url, opts) => { last = { url, opts }; return { ok: httpOk, status, json: async () => body }; };
+  };
+  const tok = 'ghp_x'.padEnd(30, 'a');
+  try {
+    stub({ body: { merged: true, sha: 'deadbeefcafe0000', message: 'Pull Request successfully merged' } });
+    let r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7, method: 'squash' });
+    ok(r.merged === true && r.state === 'merged' && r.sha === 'deadbeefcafe0000', 'success → merged with sha');
+    ok(last.opts.method === 'PUT' && /\/pulls\/7\/merge$/.test(last.url), 'calls PUT …/pulls/7/merge');
+    ok(JSON.parse(last.opts.body).merge_method === 'squash', 'honours merge_method=squash');
+
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7, method: 'bogus' });
+    ok(JSON.parse(last.opts.body).merge_method === 'merge', 'unknown method falls back to merge');
+
+    stub({ ok: false, status: 405, body: { message: 'Pull Request is not mergeable' } });
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7 });
+    ok(r.merged === false && r.state === 'not-mergeable' && /not mergeable/i.test(r.reason || ''), '405 → not-mergeable, reason shown');
+
+    stub({ ok: false, status: 409, body: { message: 'Head branch was modified' } });
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7 });
+    ok(r.merged === false && r.state === 'conflict', '409 → conflict (head moved)');
+
+    stub({ ok: false, status: 403, body: { message: 'Resource not accessible' } });
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: 7 });
+    ok(r.merged === false && r.state === 'refused' && /write access|branch protection/i.test(r.reason || ''), '403 → refused with reason');
+
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: null, number: 7 });
+    ok(r.merged === false && /write access/i.test(r.reason || ''), 'no token → refused before any call');
+
+    r = await mergePullRequest({ remoteUrl: 'https://github.com/org/repo', token: tok, number: null });
+    ok(r.merged === false && /PR number/i.test(r.reason || ''), 'no PR number → refused');
+
+    r = await mergePullRequest({ remoteUrl: 'git@github.com:org/repo.git', token: tok, number: 7 });
+    ok(r.merged === false && /not a github url/i.test(r.reason || ''), 'non-GitHub URL → refused');
+  } finally { globalThis.fetch = realFetch; }
 }
 
 console.log(failures === 0 ? '\nALL GREEN' : `\n${failures} FAILURE(S)`);

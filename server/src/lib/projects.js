@@ -11,13 +11,26 @@ import { pool, one, q } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
-import { cleanGitEnv } from './git.js';
+import { cleanGitEnv, headCommit, isAncestor } from './git.js';
 import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
-         remoteAccess, pushRemote, openPullRequest } from './remote-git.js';
+         remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
 import { resolveSite } from './sites.js';
+
+// Same switch every other real-side-effect module reads (landgate, xellgit, nudge, harness, reaper,
+// the .zeehive.env reconcile): 'real' touches machines, anything else models. The three OUTBOUND
+// verbs below (Pull · Push · PR) run git against a project's repo_root and its `origin` — both taken
+// off a project row, and a xell's database is a CLONE of the meta-DB, so a NESTED queenzee's project
+// rows are the REAL fleet's. Its console renders the real projects with the real buttons; one click
+// there would fast-forward the real xource from the remote, or publish the real main OUTWARD, from
+// an instance that is only modelling. See outboundRefusal at the head of each verb.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+const outboundRefusal = (what, p) =>
+  `PROVISION_MODE=simulate: this queenzee models the fleet, it does not ${what} — ${p.repo_root} is a `
+  + 'real checkout and its origin is a real remote, and this project row came out of a CLONE of the '
+  + 'meta-DB. Nothing was run. Use the real queenzee.';
 
 // Live statuses that mean a zee is actively bound — deleting such a project is refused.
 const LIVE_ZEE = ['spawning', 'online', 'working', 'idle'];
@@ -33,10 +46,22 @@ export async function dbIdentity(projectId) {
   };
 }
 
+// Every project, with what is WAITING ON A HUMAN in each. The counts matter because the console is
+// per-project: the production panel, the landing banner and the honeycomb all show the SELECTED
+// project only, so a ship awaiting approval in the other one is invisible until you happen to
+// switch to it. A zee that asked would keep saying "it is waiting for you" while the operator, on
+// the other project, saw an empty panel — the same "i see zero" this whole change is about, one
+// level up. Two cheap correlated counts on indexed columns, on a menu that opens rarely.
 export async function listProjects() {
   return q(
     `SELECT p.*,
-            (SELECT count(*) FROM xell x WHERE x.project_id = p.id AND x.status <> 'retired') AS xell_count
+            (SELECT count(*) FROM xell x WHERE x.project_id = p.id AND x.status <> 'retired') AS xell_count,
+            (SELECT count(*) FROM ship_request s
+               WHERE s.project_id = p.id AND s.status = 'pending'
+                 AND s.dismissed_at IS NULL AND s.deferred_at IS NULL)::int AS ships_waiting,
+            (SELECT count(*) FROM land_request lr
+               WHERE lr.project_id = p.id AND lr.status = 'pending'
+                 AND lr.dismissed_at IS NULL)::int AS landings_waiting
        FROM project p ORDER BY p.created_at`);
 }
 
@@ -94,10 +119,15 @@ export async function createProject(body) {
        mf.found ? mf.hash : null,
        (body.remote_url || '').trim() || null]);
 
+    // Record the xource's head AT ONBOARDING. This is the baseline the rollback tripwire
+    // reads: a remote that later moves BACKWARD (force-push, restored-from-stale-backup)
+    // leaves the checkout on a commit that no longer contains this one, and that is only
+    // detectable if we wrote down where we started. Null when repo_root is not a readable
+    // git repo yet — the column is advisory, never a gate on onboarding.
     await client.query(
-      `INSERT INTO xource (project_id, ref, read_only) VALUES ($1,$2,true)
-       ON CONFLICT (project_id, ref) DO NOTHING`,
-      [project.id, mainBranch]);
+      `INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+       ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
+      [project.id, mainBranch, headCommit(repoRoot, mainBranch)]);
 
     // Deploy sites are the real "where" (spec §5); the columns above stay as deprecated
     // fallback. Every project gets a dev site ('default' = this machine's daemon when unset);
@@ -234,6 +264,30 @@ export async function cloneProject(body = {}) {
   return { ...project, gate_warning: gateWarning, token_warning: tokenWarning };
 }
 
+// Write down where the xource ref now points, and check it did not move BACKWARD. A remote
+// that regresses (force-push, restore-from-stale-backup, a re-clone of a rolled-back remote)
+// leaves the checkout on a commit that no longer CONTAINS the head we last recorded — and
+// nothing else in the system notices, because every xell dutifully branches from the new tip.
+// That is exactly how OmniBiz lost six days of work in July 2026: the remote went back from
+// 90a7548b to 0265998f and the containerized xource was cloned from the regressed remote.
+// Returns a regression descriptor when the ref moved backward, else null.
+export async function recordXourceHead(project, ref, head) {
+  if (!head) return null;
+  const prev = await one(`SELECT head_commit FROM xource WHERE project_id=$1 AND ref=$2`, [project.id, ref]);
+  const was = prev?.head_commit || null;
+  const regressed = !!was && was !== head && !isAncestor(project.repo_root, was, head);
+
+  await q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+           ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = EXCLUDED.head_commit`,
+          [project.id, ref, head]);
+
+  if (regressed) {
+    logline('projects', `WARNING ${project.name}: xource ${ref} moved BACKWARD — recorded ${was.slice(0, 8)} is not contained in ${head.slice(0, 8)}; work may have been dropped`);
+    return { regressed: true, was, now: head };
+  }
+  return null;
+}
+
 // Fetch + ff-only merge of the recorded remote into the xource checkout. Human-triggered from
 // the console; refusals (dirty tree, divergence, wrong branch) come back as {pulled:false,
 // reason} for the refuse-with-reason UI convention.
@@ -241,6 +295,10 @@ export async function pullProject(id, by = 'human@console') {
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { pulled: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
+  if (PROVISION_MODE !== 'real') {
+    logline('projects', `${p.name}: PULL from origin NOT run — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return { pulled: false, state: 'refused', dry_run: true, reason: outboundRefusal('pull a real xource from its remote', p) };
+  }
 
   let token = null;
   try { token = (await tokenForSpawn(p.id, 'github'))?.token || null; } catch { /* no token = anonymous fetch (public repo) */ }
@@ -249,11 +307,16 @@ export async function pullProject(id, by = 'human@console') {
     repoRoot: String(p.repo_root).replace(/\\/g, '/'),
     branch: p.main_branch, remoteUrl: p.remote_url, token,
   });
+  // Record the head on any successful read of the ref — including 'up-to-date', which is where
+  // a first-ever population lands for a project onboarded before head_commit was tracked.
+  let regression = null;
+  if (r.pulled) regression = await recordXourceHead(p, p.main_branch, r.to || headCommit(p.repo_root, p.main_branch));
+
   if (r.state === 'fast-forwarded') {
     logline('projects', `${by} pulled ${p.name}: origin/${p.main_branch} → ${(r.to || '').slice(0, 8)} (${r.commits} commit${r.commits === 1 ? '' : 's'})`);
     broadcast('project', p);
   }
-  return r;
+  return regression ? { ...r, ...regression } : r;
 }
 
 // ── OUTBOUND (opt-in, human-gated): does this project's PAT carry write access? ──
@@ -276,6 +339,10 @@ export async function pushProject(id, by = 'human@console') {
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { pushed: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
+  if (PROVISION_MODE !== 'real') {
+    logline('projects', `${p.name}: PUSH to origin NOT run — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return { pushed: false, state: 'refused', dry_run: true, reason: outboundRefusal('publish a real xource to its remote', p) };
+  }
 
   const access = await githubAccess(id);
   if (!access.can_push) return { pushed: false, state: 'refused', reason: access.reason || 'the connected GitHub token cannot push to this repo' };
@@ -291,11 +358,19 @@ export async function pushProject(id, by = 'human@console') {
   return r;
 }
 
-// Open a PR from local main. Human-triggered; the console may pass a head branch name / title.
-export async function pullRequestProject(id, { headBranch = null, title = null, base = null } = {}, by = 'human@console') {
+// Open a PR from local main — and, when `merge` is set, MERGE it too (pull-request AND merge).
+// Human-triggered; the console may pass a head branch name / title, a merge flag and a merge method
+// ('merge' | 'squash' | 'rebase'). The merge is a separate GitHub call after the PR is opened, so a
+// refused merge (branch protection, not-yet-mergeable) still leaves an OPEN PR the human can finish
+// by hand — the outcome is reported as r.merge = {merged, state, reason}.
+export async function pullRequestProject(id, { headBranch = null, title = null, base = null, merge = false, mergeMethod = 'merge' } = {}, by = 'human@console') {
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { opened: false, reason: 'project has no remote_url — set one in Project setup first' };
+  if (PROVISION_MODE !== 'real') {
+    logline('projects', `${p.name}: PR on origin NOT opened — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return { opened: false, dry_run: true, reason: outboundRefusal('open or merge a PR on a real remote', p) };
+  }
 
   const access = await githubAccess(id);
   if (!access.can_pr) return { opened: false, reason: access.reason || 'the connected GitHub token cannot open PRs on this repo' };
@@ -309,6 +384,13 @@ export async function pullRequestProject(id, { headBranch = null, title = null, 
     headBranch, title, base,
   });
   if (r.opened) logline('projects', `${by} opened PR on ${p.name}: ${r.head} → ${r.base}${r.number ? ` (#${r.number})` : ''} [${r.state}]`);
+
+  if (merge && r.opened && r.number) {
+    const m = await mergePullRequest({ remoteUrl: p.remote_url, token, number: r.number, method: mergeMethod, title });
+    r.merge = m;
+    if (m.merged) logline('projects', `${by} merged PR #${r.number} on ${p.name} → ${r.base} (${m.method}, ${(m.sha || '').slice(0, 8)})`);
+    else logline('projects', `${by} opened PR #${r.number} on ${p.name} but merge was refused: ${m.reason}`);
+  }
   return r;
 }
 
@@ -461,14 +543,19 @@ export async function projectReadiness(id) {
 // ── the dev spawn template: what a NEW xell gets by default ─────────────────
 export async function getPoolConfig(projectId) {
   return one(
-    `SELECT pc.*, r.key AS runtime_key, r.label AS runtime_label
-       FROM pool_config pc LEFT JOIN agent_runtime r ON r.id = pc.default_runtime_id
+    `SELECT pc.*, r.key AS runtime_key, r.label AS runtime_label,
+            h.key AS harness_key, h.label AS harness_label
+       FROM pool_config pc
+       LEFT JOIN agent_runtime r ON r.id = pc.default_runtime_id
+       LEFT JOIN harness h ON h.id = pc.default_harness_id
       WHERE pc.project_id=$1`, [projectId]);
 }
 
 const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
                         'refresh_interval_sec', 'default_build_ctx'];
-const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod'];
+// Every coupling a xell can hold. The two prod ones are listed so a bad value still gets the honest
+// "must be one of" error, then refused individually below as DEFAULTS (prod access is per-xell).
+const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod', 'db-prod-readonly'];
 
 export async function updatePoolConfig(projectId, body = {}) {
   const pc = await one(`SELECT * FROM pool_config WHERE project_id=$1`, [projectId]);
@@ -478,6 +565,13 @@ export async function updatePoolConfig(projectId, body = {}) {
   }
   if (body.default_db_coupling === 'db-shared-prod') {
     throw new Error('db-shared-prod cannot be a DEFAULT — prod data access is per-xell and human-granted (/xell-prod)');
+  }
+  // Read-only prod is still PROD, and it belongs to exactly one kind of xell (a manager, bound when
+  // a human adds one). As a project default it would silently point every pooled worker at the live
+  // database — the same reason db-shared-prod is refused above, one notch quieter.
+  if (body.default_db_coupling === 'db-prod-readonly') {
+    throw new Error('db-prod-readonly cannot be a DEFAULT — it is the MANAGER binding, minted per xell '
+      + 'when a human adds a manager zee (its own SELECT-only postgres role)');
   }
   // Default compile host: normalize empty → NULL (compile on the run host), and refuse a foreign
   // context unless the project can hand the image over (a registry). Same rule as a per-xell knob,
@@ -509,6 +603,29 @@ export async function updatePoolConfig(projectId, body = {}) {
     if (!r) throw new Error(`no enabled runtime keyed "${body.default_runtime_key}"`);
     vals.push(r.id);
     sets.push(`default_runtime_id = $${vals.length}`);
+  }
+  // Default harness: the persona a BARE dispatch attaches (intake reads pool_config.default_harness_id
+  // when --harness is omitted and the pooled xell has none). A key names a harness; '' / 'none' /
+  // 'core-only' clears it back to core-only (the law layer, always on). The core (law) harness is not
+  // a selectable default — every xell already gets it.
+  if (body.default_harness_key !== undefined) {
+    const key = String(body.default_harness_key || '').trim().toLowerCase();
+    if (!key || key === 'none' || key === 'core-only') {
+      vals.push(null);
+      sets.push(`default_harness_id = $${vals.length}`);
+    } else {
+      const h = await one(`SELECT id, project_id FROM harness WHERE key=$1 AND enabled AND NOT is_law_core`, [key]);
+      if (!h) throw new Error(`no enabled harness keyed "${key}"`);
+      // SCOPE (084): a project-scoped harness is only a default for ITS project. The DB trigger
+      // (pool_default_harness_scope_guard) is the wall; this is the sentence, because the default is
+      // the one path that attaches a persona without anybody naming it.
+      if (h.project_id && String(h.project_id) !== String(projectId)) {
+        throw new Error(`harness "${key}" belongs to another project — it cannot be this project's `
+          + "default harness. A default must be system-wide, or this project's own.");
+      }
+      vals.push(h.id);
+      sets.push(`default_harness_id = $${vals.length}`);
+    }
   }
   if (!sets.length) return pc;
   const row = await one(`UPDATE pool_config SET ${sets.join(', ')} WHERE project_id=$1 RETURNING *`, vals);
@@ -561,8 +678,9 @@ export async function updateProject(id, body = {}) {
   const updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
   // A changed main branch needs its xource row, or the pool can't provision from it.
   if (body.main_branch && body.main_branch !== project.main_branch) {
-    await q(`INSERT INTO xource (project_id, ref, read_only) VALUES ($1,$2,true)
-             ON CONFLICT (project_id, ref) DO NOTHING`, [id, updated.main_branch]);
+    await q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+             ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
+            [id, updated.main_branch, headCommit(updated.repo_root, updated.main_branch)]);
   }
   broadcast('project', updated);
   return updated;

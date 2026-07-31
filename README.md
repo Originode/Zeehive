@@ -48,8 +48,15 @@ and a zee goes to work in one.
   (`cxell_<slug>` on the `zee-hive-net` network). No docker socket, no host filesystem, a
   default-deny egress firewall — the queenzee API is its only door out, and every privileged
   verb behind that door lands on a human gate. The repo enters as a git bundle; commits leave
-  the same way. See [docs/cxell-zee-manual.md](docs/cxell-zee-manual.md).
+  the same way. The zee's manual is not a file in this repo: it lives in the **meta-DB** (harness
+  `zee-base`, seeded and amended by `db/migrations/`) and is delivered into every xell at
+  `.zeehive/harness/memory/cxell-zee-manual.md`, so it can never drift from the API it documents.
 - **zee** — an agent (a Claude session) bound to exactly one xell, running inside its cxell.
+- **manager zee** — a zee whose job is running OTHER zees: it dispatches workers, talks to them in
+  real time, reads their post-ship reflections, and suggests when one is done (a human confirms).
+  It holds the production database **read-only** (its own SELECT-only postgres role) and has **zero
+  push/PR access to the xource** — it writes no code and lands none. Humans add them, unlimited;
+  a manager can never mint another. See [docs/manager-zees.md](docs/manager-zees.md).
 - **queenzee** — the orchestrator. **Pure script, no AI.** It provisions/reaps deterministically,
   keeps the pool warm, monitors health, runs maintenance, and executes the privileged actions
   humans approve. AI is invoked only at dispatch — never in routine loops.
@@ -66,8 +73,24 @@ human's click.**
 - **Ship gate** — production deploys are requests; a human approves, and the *queenzee* builds
   from the landed main and deploys. A zee never holds the prod lock or runs a prod build.
 - **Prod data** — binding a xell to a production database is a per-xell human grant.
-- **Done** — a zee proposes it's finished; a human's "Mark done" is what tears the cxell down
-  (commits are collected first).
+- **Done** — a zee proposes it's finished (and can withdraw that with `zee done --clear` if it is
+  handed more work); a human's "Mark done" is what tears the cxell down
+  (commits are collected first). A **manager zee** may only *suggest* that another xell is done —
+  the same human click, with a typed confirmation, is still what ends it.
+
+And one control that is the opposite of a gate — a gate holds ONE act until a human agrees; this
+stops everything until they say otherwise:
+
+- **Pause / play** — one button in the console statusline, fleet-wide across every project. **Pause**
+  interrupts the running turn in every live cxell (workers *and* manager zees) with a SIGINT, and
+  holds down everything that would start another: no dispatch, no landing/clearance/reflection nudge,
+  no operator or manager message reaching a session. It touches nothing else — no commit, no branch,
+  no request, no gate — so a paused zee loses the remainder of its turn and nothing more, and the
+  paused hexagons say `paused` rather than going quiet. **Play** lowers the flag and calls back
+  exactly the zees the pause interrupted, each with a prompt telling it what happened (an interrupted
+  turn is otherwise indistinguishable from a crash) and sending it to `zee status` for anything that
+  changed while it was stopped. It is a HUMAN verb only: there is no `zee pause`, because a zee that
+  could stop the fleet could stop the zee about to land a rival change.
 
 ## GitHub-centric, inbound by default — outbound opt-in
 
@@ -95,16 +118,25 @@ server/src/
 web/             the console (React + Vite) — honeycomb fleet view, gates, terminals
 docker/zeehive/  Dockerfile.server (the queenzee), Dockerfile.zee-agent (the cxell image),
                  Dockerfile.web, docker-compose.prod.yml, migration playbook (README.md)
-scripts/         provisioning/despawn/build/ship scripts + the in-cxell `zee` CLI
-docs/            deploy-topology spec, the cxell zee manual
+scripts/         provisioning/despawn/build/ship scripts + `zee`, the ONE copy of the in-cxell
+                 CLI (the zee-agent image COPYs it from the repo-root build context; the
+                 queenzee also installs it into each cxell at spawn — never a second copy)
+docs/            deploy-topology spec, manager zees, the work tracker, harnesses
 ```
+
+**Working on ZEEHIVE (human or zee)? Start at [CLAUDE.md](CLAUDE.md)** — how to tell which surface
+you are on, the verbs that are actually yours, how to run and verify, and a map of the docs.
 
 ## Developing ZEEHIVE with ZEEHIVE
 
 ZEEHIVE is its own first project: work on it happens in xells like any other project. A Zeehive
 xell gets its own per-xell meta-DB container (`zeehive_db_spin_<slug>`), and the nested queenzee
-inside it runs with simulate-mode safety defaults (`zeehive.yml`) — it can never touch the real
-fleet. Landed work reaches the running instance via its **self-ship**: the approved ref is
+inside it runs with simulate-mode safety defaults (`zeehive.yml`) — every provisioning, teardown,
+build, deploy-file and backup path is mode-gated, so it provisions and deploys nothing. It is **not**
+fully sealed off, though: its meta-DB is a clone of the real one, the flags gate actions rather than
+reads, and `proddiff` reads real production databases with no mode gate
+([docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md) is the loop-by-loop
+audit). Landed work reaches the running instance via its **self-ship**: the approved ref is
 rebuilt and the server replaces itself, finishing the ship record on the new boot.
 
 Legacy note: a host-process deployment mode (the pre-container era) still exists alongside the

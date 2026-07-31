@@ -1,7 +1,50 @@
 import React, { useState, useCallback, useLayoutEffect, useEffect, useReducer } from 'react';
 import { buildHexGraph, shortestPath, nearestVertex, nearestNode, latticeCells, assignLanes, offsetPolyline } from './hive/maze.js';
+import { crewLinks, relatedTo, focusIdOf, hexDim, REL_DASH_ATTR } from './hive/crew.js';
 
 const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
+
+// ── how a wire reads: focus / RELATED / receded / plain ───────────────────────
+// The honeycomb marks a manager's live crew (#24); this is the same mark one layer out. A crew
+// member's trace must stay VISIBLE while its manager is hovered — a group that keeps its cells and
+// loses its traces makes the view contradict itself in the one interaction the feature exists for —
+// and it must not read as the FOCUS's own wire any more than a marked hex reads as selected. So:
+//
+//   related    → nearly full, ordinary width, DASHED — the same dash as the hexagon's tie-ring and
+//                the graph's anchor ring, so all three layers teach one idea
+//   the focus  → full opacity, THICK, solid   (unchanged: this is the thing you pointed at)
+//   receded    → faded (0.1, or 0.12 behind an open bloom), as before
+//
+// The hover rung sits ABOVE the bloom's 0.12: a hexagon the pointer is on lights up (see hive/crew.js
+// hexDim — a hovered hex is never dimmed, even while another xell's flower is open), so its WIRE must
+// light up with it or the three layers contradict each other — the hex says "look at me" and the trace
+// to its commit says "no". The bloom still recedes everything the pointer is NOT on; it only yields to
+// the thing being pointed at. Only "related" sits higher, because a manager whose flower is open is
+// exactly when a human is asking "which of these are yours?".
+// Pure, so what a human ends up seeing is asserted as data rather than grepped for.
+export function wireStyle({ hovered = false, related = null, dim = false, bloomDim = false } = {}) {
+  if (related) return { opacity: 0.85, width: 2, dash: REL_DASH_ATTR };
+  if (hovered) return { opacity: 1, width: 3.2, dash: null };
+  if (bloomDim) return { opacity: 0.12, width: 2, dash: null };
+  if (dim) return { opacity: 0.1, width: 2, dash: null };
+  return { opacity: 0.92, width: 2, dash: null };
+}
+
+// One trace: the corridor path, its commit-dot end and its hexagon end. Exported so a test can render
+// the REAL element and read what it emitted (the SVG counterpart of painting into a recording 2D
+// context) instead of trusting the source to mean what it says.
+export function Wire({ p, hovered = false, related = null, dim = false }) {
+  const st = wireStyle({ hovered, related, dim, bloomDim: p.dim });
+  return (
+    <g opacity={st.opacity} data-wire={p.id} data-rel={related || undefined}>
+      <path d={p.d} fill="none" stroke={p.color} strokeWidth={st.width} strokeDasharray={st.dash || undefined}
+            strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={p.x1} cy={p.y1} r={hovered ? 4 : 3} fill={p.color} />
+      <rect x={p.x2 - 3.5} y={p.y2 - 3.5} width="7" height="7" rx="1.5"
+            fill={p.color} stroke="var(--bg)" strokeWidth="1.5" />
+    </g>
+  );
+}
 
 // SVG overlay spanning the whole hive-split. For each xell it draws a colored wire from the xell's
 // commit dot in the centre <GraphPane> (the point in history it sits at) to that xell's hexagon in
@@ -14,7 +57,7 @@ const LANE_PITCH = 5;   // px between parallel channels sharing a corridor
 //   • everyone else: the wire threads the honeycomb like a MAZE — it hops from the dot across the
 //     open gap to the nearest lattice vertex, then pathfinds along hex EDGES to the target hex's
 //     vertex nearest the dot, so it never crosses a hexagon and every segment runs along a hex side.
-export default function Connectors({ timeline, layoutRef, version, hexPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom, hoverRef, subscribeHover }) {
+export default function Connectors({ timeline, xells = [], layoutRef, version, hexPosRef, harnessPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom, hoverRef, subscribeHover }) {
   const [paths, setPaths] = useState([]);
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [, forceHover] = useReducer((x) => x + 1, 0);
@@ -57,6 +100,22 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     // ≈cellSize from the centre, is still forward) — so no lattice vertex ever sits behind the dots.
     const forward = (cx, cy) => (perpOf(cx, cy) - spine) * fwd >= cellSize;
 
+    // HARNESS NODES (docs §5): each harness occupies its own honeycomb CELL (published by HiveCanvas
+    // in harnessPosRef — the badge is drawn on the canvas there, at the hex centre). Here we only
+    // record each cell centre so a consumer's wire can be routed IN SERIES through it: the trace is
+    // ONE continuous line commit-dot → harness hexagon → xell. There is no separate harness inbound
+    // wire — that used to draw a SECOND trace to the same junction; the through-routing IS the inbound.
+    const harnessPos = (harnessPosRef && harnessPosRef.current) || {};
+    const consumerHarness = new Map();     // consumer xellId → harness cell centre {x,y}
+    for (const h of (timeline.harnesses || [])) {
+      const hp = harnessPos[h.id];
+      if (!hp) continue;                   // HiveCanvas hasn't published this harness's cell yet
+      const node = { id: h.id, color: h.color, x: hp.x - cr.left, y: hp.y - cr.top };
+      // consumer_ids, NOT wearer_ids: a MANAGER wears a harness but is never routed through its cell
+      // — its own hexagon is drawn as that persona, so its wire runs straight from the dot to it.
+      for (const id of h.consumer_ids || []) consumerHarness.set(id, node);
+    }
+
     // "infinite maze": tile invisible cells across the dots→honeycomb bbox, but only on the honeycomb
     // side of the spine, so a wire threads corridors through the gap without ever going backward.
     const xs = realHexes.map((h) => h.cx).concat(dots.map((d) => d.dx));
@@ -74,15 +133,30 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
       .filter((c) => forward(c.cx, c.cy) && insideHoney(c.cx, c.cy));
     const graph = buildHexGraph(realHexes.concat(virtual));
 
-    // pass 1: pathfind every wire (prod included) through the corridor maze
+    // pass 1: pathfind every wire (prod included) through the corridor maze. A harnessed consumer's
+    // wire is forced THROUGH its harness cell — two maze legs (dot→cell, cell→hex) spliced — so it
+    // reads as ONE continuous series: commit-dot → harness hexagon → xell (docs §5), instead of the
+    // old pair of a xell wire plus a separate harness inbound wire.
     const routed = [];
     for (const dd of dots) {
       const verts = graph.vertsById.get(dd.id);
       if (!verts) continue;
       const target = nearestVertex(verts, dd.dx, dd.dy);   // hex vertex nearest the commit head
       const entryKey = nearestNode(graph, dd.dx, dd.dy);
-      const path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
-      routed.push({ id: dd.id, color: dd.color, dot: dd, target, pts: path });
+      const hn = consumerHarness.get(dd.id);
+      let path = entryKey ? shortestPath(graph, entryKey, target.key) : null;
+      let harnessAt = null, harnessCenter = null;
+      if (hn && entryKey) {
+        const midKey = nearestNode(graph, hn.x, hn.y);
+        const l1 = shortestPath(graph, entryKey, midKey);
+        const l2 = shortestPath(graph, midKey, target.key);
+        if (l1 && l2 && l1.length && l2.length) {
+          path = [...l1, ...l2.slice(1)];   // splice at the cell
+          harnessAt = l1.length - 1;        // index of the shared harness vertex in the joined path…
+          harnessCenter = [hn.x, hn.y];     // …pinned to the badge centre so the trace runs THROUGH it
+        }
+      }
+      routed.push({ id: dd.id, color: dd.color, dot: dd, target, pts: path, harnessAt, harnessCenter });
     }
 
     // pass 2: where wires share a corridor, split them into parallel channels
@@ -92,9 +166,18 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     for (const r of routed) {
       const { dot: dd, target } = r;
       let d, ex = target.x, ey = target.y;
+      // All wires — harnessed or not — render through the corridor maze. A harnessed consumer's
+      // r.pts was already spliced through its harness cell in pass 1, so it threads the honeycomb
+      // like the rest instead of a straight diagonal.
       if (r.pts && r.pts.length > 1) {
         const off = lanes.get(r.id) || r.pts.slice(1).map(() => [0, 0]);
         const maze = offsetPolyline(r.pts, off);           // channel-offset corridor path
+        // pin the shared through-vertex to the harness badge CENTRE so every consumer's trace visibly
+        // runs THROUGH the hexagon (and parallel consumers converge there — reading as one junction).
+        // Interior vertices only — never move the entry lead-in or the xell endpoint.
+        if (r.harnessAt != null && r.harnessCenter && r.harnessAt > 0 && r.harnessAt < maze.length - 1) {
+          maze[r.harnessAt] = r.harnessCenter;
+        }
         const e0 = maze[0];                                // offset entry point
         const corner = portrait ? [dd.dx, e0[1]] : [e0[0], dd.dy];  // ⟂ off the spine, then 90° turn
         const poly = [[dd.dx, dd.dy], corner, ...maze];
@@ -134,25 +217,38 @@ export default function Connectors({ timeline, layoutRef, version, hexPosRef, or
     };
   }, [measure, layoutRef]);
 
-  const hov = hoverRef ? hoverRef.current : { id: null, commit: null };
-  const hoverActive = !!(hov.id || hov.commit);
-  const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit);
+  const hov = hoverRef ? hoverRef.current : { id: null, commit: null, harness: null };
+  // hovering a harness badge focuses every xell that WEARS it — so their through-traces light up
+  // together, the mirror of a xell hover lighting its harness. Wearers, not consumers: a manager
+  // wears a harness without routing through its cell (its own hexagon IS that persona), and its wire
+  // still belongs in the family the hover lights.
+  const hovHarness = hov.harness ? (timeline?.harnesses || []).find((h) => h.id === hov.harness) : null;
+  const hovConsumers = new Set(hovHarness?.wearer_ids || hovHarness?.consumer_ids || []);
+  const hoverActive = !!(hov.id || hov.commit || hov.harness);
+  const isHov = (p) => p.id === hov.id || (!!hov.commit && p.base === hov.commit) || hovConsumers.has(p.id);
+
+  // THE CREW RELATION, one layer out (#25). Same helpers the honeycomb draws its hexes with, reading
+  // the same fleet list — the grouping is never re-derived here, because the bug #24 fixed WAS a second
+  // hand-rolled grouping that had drifted from the first. A reaped crew member is not in `related`, so
+  // its trace recedes with every other stranger's.
+  const related = relatedTo(xells, focusIdOf(hov, expandedId), crewLinks(xells));
 
   return (
+    // zIndex:1 keeps the trace-line overlay a LOW decorative layer: above the honeycomb canvas
+    // (which is z-auto inside the honey pane, so the wires still thread the cells) but beneath every
+    // dialog and UI surface. Anything positioned (the in-honey terminal-choice/message-composer
+    // overlays, all the fixed modals, panel chrome) therefore renders ON TOP of the wires, never
+    // buried by them. Do NOT raise this above the dialog layer, and do NOT lift the honey PANE
+    // above it — a pane-level z-index makes the pane a stacking context that covers the modals.
     <svg className="connectors" width={size.w} height={size.h}
-         style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', zIndex: 5 }}>
+         style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', zIndex: 1 }}>
       {paths.map((p) => {
         const hovered = isHov(p);
-        const opacity = p.dim ? 0.12 : (hoverActive ? (hovered ? 1 : 0.1) : 0.92);
-        return (
-        <g key={p.id} opacity={opacity}>
-          <path d={p.d} fill="none" stroke={p.color} strokeWidth={hovered ? 3.2 : 2}
-                strokeLinejoin="round" strokeLinecap="round" />
-          <circle cx={p.x1} cy={p.y1} r={hovered ? 4 : 3} fill={p.color} />
-          <rect x={p.x2 - 3.5} y={p.y2 - 3.5} width="7" height="7" rx="1.5"
-                fill={p.color} stroke="var(--bg)" strokeWidth="1.5" />
-        </g>
-        );
+        const rel = related.get(p.id) || null;
+        // the SAME dim rule the hexes use (hive/crew.js hexDim): the focus lights its own group and
+        // the rest of the fleet recedes — a related trace is never the thing that recedes.
+        const dim = hexDim({ hexId: p.id, expandedId, hovered, hoverActive, related: rel });
+        return <Wire key={p.id} p={p} hovered={hovered} related={rel} dim={dim} />;
       })}
     </svg>
   );

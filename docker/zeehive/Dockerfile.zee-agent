@@ -1,5 +1,15 @@
 # ZEEHIVE zee-agent — the CXELL a headless zee runs in. One container per xell.
 #
+# BUILD CONTEXT IS THE REPO ROOT (like Dockerfile.server / Dockerfile.web):
+#   docker build -f docker/zeehive/Dockerfile.zee-agent -t zeehive/zee-agent .
+# It has to be, because the image bakes the AUTHORITATIVE `scripts/zee` CLI — and a
+# docker/zeehive context cannot COPY out of scripts/. That used to be "solved" by keeping a
+# hand-synced duplicate at docker/zeehive/zee with a comment saying "update both"; the duplicate
+# then missed the crew verbs (zees/dispatch/say/report/inbox/suggest-done) for every cxell in the
+# fleet — a manager zee in a cage could not dispatch at all. A comment is not a mechanism. One
+# file, one COPY, and the root .dockerignore keeps the context lean.
+# NOTE: every COPY source below is therefore REPO-ROOT-relative (docker/zeehive/… , scripts/…).
+#
 # Confinement is structural, not prompted: the container sees ONLY
 #   /work            — a private clone of the xell's branch (from a git bundle; no
 #                      shared object store with the xource, no host mounts)
@@ -16,13 +26,22 @@
 # inbound, so the egress-only firewall (OUTPUT DROP) neither blocks it nor is loosened by it.
 # tmux keeps the interactive session alive across disconnects (true async, come-back-whenever).
 FROM node:22-bookworm-slim
-# adb (android-tools-adb, ~5 MB): the ONE tool a zee needs to drive a DEVICE xhip — connect over
-# network adb, install an APK, launch it, screencap, logcat. The heavier JDK+Android SDK to BUILD an
-# APK is deliberately NOT here (it would balloon the base image for every zee); an Android project
-# uses a zee-agent image VARIANT with the SDK via the CXELL_IMAGE override. Building the app tier and
-# talking to the device are separate concerns, so the slim cxell only carries the client.
+# adb: the ONE tool a zee needs to drive a DEVICE xhip — connect over network adb, install an APK,
+# launch it, screencap, logcat. It must be CURRENT platform-tools, NOT Debian's `android-tools-adb`:
+# that package ships adb 29.0.6 (2019), which predates Android 11 WIRELESS DEBUGGING — it has no
+# `adb pair` and can't do the TLS `adb connect`, so against a modern phone on a dynamic TLS port it
+# just times out to `offline` (diagnosed live, 2026-07-28: a wireless-debug device at :42005 was
+# unreachable from adb 29, reachable from a current one). The slim base's whole purpose is to DRIVE a
+# device, so it carries an adb new enough to. Pinned like the -android variant's SDK; bump deliberately.
+# The heavier JDK+Android SDK to BUILD an APK stays out of the base — an Android project uses the
+# zee-agent-android VARIANT via the CXELL_IMAGE override for that.
+ARG PLATFORM_TOOLS_VERSION=r35.0.2
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git bash ca-certificates curl iptables dnsutils openssh-server tmux android-tools-adb \
+      git bash ca-certificates curl unzip iptables dnsutils openssh-server tmux \
+    && curl -fsSL "https://dl.google.com/android/repository/platform-tools_${PLATFORM_TOOLS_VERSION}-linux.zip" -o /tmp/pt.zip \
+    && unzip -q /tmp/pt.zip -d /opt \
+    && ln -sf /opt/platform-tools/adb /usr/local/bin/adb \
+    && rm -f /tmp/pt.zip \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 # ALL vendor-native agent CLIs bake into the one image — which one runs is decided per dispatch
@@ -32,18 +51,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # kimi-code is PINNED (young CLI, moving fast — bump deliberately, not on every rebuild);
 # claude/codex track latest like the image always has for claude.
 RUN npm install -g @anthropic-ai/claude-code @openai/codex @moonshot-ai/kimi-code@0.28.1
-COPY cxell-firewall.sh /usr/local/bin/cxell-firewall.sh
-COPY cxell-sshd.sh /usr/local/bin/cxell-sshd.sh
-# The cxell zee's workflow CLI (land/ship/prod/done/status → the queenzee's /api/xell/self/* verbs).
-# This is a synced copy of scripts/zee (the authoritative source); it lives here because the image's
-# build context is this directory. Update both if you change it.
-COPY zee /usr/local/bin/zee
+COPY docker/zeehive/cxell-firewall.sh /usr/local/bin/cxell-firewall.sh
+COPY docker/zeehive/cxell-sshd.sh /usr/local/bin/cxell-sshd.sh
+# The cxell zee's workflow CLI (land/ship/prod/done/status/crew → the queenzee's /api/xell/self/*
+# verbs), copied straight from the ONE authoritative source, scripts/zee. No duplicate to sync.
+# Belt-and-braces: the queenzee ALSO docker-cp's its own current scripts/zee into every cxell at
+# spawn (server/src/lib/cxell.js: installZeeCliIntoCxell), so a fleet still running an older
+# zee-agent image can never hand a zee a CLI older than the queenzee that defines its API.
+COPY scripts/zee /usr/local/bin/zee
 # The ATTEND path: cxell-claude-seed.mjs pre-answers Claude Code's first-run gauntlet (so an
 # attending human sees ZERO onboarding/theme/trust/bypass prompts); zee-attach.sh + zee-live.mjs
 # land that human straight in the zee's live workflow, then `claude --resume` for the full session.
-COPY cxell-claude-seed.mjs /usr/local/bin/cxell-claude-seed.mjs
-COPY zee-live.mjs /usr/local/bin/zee-live.mjs
-COPY zee-attach.sh /usr/local/bin/zee-attach.sh
+COPY docker/zeehive/cxell-claude-seed.mjs /usr/local/bin/cxell-claude-seed.mjs
+COPY docker/zeehive/zee-live.mjs /usr/local/bin/zee-live.mjs
+COPY docker/zeehive/zee-attach.sh /usr/local/bin/zee-attach.sh
 # Belt-and-suspenders CRLF strip: .gitattributes pins these to LF, but if the build context was
 # checked out on Windows with autocrlf=true (or copied through a Windows tool) a `#!/usr/bin/env
 # node\r` shebang would make `zee` die with `node\r: No such file or directory`. Strip any trailing
@@ -55,7 +76,14 @@ RUN sed -i 's/\r$//' /usr/local/bin/cxell-firewall.sh /usr/local/bin/cxell-sshd.
 
 RUN useradd -m -s /bin/bash zee \
     && mkdir -p /work && chown zee:zee /work \
-    && mkdir -p /home/zee/.ssh && chmod 700 /home/zee/.ssh && chown zee:zee /home/zee/.ssh
+    && mkdir -p /home/zee/.ssh && chmod 700 /home/zee/.ssh && chown zee:zee /home/zee/.ssh \
+    # The SHARED npm cache mountpoint (ticket #7). It exists in the image, owned by `zee`, purely so
+    # that the first cxell to mount the fleet's cache VOLUME here initializes it with that ownership
+    # — docker seeds a new named volume from the image path, and a root-owned cache would give npm
+    # (which runs as zee) EACCES on every install. NOT a cache: nothing is baked in, and project
+    # node_modules deliberately never are — the image is shared by every project and would go stale
+    # against each one's lockfile. See server/src/lib/npm-cache.js.
+    && mkdir -p /npm-cache && chown zee:zee /npm-cache
 USER zee
 WORKDIR /work
 ENV NODE_NO_WARNINGS=1 \

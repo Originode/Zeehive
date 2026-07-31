@@ -5,6 +5,8 @@ import { q, one } from '../db/pool.js';
 import { gitLog, diffStat, worktreeDiff, worktreeHead, isAncestor, countBehind } from './git.js';
 import { cxellDiff } from './cxell.js';
 import { defaultProject } from './fleet.js';
+import { isManager } from './managers.js';
+import { harnessHealth } from './harness.js';
 
 // A cxell zee's work lives INSIDE its cxell, not in the host worktree (see cxellDiff): the host
 // worktree stays frozen at the provisioning base until `zee land`, so worktreeDiff reads 0/0 for
@@ -99,8 +101,12 @@ export async function getDiffs(projectId) {
 
 // stable, distinct connector colors per xell
 const COLORS = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff', '#e5554e', '#3bc6c0'];
-// production's gold — matches its hexagon (COL.prod in HiveCanvas) so its ring + wire read as prod.
-const PROD_COLOR = '#f2c14e';
+// production's orange — matches its hexagon (COL.prod / live-protected in HiveCanvas) so its ring +
+// wire read as prod. Orange is the hive's "production" temperature: hotter than working green, cooler
+// than a held land/ship red.
+const PROD_COLOR = '#f0913b';
+// harness wires read as a distinct family (cooler, avatar-badge palette) — not xell, not prod.
+const HARNESS_COLORS = ['#5b8cff', '#9b8cff', '#3bc6c0', '#7bd0e0'];
 
 export async function getTimeline(projectId, n = 250) {
   const project = projectId ? await one(`SELECT * FROM project WHERE id=$1`, [projectId]) : await defaultProject();
@@ -121,7 +127,7 @@ export async function getTimeline(projectId, n = 250) {
        ORDER BY finished_at DESC NULLS LAST LIMIT 1`, [project.id]);
 
   const xells = await q(
-    `SELECT id, slug, branch, head_commit, status, worktree_path
+    `SELECT id, slug, branch, head_commit, status, worktree_path, harness_id, zee_type
        FROM xell WHERE project_id=$1 AND status<>'retired' AND NOT is_production
        ORDER BY created_at`, [project.id]);
 
@@ -135,10 +141,53 @@ export async function getTimeline(projectId, n = 250) {
       : x.head_commit && known.has(x.head_commit) ? x.head_commit
       : allCommits[0]?.hash;
     return {
-      id: x.id, slug: x.slug, branch: x.branch, status: x.status,
+      id: x.id, slug: x.slug, branch: x.branch, status: x.status, harness_id: x.harness_id,
+      zee_type: x.zee_type || 'worker',
       worktree_path: x.worktree_path, base_commit: base, head: live, color: COLORS[i % COLORS.length],
     };
   });
+
+  // HARNESSES in play — any enabled harness assigned to ≥1 live xell above. Each is a graph node,
+  // anchored to its folder's last-touch commit (head_commit) the way prod anchors to the shipped
+  // commit; the frontend renders it as ONE avatar badge at the junction and routes its consumers'
+  // wires through it IN SERIES (docs §5).
+  //
+  // Two lists, and the difference is the whole point:
+  //   • wearer_ids   — every live xell wearing it. This is the ART lookup: it is how a MANAGER's
+  //                    hexagon knows which persona disc to draw.
+  //   • consumer_ids — the wearers the BADGE is for: the ones that get a cell in the grid and a wire
+  //                    routed through it. A MANAGER is deliberately NOT one. A manager's hexagon is
+  //                    already drawn in the harness badge's own language (dashed seat + that
+  //                    harness's persona disc, drawManagerHex), so seating the same avatar a second
+  //                    time as its own harness cell says the same thing twice and spends a cell on
+  //                    it — the manager xell IS the harness's presence in the grid.
+  // A harness worn by managers ONLY therefore has NO consumers: it is still emitted (the manager
+  // hexagon needs its art) but the frontend draws no cell and routes no wire for it.
+  const assignedHarnessIds = [...new Set(anchored.map((a) => a.harness_id).filter(Boolean))];
+  let harnesses = [];
+  if (assignedHarnessIds.length) {
+    // dir + the bundle's three carrying fields ride along so the badge can say when a harness is
+    // EMPTY. A xell wearing a blank persona looked identical to one wearing a 12k manual in the
+    // honeycomb, which is how the deployed queenzee hid it for weeks.
+    const hrows = await q(
+      `SELECT id, key, label, head_commit, is_law_core, (bundle->>'avatar_svg') IS NOT NULL AS has_avatar,
+              bundle->>'summary' AS summary, bundle->>'glyph' AS glyph,
+              bundle->>'personality' AS personality, (bundle->'skills') AS skills, (bundle->'memory') AS memory
+         FROM harness WHERE id = ANY($1::uuid[]) AND enabled`, [assignedHarnessIds]);
+    harnesses = hrows.map((h, i) => {
+      const hbase = h.head_commit && known.has(h.head_commit) ? h.head_commit : allCommits[0]?.hash;
+      const wearers = anchored.filter((a) => a.harness_id === h.id);
+      return {
+        id: h.id, key: h.key, label: h.label, summary: h.summary, glyph: h.glyph,
+        ...harnessHealth(h),
+        avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
+        base_commit: hbase,
+        wearer_ids: wearers.map((a) => a.id),
+        consumer_ids: wearers.filter((a) => !isManager(a)).map((a) => a.id),
+        color: HARNESS_COLORS[i % HARNESS_COLORS.length],
+      };
+    });
+  }
 
   // Production is a xell too, and the graph SCROLLS to keep its dot across from the prod hexagon —
   // but it can only do that if prod has a dot, so it must be in this list. It is anchored to the
@@ -166,12 +215,17 @@ export async function getTimeline(projectId, n = 250) {
   // all live branches (prod included), and no further. Everything below that is history no live
   // branch touches, so it is just noise pushing the interesting rows off the top. Keep one commit of
   // padding past the fork so the oldest branch's dot isn't flush against the bottom edge.
+  // Only harnesses that are actually DRAWN (≥1 consumer) get a vote here: a manager-only harness has
+  // no cell and no wire, so letting its anchor deepen the spine would pad the graph for a node the
+  // eye never finds.
   let cut = 0;
-  for (const a of anchors) { const r = rowOf.get(a.base_commit); if (r != null && r > cut) cut = r; }
+  for (const a of [...anchors, ...harnesses.filter((h) => h.consumer_ids.length)]) {
+    const r = rowOf.get(a.base_commit); if (r != null && r > cut) cut = r;
+  }
   // A small floor so a project whose branches all fork near the tip still draws a usable spine
   // instead of two lonely rows; the deepest fork wins whenever it is deeper than the floor.
   const depth = Math.max(cut + 2, Math.min(allCommits.length, 12));
   const commits = allCommits.slice(0, Math.min(allCommits.length, depth));
 
-  return { branch, repo_root: project.repo_root, commits, xells: anchors };
+  return { branch, repo_root: project.repo_root, commits, xells: anchors, harnesses };
 }

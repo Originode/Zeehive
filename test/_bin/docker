@@ -6,10 +6,36 @@ LOG="${DOCKER_LOG:-/tmp/fake-docker.log}"
 {
   echo "=== docker $* ==="
 } >> "$LOG"
+# EARLY-CLOSE simulation: read only a few bytes then exit WITHOUT draining stdin, so a large
+# payload write hits a closing pipe (EPIPE) mid-stream — the exact failure a multi-MB image
+# attachment can trigger against `docker exec -i`. Lets the message test prove dk surfaces it.
+if [ "${DOCKER_FAKE_EARLY_CLOSE:-}" = "1" ] && [ ! -t 0 ]; then
+  head -c 16 >/dev/null 2>&1 || true
+  exit 0
+fi
+# SLOW-STDIN simulation: the argv line above is on disk the instant docker starts, but the PROMPT
+# only reaches the log after this process has finished reading stdin. On a loaded box that gap is
+# real, and a test that asserts on the prompt after merely seeing `--resume` reads the gap as a
+# broken protocol (ticket #19 — the go-around "flake"). This knob makes the gap deterministic so a
+# wait that is too loose fails every time instead of one run in thirty.
+if [ -n "${DOCKER_FAKE_SLOW_STDIN_MS:-}" ]; then
+  sleep "$(awk "BEGIN{print ${DOCKER_FAKE_SLOW_STDIN_MS}/1000}")"
+fi
 # read stdin (the resume prompt) if any, record it
 if [ ! -t 0 ]; then
   IN="$(cat)"
   if [ -n "$IN" ]; then printf 'STDIN<<\n%s\n>>STDIN\n' "$IN" >> "$LOG"; fi
+fi
+# CXELL FILE-WRITE simulation: writeFileIntoCxellIfChanged pipes a payload in and asks the CAGE
+# whether those bytes differ from the file already there, and REFUSES to guess when no verdict comes
+# back. A fake container cannot run that script (and must not — the script's target is a real
+# /work/repo), so a test states the answer it wants: WROTE (the copy was stale) or SAME (identical).
+# DOCKER_FAKE_CXELL_EXIT is the other half, and it is the knob that was missing: production returned
+# exit 1 while printing the healthy SAME verdict, and a shim that always exited 0 could never have
+# caught the caller treating that as a failure. NONE prints no verdict at all (the one real error).
+if [ -n "${DOCKER_FAKE_CXELL_VERDICT:-}" ]; then
+  [ "$DOCKER_FAKE_CXELL_VERDICT" = "NONE" ] || printf '%s\n' "$DOCKER_FAKE_CXELL_VERDICT"
+  exit "${DOCKER_FAKE_CXELL_EXIT:-0}"
 fi
 for a in "$@"; do
   if [ "$a" = "/etc/environment" ]; then

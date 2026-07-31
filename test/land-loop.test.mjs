@@ -18,6 +18,10 @@ import { join } from 'node:path';
 const API_PORT = 47999;
 const API = `http://127.0.0.1:${API_PORT}`;
 process.env.ZEEHIVE_API = API;
+// These exercise the LIVE half of the nested-queenzee guard (test/nested-queenzee-land-ship-guard.test.mjs):
+// a real queenzee moves real refs and resumes real cages, and this suite is what proves that did not
+// change. Declared BEFORE any import, because the modules read it once at load.
+process.env.PROVISION_MODE = 'real';
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
 const { selfLand } = await import('../server/src/queenzee/self.js');
@@ -60,6 +64,11 @@ const nonFF = spawnSync('git', ['-C', wt, 'merge-base', '--is-ancestor', shaB, s
 ok(nonFF, 'confirmed: master (B) is NOT an ancestor of the zee commit (Z) — the divergence the bug hit');
 
 // ── 2. seed the throwaway DB ──────────────────────────────────────────────────
+// project.name is UNIQUE and this test leaves its row behind (there is no teardown — the rows are
+// harmless and the fixtures are readable after a failure). So clear the PREVIOUS run's project
+// first: without this the suite passes exactly once per fresh database and fails on every re-run
+// with `Key (name)=(landtest) already exists`, which reads as a regression in whatever changed.
+await q(`DELETE FROM project WHERE name='landtest'`);
 const project = await one(
   `INSERT INTO project (name, repo_root, main_branch, auto_approve_land)
    VALUES ('landtest', $1, 'main', false) RETURNING *`, [src]);
@@ -106,9 +115,11 @@ const land = await selfLand(xell);
 console.log('  selfLand →', JSON.stringify({ ok: land.ok, status: land.status, catch_up: land.catch_up?.state,
   request_status: land.request?.status, request_new_sha: land.request?.new_sha?.slice(0, 8) }));
 ok(land.status === 'held', `status is 'held' (was: ${land.status})`);
-ok(land.catch_up?.state === 'rebased', `catch-up REBASED the zee commit onto current master (state=${land.catch_up?.state})`);
+// catch-up MERGES current master into the diverged branch (kept as a merge, not a rebase, so the
+// branch survives as its own lane on the graph — see catchUpWorktree's rationale in xellgit.js).
+ok(land.catch_up?.state === 'merged', `catch-up MERGED current master into the zee branch (state=${land.catch_up?.state})`);
 const wtHeadAfter = git(wt, ['rev-parse', 'HEAD']);
-ok(wtHeadAfter !== shaZ, `worktree HEAD is a NEW sha after rebase (${wtHeadAfter.slice(0, 8)}, was ${shaZ.slice(0, 8)})`);
+ok(wtHeadAfter !== shaZ, `worktree HEAD is a NEW sha after the catch-up merge (${wtHeadAfter.slice(0, 8)}, was ${shaZ.slice(0, 8)})`);
 ok(spawnSync('git', ['-C', wt, 'merge-base', '--is-ancestor', shaB, wtHeadAfter]).status === 0,
   'the rebased HEAD now FAST-FORWARDS master (B is its ancestor) — the push can land cleanly');
 // the REAL land_request row exists, pending, for exactly the pushed sha
@@ -123,9 +134,17 @@ console.log('\n── approval: land + queenzee NUDGE ──');
 const DOCKER_LOG = join(tmp, 'docker.log');
 process.env.DOCKER_LOG = DOCKER_LOG;                 // fake docker (test/_bin) logs here
 process.env.PATH = `${join(REPO_ROOT, 'test', '_bin')}:${process.env.PATH}`;
+// snapshot the xell's STORED position before the landing — it is still the frozen provisioning base
+const xellBefore = await one(`SELECT head_commit, last_synced_commit FROM xell WHERE id=$1`, [xell.id]);
+ok(xellBefore.head_commit === shaA, `xell.head_commit is still the provisioning base A (${shaA.slice(0, 8)}) before landing`);
 const decided = await decideLandRequest(row.id, 'approved', 'human@test');
 ok(decided?.status === 'landed', `land_request → 'landed' (${decided?.status})`);
 ok(git(src, ['rev-parse', 'main']) === wtHeadAfter, 'master NOW moved to the approved sha (queenzee update-ref, no hook re-entrancy)');
+// BUG 3: after the ref moves, the queenzee brings the xell's STORED data in line with reality — its
+// work is on main now, so head_commit/last_synced_commit read the landed sha, not the frozen base.
+const xellAfter = await one(`SELECT head_commit, last_synced_commit FROM xell WHERE id=$1`, [xell.id]);
+ok(xellAfter.head_commit === wtHeadAfter, `xell.head_commit now === the landed sha (${wtHeadAfter.slice(0, 8)}), not the old base — its card reads level`);
+ok(xellAfter.last_synced_commit === wtHeadAfter, `xell.last_synced_commit now === the landed sha (${wtHeadAfter.slice(0, 8)}) — synced to what landed`);
 // the nudge is fire-and-forget — wait briefly for the fake docker to record the resume
 let log = '';
 for (let i = 0; i < 25 && !/--resume/.test(log); i++) { await sleep(120); log = existsSync(DOCKER_LOG) ? readFileSync(DOCKER_LOG, 'utf8') : ''; }

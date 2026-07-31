@@ -15,6 +15,14 @@ import { namingFor } from './manifest.js';
 import { resolveBash } from './bash.js';
 import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
 import { dbIdentity } from './projects.js';
+import { derivedTcpDsn } from './xell-db.js';
+import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
+import { warmWorktree } from './npm-cache.js';
+import { logline } from './logbus.js';
+
+// Same switch every other real-side-effect module reads (intake, pool, xell-db, machines): 'real'
+// touches machines, anything else models. The fleet-wide .zeehive.env reconcile below obeys it.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* noop */ } };
 
@@ -73,10 +81,15 @@ function sameDatabase(a, b) {
   return host(ua) === host(ub) && ua.port === ub.port && ua.pathname === ub.pathname;
 }
 
-export async function emitXellEnv(xellId) {
+// Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
+// The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
+// ordinary state of a pooled xell, not a projection failure worth flagging to a human.
+async function writeXellEnv(xellId, { dryRun = false } = {}) {
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
-  if (!xell?.worktree_path) throw new Error('xell has no worktree');
-  if (!existsSync(xell.worktree_path)) throw new Error(`worktree does not exist: ${xell.worktree_path}`);
+  if (!xell?.worktree_path) throw Object.assign(new Error('xell has no worktree'), { no_worktree: true });
+  if (!existsSync(xell.worktree_path)) {
+    throw Object.assign(new Error(`worktree does not exist: ${xell.worktree_path}`), { no_worktree: true });
+  }
   const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
   const site = await resolveSite(xell.project_id, 'dev');
   const cs = await q(
@@ -99,10 +112,59 @@ export async function emitXellEnv(xellId) {
     `ZEEHIVE_DOCKER_CONTEXT=${xellCtx || site?.docker_ctx || config.dockerCtx}`,
   ];
 
-  // The xell's OWN database, when it has one. HARD GUARD (spec §6.2): never emit the managing
-  // instance's meta-DB — two queenzees reconciling one meta-DB reap each other's xells; that
-  // failure class has destroyed live work before, so it is a refusal, not a warning.
-  let dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
+  // DATABASE_URL — the one database this xell's zee is meant to talk to, in binding order. HARD
+  // GUARD (spec §6.2, below): never emit the managing instance's meta-DB — two queenzees
+  // reconciling one meta-DB reap each other's xells; that failure class has destroyed live work
+  // before, so it is a refusal, not a warning.
+  //
+  // FIRST, before the xell's own db container: PRODUCTION, when the COUPLING says the xell holds
+  // it. A xell on prod is an ordinary pooled spinoff — owned db container and all — that was THEN
+  // re-pointed (attachXellDb links the prod container and flips the coupling together), so taking
+  // the owned container first meant the file quietly named the throwaway spinoff database while
+  // the binding advertised production (ticket #15). The binding is what the zee was TOLD it has,
+  // so the binding wins. Emitted at all because a cxell zee has no docker and reaches postgres
+  // over TCP. The §6.2 refusal below applies to whatever this resolves to, like any other DSN.
+  //
+  // The two prod couplings are the same link and DIFFERENT credentials, and that distinction is a
+  // safety boundary, not a detail:
+  //   • db-shared-prod  — a full human-granted bind: the prod container's own conn_ref.
+  //   • db-prod-readonly — the manager binding: ONLY the SELECT-only DSN lib/prod-readonly.js
+  //     minted for this xell. Never the prod owner's connection string — following the binding
+  //     must never widen a reader into a writer — and never its own clone either. If the reader
+  //     was not minted (or was dropped) while the xell is still LINKED to prod, we emit no
+  //     DATABASE_URL at all: no database is a fixable state, the wrong database is a silent one.
+  // A coupling with NO prod db linked (a project with no production registered — bindManagerTo-
+  // ProdReadonly skips the bind there) is not "on prod" in any usable sense, so it falls through
+  // to the ordinary resolution below and keeps whatever database it really has.
+  let dbUrl = null;
+  let bindingIsProd = false;                 // linked to prod → the owned container is NOT a fallback
+  if (xell.db_coupling === 'db-shared-prod' || xell.db_coupling === 'db-prod-readonly') {
+    const linkedProd = await one(
+      `SELECT c.conn_ref, host(c.host) AS host, c.host_port
+         FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+        WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [xellId]);
+    bindingIsProd = !!linkedProd || !!xell.prod_ro_dsn;
+    // db-shared-prod with a conn_ref-less prod row falls back to the row's PUBLISHED ADDRESS
+    // (host:host_port). This is the omnibiz bug: its prod db records no conn_ref (only host +
+    // host_port, on another machine's docker context), so the projection emitted NO DATABASE_URL,
+    // the binding's psql said `docker exec` — impossible in a cage — and a prod-bound cxell zee
+    // concluded the online production db was unreachable. The address was reachable over TCP all
+    // along; the file just never said so. db-prod-readonly is deliberately NOT widened: the minted
+    // SELECT-only DSN or nothing — following the binding must never turn a reader into a writer.
+    dbUrl = xell.db_coupling === 'db-prod-readonly'
+      ? (xell.prod_ro_dsn || null)
+      : (linkedProd?.conn_ref
+        || derivedTcpDsn(linkedProd, await dbIdentity(xell.project_id))
+        || xell.prod_ro_dsn || null);
+    if (bindingIsProd && !dbUrl) {
+      logline('prod-ro', `${xell.slug}: coupled ${xell.db_coupling} but no usable production DSN `
+        + '(no minted reader / the prod container row records no conn_ref and publishes no '
+        + 'host:host_port) — .zeehive.env is emitted with NO DATABASE_URL rather than a database '
+        + 'the binding does not mean');
+    }
+  }
+  // …else the xell's OWN db container, when it has one.
+  if (!dbUrl && !bindingIsProd) dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
   // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
   // dev postgres — the shared container's conn_ref with the database name swapped for the
   // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
@@ -147,11 +209,78 @@ export async function emitXellEnv(xellId) {
   }
   if (dbUrl) {
     if (sameDatabase(dbUrl, config.databaseUrl)) {
-      throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
-        + `managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}) — `
-        + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
+      // §6.2, and the ONE exemption — the minted READ-ONLY reader.
+      //
+      // What the refusal protects against is a nested queenzee OPERATING on the managing instance's
+      // meta-DB: two reconcilers on one meta-DB reap each other's xells, and that has destroyed live
+      // work. Every part of that needs WRITE access — DELETE, UPDATE, the reaper. A db-prod-readonly
+      // xell holds a role minted by lib/prod-readonly.js: NOSUPERUSER, no write grant of any kind,
+      // `default_transaction_read_only = on`. It cannot reap anything; the worst it can do is crash
+      // its own nested server on the first INSERT.
+      //
+      // It has to be exempt, because when ZEEHIVE orchestrates ITSELF the production database IS the
+      // managing instance's meta-DB: refusing here would refuse the ENTIRE projection (ports, site,
+      // env vars — the file is written at the end) for every manager zee on this project, and the
+      // manager would keep pointing at its own throwaway spinoff db while its binding said
+      // production. That is ticket #15 again, with a scarier log line.
+      //
+      // The exemption is deliberately as narrow as it can be: this exact xell must be coupled
+      // read-only AND the URL must be the DSN the queenzee itself minted for it. An owner credential,
+      // an owned db container, a clone — anything else that resolves to the meta-DB is still refused.
+      const readerBinding = xell.db_coupling === 'db-prod-readonly' && dbUrl === xell.prod_ro_dsn;
+      if (!readerBinding) {
+        throw new Error(`REFUSING to emit .zeehive.env: the xell's DATABASE_URL resolves to the `
+          + `managing instance's own meta-DB (${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')}) — `
+          + 'a nested queenzee on the real meta-DB reaps live xells. Re-point the xell db first.');
+      }
+      logline('prod-ro', `${xell.slug}: DATABASE_URL is the managing instance's own meta-DB, emitted `
+        + 'because this xell holds it READ-ONLY (SELECT-only role) — the §6.2 reap risk needs writes');
     }
     lines.push(`DATABASE_URL=${dbUrl}`);
+  }
+
+  // Environment vars — the meta-DB source of truth for the untracked .env (migration 043).
+  // Resolved by tier: a xell ON PRODUCTION (environments.isOnProduction — writing it, reading it
+  // read-only, or being it) gets the project's default PROD environment, else the default DEV one;
+  // an explicit xell.environment_id overrides. Merged AFTER the per-xell truth above (ports/DATABASE_URL/site/slug) and BEFORE the manifest safety
+  // defaults below, and it can never override either: any name already emitted (or declared in
+  // spin.env) is skipped, so an environment can't redirect DATABASE_URL past the §6.2 guard nor
+  // undo BUILD_MODE=simulate. Best-effort — a projection failure must not sink provisioning.
+  //
+  // The resolution is STATED in the file even when it contributes nothing. A project whose
+  // environments are empty (Zeehive's own dev AND prod are, today: 0 vars each) merges correctly
+  // and writes zero lines — which reads exactly like ticket #15 did, "my binding says prod and my
+  // .zeehive.env clearly does not". One comment line naming the environment, its tier and its var
+  // count is the difference between "the merge is broken" and "the environment is empty", and it
+  // costs nothing: a comment is not a variable, so nothing consumes it and no rule bends for it.
+  try {
+    const env = await resolveEnvironmentFor(xell);
+    const envVars = await fullVarsFor(env?.id);
+    if (!env) {
+      lines.push(`# —— environment: none configured for this project at tier `
+        + `${isOnProduction(xell) ? 'prod' : 'dev'} (nothing to merge) ——`);
+    } else if (!envVars.length) {
+      lines.push(`# —— environment: ${env.key} (${env.tier}) — resolved, but it holds 0 vars in the `
+        + 'meta-DB, so nothing was merged ——');
+    }
+    if (env && envVars.length) {
+      // Reserve, UNCONDITIONALLY, the structural keys emitXellEnv owns — not just the ones already
+      // emitted. A db-less xell emits no DATABASE_URL line, so a dynamic-only reserve would let an
+      // environment introduce its own DATABASE_URL and slip past the §6.2 guard; these names are
+      // never an environment's to set, present in the file or not.
+      const reserved = new Set([
+        'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', serverEnv, webEnv,
+        ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
+      ]);
+      for (const k of Object.keys(spin.env || {})) reserved.add(k);
+      lines.push(`# —— environment: ${env.key} (${env.tier}) — ${envVars.length} var(s) from the meta-DB ——`);
+      for (const { name, value } of envVars) {
+        if (reserved.has(name)) continue;   // never fight per-xell wiring or the manifest defaults
+        lines.push(`${name}=${value}`);
+      }
+    }
+  } catch (e) {
+    console.error(`[provision] ${xell.slug}: environment merge skipped — ${e.message}`);
   }
 
   // Manifest-declared extra env for spinoffs — for Zeehive itself these are the §6.2 safety
@@ -161,7 +290,21 @@ export async function emitXellEnv(xellId) {
 
   const wt = xell.worktree_path.replace(/\\/g, '/');
   const path = `${wt}/.zeehive.env`;
-  writeFileSync(path, lines.join('\n'));
+  const text = lines.join('\n');
+  // A projection identical to what is already on disk is a NO-OP, not a write. The reconcile below
+  // runs over the whole fleet, and a queenzee that rewrites an unchanged file under every working
+  // zee is indistinguishable (mtime, watchers, "did I do that?") from the zee having edited it —
+  // the same rule reinjectHarnessIntoLiveXells holds for harness files.
+  let changed = true;
+  try { changed = readFileSync(path, 'utf8') !== text; } catch { changed = true; }   // unreadable/absent → write
+  // The zee in the cage reads a COPY of this file, not this file (refreshLiveCxellEnv below). That
+  // copy does its OWN comparison, so it runs whether or not the HOST file moved — see the comment
+  // there for why keying it off `changed` would leave the affected zees unreachable forever.
+  if (dryRun) {                                                                      // report, write nothing
+    return { ok: true, path, slug: xell.slug, changed, dry_run: true,
+             cxell: await refreshLiveCxellEnv(xell, text, { dryRun: true }) };
+  }
+  if (changed) writeFileSync(path, text);
 
   // Keep the projection out of git's sight WITHOUT touching the project's committed .gitignore:
   // the repo-local exclude file (info/exclude, shared across this repo's worktrees) exists for
@@ -180,7 +323,211 @@ export async function emitXellEnv(xellId) {
       }
     }
   } catch { /* exclusion is a nicety; the projection itself matters more */ }
-  return { ok: true, path, slug: xell.slug };
+  return { ok: true, path, slug: xell.slug, changed,
+           cxell: await refreshLiveCxellEnv(xell, text, { dryRun: false }) };
+}
+
+// ── …AND THE COPY THE ZEE ACTUALLY READS ─────────────────────────────────────────────────────────
+//
+// Everything above lands in the HOST worktree. A cxell zee never reads that file: it reads a COPY,
+// `docker cp`d into /work/repo at spawn (lib/cxell.js cloneIntoCxell, beside the git bundle). So
+// every re-emit — ticket #15's rule fix, a prod bind, a db-clone, a rename, an environment pin, the
+// boot reconcile — was invisible to the only reader that matters: the zee already in the cage,
+// working from the values it was born with. A manager bound to production read-only was TOLD it
+// holds production while its file named its own throwaway spinoff db, and the fix that shipped
+// could not reach it. Fixing the projection and fixing the host file are both necessary and neither
+// is sufficient.
+//
+// So the projection is pushed into the LIVE cxell too, through the mechanism the harness layer
+// already uses (reinjectHarnessIntoLiveXells → a docker exec write into cxell_<slug>), under the
+// same three rules:
+//
+//   • IT COMPARES THE COPY IT IS REPLACING, in the cage, in the same exec (writeFileIntoCxellIf-
+//     Changed). Identical bytes write nothing, here as on the host: a file changing under a working
+//     zee is otherwise indistinguishable from the zee having changed it.
+//     The comparison is against the CAGE's copy deliberately, NOT the host `changed` flag above.
+//     Keying off the host would be the whole bug again: once the boot reconcile has repaired the
+//     host file, host-changed is false at every subsequent emit while the zee's copy stays stale
+//     forever — which is the exact state of every xell that was already running when that reconcile
+//     shipped.
+//   • EVERY WRITE IS LOGGED, saying the queenzee did it, and that whatever already sourced the file
+//     keeps the old values until it re-reads or rebuilds.
+//   • IT OBEYS PROVISION_MODE, for the reason the harness path documents at length: the exec targets
+//     a container named from a fleet row, and a xell's db is a CLONE of the meta-DB, so a NESTED
+//     queenzee's fleet rows are the REAL fleet's. In simulate it REPORTS the cxell it would have
+//     refreshed and execs nothing.
+//
+// It never widens a binding: the text is the projection computed above, from this meta-DB, through
+// the §6.2 guard. This decides WHERE the projection lands, never WHAT it says.
+//
+// Never throws — a xell whose file is correct on disk must not fail its emit because its cage is
+// unreachable. The outcome is returned, logged, and (in emitXellEnv) recorded on the xell row.
+async function refreshLiveCxellEnv(xell, text, { dryRun }) {
+  try {
+    // Lazily imported: intake.js imports THIS module, so a static import would close a cycle — the
+    // same reason lib/harness.js reaches for reinjectHarnessIntoXell this way.
+    const { injectXellEnvIntoCxell } = await import('../queenzee/intake.js');
+    return await injectXellEnvIntoCxell({ xellId: xell.id, slug: xell.slug, text, dryRun });
+  } catch (e) {
+    return { live: null, refreshed: false, error: `cxell env refresh unavailable: ${e.message}` };
+  }
+}
+
+// Emit a xell's .zeehive.env AND record what happened on the xell row. Same signature, same throws,
+// same result (plus `changed`) — every existing caller is unaffected.
+//
+// The bookkeeping is the point: until now the ONLY trace of a failed projection was a log line, and
+// every caller after provisioning re-emits best-effort (bindManagerToProdReadonly, dbclone, rename,
+// an environment pin). So a manager could be bound to production, be told it holds production, and
+// keep a file pointing at its own throwaway spinoff db, with nothing a human could look at (ticket
+// #15). env_projected_at / env_projection_error (migration 078) are that read model; fleet.js
+// selects x.*, so the console's env chip carries them for free.
+export async function emitXellEnv(xellId, { dryRun = false } = {}) {
+  try {
+    const r = await writeXellEnv(xellId, { dryRun });
+    if (!dryRun) await noteEnvProjection(xellId, null, r.cxell);
+    return r;
+  } catch (e) {
+    // A pooled xell with no worktree on disk yet has nothing to project — that is its normal state,
+    // not a fault, and flagging it would bury the failures that ARE faults. A dry run DOES record a
+    // failure: it wrote no file, but "this projection cannot be computed" is true either way, and
+    // the note lands in this queenzee's OWN meta-DB, which is not a side effect on the fleet.
+    if (!e?.no_worktree) await noteEnvProjection(xellId, e.message);
+    throw e;
+  }
+}
+
+// Stamp the outcome of a projection. Never throws: bookkeeping about a write must not become a
+// second way for the write to fail. Broadcasts only when an error STATE changes, so a fleet-wide
+// reconcile of healthy xells is silent on the event stream.
+//
+// TWO outcomes, TWO columns, deliberately not folded into one (migration 082 beside 078):
+// env_projection_error says the HOST file is not what the meta-DB says it should be;
+// env_cxell_error says the host file is fine but the LIVE CXELL's copy — the bytes the zee is
+// actually reading — could not be refreshed. They need different remedies (re-point the xell vs. an
+// unreachable container), and conflating them would have made every host-side xell in the fleet
+// look broken the moment it had no cage. `cxell` null means the refresh was not evaluated at all
+// (a throw before it ran): leave both cage columns exactly as they were rather than inventing news.
+async function noteEnvProjection(xellId, error = null, cxell = null) {
+  // A cage refresh only FAILED if we got far enough to try and could not; "no live cxell zee" is the
+  // normal state of a host-side xell, and it clears any stale failure rather than asserting one.
+  const cxellError = cxell ? (cxell.error || null) : undefined;
+  const cxellOk = !!cxell && !cxell.error && cxell.refreshed;
+  try {
+    const prev = await one(`SELECT env_projection_error, env_cxell_error FROM xell WHERE id=$1`, [xellId]);
+    if (!prev) return;
+    const row = await one(
+      `UPDATE xell
+          SET env_projection_error = $2,
+              env_projected_at = CASE WHEN $2::text IS NULL THEN now() ELSE env_projected_at END,
+              env_cxell_error = CASE WHEN $3::bool THEN $4::text ELSE env_cxell_error END,
+              env_cxell_refreshed_at = CASE WHEN $5::bool THEN now() ELSE env_cxell_refreshed_at END
+        WHERE id=$1 RETURNING *`,
+      [xellId, error || null, cxellError !== undefined, cxellError, cxellOk]);
+    if (row && ((prev.env_projection_error || null) !== (error || null)
+                || (cxellError !== undefined && (prev.env_cxell_error || null) !== cxellError))) {
+      broadcast('xell', row);
+    }
+  } catch { /* the projection itself matters more than the note about it */ }
+}
+
+// ── THE FLEET-WIDE CATCH-UP (ticket #15 follow-up) ───────────────────────────────────────────────
+//
+// .zeehive.env is a FILE, written from the meta-DB at provision time. Fix the RULE that computes it
+// — which is what ticket #15 did — and every xell provisioned before the fix keeps its wrong file
+// forever: its binding says production read-only, its file says its own throwaway spinoff database,
+// and nothing tells anyone. A human had to remember to re-bind each manager by hand.
+//
+// WHEN this runs: at queenzee BOOT, over every non-retired xell (index.js, beside the other boot
+// reconciles). Deliberately not a periodic tick — every path that CHANGES a xell's binding already
+// re-emits (bind/unbind, the db-clone watch, rename, an environment pin), so the only way a
+// correctly-emitted file goes stale is that the PROJECTION RULE changed, and a rule change arrives
+// as new code, which restarts the queenzee. A loop re-walking every worktree on a timer would be
+// scanning for a condition that can only appear at a deploy.
+//
+// WHAT it writes: only what is provably stale. emitXellEnv compares the computed text with the file
+// and no-ops when they are identical, so a healthy fleet is read-only here. A rewrite UNDER A LIVE
+// ZEE is logged as such — a file changing under a working zee is otherwise indistinguishable from
+// the zee having changed it (the rule reinjectHarnessIntoLiveXells earned).
+//
+// WHAT it never does: widen a binding. It recomputes from the meta-DB through the same emitXellEnv
+// every other caller uses — §6.2 guard, reserved names and all. It cannot invent access a xell's
+// row does not already carry.
+//
+// AND IT OBEYS PROVISION_MODE. Writing into worktrees is a real side effect on real machines, so a
+// queenzee running with PROVISION_MODE=simulate — every NESTED queenzee a zee runs inside its own
+// xell, by manifest default — only REPORTS what is stale and writes nothing. That is not caution
+// for its own sake: a xell's database is a CLONE of the meta-DB, so a nested queenzee's fleet rows
+// are the REAL fleet's rows, worktree paths and all. Unguarded, the first zee to run the server in
+// its own xell would have reconciled every other zee's .zeehive.env from a snapshot of the meta-DB.
+export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE } = {}) {
+  const dryRun = mode !== 'real';
+  const xells = await q(
+    `SELECT x.id, x.slug, x.worktree_path,
+            EXISTS(SELECT 1 FROM zee z WHERE z.xell_id = x.id AND z.decommissioned_at IS NULL
+                     AND z.status IN ('spawning','online','working','idle')) AS live
+       FROM xell x
+      WHERE x.status NOT IN ('retired','tearing-down','husk') AND x.worktree_path IS NOT NULL
+      ORDER BY x.created_at`);
+  let checked = 0, rewritten = 0, failed = 0, skipped = 0;
+  const broken = [], stale = [];
+  // The CAGE half, counted separately: a xell's host file and the copy its zee reads are two
+  // different files with two different failure modes (emitXellEnv → refreshLiveCxellEnv), and a
+  // sweep that reported only the host would say "0 rewritten" on the very fleet it just repaired.
+  let cxellRefreshed = 0, cxellFailed = 0, cxellWould = 0;
+  const cxellBroken = [], cxellStale = [];
+  for (const x of xells) {
+    if (!existsSync(x.worktree_path)) { skipped++; continue; }   // pooled/torn-down: nothing on disk
+    checked++;
+    try {
+      const r = await emitXellEnv(x.id, { dryRun });
+      // Accounted for BEFORE the unchanged-host early-out below: the cage copy is compared in the
+      // cage, so it can be stale while the host file is already correct.
+      if (r.cxell?.error) { cxellFailed++; cxellBroken.push(`${x.slug} (${r.cxell.error})`); }
+      else if (r.cxell?.would_refresh) { cxellWould++; cxellStale.push(x.slug); }
+      else if (r.cxell?.changed) { cxellRefreshed++; cxellStale.push(x.slug); }
+      if (!r.changed) continue;
+      rewritten++;
+      stale.push(x.slug);
+      logline('env', `${x.slug}: .zeehive.env is STALE — ${dryRun ? 'NOT rewritten (PROVISION_MODE=simulate: this queenzee models the fleet, it does not touch it)' : 'rewritten from the meta-DB'}`
+        + (!dryRun && x.live
+          ? ' WHILE A ZEE IS WORKING IN IT. The QUEENZEE wrote that file, not the zee; its app tier '
+            + 'still runs on the old values until its next build.'
+          : ''));
+    } catch (e) {
+      failed++;
+      broken.push(`${x.slug} (${e.message})`);
+      // LOUD, both ways: the queenzee log a human reads in the console, and stdout (the docker log).
+      // This is the exact failure that used to disappear into a `.catch(() => {})`.
+      logline('env', `${x.slug}: .zeehive.env could NOT be reconciled — ${e.message}. That xell is `
+        + 'still running on whatever its file already said.');
+      console.error(`[env] ${x.slug}: .zeehive.env projection FAILED — ${e.message}`);
+    }
+  }
+  // ONE summary line, always — a reconcile that found nothing must still say it ran, or "no news"
+  // and "never ran" look identical (the lesson logHarnessSummary is built on).
+  logline('env', `.zeehive.env reconcile (${reason}${dryRun ? ', SIMULATE — nothing written' : ''}): `
+    + `${checked} checked, ${rewritten} ${dryRun ? 'STALE (would be rewritten)' : 'rewritten'}`
+    + `${stale.length ? ` [${stale.slice(0, 5).join(', ')}${stale.length > 5 ? ', …' : ''}]` : ''}`
+    + `, ${failed} FAILED${broken.length ? ` [${broken.slice(0, 3).join('; ')}]` : ''}`
+    + `, ${skipped} skipped (no worktree on disk)`
+    // The cage half on the SAME line: the host worktree and the copy a zee reads are the two halves
+    // of one answer to "is the fleet running on what the meta-DB says?", and split across two lines
+    // one of them is the one that scrolls away.
+    + ` · live cxells: ${dryRun ? `${cxellWould} would be refreshed` : `${cxellRefreshed} refreshed`}`
+    + `${cxellStale.length ? ` [${cxellStale.slice(0, 5).join(', ')}${cxellStale.length > 5 ? ', …' : ''}]` : ''}`
+    + `, ${cxellFailed} UNREACHABLE${cxellBroken.length ? ` [${cxellBroken.slice(0, 3).join('; ')}]` : ''}`);
+  if (failed) {
+    console.error(`[env] ${failed} xell(s) are running on a .zeehive.env that could not be `
+      + `reconciled with the meta-DB: ${broken.join('; ')}`);
+  }
+  if (cxellFailed) {
+    console.error(`[env] ${cxellFailed} LIVE cxell(s) could not be handed the refreshed .zeehive.env — `
+      + `those zees are still reading their old copy: ${cxellBroken.join('; ')}`);
+  }
+  return { checked, rewritten, failed, skipped, broken, stale, dry_run: dryRun,
+           cxell_refreshed: cxellRefreshed, cxell_failed: cxellFailed, cxell_would_refresh: cxellWould,
+           cxell_broken: cxellBroken, cxell_stale: cxellStale };
 }
 
 // ── bootstrap prerequisites (spec §4.2/§4.3) ──────────────────────────────────
@@ -460,6 +807,14 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {
       await emitXellEnv(xell.id).catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
+      // WARM THE WORKTREE ON THE POOL'S CLOCK, not the zee's. A pooled xell sits `ready` for
+      // minutes or hours; doing its `npm ci` now costs nobody anything, fills the SHARED package
+      // cache for every xell that follows, and means the first build of a process role is not also
+      // a cold install. Deliberately NOT awaited and never fatal — a provision that failed because
+      // a cache was cold would be a far worse bug than the one this fixes. `npm ci` only: a
+      // worktree with no lockfile is skipped rather than `npm install`ed, because install rewrites
+      // the lock and the pool reaps a dirty worktree (the 2026-07-20 provision→build→reap loop).
+      warmWorktree(worktree, { slug }).catch((e) => logline('pool', `${slug}: worktree warm errored (ignored): ${e.message}`));
     }
     return { ...xell, ports, url, mode };
   } catch (err) {

@@ -24,8 +24,10 @@ jobs:
           - image: zeehive-web
             context: .
             dockerfile: docker/zeehive/Dockerfile.web
+          # Repo-ROOT context like the other two: the cxell image bakes the authoritative
+          # scripts/zee, which a docker/zeehive context cannot COPY.
           - image: zeehive-zee-agent
-            context: docker/zeehive
+            context: .
             dockerfile: docker/zeehive/Dockerfile.zee-agent
     steps:
       - uses: actions/checkout@v4

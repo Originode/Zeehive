@@ -1,0 +1,17 @@
+-- WHAT HAPPENED DURING THE RESTORE — ticket #30.
+--
+-- pg_restore runs without --exit-on-error, so it continues past an object it cannot create and prints
+-- "errors ignored on restore: N" at the end. That number was discarded, and — verified by running a real
+-- dump and a real restore rather than trusting memory — pg_restore EXITS 1 when it ignores errors, so
+-- both restore paths treated a restore that actually COMPLETED as a total failure. The data was on disk;
+-- the log said FAILED; nothing recorded that the database had been loaded at all.
+--
+-- restore_report: the outcome of the most recent restore into this container —
+--   { ok, ignored, errors:[…], error_count, completed_with_errors, reason, at, snapshot_id, scoped }
+-- Kept SEPARATE from data_check (the row comparison) because the two are complementary and neither
+-- substitutes for the other: this one says "this restore had trouble, and here is the cause", the other
+-- says "and here is what is missing". A restore can report 400 ignored errors while every table it did
+-- load still passes its counts — that is worth knowing, and one column cannot say both.
+--
+-- NULL = no restore has been recorded for this container (or it predates this).
+ALTER TABLE container ADD COLUMN IF NOT EXISTS restore_report jsonb;

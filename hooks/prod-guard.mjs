@@ -69,7 +69,10 @@ function deny(reason) {
 // writes would pass. That is consistent with this hook's stated threat model (it stops
 // instruction-following and accident; it is not adversary-proof — a determined zee can obfuscate
 // any command). The airtight version is a postgres ROLE with only SELECT grants, where the SERVER
-// enforces it and no regex is involved.
+// enforces it and no regex is involved — which is exactly what a MANAGER zee gets (migration 052,
+// lib/prod-readonly.js: db_coupling='db-prod-readonly'). This regex still runs for a manager, but
+// only as the message-quality layer: it explains the refusal in the zee's own terms instead of
+// letting it discover the wall as a postgres error.
 function readOnlyPsql(cmd) {
   if (!/\bpsql\b/i.test(cmd)) return false;
 
@@ -200,6 +203,19 @@ process.stdin.on('end', () => {
       // rows only; DDL goes through a migration + ship, never a live edit. A write we cannot see
       // (a -f file, a piped/heredoc statement) could carry DDL, so it is refused as conservatively
       // as a visible DROP: put the SQL in -c and the guard can prove it is data-only.
+      // A MANAGER zee holds prod READ-ONLY (db_coupling='db-prod-readonly'). Postgres already
+      // refuses its writes — its role is granted SELECT and nothing else — but a guard that waves
+      // a write through and lets the DATABASE do the refusing teaches the agent the wrong lesson
+      // (and would wave it through if the credential were ever widened). Prove it read-only here
+      // too: anything the guard cannot see as a read is refused, same conservatism as DDL.
+      if (answer.readonly && !readOnlyPsql(cmd)) {
+        deny('Your production access is READ-ONLY (this xell is a manager: db_coupling='
+          + 'db-prod-readonly, and its postgres role is granted SELECT and nothing else). This command '
+          + 'is not provably a read, so it is refused here — and postgres would refuse the write '
+          + 'anyway. Read freely with a visible `psql -c "SELECT …"`. Rows that must CHANGE in '
+          + 'production go through `zee seed` (a landed file a human approves and the queenzee runs), '
+          + 'never a live edit.');
+      }
       const verdict = schemaVerdict(cmd);
       if (verdict === 'ddl') deny(SCHEMA_DENIED);
       if (verdict === 'opaque') deny(

@@ -5,9 +5,13 @@ import {
   githubAccess, pushProject, pullRequestProject,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
-  deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes,
+  deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes, getHarnesses,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
+  getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
+  getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
+  getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
+  previewProjectDoc,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -358,6 +362,8 @@ function ProbeChips({ probe }) {
 const SETUP_TABS = [
   { key: 'project', label: 'Project', gates: ['repo', 'main_branch', 'env', 'manifest'] },
   { key: 'deploy', label: 'Deploy', gates: ['dev_site', 'prod_site', 'shippable'] },
+  { key: 'docs', label: 'Docs', gates: [] },
+  { key: 'env', label: 'Environments', gates: [] },
   { key: 'providers', label: 'Providers', gates: [] },
   { key: 'pool', label: 'Pool', gates: ['pool'] },
   { key: 'danger', label: '⚠ Danger', gates: [], danger: true },
@@ -401,6 +407,8 @@ function EditSections({ project, onChanged, onProject }) {
         <SitesSection project={project} run={run} busy={busy} />
         <InventorySection project={project} run={run} busy={busy} />
       </>}
+      {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
+      {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'pool' && <SpawnSection project={project} run={run} />}
       {tab === 'danger' && <DangerSection project={project} onChanged={() => { reload(); onChanged?.(); }} />}
@@ -535,30 +543,44 @@ function BasicsSection({ project, run, onProject }) {
     } catch (e) { setOut({ kind: 'push', reason: e.message }); }
   };
   // PR is OUTBOUND and human-gated: prompt for a branch name, then push a side branch + open a PR.
-  const doPR = async () => {
+  // With merge=true it goes one step further and MERGES the PR on GitHub (pull-request AND merge) —
+  // a refused merge (branch protection, checks pending) still leaves the PR open to finish by hand.
+  const doPR = async (merge = false) => {
     const headBranch = await showPrompt(
-      `Open a pull request from local ${project.main_branch} of ${project.name}.\n\n`
-      + `A side branch is pushed to the remote and a PR is opened against ${access?.default_branch || 'the default branch'}. `
+      `${merge ? 'Open a pull request and MERGE it' : 'Open a pull request'} from local ${project.main_branch} of ${project.name}.\n\n`
+      + `A side branch is pushed to the remote and a PR is opened against ${access?.default_branch || 'the default branch'}`
+      + `${merge ? ', then merged into it on GitHub' : ''}. `
       + `Name the head branch (leave as-is for a generated name):`,
-      { title: 'Open a pull request?', defaultValue: `zeehive/${project.main_branch}`, okLabel: 'Open PR' });
+      { title: merge ? 'Open a pull request and merge?' : 'Open a pull request?',
+        defaultValue: `zeehive/${project.main_branch}`, okLabel: merge ? 'Open & merge' : 'Open PR' });
     if (headBranch === null) return;   // cancelled
-    setPull(null); setOut({ busy: true, kind: 'pr' });
+    setPull(null); setOut({ busy: true, kind: 'pr', merge });
     try {
-      const r = await run(() => pullRequestProject(project.id, { headBranch: headBranch.trim() || undefined }));
-      setOut({ ...r, kind: 'pr' });
-    } catch (e) { setOut({ kind: 'pr', reason: e.message }); }
+      const r = await run(() => pullRequestProject(project.id, { headBranch: headBranch.trim() || undefined, merge }));
+      setOut({ ...r, kind: 'pr', merge });
+    } catch (e) { setOut({ kind: 'pr', merge, reason: e.message }); }
   };
   const pullLabel = !pull ? null
     : pull.busy ? 'pulling…'
     : pull.state === 'up-to-date' ? '✓ up to date'
     : pull.state === 'fast-forwarded' ? `✓ fast-forwarded (${pull.commits} commit${pull.commits === 1 ? '' : 's'})`
     : pull.reason;
+  const prLabel = (o) => {
+    if (!o.opened) return o.reason || 'PR refused';
+    const opened = `✓ PR ${o.state === 'existing' ? 'already open' : 'opened'}${o.number ? ` #${o.number}` : ''}`;
+    if (!o.merge) return `${opened}${o.url ? ' — open on GitHub ↗' : ''}`;
+    // pull-request AND merge: report the merge outcome, but a refused merge still opened a PR.
+    return o.merge?.merged
+      ? `✓ PR #${o.number} merged → ${o.base}${o.merge.sha ? ` (${o.merge.sha.slice(0, 8)})` : ''}`
+      : `${opened} — merge refused: ${o.merge?.reason || 'not mergeable'}${o.url ? ' (finish on GitHub ↗)' : ''}`;
+  };
   const outLabel = !out ? null
-    : out.busy ? (out.kind === 'push' ? 'pushing…' : 'opening PR…')
+    : out.busy ? (out.kind === 'push' ? 'pushing…' : out.merge ? 'opening & merging PR…' : 'opening PR…')
     : out.kind === 'push'
       ? (out.pushed ? (out.state === 'up-to-date' ? '✓ remote already up to date' : `✓ pushed ${project.main_branch} → remote`) : (out.reason || 'push refused'))
-      : (out.opened ? `✓ PR ${out.state === 'existing' ? 'already open' : 'opened'}${out.number ? ` #${out.number}` : ''}${out.url ? ' — open on GitHub ↗' : ''}` : (out.reason || 'PR refused'));
-  const outOk = out && (out.pushed || out.opened);
+      : prLabel(out);
+  // Green only when fully done: an opened-but-not-merged "PR & merge" is a partial success (warn).
+  const outOk = out && (out.pushed || (out.opened && (!out.merge || out.merge?.merged)));
   return (
     <div className="setup-sec">
       <h3>Project</h3>
@@ -588,7 +610,12 @@ function BasicsSection({ project, run, onProject }) {
             {access?.can_pr && (
               <button type="button" className="ghost" disabled={pull?.busy || out?.busy}
                       title={`push a side branch off local ${project.main_branch} and open a pull request — you'll be asked to confirm`}
-                      onClick={doPR}>⇅ PR</button>
+                      onClick={() => doPR(false)}>⇅ PR</button>
+            )}
+            {access?.can_pr && (
+              <button type="button" className="ghost" disabled={pull?.busy || out?.busy}
+                      title={`open a pull request off local ${project.main_branch} AND merge it into ${access?.default_branch || 'the default branch'} on GitHub — you'll be asked to confirm`}
+                      onClick={() => doPR(true)}>⇅ PR &amp; merge</button>
             )}
           </span>
         </label>
@@ -722,6 +749,306 @@ function SiteEditor({ site, run, busy }) {
           <label>Ingress container <span className="pc">(the tunnel/proxy/wg container, if in docker)</span>
             <input value={f.provider_container} onChange={set('provider_container')} placeholder="cloudflare_tunnel" /></label>
           <label>Notes<input value={f.notes} onChange={set('notes')} placeholder="e.g. WebRTC media needs TURN — doesn't traverse the tunnel" /></label>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Environments: the meta-DB source of truth for the untracked .env ────────────
+// A project holds named environments (dev / prod / staging …); each is a set of KEY=value vars
+// stored in the meta-DB, masked here (a secret's value is never returned — only a hint). A xell is
+// loaded with one by TIER: a live-prod / production xell gets the default prod env, a dev/spinoff
+// xell the default dev env — merged into its .zeehive.env by emitXellEnv.
+// ── the project's ENTRY-POINT DOCS — ONE text, one file per AI provider ───────
+// What an agent opens before it designs anything. The CONTENTS live in the meta-DB and the queenzee
+// generates a file per provider into every xell when a zee is assigned (lib/project-docs.js,
+// lib/agent-docs.js) — the same rule the harnesses moved to: one source, and the files in the
+// workspace are artefacts of it.
+//
+// THE TEXTBOX IS THE SOURCE, NOT A PATH. That is the whole shape of this surface: an operator writes
+// the project's instructions once, ticks which providers should receive them, and the filenames come
+// from the registry — CLAUDE.md for Claude Code, AGENTS.md for the ~20 tools that read the standard,
+// GEMINI.md, .github/copilot-instructions.md, .cursor/rules/*.mdc … Nobody pastes the same text into
+// four files and watches them drift.
+//
+// The three things it has to SAY, because they are the three ways an operator gets surprised:
+// a generated file is never written over a path the project has committed (git decides, in the cage),
+// it is git-excluded there (so fleet-wide instructions never appear in a landing diff), and every
+// generated file carries a stamp plus THAT xell's own stack inventory — which is why the copy in a
+// workspace is never quite what was typed here.
+export function ProjectDocsSection({ project, run, busy }) {
+  const [docs, setDocs] = useState(null);
+  const [targets, setTargets] = useState([]);
+  const [addPath, setAddPath] = useState('');
+  const load = useCallback(() => getProjectDocs(project.id).then(setDocs).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+  // The catalogue is the server's (vendors rename these files) — an empty answer degrades to
+  // custom-path authoring rather than an empty screen.
+  useEffect(() => { getAgentDocTargets().then(setTargets).catch(() => setTargets([])); }, []);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  const claimed = new Set((docs || []).flatMap((d) => d.targets || []));
+  const defaults = targets.filter((t) => t.default && !claimed.has(t.key)).map((t) => t.key);
+  return (
+    <div className="setup-sec" data-testid="project-docs-section">
+      <h3>Docs <span className="pc">(the project's instructions for AI agents — written ONCE here, generated as each provider's entry-point file in every xell)</span></h3>
+      <div className="pc">
+        What you type below is the <b>source of truth</b>. ZEEHIVE generates one file per provider from
+        it — <code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>GEMINI.md</code>, … — each stamped as
+        generated, each ending with <b>that xell's own stack</b> (its containers, ports, database and
+        build verbs), and each added to the xell's git excludes so it never lands in a diff. If the
+        project has <b>committed</b> a file at one of those paths, the repo's own copy wins and nothing
+        is written there. Saving also regenerates them in the xells of any zees <b>already running</b>,
+        so a fix does not wait for the next dispatch.
+      </div>
+      {(docs || []).map((d) => (
+        <ProjectDocEditor key={d.id} doc={d} targets={targets} run={wrapped} busy={busy} />
+      ))}
+      {docs && docs.length === 0 && (
+        <div className="pc">No instructions yet — write them once below and every AI agent on this
+          project gets them at the path it looks for.</div>
+      )}
+      <div className="setup-row">
+        <button type="button" disabled={busy}
+                onClick={() => wrapped(() => createProjectDoc(project.id, {
+                  title: 'Project instructions', body: '', targets: defaults.length ? defaults : ['claude'],
+                }))}>＋ Project instructions</button>
+        <span className="pc">generates {(defaults.length ? defaults : ['claude'])
+          .map((k) => targets.find((t) => t.key === k)?.path || k).join(' + ')} — tick more providers after</span>
+      </div>
+      <div className="setup-row">
+        <input value={addPath} placeholder="…or one extra doc at a custom path (e.g. docs/agents/ONBOARDING.md)"
+               onChange={(e) => setAddPath(e.target.value)}
+               title="repo-relative, markdown only; .git/ and .zeehive/ are refused" />
+        <button type="button" className="pill" disabled={busy || !addPath.trim()}
+                onClick={() => wrapped(() => createProjectDoc(project.id, { rel_path: addPath.trim(), body: '' }))
+                  .then(() => setAddPath(''))}>＋ Add custom path</button>
+      </div>
+    </div>
+  );
+}
+
+// One source document: its contents, and which provider files it generates. A custom-path row keeps
+// the old path box instead of the provider checkboxes — the two modes are exclusive server-side, so
+// the UI never offers both at once.
+export function ProjectDocEditor({ doc, targets = [], run, busy }) {
+  const [body, setBody] = useState(doc.body || '');
+  const [title, setTitle] = useState(doc.title || '');
+  const [path, setPath] = useState(doc.rel_path || '');
+  // The generated file as the queenzee would write it — fetched on demand (it runs the real generator
+  // against a real xell) and dropped whenever the row changes, so a stale preview can never be read as
+  // the current one.
+  const [preview, setPreview] = useState(null);
+  const custom = !(doc.targets || []).length;
+  const dirty = body !== (doc.body || '') || title !== (doc.title || '')
+    || (custom && path !== (doc.rel_path || ''));
+  useEffect(() => {
+    setBody(doc.body || ''); setTitle(doc.title || ''); setPath(doc.rel_path || ''); setPreview(null);
+  }, [doc.id, doc.body, doc.title, doc.rel_path, (doc.targets || []).join(',')]);
+  const on = new Set(doc.targets || []);
+  const generated = custom ? [doc.rel_path] : targets.filter((t) => on.has(t.key)).map((t) => t.path);
+  // Toggling a provider SAVES immediately (like `enabled`): it is one fact, and the pending-edit
+  // dance that a text field needs would only make it possible to lose the body you were typing.
+  const toggle = (key, want) => {
+    const next = want ? [...on, key] : [...on].filter((k) => k !== key);
+    // The last one off is refused rather than saved: the server's CHECK would reject it anyway, and a
+    // doc that generates no file is text an operator wrote that reaches nobody. Say which action they
+    // actually want instead.
+    if (!next.length) {
+      return showAlert('This is the last provider.\n\nA doc that generates no file reaches nobody — '
+        + 'untick "enabled" to stop it being written, or delete it.');
+    }
+    return run(() => updateProjectDoc(doc.id, { targets: next, rel_path: null, body }));
+  };
+  return (
+    <div className={`setup-sub${doc.enabled ? '' : ' off'}`}
+         data-testid={`project-doc-${custom ? doc.rel_path : (doc.targets || []).join('+')}`}>
+      <div className="setup-row">
+        {custom
+          ? <input value={path} onChange={(e) => setPath(e.target.value)} style={{ minWidth: 220 }} />
+          : <input value={title} placeholder="what to call this text (cosmetic)"
+                   onChange={(e) => setTitle(e.target.value)} style={{ minWidth: 220 }} />}
+        <label className="pc" title="a disabled doc is not written into new xells">
+          <input type="checkbox" checked={!!doc.enabled} disabled={busy}
+                 onChange={(e) => run(() => updateProjectDoc(doc.id, { enabled: e.target.checked }))} /> enabled
+        </label>
+        <span className="pc">{(body || '').length} chars</span>
+        <button type="button" disabled={busy || !dirty}
+                onClick={() => run(() => updateProjectDoc(doc.id,
+                  custom ? { rel_path: path.trim(), body } : { title: title.trim() || null, body }))}>Save</button>
+        <button type="button" className="hm-del" disabled={busy}
+                onClick={async () => {
+                  if (!await showConfirm(`Delete ${generated.filter(Boolean).join(', ') || 'this doc'}?\n\n`
+                    + `New xells stop receiving it. A zee already working keeps the copy it was given — `
+                    + `the queenzee does not delete files out of a live workspace.`)) return;
+                  run(() => deleteProjectDoc(doc.id));
+                }} title="Delete this doc">🗑</button>
+      </div>
+      <textarea className="setup-md" rows={12} value={body} spellCheck={false}
+                placeholder="# How this project works&#10;&#10;What an agent arriving with no context needs to know: what the project IS, how to run and test it, the house rules it must not relearn."
+                onChange={(e) => setBody(e.target.value)} />
+      <div className="setup-row">
+        <button type="button" className="pill" disabled={busy}
+                onClick={() => (preview ? setPreview(null)
+                  : previewProjectDoc(doc.id).then(setPreview).catch((e) => setPreview({ error: e.message })))}>
+          {preview ? 'hide' : 'preview'} what gets written
+        </button>
+        {preview?.note && <span className="pc">{preview.note}</span>}
+        {preview?.error && <span className="pc">could not preview: {preview.error}</span>}
+      </div>
+      {preview?.files?.map((f) => (
+        <div key={f.relPath} className="docpv">
+          <div className="pc mono">{f.relPath}</div>
+          <pre>{f.text}</pre>
+        </div>
+      ))}
+      {!custom && (
+        <div className="docgen">
+          <div className="pc">Generate for <b>{generated.length}</b> provider
+            {generated.length === 1 ? '' : 's'}:{' '}
+            {generated.length
+              ? generated.map((p, i) => <span key={p}>{i ? ' · ' : ''}<code>{p}</code></span>)
+              : 'nothing — this doc reaches nobody'}
+          </div>
+          <div className="docgen-grid">
+            {targets.map((t) => (
+              <label key={t.key} className={`docgen-t${on.has(t.key) ? ' on' : ''}`}
+                     title={`${(t.reads || []).join(', ')}${t.note ? `\n\n${t.note}` : ''}`}>
+                <input type="checkbox" checked={on.has(t.key)} disabled={busy}
+                       onChange={(e) => toggle(t.key, e.target.checked)} />
+                <span className="mono">{t.label || t.path}</span>
+                <span className="pc">{(t.reads || []).slice(0, 3).join(', ')}
+                  {(t.reads || []).length > 3 ? ` +${t.reads.length - 3}` : ''}</span>
+              </label>
+            ))}
+          </div>
+          {!targets.length && <div className="pc">(the provider catalogue could not be loaded — reload the console)</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EnvironmentsSection({ project, run, busy }) {
+  const [envs, setEnvs] = useState(null);
+  const [add, setAdd] = useState({ key: '', tier: 'dev', label: '' });
+  const load = useCallback(() => getEnvironments(project.id).then(setEnvs).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+  const dupTier = (envs || []).some((e) => e.tier === add.tier);
+  return (
+    <div className="setup-sec">
+      <h3>Environments <span className="pc">(the meta-DB source of truth for the untracked <code>.env</code> — a xell is loaded with one by tier)</span></h3>
+      {(envs || []).map((e) => <EnvironmentEditor key={e.id} env={e} run={wrapped} busy={busy} />)}
+      {envs && envs.length === 0 && <div className="pc">No environments yet — every project starts with a default <b>dev</b> and <b>prod</b>; add more (e.g. <i>staging</i>) below.</div>}
+      <div className="setup-row">
+        <select value={add.tier} onChange={(e) => setAdd({ ...add, tier: e.target.value })}
+                title="dev serves dev/spinoff xells; prod serves production xells and any xell bound to the live prod db">
+          <option value="dev">dev</option><option value="prod">prod</option>
+        </select>
+        <input value={add.key} placeholder="key (e.g. staging)" onChange={(e) => setAdd({ ...add, key: e.target.value })} />
+        <input value={add.label} placeholder="label (optional)" onChange={(e) => setAdd({ ...add, label: e.target.value })} />
+        <button type="button" disabled={busy || !add.key.trim()}
+                onClick={() => wrapped(() => createEnvironment(project.id, {
+                  key: add.key.trim(), tier: add.tier, label: add.label.trim() || null,
+                  // first environment of a tier becomes that tier's default automatically
+                  is_default: !dupTier,
+                })).then(() => setAdd({ key: '', tier: 'dev', label: '' }))}>＋ Add environment</button>
+      </div>
+    </div>
+  );
+}
+
+function EnvironmentEditor({ env, run, busy }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState(null);      // { environment, vars: [{name, is_secret, value|value_hint, length}] }
+  const [add, setAdd] = useState({ name: '', value: '', is_secret: true });
+  const [blob, setBlob] = useState('');
+  const [lint, setLint] = useState(null);
+  const loadVars = useCallback(() => getEnvVars(env.id).then(setData).catch(() => {}), [env.id]);
+  useEffect(() => { if (open && !data) loadVars(); }, [open, data, loadVars]);
+  const wrapped = (fn) => run(async () => { await fn(); await loadVars(); });
+
+  const del = async () => {
+    const pinned = Number(env.pinned_xells);
+    const msg = env.is_default
+      ? `"${env.key}" is the default ${env.tier} environment — ${env.tier}/spinoff xells resolve to it. Force-remove?`
+      : pinned > 0 ? `${pinned} xell(s) are pinned to "${env.key}" — they'll fall back to the tier default. Remove?`
+      : `Remove environment "${env.key}"?`;
+    if (await showConfirm(msg, { variant: 'danger', okLabel: 'Remove' })) run(() => deleteEnvironment(env.id, env.is_default));
+  };
+  const reveal = async () => {
+    const r = await exportEnv(env.id);
+    await showAlert(
+      <pre style={{ whiteSpace: 'pre-wrap', margin: 0, maxHeight: 360, overflow: 'auto', fontFamily: 'monospace', fontSize: 12 }}>{r.text || '(empty)'}</pre>,
+      { title: `${env.key} (${env.tier}) — ${r.count} var(s), full values` });
+  };
+  const runLint = async () => { try { setLint(await lintEnv(env.id)); } catch (e) { setLint({ ok: false, reason: e.message }); } };
+  const addVar = () => {
+    if (!add.name.trim()) return;
+    wrapped(() => setEnvVar(env.id, add.name.trim(), add.value, add.is_secret))
+      .then(() => setAdd({ name: '', value: '', is_secret: true }));
+  };
+  const doImport = () => {
+    if (!blob.trim()) return;
+    wrapped(() => importEnv(env.id, blob)).then(() => setBlob(''));
+  };
+
+  return (
+    <div className="siteed">
+      <div className="setup-row">
+        <span className={`sitetier t-${env.tier}`}>{env.tier}</span>
+        <span className="sitekey">{env.key}{env.is_default ? ' ●' : ''}</span>
+        <span className="pc">{env.var_count} var{Number(env.var_count) === 1 ? '' : 's'}{Number(env.pinned_xells) > 0 ? ` · ${env.pinned_xells} pinned` : ''}</span>
+        <button type="button" className="ghost" onClick={() => setOpen(!open)}>{open ? '▾' : '▸'} vars</button>
+        <button type="button" className="ghost" disabled={busy} onClick={reveal} title="Reveal the full .env (secrets included)">⤓ export</button>
+        <button type="button" className="ghost" disabled={busy} onClick={runLint} title="Check coverage vs the repo's .env.example">✓ lint</button>
+        {!env.is_default && <button type="button" className="ghost" disabled={busy}
+          onClick={() => run(() => updateEnvironment(env.id, { is_default: true }))}>make default</button>}
+        <button type="button" className="projpop-del" disabled={busy} title={`Remove ${env.key}`} onClick={del}>🗑</button>
+      </div>
+      {lint && (
+        <div className="pc" style={{ marginLeft: 4 }}>
+          {lint.ok
+            ? <>vs <code>{lint.example}</code>: {lint.missing.length ? <span className="g-fail">missing {lint.missing.join(', ')}</span> : <span className="g-pass">all {lint.expected} keys present</span>}{lint.extra.length ? <> · extra {lint.extra.join(', ')}</> : null}</>
+            : <>lint: {lint.reason}</>}
+        </div>
+      )}
+      {open && (
+        <div className="ingress" style={{ paddingLeft: 8 }}>
+          {(data?.vars || []).map((v) => (
+            <div className="setup-row" key={v.name}>
+              <span className="mono" style={{ minWidth: 160 }}>{v.name}</span>
+              {v.is_secret
+                ? <span className="mono pc" title={`secret · ${v.length} chars`}>{v.value_hint}</span>
+                : <span className="mono">{v.value}</span>}
+              <span className="pc">{v.is_secret ? '🔒 secret' : 'plain'}</span>
+              <button type="button" className="ghost" disabled={busy} title="Replace value"
+                onClick={async () => {
+                  const nv = await showPrompt(`New value for ${v.name}`, { placeholder: v.is_secret ? 'new secret value' : 'new value' });
+                  if (nv !== null) wrapped(() => setEnvVar(env.id, v.name, nv, v.is_secret));
+                }}>edit</button>
+              <button type="button" className="projpop-del" disabled={busy} title={`Delete ${v.name}`}
+                onClick={() => wrapped(() => deleteEnvVar(env.id, v.name))}>🗑</button>
+            </div>
+          ))}
+          {data && data.vars.length === 0 && <div className="pc">No vars yet — add one, or paste a whole <code>.env</code> below.</div>}
+          <div className="setup-row">
+            <input value={add.name} placeholder="NAME" spellCheck={false}
+                   onChange={(e) => setAdd({ ...add, name: e.target.value })} />
+            <input value={add.value} placeholder="value" type={add.is_secret ? 'password' : 'text'} autoComplete="off"
+                   onChange={(e) => setAdd({ ...add, value: e.target.value })}
+                   onKeyDown={(e) => { if (e.key === 'Enter') addVar(); }} />
+            <label className="pc" title="secrets are masked in the console; plain vars (ports, flags) show in full">
+              <input type="checkbox" checked={add.is_secret} onChange={(e) => setAdd({ ...add, is_secret: e.target.checked })} /> secret</label>
+            <button type="button" disabled={busy || !add.name.trim()} onClick={addVar}>＋ Add var</button>
+          </div>
+          <div className="setup-row" style={{ alignItems: 'flex-start' }}>
+            <textarea value={blob} placeholder={'Paste a .env to bulk-import\nKEY=value per line'} rows={3}
+                      spellCheck={false} style={{ flex: 1, fontFamily: 'monospace', fontSize: 12 }}
+                      onChange={(e) => setBlob(e.target.value)} />
+            <button type="button" disabled={busy || !blob.trim()} onClick={doImport} title="Parse KEY=value lines; each imported as a secret">⇪ Import .env</button>
+          </div>
         </div>
       )}
     </div>
@@ -925,6 +1252,19 @@ function TokensSection({ project, run, busy }) {
       wrapped(() => deleteProviderAccount(project.id, a.id));
     }
   };
+  // Pausing disables the account for every dispatch surface without disconnecting it — the token
+  // stays connected and can be resumed (or still deleted) at any time.
+  const pauseToggle = async (p, a) => {
+    const name = a.label || `${p.label} ${a.token_hint || ''}`;
+    if (a.paused) {
+      if (await showConfirm(`Resume the "${name}" account?\n\nDispatches on it are enabled again.`, { okLabel: 'Resume' })) {
+        wrapped(() => resumeProviderAccount(project.id, a.id));
+      }
+    } else {
+      const reason = await showPrompt(`Pause the "${name}" account?\n\nNo dispatch on it can start a zee while it is paused (the token stays connected). You can resume it here any time.\n\nWhy pause it? (optional)`, { placeholder: 'e.g. rate-limited, bad token, billing issue' });
+      if (reason !== null) wrapped(() => pauseProviderAccount(project.id, a.id, String(reason || '').trim() || null));
+    }
+  };
 
   return (
     <div className="setup-sec">
@@ -941,10 +1281,22 @@ function TokensSection({ project, run, busy }) {
           </div>
           {(p.accounts || []).map((a) => (
             <div className="setup-row" key={a.id} data-testid={`token-account-${p.provider}`}>
-              <span className="gate g-pass" title={a.created_at ? `connected ${new Date(a.created_at).toLocaleDateString()}` : ''}>
-                ✓ {a.label ? <b>{a.label} · </b> : null}<span className="mono">{a.token_hint}</span>
-                {a.last_used_at ? ` · used ${new Date(a.last_used_at).toLocaleDateString()}` : ' · never used'}
-              </span>
+              {a.paused ? (
+                <span className="gate g-warn" title={a.reason ? `paused: ${a.reason}` : 'paused'}
+                      data-testid={`token-account-${p.provider}-paused`}>
+                  ⏸ {a.label ? <b>{a.label} · </b> : null}<span className="mono">{a.token_hint}</span>
+                  {a.paused_by ? ` · paused by ${a.paused_by}` : ' · paused'}
+                  {a.reason ? ` — ${a.reason}` : ''}
+                </span>
+              ) : (
+                <span className="gate g-pass" title={a.created_at ? `connected ${new Date(a.created_at).toLocaleDateString()}` : ''}>
+                  ✓ {a.label ? <b>{a.label} · </b> : null}<span className="mono">{a.token_hint}</span>
+                  {a.last_used_at ? ` · used ${new Date(a.last_used_at).toLocaleDateString()}` : ' · never used'}
+                </span>
+              )}
+              <button type="button" className="projpop-del" disabled={busy}
+                      title={a.paused ? `Resume this ${p.label} account` : `Pause this ${p.label} account — no dispatch can use it while paused`}
+                      onClick={() => pauseToggle(p, a)}>{a.paused ? '▶' : '⏸'}</button>
               <button type="button" className="projpop-del" disabled={busy}
                       title={`Disconnect this ${p.label} account`} onClick={() => disconnect(p, a)}>🗑</button>
             </div>
@@ -980,10 +1332,17 @@ function TokensSection({ project, run, busy }) {
 function SpawnSection({ project, run }) {
   const [pc, setPc] = useState(null);
   const [runtimes, setRuntimes] = useState([]);
+  const [harnesses, setHarnesses] = useState([]);
   const [ctxs, setCtxs] = useState([]);
   useEffect(() => {
     getPoolConfig(project.id).then(setPc).catch(() => {});
     getRuntimes().then(setRuntimes).catch(() => {});
+    // Non-core, enabled harnesses only — core is the always-on law layer, never a selectable default.
+    // The project DEFAULT harness is what a bare dispatch attaches to a pooled xell — always a
+    // worker. A manager gets its harness when a human adds it, so manager personas are not offered.
+    // …and scoped to THIS project (084): another project's persona cannot be this project's default
+    // (pool_default_harness_scope_guard refuses it), so it is never offered here.
+    getHarnesses('worker', project.id).then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     getDockerContexts().then(setCtxs).catch(() => {});
   }, [project.id]);
   if (!pc) return null;
@@ -1003,6 +1362,11 @@ function SpawnSection({ project, run }) {
         <label>Default runtime
           <select value={pc.runtime_key || ''} onChange={(e) => save({ default_runtime_key: e.target.value })}>
             {runtimes.filter((r) => r.enabled !== false).map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
+          </select></label>
+        <label>Default harness <span className="pc">(persona a bare dispatch wears)</span>
+          <select value={pc.harness_key || ''} onChange={(e) => save({ default_harness_key: e.target.value })}>
+            <option value="">core only (no persona)</option>
+            {harnesses.map((h) => <option key={h.key} value={h.key}>{h.label}{h.scope === 'project' ? ' ⌂ (this project)' : ''}</option>)}
           </select></label>
         <label>Compile on <span className="pc">(build host for new xells{project.registry ? '' : ' — set a Build registry to enable'})</span>
           <select value={pc.default_build_ctx || ''} onChange={(e) => save({ default_build_ctx: e.target.value })}

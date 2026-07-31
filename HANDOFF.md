@@ -1,17 +1,26 @@
-# ZEEHIVE — handover
+# ZEEHIVE — the rationale of record
 
-Paste this into a fresh Claude Code session **opened in `D:\Repos\Zeehive`**.
+> ## ⚠ This is NOT your orientation. [`CLAUDE.md`](CLAUDE.md) is.
+>
+> **If you are a zee: read [`CLAUDE.md`](CLAUDE.md) and [`README.md`](README.md) first, and your
+> own manual at `.zeehive/harness/memory/cxell-zee-manual.md`.** Then come back here for *why*.
+>
+> This file is **history and reasoning, not instructions.** It was written as a paste-in handover
+> for a **host** Claude Code session on one Windows machine, in an earlier era of this repo, and it
+> is kept because code comments cite it and because the expensive mistakes recorded here are worth
+> not repeating. It is **not maintained as a description of the current system**.
+>
+> Zees have repeatedly read it as their briefing and gone chasing things that do not exist for
+> them — a design doc on somebody's `C:` drive, worktrees under `D:\Repos\…`, `docker --context`
+> commands, `/xell` slash-commands, MCP tools that were retired. **A caged zee has none of that**;
+> its whole toolset is the `zee` CLI. Treat any drive letter, machine name, docker context or
+> container name below as a museum piece.
+>
+> **Read it for the WHY, take the WHAT from the code.** Where the two disagree, the code is right —
+> fix the line here, do not work around it.
 
-**Every factual claim here was verified against the live system on 2026-07-15.** It will rot
-anyway — the previous version told two sessions to delete a folder that no longer existed, and
-listed as "broken" two things that had since been fixed. **Check before you trust.** If you find
-a claim that is wrong, fix the line; do not work around it.
-
----
-
-You are picking up **ZEEHIVE**, a deterministic agent-environment orchestrator. Read this whole
-file, then `README.md`, then skim the design doc at
-`C:\Users\Mark\.claude\plans\okay-so-here-is-merry-gizmo.md` (the full rationale — verified present).
+Sections are dated where the record is worth keeping. Claims marked **[stale]** are left in place,
+struck through in prose, because they explain a decision that is still load-bearing.
 
 ## What it is (vocabulary)
 
@@ -27,58 +36,40 @@ file, then `README.md`, then skim the design doc at
 Core thesis: **provisioning is 100% deterministic and belongs in a script; the AI only does the
 actual work, starting from a proven-correct environment.**
 
-## Projects (both live in the same meta-DB)
+## Projects
 
-| project | repo_root | main_branch | target_ready |
-|---|---|---|---|
-| OmniBiz | `D:\Repos\OmniBiz\omnibiz` | `main` | 3 |
-| Zeehive | `D:\Repos\Zeehive` | `master` | 0 |
+**[stale — deleted]** This section used to table the two live projects with their `repo_root`
+paths, branches and pool targets. It was wrong within days, every time. Projects, paths, branches,
+pool targets, container names and couplings are **DATA**: they live in the meta-DB and the API
+resolves them live. Read them from the console or the API, never from prose. (The same lesson,
+generalised, is house rule #7 in `CLAUDE.md`.)
 
-Zeehive orchestrates **itself** as of the rename. Its pool target is 0, so it warms nothing — it
-provisions on demand only. `/xell` resolves the project from the **invoker's cwd**; there is no
-default, and an unresolvable cwd refuses rather than guessing (that guess used to silently hand
-out an OmniBiz worktree to a session standing in this repo).
+What is worth keeping from it: **Zeehive orchestrates itself**, and `/xell` resolves the project
+from the **invoker's cwd** — there is no default, and an unresolvable cwd refuses rather than
+guessing. That guess used to silently hand a session standing in this repo a worktree belonging to
+a different project.
 
 ## Layout
 
-```
-db/migrations/*.sql      001 init · 002 monitor · 003 deploy_lock · 004 production
-                         005 container_build · 006 db_backups · 007 container_restoring
-                         008 async_backup_jobs · 009 land_gate
-server/src/
-  db/        migrate.js, seed.js, seed_demo.js  ← seed_demo is DEAD to us (see House rules)
-  api/routes.js          all HTTP routes
-  queenzee/  pool (reconciler), intake (claim+dispatch), landing, poller, monitor, containers,
-             reaper, tasks, maintenance, deploylock
-  lib/       fleet, timeline, git, sessions, session-title, claude-cli, provision, project-resolve,
-             rename-xell, build, xell-db, reveal, runtimes, names, projects, logbus, events, status
-web/src/     App.jsx, Container.jsx (reusable chip), GitRail.jsx, Connectors.jsx, Backups.jsx,
-             ProjectMenu.jsx, Terminal.jsx (queenzee log modal), nick.js, api.js, styles.css
-mcp/server.js            MCP server wrapping the API
-skill/xell, skill/xell-done   source of the slash-command skills (installed copies live in
-                              ~/.claude/skills/ — edit BOTH or they drift)
-scripts/     provision-xell.sh, provision-xell-db.sh, despawn-xell.sh, land-xell.sh,
-             rename-xell.sh, build-container.sh, check-containers.sh, xell-*.mjs
-```
+**Current layout: [`CLAUDE.md` §4](CLAUDE.md).** The copy that used to live here listed migrations
+up to `049`, two skills and half of `lib/` — it drifted, as any hand-maintained tree does.
+
+The rule that made it drift is the one to keep: **`db/migrations/` is forward-only and
+filename-ordered, so the FOLDER is the truth** and the newest number is the tip. Never enumerate it
+in a doc.
 
 ## Run it
 
-Meta-DB is Postgres on the `ugreen-nas` Docker context: container **`zeehive_db`** at
-`10.1.0.18:5445` (`.env` → `DATABASE_URL`). It was migrated from the old `xeehive_db` by
-pg_dump/pg_restore, verified table-by-table.
+**[stale]** The meta-DB was on the `ugreen-nas` Docker context when this was written; it was
+migrated onto the local daemon on 2026-07-18, and later the whole stack became self-starting from
+published images. **For how to run it today see [`README.md`](README.md) (self-start) and
+[`docker/zeehive/README.md`](docker/zeehive/README.md) (what runs where in production); to run it
+inside a xell see [`CLAUDE.md` §3](CLAUDE.md).**
 
-```bash
-npm install
-docker --context ugreen-nas compose up -d db     # compose pins `name: zeehive` — do not remove it
-# Mark's standard run — REAL provisioning, pool on, no app tier:
-PROVISION_MODE=real PROVISION_APP_TIER=false POOL_ENABLED=true POLLER_ENABLED=false \
-  NODE_NO_WARNINGS=1 node server/src/index.js
-npm --workspace web run dev                       # dashboard on http://localhost:5180
-```
-
-`docker-compose.yml` pins `name: zeehive` deliberately: compose otherwise derives the volume
-prefix from the **folder name**, so moving the repo would make it look for a volume that doesn't
-exist and quietly start an **empty meta database**.
+One detail from here that still matters: `docker-compose.yml` pins `name: zeehive` deliberately —
+compose otherwise derives the project name, and therefore the **volume prefix**, from the folder it
+is run from, so renaming or moving the repo would make it look for a volume that doesn't exist and
+quietly start an **empty meta database**. Do not remove that pin.
 
 Flags: `PROVISION_MODE=real|simulate` · `PROVISION_APP_TIER` (false = worktree only, no NAS
 containers) · `POOL_ENABLED` · `POLLER_ENABLED` · `BUILD_MODE=real|simulate` · `ZEE_MODEL`
@@ -133,21 +124,130 @@ poller sees the new tip, main has already moved. So the gate lives in git itself
   working normally) is untouched, and a queenzee outage can never block a non-main push.
 - Approval is bound to the **exact sha** a human read; it is **spent on use**. Amend/rebase → new
   sha → new decision. Approve → the zee re-runs the **same** push and it goes through.
+- **A landing that main moved past is STALE, and the zee is TOLD** (added 2026-07-29,
+  `landgate.js → closeAsStale` + `nudge.js → nudgeXellForStaleLanding`). Binding an approval to one
+  sha means another xell landing first kills it: it can never fast-forward. That was already
+  recorded honestly (row → `stale`, log line, pad receipt) and told **nobody** — a cxell zee's turn
+  ends at `zee land`, so it sat waiting on a decision that had already become impossible. Now
+  closing the row **resumes the zee's session** with the only recovery that works from inside a
+  cage: `zee sync` (merge current main in — `git fetch`/`git rebase main` cannot work there) then
+  `zee land` again for a fresh decision on a landable sha. No live cxell to reach → a **tend** is
+  raised instead, so it reaches a human. The reason, and whether the zee was actually nudged, is
+  written to `land_request.note` (shown on the pad receipt).
+  - **Held** requests are swept too (`sweepStalePending`, on the 10s land-reaper tick): a pending
+    card main has already moved past is a human being asked to approve something with no possible
+    outcome. Only a **proven non-fast-forward** is closed; a sha the ref already contains is left
+    alone for a human.
+  - A row leaving `pending` needs a decider (009's `land_decided_has_decider` check), and nobody
+    decided this one — it is recorded as `queenzee@stale`, never a human's name.
+  - Both waiters (`scripts/zee`, `scripts/xell-land.mjs`) exit on `stale` with the same
+    sync-then-land instruction. `xell-land.mjs` had **no** stale case and burned its full hour
+    timeout on a dead landing.
+  - Test: `node test/land-stale-nudge.test.mjs` (real git repos + throwaway postgres; the fake
+    `docker` in `test/_bin` captures the resume prompt).
 - Console: held landings render **above everything** (`web/src/Landing.jsx`) with the commit list
   + diffstat and Approve/Reject. A T-Keyboard ping fires too (`lib/notify.js`, `TKB_NOTIFY=0` to
   mute) — a held push blocks a zee, so it must reach you off-screen.
 - **Zees checkpoint-commit freely** on their own branch — a commit only moves their branch ref and
   lands nothing, so the prompt now tells them to commit early and often rather than hoard
   uncommitted work while waiting on approval. Only the *push* is gated.
+- **A zee can WITHDRAW its own held landing** (2026-07-29, 061–063). Every other ask a zee raises
+  can be lowered by the zee that raised it (`zee tend --clear`, `zee hint-land --clear`, `zee done
+  --clear`); a land request could not, so a zee that changed its mind pushed again and left a second
+  card for the same job. `zee land --withdraw [--reason]` → `POST /api/xell/self/land/withdraw`:
+  status `withdrawn` (terminal, with `withdrawn_at/by/reason` — never `decided_by`, because nobody
+  decided anything), the row drops out of every open read model, main never moves and the commits
+  stay on the branch. **Pending only**: an approved request is a human's decision the queenzee is
+  acting on, and retracting it is not an agent's call (`zee tend` is). Scoped to `kind='push'`, so it
+  never sweeps up a PR. The console has the same quiet exit beside Reject (Reject *burns* the sha;
+  Withdraw decides nothing), and the pad keeps a brief "withdrawn by zee" receipt.
+  - The DISCIPLINE that goes with it, taught in the manual (062) and the spawn briefing: **one open
+    landing per zee** — withdraw the previous one *before* landing again. `zee land` now names the
+    older open requests it just superseded, and `zee status` carries `landing.open`, so the zee sees
+    its own stack instead of a human discovering it. Test: `node test/land-withdraw.test.mjs`.
+- **ONE RUNWAY PER REF — the rest fly a HOLDING PATTERN** (2026-07-29, 067–068). One open landing per
+  zee was only half the problem: two *different* zees finishing together both pushed, so a human got
+  TWO cards for one ref. Approving either moved the ref, and the other could never fast-forward — it
+  was swept `stale` and its zee sent back to `zee sync`. A human was asked to decide something that
+  already had no outcome. Three zees made it three cards and two go-arounds.
+  - A push that arrives while **another xell's** landing is open on that ref is no longer raised as a
+    second card: it enters the pattern as `holding` — recorded, with a POSITION, never in front of a
+    human. `checkPush → runwayOccupant()` is the whole decision.
+  - When the runway frees (**landed, rejected, withdrawn or stale — all four**), `clearRunway()`
+    calls the next holder: a session resume (`nudge.js → CLEARED_PROMPT`) naming `zee sync` then
+    `zee land`. Clearance is a NUDGE, never an approval — the zee re-pushes and *that* raises the card.
+  - **The human gate did not move**, and 068 is where that is made true rather than promised: a
+    trigger refuses `holding → approved/landed` outright (any code path, any hand-run UPDATE), a
+    holding row cannot carry a decider/`landed_at`, PRs cannot enter the pattern, and one live
+    holding row per sha. 009's `land_decided_has_decider` is *widened* the way 062 did for
+    `withdrawn`; its partial indexes on `status IN ('pending','approved')` are untouched — a holder
+    sitting **outside** them is exactly what keeps it off `/api/land/requests`, the pad, and
+    `land_pending`.
+  - Position is **counted at read time**, never stored: a stored number goes stale the moment a
+    holder leaves, and "you are #3" when two ahead have withdrawn is how a zee gives up.
+  - **Never auto-lands, never merges, never rebases from the queenzee side.** `auto_approve_land`
+    lands on arrival, so the runway is never occupied and the queue is a no-op in that mode.
+  - Nobody home → a **tend** on that xell and the NEXT in line is cleared, so one dead zee cannot
+    keep the runway empty. A reaped xell's holding row is swept (`sweepHoldingPattern`), and the land
+    reaper tick re-drives every runway as the backstop for a missed clearance.
+  - Both waiters print the position and **exit** — waiting would burn the full timeout on a card no
+    human will ever see, which is exactly how `xell-land.mjs` used to fail on `stale`.
+  - **The git hook needed its own branch** — found by pushing for real, not by reading it: with no
+    `holding` case it fell through to "LANDING HELD — a human must verify this… tell your human the
+    landing is waiting in the console", every word of which is false for a queued push. It now says
+    HOLDING PATTERN, names the go-around, and the test asserts those bytes through a real push.
+  - Test: `node test/land-queue.test.mjs` (two xells, one card; clearance on land/reject/withdraw/
+    stale; the no-cxell go-around; the retired-xell sweep; auto-approve as a no-op).
+  - **The human surface, one task later** (069–072): the console renders the APPROACH QUEUE under the
+    card holding it up — slug, position, commits waiting — with no buttons, because only one thing on
+    a runway is ever a question, and it survives the card being collapsed (which is when it matters
+    most). A queued zee gets its own hexagon, `occ-landHolding` (`holding`, cool slate), ranked
+    **below every ask** — a tend behind a queued landing is still the thing to act on — and **above
+    plain activity**, because it is the only thing that answers "why has this zee gone quiet with
+    commits it wants to land?". Holders whose runway has no card render in the orphan panel, loudly:
+    that should be impossible, and if it happens those zees were about to be invisible again.
+    - The manual is taught by MIGRATION (069/070, the 065 pattern), because the manual a zee reads
+      lives in the meta-DB: holding is normal, nothing was rejected, no human has been asked, you
+      will be resumed, and the recovery is `zee sync` → `zee land`. It also heads off the three
+      wrong reactions (re-push, tend, withdraw-and-re-land) — a state a zee meets first in an
+      unexpected answer is a state it will improvise around.
+    - Test: `node test/land-queue-console.test.mjs` RENDERS the real component with
+      `react-dom/server` rather than grepping it, so what is asserted is the markup a human reads.
+  - **`tend-or-land.md` was seeded at last** (071/072, ticket #3). That hygiene note existed only
+    because a human typed it into the harness manager — it was in NO migration, so on any database
+    that has only ever seen migrations it was absent, three assertions in `land-withdraw` failed, and
+    "is the suite green?" had no answer. Every cxell database is exactly that. 071 seeds it in full
+    (the human's words verbatim) when absent; 072 appends the holding half to databases that already
+    had it; both paths converge on identical text. Proved by migrating a virgin database and running
+    the landgate suite against it — which is the only way this class of bug is ever actually fixed.
 - The xell card therefore shows **two** diffs (`lib/git.js → worktreeDiff`):
   - **source diff** = worktree vs the source (`↑ahead ↓behind · files +ins/−del`, includes
     uncommitted) — everything the zee has produced; what would land.
   - **diff** = worktree vs its OWN HEAD (`own`) — work not yet checkpointed. Drops to 0 on every
     checkpoint while source diff persists. `●N` = dirty files incl. untracked.
-- **Installed for OmniBiz only.** `.git/hooks` is machine-local and not version-controlled, so it
-  does NOT travel with a clone — re-run the installer per machine, and after any `main_branch`
-  change (the protected ref is baked in). Zeehive's own repo is NOT gated yet.
-  - status: `bash scripts/install-land-gate.sh --status D:/Repos/OmniBiz/omnibiz`
+- **Every one of those diffstats is CLICKABLE** (added 2026-07-28, `web/src/DiffViewer.jsx` +
+  `server/src/lib/diffview.js`): the numbers open the **patch** they are counting. A landing was
+  the case that mattered — you were asked to approve a push with only a commit list and a line
+  count to go on, and the actual change lived in a terminal on the host that the console user does
+  not have. Clickable in four places: the xell card's two stats, the hive flower's two diff petals
+  (drawn underlined — a canvas has no cursor to discover), a held **landing**, and a **PR** card.
+  - `GET /api/xells/:id/diff?kind=source|own` · `GET /api/land/requests/:id/diff` — read-only.
+  - A landing/PR is read at exactly `old_sha..new_sha` in the xource (the range being approved).
+    A live xell is read from the same place its STAT came from — the **cxell** for a cxelld zee
+    (where the work is until it lands), else the worktree — so viewer and card cannot disagree.
+  - **Untracked files are synthesised in**: `git diff` cannot see a file git was never told about,
+    and "the zee just wrote five new files and hasn't committed" is exactly when this is opened.
+  - Capped three ways (whole payload / per file / file count) and every cap is *reported* on the
+    card, never silently applied. Test: `node test/diff-viewer.test.mjs`.
+- **Installation is per machine, because `.git/hooks` is.** ~~Installed for OmniBiz only; Zeehive's
+  own repo is NOT gated yet~~ — **[superseded]**: onboarding a project by CLONE now installs the
+  gate itself (`lib/projects.js` runs `scripts/install-land-gate.sh` best-effort, and reports a
+  warning rather than rolling back if it fails), and that includes ZEEHIVE's own self-onboard.
+  Onboarding an existing FOLDER still leaves it manual. The underlying fact is unchanged and is why
+  the installer exists: `.git/hooks` is machine-local and not version-controlled, so the gate does
+  **not** travel with a clone — re-run the installer per machine, and after any `main_branch` change
+  (the protected ref is baked in).
+  - status: `bash scripts/install-land-gate.sh --status <repo path>`
   - override (human, on purpose): `git -c core.hooksPath=/dev/null push . HEAD:main`
 
 ## Shipping to production (the zee asks; the QUEENZEE ships)
@@ -202,6 +302,333 @@ prod, absent from main, silently reverted by the next rebuild from main.
   hover → 🔓, click → confirm → force release. Reaper tick: 5s; it also starts any approved ship
   that was waiting for prod to free up.
 
+## Prod DATA asks: `zee seed` (new) and the prod-bind request that nobody could see
+
+Added 2026-07-28. Code reaching prod has had a gate since the ship flow; **data** reaching prod had
+half of one. Two concrete holes, one fix each:
+
+- **`zee prod` was a dead end.** It wrote a `prod_bind_request` row (029) and logged a line — and
+  **nothing in the console ever rendered it**: no hive status, no card, no panel, no ping. A zee
+  could ask for production and simply never be answered. Now: `occ-prodRequest` (`prod?`) on the
+  hexagon, the request on the asking xell's chip in the "waiting on you" bar with
+  **Reject / Bind to PROD** (typed `BIND` confirmation — it hands a running agent the live db), a
+  `ProdAsksPanel` for asks whose xell is gone, and a T-Keyboard ping. `fleet.prod_bind` carries it.
+- **A shipment that needs ROWS in prod had only that sledgehammer.** `server/sql/ops/` rides the
+  ship (014), but it is decided *before* the containers rebuild and only for files already in the
+  approved commit; seeding that must happen *after* the new code is live, or that is only discovered
+  once prod serves it, had no path except binding the whole database. So: **`zee seed`**.
+
+**`zee seed --file server/sql/seeds/<name>.sql --reason "…"`** (`prod_seed_request`, migration 049;
+`queenzee/seedgate.js`) is the ship gate's division of labour applied to data:
+
+- zee **asks**, naming files that are **already on main**; human **approves**, with the exact SQL
+  (read at the request's own sha) in view; **queenzee runs it** against the production database.
+  The zee never touches prod and cannot approve its own ask. `POST /api/xell/self/seed-request`.
+- **Only `server/sql/seeds/*.sql`** — the whitelist is what stops "approve" ever meaning "run any
+  file in the repo on prod". `normalizeSeedPath` accepts shorthands (`x.sql`, `seeds/x.sql`) and
+  refuses everything outside, including traversal.
+- **Unlanded → refused**, because the queenzee reads the file with `git show <main-tip>:<file>`.
+  Same anti-band-aid rule as a ship, and it makes "what ran on prod" always readable in the repo.
+- **Not ledgered, deliberately** — a migration runs once, a seed is legitimately re-runnable. The
+  contract is idempotent SQL, and the console surfaces **every prior run of the same file** so a
+  repeat is a decision rather than a surprise (`priorRuns`).
+- Before writing anything it re-proves the target with `assertProdDbTarget` (the same guard that
+  stopped a ship migrating a 7.7 MB dev clone), and it **refuses while the prod lock is held** —
+  a seed must not write data underneath a half-swapped container. Each file runs in its own
+  transaction; the first failure stops the run and lands on the row as `failed` + reason.
+- **`SEED_MODE=simulate`** runs nothing and records `mode: simulate` (mirrors `SHIP_MODE`) — how
+  `test/prod-seed-gate.test.mjs` exercises the whole path against a throwaway project.
+  ⚠ Like the first prod ship, **the real psql has never run against a live prod db** — everything
+  around it is verified, and it reuses shipmigrate's `psql`/`prodDb`, but read it before the first
+  real seed.
+- Receipts **outlive the xell** (`xell_id ON DELETE SET NULL` + a stamped `xell_slug`): a record of
+  something that touched production does not get reaped with a throwaway worktree.
+- Hive: `occ-seedRequest` (`seed?`). Human API: `GET /api/prod-seed/requests`,
+  `…/:id/sql`, `…/:id/(approve|reject)`, `…/:id/dismiss`, plus `POST /api/xells/:id/seed` for an
+  operator filing one on a zee's behalf (still only a request).
+
+Tests: `test/prod-seed-gate.test.mjs` (DB integration: refusals, approve→run, lock-held failure,
+real-mode refusal, receipts, and the fleet read model) and `test/prod-asks-console.test.mjs`
+(static: hive-status ↔ web palette lockstep, App renders the cards, NeedsYouBar counts the asks).
+
+## MANAGER ZEES — the fleet's middle layer (052/053/054)
+
+Added 2026-07-28. Every zee was a worker and every decision above a worker was a human's — fine for a
+handful of xells, useless once "which of these twelve needs me?" is itself a job. A **manager zee** is
+a xell (`xell.role='manager'`) whose zee runs a CREW. Full write-up: [docs/manager-zees.md](docs/manager-zees.md).
+
+- **TYPE and HARNESS are two axes (054).** `xell.zee_type` (worker|manager) is what the queenzee
+  lets a zee do; a HARNESS declares the type it is for (`harness.zee_type`, from `zee_type:` in
+  HARNESS.yml) and a xell may only wear one of its own type — because a harness IS that type's
+  manual. Enforced by triggers from both directions: no mismatched assign, no retyping a xell out
+  from under its harness, no retyping a harness while it is worn, no cross-type inheritance (a
+  manager harness parented on Zee Base would teach it `zee land`). `GET /api/harnesses?zee_type=…`
+  is what every picker asks for; the harness manager has a **For zee type** selector.
+  ⚠ 054 RENAMED `xell.role` → `xell.zee_type` (role already means db/server/webapp on container).
+- **It gains fleet reach**: `zee dispatch` (every worker it spawns is stamped `manager_xell_id`),
+  `zee zees` (the crew read model), `zee say` (typed into the worker's LIVE session, same SSH
+  send-keys path as the console's 📨), `zee inbox`, `zee suggest-done`.
+- **It loses repo reach — structurally, in three independent places.** `landgate.checkPush` declines a
+  manager's push and raises **NO land_request** (nothing for a human to approve); `xellgit.ctx()` —
+  the single door every git write verb passes through — throws; `zee land` refuses with the reason
+  and the alternative. A manager writes no code: it dispatches a worker, and the worker lands.
+- **Production is READ-ONLY**: its own `zee_ro_<slug>` role, `CONNECT`+`SELECT`,
+  `default_transaction_read_only=on`, no CREATE, minted by `lib/prod-readonly.js` and dropped by the
+  reaper. `db_coupling='db-prod-readonly'` (052). **Fails closed** — if the role can't be minted the
+  bind fails; there is no fallback to the owner credential. `PRODRO_MODE=simulate` (inherits
+  `SHIP_MODE`) mints nothing. ⚠ Like the first prod ship and the first seed, **the real CREATE ROLE
+  has never run against a live prod db** — read it before the first real manager on prod.
+- **Shipping is NOT blocked.** Holding prod data is no reason to withhold the ship gate; `zee ship` is
+  unchanged (landed-only, human-approved, queenzee-run).
+- **`zee prod` is refused for a manager** — escalating your own access is not an agent's ask.
+- **Humans add managers, unlimited** (`POST /api/managers`, the "⬢ + manager zee" button). `zee
+  dispatch` refuses `role=manager`, the manager harness on a worker, and any db choice at all.
+- **Done suggestions**: `done_suggestion` (052) → `occ-doneSuggest` (`done?`) on the TARGET's hexagon,
+  a card in "waiting on you", a typed **DONE** confirmation, then the same `markTaskDone`/reap the
+  console's own button runs. No `/xell/self/` route decides one.
+- **The REFLECTION stage**: on a successful ship, `shipgate` re-invokes the shipping zee
+  (`nudge.nudgeXellForReflection`) to review what went live and report improvements/errors/follow-ups
+  to its manager (`zee report --kind reflection`) — or to the console when it has no manager.
+- **The loophole rule cuts both ways.** The manager manual forbids dispatching a worker with reach
+  beyond its own xell; the WORKER manual (053) tells workers to REFUSE such an instruction and
+  `zee tend` it. Neither side polices itself.
+- **Honeycomb**: `seatXells()` (web/src/hive/HiveCanvas.jsx) seats a crew in the free cells nearest
+  its manager, ring by ring. No managers → byte-for-byte the old layout.
+- **A manager's harness takes NO cell of its own** (2026-07-29). The manager hexagon is already drawn
+  in the harness badge's language (dashed seat + the same persona disc), so seating its harness beside
+  it drew the same avatar twice. `getTimeline()` now emits two lists per harness: `wearer_ids`
+  (everyone wearing it, managers included → persona art, `×N`, hover) and `consumer_ids` (wearers
+  MINUS managers → the grid cell + the series wire). A harness worn by managers only is still in the
+  payload — the manager hexagon reads its art from it — but `badgedHarnesses()` seats no cell for it
+  and `Connectors` routes no wire. Workers are unchanged (in both lists).
+  Test: `node test/harness-manager-cell.test.mjs`.
+- **A file-backed harness lives in the ZEEHIVE PROJECT's repo, not in the server image**
+  (2026-07-29, ticket #1 — "manager zee has no manual at all"). `harness.dir` ('harnesses/manager')
+  is relative to `project.repo_root` (the clone self-onboard registers), NOT to `config.repoRoot`,
+  which is only where the running server's code sits. On a checkout they are the same folder — which
+  is why every test passed while the DEPLOYED queenzee shipped manager zees with an EMPTY harness:
+  `Dockerfile.server` copies `server/ scripts/ db/ hooks/ skill/` and deliberately **not**
+  `harnesses/` (one copy of the files, in the repo the DB row projects — same reasoning as the single
+  copy of `scripts/zee`), so `/app` had no harness folders and `refreshHarnesses()` kept the empty
+  seed bundle. `GET /api/harnesses/manager/full` returned `""` for persona, summary, glyph, and no
+  skills or memory at all. Fixed in `lib/harness.js`: ONE resolution (`harnessRoots()` /
+  `harnessBase()` — project repo roots first, self project first, `config.repoRoot` always last and
+  never absent) shared by `loadHarnessDir()`, its hash re-read, `dirHeadCommit()`, the avatar
+  (`harnessAvatarFile()`, which `GET /api/harnesses/:key/avatar` now calls) and the read models. A
+  root only wins if the folder is actually there, so a stale `repo_root` falls through instead of
+  blanking a harness. **Do NOT "fix" this by COPYing `harnesses/` into the image** — a second copy
+  drifts from the repo the row claims to project.
+  And it is no longer SILENT: an unreadable folder still keeps its last good bundle, but logs
+  `FOLDER MISSING` (queenzee log + stdout) naming the key, the roots searched and how many live
+  xells wear it, and `GET /api/harnesses` / `…/full` carry `files_missing` + `bundle_empty` so a
+  harness that briefs a zee with nothing is visible instead of looking healthy.
+  Test: `node test/harness-repo-root.test.mjs` (reproduces the container: a `config.repoRoot` with
+  no `harnesses/` + a project `repo_root` that has them).
+- **An unloaded harness is impossible to miss** (2026-07-29, the follow-up to the above). Two halves:
+  (1) `refreshHarnesses()` ends with ONE summary line — `harnesses: 3 loaded, 1 EMPTY — <keys> · N
+  live xell(s) are wearing an EMPTY harness` — logged always, `console.error` when any are empty
+  (`logHarnessSummary()` is exported and callable on its own). The per-harness loglines were each
+  true and each easy to miss; a boot is not clean if a zee's persona is a blank page.
+  (2) The console SAYS it, in words: `web/src/harnessHealth.js` (`emptyWarning()`) is the one place
+  `files_missing`/`bundle_empty` become `⚠ no files` / `⚠ empty`, used by the harness manager
+  (`HarnessRow` + `HarnessEmptyBanner`, both exported so they can be RENDERED in a test), the
+  dispatch picker (where a human chooses what a zee will wear), and the honeycomb —
+  `harnessWarning()` in HiveCanvas writes the word under the badge in place of `×N`, and rings +
+  labels a MANAGER hexagon, which IS its persona. `getTimeline()` carries the two fields for that.
+  Colour is reinforcement; the WORD is the signal (same rule as the feed chips).
+  Test: `node test/harness-empty-visible.test.mjs` — the boot line against real rows, plus the real
+  components rendered (react-dom/server) and the real canvas functions DRAWN against a recording
+  2D context, so a regex over the source can't fake it.
+- **The ship card names EVERY migration the deploy applies — including the ones it applies at BOOT**
+  (2026-07-29, ticket #12). `ship_request.migrations` only ever held the DEPLOY-TIME set
+  (`server/sql/migrations|ops`, applied by the queenzee before the containers build). Zeehive
+  migrates ITSELF: `runMigrations()` applies `db/migrations/*.sql` to the live meta-DB as the new
+  server boots. Nothing joined those facts, so every Zeehive ship card said **"no migrations"** while
+  one deploy applied five — including the one that repaired live data loss and two that rewrote the
+  manual every zee reads. A GATE bug, not a display bug: the gate is only as good as what it tells
+  the human (same class as the harness that rendered healthy while carrying nothing).
+  `pendingBootMigrations()` (shipmigrate.js) resolves the boot set at request time and
+  `ship_request.boot_migrations` (075) records it. Detected from the project's SHAPE at the shipped
+  sha — `db: { boot_migrations: … }` in zeehive.yml, else a repo carrying both `db/migrations/*.sql`
+  and a `runMigrations()` boot runner — so a fork or rename keeps working and any project can opt in
+  or out. The ledger (`schema_migrations`) is read over the queenzee's OWN pool when the prod db row
+  names the database it is already connected to (the self-hosting case), else through `psql`.
+  **The two sets are never merged**: deploy-time runs under the queenzee before anything swaps and a
+  failure stops the ship; boot-time runs inside the new process after the swap. `ShipSchema`
+  (web/src/Ship.jsx) renders them apart, each with WHEN it runs — and an unreadable ledger renders as
+  **UNKNOWN with the reason**, never as "none", because a silent zero is the bug itself.
+  Also: a ship is FLEET-WIDE and deploys the **current tip of main**, not the requester's landed sha
+  (one deploy went out 5 commits ahead of the asking zee's). The approve confirmation, the request
+  confirmation and the answer `zee ship` gives now all say so.
+  Test: `node test/ship-boot-migrations.test.mjs` — a REAL `requestShip()` against a throwaway
+  project whose prod-db row points at the test's own postgres, so "pending" is a fact about a live
+  ledger. Verified again over HTTP on a booted queenzee: `POST /api/ship/request` → the card,
+  rendered from the console's own read model, named `db/migrations/998_zt_live_demo.sql`.
+- **Inject a project environment into a xell, from the console** (2026-07-29, ticket #20). The server
+  half already existed — `resolveEnvironmentFor` (pin → on-production → dev), `resolvedEnvView`,
+  `setXellEnvironment` — and none of it was reachable without curl. `web/src/XellEnvironment.jsx` is
+  that surface: what the xell resolved to and WHY (pinned vs by tier), its var names, and a picker
+  over the project's environments with a clear-the-pin. It is a picker, not a second editor;
+  environments are still authored in Project setup.
+  **The trap it is built around:** on this project both Zeehive environments hold ZERO vars, so a
+  correct injection writes nothing and reads exactly like a bug (ticket #15 lost an afternoon to it).
+  So absent / empty / populated are three different sentences, in the panel AND on the card chip —
+  which now renders a third face (`no env`) instead of vanishing when nothing resolves, because an
+  absent chip read as "fine". A var the projection owns (`DATABASE_URL`, the slug, …) is LABELLED
+  "not injected (queenzee-owned)" rather than silently dropped.
+  Pinning asks first (it rewrites a file in a live xell) and says the thing people get wrong: a
+  process already running keeps the environment it started with.
+  Test: `node test/xell-environment-inject.test.mjs` — pin → re-read `.zeehive.env` off disk → clear
+  → re-read, against a real xell row with a real worktree; a `db-shared-prod` xell resolving to the
+  PROD environment with no pin; the reserved names refused at projection time even when the
+  environment sets them; and a secret's value absent from the picker payload (a NON-secret value is
+  not a secret and does come through — the panel says so accurately rather than overclaiming).
+- **Compose a long body the shell will not execute** (2026-07-29, ticket #21 — migration 079).
+  Three incidents in one afternoon across three zees: backticks inside a DOUBLE-quoted shell string
+  are a command substitution, so composing a report body that way RUNS what it meant to name (it
+  invoked the ship verb once and the build verb once), and an apostrophe inside a single-quoted
+  `git commit -m` closes the quote early. The note teaches the quoted heredoc / single quotes, and
+  `git commit -F` for anything multi-line or apostrophe-bearing — with the REASON, which is the part
+  that makes it stick: **those two invocations were refused only because those verbs require an
+  argument, and `zee land` does not.** Whether a gated verb should refuse a bare invocation is
+  ticket #17 and a human's call; 079 is documentation only.
+  It also shows the SPLIT every manual edit has to respect: `zee-base` is DB-owned (`dir IS NULL`),
+  so its manual is patched by migration through 076's `harness_memory_put` in 077's anchored/guarded
+  shape; the MANAGER manual is FILE-backed (`harnesses/manager/`, reloaded from the folder at every
+  boot), so its copy of the note is a repo file edit — a DB write there is overwritten on the next
+  boot. Verified on a VIRGIN database (created empty, migrated from scratch: 81 migrations, the note
+  present, both `zee-base` memory files intact) and re-applied past the ledger as a byte-identical
+  no-op. Suite 77/0 on both the virgin and the in-place database.
+- **Notify a manager about a ticket: proved it ARRIVES, and made it ask first** (2026-07-29,
+  ticket #16). The feature itself (the derived `TKT-<n>-<4hex>` code, the live-manager picker, the
+  notify route through the existing `sendMessageToXell` door) landed separately; two things it was
+  missing were the two the ticket cares most about.
+  **Receipt.** The original test said in its own header that a successful delivery was out of scope.
+  But a notification is a RICH message, so `sendMessageToXell` writes it into the cage as
+  `.zee-inbox/<ts>/message.md` over `docker exec` FIRST and only then types a pointer at it over SSH
+  — and that first hop is the substantive one (it is the file every manager in this fleet actually
+  reads). With `test/_bin/docker` on PATH, the message.md that lands is read back off the recorded
+  stdin: it carries the CODE, the number, the title and the not-an-order sentence. The SSH hop stays
+  unproven here (it needs a real sshd) and is stated as such.
+  **It asks first.** Notifying types into a RUNNING agent's session, and it fired on one click. It
+  now goes through `showConfirm` like every other console action that reaches a live zee, naming the
+  manager, whether it is live, and that a notification assigns nothing.
+  Also asserted, because it is the ticket's hard constraint: notifying creates no work item, sets no
+  assignee, and changes neither the ticket's status nor the manager's xell.
+  Test: `node test/ticket-notify.test.mjs` (55 assertions; `TicketCode`/`NotifyManager` are exported
+  so the human surface is RENDERED rather than grepped).
+- **The go-around "flake" was the TEST'S WAIT, not the runway** (2026-07-29, ticket #19). `land-queue`
+  failed once in six full-suite runs on *"the unreachable holder did not block the runway"*, and 0/12
+  in isolation. Characterised before touching anything: the fake docker (`test/_bin/docker`) writes
+  its ARGV line the instant it starts and the PROMPT only after it finishes reading stdin — two
+  writes with a real gap — and `awaitResume()` returned as soon as `--resume` appeared, so the caller
+  asserted on a half-written log. Everything the assertions care about ("runway is CLEAR", `zee sync`
+  before `zee land`, "clearance is not approval") is in the SECOND write. Case 9 had grown its own
+  extra polling loop for exactly this; five other call sites had not.
+  RATES, measured: **1 failure in 6 full-suite runs** (the only condition that has ever produced it),
+  **0/12** in isolation on an idle box, and — worth knowing — **0/15 pre-fix under 4-way CPU load**,
+  so plain CPU pressure does NOT reproduce it. That is why the mechanism was forced directly instead.
+  Post-fix: **15/15** with the gap varied 0–1299ms, and green at 2.5s.
+  Made deterministic with a new `DOCKER_FAKE_SLOW_STDIN_MS` knob (same spirit as the existing
+  `DOCKER_FAKE_EARLY_CLOSE`): at a forced 1.5s gap the pre-fix test failed **7 assertions across 5
+  cases**, every time — while the ROW-level assertions (`cleared_at`, the tend, the go-around itself)
+  still passed, which is what proves the protocol sound and the wait loose. A direct probe timed the
+  argv line at 32ms and the prompt at 1,526ms of the same invocation: **late, never lost.**
+  `awaitResume(want)` now waits until the INVOCATION matching `want` is complete (a closed stdin block
+  is the marker), per record — because one clearance step can emit TWO nudges (case 9: the stale
+  notice to the occupant AND the clearance to the holder behind it), and "some resume, fully written"
+  would return on the first while the second was half-recorded. Every call site now passes what it is
+  about to assert on, so the wait and the assertion cannot drift apart. **The assertion still fails when the go-around genuinely breaks** —
+  proved by deleting the `if (r.nudged) break` go-around in `clearRunway()` and watching it go red.
+  NOT the cause, and still open (ticket #11's, not folded in here): `clearRunway` fires on
+  `setImmediate` from checkPush's ALLOW path just before git moves the ref — a different call path
+  from the one this assertion exercises (`decideLandRequest` → `landOne`, where the ref has already
+  moved), whose consequence is a late clearance the reaper's `driveRunways` backstop picks up; and
+  the clearance nudge is fire-and-forget with no retry, so a nudge that STARTS and dies is still
+  recorded as delivered. Neither was what made the test red.
+- **The warm never rewrites the lockfile a zee then lands** (2026-07-29, ticket #14 — found while
+  building the cache above). `warmCxell()` ran `npm ci … || npm install …` UNCONDITIONALLY, in
+  `/work/repo` — the tree the zee lands from. `npm install` rewrites package-lock.json, so any lock
+  drift at dispatch handed the zee a dirty tree before it had done anything, and from there into an
+  accidental lockfile change in somebody's landing, attributed to a zee that never touched
+  dependencies. Now: `npm ci` with NO fallback when a lockfile exists (a failing `ci` in a fresh cage
+  IS the signal), the lockfile-less branch kept because `npm install` there CREATES the missing file
+  rather than rewriting a committed one, a lock-drift failure named as such in the log, and a
+  post-warm `git status package-lock.json` check that shouts if anything ever dirties it again.
+  The warm stays best-effort — a failed warm still never fails a dispatch.
+  **The same bug was live on the HOST side, hidden in a shell idiom**: `scripts/start-xell-process.sh`
+  carried the ci-not-install rule as a COMMENT while its code read
+  `[ -f lock ] && npm ci || npm install` — the `||` branch runs when EITHER part fails, including a
+  failing `npm ci`, so a drifted worktree still ran install and re-armed the provision→build→reap
+  loop that comment warns about. Spelled out as if/else; a `ci` that cannot run now emits
+  `npm-ci-failed` instead of mutating the tree until it installs.
+  Test: `node test/warm-never-rewrites-lock.test.mjs` — it RUNS both scripts against real npm (no
+  daemon needed: the scripts are the behaviour, `docker exec` only carries them), reproduces the old
+  idiom rewriting the lock, and proves the new one leaves it byte-identical. It also sweeps every
+  remaining `npm install` in server/ and scripts/ against an allowlist with reasons, so a new
+  unguarded one fails there.
+- **ONE npm cache for the fleet, and a pooled xell warms itself** (2026-07-29, ticket #7 — "give
+  provisioned xells the usual stuff needed such as pg driver so they dont have to install it every
+  time"). Nothing was broken: `warmCxell()` already ran `npm ci` in a cage and
+  `start-xell-process.sh` runs one on a host worktree. The waste was that each started from a COLD
+  cache — a cxell is a fresh container with its own empty `~/.npm`, so every xell of every project
+  re-downloaded the same tarballs. Now: `ensureCxell()` mounts a shared docker volume
+  (`zeehive_npm_cache` → `/npm-cache`, `NPM_CONFIG_CACHE` set with it) and the queenzee spawns the
+  host-side starter with `npmCacheEnv()` (`<reposDir>/.npm-cache`); `provisionXell()` warms a
+  POOLED xell's worktree while it sits ready, so the install is on the pool's clock, not the zee's.
+  All of it in `server/src/lib/npm-cache.js`, all of it best-effort — a cold volume, an unwritable
+  cache or a failed warm may never fail a provision or a dispatch, and `CXELL_NPM_CACHE_VOLUME=off`
+  / `ZEEHIVE_NPM_CACHE=off` restore the old behaviour exactly.
+  **`npm ci`, never `npm install`, on a pool-watched worktree** — install rewrites the lockfile, the
+  pool reads a dirty worktree and reaps the xell (the 2026-07-20 provision→build→reap loop). A
+  worktree with no lockfile is SKIPPED by the warm rather than installed.
+  Measured in a cxell on this repo (217 packages, 577MB `node_modules`), same machine, cache the
+  only variable: cold **20.6 / 31.8 / 46.1s** (176MB downloaded) vs warm **9.9 / 13.2 / 27.4s** (zero
+  downloaded), and `npm ci --offline` against the warm cache succeeds in **13.3s** — proof the cache
+  alone satisfies the whole install. All the saving is network, so a slower link gains more.
+  Ownership matters: a fresh named volume is root-owned and npm runs as `zee`, so Dockerfile.zee-agent
+  ships `/npm-cache` owned by zee (docker seeds a new volume from the image path) and the create path
+  chowns + probes it, logging loudly if the cache came up read-only. No project `node_modules` are
+  baked into the agent image — it is shared by every project and would go stale against each lockfile.
+  Test: `node test/npm-cache.test.mjs`. NOT verified: no docker in a cxell, so the mount, the fixup
+  and a real warm were never observed running — only the argv/env they are built from.
+- **A repaired harness reaches the zees ALREADY RUNNING** (2026-07-29, the last thread of ticket #1).
+  Harness files are materialized into a xell at DISPATCH, so fixing a bundle used to reach new zees
+  only — which is precisely what left the running fleet briefed on nothing while the fix sat in the
+  DB. `refreshHarnesses()` now calls `reinjectHarnessIntoLiveXells(id)` for each harness whose bundle
+  ACTUALLY CHANGED (the no-op branch writes nothing — a queenzee reaching into a running zee's
+  worktree uninvited on every boot would be worse than the bug), covering the xells wearing it AND
+  those wearing a harness that INHERITS it (a child's effective persona is the merged chain). It
+  reuses the existing live-injection path (`reinjectHarnessIntoXell`, what a harness re-assign uses),
+  lazily imported because intake.js imports lib/harness.js.
+  Every outcome is LOGGED, because a file appearing under a live zee is otherwise indistinguishable
+  from the zee having written it: injected (with the count and the cause), no-live-zee (collected
+  into one line — they pick it up at the next dispatch), and FAILED, which is loud on stdout because
+  it means a running zee is still on its old persona. `reinjectHarnessIntoXell` was reporting
+  `injected: true` after writing ZERO files; it now returns `{files, failed, wanted}` and calls that
+  what it is. Test: `node test/harness-reinject-live.test.mjs`.
+- **INJECTED artefacts are not source: nothing under `.zeehive/` is tracked** (2026-07-29, ticket #6).
+  `.gitignore` has ignored `.zeehive/` since it was first swept into a commit, but ignore rules do
+  not apply to a file already in the index — and `.zeehive/harness/memory/cxell-zee-manual.md` was.
+  So every cxell's injected copy read as a modification to a tracked file: two zees wrote commits
+  whose only purpose was undoing it (7c00642, cad07a8), one swept it in (28ff5c3), and one hit it as
+  a merge CONFLICT mid-land. The version that had not happened yet is the bad one — a zee lands its
+  injected copy and silently overwrites the repo's manual with a stale injection. `git rm --cached`
+  now makes the ignore rule bite; the file stays on disk, injected per xell, and a fresh injection
+  leaves `git status` clean. **Never re-add it, and never `git add -f` anything under `.zeehive/`
+  or `.claude/`.**
+  The manual's home is the META DB (harness `zee-base`, memory `cxell-zee-manual.md`, seeded by 047
+  and amended by 050/053/056/063/065 — every edit is a migration). There is **no `docs/cxell-zee-manual.md`**
+  and there must not be: a file copy drifts from the row the next migration lands, exactly as the
+  duplicated `scripts/zee` did. The four references that still pointed at that dead path
+  (`docs/harness-proposal.md`, `docs/schema-catchup-plan.md`, `harnesses/core/HARNESS.yml`,
+  `lib/harness.js`) now say where it actually lives; 046's comment carries a SUPERSEDED-BY-047 note
+  rather than being rewritten (an applied migration is a record, not a document).
+- Test: `test/manager-zee.test.mjs` (55 assertions: guard trigger, the three push refusals, crew,
+  messages, done suggestions incl. the human decision, the read-only SQL, the manual). Verified live
+  over HTTP with the real `zee` CLI: crew listing, say/report/inbox, suggest-done → human approve →
+  the target xell went `retired`.
+
 ## Hotfix / data-manipulation xells (prod DATA is not prod CODE)
 
 **Read the MCP tools or the API.** Container names, bindings, couplings and status are DATA: they
@@ -211,7 +638,11 @@ an exited husk for weeks.
 
 A xell dispatched with **`--db shared-prod`** has `db_coupling='db-shared-prod'`: the live production
 database IS its assigned container. Querying it is the job, not a violation — "use ONLY your
-assigned containers" is *satisfied*, because a human deliberately gave it that one.
+assigned containers" is *satisfied*, because a human deliberately gave it that one. A LIVE xell can
+be re-pointed the same way after the fact (`lib/xell-prod.js`), and a zee can now **ask** for that
+(`zee prod` → `prod_bind_request`) and actually be answered — see the section above. Before reaching
+for a bind, check whether the job is really "rows into prod": that is `zee seed`, and it costs the
+zee no prod access at all.
 
 ⚠ The flag value is **`shared-prod`**, not `prod`. Dispatch prefixes it with `db-`
 (`xell-dispatch.mjs`), so `--db prod` → `db-prod`, which is not a mode. This doc and the prod
@@ -377,33 +808,96 @@ were both verified working — it is not the install, and reinstalling is a wast
    needs a xell with commits ahead of its xource. Use a DUMMY, targeted by explicit slug (House
    rule: never test on live xells).
 
-1. **Delete the leftover `D:\Repos\Xeehive`** — Zeehive was built fresh from the pushed commit
-   because the folder could not be renamed while a Claude Code session held it as its cwd. The old
-   folder is a clean, fully-pushed duplicate holding nothing unique. Run
-   `pwsh -File D:\Repos\remove-old-xeehive.ps1` (it refuses unless the new folder is complete).
-   *This is the third time a rename has left a leftover — Originode → Xeehive → Zeehive.*
-2. **Drop the meta-DB rollback** once you're confident: container `xeehive_db` (stopped) and
-   volume `xeehive_xeehive_pgdata` on `ugreen-nas` are the pre-migration copy, kept on purpose.
-3. **Dispatch is one-shot** (open decision). A dispatched zee runs exactly one `query()` turn and
-   then idles until a human prompts it — Mark: *"the zees are really slow, I have to keep prompting
-   them back."* Either add a continuation loop in `spawnHeadless`, or keep one-shot and size tasks
-   to fit one turn. Not decided.
-4. **Zeehive's pool target is 0** — set `pool_config.target_ready` if you want it warming xells.
-5. **Skills are duplicated, and they HAVE already drifted** — `skill/` in the repo vs the
-   installed `~/.claude/skills/`. Not hypothetical: as of 2026-07-15 `skill/xell/SKILL.md` is 33
-   lines and the installed copy is 61 — the installed one has the claim GATE, the project-handover
-   note and the build rules; the repo copy has none of them. **The installed copy is what actually
-   runs**, so treat it as authoritative and back-port, don't overwrite it with the repo's. (The
-   landing-gate text was added to both.) Worth making the repo the source and installing from it.
+1–2. **[closed — old-repo housekeeping, deleted.]** These were one machine's chores from the
+   `Xeehive` → `Zeehive` rename: delete a leftover `D:\Repos\Xeehive` folder with a PowerShell
+   script, and drop a stopped pre-migration meta-DB container kept as a rollback. Both are long
+   gone — the meta-DB moved off that host on 2026-07-18, and the stack now self-starts from
+   published images. **They are the reason this file got a warning banner**: a zee orienting on
+   HANDOFF read them as live work and went looking for drives it cannot see. The durable lesson,
+   and all that is worth keeping: *a rename leaves a leftover every single time* (Originode →
+   Xeehive → Zeehive), so plan the cleanup as part of the rename, not after it.
+
+3. **Dispatch is one-shot** (open decision, 2026-07-15 — **check before you trust**; the nudge/
+   resume paths in `queenzee/nudge.js` have moved a long way since). A dispatched zee ran exactly
+   one `query()` turn and then idled until a human prompted it — *"the zees are really slow, I have
+   to keep prompting them back."* Either a continuation loop in `spawnHeadless`, or keep one-shot
+   and size tasks to fit one turn. What DID land in this space: a background `--wait` exiting
+   re-invokes the session, and the queenzee resumes a zee's session for a stale landing or a
+   post-ship reflection — i.e. "something ended" is the nudge, rather than a polling loop.
+
+4. **Pool targets are DATA** (`pool_config.target_ready`), per project — read them from the
+   console, not from here. A target of 0 warms nothing and provisions on demand only.
+
+5. **Duplicated copies of a thing an agent runs WILL drift** — the single most repeated failure in
+   this repo. Recorded here as `skill/` in the repo vs the installed `~/.claude/skills/` (2026-07-15:
+   33 lines vs 61 — the installed copy had the claim gate, the project-handover note and the build
+   rules; the repo copy had none of them, and the installed copy is what actually ran). The same
+   bug then recurred one layer down and stranded a manager zee in its cage, with a hand-synced
+   duplicate of the cxell CLI baked into the agent image.
+   **The fix, now enforced:** there is exactly ONE copy of `scripts/zee`, the image COPYs it, the
+   queenzee installs it at spawn — and `test/cxell-cli-drift.test.mjs` fails if a duplicate is
+   reintroduced or if the CLI, the routes, the briefing and the manual drift apart. Apply the same
+   rule to anything else an agent reads: one source, asserted by a test. A comment saying "update
+   both" is not a mechanism.
 
 ## How to talk to it as an agent
+
+⚠ **This section is the HOST surface only.** A caged zee has none of it — no slash-commands, no
+MCP, no `scripts/`. Its entire toolset is the `zee` CLI; see `CLAUDE.md` §2 and the manual delivered
+into every xell at `.zeehive/harness/memory/cxell-zee-manual.md`.
 
 - `/xell <task>` — claims a ready xell **only if your cwd IS its worktree**; otherwise it refuses
   and offers a confirmed dispatch (`scripts/xell-dispatch.mjs`, `--mode 1..5`, default 5=bypass;
   `--attended`; `--db`/`--dump`/`--db-container`).
 - `/xell-done` — marks this xell done and tears it down.
 - MCP (`mcp/server.js`): `zeehive_get_context`, `zeehive_status`, `zeehive_report_done`,
-  `zeehive_prod_lock_{acquire,release,status}`.
+  `zeehive_build{,_status,_contexts}`, `zeehive_set_build_context`, `zeehive_ooney`,
+  `zeehive_ship_{request,status}`, `zeehive_seed_request`, `zeehive_prod_lock_status` (read-only).
+  ~~`zeehive_prod_lock_{acquire,release}`~~ are **gone** — the zee-driven lock path was retired with
+  the ship gate (see "Shipping"), and this line contradicted that section for a while. Read the
+  tool list from `mcp/server.js`, not from here.
 
-The web app is **read-only** (no prompting there); the **▚_ terminal** button by "Status" opens a
-live queenzee activity log.
+The web app is **read-only** about the FLEET (no prompting there); the **▚_ terminal** button by
+"Status" opens a live queenzee activity log. ⚠ That stance was never about the zee TERMINAL —
+"when i said readonly i didnt mean the terminal was readonly". You can converse with any cxell zee
+from its terminal, mid-turn included: see the TALK QUEUE below.
+
+**Attending a cxell zee** (`⌨` on its card) opens the live terminal: while the headless turn runs
+you get its transcript feed (`docker/zeehive/zee-live.mjs` — ✱ thinking, ● what it says, ⚒ tool
+calls + ↳ results), then `claude --resume` takes the pane for the full interactive session. The
+header's **✱ thinking / ⚒ moves** chips show/hide the two noisy halves of that feed: they write
+`/tmp/zee-live-view.json` into the cxell over a SECOND ssh channel (never keystrokes — the pane
+belongs to `claude` after the turn), and the renderer watches the file and REPAINTS, so hiding
+also removes what already scrolled past. The queenzee installs its own zee-live.mjs into every
+cxell at spawn, exactly as it does `scripts/zee`, or a stale image would leave the chips dead.
+Tests: `test/zee-live-view.test.mjs`, `test/terminal-feed-filter.test.mjs`.
+
+**The TALK QUEUE — conversing with a zee that is MID-TURN** (2026-07-29). That feed is read-only in
+BOTH directions: it renders the transcript and reads nothing from the terminal. So while a zee
+worked, every keystroke aimed at it vanished — a human's in the browser, and the queenzee's
+`send-keys` behind the 📨 message button, the 💬 nudge and a manager's `zee say` — while the console
+reported "typed into its live session". Worst for a **manager zee**, whose whole job is conversation,
+in the one place a human goes to talk to it.
+
+- **The queenzee decides, from the cage's real state.** `cxellTalkCommand` (`lib/cxell.js`, pure)
+  attaches-or-creates the pane session, then TYPES when the interactive session owns it and QUEUES a
+  file in `/tmp/zee-talk` when a headless turn (or its feed) does. `sendKeysToCxellZee` resolves
+  `{ sent, delivery: 'typed' | 'queued' }` and every caller passes that word on — "delivered" and
+  "will be delivered" are different promises.
+- **The cage drains it.** `zee-attach.sh` starts `drain_talk` AFTER the feed hands over and before
+  the vendor's resume takes the pane: oldest first, newlines collapsed (Enter SUBMITS in the TUI),
+  each file removed BEFORE it is typed (a crash loses a message rather than repeating it), and the
+  drainer is STOPPED before the pane falls back to a login shell — a queued message typed at a bash
+  prompt is a COMMAND, not a message.
+- **One pattern, two places.** `HEADLESS_PROC_PATTERN` (`lib/cxell-runtimes.js`) IS `live_run()` in
+  `zee-attach.sh`; they disagreeing means a message queued that nothing drains. Its brackets are
+  load-bearing: `pgrep -f` reads whole cmdlines and the pattern rides inside the command the
+  queenzee execs, so unbracketed it matched its OWN wrapper and made every cxell look mid-turn
+  forever (caught live). Same trick, same reason, as `zee-live[.]mjs`.
+- **zee-attach.sh now joins the CLI/renderer refresh** (spawn + the boot sweep), or the drainer would
+  exist only in cages built after the next image rebuild while the queue filled in every cxell alive.
+- **The terminal grew 💬 talk** — the same composer 📨 opens (one delivery path, one set of rules for
+  long text and images), highlighted while a feed owns the pane, printing a receipt into the pane
+  that says *typed* or *queued*. The feed banner now says the pane is read-only and where the door is.
+- Tests: `test/cxell-talk.test.mjs` (runs the REAL `drain_talk` against a REAL tmux pane, and the real
+  `sendKeysToCxellZee` against a throwaway sshd) and `test/terminal-talk-button.test.mjs`.

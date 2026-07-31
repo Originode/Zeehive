@@ -1,0 +1,396 @@
+import React, { useEffect, useState, useCallback } from 'react';
+import { getHarnesses, getHarnessFull, createHarness, updateHarness, deleteHarness } from './api.js';
+import { emptyWarning } from './harnessHealth.js';
+
+// Author harnesses — the personas an AI assumes as a zee. A harness = personality + skills + memory,
+// layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
+// law harness is not shown here (it is not editable). This is a DB-owned surface: create/edit/delete
+// applies live, no land/ship.
+//
+// Since migration 080 this is THE authoring surface — the meta-DB owns every harness's text and there
+// is no file to edit instead — so it has to be usable for the real thing: a manual is 15k characters,
+// not a sentence. Hence full-height monospace editors with character counts, and INHERITED text that
+// can actually be read here (it was a char count, while the docs told people to "read it in the
+// harness manager"). What a wearer is briefed with is shown as one total, because that is what the
+// harness costs on every dispatch.
+const blank = () => ({ label: '', glyph: '', summary: '', personality: '', avatar_svg: '', parent: null, zee_type: 'worker', scope: 'global', project_id: null, project_name: null, skills: [], memory: [], enabled: true, inherited: { skills: [], memory: [], chain: [] } });
+
+const chars = (t) => `${String(t || '').length.toLocaleString()} chars`;
+const fileSafe = (s) => String(s || 'note').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'note';
+const skillFile = (name) => fileSafe(name || 'skill');
+const memFile = (path) => `${fileSafe(String(path || 'memory').split('/').pop()).replace(/\.md$/, '')}.md`;
+
+// Everything a wearer is briefed with: this harness's own text plus the whole inherited chain. The
+// number is the point — a harness is tokens spent before the zee has read any code.
+export function briefingChars(form) {
+  if (!form) return 0;
+  const len = (t) => String(t || '').length;
+  const sum = (arr, pick) => (arr || []).reduce((n, x) => n + len(pick(x)), 0);
+  return len(form.personality)
+    + sum(form.skills, (s) => `${s.name}${s.when}${s.body}`)
+    + sum(form.memory, (m) => m.text)
+    + sum(form.inherited?.skills, (s) => `${s.name}${s.when}${s.body}`)
+    + sum(form.inherited?.memory, (m) => m.text);
+}
+
+// An inherited skill/memory entry: the line you could always see, plus the TEXT you could not. Closed
+// by default (the chain is long), read-only when open — the source is the parent harness.
+export function InheritedEntry({ icon, name, note, text }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="hm-inh">
+      <button type="button" className="hm-inh-head" onClick={() => setOpen(!open)}
+              aria-expanded={open} title={open ? 'collapse' : 'read it'}>
+        <span className="hm-inh-caret">{open ? '▾' : '▸'}</span> {icon} <b>{name}</b>
+        {note ? <span className="disp-hint"> — {note}</span> : null}
+        <span className="disp-hint"> ({chars(text)})</span>
+      </button>
+      {open && <textarea className="disp-input hm-ta hm-mono" rows={20} value={text || ''} readOnly spellCheck={false} />}
+    </div>
+  );
+}
+
+// The badge editor: paste or load an SVG, see it rendered, clear it. Kept deliberately plain — an SVG
+// preview is the only honest check that what you pasted is the art you meant.
+export function AvatarField({ svg, onChange }) {
+  const [err, setErr] = useState(null);
+  const looksSvg = /^<svg[\s>]/i.test(String(svg || '').trim());
+  const take = (text) => {
+    const t = String(text || '').trim();
+    if (t && !/^<svg[\s>]/i.test(t)) { setErr('that is not an SVG document (it must start with <svg …>)'); return; }
+    setErr(null); onChange(t);
+  };
+  return (
+    <div className="disp-field" data-testid="harness-avatar-field">
+      <label className="disp-label">
+        Badge art <span className="disp-hint">SVG, stored in the meta-DB — no repo needed{svg ? `, ${chars(svg)}` : ''}</span>
+      </label>
+      <div className="hm-avatar-row">
+        <div className="hm-avatar-prev" aria-label="badge preview">
+          {looksSvg
+            ? <img alt="" src={`data:image/svg+xml;utf8,${encodeURIComponent(svg)}`} width={48} height={48} />
+            : <span className="disp-hint">none</span>}
+        </div>
+        <div className="hm-avatar-acts">
+          <input type="file" accept=".svg,image/svg+xml" onChange={async (e) => {
+            const f = e.target.files?.[0];
+            if (f) take(await f.text());
+            e.target.value = '';
+          }} />
+          {svg ? <button type="button" className="hm-del" onClick={() => take('')} title="Remove the badge art">🗑 clear</button> : null}
+        </div>
+      </div>
+      <textarea className="disp-input hm-ta hm-mono" rows={4} value={svg} spellCheck={false}
+                placeholder="<svg xmlns=…>  — paste the badge here, or load a file above"
+                onChange={(e) => onChange(e.target.value)} onBlur={(e) => take(e.target.value)} />
+      {err && <div className="disp-hint hm-avatar-err">{err}</div>}
+    </div>
+  );
+}
+
+// order the flat harness list into a parent→child tree (depth for indentation)
+function treeRows(list) {
+  const byParent = {};
+  for (const h of list) (byParent[h.parent || ''] = byParent[h.parent || ''] || []).push(h);
+  const rows = [];
+  const walk = (pk, depth) => { for (const h of (byParent[pk] || [])) { rows.push({ h, depth }); walk(h.key, depth + 1); } };
+  walk('', 0);
+  // any orphan whose parent isn't in the list (disabled/removed) still shows at root
+  const seen = new Set(rows.map((r) => r.h.key));
+  for (const h of list) if (!seen.has(h.key)) rows.push({ h, depth: 0 });
+  return rows;
+}
+
+// Which harnesses may be this one's PARENT. Two rules, both of them also enforced in the DB, and both
+// about text being MERGED into a briefing:
+//   • same zee TYPE (054) — a manager parented on Zee Base would be taught `zee land`, the one verb it
+//     is refused;
+//   • same SCOPE or global (084) — a parent in another project would pour that project's persona,
+//     skills and memory into this harness's wearers.
+// Exported and pure for the same reason HarnessRow is: a picker that offers a choice the save would
+// refuse is a bug, and it should be provable in a test rather than grepped for in this file.
+export function parentOptions(list, { key = null, zee_type = 'worker', project_id = null } = {}) {
+  return (list || []).filter((h) => h.key !== key
+    && (h.zee_type || 'worker') === (zee_type || 'worker')
+    && (!h.project_id || h.project_id === project_id));
+}
+
+// One row of the harness list. Exported (and prop-driven) so the "does it SAY it carries nothing"
+// contract can be rendered and read in a test, instead of grepped for in this file's source.
+export function HarnessRow({ h, depth = 0, on = false, onOpen }) {
+  const warn = emptyWarning(h);
+  return (
+    <button className={`hm-item ${on ? 'on' : ''} ${warn ? 'hm-hollow' : ''}`}
+            data-testid={`harness-item-${h.key}`} onClick={onOpen}
+            style={{ marginLeft: depth * 14 }}
+            title={warn ? warn.why : (depth ? `inherits ${h.parent}` : '')}>
+      {depth > 0 && <span className="hm-branch">↳</span>}
+      <span className="hm-glyph">{h.glyph || (h.label || '?')[0]}</span>
+      <span className="hm-name">{h.label}</span>
+      {/* SCOPE (084). This list is the UNFILTERED one — every harness in the fleet — so a row that
+          belongs to ONE project must say so: editing what looks like a shared persona and finding it
+          reaches one project (or the reverse) is the mistake this chip exists to prevent. */}
+      {h.scope === 'project' && (
+        <span className="hm-scope" data-testid={`harness-scope-${h.key}`}
+              title={`Project-scoped: visible only to ${h.project_name || 'its project'}. Created by that project's manager zee (or a human), and deleted with the project.`}>
+          ⌂ {h.project_name || 'project'}
+        </span>
+      )}
+      {warn
+        ? <span className="hm-warn" data-testid={`harness-empty-${h.key}`}>{warn.chip}</span>
+        : <span className="hm-meta">
+            {h.zee_type === 'manager' ? '⬢ mgr · ' : ''}{h.skill_count}★
+          </span>}
+    </button>
+  );
+}
+
+// The loud version, where an operator is looking straight at the persona: a harness that carries
+// nothing is a broken assignment, not a style choice. Renders nothing when the harness is healthy.
+export function HarnessEmptyBanner({ h }) {
+  const warn = emptyWarning(h);
+  if (!warn) return null;
+  return (
+    <div className="hm-empty" data-testid="harness-empty-banner">
+      <b>⚠ this harness carries nothing</b>
+      <span>{warn.why}</span>
+      <span>
+        Its text lives in the meta-DB, so fill it in right here — personality, skills and memory are
+        saved to the harness row and injected into every xell that wears it.
+      </span>
+    </div>
+  );
+}
+
+export default function HarnessManager({ onClose }) {
+  const [list, setList] = useState([]);
+  const [sel, setSel] = useState(null);       // selected key, or '' for a new (unsaved) harness
+  const [form, setForm] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const refresh = useCallback(() => getHarnesses().then((hs) => setList(hs.filter((h) => !h.is_law_core))).catch((e) => setErr(e.message)), []);
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const open = (key) => {
+    setSaved(false); setErr(null);
+    getHarnessFull(key).then((h) => { setSel(key); setForm({ ...blank(), ...h }); }).catch((e) => setErr(e.message));
+  };
+  const startNew = () => { setSel(''); setForm(blank()); setSaved(false); setErr(null); };
+
+  const set = (k, v) => { setForm((f) => ({ ...f, [k]: v })); setSaved(false); };
+  const setSkill = (i, k, v) => set('skills', form.skills.map((s, j) => (j === i ? { ...s, [k]: v } : s)));
+  const addSkill = () => set('skills', [...form.skills, { name: '', when: '', body: '' }]);
+  const rmSkill = (i) => set('skills', form.skills.filter((_, j) => j !== i));
+  const setMem = (i, k, v) => set('memory', form.memory.map((m, j) => (j === i ? { ...m, [k]: v } : m)));
+  const addMem = () => set('memory', [...form.memory, { path: '', text: '' }]);
+  const rmMem = (i) => set('memory', form.memory.filter((_, j) => j !== i));
+
+  const save = async () => {
+    setBusy(true); setErr(null);
+    try {
+      if (sel === '') {
+        if (!form.label.trim()) throw new Error('give the harness a name');
+        // The TYPE rides the create, not just the follow-up update: a manager persona that is born a
+        // worker and retyped a moment later would be refused the instant anything already wore it.
+        const created = await createHarness({ label: form.label, glyph: form.glyph, zee_type: form.zee_type || 'worker' });
+        await updateHarness(created.key, form);
+        await refresh(); open(created.key);
+      } else {
+        const h = await updateHarness(sel, form);
+        setForm({ ...blank(), ...h }); await refresh();
+      }
+      setSaved(true);
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+  const remove = async () => {
+    if (sel === '' || !sel) { setSel(null); setForm(null); return; }
+    setBusy(true); setErr(null);
+    try { await deleteHarness(sel); setSel(null); setForm(null); await refresh(); }
+    catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="disp-overlay" onClick={onClose}>
+      <div className="disp hm" role="dialog" aria-label="Harnesses" onClick={(e) => e.stopPropagation()}>
+        <div className="disp-head">
+          <span className="disp-title">⚙ Harnesses — personas a zee can wear</span>
+          <button className="disp-x" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+        <div className="hm-body">
+          <aside className="hm-list">
+            {treeRows(list).map(({ h, depth }) => (
+              <HarnessRow key={h.key} h={h} depth={depth} on={sel === h.key} onOpen={() => open(h.key)} />
+            ))}
+            <button className="hm-new" onClick={startNew}>＋ New harness</button>
+          </aside>
+
+          <section className="hm-edit">
+            {!form && <div className="disp-note">Select a harness, or create one. A harness is a persona — personality, skills, and memory — that a zee wears when it works a xell. It layers below the law (the manual &amp; your binding rules), never over it.</div>}
+            {form && <HarnessEmptyBanner h={form} />}
+            {form && (
+              <>
+                <div className="hm-row2">
+                  <div className="disp-field" style={{ flex: 3 }}>
+                    <label className="disp-label">Name</label>
+                    <input className="disp-input" value={form.label} onChange={(e) => set('label', e.target.value)} placeholder="e.g. Scribe" />
+                  </div>
+                  <div className="disp-field" style={{ flex: 1 }}>
+                    <label className="disp-label">Badge glyph</label>
+                    <input className="disp-input" value={form.glyph || ''} onChange={(e) => set('glyph', e.target.value)} placeholder="✒️" maxLength={4} />
+                  </div>
+                </div>
+
+                {/* The BADGE ART, stored in the meta-DB like everything else (082). It used to be a
+                    file in the Zeehive repo, which meant the badge vanished on any queenzee that could
+                    not read that repo — so it is editable here, and it travels with the harness. */}
+                <AvatarField svg={form.avatar_svg || ''} onChange={(v) => set('avatar_svg', v)} />
+
+                {/* WHICH ZEE TYPE this persona is for. A harness carries the MANUAL for a type's
+                    verbs and refusals, so a xell may only wear one of its own type — a manager
+                    persona describes dispatch/say/suggest-done and says landing is refused, which is
+                    nonsense (and a trap) for a worker. Retyping is refused while a zee of the other
+                    type is wearing it; the server says which ones. */}
+                <div className="disp-field">
+                  <label className="disp-label">For zee type</label>
+                  <div className="disp-models" role="group" aria-label="Zee type">
+                    {['worker', 'manager'].map((t) => (
+                      <button key={t} className={`disp-seg ${(form.zee_type || 'worker') === t ? 'on' : ''}`}
+                              data-testid={`harness-type-${t}`}
+                              title={t === 'manager'
+                                ? 'A MANAGER zee: dispatches and monitors a crew, holds production read-only, cannot push to the xource.'
+                                : 'A WORKER zee: does the job in its own xell and lands its own work.'}
+                              onClick={() => { set('zee_type', t); if (form.parent) set('parent', null); }}>
+                        {t === 'manager' ? '⬢ manager' : 'worker'}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="disp-hint">
+                    Only a xell of this type can wear this harness. A worker picker will not offer a
+                    manager persona, and assigning one is refused.
+                  </div>
+                </div>
+
+                {/* WHICH SCOPE this persona is in (084). Stated, not editable: a system-wide harness
+                    is the fleet's shared vocabulary, and a project-scoped one is created by that
+                    project's manager (`zee harness --new`) or by migration. Moving one across is
+                    refused while any xell wears it, so it is not a dropdown here. */}
+                {sel !== '' && (
+                  <div className="disp-field" data-testid="harness-scope-field">
+                    <label className="disp-label">Scope</label>
+                    <div className="disp-hint">
+                      {form.scope === 'project'
+                        ? <><b>⌂ {form.project_name}</b> — visible to that project only, offered in no
+                            other project's picker, and deleted with the project.</>
+                        : <><b>System-wide</b> — every project sees this persona and any project's xell
+                            may wear it.</>}
+                    </div>
+                  </div>
+                )}
+
+                <div className="disp-field">
+                  <label className="disp-label">Inherits (parent harness)</label>
+                  <select className="disp-input" value={form.parent || ''} onChange={(e) => set('parent', e.target.value || null)}>
+                    <option value="">— none (root) —</option>
+                    {/* parentOptions() above holds the two rules (same type, same scope or global)
+                        and says why each one exists. */}
+                    {parentOptions(list, { key: sel, zee_type: form.zee_type, project_id: form.project_id }).map((h) => (
+                      <option key={h.key} value={h.key}>{h.label}{h.scope === 'project' ? ' ⌂' : ''}</option>
+                    ))}
+                  </select>
+                  <div className="disp-hint">This harness merges its parent's persona, skills &amp; memory (root → this), then the law applies on top.</div>
+                </div>
+
+                <div className="disp-field">
+                  <label className="disp-label">Summary</label>
+                  <input className="disp-input" value={form.summary || ''} onChange={(e) => set('summary', e.target.value)} placeholder="one line — shown on the badge/picker" />
+                </div>
+
+                <div className="disp-field">
+                  <label className="disp-label">
+                    Personality / voice <span className="disp-hint">{chars(form.personality)}</span>
+                  </label>
+                  <textarea className="disp-input hm-ta hm-mono" rows={12} value={form.personality || ''} onChange={(e) => set('personality', e.target.value)}
+                            spellCheck={false} placeholder="How this persona thinks and writes…" />
+                </div>
+
+                <div className="disp-field">
+                  <label className="disp-label">Skills ({form.skills.length})</label>
+                  {form.skills.map((s, i) => (
+                    <div key={i} className="hm-sub">
+                      <div className="hm-row2">
+                        <input className="disp-input" value={s.name} onChange={(e) => setSkill(i, 'name', e.target.value)} placeholder="skill name" />
+                        <button className="hm-del" onClick={() => rmSkill(i)} title="Remove skill">🗑</button>
+                      </div>
+                      <input className="disp-input" value={s.when} onChange={(e) => setSkill(i, 'when', e.target.value)} placeholder="when to use it" />
+                      <textarea className="disp-input hm-ta hm-mono" rows={10} value={s.body} onChange={(e) => setSkill(i, 'body', e.target.value)}
+                                spellCheck={false} placeholder="the instructions — a procedure the wearer follows" />
+                      <div className="disp-hint">{chars(s.body)} · lands in the xell as <code>.claude/skills/{skillFile(s.name)}/SKILL.md</code></div>
+                    </div>
+                  ))}
+                  <button className="hm-add" onClick={addSkill}>＋ Add skill</button>
+                </div>
+
+                <div className="disp-field">
+                  <label className="disp-label">Memory ({form.memory.length})</label>
+                  {form.memory.map((m, i) => (
+                    <div key={i} className="hm-sub">
+                      <div className="hm-row2">
+                        <input className="disp-input" value={m.path} onChange={(e) => setMem(i, 'path', e.target.value)} placeholder="note name" />
+                        <button className="hm-del" onClick={() => rmMem(i)} title="Remove memory">🗑</button>
+                      </div>
+                      <textarea className="disp-input hm-ta hm-mono" rows={18} value={m.text} onChange={(e) => setMem(i, 'text', e.target.value)}
+                                spellCheck={false} placeholder="a fact the persona always carries — a manual, a note, a checklist" />
+                      <div className="disp-hint">{chars(m.text)} · lands in the xell as <code>.zeehive/harness/memory/{memFile(m.path)}</code>, stamped as generated</div>
+                    </div>
+                  ))}
+                  <button className="hm-add" onClick={addMem}>＋ Add memory</button>
+                </div>
+
+                {form.inherited && (form.inherited.skills.length > 0 || form.inherited.memory.length > 0) && (
+                  <div className="disp-field">
+                    <label className="disp-label">Inherited — from {form.inherited.chain.join(' → ') || 'parent'}</label>
+                    {form.inherited.skills.map((s, i) => (
+                      <InheritedEntry key={`is${i}`} icon="★" name={s.name} note={s.when} text={s.body} />
+                    ))}
+                    {form.inherited.memory.map((m, i) => (
+                      <InheritedEntry key={`im${i}`} icon="🧠" name={m.path} text={m.text} />
+                    ))}
+                    <div className="disp-hint">Read-only — carried from the parent chain (the cxell manual comes down from Zee Base this way). Open one to read exactly what a wearer gets; to change it, edit the parent.</div>
+                  </div>
+                )}
+
+                <div className="disp-hint hm-total">
+                  A zee wearing this is briefed with <b>{briefingChars(form).toLocaleString()}</b> characters
+                  of persona, skills and memory (its own plus everything inherited) — paid on every
+                  dispatch, before it has read a line of the project.
+                </div>
+
+                <div className="disp-field">
+                  <label className="disp-label">Enabled</label>
+                  <div className="disp-sup">
+                    <button className={`disp-seg ${form.enabled ? 'on' : ''}`} onClick={() => set('enabled', true)}>on</button>
+                    <button className={`disp-seg ${!form.enabled ? 'on' : ''}`} onClick={() => set('enabled', false)}>off</button>
+                  </div>
+                </div>
+              </>
+            )}
+            {err && <div className="disp-err">{err}</div>}
+          </section>
+        </div>
+        <div className="disp-foot">
+          {form && sel !== '' && <button className="disp-cancel" onClick={remove} disabled={busy}>Delete</button>}
+          <span style={{ flex: 1 }} />
+          <button className="disp-cancel" onClick={onClose}>Close</button>
+          {form && <button className="disp-submit" onClick={save} disabled={busy}>{saved ? 'Saved ✓' : busy ? 'Saving…' : (sel === '' ? 'Create' : 'Save')}</button>}
+        </div>
+      </div>
+    </div>
+  );
+}

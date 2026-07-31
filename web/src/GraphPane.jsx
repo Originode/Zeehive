@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { computeGraph } from './hive/graph.js';
+import { crewLinks, relatedTo, focusIdOf, REL_DASH_ATTR } from './hive/crew.js';
 
 // The git graph as the centre divider — proper GitLens-style lanes (ported from GitRail), oriented
 // by aspect: a VERTICAL spine in landscape, a HORIZONTAL one in portrait. It is a fixed-step spine
@@ -8,11 +9,12 @@ import { computeGraph } from './hive/graph.js';
 // straight perpendicular line. The scroll offset is applied imperatively (group transform) on every
 // canvas frame so it stays glued without re-rendering. Dots carry data-commit for <Connectors>.
 //
-// Each landscape row reads like GitLens: <short hash> <commit subject>, the head PREPENDED before
-// the message. The pane is user-RESIZABLE (drag the panels-facing edge); its width persists per
-// orientation. Squeeze it narrow and it COMPRESSES — the subjects drop out and it shows only the
-// commit heads (short hashes), exactly as it does in portrait where a rotated spine has no room for
-// a message anyway.
+// Each row reads like GitLens: <short hash> <commit subject>, the head PREPENDED before the message.
+// The pane is user-RESIZABLE (drag the panels-facing edge); its width persists per orientation.
+// Squeeze it narrow and it COMPRESSES — the subjects drop out and it shows only the commit heads
+// (short hashes). Portrait starts compressed too (a rotated spine parks a short hash against the
+// dot), but expand the band PAST the width of those heads and the subjects fan back in along the
+// same 45° diagonal, trailing away from the honeycomb into the space the drag just freed.
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff',
   '#e5554e', '#3bc6c0', '#d98c5f', '#7bd0e0', '#c98cff', '#8cd98c'];
 
@@ -29,7 +31,22 @@ const median = (a) => {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
 
-export default function GraphPane({ timeline, orientation, honeySide, hexPosRef, prodIds = [], subscribeGeom,
+// ── a commit dot's ANCHOR RING: whose xell sits here, and how it relates to the focus ──
+// The ring around a dot says "a xell is anchored at this commit" (in that xell's trace colour). On top
+// of that it carries the hive's focus vocabulary, the same one the hexes and the wires use:
+//   the focus  → a SOLID bright ring (unchanged)
+//   related    → the same ring, DASHED (hive/crew.js REL_DASH) — a manager's live crew, marked here as
+//                "related to what you are looking at", never as the thing you are looking at
+//   otherwise  → the plain anchor ring, or none at all
+// Pure so it can be asserted as data; the component below only renders it.
+export function anchorRing({ ring = null, hovered = false, related = null }) {
+  if (hovered) return { show: true, stroke: 'var(--text)', width: 2.5, dash: null };
+  if (related) return { show: true, stroke: 'var(--text)', width: 2, dash: REL_DASH_ATTR };
+  return { show: !!ring, stroke: ring, width: 2, dash: null };
+}
+
+export default function GraphPane({ timeline, xells = [], orientation, honeySide, hexPosRef, prodIds = [],
+                                   expandedId = null, subscribeGeom,
                                    hoverRef, setHover, subscribeHover, onFlip, onReposition }) {
   const groupRef = useRef(null);
   const portrait = orientation === 'portrait';
@@ -60,10 +77,14 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
   const baseThickness = portrait ? minThickness : (labelRaw + MSG_W + PAD);
   const thickness = Math.max(minThickness, Math.min(maxThickness, userSize || baseThickness));
 
-  // text room left after the lanes → decides whether we can show subjects at all
+  // text room left after the lanes → decides whether we can show subjects at all. In portrait the
+  // label reads on a 45° diagonal, so a given band thickness affords √2× the horizontal text length
+  // a landscape row of the same size would — which is why expanding the band past the commit heads
+  // buys enough room to fan the subjects out beside them.
   const textPx = thickness - labelRaw - PAD;
-  const compressed = portrait || textPx < MSG_MIN_PX;   // heads-only when squeezed (or rotated)
-  const msgChars = Math.max(0, Math.floor(textPx / CHAR_W) - HASH_COLS);
+  const avail = portrait ? textPx * Math.SQRT2 : textPx;
+  const compressed = avail < MSG_MIN_PX;                 // heads-only until expanded past the heads
+  const msgChars = Math.max(0, Math.floor(avail / CHAR_W) - HASH_COLS);
 
   const persistSize = useCallback((v) => {
     setUserSize(v);
@@ -160,9 +181,33 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
     return `M${pt(fA, fC)} C${pt(fA + ROW * 0.5, fC)} ${pt(fA + ROW * 0.4, tC)} ${pt(fA + ROW, tC)} L${pt(tA, tC)}`;
   };
 
-  // which commit is highlighted: a hovered dot, or the commit a hovered hex/wire sits on
-  const hov = hoverRef ? hoverRef.current : { id: null, commit: null };
-  const hovCommit = hov.commit || (hov.id ? (timeline.xells || []).find((t) => t.id === hov.id)?.base_commit : null);
+  // which commit(s) are highlighted: a hovered dot, the commit a hovered hex/wire sits on, or — when a
+  // harness badge is hovered — the base commits of every xell that wears it (its through-traces all
+  // originate from those dots, so they light up together).
+  const hov = hoverRef ? hoverRef.current : { id: null, commit: null, harness: null };
+  const hovCommits = new Set();
+  if (hov.commit) hovCommits.add(hov.commit);
+  if (hov.id) { const b = (timeline.xells || []).find((t) => t.id === hov.id)?.base_commit; if (b) hovCommits.add(b); }
+  if (hov.harness) {
+    const h = (timeline.harnesses || []).find((hh) => hh.id === hov.harness);
+    // every xell that WEARS it — a manager wears one without taking a cell or a wire from it, and
+    // its commit dot belongs in the same highlight (see wearersOf in hive/HiveCanvas.jsx).
+    for (const id of h?.wearer_ids || h?.consumer_ids || []) {
+      const b = (timeline.xells || []).find((t) => t.id === id)?.base_commit;
+      if (b) hovCommits.add(b);
+    }
+  }
+
+  // THE CREW RELATION in this projection (#25): the commits a manager's LIVE crew is anchored at (or,
+  // focused on a worker, the commit its manager sits on). Same helpers as the honeycomb and the wire
+  // overlay — the relationship is read from the fleet list, never re-derived here. A commit the FOCUS
+  // itself sits on stays the focus: hovCommits wins, so a shared dot is never demoted to "related".
+  const related = relatedTo(xells, focusIdOf(hov, expandedId), crewLinks(xells));
+  const relCommits = new Set();
+  for (const id of related.keys()) {
+    const b = (timeline.xells || []).find((t) => t.id === id)?.base_commit;
+    if (b && !hovCommits.has(b)) relCommits.add(b);
+  }
 
   return (
     <div className="graph-pane" data-orient={orientation} style={paneStyle}>
@@ -178,23 +223,35 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
             const isMerge = c.parents.length > 1;
             const ring = anchors[c.hash]?.[0];
             const [lx, ly] = P(alongOf(row), labelRaw);
-            const hovered = hovCommit === c.hash;
+            const hovered = hovCommits.has(c.hash);
+            const rel = relCommits.has(c.hash) ? 'crew' : null;
+            const anchor = anchorRing({ ring, hovered, related: rel });
             const subj = c.subject || '';
             const shownSubj = subj.length > msgChars ? subj.slice(0, Math.max(0, msgChars - 1)) + '…' : subj;
             return (
-              <g key={c.hash}>
-                {(ring || hovered) && <circle cx={cx} cy={cy} r={DOT + 3} fill="none"
-                        stroke={hovered ? 'var(--text)' : ring} strokeWidth={hovered ? 2.5 : 2} />}
+              <g key={c.hash} data-rel={rel || undefined}>
+                {anchor.show && <circle cx={cx} cy={cy} r={DOT + 3} fill="none"
+                        stroke={anchor.stroke} strokeWidth={anchor.width}
+                        strokeDasharray={anchor.dash || undefined} />}
                 <circle cx={cx} cy={cy} r={hovered ? DOT + 1 : DOT} data-commit={c.hash} data-dot
                         fill={isMerge ? 'var(--bg)' : LANE[lane % LANE.length]}
                         stroke={LANE[lane % LANE.length]} strokeWidth={isMerge ? 2 : 0} />
                 {ring && <circle cx={cx} cy={cy} r={DOT + 6} fill="transparent" style={{ cursor: 'pointer' }}
                         onMouseEnter={() => emitHover({ id: null, commit: c.hash })}
                         onMouseLeave={() => emitHover({ id: null, commit: null })} />}
-                {/* head PREPENDED before the subject; heads-only when compressed / rotated */}
+                {/* head PREPENDED before the subject. Heads-only when compressed; in portrait that is
+                    a rotated short hash parked at the dot, and expanding the band past the heads fans
+                    the subject out along the same diagonal — down-and-out with the honeycomb up top,
+                    up-and-out with it below — so it trails into the freed space, never over the lanes. */}
                 {portrait
-                  ? <text className="ghash" x={lx} y={ly} textAnchor="middle"
-                          transform={`rotate(-45 ${lx} ${ly})`}>{c.short}</text>
+                  ? (compressed
+                      ? <text className="ghash" x={lx} y={ly} textAnchor="middle"
+                              transform={`rotate(-45 ${lx} ${ly})`}>{c.short}</text>
+                      : <text className={`gline${hovered ? ' hov' : ''}`} x={lx} y={ly} textAnchor="start"
+                              transform={`rotate(${honeyLow ? 45 : -45} ${lx} ${ly})`}>
+                          <tspan className="ghash">{c.short}</tspan>
+                          {shownSubj && <tspan className="gsubj" dx="7">{shownSubj}</tspan>}
+                        </text>)
                   : <text className={`gline${hovered ? ' hov' : ''}`} x={lx} y={ly + 3}
                           textAnchor={honeyLow ? 'start' : 'end'}>
                       <tspan className="ghash">{c.short}</tspan>
@@ -220,7 +277,7 @@ export default function GraphPane({ timeline, orientation, honeySide, hexPosRef,
       {/* drag the panels-facing edge to resize; squeeze it to collapse subjects to heads only */}
       <div className={`graph-resize${compressed && !portrait ? ' compressed' : ''}`} data-orient={orientation}
            onPointerDown={onResizeDown}
-           title="Drag to resize the graph — squeeze it to show only the commit heads"
+           title="Drag to resize the graph — squeeze it to the commit heads, or expand it past them to reveal the commit messages"
            style={portrait
              ? { position: 'absolute', left: 0, right: 0, height: 9, cursor: 'row-resize', [honeyLow ? 'bottom' : 'top']: 0 }
              : { position: 'absolute', top: 0, bottom: 0, width: 9, cursor: 'col-resize', [honeyLow ? 'right' : 'left']: 0 }} />

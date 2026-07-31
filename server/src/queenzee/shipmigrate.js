@@ -32,6 +32,8 @@ import { logline } from '../lib/logbus.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { resolveRealDbContainer } from '../lib/xell-db.js';
 import { cloneInstanceFor } from '../lib/db-instances.js';
+import { catchupDelta } from './catchup-delta.js';
+import { diffXellDbAgainstProd } from './proddiff.js';
 
 // Schema dir first in sort order (m < o) — DDL lands before the data that may depend on it.
 export const SCHEMA_DIR = 'server/sql/migrations';
@@ -55,7 +57,10 @@ export function listMigrationFiles(repoRoot, sha, dirs = MIG_DIRS) {
 
 // `db` = the prodDb() handle: {ctx, container, user, name} — identity comes from the PROJECT
 // row (db_name/db_user), never from a global.
-function psql(db, args, input = null, timeout = 120000) {
+// EXPORTED for the prod SEED gate (queenzee/seedgate.js), which runs approved seed files against
+// the same production database through the same one door: one psql implementation, one set of
+// timeout/ON_ERROR_STOP semantics, so a seed can never quietly get looser rules than a migration.
+export function psql(db, args, input = null, timeout = 120000) {
   return new Promise((resolve) => {
     const child = spawn('docker', ['--context', db.ctx, 'exec', '-i', db.container,
       'psql', '-U', db.user, '-d', db.name,
@@ -121,24 +126,135 @@ async function ledgerFiles(project, db, sha) {
 // `site` scopes to ONE prod site's database (spec §5.2 — the ledger is per-database, so per-site
 // parity falls out naturally). NULL = default/legacy behavior; NULL-site container rows belong
 // to the default site.
-async function prodDb(project, site = null) {
+// EXPORTED (as prodDbHandle) for the seed gate: resolving WHICH container is this project's
+// production database — versioned name and all — is subtle enough that a second copy of it is how
+// you end up seeding a dev clone. One resolver, one answer.
+export async function prodDb(project, site = null) {
   const c = await one(
-    `SELECT name, docker_ctx FROM container
+    `SELECT name, docker_ctx, tier, host_port, conn_ref FROM container
       WHERE project_id=$1 AND role='db' AND tier='prod'
         AND ($2::uuid IS NULL OR site_id = $2::uuid OR (site_id IS NULL AND $3)) LIMIT 1`,
     [project.id, site?.id || null, !!site?.is_default]);
   if (!c) return null;
   return {
-    ctx: c.docker_ctx, container: resolveRealDbContainer(c.docker_ctx, c.name),
+    ctx: c.docker_ctx, container: await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }),
+    tier: c.tier, host_port: c.host_port, conn_ref: c.conn_ref, logical: c.name,
     // db identity is a project fact (spec Appendix A); env vars are last-resort fallback
     user: project.db_user || config.prodDbUser || 'postgres',
     name: project.db_name || config.prodDbName || 'omnibiz',
   };
 }
 
+// The network host a conn_ref names — `postgresql://zeehive@meta-db:5432/zeehive` → `meta-db`.
+// Only a DNS-style host counts: an IP, `localhost`, or the literal `null` some legacy rows carry
+// is not an identity docker can confirm. Exported so the pure decision can be unit-tested.
+export function connRefAlias(connRef) {
+  try {
+    const h = new URL(connRef).hostname;
+    return /^[a-z][a-z0-9_.-]*$/i.test(h) && h !== 'null' && h !== 'localhost' ? h : null;
+  } catch { return null; }
+}
+
+// Which ADDRESS the registry recorded for this row, and how docker must confirm it — PURE.
+// A published host_port where the row has one; otherwise the network alias its conn_ref names,
+// where the database publishes NOTHING and is reachable only on a docker network. A row carrying
+// NEITHER is unaddressed and proves nothing.
+//   → { mode: 'port', port }  |  { mode: 'alias', alias }  |  { mode: 'none' }
+export function prodDbAddress(db) {
+  if (db.host_port != null) return { mode: 'port', port: Number(db.host_port) };
+  const alias = connRefAlias(db.conn_ref);
+  return alias ? { mode: 'alias', alias } : { mode: 'none' };
+}
+
+// The docker inspect --format template for an address mode. Alias needs the network membership;
+// a published port needs the port bindings.
+function inspectFormatFor(mode) {
+  return mode === 'alias' ? '{{json .NetworkSettings.Networks}}' : '{{json .NetworkSettings.Ports}}';
+}
+
+// PURE DECISION over (row-handle, docker-inspect-result) — the same shape pickDbContainer uses:
+// no I/O, exported for tests. `inspect` mirrors a spawnSync result: { status, stdout, stderr }
+// (pass null when we deliberately skipped the daemon because the pre-conditions already fail).
+//
+// resolveRealDbContainer maps the registry's logical prod name to a running container by durable
+// identity, but a migration is irreversible — so before we apply anything we INDEPENDENTLY
+// re-confirm the container we hold really is the registry's PRODUCTION database:
+//   • the row we selected is tier='prod' (never a dev / clone row), and
+//   • docker's OWN report says that container carries the ADDRESS the registry recorded for the
+//     row — the published host_port where the row has one (omnibiz prod: 10.2.0.16:5432), or the
+//     network alias its conn_ref names where the database publishes NOTHING and is reachable only
+//     on a docker network (Zeehive's own meta db answers to `meta-db` on zeehive_default, and its
+//     Ports map is {"5432/tcp": null} by design).
+// A row carrying NEITHER address is refused: an unaddressed row proves nothing. And recording a
+// port the container does not publish, to get past this guard, re-creates precisely the hazard it
+// exists to stop — a stranger binding that port later would read as "this is prod".
+// On 2026-07-23 a prod ship applied its migrations to a 7.7MB dev clone and reported success.
+export function decideProdDbTarget(db, inspect) {
+  if (db.tier !== 'prod') {
+    return { ok: false, error: `refusing to migrate ${db.container}: the selected registry row is `
+      + `tier='${db.tier}', not 'prod'` };
+  }
+
+  const addr = prodDbAddress(db);
+  if (addr.mode === 'none') {
+    return { ok: false, error: `refusing to migrate ${db.container}: the prod db row records neither `
+      + 'a host_port nor a network host in conn_ref, so its identity cannot be confirmed — record '
+      + 'one before shipping migrations' };
+  }
+
+  if (!inspect || inspect.status !== 0) {
+    const tail = (inspect?.stderr || inspect?.error?.message || '').trim().split('\n').pop();
+    return { ok: false, error: `refusing to migrate: cannot inspect ${db.container} on ${db.ctx} to `
+      + `confirm it is prod — ${(tail || '').slice(0, 160)}` };
+  }
+
+  let seen;
+  try { seen = JSON.parse(inspect.stdout || '{}') || {}; } catch { seen = {}; }
+
+  if (addr.mode === 'alias') {
+    const names = new Set();
+    for (const net of Object.values(seen)) {
+      for (const n of [...(net?.Aliases || []), ...(net?.DNSNames || [])]) names.add(n);
+    }
+    if (!names.has(addr.alias)) {
+      return { ok: false, error: `refusing to migrate ${db.container}: it does not answer to the prod `
+        + `db row's network name '${addr.alias}' (aliases: ${[...names].join(', ') || 'none'}). This is `
+        + 'NOT the registry\'s production database — aborting before any write.' };
+    }
+    return { ok: true };
+  }
+
+  const published = new Set();
+  for (const binds of Object.values(seen)) {
+    for (const b of (binds || [])) if (b?.HostPort) published.add(Number(b.HostPort));
+  }
+  if (!published.has(addr.port)) {
+    return { ok: false, error: `refusing to migrate ${db.container}: it does not publish the prod db `
+      + `row's host_port ${db.host_port} (published: ${[...published].join(', ') || 'none'}). This is `
+      + 'NOT the registry\'s production database — aborting before any write.' };
+  }
+  return { ok: true };
+}
+
+// ASSERT THE TARGET before any write. Thin I/O wrapper over decideProdDbTarget: pick the inspect
+// format the address mode needs, run docker (skipping the daemon call entirely when the row already
+// fails on tier or carries no address — those refusals need no daemon), and let the pure decider
+// judge. See decideProdDbTarget for the full rationale.
+export async function assertProdDbTarget(db) {
+  const addr = prodDbAddress(db);
+  const inspect = (db.tier === 'prod' && addr.mode !== 'none')
+    ? spawnSync('docker', ['--context', db.ctx, 'inspect', '--format',
+      inspectFormatFor(addr.mode), db.container],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true })
+    : null;
+  return decideProdDbTarget(db, inspect);
+}
+
 // What would this ship apply? Called at REQUEST time so the human approves with the list in view.
 export async function pendingMigrations(project, sha, site = null) {
-  const db = await prodDb(project, site);
+  let db;
+  try { db = await prodDb(project, site); }
+  catch (e) { return { ok: false, error: e.message, pending: [] }; }
   if (!db) return { ok: false, error: 'no prod db container', pending: [] };
   try {
     const done = await ledgerFiles(project, db, sha);
@@ -175,8 +291,13 @@ async function runPending(project, db, sha, pending) {
 // Apply everything pending at `sha` to PROD, recording each success. First failure stops the
 // run — and the ship.
 export async function applyMigrations(project, sha, site = null) {
-  const db = await prodDb(project, site);
+  let db;
+  try { db = await prodDb(project, site); }
+  catch (e) { logline('shipmigrate', `migration ABORTED: ${e.message}`); return { ok: false, error: e.message, applied: [] }; }
   if (!db) return { ok: false, error: 'no prod db container', applied: [] };
+  // Prove the target IS the registry's prod database before touching it. Refuse otherwise.
+  const guard = await assertProdDbTarget(db);
+  if (!guard.ok) { logline('shipmigrate', `migration ABORTED: ${guard.error}`); return { ok: false, error: guard.error, applied: [] }; }
   const { ok, error, pending } = await pendingMigrations(project, sha, site);
   if (!ok) return { ok: false, error, applied: [] };
   return runPending(project, db, sha, pending);
@@ -223,8 +344,10 @@ export async function applyMigrationsToXell(xellId) {
     user: project.db_user || config.prodDbUser || 'postgres',
     name: clone ? clone.name : (project.db_name || config.prodDbName || 'omnibiz'),
   };
-  const db = { ctx: c.docker_ctx, container: resolveRealDbContainer(c.docker_ctx, c.name),
-               user: dbid.user, name: dbid.name };
+  let realContainer;
+  try { realContainer = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  const db = { ctx: c.docker_ctx, container: realContainer, user: dbid.user, name: dbid.name };
 
   const head = xell.worktree_path ? gitOut(xell.worktree_path, ['rev-parse', 'HEAD']) : null;
   if (!head) return { ok: false, error: 'cannot read the worktree HEAD — is the worktree still bound?', applied: [] };
@@ -241,5 +364,283 @@ export async function applyMigrationsToXell(xellId) {
     return { ...r, pending, database: db.name };
   } catch (e) {
     return { ok: false, error: e.message, applied: [] };
+  }
+}
+
+// ── CATCH UP TO PROD — roll a xell's OWN db FORWARD to prod's current schema ──────────────────────
+//
+// The gap applyMigrationsToXell (above) cannot close: it baselines at the branch FORK POINT, i.e. it
+// assumes everything main carried at fork is already in the db. That is false for a STALE seed — a
+// db-isolated restored from a three-week-old prod dump is missing every migration prod shipped since,
+// and forward-apply baselines those away instead of running them. proddiff MEASURES that gap
+// (`missing` = "prod has it, this db does not"); this closes it, forward, without discarding the
+// zee's work — the same runPending loop the prod ship uses. See docs/schema-catchup-plan.md.
+//
+// The ledger IS prod's forward history: prod's zeehive_migrations lists exactly what prod ran, and
+// every one of those files is on main (prod builds from main). So "catch up" = apply, to my db, the
+// prod-ledger files my db does not yet reflect, in filename order, each in its own transaction,
+// ledgered. NEVER touches prod (reads it read-only, after assertProdDbTarget) — writes only my db.
+
+// My db's OWN ledger → Set<filename> (dir: markers excluded), or null if it has no ledger table.
+async function ownLedgerFiles(db) {
+  const r = await psql(db, ['-tA', '-c', `SELECT filename FROM ${LEDGER}`]);
+  if (r.ok) {
+    return new Set(r.out.split('\n').map((s) => s.trim())
+      .filter((f) => f && !f.startsWith('dir:')));
+  }
+  if (/does not exist/i.test(r.err)) return null;
+  throw new Error(`own ledger unreadable: ${r.err.trim().slice(0, 200)}`);
+}
+
+// PROD's ledger, READ-ONLY → the migrations prod actually RAN (baseline=false, no dir markers), as
+// [{ filename, sha, applied_at }]. An absent ledger means prod has shipped no migration → nothing to
+// catch up to.
+async function prodRunMigrations(prodHandle) {
+  const r = await psql(prodHandle, ['-tAF', '\x1f', '-c',
+    `SELECT filename, sha, applied_at FROM ${LEDGER} WHERE baseline = false ORDER BY filename`]);
+  if (!r.ok) {
+    if (/does not exist/i.test(r.err)) return [];
+    throw new Error(`prod ledger unreadable: ${r.err.trim().slice(0, 200)}`);
+  }
+  return r.out.split('\n').map((s) => s.trim()).filter(Boolean).map((line) => {
+    const [filename, sha, applied_at] = line.split('\x1f');
+    return { filename, sha: sha || null, applied_at };
+  }).filter((x) => x.filename && !x.filename.startsWith('dir:'));
+}
+
+// The taken_at of the snapshot a db-isolated xell was restored from — recorded as a db_refresh row by
+// provisionIsolatedDb. Only needed for the fallback (an isolated db whose dump did NOT carry the
+// ledger table); when the dump carried it, ownLedgerFiles is exact and this is never consulted.
+async function snapshotTakenAtFor(xellId) {
+  const r = await one(
+    `SELECT s.taken_at FROM db_refresh r JOIN db_snapshot s ON s.id = r.snapshot_id
+      WHERE r.xell_id=$1 AND r.snapshot_id IS NOT NULL
+      ORDER BY r.started_at DESC NULLS LAST LIMIT 1`, [xellId]);
+  return r?.taken_at || null;
+}
+
+export async function catchUpXellToProd(xellId) {
+  const xell = await one(`SELECT * FROM xell WHERE id=$1`, [xellId]);
+  if (!xell) return { ok: false, error: 'unknown xell', applied: [] };
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [xell.project_id]);
+
+  // Guards — mirror applyMigrationsToXell. Prod is already prod; the shared dev db is frozen.
+  if (xell.db_coupling === 'db-shared-prod') {
+    return { ok: false, applied: [], error: 'your database IS live production — it already carries the '
+      + 'prod schema; migrations reach prod only through an approved ship (`zee ship`), never a catch-up.' };
+  }
+  const clone = xell.db_coupling === 'db-clone' ? await cloneInstanceFor(xellId) : null;
+  if (xell.db_coupling === 'db-shared-dev' || (xell.db_coupling === 'db-clone' && !clone)) {
+    return { ok: false, applied: [], error: 'your database is the SHARED dev db — its schema is frozen, '
+      + 'so it is not caught up in place. Attach your own clone first '
+      + `(POST /api/xells/${xellId}/db {"coupling":"db-clone"}, or dispatch with --db clone), then catch up.` };
+  }
+
+  // Resolve MY OWN db handle (clone instance name, or the isolated container).
+  const c = await one(
+    `SELECT c.* FROM container c JOIN xell_uses_container uc ON uc.container_id=c.id
+      WHERE uc.xell_id=$1 AND c.role='db' LIMIT 1`, [xellId]);
+  if (!c) return { ok: false, error: 'this xell has no database container linked', applied: [] };
+  const dbid = {
+    user: project.db_user || config.prodDbUser || 'postgres',
+    name: clone ? clone.name : (project.db_name || config.prodDbName || 'omnibiz'),
+  };
+  let realMine;
+  try { realMine = await resolveRealDbContainer(c.docker_ctx, c.name, { row: c }); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  const myDb = { ctx: c.docker_ctx, container: realMine, user: dbid.user, name: dbid.name };
+
+  // Read PROD's ledger — but PROVE the handle really is prod first (we import files FROM it; the same
+  // guard that stopped a ship migrating a 7.7MB clone stops us reading the wrong "prod").
+  let prodHandle;
+  try { prodHandle = await prodDb(project); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  if (!prodHandle) return { ok: false, error: 'no prod db container to catch up to', applied: [] };
+  const guard = await assertProdDbTarget(prodHandle);
+  if (!guard.ok) return { ok: false, error: `refusing to read the prod ledger: ${guard.error}`, applied: [] };
+
+  let prodRun;
+  try { prodRun = await prodRunMigrations(prodHandle); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+  if (!prodRun.length) {
+    return { ok: true, applied: [], pending: [], database: myDb.name,
+      note: 'prod has run no ledgered migrations — there is nothing to catch up to.' };
+  }
+
+  // Baseline: what does MY db already reflect? Pick the delta accordingly (pure — catchup-delta.js).
+  let own;
+  try { own = await ownLedgerFiles(myDb); }
+  catch (e) { return { ok: false, error: e.message, applied: [] }; }
+
+  const main = project.main_branch || 'main';
+  const mainSha = gitOut(project.repo_root, ['rev-parse', main]) || main;
+  let d, baselineNote;
+
+  if (own) {
+    // The exact primary path: my db carries a ledger (isolated-from-full-dump has prod's, frozen at
+    // dump time; a re-catch-up has last run's). Set-diff against prod's current ledger.
+    d = catchupDelta(prodRun, { mode: 'ledger', done: own });
+    baselineNote = "my db's own migration ledger";
+  } else if (clone) {
+    // A clone with no ledger yet: baseline at the branch fork point (dev ≈ main at fork), then apply
+    // prod-ledger files after it. Create+baseline the ledger so runPending can ledger and future
+    // catch-ups are cheap. Best-effort: the clone came from dev, so residual drift is reported below.
+    const head = xell.worktree_path ? gitOut(xell.worktree_path, ['rev-parse', 'HEAD']) : null;
+    const base = (head && gitOut(project.repo_root, ['merge-base', main, head])) || head || mainSha;
+    const forkFiles = new Set(listMigrationFiles(project.repo_root, base) || []);
+    d = catchupDelta(prodRun, { mode: 'clone', baselineDone: forkFiles });
+    baselineNote = 'the branch fork point (clone had no ledger yet)';
+    try { await ledgerFiles(project, myDb, base); }
+    catch (e) { return { ok: false, error: `could not baseline the clone ledger: ${e.message}`, applied: [] }; }
+  } else {
+    // db-isolated whose dump did NOT carry the ledger (table-scoped, migration 042). Anchor on the
+    // source snapshot's taken_at; without it a safe forward delta cannot be computed — recommend a
+    // full re-restore rather than guess.
+    const takenAt = await snapshotTakenAtFor(xellId);
+    if (!takenAt) {
+      return { ok: false, applied: [], recommend_restore: true,
+        error: 'your isolated db carries no migration ledger (its dump was table-scoped or predates the '
+          + 'ledger) and no source snapshot is on record, so a safe forward delta cannot be computed. '
+          + 'Rebuild from the latest full prod snapshot: `zee db-catchup --restore`.' };
+    }
+    d = catchupDelta(prodRun, { mode: 'isolated', takenAt });
+    baselineNote = `the source snapshot's taken_at (${takenAt})`;
+    const create = await psql(myDb, ['-c',
+      `CREATE TABLE IF NOT EXISTS ${LEDGER} (filename text PRIMARY KEY, sha text,
+         applied_at timestamptz NOT NULL DEFAULT now(), baseline boolean NOT NULL DEFAULT false)`]);
+    if (!create.ok) return { ok: false, error: `could not create the isolated ledger: ${create.err.trim().slice(-200)}`, applied: [] };
+    const before = prodRun.filter((r) => new Date(r.applied_at).getTime() <= new Date(takenAt).getTime())
+      .map((r) => r.filename);
+    await insertBaseline(myDb, [...before, ...MIG_DIRS.map(dirMarker)], mainSha);
+  }
+
+  if (!d.delta.length) {
+    return { ok: true, applied: [], pending: [], database: myDb.name, baseline: baselineNote,
+      note: `nothing to catch up — your schema already reflects every migration prod has run (measured by ${baselineNote}).` };
+  }
+
+  // Apply the delta from the xource's main tip: every migration prod ran is a file on main, so main
+  // tip carries them all (runPending reads `${sha}:${file}`, one transaction each, stopping at the
+  // first failure and ledgering each success in MY db).
+  const pending = d.delta.map((x) => x.filename);
+  logline('shipmigrate', `${xell.slug}: catching ${myDb.name} up to prod — ${pending.length} migration(s) `
+    + `prod has run that it lacks (baseline: ${baselineNote})`);
+  const r = await runPending(project, myDb, mainSha, pending);
+
+  // Verify: re-measure drift against prod so the chip is truthful and residual `missing` surfaces.
+  let residual = null;
+  try { const diff = await diffXellDbAgainstProd(project.id, xellId); if (diff && diff.ok) residual = diff.total; }
+  catch { /* verification is best-effort — a caught-up db is still caught up if the diff can't run */ }
+
+  return {
+    ...r, pending, database: myDb.name, baseline: baselineNote, residual_missing: residual,
+    recommend_restore: !!(r.ok && residual != null && residual > 0 && xell.db_coupling === 'db-isolated'),
+  };
+}
+
+// ── BOOT-TIME migrations: the schema a ship applies when the new process STARTS ───────────────
+//
+// Ticket #12. Everything above is DEPLOY-TIME schema: files under server/sql/migrations|ops that
+// the queenzee applies to the production database before the containers build, decided at request
+// time so a human approves code and schema as one thing.
+//
+// But a project can also migrate ITSELF at boot — Zeehive does: `runMigrations()` in
+// server/src/index.js applies db/migrations/*.sql to its own meta-DB as the new server comes up,
+// because a self-ship IS the restart. Nothing here knew about that set, so `ship_request.migrations`
+// was `[]` for every Zeehive ship and the card told the approving human "no migrations" while the
+// deploy applied five to the live meta-DB — including one that repaired data loss and two that
+// rewrote the manual every zee reads. The gate was less informative than the human believed.
+//
+// The two sets are NOT interchangeable and are deliberately kept apart: deploy-time runs under the
+// queenzee's control, before anything swaps, and a failure stops the ship; boot-time runs inside the
+// new process after the swap, where a failure leaves a started server on a partly-migrated schema.
+// A card that merged them would misstate the risk of both.
+export const BOOT_LEDGER = 'schema_migrations';   // written by runMigrations(); filename is the PK
+export const BOOT_DIR_DEFAULT = 'db/migrations';
+
+// Read a file out of the repo at a sha (null when absent) — the manifest AS THE DEPLOY WILL SEE IT.
+function fileAt(repoRoot, sha, path) {
+  const r = spawnSync('git', ['-C', repoRoot, 'show', `${sha}:${path}`],
+    { encoding: 'utf8', timeout: 20000, windowsHide: true, env: cleanGitEnv() });
+  return r.status === 0 ? r.stdout : null;
+}
+
+// WHICH directory (if any) this project migrates itself from at boot, decided from the project's
+// SHAPE at the shipped sha — not from its name, so a fork or a rename keeps working.
+//   1. `db: { boot_migrations: <dir|false> }` in zeehive.yml — explicit, and any project can opt in
+//      or out. Read at the SHA, so the answer is the one the deploy will act on.
+//   2. otherwise: a repo that carries BOTH db/migrations/*.sql AND the boot runner that applies
+//      them (server/src/db/migrate.js, called from server/src/index.js) is self-migrating.
+// Returns null when the project has no boot-applied schema at all (every normal project).
+export function bootMigrationDir(project, sha) {
+  const yml = fileAt(project.repo_root, sha, 'zeehive.yml');
+  if (yml) {
+    const m = yml.match(/^\s*boot_migrations:\s*(.+?)\s*$/m);
+    if (m) {
+      const v = m[1].replace(/^["']|["']$/g, '');
+      if (/^(false|none|off|no)$/i.test(v)) return null;
+      if (v) return v;
+    }
+  }
+  const declared = project?.manifest?.db?.boot_migrations;
+  if (declared === false) return null;
+  if (typeof declared === 'string' && declared.trim()) return declared.trim();
+  const files = listMigrationFiles(project.repo_root, sha, [BOOT_DIR_DEFAULT]);
+  if (!files?.length) return null;
+  const runner = fileAt(project.repo_root, sha, 'server/src/db/migrate.js');
+  const boot = fileAt(project.repo_root, sha, 'server/src/index.js');
+  return runner && boot && /runMigrations\s*\(/.test(boot) ? BOOT_DIR_DEFAULT : null;
+}
+
+// Is the production database of this project OUR OWN database? For a self-hosting Zeehive it is:
+// the meta-DB the queenzee is connected to IS the prod db it ships. That matters because it can
+// then be read over the existing pool instead of `docker exec psql` — more direct, and it works
+// wherever the queenzee runs. Compared on host+port+database, never on string equality.
+export function isOwnDatabase(connRef, databaseUrl = config.databaseUrl) {
+  const parse = (s) => { try { return new URL(String(s).replace(/^postgres(ql)?:/, 'http:')); } catch { return null; } };
+  const a = parse(connRef), b = parse(databaseUrl);
+  if (!a || !b) return false;
+  const host = (u) => (['localhost', '127.0.0.1', '::1'].includes(u.hostname) ? 'localhost' : u.hostname);
+  return host(a) === host(b) && (a.port || '5432') === (b.port || '5432') && a.pathname === b.pathname;
+}
+
+// Which BOOT migrations a ship at `sha` will actually run, and against which ledger.
+// Shape: { applicable, dir, ok, pending: [...], applied: n, via, error }
+//   applicable:false → this project has no boot-applied schema (nothing to say on the card)
+//   ok:false         → we could not READ the ledger. The card must say "unknown", never "none":
+//                      an unreadable ledger silently rendering as zero is the whole bug.
+// Never throws: a ship request must not fail because a ledger was unreachable.
+export async function pendingBootMigrations(project, sha, site = null) {
+  const dir = bootMigrationDir(project, sha);
+  if (!dir) return { applicable: false, dir: null, ok: true, pending: [], applied: 0 };
+  const all = listMigrationFiles(project.repo_root, sha, [dir]) || [];
+  const base = { applicable: true, dir, pending: [], applied: 0 };
+  try {
+    const db = await prodDb(project, site);
+    if (!db) return { ...base, ok: false, error: 'no prod db container registered — cannot read the boot ledger', pending: all };
+    let applied = null;
+    if (isOwnDatabase(db.conn_ref)) {
+      // the self-hosting case: the prod database IS the meta-DB this queenzee is connected to
+      const rows = await q(`SELECT filename FROM ${BOOT_LEDGER}`).catch((e) => {
+        if (/does not exist/i.test(e.message)) return [];      // fresh database: everything is pending
+        throw e;
+      });
+      applied = new Set(rows.map((r) => r.filename));
+      return { ...base, ok: true, via: 'own-pool', applied: applied.size,
+        pending: all.filter((f) => !applied.has(f.split('/').pop())) };
+    }
+    const r = await psql(db, ['-Atc', `SELECT filename FROM ${BOOT_LEDGER}`]);
+    if (!r.ok) {
+      if (/does not exist/i.test(r.err || '')) {
+        return { ...base, ok: true, via: 'psql', applied: 0, pending: all };
+      }
+      return { ...base, ok: false, via: 'psql', pending: all,
+        error: `could not read ${BOOT_LEDGER} on ${db.container}: ${(r.err || '').trim().split('\n').pop()?.slice(0, 200)}` };
+    }
+    applied = new Set(r.out.split('\n').map((s) => s.trim()).filter(Boolean));
+    return { ...base, ok: true, via: 'psql', applied: applied.size,
+      pending: all.filter((f) => !applied.has(f.split('/').pop())) };
+  } catch (e) {
+    return { ...base, ok: false, pending: all, error: String(e.message).slice(0, 200) };
   }
 }

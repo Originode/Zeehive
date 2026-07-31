@@ -13,9 +13,17 @@
 // cxell is unreachable.
 import { one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
-import { cxellName, nudgeCxellZee, sendKeysToCxellZee } from '../lib/cxell.js';
+import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from '../lib/cxell.js';
 import { adapterFor } from '../lib/cxell-runtimes.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
+import { setTend } from '../lib/status.js';
+import { fleetPaused, PAUSED_REASON, noteHeldNudge } from '../lib/fleet-pause.js';
+
+// Same switch every other real-side-effect module reads (landgate, xellgit, harness, reaper, the
+// .zeehive.env reconcile): 'real' touches machines, anything else models. A nudge is a
+// `docker exec cxell_<slug>` that RESUMES an agent's session, and the slug comes off a fleet row —
+// which, in a NESTED queenzee, is another zee's live cage. See nudgeCxell() for the guard itself.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 const CONTINUE_PROMPT =
   'Your landing was APPROVED and is now on main — the queenzee moved the ref, nothing is left for you '
@@ -25,6 +33,330 @@ const CONTINUE_PROMPT =
   + '  2. If more work remains, keep going and `zee land` again when the next chunk is ready.\n'
   + '  3. When you are satisfied the whole job is complete, run `zee done --summary "…"`.\n'
   + 'Do NOT try to re-run `zee land` for the work that just landed; it is done. Pick the next step and act.';
+
+// A STALE LANDING is the other end of the same loop, and it was the SILENT one. An approval is
+// bound to one exact sha; if main moves past that sha before it lands (another xell landed first,
+// a human pushed by hand), it can never fast-forward and the gate closes the row as 'stale'. That
+// was recorded honestly — in the log, in the row, on the pad — and told NOBODY. The zee's turn had
+// already ended at `zee land`, so it sat there believing a human was still deciding: no nudge, no
+// second request, work stranded on a branch nobody would ever be asked to approve again.
+//
+// So a stale landing nudges too, with the ONE recovery that actually works from inside a cxell:
+// `zee sync` (the queenzee merges current main into the branch — `git fetch`/`git rebase main`
+// cannot work in the cage) and then `zee land` again, which raises a FRESH request on the new sha.
+// Deliberately explicit that this is not a failure of the work and not something to route around:
+// the sha is dead, the commits are not.
+const STALE_PROMPT = (ref, sha, tip) => [
+  `Your landing did NOT land — it went STALE${sha ? ` (${String(sha).slice(0, 8)})` : ''}. While your push was waiting,`,
+  `${ref ? ref.replace('refs/heads/', '') : 'main'} moved on${tip ? ` (it is now at ${String(tip).slice(0, 8)})` : ''} — someone else landed first — so the sha a human`,
+  'approved can no longer fast-forward, and the gate binds an approval to ONE exact sha. Nothing is lost:',
+  'every commit is still on your branch and nothing was rewritten. The sha is dead, your work is not.',
+  '',
+  'Get back on top of main and ask again — two steps, in this order:',
+  '  1. `zee sync` — the queenzee delivers current main INTO your cxell and MERGES it into your branch.',
+  '     This is the ONLY way to catch up in here (`git fetch` / `git rebase main` cannot work — your cage',
+  '     has no main ref). If it reports a genuine CONFLICT the merge is left in progress for YOU: resolve',
+  '     the files, `git add` them, `git commit`. If the merge touched your change, re-verify it',
+  '     (`zee build <role> --wait`, in the BACKGROUND).',
+  '  2. `zee land` — pushes your NEW sha and raises a FRESH request for a human. A new decision on new',
+  '     content is expected, not a setback.',
+  '',
+  'Do NOT re-run the old push, do NOT amend/force to dodge the gate, and do NOT touch origin. If the sync',
+  'conflicts in a way you cannot honestly resolve, stop and raise it: `zee tend --reason "…"`.',
+].join('\n');
+
+// Tell the zee its landing died so it can sync and ask again. Called by the land gate the moment a
+// row is closed as 'stale' — from an approval that could no longer fast-forward, or from the sweep
+// that closes held requests main has already moved past. Best-effort and NEVER throws: closing a
+// dead row must not depend on a cxell being reachable.
+//
+// If there is no live cxell to nudge (the zee finished, or its container is gone) the landing would
+// go unheard entirely — so we raise a TEND instead: "needs a human in the console". A stale landing
+// with nobody listening is exactly the state that must not be silent.
+export async function nudgeXellForStaleLanding(xellId, { sha = null, ref = null, tip = null, requestId = null, by = 'queenzee', mode = PROVISION_MODE } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const r = await nudgeCxell(xellId, {
+    by, mode, prompt: STALE_PROMPT(ref, sha, tip), why: 'landing went stale',
+    log: (slug, sid) => `${slug}: landing ${short} went STALE — resuming cxell session ${sid} to `
+      + '`zee sync` and land again',
+    // Delivery is fire-and-forget, so "we started a resume" is all nudgeCxell can honestly return.
+    // For most nudges that is fine. Not this one: it is the zee's ONLY way to learn its landing
+    // died, so a delivery that never even starts (docker gone, cxell torn down between the SELECT
+    // and the exec) must degrade to a HUMAN rather than to silence — and the receipt must stop
+    // claiming the zee was told.
+    onFail: (e) => staleNudgeUndelivered(xellId, { short, requestId, why: e.message })
+      .catch(() => {}),
+  });
+  if (r?.nudged) return r;
+  // A dry-run nudge is not an UNDELIVERED one: nothing was attempted, because this queenzee is not
+  // allowed to reach the cage at all. Raising a tend here would summon a human to a xell that is not
+  // this instance's, over a landing it is only modelling.
+  // A PAUSED fleet is the same shape for the same reason: nothing was attempted, and the human who
+  // pressed pause is the last person who needs a "needs you" chip about it. The recovery is not lost
+  // — the play prompt sends every resumed zee to `zee status`, which is where a dead sha is reported.
+  if (r?.dry_run || r?.paused) return r;
+  const tended = await staleNudgeUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
+  return { ...r, ...tended };
+}
+
+// CLEARED FOR LANDING — the third message in this loop, and the one that makes a QUEUE possible.
+//
+// When a zee pushes while another xell's landing is still open on the ref, its push is not raised as
+// a second card: it enters the holding pattern (067). That is only humane if somebody calls it back.
+// A cxell zee's turn ends at `zee land`, so a holder that is never told the runway freed is a zee
+// that waits forever on a card that was never on a human's screen.
+//
+// So the tower resumes it, with the SAME two steps as the stale recovery — for the same reason: the
+// ref has usually just moved (the xell ahead landed), so its sha is behind main, and `zee sync` is
+// the only way to catch up inside a cage. Deliberately explicit that clearance is NOT approval:
+// nothing of this zee's has been read by a human yet, and the fresh push is what raises the card.
+const CLEARED_PROMPT = (ref, sha, reason) => [
+  `The runway is CLEAR — you are next to land on ${ref ? ref.replace('refs/heads/', '') : 'main'}.`,
+  `While you were holding, the landing ahead of you finished${reason ? ` (${reason})` : ''}, so nothing is in front of`,
+  'you any more. Your push was never dropped and never rejected: it waited in a holding pattern so that a',
+  'human only ever had ONE landing to decide on this ref, which is what stops two zees racing and one of',
+  'them going stale.',
+  '',
+  'Take the runway — two steps, in this order:',
+  `  1. \`zee sync\` — the xell ahead of you probably just landed, so ${ref ? ref.replace('refs/heads/', '') : 'main'} has moved and your sha is`,
+  '     behind it. `zee sync` delivers current main INTO your cxell and MERGES it into your branch (in a cage',
+  '     `git fetch` / `git rebase main` cannot work). If it reports a genuine CONFLICT the merge is left in',
+  '     progress for YOU: resolve the files, `git add` them, `git commit`. If the merge touched your change,',
+  '     re-verify it (`zee build <role> --wait`, in the BACKGROUND).',
+  '  2. `zee land` — pushes your sha and raises a FRESH request for a human. THIS is the card they read.',
+  '',
+  'Being cleared is NOT an approval: nobody has looked at your commits yet, and nothing lands until they do.',
+  'Do not amend/force to dodge the gate, and do not touch origin. If the sync conflicts in a way you cannot',
+  'honestly resolve, stop and raise it: `zee tend --reason "…"`.',
+].join('\n');
+
+// Call a holder onto the runway. Same contract as the stale nudge — best-effort, NEVER throws, and a
+// zee that cannot be reached becomes a TEND rather than silence, because a clearance nobody hears is
+// a zee stranded in a pattern with no card and no way to know.
+export async function nudgeXellForClearedRunway(xellId, { sha = null, ref = null, reason = null, requestId = null, by = 'queenzee', mode = PROVISION_MODE } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const r = await nudgeCxell(xellId, {
+    by, mode, prompt: CLEARED_PROMPT(ref, sha, reason), why: 'runway cleared',
+    log: (slug, sid) => `${slug}: CLEARED to land ${short} — resuming cxell session ${sid} to `
+      + '`zee sync` and land',
+    onFail: (e) => clearanceUndelivered(xellId, { short, requestId, why: e.message }).catch(() => {}),
+  });
+  if (r?.nudged) return r;
+  // A dry-run nudge is not an UNDELIVERED one: nothing was attempted, because this queenzee is not
+  // allowed to reach the cage at all. Raising a tend here would summon a human to a xell that is not
+  // this instance's, over a landing it is only modelling.
+  // …and a PAUSED fleet, for the same reason (see the stale-landing note above): nothing was
+  // attempted, so there is nothing to summon a human about.
+  if (r?.dry_run || r?.paused) return r;
+  const tended = await clearanceUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
+  return { ...r, ...tended };
+}
+
+// THE RE-CALL — a clearance that was DELIVERED and then died with the session (#11).
+//
+// The clearance above is fire-and-forget: `nudged: true` means the resume STARTED, not that the zee
+// lived long enough to act. If its session ends first the row truthfully says it was nudged, the row is
+// out of the pattern (clearRunway only walks `cleared_at IS NULL`), and nothing ever returns to it —
+// the zee waits forever for a clearance it already had.
+//
+// So it is called ONCE more, and this prompt is deliberately NOT the clearance prompt. By now the
+// runway has very likely been taken by the next holder (the tower moved on within a tick), so telling
+// this zee "the runway is CLEAR, you are next" would be a lie. What is true either way is the recovery:
+// sync, push, and take whatever the gate gives you — the runway or a fresh place in the pattern.
+const RECALL_PROMPT = (ref, sha, min) => [
+  `You were CLEARED to land${sha ? ` ${String(sha).slice(0, 8)}` : ''} on ${ref ? ref.replace('refs/heads/', '') : 'main'} and never came back.`,
+  `The tower resumed your session about ${min} minute(s) ago with the go-around and no push has arrived since,`,
+  'so this is a RE-CALL: the first one was most likely lost with a session that ended before it could act.',
+  'Nothing about your work is wrong and nothing was rejected — your commits are exactly where you left them.',
+  '',
+  'Take it now — two steps, in this order:',
+  `  1. \`zee sync\` — ${ref ? ref.replace('refs/heads/', '') : 'main'} has moved since you were queued. The queenzee delivers current main INTO`,
+  '     your cxell and MERGES it into your branch (in a cage `git fetch` / `git rebase main` cannot work). A',
+  '     genuine CONFLICT is left in progress for YOU: resolve the files, `git add`, `git commit`. If the merge',
+  '     touched your change, re-verify it (`zee build <role> --wait`, in the BACKGROUND).',
+  '  2. `zee land` — pushes your sha and raises a FRESH request for a human.',
+  '',
+  'The runway may have been taken while you were quiet. If your push goes back into the HOLDING PATTERN that is',
+  'normal and nothing is wrong: you are told your position and called again when it frees. Being cleared was',
+  'never an approval — nobody has read your commits yet, and nothing lands until a human decides this sha.',
+  'This is the LAST automatic call: if nothing arrives after it, a human is raised instead.',
+].join('\n');
+
+// Re-call a holder whose clearance went unheard. Same contract as every nudge here: best-effort, never
+// throws, and an undeliverable one degrades to a TEND rather than to silence — the case this whole
+// mechanism exists to end.
+export async function nudgeXellForLostClearance(xellId, { sha = null, ref = null, minutes = null, requestId = null, by = 'queenzee', mode = PROVISION_MODE } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const r = await nudgeCxell(xellId, {
+    by, mode, prompt: RECALL_PROMPT(ref, sha, minutes ?? '?'), why: 'clearance went unanswered',
+    log: (slug, sid) => `${slug}: RE-CALLED to land ${short} — the clearance went unanswered, resuming `
+      + `cxell session ${sid} to \`zee sync\` and land`,
+    onFail: (e) => clearanceUndelivered(xellId, { short, requestId, why: e.message }).catch(() => {}),
+  });
+  if (r?.nudged || r?.dry_run || r?.paused) return r;
+  const tended = await clearanceUndelivered(xellId, { short, requestId, why: r?.reason || r?.error || 'no live cxell' });
+  return { ...r, ...tended };
+}
+
+// …and the end of the automatic path: two clearances, no push. Hand it to a human with the whole story,
+// because the one thing this state does not need is another retry — the zee is not slow, it is gone or
+// it is ignoring the tower, and both are a human's call. Never tends a xell that is already gone.
+export async function tendForSilentClearance(xellId, { sha = null, ref = null, minutes = null, requestId = null } = {}) {
+  const short = sha ? String(sha).slice(0, 8) : 'a landing';
+  const branch = ref ? String(ref).replace('refs/heads/', '') : 'main';
+  const xell = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xellId]).catch(() => null);
+  if (!xell || xell.status === 'retired') return { tended: false };
+  const reason = `Cleared to land ${short} on ${branch} and never came back — re-called once, still silent `
+    + `after ~${minutes ?? '?'} minute(s). Its commits are unlanded and no card exists for them: check whether `
+    + 'the zee\'s session is alive, then have it `zee sync` and `zee land` (or mark it done).';
+  await setTend(xellId, true, { reason, source: 'queenzee' }).catch(() => {});
+  if (requestId) {
+    await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING id`,
+      [requestId, `runway clear, then silence: ${reason}`]).catch(() => {});
+  }
+  logline('nudge',
+    `${xell.slug}: cleared to land ${short} and never re-pushed (re-called once) — raised a tend for a human`);
+  return { tended: true, reason };
+}
+
+// The go-around: nobody was home when the runway freed. Raise "needs a human in the console" and
+// correct the receipt, exactly as a stale landing does — the queue then calls the NEXT holder, so
+// one unreachable zee never leaves the runway standing empty.
+async function clearanceUndelivered(xellId, { short, requestId = null, why = 'unknown' } = {}) {
+  const xell = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xellId]).catch(() => null);
+  if (!xell || xell.status === 'retired') return { tended: false };
+  const reason = `The runway is clear and this xell is next to land ${short}, but its zee could NOT be nudged `
+    + `(${why}) — so nothing has synced or re-pushed, and the landing is waiting on a human.`;
+  await setTend(xellId, true, { reason, source: 'queenzee' }).catch(() => {});
+  if (requestId) {
+    await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING id`,
+      [requestId, `runway clear: ${reason}`]).catch(() => {});
+  }
+  logline('nudge', `${xell.slug}: cleared to land ${short} but the zee could NOT be reached (${why}) — raised a tend for a human`);
+  return { tended: true, reason };
+}
+
+// Nobody heard it. Raise "needs a human in the console" and correct the request's receipt, which
+// until this ran said the zee had been nudged. Never throws; never tends a xell that is already
+// gone (there is no zee left to come back to it, and a tend on a corpse is just noise).
+async function staleNudgeUndelivered(xellId, { short, requestId = null, why = 'unknown' } = {}) {
+  const xell = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xellId]).catch(() => null);
+  if (!xell || xell.status === 'retired') return { tended: false };
+  const reason = `Landing ${short} went STALE — main moved past it, so it can never land. The zee could NOT be `
+    + `nudged (${why}), so nothing has synced and re-requested it.`;
+  await setTend(xellId, true, { reason, source: 'queenzee' }).catch(() => {});
+  if (requestId) {
+    await one(`UPDATE land_request SET note=$2 WHERE id=$1 RETURNING id`,
+      [requestId, `stale: ${reason}`]).catch(() => {});
+  }
+  logline('nudge', `${xell.slug}: landing ${short} went STALE and the zee could NOT be reached (${why}) — raised a tend for a human`);
+  return { tended: true, reason };
+}
+
+// THE REFLECTION STAGE — what a worker does AFTER its work is live in production.
+//
+// A ship used to be the end of a zee's story: the containers swapped, the card went quiet, and
+// everything the zee learned on the way — the workaround it had to leave in, the test it could not
+// write, the bug it saw in passing — died with the cxell. The one moment a worker knows the most
+// about a change is right after it ships, and nobody was asking.
+//
+// So the queenzee re-invokes the shipping zee with a REFLECTION prompt: review what actually shipped
+// and report improvements and errors to its MANAGER (`zee report --kind reflection`), which lands in
+// the manager's inbox and is delivered into its live session. A worker with no manager still writes
+// the reflection — it is recorded for the humans in the console instead of being lost.
+//
+// It is a prompt, not a gate: it opens nothing, blocks nothing, and a dead cxell simply logs.
+const REFLECT_PROMPT = (commit, managerSlug) => [
+  `Your work SHIPPED to production${commit ? ` (${String(commit).slice(0, 8)})` : ''}. Before you stop, do the REFLECTION pass —`,
+  'this is a required stage, and it is the most valuable thing you will write today, because right now',
+  'you know more about this change than anyone else ever will.',
+  '',
+  'Review what actually shipped (your diff, what you had to work around, what you could not verify), then',
+  'report — honestly, specifically, no reassurance:',
+  '  1. IMPROVEMENTS — what should be done better next time, in this code or in how the job was set up.',
+  '  2. ERRORS / RISKS — anything you know is wrong, fragile, or unverified in what just went live,',
+  '     including things outside your task that you noticed on the way. Say it even if it is your own',
+  '     mistake: an unreported flaw in production is far more expensive than an admitted one.',
+  '  3. FOLLOW-UPS — the concrete next tasks you would cut, in priority order.',
+  '',
+  managerSlug
+    ? `Send it with \`zee report --kind reflection --message "…"\` — it goes to your MANAGER (${managerSlug}),`
+      + ' who decides what becomes the next task. Keep it under ~25 lines and lead with anything broken.'
+    : 'Send it with `zee report --kind reflection --message "…"`. You have no manager zee, so it is recorded'
+      + ' for the humans in the console. Keep it under ~25 lines and lead with anything broken.',
+  '',
+  'If you find something genuinely broken in production, ALSO raise it now: `zee tend --reason "…"`.',
+  'Do not deploy, do not touch prod, and do not start fixing it in this xell without being asked —',
+  'reflect, report, and let a human or your manager decide what happens next.',
+].join('\n');
+
+// Ask the zee that just shipped to reflect. Called by the ship gate on a SUCCESSFUL ship only —
+// there is nothing to reflect on when nothing went live (a failed ship is a build problem the human
+// is already looking at). Best-effort, never throws: a ship must never fail because a cxell is gone.
+export async function nudgeXellForReflection(xellId, { commit = null, by = 'queenzee', mode = PROVISION_MODE } = {}) {
+  const mgr = await one(
+    `SELECT m.slug FROM xell x JOIN xell m ON m.id = x.manager_xell_id WHERE x.id=$1`, [xellId])
+    .catch(() => null);
+  return nudgeCxell(xellId, {
+    by, mode, prompt: REFLECT_PROMPT(commit, mgr?.slug || null), why: 'post-ship reflection',
+    log: (slug, sid) => `${slug}: shipped — resuming cxell session ${sid} for the REFLECTION pass`
+      + `${mgr?.slug ? ` (reports to ${mgr.slug})` : ''}`,
+  });
+}
+
+// PLAY — the other half of the pause button (queenzee/pause.js does the fan-out).
+//
+// A paused zee was SIGINT'd mid-turn: its tool call stopped in flight, its transcript ends in the
+// middle of a thought, and nothing in the session says why. Left to work it out, an agent's most
+// reasonable reading is that something FAILED — a build died, a request was rejected, it crashed —
+// and the recovery it would then attempt (re-running a land, re-asking a gate, chasing a phantom
+// error) is worse than the pause was. So the prompt says, in order: nothing of yours failed, here is
+// what could genuinely have changed while you were stopped, and `zee status` is how you find out
+// rather than by guessing.
+//
+// It deliberately does NOT re-issue the specific continuation the zee might have missed (a landing
+// approved, a runway cleared, a stale sha, a ship to reflect on). Those nudges were HELD while the
+// flag was up, and re-deriving each of them per xell here would be a second, divergent copy of four
+// different prompts. `zee status` is the one authoritative answer to all of them — it reports the
+// landing state, the ship state, the tend, the inbox — so the prompt points there and says what to do
+// with each outcome.
+const RESUMED_PROMPT = (min, why) => [
+  'RESUMED — a human pressed PLAY. The whole fleet was PAUSED'
+    + (min != null ? ` about ${min} minute(s) ago` : '')
+    + (why ? ` (reason given: ${why})` : '') + ', which interrupted every zee mid-turn, managers included.',
+  '',
+  'That interrupt was a SIGINT to your turn and NOTHING ELSE. Read that carefully before you react:',
+  'nothing of yours failed, nothing was rejected, no gate moved and no work was lost. Your commits are',
+  'exactly where you left them; a landing or ship you had already asked for is still asked for. If your',
+  'last turn stopped in the middle of a tool call, that is the pause and not a crash — do not go hunting',
+  'for the error.',
+  '',
+  'Pick up where you were, in this order:',
+  '  1. `zee status` — the authoritative answer to "what happened while I was stopped?". Decisions kept',
+  '     arriving while the fleet was still: your landing may have been APPROVED (then carry on: ship if',
+  '     this work ships, else keep going), gone STALE or been CLEARED for the runway (then `zee sync`,',
+  '     resolve any conflict, and `zee land` again). It also carries your tend, your ship state and your',
+  '     inbox — and a message somebody sent you during the pause was REFUSED rather than queued, so ask',
+  '     for it again if you were expecting one.',
+  '  2. `zee work` if you are on a work item — re-read it rather than trusting your memory of it.',
+  '  3. Re-verify ONLY what the interrupt actually cut: if a `zee build … --wait` was in flight, run it',
+  '     again (in the BACKGROUND). A test run that was killed mid-way proves nothing either way.',
+  '  4. Then continue the job.',
+  '',
+  'Do NOT re-raise a request you had already made (check `zee status` first — a second card from you is',
+  'noise a human has to disambiguate), and do NOT `zee tend` about having been paused: a human did it',
+  'deliberately and has just undone it.',
+].join('\n');
+
+// Call one zee back after a pause. Same contract as every nudge here — fire-and-forget, best-effort,
+// NEVER throws. `allowWhilePaused` because this IS the unpause: the fan-out clears the flag first, but
+// saying so at the call site is what stops a future refactor from making play un-pressable.
+export async function nudgeXellForFleetResume(xellId, { minutes = null, reason = null, by = 'human@console', mode = PROVISION_MODE } = {}) {
+  return nudgeCxell(xellId, {
+    by, mode, allowWhilePaused: true, prompt: RESUMED_PROMPT(minutes, reason), why: 'fleet resumed',
+    log: (slug, sid) => `${slug}: fleet RESUMED by ${by} — resuming cxell session ${sid} to continue`,
+  });
+}
 
 // An OPERATOR-initiated nudge: poke the running zee for a status update, WITHOUT changing anything.
 // The word the operator wants the agent to actually SEE, typed into the live session as-is.
@@ -41,9 +373,101 @@ export async function nudgeXellForStatus(xellId, { by = 'human' } = {}) {
 }
 
 // Re-invoke the cxell zee that owns this xell, if one is live. NEVER throws.
-export async function nudgeXellAfterLand(xellId, { by = 'human' } = {}) {
-  return nudgeCxell(xellId, { by, prompt: CONTINUE_PROMPT,
+export async function nudgeXellAfterLand(xellId, { by = 'human', mode = PROVISION_MODE } = {}) {
+  return nudgeCxell(xellId, { by, mode, prompt: CONTINUE_PROMPT,
     why: 'landing approved', log: (slug, sid) => `${slug}: landing approved by ${by} — resuming cxell session ${sid} to continue` });
+}
+
+// SEND A COMPOSED OPERATOR MESSAGE to this xell's live cxell zee — the "proper message" path behind
+// the flower's 📨 button, for when the raw terminal is too clumsy for long text or images. Short,
+// single-line text is TYPED straight into the live interactive session (exactly like a status nudge,
+// so the zee's reply lands where the operator is looking). Anything richer — any image, or multi-line
+// / long text — is written into the cxell as real files under `.zee-inbox/<ts>/` (images verbatim, the
+// body as `message.md`), and a one-line pointer is typed in telling the zee to READ the body and VIEW
+// the attached images by path (Claude opens image files from a path). Delivery is fire-and-forget and
+// best-effort — this NEVER throws; it returns { sent, reason?/error? } so the route/UI can report.
+export async function sendMessageToXell(xellId, { text = '', images = [], by = 'human' } = {}) {
+  try {
+    const body = String(text || '').trim();
+    const imgs = (Array.isArray(images) ? images : []).filter((i) => i && i.data);
+    if (!body && !imgs.length) return { sent: false, reason: 'empty message (no text or images)' };
+    // PAUSED: refused, and refused HONESTLY. This is the door the 📨 button, the Hermes inbound
+    // bridge and a manager's `zee say` all come through, and every one of them ends in a message
+    // TYPED into a session — i.e. a zee starting a turn. Queueing it into the cage instead would be
+    // worse than refusing: the drainer types it the moment a session takes the pane, so a "queued"
+    // message would restart the very zee the operator just stopped, minutes later, with nothing on
+    // screen to explain it. The sender is told, and can re-send after pressing play.
+    if (await fleetPaused()) return { sent: false, paused: true, reason: PAUSED_REASON };
+
+    const zee = await one(
+      `SELECT z.id, z.claude_session_id, z.viewer_kind, z.viewer_url, x.slug
+         FROM zee z JOIN xell x ON x.id = z.xell_id
+        WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
+        ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
+    if (!zee) return { sent: false, reason: 'no cxell zee for this xell (nothing to message)' };
+    if (zee.viewer_kind !== 'ssh-terminal') return { sent: false, reason: `zee is not in a live cxell (viewer_kind=${zee.viewer_kind})` };
+    let sshPort;
+    try { sshPort = Number(new URL(zee.viewer_url).port); } catch { /* handled below */ }
+    if (!sshPort) return { sent: false, reason: 'cxell has no SSH port to reach (viewer_url missing/invalid)' };
+
+    // Rich message → hand it over as files; plain short text → type it inline.
+    const rich = imgs.length > 0 || body.includes('\n') || body.length > 300;
+    let typed = body;
+    const written = [];
+
+    const failed = [];
+    if (rich) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const dir = `.zee-inbox/${ts}`;
+      for (let i = 0; i < imgs.length; i++) {
+        const b64 = String(imgs[i].data).replace(/^data:[^,]*,/, '');
+        const rel = `${dir}/image-${i + 1}${msgImageExt(imgs[i].name, imgs[i].type)}`;
+        try { written.push((await writeFileIntoCxell({ slug: zee.slug, relPath: rel, base64: b64 })).path); }
+        catch (e) { failed.push(imgs[i].name || rel); logline('message', `${zee.slug}: could not write attachment ${rel} (${String(e.message).slice(0, 120)})`); }
+      }
+      // Every attachment failed to land — don't type a pointer to files that aren't there and don't
+      // report a clean send. The operator needs to know the images did NOT reach the zee (this is the
+      // "attach image fails silently" case: writes threw, yet the UI showed success).
+      if (imgs.length && !written.length) {
+        return { sent: false, reason: `could not deliver ${imgs.length} image attachment(s) into the cxell — ${failed.join(', ')}`, failed };
+      }
+      const md = ['# Operator message', `_sent ${new Date().toISOString()} by ${by}_`, '',
+        body || '(no text — see attachments)', '',
+        ...(written.length ? [`## Attachments (${written.length})`, ...written.map((p) => `- ${p}`)] : []),
+        ...(failed.length ? ['', `> ⚠ ${failed.length} attachment(s) could not be delivered: ${failed.join(', ')}`] : [])].join('\n');
+      let bodyPath = `${dir}/message.md`;
+      try { bodyPath = (await writeFileIntoCxell({ slug: zee.slug, relPath: bodyPath, text: md })).path; }
+      catch (e) { logline('message', `${zee.slug}: could not write message body (${String(e.message).slice(0, 120)})`); }
+      typed = `📨 New operator message — please read ${bodyPath}`
+        + (written.length ? ` and view the ${written.length} attached image(s): ${written.join(', ')}` : '')
+        + (body ? `. Summary: ${body.replace(/\s+/g, ' ').slice(0, 160)}` : '');
+    }
+
+    logline('message', `${zee.slug}: operator message by ${by} — ${rich ? `${written.length} file(s) to .zee-inbox, ` : ''}typing into live cxell session over SSH (:${sshPort})`);
+    // Fire and forget: opening SSH, resuming the TUI and typing can take several seconds.
+    // The answer now distinguishes TYPED from QUEUED (the zee was mid-turn, so the pane was its
+    // read-only feed and the message waits in the cage for zee-attach.sh to type it in when the
+    // turn ends). Say which — this line used to claim delivery for messages that reached nobody.
+    sendKeysToCxellZee({ sshPort, slug: zee.slug, text: typed, sessionId: zee.claude_session_id })
+      .then((r) => logline('message', r?.delivery === 'queued'
+        ? `${zee.slug}: the zee is MID-TURN — operator message QUEUED in the cxell; it is typed into its session when the turn ends`
+        : `${zee.slug}: delivered operator message to the live session`))
+      .catch((e) => logline('message', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`));
+
+    return { sent: true, zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written, ...(failed.length ? { failed } : {}) };
+  } catch (e) {
+    logline('message', `message for xell ${String(xellId).slice(0, 8)} failed: ${String(e.message).slice(0, 160)}`);
+    return { sent: false, error: e.message };
+  }
+}
+
+// Pick a sane file extension for an attachment from its name, else its mime type, else default png.
+function msgImageExt(name = '', type = '') {
+  const m = String(name).match(/\.([A-Za-z0-9]{1,5})$/);
+  if (m) return `.${m[1].toLowerCase()}`;
+  const sub = String(type).split('/')[1];
+  if (sub) return `.${sub.replace('jpeg', 'jpg').replace('svg+xml', 'svg').replace(/[^a-z0-9]/gi, '')}`;
+  return '.png';
 }
 
 // STATUS delivery: resolve this xell's live cxell zee and TYPE `text` into the interactive session
@@ -53,6 +477,10 @@ export async function nudgeXellAfterLand(xellId, { by = 'human' } = {}) {
 // (typing + the reply can take a beat), best-effort, NEVER throws.
 async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = {}) {
   try {
+    // A keystroke is the OTHER way to start a turn — typed into the pane, the zee answers. So it is
+    // gated by the pause exactly like a session resume; a pause that a `status?` poke can undo is
+    // not a pause. Reported, not swallowed: the caller says so in the UI.
+    if (await fleetPaused()) return { nudged: false, paused: true, reason: PAUSED_REASON };
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.viewer_url, x.slug
          FROM zee z JOIN xell x ON x.id = z.xell_id
@@ -69,7 +497,9 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
     // Fire and forget: opening SSH, starting the TUI if needed, and typing can take several seconds;
     // do NOT block the caller (the flower's button) on it.
     sendKeysToCxellZee({ sshPort, slug: zee.slug, text, sessionId: zee.claude_session_id })
-      .then(() => logline('nudge', `${zee.slug}: sent ${JSON.stringify(text)} to the live session`))
+      .then((r) => logline('nudge', r?.delivery === 'queued'
+        ? `${zee.slug}: the zee is MID-TURN — ${JSON.stringify(text)} QUEUED in the cxell; typed in when the turn ends`
+        : `${zee.slug}: sent ${JSON.stringify(text)} to the live session`))
       .catch((e) => logline('nudge', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`));
 
     return { nudged: true, zee_id: zee.id, session: zee.claude_session_id, sent: text, via: 'ssh-send-keys' };
@@ -81,8 +511,25 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
 
 // The shared delivery: resolve this xell's live cxell zee and resume its claude session with
 // `prompt`. Fire-and-forget (the turn can run for minutes), best-effort, NEVER throws.
-async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log } = {}) {
+//
+// `allowWhilePaused` exists for exactly ONE caller — the fleet PLAY fan-out, which is itself the act
+// of unpausing (queenzee/pause.js). Everything else must be refused while the fleet is paused: this
+// function's whole job is to START A TURN, and a pause that any queenzee loop can undo on its next
+// tick is not a pause. See the `paused` handling in the callers above: they treat it like `dry_run`
+// (report it, raise NOTHING) rather than as an undelivered nudge, because a paused fleet must not
+// spray tends at a human who is deliberately holding the fleet still.
+async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, onFail = null,
+                                    mode = PROVISION_MODE, allowWhilePaused = false } = {}) {
   try {
+    if (!allowWhilePaused && await fleetPaused()) {
+      // RECORDED, not discarded: a zee waiting on a landing is between turns, so the pause never
+      // interrupted it and would not call it back — yet the decision a human just made during the
+      // pause reaches it only through this nudge. See noteHeldNudge for the two zees that stranded.
+      await noteHeldNudge(xellId, why);
+      logline('nudge', `xell ${String(xellId).slice(0, 8)}: ${why} — HELD, ${PAUSED_REASON} `
+        + '(recorded: play will resume this zee, and `zee status` is where it reads what changed)');
+      return { nudged: false, paused: true, held: true, reason: PAUSED_REASON };
+    }
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
               x.slug, x.project_id, rt.key AS runtime_key
@@ -104,6 +551,18 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log } =
     const token = await tokenForSpawn(zee.project_id, adapter.provider).then((a) => a?.token).catch(() => null);
 
     const sid = String(zee.claude_session_id || 'latest').slice(0, 8);
+    // A NESTED QUEENZEE MUST NOT RESUME A REAL ZEE'S SESSION. Every caller of this helper is a
+    // LANDING or SHIP outcome (landed · went stale · runway cleared · shipped, so reflect), and the
+    // xell it is answering came out of a CLONE of the meta-DB — so in a nested queenzee the cage
+    // below is another zee's, mid-task, and the prompt is a lie about work it never did. Report the
+    // cage it would have resumed and exec nothing; the real queenzee still nudges (mode='real').
+    if (mode !== 'real') {
+      logline('nudge',
+        `${zee.slug}: ${why} — NOT delivered. PROVISION_MODE=simulate: this queenzee models the fleet, it `
+        + `does not resume sessions in a real cxell. Would have resumed ${cxellName(zee.slug)} (session ${sid}).`);
+      return { nudged: false, dry_run: true, zee_id: zee.id,
+        reason: 'PROVISION_MODE=simulate — this queenzee models the fleet; no cxell session was resumed' };
+    }
     logline('nudge', log ? log(zee.slug, sid) : `${zee.slug}: ${why} by ${by} — resuming cxell session ${sid}`);
     // Fire and forget: the continuation turn can run for minutes; do NOT block the caller on it.
     nudgeCxellZee({
@@ -111,7 +570,12 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log } =
       prompt, model: zee.model, adapter, token,
     })
       .then((r) => logline('nudge', `${zee.slug}: nudge session exited (code ${r?.code ?? '?'})`))
-      .catch((e) => logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`));
+      .catch((e) => {
+        logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`);
+        // The caller may need to KNOW the message never arrived (a stale landing has no other way
+        // to reach its zee). Best-effort by construction: this is already the failure path.
+        try { onFail?.(e); } catch { /* a failing handler must not become an unhandled rejection */ }
+      });
 
     return { nudged: true, zee_id: zee.id, session: zee.claude_session_id, prompt };
   } catch (e) {

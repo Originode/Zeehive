@@ -21,8 +21,11 @@ import { logline } from '../lib/logbus.js';
 // immediately, no cross-lane ordering). The gate helpers below then always answer "go".
 const ENABLED = process.env.LANDING_PAD_ENABLED !== 'false';
 
-// How long a finished item lingers on the pad as a receipt before it drops off the list.
-const RECEIPT_MIN = 5;
+// How long a finished item lingers on the pad as a receipt before it drops off the list — and, since
+// #11, the same minute-scale settle window the landgate times a SILENT cleared holder by (it is the
+// only one the runway machinery keeps, and it means the same thing: how long before we treat a thing
+// as settled). Exported so there is one number rather than two that drift.
+export const RECEIPT_MIN = 5;
 
 // ── the read model the UI renders ─────────────────────────────────────────────
 // Merge open (and just-finished) landings + shipments into ONE list, oldest-first, and label each
@@ -35,19 +38,36 @@ export async function buildLandingPad(projectId) {
   const pid = projectId || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
   if (!pid) return { items: [], processing: null, next: null, active: 0, enabled: ENABLED };
 
+  // DISMISSAL HIDES A RECEIPT, NOT AN OCCUPANCY (#11 gap 2). The `dismissed_at IS NULL` filter used to
+  // sit on the whole WHERE, so a dismissed APPROVED landing — one that still owns its runway and is
+  // still the queenzee's to land — vanished from the one panel whose entire job is "what is on the
+  // runway and what is queued behind it". Combined with the gate's deliberate choice to ignore
+  // dismissal when deciding occupancy (landgate runwayOccupant), that produced the invisible blocker:
+  // an approved landing that never lands, holding the ref, with zees queued behind it and nothing on
+  // any screen. Freeing the runway on dismissal would be worse — a human could hide a landing and
+  // silently pass the next one through — so the filter moved to where it belongs: RECEIPTS only. An
+  // item the queenzee still has work to do on is never hidden, and it carries who hid it and how many
+  // zees are waiting on it, so the pad can say why it is still there.
   const landings = await q(
     `SELECT lr.id, lr.xell_id, x.slug AS xell_slug, lr.status, lr.requested_at, lr.decided_at,
-            lr.landed_at AS finished_at, lr.new_sha AS sha, lr.ref, lr.commits
+            COALESCE(lr.landed_at, lr.withdrawn_at) AS finished_at, lr.new_sha AS sha, lr.ref,
+            lr.commits, lr.note, lr.dismissed_at, lr.dismissed_by,
+            (SELECT count(*)::int FROM land_request h
+               WHERE h.project_id = lr.project_id AND h.ref = lr.ref AND h.kind = 'push'
+                 AND h.status = 'holding' AND h.cleared_at IS NULL) AS holders
        FROM land_request lr LEFT JOIN xell x ON x.id = lr.xell_id
-      WHERE lr.project_id = $1 AND lr.dismissed_at IS NULL
+      WHERE lr.project_id = $1
         AND (lr.status IN ('pending','approved')
-          OR (lr.status IN ('landed','rejected','stale')
-              AND COALESCE(lr.landed_at, lr.decided_at) > now() - ($2 || ' minutes')::interval))`,
+          -- 'withdrawn' rides the same brief receipt window as the other endings: a card that simply
+          -- VANISHES mid-read is worse than one that says the zee un-asked it. It carries no
+          -- decided_at (nobody decided anything), so its timestamp is withdrawn_at.
+          OR (lr.dismissed_at IS NULL AND lr.status IN ('landed','rejected','stale','withdrawn')
+              AND COALESCE(lr.landed_at, lr.decided_at, lr.withdrawn_at) > now() - ($2 || ' minutes')::interval))`,
     [pid, String(RECEIPT_MIN)]);
 
   const ships = await q(
     `SELECT s.id, s.xell_id, x.slug AS xell_slug, s.status, s.requested_at, s.decided_at,
-            s.finished_at, s.commit AS sha, s.reason
+            s.finished_at, s.commit AS sha, s.reason, s.deferred_at
        FROM ship_request s JOIN xell x ON x.id = s.xell_id
       WHERE s.project_id = $1 AND s.dismissed_at IS NULL
         AND (s.status IN ('pending','approved','shipping')
@@ -71,11 +91,14 @@ export async function buildLandingPad(projectId) {
 // currently holding the land merge lock (a landing mid ref-move).
 export function composePad({ landings = [], ships = [], merging = new Set() }) {
   const phaseOf = (r, kind) => {
+    // A DEFERRED ship is pending but set aside — it is out of the runway queue (no position, no
+    // spinner), waiting for a human to resume it, so it never counts as awaiting-approval work.
+    if (r.deferred_at) return 'deferred';
     if (r.status === 'pending') return 'awaiting-approval';
     if (kind === 'landing') {
       if (r.status === 'approved') return merging.has(r.xell_id) ? 'processing' : 'queued';
       if (r.status === 'landed') return 'done';
-      return r.status;                 // rejected | stale
+      return r.status;                 // rejected | stale | withdrawn (the zee un-asked it)
     }
     if (r.status === 'approved') return 'queued';
     if (r.status === 'shipping') return 'processing';
@@ -89,8 +112,18 @@ export function composePad({ landings = [], ships = [], merging = new Set() }) {
       kind, id: r.id, xell_id: r.xell_id, xell_slug: r.xell_slug || 'unknown', status: r.status, phase,
       processing: phase === 'processing',
       sha: r.sha || null, ref: r.ref || null, reason: r.reason || null,
+      // Why a receipt ended the way it did. This is the only place a STALE landing can explain
+      // itself — the landing card renders open requests only, and stale is neither open nor a
+      // rejection — and the note says whether the zee was actually nudged to sync and ask again.
+      note: r.note || null,
       commits: Array.isArray(r.commits) ? r.commits.length : null,
       requested_at: r.requested_at, decided_at: r.decided_at, finished_at: r.finished_at,
+      // A landing a human HID that is still on the runway, and how many zees are queued behind it.
+      // Both ride to the UI because "why is this still here?" is the question the row raises, and
+      // "somebody dismissed it and N zees are waiting on it" is the answer (#11 gap 2).
+      dismissed_at: r.dismissed_at || null,
+      dismissed_by: r.dismissed_by || null,
+      holders: Number(r.holders) || 0,
     };
   };
 

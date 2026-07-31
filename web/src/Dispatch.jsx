@@ -1,5 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { getDispatchModes, getDispatchModels } from './api.js';
+import { dispatchOverlap } from './api.js';
+import { createPortal } from 'react-dom';
+import { getDispatchModes, getDispatchModels, getHarnesses } from './api.js';
+import { emptyWarning } from './harnessHealth.js';
 
 // The "+" composer. A human writes a prompt (rich text, paste-friendly, images welcome) and picks
 // the autonomy mode / model / attended flag — then SUBMIT dispatches it exactly like a /xell
@@ -15,10 +18,42 @@ import { getDispatchModes, getDispatchModels } from './api.js';
 // blocking "Dispatching…" button freeze the modal for seconds. So submit now just validates, hands
 // the whole payload up to the parent and closes at once — the parent runs the dispatch and reports
 // progress through a toast (including a Retry that reuses this exact payload if it fails).
-export default function Dispatch({ projectId, projectName, provider = 'claude', providerLabel, tokenId = null, onClose, onDispatch }) {
+//
+// ── ONE COMPOSER, TWO ZEE TYPES (`manager`) ─────────────────────────────────────────────────────
+// Adding a MANAGER used to be a one-line showPrompt() box: a single `<input>` for what is the most
+// consequential prompt in the fleet — the programme an agent runs a whole CREW from. You could not
+// see what you had typed, could not paste a backlog or a screenshot, could not pick the model, the
+// autonomy mode or the account, and Enter fired it. A worker (one xell, one job) got the full
+// composer; the manager above it got a text field. So the manager now opens THIS modal with
+// `manager` set, and the differences are only the ones that are actually true of a manager:
+//   • it offers MANAGER harnesses (a worker harness on a manager is refused by the DB anyway);
+//   • there is NO prod-DB toggle — a manager is always bound to production READ-ONLY, and that is
+//     not a switch a human flips here (stated as a note instead of a control that lies);
+//   • the brief MAY be left blank — the server then hands it DEFAULT_MANAGER_BRIEF (study the
+//     project, propose a plan, ask before starting a crew), which is a real answer, not an empty one.
+// Everything else — the editor, images, model, mode, supervision, account — is shared, because a
+// manager's prompt deserves at least what a worker's gets.
+export default function Dispatch({ projectId, projectName, provider = 'claude', providerLabel, tokenId = null,
+                                   manager = false, accounts = null, onClose, onDispatch }) {
   const editorRef = useRef(null);
   const [modes, setModes] = useState([]);
   const [models, setModels] = useState([]);
+  // WHICH ACCOUNT runs this zee. The worker composer is opened FROM an account's own button, so it
+  // arrives decided (accounts=null → the provider/tokenId props stand). The manager button is one
+  // button for the whole fleet, so it passes the list and the choice is made in here.
+  // PAUSED accounts are excluded — the server refuses a dispatch on one anyway (spawnCreds →
+  // tokenForSpawn), so the picker must not offer it; if every passed account is paused the
+  // composer falls back to the generic provider (server picks an active account or refuses).
+  const activeAccounts = (accounts || []).filter((a) => !a.paused);
+  const [acct, setAcct] = useState(() => (activeAccounts.length ? activeAccounts[0] : null));
+  const activeProvider = acct?.provider || provider;
+  const activeTokenId = acct ? acct.id : tokenId;
+  // A xell may only wear a harness of its own zee type (054's guard), so ask for the list this
+  // composer is allowed to offer: worker personas for a dispatch, manager ones for a manager.
+  const [harnesses, setHarnesses] = useState([]);
+  // undefined = use the default (omit; project default for a worker, the manager harness for a
+  // manager); '' = core only (send null); 'hermes' = that harness.
+  const [harness, setHarness] = useState(undefined);
   const [mode, setMode] = useState(5);            // default 5 = bypass (fully unattended)
   const [model, setModel] = useState('opus');     // overwritten by the server's default once loaded
   const [headless, setHeadless] = useState(true); // default headless (fire-and-forget)
@@ -26,19 +61,31 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
   const [images, setImages] = useState([]);       // [{ id, name, data(dataURL), size }]
   const [err, setErr] = useState(null);
   const [empty, setEmpty] = useState(true);       // drives the placeholder + submit-disabled state
+  // WHO ELSE IS IN THIS WORK (#33). Debounced while the prompt is written, so the warning is on screen
+  // at the moment of the decision instead of in the receipt afterwards. Purely informational: it never
+  // disables the button and a failed check simply says nothing — two zees on one file is ordinary work,
+  // and the failure this closes was not KNOWING.
+  const [overlap, setOverlap] = useState(null);
 
   useEffect(() => {
     getDispatchModes().then((ms) => setModes(ms)).catch(() => {});
     // The model list is the PROVIDER'S — a Codex composer offers Codex model ids, a Kimi one
-    // Kimi's; claude keeps opus/sonnet/haiku. The server owns the lists (/xell/models?provider=).
-    getDispatchModels(provider).then((ms) => {
+    // Kimi's; claude keeps its generation ALIASES. The server owns the lists
+    // (/xell/models?provider=) — never restate them here beyond the offline fallback below.
+    getDispatchModels(activeProvider).then((ms) => {
       setModels(ms);
       const def = ms.find((m) => m.default) || ms[0];
       if (def) setModel(def.key);
     }).catch(() => {});
+    // Harnesses are non-core, enabled config layers; core is always-on and implicit, so the picker
+    // only offers the extras (plus a "core only" = none).
+    // …and scoped to THIS project (084): the fleet's harnesses plus this project's own. A persona
+    // another project owns is never offered — wearing it is refused by the database anyway.
+    getHarnesses(manager ? 'manager' : 'worker', projectId)
+      .then((hs) => setHarnesses(hs.filter((h) => !h.is_law_core))).catch(() => {});
     // focus the editor on open so the human can just start typing
     setTimeout(() => editorRef.current?.focus(), 30);
-  }, [provider]);
+  }, [activeProvider, manager, projectId]);
 
   // Esc closes only when nothing is composed — so it can't silently discard a written prompt.
   useEffect(() => {
@@ -53,7 +100,24 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
     setImages((prev) => [...prev, { id: `${Date.now()}-${prev.length}`, ...img }]);
   const removeImage = (id) => setImages((prev) => prev.filter((im) => im.id !== id));
 
-  const syncEmpty = () => setEmpty(!(editorRef.current?.innerText || '').trim());
+  const syncEmpty = () => {
+    setEmpty(!(editorRef.current?.innerText || '').trim());
+    scheduleOverlap();
+  };
+  // One check per pause in typing, and only for a WORKER dispatch: a manager's programme names the whole
+  // project by design, so every word of it would "overlap" everything and the signal would be noise.
+  const overlapTimer = useRef(null);
+  const scheduleOverlap = () => {
+    if (manager) return;
+    clearTimeout(overlapTimer.current);
+    overlapTimer.current = setTimeout(async () => {
+      const task = (editorRef.current?.innerText || '').trim();
+      if (task.length < 12) { setOverlap(null); return; }
+      const o = await dispatchOverlap({ project: projectId, task }).catch(() => null);
+      setOverlap(o && o.warnings?.length ? o : null);
+    }, 700);
+  };
+  useEffect(() => () => clearTimeout(overlapTimer.current), []);
 
   // Paste: capture image FILES (a pasted screenshot) as attachments rather than letting the browser
   // dump a giant base64 blob into the editor; let text/HTML paste through so formatted text lands
@@ -80,16 +144,19 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
 
   const submit = () => {
     const task = (editorRef.current?.innerText || '').trim();
-    if (!task) { setErr('Write a prompt first (an image alone is not enough — the zee needs a task).'); return; }
+    // A WORKER with no task is nothing to do. A MANAGER with no task is a defined thing: the server
+    // hands it DEFAULT_MANAGER_BRIEF (study the project, propose a programme, ask before starting a
+    // crew), which is exactly what the old one-line box allowed by leaving it blank. Keep that.
+    if (!task && !manager) { setErr('Write a prompt first (an image alone is not enough — the zee needs a task).'); return; }
     // Hand the whole payload up and let the parent dispatch it asynchronously (progress → toast).
     // The prompt isn't lost on failure: the parent captures this payload in the toast's Retry.
     onDispatch?.({
       project: projectId,
-      task,
-      provider,   // which AI provider TYPE's button opened this composer (picks the runtime)
+      ...(task ? { task } : {}),
+      provider: activeProvider,   // which AI provider TYPE runs this zee (picks the runtime)
       // which exact ACCOUNT of that type — a project can hold several (e.g. two Claude
       // subscriptions); the spawn uses precisely this one's token
-      ...(tokenId ? { provider_token_id: tokenId } : {}),
+      ...(activeTokenId ? { provider_token_id: activeTokenId } : {}),
       mode,
       model,
       headless,
@@ -97,6 +164,9 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
       // dispatch hands to attachXellDb → the prod db container becomes THIS xell's assigned
       // database. Reads and writes are allowed; the prod guard HARD-BLOCKS schema changes (DDL).
       ...(prodDb ? { db: 'db-shared-prod' } : {}),
+      // the config layer this zee wears (persona/skills). undefined → omit (project default); ''
+      // → core only (null); a key → that harness.
+      ...(harness !== undefined ? { harness: harness || null } : {}),
       images: images.map(({ name, data }) => ({ name, data })),
     });
   };
@@ -107,21 +177,81 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
 
   const totalMb = images.reduce((n, im) => n + (im.size || 0), 0) / (1024 * 1024);
 
-  return (
+  // ── PORTALLED TO <body>, ALWAYS ─────────────────────────────────────────────────────────────
+  // A z-index only ranks siblings INSIDE the nearest stacking context, so a full-screen overlay
+  // rendered where its button happens to live is ranked among that pane's contents and nothing
+  // else. The manager composer opens from the toolbar inside `.content` (`position: relative;
+  // z-index: 1`), which is a stacking context — so `.disp-overlay { z-index: 60 }` collapsed to
+  // "z-index 1, in the panels pane", and the graph divider + its grip (z 4/5/6 on `.hive-split`)
+  // and the <Connectors> line overlay (a later sibling at z 1) painted straight over the modal.
+  // Raising the number could not have fixed that: 60 was never being compared with 6.
+  //
+  // So the overlay leaves the tree entirely and mounts on <body>, where its z-index means what it
+  // says against the other real overlays (toasts 80 · dialogs 90 · diff viewer 95, all deliberately
+  // above it). This is unconditional rather than manager-only: the worker composer only escaped by
+  // luck of being rendered high in App's tree, and the next component to open one should not have
+  // to know that.
+  return createPortal((
     <div className="disp-overlay">
-      <div className="disp" role="dialog" aria-label="Compose a prompt" data-testid="dispatch-modal">
+      <div className={`disp${manager ? ' disp-mgr' : ''}`} role="dialog"
+           aria-label={manager ? 'Add a manager zee' : 'Compose a prompt'}
+           data-testid={manager ? 'manager-modal' : 'dispatch-modal'}>
         <div className="disp-head">
-          <span className="disp-title">＋ New prompt{providerLabel ? ` · ${providerLabel}` : ''} <span className="disp-sub">→ dispatches a zee into a ready xell{projectName ? ` · ${projectName}` : ''}</span></span>
+          {manager ? (
+            <span className="disp-title">⬢ ＋ manager zee <span className="disp-sub">→ runs a CREW: dispatches workers, reads production (read-only), pushes nothing{projectName ? ` · ${projectName}` : ''}</span></span>
+          ) : (
+            <span className="disp-title">＋ New prompt{providerLabel ? ` · ${providerLabel}` : ''} <span className="disp-sub">→ dispatches a zee into a ready xell{projectName ? ` · ${projectName}` : ''}</span></span>
+          )}
           <button className="disp-x" onClick={onClose} title="Close">✕</button>
         </div>
 
         <div className="disp-body">
+          {manager && (
+            <p className="disp-note" data-testid="manager-what">
+              A manager runs a crew: it dispatches worker zees, talks to them in real time, reads
+              their post-ship reflections and suggests when one is done (<b>you</b> confirm). It
+              holds the <b>production database READ-ONLY</b> — its own postgres role, granted SELECT
+              and nothing else — and it has <b>zero push access</b> to the xource: it writes no code
+              and lands none. Give it its <b>programme</b> below.
+            </p>
+          )}
           <div className="disp-editor-wrap">
-            {empty && <div className="disp-placeholder">Describe the task for the zee… (paste text or a screenshot — ⌘/Ctrl+Enter to dispatch)</div>}
+            {empty && (
+              <div className="disp-placeholder">
+                {manager
+                  ? 'Its programme — what this crew is FOR, in priority order… (paste a backlog or a screenshot; ⌘/Ctrl+Enter to add. Leave blank and it will study the project, propose a plan and ask you before starting a crew.)'
+                  : 'Describe the task for the zee… (paste text or a screenshot — ⌘/Ctrl+Enter to dispatch)'}
+              </div>
+            )}
             <div className="disp-editor" ref={editorRef} contentEditable suppressContentEditableWarning
                  data-testid="dispatch-editor" role="textbox" aria-multiline="true"
                  onInput={syncEmpty} onPaste={onPaste} onKeyDown={onKeyDown} />
           </div>
+
+          {/* Who else is already in this work — stated, never enforced. It names the xell and the overlap
+              so the decision can be made with it in view: re-brief, talk to that xell, or carry on. */}
+          {overlap?.warnings?.length > 0 && (
+            <div className="disp-overlap" data-testid="dispatch-overlap">
+              <b>⚠ {new Set(overlap.warnings.map((w) => w.xell_slug)).size} live xell(s) may already be in this work.</b>
+              <ul>
+                {[...new Map(overlap.warnings.map((w) => [w.xell_slug, w])).values()].map((w) => (
+                  <li key={w.xell_slug}>
+                    <code>{w.xell_slug}</code>
+                    {w.title ? <> — “{w.title}”</> : null}:{' '}
+                    {overlap.warnings.filter((x) => x.xell_slug === w.xell_slug).map((x) => (
+                      x.kind === 'ticket'
+                        ? `ticket ${x.tickets.join(', ')} (${x.detail})`
+                        : `${x.paths.join(', ')}${x.more ? ` +${x.more} more` : ''} (${x.via})`
+                    )).join('; ')}
+                  </li>
+                ))}
+              </ul>
+              <span className="disp-overlap-note">
+                Two zees on one file is ordinary. Two zees on one PROBLEM is a duplicate nobody sees until it
+                lands — dispatch anyway if you meant to.
+              </span>
+            </div>
+          )}
 
           {images.length > 0 && (
             <div className="disp-imgs" data-testid="dispatch-images">
@@ -137,6 +267,25 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
           )}
 
           <div className="disp-controls">
+            {/* WHICH ACCOUNT — only when the opener handed us a list (the manager button, which is
+                one button for every connected account). A worker composer is opened from an
+                account's own button, so it renders nothing here and nothing changes for it. */}
+            {activeAccounts.length > 1 && (
+              <div className="disp-field">
+                <label className="disp-label">Account</label>
+                <div className="disp-models" role="group" aria-label="AI account">
+                  {activeAccounts.map((a) => (
+                    <button key={a.id} className={`disp-seg ${acct?.id === a.id ? 'on' : ''}`}
+                            data-testid={`dispatch-account-${a.id}`}
+                            title={`Run this zee on ${a.name} (${a.typeLabel}) — its own CLI inside the cxell`}
+                            onClick={() => setAcct(a)}>
+                      {a.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div className="disp-field">
               <label className="disp-label">Autonomy mode</label>
               <div className="disp-modes" role="group" aria-label="Autonomy mode">
@@ -154,7 +303,7 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
             <div className="disp-field">
               <label className="disp-label">Model</label>
               <div className="disp-models" role="group" aria-label="Model">
-                {(models.length ? models : fallbackModels(provider)).map((m) => (
+                {(models.length ? models : fallbackModels(activeProvider)).map((m) => (
                   <button key={m.key} className={`disp-seg ${model === m.key ? 'on' : ''}`}
                           data-testid={`dispatch-model-${m.key}`}
                           title={m.note || m.label} onClick={() => setModel(m.key)}>
@@ -163,6 +312,47 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
                 ))}
               </div>
             </div>
+
+            {harnesses.length > 0 && (
+              <div className="disp-field">
+                <label className="disp-label">Harness</label>
+                <div className="disp-models" role="group" aria-label="Harness">
+                  <button className={`disp-seg ${harness === undefined ? 'on' : ''}`}
+                          data-testid="dispatch-harness-default"
+                          title={manager
+                            ? 'The manager harness — its own persona, skills and manual (the default for a manager)'
+                            : "Use this project's default harness"}
+                          onClick={() => setHarness(undefined)}>
+                    Default
+                  </button>
+                  {/* A MANAGER is never offered "core only": its manual IS the manager harness (the
+                      crew verbs, the read-only-prod and no-push law it must know). Stripping it
+                      would cage an agent that does not know what it may do. */}
+                  {!manager && (
+                    <button className={`disp-seg ${harness === '' ? 'on' : ''}`}
+                            data-testid="dispatch-harness-none"
+                            title="Core only — the manual + binding rules, no persona/skills layer" onClick={() => setHarness('')}>
+                      Core only
+                    </button>
+                  )}
+                  {/* A harness that carries NOTHING is offered here exactly like a full one, and the
+                      zee you dispatch is the one who pays for it — so say so at the point of choice.
+                      bundle_empty comes from GET /api/harnesses. */}
+                  {harnesses.map((h) => {
+                    const warn = emptyWarning(h);
+                    return (
+                    <button key={h.key} className={`disp-seg ${harness === h.key ? 'on' : ''} ${warn ? 'seg-hollow' : ''}`}
+                            data-testid={`dispatch-harness-${h.key}`}
+                            title={`${warn ? `${warn.chip.replace('⚠ ', '')} — ${warn.why}` : (h.summary || h.label)}`
+                              + (h.scope === 'project' ? `  (⌂ this project's own persona)` : '  (system-wide)')}
+                            onClick={() => setHarness(h.key)}>
+                      {h.label}{h.scope === 'project' ? ' ⌂' : ''}{warn ? ` ${warn.chip}` : (h.skill_count ? ` ·${h.skill_count}` : '')}
+                    </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             <div className="disp-field">
               <label className="disp-label">Supervision</label>
@@ -176,21 +366,36 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
               </div>
             </div>
 
+            {/* Production DB. For a WORKER it is an opt-in toggle; for a MANAGER it is not a
+                choice at all — adding one mints a SELECT-only postgres role and binds it, failing
+                closed if that cannot be done. So state the fact instead of showing a control that
+                would be a lie in either position. */}
             <div className="disp-field">
               <label className="disp-label">Production DB access</label>
-              <div className="disp-sup" role="group" aria-label="Production database access">
-                <button className={`disp-seg ${!prodDb ? 'on' : ''}`} data-testid="dispatch-proddb-off"
-                        title="The xell uses its normal (dev) database — the safe default."
-                        onClick={() => setProdDb(false)}>off</button>
-                <button className={`disp-seg disp-seg-danger ${prodDb ? 'on' : ''}`} data-testid="dispatch-proddb-on"
-                        title="Point this xell at the LIVE PRODUCTION database — real, irreversible writes. Schema changes are hard-blocked."
-                        onClick={() => setProdDb(true)}>⚠ LIVE PROD</button>
-              </div>
-              <div className="disp-hint">For manual data processing on prod. Read + write only — schema changes (DDL) are hard-blocked.</div>
+              {manager ? (
+                <div className="disp-hint" data-testid="manager-proddb-note">
+                  <b>READ-ONLY, always.</b> Adding a manager mints it its own postgres role
+                  (CONNECT + SELECT, nothing else) on production and binds it — it is not a switch.
+                  Every write and every DDL is refused by the server. Rows that must change in
+                  production still go through a landed seed a human approves.
+                </div>
+              ) : (
+                <>
+                  <div className="disp-sup" role="group" aria-label="Production database access">
+                    <button className={`disp-seg ${!prodDb ? 'on' : ''}`} data-testid="dispatch-proddb-off"
+                            title="The xell uses its normal (dev) database — the safe default."
+                            onClick={() => setProdDb(false)}>off</button>
+                    <button className={`disp-seg disp-seg-danger ${prodDb ? 'on' : ''}`} data-testid="dispatch-proddb-on"
+                            title="Point this xell at the LIVE PRODUCTION database — real, irreversible writes. Schema changes are hard-blocked."
+                            onClick={() => setProdDb(true)}>⚠ LIVE PROD</button>
+                  </div>
+                  <div className="disp-hint">For manual data processing on prod. Read + write only — schema changes (DDL) are hard-blocked.</div>
+                </>
+              )}
             </div>
           </div>
 
-          {prodDb && (
+          {!manager && prodDb && (
             <div className="disp-warn" data-testid="dispatch-proddb-warning" role="alert">
               <div className="disp-warn-title">⚠ LIVE PRODUCTION DATABASE</div>
               <div className="disp-warn-body">
@@ -208,14 +413,20 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
         </div>
 
         <div className="disp-foot">
+          {manager && empty && (
+            <span className="disp-hint" data-testid="manager-blank-hint">
+              No programme? It will study the project, propose one, and ask you before starting a crew.
+            </span>
+          )}
           <button className="disp-cancel" onClick={onClose}>Cancel</button>
-          <button className="disp-submit" onClick={submit} data-testid="dispatch-submit">
-            Dispatch →
+          <button className="disp-submit" onClick={submit}
+                  data-testid={manager ? 'manager-submit' : 'dispatch-submit'}>
+            {manager ? 'Add manager zee →' : 'Dispatch →'}
           </button>
         </div>
       </div>
     </div>
-  );
+  ), document.body);
 }
 
 // Shown only if the API calls fail — keeps the composer usable rather than blank.
@@ -230,5 +441,6 @@ const FALLBACK_MODES = [
 // not, so its fallback is the single honest "vendor default" entry (key '' → dispatch sends no
 // model and the vendor CLI runs its own default).
 const fallbackModels = (provider) => provider === 'claude' || !provider
-  ? [{ key: 'opus', label: 'Opus', default: true }, { key: 'sonnet', label: 'Sonnet' }, { key: 'haiku', label: 'Haiku' }]
+  ? [{ key: 'opus', label: 'Opus', default: true }, { key: 'sonnet', label: 'Sonnet' }, { key: 'haiku', label: 'Haiku' },
+     { key: 'fable', label: 'Fable' }]
   : [{ key: '', label: 'default', note: "the vendor CLI's own default model", default: true }];

@@ -24,10 +24,14 @@ const PHASE = {
   'awaiting-approval': { label: 'awaiting approval', cls: 'pad-await' },
   queued:              { label: 'queued',            cls: 'pad-queued' },
   processing:          { label: 'processing…',       cls: 'pad-proc' },
+  deferred:            { label: 'deferred',           cls: 'pad-stale' },
   done:                { label: 'done',               cls: 'pad-done' },
   failed:              { label: 'failed',             cls: 'pad-failed' },
   rejected:            { label: 'rejected',           cls: 'pad-rejected' },
   stale:               { label: 'stale',              cls: 'pad-stale' },
+  // The zee un-asked its own landing (`zee land --withdraw`). Not a rejection and not a failure:
+  // nobody decided anything, so it reads as a quiet receipt rather than a verdict.
+  withdrawn:           { label: 'withdrawn by zee',   cls: 'pad-stale' },
 };
 
 function PadRow({ item }) {
@@ -52,7 +56,24 @@ function PadRow({ item }) {
           <span className="pad-commits"> · {item.commits} commit{item.commits === 1 ? '' : 's'}</span>
         )}
       </span>
-      <span className={`pad-phase ${p.cls}`}>
+      {/* A STALE landing is the one phase whose label raises a question ("stale — and now what?").
+          The note answers it in place: main moved past the sha, and whether the zee was nudged to
+          sync and ask again. Tooltip, not a new line — this is a receipt, not a decision. */}
+      {/* HIDDEN, BUT STILL ON THE RUNWAY (#11 gap 2). Dismissing a landing hides a RECEIPT; it does not
+          free the ref, and the gate deliberately ignores dismissal when it decides who occupies a
+          runway. So an open item that was dismissed still belongs on this list — it is the queenzee's
+          work and it is blocking whoever is queued behind it — and it says so here rather than being
+          the invisible blocker it used to be. The holder count is the reason it matters. */}
+      {item.dismissed_at && (
+        <span className="pad-hidden" data-testid="pad-hidden"
+              title={`Dismissed${item.dismissed_by ? ` by ${item.dismissed_by}` : ''} — hiding a landing hides a receipt, `
+                + 'it does not free the runway. This one is still open, so the queenzee still has work to do on it '
+                + `and it still holds ${(item.ref || 'main').replace('refs/heads/', '')}`
+                + (item.holders ? `, with ${item.holders} zee(s) queued behind it.` : '.')}>
+          ⛔ dismissed{item.holders ? ` · ${item.holders} queued behind` : ''}
+        </span>
+      )}
+      <span className={`pad-phase ${p.cls}`} title={item.note || undefined}>
         {item.processing && <span className="pad-spin" data-testid="pad-spin" aria-label="processing" />}
         {item.next && !item.processing && <span className="pad-nextdot" title="next up" />}
         {p.label}

@@ -101,6 +101,18 @@ export function parseGitProgress(line) {
 const looksLikeAuthFailure = (err) =>
   /authentication failed|could not read Username|terminal prompts disabled|403|invalid credentials|Password authentication is not supported/i.test(err || '');
 
+// A PAT push that adds or updates `.github/workflows/*` is REFUSED by GitHub unless the token
+// carries the `workflow` scope — a Contents:write fine-grained token is NOT enough for a repo
+// that has Actions workflows (this one does: `.github/workflows/publish-images.yml`). Git's raw
+// sentence ("[remote rejected] … refusing to allow a Personal Access Token to create or update
+// workflow … without `workflow` scope") is unhelpful, and worse, it CONTAINS the word "rejected",
+// so it used to trip the divergence regex below and tell the human "pull or reconcile first" —
+// the exact wrong instruction. Detect it before the divergence check and say what is actually
+// fixable: the token's scope, not the branch's state.
+const looksLikeWorkflowScope = (err) =>
+  /(refusing to allow|create or update workflow|without `?workflow`? scope|workflow scope)/i.test(err || '');
+const WORKFLOW_SCOPE_HINT = 'this repo has GitHub Actions workflow files, and the connected token lacks the `workflow` scope — GitHub refuses PAT pushes that touch .github/workflows/. Add the `workflow` scope to the token (Project setup → Tokens) and push again; no local changes are needed';
+
 // What's at the other end of this URL? Read-only ls-remote: default branch (via --symref HEAD)
 // and the branch list. Never touches the local repo. auth_required=true when an anonymous try
 // smells like a credential wall (a private repo probed without a token).
@@ -178,8 +190,13 @@ export async function pullRemote({ repoRoot, branch = 'main', remoteUrl, token }
     return { pulled: false, state: 'refused', reason: `checkout is on '${current || 'unknown'}', not '${branch}' — pull only fast-forwards the checked-out main` };
   }
 
-  // dirty tree → refuse (same stance as pullFromXource: never merge over uncommitted work)
-  const st = await g(['status', '--porcelain'], { timeout: 30000 });
+  // dirty tree → refuse (same stance as pullFromXource: never merge over uncommitted work).
+  // TRACKED changes only: a xource carries its xells' worktrees at .claude/worktrees/, which is
+  // untracked and never goes away, so counting untracked files refused every pull on a project
+  // that had ever been provisioned (seen live on OmniBiz: "1 uncommitted change(s)" forever).
+  // Untracked files are not at risk here — a fast-forward cannot silently clobber one, and git
+  // itself aborts the merge if it would need to write over an untracked path.
+  const st = await g(['status', '--porcelain', '--untracked-files=no'], { timeout: 30000 });
   const dirty = st.status === 0 ? st.out.split('\n').filter(Boolean).length : -1;
   if (dirty !== 0) {
     return { pulled: false, state: 'refused', reason: dirty > 0 ? `${dirty} uncommitted change(s) in the checkout — commit or stash first` : 'could not read working-tree status' };
@@ -321,14 +338,20 @@ export async function pushRemote({ repoRoot, branch = 'main', remoteUrl, token }
   if (pr.status !== 0) {
     const err = (pr.err || '').trim();
     const nonff = /non-fast-forward|fetch first|rejected|failed to push/i.test(err);
+    // workflow-scope BEFORE the divergence check: git's rejection sentence contains "rejected",
+    // which nonff would misread as a divergence — the wrong instruction entirely.
     return {
       pushed: false,
-      state: looksLikeAuthFailure(err) ? 'refused-auth' : nonff ? 'refused-diverged' : 'error',
-      reason: looksLikeAuthFailure(err)
-        ? 'authentication failed — the connected GitHub token cannot write to this repo'
-        : nonff
-          ? `remote ${branch} has commits local ${branch} does not — Zeehive only fast-forwards; pull or reconcile first`
-          : `push failed: ${err.slice(-300)}`,
+      state: looksLikeWorkflowScope(err) ? 'refused-workflow-scope'
+        : looksLikeAuthFailure(err) ? 'refused-auth'
+        : nonff ? 'refused-diverged'
+        : 'error',
+      reason: looksLikeWorkflowScope(err) ? WORKFLOW_SCOPE_HINT
+        : looksLikeAuthFailure(err)
+          ? 'authentication failed — the connected GitHub token cannot write to this repo'
+          : nonff
+            ? `remote ${branch} has commits local ${branch} does not — Zeehive only fast-forwards; pull or reconcile first`
+            : `push failed: ${err.slice(-300)}`,
     };
   }
   const upToDate = /up-to-date|Everything up-to-date/i.test(pr.err || '');
@@ -366,9 +389,11 @@ export async function openPullRequest({ repoRoot, remoteUrl, token, branch = 'ma
   const pushRes = await g([...credArgs(token), 'push', 'origin', `+refs/heads/${branch}:refs/heads/${head}`], { token, timeout: 5 * 60 * 1000 });
   if (pushRes.status !== 0) {
     const err = (pushRes.err || '').trim();
-    return { opened: false, reason: looksLikeAuthFailure(err)
-      ? 'authentication failed — the connected GitHub token cannot write to this repo'
-      : `could not push PR branch: ${err.slice(-300)}` };
+    return { opened: false, reason: looksLikeWorkflowScope(err)
+      ? WORKFLOW_SCOPE_HINT
+      : looksLikeAuthFailure(err)
+        ? 'authentication failed — the connected GitHub token cannot write to this repo'
+        : `could not push PR branch: ${err.slice(-300)}` };
   }
 
   const prTitle = String(title || '').trim() || `Zeehive: ${branch} → ${baseBranch}`;
@@ -389,4 +414,40 @@ export async function openPullRequest({ repoRoot, remoteUrl, token, branch = 'ma
       : `could not open PR: ${r.error}`, head };
   }
   return { opened: true, state: 'opened', url: r.body?.html_url || null, number: r.body?.number || null, head, base: baseBranch };
+}
+
+// MERGE a pull request on the remote (GitHub REST `PUT /pulls/{number}/merge`). Human-gated, exactly
+// like open — a read-only PAT (or branch protection the token can't satisfy) is refused LOUDLY as
+// {merged:false, reason}, never forced. `method` is GitHub's merge strategy: 'merge' (default),
+// 'squash' or 'rebase'. A PR that isn't mergeable yet (GitHub still computing, or a conflict) comes
+// back 405 → {state:'not-mergeable'}; a head that moved since we read it comes back 409 →
+// {state:'conflict'}. Nothing here touches the local checkout — the merge happens entirely on GitHub.
+export async function mergePullRequest({ remoteUrl, token, number, method = 'merge', title, message } = {}) {
+  if (!remoteUrl || !number) return { merged: false, state: 'error', reason: 'remoteUrl and a PR number are required to merge' };
+  if (!token) return { merged: false, state: 'error', reason: 'a GitHub token with write access is required to merge' };
+  const slug = parseGitHubSlug(remoteUrl);
+  if (!slug) return { merged: false, state: 'error', reason: 'remote is not a GitHub URL — PRs are GitHub-only' };
+  const merge_method = new Set(['merge', 'squash', 'rebase']).has(method) ? method : 'merge';
+
+  const r = await githubApi(slug, `/repos/${slug.owner}/${slug.repo}/pulls/${number}/merge`, {
+    token, method: 'PUT',
+    body: {
+      merge_method,
+      ...(title ? { commit_title: String(title) } : {}),
+      ...(message ? { commit_message: String(message) } : {}),
+    },
+  });
+  if (!r.ok) {
+    // 405 = "not mergeable" (conflict / checks / mergeability still computing); 409 = head moved.
+    const state = r.status === 405 ? 'not-mergeable' : r.status === 409 ? 'conflict' : r.status === 403 ? 'refused' : 'error';
+    return {
+      merged: false, number, state,
+      reason: state === 'not-mergeable' ? `pull request #${number} is not mergeable yet: ${r.error}`
+        : state === 'conflict' ? `PR #${number} head moved since it was read — re-open and retry: ${r.error}`
+        : state === 'refused' ? 'the GitHub token cannot merge here (needs write access; branch protection may require a review/checks)'
+        : `could not merge PR #${number}: ${r.error}`,
+    };
+  }
+  // GitHub returns {merged:true, sha, message} on success.
+  return { merged: !!r.body?.merged, number, state: 'merged', sha: r.body?.sha || null, method: merge_method };
 }

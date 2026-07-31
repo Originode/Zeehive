@@ -19,7 +19,9 @@ const commits = Array.from({ length: 12 }, (_, i) => ({
 commits[2].parents = ['h3', 'h5'];          // a merge → a second lane, to show the weave
 
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff'];
-const BASES = ['h0', 'h2', 'h4', 'h6', 'h9', 'h3'];    // six xells, six different heads (prods on h0,h2)
+// eight xells, eight different heads (prods on h0,h2; then the manager on h1 and its reaped worker on
+// h8 — a husk needs a dot of its OWN or the "a husk lends nothing" story lands on the manager's dot)
+const BASES = ['h0', 'h2', 'h4', 'h6', 'h9', 'h3', 'h1', 'h8'];
 const NAMES = ['swift-atlas', 'sunny-ember', 'calm-ridge', 'bold-harbor', 'lucid-fern', 'brave-quill'];
 
 const xells = NAMES.map((slug, i) => ({
@@ -36,11 +38,46 @@ const xells = NAMES.map((slug, i) => ({
     { role: 'webapp', name: 'web-' + slug, health: 'up', docker_ctx: 'ugreen' },
   ],
 }));
+// A MANAGER zee and its crew — the one hexagon that is NOT a work-cell. It is drawn as a persona
+// (the harness badge's language: dashed seat + avatar disc) with no head sha and no diffstat,
+// because a manager has zero push access to the xource; its crew is seated around it by seatXells.
+xells.push({
+  id: 'x6', slug: 'wise-cove-d6af', zee_type: 'manager', status: 'working', zee_status: 'working',
+  cli_active: true, hive_status: 'occ-working', hive_status_label: 'working',
+  db_coupling: 'db-prod-readonly', branch: 'spinoff/wise-cove-d6af', created_at: new Date(Date.now() - 5 * 3600e3).toISOString(),
+  head_commit: 'ab99f00d', remote_source: { ref: 'master' }, viewer_kind: 'ssh-terminal', viewer_url: 'ssh://x6',
+  zee_title: 'run the refactor crew', task_id: 'demo-task',
+  stack: [{ role: 'db', name: 'db-wise-cove', health: 'up', docker_ctx: 'ugreen' }],
+});
+xells[3].manager_xell_id = 'x6';   // bold-harbor reports to it (idle → "1 waiting")
+xells[5].manager_xell_id = 'x6';   // brave-quill too (working)
+xells[3].hive_status = 'occ-tendRequest'; xells[5].hive_status = 'occ-working';
+// A tend is only as useful as the reason on it — the mock hive carries one so the demo shows the
+// ask the way a human meets it ("who wants me, and what for"), not a bare amber hexagon.
+xells[3].tend = { open: true, at: new Date(Date.now() - 9 * 60e3).toISOString(),
+  reason: 'the migration needs prod’s schema — do I ask for a db-catchup or is this a seed?' };
+xells[5].zee_status = 'working'; xells[5].cli_active = true;
+// …and a REAPED crew member, because the rule easiest to get wrong is the one worth SEEING: a husk
+// lends nothing to the highlight (hive/crew.js isLiveXell). Hover or select the manager and this one
+// stays dark — hexagon, wire and commit dot — while its two live siblings light up, and the manager's
+// hexagon counts 2 crew, not 3.
+xells.push({
+  id: 'x7', slug: 'stale-glade-7f2c', status: 'husk', hive_status: 'vac-dirty', manager_xell_id: 'x6',
+  branch: 'spinoff/stale-glade-7f2c', head_commit: 'ab5510de', remote_source: { ref: 'master' },
+  created_at: new Date(Date.now() - 26 * 3600e3).toISOString(),
+  stack: [{ role: 'db', name: 'db-stale-glade', health: 'down', docker_ctx: 'ugreen' }],
+});
+
 // x0/x1 are the two prods (gold), on h0 & h2 → the graph tracks the median of the pair
 const timeline = {
   branch: 'master', commits,
-  xells: xells.map((x, i) => ({ id: x.id, base_commit: BASES[i],
-    color: i < 2 ? '#f2c14e' : LANE[i % LANE.length] })),
+  xells: xells.map((x, i) => ({ id: x.id, base_commit: BASES[i] || 'h1',
+    color: i < 2 ? '#f0913b' : LANE[i % LANE.length] })),
+  // The manager wears a manager harness — its badge art is what the manager HEXAGON shows, and that
+  // is the whole appearance of this harness in the grid: a manager is a `wearer` but never a
+  // `consumer`, so this harness takes NO cell of its own (it would seat the same avatar twice).
+  harnesses: [{ id: 'h-mgr', key: 'manager', label: 'Manager', glyph: '🧭', color: '#9b8cff',
+    base_commit: 'h1', wearer_ids: ['x6'], consumer_ids: [] }],
 };
 const diffs = Object.fromEntries(xells.map((x, i) => {
   const baseRow = commits.findIndex((c) => c.hash === BASES[i]);
@@ -80,13 +117,16 @@ function Demo() {
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
       </section>
 
-      <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
-                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+      {/* `xells` to BOTH of these as well as the canvas: the manager↔crew relation is drawn in all
+          three layers (hive/crew.js), so a demo that withheld the fleet from two of them would show a
+          highlight that half works — exactly the state ticket #25 existed to fix. */}
+      <GraphPane timeline={timeline} xells={xells} orientation={orientation} honeySide={honeySide}
+                 hexPosRef={hexPosRef} prodIds={prodIds} expandedId={expandedId} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
                  onFlip={() => { setHoneySide((s) => s === 'a' ? 'b' : 'a'); setVersion((v) => v + 1); }}
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
-      <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
+      <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />
@@ -105,6 +145,12 @@ function Demo() {
             Six xells on six different base commits. Each wire leaves the commit dot the xell sits on —
             a xell based on an older commit hangs off a lower dot (it's behind). Pan/zoom the honeycomb;
             the wires re-route live. Click a hex to bloom its flower.
+            <br /><br />
+            The seventh is a <b>manager</b> (wise-cove): drawn as a persona — dashed seat, its harness
+            avatar, a prod-orange double wall — with its crew seated around it, and deliberately
+            without a head sha or a diffstat. Bloom it: petals 5/6 are CREW and PROD·AGE, and there is
+            no pull/land/PR to click. Note what is <i>not</i> in the grid: its harness gets no cell of
+            its own — the manager hexagon already IS that persona.
           </p>
           <ul style={{ color: 'var(--muted)', font: "12px 'Cascadia Code', monospace", lineHeight: 1.8 }}>
             {timeline.xells.map((tx) => {

@@ -6,6 +6,7 @@ import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { dockerPs, stopAndRemoveContainer, removeImage } from '../lib/docker.js';
+import { deviceBootState } from '../lib/devices.js';
 
 // Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
 // role } (the zeehive.* identity labels, null when the container is unlabeled) and a null map
@@ -93,7 +94,7 @@ export async function checkContainers() {
   // project/xell identity rides along so labeled containers match exactly (sanitized project
   // token = what the compose labels carry, mirroring lib/manifest.js sanitizeName).
   const containers = await q(
-    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role,
+    `SELECT c.id, c.name, c.docker_ctx, c.health, c.role, c.isolation,
             lower(regexp_replace(p.name, '[^a-zA-Z0-9]', '', 'g')) AS project_token,
             x.slug AS xell_slug
        FROM container c
@@ -107,7 +108,7 @@ export async function checkContainers() {
     ? await probeContexts([...new Set(containers.map((c) => c.docker_ctx))])
     : {};
 
-  let up = 0, down = 0, unknown = 0, changed = 0, busy = 0;
+  let up = 0, down = 0, unknown = 0, changed = 0, busy = 0, booting = 0;
   for (const c of containers) {
     // A build owns the 'building' state — don't clobber it from `docker ps`. Mid-build the old
     // container may still be Up (or already gone), and overwriting it would kill the UI spinner
@@ -119,8 +120,16 @@ export async function checkContainers() {
     else {
       const state = matchState(ps, c);
       health = state == null ? 'down' : toHealth(state);
+      // Device readiness (035/048): a per-xell emulator that docker calls 'running' is not yet
+      // installable — the Android OS inside is still booting. Probe adb boot_completed and hold it
+      // at 'booting' until the device will accept an install. An inconclusive probe ('unknown')
+      // trusts docker and leaves it 'up', so a probe failure never traps a working device.
+      if (health === 'up' && c.role === 'device' && c.isolation === 'per-xell') {
+        const boot = await deviceBootState(c).catch(() => 'unknown');
+        if (boot === 'booting') health = 'booting';
+      }
     }
-    if (health === 'up') up++; else if (health === 'down') down++; else unknown++;
+    if (health === 'up') up++; else if (health === 'down') down++; else if (health === 'booting') booting++; else unknown++;
     if (health !== c.health) {
       const row = await one(
         `UPDATE container SET health = $2::container_health,
@@ -182,9 +191,9 @@ export async function checkContainers() {
   // Change-only: this ran every 30s and said the same thing every 30s, which in a shared
   // terminal is noise wearing a uniform. Note `changed` is part of the line, so any actual
   // health movement always logs.
-  const healthLine = `docker health: ${up} up · ${down} down · ${unknown} unknown${busy ? ` · ${busy} building (skipped)` : ''}${procs.length ? ` (incl. ${procs.length} process role(s) by URL)` : ''}${unreach.length ? ` (unreachable: ${unreach.join(', ')})` : ''}${changed ? ` · ${changed} changed` : ''}${orphans.length ? ` · ${orphans.length} ORPHANED` : ''}`;
+  const healthLine = `docker health: ${up} up · ${down} down · ${unknown} unknown${booting ? ` · ${booting} booting` : ''}${busy ? ` · ${busy} building (skipped)` : ''}${procs.length ? ` (incl. ${procs.length} process role(s) by URL)` : ''}${unreach.length ? ` (unreachable: ${unreach.join(', ')})` : ''}${changed ? ` · ${changed} changed` : ''}${orphans.length ? ` · ${orphans.length} ORPHANED` : ''}`;
   if (healthLine !== lastHealthLine) { lastHealthLine = healthLine; logline('containers', healthLine); }
-  return { up, down, unknown, changed, building: busy, unreachable: unreach, orphans };
+  return { up, down, unknown, booting, changed, building: busy, unreachable: unreach, orphans };
 }
 
 // ── decommission ONE container (the context-menu action) ─────────────────────
@@ -222,14 +231,21 @@ export async function decommissionContainer(id, { force = false } = {}) {
            + 'wait for it to finish, or force to remove it anyway.' };
   }
 
-  logline('containers', `decommissioning container ${c.name}`
-    + `${c.owner_slug ? ` (xell ${c.owner_slug})` : ''} — stopping + removing, reclaiming its image`);
+  // A SHARED device (035) is a real phone modeled as a row — there is NO container to stop and no
+  // image to reclaim, so removing it just drops the registration (the phone is untouched). A per-xell
+  // emulator, by contrast, IS a real container and goes through the normal stop+remove below.
+  const physicalDevice = c.role === 'device' && c.isolation === 'shared';
+
+  logline('containers', physicalDevice
+    ? `decommissioning device registration ${c.name} — removing the row (the physical phone is untouched)`
+    : `decommissioning container ${c.name}`
+      + `${c.owner_slug ? ` (xell ${c.owner_slug})` : ''} — stopping + removing, reclaiming its image`);
 
   // Stop + remove the real container. removeVolumes for a db so its data goes with it (a db
   // container's whole point is its volume). Best-effort over the daemon HTTP API — a missing
   // container (already gone) is success, and an unreachable daemon must not strand the row.
   let docker = { skipped: true };
-  if (c.docker_ctx) {
+  if (c.docker_ctx && !physicalDevice) {
     docker = await stopAndRemoveContainer(c.docker_ctx, c.name, { removeVolumes: c.role === 'db' })
       .catch((e) => ({ error: e.message }));
     if (docker.error) {

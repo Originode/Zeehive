@@ -2,19 +2,32 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
-         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup } from './api.js';
+         streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
+         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
+         pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject } from './api.js';
+import MessageComposer from './MessageComposer.jsx';
+import SwapZee from './SwapZee.jsx';
+import XellEnvironment from './XellEnvironment.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
+import { showDiff } from './DiffViewer.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 import HiveCanvas from './hive/HiveCanvas.jsx';
+// the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
+import { crewLinks } from './hive/crew.js';
+// the project-scoping filter for the fleet render surfaces (honeycomb and everything fed from it)
+import { projectScoped } from './projectFilter.js';
+import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel, { BackupsModal } from './Backups.jsx';
-import LandingPanel, { LandCard } from './Landing.jsx';
+import LandingPanel, { LandCard, holdsRunway } from './Landing.jsx';
+import ProdAsksPanel, { ProdBindCard, SeedCard } from './ProdData.jsx';
+import { AddManagerButton, DoneSuggestionCard } from './Manager.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
@@ -22,7 +35,9 @@ import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.j
 import MachineMatrix from './Machines.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
+import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
+import WorkConsole from './work/WorkConsole.jsx';
 import Toasts from './Toasts.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
@@ -56,6 +71,13 @@ const writeProjectParam = (project) => {
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', other: 'Other' };
 const shortSid = (s) => (s ? s.slice(0, 8) : '—');
 const base = (p) => (p ? p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() : '—');
+// One line, capped — for the short prose a zee writes for a human (a tend's reason, say), which is
+// shown inline on a chip that has no room to wrap. The FULL text always rides the element's title.
+const clip = (s, n = 60) => {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t;
+};
+const capitalise = (s) => String(s || '').charAt(0).toUpperCase() + String(s || '').slice(1);
 
 // FLEET BURN formatters. Compact token counts (1.2M, 890K, 4.2k → keep it short on a card) and a
 // dollar figure that keeps cents but never a distracting tail of zeros. These render fleet-OWN
@@ -94,22 +116,44 @@ function useStreamedXells(projectId) {
   const [xells, setXells] = useState([]);
   const mapRef = useRef(new Map());
   const acRef = useRef(null);
+  // FORCE-CLEAR on switch, synchronously. The effect below also resets, but effects run AFTER the
+  // render that already saw the new projectId — so for one frame the grid would still hold the
+  // PREVIOUS project's hexes (the lingering remnants). Reset-on-prop-change during render (React's
+  // documented pattern) drops them before paint, so a switch never flashes the old project.
+  const [prevPid, setPrevPid] = useState(projectId);
+  if (projectId !== prevPid) {
+    setPrevPid(projectId);
+    mapRef.current = new Map();
+    acRef.current?.abort();
+    setXells([]);
+  }
+  // Always-current selected project, written during render so an ASYNC stream from a PREVIOUS
+  // selection can tell it is stale before it writes a single hex into the NEW project's grid. A
+  // stale runStream — the previous project's LAST update stream landing after the switch — would
+  // otherwise abort the fresh stream, stream the OLD project's xells into the SAME map, and paint
+  // the remnants that linger across a project switch.
+  const pidRef = useRef(projectId);
+  pidRef.current = projectId;
   const runStream = useCallback(async () => {
     acRef.current?.abort();
     const ac = new AbortController();
     acRef.current = ac;
     const seen = new Set();
+    const streamProjectId = projectId;         // this stream's project — the staleness witness
+    const stillCurrent = () => pidRef.current === streamProjectId;
     try {
-      await streamFleetXells(projectId, {
+      await streamFleetXells(streamProjectId, {
         signal: ac.signal,
         onXell: (x) => {
           if (ac.signal.aborted) return;
+          if (!stillCurrent()) { ac.abort(); return; }   // stale — drop this stream, keep the new grid
           seen.add(x.id);
           mapRef.current.set(x.id, x);
           setXells(Array.from(mapRef.current.values()));
         },
       });
       if (ac.signal.aborted) return;
+      if (!stillCurrent()) return;   // stale at completion — never prune the new project's map
       for (const id of Array.from(mapRef.current.keys())) if (!seen.has(id)) mapRef.current.delete(id);
       setXells(Array.from(mapRef.current.values()));
     } catch (e) { /* aborted or transient — keep the last good set */ }
@@ -125,7 +169,6 @@ function useStreamedXells(projectId) {
   return [xells, runStream];
 }
 
-
 export default function App() {
   const [projects, setProjects] = useState([]);
   const [projectId, setProjectId] = useState(null);
@@ -140,9 +183,12 @@ export default function App() {
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
   const [showDispatch, setShowDispatch] = useState(false); // false | { provider } — the "+" prompt composer
+  const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
+  const [githubAccessState, setGithubAccessState] = useState(null); // {can_push, can_pr, default_branch, reason}
+  const [githubOut, setGithubOut] = useState(null); // last push/PR outcome {kind, busy, pushed, opened, url, reason}
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
   const [loadBackupFor, setLoadBackupFor] = useState(null); // db container to restore a backup INTO
   const [shellFor, setShellFor] = useState(null); // container to open a docker-exec shell into
@@ -156,12 +202,19 @@ export default function App() {
   useEffect(() => { setSplit(readSplit(orientation)); }, [orientation]);
   const [expandedId, setExpandedId] = useState(null); // the xell blown into a flower + action drawer
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
+  const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
+  const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
+  // ♻ swap composer, opened from the flower's BRANCH petal: replace the ZEE working this xell and
+  // keep the xell (same branch, commits, containers, database, card). It carries the xell's diff so the
+  // composer can warn about uncommitted work — the collect saves COMMITS, and only commits.
+  const [swapXell, setSwapXell] = useState(null);
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
   const [streamedXells, restreamXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
   // per-frame "geometry changed" fire so a pan/zoom re-tracks the graph and re-routes the wires
   // WITHOUT re-rendering the whole app.
   const hexPosRef = useRef({});
+  const harnessPosRef = useRef({});   // harness grid-cell centres (published by HiveCanvas, read by Connectors)
   const geomListeners = useRef(new Set());
   const subscribeGeom = useCallback((fn) => {
     geomListeners.current.add(fn);
@@ -171,13 +224,16 @@ export default function App() {
     geomListeners.current.forEach((fn) => { try { fn(); } catch { /* listener detached mid-fire */ } });
   }, []);
   // shared hover: hovering a hex or a commit dot highlights the hex, its wire, and its dot together.
+  // `harness` is the third focus target — hovering a harness badge lights up every xell that wears
+  // it (and its through-traces), the mirror of a xell hover lighting up the harness it wears.
   // A ref + subscription (not state) so a hover doesn't re-render the whole app.
-  const hoverRef = useRef({ id: null, commit: null });
+  const hoverRef = useRef({ id: null, commit: null, harness: null });
   const hoverListeners = useRef(new Set());
   const setHover = useCallback((h) => {
+    const n = { id: h.id ?? null, commit: h.commit ?? null, harness: h.harness ?? null };
     const c = hoverRef.current;
-    if (c.id === h.id && c.commit === h.commit) return;
-    hoverRef.current = h;
+    if (c.id === n.id && c.commit === n.commit && c.harness === n.harness) return;
+    hoverRef.current = n;
     hoverListeners.current.forEach((fn) => { try { fn(); } catch { /* detached */ } });
   }, []);
   const subscribeHover = useCallback((fn) => {
@@ -210,8 +266,11 @@ export default function App() {
 
   // Always-current selected project, so async fetches from a *previous* selection can be
   // dropped instead of clobbering the newly-selected project's data (fixes the switch race).
+  // Written during render (not in an effect) so an in-flight fetch that resolves in the render→
+  // effect window already sees the NEW selection — the effect-updated ref let the old project's
+  // LAST update stream land one frame late and repaint the previous project's remnants.
   const projectIdRef = useRef(null);
-  useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
+  projectIdRef.current = projectId;
   // Which AI provider ACCOUNTS this project can dispatch on — drives the per-account prompt
   // buttons. NB: read the fallback id off `fleet` (state), NOT the `project` const destructured
   // from it further down — referencing that in this deps array is a temporal-dead-zone crash
@@ -221,6 +280,16 @@ export default function App() {
     if (!pid) return;
     getProviderTokens(pid).then((t) => setProviders(Array.isArray(t) ? t : [])).catch(() => setProviders([]));
   }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
+  // GitHub access check: does the stored token let us push / open PRs to the remote?
+  // Re-fetches when the project or the setup modal closes (the operator may have added a token there).
+  useEffect(() => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid) { setGithubAccessState(null); return; }
+    let live = true;
+    githubAccess(pid).then((a) => { if (live) setGithubAccessState(a); })
+      .catch(() => { if (live) setGithubAccessState(null); });
+    return () => { live = false; };
+  }, [projectId, fleet?.project?.id, showSetup]);
   // Latest project list, read from callbacks with stable identities (e.g. selectProject) so they
   // can resolve an id → project row for the URL without re-binding on every list change.
   const projectsRef = useRef([]);
@@ -236,8 +305,14 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const pid = projectId;
     try {
-      const [f, t, d] = await Promise.all([getFleet(projectId), getTimeline(projectId), getDiffs(projectId)]);
+      const [f, t, d] = await Promise.all([getFleet(pid), getTimeline(pid), getDiffs(pid)]);
+      // STALE-GUARD: the selected project can change while this fetch is in flight (a switch, or the
+      // previous project's LAST stream event). Drop the WHOLE batch — applying it would repaint the
+      // previous project's timeline/diffs AND re-stream its xells into the honeycomb (the lingering
+      // remnants across a switch).
+      if (projectIdRef.current !== pid) return;
       applyFleet(f);
       if (t) setTimeline(t);
       if (d) setDiffs(d);
@@ -249,9 +324,48 @@ export default function App() {
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
-  const pushToast = useCallback((t) => setToasts((ts) => [...ts, t]), []);
+  // Upsert: create or update a toast by id. Used for progress where the same id emits
+  // multiple events, and for one-shot notifications (dispatch, pause, etc.) whose ids
+  // are always unique — so this single verb replaces the old "push then update" pattern.
+  const upsertToast = useCallback((id, props) => {
+    setToasts((ts) => {
+      const idx = ts.findIndex((t) => t.id === id);
+      if (idx >= 0) {
+        const updated = [...ts];
+        updated[idx] = { ...updated[idx], ...props };
+        return updated;
+      }
+      return [...ts, { id, ...props }];
+    });
+  }, []);
+  // Convenience for callers that pass { id, … } as one object (dispatch, pause, nudge, …).
+  // Unpacks to upsertToast(id, rest) so the upsert pattern is shared.
+  const pushToast = useCallback((t) => {
+    if (t?.id) upsertToast(t.id, t);
+  }, [upsertToast]);
+  // Update-only for cases where the toast is guaranteed to already exist.
   const updateToast = useCallback((id, patch) =>
     setToasts((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t))), []);
+
+  // Live progress of db backup / restore / copy operations — maps SSE events to progress toasts.
+  // The toast id is `dbop-<op>-<id>` so all events for the same operation update the same toast.
+  const onDbOpProgress = useCallback((p) => {
+    if (!p?.op || !p?.id) return;
+    const tid = `dbop-${p.op}-${p.id}`;
+    if (p.status === 'finished') {
+      upsertToast(tid, { kind: 'success', title: `${capitalise(p.op)} complete`, body: p.msg, pct: 100, onRetry: null });
+      setTimeout(() => dismissToast(tid), 6000);
+    } else if (p.status === 'failed') {
+      upsertToast(tid, { kind: 'error', title: `${capitalise(p.op)} failed`, body: p.error || p.msg, pct: 0, onRetry: null });
+      setTimeout(() => dismissToast(tid), 12000);
+    } else {
+      // running — upsert with progress
+      const title = p.label
+        ? `${capitalise(p.op)} — ${p.label}`
+        : `${capitalise(p.op)} in progress`;
+      upsertToast(tid, { kind: 'progress', title, body: p.msg, pct: p.pct ?? 0 });
+    }
+  }, [upsertToast, dismissToast]);
 
   // Fire-and-forget dispatch. The composer hands us the whole payload and closes IMMEDIATELY; the
   // slow bits (uploading a pasted image, renaming the worktree, spawning + awaiting the zee) run
@@ -308,6 +422,52 @@ export default function App() {
     // state declared at the top of the component, so it is always safe to reference here.
   }, [pushToast, updateToast, dismissToast, refresh, projectId, fleet]);
 
+  // ── GitHub outbound (push / open PR) ───────────────────────────────────────
+  // Same flow as ProjectSetup's BasicsSection — confirm, call API, report the outcome.
+  const doGitHubPush = useCallback(async () => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid || !githubAccessState?.can_push) return;
+    if (!(await showConfirm(
+      `Push local ${fleet?.project?.main_branch || 'main'} of ${fleet?.project?.name} to the GitHub remote?\n\n`
+      + `${fleet?.project?.remote_url || ''}\n\nThis publishes your local history to the remote (fast-forward only — a `
+      + `diverged remote is refused, never force-pushed).`,
+      { title: 'Push to remote?', okLabel: 'Push' }))) return;
+    setGithubOut({ busy: true, kind: 'push' });
+    try {
+      const r = await pushProject(pid);
+      setGithubOut({ ...r, kind: 'push' });
+    } catch (e) { setGithubOut({ kind: 'push', reason: e.message }); }
+  }, [projectId, fleet?.project?.id, fleet?.project?.main_branch, fleet?.project?.name, fleet?.project?.remote_url, githubAccessState]);
+
+  // Pull is fetch + fast-forward ONLY from the GitHub remote.
+  const doGitHubPull = useCallback(async () => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid) return;
+    setGithubOut({ busy: true, kind: 'pull' });
+    try {
+      const r = await pullProject(pid);
+      setGithubOut({ ...r, kind: 'pull' });
+    } catch (e) { setGithubOut({ kind: 'pull', reason: e.message }); }
+  }, [projectId, fleet?.project?.id]);
+
+  const doGitHubPR = useCallback(async (merge = false) => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid || !githubAccessState?.can_pr) return;
+    const headBranch = await showPrompt(
+      `${merge ? 'Open a pull request and MERGE it' : 'Open a pull request'} from local ${fleet?.project?.main_branch || 'main'}.\n\n`
+      + `A side branch is pushed to the remote and a PR is opened against ${githubAccessState?.default_branch || 'the default branch'}`
+      + `${merge ? ', then merged into it on GitHub' : ''}. `
+      + `Name the head branch (leave as-is for a generated name):`,
+      { title: merge ? 'Open a pull request and merge?' : 'Open a pull request?',
+        defaultValue: `zeehive/${fleet?.project?.main_branch || 'main'}`, okLabel: merge ? 'Open & merge' : 'Open PR' });
+    if (headBranch === null) return;
+    setGithubOut({ busy: true, kind: 'pr', merge });
+    try {
+      const r = await pullRequestProject(pid, { headBranch: headBranch.trim() || undefined, merge });
+      setGithubOut({ ...r, kind: 'pr', merge });
+    } catch (e) { setGithubOut({ kind: 'pr', merge, reason: e.message }); }
+  }, [projectId, fleet?.project?.id, fleet?.project?.main_branch, githubAccessState]);
+
   // once: global logs, and pick the active project (persisted → first)
   useEffect(() => {
     getLogs().then((ls) => setLogs(ls));
@@ -327,8 +487,9 @@ export default function App() {
   useEffect(() => {
     setConn('connecting');
     setTimeline(null); setDiffs({});   // don't show the previous project's git graph while loading
-    getTimeline(projectId).then((t) => { if (t) { setTimeline(t); setVersion((v) => v + 1); } });
-    getDiffs(projectId).then((d) => d && setDiffs(d));
+    let live = true;   // a fetch/stream from a PREVIOUS project must never paint over the new one
+    getTimeline(projectId).then((t) => { if (live && t) { setTimeline(t); setVersion((v) => v + 1); } });
+    getDiffs(projectId).then((d) => { if (live && d) setDiffs(d); });
     const unsub = subscribe(projectId, {
       onSnapshot: (f) => { applyFleet(f); setConn('live'); },
       onChange: refresh,
@@ -336,9 +497,11 @@ export default function App() {
       onLog: (l) => setLogs((prev) => [...prev.slice(-1999), l]),
       // Per-ship build feed, keyed by ship id, capped so a chatty build can't eat the tab.
       onShipLog: (l) => setShipLogs((prev) => ({ ...prev, [l.id]: [...(prev[l.id] || []).slice(-399), l] })),
+      // Live progress of db backup / restore / copy — drives progress toasts.
+      onDbOpProgress,
     });
-    return unsub;
-  }, [projectId, refresh, applyFleet]);
+    return () => { live = false; unsub(); };
+  }, [projectId, refresh, applyFleet, onDbOpProgress]);
 
   const selectProject = useCallback((id) => {
     setProjectId(id);
@@ -383,6 +546,18 @@ export default function App() {
   // ASKED, which is a different card entirely — that is the point of a PR.
   const shipByXell = {};
   for (const s of fleet.shipping || []) shipByXell[s.xell_id] ||= s;
+  // The PROD-DATA asks (a zee asking for the production database, or for a landed seed file to be
+  // run on production) live on the card of the xell that asked — the same reasoning as landings:
+  // "wise-grove wants prod" is information about wise-grove, and it is decided next to that xell's
+  // own diff and status. Before this they had no console surface at all.
+  const prodBindByXell = {};
+  for (const r of fleet.prod_bind || []) (prodBindByXell[r.xell_id] ||= []).push(r);
+  const seedByXell = {};
+  for (const r of fleet.prod_seed || []) (seedByXell[r.xell_id] ||= []).push(r);
+  // A MANAGER zee's open "this xell is finished" suggestions, keyed by the xell they are ABOUT —
+  // they render on that xell's chip, because that is the xell the decision reaps.
+  const doneSuggestByXell = {};
+  for (const r of fleet.done_suggestions || []) (doneSuggestByXell[r.target_xell_id] ||= []).push(r);
 
   // Dismissed notifications, by request id. The server records the dismissal (dismissed_at on the
   // row) so it survives reloads and SSE refreshes — receipts used to pop back on every refresh
@@ -392,7 +567,12 @@ export default function App() {
     setDismissed((d) => ({ ...d, [id]: true }));
     dismissLanding(id).catch(() => setDismissed((d) => ({ ...d, [id]: false })));
   };
-  const visible = (rs) => (rs || []).filter((r) => !dismissed[r.id] && !r.dismissed_at);
+  // …with ONE exception, and it is the whole of #11's gap 2: a landing that HOLDS THE RUNWAY with zees
+  // queued behind it is not a receipt, it is a blocker, and hiding it hid them too (the approach queue
+  // renders under the card that owns the runway). Dismissal still does not free the ref — the gate's
+  // runwayOccupant ignores dismissed_at on purpose — so the honest resolution is to stop hiding it
+  // rather than to let a hidden card silently pass the next push through. See holdsRunway in Landing.jsx.
+  const visible = (rs) => (rs || []).filter((r) => holdsRunway(r) || (!dismissed[r.id] && !r.dismissed_at));
 
   // Route each landing to the card that will actually RENDER it — which is not the same question as
   // "does it have a xell_id". The fleet only lists xells with status <> 'retired', so a landing
@@ -401,16 +581,48 @@ export default function App() {
   // invisible. Ask whether a card exists, not whether an id does.
   // The honeycomb's xells come from the lazy NDJSON stream (hexagons appear as data arrives); fall
   // back to the fleet snapshot if the stream hasn't produced anything yet (e.g. it errored).
-  const gridXells = streamedXells.length ? streamedXells : (fleet.xells || []);
+  // FORCE-CLEAR on switch: during a project switch the stream is reset to empty while the OLD
+  // project's fleet snapshot still sits in state (applyFleet won't overwrite it until the NEW
+  // project's snapshot arrives). Falling back to that stale fleet paints the previous project's
+  // xells on the canvas — the "remnants that linger". So only use the fleet fallback when it
+  // actually belongs to the selected project; otherwise show nothing until the new data lands.
+  const fleetMatchesSelection = !projectId || fleet.project?.id === projectId;
+  // CLIENT-SIDE PROJECT FILTER, belt-and-braces under the stream guards: every render, drop any xell
+  // that demonstrably belongs to a DIFFERENT project before the honeycomb (or anything downstream)
+  // sees it. The stream and fleet are project-scoped and the stale-stream guards keep the map clean,
+  // but a xell from the previous project's LAST update stream must never paint — the filter is the
+  // final gate, and it costs one pass over an already-small list.
+  const gridXells = projectScoped(
+    streamedXells.length ? streamedXells : (fleetMatchesSelection ? (fleet.xells || []) : []),
+    projectId);
   const carded = new Set(gridXells.map((x) => x.id));
+  // THE APPROACH QUEUE, by ref (067). One runway per ref, so the queue belongs under the card that
+  // is holding it up — keyed the same way, and never merged into `landing` (a holding row is not a
+  // card, and putting it there would raise the second question the runway exists to prevent).
+  const holdingByRef = {};
+  for (const h of fleet.holding || []) (holdingByRef[h.ref] ||= []).push(h);
+  const queueFor = (r) => holdingByRef[r?.ref] || [];
+  // Attached to the ROW at routing time rather than threaded down as a prop: a LandCard renders in
+  // three different component trees, and the queue has to arrive in all of them.
+  const withQueue = (r) => ({ ...r, queue: queueFor(r) });
+
   const landingByXell = {};
   const prsByRef = {};
   const orphanLandings = [];
+  const refsWithCard = new Set();
   for (const r of fleet.landing || []) {
-    if (r.kind === 'pull') (prsByRef[r.ref] ||= []).push(r);
-    else if (r.xell_id && carded.has(r.xell_id)) (landingByXell[r.xell_id] ||= []).push(r);
-    else orphanLandings.push(r);   // no xell (gate could not match the sha), or its xell is gone
+    if (r.kind === 'pull') { (prsByRef[r.ref] ||= []).push(r); continue; }
+    refsWithCard.add(r.ref);
+    if (r.xell_id && carded.has(r.xell_id)) (landingByXell[r.xell_id] ||= []).push(withQueue(r));
+    else orphanLandings.push(withQueue(r));   // no xell (gate could not match the sha), or its xell is gone
   }
+  // Holders whose runway has NO card to sit under. This should be a blink — the tower clears the
+  // queue the moment the runway frees — but if a clearance ever fails to land, those zees would be
+  // waiting with nothing on any screen, which is precisely the invisibility this protocol must not
+  // introduce. So they get rendered somewhere rather than nowhere.
+  const orphanQueues = Object.entries(holdingByRef)
+    .filter(([ref]) => !refsWithCard.has(ref))
+    .map(([ref, queue]) => ({ ref, queue }));
   const prsFor = (x) => prsByRef[`refs/heads/${x.remote_source?.ref || ''}`]
     // production IS local main, so PRs against main are production's to answer. Its remote_source
     // is origin (what it tracks), which is NOT what it receives work on — hence the special case.
@@ -431,14 +643,17 @@ export default function App() {
 
   const expandedXell = expandedId ? xells.find((x) => x.id === expandedId) : null;
   const prodIds = xells.filter((x) => x.is_production).map((x) => x.id);  // graph tracks their median
+  // The manager↔crew relation for the DOM surfaces (hive/crew.js — the SAME grouping the honeycomb, the
+  // wires and the graph read; live crew only). Computed once here and handed down, not re-derived per row.
+  const crewOfFleet = crewLinks(xells);
 
   // Open a xell's session in the right surface — the honeycomb flower's click target, and the
   // drawer card's. Web sessions open a tab; desktop-protocol sessions deep-link into Claude Desktop.
   const openSession = (x) => {
     if (!x?.viewer_url || x.is_production) return;
-    // A cxell zee's viewer is an ssh:// terminal, not a URL a browser can open — its card
-    // carries the ⌨ terminal button instead, so ignore the generic open here.
-    if (x.viewer_kind === 'ssh-terminal') return;
+    // A cxell zee's viewer is an ssh:// terminal, not a URL a browser can open — open the
+    // in-house terminal modal directly (the bloom center and shift+click both land here).
+    if (x.viewer_kind === 'ssh-terminal') { setTermXell(x); return; }
     if (x.viewer_kind === 'desktop-protocol') openProtocol(x.viewer_url);
     else window.open(x.viewer_url, '_blank', 'noopener');
   };
@@ -446,9 +661,31 @@ export default function App() {
   // The flower's canvas action buttons dispatch here (HiveCanvas onAction) — same verbs the old DOM
   // toolbar/drawer ran, with the same confirmations, so nothing changed but WHERE they are clicked.
   const handleFlowerAction = async (kind, x, diff) => {
-    if (!x || x.is_production) return;
+    if (!x) return;
+    // READ-ONLY, so it comes BEFORE the production guard: the flower's two diffstat petals open the
+    // diff viewer, and "what has production drifted to?" is a question worth answering on prod too.
+    if (kind === 'srcdiff' || kind === 'owndiff') {
+      const own = kind === 'owndiff';
+      if (own && x.is_production) return;                    // prod has no working tree
+      showDiff({ kind: 'xell', xellId: x.id, diffKind: own ? 'own' : 'source',
+        title: `${x.slug} · ${own ? 'uncommitted' : 'source diff'}`,
+        subtitle: own ? 'work since its own last checkpoint — not yet committed'
+          : x.is_production ? 'what is deployed vs the origin mirror'
+          : 'everything this xell adds over its fork point — what would land' });
+      return;
+    }
+    if (x.is_production) return;
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
+    if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
+    if (kind === 'env') {
+      // Opens the ENVIRONMENT panel (ticket #20): which environment this xell resolved to and why,
+      // its var names, and the pin/clear. The raw .zeehive.env dump this used to show is still one
+      // click away inside it — but the file alone could not answer "why is it unchanged?", which is
+      // the question that actually gets asked.
+      setEnvXell(x);
+      return;
+    }
     if (kind === 'build') {
       if (x.stack.some(isBusy)) { showAlert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
@@ -457,6 +694,10 @@ export default function App() {
       markXellDone(x, diff, refresh, { landing: landingByXell[x.id], prs: prsFor(x), ship: shipByXell[x.id] });
       return;
     }
+    // ♻ SWAP — done's cheaper neighbour: keep the xell, change who is in it. The composer collects
+    // the persona (and an optional brief); the server owns every refusal, so nothing is pre-checked
+    // here beyond opening the right modal.
+    if (kind === 'swap') { setSwapXell({ ...x, diff }); return; }
     if (kind === 'push' || kind === 'land') {
       if (!(await showConfirm(`Land ${x.slug} → ${src}?\n\nThis runs the same gated push a zee runs. Unless a human has ALREADY `
         + `approved this exact commit, the gate HOLDS it and raises it for verification — expected, not a failure. `
@@ -466,7 +707,9 @@ export default function App() {
     }
     if (kind === 'ship') {
       if (!(await showConfirm(`Ship ${x.slug} to PRODUCTION?\n\nThis files a ship request. It is REFUSED unless the work is `
-        + `already landed on main; a human then approves it in the ship panel, and the queenzee deploys from main.`,
+        + `already landed on main; a human then approves it in the ship panel, and the queenzee deploys from main.\n\n`
+        + `A ship is FLEET-WIDE: it deploys the CURRENT TIP of main — every landing on main at that moment, `
+        + `not only ${x.slug}'s work. The ship card names the sha and the migrations that ride with it.`,
         { variant: 'danger', okLabel: 'Request ship' }))) return;
       const id = `ship-${x.id}-${Date.now()}`;
       pushToast({ id, kind: 'progress', title: `Requesting ship of ${x.slug}…` });
@@ -478,6 +721,44 @@ export default function App() {
         refresh();
       }).catch((e) => { updateToast(id, { kind: 'error', title: 'Ship failed', body: e?.message || String(e), onRetry: null });
         setTimeout(() => dismissToast(id), 7000); });
+      return;
+    }
+    if (kind === 'pause') {
+      // Optimistic update: set local state immediately so the flower shows play
+      x.hive_status = 'occ-paused';
+      x.hive_status_label = 'paused';
+      x.xell_paused = true;
+      setVersion((v) => v + 1);
+      const id = `xpause-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Pausing ${x.slug}…` });
+      pauseXell(x.id).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: `Paused ${x.slug}`, onRetry: null,
+          body: r?.counts?.interrupted ? `${r.counts.interrupted} turn(s) interrupted` : 'marked as paused' });
+        else updateToast(id, { kind: 'error', title: 'Pause not delivered', onRetry: null,
+          body: r?.reason || 'server refused' });
+        setTimeout(() => dismissToast(id), 6000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Pause failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
+      return;
+    }
+    if (kind === 'resume') {
+      // Optimistic update: set local state immediately so the flower shows pause
+      x.hive_status = 'occ-working';
+      x.hive_status_label = 'working';
+      x.xell_paused = false;
+      setVersion((v) => v + 1);
+      const id = `xresume-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Resuming ${x.slug}…` });
+      resumeXell(x.id).then((r) => {
+        if (r?.ok) updateToast(id, { kind: 'success', title: `Resumed ${x.slug}`, onRetry: null,
+          body: r?.counts?.nudged ? `${r.counts.nudged} zee(s) called back` : 'marked as active' });
+        else updateToast(id, { kind: 'error', title: 'Resume not delivered', onRetry: null,
+          body: r?.reason || 'server refused' });
+        setTimeout(() => dismissToast(id), 6000);
+        refresh();
+      }).catch((e) => { updateToast(id, { kind: 'error', title: 'Resume failed', body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 6000); });
       return;
     }
     if (kind === 'nudge') {
@@ -519,8 +800,9 @@ export default function App() {
                     machines={fleet.machines} onOpenSession={openSession} onAction={handleFlowerAction}
                     onContainerMenu={openMenu}
                     expandedId={expandedId} onExpand={setExpandedId}
-                    hexPosRef={hexPosRef} onGeometry={fireGeom}
-                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+                    hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} onGeometry={fireGeom}
+                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                    redrawKey={version} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs
             DOM, so it opens as a modal from the flower's ⌨ button. */}
@@ -542,20 +824,63 @@ export default function App() {
             </div>
           </div>
         )}
+        {/* xellId lights the terminal's 💬 talk composer — the door that reaches this zee even while
+            it is mid-turn (the pane is a read-only feed then, so typing reaches nobody). */}
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
-                       onClose={() => setTermXell(null)} />
+                       xellId={termXell.id} onClose={() => setTermXell(null)} />
+        )}
+        {envXell && (
+          <XellEnvironment xell={envXell} onClose={() => setEnvXell(null)} onChanged={refresh} />
+        )}
+        {msgXell && (
+          <MessageComposer xell={msgXell} initialText={msgXell.initialText || ''} onClose={() => setMsgXell(null)}
+                           onSent={(r) => { const id = `msg-${msgXell.id}-${Date.now()}`;
+                             pushToast({ id, kind: 'success', title: `Message sent to ${msgXell.slug}`, onRetry: null,
+                               body: r?.attachments?.length ? `${r.attachments.length} attachment(s) delivered to its .zee-inbox` : 'typed into its live session' });
+                             setTimeout(() => dismissToast(id), 6000); }} />
+        )}
+        {/* ♻ SWAP THE ZEE — the console half of `zee swap`. FIRE-AND-FORGET, like the dispatch
+            composer: the swap collects the outgoing cage's commits, recreates the cage and spawns a
+            zee, which takes seconds, so the modal closes at once and a toast carries the outcome.
+            A REFUSAL is the server's own sentence, verbatim — "swap refused" with no reason would
+            send a human hunting for a rule (an open landing card, a persona of the wrong type) that
+            the answer already named. */}
+        {swapXell && (
+          <SwapZee xell={swapXell} projectId={projectId} diff={swapXell.diff || null}
+                   onClose={() => setSwapXell(null)}
+                   onSwap={(payload) => {
+                     const x = swapXell;
+                     setSwapXell(null);
+                     const id = `swap-${x.id}-${Date.now()}`;
+                     pushToast({ id, kind: 'progress', title: `Swapping the zee in ${x.slug}…`,
+                       body: `collecting its commits, then caging a ${payload.harness} zee on the same branch` });
+                     swapXellZee(x.id, payload).then((r) => {
+                       updateToast(id, { kind: 'success', onRetry: null,
+                         title: `${x.slug} now wears ${r?.harness?.key || payload.harness}`,
+                         body: r?.message || 'the incoming zee was briefed that it inherited this xell' });
+                       setTimeout(() => dismissToast(id), 9000);
+                       refresh();
+                     }).catch((e) => {
+                       updateToast(id, { kind: 'error', title: `Swap refused · ${x.slug}`,
+                         body: e?.message || String(e), onRetry: null });
+                       setTimeout(() => dismissToast(id), 14000);
+                       refresh();
+                     });
+                   }} />
         )}
       </section>
 
-      <GraphPane timeline={timeline} orientation={orientation} honeySide={honeySide}
-                 hexPosRef={hexPosRef} prodIds={prodIds} subscribeGeom={subscribeGeom}
+      {/* `xells` rides along to BOTH the graph and the wires so the manager↔crew relation is drawn
+          from the same fleet list the honeycomb uses (hive/crew.js) — three views, one grouping. */}
+      <GraphPane timeline={timeline} xells={xells} orientation={orientation} honeySide={honeySide}
+                 hexPosRef={hexPosRef} prodIds={prodIds} expandedId={expandedId} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
                  onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
-      <Connectors timeline={timeline} layoutRef={layoutRef} version={version}
-                  hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
+      <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
+                  hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
                   hoverRef={hoverRef} subscribeHover={subscribeHover} />
 
@@ -570,6 +895,47 @@ export default function App() {
           <span className="k folder">Folder:</span> <span className="mono">{project.repo_root}</span>
         </div>
         <div className="right">
+          {/* GitHub remote: push / PR buttons — only surface when the token allows outbound. */}
+          {(fleet?.project?.remote_url) && (
+            <span className="gh-btns" title={`GitHub: ${fleet?.project?.remote_url}`}>
+              <a className="gh-link" href={fleet?.project?.remote_url} target="_blank" rel="noreferrer"
+                 title="Open the GitHub remote in your browser">⑂</a>
+              <button className={`gh-btn ${githubOut?.kind === 'pull' && githubOut?.busy ? 'busy' : ''}`}
+                      disabled={githubOut?.busy}
+                      onClick={doGitHubPull}
+                      title="Fetch + fast-forward from the GitHub remote">↓ Pull</button>
+              {githubAccessState?.can_push && (
+                <button className={`gh-btn ${githubOut?.kind === 'push' && githubOut?.busy ? 'busy' : ''}`}
+                        disabled={githubOut?.busy}
+                        onClick={doGitHubPush}
+                        title="Push local main to the GitHub remote (fast-forward only)">↑ Push</button>
+              )}
+              {githubAccessState?.can_pr && (
+                <button className={`gh-btn ${githubOut?.kind === 'pr' && githubOut?.busy ? 'busy' : ''}`}
+                        disabled={githubOut?.busy}
+                        onClick={() => doGitHubPR(false)}
+                        title="Push a side branch and open a pull request on GitHub">⇅ PR</button>
+              )}
+              {githubAccessState?.can_pr && (
+                <button className={`gh-btn ${githubOut?.kind === 'pr' && githubOut?.busy ? 'busy' : ''}`}
+                        disabled={githubOut?.busy}
+                        onClick={() => doGitHubPR(true)}
+                        title="Open a PR AND merge it into the default branch on GitHub">⇅ PR ⟳</button>
+              )}
+              {githubOut && !githubOut.busy && (
+                <a className={`gh-out${!githubOut.pushed && !githubOut.opened && !githubOut.pulled ? ' bad' : ''}`}
+                   href={githubOut?.url || null} target="_blank" rel="noreferrer"
+                   title={githubOut?.pushed ? 'Pushed successfully'
+                     : githubOut?.opened ? (githubOut?.merge?.merged ? 'PR opened & merged' : 'PR opened')
+                     : githubOut?.pulled ? (githubOut?.state === 'up-to-date' ? 'Remote already up to date' : 'Pulled from remote')
+                     : githubOut?.reason || 'result'}>
+                  {githubOut?.pushed || githubOut?.pulled ? '✓'
+                    : githubOut?.opened ? `#${githubOut?.number || '✓'}`
+                    : '✗'}
+                </a>
+              )}
+            </span>
+          )}
           {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
           {/* No runtime toggle here: WHICH AI answers a prompt is decided by clicking that
               account's own prompt button in the status line — one click, no second choice. */}
@@ -578,6 +944,13 @@ export default function App() {
       </header>
 
       <div className="statusline" data-testid="statusline">
+        {/* FIRST in the line, before anything that starts work: the one control that stops all of it.
+            Its own state is also the answer to "why is nothing happening?", which is the question the
+            rest of this line cannot answer while the fleet is paused.
+            With a project selected, this operates on the PROJECT (project_pause), not the whole fleet. */}
+        <FleetPause pause={fleet.project_pause || fleet.pause}
+                    projectId={projectId || project.id} onChanged={refresh}
+                    pushToast={pushToast} dismissToast={dismissToast} />
         <span className="k">Status:</span>{' '}
         <b>{status.inUse}</b> of <b>{status.total}</b> xells in use
         <span className="sub"> ({status.working} active · {status.ready} ready)</span>
@@ -614,7 +987,7 @@ export default function App() {
           const buttons = ai.flatMap((p) => (p.accounts || []).map((a) => {
             const dupes = (p.accounts || []).length > 1;
             const name = a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label);
-            return { id: a.id, provider: p.provider, name, typeLabel: p.label };
+            return { id: a.id, provider: p.provider, name, typeLabel: p.label, paused: !!a.paused };
           }));
           if (!buttons.length) {
             return (
@@ -623,29 +996,66 @@ export default function App() {
                       onClick={() => setShowSetup(true)}>＋ add provider</button>
             );
           }
+          // A paused account keeps its button so it stays VISIBLE as disabled — hiding it would
+          // read as "the account vanished", and the pause is deliberately reversible. The server
+          // refuses a dispatch on it regardless (spawnCreds → tokenForSpawn).
           return buttons.map((b) => (
             <button key={b.id} className="new-prompt-btn" data-testid={`new-prompt-btn-${b.provider}`}
-                    title={`Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
+                    disabled={b.paused}
+                    title={b.paused
+                      ? `⏸ ${b.typeLabel} (${b.name}) is PAUSED — resume it in Project setup to dispatch on it`
+                      : `Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
                     onClick={() => setShowDispatch({ provider: b.provider, tokenId: b.id, label: b.name })}>
-              ＋ prompt · {b.name}
+              {b.paused ? '⏸' : '＋'} prompt · {b.name}
             </button>
           ));
         })()}
+        {/* ADD A MANAGER ZEE — unlimited, and only from here: a manager coordinates workers, holds
+            production READ-ONLY and cannot push to the xource, and `zee dispatch` refuses the role
+            so managers can never mint managers. Sits beside the prompt buttons because it is the
+            same act one level up: starting an agent. */}
+        {/* It opens the SAME composer the "+ prompt" buttons do (Dispatch, manager variant) — a
+            manager's programme is a prompt, and it used to get a one-line input box. `providers`
+            rides along so the one manager button can still choose WHICH connected account runs it,
+            the choice the per-account prompt buttons make by being clicked. */}
+        <AddManagerButton projectId={projectId || project.id} projectName={project.name}
+                          providers={providers} onAdded={refresh} />
+        {/* THE WORK TRACKER — tickets in, a plan on a board, a timeline over it. It sits with the
+            prompt buttons because it is the other half of the same question: the prompt buttons
+            start work, this is where the work being done is decided and tracked. It opens as a
+            portalled overlay (no router in this console), so nothing else on this page moves. */}
+        <button className="work-btn-open" data-testid="work-btn" title="Open the work tracker — tickets, board, timeline"
+                onClick={() => setShowWork(true)}>▦ work</button>
+        {showWork && (
+          <WorkConsole projectId={projectId || project.id} projectName={project.name}
+                       onClose={() => setShowWork(false)} />
+        )}
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
       </div>
 
       {/* THE BAR — the one thing on the page that can't wait for you to scroll: a zee blocked on a
           human. A pointer, not a copy; clicking a chip expands that xell's flower + action drawer. */}
-      <NeedsYouBar xells={xells} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
+      <NeedsYouBar xells={xells} links={crewOfFleet} landingByXell={landingByXell} prsFor={prsFor} onJump={setExpandedId}
+                   prodBindByXell={prodBindByXell} seedByXell={seedByXell}
+                   doneSuggestByXell={doneSuggestByXell}
                    expandedId={expandedId} onDecided={refresh} onDismiss={dismiss} visible={visible} />
 
-      <LandingPanel landing={orphanLandings} onDecided={refresh} />
+      <LandingPanel landing={orphanLandings} onDecided={refresh} orphanQueues={orphanQueues} />
+
+      {/* PRODUCTION DATA — a zee asking for the live prod database, or for a landed seed file to be
+          run on it, plus the receipt of every seed that ran. Live asks render on their xell's chip
+          above; this carries the ones with no chip (reaped xell) and the finished receipts. */}
+      <ProdAsksPanel bind={(fleet.prod_bind || []).filter((r) => !carded.has(r.xell_id))}
+                     seeds={(fleet.prod_seed || []).filter((r) => !carded.has(r.xell_id)
+                       || ['seeded', 'failed'].includes(r.status))}
+                     onDecided={refresh} />
 
       {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
           both are decisions only a human may make, and both block a zee until made. */}
       <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock} shipLogs={shipLogs}
-                 projectId={projectId || project.id} onDecided={refresh} />
+                 refused={fleet.ship_refused} projectId={projectId || project.id} onDecided={refresh}
+                 onForwardToZee={(xell, text) => setMsgXell({ ...xell, initialText: text })} />
 
       {/* THE LANDING PAD — every landing + shipment in one chronological FIFO queue, with the item
           the queenzee is processing right now spinning. A view of the runway, not a decision. */}
@@ -774,6 +1184,51 @@ function BuildAllButton({ x }) {
   );
 }
 
+// The device xhip slot on a xell card (035). Renders the attached device's chip when there is one,
+// with a detach control; otherwise, for a device-enabled project, a faint "＋📱 device" affordance
+// that attaches one (emulator or the project's physical default). Absent entirely for a project that
+// does not opt into devices AND has none attached, so ordinary stacks stay three chips wide.
+function DeviceSlot({ x, onMenu, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const device = (x.stack || []).find((s) => s.role === 'device');
+  if (!device && !x.device_enabled) return null;
+
+  const attach = async (e) => {
+    e.stopPropagation();
+    setBusy(true);
+    try { await attachXellDevice(x.id); onChanged?.(); }
+    catch (err) { showAlert('Attach device failed: ' + (err?.error || err?.message || err), { variant: 'error' }); }
+    finally { setBusy(false); }
+  };
+  const detach = async (e) => {
+    e.stopPropagation();
+    if (!(await showConfirm(`Detach the device from ${x.slug}?\n\n`
+      + (device.name?.includes('phys') ? 'The shared physical device is only UNLINKED — the phone is untouched.'
+         : 'The per-xell emulator is stopped and removed.'), { okLabel: 'Detach' }))) return;
+    setBusy(true);
+    try { await detachXellDevice(x.id); onChanged?.(); }
+    catch (err) { showAlert('Detach device failed: ' + (err?.error || err?.message || err), { variant: 'error' }); }
+    finally { setBusy(false); }
+  };
+
+  if (device) {
+    return (
+      <span className="devslot" onClick={(e) => e.stopPropagation()}>
+        <ContainerChip c={device} onMenu={onMenu} />
+        <button className="devdetach" data-testid={`device-detach-${x.slug}`} disabled={busy}
+                title="Detach this device from the xell" onClick={detach}>✕</button>
+      </span>
+    );
+  }
+  return (
+    <button className="cbox empty devattach" data-role="device" data-testid={`device-attach-${x.slug}`}
+            disabled={busy} onClick={attach}
+            title={`Attach a ${x.device_kind === 'physical' ? 'physical' : 'emulator'} device to ${x.slug} — build, install and screenshot your app on it`}>
+      {busy ? '…' : '＋📱'}
+    </button>
+  );
+}
+
 // Confirm-and-tear-down. Goes through the task when there is one; otherwise reaps the xell
 // directly — a xell can legitimately have no task row (a dispatched zee that reported done), and
 // gating the only teardown button on task_id stranded those forever. Extracted from the drawer
@@ -858,7 +1313,7 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 // (The old DOM FlowerToolbar was removed: its build/pull/push/PR/mark-done buttons are now drawn
 // directly on the flower by HiveCanvas and hit-tested there — see handleFlowerAction above.)
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines }) {
+function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines, onEnv, links }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const [termOpen, setTermOpen] = useState(false);
@@ -902,12 +1357,53 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           naturally below and makes the overlap unrepresentable rather than tuned-around. */}
       <div className="cardtop">
         {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
+        {/* whose crew this is, or how big a crew it runs — the one relationship in the fleet that is a
+            real relationship, stated in words because a list is scanned rather than pointed at */}
+        {links && !isProd && <CrewChip x={x} links={links} />}
         {stackCtx && (
           <span className="machinechip" data-testid="machine-chip"
                 title={machine
                   ? `machine ${machine.key}${machine.label ? ` (${machine.label})` : ''} — ${machine.docker_ctx}@${machine.host_ip || '?'}`
                   : `machine context ${stackCtx}`}>
             ⌂ {machine ? machine.key : stackCtx}
+          </span>
+        )}
+        {/* WHICH ENVIRONMENT THIS XELL GETS. It renders even when NOTHING resolves (ticket #20):
+            an absent environment used to be an absent chip, which reads as "fine" — and the whole
+            trap here is that "empty" and "absent" and "healthy" all look alike from the outside.
+            Three states, three faces: ∅ = resolved but 0 vars, ·N = resolved with N, and "no env" =
+            nothing resolves at all. Clicking opens the panel that can PIN or CLEAR one. */}
+        {(x.env_key || !x.is_production) && (
+          <span className={`envchip env-${x.env_tier || 'none'}${x.env_key && Number(x.env_var_count) === 0 ? ' env-empty' : ''}`
+                  + (!x.env_key ? ' env-absent' : '')
+                  /* the .zeehive.env PROJECTION failed (078) — the file on disk is not what the
+                     meta-DB says it should be, and no log line survives long enough to say so.
+                     env_cxell_error (082) is the OTHER half: the host file is right and the zee
+                     cannot see it, because its cage copy could not be refreshed. Same badge — from
+                     the outside both mean "this zee is running on values the meta-DB disagrees
+                     with" — and the tooltip says which. */
+                  + (x.env_projection_error || x.env_cxell_error ? ' env-broken' : '')}
+                data-testid="env-chip"
+                title={(x.env_key
+                  ? `Environment: ${x.env_key} (${x.env_tier})`
+                    + (x.env_pinned ? ' — pinned to this xell' : ` — default for ${x.env_tier} xells`)
+                    + `\n${x.env_var_count} var(s) from the meta-DB`
+                    + (Number(x.env_var_count) === 0 ? ' (empty → nothing added to .zeehive.env; xell runs as before)' : '')
+                  : 'NO environment resolves for this xell — nothing from the meta-DB is projected into its'
+                    + ' .zeehive.env (its ports and DATABASE_URL still are; the queenzee owns those)')
+                  + (x.env_projection_error
+                    ? `\n\n⚠ .zeehive.env is NOT in sync with the meta-DB — the last projection failed:\n${x.env_projection_error}`
+                    : '')
+                  + (x.env_cxell_error
+                    ? '\n\n⚠ the file on the worktree is in sync, but this zee reads a COPY inside its'
+                      + ' cxell and that copy could NOT be refreshed — it is still working from the old'
+                      + ` values:\n${x.env_cxell_error}`
+                    : '')
+                  + '\n\nClick to see it, pin one, or clear the pin'}
+                onClick={(e) => { e.stopPropagation(); onEnv?.(x); }}>
+            ❖ {x.env_key
+              ? <>{x.env_key}{Number(x.env_var_count) === 0 ? ' ∅' : ` ·${x.env_var_count}`}{x.env_pinned ? ' 📌' : ''}</>
+              : 'no env'}{x.env_projection_error || x.env_cxell_error ? ' ⚠' : ''}
           </span>
         )}
         <span className="cardtop-right">
@@ -936,6 +1432,11 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             ? <ContainerChip key={role} c={c} onMenu={onMenu} hammer />
             : <span key={role} className="cbox empty" data-role={role} title={`no ${role} container`}>—</span>;
         })}
+        {/* Device xhip (035): a mobile device the zee builds/installs/screenshots on. Shown only for
+            a device-enabled project (or whenever one is actually attached) so non-device projects
+            stay a clean three-chip stack. The chip is a real container chip (health/viewer URL); the
+            control attaches/detaches it to THIS xell. */}
+        <DeviceSlot x={x} onMenu={onMenu} onChanged={onDone} />
       </div>
       <div className="meta">
         {!isProd && (
@@ -965,7 +1466,7 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
         )}
         {cxell && termOpen && (
           <ZeeTerminal zeeId={x.zee_id} slug={x.slug} viewerUrl={x.viewer_url}
-                       onClose={() => setTermOpen(false)} />
+                       xellId={x.id} onClose={() => setTermOpen(false)} />
         )}
         {!isProd && <Row k="zee" v={working ? x.zee_name : '—'} highlight={working} testid="zee-name" />}
         {isProd
@@ -989,16 +1490,27 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             nothing recorded the hand-deploys that predate the ship gate — that is honest, not a
             placeholder: the system does not know what prod is running. */}
         <div className="row"><span className="rk">source diff</span>
-          <span className="diff" data-testid="source-diff"
+          {/* CLICKABLE: the numbers open the patch they are counting (DiffViewer). For a cxelld
+              zee the server reads it from inside the cxell, which is the only place that work
+              exists before it lands — the same source the stat itself came from. */}
+          <button className="diff difflink" data-testid="source-diff" disabled={!diff}
                 title={diff
                   ? (isProd
-                    ? `Deployed is ${diff.ahead} commit(s) ahead of origin · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs origin`
-                    : `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted work)`)
-                  : (isProd ? 'No ship has landed yet, so nothing recorded what production is running' : '')}>
+                    ? `Deployed is ${diff.ahead} commit(s) ahead of origin · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs origin\n\nClick to read the diff.`
+                    : `${diff.ahead} commit(s) ahead of source · ${diff.behind} behind\n${diff.files} file(s), +${diff.insertions}/−${diff.deletions} vs source (includes uncommitted work)\n\nClick to read the diff.`)
+                  : (isProd ? 'No ship has landed yet, so nothing recorded what production is running' : '')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!diff) return;
+                  showDiff({ kind: 'xell', xellId: x.id, diffKind: 'source',
+                    title: `${x.slug} · source diff`,
+                    subtitle: isProd ? 'what is deployed vs the origin mirror'
+                                     : 'everything this xell adds over its fork point — what would land' });
+                }}>
             {diff
               ? <>↑{diff.ahead} ↓{diff.behind}<span className="dstat"> · {diff.files}f <span className="ins">+{diff.insertions}</span>/<span className="del">−{diff.deletions}</span></span></>
               : '—'}
-          </span>
+          </button>
         </div>
         {/* For prod: the commit it is SERVING. For a work xell: the commit it was provisioned at. */}
         <Row k="commit" mono testid="commit-head"
@@ -1009,21 +1521,42 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             drops to 0 every time the zee checkpoints. ●N counts dirty files incl. untracked. */}
         {!isProd && (
           <div className="row"><span className="rk">diff</span>
-            <span className="diff" data-testid="diff"
+            <button className="diff difflink" data-testid="diff" disabled={!diff?.own}
                   title={diff?.own
-                    ? `Uncommitted: ${diff.own.files} file(s), +${diff.own.insertions}/−${diff.own.deletions} vs its own last checkpoint (HEAD)${diff.dirty ? `\n${diff.dirty} dirty file(s) in the worktree (incl. untracked)` : '\nnothing uncommitted — all work is checkpointed'}`
-                    : ''}>
+                    ? `Uncommitted: ${diff.own.files} file(s), +${diff.own.insertions}/−${diff.own.deletions} vs its own last checkpoint (HEAD)${diff.dirty ? `\n${diff.dirty} dirty file(s) in the worktree (incl. untracked)` : '\nnothing uncommitted — all work is checkpointed'}\n\nClick to read the diff.`
+                    : ''}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!diff?.own) return;
+                    showDiff({ kind: 'xell', xellId: x.id, diffKind: 'own',
+                      title: `${x.slug} · uncommitted`,
+                      subtitle: 'work since its own last checkpoint — not yet committed' });
+                  }}>
               {diff?.own
                 ? <><span className="dstat">{diff.own.files}f <span className="ins">+{diff.own.insertions}</span>/<span className="del">−{diff.own.deletions}</span></span>
                     {diff.dirty > 0 && <span className="dirty" data-testid="dirty" title={`${diff.dirty} dirty file(s) incl. untracked`}> ●{diff.dirty}</span>}</>
                 : '—'}
-            </span>
+            </button>
           </div>
         )}
         <div className="row">
           <span className="rk">status</span>
           <span className={`badge b-${x.status}`} data-testid="xell-status" title={`hive: ${x.hive_status || x.status}`}>{x.hive_status_label || (isProd ? 'live · protected' : x.status)}</span>
         </div>
+        {/* TEND — the zee asked for a human, and WHY. The status badge already says a tend is open;
+            this row is the reason it gave, because "someone needs you" without a what-for is an
+            interruption, not a request. Clipped to the card, full text in the title. It clears when
+            the zee reports working or runs `zee tend --clear`. */}
+        {x.tend?.open && (
+          <div className="row"><span className="rk">tend</span>
+            <span className="tendwhy" data-testid="tend-reason"
+                  title={`${x.tend.full || x.tend.reason || 'The zee raised a tend without a reason.'}\n\n`
+                    + 'Its zee asked for a human in the console. Nothing is gated or blocked — it clears '
+                    + 'when the zee reports working or runs `zee tend --clear`.'}>
+              🖐 {x.tend.reason ? clip(x.tend.reason, 48) : 'no reason given'}
+            </span>
+          </div>
+        )}
         {/* FLEET BURN — what every zee this xell hosted consumed (tokens + $), summed. Compact by
             design (Σ 1.2M tok · $8.90). This is the xell's OWN spend; account-wide %/limits are not
             available to us (only Anthropic's /usage shows those). Shown once there's anything to show. */}
@@ -1145,21 +1678,53 @@ function shipState(x, diff, prodLock, ship) {
 // EXPANDS that xell's flower (highlighting it on the canvas) AND drops its decision card(s) — the
 // held landing / open PR, with the Approve/Reject buttons — inline right below the bar, so the
 // judgement is made next to its own commits without hunting for a card at the bottom of the page.
-function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible }) {
+function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, onDecided, onDismiss, visible,
+                       prodBindByXell = {}, seedByXell = {}, doneSuggestByXell = {} }) {
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
     // A zee's TEND ping (occ-tendRequest): it asked for a human in the console. No approve/reject —
     // the chip just takes you to it; the zee (or you) clears the tend once handled.
     const tend = x.hive_status === 'occ-tendRequest' ? 1 : 0;
-    return { x, held, prs, tend, n: held + prs + tend };
+    // …and WHY: the brief reason the zee gave when it raised the tend (fleet: x.tend.reason). The
+    // whole point of being called is knowing what you were called for — without it this line could
+    // only say "somebody wants you", and the human had to open the session to find out what for.
+    const tendWhy = tend ? (x.tend?.reason || null) : null;
+    // …and the WHOLE thing, when the brief line is only its head. The chip stays one line (it has
+    // no room), but the opened ask must be readable in full: a tend clipped to "…re-tasking a
+    // manager wi…" with the rest nowhere is barely better than no reason at all.
+    const tendFull = tend ? (x.tend?.full || x.tend?.reason || null) : null;
+    // PROD DATA: "bind me to the production database" / "run this landed seed file on production".
+    // These are held gates exactly like a landing — the zee cannot proceed until a human answers —
+    // so they belong in the one line that says who is waiting on you.
+    const bind = (prodBindByXell[x.id] || []).filter((r) => r.status === 'pending').length;
+    const seed = (seedByXell[x.id] || []).filter((r) => r.status === 'pending').length;
+    // A manager suggested this xell is done. It is a real decision waiting on a human — and the only
+    // one raised by another AGENT, so if it were not counted here nobody would ever answer it.
+    const doneSug = (doneSuggestByXell[x.id] || []).filter((r) => r.status === 'pending').length;
+    // A landing that HOLDS THE RUNWAY with zees queued behind it, after a human already approved it and
+    // nothing landed (#11 gap 2). It is not "awaiting approval", so nothing counted it — and if it was
+    // also dismissed it was on no screen at all, while the queue behind it waited on a card that had
+    // been hidden. It is the one approved landing that genuinely waits on a human: decide it, or let
+    // the zee withdraw it. Pending occupants are already counted as `held`.
+    const blocking = (landingByXell[x.id] || []).filter((r) => r.status === 'approved' && holdsRunway(r));
+    const blocked = blocking.length;
+    const blockedBy = blocking[0]?.holders || 0;
+    return { x, held, prs, tend, tendWhy, tendFull, bind, seed, doneSug, blocked, blockedBy,
+      n: held + prs + tend + bind + seed + doneSug + blocked };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
   const go = (id) => onJump?.(id === expandedId ? null : id);  // click the open one again to collapse
   const open = waiting.find((w) => w.x.id === expandedId);
-  const landings = open ? visible(landingByXell[open.x.id]).filter((r) => r.status === 'pending') : [];
+  // pending decisions, PLUS an approved landing that is wedging the runway — that one is a decision
+  // again (see `blocked` above), and holdsRunway is why it survives `visible` even when dismissed.
+  const landings = open
+    ? visible(landingByXell[open.x.id]).filter((r) => r.status === 'pending' || holdsRunway(r)) : [];
   const prs = open ? visible(prsFor(open.x)).filter((r) => r.status === 'pending') : [];
+  const binds = open ? (prodBindByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
+  const seeds = open ? (seedByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
+  const doneSugs = open ? (doneSuggestByXell[open.x.id] || []).filter((r) => r.status === 'pending') : [];
 
   return (
     <section className="needsyou">
@@ -1167,13 +1732,21 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <span className="ny-t">⚠ waiting on you:</span>
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
-                  title={`${w.held ? `${w.held} landing held` : ''}${w.held && w.prs ? ' · ' : ''}${w.prs ? `${w.prs} PR` : ''}${(w.held || w.prs) && w.tend ? ' · ' : ''}${w.tend ? 'tend (needs a human)' : ''} — click to review`}>
+                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.blocked && `an APPROVED landing is holding the runway with ${w.blockedBy} zee(s) queued behind it — it never landed`, w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
             {w.x.slug}
-            <span className="ny-n">{w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`}
-              {w.held > 0 && w.prs > 0 && ' · '}
-              {w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`}
-              {(w.held || w.prs) && w.tend > 0 && ' · '}
-              {w.tend > 0 && '🖐 tend'}</span>
+            {/* WHOSE crew is asking. A held landing from a crew member is a different decision from one
+                by a lone xell — there is an agent whose plan it belongs to — and this line was the one
+                place a human meets that ask. Same words as the card and the canvas (hive/crew.js). */}
+            {links && <CrewChip x={w.x} links={links} />}
+            <span className="ny-n">{[
+              w.held > 0 && `${w.held} landing${w.held === 1 ? '' : 's'}`,
+              w.prs > 0 && `${w.prs} PR${w.prs === 1 ? '' : 's'}`,
+              w.bind > 0 && '⚠ wants PROD DB',
+              w.seed > 0 && `⚠ seed prod (${w.seed})`,
+              w.doneSug > 0 && '⬢ manager says done',
+              w.blocked > 0 && `⛔ holds the runway${w.blockedBy ? ` · ${w.blockedBy} queued` : ''}`,
+              w.tend > 0 && `🖐 tend${w.tendWhy ? `: ${clip(w.tendWhy, 60)}` : ''}`,
+            ].filter(Boolean).join(' · ')}</span>
           </button>
         ))}
       </div>
@@ -1181,9 +1754,14 @@ function NeedsYouBar({ xells, landingByXell, prsFor, onJump, expandedId, onDecid
         <div className="ny-decision">
           {landings.map((r) => <LandCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
           {prs.map((r) => <PrCard key={r.id} req={r} onDone={onDecided} onDismiss={onDismiss} />)}
-          {open.tend > 0 && landings.length === 0 && prs.length === 0 && (
-            <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human.
-              Open its session to see why; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
+          {binds.map((r) => <ProdBindCard key={r.id} req={r} onDone={onDecided} />)}
+          {seeds.map((r) => <SeedCard key={r.id} req={r} onDone={onDecided} />)}
+          {doneSugs.map((r) => <DoneSuggestionCard key={r.id} req={r} onDone={onDecided} />)}
+          {open.tend > 0 && landings.length === 0 && prs.length === 0 && binds.length === 0
+            && seeds.length === 0 && doneSugs.length === 0 && (
+            <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human
+              {open.tendFull ? <>: <b className="ny-why">{open.tendFull}</b></> : ' (it gave no reason)'}.
+              {' '}Open its session for the detail; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
           )}
         </div>
       )}
@@ -1237,10 +1815,19 @@ function PrCard({ req, onDone, onDismiss }) {
       ) : (
         <>
           <div className="land-meta">{String(req.new_sha).slice(0, 10)}</div>
-          <div className="land-stat">
+          {/* Same as a held landing: the stat opens the patch you are being asked to accept. */}
+          <button className="land-stat difflink" data-testid="pr-diff"
+                  title="Read the diff — the exact lines this PR would bring in"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    showDiff({ kind: 'land', landId: req.id,
+                      title: `${req.xell_slug || 'a xell'} → ${(req.ref || '').replace('refs/heads/', '')}`,
+                      subtitle: `PR · ${String(req.new_sha).slice(0, 10)} · ${commits.length} commit${commits.length === 1 ? '' : 's'}` });
+                  }}>
             {commits.length} commit{commits.length === 1 ? '' : 's'}
             {stat.files != null && <> · {stat.files}f <span className="ins">+{stat.insertions}</span>/<span className="del">−{stat.deletions}</span></>}
-          </div>
+            <span className="difflink-hint">view diff</span>
+          </button>
           <ul className="land-commits">
             {commits.slice(0, 8).map((c) => (
               <li key={c.short}><code>{c.short}</code> {c.subject} <span className="land-author">{c.author}</span></li>

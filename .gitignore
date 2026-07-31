@@ -12,4 +12,13 @@ web/dist/
 *.dump
 data/
 .zeehive.env
+# INJECTED, not authored: the queenzee writes a xell's harness (persona + memory) into
+# .zeehive/harness/ at provision. It is per-xell state, and it has now been swept into a commit by
+# a `git add -A` twice — ignore it so there is no third time.
+.zeehive/
 .claude/
+
+# Messages the queenzee DELIVERS into a xell (`zee say` / inbox drops). Per-xell runtime data,
+# not source — and a tracked drop directory means every cxell that runs `git add -A` commits its
+# own mail into an unrelated landing.
+.zee-inbox/

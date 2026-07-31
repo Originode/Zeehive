@@ -9,13 +9,18 @@ import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
+import { startWorkSync } from './queenzee/worksync.js';
 import { recoverOrphanBuilds } from './lib/build.js';
+import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
-import { pool } from './db/pool.js';
+import { logHarnessSummary } from './lib/harness.js';
+import { startHarnessBridge } from './lib/harness-bridge.js';
+import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
+import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
 import { startImageJanitor } from './lib/images.js';
@@ -92,6 +97,10 @@ try {
   // Fresh run (zero projects) → ZEEHIVE onboards itself before anything else looks at the
   // fleet (self-onboard.js). Loud-but-never-fatal, like the migrations above.
   await ensureSelfProject();
+  // A harness is entirely in the meta-DB now (080 text, 082 badge) — there is nothing to load, and no
+  // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
+  // a harness that would brief a zee with a blank page is invisible otherwise.
+  await logHarnessSummary();
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }
@@ -111,6 +120,27 @@ const server = app.listen(config.port, () => {
   // Same principle for teardowns: a xell stranded at 'tearing-down' by a mid-reap death renders
   // on the dashboard forever (only 'retired' is filtered out) and nothing else revisits it.
   recoverOrphanTeardowns().catch((e) => console.error('[reaper] teardown recovery failed:', e.message));
+  // The attend path's renderer is BAKED into the zee-agent image, and only the spawn path replaced
+  // it — so every cxell created before an attend-path ship kept the old one, and the terminal's
+  // ✱/⚒ feed chips wrote a view file nothing in there was watching. Boot is also the moment after
+  // a ship (we restart into the new code), so sweep the RUNNING cxells here. A live cxell is one
+  // whose zee still has an ssh-terminal viewer; the sweep is best-effort per cage.
+  refreshZeeLiveInLiveCxells(async () => (await q(
+    `SELECT DISTINCT x.slug
+       FROM zee z JOIN xell x ON x.id = z.xell_id
+      WHERE z.viewer_kind = 'ssh-terminal'
+        AND z.decommissioned_at IS NULL
+        AND x.status NOT IN ('retired', 'tearing-down')`
+  )).map((r) => ({ ctx: 'default', name: cxellName(r.slug) })))
+    .catch((e) => console.error('[cxell] live-feed renderer sweep failed:', e.message));
+  // Same shape, for the OTHER file the queenzee projects into a worktree: .zeehive.env is written
+  // from the meta-DB at provision time and never re-emitted on its own, so a fix to the projection
+  // RULE (ticket #15: a xell holding production read-only kept its dev vars and its own spinoff db)
+  // left every xell provisioned before it wrong forever, with a human expected to remember. Boot is
+  // exactly when a rule change arrives, so recompute every non-retired xell here and write only the
+  // ones that are provably stale (lib/provision.reconcileXellEnvs).
+  reconcileXellEnvs({ reason: 'boot' })
+    .catch((e) => console.error('[env] .zeehive.env reconcile failed:', e.message));
   startPool();
   startMonitor();
   startContainerMonitor();
@@ -121,6 +151,11 @@ const server = app.listen(config.port, () => {
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();
+  // The work tracker's board follows the fleet: every item with a zee on it takes that zee's live
+  // hive status (worksync.js). It only ever moves a card BETWEEN the in-flight statuses — finishing
+  // is a human's decision, never a tick's.
+  startWorkSync();
+  startHarnessBridge();
 });
 // Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
 // existing /api proxy (vite dev + the prod nginx bundle) with no extra port to expose.

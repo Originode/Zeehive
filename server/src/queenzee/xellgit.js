@@ -26,6 +26,21 @@ import { cleanGitEnv, worktreeBound } from '../lib/git.js';
 // root@ or whoever last configured the box. (Harmless on read-only calls like rev-parse.)
 const QUEENZEE_IDENTITY = ['-c', 'user.name=Zeehive queenzee', '-c', 'user.email=queenzee@zeehive.local'];
 
+// Same switch every other real-side-effect module reads (landgate, intake, pool, reaper, harness,
+// the .zeehive.env reconcile): 'real' touches machines, anything else models. EVERY verb in this
+// file runs git in a WORKTREE PATH or a REPO_ROOT taken straight off a fleet row — it pushes into
+// the xource, merges into a zee's checkout, stashes files it finds there. A xell's database is a
+// CLONE of the meta-DB, so a NESTED queenzee's rows are the REAL fleet's: unguarded, a zee that
+// booted the server in its own xell (or a human clicking push/pull on the nested console, which
+// renders the real fleet) would move real refs and rewrite another zee's working tree.
+const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
+// The refusal, in one sentence, wherever it is needed. Loud on purpose — a nested queenzee that
+// silently did nothing would be indistinguishable from one whose git failed.
+const modelsTheFleet = (what, where) =>
+  `PROVISION_MODE=simulate: this queenzee models the fleet, it does not ${what} — ${where} is a real `
+  + 'path on a real machine, and its row came out of a CLONE of the meta-DB. Nothing was run.';
+
 function git(cwd, args, timeout = 60000) {
   const r = spawnSync('git', ['-C', cwd, ...QUEENZEE_IDENTITY, ...args],
     { encoding: 'utf8', timeout, windowsHide: true, env: cleanGitEnv() });
@@ -55,12 +70,30 @@ function gitAsyncPush(cwd, args, timeout = 60000) {
 // A xell, its xource ref, and — if that xource is itself a xell — the worktree that ref is checked
 // out in. That worktree is the difference between "push it" and "merge it": git refuses a push to
 // a branch someone has checked out, so a xell-backed xource must be merged from the inside.
-async function ctx(xellId) {
+async function ctx(xellId, { mode = PROVISION_MODE } = {}) {
   const x = await one(
     `SELECT x.*, xo.ref AS xource_ref, xo.xell_id AS xource_xell_id
        FROM xell x JOIN xource xo ON xo.id = x.xource_id WHERE x.id=$1`, [xellId]);
   if (!x) throw new Error('unknown xell');
   if (x.is_production) throw new Error('production does not push, pull or raise PRs — it is shipped to');
+  // A MANAGER xell has ZERO push/PR access to the xource. Refused here, in the one place every git
+  // verb passes through, so no route, script or future caller can reach around it: a manager writes
+  // no code and lands none — it dispatches a worker, and the worker lands its own work. (Read-only
+  // verbs that a human might still want on a manager's branch go through their own paths; this ctx
+  // is the write door.)
+  if (x.zee_type === 'manager') {
+    throw new Error(`${x.slug} is a MANAGER xell: zero push/PR access to the xource. A manager writes no `
+      + 'code and lands none — dispatch a worker to make the change, and it lands its own work.');
+  }
+  // …and a NESTED QUEENZEE has none either, for the same structural reason: this ctx is the WRITE
+  // DOOR every verb in this file passes through, and beyond it they all run git in x.worktree_path
+  // or the project's repo_root. Refused here, once, rather than at four call sites — so a verb added
+  // later inherits the guard instead of forgetting it. (requestPullIn is only a row, but it reads
+  // that same real worktree to build the row, and one door is worth more than one exemption.)
+  if (mode !== 'real') {
+    throw new Error(`${x.slug}: ${modelsTheFleet('run git in a xell worktree or push into a xource',
+      x.worktree_path || 'that worktree')}`);
+  }
   const project = await one(`SELECT * FROM project WHERE id=$1`, [x.project_id]);
   const parent = x.xource_xell_id
     ? await one(`SELECT id, slug, worktree_path FROM xell WHERE id=$1`, [x.xource_xell_id])
@@ -163,11 +196,17 @@ export function catchUpWorktree(worktree, ref) {
 // A failed `git merge` is only a real CONFLICT when git says so (unmerged paths / "Automatic merge
 // failed"). Anything else — a missing committer identity, a hook refusal, an unreadable object — is
 // an operational ERROR the zee cannot "resolve by hand", and calling it a conflict sent zees chasing
-// a phantom (2026-07-22). Split the two so each gets an honest message.
+// a phantom (2026-07-22). Split the two so each gets an honest message. Exported because the SAME
+// distinction has to reach a CAGED zee: its self-heal merge (of the xource into the cxell) runs
+// inside the container over docker exec, and cxell.js classifies that merge's output with this exact
+// predicate so a caged zee is told "conflict — yours to resolve" vs "operational error — not yours".
+export function classifyMergeOutput(output) {
+  const text = String(output || '').trim();
+  const realConflict = /^CONFLICT|Automatic merge failed|fix conflicts|would be overwritten by merge/im.test(text);
+  return { state: realConflict ? 'conflict' : 'error', output: text.slice(-1200) };
+}
 function mergeFailure(m) {
-  const output = `${m.out}\n${m.err}`.trim();
-  const realConflict = /^CONFLICT|Automatic merge failed|fix conflicts|would be overwritten by merge/im.test(output);
-  return { state: realConflict ? 'conflict' : 'error', output: output.slice(-1200) };
+  return classifyMergeOutput(`${m.out}\n${m.err}`);
 }
 
 // DB-aware wrapper: resolve the xell's worktree + xource ref, then catch that worktree up. Same
@@ -190,8 +229,8 @@ export async function catchUpToXource(xellId) {
 // same update hook and gets held the same way. A human clicking it is not an override — it is the
 // same request, raised from a nicer place. If it lands, it is because a human had already approved
 // this exact sha; if it does not, the hook's own message says why.
-export async function pushToXource(xellId, by = 'human@console') {
-  const { x, ref, fullRef } = await ctx(xellId);
+export async function pushToXource(xellId, by = 'human@console', { mode = PROVISION_MODE } = {}) {
+  const { x, ref, fullRef } = await ctx(xellId, { mode });
   const head = git(x.worktree_path, ['rev-parse', 'HEAD']);
   if (!head.ok) throw new Error('cannot read the xell HEAD');
 
@@ -298,12 +337,24 @@ export async function requestPullIn(xellId, { by = 'human@console', note = null 
 // approval-bound-to-a-sha rule exists to prevent. A fast-forward moves the ref to the sha on the
 // card — no new commit, nothing unreviewed. If it is not a fast-forward, the answer is "pull
 // first", which is the button next to this one.
-export async function acceptPullIn(requestId, by = 'human@console') {
+export async function acceptPullIn(requestId, by = 'human@console', { mode = PROVISION_MODE } = {}) {
   const req = await one(`SELECT * FROM land_request WHERE id=$1`, [requestId]);
   if (!req) throw new Error('no such request');
   if (req.status !== 'pending') throw new Error(`this PR is already ${req.status}`);
   const project = await one(`SELECT * FROM project WHERE id=$1`, [req.project_id]);
   const xell = await one(`SELECT * FROM xell WHERE id=$1`, [req.xell_id]);
+
+  // This one does NOT go through ctx() — it works from the REQUEST row — so it needs the guard in
+  // its own right: it fast-forwards refs/heads/<xource> inside project.repo_root (or merges into the
+  // parent xell's checkout), which is a landing by another name. Report and refuse; the row stays
+  // pending, so the real queenzee's console still has exactly the PR it had before.
+  if (mode !== 'real') {
+    logline('landgate',
+      `PR ${String(req.new_sha).slice(0, 8)} → ${req.ref.replace('refs/heads/', '')} NOT accepted — `
+      + `PROVISION_MODE=simulate: this queenzee models the fleet, it does not move refs in ${project.repo_root}. `
+      + 'The request is left PENDING, exactly as it was.');
+    return { ok: false, reason: modelsTheFleet('take a PR into a xource', project.repo_root), dry_run: true };
+  }
 
   // Re-read the tip: it may have moved since the PR was raised, which is precisely when a stale
   // "it was a fast-forward when I asked" would stop being true.
@@ -364,7 +415,13 @@ export async function acceptPullIn(requestId, by = 'human@console') {
     const row = await one(
       `UPDATE land_request SET status='landed', landed_at=now() WHERE id=$1 RETURNING *`, [requestId]);
     broadcast('land', row);
-    broadcast('xell', { id: req.xell_id });
+    // Its work is now on the target ref — point the xell's stored head/last-synced at the landed sha
+    // so its card reads level, not still-ahead (inlined rather than importing landgate's helper to
+    // keep this module free of a landgate → nudge → cxell → xellgit import cycle).
+    const synced = await one(
+      `UPDATE xell SET head_commit=$2, last_synced_commit=$2 WHERE id=$1 RETURNING *`,
+      [req.xell_id, req.new_sha]).catch(() => null);
+    broadcast('xell', synced || { id: req.xell_id });
     logline('landgate',
       `PR ACCEPTED by ${by}: ${xell?.slug} @ ${req.new_sha.slice(0, 8)} is on ${req.ref.replace('refs/heads/', '')}`);
   } else {
