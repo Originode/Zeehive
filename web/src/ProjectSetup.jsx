@@ -1252,6 +1252,19 @@ function TokensSection({ project, run, busy }) {
       wrapped(() => deleteProviderAccount(project.id, a.id));
     }
   };
+  // Pausing disables the account for every dispatch surface without disconnecting it — the token
+  // stays connected and can be resumed (or still deleted) at any time.
+  const pauseToggle = async (p, a) => {
+    const name = a.label || `${p.label} ${a.token_hint || ''}`;
+    if (a.paused) {
+      if (await showConfirm(`Resume the "${name}" account?\n\nDispatches on it are enabled again.`, { okLabel: 'Resume' })) {
+        wrapped(() => resumeProviderAccount(project.id, a.id));
+      }
+    } else {
+      const reason = await showPrompt(`Pause the "${name}" account?\n\nNo dispatch on it can start a zee while it is paused (the token stays connected). You can resume it here any time.\n\nWhy pause it? (optional)`, { placeholder: 'e.g. rate-limited, bad token, billing issue' });
+      if (reason !== null) wrapped(() => pauseProviderAccount(project.id, a.id, String(reason || '').trim() || null));
+    }
+  };
 
   return (
     <div className="setup-sec">
@@ -1268,10 +1281,22 @@ function TokensSection({ project, run, busy }) {
           </div>
           {(p.accounts || []).map((a) => (
             <div className="setup-row" key={a.id} data-testid={`token-account-${p.provider}`}>
-              <span className="gate g-pass" title={a.created_at ? `connected ${new Date(a.created_at).toLocaleDateString()}` : ''}>
-                ✓ {a.label ? <b>{a.label} · </b> : null}<span className="mono">{a.token_hint}</span>
-                {a.last_used_at ? ` · used ${new Date(a.last_used_at).toLocaleDateString()}` : ' · never used'}
-              </span>
+              {a.paused ? (
+                <span className="gate g-warn" title={a.reason ? `paused: ${a.reason}` : 'paused'}
+                      data-testid={`token-account-${p.provider}-paused`}>
+                  ⏸ {a.label ? <b>{a.label} · </b> : null}<span className="mono">{a.token_hint}</span>
+                  {a.paused_by ? ` · paused by ${a.paused_by}` : ' · paused'}
+                  {a.reason ? ` — ${a.reason}` : ''}
+                </span>
+              ) : (
+                <span className="gate g-pass" title={a.created_at ? `connected ${new Date(a.created_at).toLocaleDateString()}` : ''}>
+                  ✓ {a.label ? <b>{a.label} · </b> : null}<span className="mono">{a.token_hint}</span>
+                  {a.last_used_at ? ` · used ${new Date(a.last_used_at).toLocaleDateString()}` : ' · never used'}
+                </span>
+              )}
+              <button type="button" className="projpop-del" disabled={busy}
+                      title={a.paused ? `Resume this ${p.label} account` : `Pause this ${p.label} account — no dispatch can use it while paused`}
+                      onClick={() => pauseToggle(p, a)}>{a.paused ? '▶' : '⏸'}</button>
               <button type="button" className="projpop-del" disabled={busy}
                       title={`Disconnect this ${p.label} account`} onClick={() => disconnect(p, a)}>🗑</button>
             </div>

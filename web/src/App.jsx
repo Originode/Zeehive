@@ -955,7 +955,7 @@ export default function App() {
           const buttons = ai.flatMap((p) => (p.accounts || []).map((a) => {
             const dupes = (p.accounts || []).length > 1;
             const name = a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label);
-            return { id: a.id, provider: p.provider, name, typeLabel: p.label };
+            return { id: a.id, provider: p.provider, name, typeLabel: p.label, paused: !!a.paused };
           }));
           if (!buttons.length) {
             return (
@@ -964,11 +964,17 @@ export default function App() {
                       onClick={() => setShowSetup(true)}>＋ add provider</button>
             );
           }
+          // A paused account keeps its button so it stays VISIBLE as disabled — hiding it would
+          // read as "the account vanished", and the pause is deliberately reversible. The server
+          // refuses a dispatch on it regardless (spawnCreds → tokenForSpawn).
           return buttons.map((b) => (
             <button key={b.id} className="new-prompt-btn" data-testid={`new-prompt-btn-${b.provider}`}
-                    title={`Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
+                    disabled={b.paused}
+                    title={b.paused
+                      ? `⏸ ${b.typeLabel} (${b.name}) is PAUSED — resume it in Project setup to dispatch on it`
+                      : `Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
                     onClick={() => setShowDispatch({ provider: b.provider, tokenId: b.id, label: b.name })}>
-              ＋ prompt · {b.name}
+              {b.paused ? '⏸' : '＋'} prompt · {b.name}
             </button>
           ));
         })()}

@@ -43,7 +43,7 @@ import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
 import { listSites, createSite, updateSite, deleteSite, listDockerContexts } from '../lib/sites.js';
 import { listProviderTokens, setProviderToken, addProviderToken, deleteProviderToken,
-         deleteProviderAccount } from '../lib/provider-tokens.js';
+         deleteProviderAccount, setProviderAccountPaused } from '../lib/provider-tokens.js';
 import { listEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
          listVars, setVar, deleteVar, importEnv, exportEnv, lintEnv, diffEnvironments,
          resolvedEnvView, setXellEnvironment, extractXellEnv } from '../lib/environments.js';
@@ -530,6 +530,21 @@ router.post('/projects/:id/tokens', async (req, res) => {
 router.delete('/projects/:id/tokens/account/:accountId', async (req, res) => {
   try { res.json(await deleteProviderAccount(req.params.id, req.params.accountId)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// PAUSE / RESUME a provider account (migration 104): disabling it for every dispatch surface
+// without disconnecting the token. Pausing is reversible (resume), and a paused account can
+// still be deleted. Same shape as the fleet/project/xell pause routes.
+router.post('/projects/:id/tokens/account/:accountId/pause', async (req, res) => {
+  try {
+    res.json(await setProviderAccountPaused(req.params.id, req.params.accountId, true,
+      { by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/projects/:id/tokens/account/:accountId/resume', async (req, res) => {
+  try {
+    res.json(await setProviderAccountPaused(req.params.id, req.params.accountId, false,
+      { by: req.body?.by || 'human@console' }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.put('/projects/:id/tokens/:provider', async (req, res) => {
   try { res.json(await setProviderToken(req.params.id, req.params.provider, req.body?.token)); }

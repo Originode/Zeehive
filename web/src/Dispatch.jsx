@@ -41,7 +41,11 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
   // WHICH ACCOUNT runs this zee. The worker composer is opened FROM an account's own button, so it
   // arrives decided (accounts=null → the provider/tokenId props stand). The manager button is one
   // button for the whole fleet, so it passes the list and the choice is made in here.
-  const [acct, setAcct] = useState(() => (accounts?.length ? accounts[0] : null));
+  // PAUSED accounts are excluded — the server refuses a dispatch on one anyway (spawnCreds →
+  // tokenForSpawn), so the picker must not offer it; if every passed account is paused the
+  // composer falls back to the generic provider (server picks an active account or refuses).
+  const activeAccounts = (accounts || []).filter((a) => !a.paused);
+  const [acct, setAcct] = useState(() => (activeAccounts.length ? activeAccounts[0] : null));
   const activeProvider = acct?.provider || provider;
   const activeTokenId = acct ? acct.id : tokenId;
   // A xell may only wear a harness of its own zee type (054's guard), so ask for the list this
@@ -266,11 +270,11 @@ export default function Dispatch({ projectId, projectName, provider = 'claude', 
             {/* WHICH ACCOUNT — only when the opener handed us a list (the manager button, which is
                 one button for every connected account). A worker composer is opened from an
                 account's own button, so it renders nothing here and nothing changes for it. */}
-            {accounts?.length > 1 && (
+            {activeAccounts.length > 1 && (
               <div className="disp-field">
                 <label className="disp-label">Account</label>
                 <div className="disp-models" role="group" aria-label="AI account">
-                  {accounts.map((a) => (
+                  {activeAccounts.map((a) => (
                     <button key={a.id} className={`disp-seg ${acct?.id === a.id ? 'on' : ''}`}
                             data-testid={`dispatch-account-${a.id}`}
                             title={`Run this zee on ${a.name} (${a.typeLabel}) — its own CLI inside the cxell`}
