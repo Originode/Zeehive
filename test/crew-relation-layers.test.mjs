@@ -126,8 +126,10 @@ ok(wireStyle({ related: 'crew', dim: true, bloomDim: true }).opacity === relW.op
 ok(plainW.opacity === 0.92 && goneW.opacity === 0.1
    && wireStyle({ bloomDim: true }).opacity === 0.12 && focusW.opacity === 1 && focusW.width === 3.2,
    'and every OTHER rung of the ladder is the one that was there before (0.92 / 0.1 / 0.12 / 1)');
-ok(wireStyle({ hovered: true, bloomDim: true }).opacity === 0.12,
-   'including the bloom outranking a stray hover, which is how an open flower keeps the pane');
+ok(wireStyle({ hovered: true, bloomDim: true }).opacity === 1 && wireStyle({ hovered: true, bloomDim: true }).width === 3.2,
+   'a wire the pointer is ON lights up even behind a bloom — its hexagon lit too, so the trace must follow');
+ok(wireStyle({ bloomDim: true }).opacity === 0.12 && wireStyle({ hovered: true, bloomDim: true }).opacity !== 0.12,
+   'and a bloom still recedes the wires the pointer is NOT on — only the thing being pointed at is lifted');
 
 // ── 4. RENDER the real wire and read what it emitted ─────────────────────────
 console.log('\n── the real <Wire>, rendered ──');
