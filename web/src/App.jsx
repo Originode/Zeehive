@@ -853,11 +853,15 @@ export default function App() {
                         title="Open a PR AND merge it into the default branch on GitHub">⇅ PR ⟳</button>
               )}
               {githubOut && !githubOut.busy && (
-                <a className="gh-out" href={githubOut?.url || null} target="_blank" rel="noreferrer"
+                <a className={`gh-out${!githubOut.pushed && !githubOut.opened && !githubOut.pulled ? ' bad' : ''}`}
+                   href={githubOut?.url || null} target="_blank" rel="noreferrer"
                    title={githubOut?.pushed ? 'Pushed successfully'
                      : githubOut?.opened ? (githubOut?.merge?.merged ? 'PR opened & merged' : 'PR opened')
+                     : githubOut?.pulled ? (githubOut?.state === 'up-to-date' ? 'Remote already up to date' : 'Pulled from remote')
                      : githubOut?.reason || 'result'}>
-                  {githubOut?.pushed ? '✓' : githubOut?.opened ? `#${githubOut?.number || '✓'}` : '✗'}
+                  {githubOut?.pushed || githubOut?.pulled ? '✓'
+                    : githubOut?.opened ? `#${githubOut?.number || '✓'}`
+                    : '✗'}
                 </a>
               )}
             </span>
