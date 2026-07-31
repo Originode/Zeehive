@@ -18,7 +18,7 @@ import { resolveProjectId } from '../lib/project-resolve.js';
 import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
-import { spawnCreds } from '../lib/provider-tokens.js';
+import { spawnCreds, assertProviderDispatchable } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
          ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell, writeFileIntoCxellIfChanged,
          writeGeneratedDocIntoCxell,
@@ -1052,6 +1052,10 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   if (await fleetPaused()) throw new Error(`cannot spawn a zee: ${PAUSED_REASON}`);
   const m = resolveMode(mode);
   const pid = projectId || (await defaultProjectId());
+  // PROVIDER PAUSE: no dispatch on a paused provider, whatever surface asked for it. This is the
+  // pre-flight that also catches runtimes which never read a meta-DB token (claude-code-remote,
+  // the host SDK); the cxell path re-checks the exact account in spawnCreds → tokenForSpawn.
+  await assertProviderDispatchable(pid, provider, { tokenId: providerTokenId });
   const xell = xellId
     ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId])
     // No xell named → take the freshest ready one OF THE RIGHT TYPE. (readyXellForCwd matches a

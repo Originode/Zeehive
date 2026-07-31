@@ -16,6 +16,8 @@ const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || 
 import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
+// the project-scoping filter for the fleet render surfaces (honeycomb and everything fed from it)
+import { projectScoped } from './projectFilter.js';
 import CrewChip from './CrewChip.jsx';
 import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
@@ -125,22 +127,33 @@ function useStreamedXells(projectId) {
     acRef.current?.abort();
     setXells([]);
   }
+  // Always-current selected project, written during render so an ASYNC stream from a PREVIOUS
+  // selection can tell it is stale before it writes a single hex into the NEW project's grid. A
+  // stale runStream — the previous project's LAST update stream landing after the switch — would
+  // otherwise abort the fresh stream, stream the OLD project's xells into the SAME map, and paint
+  // the remnants that linger across a project switch.
+  const pidRef = useRef(projectId);
+  pidRef.current = projectId;
   const runStream = useCallback(async () => {
     acRef.current?.abort();
     const ac = new AbortController();
     acRef.current = ac;
     const seen = new Set();
+    const streamProjectId = projectId;         // this stream's project — the staleness witness
+    const stillCurrent = () => pidRef.current === streamProjectId;
     try {
-      await streamFleetXells(projectId, {
+      await streamFleetXells(streamProjectId, {
         signal: ac.signal,
         onXell: (x) => {
           if (ac.signal.aborted) return;
+          if (!stillCurrent()) { ac.abort(); return; }   // stale — drop this stream, keep the new grid
           seen.add(x.id);
           mapRef.current.set(x.id, x);
           setXells(Array.from(mapRef.current.values()));
         },
       });
       if (ac.signal.aborted) return;
+      if (!stillCurrent()) return;   // stale at completion — never prune the new project's map
       for (const id of Array.from(mapRef.current.keys())) if (!seen.has(id)) mapRef.current.delete(id);
       setXells(Array.from(mapRef.current.values()));
     } catch (e) { /* aborted or transient — keep the last good set */ }
@@ -155,7 +168,6 @@ function useStreamedXells(projectId) {
 
   return [xells, runStream];
 }
-
 
 export default function App() {
   const [projects, setProjects] = useState([]);
@@ -254,8 +266,11 @@ export default function App() {
 
   // Always-current selected project, so async fetches from a *previous* selection can be
   // dropped instead of clobbering the newly-selected project's data (fixes the switch race).
+  // Written during render (not in an effect) so an in-flight fetch that resolves in the render→
+  // effect window already sees the NEW selection — the effect-updated ref let the old project's
+  // LAST update stream land one frame late and repaint the previous project's remnants.
   const projectIdRef = useRef(null);
-  useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
+  projectIdRef.current = projectId;
   // Which AI provider ACCOUNTS this project can dispatch on — drives the per-account prompt
   // buttons. NB: read the fallback id off `fleet` (state), NOT the `project` const destructured
   // from it further down — referencing that in this deps array is a temporal-dead-zone crash
@@ -290,8 +305,14 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    const pid = projectId;
     try {
-      const [f, t, d] = await Promise.all([getFleet(projectId), getTimeline(projectId), getDiffs(projectId)]);
+      const [f, t, d] = await Promise.all([getFleet(pid), getTimeline(pid), getDiffs(pid)]);
+      // STALE-GUARD: the selected project can change while this fetch is in flight (a switch, or the
+      // previous project's LAST stream event). Drop the WHOLE batch — applying it would repaint the
+      // previous project's timeline/diffs AND re-stream its xells into the honeycomb (the lingering
+      // remnants across a switch).
+      if (projectIdRef.current !== pid) return;
       applyFleet(f);
       if (t) setTimeline(t);
       if (d) setDiffs(d);
@@ -466,8 +487,9 @@ export default function App() {
   useEffect(() => {
     setConn('connecting');
     setTimeline(null); setDiffs({});   // don't show the previous project's git graph while loading
-    getTimeline(projectId).then((t) => { if (t) { setTimeline(t); setVersion((v) => v + 1); } });
-    getDiffs(projectId).then((d) => d && setDiffs(d));
+    let live = true;   // a fetch/stream from a PREVIOUS project must never paint over the new one
+    getTimeline(projectId).then((t) => { if (live && t) { setTimeline(t); setVersion((v) => v + 1); } });
+    getDiffs(projectId).then((d) => { if (live && d) setDiffs(d); });
     const unsub = subscribe(projectId, {
       onSnapshot: (f) => { applyFleet(f); setConn('live'); },
       onChange: refresh,
@@ -478,7 +500,7 @@ export default function App() {
       // Live progress of db backup / restore / copy — drives progress toasts.
       onDbOpProgress,
     });
-    return unsub;
+    return () => { live = false; unsub(); };
   }, [projectId, refresh, applyFleet, onDbOpProgress]);
 
   const selectProject = useCallback((id) => {
@@ -565,8 +587,14 @@ export default function App() {
   // xells on the canvas — the "remnants that linger". So only use the fleet fallback when it
   // actually belongs to the selected project; otherwise show nothing until the new data lands.
   const fleetMatchesSelection = !projectId || fleet.project?.id === projectId;
-  const gridXells = streamedXells.length ? streamedXells
-    : (fleetMatchesSelection ? (fleet.xells || []) : []);
+  // CLIENT-SIDE PROJECT FILTER, belt-and-braces under the stream guards: every render, drop any xell
+  // that demonstrably belongs to a DIFFERENT project before the honeycomb (or anything downstream)
+  // sees it. The stream and fleet are project-scoped and the stale-stream guards keep the map clean,
+  // but a xell from the previous project's LAST update stream must never paint — the filter is the
+  // final gate, and it costs one pass over an already-small list.
+  const gridXells = projectScoped(
+    streamedXells.length ? streamedXells : (fleetMatchesSelection ? (fleet.xells || []) : []),
+    projectId);
   const carded = new Set(gridXells.map((x) => x.id));
   // THE APPROACH QUEUE, by ref (067). One runway per ref, so the queue belongs under the card that
   // is holding it up — keyed the same way, and never merged into `landing` (a holding row is not a
@@ -895,11 +923,15 @@ export default function App() {
                         title="Open a PR AND merge it into the default branch on GitHub">⇅ PR ⟳</button>
               )}
               {githubOut && !githubOut.busy && (
-                <a className="gh-out" href={githubOut?.url || null} target="_blank" rel="noreferrer"
+                <a className={`gh-out${!githubOut.pushed && !githubOut.opened && !githubOut.pulled ? ' bad' : ''}`}
+                   href={githubOut?.url || null} target="_blank" rel="noreferrer"
                    title={githubOut?.pushed ? 'Pushed successfully'
                      : githubOut?.opened ? (githubOut?.merge?.merged ? 'PR opened & merged' : 'PR opened')
+                     : githubOut?.pulled ? (githubOut?.state === 'up-to-date' ? 'Remote already up to date' : 'Pulled from remote')
                      : githubOut?.reason || 'result'}>
-                  {githubOut?.pushed ? '✓' : githubOut?.opened ? `#${githubOut?.number || '✓'}` : '✗'}
+                  {githubOut?.pushed || githubOut?.pulled ? '✓'
+                    : githubOut?.opened ? `#${githubOut?.number || '✓'}`
+                    : '✗'}
                 </a>
               )}
             </span>
@@ -955,7 +987,7 @@ export default function App() {
           const buttons = ai.flatMap((p) => (p.accounts || []).map((a) => {
             const dupes = (p.accounts || []).length > 1;
             const name = a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label);
-            return { id: a.id, provider: p.provider, name, typeLabel: p.label };
+            return { id: a.id, provider: p.provider, name, typeLabel: p.label, paused: !!a.paused };
           }));
           if (!buttons.length) {
             return (
@@ -964,11 +996,17 @@ export default function App() {
                       onClick={() => setShowSetup(true)}>＋ add provider</button>
             );
           }
+          // A paused account keeps its button so it stays VISIBLE as disabled — hiding it would
+          // read as "the account vanished", and the pause is deliberately reversible. The server
+          // refuses a dispatch on it regardless (spawnCreds → tokenForSpawn).
           return buttons.map((b) => (
             <button key={b.id} className="new-prompt-btn" data-testid={`new-prompt-btn-${b.provider}`}
-                    title={`Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
+                    disabled={b.paused}
+                    title={b.paused
+                      ? `⏸ ${b.typeLabel} (${b.name}) is PAUSED — resume it in Project setup to dispatch on it`
+                      : `Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
                     onClick={() => setShowDispatch({ provider: b.provider, tokenId: b.id, label: b.name })}>
-              ＋ prompt · {b.name}
+              {b.paused ? '⏸' : '＋'} prompt · {b.name}
             </button>
           ));
         })()}

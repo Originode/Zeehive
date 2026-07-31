@@ -159,7 +159,7 @@ ok(/geomRef\.current\.crew = isManagerXell\(expanded\)\s*\?\s*flowerCrewRects\(c
 ok(/const hitCrew = useCallback/.test(src.canvas)
    && /\(wx - d\.x\) \*\* 2 \+ \(wy - d\.y\) \*\* 2 <= d\.r \*\* 2/.test(src.canvas),
    'hitCrew tests DISTANCE, because a dot is a circle and a box around it would steal its neighbours');
-ok(/const cw = hitCrew\(wx, wy\);[\s\S]{0,400}emitHover\(\{ id: cw\?\.id \|\| null/.test(src.canvas),
+ok(/const cw = hitCrew\(wx, wy\);[\s\S]{0,2400}emitHover\(\{ id: hx\?\.id \?\? cw\?\.id \?\? null/.test(src.canvas),
    'a hover over a dot emits THAT worker’s id — which is how the crew list leads back to its hexagons');
 ok(/const cw = hitCrew\(wx, wy\);\n\s*if \(cw && cw\.id !== expandedId\) \{ setExpandedId\(cw\.id\); return; \}/.test(src.canvas),
    'and a click on one opens that worker’s own bloom');

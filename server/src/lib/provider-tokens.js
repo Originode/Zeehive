@@ -73,19 +73,28 @@ const hint = (t) => `${t.slice(0, 13)}…${t.slice(-4)}`;
 
 // masked read model: every provider TYPE, each with its list of connected ACCOUNTS — never the
 // token itself. The legacy per-type fields (connected/token_hint/…) mirror the FIRST account so
-// older consumers keep working; new consumers read `accounts`.
+// older consumers keep working; new consumers read `accounts`. Each account carries its pause
+// state (paused/paused_at/paused_by/reason — migration 104): a paused account is still connected
+// but no dispatch may start a zee on it.
 export async function listProviderTokens(projectId) {
   const rows = await q(
-    `SELECT id, provider, label, token_hint, created_at, last_used_at
+    `SELECT id, provider, label, token_hint, created_at, last_used_at,
+            paused_at, paused_by, reason
        FROM provider_token WHERE project_id = $1 ORDER BY created_at`, [projectId]);
   return Object.values(PROVIDERS).map((p) => {
     const accounts = rows.filter((r) => r.provider === p.key)
-      .map(({ id, label, token_hint, created_at, last_used_at }) => ({ id, label, token_hint, created_at, last_used_at }));
+      .map(({ id, label, token_hint, created_at, last_used_at, paused_at, paused_by, reason }) => ({
+        id, label, token_hint, created_at, last_used_at,
+        paused: !!paused_at, paused_at, paused_by, reason,
+      }));
+    const pausedCount = accounts.filter((a) => a.paused).length;
     return {
       provider: p.key, label: p.label, command: p.command, steps: p.steps,
       dispatch: !!p.dispatch,   // can a zee run on it? (github: no — infra credential)
       connected: accounts.length > 0,
       accounts,
+      // every account of this type is paused → the provider as a whole is disabled
+      all_paused: accounts.length > 0 && pausedCount === accounts.length,
       token_hint: accounts[0]?.token_hint || null,
       created_at: accounts[0]?.created_at || null,
       last_used_at: accounts[0]?.last_used_at || null,
@@ -141,6 +150,53 @@ export async function deleteProviderToken(projectId, provider) {
   return { ok: true };
 }
 
+// PAUSE / RESUME one account (migration 104). Pausing disables the account for every dispatch
+// surface without disconnecting it — the token stays in the meta-DB, the row stays connected,
+// and only the spawn gate refuses it. `by` and `reason` ride along for the audit trail, exactly
+// like the fleet/project/xell pause tables. A paused account can always be resumed (or deleted).
+export async function setProviderAccountPaused(projectId, accountId, paused, { by = 'human@console', reason = null } = {}) {
+  const row = await one(
+    `UPDATE provider_token SET
+        paused_at  = CASE WHEN $3 THEN COALESCE(paused_at, now()) ELSE NULL END,
+        paused_by  = CASE WHEN $3 THEN $4::text ELSE NULL END,
+        reason     = CASE WHEN $3 THEN $5::text ELSE NULL END,
+        resumed_at = CASE WHEN $3 THEN NULL ELSE now() END,
+        resumed_by = CASE WHEN $3 THEN NULL ELSE $4::text END
+      WHERE project_id = $1 AND id = $2 RETURNING id, provider, paused_at, paused_by, reason, resumed_at`,
+    [projectId, accountId, !!paused, by, reason]);
+  if (!row) throw new Error('provider account not found');
+  return { id: row.id, provider: row.provider, paused: !!row.paused_at,
+           paused_at: row.paused_at, paused_by: row.paused_by, reason: row.reason, resumed_at: row.resumed_at };
+}
+
+// The pre-flight gate every dispatch path calls before it routes to a runtime. The cxell spawn
+// re-checks the exact account in tokenForSpawn (that is the authoritative full-token read); this
+// is the broader "is this provider usable at all" check that also catches runtimes which never
+// read a meta-DB token (claude-code-remote, the host SDK) — pausing every Claude account must
+// stop a Claude-remote spawn too, not just the cxell one. A provider with NO accounts is left to
+// the spawn path: claude remote/local need no meta-DB token, and the cxell path already answers
+// "no token connected" with the exact fix.
+export async function assertProviderDispatchable(projectId, provider, { tokenId = null } = {}) {
+  const p = PROVIDERS[provider];
+  if (!p) throw new Error(`unknown provider "${provider}"`);
+  if (!p.dispatch) return; // infra credential (github) — nothing dispatches a zee on it anyway
+  if (tokenId) {
+    const row = await one(
+      `SELECT paused_at FROM provider_token WHERE project_id = $1 AND id = $2 AND provider = $3`,
+      [projectId, tokenId, provider]);
+    if (row?.paused_at) throw new Error(
+      `that ${p.label} account is PAUSED — resume it in Project setup, or pick another account`);
+    return;
+  }
+  const [total, active] = await Promise.all([
+    one(`SELECT count(*)::int AS n FROM provider_token WHERE project_id = $1 AND provider = $2`, [projectId, provider]),
+    one(`SELECT count(*)::int AS n FROM provider_token WHERE project_id = $1 AND provider = $2 AND paused_at IS NULL`, [projectId, provider]),
+  ]);
+  if ((total?.n || 0) > 0 && (active?.n || 0) === 0) {
+    throw new Error(`every ${p.label} account is PAUSED — resume one in Project setup to dispatch ${p.label} zees`);
+  }
+}
+
 // What a cxell spawn needs for a given AI provider ACCOUNT: the token plus (for a provider
 // whose CLI takes an alternate endpoint) the base URL. `tokenId` pins the exact account the
 // human's button carries; without one (CLI dispatches), the freshest account of the type is
@@ -157,21 +213,40 @@ export async function spawnCreds(projectId, provider = 'claude', { tokenId = nul
 
 // the one full-token read — the spawn path injecting into a cxell zee's environment
 export async function tokenForSpawn(projectId, provider = 'claude', { tokenId = null } = {}) {
+  const p = PROVIDERS[provider];
   const row = tokenId
     ? await one(
         // the id is authoritative but must MATCH the claimed type — a button can't smuggle a
-        // github PAT into a zee spawn by pairing its id with provider=claude
+        // github PAT into a zee spawn by pairing its id with provider=claude. A PAUSED account
+        // is refused here even when its id is named, so no surface can route around the pause.
         `UPDATE provider_token SET last_used_at = now()
-          WHERE project_id = $1 AND id = $2 AND provider = $3 RETURNING id, label, token`,
+          WHERE project_id = $1 AND id = $2 AND provider = $3 AND paused_at IS NULL
+          RETURNING id, label, token`,
         [projectId, tokenId, provider])
     : await one(
+        // generic pick: the freshest ACTIVE account of the type — a paused account never shadows
+        // an active sibling, and a type whose every account is paused refuses below
         `UPDATE provider_token SET last_used_at = now()
           WHERE id = (SELECT id FROM provider_token WHERE project_id = $1 AND provider = $2
-                       ORDER BY created_at DESC LIMIT 1) RETURNING id, label, token`,
+                       AND paused_at IS NULL ORDER BY created_at DESC LIMIT 1)
+          RETURNING id, label, token`,
         [projectId, provider]);
   if (!row) {
-    throw new Error(tokenId
-      ? `that ${provider} account is no longer connected — it may have been removed; reopen the composer`
+    if (tokenId) {
+      // Distinguish PAUSED from gone so the caller is told which — a paused account is connected
+      // and resumable; a missing one must be re-added.
+      const existing = await one(
+        `SELECT paused_at FROM provider_token WHERE project_id = $1 AND id = $2 AND provider = $3`,
+        [projectId, tokenId, provider]);
+      throw new Error(existing?.paused_at
+        ? `that ${p?.label || provider} account is PAUSED — resume it in Project setup, or pick another account`
+        : `that ${provider} account is no longer connected — it may have been removed; reopen the composer`);
+    }
+    const any = await one(
+      `SELECT count(*)::int AS n FROM provider_token WHERE project_id = $1 AND provider = $2`,
+      [projectId, provider]);
+    throw new Error((any?.n || 0) > 0
+      ? `every ${p?.label || provider} account is PAUSED — resume one in Project setup to dispatch ${p?.label || provider} zees`
       : `project has no ${provider} token — connect one in Project setup`);
   }
   return row;

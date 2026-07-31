@@ -288,6 +288,11 @@ export const addProviderToken = (projectId, provider, token, label) =>
   siteCall(`/api/projects/${projectId}/tokens`, 'POST', { provider, token, label: label || undefined });
 export const deleteProviderAccount = (projectId, accountId) =>
   siteCall(`/api/projects/${projectId}/tokens/account/${accountId}`, 'DELETE');
+export const pauseProviderAccount = (projectId, accountId, reason) =>
+  siteCall(`/api/projects/${projectId}/tokens/account/${accountId}/pause`, 'POST',
+    { reason: reason || undefined });
+export const resumeProviderAccount = (projectId, accountId) =>
+  siteCall(`/api/projects/${projectId}/tokens/account/${accountId}/resume`, 'POST');
 export const putProviderToken = (projectId, provider, token) =>
   siteCall(`/api/projects/${projectId}/tokens/${provider}`, 'PUT', { token });
 export const deleteProviderToken = (projectId, provider) =>
