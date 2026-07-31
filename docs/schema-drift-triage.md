@@ -63,7 +63,8 @@ This is the control experiment, and it is the fastest way to stop chasing a data
    the queenzee's log is an in-memory ring — so **read it while it is there**, or restore again and
    watch. (The `--no-privileges` half keeps prod's custom ROLEs — read-only managers' `zee_ro_*` and
    the like — from being replayed as GRANTs the dev server cannot satisfy; before it was added, a
-   restore that loaded every table still reported itself "completed with holes" for a missing role.)
+   restore that loaded every table still reported itself "completed with holes" for a missing role.
+   A restore over PROD itself is the exception and still replays ACLs, since prod's roles exist there.)
 4. **Is this database the one that was restored at all?** The chip measures the database named by
    `project.db_name` inside that container. A container whose real payload lives under a different
    database name will faithfully report an empty one. `container.instances` (the chip tooltip) lists

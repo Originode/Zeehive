@@ -94,12 +94,14 @@ on the live Zeehive fleet 2026-07-31: `bold-grove` and `calm-summit`, two databa
 from the newest prod dump, both carried 39/39 tables and schema-drift `0` — yet both logged
 `pg_restore completed but IGNORED 43 error(s)` whose only causes were the two `zee_ro_*` roles.
 
-**The fix:** every restore path (`runRestoreJob` streamed + docker-cp, `duplicateProdInto`, and
-`provision-xell-db.sh`) now passes `--no-privileges` to pg_restore, so ACL/GRANT statements from prod
-are not replayed onto a copy that cannot satisfy them. Ownership was already ignored (`--no-owner`);
-the privileges half was the missing piece. This makes a restore's tally mean what a human reads it to
-mean — if it says `ignored 0`, the copy is complete; if it says `ignored N`, those are objects that
-genuinely did not load.
+**The fix:** every DEV restore path (`runRestoreJob` streamed + docker-cp for non-prod targets,
+`duplicateProdInto`, and `provision-xell-db.sh`) now passes `--no-privileges` to pg_restore, so
+ACL/GRANT statements from prod are not replayed onto a copy that cannot satisfy them. Ownership was
+already ignored (`--no-owner`); the privileges half was the missing piece. One deliberate exception:
+a restore **over production** itself (the gated `confirmProd` flow) still replays ACLs, because
+prod's roles exist there and the restore must not strip their grants. This makes a restore's tally
+mean what a human reads it to mean — if it says `ignored 0`, the copy is complete; if it says
+`ignored N`, those are objects that genuinely did not load.
 
 ## 3. What IS known about data completeness (and its limits)
 

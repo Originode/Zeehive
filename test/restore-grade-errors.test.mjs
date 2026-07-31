@@ -121,20 +121,20 @@ try {
   // A prod dump carries GRANT/ACL statements naming prod-only roles (read-only managers' `zee_ro_*`,
   // etc.). pg_restore replays those by default, so restoring into a dev server that lacks the roles
   // makes it exit 1 with "role does not exist" and the restore reports itself "completed with holes"
-  // for ACL objects that have no meaning on the copy. Every restore path must pass --no-privileges
-  // so the data loads cleanly and the restore's tally means what a human reads it to mean.
+  // for ACL objects that have no meaning on the copy. Every DEV restore path must pass --no-privileges
+  // so the data loads cleanly and the restore's tally means what a human reads it to mean — while a
+  // restore OVER PROD (gated) must KEEP replaying ACLs, because prod's roles exist there and the
+  // restore must not strip their grants.
   console.log('\n── prod roles are never replayed on a dev copy (--no-privileges) ──');
-  const pgRestoreCalls = [...m.matchAll(/'pg_restore',[^\]]*?\]/g)].map((mm) => mm[0])
-    .filter((s) => s.includes('--clean'));   // only actual restores — the two `--list` TOC probes carry no flags
-  ok(pgRestoreCalls.length >= 3, `every pg_restore restore path is present (${pgRestoreCalls.length} call sites)`);
-  ok(pgRestoreCalls.every((s) => s.includes('--no-privileges')),
-     `and every one carries --no-privileges (${pgRestoreCalls.map((s) => s.includes('--no-privileges') ? '✓' : '✗').join(', ')})`);
-  ok(/--no-owner', '--no-privileges', \.\.\.tArgs, '-d', dbName\]/.test(m),
-     'the streamed restore path carries the flag');
-  ok(/--no-owner', '--no-privileges', \.\.\.tArgs, '-d', dbName, remoteTmp\]/.test(m),
-     'the docker-cp restore path carries the flag');
+  ok(/const aclArg = c\.tier === 'prod' \? \[\] : \['--no-privileges'\]/.test(m),
+     'runRestoreJob picks the ACL flag by TARGET tier: skip on dev, keep on prod');
+  const devRestores = [...m.matchAll(/'pg_restore',[^\]]*?\]/g)].map((mm) => mm[0])
+    .filter((s) => s.includes('--clean') && s.includes('...aclArg'));   // the two runRestoreJob paths
+  ok(devRestores.length === 2, `both runRestoreJob paths thread aclArg (${devRestores.length})`);
+  ok(devRestores.every((s) => s.includes('--no-owner') && s.includes('...aclArg')),
+     'and both use the tier-dependent aclArg (skip on dev, keep on prod)');
   ok(/--no-owner', '--no-privileges', '-d', dbName\]/.test(m),
-     'the duplicate-prod path carries the flag');
+     'the duplicate-prod path carries --no-privileges (it always targets a dev db)');
   const sh = read('scripts/provision-xell-db.sh');
   ok(/pg_restore -U "\$DBUSER" --clean --if-exists --no-owner --no-privileges/.test(sh),
      'and the isolated-db provision script carries it too');

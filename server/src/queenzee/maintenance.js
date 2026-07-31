@@ -955,6 +955,12 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
   const tArgs = restoreTableArgs(tables);   // [] ⇒ restore the whole archive
   const opLabel = c.name || c.id;
   const progressBase = { op: 'restore', id: c.id, project_id: c.project_id, label: opLabel };
+  // A prod dump records GRANTs for prod-only roles (read-only managers' `zee_ro_*`, etc.). A DEV
+  // server has none of those roles, so replaying the GRANTs makes pg_restore exit 1 with "role does
+  // not exist" and the restore reports itself "completed with holes" for ACL objects that have no
+  // meaning on the copy. Skip privileges on a non-prod target; KEEP them when restoring over prod
+  // itself (gated) — prod's roles exist there and the restore must not strip its grants.
+  const aclArg = c.tier === 'prod' ? [] : ['--no-privileges'];
   try {
     if (MODE === 'real') {
       const ctx = c.docker_ctx;
@@ -970,7 +976,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         const dir = snap.dump_path.slice(0, i), file = snap.dump_path.slice(i + 1);
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', snap.dest_ctx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'cat', `/out/${file}`] },
-          { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '--no-privileges', ...tArgs, '-d', dbName] },
+          { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...aclArg, ...tArgs, '-d', dbName] },
           { timeout: 1800000 });
         // The READER is unconditional: if cat/the mount failed, no archive reached pg_restore at all.
         if (piped.srcStatus !== 0) {
@@ -990,7 +996,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         if (cp.status !== 0) throw new Error(`docker cp into ${target} failed: ${(cp.stderr || '').slice(-300)}`);
         broadcastDbOpProgress({ ...progressBase, msg: 'Restoring database…', pct: 40, status: 'running' });
         const rest = await execAsync('docker',
-          ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '--no-privileges', ...tArgs, '-d', dbName, remoteTmp],
+          ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...aclArg, ...tArgs, '-d', dbName, remoteTmp],
           { timeout: 1800000 });
         await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000 });
         report = restoreOutcome({ status: rest.status, stderr: rest.stderr });
