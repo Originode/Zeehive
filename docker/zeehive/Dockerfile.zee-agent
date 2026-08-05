@@ -47,10 +47,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ALL vendor-native agent CLIs bake into the one image — which one runs is decided per dispatch
 # by the provider's token (server/src/lib/cxell-runtimes.js picks the adapter):
 #   claude (Anthropic), codex (OpenAI, `codex exec` headless), kimi (Moonshot Kimi Code CLI,
-#   `kimi -p` headless; needs Node >= 22.19, satisfied by the node:22 base).
-# kimi-code is PINNED (young CLI, moving fast — bump deliberately, not on every rebuild);
-# claude/codex track latest like the image always has for claude.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex @moonshot-ai/kimi-code@0.28.1
+#   `kimi -p` headless; needs Node >= 22.19, satisfied by the node:22 base), grok (xAI Grok Build,
+#   `grok -p` headless — an npm wrapper that pulls its own platform binary on postinstall).
+# kimi-code and grok are PINNED (young CLIs, moving fast — bump deliberately, not on every
+# rebuild); claude/codex track latest like the image always has for claude.
+RUN npm install -g @anthropic-ai/claude-code @openai/codex @moonshot-ai/kimi-code@0.28.1 \
+      @xai-official/grok@0.2.118
 COPY docker/zeehive/cxell-firewall.sh /usr/local/bin/cxell-firewall.sh
 COPY docker/zeehive/cxell-sshd.sh /usr/local/bin/cxell-sshd.sh
 # The cxell zee's workflow CLI (land/ship/prod/done/status/crew → the queenzee's /api/xell/self/*

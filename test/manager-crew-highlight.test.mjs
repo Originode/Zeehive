@@ -303,6 +303,11 @@ if (!process.env.DATABASE_URL) {
     const B = await mk('pay-idle', 'worker', 'idle', M);
     const D = await mk('pay-husk', 'worker', 'husk', M);        // reaped: must lend nothing
     const N = await mk('pay-none', 'worker', 'working', null);
+    // the manager's DIRECTIVE: its task brief. From the meta-DB, exactly as createManagerZee leaves it.
+    await client.query(
+      `INSERT INTO task (project_id, prompt_text, source, status, xell_id, assigned_at)
+         VALUES ($1,$2,'console','assigned',$3, now())`,
+      [PID, 'Manage the payment crew and ship the release', M]);
 
     const { getFleet } = await import('../server/src/lib/fleet.js');
     const fleet = await getFleet(PID);
@@ -314,6 +319,10 @@ if (!process.env.DATABASE_URL) {
        'it carries manager_xell_id and zee_type per xell — no new endpoint, no per-hover request');
     ok(byId[D].status === 'husk' && byId[A].status === 'working',
        'and the STATUS the liveness rule reads (the husk is in the payload — it still owns a cell)');
+    ok(byId[M].task_text === 'Manage the payment crew and ship the release',
+       'and the manager\'s DIRECTIVE rides on the same payload row (task_text) — the console needs no extra fetch');
+    ok(managerCard(byId[M], crewLinks(rows).crewOf[M]).directive === 'Manage the payment crew and ship the release',
+       'so the hexagon card can lead with what this manager is FOR');
 
     console.log('\n── that payload, straight into the highlight ──');
     const l = crewLinks(rows);

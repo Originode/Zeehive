@@ -391,6 +391,29 @@ try {
   ok(built.item?.id === item.id && built.prevZee?.id === outgoing.id,
      'the brief builder resolved the same card and the same outgoing zee the swap did');
 
+  // ── 7b. THE SWAP FORWARDS --model TO THE SAME VALIDATION AS DISPATCH (TKT-97-BD32) ──
+  // `zee swap --model fable` on a project whose provider is deepseek must not silently run
+  // deepseek-chat — it must be REFUSED by name, exactly as `zee dispatch --model fable` would be.
+  // The xell is already in the half-swapped state from the swap above, which is fine: the swap
+  // still collects, retires nothing (no live zee rows), and the dispatch validates the model
+  // BEFORE the spawn — so the refusal surfaces here, not a spawn failure.
+  console.log('\nthe swap forwards --model to the same validation as dispatch');
+  setState({ running: { 'cxell_scout-work-aa11bb': true }, bundle, commits: 1 });
+  const badModelSwap = await selfSwap(manager, { to: worker.slug, harness: 'dev-builder',
+                                                  model: 'fable', provider: 'deepseek' });
+  ok(badModelSwap.ok === false && /model "fable" is not offered by provider "deepseek"/.test(badModelSwap.error || ''),
+     `a model the provider does not offer is REFUSED by name [${(badModelSwap.error || '').slice(0, 110)}]`);
+  ok(!/no deepseek token/.test(badModelSwap.error || ''),
+     'and it was refused BEFORE the spawn — this is the model policy, not a missing account');
+  // a VALID non-default model for that same provider passes the model gate and dies at the spawn
+  // (no deepseek account in a throwaway project), NOT at the model policy.
+  const goodModelSwap = await selfSwap(manager, { to: worker.slug, harness: 'dev-builder',
+                                                   model: 'deepseek-reasoner', provider: 'deepseek' });
+  ok(goodModelSwap.ok === false && SPAWN_STAGE.test(goodModelSwap.error || ''),
+     `a valid model for the provider passes the model gate (the only failure is the spawn) [${(goodModelSwap.error || '').slice(0, 110)}]`);
+  ok(!/not offered by provider/.test(goodModelSwap.error || ''),
+     'and the valid model was NOT refused by the model policy');
+
   // …and the ORDER is structural in the source too, not just incidental to this run — in the ONE
   // function that owns it. selfSwap is now only the manager's AUTHORISATION (my crew, a worker
   // target, a worker persona of my project) in front of swapZeeInXell, which the console's human

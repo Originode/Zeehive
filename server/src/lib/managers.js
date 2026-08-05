@@ -18,9 +18,15 @@
 // This module owns the manager's DOMAIN (who manages whom, the crew read model, the messages, the
 // done suggestions). The verbs that expose it live in queenzee/self.js; the human side lives in
 // api/routes.js. Nothing here despawns anything or moves a ref.
+import { existsSync } from 'node:fs';
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
+// What a worker has PRODUCED is a git question, and the two helpers that answer it already exist:
+// worktreeDiff for a host worktree (queenzee/monitor.js reads stale claims with it) and cxellDiff
+// for a caged zee, whose work is not on the host at all. See crewDiff below for which is asked.
+import { worktreeDiff } from './git.js';
+import { cxellDiff } from './cxell.js';
 // briefReason is the house's one-line normaliser (collapse whitespace, ELIDE with …). Quoting an
 // error inside our own prose needs exactly that: a hard slice ends the quote mid-word, which reads
 // as a truncated MESSAGE rather than a quoted one ("…so a spawn there would fail. Do ").
@@ -46,6 +52,48 @@ export function refuseForManager(xell, verb) {
   return { ok: false, status: 'refused', refused: verb, error: NO_PUSH_REASON };
 }
 
+// ── what a worker has PRODUCED ───────────────────────────────────────────────
+//
+// Everything else on a crew row comes from the `zee` row, which is written at TURN BOUNDARIES: a
+// worker mid-turn reads as the status (and the cost) it had when its last turn ended. A manager read
+// `idle` on a reviewer that had restarted and landed a commit eight minutes earlier, concluded it was
+// inert, and spent a whole redundant xell redoing landed work. So the crew row also carries the two
+// facts that are true AT THE MOMENT OF THE READ, because they are measured rather than remembered:
+// what has LANDED (the ledger) and what has not (the diff).
+//
+// WHICH DIFF. Same fallback order as timeline.getDiffs, for the same reason: a caged worker commits
+// in its private clone and the host worktree stays frozen at the provisioning base until a land or a
+// build collects it, so a host-side `git diff` reads 0/0 for a worker that has written all day.
+// Ask the cxell first (cxellDiff), fall back to the host worktree (worktreeDiff — the helper
+// queenzee/monitor.js reads stale claims with), and answer null rather than 0 when neither can be
+// read: "I could not measure it" and "it has produced nothing" must not look the same to a manager
+// deciding whether to close a worker out.
+//
+// THROTTLING: cached per xell, because a manager POLLS this (`zee zees`, and `zee status` carries the
+// crew too). A docker exec per worker per poll is not free — timeline.getDiffs caches the same read
+// for 12s; this one is a little longer because a crew is read at human/agent cadence, not at 60fps.
+const CREW_DIFF_TTL_MS = 15_000;
+const crewDiffCache = new Map(); // xell id -> { at, val }
+
+async function crewDiff(row, branch) {
+  const hit = crewDiffCache.get(row.id);
+  if (hit && Date.now() - hit.at < CREW_DIFF_TTL_MS) return hit.val;
+  let val = null;
+  // `entrypoint='cxell-cli'` is the provider-agnostic marker of a caged zee (the same predicate the
+  // poller and the reaper use). Keying on one runtime KEY instead would send a codex or kimi worker
+  // down the host path, where its work is invisible.
+  if (row.cxell_live && row.head_commit) {
+    const d = await cxellDiff({ ctx: 'default', slug: row.slug, base: row.head_commit }).catch(() => null);
+    if (d) val = { ...d, source: 'cxell' };
+  }
+  if (!val && row.worktree_path && existsSync(row.worktree_path)) {
+    const d = await worktreeDiff(row.worktree_path, branch).catch(() => null);
+    if (d) val = { ...d, source: 'worktree' };
+  }
+  crewDiffCache.set(row.id, { at: Date.now(), val });
+  return val;
+}
+
 // ── the crew ─────────────────────────────────────────────────────────────────
 // Every worker this manager dispatched, with the live signals a manager actually decides on: what
 // the hive shows, whether it is waiting on a human, and its git position (unlanded work is the one
@@ -54,8 +102,16 @@ export function refuseForManager(xell, verb) {
 export async function crewFor(managerXellId) {
   const rows = await q(
     `SELECT x.id, x.slug, x.branch, x.status, x.head_commit, x.created_at, x.db_coupling,
+            x.worktree_path, p.main_branch,
             z.status AS zee_status, z.cli_active, z.title AS zee_title, z.model,
+            (z.entrypoint = 'cxell-cli'
+               AND z.status IN ('spawning','online','working','idle')) AS cxell_live,
             t.prompt_text AS task_text,
+            -- WHAT IT LANDED. The land ledger, not the worker's own account of itself: a landed row
+            -- is a sha that actually reached main, so a manager can tell a worker that has produced
+            -- something from one that has only been busy. LANDED only — pending/approved/withdrawn
+            -- are asks, and an ask is not a landing.
+            lands.n AS landings, lands.last_sha AS last_landed_sha, lands.last_at AS last_landed_at,
             EXISTS(SELECT 1 FROM land_request lr WHERE lr.xell_id=x.id
                      AND lr.status IN ('pending','approved') AND lr.dismissed_at IS NULL) AS land_pending,
             -- queued for the runway (067) — a manager watching a crew needs to know WHY a worker
@@ -79,6 +135,13 @@ export async function crewFor(managerXellId) {
             (SELECT zm.created_at FROM zee_message zm WHERE zm.from_xell_id=x.id AND zm.to_xell_id=$1
                ORDER BY zm.created_at DESC LIMIT 1) AS last_message_at
        FROM xell x
+       -- LEFT, not inner: the FK makes a projectless xell impossible, and if that ever stopped
+       -- being true a manager must lose a BRANCH NAME here, never a worker off its crew list.
+       LEFT JOIN project p ON p.id = x.project_id
+       LEFT JOIN LATERAL (
+         SELECT count(*)::int AS n, max(l.landed_at) AS last_at,
+                (array_agg(l.new_sha ORDER BY l.landed_at DESC NULLS LAST))[1] AS last_sha
+           FROM land_request l WHERE l.xell_id = x.id AND l.status = 'landed') lands ON true
        LEFT JOIN LATERAL (
          SELECT * FROM zee zz WHERE zz.xell_id = x.id
           ORDER BY CASE WHEN zz.status IN ('spawning','online','working','idle') THEN 0 ELSE 1 END,
@@ -92,7 +155,14 @@ export async function crewFor(managerXellId) {
       WHERE x.manager_xell_id = $1 AND x.status <> 'retired'
       ORDER BY x.created_at`, [managerXellId]);
 
+  // The diffs run CONCURRENTLY (independent read-only git reads, mostly served from the cache) —
+  // one crew is a handful of workers, and doing them in series would add a docker exec's latency per
+  // worker to every poll.
+  const diffs = new Map(await Promise.all(
+    rows.map(async (r) => [r.id, await crewDiff(r, r.main_branch || 'main').catch(() => null)])));
+
   return rows.map((r) => {
+    const d = diffs.get(r.id);
     // the tend's reason in both forms: one line for the waiting summary, the whole text on the row
     // (a manager has no console to hover and no terminal to open — a clipped tail would be lost).
     const why = reasonPair(r.tend_reason);
@@ -127,6 +197,19 @@ export async function crewFor(managerXellId) {
       model: r.model || null, title: r.zee_title || null,
       task: r.task_text ? String(r.task_text).split('\n')[0].slice(0, 160) : null,
       head_commit: r.head_commit || null,
+      // WHAT IT HAS PRODUCED, in the two halves a manager decides on:
+      //   landings — what reached main (count, the last sha, when). A worker with landings has
+      //     produced something whatever its status says.
+      //   diff     — what has NOT: `ahead` unlanded commits and `dirty` uncommitted files, plus the
+      //     shortstat, the live head, and WHERE it was read from. null = could not be measured (no
+      //     worktree on disk, cxell unreachable) — never silently 0.
+      // The manual's own rule ("never suggest done over unlanded work") is checked on diff.ahead.
+      landings: { count: r.landings || 0,
+                  last_sha: r.last_landed_sha || null,
+                  landed_at: r.last_landed_at || null },
+      diff: d ? { ahead: d.ahead || 0, dirty: d.dirty || 0, files: d.files || 0,
+                  insertions: d.insertions || 0, deletions: d.deletions || 0,
+                  head: d.head || null, source: d.source } : null,
       waiting_on_human: waiting,
       tend: r.tend_pending ? { open: true, reason: why.brief, full: why.full } : null,
       last_message: r.last_message ? String(r.last_message).slice(0, 300) : null,
@@ -167,15 +250,47 @@ export async function postMessage({ from, to, body, kind = 'message', by = null,
       ? `🪞 REFLECTION from ${from?.slug || 'a worker'}`
       : kind === 'directive' ? `🐝 MANAGER ${from?.slug || ''}`
       : `✉ ${from?.slug || 'zee'}`;
-    delivery = await sendMessageToXell(to.id, { text: `${prefix}: ${text}`, by: from?.slug || 'queenzee' });
+    // `messageId` is what lets a delivery that dies LATER come back and correct this row: every
+    // delivery is fire-and-forget, so `sent` below means it started (queenzee/nudge.js).
+    delivery = await sendMessageToXell(to.id, { text: `${prefix}: ${text}`, by: from?.slug || 'queenzee',
+                                               messageId: row.id });
   }
+  // …which is also why this stamp must not clobber a correction that got here first: a resume can
+  // fail within a millisecond (no cage, no daemon), i.e. before this line runs. The guard is the
+  // marker the correction writes, so the last word belongs to whichever of the two is the truth
+  // rather than to whichever won a race — and a blocked stamp still reads its row back to return.
   const done = await one(
-    `UPDATE zee_message SET delivered=$2, delivery=$3::jsonb WHERE id=$1 RETURNING *`,
-    [row.id, !!delivery.sent, JSON.stringify(delivery)]);
+    `UPDATE zee_message SET delivered=$2, delivery=$3::jsonb
+      WHERE id=$1 AND NOT COALESCE((delivery->>'undelivered')::boolean, false) RETURNING *`,
+    [row.id, !!delivery.sent, JSON.stringify(delivery)])
+    || await one(`SELECT * FROM zee_message WHERE id=$1`, [row.id]);
   broadcast('zee-message', { id: done.id, to_xell_id: done.to_xell_id, from_xell_id: done.from_xell_id, kind });
   logline('crew', `${done.from_slug || '?'} → ${done.to_slug || 'console'} (${kind}): `
-    + `${text.replace(/\s+/g, ' ').slice(0, 120)}${delivery.sent ? '' : ` [not delivered: ${delivery.reason || delivery.error || '—'}]`}`);
+    + `${text.replace(/\s+/g, ' ').slice(0, 120)}`
+    + (delivery.sent ? ` [${delivery.delivery || 'delivered'}]` : ` [not delivered: ${delivery.reason || delivery.error || '—'}]`));
   return { ok: true, message: done, delivered: !!delivery.sent, delivery };
+}
+
+// WHAT A DELIVERY ACTUALLY PROMISES, in one sentence, for the agent or human that sent the message.
+// There are THREE deliveries (queenzee/nudge.js sendMessageToXell → lib/zee-turn.js
+// decideMessageDelivery) and only ONE of them means "it is reading this now" — yet `zee say` used to
+// answer "Delivered into <slug>'s live session — it will answer there" for every message it managed
+// to hand off, including the ones that reached nobody at all. A manager acts on that sentence: it
+// stops watching, and the instruction is never carried out.
+export function deliveryReceipt(delivery, slug, why = null) {
+  switch (delivery) {
+    case 'resumed':
+      return `RESUMED ${slug} — its turn had already ENDED, so the queenzee restarted its session with `
+        + 'your message as the prompt. It is acting on it now; watch its status rather than re-sending.';
+    case 'queued':
+      return `QUEUED for ${slug} — it is MID-TURN, so the message is held in its cxell and typed into `
+        + 'its session the moment this turn ends. It has NOT read it yet.';
+    case 'typed':
+      return `TYPED into ${slug}'s live session — it will answer there.`;
+    default:
+      return `Stored for ${slug} but NOT delivered live (${why || 'no live cxell'}) — `
+        + 'it will read it with `zee inbox` on its next turn.';
+  }
 }
 
 // This xell's inbox. Unread by default (an agent polling its own inbox wants what it has not seen);
@@ -190,6 +305,28 @@ export async function inboxFor(xellId, { all = false, limit = 50 } = {}) {
   return rows.map((r) => ({
     id: r.id, from: r.from_slug, kind: r.kind, body: r.body,
     at: r.created_at, was_unread: unread.includes(r.id),
+  }));
+}
+
+// A xell's MESSAGE HISTORY — the manager⇄worker conversation as the CONSOLE reads it. A worker sees
+// the directives its manager sent it (via `zee say`) and the reports it sent back; a manager sees
+// the same conversation from its own side. Human-facing, so READING marks NOTHING read — the
+// agent's own `zee inbox` is the receipt; this is the audit view, and a human looking at the
+// history must not clear an agent's unread flags.
+export async function messagesForXell(xellId) {
+  const rows = await q(
+    `SELECT id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, delivered, read_at, created_at
+       FROM zee_message
+      WHERE from_xell_id=$1 OR to_xell_id=$1
+      ORDER BY created_at DESC LIMIT 200`,
+    [xellId]);
+  return rows.map((r) => ({
+    id: r.id,
+    from: r.from_slug, from_xell_id: r.from_xell_id,
+    to: r.to_slug, to_xell_id: r.to_xell_id,
+    kind: r.kind, body: r.body,
+    delivered: r.delivered, read_at: r.read_at,
+    at: r.created_at,
   }));
 }
 
@@ -290,6 +427,20 @@ export async function suggestDone({ manager, target, reason = null }) {
     [target.project_id, manager.id, manager.slug, target.id, target.slug, reason]);
   broadcast('done-suggestion', row);
   broadcast('xell', { id: target.id });
+
+  // Operator policy: auto-DONE — a project can choose to confirm a manager's done suggestion with no
+  // human in the loop. It ONLY applies to a manager's recommendation (a done_suggestion row is
+  // manager-raised by construction; a worker's OWN `zee done` still needs a human), which is the
+  // "only if recommended by manager" of the policy. The reap still runs through the SAME guards:
+  // an actively-working xell is refused and the card stays open for a human (decideDoneSuggestion →
+  // refuseApproval). Nothing about the teardown is bypassed — only the human decision.
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [target.project_id]);
+  if (project?.auto_done) {
+    logline('crew', `AUTO-CONFIRMING done suggestion for ${target.slug} from ${manager.slug} — auto-done policy (no human review)`);
+    const approved = await decideDoneSuggestion(row.id, 'approved', 'auto-done@policy');
+    return { ok: true, suggestion: approved, note: 'auto-done by policy — the xell is being marked done' };
+  }
+
   logline('crew', `${manager.slug} SUGGESTS ${target.slug} is done — awaiting human confirmation${reason ? `: ${reason}` : ''}`);
   return {
     ok: true, suggestion: row,
@@ -425,8 +576,10 @@ export async function decideDoneSuggestion(id, decision, by = 'human@console', {
   broadcast('xell', { id: target.id });
   logline('crew', `done suggestion for ${row.target_slug} CONFIRMED by ${by} — task marked done and the xell reaped`);
   if (manager) {
+    const confirmedBy = by === 'auto-done@policy' ? 'The auto-done policy (a human turned it on)'
+      : `A human (${by || 'human@console'})`;
     await postMessage({ from: null, to: manager, kind: 'report', by,
-      body: `A human CONFIRMED your suggestion: ${row.target_slug} is marked done and its cxell is being torn `
+      body: `${confirmedBy} CONFIRMED your suggestion: ${row.target_slug} is marked done and its cxell is being torn `
         + 'down (its commits were collected first). One fewer worker in your crew.' }).catch(() => {});
   }
   return done;

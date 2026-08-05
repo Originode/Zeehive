@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { getBackups, setBackupConfig, runBackup, revealBackup, restoreBackup, deleteBackup } from './api.js';
-import { showConfirm, showPrompt } from './Dialog.jsx';
+import { getBackups, setBackupConfig, runBackup, revealBackup, restoreBackup, deleteBackup, cancelBackup, subscribe } from './api.js';
+import { showConfirm, showPrompt, showAlert } from './Dialog.jsx';
 
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -172,6 +172,20 @@ export default function BackupsPanel({ backup, projectId }) {
   const stale = !running && (fresh.state === 'overdue' || fresh.failedSince);
   const nextAttempt = nextAttemptLine(backup);
 
+  // Cancel the in-flight backup right from the panel — the same verb as the modal's running-row
+  // Cancel. The confirm is the same wording, because the outcome is the same: the dump is killed,
+  // the partial removed, prod un-busied, and the row is left 'cancelled', not 'failed'. No explicit
+  // refresh: the server broadcasts the settled row over SSE and the fleet snapshot re-reads it.
+  const cancelRunning = async () => {
+    const b = backup?.running;
+    if (!b) return;
+    if (!(await showConfirm(`Cancel this backup?\n\n${stampFmt(b.taken_at)}\n\n`
+      + `The in-flight dump will be stopped and any partial file removed. This cannot be undone.`,
+      { variant: 'danger', okLabel: 'Cancel backup' }))) return;
+    try { await cancelBackup(b.id); }
+    catch (e) { showAlert(e.message || 'Cancel failed', { variant: 'error' }); }
+  };
+
   return (
     <section className="backups" data-testid="backups-panel">
       <span className="bklabel">Last backup:</span>
@@ -222,9 +236,18 @@ export default function BackupsPanel({ backup, projectId }) {
         </span>
       )}
       {running && (
-        <span className="bkrunning" data-testid="backup-running" title="A backup is running">
-          <span className="cspin backup" />backing up…
-        </span>
+        <>
+          <span className="bkrunning" data-testid="backup-running" title="A backup is running">
+            <span className="cspin backup" />backing up…
+          </span>
+          <span className="bkacts">
+            <button className="bkbtn sm danger" onClick={cancelRunning}
+                    title="Stop this backup now — kills the in-flight dump, removes any partial file, and marks it cancelled"
+                    data-testid="backup-cancel">
+              Cancel
+            </button>
+          </span>
+        </>
       )}
       {backup?.count > 0 && <span className="bkcount">{backup.count} stored</span>}
       <button className="bkcog" onClick={() => setShowCfg(true)}
@@ -249,6 +272,20 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
   const [openPick, setOpenPick] = useState(null);   // which backup row's table picker is expanded
   const [msg, setMsg] = useState('');
   const flash = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2600); };
+  // Live pg_dump / docker log lines per in-flight backup, streamed over SSE. The same lines the
+  // notification toast shows bottom-right; here they are rendered IN the running row, so the backups
+  // window is self-sufficient — a human who started (or is watching) a backup HERE sees its log HERE,
+  // not in a corner toast they may never look at. Keyed by backup id, capped like the toast.
+  const [runLogs, setRunLogs] = useState({});
+  useEffect(() => {
+    const unsub = subscribe(projectId, {
+      onDbOpLog: (p) => {
+        if (p?.op !== 'backup' || p.line == null) return;
+        setRunLogs((m) => ({ ...m, [p.id]: [...(m[p.id] || []), p.line].slice(-200) }));
+      },
+    });
+    return () => unsub();
+  }, [projectId]);
 
   const load = () => getBackups(projectId).then((d) => {
     setBackups(d.backups || []);
@@ -307,6 +344,15 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
     try { await deleteBackup(b.id); await load(); flash('Backup deleted'); }
     catch (e) { flash(e.message || 'Delete failed'); }
   };
+  // Cancel is not delete: it stops the in-flight dump (kills pg_dump, removes any partial, un-busies
+  // prod) and leaves the row as 'cancelled' so a human can see it was stopped, not a failure.
+  const cancel = async (b) => {
+    if (!(await showConfirm(`Cancel this backup?\n\n${stampFmt(b.taken_at)}\n\n`
+      + `The in-flight dump will be stopped and any partial file removed. This cannot be undone.`,
+      { variant: 'danger', okLabel: 'Cancel backup' }))) return;
+    try { await cancelBackup(b.id); await load(); flash('Cancelling backup…'); }
+    catch (e) { flash(e.message || 'Cancel failed'); }
+  };
 
   return (
     <div className="term-overlay" onClick={onClose}>
@@ -346,7 +392,29 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
               <span className="bkstamp mono">{stampFmt(b.taken_at)}</span>
               <span className="bkago2">{ago(b.taken_at)}</span>
               {b.status === 'running' ? (
-                <span className="bkjob" data-testid="backup-row-running"><span className="cspin backup" />backing up…</span>
+                <>
+                  <span className="bkjob" data-testid="backup-row-running"><span className="cspin backup" />backing up…</span>
+                  <span className="bkacts">
+                    <button className="bkbtn sm danger" onClick={() => cancel(b)}
+                            title="Stop this backup now — kills the in-flight dump, removes any partial file, and marks it cancelled">
+                      Cancel
+                    </button>
+                  </span>
+                  {/* the LIVE log for THIS dump — pg_dump / docker lines as they happen. The toast
+                      streams the same lines bottom-right; here they ride the row, so the backups
+                      window shows the log where the backup is listed. */}
+                  {runLogs[b.id]?.length > 0 && (
+                    <pre className="bkrow-log" data-testid="backup-row-log">{runLogs[b.id].join('\n')}</pre>
+                  )}
+                </>
+              ) : b.status === 'cancelled' ? (
+                <>
+                  <span className="bkjob cancelled" title={b.error || 'backup cancelled by the operator'}>✕ cancelled</span>
+                  <span className="bkacts">
+                    <button className="bkbtn sm danger" onClick={() => del(b)}
+                            title="Delete this cancelled backup (removes any partial file and its record)">Delete</button>
+                  </span>
+                </>
               ) : b.status === 'failed' ? (
                 <>
                   <span className="bkjob failed" title={b.error || 'backup failed'}>✕ failed</span>
@@ -419,7 +487,7 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
                   </span>
                 </>
               )}
-              {openPick === b.id && b.status !== 'running' && b.status !== 'failed' && (
+              {openPick === b.id && b.status !== 'running' && b.status !== 'failed' && b.status !== 'cancelled' && (
                 <div className="bkrow-pick">
                   <TableSelect available={b.toc_tables || b.tables || []} value={picks[b.id] || []}
                                onChange={(v) => setPicks((p) => ({ ...p, [b.id]: v }))}
@@ -434,7 +502,7 @@ export function BackupsModal({ projectId, onClose, initialTargetId = '' }) {
   );
 }
 
-// ── settings (folder / interval / retention) ─────────────────────────────────
+// ── settings (folder / interval / retention / tables / plugins) ──────────────
 const UNITS = [['minutes', 60], ['hours', 3600], ['days', 86400]];
 
 function splitInterval(sec) {
@@ -443,6 +511,10 @@ function splitInterval(sec) {
   }
   return { value: Math.max(1, Math.round((sec || 60) / 60)), unit: 'minutes' };
 }
+
+// A comma-separated list of postgres extension names → array (trimmed, lowercased, blanks dropped).
+// Mirrors the server's lowercasing/dedup so the input reflects what will be saved.
+const parsePlugins = (s) => s.split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
 
 function BackupSettings({ backup, projectId, onClose }) {
   const cfg = backup?.config || {};
@@ -453,6 +525,7 @@ function BackupSettings({ backup, projectId, onClose }) {
   const [unit, setUnit] = useState(init.unit);
   const [maxB, setMaxB] = useState(cfg.max_backups ?? 14);
   const [tables, setTables] = useState(Array.isArray(cfg.backup_tables) ? cfg.backup_tables : []);
+  const [plugins, setPlugins] = useState(Array.isArray(cfg.backup_plugins) ? cfg.backup_plugins : []);
   const [universe, setUniverse] = useState([]);   // tables to tick, from the most recent full backup
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
@@ -476,6 +549,7 @@ function BackupSettings({ backup, projectId, onClose }) {
         backup_interval_sec: Math.round(Number(ival) * mult),
         max_backups: Number(maxB),
         backup_tables: tables.length ? tables : null,
+        backup_plugins: plugins.length ? plugins : null,
       });
       onClose();
     } catch (e) { setErr(e.message); setSaving(false); }
@@ -519,6 +593,15 @@ function BackupSettings({ backup, projectId, onClose }) {
             <span className="bkhint">applies to scheduled AND manual backups. Leave empty to dump the
               whole database (the default). A scoped selection dumps ONLY these tables — smaller, faster,
               but a partial restore of it can't reconstruct the tables you left out.</span>
+          </label>
+          <label>Plugins (extensions to create on restore)
+            <input value={plugins.join(', ')} placeholder="postgis, h3"
+                   onChange={(e) => setPlugins(parsePlugins(e.target.value))} spellCheck={false}
+                   data-testid="backup-plugins" />
+            <span className="bkhint">PostgreSQL extensions a restore target must have BEFORE a backup
+              is loaded into it (e.g. postgis, h3). A dump taken from a database that uses an extension
+              can't restore into one that doesn't have it — this creates them in the target first.
+              Blank = none.</span>
           </label>
           {err && <div className="bkerr">{err}</div>}
         </div>

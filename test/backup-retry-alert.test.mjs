@@ -243,8 +243,8 @@ try {
   w(tmp, transformSync(read('web/src/Backups.jsx'), { loader: 'jsx', format: 'esm' }).code
     .replace(/import[^\n]*\.\/(api|Dialog)\.jsx?['"];?/g, (_m, mod) => ({
       api: 'const getBackups=async()=>({}),setBackupConfig=async()=>{},runBackup=async()=>{},'
-         + 'revealBackup=async()=>{},restoreBackup=async()=>{},deleteBackup=async()=>{};',
-      Dialog: 'const showConfirm=async()=>true,showPrompt=async()=>null;',
+         + 'revealBackup=async()=>{},restoreBackup=async()=>{},deleteBackup=async()=>{},cancelBackup=async()=>{},subscribe=()=>()=>{};',
+      Dialog: 'const showConfirm=async()=>true,showPrompt=async()=>null,showAlert=async()=>{};',
     }[mod] || '')));
   let nextAttemptLine, backupFreshness;
   try {

@@ -8,9 +8,13 @@
 # both lib/docker.js (HTTP) and the CLI honor it for the 'default' context.
 #
 # Endpoints come from env so nothing is baked into the image:
-#   ZEEHIVE_CTX_UGREEN   (e.g. tcp://10.1.0.18:2375)  → context ugreen-nas
-#   ZEEHIVE_CTX_MARDALE  (e.g. tcp://10.2.0.16:2375)  → context mardale-prod
+#   ZEEHIVE_CTX_UGREEN       (e.g. tcp://10.1.0.18:2375)  → context ugreen-nas
+#   ZEEHIVE_CTX_MARDALE      (e.g. tcp://10.2.0.16:2375)  → context mardale-prod
+#   ZEEHIVE_CTX_MARDALE_ALT  (e.g. ssh://mnrevelo@ssh.omnibiz.express)  → context mardale-prod-alt
 # Unset = skip. Idempotent: an existing context is updated, not duplicated.
+# NOTE: an SSH context (mardale-prod-alt) is usable ONLY through the `docker` CLI — the docker
+# HTTP API cannot ride SSH, so lib/docker.js refuses ssh:// endpoints with an explicit error.
+# The health/discovery/reaper HTTP paths must keep pointing at a TCP context.
 set -uo pipefail
 
 ensure_ctx() { # <name> <endpoint>
@@ -27,8 +31,9 @@ ensure_ctx() { # <name> <endpoint>
   fi
 }
 
-ensure_ctx ugreen-nas   "${ZEEHIVE_CTX_UGREEN:-}"
-ensure_ctx mardale-prod "${ZEEHIVE_CTX_MARDALE:-}"
+ensure_ctx ugreen-nas       "${ZEEHIVE_CTX_UGREEN:-}"
+ensure_ctx mardale-prod     "${ZEEHIVE_CTX_MARDALE:-}"
+ensure_ctx mardale-prod-alt "${ZEEHIVE_CTX_MARDALE_ALT:-}"
 
 # Join the cxell network OURSELVES instead of declaring it in compose: a compose-owned network
 # refuses to start when the name already exists without compose labels (which is exactly what

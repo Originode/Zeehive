@@ -123,7 +123,10 @@ export async function unbindManagerFromProdReadonly(xellId, reason = 'the dispat
 // is observed, built, nudged and reaped exactly like any other xell.
 export async function createManagerZee({ project, cwd, task, title, model, mode, runtime, harness,
                                          headless, images,
-                                         provider = 'claude', provider_token_id = null } = {}) {
+                                         // null = the caller named none; dispatchXell resolves it from
+                                         // what the project has connected (a manager on a Codex-only
+                                         // project is a manager, not a failed claude dispatch)
+                                         provider = null, provider_token_id = null } = {}) {
   const brief = String(task || '').trim() || DEFAULT_MANAGER_BRIEF;
   const { dispatchXell } = await import('../queenzee/intake.js');
   const out = await dispatchXell({

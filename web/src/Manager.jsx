@@ -36,24 +36,16 @@ const ago = (ts) => {
 // Leaving it blank is still allowed and still means something: the server hands it
 // DEFAULT_MANAGER_BRIEF (study the project, propose a programme, ask a human before starting a
 // crew). The composer says so, rather than making a human guess.
-export function AddManagerButton({ projectId, projectName, providers = [], onAdded }) {
+export function AddManagerButton({ projectId, projectName, onAdded }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
-  // Every connected AI ACCOUNT that can run a zee — the same list the "+ prompt" buttons are built
-  // from in App.jsx, flattened into one picker because a manager has one button, not one per
-  // account. PAUSED accounts are excluded — a manager must not deploy a worker on a paused
-  // provider, and the server refuses it anyway (spawnCreds → tokenForSpawn). Empty (no provider
-  // connected) → the composer simply shows no Account field and the server picks the project's
-  // newest claude token, exactly as before.
-  const accounts = (providers || [])
-    .filter((p) => p.provider !== 'github' && p.dispatch)
-    .flatMap((p) => (p.accounts || []).filter((a) => !a.paused)
-      .map((a) => {
-        const dupes = (p.accounts || []).length > 1;
-        return { id: a.id, provider: p.provider, typeLabel: p.label,
-                 name: a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label) };
-      }));
+  // WHICH ACCOUNT runs it is chosen INSIDE the composer, and the composer reads that list itself
+  // now (GET /api/dispatch/options): a manager has one button, not one per account, so the provider
+  // and the account are picked in there — filtered by the manager PERSONA's own model policy, which
+  // is the choice this modal makes first. This component used to flatten the account list out of
+  // the console's provider read-model and hand it down; that list could not know the policy, so it
+  // offered accounts the spawn would refuse.
 
   const add = async (payload) => {
     setOpen(false);
@@ -75,7 +67,7 @@ export function AddManagerButton({ projectId, projectName, providers = [], onAdd
         {busy ? 'adding…' : '⬢ + manager zee'}
       </button>
       {open && (
-        <Dispatch manager projectId={projectId} projectName={projectName} accounts={accounts}
+        <Dispatch manager projectId={projectId} projectName={projectName}
                   onClose={() => setOpen(false)} onDispatch={add} />
       )}
     </>

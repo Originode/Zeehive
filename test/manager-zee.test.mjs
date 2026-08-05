@@ -149,6 +149,22 @@ try {
   ok((await managers.inboxFor(mgr.id)).length === 0, 'reading marks read — an inbox does not nag twice');
   ok((await managers.inboxFor(mgr.id, { all: true })).length === 1, '--all still shows the history');
 
+  // the CONSOLE read model is the whole conversation, and it marks NOTHING read — a human auditing
+  // the manager⇄worker history must not clear an agent's unread flags
+  const hist = await managers.messagesForXell(w1.id);
+  ok(hist.length === 2, 'messagesForXell returns both sides of the conversation (directive in, reflection out)');
+  ok(hist.some((m) => m.kind === 'directive' && m.from === 'mgr' && m.to === 'w1' && /scope it to the console/.test(m.body)),
+     'the worker side shows the DIRECTIVE its manager sent it');
+  ok(hist.some((m) => m.kind === 'reflection' && m.from === 'w1' && m.to === 'mgr'),
+     'and the report the worker sent back');
+  ok(hist.every((m) => m.from_xell_id && m.to_xell_id), 'every row carries both endpoint ids for the UI to draw direction');
+  const mgrHist = await managers.messagesForXell(mgr.id);
+  ok(mgrHist.length === 2, 'the manager sees the same conversation from its side');
+  // the console read must not have consumed the agent's unread inbox: w1's directive is still unread
+  const w1box = await managers.inboxFor(w1.id);
+  ok(w1box.length === 1 && w1box[0].kind === 'directive' && w1box[0].was_unread === true,
+     'a console read does NOT mark the worker\'s unread directive read (its own `zee inbox` still sees it)');
+
   // ── 5. scoping + the worker-calls-a-manager-verb explanation ─────────────
   const { selfCrew, selfSay, selfSuggestDone, selfDispatch, selfReport } = await import('../server/src/queenzee/self.js');
   const denied = await selfCrew(w1);
@@ -157,8 +173,9 @@ try {
   const stranger = await selfSay(mgr, { to: 'somebody-else', message: 'hi' });
   ok(stranger.ok === false && /no worker/.test(stranger.error), 'a manager cannot message a xell outside its crew');
   const selfDispatchMgr = await selfDispatch(mgr, { task: 'make me another boss', harness: 'manager' });
-  ok(selfDispatchMgr.ok === false && /added by a human/.test(selfDispatchMgr.error),
-     'a manager cannot dispatch another MANAGER — only a human adds those');
+  ok(selfDispatchMgr.ok === false && /work-items board/.test(selfDispatchMgr.error)
+     && /zee assign/.test(selfDispatchMgr.error),
+     'a manager\'s free-form `zee dispatch` is REFUSED — deploying must go through the work-items board (`zee assign`)');
   const noTask = await selfDispatch(mgr, {});
   ok(noTask.ok === false && /--task/.test(noTask.error), 'a dispatch without a brief is refused');
   const reported = await selfReport(w2, { message: 'blocked on a decision' });

@@ -91,6 +91,49 @@ export async function listTickets({ projectId, status, kind, q: search } = {}) {
   return rows.map(shapeTicket);
 }
 
+// THE HANDLE A HUMAN TYPES — a ticket named by its CODE, its ref, its bare number, or its uuid.
+//
+// `ticketCode` derives TKT-52-2518 from the row precisely so a person can copy it out of the console
+// and paste it into a verb; the uuid is what the API speaks. This turns one into the other. Numbers
+// are PER PROJECT (two projects both have a #52), so anything but a uuid is resolved INSIDE a
+// project — the caller supplies which, and for a cxell verb that is the token's project, never a
+// parameter the caller sends.
+//
+// Returns the shaped ticket, or null when nothing matches: only the caller knows whether "no such
+// ticket" or "not in your project" is the honest sentence to refuse with. A code whose suffix names
+// a DIFFERENT ticket than its number is a 400 rather than a miss — silently answering with the
+// number's ticket would hand back a row the caller did not ask for.
+//
+// `projectId` scopes the UUID branch too, not only the number. It read the whole table by id at
+// first, and a uuid is exactly the handle a cross-project reach arrives on: `zee work --new --ticket
+// <another project's id>` linked the new card to somebody else's ticket (and briefed its worker with
+// that ticket's body), and `zee breakdown --ticket <another project's id>` cut its items into the
+// OTHER project's plan and moved that ticket out of queued. The refusals were all asserted by CODE,
+// where numbers-are-per-project hid it. Scoped here rather than at each caller so a later caller
+// cannot forget it; unscoped (projectId omitted) is still the whole table, for the console.
+export async function resolveTicket(ref, { projectId = null } = {}) {
+  const s = String(ref ?? '').trim();
+  if (!s) throw bad('name the ticket — its code (TKT-52-2518), its ref (#52) or its id');
+  if (isUuid(s)) {
+    if (projectId) assertId(projectId, 'project id');
+    return shapeTicket(await one(
+      `SELECT ${COLS} FROM ticket WHERE id=$1${projectId ? ' AND project_id=$2' : ''}`,
+      projectId ? [s, projectId] : [s]));
+  }
+  const m = s.match(/^(?:TKT-)?#?(\d+)(?:-([0-9a-fA-F]{4}))?$/i);
+  if (!m) throw bad(`"${s}" is neither a ticket id nor a ticket code (TKT-52-2518, #52, 52)`);
+  if (!projectId) throw bad(`"${s}" is a ticket NUMBER, and numbers are per project — name the ticket by its id, or ask inside a project`);
+  assertId(projectId, 'project id');
+  const row = await one(`SELECT ${COLS} FROM ticket WHERE project_id=$1 AND number=$2`,
+                        [projectId, Number(m[1])]);
+  if (!row) return null;
+  if (m[2] && ticketCode(row).toUpperCase() !== `TKT-${row.number}-${m[2].toUpperCase()}`) {
+    throw bad(`"${s.toUpperCase()}" does not name ticket #${row.number} in this project — that one is `
+      + `${ticketCode(row)}. Check the code you copied.`);
+  }
+  return shapeTicket(row);
+}
+
 export async function getTicket(id) {
   assertId(id, 'ticket id');
   const row = await one(`SELECT ${COLS} FROM ticket WHERE id=$1`, [id]);

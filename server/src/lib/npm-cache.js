@@ -26,25 +26,49 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { config } from '../config.js';
 import { logline } from './logbus.js';
+import { npmInstallFlags, enabledSteps, normalizeSpawnPrep } from './spawn-prep.js';
 
 // Where the cache is mounted INSIDE a cxell. Not `~/.npm`: an explicit path plus NPM_CONFIG_CACHE
 // is immune to the container's HOME (the zee's shell, an ssh login and a `docker exec` do not
 // necessarily agree on it), and it is obvious in `docker inspect` what that mount is for.
 export const CXELL_NPM_CACHE_DIR = '/npm-cache';
 
+// Where the shared APT archive cache is mounted inside a cxell. Only ever mounted for a project
+// whose spawn template actually installs packages (lib/spawn-prep.js) — an empty volume on a cage
+// that never runs apt is dead weight, and mounting over apt's archive dir has a prerequisite (the
+// `partial` subdir) that only the root prep script satisfies.
+export const CXELL_APT_CACHE_DIR = '/var/cache/apt/archives';
+
 // The docker volume every cxell shares. `CXELL_NPM_CACHE_VOLUME=off` (or empty) turns the whole
 // mechanism off and restores today's per-container cache — the escape hatch if a shared cache ever
-// misbehaves on a fleet.
-export function npmCacheVolume() {
+// misbehaves on a fleet. A project can ALSO opt out per spawn template (cache.npm='container'),
+// which is the same escape hatch one scope down: `mode` wins when it says 'container'.
+export function npmCacheVolume(mode = 'shared') {
+  if (mode && mode !== 'shared') return null;
   const v = (process.env.CXELL_NPM_CACHE_VOLUME ?? 'zeehive_npm_cache').trim();
   return !v || /^(off|none|no|0|false)$/i.test(v) ? null : v;
 }
 
-// The `docker run` arguments that mount it. Empty when disabled — the caller splices them in, so
-// "off" is literally the absence of a mount, not a flag someone has to honour.
-export function cxellCacheRunArgs() {
-  const vol = npmCacheVolume();
-  return vol ? ['-v', `${vol}:${CXELL_NPM_CACHE_DIR}`, '-e', `NPM_CONFIG_CACHE=${CXELL_NPM_CACHE_DIR}`] : [];
+// Same shape for apt. Off by default at the fleet level only if a human says so; the real gate is
+// `aptCache` below, which the caller sets from the project's template.
+export function aptCacheVolume(mode = 'shared') {
+  if (mode && mode !== 'shared') return null;
+  const v = (process.env.CXELL_APT_CACHE_VOLUME ?? 'zeehive_apt_cache').trim();
+  return !v || /^(off|none|no|0|false)$/i.test(v) ? null : v;
+}
+
+// The `docker run` arguments that mount them. Empty when disabled — the caller splices them in, so
+// "off" is literally the absence of a mount, not a flag someone has to honour. Called with no
+// arguments it is exactly what it always was: the shared npm cache, no apt mount.
+export function cxellCacheRunArgs({ npm = 'shared', apt = 'shared', aptCache = false } = {}) {
+  const args = [];
+  const vol = npmCacheVolume(npm);
+  if (vol) args.push('-v', `${vol}:${CXELL_NPM_CACHE_DIR}`, '-e', `NPM_CONFIG_CACHE=${CXELL_NPM_CACHE_DIR}`);
+  // aptCache is "does this project's template install packages at all?" — a cage that runs no apt
+  // gets no mount, so nothing changes for the 99% and the volume only exists where it pays.
+  const av = aptCache ? aptCacheVolume(apt) : null;
+  if (av) args.push('-v', `${av}:${CXELL_APT_CACHE_DIR}`);
+  return args;
 }
 
 // A named volume is created ROOT-owned the first time it is mounted at a path the image does not
@@ -53,8 +77,8 @@ export function cxellCacheRunArgs() {
 // root exec is belt-and-braces for volumes created before that, and for any fleet where the image
 // is older than the queenzee. Non-recursive on purpose: the cache contents are already zee-owned,
 // and a recursive chown over a large cache would cost more than the cache saves.
-export function cxellCacheFixupCommand(name) {
-  if (!npmCacheVolume()) return null;
+export function cxellCacheFixupCommand(name, { npm = 'shared' } = {}) {
+  if (!npmCacheVolume(npm)) return null;
   return ['exec', '-u', '0', name, 'bash', '-lc',
     `chown zee:zee ${CXELL_NPM_CACHE_DIR} 2>/dev/null; test -w ${CXELL_NPM_CACHE_DIR} && echo CACHE_RW || echo CACHE_RO`];
 }
@@ -91,8 +115,11 @@ export function warmableWorktree(worktree) {
   return { warmable: true, reason: null };
 }
 
-// The argv, as data, so a test can assert "ci, never install" without running npm.
+// The argv, as data, so a test can assert "ci, never install" without running npm. The FLAGS after
+// `ci` come from the project's spawn template (lib/spawn-prep.js: npmInstallFlags) so the host warm
+// and the in-cage warm cannot drift apart — with no template it is exactly what it always was.
 export const WARM_ARGS = ['ci', '--no-audit', '--no-fund'];
+export const warmArgsFor = (cache) => ['ci', ...npmInstallFlags(cache)];
 
 // WARM A POOLED XELL'S WORKTREE, on the pool's clock instead of the zee's.
 //
@@ -100,8 +127,17 @@ export const WARM_ARGS = ['ci', '--no-audit', '--no-fund'];
 // costs nobody anything, fills the shared cache for every xell that follows, and means the first
 // build of a process-runner role is not also a cold install. Fire-and-forget: the caller does not
 // await it, and every failure is a logline, never a throw.
-export function warmWorktree(worktree, { slug = '', timeoutMs = 900000 } = {}) {
+export function warmWorktree(worktree, { slug = '', timeoutMs = 900000, prep = null } = {}) {
   const wt = String(worktree || '').replace(/\\/g, '/');
+  // The project's spawn template decides whether the HOST worktree is warmed at all, and with which
+  // npm flags. A template with the npm step switched OFF means "this project does not want a
+  // pool-clock install" — honour it here rather than installing anyway and calling it best-effort.
+  const tpl = prep && prep.steps ? prep : normalizeSpawnPrep(null);
+  const npmStep = enabledSteps(tpl).find((s) => s.kind === 'npm');
+  if (!npmStep) {
+    logline('pool', `${slug || wt}: worktree warm skipped — the spawn template has no enabled npm step`);
+    return Promise.resolve({ warmed: false, skipped: true, reason: 'the spawn template has no enabled npm step' });
+  }
   const { warmable, reason } = warmableWorktree(wt);
   if (!warmable) {
     logline('pool', `${slug || wt}: worktree warm skipped — ${reason}`);
@@ -113,7 +149,7 @@ export function warmWorktree(worktree, { slug = '', timeoutMs = 900000 } = {}) {
     const finish = (r) => { if (!done) { done = true; res(r); } };
     let p;
     try {
-      p = spawn('npm', WARM_ARGS, { cwd: wt, env: npmCacheEnv({ ...process.env }), windowsHide: true, shell: process.platform === 'win32' });
+      p = spawn('npm', warmArgsFor(tpl.cache), { cwd: wt, env: npmCacheEnv({ ...process.env }), windowsHide: true, shell: process.platform === 'win32' });
     } catch (e) {
       logline('pool', `${slug || wt}: worktree warm could not start (${e.message}) — the zee will install as needed`);
       return finish({ warmed: false, error: e.message });

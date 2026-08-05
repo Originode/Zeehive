@@ -27,6 +27,11 @@ export const HIVE_COLORS = {
   'vac-dirty':        '#cd9a4a',   // dull amber — needs queenzee housekeeping
   'occ-idle':         '#e0a53b',   // amber — a zee gone quiet
   'occ-tendRequest':  '#f2c518',   // yellow — "I need a human"
+  // The ENVIRONMENT is wrong under a running zee (env reconcile refused; the xell kept its old
+  // .zeehive.env). Magenta, and the only magenta on the scale, because it belongs to no family
+  // above: it is not the zee asking (yellow) and not main/prod being touched (red) — it is the
+  // ground the zee is standing on being wrong, and it should not read as either.
+  'occ-envAlert':     '#e05fd0',   // magenta — the xell's environment could not be reconciled
   'occ-doneSuggest':  '#3bb0c6',   // cyan — a MANAGER zee suggested this xell is finished (a human confirms)
   // Deliberately COOL, and deliberately not the land? red: a queued landing asks a human for
   // NOTHING. It is a waiting state that explains a quiet zee, so it should read as "parked", not
@@ -61,6 +66,9 @@ export const HIVE_HEAT = {
   'vac-dirty':        0.58,
   'occ-idle':         0.62,
   'occ-tendRequest':  0.72,
+  // Hotter than tend, cooler than a held land/ship: nothing irreversible is happening right now,
+  // but a live zee is running on an environment the queenzee itself refused to write.
+  'occ-envAlert':     0.90,
   'occ-doneSuggest':  0.30,
   'occ-landHolding':  0.34,
   'occ-paused':       0.10,        // coldest of the occupied keys: deliberately stopped, so it recedes
@@ -86,6 +94,7 @@ export const HIVE_LABELS = {
   'occ-idle':         'idle',
   'occ-paused':       'paused',
   'occ-tendRequest':  'tend?',
+  'occ-envAlert':     'env!',
   'occ-landRequest':  'land?',
   'occ-shipRequest':  'ship?',
   'occ-prodRequest':  'prod?',

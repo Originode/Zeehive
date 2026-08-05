@@ -218,6 +218,7 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .sitekey { font-family: 'Cascadia Code', monospace; font-size: 11px; min-width: 76px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sitehost { width: 92px; }
+.siteendpoint { width: 240px; font-family: 'Cascadia Code', monospace; font-size: 11px; }
 .sitekey-in { width: 110px; }
 .addsite { margin-top: 2px; border-top: 1px dashed var(--line); padding-top: 6px; }
 .right { display: flex; align-items: center; gap: 14px; }
@@ -354,6 +355,15 @@ a.sname.link .ext { opacity: .6; font-size: 10px; }
    the "waiting on you" bar — it is the card-side face of that ask — and clipped to one line (the
    full text is on the title), because a card row that wraps pushes the whole grid around. */
 .tendwhy { font-size: 11px; text-align: right; color: var(--building);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The env-reconcile alert row (ticket #44) — the queenzee refused to write this xell's
+   .zeehive.env while a zee is live in it. Magenta, matching its hexagon (hive/status.js): it is
+   neither the zee asking (amber) nor main/prod being touched (red), and reading it as either sends
+   a human looking for the wrong kind of problem. Clipped like .tendwhy; the full refusal is on the
+   title, and the second (age) line is deliberately quieter — it qualifies the alert, it is not it. */
+.envalert { font-size: 11px; text-align: right; color: #e05fd0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.envalert-age { font-size: 10px; text-align: right; color: var(--muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shipst { font-size: 11px; text-align: right; }
 .shipst.s-ready { color: var(--up); }
@@ -610,6 +620,11 @@ a.cbox:hover { border-color: var(--accent); }
 .ctxmenu .ctxdbname { display: flex; flex-direction: column; gap: 2px; min-width: 0; max-width: 240px;
   font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }
 .ctxmenu .ctxdbname > .ctxsub { font-family: inherit; }
+/* the URL shown under "Copy database URL" — truncated (a flex child needs min-width:0 for the
+   ellipsis to kick in), so a long conn_ref never blows the menu wide; the full string is what the
+   item copies, and the chip's tooltip carries the rest */
+.ctxmenu [data-testid="copy-db-url"] .ctxsub {
+  min-width: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* restore-over-prod entry: loud, because it targets live production */
 .ctxmenu button.ctxdanger-item { color: #ff8b81; }
 .ctxmenu button.ctxdanger-item:hover { background: #b3261e; color: #fff; }
@@ -685,11 +700,26 @@ a.cbox:hover { border-color: var(--accent); }
 .matrix { display: grid; gap: 4px 14px; align-items: start; margin: 10px 0 4px;
   padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
 .matrix .mx-corner, .matrix .mx-pad { min-width: 0; }
+/* The machine-pooling-DISABLED banner (mardale-prod never gets pool xells) — an operator who
+   configured per-machine pooling must SEE why it is not happening. Same family as .mx-devdb:
+   the warning colour, full width, above the grid. */
+.mx-warn { grid-column: 1 / -1; font-size: 11px; line-height: 1.5;
+  background: rgba(217,85,59,.12); color: #ffb4a2; border: 1px solid rgba(217,85,59,.35);
+  border-radius: 6px; padding: 6px 8px; margin-bottom: 2px; }
 .mx-head { font-size: 12px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
 .mx-head.off { opacity: .45; }
 .mx-head.elsewhere { color: var(--muted); font-style: italic; align-self: end; }
 .mx-name { display: flex; align-items: center; gap: 6px; }
 .mx-name b { font-size: 13px; }
+/* the per-machine connection probe (Deploy tab) — one button that is also the verdict */
+.mx-conn { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
+  cursor: pointer; font-size: 9px; padding: 0 4px; white-space: nowrap; }
+.mx-conn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.mx-conn.checking { opacity: .7; cursor: default; }
+.mx-conn.ok { color: var(--up); border-color: rgba(53,196,107,.5); }
+.mx-conn.ok:hover:not(:disabled) { color: var(--up); border-color: var(--up); }
+.mx-conn.fail { color: var(--down); border-color: rgba(229,85,78,.5); }
+.mx-conn.fail:hover:not(:disabled) { color: var(--down); border-color: var(--down); }
 .mx-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 10px; padding: 0 2px; }
 .mx-del:hover { color: #d9553b; }
 .mx-prod { background: none; border: 1px solid var(--line); border-radius: 4px; color: var(--muted);
@@ -911,6 +941,13 @@ a.cbox:hover { border-color: var(--accent); }
   padding: 1px 7px; font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
 .bkbtn.sm.active { color: var(--text); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 22%, var(--panel2)); }
 .bkrow-pick { grid-column: 1 / -1; margin: 6px 2px 2px; }
+/* the live log of a RUNNING backup, inside its modal row — the same streaming lines as the
+   db-op toast, read where the backup is listed. Full row width (the grid's 5th+ columns), capped
+   like the toast so a chatty pg_dump cannot eat the tab. */
+.bkrow-log { grid-column: 1 / -1; max-height: 160px; overflow: auto; background: #0b0e14;
+  border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; margin: 2px 0 4px;
+  font-family: 'Cascadia Code', monospace; font-size: 11px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-word; color: var(--text); }
 
 /* reusable table picker (backup settings + restore) */
 .tblsel { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 8px;
@@ -959,8 +996,11 @@ a.cbox:hover { border-color: var(--accent); }
 .bkrunning .cspin, .bkrestoring .cspin, .bkjob .cspin, .bkbtn .cspin { position: static; }
 .bkjob { color: #3bc6c0; font-size: 12px; }
 .bkjob.failed { color: var(--down); }
-.bkrow.running { grid-template-columns: auto auto 1fr; opacity: .9; }
+/* a backup a HUMAN stopped — not a failure, so a calmer amber rather than the error red */
+.bkjob.cancelled { color: #d9a441; }
+.bkrow.running { grid-template-columns: auto auto 1fr auto; opacity: .9; }
 .bkrow.failed { grid-template-columns: auto auto 1fr auto; }
+.bkrow.cancelled { grid-template-columns: auto auto 1fr auto; }
 
 /* "restore into <db container>" selector in the backups modal header */
 .bkrestore-into { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
@@ -1217,6 +1257,18 @@ a.cbox:hover { border-color: var(--accent); }
 .new-prompt-btn { margin-left: 12px; background: var(--accent); border: 1px solid var(--accent);
   color: #fff; font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 6px; cursor: pointer; }
 .new-prompt-btn:hover { filter: brightness(1.1); }
+/* A persona whose model policy has no connected provider keeps its button, DISABLED — hiding it
+   would read as "my persona disappeared", and the reason is on the title. Same treatment the
+   paused ACCOUNT buttons had before the buttons became personas. */
+.new-prompt-btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
+/* A PERSONA IN THE TOOLBAR: its badge BESIDE the button, not inside it. Inside a 22px pill the
+   avatar had to shrink to ~18px and read as decoration; a persona's face is what a human scans this
+   row for, so it gets its own size and the pill carries only the name. The pair is one hit target's
+   worth of meaning but only the button is the control (a disabled persona must stay unclickable). */
+.np-persona { display: inline-flex; align-items: center; gap: 6px; margin-left: 12px; vertical-align: middle; }
+.np-persona .new-prompt-btn { margin-left: 0; }
+.np-blocked .zav, .np-blocked .np-core { opacity: .45; }
+.np-core { opacity: .7; font-size: 22px; line-height: 1; }
 
 /* THE OVERLAY BAND — every full-screen overlay is portalled onto <body> (see Dispatch.jsx), so
    these numbers are compared with each other and nothing else. In-pane chrome (the graph divider
@@ -1264,6 +1316,8 @@ a.cbox:hover { border-color: var(--accent); }
 .disp-seg { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
   border-radius: 6px; padding: 4px 9px; font-size: 12px; cursor: pointer; }
 .disp-seg b { color: var(--text); font-weight: 700; }
+/* a segment that carries a provider coin lays it out beside its words */
+.disp-seg:has(.zav) { display: inline-flex; align-items: center; gap: 6px; }
 .disp-seg:hover { border-color: var(--accent); }
 .disp-seg.on { border-color: var(--accent); color: var(--text); background: rgba(91,140,255,.14); }
 .disp-hint { color: var(--muted); font-size: 11px; max-width: 320px; }
@@ -1325,6 +1379,23 @@ a.cbox:hover { border-color: var(--accent); }
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px; }
 .swap-now b { color: var(--text); }
 
+/* THE PERSONA a worker composer was opened FOR — pinned by its own prompt button, so it is stated
+   at the top of the modal (with the model policy it will be dispatched under) rather than being a
+   control. The way to run a different persona is that persona's own button. */
+.disp-persona { background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 11px; font-size: 12px; color: var(--muted); }
+.disp-persona b { color: var(--text); }
+.disp-persona .disp-hint { display: inline; max-width: none; }
+.disp-persona .disp-policy { display: block; margin-top: 3px; }
+
+/* CUSTOM DEPLOYMENT — the router's own knobs, taken back by a human who knows. Collapsed by
+   default (the router deciding is the norm), so it reads as one small toggle until it is opened;
+   the opened panel is dashed rather than solid, because everything in it is optional. */
+.disp-custom { display: flex; flex-direction: column; gap: 6px; }
+.disp-custom-toggle { align-self: flex-start; }
+.disp-custom > .disp-hint { max-width: none; }
+.disp-custom .disp-controls { border: 1px dashed var(--line); border-radius: 8px; padding: 11px 12px; }
+
 /* harness web-UI bridge setup */
 .disp-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; }
 .disp-input { background: var(--panel2); border: 1px solid var(--line); color: var(--text);
@@ -1375,6 +1446,23 @@ a.cbox:hover { border-color: var(--accent); }
   cursor: pointer; padding: 4px 8px; }
 .hm-del:hover { color: var(--del, #e5554e); border-color: var(--del, #e5554e); }
 
+/* MODEL POLICY editor (migration 110) — the knobs that restrict what a harness wearer may run on. */
+.hm-policy { display: flex; flex-direction: column; gap: 10px; padding: 10px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--panel2); margin-top: 6px; }
+.hm-policy-models { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 4px 0; }
+.hm-check { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+.hm-pri { width: 56px; }
+.hm-policy .disp-hint { font-size: 11px; }
+/* A provider's model column in the policy editor — one group per selected provider, so a policy
+   spanning several providers shows every model of every one, not just the first provider's. */
+.hm-model-group { display: flex; flex-direction: column; gap: 3px; padding: 4px 8px;
+  border: 1px solid var(--line); border-radius: 6px; }
+.hm-model-prov { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted); }
+/* The top-level inherit-all / customize mode switch (hierarchical harnesses, migration 110). */
+.hm-pf-mode { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 4px; }
+.hm-pf-inherited { opacity: 0.6; }
+
 /* A harness carrying NOTHING (bundle_empty). It used to render identically to one
    carrying a 12.9k manual — same row, same badge — which is how a whole fleet of manager zees ran
    with a blank persona unnoticed. The chip's WORDS are the signal (see web/src/harnessHealth.js);
@@ -1395,12 +1483,14 @@ a.cbox:hover { border-color: var(--accent); }
 .disp-seg.seg-hollow { border-color: rgba(229,85,78,.5); color: #ff9a94; }
 
 /* ── toasts: async-dispatch progress, bottom-right, above the overlay layer ────── */
+/* The stack is wide enough for the live db-op panel card (db backup/restore/copy); the plain
+   one-line toasts stay narrow via their own max-width. */
 .toast-stack { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: flex;
-  flex-direction: column; gap: 10px; max-width: min(380px, 92vw); pointer-events: none; }
+  flex-direction: column; gap: 10px; max-width: min(560px, 94vw); pointer-events: none; }
 .toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 10px;
   background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent);
   border-radius: 9px; padding: 11px 12px; box-shadow: 0 8px 26px rgba(0,0,0,.42);
-  animation: toast-in .18s ease-out; }
+  animation: toast-in .18s ease-out; max-width: min(380px, 100%); }
 .toast-success { border-left-color: var(--up); }
 .toast-error   { border-left-color: var(--down); }
 .toast-progress { border-left-color: var(--accent); }
@@ -1424,11 +1514,29 @@ a.cbox:hover { border-color: var(--accent); }
 @keyframes toast-spin { to { transform: rotate(360deg); } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
-/* ── progress bar inside progress toasts (db backup / restore / copy) ──────────── */
+/* ── progress bar inside toasts (db backup / restore / copy) ──────────────────── */
 .toast-progress-bar { margin-top: 8px; height: 4px; border-radius: 2px; overflow: hidden;
   background: var(--bg); border: 1px solid var(--line); }
 .toast-progress-fill { height: 100%; background: var(--accent); border-radius: 2px;
   transition: width .35s ease; min-width: 2px; }
+
+/* ── the LIVE db-op panel card (backup / restore / duplicate) — the "build event" ──
+   Wider than a one-line toast, persistent while running, with the RAW pg_dump / pg_restore
+   log streaming in below the progress bar. Follows the tail unless the human scrolls up. */
+.toast-dbop { flex-direction: column; align-items: stretch; max-width: min(560px, 94vw);
+  width: min(560px, 94vw); }
+.dbop-head { display: flex; align-items: center; gap: 8px; }
+.dbop-head .toast-title { flex: 1; }
+.dbop-pct { font-family: 'Cascadia Code', monospace; color: var(--accent); font-size: 12px; }
+.dbop-running { border-left-color: var(--accent); }
+.dbop-finished { border-left-color: var(--up); }
+.dbop-failed { border-left-color: var(--down); }
+.dbop-cancelled { border-left-color: #d9a441; }
+.dbop-log { max-height: 200px; overflow: auto; background: #0b0e14; border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 9px; margin-top: 8px; font-family: 'Cascadia Code', monospace;
+  font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.dbop-log::-webkit-scrollbar { width: 8px; height: 8px; }
+.dbop-log::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
 
 /* ── modal dialog: the non-blocking replacement for window.alert() ─────────────────
    A real overlay (z above everything) instead of the native alert box that froze the
@@ -1510,6 +1618,14 @@ a.cbox:hover { border-color: var(--accent); }
   white-space: nowrap; }
 .graph-flip:hover { color: var(--text); border-color: var(--accent); }
 
+/* show-harness toggle, stacked directly above the flip button. Reads as the sibling view control: same
+   chrome, plus a tick and an accent border when the harness hexagons are shown. */
+.graph-harness-toggle { z-index: 5; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  border-radius: 8px; padding: 4px 10px; font-size: 11px; line-height: 1; cursor: pointer;
+  white-space: nowrap; }
+.graph-harness-toggle:hover { color: var(--text); border-color: var(--accent); }
+.graph-harness-toggle.on { color: var(--text); border-color: var(--accent); background: var(--panel); }
+
 /* draggable resize grip: a visible icon on the panels-facing edge. Dragging it repositions the
    whole middle pane — growing one neighbour while shrinking the other, down to heads-only. */
 .graph-grip { z-index: 6; display: flex; align-items: center; justify-content: center;
@@ -1540,6 +1656,26 @@ a.cbox:hover { border-color: var(--accent); }
 }
 .hive-tooltip-k { font-weight: 700; color: #5b8cff; text-transform: uppercase; font-size: 10px; }
 .hive-tooltip-t { font-weight: 400; color: #e6ebf2; }
+
+/* Xell hover tooltip — the directive and status of the xell under the cursor. Bigger than the
+   button tooltip because it carries two facts (what this xell is FOR and what state it is in);
+   wraps instead of truncating, so a directive's first line is read whole, and it reads as a card. */
+.hive-xell-tooltip {
+  position: absolute; z-index: 30; pointer-events: none;
+  padding: 7px 11px; border-radius: 8px;
+  background: #1a1f2a; color: #e6ebf2;
+  font-size: 12px; line-height: 1.45;
+  max-width: 300px;
+  box-shadow: 0 3px 12px rgba(0,0,0,0.55);
+  border: 1px solid #2a3242;
+}
+.hive-xt-head { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13px; }
+.hive-xt-role { font-weight: 400; font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+  color: #9db8ff; background: rgba(91,140,255,.15); padding: 1px 6px; border-radius: 8px; }
+.hive-xt-role.mgr { color: #ffb574; background: rgba(240,145,59,.16); }
+.hive-xt-dir { margin-top: 4px; font-size: 12px; color: #e6ebf2; word-break: break-word; }
+.hive-xt-dir.none { color: #8a93a6; font-style: italic; }
+.hive-xt-status { margin-top: 3px; font-size: 11px; color: #8a93a6; }
 
 /* the panels half scrolls independently; drop the old flex/rail padding assumptions */
 .hive-pane.panels .content { padding: 16px 20px 60px; padding-left: 20px; max-width: none; }
@@ -2124,6 +2260,36 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   gap: 8px; flex-wrap: wrap; align-items: baseline; }
 .work-comment-b { flex-basis: 100%; white-space: pre-wrap; color: var(--muted); }
 
+/* ── the reflections ledger (Reflections.jsx) ────────────────────────────────
+   Reflections are the fleet talking to itself, so they wear the same amber the 🪞 kind chip wears in
+   the Directives panel. UNREAD is the emphasis (it is a fact about the AGENT — only its own
+   `zee inbox` clears it, never this screen), and ORPHANED is the badge that matters most: nobody
+   can read that one at all. A filed row loses its button and shows the ticket code instead. */
+.work-reflections .work-tlist { gap: 6px; }
+.refl-row { border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 8px;
+  background: var(--panel); padding: 6px 10px; }
+.refl-row.unread { border-left-color: var(--warn, #e0a53b); background: rgba(224,165,59,.06); }
+.refl-row.orphan { border-left-color: var(--prod, #f0913b); }
+.refl-row.open { border-color: var(--accent); }
+.refl-head { display: flex; align-items: center; gap: 8px; width: 100%; background: none; border: 0;
+  color: var(--text); text-align: left; font-size: 12.5px; padding: 2px 0; cursor: pointer; }
+.refl-chev { color: var(--muted); width: 10px; }
+.refl-from { font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--accent); }
+.refl-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.refl-unread { color: var(--warn, #e0a53b); font-size: 10px; font-weight: 600; letter-spacing: .03em;
+  text-transform: uppercase; }
+.refl-readmark { color: var(--muted); font-size: 10px; }
+.refl-orphan { color: var(--prod, #f0913b); font-size: 10.5px; border: 1px solid var(--line);
+  border-radius: 8px; padding: 0 5px; }
+.refl-at { color: var(--muted); font-size: 11px; }
+.refl-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--muted);
+  padding-left: 18px; }
+.refl-why { font-style: italic; }
+.refl-body { margin: 6px 0 4px 18px; font-size: 12px; line-height: 1.55; white-space: pre-wrap;
+  word-break: break-word; border-left: 1px solid var(--line); padding-left: 10px; }
+.refl-actions { display: flex; align-items: center; gap: 6px; padding-left: 18px; margin-top: 4px; }
+.refl-filed { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); }
+
 /* ── the timeline (gantt) ──────────────────────────────────────────────────────
    The chart is ONE scroller: the name cells are `position: sticky; left: 0` and the axis header is
    `position: sticky; top: 0`, so vertical scroll is shared with the canvas BY CONSTRUCTION (no JS
@@ -2320,6 +2486,55 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 /* the card chip's third face: nothing resolved at all */
 .envchip.env-absent { color: var(--muted); border-style: dashed; }
 
+/* ── MANAGER DIRECTIVES (Directives.jsx) ─────────────────────────────────────
+   The manager⇄worker conversation read from the console. Marked in the PROD orange the manager's
+   hexagon wears (it is the manager's own colour in this UI), and read-only: no composer, because a
+   human already talks to a zee through the flower's 📨 button and this panel must not grow a second
+   door to the same place. */
+.disp.directives { width: min(680px, 96vw); }
+.dir-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.dir-row { border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 8px;
+  background: var(--panel2); padding: 8px 10px; }
+.dir-row.in { border-left-color: var(--accent, #5b8cff); }
+.dir-row.out { border-left-color: var(--prod, #f0913b); }
+.dir-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+.dir-kind { padding: 1px 7px; border-radius: 10px; font-weight: 600; font-size: 10px; letter-spacing: .03em;
+  text-transform: uppercase; }
+.dir-kind.dir-directive { background: rgba(240,145,59,.18); color: #ffb574; }
+.dir-kind.dir-report { background: rgba(91,140,255,.15); color: #9db8ff; }
+.dir-kind.dir-reflection { background: rgba(224,165,59,.16); color: #ffd68a; }
+.dir-kind.dir-message { background: var(--panel2); color: var(--muted); border: 1px solid var(--line); }
+.dir-dir { font-family: 'Cascadia Code', monospace; font-size: 11px; }
+.dir-at { opacity: .8; }
+.dir-delivered { color: var(--add, #35c46b); }
+.dir-undelivered { color: var(--warn, #e0a53b); }
+.dir-read { color: var(--muted); font-size: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 0 5px; }
+.dir-body { margin-top: 5px; font-size: 12px; line-height: 1.55; color: var(--text); white-space: pre-wrap;
+  word-break: break-word; }
+/* the xell's OWN directive — the brief it was given, in full. A box that reads as text, not a list:
+   it is the thing that tells one manager apart from another, so it gets the space the rows share. */
+.dir-directive { border: 1px solid var(--line); border-left: 3px solid var(--prod, #f0913b);
+  border-radius: 8px; background: var(--bg); padding: 10px 12px; font-size: 12.5px; line-height: 1.6;
+  color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.dir-none { color: var(--muted); font-size: 12px; font-style: italic; }
+/* the manager's crew, in the same panel: one row per worker, and the columns that say what it has
+   PRODUCED rather than what status its last turn ended in. Unlanded work is marked (amber) because
+   it is the one thing that must not be closed out. */
+.crew-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.crew-row { border: 1px solid var(--line); border-left: 3px solid var(--accent, #5b8cff); border-radius: 8px;
+  background: var(--panel2); padding: 7px 10px; }
+.crew-meta { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+.crew-slug { font-weight: 600; font-size: 12px; color: var(--text); }
+.crew-branch { font-family: 'Cascadia Code', monospace; font-size: 10.5px; }
+.crew-produced { margin-top: 4px; display: flex; gap: 10px; flex-wrap: wrap;
+  font-family: 'Cascadia Code', monospace; font-size: 11px; color: var(--muted); }
+.crew-landed { color: var(--add, #35c46b); }
+.crew-unlanded-none { opacity: .8; }
+.crew-diff.unlanded { color: var(--warn, #e0a53b); }
+.crew-src { opacity: .7; }
+.crew-diff-unknown { font-style: italic; }
+.crew-waiting { margin-top: 4px; font-size: 11px; color: var(--warn, #e0a53b); }
+
 /* WHO ELSE IS IN THIS WORK (#33) — the dispatch dialog's coordination advisory. Deliberately styled as
    INFORMATION and not as an error: it never disables the button, and two zees touching one file is
    ordinary work. Amber rather than red, and a dashed edge — the same "related, not wrong" language the
@@ -2330,3 +2545,151 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .disp-overlap li { margin: 2px 0; }
 .disp-overlap code { font-size: 11px; }
 .disp-overlap-note { display: block; margin-top: 5px; color: var(--muted); }
+
+/* LANGFUSE PANEL — the one system-wide observability instance. Uses the shared .disp modal
+   language; these are the langfuse-specific touches: a status dot that reads up/provisioning/
+   down/off, a monospace fact box, and a compact recent-traces list. */
+.disp-mono { font-family: 'Cascadia Code', 'SF Mono', monospace; font-size: 11px; color: var(--text);
+  line-height: 1.5; word-break: break-all; }
+.langfuse-status { font-size: 12px; font-weight: 600; letter-spacing: .03em; }
+.langfuse-status.up { color: var(--add, #35c46b); }
+.langfuse-status.provisioning { color: var(--warn, #e0a53b); }
+.langfuse-status.down, .langfuse-status.error { color: var(--down); }
+.langfuse-status.off { color: var(--muted); }
+a.langfuse-ui { color: var(--accent); font-weight: 600; text-decoration: none; }
+a.langfuse-ui:hover { text-decoration: underline; }
+.langfuse-reveal { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
+.langfuse-traces { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column;
+  gap: 3px; max-height: 220px; overflow-y: auto; }
+.langfuse-traces li { padding: 4px 8px; background: var(--panel2); border-radius: 6px; }
+
+/* ── the ZEE AVATAR: an AI-provider coin, wearing its harness ──────────────────
+   The DOM twin of the honeycomb's drawZeeAvatar (web/src/hive/HiveCanvas.jsx), from the same two
+   registries (providerArt.js / harnessGear.js): the PROVIDER is the badge (a brand coin) and the
+   HARNESS is a COSTUME framed around it — wings, a hammer, a necktie, glasses — drawn as two SVG
+   layers, one behind the coin and one in front. Two zees on the same job wear the same costume;
+   only the coin says whose model is thinking.
+   Sized entirely off --zav-size so one component serves an 18px list row and a 56px preview; the
+   coin's inset is set inline from GEAR_EXTENT — the logo takes the middle and the costume the rest. */
+.zav { position: relative; display: inline-grid; place-items: center; flex: none;
+  width: var(--zav-size, 26px); height: var(--zav-size, 26px); vertical-align: middle; }
+/* inset is set INLINE from GEAR_EXTENT (ZeeAvatar.jsx) — this is only the fallback */
+.zav-coin { position: absolute; inset: 21%; border-radius: 50%; overflow: hidden;
+  display: grid; place-items: center; border: 1.5px solid var(--line); z-index: 1; }
+.zav-coin img { width: 76%; height: 76%; object-fit: contain; display: block; user-select: none; }
+.zav-mono { font-size: calc(var(--zav-size, 26px) * 0.22); line-height: 1; color: var(--text); }
+/* the costume: unit-space SVG over the whole box — behind the coin (wings) and in front of it
+   (the tool on the belt, the glasses on the face). pointer-events off: it is paint, not a target. */
+.zav-gear { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible;
+  pointer-events: none; }
+.zav-gear-back { z-index: 0; }
+.zav-gear-front { z-index: 2; }
+/* the fallback ribbon's nameplate glyph, punched out of the plate in the panel colour */
+.zav-plate { fill: var(--bg); font-family: 'Segoe UI Symbol', 'Segoe UI Emoji', 'Segoe UI', sans-serif;
+  font-weight: 700; }
+/* a row of "the same harness on every provider" — the harness editor's WORN preview */
+.zav-worn { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* runtime row: the coin sits with the words it names */
+.rt-worn { display: inline-flex; align-items: center; gap: 6px; }
+/* a prompt button carries the coin of the account it will dispatch on */
+.new-prompt-btn { display: inline-flex; align-items: center; gap: 6px; }
+/* harness editor: the same costume shown on three different provider coins, and the picker under it */
+.hm-worn-one { display: inline-flex; flex-direction: column; align-items: center; gap: 4px; }
+.hm-gear-pick { margin-top: 8px; }
+/* ── spawn template: dependencies & cache (Project setup → Pool) ─────────────────────────────── */
+.setup-sub { margin-top: 12px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.setup-sub h4 { margin: 0 0 8px; font-size: 12px; color: var(--text); font-weight: 600; }
+.setup-sub h4 .pc { color: var(--muted); font-weight: 400; font-size: 11px; }
+.setup-grid label.prep-check { flex-direction: column; gap: 2px; justify-content: center; }
+.setup-grid label.prep-check input { width: auto; }
+.prep-steps { margin: 8px 0 4px; }
+.prep-step { border: 1px solid var(--line); border-radius: 8px; padding: 2px 8px; margin: 4px 0; }
+.prep-step.off { opacity: .5; }
+.prep-step .setup-row { align-items: center; gap: 6px; }
+.prep-step .prep-arg { flex: 1; min-width: 140px; font-family: var(--mono, monospace); font-size: 11px; }
+.prep-actions { margin-left: auto; display: flex; gap: 2px; }
+.prep-add { margin-top: 6px; gap: 8px; align-items: center; }
+
+/* ══ DELIVERY TELEMETRY — cycle time · waste · gate waits ════════════════════════════════════
+   Every selector in this fenced section is prefixed `.dt-`, the same discipline the work tracker
+   above follows, so it reads as a unit and can never collide with the fleet console.
+
+   It reuses the palette rather than introducing one: --panel/--panel2/--line for surfaces,
+   --muted for the sample sizes (they qualify a number, they are not a number), --building for the
+   transient/recoverable waste and --down for the terminal kind. The one thing this screen must get
+   right visually is that `n=…` is never louder than the figure it belongs to and never invisible.
+   ═══════════════════════════════════════════════════════════════════════════════════════════ */
+
+/* the button in the status line that opens it */
+.dt-btn-open { margin-left: 8px; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--text); font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 6px; cursor: pointer; }
+.dt-btn-open:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── the overlay shell (same shape as the work tracker's) ──────────────────── */
+.dt-overlay { position: fixed; inset: 0; z-index: 70; background: rgba(6,8,12,.72);
+  display: flex; padding: 26px; }
+.dt-shell { flex: 1; min-width: 0; display: flex; flex-direction: column;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: 0 24px 70px rgba(0,0,0,.6); overflow: hidden; }
+.dt-head { display: flex; align-items: center; gap: 14px; padding: 10px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex: 0 0 auto; }
+.dt-h-title { font-size: 15px; letter-spacing: .02em; }
+.dt-windows { display: flex; gap: 4px; }
+.dt-win { background: none; border: 1px solid transparent; color: var(--muted); font-size: 12.5px;
+  padding: 3px 10px; border-radius: 6px; cursor: pointer; }
+.dt-win:hover { color: var(--text); }
+.dt-win.on { color: var(--accent); border-color: var(--accent); background: rgba(91,140,255,.10); }
+.dt-scope { margin-left: auto; color: var(--muted); font-size: 12px; }
+.dt-x { background: none; border: 0; color: var(--muted); font-size: 15px; cursor: pointer; padding: 2px 6px; }
+.dt-x:hover { color: var(--text); }
+.dt-main { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 14px; }
+
+.dt-err { display: flex; align-items: center; gap: 8px; margin: 8px 14px; padding: 7px 11px;
+  border: 1px solid var(--down); border-radius: 7px; color: var(--down); font-size: 12.5px; }
+.dt-err-x { margin-left: auto; background: none; border: 0; color: inherit; cursor: pointer;
+  text-decoration: underline; }
+
+/* ── the seven cards ──────────────────────────────────────────────────────── */
+.dt-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
+.dt-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px 12px; min-width: 0; }
+.dt-card-h { display: flex; align-items: baseline; gap: 6px; margin-bottom: 8px;
+  border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+.dt-card-t { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.dt-card-why { color: var(--muted); font-size: 11px; cursor: help; border: 1px solid var(--line);
+  border-radius: 50%; width: 15px; height: 15px; line-height: 13px; text-align: center; }
+
+.dt-row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; padding: 3px 0; }
+.dt-k { color: var(--muted); font-size: 12px; min-width: 96px; }
+.dt-v { font-size: 14px; }
+.dt-sep { color: var(--muted); }
+.dt-sub { color: var(--muted); font-size: 11.5px; }
+.dt-sublabel { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  margin: 8px 0 2px; }
+.dt-empty { color: var(--muted); font-size: 12px; padding: 3px 0; }
+.dt-bad { color: var(--down); }
+.dt-transient .dt-v { color: var(--building); }
+.dt-terminal .dt-v { color: var(--down); }
+
+/* n=… — beside the figure it qualifies, in every single place, and deliberately quieter than it */
+.dt-n { color: var(--muted); font-size: 11px; font-family: 'Cascadia Code', 'Consolas', monospace;
+  border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; cursor: help; }
+
+.dt-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.dt-list li { display: flex; align-items: baseline; gap: 6px; padding: 2px 0; font-size: 12px;
+  border-top: 1px solid rgba(42,50,66,.5); }
+.dt-list li .mono { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; color: var(--muted); font-size: 11.5px; }
+.dt-list li b { flex: 0 0 auto; }
+.dt-reason { cursor: help; }
+.dt-buckets li .mono { color: var(--text); }
+
+/* MANAGER MINT (149) — a router asking a human for another manager. It borrows the landing-card
+   shell like every other "an agent is asking you for something" panel; the only thing it needs of
+   its own is the programme block, which is pre-formatted text a human reads before approving. */
+.manager-mint-card .mint-task {
+  margin: 4px 0 0; padding: 6px 8px; max-height: 180px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  font-size: 11.5px; white-space: pre-wrap; color: var(--text);
+}

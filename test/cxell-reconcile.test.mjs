@@ -4,12 +4,15 @@
 //   • reconcileBundleIntoWorktree (cxell.js) — the pure-git core of `zee land`'s collect
 //   • classifyMergeOutput        (xellgit.js) — conflict vs operational-error, the distinction that
 //                                               now reaches a caged zee (Change 4)
+//   • the collect self-heals a STALE index.lock in the worktree admin dir (TKT-86-B3B2) — a stale
+//     lock used to make every `git merge --ff-only` die with "File exists", which a caged zee can
+//     neither see nor delete, taking it out of service entirely.
 //
 // The docker wrappers (deliverXourceIntoCxell / syncCxellWithXource) can't run without a container,
 // so their GIT MECHANICS are reproduced here with the exact commands they issue, proving the
 // end-to-end reconciliation: deliver main → fetch origin/main → merge → collect fast-forwards.
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, utimesSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -159,6 +162,59 @@ console.log('3) a genuine content conflict is classified as a conflict (not an o
   // an operational failure (no identity, hook refusal, unreadable object) is NOT called a conflict
   ok(classifyMergeOutput('fatal: unable to auto-detect email address (got root@host)').state === 'error',
      'an operational failure is classified as an ERROR, not a phantom conflict');
+}
+
+// ── 4. STALE INDEX.LOCK SELF-HEAL: a stale index.lock in the worktree admin dir no longer bricks ──
+// the collect (TKT-86-B3B2). A git process that crashed mid-write leaves index.lock behind; every
+// `git -C <worktree>` index-touching op (merge/stash/commit) then dies with "File exists", and the
+// collect used to misread that as a worktree divergence and throw "do not fast-forward" — taking a
+// caged zee (which can neither see nor delete the host file) fully out of service. The collect now
+// resolves the admin dir (`git rev-parse --absolute-git-dir` — for a linked worktree that is
+// <repo>/.git/worktrees/<name>), clears a STALE lock (present + mtime older than a few minutes), and
+// retries once. A FRESH lock is never deleted — a live git process may be holding it.
+console.log('4) a STALE index.lock in the worktree admin dir self-heals; a FRESH one still refuses');
+{
+  const adminDirOf = (wt) => gx(wt, ['rev-parse', '--absolute-git-dir']);
+  // 10 minutes back — comfortably older than the ~5-minute STALE_INDEX_LOCK_MS threshold, so the
+  // test does not depend on that constant's exact value.
+  const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
+
+  // (a) STALE lock → collect succeeds and the lock is gone (self-heal)
+  {
+    const { root, src } = scratchSrc();
+    const cxell = cageCxell(root, src, BRANCH);
+    const C1 = commit(cxell, 'work.txt', 'zee work\n', 'cxell work');
+    const wt = join(root, 'wt');
+    gx(src, ['worktree', 'add', '-q', wt, BRANCH]);            // the real HOST worktree shape (linked worktree)
+    ok(/worktrees\//.test(adminDirOf(wt)), 'setup: linked worktree admin dir is <repo>/.git/worktrees/<name>');
+    const lockPath = join(adminDirOf(wt), 'index.lock');
+    write(adminDirOf(wt), 'index.lock', '');                   // a lock a crashed git process left behind
+    utimesSync(lockPath, tenMinAgo, tenMinAgo);                // …and it is STALE (mtime 10 min old)
+    const bundle = cxellOutBundle(root, cxell, BRANCH);
+
+    const res = await reconcileBundleIntoWorktree(wt, { bundle, slug: BRANCH });
+    ok(res.collected && res.head === C1, 'STALE lock: collect SUCCEEDS (self-heal) and fast-forwards to the cxell HEAD');
+    ok(!existsSync(lockPath), 'STALE lock: the lock file is GONE after the collect');
+    ok(rev(wt, 'HEAD') === C1, 'STALE lock: the worktree now holds the cxell commit (the push that follows is a real fast-forward)');
+  }
+
+  // (b) FRESH lock → collect still refuses exactly as today, and the lock is PRESERVED
+  {
+    const { root, src } = scratchSrc();
+    const cxell = cageCxell(root, src, BRANCH);
+    const C1 = commit(cxell, 'work.txt', 'zee work\n', 'cxell work');
+    const wt = join(root, 'wt');
+    gx(src, ['worktree', 'add', '-q', wt, BRANCH]);
+    const lockPath = join(adminDirOf(wt), 'index.lock');
+    write(adminDirOf(wt), 'index.lock', '');                   // FRESH — current mtime, a live git op may hold it
+    const bundle = cxellOutBundle(root, cxell, BRANCH);
+
+    let threw = null;
+    try { await reconcileBundleIntoWorktree(wt, { bundle, slug: BRANCH }); }
+    catch (e) { threw = e; }
+    ok(threw && /File exists/i.test(threw.message), 'FRESH lock: collect still REFUSES (a live git process may hold it)');
+    ok(existsSync(lockPath), 'FRESH lock: the lock is PRESERVED (never deleted)');
+  }
 }
 
 for (const r of roots) rmSync(r, { recursive: true, force: true });

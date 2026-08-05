@@ -7,6 +7,7 @@ import { startPool } from './queenzee/pool.js';
 import { startMaintenance } from './queenzee/maintenance.js';
 import { startMonitor } from './queenzee/monitor.js';
 import { startContainerMonitor } from './queenzee/containers.js';
+import { startContextReconcile } from './queenzee/context-reconcile-loop.js';
 import { startProdDiff } from './queenzee/proddiff.js';
 import { startDbCloneWatch } from './queenzee/dbclone.js';
 import { startWorkSync } from './queenzee/worksync.js';
@@ -14,6 +15,7 @@ import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
+import { reconcileLangfuseBaseUrl } from './lib/langfuse.js';
 import { logHarnessSummary } from './lib/harness.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool, q } from './db/pool.js';
@@ -23,6 +25,7 @@ import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
+import { startRevive } from './queenzee/revive.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
 
@@ -72,7 +75,12 @@ app.use('/api', router);
 // connection held for the process lifetime — so it guards exactly the resource that's in danger
 // and dies with the process (kill → connection drops → lock frees; the self-ship's 3s grace fits
 // well inside the 90s wait). A second instance waits, then exits LOUDLY instead of double-driving.
-{
+//
+// QUEENZEE_INPROC=false (API-only) SKIPS this lock entirely: an API instance holds no lock and
+// drives no fleet, so it is startable on a meta-DB where THE queenzee already holds it — the
+// db-shared-dev spinoff case, where the 90s wait + restart loop is exactly what a verification
+// server hits today (TKT-136-FE32 / TKT-137-F266). The lock stays a property of the loop-runner.
+if (config.queenzeeInproc) {
   const LOCK_KEY = 715533001; // arbitrary constant: "the queenzee of this meta-DB"
   const client = await pool.connect(); // deliberately never released
   const deadline = Date.now() + 90000;
@@ -101,6 +109,13 @@ try {
   // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
   // a harness that would brief a zee with a blank page is invisible otherwise.
   await logHarnessSummary();
+  // Langfuse self-heal: a row provisioned pre-container-aware-base_url keeps localhost, which a
+  // containerized queenzee cannot reach. Best-effort, never fatal (see reconcileLangfuseBaseUrl).
+  await reconcileLangfuseBaseUrl();
+  // NOTE: the v4 events_only→dual heal (reconcileLangfuseWriteMode) is deliberately NOT run here.
+  // The first version auto-fired `docker compose up -d` on the live langfuse stack at boot with an
+  // incomplete interpolation env and took observability down (2026-08-03). New stacks are dual by
+  // default; flipping an existing stack is the human's "Heal write mode" click / /api/langfuse/heal.
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }
@@ -108,6 +123,15 @@ try {
 
 const server = app.listen(config.port, () => {
   console.log(`[zeehive] API on http://localhost:${config.port}  (db: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);
+  if (!config.queenzeeInproc) {
+    // API-ONLY (QUEENZEE_INPROC=false): no single-queenzee lock, no background loops, and NONE of
+    // the boot reconciles that assume this process is THE queenzee (recoverOrphan*, the cxell
+    // renderer sweep, reconcileXellEnvs) — those would fight the real lock-holder on a shared
+    // meta-DB and double-drive the fleet. Serving routes is the whole job (TKT-136-FE32/TKT-137-F266).
+    console.log('[queenzee] loops DISABLED (QUEENZEE_INPROC=false) — API-only: no advisory lock, no background loops, no boot reconciles');
+    logline('api', `queenzee API-ONLY (QUEENZEE_INPROC=false) — routes on :${config.port}, no lock, no loops`);
+    return;
+  }
   startPoller();
   console.log(`[queenzee] poller started (${config.pollerIntervalMs}ms)`);
   logline('api', `queenzee online — API on :${config.port}, DB connected`);
@@ -144,10 +168,15 @@ const server = app.listen(config.port, () => {
   startPool();
   startMonitor();
   startContainerMonitor();
+  startContextReconcile();
   startMaintenance();
   startShipReaper();
   startLandReaper();
   startLandingPad();
+  // A turn the PROVIDER cut (429 / 529 / a connection closed mid-response) is resumed automatically
+  // on a 5/15/45-minute ladder; a turn a dead CREDENTIAL cut is never resumed and raises a human
+  // naming the account (queenzee/revive.js).
+  startRevive();
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();

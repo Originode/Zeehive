@@ -289,6 +289,52 @@ try {
     await client.query(`UPDATE work_item SET status='queued' WHERE id=$1`, [item.id]);
   }
 
+  // ── 5b. deploy FORWARDS --model/--mode/--harness to the dispatch (TKT-97-BD32) ──
+  // `zee assign` accepts --model, so it must reach the SAME dispatch validation `zee dispatch`
+  // uses — never be dropped and let the worker spawn on the harness default. The dispatchFn seam
+  // captures what deployWorkItem hands the dispatch, proving the forwarding half; the refusal
+  // half is fenced in test/model-policy.test.mjs (resolveDispatchModel).
+  {
+    let seen = null;
+    const stub = async (o) => { seen = o; return { xell_id: spare.id, slug: spare.slug }; };
+    const out = await WA.deployWorkItem(item.id, {
+      task: 'forward the model', model: 'fable', mode: '5', harness: 'dev-builder', dispatchFn: stub });
+    ok(out.ok, 'deploy with explicit model/mode/harness succeeds against the stub');
+    ok(seen.model === 'fable', 'the requested --model reaches the dispatch (not silently dropped)');
+    ok(seen.mode === '5', 'and --mode reaches the dispatch');
+    ok(seen.harness === 'dev-builder', 'and --harness reaches the dispatch');
+    await WA.unassignWorkItem(item.id);
+  }
+
+  // ── 5c. TWO CONCURRENT DEPLOYS ON ONE ITEM — exactly one wins (TKT-110-3DA9) ──
+  // The race: a slow deploy outlives the caller's timeout, the caller retries, and the retry
+  // races the original INSIDE the window before either links the item. Both read xell_id=NULL,
+  // both spawn a worker, and whichever links last wins while the other worker is an orphaned
+  // crew with no card. deployWorkItem now takes a per-item advisory lock BEFORE the spawn, so
+  // the retry is refused while the first is still in flight — one worker per item per window.
+  {
+    let dispatchCount = 0;
+    const slowStub = async () => {
+      dispatchCount++;
+      await new Promise((r) => setTimeout(r, 30));   // let the two deploys overlap
+      return { xell_id: spare.id, slug: spare.slug };
+    };
+    const [a, b] = await Promise.allSettled([
+      WA.deployWorkItem(item.id, { task: 'first racer', dispatchFn: slowStub }),
+      WA.deployWorkItem(item.id, { task: 'second racer', dispatchFn: slowStub }),
+    ]);
+    const won = [a, b].filter((r) => r.status === 'fulfilled' && r.value?.ok);
+    const lost = [a, b].filter((r) => r.status === 'rejected');
+    ok(won.length === 1, `exactly ONE of two concurrent deploys wins (${won.length} won)`);
+    ok(lost.length === 1 && /already in flight/.test(lost[0].reason?.message || ''),
+       `and the loser is REFUSED before spawning ["${(lost[0].reason?.message || '').slice(0, 90)}"]`);
+    ok(dispatchCount === 1,
+       `and the dispatch ran exactly ONCE — the loser never spawned a worker (${dispatchCount})`);
+    ok((await client.query(`SELECT xell_id FROM work_item WHERE id=$1`, [item.id])).rows[0].xell_id === spare.id,
+       'the item is linked to the ONE winner');
+    await WA.unassignWorkItem(item.id);
+  }
+
   // ── 6. worksync: the board moves itself, and the fence holds ─────────────
   {
     await WA.assignWorkItem(item.id, { xell_id: worker.id });
@@ -435,6 +481,21 @@ try {
     const foreignAssign = await selfWorkAssign(m, { item: other.id, task: 'go' });
     ok(foreignAssign.ok === false && /another project/.test(foreignAssign.error),
        "and a manager cannot deploy onto another project's plan");
+
+    // ── 7c. THE BOARD IS THE ONLY MANAGER DEPLOYMENT PATH (TKT-b14934) ──
+    // A free-form `zee dispatch` has no per-item guard — the exact loophole that produced duplicate
+    // workers (TKT-104/TKT-110/TKT-114). It is refused for a manager; the board path (`zee assign`,
+    // which routes through deployWorkItem's per-item advisory lock) is the one that carries work.
+    const { selfDispatch } = await import('../server/src/queenzee/self.js');
+    const crewBefore = (await client.query(
+      `SELECT count(*)::int n FROM xell WHERE manager_xell_id=$1`, [m.id])).rows[0].n;
+    const freeForm = await selfDispatch(m, { task: 'a second worker for the same job' });
+    ok(freeForm.ok === false && /work-items board/.test(freeForm.error) && /zee assign/.test(freeForm.error),
+       "a manager's free-form `zee dispatch` is REFUSED — the board is the deployment path");
+    const crewAfter = (await client.query(
+      `SELECT count(*)::int n FROM xell WHERE manager_xell_id=$1`, [m.id])).rows[0].n;
+    ok(crewAfter === crewBefore,
+       `and nothing was spawned by the refused dispatch (crew still ${crewBefore})`);
   }
 
   // ── 7b. the SSE payloads keep part 1's documented shape ─────────────────

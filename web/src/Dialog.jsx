@@ -31,7 +31,10 @@ function _push(dialog) {
 }
 
 function _defaults(d) {
-  const message = d.message == null ? '' : String(d.message);
+  // Preserve React elements (JSX) so callers can pass <pre>…</pre> (e.g. the .env export / .zeehive.env
+  // reveal dialogs) as the message — String(<element>) yields "[object Object]". Only coerce
+  // primitives (numbers, plain strings) to a display string.
+  const message = d.message == null ? '' : (React.isValidElement(d.message) ? d.message : String(d.message));
   return { kind: 'alert', variant: 'info', okLabel: 'OK', cancelLabel: 'Cancel', ...d, message };
 }
 

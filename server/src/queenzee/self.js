@@ -24,6 +24,7 @@ import { existsSync } from 'node:fs';
 import { landStatus, openLandRequests, holdingRequests, withdrawLandRequest } from './landgate.js';
 import { requestShip, shipStatus } from './shipgate.js';
 import { requestProdSeed, seedStatusFor, SEED_DIR } from './seedgate.js';
+import { requestXourceClean, xourceCleanStatusFor } from '../lib/xource-clean.js';
 import { notifyProdBindRequest } from '../lib/notify.js';
 import { proposeDone, retractDone } from './tasks.js';
 import { attachProdStack } from '../lib/xell-prod.js';
@@ -38,20 +39,25 @@ import { attachXellDb } from '../lib/xell-db.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
+import { providerRunEnv } from '../lib/provider-tokens.js';
 import { buildXell, getBuildStatus } from '../lib/build.js';
 import { hiveStatus, hiveLabel } from '../lib/hive-status.js';
 import { pauseState, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefReason,
-  shipRefusalState, setZeeStatus } from '../lib/status.js';
+  shipRefusalState, envAlertState, setZeeStatus, recordEvent } from '../lib/status.js';
+// The zee-row-only turn writer — the same one intake's spawn and nudge's resume use, so an
+// interactive turn is recorded exactly like the two the queenzee starts (lib/turn-record.js).
+import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
-         notifyManagerOfSwap, notifyManagerOfHalfSwap,
+         notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
          NO_PUSH_REASON } from '../lib/managers.js';
 // The harness DOMAIN (lib/harness.js) — listed/authored here for the manager harness verbs at the
 // bottom of this file, and read on the dispatch path. Same one-rule-one-place discipline as the type
 // check: this file adds the manager REFUSALS, never a second copy of the rules.
 import { normalizeZeeType, resolveHarness, listHarnesses, createHarness, updateHarness,
          deleteHarnessUnlessWorn, liveHarnessWearers, wearerList } from '../lib/harness.js';
+import { uploadConversationArchive, conversationsForManager, harnessArchivalSettings } from '../lib/conversations.js';
 
 // NOTE: xell_id is in the select list because pingWorking/setZeeStatus dereference zee.xell_id —
 // without it a cxell's `zee working` ping silently skipped BOTH the xell status mirror AND the
@@ -77,9 +83,10 @@ export async function selfStatus(xell) {
     `SELECT id, status, reason, requested_at, decided_at, decided_by FROM prod_bind_request
        WHERE xell_id=$1 ORDER BY requested_at DESC LIMIT 1`, [xell.id]);
   const seed = await seedStatusFor(xell.id);
+  const xourceClean = await xourceCleanStatusFor(xell.id);
   const lock = await one(`SELECT container, phase FROM deploy_lock WHERE xell_id=$1`, [xell.id]);
   const containers = await q(
-    `SELECT c.role, c.name, c.tier, host(c.host) AS host, c.host_port FROM xell_uses_container uc
+    `SELECT c.role, c.name, c.tier, c.host AS host, c.host_port FROM xell_uses_container uc
        JOIN container c ON c.id = uc.container_id WHERE uc.xell_id=$1 ORDER BY c.role`, [xell.id]);
   // The tend as the console sees it: open + the brief REASON the zee gave for calling a human.
   const tend = await tendState(xell.id);
@@ -89,6 +96,12 @@ export async function selfStatus(xell) {
   // status` cannot read as "nothing happened" when the zee's last ship went nowhere — the exact
   // mismatch behind "xells insist they have ship requests… i see zero" (lib/status.setShipRefusal).
   const shipRefused = await shipRefusalState(xell.id);
+  // The ENV-RECONCILE ALERT on this xell (ticket #44). The zee did not raise it and cannot clear it
+  // — but it is the party STANDING on the environment in question, and a zee that reads "my
+  // .zeehive.env could not be reconciled" is a zee that stops trusting the DSN in it. It must never
+  // try to fix this itself: rewriting a live xell's file, or re-pointing its own database, is the
+  // more dangerous half of the very act the reconcile refused.
+  const envAlert = await envAlertState(xell.id);
   // The DISPLAY status the hive shows for this xell — the same derivation the dashboard renders, so
   // a cxell zee sees itself exactly as a human does (and can tell its tend/hint/land/ship pings landed).
   // The fleet PAUSE. A zee resumed by the play button is told to run `zee status` first, so this has
@@ -101,6 +114,9 @@ export async function selfStatus(xell) {
     { ...xell, zee_status: zee?.status },
     {
       paused: pausedHere,
+      // The readiness preflight (#53), so a zee sees the same verdict a human does rather than
+      // discovering the fault by tripping over it hours in.
+      preflightFailed: !!xell.preflight_error,
       landPending: land ? ['pending', 'approved'].includes(land.status) : false,
       // Queued for the runway (067) — the zee sees the same `holding` hexagon a human does, which is
       // how it can tell its push really did land in the pattern rather than vanish.
@@ -109,10 +125,17 @@ export async function selfStatus(xell) {
       // human" — it matches how fleet.js derives the hive status, so the zee sees itself as a human does.
       shipPending: ship ? (['pending', 'approved', 'shipping'].includes(ship.status) && !ship.deferred_at) : false,
       tendPending: tend.open,
+      // The env-reconcile alert (#44) — the zee sees the same `env!` hexagon a human does, rather
+      // than reading `working` while the console shows a card about the ground it stands on.
+      envAlert: envAlert.open,
       landHint, shipHint,
       // The two PROD-DATA asks, so a cxell zee sees its own `prod?` / `seed?` hexagon exactly as a
       // human does — and can tell that its request actually reached the console.
       prodBindPending: prodBind ? prodBind.status === 'pending' : false,
+      // A ROUTER's open ask for another MANAGER (149) — the same reasoning as the two above: the zee
+      // must see the `manager?` hexagon a human sees, and be able to tell its ask arrived.
+      managerMintPending: !!(await one(
+        `SELECT 1 FROM manager_mint_request WHERE xell_id=$1 AND status='pending'`, [xell.id])),
       seedPending: seed ? ['pending', 'approved', 'running'].includes(seed.status) : false,
       // A manager suggested THIS xell is finished (a human decides) — the zee should see the same
       // `done?` a human sees on its hexagon rather than be closed out without warning.
@@ -211,6 +234,17 @@ export async function selfStatus(xell) {
           note: 'your last `zee ship` was REFUSED — NO request exists and nothing is awaiting a human. '
             + 'Fix the reason and ask again; do not report a ship as pending.' }
       : null,
+    // Your xell's .zeehive.env could NOT be reconciled with the meta-DB, and you are live in it —
+    // so you are running on whatever that file already said. Not yours to fix (see above): a human
+    // re-points the xell's database, and the next reconcile clears this by itself.
+    env_alert: envAlert.open
+      ? { reason: envAlert.reason, reason_full: envAlert.full, at: envAlert.at,
+          since: envAlert.since, count: envAlert.count,
+          note: 'the queenzee could NOT reconcile this xell\'s .zeehive.env — it REFUSED to rewrite it '
+            + 'and you are still running on the file you already had. A card is up in the console for a '
+            + 'human. Do NOT try to fix it yourself: do not edit .zeehive.env and do not re-point your '
+            + 'own database. Treat the DATABASE_URL you hold as suspect until this clears.' }
+      : null,
     prod_bind: prodBind
       ? { id: prodBind.id, status: prodBind.status, pending: prodBind.status === 'pending' }
       : null,
@@ -220,6 +254,16 @@ export async function selfStatus(xell) {
       ? { id: seed.id, status: seed.status, files: seed.files || [], commit: seed.commit,
           decided_by: seed.decided_by, error: seed.result?.error || null,
           pending: ['pending', 'approved', 'running'].includes(seed.status) }
+      : null,
+    // A MANAGER's request to clean up the project xource (a mangled main checkout blocks every
+    // landing and ship). Carried here so `zee status` cannot read as "nothing happened" when the
+    // manager's last xource-clean ask is still on a human's screen — or was refused.
+    xource_clean: xourceClean
+      ? { id: xourceClean.id, status: xourceClean.status, reason: xourceClean.reason,
+          decided_by: xourceClean.decided_by, error: xourceClean.result?.error || null,
+          pending: xourceClean.status === 'pending',
+          result: xourceClean.result ? { ok: xourceClean.result.ok, dry_run: !!xourceClean.result.dry_run,
+                                          steps: xourceClean.result.steps || [] } : null }
       : null,
     holds_prod_lock: !!lock, prod_lock_phase: lock?.phase || null,
     containers,
@@ -724,6 +768,17 @@ function shipSchemaNote(req) {
 }
 
 export async function selfShip(xell, { targets = null, reason = null } = {}) {
+  // A ROUTER may not ask to ship (139). A plain manager may — a ship deploys the TIP OF MAIN and a
+  // human approves it, so the ask is safe in a manager's mouth. But a router is the fleet's front
+  // door with a fixed job: it routes prompts, lands nothing, ships nothing; a deploy ask from it is
+  // always a misunderstanding of its own manual, so it is refused by name, before any request exists.
+  const { isRouterXell } = await import('../lib/router.js');
+  if (await isRouterXell(xell)) {
+    return { ok: false, status: 'refused', refused: 'ship', error:
+      'a ROUTER zee routes prompts — it lands nothing and ships nothing, so `zee ship` is not its '
+      + 'verb. If production needs a deploy, ROUTE the ask: dispatch a worker whose work lands, or '
+      + 'tell a human (`zee tend --reason "…"`).' };
+  }
   const zee = await liveZee(xell.id);
   const r = await requestShip({ xellId: xell.id, zeeId: zee?.id || null, reason, targets });
   if (r.ok === false) return r;                      // requestShip already wrote the loud message
@@ -809,6 +864,115 @@ export async function selfSeedStatus(xell) {
   return { ok: true, request: row };
 }
 
+// ── POST /api/xell/self/verify-webapp — OFFER your built webapp to a human ────
+// A human turned on VISUAL VERIFICATION for this xell (at dispatch time). The zee builds the
+// webapp, then calls this to OFFER the live link to a human in the console: a small card with an
+// Open-link button (the webapp container url, new tab) and a dismiss. The offer table is shaped
+// like prod_seed_request (049) but there is no gate to climb — status is open|dismissed only, and
+// the row carries the url + head commit so the console card never has to re-derive them. The zee
+// only OFFERS; a human opens the link or dismisses it. Nothing is landed or shipped to do this.
+export async function selfVerifyWebapp(xell) {
+  const rows = await q(
+    `SELECT c.role, c.url FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+      WHERE uc.xell_id = $1 ORDER BY c.role`, [xell.id]);
+  const webapp = rows.find((c) => c.role === 'webapp');
+  if (!webapp?.url) {
+    return { ok: false, error: 'this xell has no webapp container URL to offer — build the webapp '
+      + 'first (`zee build webapp --wait`), then try again.' };
+  }
+  const zee = await liveZee(xell.id);
+  // One OPEN offer per xell, like prod_seed_request's one-open-ask guard: a zee that calls this
+  // twice must not flood the console with cards. The existing open offer is handed back, not a
+  // second row.
+  const existing = await one(
+    `SELECT * FROM visual_verify_offer WHERE xell_id=$1 AND status='open'
+      ORDER BY created_at DESC LIMIT 1`, [xell.id]);
+  if (existing) {
+    return { ok: true, offer: existing,
+      message: `You already offered your webapp (${existing.url}) to a human in the console — `
+        + 'they can open the link or dismiss it. Nothing new was inserted.' };
+  }
+  const row = await one(
+    `INSERT INTO visual_verify_offer (project_id, xell_id, xell_slug, url, commit)
+     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [xell.project_id, xell.id, xell.slug, webapp.url, xell.head_commit || null]);
+  broadcast('visual-verify', row);
+  broadcast('xell', { id: xell.id });
+  logline('self', `${xell.slug} offered its webapp for visual verification @ ${webapp.url}`);
+  return {
+    ok: true, offer: row,
+    message: `Offered your webapp at ${webapp.url} to a human in the console — they can open the `
+      + 'link in a new tab or dismiss it. Nothing was landed or shipped.',
+  };
+}
+
+// ── POST /api/xell/self/upload-conversation — `zee upload-conversation` ────────
+// Archive THIS xell's conversation to the queenzee. The zee CLI reads its own session transcript
+// (~/.claude/projects/-work-repo/<sid>.jsonl) and POSTs the raw text; the server parses + stores
+// it as a xell_conversation row. NOT human-gated: an archive is a fact about a throwaway xell's
+// work, exactly the class of `zee working` — it opens no gate and blocks nothing. The "upload on
+// done" harness setting uses the same store via selfDone (where content is omitted and the queenzee
+// reads the transcript from the cxell container itself).
+export async function selfUploadConversation(xell, { content = null, session_id = null, title = null,
+                                                      reason = null } = {}) {
+  const r = await uploadConversationArchive(xell, { content, sessionId: session_id, title, reason, uploadedBy: 'verb' });
+  if (r.ok) broadcast('xell', { id: xell.id });
+  return r;
+}
+
+// ── GET /api/xell/self/conversations — `zee conversations` (MANAGER only) ──────
+// Review the conversation archives of the crew a manager dispatched. Same token-scoped wall as
+// every crew verb: the caller is resolved from its token, so a manager can only ever read its own
+// workers' archives, and a worker is refused (it has no crew). `?xell=<slug>` narrows to one
+// worker; `&full=1` returns the whole transcript of the newest archive for that worker.
+export async function selfConversations(xell, { xell: slug = null, full = false } = {}) {
+  // Pure read, exactly like `zee zees`: no broadcast, no side effect — the caller just wants
+  // to know what its crew archived.
+  return conversationsForManager(xell, { xell: slug, full });
+}
+
+// ── HUMAN side: set/clear visual verification on a xell, or dismiss an offer ──
+// The same flag the dispatch composer sets at dispatch time, applied to an EXISTING xell. A running
+// zee is not re-briefed by this — it takes effect for the next spawn/dispatch — so it is how a human
+// keeps the per-xell config truthful on the row the briefing reads.
+export async function setVisualVerify(xellId, { visual_verify = false, by = 'human@console' } = {}) {
+  const xell = await one(`SELECT slug FROM xell WHERE id=$1`, [xellId]);
+  if (!xell) throw new Error('no such xell');
+  const row = await one(`UPDATE xell SET visual_verify=$2 WHERE id=$1 RETURNING *`, [xellId, !!visual_verify]);
+  broadcast('xell', row);
+  logline('self', `visual verification ${row.visual_verify ? 'ON' : 'OFF'} for ${xell.slug} by ${by}`);
+  return { ok: true, xell: { id: row.id, slug: row.slug, visual_verify: row.visual_verify } };
+}
+
+// PER-XELL LANGFUSE TRACKING (default ON) — the human-side knob (terminal window header). Turning it
+// OFF means this xell's turns are not traced to Langfuse and its cage gets no LANGFUSE_* env. Same
+// shape as setVisualVerify: a per-xell boolean on the xell row, broadcast so the console refreshes.
+export async function setLangfuseTracking(xellId, { langfuse_tracking = true, by = 'human@console' } = {}) {
+  const xell = await one(`SELECT slug FROM xell WHERE id=$1`, [xellId]);
+  if (!xell) throw new Error('no such xell');
+  const row = await one(`UPDATE xell SET langfuse_tracking=$2 WHERE id=$1 RETURNING *`,
+    [xellId, !!langfuse_tracking]);
+  broadcast('xell', row);
+  logline('self', `langfuse tracking ${row.langfuse_tracking ? 'ON' : 'OFF'} for ${xell.slug} by ${by}`);
+  return { ok: true, xell: { id: row.id, slug: row.slug, langfuse_tracking: row.langfuse_tracking } };
+}
+
+// Dismiss a visual-verify offer (the console card's ✕). With no offerId, dismisses the xell's open
+// offers. View-only, like a seed/landing dismiss: it never changes what was offered, it just stops
+// the card rendering.
+export async function dismissVisualVerifyOffer(xellId, { offerId = null, by = 'human@console' } = {}) {
+  const row = offerId
+    ? await one(
+        `UPDATE visual_verify_offer SET status='dismissed', dismissed_at=now(), dismissed_by=$3
+          WHERE id=$1 AND xell_id=$2 AND status='open' RETURNING *`, [offerId, xellId, by])
+    : await one(
+        `UPDATE visual_verify_offer SET status='dismissed', dismissed_at=now(), dismissed_by=$2
+          WHERE xell_id=$1 AND status='open' RETURNING *`, [xellId, by]);
+  if (!row) throw new Error('no such open visual-verify offer (already dismissed?)');
+  broadcast('visual-verify', row);
+  return { ok: true, offer: row };
+}
+
 // ── HUMAN side: confirm/reject a prod-bind request (no zee path to this) ────────
 export async function listProdBindRequests(projectId, { open = true } = {}) {
   const where = open ? `AND pbr.status = 'pending'` : '';
@@ -862,7 +1026,7 @@ export async function decideProdBind(id, decision, by = 'human@console') {
 async function resealCxellForStack(xellId) {
   const xell = await one(`SELECT slug, project_id FROM xell WHERE id=$1`, [xellId]);
   const prodDbs = await q(
-    `SELECT DISTINCT host(c.host) AS host, c.host_port, c.project_id FROM container c
+    `SELECT DISTINCT c.host AS host, c.host_port, c.project_id FROM container c
       WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
   const blockTcp = prodDbs
     .filter((r) => r.project_id !== xell.project_id) // this xell's prod DB is now allowed
@@ -881,7 +1045,24 @@ async function resealCxellForStack(xellId) {
 // what a human has ALREADY confirmed is refused inside retractDone — that decision is theirs.
 export async function selfDone(xell, { summary = null, clear = false } = {}) {
   if (clear) return retractDone({ xell_id: xell.id });
-  return proposeDone({ xell_id: xell.id, note: summary });
+  // UPLOAD CONVERSATIONS ON DONE (migration 112, harness setting). When the harness a zee wears
+  // asks for it, archive the conversation BEFORE proposing done — the zee is still in its cxell
+  // now, and the "upload on done" contract is "the queenzee captures it as you leave". Best-effort
+  // and NEVER fatal: a failed archive (no docker here, no transcript, a torn-down cage) is reported
+  // on the done response and must not block the proposal itself.
+  let conversation_upload = null;
+  try {
+    const settings = await harnessArchivalSettings(xell);
+    if (settings.upload_conversations_on_done) {
+      conversation_upload = await uploadConversationArchive(xell, { reason: 'done', uploadedBy: 'done' });
+    }
+  } catch (e) {
+    conversation_upload = { ok: false, error: `upload-on-done could not archive the conversation: ${e.message}` };
+    logline('self', `${xell.slug}: upload-on-done failed (${e.message}) — the done proposal still stands`);
+  }
+  const res = await proposeDone({ xell_id: xell.id, note: summary });
+  if (conversation_upload) res.conversation_upload = conversation_upload;
+  return res;
 }
 
 // ── POST /api/xell/self/tend — raise (or clear) "I need a human in the console" ─
@@ -936,6 +1117,67 @@ export async function selfHint(xell, kind, { reason = null, clear = false } = {}
   };
 }
 
+// ── POST /api/xell/self/turn — THE CAGE REPORTS ITS OWN TURN BOUNDARIES ─────────
+//
+// THE GAP THIS CLOSES, in the words reaper.js already used for it: an INTERACTIVE turn — one a human
+// or a manager starts by TYPING into the resting session in the cage's pane — "starts a turn nothing
+// in the fleet observes". No hook, no poller, and the monitor's `pgrep` cannot tell a generating TUI
+// from one sitting at its prompt, so such a zee reads 'idle' for the whole of it. That is the same
+// blindness that cost a manager a duplicate xell (TKT-57/60), on the one door the queenzee does not
+// own: it starts the spawned turn and it starts the resumed turn, but it does not start this one.
+//
+// The cage can answer for itself — it holds the `zee` CLI and its own identity token — so it does:
+// the vendor CLI's own turn hooks call `zee turn --start` / `zee turn --end` (installed at spawn,
+// lib/cxell-runtimes.js turnHookCmd), and this is where they land.
+//
+// WHAT IT DOES NOT DO, said plainly rather than implied:
+//   • NO COST. A hook knows a turn began and ended; it does not know what the vendor charged for it.
+//     Only a turn the queenzee itself ran reports usage (queenzee/intake.js, queenzee/nudge.js), so
+//     an interactive turn moves the STATUS and never the burn columns — a row that stayed silent is
+//     replaced by one that is honest about what it can see, not by an invented figure.
+//   • CLAUDE ONLY, today. The hook is declared per vendor and measured, never assumed (the same rule
+//     as authSetupCmd/firstRunSeedCmd); codex and kimi declare none, so their cages are exactly as
+//     they were.
+//   • CAGES SPAWNED FROM HERE ON. The install runs at spawn; a cxell already running keeps the gap.
+//
+// ZEE ROW ONLY (lib/turn-record.js), for the reason TKT-57 established: mirroring 'working' onto the
+// xell would overwrite an 'awaiting-done' a human is holding — and a zee that has proposed done and
+// is then TYPED at is precisely that case.
+export async function selfTurn(xell, { state = null } = {}) {
+  const want = String(state || '').trim().toLowerCase();
+  if (want !== 'start' && want !== 'end') {
+    return { ok: false, error: 'state must be "start" or "end" (zee turn --start | --end)' };
+  }
+  const zee = await liveZee(xell.id);
+  if (!zee) return { ok: false, error: 'no live zee bound to this xell to record a turn for' };
+  // A turn the QUEENZEE is running already records itself at both ends, and it runs in the same cage
+  // as the interactive session. Reporting 'end' from a hook mid-headless-turn would mark that turn
+  // over while it is still going — so a start only CLAIMS the turn (claimZeeTurn, the same atomic
+  // single-writer lock the resume path uses — TKT-114-B) and is refused if any turn is in flight,
+  // and an end only releases a row this door itself claimed. (Measured, and the reason the two
+  // cannot collide in practice: `claude --bare` — what every queenzee-started turn runs — does not
+  // fire hooks at all. This guard is the belt to that braces.)
+  let row = null;
+  if (want === 'start') {
+    row = await claimZeeTurn(zee.id, 'interactive turn');
+    if (!row) {
+      return { ok: true, recorded: false, zee_status: zee.status,
+               message: 'This zee is already recorded as WORKING (a queenzee-started turn is in flight) — '
+                 + 'the interactive turn boundary was not written over it.' };
+    }
+  } else {
+    row = await markZeeTurn(zee.id, 'idle', 'end_turn');
+  }
+  await recordEvent({ source: 'cxell-hook', hook_event_name: `interactive-turn-${want}`,
+                      zee_id: zee.id, xell_id: xell.id, stop_reason: want === 'end' ? 'end_turn' : null });
+  logline('self', `${xell.slug}: interactive turn ${want} (reported by the cage's own hook)`);
+  return { ok: true, recorded: !!row, zee_status: row?.status || null,
+    message: want === 'start'
+      ? 'Turn START recorded — the hive and the crew view show this zee as working while a human or '
+        + 'a manager talks to it. No cost is recorded for an interactive turn: the queenzee did not run it.'
+      : 'Turn END recorded — the zee is idle again (end_turn).' };
+}
+
 // ── POST /api/xell/self/working — ping "I am actively working" ──────────────────
 // Channel A (harness hooks) isn't installed for cxell zees, so a cxell can look idle to the passive
 // poller even mid-task. This ping lets a zee assert live activity — the hive shows `occ-working` —
@@ -950,6 +1192,27 @@ export async function selfWorking(xell, { note = null } = {}) {
   const res = await pingWorking(zee, { note });
   return { ok: true, ...res, tend_nudge: nudge,
     message: 'Working ping recorded — the hive shows this xell as occ-working.' };
+}
+
+// ── GET /api/xell/self/provider-env — the RUNNABLE env for ONE provider (`zee creds --provider <key> --export`) ──
+// SERVER-COMPUTED, read-only, token-scoped. The cage holds every provider's raw token under
+// ZEE_PROVIDER_<KEY>_TOKEN, but a zee cannot RUN a vendor CLI from that: the vendor wants its own
+// env (KIMI_MODEL_*, OPENAI_API_KEY, ANTHROPIC_*) and, for codex, an in-cage install. That mapping
+// is the runtime adapters' (lib/cxell-runtimes.js) and lives HERE — never duplicated in the CLI
+// (the drift class test/cxell-cli-drift.test.mjs exists to catch). The CLI prints; it decides
+// nothing. The token in the answer is NOT the project's current key: it is the key of the EXACT
+// ACCOUNT THIS CAGE WAS GRANTED, read from the xell_provider_grant ledger (written at spawn and at
+// every injection). A cage spawned before a rotation has a grant for the OLD account; after a
+// rotation that account is gone/replaced/paused, so the door REFUSES and the fresh key stays in the
+// meta-DB — the credential-inject card is the only door. What it guarantees, in one sentence: a cage
+// may only ever obtain the runnable env for the exact account it was granted — never the project's
+// current key after a rotation. Fail-closed (no record → refuse).
+export async function selfProviderEnv(xell, { provider = null } = {}) {
+  const want = String(provider || '').trim().toLowerCase();
+  if (!want) throw new Error('missing provider — `zee creds --provider <key> --export`');
+  const r = await providerRunEnv(xell.project_id, want, { xellId: xell.id });
+  if (r?.ok === false) return r;   // the ledger refused — the fresh key stays in the meta-DB
+  return { ok: true, ...r };
 }
 
 // ── POST /api/xell/self/build — (re)build THIS cxell's own app tier ─────────────
@@ -1058,10 +1321,17 @@ export async function selfCrew(xell) {
   if (guard) return guard;
   const crew = await crewFor(xell.id);
   const waiting = crew.filter((c) => c.waiting_on_human.length);
+  // UNLANDED work is the one thing that must not be closed out (`zee suggest-done` reaps the xell,
+  // and commits that never reached main die with the worktree). The manual tells a manager to check
+  // it before suggesting done, so the summary counts it rather than making it hunt row by row.
+  const unlanded = crew.filter((c) => (c.diff?.ahead || 0) > 0);
+  const landed = crew.filter((c) => c.landings.count > 0);
   return {
     ok: true, manager: { slug: xell.slug, xell_id: xell.id }, count: crew.length, crew,
     message: crew.length
-      ? `${crew.length} worker(s) in your crew; ${waiting.length} waiting on a human.`
+      ? `${crew.length} worker(s) in your crew; ${waiting.length} waiting on a human; `
+        + `${landed.length} have landed work; ${unlanded.length} hold UNLANDED commits`
+        + `${unlanded.length ? ` (${unlanded.map((c) => c.slug).join(', ')} — never suggest done over those)` : ''}.`
         + ' Read `waiting_on_human` before you interrupt anyone — a worker that is occ-working is working.'
       : 'No workers yet. `zee dispatch --task "…"` spawns one (it is seated next to you in the honeycomb).',
   };
@@ -1099,11 +1369,42 @@ function managerBriefBlock(managerSlug, what = 'dispatched you and is watching t
 //   • no type/manager escalation → only a HUMAN adds a manager zee;
 //   • no manager harness on a worker → it cannot be handed the manager's verbs.
 export async function selfDispatch(xell, { task = null, model = null, mode = null, harness = null,
-                                           title = null, runtime = null } = {}) {
+                                           title = null, runtime = null, visual_verify = false,
+                                           langfuse_tracking = null, work_item_id = null,
+                                           // WHICH AI PROVIDER the worker runs on (139). Added for
+                                           // the ROUTER (a manager-type zee whose whole job is
+                                           // deciding this), and real for any manager: dispatchXell
+                                           // already resolves/refuses it exactly as a console
+                                           // dispatch would. null = the project default, as before.
+                                           provider = null } = {}) {
   const guard = requireManager(xell, 'dispatch');
   if (guard) return guard;
   const text = String(task || '').trim();
   if (!text) return { ok: false, error: 'dispatch needs --task "…" — the brief the worker will work from' };
+
+  // THE BOARD IS THE ONLY MANAGER DEPLOYMENT PATH (TKT-b14934). A free-form `zee dispatch` has no
+  // per-item guard — two dispatches for one unit of work each spawn a worker and the board never
+  // sees either, which is exactly how the fleet produced duplicate workers (TKT-104/TKT-110/TKT-114).
+  // The work-items board closes that: deployWorkItem holds a per-item advisory lock and refuses a
+  // second worker on an item that already has one. So a MANAGER's deployment goes through
+  // `zee assign` (which routes through that guard) and a free-form `zee dispatch` is refused for
+  // managers. Two exceptions, both deliberate:
+  //   • work_item_id is set — this is `zee assign` reaching back through deployWorkItem; it IS the
+  //     guarded board path, and refusing it would break the very verb the refusal points at;
+  //   • the xell is a ROUTER (lib/router.js) — routing a prompt IS its job, one worker per request,
+  //     each a fresh unit of work; the router is the project's front door, not a manager deploying a
+  //     unit, and the task names its routing dispatches a legitimate itemless path to keep working.
+  if (!work_item_id) {
+    const { isRouterXell } = await import('../lib/router.js');
+    if (!(await isRouterXell(xell))) {
+      return { ok: false, status: 'refused', error:
+        '`zee dispatch` is the ROUTER\'s verb. Deploying a worker must go through the work-items board, '
+        + 'which is what prevents two workers on one unit of work — an item admits at most one live '
+        + 'worker and a second deploy on the same item is refused with a sentence. Cut a card '
+        + '(`zee work --new --title "…"`) or break a ticket down, then '
+        + '`zee assign --item <id> --task "…"`.' };
+    }
+  }
 
   // A worker gets a WORKER harness — checked by TYPE, not by key, so renaming or adding a manager
   // persona cannot open a side door. (The assign path and the DB would refuse it too; refusing here
@@ -1161,10 +1462,24 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   // as it was when the decision was made — and read best-effort: overlapForBrief never throws, and a
   // failure inside it degrades to fewer warnings, never to a dispatch that did not happen. Advisory by
   // construction: nothing below branches on it. The manager is the one party who can act on it.
+  //
+  // `work_item_id` rides along when this dispatch is a DEPLOY onto a card (`zee assign` →
+  // deployWorkItem): the item is a stronger key than its own brief, which writes the ticket as a bare
+  // "(#64)" that ticketRefsIn deliberately does not read. Without it, the verb that cuts a worker for a
+  // card is the one dispatch with no key at all.
   const { overlapForBrief, overlapNote } = await import('../lib/work-overlap.js');
-  const overlap = await overlapForBrief({ projectId: xell.project_id, brief: text, excludeXellId: xell.id });
-  const note = overlapNote(overlap);
-  if (note) logline('crew', `${xell.slug}: dispatching into work ${overlap.warnings.length} other live xell(s) already touch`);
+  const checked = await overlapForBrief({ projectId: xell.project_id, brief: text, excludeXellId: xell.id,
+                                          workItemId: work_item_id || null });
+  const note = overlapNote(checked);
+  // The note travels ON the answer, the way the console's dispatch route already hands it to a human —
+  // so a caller that reads JSON and a caller that reads the message get the same sentence.
+  const overlap = note ? { ...checked, note } : checked;
+  if (note) {
+    const live = checked.warnings.filter((w) => w.kind === 'ticket' || w.kind === 'path').length;
+    const landed = checked.warnings.length - live;
+    logline('crew', `${xell.slug}: dispatching into work ${live} other live xell(s) already touch`
+      + (landed ? `, and ${landed} landing(s) already on main` : ''));
+  }
 
   const { dispatchXell } = await import('./intake.js');
   let out;
@@ -1174,10 +1489,19 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
       ...(provisioned?.id ? { xell_id: provisioned.id } : {}),
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
+      ...(visual_verify ? { visual_verify: true } : {}),
+      // --langfuse / --no-langfuse: explicit true or false always lands; omission (null) preserves
+      // whatever the target xell already has (dispatchXell's NULL-preserves shape).
+      ...(langfuse_tracking === true || langfuse_tracking === false ? { langfuse_tracking } : {}),
+      ...(provider ? { provider } : {}),
       manager_xell_id: xell.id,
     });
   } catch (e) {
-    return { ok: false, error: `dispatch failed: ${e.message}`, detail: e.detail || null };
+    // The overlap was READ before the spawn was attempted, and it is a fact about the WORK rather than
+    // about this attempt: a manager that retries (or re-briefs) must not lose what it already knows
+    // about landings and live xells because the pool, the provider token or docker let it down.
+    return { ok: false, error: `dispatch failed: ${e.message}`, detail: e.detail || null, overlap,
+             ...(note ? { warning: note } : {}) };
   }
   logline('crew', `${xell.slug} dispatched a worker into ${out.slug}`);
   return {
@@ -1739,12 +2063,14 @@ export async function selfSay(xell, { to = null, message = null, kind = 'directi
       + 'You can only message your OWN workers.' };
   }
   const r = await postMessage({ from: xell, to: worker, body: message, kind });
+  // WHICH delivery, in the worker's own state's words — a manager plans on this sentence. RESUMED
+  // means the worker's finished turn was restarted with your message as its prompt (this is how you
+  // re-task the zee that already holds the context); QUEUED means it is mid-turn and has not read it
+  // yet; TYPED means an interactive session took the keystrokes. See lib/zee-turn.js.
   return {
-    ok: true, ...r,
-    message: r.delivered
-      ? `Delivered into ${worker.slug}'s live session — it will answer there.`
-      : `Stored for ${worker.slug} but NOT delivered live (${r.delivery?.reason || r.delivery?.error || 'no live cxell'}) — `
-        + 'it will read it with `zee inbox` on its next turn.',
+    ok: true, ...r, delivery: r.delivery?.delivery || 'none',
+    message: deliveryReceipt(r.delivery?.delivery, worker.slug,
+                             r.delivery?.reason || r.delivery?.error || null),
   };
 }
 
@@ -1765,10 +2091,11 @@ export async function selfReport(xell, { message = null, kind = 'report' } = {})
         + '(nothing was delivered to another agent).' };
   }
   const r = await postMessage({ from: xell, to: manager, body: text, kind: kind === 'reflection' ? 'reflection' : 'report' });
-  return { ok: true, ...r, addressed: true,
-    message: r.delivered
-      ? `Sent to your manager (${manager.slug}) and typed into its live session.`
-      : `Stored for your manager (${manager.slug}); it was not live, so it reads it with \`zee inbox\`.` };
+  // Same three-way receipt as `zee say` (a manager reading its own worker's report is the other end
+  // of the same delivery): RESUMED / QUEUED / TYPED, never one word for all three.
+  return { ok: true, ...r, addressed: true, delivery: r.delivery?.delivery || 'none',
+    message: `Sent to your manager (${manager.slug}). `
+      + deliveryReceipt(r.delivery?.delivery, manager.slug, r.delivery?.reason || r.delivery?.error || null) };
 }
 
 // GET /api/xell/self/inbox — what other zees sent ME (`zee inbox`). Reading marks read.
@@ -1796,6 +2123,68 @@ export async function selfSuggestDone(xell, { to = null, reason = null } = {}) {
   return suggestDone({ manager: xell, target: worker, reason });
 }
 
+// POST /api/xell/self/xource-clean — ask a HUMAN to clean up the project xource (`zee xource-clean`).
+//
+// A MANAGER-only verb, and the one case where a manager's zero-push-access is not a limitation but
+// the point: a manager that watches its crew is the one most likely to notice landings/ships
+// wedging on a mangled main checkout, and it CANNOT fix it itself (it has no git access to the
+// xource, by design). What it can do is raise a request a human decides — exactly the shape of
+// `zee suggest-done` / `zee prod`. A WORKER is refused: resetting the main checkout is a
+// project-wide act, not a per-xell one, and the request must never be a way for a zee to blow away
+// a checkout somebody else is mid-landing into.
+export async function selfXourceClean(xell, { reason = null } = {}) {
+  const guard = requireManager(xell, 'xource-clean');
+  if (guard) return guard;
+  const why = String(reason || '').trim();
+  if (!why) {
+    return { ok: false, error: 'xource-clean needs --reason "why" — it is the one line a human reads on the '
+      + 'card, and a request to reset the main checkout without one is a request nobody can judge.' };
+  }
+  const zee = await liveZee(xell.id);
+  const r = await requestXourceClean({ xellId: xell.id, zeeId: zee?.id || null, reason: why });
+  broadcast('xell', { id: xell.id });
+  return r;
+}
+
+// ── `zee mint-manager` — a ROUTER asking a human for ANOTHER MANAGER (149) ────────────────────
+//
+// The one door in the fleet through which a manager can be asked for by an agent, and it is a door
+// onto a human's screen rather than onto a spawn: the QUEENZEE mints on approval (lib/manager-mint.js
+// → manager-spawn.createManagerZee, the same call the console's own button makes). Refused for
+// everyone but a ROUTER, and refused BY ROUTER-NESS rather than by key, so a project's own router
+// persona (a descendant of `router`) asks with the same verb and nothing else gains it:
+//   • a WORKER is refused by requireManager, as with every crew verb;
+//   • a crew-running MANAGER is refused here — it already has hands (`zee assign`), and a manager
+//     asking for a peer manager is the fleet growing sideways by another road. The router is the only
+//     zee that sees a raw prompt before anyone has sized it, which is the whole basis of the ask.
+export async function selfMintManager(xell, { reason = null, task = null, harness = null,
+                                              title = null, withdraw = false, status = false } = {}) {
+  const guard = requireManager(xell, 'mint-manager');
+  if (guard) return guard;
+  const { isRouterXell } = await import('../lib/router.js');
+  if (!(await isRouterXell(xell))) {
+    return { ok: false, status: 'refused', error:
+      '`zee mint-manager` is the ROUTER\'s verb. A manager already has hands — deploy one of your crew '
+      + 'through the board (`zee assign --item <id> --task "…"`). Asking for a PEER manager is the '
+      + 'router\'s ask because it is the zee that sees a prompt before anyone has sized it; if you '
+      + 'genuinely believe this project needs another manager, say so with `zee tend --reason "…"` and '
+      + 'let a human decide it directly.' };
+  }
+  const { requestManagerMint, withdrawManagerMint, managerMintStatusFor } =
+    await import('../lib/manager-mint.js');
+  if (status) return { ok: true, request: await managerMintStatusFor(xell.id) };
+  if (withdraw) {
+    const w = await withdrawManagerMint({ xellId: xell.id, reason });
+    broadcast('xell', { id: xell.id });
+    return w;
+  }
+  const zee = await liveZee(xell.id);
+  const r = await requestManagerMint({ xellId: xell.id, zeeId: zee?.id || null,
+                                       reason, task, harnessKey: harness, title });
+  broadcast('xell', { id: xell.id });
+  return r;
+}
+
 // The one guard every crew verb shares: these are MANAGER verbs, and a worker calling one gets told
 // what it is instead of a 404 (a worker that "discovers" a manager verb should learn the shape of
 // the system, not that it found a locked door).
@@ -1806,6 +2195,99 @@ function requireManager(xell, verb) {
     + 'job in their own xell; dispatching, monitoring and closing out other zees belongs to a manager '
     + '(a human adds those in the console). You CAN talk to your manager, if you have one: `zee report '
     + '--message "…"` and `zee inbox`.' };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// THE MINISTER VERBS — review the queenzee's own operations, and file tickets about them.
+//
+// `zee ops` (GET /api/xell/self/ops) is the read: the queenzee's log ring, its warnings/errors,
+// every landing/ship/seed/prod-bind with how long each waited on a human, the fleet's token burn
+// and the backup ledger, in ONE digest (lib/ops-review.js — every query a SELECT). `zee ticket`
+// (POST /api/xell/self/ticket) is the only write the critique is allowed: a TICKET in the caller's
+// OWN project, which a human or a manager breaks down and takes up (docs/work-tracker.md). The
+// review can therefore never ACT on the queenzee — no gate opens, no container moves, no config
+// changes. That wall is the design: criticism flows through the work tracker, decisions stay with
+// humans and managers.
+//
+// MANAGER-only, like every fleet-reach verb: the digest spans projects (the queenzee is one
+// orchestrator), and fleet visibility is precisely the manager trade (docs/manager-zees.md). The
+// `queenzee-minister` harness (migration 120) is the persona built on these two verbs.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/xell/self/ops — `zee ops` (MANAGER only).
+export async function selfOps(xell, { hours = 24, logs = 300 } = {}) {
+  const guard = requireManager(xell, 'ops');
+  if (guard) return guard;
+  const { opsDigest } = await import('../lib/ops-review.js');
+  const digest = await opsDigest({ hours, logN: logs });
+  logline('self', `${xell.slug} pulled the ops digest (${digest.window_hours}h window, `
+    + `${digest.alerts.n} alert line${digest.alerts.n === 1 ? '' : 's'})`);
+  return digest;
+}
+
+// POST /api/xell/self/ticket — `zee ticket` (MANAGER only). The project comes from the TOKEN-resolved
+// xell, never from the body — the same "which project? unaskable" rule as every other self verb.
+export async function selfTicketCreate(xell, { title = null, body = null, kind = null,
+                                               priority = null, labels = null, notify = false } = {}) {
+  const guard = requireManager(xell, 'ticket');
+  if (guard) return guard;
+  if (!String(title || '').trim()) {
+    return { ok: false, error: 'a ticket needs --title "…" — one line a human can judge on the board. '
+      + 'Put the evidence (log lines, request ids, ages) in --body.' };
+  }
+  const { createTicket, ticketManagers, notifyManagerOfTicket } = await import('../lib/tickets.js');
+  let ticket;
+  try {
+    ticket = await createTicket({
+      project_id: xell.project_id, title, body,
+      kind: kind || null, priority: priority ?? null,
+      labels: Array.isArray(labels) ? labels : null,
+      reporter: `zee:${xell.slug}`,
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
+  logline('self', `${xell.slug} filed ticket ${ticket.code} "${ticket.title}"`);
+
+  // --notify: hand the ticket to the project's OTHER live managers (the minister files it, a crew
+  // lead takes it up). Best-effort per manager — a dead inbox must not fail the filing.
+  const notified = [];
+  if (notify) {
+    try {
+      const { managers = [] } = (await ticketManagers(ticket.id)) || {};
+      for (const m of managers) {
+        if (m.xell_id === xell.id) continue;   // not to itself — it already knows
+        try {
+          await notifyManagerOfTicket(ticket.id, { xellId: m.xell_id, by: `zee:${xell.slug}` });
+          notified.push(m.slug);
+        } catch { /* that one manager is gone/asleep — the ticket itself stands */ }
+      }
+    } catch { /* the picker failing must not fail the filing either */ }
+  }
+  return {
+    ok: true, ticket, notified,
+    message: `Filed ${ticket.code} (${ticket.ref}) in your project's tracker`
+      + (notified.length ? `, and notified manager${notified.length === 1 ? '' : 's'} ${notified.join(', ')}` : '')
+      + '. A human (or a manager) breaks it down into work items from there — filing it opens no gate '
+      + 'and changes nothing else.',
+  };
+}
+
+// GET /api/xell/self/tickets — `zee ticket --list` (MANAGER only): the caller's own project's
+// tickets, so a critic can check what is ALREADY filed before filing it again.
+export async function selfTicketList(xell, { status = null, q: search = null } = {}) {
+  const guard = requireManager(xell, 'ticket');
+  if (guard) return guard;
+  const { listTickets } = await import('../lib/tickets.js');
+  let rows;
+  try { rows = await listTickets({ projectId: xell.project_id,
+                                   status: status || undefined, q: search || undefined }); }
+  catch (e) { return { ok: false, error: e.message }; }
+  return {
+    ok: true, count: rows.length,
+    tickets: rows.map((t) => ({ id: t.id, ref: t.ref, code: t.code, title: t.title, kind: t.kind,
+                                status: t.status, priority: t.priority, reporter: t.reporter,
+                                labels: t.labels, created_at: t.created_at,
+                                work_items: t.work_items_count, open_work_items: t.open_work_items_count })),
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1884,6 +2366,189 @@ export async function selfWork(xell, { board = false, item = null } = {}) {
   };
 }
 
+// ── CUTTING THE PLAN: `zee work --new` · `zee breakdown` · `zee unassign` (MANAGER only) ─────
+//
+// A manager's own manual orders it to break a ticket down into work items BEFORE it dispatches
+// anybody — and until these three verbs existed it had no way to create one. `zee work` READ the
+// plan and `zee assign` deployed onto an item somebody else had cut, so a manager wanting a card
+// had to ask a human to type it into the console. The same hole on the way back out: when a worker
+// died at spawn its card stayed locked to the dead xell, `zee assign` refused the replacement with
+// "unassign it first", and no manager verb could.
+//
+// These create and MOVE PLAN ROWS ONLY. Nothing here dispatches, lands, ships, marks a xell done or
+// touches a gate — cutting a card is not a decision about anybody's work, which is exactly why a
+// manager may do it unaided. The project comes from the TOKEN like every other self verb, so a
+// parent, ticket or item in another project is refused BY NAME rather than quietly created in the
+// caller's own.
+
+// POST /api/xell/self/work/new — `zee work --new` (MANAGER only): ONE work item in the caller's own
+// project. It answers with the item, and the CLI prints the ID first, because the next thing a
+// manager does with a fresh card is `zee assign --item <id>`.
+export async function selfWorkNew(xell, { title = null, body = null, kind = null, parent = null,
+                                          ticket = null, priority = null, status = null } = {}) {
+  const guard = requireManager(xell, 'work --new');
+  if (guard) return guard;
+  if (!String(title || '').trim()) {
+    return { ok: false, error: 'a work item needs --title "…" — the one line that becomes the card. '
+      + 'The detail (what to change, how to verify it) goes in --body, and a worker is briefed from both.' };
+  }
+  const { createWorkItem } = await import('../lib/work-items.js');
+  const { getItem } = await import('../lib/work-assign.js');
+  const { resolveTicket } = await import('../lib/tickets.js');
+
+  // A parent in another project would move the whole item there (createWorkItem inherits the
+  // parent's project). Refused by name, before anything is written.
+  let parentId = null;
+  if (parent) {
+    let row;
+    try { row = await getItem(parent); }
+    catch (e) { return { ok: false, error: e.message }; }
+    if (row.project_id !== xell.project_id) {
+      return { ok: false, status: 'refused', error:
+        `work item ${parent} ("${row.title}") is in another project. You cut YOUR project's plan only.` };
+    }
+    parentId = row.id;
+  }
+  let ticketRow = null;
+  if (ticket) {
+    try { ticketRow = await resolveTicket(ticket, { projectId: xell.project_id }); }
+    catch (e) { return { ok: false, error: e.message }; }
+    if (!ticketRow) {
+      return { ok: false, status: 'refused', error:
+        `no ticket ${ticket} in your project — \`zee ticket --list\` shows what is filed. A ticket is `
+        + 'per project, so a code from another project names nothing here.' };
+    }
+  }
+
+  let item;
+  try {
+    item = await createWorkItem({
+      project_id: xell.project_id, parent_id: parentId, title, body,
+      kind: kind || 'task', ticket_id: ticketRow?.id || null,
+      priority: priority ?? null, status: status || null, actor: xell.slug });
+  } catch (e) { return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message }; }
+  logline('self', `${xell.slug} cut work item "${item.title}" (${item.kind}, ${item.status})`
+    + `${ticketRow ? ` for ${ticketRow.code}` : ''}`);
+  return {
+    ok: true, item, id: item.id, ticket: ticketRow ? { id: ticketRow.id, code: ticketRow.code } : null,
+    message: `Created "${item.title}" (${item.kind}, ${item.status}) — ${item.id}. Deploy a worker for it `
+      + `with \`zee assign --item ${item.id} --task "…"\`, or hang children off it with `
+      + `\`zee work --new --parent ${item.id} --title "…"\`. Creating a card dispatches nobody.`,
+  };
+}
+
+// The ONLY keys a breakdown item may carry. breakdownTicket spreads each entry straight into
+// createWorkItem, whose input surface is wider than this verb advertises — and the file is untrusted
+// input, so the extra keys were a mass assignment. `xell_id` was the sharp one: an item naming a LIVE
+// worker in ANOTHER project produced a card in the caller's own project that that worker then owned
+// (itemForXell resolves by work_item.xell_id first, so its `zee work` answered with this card and its
+// `zee item` wrote to it), with no 'assigned' event to say who did it and none of assignWorkItem's
+// guards run — not the project check, not "one zee, one item", not the manager-target refusal.
+// Putting a zee on a card is `zee assign`, which does all of that; this verb cuts PLAN.
+//
+// `status`/`progress` are out for the same reason in miniature: a card born 'working' at 90% has no
+// status event behind it, so its own history denies it ever moved. A card is born queued.
+const BREAKDOWN_ITEM_KEYS = ['title', 'kind', 'body', 'parent_id', 'ref', 'priority', 'starts_on', 'due_on'];
+
+// POST /api/xell/self/work/breakdown — `zee breakdown` (MANAGER only): a whole TREE from a ticket,
+// in ONE call. This is lib/tickets.js's breakdownTicket verbatim (refs and all — a later item may
+// name an earlier item's `ref` as its parent), never a second tree builder: one transaction, so
+// either the whole plan exists or the ticket is untouched.
+export async function selfWorkBreakdown(xell, { ticket = null, items = null } = {}) {
+  const guard = requireManager(xell, 'breakdown');
+  if (guard) return guard;
+  if (!ticket) {
+    return { ok: false, error: 'breakdown needs --ticket <code|id> (`zee ticket --list` shows yours)' };
+  }
+  if (!Array.isArray(items) || !items.length) {
+    return { ok: false, error: 'breakdown needs --items <file.json>: a non-empty JSON array of '
+      + `{${BREAKDOWN_ITEM_KEYS.map((k) => (k === 'title' ? k : `${k}?`)).join(', ')}}. A later item `
+      + 'may name an earlier one\'s "ref" as its parent_id, so one call cuts a whole tree.' };
+  }
+  // Refused BY NAME and BEFORE the transaction, so a file with a stray key costs the error message
+  // and nothing else — the same contract as a bad `ref`.
+  for (const [i, spec] of items.entries()) {
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+      return { ok: false, status: 'refused', error:
+        `item ${i + 1} is not an object — --items is a JSON array of {${BREAKDOWN_ITEM_KEYS.join(', ')}}.` };
+    }
+    const extra = Object.keys(spec).filter((k) => !BREAKDOWN_ITEM_KEYS.includes(k));
+    if (extra.length) {
+      return { ok: false, status: 'refused', error:
+        `item "${spec.title || `#${i + 1}`}" carries ${extra.map((k) => `"${k}"`).join(', ')}, which `
+        + `\`zee breakdown\` does not take. An item may carry ${BREAKDOWN_ITEM_KEYS.join(', ')} — it cuts `
+        + 'PLAN. Putting a zee on a card is `zee assign --item <id> --task "…"` (it checks the project, '
+        + 'refuses a zee that is already on something, and logs who did it); moving one is `zee item '
+        + '<id> --status <s>`. Nothing was created.' };
+    }
+  }
+  const { resolveTicket, breakdownTicket } = await import('../lib/tickets.js');
+  let ticketRow;
+  try { ticketRow = await resolveTicket(ticket, { projectId: xell.project_id }); }
+  catch (e) { return { ok: false, error: e.message }; }
+  if (!ticketRow) {
+    return { ok: false, status: 'refused', error:
+      `no ticket ${ticket} in your project — you break down YOUR project's tickets only `
+      + '(`zee ticket --list`).' };
+  }
+  let out;
+  try { out = await breakdownTicket(ticketRow.id, { items, actor: xell.slug }); }
+  catch (e) { return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message }; }
+  // breakdownTicket answers null when the ticket is gone by the time it looks (it re-reads inside its
+  // own transaction). Narrow race, but reading out.count off null made it a TypeError the route
+  // rendered as "Cannot read properties of null" — a sentence about the ticket is the honest answer.
+  if (!out) {
+    return { ok: false, status: 'refused', error:
+      `${ticketRow.code} was deleted while this breakdown was running — nothing was created. `
+      + '`zee ticket --list` shows what is filed now.' };
+  }
+  logline('self', `${xell.slug} broke ${ticketRow.code} down into ${out.count} work item(s)`);
+  return {
+    ok: true, ...out,
+    message: `${ticketRow.code} is now ${out.count} work item(s). It is ADDITIVE — running it again cuts a `
+      + 'SECOND set rather than reconciling the first. Deploy a worker for one with `zee assign --item <id>`.',
+  };
+}
+
+// POST /api/xell/self/work/unassign — `zee unassign` (MANAGER only): take the zee off a card.
+// The verb the "unassign it first" refusal has been telling managers to run since deploy existed.
+// The STATUS is deliberately left alone (work that happened, happened) — this frees the card, it
+// does not un-do it, and it neither reaps nor touches the xell that was on it.
+export async function selfWorkUnassign(xell, { item = null, reason = null } = {}) {
+  const guard = requireManager(xell, 'unassign');
+  if (guard) return guard;
+  if (!item) return { ok: false, error: 'unassign needs --item <work-item-id> (see `zee work`)' };
+  const { unassignWorkItem, getItem } = await import('../lib/work-assign.js');
+  let row;
+  try { row = await getItem(item); }
+  catch (e) { return { ok: false, error: e.message }; }
+  if (row.project_id !== xell.project_id) {
+    return { ok: false, status: 'refused', error:
+      `work item ${row.id} ("${row.title}") is in another project. You move YOUR project's plan only.` };
+  }
+  // IS THE ZEE STILL ALIVE? The case this verb was built for is a xell that died at spawn, so it must
+  // stay ONE call for that — but it detaches a xell that is mid-turn just as readily, and that worker
+  // then finds `zee work` blank and `zee item` refused, with nobody having told it. Not refused: SAID.
+  // Read BEFORE the unassign, because afterwards the link that names the xell is gone.
+  const wasOn = row.xell_id ? await one(`SELECT slug, status FROM xell WHERE id=$1`, [row.xell_id]) : null;
+  const live = !!wasOn && wasOn.status !== 'retired';
+  let out;
+  try { out = await unassignWorkItem(row.id, { actor: xell.slug, reason: reason || null }); }
+  catch (e) { return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message }; }
+  const free = `The card is free: \`zee assign --item ${row.id} --task "…"\` will now deploy a worker `
+    + 'onto it.';
+  return {
+    ok: true, ...out, xell_was_live: out.already ? false : live,
+    message: out.already || !wasOn ? `${out.message} ${free}`
+      : live
+        ? `${out.message} ${free} ⚠ ${wasOn.slug} is still LIVE (status: ${wasOn.status}) — you have `
+          + 'detached a card from a RUNNING zee. It is not reaped and its work is untouched, but from '
+          + 'now on its `zee work` shows no item and its `zee item --status …` is refused, and it was '
+          + `not told: \`zee say --to ${wasOn.slug} --message "…"\` if it needs to know.`
+        : `${out.message} ${free} ${wasOn.slug} is ${wasOn.status}, so no running zee lost its card.`,
+  };
+}
+
 // POST /api/xell/self/work/assign — `zee assign` (MANAGER only).
 // Deploys a WORKER for a work item, through the SAME dispatch path `zee dispatch` uses: the worker is
 // still stamped manager_xell_id, still seated next to its manager, still gets its own throwaway db,
@@ -1891,7 +2556,8 @@ export async function selfWork(xell, { board = false, item = null } = {}) {
 // the BRIEF: it is built from the item itself (title, body, ancestors, ticket, dates) plus whatever
 // extra the manager types, so a well-cut plan briefs a worker for free.
 export async function selfWorkAssign(xell, { item = null, task = null, model = null, mode = null,
-                                             harness = null, title = null } = {}) {
+                                             harness = null, title = null, visual_verify = false,
+                                             langfuse_tracking = null } = {}) {
   const guard = requireManager(xell, 'assign');
   if (guard) return guard;
   if (!item) return { ok: false, error: 'assign needs --item <work-item-id> (see `zee work`)' };
@@ -1905,7 +2571,8 @@ export async function selfWorkAssign(xell, { item = null, task = null, model = n
   }
   try {
     const out = await deployWorkItem(row.id, {
-      task, model, mode, harness, title, actor: xell.slug, managerXellId: xell.id });
+      task, model, mode, harness, title, visual_verify, langfuse_tracking,
+      actor: xell.slug, managerXellId: xell.id });
     return {
       ok: true, ...out,
       message: `${out.message} It reports to you (\`zee zees\`, \`zee say --to ${out.xell.slug} …\`), it `
@@ -1991,7 +2658,8 @@ export async function selfWorkItem(xell, { id = null, status = null, progress = 
 // The persona fields a manager may set. Everything else is refused BY NAME rather than ignored: a
 // silently-dropped `is_law_core: true` reads to the caller exactly like a granted one.
 const MANAGER_HARNESS_FIELDS = ['label', 'summary', 'glyph', 'personality', 'skills', 'memory',
-                                'parent', 'enabled', 'avatar_svg'];
+                                'parent', 'enabled', 'avatar_svg',
+                                'upload_conversations_on_done', 'enable_reflection'];
 
 // Resolve a harness key the CALLER is allowed to touch, or the refusal explaining why not. The order
 // of the checks is the order a zee needs to hear them in: does it exist, is it the fleet's, is it

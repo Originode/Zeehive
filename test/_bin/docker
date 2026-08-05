@@ -37,6 +37,25 @@ if [ -n "${DOCKER_FAKE_CXELL_VERDICT:-}" ]; then
   [ "$DOCKER_FAKE_CXELL_VERDICT" = "NONE" ] || printf '%s\n' "$DOCKER_FAKE_CXELL_VERDICT"
   exit "${DOCKER_FAKE_CXELL_EXIT:-0}"
 fi
+# RESUMED-TURN OUTPUT simulation: the resume path (nudgeCxellZee) attaches no stream parser, so what
+# the queenzee gets back is the raw stdout of `docker exec … claude --bare -p --output-format
+# stream-json` — which is how a RESUMED turn's own death (a second 429, say) is seen at all. Emitted
+# only for the shell exec, never for the `cat /etc/environment` read that precedes it, so a test can
+# state the turn's ending without corrupting the token read. Pair with DOCKER_FAKE_EXEC_EXIT for a
+# CLI that also exits non-zero.
+if [ -n "${DOCKER_FAKE_STREAM_JSON:-}" ]; then
+  for a in "$@"; do
+    if [ "$a" = "-lc" ]; then printf '%s\n' "$DOCKER_FAKE_STREAM_JSON"; fi
+  done
+fi
+# EXEC-FAILS simulation: the cage is gone / the daemon refuses, so `dk` REJECTS (a non-zero exit is
+# the answer for nearly every call it makes). A caller that marks state before the exec has to put
+# that state back when the exec never runs — with no knob for it, "the resume died on the way out"
+# is a branch a test can only assert by deleting docker from PATH for the whole process.
+if [ -n "${DOCKER_FAKE_EXEC_EXIT:-}" ]; then
+  echo "fake docker: refusing (DOCKER_FAKE_EXEC_EXIT=${DOCKER_FAKE_EXEC_EXIT})" >&2
+  exit "$DOCKER_FAKE_EXEC_EXIT"
+fi
 for a in "$@"; do
   if [ "$a" = "/etc/environment" ]; then
     printf 'ANTHROPIC_AUTH_TOKEN=sk-ant-fake-tok\nZEEHIVE_XELL_TOKEN=fake-ident-tok\n'

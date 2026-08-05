@@ -30,6 +30,9 @@ const mgr = {
   db_coupling: 'db-prod-readonly', hive_status: 'occ-working', status: 'claimed',
   head_commit: 'deadbeefcafe0000', created_at: new Date(Date.now() - 3600e3).toISOString(),
   viewer_kind: 'ssh-terminal', viewer_url: 'ssh://x', task_id: 't1',
+  // the manager's DIRECTIVE — the programme it was given (task_text on the fleet row). Its FIRST
+  // line is what distinguishes one manager from another at a glance.
+  task_text: '# Direct the crew\nShip the release, one well-briefed worker at a time.',
   stack: [{ role: 'db', name: 'db_m', health: 'up' }, { role: 'server', name: 'srv_m', health: 'up' }],
 };
 const crew = [
@@ -58,6 +61,11 @@ ok(managerCard({ ...mgr, db_coupling: 'db-isolated' }, []).prod === null,
    'a manager with no prod bind claims none');
 ok(/no crew yet/.test(managerCard(mgr, []).crew), 'an empty crew is stated, not left blank');
 ok(!JSON.stringify(card).includes('deadbeef'), 'the card carries NO head commit — a manager lands nothing');
+
+// the DIRECTIVE — what tells one manager apart from another. First line only, markdown '#' stripped.
+ok(card.directive === 'Direct the crew', `the card carries the manager's directive, first line (${card.directive})`);
+ok(managerCard({ ...mgr, task_text: '  \n' }, crew).directive === null, 'a blank brief yields no directive line');
+ok(managerCard({ ...mgr, task_text: null }, crew).directive === null, 'a manager with no brief yields none');
 
 // ── 3. the bloom: petals 5/6 are CREW and PROD·AGE, not the two git facets ───
 const f = managerFacets(mgr, [], crew);
@@ -115,8 +123,10 @@ ok(/isManagerXell\(hx\.x\)[\s\S]{0,200}drawManagerHex\(/.test(src),
    'the honeycomb routes a manager to drawManagerHex instead of the two-half work-cell card');
 ok(!/\bdiff\b/.test(mgrHex) && !/\bsha\b/.test(mgrHex),
    'the manager hexagon draws neither a diffstat nor a commit head');
-ok(/drawAvatarDisc\(/.test(mgrHex) && /drawAvatarDisc\(/.test(body('drawHarnessBadge')),
-   'it wears its persona through the SAME disc the harness badge draws (one implementation)');
+// One implementation, one level up since the provider became the badge: both a manager hexagon and
+// a harness cell go through drawZeeAvatar (coin + strap + tool pip), which is what calls the disc.
+ok(/drawZeeAvatar\(/.test(mgrHex) && /drawZeeAvatar\(/.test(body('drawHarnessBadge')),
+   'it wears its persona through the SAME badge the harness cell draws (one implementation)');
 ok(/setLineDash\(\[5, 3\]\)/.test(mgrHex), 'and sits on a DASHED seat — the harness badge’s "not a work-cell" tell');
 ok(/hiveStatusLabel\(x\)/.test(mgrHex), 'it still carries the status pill every hexagon carries');
 ok(/const diffPetal = \(x, cell\) => \(isManagerXell\(x\) \? null/.test(src),
@@ -130,7 +140,7 @@ ok(/if \(x && diffPetal\(x, f\.cell\)\) onAction\?\.\(DIFF_PETAL\[f\.cell\]/.tes
 // bottom of the card. So the drawing code is actually EXECUTED here, at every size branch, against a
 // stub 2D context that records what was painted — and the record is asserted.
 function recorder() {
-  const rec = { text: [], dash: [], arcs: [], ops: [] };
+  const rec = { text: [], dash: [], arcs: [], ops: [], fills: [] };
   const noop = (name) => (...a) => { rec.ops.push(name); return a; };
   const self = {
     rec,
@@ -139,7 +149,11 @@ function recorder() {
     beginPath: noop('beginPath'), closePath: noop('closePath'), moveTo: noop('moveTo'),
     lineTo: noop('lineTo'), rect: noop('rect'), roundRect: noop('roundRect'),
     strokeRect: noop('strokeRect'), ellipse: noop('ellipse'), bezierCurveTo: noop('bezierCurveTo'),
-    fill: noop('fill'), stroke: noop('stroke'), clip: noop('clip'), clearRect: noop('clearRect'),
+    // the harness COSTUME (a necktie, wings, a hammer — hive/harnessGear.js) is drawn as paths, in
+    // the harness's own colour, so the fill colour is now part of what this record has to hold
+    quadraticCurveTo: noop('quadraticCurveTo'),
+    fill() { rec.ops.push('fill'); rec.fills.push(self.fillStyle); },
+    stroke: noop('stroke'), clip: noop('clip'), clearRect: noop('clearRect'),
     setTransform: noop('setTransform'), translate: noop('translate'), scale: noop('scale'),
     drawImage: noop('drawImage'),
     arc(cx, cy, r) { rec.ops.push('arc'); rec.arcs.push({ cx, cy, r }); },
@@ -166,14 +180,22 @@ const said = big.text.map((t) => t.t).join(' | ');
 ok(big.text.some((t) => t.t === '⬢ wise-cove'), `the full card names the manager (${said})`);
 ok(big.text.some((t) => /3 crew/.test(t.t)) && big.text.some((t) => /1 working · ⚑ 1 waiting/.test(t.t)),
    'and paints the crew count and the WHOLE activity line — it shrinks to fit, it does not clip');
+ok(big.text.some((t) => /📜 Direct th/.test(t.t)), 'the seam leads with the directive — what this manager is FOR');
+ok(big.text.some((t) => /⬡ 3 crew/.test(t.t)), 'the crew count survives beside it');
+ok(!big.text.some((t) => /^manager ·/.test(t.t)), 'the redundant word "manager" is replaced by the directive');
 ok(big.text.some((t) => t.t === 'working'), 'and the hive status pill');
 ok(big.text.some((t) => /read-only/.test(t.t)), 'and its read-only hold on production');
-ok(big.text.some((t) => t.t === '🧭'), 'and the persona glyph of the harness it wears');
+// It used to paint the harness's GLYPH on the disc. It now paints the harness's COSTUME around the
+// coin — a Manager wears a necktie — in the harness's own colour. Same fact, better drawing.
+ok(big.fills.includes('#9b8cff'), 'and the costume of the harness it wears, in that harness colour');
 ok(!big.text.some((t) => /^[0-9a-f]{7,}$/i.test(t.t)), 'and NOTHING that looks like a commit sha');
 ok(!big.text.some((t) => /[+−]\d/.test(t.t)), 'and no diffstat');
 ok(big.dash.includes('5,3'), 'the seat is stroked dashed — a persona cell, not a work-cell');
 ok(big.text.every((t) => Math.abs(t.y - 200) <= 70), 'every line it paints stays inside the hexagon');
-ok(big.arcs.some((a) => Math.abs(a.r - 70 * 0.24) < 0.01), 'the persona disc is drawn at the badge radius');
+// 0.20, not the old 0.24: the disc gave up a sliver so the COSTUME it wears (which reaches
+// GEAR_EXTENT × the coin — a necktie hangs below it) has room inside the seat without sitting on
+// the identity line.
+ok(big.arcs.some((a) => Math.abs(a.r - 70 * 0.20) < 0.01), 'the persona disc is drawn at the badge radius');
 
 const mid = paint(mgr, 40);
 ok(mid.text.some((t) => t.t === '⬢ wise-cove') && mid.text.some((t) => /×3/.test(t.t)),

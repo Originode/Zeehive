@@ -88,6 +88,11 @@ try {
   const mgr = await mkXell(P1, `zt-mgr-${tag}`, 'manager');
   const w1 = await mkXell(P1, `zt-w1-${tag}`);
   const w2 = await mkXell(P2, `zt-w2-${tag}`);
+  // The manager's free-form `zee dispatch` is the ROUTER's verb now (the board is the deployment
+  // path); the dispatch-guard assertions below run through the preserved router path, so the mgr
+  // xell wears the router harness.
+  await q(`UPDATE xell SET harness_id=(SELECT id FROM harness WHERE key='router') WHERE id=$1`, [mgr.id]);
+  Object.assign(mgr, await one(`SELECT * FROM xell WHERE id=$1`, [mgr.id]));
 
   // ── 1. the DEFAULT is global, and nothing was migrated off it ──────────────
   console.log('\n── NULL project_id = system-wide, and that is still the default ──');
@@ -378,13 +383,19 @@ try {
   ok(!offered.includes('manager'), 'nor a manager persona (054, unchanged)');
 
   const disp = readFileSync('web/src/Dispatch.jsx', 'utf8');
+  const app = readFileSync('web/src/App.jsx', 'utf8');
   const setup = readFileSync('web/src/ProjectSetup.jsx', 'utf8');
-  ok(/getHarnesses\(manager \? 'manager' : 'worker', projectId\)/.test(disp),
-     'the dispatch composer asks for ITS PROJECT\'S list, so a foreign persona is never a button');
+  // The WORKER personas are the console's prompt BUTTONS now (one per harness — App.jsx), and the
+  // composer's own picker is the manager's. Both ask for their project's list, so a foreign persona
+  // is never a button anywhere.
+  ok(/getHarnesses\('worker', pid\)/.test(app),
+     "the prompt buttons are built from ITS PROJECT'S worker personas, so a foreign one is never a button");
+  ok(/getHarnesses\('manager', projectId\)/.test(disp),
+     "and the manager composer's picker asks for its project's manager personas");
   ok(/getHarnesses\('worker', project\.id\)/.test(setup),
      "and so does the spawn template's default-harness picker");
-  ok(/scope === 'project'/.test(disp) && /scope === 'project'/.test(setup),
-     'and both mark a project-scoped persona as one');
+  ok(/scope === 'project'/.test(disp) && /scope === 'project'/.test(app) && /scope === 'project'/.test(setup),
+     'and all three mark a project-scoped persona as one');
 } finally {
   await cleanup();
   await pool.end().catch(() => {});

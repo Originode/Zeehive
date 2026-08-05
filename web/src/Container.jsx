@@ -22,6 +22,23 @@ const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a
 export const isBuildable = (c) => BUILDABLE.has(c.role) && !!c.owner_xell_id;
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 
+// Best-effort OS-clipboard write: the async API where allowed (secure ctx / localhost), else a
+// throwaway textarea + execCommand for an insecure http origin (the ZeeTerminal pattern — the
+// console is usually served over plain LAN http, where navigator.clipboard is undefined). Never
+// throws; resolves true when the copy landed, false when nothing could be written.
+async function toClipboard(t) {
+  try {
+    if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(t); return true; }
+  } catch { /* fall through to the textarea path */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    const ok = document.execCommand('copy'); document.body.removeChild(ta);
+    return ok;
+  } catch { return false; }
+}
+
 // Why a container is busy right now (null = idle): 'building' (its own health state), or a db
 // job — 'backup' (dumping the source) / 'restore' (loading a backup into it), from busy_since/op.
 export function busyReason(c) {
@@ -123,6 +140,43 @@ export function buildHost(c) {
   return { run, build, split: !!c.build_ctx && c.build_ctx !== run };
 }
 
+// ── database identity on a db chip ─────────────────────────────────────────────────────────────
+// A db chip says WHICH database it is: the URL it answers at and the published port. The URL is
+// the row's recorded conn_ref when it has one, else a DSN derived from its published host:host_port
+// (the same rule lib/xell-db.js derivedTcpDsn applies everywhere else). Passwordless by design —
+// conn_refs are "parameters, not secrets". Absent both → null: a database with no address is a
+// fixable state, and a GUESSED address would point at a silent wrong database (db-dsn-needs-a-host).
+export function dbUrl(c) {
+  if (c?.role !== 'db') return null;
+  if (c.conn_ref) return c.conn_ref;
+  if (c.host && c.host_port) return `postgresql://${c.host}:${c.host_port}`;
+  return null;
+}
+
+// The port a db answers at: its recorded host_port, else the port parsed out of its conn_ref.
+export function dbPort(c) {
+  if (c?.role !== 'db') return null;
+  if (c.host_port) return c.host_port;
+  const u = dbUrl(c);
+  if (!u) return null;
+  try {
+    const p = new URL(String(u).replace(/^postgres(ql)?:/, 'http:'));
+    return p.port || null;
+  } catch { return null; }
+}
+
+// The tooltip half of the database identity: the full URL + the port, so hovering a db chip names
+// the exact database it refers to. The chip itself stays the compact box — a URL is long, and the
+// tooltip is where the full connection string fits (the row's url is empty for a db; its address
+// lives in conn_ref / host:host_port, which is what this surfaces).
+function dbTooltip(c) {
+  if (c?.role !== 'db') return '';
+  const url = dbUrl(c);
+  const port = dbPort(c);
+  if (!url && port == null) return '';
+  return `\n\ndatabase: ${url || 'no URL recorded'}${port != null ? `\nport: ${port}` : ''}`;
+}
+
 function tooltip(c, buildable, busy) {
   if (busy) return `${c.name}\n${c.tier} · ${BUSY_LABEL[busy] || 'working…'}`;
   const built = c.last_build_commit
@@ -133,7 +187,7 @@ function tooltip(c, buildable, busy) {
     ? (bh.split ? `\ncompiles on ${bh.build} → runs on ${bh.run}` : (bh.run ? `\nbuilds & runs on ${bh.run}` : ''))
     : '';
   return `${c.name}\n${c.tier} · ${c.health}${c.url ? '\n' + c.url : ''}${built}${host}`
-    + `${driftText(c)}${dataText(c)}${instancesText(c)}`;
+    + `${dbTooltip(c)}${driftText(c)}${dataText(c)}${instancesText(c)}`;
 }
 
 // onMenu  → the chip is right-clickable (context menu). Passed by BOTH the inventory and the
@@ -232,12 +286,15 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
   // "Duplicate prod" streams a fresh prod dump into THIS dev db (backup + restore in one). Guard the
   // in-flight window so a double-click can't fire two overwrites. Reset when the menu retargets.
   const [dupPending, setDupPending] = useState(false);
+  // "Copy database URL" feedback: `copied` flips the item's label to "Copied!" for a moment (the
+  // same in-menu state pattern as diffing/dupPending), reset whenever the menu retargets.
+  const [copied, setCopied] = useState(false);
   const c = menu?.c;
   const cid = c?.id;
   useEffect(() => {
     setConfirming(false); setTyped(''); setBusyAct(false); setErr(null);
     setDiffing(null); setPicking(false); setCands(null); setCandErr(null); setDupPending(false);
-    setDataing(false); setDataReady(null);
+    setDataing(false); setDataReady(null); setCopied(false);
   }, [cid]);
 
   // The reference dbs this container can be measured against, fetched the first time the picker is
@@ -339,6 +396,16 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
       setDiffing(null);
       showAlert('Check diff failed: ' + (e?.error || e?.message || e), { variant: 'error' });
     }
+  };
+
+  // Copy THIS db's connection URL to the OS clipboard. Uses the SAME dbUrl() the tooltip shows, so
+  // the menu can never offer a string that disagrees with what a hovered chip says. The item's label
+  // flips to "Copied!" on success; a failure points at the tooltip rather than silently doing nothing.
+  const copyDbUrl = async () => {
+    const t = dbUrl(c);
+    if (!t || copied) return;
+    if (await toClipboard(t)) { setCopied(true); setTimeout(() => setCopied(false), 1500); }
+    else showAlert('Copy failed — grab the URL from the chip\'s tooltip instead.', { variant: 'error' });
   };
 
   // Check this db's ROWS against the backup it was restored from. Deliberately NOT folded into
@@ -471,6 +538,18 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
         <div className="ctxsub ctxbusy-note" data-testid="shell-unavailable">
           ⌨ shell unavailable — {buildable && !c.last_build_commit ? 'build it first' : `container is ${c.health}`}
         </div>
+      )}
+
+      {/* Copy database URL: the exact connection string this db answers at (conn_ref, or the DSN
+          derived from its published host:host_port — the same dbUrl() the chip's tooltip shows). A
+          db's address lives in conn_ref, not url, so this is the quick way to grab it without
+          hunting the inventory. Hidden when no address is recorded (nothing safe to copy). */}
+      {isDb && dbUrl(c) && (
+        <button role="menuitem" data-testid="copy-db-url" disabled={copied}
+                onClick={(e) => { e.stopPropagation(); copyDbUrl(); }}>
+          📋 {copied ? 'Copied!' : 'Copy database URL'}
+          <span className="ctxsub">{dbUrl(c)}</span>
+        </button>
       )}
 
       {/* Back up now: dump THIS database to a new backup. Offered only on the PRODUCTION db chip —

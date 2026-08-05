@@ -103,7 +103,7 @@ export async function renameXellForTask(xellId, title) {
       // the first two cxell dispatches each stranded a renamed worktree this way).
       await client.query(
         `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5::int,
-                url = 'http://' || COALESCE(host(host), $6) || ':' || $5::text
+                url = 'http://' || COALESCE(host, $6) || ':' || $5::text
            WHERE owner_xell_id=$1 AND role=$7`,
         [xellId, nm.container, isProc ? null : nm.image, isProc ? null : nm.composeProject,
          port, project.dev_host_ip || 'localhost', role]);

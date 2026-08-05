@@ -25,6 +25,13 @@ export const isLiveXell = (x) => !!x && !DEAD_XELL_STATUSES.includes(String(x.st
 // hexagon is drawn as a persona. Here it is simply the end of the relation that HAS a crew.
 export const isManagerXell = (x) => x?.zee_type === 'manager';
 
+// THE ROUTER — the one non-worker, non-production cell that is also not just "a manager": the front
+// door that recomposes a human's prompt and decides dispatch (server/src/lib/router.js, migration
+// 139). It is a MANAGER for every wall a router needs (no land/ship, prod read-only), so it is not a
+// third zee_type — it is the `router` HARNESS key, which the fleet payload already carries on each
+// xell row (fleet.js harness_key). The honeycomb paints it WHITE (HiveCanvas statusColor).
+export const isRouterXell = (x) => x?.harness_key === 'router';
+
 // manager id → its LIVE crew, and worker id → the manager it reports to (only when that manager is
 // itself live — a husk manager cannot be "who this one reports to"). A dead manager's own hover still
 // gets a crew list: the manager row is vacant, but the workers it dispatched are real and running.

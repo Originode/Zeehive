@@ -21,10 +21,11 @@
 #      per-tool prompts. Falls back to a fresh session, then a login shell, so the pane (and the
 #      zee's box) stays reachable if claude exits.
 #
-# codex-cxell / kimi-code-cxell:
+# codex-cxell / kimi-code-cxell / grok-cxell:
 #   No transcript-follow (that renderer is claude-JSONL-specific) — wait for the headless run to
 #   end, then resume the session with the vendor's own resume verb (`codex resume <sid>`,
-#   `kimi --continue`) in its skip-approvals mode; same fresh-session → login-shell fallbacks.
+#   `kimi --continue`, `grok -r <sid>`) in its skip-approvals mode; same fresh-session → login-shell
+#   fallbacks.
 #
 # All claude first-run prompts (onboarding/theme/trust/bypass) are pre-answered by
 # cxell-claude-seed.mjs, so the claude path drops straight in on first open and every open.
@@ -51,7 +52,7 @@ TALK_TARGET="${TMUX_PANE:-zee}"
 # ⚠ This pattern is HEADLESS_PROC_PATTERN in server/src/lib/cxell-runtimes.js — the queenzee decides
 # "type or queue" with the same test, and the two disagreeing loses messages. The brackets match the
 # same processes while keeping the probe from matching its OWN command line (see that constant).
-live_run() { pgrep -f 'claude --bare [-]p|codex [e]xec|kimi [-]p' >/dev/null 2>&1; }
+live_run() { pgrep -f 'claude --bare [-]p|codex [e]xec|kimi [-]p|grok( -r [^ ]*)? [-]p' >/dev/null 2>&1; }
 
 # Deliver queued operator messages into whatever holds the pane now, oldest first, one Enter each.
 # Runs in the BACKGROUND for as long as the interactive session owns this pane, so a message that
@@ -153,6 +154,20 @@ case "$RUNTIME" in
     # kimi resumes by workdir, not id (headless print mode never surfaces one); --yolo because
     # the cxell is the permission system, same stance as the other runtimes
     kimi --continue --yolo || kimi --yolo
+    ;;
+  grok-cxell)
+    wait_live
+    start_talk_drain
+    # grok resumes by session id (`-r <id>`), out of ~/.grok/sessions in this cage — which is where
+    # the headless turn wrote it. ⚠ an id that is NOT there locally makes grok try to restore it
+    # from remote and sit on a device-code login prompt, so the plain `grok` fallback is reached by
+    # Ctrl-C rather than by an exit: never pass an id this cage did not produce.
+    # --always-approve because the cxell is the permission system, same stance as the others.
+    if [[ -n "$SID" ]]; then
+      grok -r "$SID" --always-approve || grok --always-approve
+    else
+      grok --always-approve
+    fi
     ;;
   *)
     if [[ -n "$SID" ]]; then

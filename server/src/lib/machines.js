@@ -15,9 +15,10 @@ import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
-import { resolveContext } from './docker.js';
+import { resolveContext, contextEndpoint, dockerPs } from './docker.js';
 import { resolveBash } from './bash.js';
 import { namingFor, sanitizeName } from './manifest.js';
+import { derivedTcpDsn } from './xell-db.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
@@ -186,6 +187,41 @@ export async function deleteMachine(id) {
   return { ok: true };
 }
 
+// Can the queenzee actually REACH this machine with the settings stored on its row? The console's
+// per-machine "check" button (Deploy tab) calls this. Two facts decide the verdict, reported
+// separately so the UI can say WHICH setting is wrong:
+//   1. context exists — the docker_ctx is configured on the queenzee's own docker CLI
+//      (contextEndpoint reads it from docker's contexts/meta, the same lookup `docker --context` uses);
+//   2. daemon reachable — `docker ps` against that context answers (HTTP for TCP contexts, the
+//      docker CLI for SSH ones). dockerPs THROWS on an unknown context too, so step 1 already
+//      narrows "wrong context" from "daemon down".
+// Pure read: never mutates docker, the context, or the machine row. Returns a result object, never
+// throws for a reachability outcome (a machine-not-found is still a throw — the row is gone).
+export async function checkMachineConnection(id) {
+  const m = await one(`SELECT * FROM machine WHERE id=$1`, [id]);
+  if (!m) throw new Error('machine not found');
+
+  let endpoint = null;
+  try {
+    endpoint = await contextEndpoint(m.docker_ctx);
+  } catch (err) {
+    // The docker_ctx itself is not configured on the queenzee — settings cannot connect.
+    return { ok: false, key: m.key, docker_ctx: m.docker_ctx, endpoint: null,
+             reachable: false, code: 'unknown-context', error: err.message };
+  }
+
+  try {
+    const t0 = Date.now();
+    const containers = await dockerPs(m.docker_ctx, 15000);
+    return { ok: true, key: m.key, docker_ctx: m.docker_ctx, endpoint,
+             reachable: true, container_count: containers.size, latency_ms: Date.now() - t0 };
+  } catch (err) {
+    // The context resolves but the daemon does not answer — the setting is right, the host is not.
+    return { ok: false, key: m.key, docker_ctx: m.docker_ctx, endpoint,
+             reachable: false, code: 'unreachable', error: err.message };
+  }
+}
+
 // Live DEV xells on a machine, ACROSS every project — max_xells is a machine-wide cap (the host
 // only has so much muscle, whoever's xells they are). ready + claimed + working all count; only
 // retired ones and production don't. Counted through the server container because that is the
@@ -325,7 +361,26 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
       if (!res?.ok) throw new Error(res?.reason || (r.stderr || 'provision-xell-db.sh failed').slice(-300));
       port = Number(res.port) || 0;
     }
-    const conn = `postgresql://${dbUser}@${host}:${port || 5432}/${dbName}`;
+    // FAIL CLOSED WHEN NO HOST IS KNOWN. This used to interpolate `host` straight into the string,
+    // and `host` is `m.host_ip || project.dev_host_ip || config.devHostIp` — all three of which can
+    // be null. The result was a conn_ref of `postgresql://zeehive@null:32772/zeehive`, which is not
+    // a broken address so much as a POISONED one: it is stored on the container row, copied into
+    // every xell's .zeehive.env as DATABASE_URL, and it fails as `getaddrinfo ENOTFOUND null` — in
+    // the app tier, in the tests, and inside a cage where a zee has no way to see where it came
+    // from. (Found from inside a cxell on 2026-08-03: a dev xell whose server container could not
+    // boot, on a db that was listening the whole time.)
+    //
+    // derivedTcpDsn is the function that already owns this rule ("no address is a fixable state, a
+    // guessed one is a silent wrong database") and it returns null rather than compose one. Same
+    // rule here, and the same one prod-readonly.js decideReaderAddress applies for prod: no host →
+    // no conn_ref, and a line saying exactly which of the three places to fill it in.
+    const conn = derivedTcpDsn({ host, host_port: port || 5432 }, { user: dbUser, name: dbName });
+    if (!conn) {
+      logline('machine', `!!! dev db ${name} on ${m.key} has NO reachable host address — machine.host_ip, `
+        + `project.dev_host_ip and DEV_HOST_IP are all empty. Recording the row with NO conn_ref rather `
+        + `than a "null" host: a poisoned DSN reaches every xell on this db as its DATABASE_URL. Set the `
+        + `machine's host_ip (Deploy sites / machines) and re-provision.`);
+    }
     const row = await one(
       `INSERT INTO container (project_id, role, tier, isolation, name, image_tag, docker_ctx, host,
                               host_port, internal_port, conn_ref, health)

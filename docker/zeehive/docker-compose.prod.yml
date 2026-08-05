@@ -117,7 +117,13 @@ services:
       PROVISION_MODE: ${ZEEHIVE_CTR_PROVISION_MODE:-real}   # worktrees are real here — they live
                                                             # on the container's own /repos volume
       ZEEHIVE_CTX_UGREEN: tcp://10.1.0.18:2375   # remote contexts, created by the entrypoint
-      ZEEHIVE_CTX_MARDALE: tcp://10.2.0.16:2375
+      # MARDALE is overridable via docker/zeehive/.env — e.g. set it to the SSH endpoint when the
+      # LAN route to 10.2.0.16 is down (docs/onboard-mardale-prod-alt.md → Failover). TCP is the
+      # default so prod auto-recovers when the LAN returns.
+      ZEEHIVE_CTX_MARDALE: ${ZEEHIVE_CTX_MARDALE:-tcp://10.2.0.16:2375}
+      # Alt path to the SAME Mardale NAS: SSH through Cloudflare Access (works off-LAN).
+      # CLI-only (lib/docker.js refuses ssh:// over the HTTP API); see docs/onboard-mardale-prod-alt.md
+      ZEEHIVE_CTX_MARDALE_ALT: ${ZEEHIVE_CTX_MARDALE_ALT:-ssh://mnrevelo@ssh.omnibiz.express}
       REPOS_DIR: /repos                    # clone-from-GitHub destination default
       # Self-onboard on a fresh meta-DB (lib/self-onboard.js): where ZEEHIVE clones ITSELF from.
       # The repo is private — put ZEEHIVE_GITHUB_TOKEN in docker/zeehive/.env (gitignored) once
@@ -142,6 +148,11 @@ services:
       # bootstrap; see the identity rule in the header.
       CXELL_IMAGE: ${CXELL_IMAGE:-ghcr.io/originode/zeehive-zee-agent:latest}
       CXELL_API_BASE: http://zeehive_server:4700
+    # host-gateway for the Langfuse plugin: the queenzee reaches the langfuse stack (published on
+    # the HOST by docker compose -p zeehive-langfuse) at host.docker.internal:<port>. Docker Desktop
+    # adds that name automatically; native Linux needs the alias, exactly like the web service above.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - zeehive_repos:/repos                        # the migrated project folders (Linux-native git)
       - /var/run/docker.sock:/var/run/docker.sock   # the local daemon; TCP contexts for the rest

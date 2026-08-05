@@ -68,7 +68,7 @@ export async function attachProdStack(xellId, { by = 'human@console' } = {}) {
   // anyone ever starts it — a silent write to the WRONG database. resolveRealDbContainer picks the
   // running versioned one; proddiff.js already does this, the zee-facing binding did not.
   const dbRow = await one(
-    `SELECT c.name, c.docker_ctx, c.conn_ref, host(c.host) AS host, c.host_port FROM container c
+    `SELECT c.name, c.docker_ctx, c.conn_ref, c.host AS host, c.host_port FROM container c
        JOIN xell_uses_container uc ON uc.container_id=c.id
       WHERE uc.xell_id=$1 AND c.role='db' LIMIT 1`, [xellId]);
   const realDb = dbRow

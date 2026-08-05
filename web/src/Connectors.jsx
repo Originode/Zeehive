@@ -57,7 +57,7 @@ export function Wire({ p, hovered = false, related = null, dim = false }) {
 //   • everyone else: the wire threads the honeycomb like a MAZE — it hops from the dot across the
 //     open gap to the nearest lattice vertex, then pathfinds along hex EDGES to the target hex's
 //     vertex nearest the dot, so it never crosses a hexagon and every segment runs along a hex side.
-export default function Connectors({ timeline, xells = [], layoutRef, version, hexPosRef, harnessPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom, hoverRef, subscribeHover }) {
+export default function Connectors({ timeline, xells = [], layoutRef, version, hexPosRef, harnessPosRef, orientation, honeySide, expandedId, prodIds = [], subscribeGeom, hoverRef, subscribeHover, showHarness = true }) {
   const [paths, setPaths] = useState([]);
   const [size, setSize] = useState({ w: 0, h: 0 });
   const [, forceHover] = useReducer((x) => x + 1, 0);
@@ -105,15 +105,21 @@ export default function Connectors({ timeline, xells = [], layoutRef, version, h
     // record each cell centre so a consumer's wire can be routed IN SERIES through it: the trace is
     // ONE continuous line commit-dot → harness hexagon → xell. There is no separate harness inbound
     // wire — that used to draw a SECOND trace to the same junction; the through-routing IS the inbound.
+    // HARNESS NODES are built ONLY when the show-harness toggle is on. Hidden, the consumerHarness map
+    // stays empty and every wire traces straight from its commit dot to its xell — the "no harness in
+    // the picture" route. (HiveCanvas also publishes an empty harnessPosRef, but this guard is the
+    // source of truth: even a stale ref from a prior draw cannot route through a harness that isn't shown.)
     const harnessPos = (harnessPosRef && harnessPosRef.current) || {};
     const consumerHarness = new Map();     // consumer xellId → harness cell centre {x,y}
-    for (const h of (timeline.harnesses || [])) {
-      const hp = harnessPos[h.id];
-      if (!hp) continue;                   // HiveCanvas hasn't published this harness's cell yet
-      const node = { id: h.id, color: h.color, x: hp.x - cr.left, y: hp.y - cr.top };
-      // consumer_ids, NOT wearer_ids: a MANAGER wears a harness but is never routed through its cell
-      // — its own hexagon is drawn as that persona, so its wire runs straight from the dot to it.
-      for (const id of h.consumer_ids || []) consumerHarness.set(id, node);
+    if (showHarness) {
+      for (const h of (timeline.harnesses || [])) {
+        const hp = harnessPos[h.id];
+        if (!hp) continue;                 // HiveCanvas hasn't published this harness's cell yet
+        const node = { id: h.id, color: h.color, x: hp.x - cr.left, y: hp.y - cr.top };
+        // consumer_ids, NOT wearer_ids: a MANAGER wears a harness but is never routed through its cell
+        // — its own hexagon is drawn as that persona, so its wire runs straight from the dot to it.
+        for (const id of h.consumer_ids || []) consumerHarness.set(id, node);
+      }
     }
 
     // "infinite maze": tile invisible cells across the dots→honeycomb bbox, but only on the honeycomb
@@ -190,7 +196,7 @@ export default function Connectors({ timeline, xells = [], layoutRef, version, h
         dim: expandedId && expandedId !== r.id });
     }
     setPaths(items);
-  }, [timeline, layoutRef, hexPosRef, orientation, honeySide, expandedId, prodIds.join(',')]);   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [timeline, layoutRef, hexPosRef, orientation, honeySide, expandedId, prodIds.join(','), showHarness]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   useLayoutEffect(() => { measure(); }, [measure, version]);
 

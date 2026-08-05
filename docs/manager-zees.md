@@ -90,6 +90,31 @@ one whose job it was breaking. The mechanism is the TALK QUEUE in HANDOFF.md (`c
 `zee say` between a manager and its crew rides the same path, so a worker that is mid-turn now
 hears its manager too.
 
+### Re-tasking the worker that already holds the context
+
+There is a THIRD delivery, and it is the one that lets a manager hand more work to a zee whose turn
+has already ENDED rather than spending a fresh xell on a worker with none of the context. The state
+decides which one a message gets (`decideMessageDelivery`, `server/src/lib/zee-turn.js`), and the
+answer says which happened rather than one word for all three:
+
+| the zee | delivery | what it promises |
+|---|---|---|
+| its turn has **ENDED** | `resumed` | the queenzee RESUMES its session with your message as the prompt — it is acting on it now |
+| it is **MID-TURN** | `queued` | held in its cage, typed in the moment this turn ends; it has **not** read it yet |
+| its session cannot be re-invoked | `typed` | keystrokes into the interactive session in its pane |
+
+A `resumed` message is a TURN, and the fleet says so: the zee row goes `working` (named, broadcast)
+for the length of it and back to `idle` after, so `zee zees` and the hexagon show a messaged worker
+working. That is not cosmetic — a manager once read a restarted worker as idle for a whole turn and
+dispatched a second xell to redo work that was already being done. The same recording now covers
+every other continuation (a landing approved or gone stale, a runway cleared, a post-ship reflection,
+a fleet resume), because all of them come through the one resume.
+
+⚠ A message can only start a turn a human has not stopped: a **fleet pause** still refuses it, and a
+decommissioned zee or one in a retired xell is never restarted. And a `typed` turn stays invisible to
+the fleet — nothing inside the cage reports turn-start/turn-end (see the KNOWN GAP in
+`server/src/queenzee/reaper.js`).
+
 ### Its harness takes no cell of its own
 
 A harness normally seats itself in the grid as its **own hexagon cell** (docs/harness-proposal.md §5)
@@ -180,8 +205,12 @@ One composer, and the manager variant differs only where a manager genuinely dif
   closed. A switch would be a lie in both positions, so the field states the fact instead.
 - **A blank programme is legal** and means `DEFAULT_MANAGER_BRIEF` (study the project, propose a
   plan, ask a human before starting a crew) — the footer says so rather than leaving you to guess.
-- **Account picker.** The prompt buttons are one-per-connected-account, so clicking one *is* the
-  choice; the manager is a single button, so it makes that choice inside the composer.
+- **Persona, provider and account are all picked inside it.** The worker prompt buttons are
+  one-per-HARNESS (docs/harness-proposal.md §3.2d), so clicking one pins the persona and the
+  composer derives the rest of the choices from its model policy. The manager is a single button for
+  the whole fleet, so it picks the persona in here too — and re-asks
+  `GET /api/dispatch/options?zee_type=manager&harness=…` whenever that changes, which is what keeps
+  the providers, accounts and models it offers to the ones the spawn would actually accept.
 
 Model, autonomy mode, supervision (headless/attended) and pasted images are the shared controls, and
 `createManagerZee` forwards all of them — `headless` and `images` used to be dropped on the floor.

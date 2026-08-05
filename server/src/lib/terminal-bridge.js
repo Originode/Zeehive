@@ -209,7 +209,7 @@ async function openTerminal(ws, zeeId) {
 // exactly the shape the xterm client already speaks. Resize is a separate POST /exec/:id/resize.
 
 // One-shot JSON request to a daemon (create/resize). Tolerates an empty 2xx body (resize).
-function dockerReq(conn, method, path, body, timeout = 15000) {
+export function dockerReq(conn, method, path, body, timeout = 15000) {
   return new Promise((res, rej) => {
     const payload = body == null ? null : JSON.stringify(body);
     const req = http.request({
@@ -238,7 +238,7 @@ function dockerReq(conn, method, path, body, timeout = 15000) {
 // `npm run …` as a child of the QUEENZEE, inside the queenzee's container, cwd = the xell's
 // worktree. So its shell is the queenzee's own container opened at that worktree — the exact place
 // the process and its code live. Returns { ctx, name, workingDir, banner } or { error }.
-async function resolveShellTarget(c) {
+export async function resolveShellTarget(c) {
   const ctx = c.docker_ctx || 'default';
   if (c.role === 'db') {
     // db rows carry LOGICAL names (omnibiz_db_dev) while the daemon runs versioned ones — the

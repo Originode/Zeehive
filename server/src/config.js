@@ -35,6 +35,16 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL || 'postgres://zeehive:zeehive@localhost:5433/zeehive',
   port: int(process.env.PORT, 4700),
   apiBase: process.env.ZEEHIVE_API || `http://localhost:${int(process.env.PORT, 4700)}`,
+  // QUEENZEE_INPROC=false starts an API-ONLY instance (the pre-phase-1 slice of the gateway split,
+  // docs/queenzee-gateway-split.md): it serves every HTTP route but does NOT take the
+  // single-queenzee advisory lock (715533001) and starts NONE of the background loops. The flag
+  // answers "are the queenzee loops in THIS process?" — the design's own escape-hatch name for the
+  // loop/API boundary (item 23: QUEENZEE_INPROC=true makes one process behave exactly as pre-split).
+  // Default true = today's behavior (THE queenzee, loops in-process). The lock is about DRIVING a
+  // fleet, not serving HTTP — an API-only instance must be startable on a meta-DB where the live
+  // queenzee already holds it, which is exactly the db-shared-dev spinoff case (TKT-136-FE32 /
+  // TKT-137-F266).
+  queenzeeInproc: process.env.QUEENZEE_INPROC !== 'false',
   claudeHome: process.env.CLAUDE_HOME || resolve(process.env.USERPROFILE || process.env.HOME || '.', '.claude'),
   // Seed-only (db/seed.js) + a last-resort reaper cwd fallback. No baked-in Windows default:
   // the container era has no D:\ — set OMNIBIZ_ROOT in .env where it applies.

@@ -10,7 +10,7 @@ import React, { useState, useEffect } from 'react';
 import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
          setMachinePool, setMachinePriority, getSites, createSite,
-         registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices } from './api.js';
+         registerDevice, provisionAdbHost, getUsbDevices, getAdbDevices, checkMachineConnection } from './api.js';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 
 const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', device: 'Device', other: 'Other' };
@@ -18,13 +18,21 @@ const BASE_ROLES = ['db', 'server', 'webapp', 'other'];
 
 const fail = (what) => (e) => showAlert(`${what} failed: ${e?.error || e?.message || e}`, { variant: 'error' });
 
-export default function MachineMatrix({ machines, containers, projectId, onMenu, onChanged }) {
+export default function MachineMatrix({ machines, containers, projectId, composeSpinoff, onMenu, onChanged }) {
   const ms = machines || [];
   // The device row is opt-in: shown only when this project actually uses devices (a device chip
   // exists, or a machine is marked can_device), so ordinary projects keep a 4-row matrix.
   const usesDevices = (containers.device || []).length > 0 || ms.some((m) => m.can_device);
   const ROLES = usesDevices ? ['db', 'server', 'webapp', 'device', 'other'] : BASE_ROLES;
   const all = ROLES.flatMap((r) => (containers[r] || []).map((c) => ({ ...c, _role: r })));
+
+  // THE SILENT DISABLE — the "mardale-prod never gets pool xells" defect. A machine is a dev
+  // spawn target for THIS project (dev_priority>0) but the project has no compose_spinoff, so
+  // the pool maintainer takes the legacy project-wide path and every per-machine pool/priority
+  // knob in this matrix is a dead letter. Same message as the server's pool logline, so an
+  // operator reading one can fix the project from the other.
+  const machinePoolingDisabled = ms.some((m) => m.enabled && m.dev_priority > 0) && !composeSpinoff;
+  const disabledMachines = ms.filter((m) => m.enabled && m.dev_priority > 0).map((m) => m.key);
 
   // Where a container lives, for column placement: its own run context — or, for a PROCESS role
   // (docker_ctx NULL, probed by URL: the self-shipped queenzee), its deploy site's context. A
@@ -70,6 +78,18 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
   return (
     <section className="matrix" data-testid="matrix"
              style={{ gridTemplateColumns: `max-content repeat(${cols.length}, minmax(120px, 1fr)) max-content` }}>
+      {/* The machine-pooling-DISABLED banner: an operator who configured per-machine pooling must
+          be able to SEE why it is not happening. The same message as the server's pool logline
+          (queenzee/pool.js), naming the field to set — so reading one lets you fix the project
+          from the other. */}
+      {machinePoolingDisabled && (
+        <div className="mx-warn" data-testid="mx-pooling-disabled">
+          ⚠ Machine-aware pooling is DISABLED: {disabledMachines.join(', ')} is configured for this
+          project (dev_priority&gt;0) but <b>compose_spinoff</b> is unset — per-machine pool sizes and
+          priorities have no effect until <span className="mono">tiers.spinoff.compose</span> is set in
+          the project's <span className="mono">zeehive.yml</span> (project settings → Manifest → refresh).
+        </div>
+      )}
       {/* header row */}
       <span className="mx-corner" />
       {cols.map((col, i) => {
@@ -108,6 +128,15 @@ export default function MachineMatrix({ machines, containers, projectId, onMenu,
 // every change PATCHes and refreshes, so what you read is always the server's truth.
 function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged }) {
   const [busy, setBusy] = useState(false);
+  // Connection check state — the Deploy tab's per-machine "can the queenzee reach this host with
+  // the settings on its row?" probe. null = not checked yet; { checking:true } = in flight; a
+  // checkMachineConnection() result = the verdict (ok + reachable, or ok:false + error).
+  const [conn, setConn] = useState(null);
+  const check = async () => {
+    setConn({ checking: true });
+    try { setConn(await checkMachineConnection(m.id)); }
+    catch (e) { setConn({ ok: false, reachable: false, error: e?.error || e?.message || String(e) }); }
+  };
   const patch = async (p) => {
     setBusy(true);
     try { await updateMachine(m.id, p); onChanged?.(); }
@@ -177,6 +206,7 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
         <b>{m.key}</b>
         <button className="mx-prod" data-testid={`mx-prod-${m.key}`} disabled={busy} onClick={addProd}
                 title={`Place a PRODUCTION on ${m.key} — creates the prod site + its production xell here`}>＋prod</button>
+        <MachineConn m={m} conn={conn} onCheck={check} />
         {empty && <button className="mx-del" title="Remove this machine row" onClick={remove}>✕</button>}
       </div>
       <div className="mx-knobs">
@@ -211,6 +241,34 @@ function MachineHead({ m, projectId, hasDevDb, devDbElsewhere, empty, onChanged 
         </button>
       )}
     </div>
+  );
+}
+
+// The per-machine connection probe — "does the queenzee's stored settings actually reach this
+// host's daemon?" One button that is also the verdict: idle → "🔌 check", in flight → spinner,
+// resolved → green ✓ / red ✗, with the detail (endpoint, container count, latency, or the exact
+// docker error) in the tooltip. Clicking it re-checks live.
+function MachineConn({ m, conn, onCheck }) {
+  const checking = !!conn?.checking;
+  const ok = !checking && conn?.ok;
+  const fail = !checking && conn && !conn.ok;
+  const cls = `mx-conn${checking ? ' checking' : ok ? ' ok' : fail ? ' fail' : ''}`;
+  const title = checking ? 'Checking whether the queenzee can reach this machine…'
+    : ok ? `✓ Reachable — the queenzee can connect to ${m.docker_ctx}\n`
+        + `endpoint: ${conn.endpoint || 'unknown'}\n`
+        + `${conn.container_count ?? 0} container(s) · ${conn.latency_ms ?? '?'}ms\n`
+        + 'Click to re-check'
+    : fail ? `✗ Not reachable — the stored settings do not allow connecting to ${m.docker_ctx}\n`
+        + `${conn.endpoint ? `endpoint: ${conn.endpoint}\n` : ''}`
+        + `${conn.error || 'unknown error'}\n`
+        + 'Click to re-check'
+    : `Check whether the queenzee can connect to ${m.key} (${m.docker_ctx}) with the stored settings —\n`
+        + 'probes the docker context and daemon reachability. Read-only.';
+  return (
+    <button className={cls} data-testid={`mx-conn-${m.key}`} disabled={checking}
+            onClick={onCheck} title={title}>
+      {checking ? '⏳…' : ok ? '✓ ok' : fail ? '✗ down' : '🔌 check'}
+    </button>
   );
 }
 
@@ -354,7 +412,7 @@ function AddMachine({ projectId, onChanged }) {
           {(ctxs || []).map((k) => <option key={k.name} value={k.name}>{k.name}</option>)}
         </select></label>
       <label>key<input value={f.key} placeholder="local" onChange={(e) => setF({ ...f, key: e.target.value })} /></label>
-      <label>host IP<input value={f.host_ip} placeholder="for xell URLs" onChange={(e) => setF({ ...f, host_ip: e.target.value })} /></label>
+      <label>host<input value={f.host_ip} placeholder="IP or DNS — for xell URLs" onChange={(e) => setF({ ...f, host_ip: e.target.value })} /></label>
       <label>prio<input type="number" min="0" value={f.dev_priority} onChange={(e) => setF({ ...f, dev_priority: Number(e.target.value) })} /></label>
       <label>pool<input type="number" min="0" value={f.pool_size} onChange={(e) => setF({ ...f, pool_size: Number(e.target.value) })} /></label>
       <label>cap<input type="number" min="0" value={f.max_xells} onChange={(e) => setF({ ...f, max_xells: Number(e.target.value) })} /></label>

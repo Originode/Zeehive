@@ -364,6 +364,42 @@ inside the transaction see the rows the *same* transaction just inserted (which 
 siblings created in one breakdown their increasing `sort_order`). Pinned in the test:
 `1000 < 2000 < 3000 < 4000 < 5000`.
 
+### `lib/reflections.js` — the reflections ledger
+
+A **reflection** is not a ticket noun at all: it is a `zee_message` with `kind='reflection'`, written
+by a zee right after its own work SHIPS (`queenzee/shipgate.js` re-invokes it, gated by the harness's
+`enable_reflection`). It lives in this doc because of where it ENDS UP — the ledger's one action turns
+one into a ticket, and the ticket is an ordinary ticket from that moment on.
+
+Why it needed a read of its own: a reflection is addressed to that zee's **manager**, and the only
+readers were the manager's own `zee inbox` and the per-xell Directives panel. A reflection addressed
+to a manager xell that has since been RETIRED is therefore in nobody's window at all.
+
+- `listReflections({projectId, limit, since})` — project-wide, **newest first**. Each row carries the
+  writer (`from`) and its **source xell** (`from_xell_id`/`from_xell_slug`/`from_xell_status`; a null
+  id with a slug means the xell was reaped), the recipient manager (`to`, `to_xell_id`,
+  `recipient_retired`), `read_at`, `at`, the whole `body`, and the `ticket` it was filed as (or null).
+  `orphaned` is true in the three cases where nobody will ever read it as a message — never addressed
+  (the zee had no manager), the recipient xell row is gone, or the recipient is retired — each with
+  its own `orphan_reason` sentence.
+- `fileReflectionAsTicket(id, {kind, priority, by})` — the action. Goes through **`createTicket`**,
+  never a second creation path: title = the reflection's first line (markdown ornament stripped,
+  trimmed to 160), body = the reflection **verbatim** plus the source xell slug and the date,
+  `kind='chore'` by default, `reporter` = the zee that wrote it.
+- `reflectionTitle(body)` / `reflectionTicketBody(row)` are pure and exported, so the console can show
+  a human the same headline the server will use.
+
+**Filed once.** `zee_message.ticket_id` (migration 128, `ON DELETE SET NULL`) is the link, and the
+write CLAIMS it conditionally (`WHERE ticket_id IS NULL`) rather than trusting the read before it: two
+clicks at one instant would otherwise make two tickets and remember only the second. A second attempt
+is a **409** naming the ticket that already exists; deleting that ticket unlinks the reflection, which
+legitimately re-opens it for filing.
+
+**READING MARKS NOTHING READ**, here and in the console. `read_at` is the receipt for the AGENT's own
+`zee inbox` (`managers.inboxFor`), and a human reading the ledger must not clear a zee's unread flags —
+the same rule `messagesForXell` states for the per-xell audit view. Nothing in `lib/reflections.js`
+writes `read_at`, and the console's client has exactly two calls: the read and the file.
+
 ## The read models
 
 ### `GET /api/board?project=&root=`
@@ -462,6 +498,8 @@ which is not ISO 8601 and gives `NaN` or a silently different day depending on t
 | POST | `/api/tickets/:id/breakdown` | `{items:[…], actor}` → the created tree. **One transaction**: all six items or none |
 | GET | `/api/tickets/:id/managers` | the manager zees of this ticket's project, resolved live, each with `live` + a `why` line |
 | POST | `/api/tickets/:id/notify` | `{xell_id, by}` → tells that manager about the ticket. Answers `{code, delivered, delivery, note}` |
+| GET | `/api/reflections?project=&limit=&since=` | the reflections ledger, newest first. Reading marks NOTHING read |
+| POST | `/api/reflections/:id/ticket` | `{kind?, priority?, by?}` → files it as a ticket through `createTicket`. **409** if it already is |
 | GET | `/api/work-items?project=&tree=1&status=&kind=&root=&ticket=` | |
 | POST | `/api/work-items` | `project` in the body (or inherit it from `parent_id`) |
 | GET | `/api/work-items/:id` | the full detail model |
@@ -684,6 +722,7 @@ the harness manager, and a half-rewritten manual is worse than an out-of-date on
 ```sh
 DATABASE_URL=… node test/work-tracker.test.mjs    # parts 1-2: the plan itself
 DATABASE_URL=… node test/work-assign.test.mjs     # part 3: putting a zee on it
+DATABASE_URL=… node test/reflections-ledger.test.mjs   # the reflections ledger + its console window
 ```
 
 Stands up two throwaway projects (and one real xell, to exercise the live-zee derivation), covers

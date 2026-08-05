@@ -1,9 +1,12 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { listCxellDir, readCxellFile } from './api.js';
+import { listCxellDir, readCxellFile, listContainerDir, readContainerFile } from './api.js';
 
-// The file-explorer panel that expands beside a zee terminal. Read-only: it lists the zee's
-// worktree over the same ssh door the terminal uses, and opens a text file in a viewer so a human
-// can SEE what a zee is talking about ("edited web/src/App.jsx") without leaving the terminal.
+// The file-explorer panel that expands beside a terminal. Read-only: it lists the target's
+// filesystem and opens a text file in a viewer so a human can SEE what is being talked about
+// ("edited web/src/App.jsx", a config a container is mis-reading) without leaving the terminal.
+//
+// Two doors, same panel: `zeeId` browses a cxell zee's worktree over the ssh door; `container`
+// browses a fleet container's filesystem over short-lived docker execs. Exactly one is set.
 //
 // `openReq` ({ path, n }) is a "show file" request from the terminal — a CLICKED path link in the
 // output, the 📁 button with a path selected, or the path box below. On each new request the explorer navigates to (a
@@ -13,33 +16,44 @@ const ICON = { dir: '▸', file: '·' };
 const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} K` : `${(n / 1048576).toFixed(1)} M`);
 const baseName = (p) => (p || '').replace(/\/+$/, '').split('/').pop() || '/';
 
-export default function FileExplorer({ zeeId, openReq, onClose }) {
+export default function FileExplorer({ zeeId, container, openReq, onClose }) {
   const [dir, setDir] = useState(null);          // { path, parent, root, entries }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [file, setFile] = useState(null);        // open file viewer: { path, content, size, binary, truncated }
   const [fileErr, setFileErr] = useState(null);
-  const [go, setGo] = useState('');              // the "show file" path box — paste a path a zee named
+  const [go, setGo] = useState('');              // the "show file" path box — paste a path named in the terminal
+
+  // Both doors answer the same two verbs; the target decides which bridge to ask.
+  const list = useCallback(async (path) => {
+    if (container) return listContainerDir(container.id, path);
+    return listCxellDir(zeeId, path);
+  }, [zeeId, container]);
+
+  const read = useCallback(async (path) => {
+    if (container) return readContainerFile(container.id, path);
+    return readCxellFile(zeeId, path);
+  }, [zeeId, container]);
 
   const load = useCallback(async (path) => {
     setLoading(true); setError(null);
-    try { setDir(await listCxellDir(zeeId, path)); }
+    try { setDir(await list(path)); }
     catch (e) { setError(e.message || String(e)); }
     finally { setLoading(false); }
-  }, [zeeId]);
+  }, [list]);
 
   const openFile = useCallback(async (path) => {
     setFile({ path, content: null }); setFileErr(null);
-    try { setFile(await readCxellFile(zeeId, path)); }
+    try { setFile(await read(path)); }
     catch (e) { setFileErr(e.message || String(e)); setFile({ path, content: '' }); }
-  }, [zeeId]);
+  }, [read]);
 
-  // Show a path a zee named: a dir → navigate into it, anything else → open it in the viewer.
+  // Show a path named in the terminal: a dir → navigate into it, anything else → open it in the viewer.
   const show = useCallback(async (path) => {
     if (!path) return;
-    try { const d = await listCxellDir(zeeId, path); setDir(d); setFile(null); }
+    try { const d = await list(path); setDir(d); setFile(null); }
     catch { openFile(path); }
-  }, [zeeId, openFile]);
+  }, [list, openFile]);
 
   useEffect(() => { load(null); }, [load]);
 

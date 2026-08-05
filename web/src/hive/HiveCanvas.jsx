@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { hexPath, pointInHex, hexWidth, rowStep, layoutHoneycomb, SQRT3 } from './hex.js';
 import { hiveColor, hiveStatusLabel, hiveHeat } from './status.js';
-import { isManagerXell, crewLinks, relatedTo, focusIdOf, hexDim, relationTag, REL_DASH } from './crew.js';
+import { isManagerXell, isRouterXell, crewLinks, relatedTo, focusIdOf, hexDim, relationTag, REL_DASH } from './crew.js';
+import { providerArtOf } from '../providerArt.js';
+import { harnessGear, drawGearLayer } from '../harnessGear.js';
 
 // ── palette ───────────────────────────────────────────────────────────────────
 const COL = {
@@ -9,6 +11,11 @@ const COL = {
   working: '#35c46b', idle: '#e0a53b', ready: '#5b8cff', claimed: '#9b8cff',
   awaiting: '#e0a53b', spawning: '#5b8cff', error: '#e5554e', prod: '#f0913b',
   sha: '#e0a53b', add: '#35c46b', del: '#e5554e',
+  // The two IDENTITY fills that override status colour entirely (see statusColor): the ROUTER hexagon
+  // is WHITE and a PRODUCTION hexagon is LIME GREEN, so each reads as what a xell IS — the front door,
+  // or the live fleet — rather than what it is momentarily doing. `prod` above stays the manager's
+  // prod-hold wall (COL.prod, orange); `prodFill` is the production hexagon's own fill.
+  router: '#ffffff', prodFill: '#9ccf3f',
   // the manager↔crew RELATION mark: a pale steel that is in NO status palette (hive/status.js), so a
   // marked cell can never be misread as having taken on a status of its own
   rel: '#c8d3e8',
@@ -28,9 +35,15 @@ const ROLE_TINT = { db: '#e08a3b', server: '#9b8cff', webapp: '#5b8cff' };
 // Colour a hex by its DISPLAY status (server-derived `hive_status`, palette in hive/status.js) — the
 // single vocabulary the whole hive reads by: vac-* / occ-* (incl. the tend/land/ship/done requests) /
 // live-*. Falls back to the legacy lifecycle→colour map for a payload that predates hive_status.
-function statusColor(x) {
+export function statusColor(x) {
+  // The ROUTER and PRODUCTION hexagons are IDENTITY, not activity: a router IS the front door and a
+  // production xell IS the live fleet, so each paints as what it is regardless of the momentary hive
+  // status underneath (a router can be working/idle/tend? like any manager, and a production xell can
+  // be protected or unprotected). They sit ABOVE the status palette on purpose — the status pill on
+  // the card still carries the word.
+  if (isRouterXell(x)) return COL.router;
+  if (x.is_production) return COL.prodFill;
   if (x.hive_status) return hiveColor(x.hive_status, COL.muted);
-  if (x.is_production) return COL.prod;
   const s = x.status;
   if (s === 'working') return COL.working;
   if (s === 'idle') return COL.idle;
@@ -40,12 +53,26 @@ function statusColor(x) {
   if (['errored', 'error', 'stopped'].includes(x.zee_status)) return COL.error;
   return COL.muted;
 }
+// Text INK for a hexagon's card, keyed to its FILL: the two IDENTITY fills (router white, production
+// lime) read DARK text — the pane's own bg — because COL.text is near-white and would vanish on a
+// painted-white hexagon. `inkMutedOf` is the same idea one step softer for the secondary lines that
+// usually read COL.muted (machine, title, seam). Every other hex keeps the existing light-on-dark.
+const isIdentityFill = (x) => isRouterXell(x) || x.is_production === true;
+const inkOf = (x) => (isIdentityFill(x) ? '#0d1017' : COL.text);
+const inkMutedOf = (x) => (isIdentityFill(x) ? '#3a4356' : COL.muted);
 // Background wash alphas for a hex, modulated by its status HEAT (hive/status.js hiveHeat): a COLD
 // xell (violet/blue — provisioning/ready) sits darker (a fainter wash) and a HOT one (orange/red —
 // production / a held land or ship) glows brighter, so activity/urgency reads off the fill before the
 // hue. Returns {top,bot} gradient alphas; `hover` lifts both a notch. The flower centre passes a
 // higher base so the focused bloom stays vivid at every heat.
 function heatWash(x, hover, base = 0) {
+  // The two IDENTITY fills (router white / production lime) are painted near-OPAQUE so they read as
+  // "painted", not "tinted": a white or lime WASH over the dark pane would be grey/olive, which is the
+  // status palette's job, not an identity fill. The status HEAT scale stays for every other hex.
+  if (isIdentityFill(x)) {
+    const lift = hover ? 0.04 : 0;
+    return { top: Math.min(1, base + lift + 0.9), bot: Math.min(1, base + lift + 0.8) };
+  }
   const heat = x?.hive_status ? hiveHeat(x.hive_status) : 0.4;
   const lift = hover ? 0.04 : 0;
   return {
@@ -55,6 +82,16 @@ function heatWash(x, hover, base = 0) {
 }
 const shortSlug = (s) => String(s || '');
 const stripBranch = (b) => String(b || '').replace(/^spinoff\//, '');
+// The first NON-EMPTY line of a brief (markdown '#' headings stripped), or null. This is how a
+// manager's directive is shown short: a hexagon/seam can hold one line, and the first line of the
+// programme a human typed is what distinguishes one manager from another.
+const firstLine = (s) => {
+  for (const raw of String(s || '').split(/\r?\n/)) {
+    const line = raw.replace(/^#+\s*/, '').trim();
+    if (line) return line;
+  }
+  return null;
+};
 
 // ── a MANAGER zee is not a work-cell ─────────────────────────────────────────
 // A manager has ZERO push/PR access to the xource (refused in server/src/queenzee/xellgit.js's
@@ -111,6 +148,23 @@ export function managerCard(x, crew = []) {
     waiting,
     prod: grip ? `🛡 prod · ${grip}` : null,
     prodShort: grip ? `🛡 ${grip}` : null,
+    // What this manager is FOR — the first line of the directive/programme it was given (the task
+    // brief a human typed when adding it, or DEFAULT_MANAGER_BRIEF). This is what tells one manager
+    // apart from another at a glance; the full text is in the directive panel.
+    directive: x?.task_text ? firstLine(x.task_text) : null,
+  };
+}
+
+// The facts a xell HOVER TOOLTIP shows — pure, so the imperative DOM code stays dumb and a test can
+// assert the content without a browser. The directive is the xell's own brief (task_text) first
+// line; the status is the same hive status label the hexagon's pill paints.
+export function xellTooltipParts(x) {
+  return {
+    head: x?.slug || '—',
+    role: x?.zee_type === 'manager' ? '⬢ manager' : 'worker',
+    manager: x?.zee_type === 'manager',
+    directive: x?.task_text ? firstLine(x.task_text) : null,
+    status: hiveStatusLabel(x),
   };
 }
 // compact burn formatters (mirror the dashboard's fmtTok/fmtUsd) for the per-xell burn on the flower
@@ -503,7 +557,7 @@ const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
                                     expandedId, onExpand, hexPosRef, harnessPosRef, onGeometry, onAction, onContainerMenu,
-                                    hoverRef, setHover, subscribeHover, redrawKey }) {
+                                    hoverRef, setHover, subscribeHover, redrawKey, showHarness = true }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], harnesses: [], flower: null, buttons: null, containers: null });
@@ -511,14 +565,71 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
   const drawRef = useRef(() => {});        // latest draw(), so an image onload can trigger a redraw
   const viewRef = useRef({ x: 0, y: 0, k: 1 });          // pan offset + zoom (world → screen)
   const dragRef = useRef(null);
+  const pointersRef = useRef(new Map());   // active pointers: pointerId → {x,y} in canvas space
+  const pinchRef = useRef(null);           // active two-finger pinch: start-geometry snapshot
   const [size, setSize] = useState({ w: 0, h: 0 });
   const rafRef = useRef(0);
   const setExpandedId = onExpand || (() => {});
   const emitHover = setHover || (() => {});
+  // ── the right-click xell context menu ───────────────────────────────────────
+  // {x,y} = client coords the DOM menu is fixed at, id = the xell it targets. The menu reuses the
+  // flower's action list (xellContextMenuItems), so a right-click is a shortcut to the SAME verbs —
+  // no flower required. DOM (not canvas): it is a clickable list, and a canvas-drawn one would be
+  // swallowed by the next redraw.
+  const [ctxXell, setCtxXell] = useState(null);
   // ── canvas button tooltip: DOM overlay created imperatively so onPointerMove never re-renders ──
-  const tipRef = useRef({ el: null, kind: null });  // .el = DOM element, .kind = current verb kind
+  const tipRef = useRef({ el: null, kind: null, tip: null });  // .el = DOM element, .kind/.tip = current verb
+  // ── xell hover tooltip: the directive + status of the xell under the cursor. The same imperative
+  //    trick as the button tooltip (a DOM element updated in place), so hovering the fleet never
+  //    re-renders the canvas. A hexagon can only hold one line of its directive — the tooltip is
+  //    where a human reads what THIS xell is FOR and what state it is in, unclipped. ──
+  const xellTipRef = useRef({ el: null, id: null });  // .el = DOM element, .id = xell it currently shows
   // the base commit a xell sits on (for tying a hex hover to its commit dot, and vice-versa)
   const baseOf = useCallback((id) => (timeline?.xells || []).find((t) => t.id === id)?.base_commit || null, [timeline]);
+  const xellOf = (id) => (xells || []).find((x) => x.id === id) || null;
+  const hideXellTooltip = () => {
+    const tip = xellTipRef.current;
+    if (tip.el) { tip.id = null; tip.el.style.display = 'none'; }
+  };
+  // Paint the xell hover tooltip for `xell` at the cursor. Content is rebuilt only when the hovered
+  // xell CHANGES (text nodes via textContent, so a brief can never be injected as markup); position
+  // updates every move. Below the cursor, because this tooltip wraps and can be taller than a button's.
+  const showXellTooltip = (xell, e) => {
+    if (!xell) { hideXellTooltip(); return; }
+    const tip = xellTipRef.current;
+    if (!tip.el) {
+      tip.el = document.createElement('div');
+      tip.el.className = 'hive-xell-tooltip';
+      wrapRef.current?.appendChild(tip.el);
+    }
+    if (tip.id !== xell.id) {
+      tip.id = xell.id;
+      tip.el.textContent = '';
+      const parts = xellTooltipParts(xell);
+      const head = document.createElement('div');
+      head.className = 'hive-xt-head';
+      head.textContent = parts.head;
+      const role = document.createElement('span');
+      role.className = `hive-xt-role${parts.manager ? ' mgr' : ''}`;
+      role.textContent = parts.role;
+      head.appendChild(role);
+      tip.el.appendChild(head);
+      const dir = document.createElement('div');
+      dir.className = `hive-xt-dir${parts.directive ? '' : ' none'}`;
+      dir.textContent = parts.directive ? `📜 ${parts.directive}` : 'no directive';
+      tip.el.appendChild(dir);
+      const st = document.createElement('div');
+      st.className = 'hive-xt-status';
+      st.textContent = `status · ${parts.status}`;
+      tip.el.appendChild(st);
+    }
+    const bb = wrapRef.current?.getBoundingClientRect();
+    if (bb) {
+      tip.el.style.left = `${e.clientX - bb.left + 14}px`;
+      tip.el.style.top = `${e.clientY - bb.top + 18}px`;
+    }
+    tip.el.style.display = 'block';
+  };
 
   const expanded = expandedId ? (xells || []).find((x) => x.id === expandedId) : null;
   useEffect(() => { if (expandedId && !expanded) setExpandedId?.(null); }, [expandedId, expanded, setExpandedId]);
@@ -632,14 +743,17 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       const rel = related.get(hx.id) || null;
       const dim = hexDim({ hexId: hx.id, expandedId, hovered, hoverActive, related: rel });
       const relArgs = { related: rel, relatedTo: rel ? focus?.slug || null : null, relColor };
+      // the AI PROVIDER's coin is the badge (providerArt.js): the same image cache as the harness
+      // art, so a logo loading triggers exactly one redraw like everything else here
+      const providerImg = getImg(providerArtOf(hx.x)?.logo);
       if (isManagerXell(hx.x)) {
         const h = harnessOf(hx.id);
         drawManagerHex(ctx, hx, { hover: hovered, dim, crew: crewOf[hx.id] || [],
-          harness: h, img: getImg(h?.avatar_url), ...relArgs });
+          harness: h, img: getImg(h?.avatar_url), providerImg, ...relArgs });
       } else {
         const workerHarness = harnessOf(hx.id);
         drawCompactHex(ctx, hx, { hover: hovered, dim, diff: diffs?.[hx.id], machines,
-          harness: workerHarness, harnessImg: getImg(workerHarness?.avatar_url), ...relArgs });
+          harness: workerHarness, harnessImg: getImg(workerHarness?.avatar_url), providerImg, ...relArgs });
       }
     }
     geomRef.current.flower = null;
@@ -652,8 +766,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         ...cellNeighbors(er, ec).map(([r, c]) => cellCenter(r, c, cellSize, originX, originY))];
       // H.id is the hovered CREW DOT while a bloom is open (see onPointerMove): the facet rings that
       // dot and names the worker, and the same id lights its hexagon, its wire and its commit dot.
+      const exHarness = harnessOf(expanded.id);
       drawFlower(ctx, centers, cellSize, expanded, diffs?.[expanded.id], machines,
-        tById[expanded.id]?.color || null, crewOf[expanded.id] || [], { hoverId: H.id });
+        tById[expanded.id]?.color || null, crewOf[expanded.id] || [],
+        { hoverId: H.id,
+          badge: zeeBadge(expanded, exHarness, { providerImg: getImg(providerArtOf(expanded)?.logo),
+                                                 harnessImg: getImg(exHarness?.avatar_url) }) });
       geomRef.current.flower = { centers, size: cellSize, id: expanded.id,
         openable: !!expanded.viewer_url && !expanded.is_production };
       // Per-xell ACTIONS drawn straight onto the flower (no DOM toolbar): a hit-tested button row
@@ -675,9 +793,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // wires through this centre.
     // ...and only the harnesses whose badge is FOR someone: a manager-only harness is skipped here,
     // because the manager's own hexagon (drawn above, in this badge's language) already indicates it.
+    // The SHOW-HARNESS toggle hides them entirely: no cells are seated (so no grid space is taken),
+    // no geometry is published (so no wire routes through one) and the hit-test list stays empty —
+    // the whole view drops back to commit-dot → xell traces.
     const badged = badgedHarnesses(harnesses);
     const harnessCells = [];
-    if (badged.length) {
+    if (showHarness && badged.length) {
       const cols = Math.max(1, lay.cols);
       const occupied = new Set(Object.values(cells).map(([r, c]) => cellKey(r, c)));
       for (const k of reserved) occupied.add(k);
@@ -737,7 +858,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     onGeometry && onGeometry();
     // honeySide is a dep so a flip (which moves this pane on screen) re-runs draw and republishes the
     // hexes' fresh client-space positions — otherwise <Connectors> would trace to their old spots.
-  }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, expanded, machines, hexPosRef, onGeometry, baseOf, redrawKey]);
+  }, [size, xells, diffs, timeline, orientation, honeySide, expandedId, expanded, machines, hexPosRef, onGeometry, baseOf, redrawKey, showHarness]);
 
   useLayoutEffect(() => { drawRef.current = draw; draw(); }, [draw]);
 
@@ -823,13 +944,58 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     return [e.clientX - r.left, e.clientY - r.top];
   };
 
+  // two-finger pinch-zoom. A second pointer switches the gesture from one-finger pan to pinch: the
+  // world point under the fingers' midpoint stays pinned while finger distance scales the zoom and
+  // midpoint drift pans, so one gesture zooms AND repositions in a single motion. Desktop keeps the
+  // wheel; touch gets the pinch (there is no wheel on a phone).
+  const beginPinch = () => {
+    const [p1, p2] = [...pointersRef.current.values()];
+    if (!p2) { pinchRef.current = null; return; }
+    pinchRef.current = {
+      dist: Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1,
+      mx: (p1.x + p2.x) / 2,
+      my: (p1.y + p2.y) / 2,
+      vx: viewRef.current.x,
+      vy: viewRef.current.y,
+      k: viewRef.current.k,
+    };
+    canvasRef.current.style.cursor = 'grabbing';
+  };
+
   const onPointerDown = (e) => {
+    // A LEFT-press on the canvas closes an open context menu (right-press must NOT — it is what
+    // opened it; the browser fires contextmenu after pointerdown, so closing here would race it).
+    if (ctxXell && e.button === 0) setCtxXell(null);
     const [mx, my] = relPos(e);
-    dragRef.current = { mx, my, vx: viewRef.current.x, vy: viewRef.current.y, moved: false };
+    pointersRef.current.set(e.pointerId, { x: mx, y: my });
+    if (pointersRef.current.size === 1) {
+      dragRef.current = { mx, my, vx: viewRef.current.x, vy: viewRef.current.y, moved: false };
+      pinchRef.current = null;
+    } else {
+      // second (or later) finger: hand the gesture over to the pinch
+      dragRef.current = null;
+      beginPinch();
+    }
     canvasRef.current.setPointerCapture?.(e.pointerId);
   };
   const onPointerMove = (e) => {
     const [mx, my] = relPos(e);
+    if (pointersRef.current.has(e.pointerId)) pointersRef.current.set(e.pointerId, { x: mx, y: my });
+    const pinch = pinchRef.current;
+    if (pinch && pointersRef.current.size >= 2) {
+      const [p1, p2] = [...pointersRef.current.values()];
+      const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
+      const pmx = (p1.x + p2.x) / 2;
+      const pmy = (p1.y + p2.y) / 2;
+      const v = viewRef.current;
+      const k = Math.min(3.2, Math.max(0.3, pinch.k * (dist / pinch.dist)));
+      v.x = pmx - ((pinch.mx - pinch.vx) / pinch.k) * k;
+      v.y = pmy - ((pinch.my - pinch.vy) / pinch.k) * k;
+      v.k = k;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(draw);
+      return;
+    }
     const d = dragRef.current;
     if (d) {
       if (Math.abs(mx - d.mx) + Math.abs(my - d.my) > 4) d.moved = true;
@@ -865,20 +1031,26 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       cursor = cw || b || flowerHit ? 'pointer'
         : cont ? 'context-menu'                                    // right-click hint on an icon
         : (hx || hb) ? 'pointer' : 'default';
+      // The hover signal is the primary event (it lights the related hexes, wires and commit dots),
+      // so it is emitted before the two display tooltips that may ride along on the same move.
+      emitHover({ id: hx?.id ?? cw?.id ?? null, commit: null, harness: hb?.id || null });
       // Button tooltip — update the persistent DOM element directly on pointer move.
       const tooltip = tipRef.current;
-      if (b && VERB_TOOLTIP[b.kind]) {
+      if (b && (VERB_TOOLTIP[b.kind] || b.tip)) {
         if (!tooltip.el) {
           tooltip.el = document.createElement('div');
           tooltip.el.className = 'hive-tooltip';
           tooltip.el.innerHTML = '<span class="hive-tooltip-k"></span><span class="hive-tooltip-t"></span>';
           wrapRef.current?.appendChild(tooltip.el);
         }
-        if (tooltip.kind !== b.kind) {
+        // Re-render when the kind OR the per-button tip changes (a dynamic tip, e.g. the langfuse
+        // verb's "no session yet" vs the default, would otherwise stay stale across buttons).
+        if (tooltip.kind !== b.kind || (b.tip && tooltip.tip !== b.tip)) {
           tooltip.kind = b.kind;
+          tooltip.tip = b.tip || null;
           const k = tooltip.el.children[0], t = tooltip.el.children[1];
           k.textContent = b.kind;
-          t.textContent = VERB_TOOLTIP[b.kind];
+          t.textContent = b.tip || VERB_TOOLTIP[b.kind];
         }
         const bb = wrapRef.current.getBoundingClientRect();
         tooltip.el.style.left = `${e.clientX - bb.left + 14}px`;
@@ -888,17 +1060,23 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
         tooltip.kind = null;
         tooltip.el.style.display = 'none';
       }
-      emitHover({ id: hx?.id ?? cw?.id ?? null, commit: null, harness: hb?.id || null });
+      // Xell tooltip — the directive + status of the xell under the cursor. A button's own tooltip
+      // wins (hx is null over a button); a crew dot and a plain hex both name a xell.
+      if (cw) showXellTooltip(xellOf(cw.id), e);
+      else if (hx) showXellTooltip(xellOf(hx.id), e);
+      else hideXellTooltip();
     } else {
       const hx = hitHex(wx, wy);
       if (hx) {
         emitHover({ id: hx.id, commit: null, harness: null });   // a hex is ONE xell → key on id
         cursor = 'pointer';
+        showXellTooltip(xellOf(hx.id), e);
       } else {
         // no hex under the cursor → a harness badge lights up its consumer xells (reverse highlight)
         const hb = hitHarness(wx, wy);
         emitHover({ id: null, commit: null, harness: hb?.id || null });
         cursor = hb ? 'pointer' : 'default';
+        hideXellTooltip();
       }
       const tooltip = tipRef.current;                                  // no bloom → no button tooltip
       if (tooltip.el) { tooltip.kind = null; tooltip.el.style.display = 'none'; }
@@ -906,10 +1084,26 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     canvasRef.current.style.cursor = cursor;
   };
   const onPointerUp = (e) => {
+    const wasPinching = !!pinchRef.current;
+    pointersRef.current.delete(e.pointerId);
+    if (pinchRef.current) {
+      if (pointersRef.current.size >= 2) {
+        beginPinch();                // a finger lifted but two remain: re-seed on the new pair
+      } else {
+        pinchRef.current = null;
+        if (pointersRef.current.size === 1) {
+          // back to a single finger: resume panning (moved=true so the lift is not a click)
+          const [p1] = [...pointersRef.current.values()];
+          dragRef.current = { mx: p1.x, my: p1.y, vx: viewRef.current.x, vy: viewRef.current.y, moved: true };
+        }
+      }
+    }
     const d = dragRef.current;
     dragRef.current = null;
     canvasRef.current.style.cursor = 'default';
+    if (wasPinching) return;                                 // a lifted pinch finger is not a click
     if (d?.moved) return;                                    // it was a pan, not a click
+    if (e.button !== 0) return;                              // a RIGHT release is the context menu's, not a click
     const [wx, wy] = toWorld(...relPos(e));
     if (expandedId) {
       // A crew dot is a jump: open THAT worker's bloom. It comes first for the same reason it does on
@@ -955,6 +1149,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     }
   };
 
+  const onPointerCancel = (e) => {
+    // a touch can be cancelled by the browser (palm rejection, system gesture): clear the gesture
+    // state for that pointer so a half-finished pinch cannot leave the canvas in a bad mode.
+    pointersRef.current.delete(e.pointerId);
+    if (pinchRef.current) {
+      if (pointersRef.current.size >= 2) beginPinch();
+      else { pinchRef.current = null; dragRef.current = null; }
+    } else {
+      dragRef.current = null;
+    }
+    canvasRef.current.style.cursor = 'default';
+  };
+
   const onWheel = (e) => {
     e.preventDefault();
     const [mx, my] = relPos(e);
@@ -969,33 +1176,70 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     rafRef.current = requestAnimationFrame(draw);
   };
 
-  // Right-click a container icon in the expanded flower → open the SAME context menu the inventory
-  // chips use. Only a hit preventDefaults (swallowing the browser menu); a right-click on empty
-  // canvas is left alone.
+  // Right-click on the honeycomb. Three targets, in precedence order:
+  //   1. a container ICON in the expanded flower → the inventory's ContainerMenu (existing behaviour);
+  //   2. a XELL HEX (collapsed or another xell's cell under an open bloom) → THIS file's xell context
+  //      menu, which lists the same actions the flower draws — the whole point of the feature;
+  //   3. anything else (empty canvas, a harness badge) → left alone (the browser menu stays).
+  // Every opener swallows the event (preventDefault + stopPropagation) so the browser menu and the
+  // document-level closer do not both fire; a no-hit right-click bubbles to the document closer,
+  // which dismisses an open menu — the same close-on-anything the container menu uses.
   const onContextMenu = (e) => {
-    if (!expandedId) return;
     const [wx, wy] = toWorld(...relPos(e));
-    const c = hitContainer(wx, wy);
-    if (!c) return;
-    e.preventDefault();
-    onContainerMenu?.(e, c);
+    if (expandedId) {
+      const c = hitContainer(wx, wy);
+      if (c) {
+        e.preventDefault(); e.stopPropagation();
+        setCtxXell(null);                      // one menu at a time — the container menu replaces this one
+        onContainerMenu?.(e, c);
+        return;
+      }
+    }
+    const hx = hitHex(wx, wy);
+    if (hx) {
+      e.preventDefault(); e.stopPropagation();
+      setCtxXell({ x: e.clientX, y: e.clientY, id: hx.id });
+      return;
+    }
   };
 
   const onLeave = () => {
     emitHover({ id: null, commit: null }); dragRef.current = null;
+    pointersRef.current.clear(); pinchRef.current = null;
     if (tipRef.current.el) { tipRef.current.kind = null; tipRef.current.el.style.display = 'none'; }
+    hideXellTooltip();
   };
 
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === 'Escape') {
+        if (ctxXell) { setCtxXell(null); return; }   // dismiss the menu first — never reset the view for it
         if (expandedId) setExpandedId(null);
         else { viewRef.current = { x: 0, y: 0, k: 1 }; draw(); }   // Esc with nothing open: reset view
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [expandedId, draw]);
+  }, [expandedId, draw, ctxXell]);
+
+  // Close the xell context menu on any outside interaction — the same close-on-anything the container
+  // context menu uses (App.jsx): click, another contextmenu, scroll, Escape. Attached only while the
+  // menu is open, and AFTER the opening event has finished so it cannot close itself.
+  useEffect(() => {
+    if (!ctxXell) return;
+    const close = () => setCtxXell(null);
+    const onKey = (e) => e.key === 'Escape' && close();
+    document.addEventListener('click', close);
+    document.addEventListener('contextmenu', close);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('contextmenu', close);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [ctxXell]);
 
   // wheel must be non-passive to preventDefault page scroll
   useEffect(() => {
@@ -1004,9 +1248,12 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
   });
-  // Clean up the imperative tooltip element on unmount
+  // Clean up the imperative tooltip elements on unmount
   useEffect(() => {
-    return () => { if (tipRef.current.el) { tipRef.current.el.remove(); tipRef.current.el = null; } };
+    return () => {
+      if (tipRef.current.el) { tipRef.current.el.remove(); tipRef.current.el = null; }
+      if (xellTipRef.current.el) { xellTipRef.current.el.remove(); xellTipRef.current.el = null; }
+    };
   }, []);
 
   return (
@@ -1014,7 +1261,31 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       <canvas ref={canvasRef} className="hive-canvas"
               style={{ width: size.w, height: size.h, display: 'block', touchAction: 'none' }}
               onPointerDown={onPointerDown} onPointerMove={onPointerMove}
-              onPointerUp={onPointerUp} onMouseLeave={onLeave} onContextMenu={onContextMenu} />
+              onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}
+              onMouseLeave={onLeave} onContextMenu={onContextMenu} />
+      {/* The right-click xell context menu — a DOM overlay (fixed at the cursor) listing the SAME
+          actions the flower draws, so a human reaches them without expanding the hexagon. Dispatches
+          through the flower's own onAction, so the confirmations and refusals are identical. */}
+      {ctxXell && (() => {
+        const x = (xells || []).find((xx) => xx.id === ctxXell.id);
+        if (!x) return null;
+        const diff = diffs?.[x.id];
+        const items = xellContextMenuItems(x, diff);
+        if (!items.length) return null;
+        return (
+          <div className="ctxmenu hive-xell-ctx" style={{ left: ctxXell.x, top: ctxXell.y }} role="menu"
+               onClick={(e) => e.stopPropagation()}
+               onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}>
+            <div className="ctxhead">{x.slug} <span className="ctxsub">· {hiveStatusLabel(x)}</span></div>
+            {items.map((it) => (
+              <button key={it.kind} role="menuitem" className={it.tone === 'danger' ? 'ctxitem-danger' : ''}
+                      onClick={() => { setCtxXell(null); onAction?.(it.kind, x, diff); }}>
+                {it.label}
+              </button>
+            ))}
+          </div>
+        );
+      })()}
       {(!xells || xells.length === 0) && (
         <p className="hive-empty">No active xells. The pool maintainer will fill it shortly…</p>
       )}
@@ -1094,7 +1365,7 @@ export function drawRelationMark(ctx, cx, cy, size, { kind, slug = null, color =
 // exported for the same reason drawManagerHex is: the crew highlight is a DRAWN state (there is no DOM
 // per cell), so the only honest way to assert it is to run this against a recording 2D context
 export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = null, relatedTo = null, relColor = null,
-                                          harness = null, harnessImg = null }) {
+                                          harness = null, harnessImg = null, providerImg = null }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);
   // The commit head reads in the SAME colour the git graph traces this xell with — its connector
@@ -1131,26 +1402,31 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
 
   if (size < 30) {                     // tiny: just the status dot
     ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.22), 0, Math.PI * 2);
-    ctx.fillStyle = col; ctx.fill();
+    ctx.fillStyle = isIdentityFill(x) ? inkOf(x) : col; ctx.fill();
     ctx.restore(); mark(); ctx.restore(); return;
   }
 
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   const full = size >= 52;             // the two-half card needs room; else degrade
 
-  // ── harness avatar badge (10 o'clock / upper-left vertex) ──
+  // ── the zee badge (10 o'clock / upper-left vertex): the PROVIDER coin, wearing its harness ──
   // The upper-left vertex of a pointy-top hex is at 210° math angle (vertex i=4 in hexCorners:
-  // cos=‑√3/2, sin=‑½). The badge sits at 75% of the distance from center to that vertex
-  // (i.e. 25% from the vertex back toward center), so it stays on the hex body and never
-  // overflows the stroke.
-  if (full && harness && size >= 48) {
-    const avatarR = Math.max(5, size * 0.12);
+  // cos=‑√3/2, sin=‑½). The badge sits at 70% of the distance from center to that vertex: the
+  // costume reaches GEAR_EXTENT× the coin, so at r=0.13·size its wingtips stop 0.04·size short
+  // of the two edges that meet at that vertex — measured, not eyeballed, because a hexagon narrows
+  // fast up there and a clipped wing looks like a rendering fault. The machine line below it is
+  // fitted to a hair less width for the same reason: a costume with a container name printed
+  // through it is worse than a name truncated one character earlier.
+  // It is drawn for a xell with a PROVIDER even when it wears no harness: whose model is thinking
+  // is a fact about every zee, where a harness is optional dress.
+  const badge = zeeBadge(x, harness, { providerImg, harnessImg });
+  if (full && badge && size >= 48) {
+    const avatarR = Math.max(5, size * 0.13);
     const angle = (210 * Math.PI) / 180;   // 210° math = upper-left vertex
-    const dist = size * 0.75;               // 75% from center to vertex (25% from vertex inward)
+    const dist = size * 0.70;
     const ax = cx + dist * Math.cos(angle);
     const ay = cy + dist * Math.sin(angle);
-    drawAvatarDisc(ctx, ax, ay, avatarR, harness.color || col,
-      { img: harnessImg, glyph: harness.glyph || null, letter: String(harness.label || '?')[0] });
+    drawZeeAvatar(ctx, ax, ay, avatarR, { ...badge, ring: badge.provider ? null : (harness?.color || col) });
   }
 
   // ── upper half ──
@@ -1164,7 +1440,7 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
     // Ride the machine line with the resolved environment (❖ key; ∅ = empty → nothing merged), so
     // "which env is this xell loaded with" reads at a glance. fit() truncates, never overflows.
     const envSuffix = x.env_key ? ` · ❖${x.env_key}${Number(x.env_var_count) === 0 ? '∅' : ''}` : '';
-    const machTxt = fit(ctx, mach + envSuffix, w * 0.5);
+    const machTxt = fit(ctx, mach + envSuffix, w * (full && badge ? 0.44 : 0.5));
     const y = cy - size * 0.62;
     if (lock) {
       const pre = lock.g + ' ';
@@ -1173,10 +1449,10 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
       const x0 = cx - (preW + txtW) / 2;
       const prev = ctx.textAlign; ctx.textAlign = 'left';
       ctx.fillStyle = lock.c; ctx.fillText(pre, x0, y);
-      ctx.fillStyle = COL.muted; ctx.fillText(machTxt, x0 + preW, y);
+      ctx.fillStyle = inkMutedOf(x); ctx.fillText(machTxt, x0 + preW, y);
       ctx.textAlign = prev;
     } else {
-      ctx.fillStyle = COL.muted;
+      ctx.fillStyle = inkMutedOf(x);
       ctx.fillText('⌂ ' + machTxt, cx, y);
     }
   }
@@ -1221,11 +1497,11 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
     : ownTitle;
   const label = x.is_production ? '🛡 PRODUCTION' : shortSlug(x.slug);
   fillFont(ctx, label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
-  ctx.fillStyle = COL.text;
+  ctx.fillStyle = inkOf(x);
   ctx.fillText(fit(ctx, label, w * 0.82), cx, cy - (full ? size * (zeeTitle ? 0.14 : 0.06) : size * 0.2));
   if (zeeTitle) {
     ctx.font = `italic ${Math.max(7.5, size * 0.125)}px 'Segoe UI', sans-serif`;
-    ctx.fillStyle = COL.muted;
+    ctx.fillStyle = inkMutedOf(x);
     ctx.fillText(fit(ctx, zeeTitle, w * 0.88), cx, cy + size * 0.02);
   }
 
@@ -1236,7 +1512,8 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
   if (full) {
     if (sha) {
       ctx.font = `600 ${Math.max(8.5, size * 0.155)}px 'Cascadia Code', monospace`;
-      ctx.fillStyle = shaCol;
+      // the trace colour would vanish on a lime/white identity fill, so those hexes read the sha in ink
+      ctx.fillStyle = isIdentityFill(x) ? inkOf(x) : shaCol;
       ctx.fillText(sha, cx, cy + size * (zeeTitle ? 0.2 : 0.14));
     }
     // diff: "↑1 ↓7 · 4f +32/−6" — the SOURCE diff (worktree vs its branch's fork off main), i.e.
@@ -1267,8 +1544,12 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
       const pw = ctx.measureText(st).width + 12, ph = Math.max(11, size * 0.19);
       const py2 = cy + size * (zeeTitle ? 0.53 : 0.5);
       ctx.beginPath(); ctx.roundRect(cx - pw / 2, py2 - ph / 2, pw, ph, ph / 2);
-      ctx.fillStyle = withAlpha(col, 0.22); ctx.fill();
-      ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(col, 0.7); ctx.stroke();
+      // On the two IDENTITY fills the pill flips to a DARK chip so the word stays readable on a
+      // painted-white/lime hexagon (a faint status-tinted chip would vanish); elsewhere it stays the
+      // existing faint status-tinted chip with status-coloured text.
+      ctx.fillStyle = isIdentityFill(x) ? withAlpha('#0d1017', 0.78) : withAlpha(col, 0.22); ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = isIdentityFill(x) ? withAlpha(col, 0.85) : withAlpha(col, 0.7); ctx.stroke();
       ctx.fillStyle = col;
       ctx.fillText(st, cx, py2 + 0.5);
     }
@@ -1283,11 +1564,11 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
     // mid sizes: sha + status only
     if (sha) {
       ctx.font = `600 ${Math.max(8, size * 0.17)}px 'Cascadia Code', monospace`;
-      ctx.fillStyle = shaCol;
+      ctx.fillStyle = isIdentityFill(x) ? inkOf(x) : shaCol;
       ctx.fillText(sha, cx, cy + size * 0.08);
     }
     ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
-    ctx.fillStyle = COL.muted;
+    ctx.fillStyle = inkMutedOf(x);
     ctx.fillText(fit(ctx, hiveStatusLabel(x), w * 0.6), cx, cy + size * 0.34);
   }
   ctx.restore();   // unclip
@@ -1302,8 +1583,11 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
 // a lettermark is the fallback while it loads or if it fails.
 export function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = false } = {}) {
   const col = h.color || '#5b8cff';
-  const ay = cy - size * 0.06;                 // avatar centre, nudged up to leave room for the label
-  const r = size * 0.42;
+  // avatar centre, nudged up to leave room for the label — and the disc itself kept smaller than it
+  // used to be, because the badge now wears its own COSTUME (drawZeeAvatar reaches 2× the disc), and
+  // at the old 0.42 radius a necktie or a shovel landed squarely on the label
+  const ay = cy - size * 0.20;
+  const r = size * 0.30;
   ctx.save();
   if (dim) ctx.globalAlpha = 0.28;             // dim with the rest when the focus is on a non-consumer
   // faint dashed hex seat — this cell is part of the grid, but clearly not a work-cell
@@ -1317,7 +1601,10 @@ export function drawHarnessBadge(ctx, cx, cy, size, h, img, { dim = false, hi = 
     ctx.beginPath(); ctx.arc(cx, ay, r + 4, 0, Math.PI * 2);
     ctx.lineWidth = 2.5; ctx.strokeStyle = COL.text; ctx.stroke();
   }
-  drawAvatarDisc(ctx, cx, ay, r, col, { img, glyph: h.glyph, letter: String(h.label || 'H')[0] });
+  // The harness's OWN cell is the one place the harness is the subject, so its authored badge stays
+  // the face — but it is worn in the same language it is worn everywhere else (drawZeeAvatar's strap
+  // + tool pip), so a human can match this cell to the pip hanging off a xell's provider coin.
+  drawZeeAvatar(ctx, cx, ay, r, { gear: harnessGear(h), harnessImg: img, ring: col });
   // label + consumer count
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.font = `600 ${Math.max(9, size * 0.16)}px 'Segoe UI', sans-serif`;
@@ -1355,14 +1642,17 @@ export function harnessWarning(h) {
 // The persona disc: a preloaded avatar image, else the harness's authored glyph, else a lettermark —
 // on a dark disc ringed in the badge's colour. Shared by the HARNESS badge and the MANAGER hexagon,
 // so "a persona seated in the grid" is drawn by ONE piece of code and the two cannot drift apart.
-function drawAvatarDisc(ctx, cx, cy, r, col, { img, glyph, letter } = {}) {
+// `coin` overrides the disc fill (a brand coin — see drawZeeAvatar); `inset` pads the art inside the
+// ring so a logo with no margin of its own does not touch it.
+export function drawAvatarDisc(ctx, cx, cy, r, col, { img, glyph, letter, coin, inset = 2, ringWidth = 2 } = {}) {
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
-  ctx.fillStyle = COL.bg; ctx.fill();
-  ctx.lineWidth = 2; ctx.strokeStyle = col; ctx.stroke();
+  ctx.fillStyle = coin || COL.bg; ctx.fill();
+  ctx.lineWidth = ringWidth; ctx.strokeStyle = col; ctx.stroke();
   if (img && img.complete && img.naturalWidth) {
+    const ir = Math.max(1, r - inset);
     ctx.save();
-    ctx.beginPath(); ctx.arc(cx, cy, r - 2, 0, Math.PI * 2); ctx.clip();
-    ctx.drawImage(img, cx - (r - 2), cy - (r - 2), (r - 2) * 2, (r - 2) * 2);
+    ctx.beginPath(); ctx.arc(cx, cy, r - 1, 0, Math.PI * 2); ctx.clip();
+    ctx.drawImage(img, cx - ir, cy - ir, ir * 2, ir * 2);
     ctx.restore();
     return;
   }
@@ -1379,6 +1669,68 @@ function drawAvatarDisc(ctx, cx, cy, r, col, { img, glyph, letter } = {}) {
   }
 }
 
+// ── THE ZEE BADGE: a provider coin, WEARING its harness ───────────────────────
+// One drawing, one rule, everywhere a zee is shown (worker hexagon, manager hexagon, flower):
+//
+//      \\|//  wings           the AI PROVIDER is the coin — its logo on its brand disc. It is the
+//     ( logo )⚒ hammer        identity, because "whose model is burning here" is the fact a human
+//        ▼ necktie            reads across the room.
+//                             the HARNESS is the COSTUME around it: real artwork, cut to the job —
+// a scout gets wings, a builder a hammer, a manager a necktie, a reviewer glasses across the face
+// (../harnessGear.js). The same hammer hangs on a claude coin and on an openai coin: the silhouette
+// is the role, the coin under it is the vendor.
+//
+// Parts marked `behind` are painted BEFORE the coin (wings tuck behind it, so they read as strapped
+// on rather than pasted over the logo), and `detail` parts are dropped when the badge is too small
+// for them to be anything but noise. With no provider resolved the harness's own face takes the
+// coin's place, costume and all. ZeeAvatar.jsx is the DOM twin of this drawing.
+export function drawZeeAvatar(ctx, cx, cy, r, { provider = null, providerImg = null, gear = null,
+                                                harnessImg = null, ring = null } = {}) {
+  const detail = r >= 13;                       // below this a feather notch is three grey pixels
+  // 1. the costume's back half — wings and anything else that belongs UNDER the coin
+  if (gear && r >= 5) drawGearLayer(ctx, cx, cy, r, gear, { behind: true, detail });
+
+  // 2. the coin. Provider art when we know the vendor; otherwise the harness's own face (legacy).
+  if (provider) {
+    // inset ≈ r·(1−1/√2): the logo is blitted as a SQUARE inside a round clip, so anything less
+    // shaves the corners off a mark that fills its box (claude's rays, the Z's plate).
+    // The brand ring stays hairline — the coin is the identity; the COSTUME is what must read as worn.
+    drawAvatarDisc(ctx, cx, cy, r, ring || provider.color, { img: providerImg, coin: provider.coin,
+      letter: provider.label[0], inset: Math.max(1.5, r * 0.26), ringWidth: Math.max(1, r * 0.055) });
+  } else {
+    // No provider resolved → the harness is the face (what every badge used to be). Its authored
+    // badge art if it has any, else its INITIAL — never its glyph, which belongs to the costume.
+    drawAvatarDisc(ctx, cx, cy, r, ring || gear?.color || COL.ready,
+      { img: harnessImg, glyph: gear ? null : undefined, letter: gear ? gear.label[0].toUpperCase() : 'H',
+        ringWidth: Math.max(1.2, r * 0.07) });
+  }
+  if (!gear || r < 5) return;                   // too small to dress — the coin alone is the badge
+
+  // 3. the costume's front half — the tool on the belt, the glasses on the face, the tie down the front
+  drawGearLayer(ctx, cx, cy, r, gear, { behind: false, detail });
+
+  // 4. …and for a harness with no costume of its own, its glyph on the fallback ribbon's plate:
+  //    the nameplate is the shape, the glyph is what is written on it.
+  const spot = gear.art?.glyphOn;
+  if (spot && gear.mark && r >= 11) {
+    ctx.save();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = `700 ${r * 0.42}px 'Segoe UI Symbol', 'Segoe UI Emoji', 'Segoe UI', sans-serif`;
+    ctx.fillStyle = COL.bg;
+    ctx.fillText(gear.mark, cx + spot[0] * r, cy + spot[1] * r);
+    ctx.restore();
+  }
+}
+
+// The badge for a xell, resolved from the row + the harness it wears. Kept beside the drawing so
+// every hexagon asks the same question the same way (and a test can ask it without a canvas).
+export function zeeBadge(x, harness, { providerImg = null, harnessImg = null } = {}) {
+  const provider = providerArtOf(x);
+  const gear = harnessGear(harness);
+  if (!provider && !gear) return null;
+  return { provider, gear, providerImg, harnessImg };
+}
+
 // ── the MANAGER hexagon: a persona, not a work-cell ───────────────────────────
 // Drawn in the HARNESS BADGE's language (dashed seat + the persona disc of the harness it wears) so a
 // manager is identifiable across the room, before a single word is read — and deliberately WITHOUT
@@ -1386,6 +1738,7 @@ function drawAvatarDisc(ctx, cx, cy, r, col, { img, glyph, letter } = {}) {
 // it runs (count, and how many are working / waiting on a human) and its read-only hold on prod. The
 // prod-orange outer wall stays — that ring is the "this one holds production" tell.
 export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null, img = null,
+                                          providerImg = null,
                                           related = null, relatedTo = null, relColor = null }) {
   const { cx, cy, size, x } = hx;
   const col = statusColor(x);                 // its hive status still colours it — a manager idles too
@@ -1429,17 +1782,24 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
 
   if (size < 30) {                            // tiny: the persona dot, ringed prod-orange
     ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, size * 0.24), 0, Math.PI * 2);
-    ctx.fillStyle = col; ctx.fill();
+    ctx.fillStyle = isIdentityFill(x) ? inkOf(x) : col; ctx.fill();
     ctx.lineWidth = 1.2; ctx.strokeStyle = withAlpha(COL.prod, 0.9); ctx.stroke();
     ctx.restore(); mark(); ctx.restore(); return;
   }
 
   const full = size >= 52;
-  // the persona it wears: the harness avatar/glyph, ⬢ when it wears none
-  const discR = size * (full ? 0.24 : 0.26);
-  const discY = cy - size * (full ? 0.42 : 0.3);
-  drawAvatarDisc(ctx, cx, discY, discR, harness?.color || COL.prod,
-    { img, glyph: harness?.glyph || (harness ? null : '⬢'), letter: String(harness?.label || 'M')[0] });
+  // WHO is thinking, and what it is dressed as: the provider coin wearing this manager's harness
+  // (drawZeeAvatar). A manager IS its badge, so this is the one place the composed avatar is the
+  // hexagon's subject rather than a corner mark. No provider resolved → the harness's own disc,
+  // exactly as before, with ⬢ standing in for a manager that wears no harness at all.
+  const discR = size * (full ? 0.20 : 0.23);
+  const discY = cy - size * (full ? 0.44 : 0.32);
+  const badge = zeeBadge(x, harness, { providerImg, harnessImg: img });
+  if (badge) {
+    drawZeeAvatar(ctx, cx, discY, discR, { ...badge, ring: badge.provider ? null : harness?.color });
+  } else {
+    drawAvatarDisc(ctx, cx, discY, discR, COL.prod, { glyph: '⬢', letter: 'M' });
+  }
   // A manager IS its persona here — so when that persona carries nothing, the hexagon must say it.
   // (This is the shape the original bug took: a manager zee, correctly seated, wearing a harness
   // with no manual in it, and nothing on screen different from a manager that had one.)
@@ -1456,21 +1816,33 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
 
   // identity (⬢ slug), grown to fill the seat
   fillFont(ctx, card.label, w * 0.82, 8.5, size * 0.2, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
-  ctx.fillStyle = COL.text;
+  ctx.fillStyle = inkOf(x);
   ctx.fillText(fit(ctx, card.label, w * 0.82), cx, cy + size * (full ? 0.02 : 0.16));
 
   if (full) {
-    // seam: what it is and how big its crew is — where a worker names its task
-    const seam = `${card.role} · ${card.crew}`;
+    // seam: WHAT this manager is for (its directive) and how big its crew is — where a worker names
+    // its task. The word "manager" is redundant (the shape already says it), so the directive takes
+    // its place when there is one. fit() truncates from the END, so the directive is fitted FIRST to
+    // leave the crew count its room — the count can never be clipped away.
+    let seam;
+    const crewTxt = card.crew;
+    const dir = card.directive;
+    if (dir) {
+      ctx.font = `italic 7.5px 'Segoe UI', sans-serif`;
+      const room = w * 0.88 - ctx.measureText(` · ${crewTxt}`).width - ctx.measureText('📜 ').width;
+      seam = `📜 ${fit(ctx, dir, Math.max(24, room))} · ${crewTxt}`;
+    } else {
+      seam = `${card.role} · ${crewTxt}`;
+    }
     fillFont(ctx, seam, w * 0.88, 7.5, size * 0.13, (p) => `italic ${p}px 'Segoe UI', sans-serif`);
-    ctx.fillStyle = COL.muted;
+    ctx.fillStyle = inkMutedOf(x);
     ctx.fillText(fit(ctx, seam, w * 0.88), cx, cy + size * 0.19);
     // the crew's ACTIVITY stands where a worker's DIFFSTAT stands — a manager's work is its crew.
     // Sized to FILL the card (the file's rule for every stat): it shrinks to fit rather than clipping
     // "1 working · 1 waiting" down to an ellipsis, which is where the whole line's information is.
     const line = card.activity || (card.count ? 'crew idle' : '—');
     fillFont(ctx, line, w * 0.82, 7, size * 0.15, (p) => `600 ${p}px 'Segoe UI', sans-serif`);
-    ctx.fillStyle = card.activity ? COL.text : withAlpha(COL.muted, 0.75);
+    ctx.fillStyle = card.activity ? inkOf(x) : withAlpha(inkMutedOf(x), 0.75);
     const shown = fit(ctx, line, w * 0.82);
     ctx.fillText(shown, cx, cy + size * 0.35);
     // and the yellow "actively working" dot rides beside it, exactly as it does on a worker
@@ -1491,8 +1863,10 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     const pw = ctx.measureText(st).width + 12, ph = Math.max(11, size * 0.19);
     const py = cy + size * 0.53;
     ctx.beginPath(); ctx.roundRect(cx - pw / 2, py - ph / 2, pw, ph, ph / 2);
-    ctx.fillStyle = withAlpha(col, 0.22); ctx.fill();
-    ctx.lineWidth = 1; ctx.strokeStyle = withAlpha(col, 0.7); ctx.stroke();
+    // the IDENTITY fills (router white / production lime) get a DARK pill so the word stays readable
+    ctx.fillStyle = isIdentityFill(x) ? withAlpha('#0d1017', 0.78) : withAlpha(col, 0.22); ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = isIdentityFill(x) ? withAlpha(col, 0.85) : withAlpha(col, 0.7); ctx.stroke();
     ctx.fillStyle = col;
     ctx.fillText(st, cx, py + 0.5);
     // where a worker's ship line sits: what this manager holds in production
@@ -1505,7 +1879,7 @@ export function drawManagerHex(ctx, hx, { hover, dim, crew = [], harness = null,
     }
   } else if (!full) {
     ctx.font = `${Math.max(7.5, size * 0.15)}px 'Segoe UI', sans-serif`;
-    ctx.fillStyle = COL.muted;
+    ctx.fillStyle = inkMutedOf(x);
     ctx.fillText(fit(ctx, `⬡ ×${card.count} · ${st}`, w * 0.7), cx, cy + size * 0.38);
   }
   ctx.restore();   // unclip
@@ -1545,7 +1919,8 @@ export function flowerCrewRects(centers, size, crew = []) {
 // ── the flower: rendered ON the grid cells it consumes (no overlay) ───────────
 // Exported for the same reason the two hexagons are: its CREW facet is now an interactive list, and the
 // only honest way to assert what a human sees there is to paint it into a recording 2D context.
-export function drawFlower(ctx, centers, size, x, diff, machines, traceColor, crew = [], { hoverId = null } = {}) {
+export function drawFlower(ctx, centers, size, x, diff, machines, traceColor, crew = [],
+                           { hoverId = null, badge = null } = {}) {
   const col = statusColor(x);
   // A manager's bloom keeps the five facets it has (identity, branch, session, containers, machine)
   // and swaps the two GIT facets — commit head and diffstat — for the two things a manager owns:
@@ -1567,7 +1942,7 @@ export function drawFlower(ctx, centers, size, x, diff, machines, traceColor, cr
     ctx.strokeStyle = isCenter ? col : withAlpha(col, 0.45);
     ctx.stroke();
     ctx.clip();
-    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x, traceColor, { hoverId });
+    drawFacet(ctx, hx, hy, size, facet, col, isCenter, x, traceColor, { hoverId, badge });
     ctx.restore();
   });
 }
@@ -1586,7 +1961,7 @@ function cxellLock(x) {
 }
 
 // One canvas button centred at (cx, cy). Font must already be set. Returns its WORLD-space rect.
-function drawPetalBtn(ctx, cx, cy, label, kind, accent, h, padX) {
+function drawPetalBtn(ctx, cx, cy, label, kind, accent, h, padX, tip = null) {
   const w = ctx.measureText(label).width + padX * 2;
   ctx.beginPath();
   ctx.roundRect(cx - w / 2, cy - h / 2, w, h, h / 2);
@@ -1597,7 +1972,7 @@ function drawPetalBtn(ctx, cx, cy, label, kind, accent, h, padX) {
   ctx.stroke();
   ctx.fillStyle = withAlpha(COL.text, 0.94);
   ctx.fillText(label, cx, cy + 0.5);
-  return { x: cx - w / 2, y: cy - h / 2, w, h, kind };
+  return { x: cx - w / 2, y: cy - h / 2, w, h, kind, tip };
 }
 
 // Lay out a row of 1–2 buttons centred at (cx, cy), left→right. Each btn is {label, kind, accent}.
@@ -1608,7 +1983,7 @@ function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
   let x0 = cx - total / 2;
   const rects = [];
   btns.forEach((b, i) => {
-    rects.push(drawPetalBtn(ctx, x0 + ws[i] / 2, cy, b.label, b.kind, b.accent || accent, h, padX));
+    rects.push(drawPetalBtn(ctx, x0 + ws[i] / 2, cy, b.label, b.kind, b.accent || accent, h, padX, b.tip));
     x0 += ws[i] + gap;
   });
   return rects;
@@ -1649,6 +2024,18 @@ export function petalVerbs(x, diff) {
     ? (xPaused ? ['resume', 'terminal', 'nudge'] : ['pause', 'terminal', 'nudge'])
     : (xPaused ? ['resume'] : ['pause']);
   v[4] = cxell ? ['env', 'message'] : ['env'];                    // MACHINE petal
+  // MANAGER DIRECTIVES — the manager⇄worker conversation, read from the console. A worker that has
+  // a manager (manager_slug is set) or a manager itself is part of that conversation; the button
+  // opens it read-only. Sits with the other communication verbs on the MACHINE petal.
+  if (x.manager_slug || manager) v[4] = [...v[4], 'directives'];
+  // LANGFUSE — "View Langfuse" opens THIS zee's Langfuse SESSION in a new window. Shown whenever
+  // the plugin is enabled AND this xell's per-xell langfuse_tracking flag is on (the toggle lives
+  // in the terminal window header and the dispatch prompt). A session-less zee still gets the verb
+  // (rather than silently hiding it) so the flower tooltip can say WHY there is nothing to open
+  // yet — a session appears after the zee's first finished turn (TKT-127).
+  if (x.langfuse_enabled && x.langfuse_tracking !== false) {
+    v[4] = [...v[4], 'langfuse'];
+  }
   // BRANCH petal — the two ways a xell's current job ENDS, side by side, because they are each
   // other's alternative: SWAP keeps the xell and changes who is in it (same branch, same commits,
   // same containers, same db, same card), DONE tears it down. A human reaching for "mark done"
@@ -1677,7 +2064,7 @@ export function petalVerbs(x, diff) {
 const VERB_LABEL = {
   build: '🔨 build', terminal: '⌨', nudge: '💬', env: '❖ env', message: '📨 message',
   pull: '↓ pull', land: '⬆ land', pr: 'PR', ship: '🚀 ship', swap: '♻ swap zee',
-  pause: '⏸', resume: '▶',
+  pause: '⏸', resume: '▶', directives: '🧭', langfuse: '⚗ langfuse',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
   done: 'error', swap: 'working', pause: 'error', resume: 'working' };
@@ -1696,7 +2083,54 @@ const VERB_TOOLTIP = {
   done: 'Mark this xell done',
   pause: 'Pause this xell — interrupts its zee mid-turn',
   resume: 'Resume this xell — calls the zee back',
+  directives: 'See this xell\'s directive — the brief it was given (a manager\'s programme), and the conversation around it',
+  langfuse: 'Open this zee\'s Langfuse session in a new window',
 };
+
+// The RIGHT-CLICK context menu (a DOM overlay on the honeycomb) reuses the SAME verb list as the
+// flower — one source of truth, two surfaces. The flower draws icon-only buttons (⌨ / ⏸ / 💬…) that
+// read fine on the canvas, but a menu row needs a word, so the menu gets its own full-text label for
+// the icon-only kinds and inherits the flower's wordy labels for the rest.
+const VERB_MENU_LABEL = {
+  ...VERB_LABEL,
+  terminal: '⌨ Terminal', nudge: '💬 Nudge', pause: '⏸ Pause', resume: '▶ Resume',
+  env: '❖ Environment', message: '📨 Message', directives: '🧭 Directives',
+  langfuse: '⚗ View Langfuse',
+};
+// Which menu rows carry the destructive tone (the flower paints the same kinds with COL.error).
+const VERB_MENU_TONE = { done: 'danger', pause: 'danger' };
+
+// Mark-done reads its state (confirm / mark / clean up); every other verb has a fixed label. Shared
+// by the flower's button row and the xell context menu so the two surfaces can never drift apart.
+function doneLabel(x) {
+  return x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? '✓ mark done' : '✕ clean up');
+}
+
+// The xell context menu's items — the "existing actions available in its flower", listed without
+// opening the flower. A pure function (like petalVerbs, which it reuses) so the menu can be
+// unit-tested without a browser. Order follows the flower: the two diff-petal viewers first (they are
+// the flower's read-mostly interactions), then the verb buttons in petal order 1→6.
+export function xellContextMenuItems(x, diff) {
+  const items = [];
+  // The two DIFF petals (commit/source stat, own stat) open the diff viewer on a worker's flower; a
+  // manager's petals 5/6 are CREW and PROD·AGE instead, so a manager gets neither (same rule as
+  // diffPetal()). Production keeps only the SOURCE side — "what is deployed vs the origin mirror" —
+  // because prod has no working tree for the own diff (App's handler says so too).
+  if (!isManagerXell(x)) {
+    if (!x.is_production) items.push({ kind: 'owndiff', label: '↔ Own diff', tone: '' });
+    items.push({ kind: 'srcdiff', label: '↔ Source diff', tone: '' });
+  }
+  for (const [, kinds] of Object.entries(petalVerbs(x, diff))) {
+    for (const kind of kinds || []) {
+      items.push({
+        kind,
+        label: kind === 'done' ? doneLabel(x) : (VERB_MENU_LABEL[kind] || VERB_LABEL[kind] || kind),
+        tone: VERB_MENU_TONE[kind] || '',
+      });
+    }
+  }
+  return items;
+}
 
 function drawFlowerButtons(ctx, centers, size, x, diff) {
   if (x.is_production) return [];
@@ -1736,14 +2170,19 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
     ctx.restore();
   };
 
-  // mark-done reads its state (confirm / mark / clean up); every other verb has a fixed label.
-  const doneLabel = x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? '✓ mark done' : '✕ clean up');
   const accent = { working: G, prod: P, error: D };
   for (const [petal, kinds] of Object.entries(verbs)) {
     row(Number(petal), (kinds || []).map((kind) => ({
       kind,
-      label: kind === 'done' ? doneLabel : VERB_LABEL[kind] || kind,
+      label: kind === 'done' ? doneLabel(x) : VERB_LABEL[kind] || kind,
       accent: accent[VERB_ACCENT[kind]] || R,
+      // The langfuse verb is shown even for a session-less zee (petalVerbs no longer hides it), so
+      // the tooltip carries WHY there is nothing to open yet instead of silently dropping the verb.
+      tip: kind === 'langfuse'
+        ? (x.claude_session_id || x.session_name
+            ? VERB_TOOLTIP.langfuse
+            : 'No Langfuse session recorded for this zee yet — one appears after its first finished turn')
+        : null,
     })));
   }
   return rects;
@@ -1797,10 +2236,14 @@ export function managerFacets(x, machines, crew = []) {
   return f;
 }
 
-function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor, { hoverId = null } = {}) {
+function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor, { hoverId = null, badge = null } = {}) {
   ctx.textAlign = 'center';
   if (isCenter) {
     ctx.textBaseline = 'middle';
+    // the zee badge crowns the bloom's identity petal: WHOSE model is in this xell (the provider
+    // coin) and WHAT it is dressed as (the harness strap + tool pip) — the same drawing the
+    // collapsed hexagon carries at 10 o'clock, so opening a xell enlarges it rather than replacing it
+    if (badge) drawZeeAvatar(ctx, cx, cy - size * 0.48, size * 0.13, badge);
     const titleMaxW = hexHalfWidthAt(size, 0) * 2 * 0.86;
     // grow a short slug to fill the bloom; a long one drops to min and wraps onto a second line
     const px = fillFont(ctx, facet.lines[0], titleMaxW, 11, Math.min(22, size * 0.26),
@@ -1808,9 +2251,9 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor, { hov
     const lines = wrapText(ctx, facet.lines[0], titleMaxW, 2);
     const lh = px * 1.06;
     const y0 = cy - size * 0.08 - ((lines.length - 1) * lh) / 2;
-    ctx.fillStyle = COL.text;
+    ctx.fillStyle = inkOf(x);
     lines.forEach((ln, i) => ctx.fillText(ln, cx, y0 + i * lh));
-    ctx.fillStyle = withAlpha(col, 0.95);
+    ctx.fillStyle = isIdentityFill(x) ? withAlpha(inkMutedOf(x), 0.95) : withAlpha(col, 0.95);
     fillFont(ctx, facet.lines[1], titleMaxW, 9, Math.min(14, size * 0.17),
       (p) => `${p}px 'Segoe UI', sans-serif`);
     ctx.fillText(facet.lines[1], cx, cy + size * 0.32 + ((lines.length - 1) * lh) / 2);

@@ -14,9 +14,19 @@
 import { one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from '../lib/cxell.js';
-import { adapterFor } from '../lib/cxell-runtimes.js';
+import { adapterFor, usageFrom, resultFrom } from '../lib/cxell-runtimes.js';
+import { postTurnToLangfuse } from '../lib/langfuse.js';
+import { decideMessageDelivery } from '../lib/zee-turn.js';
+import { resumeTurnDeath } from '../lib/turn-death.js';
+import { predecessorActionDigest } from '../lib/predecessor-digest.js';
+// The one writer of a turn boundary on the zee row — shared with intake's spawn and the cage's own
+// interactive report (lib/turn-record.js says why it is not lib/status.js setZeeStatus). claimZeeTurn
+// is the TURN LOCK half of the same module: a resume must CLAIM the turn atomically (refusing if one
+// is already in flight) instead of blindly marking 'working' over a live session (TKT-114-B).
+import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
+import { broadcast } from '../lib/events.js';
 import { fleetPaused, PAUSED_REASON, noteHeldNudge } from '../lib/fleet-pause.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, harness, reaper, the
@@ -24,6 +34,45 @@ import { fleetPaused, PAUSED_REASON, noteHeldNudge } from '../lib/fleet-pause.js
 // `docker exec cxell_<slug>` that RESUMES an agent's session, and the slug comes off a fleet row —
 // which, in a NESTED queenzee, is another zee's live cage. See nudgeCxell() for the guard itself.
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
+
+// ── ONE-SHOT WEARERS (migration 149) ─────────────────────────────────────────────────────────
+//
+// `harness.one_shot` is a PERSONA setting, like enable_reflection (112): every queenzee-started turn
+// for a wearer runs in a fresh session rather than resuming the last one, so context — and the bill
+// for re-sending it — does not accumulate over a cage's life. The router ships with it ON.
+//
+// Inherited, exactly like every other harness setting: a project's own router persona descends from
+// `router` and must not lose the economics by existing. So the chain is walked and ANY layer saying
+// one_shot makes the wearer one-shot.
+async function harnessIsOneShot(xellId) {
+  try {
+    const x = await one(`SELECT harness_id FROM xell WHERE id=$1`, [xellId]);
+    let cur = x?.harness_id
+      ? await one(`SELECT id, one_shot, parent_id FROM harness WHERE id=$1 AND enabled`, [x.harness_id])
+      : null;
+    let hops = 0;
+    while (cur && hops++ < 32) {
+      if (cur.one_shot === true) return true;
+      cur = cur.parent_id ? await one(`SELECT id, one_shot, parent_id FROM harness WHERE id=$1 AND enabled`, [cur.parent_id]) : null;
+    }
+  } catch { /* a database that has not run 149 has no such column — resume as before */ }
+  return false;
+}
+
+// What a fresh session must be told before it can act. Deliberately SHORT and a POINTER: the persona,
+// its memory and the project manual are already files in the cage (the queenzee injects them at
+// spawn), so re-sending them every turn would spend exactly what one-shot exists to save.
+const oneShotPreamble = () => [
+  '⟲ FRESH SESSION — your harness is ONE-SHOT, so this turn starts with no memory of any previous one.',
+  'That is deliberate and nothing has gone wrong. Before you act, read (they are already in your cage):',
+  '  • .zeehive/harness/PERSONA.md      — who you are and what you may do',
+  '  • .zeehive/harness/memory/         — your manual and notes, including the cxell-zee manual',
+  '  • CLAUDE.md / AGENTS.md at /work/repo — how this project works',
+  'Take every fact about the fleet from the verbs, never from memory: `zee status`, `zee zees`,',
+  '`zee work --board`, `zee inbox`. Anything that must outlive this turn belongs in a work item, a',
+  'dispatch brief or a report — not in your head.',
+  '',
+].join('\n');
 
 const CONTINUE_PROMPT =
   'Your landing was APPROVED and is now on main — the queenzee moved the ref, nothing is left for you '
@@ -358,6 +407,76 @@ export async function nudgeXellForFleetResume(xellId, { minutes = null, reason =
   });
 }
 
+// THE REVIVE — a turn that the PROVIDER cut, not the zee (queenzee/revive.js owns the policy).
+//
+// A 429 or a 529 ends a headless run mid-thought and intake files it as 'errored'. The session, the
+// cage, the branch and the database are all intact; the only thing that went wrong is that the API
+// said no. Measured across 279 zees, ~43 died that way and 29 of those on a rate limit or an
+// overload — most of them on their FIRST turn, at $0.06–$0.43, with the whole xell already paid for.
+//
+// So the queenzee resumes them, and the prompt has one job beyond "carry on": tell the agent WHY it
+// is running again. An agent resumed with no explanation reads its own truncated transcript as a
+// failure of its own and starts hunting for it — the same reason the fleet-resume prompt opens the
+// way it does. It also says which attempt this is, because the ladder is finite (three, then a
+// human) and a zee that knows that does not burn its turn re-triggering the thing that killed it.
+const REVIVE_PROMPT = (signal, message, attempt, max, minutes) => [
+  'RESUMED — your last turn did NOT end, it was CUT SHORT BY A PROVIDER ERROR'
+    + (minutes != null ? ` about ${minutes} minute(s) ago` : '') + '.',
+  `The provider answered ${signal ? `${signal}: ` : ''}"${String(message || '').replace(/\s+/g, ' ').slice(0, 300)}"`,
+  'and the run died there. Read that carefully before you react: NOTHING OF YOURS FAILED. You were not',
+  'rejected, no gate moved, no build broke and nothing was reverted — the API refused mid-turn, which is',
+  'why your transcript stops in the middle of a thought. Your commits are exactly where you left them.',
+  '',
+  `The queenzee revived you automatically (attempt ${attempt} of ${max}, no human involved).`,
+  '',
+  'Re-orient BEFORE you act — time has passed and you must not trust your memory of the fleet\'s state:',
+  '  1. `zee status` — the authoritative answer to "where do I stand?": your task, and whether a landing,',
+  '     a ship or a done proposal of yours is pending a human. A decision may have arrived while you were dead.',
+  '  2. `zee work` if you are on a work item — re-read it rather than recalling it.',
+  '  3. `git log --oneline -5` and `git status` in your worktree — what you had actually committed before',
+  '     the error, which is usually more (or less) than you remember.',
+  '',
+  'Then CONTINUE the job from there. Do not redo work that is already committed, do not re-raise a request',
+  '`zee status` shows is already open, and do not `zee tend` about the provider error — it is handled, and',
+  `if the same error kills this turn too the queenzee will try again${attempt < max ? '' : ' no more times'} and then raise a human itself.`,
+].join('\n');
+
+// Revive one zee whose turn a provider error killed. Same contract as every nudge here: best-effort,
+// fire-and-forget, NEVER throws — the caller (revive.js) decides what an undelivered revive means.
+// `prompt` overrides the standard turn-death text — used by the credential-injection path, whose
+// "revive" was approved by a human (the standard text says "no human involved", which would be a lie).
+//
+// The DISCLOSURE (TKT-114-A): whatever the prompt, a digest of what earlier runs of this zee did —
+// messages sent, workers dispatched, done suggestions, work-item ops, all already in the meta-DB
+// ledgers — is appended, so a revived run is told what its predecessors said and did instead of
+// re-deciding the same question blind. Best-effort: a digest that cannot be built (a ledger read
+// fails, no zee row) must not sink the revive.
+export async function nudgeXellForTurnDeath(xellId, { signal = null, message = '', attempt = 1,
+                                                      max = 3, minutes = null, by = 'queenzee',
+                                                      mode = PROVISION_MODE, prompt = null } = {}) {
+  let briefing = prompt || REVIVE_PROMPT(signal, message, attempt, max, minutes);
+  try {
+    const zee = await one(
+      `SELECT z.id, z.xell_id, z.created_at, x.slug
+         FROM zee z JOIN xell x ON x.id = z.xell_id
+        WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
+        ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
+    if (zee) {
+      const digest = await predecessorActionDigest({
+        xellId: zee.xell_id, xellSlug: zee.slug, since: zee.created_at });
+      if (digest) briefing += `\n${digest}`;
+    }
+  } catch (e) {
+    logline('nudge', `xell ${String(xellId).slice(0, 8)}: could not build the predecessor-action digest `
+      + `(${String(e.message).slice(0, 120)}) — reviving without it`);
+  }
+  return nudgeCxell(xellId, {
+    by, mode, prompt: briefing, why: 'provider error cut the turn',
+    log: (slug, sid) => `${slug}: REVIVING after a ${signal || 'provider'} death — resuming cxell session `
+      + `${sid} (attempt ${attempt}/${max})`,
+  });
+}
+
 // An OPERATOR-initiated nudge: poke the running zee for a status update, WITHOUT changing anything.
 // The word the operator wants the agent to actually SEE, typed into the live session as-is.
 const STATUS_KEYS = 'status?';
@@ -378,41 +497,107 @@ export async function nudgeXellAfterLand(xellId, { by = 'human', mode = PROVISIO
     why: 'landing approved', log: (slug, sid) => `${slug}: landing approved by ${by} — resuming cxell session ${sid} to continue` });
 }
 
+// The prompt a message becomes when the zee's turn has already ENDED and the queenzee RESUMES its
+// session to hand it over. Deliberately says why a session woke up: an agent that finds itself
+// running again with no explanation reads it as a failure and goes hunting for one (the same reason
+// the fleet-resume prompt opens the way it does). The message itself is quoted whole — this path has
+// no 300-character line to fit into, so nothing is truncated on the way in.
+const MESSAGE_PROMPT = ({ by, body, files = [], bodyPath = null }) => [
+  `📨 A MESSAGE ARRIVED FOR YOU${by ? ` — from ${by}` : ''}. Your last turn had already ENDED, so the queenzee`,
+  'RESUMED this session to hand it to you. Nothing of yours failed and no gate moved: this is somebody',
+  'talking to you, not a decision about your work.',
+  '',
+  '──────── the message ────────',
+  body || '(no text — see the attachments below)',
+  '─────────────────────────────',
+  ...(bodyPath ? ['', `The full text is also in your cage at ${bodyPath}.`] : []),
+  ...(files.length ? ['', `Attachment(s) written into your cage — open them by path: ${files.join(', ')}`] : []),
+  '',
+  'Treat it as an INSTRUCTION from whoever sent it: it may re-task you, answer something you asked, or',
+  'correct work you have already done. Time has passed since your last turn, so before you act on',
+  'anything that depends on your state, re-read it rather than trusting your memory — `zee status`',
+  '(landing/ship/tend), and `zee work` if you are on a work item. Then do the work in THIS turn.',
+  'If you disagree with it, or it cannot be done, say so (`zee report` to your manager, or',
+  '`zee tend --reason "…"`) rather than stopping silently.',
+].join('\n');
+
 // SEND A COMPOSED OPERATOR MESSAGE to this xell's live cxell zee — the "proper message" path behind
-// the flower's 📨 button, for when the raw terminal is too clumsy for long text or images. Short,
-// single-line text is TYPED straight into the live interactive session (exactly like a status nudge,
-// so the zee's reply lands where the operator is looking). Anything richer — any image, or multi-line
-// / long text — is written into the cxell as real files under `.zee-inbox/<ts>/` (images verbatim, the
-// body as `message.md`), and a one-line pointer is typed in telling the zee to READ the body and VIEW
-// the attached images by path (Claude opens image files from a path). Delivery is fire-and-forget and
-// best-effort — this NEVER throws; it returns { sent, reason?/error? } so the route/UI can report.
-export async function sendMessageToXell(xellId, { text = '', images = [], by = 'human' } = {}) {
+// the flower's 📨 button, a manager's `zee say` and the Hermes inbound bridge, all three of which
+// come through here. THREE deliveries, decided from the zee's own state by decideMessageDelivery()
+// (lib/zee-turn.js — pure, and table-tested in test/message-to-a-finished-zee.test.mjs):
+//
+//   • RESUMED — the turn has ENDED, so the message becomes the prompt of a resumed session. The
+//     keystroke path did reach a finished zee (measured), but through a TUI inside the cage that
+//     nothing in the fleet can observe — so the restart was INVISIBLE, which cost a manager an
+//     entire duplicate xell. A resume is a turn the queenzee starts, records and watches end.
+//   • QUEUED  — the zee is MID-TURN: the cage stores the message and zee-attach.sh types it into the
+//     session the moment the turn ends.
+//   • TYPED   — an interactive session is what is there to talk to (a runtime that cannot re-invoke
+//     a finished session, or no session id captured), so the keystrokes go in as they always did.
+//
+// Anything richer than short single-line text — any image, or multi-line / long text — is still
+// written into the cxell as real files under `.zee-inbox/<ts>/` (images verbatim, the body as
+// `message.md`) whichever delivery follows: a prompt cannot carry an image, and Claude opens an
+// image from a path. Delivery is fire-and-forget and best-effort — this NEVER throws; it returns
+// { sent, delivery, reason?/error? } so the route/UI/manager can report which of the three happened.
+//
+// `messageId` is the DURABLE zee_message row this delivery belongs to (lib/managers.js postMessage
+// writes one for every manager⇄worker message; the console's 📨 button and the Hermes bridge have
+// none and pass nothing). Because delivery is fire-and-forget, `sent: true` means the delivery
+// STARTED — and the row was then stamped delivered=true and left that way forever, even when the
+// resume died on the way out or the cage's SSH door never answered. The zee row is corrected in
+// that case; the message row was not, so a manager's own history said a worker had been told
+// something it never heard. Given the id, a failed delivery corrects its own record (see
+// messageUndelivered).
+export async function sendMessageToXell(xellId, { text = '', images = [], by = 'human',
+                                                  mode = PROVISION_MODE, messageId = null } = {}) {
   try {
     const body = String(text || '').trim();
     const imgs = (Array.isArray(images) ? images : []).filter((i) => i && i.data);
-    if (!body && !imgs.length) return { sent: false, reason: 'empty message (no text or images)' };
+    if (!body && !imgs.length) return { sent: false, delivery: 'none', reason: 'empty message (no text or images)' };
     // PAUSED: refused, and refused HONESTLY. This is the door the 📨 button, the Hermes inbound
     // bridge and a manager's `zee say` all come through, and every one of them ends in a message
     // TYPED into a session — i.e. a zee starting a turn. Queueing it into the cage instead would be
     // worse than refusing: the drainer types it the moment a session takes the pane, so a "queued"
     // message would restart the very zee the operator just stopped, minutes later, with nothing on
     // screen to explain it. The sender is told, and can re-send after pressing play.
-    if (await fleetPaused()) return { sent: false, paused: true, reason: PAUSED_REASON };
+    if (await fleetPaused()) return { sent: false, delivery: 'none', paused: true, reason: PAUSED_REASON };
 
     const zee = await one(
-      `SELECT z.id, z.claude_session_id, z.viewer_kind, z.viewer_url, x.slug
+      `SELECT z.id, z.claude_session_id, z.viewer_kind, z.viewer_url, z.status, z.decommissioned_at,
+              x.slug, x.status AS xell_status, rt.key AS runtime_key
          FROM zee z JOIN xell x ON x.id = z.xell_id
+         LEFT JOIN agent_runtime rt ON rt.id = z.runtime_id
         WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
         ORDER BY z.created_at DESC LIMIT 1`, [xellId]);
-    if (!zee) return { sent: false, reason: 'no cxell zee for this xell (nothing to message)' };
-    if (zee.viewer_kind !== 'ssh-terminal') return { sent: false, reason: `zee is not in a live cxell (viewer_kind=${zee.viewer_kind})` };
+    // The zee's runtime dialect decides whether a finished session can be re-invoked at all:
+    // claude/codex resume by session id, kimi by workdir (--continue). An unknown runtime key throws
+    // rather than guessing, and here that only means "cannot resume" — the keystroke path still runs.
+    let adapter = null;
+    try { adapter = zee ? adapterFor(zee.runtime_key) : null; } catch { /* unknown runtime → no resume */ }
+    const verdict = decideMessageDelivery({
+      present: !!zee,
+      status: zee?.status,
+      viewerKind: zee?.viewer_kind,
+      decommissioned: !!zee?.decommissioned_at,
+      xellStatus: zee?.xell_status,
+      runtimeResumable: !!adapter?.resumable,
+      sessionResumable: !!adapter && (!adapter.needsSid || !!zee?.claude_session_id),
+    });
+    if (verdict.delivery === 'none') return { sent: false, delivery: 'none', reason: verdict.reason };
+
     let sshPort;
     try { sshPort = Number(new URL(zee.viewer_url).port); } catch { /* handled below */ }
-    if (!sshPort) return { sent: false, reason: 'cxell has no SSH port to reach (viewer_url missing/invalid)' };
+    // Only the keystroke deliveries dial the cage's SSH door; a resume goes in over docker exec, so
+    // a zee with no viewer port is no longer unreachable just because it cannot be typed at.
+    if (!sshPort && verdict.delivery !== 'resumed') {
+      return { sent: false, delivery: 'none', reason: 'cxell has no SSH port to reach (viewer_url missing/invalid)' };
+    }
 
     // Rich message → hand it over as files; plain short text → type it inline.
     const rich = imgs.length > 0 || body.includes('\n') || body.length > 300;
     let typed = body;
+    let bodyPath = null;
     const written = [];
 
     const failed = [];
@@ -429,18 +614,48 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
       // report a clean send. The operator needs to know the images did NOT reach the zee (this is the
       // "attach image fails silently" case: writes threw, yet the UI showed success).
       if (imgs.length && !written.length) {
-        return { sent: false, reason: `could not deliver ${imgs.length} image attachment(s) into the cxell — ${failed.join(', ')}`, failed };
+        return { sent: false, delivery: 'none', failed,
+                 reason: `could not deliver ${imgs.length} image attachment(s) into the cxell — ${failed.join(', ')}` };
       }
       const md = ['# Operator message', `_sent ${new Date().toISOString()} by ${by}_`, '',
         body || '(no text — see attachments)', '',
         ...(written.length ? [`## Attachments (${written.length})`, ...written.map((p) => `- ${p}`)] : []),
         ...(failed.length ? ['', `> ⚠ ${failed.length} attachment(s) could not be delivered: ${failed.join(', ')}`] : [])].join('\n');
-      let bodyPath = `${dir}/message.md`;
+      bodyPath = `${dir}/message.md`;
       try { bodyPath = (await writeFileIntoCxell({ slug: zee.slug, relPath: bodyPath, text: md })).path; }
       catch (e) { logline('message', `${zee.slug}: could not write message body (${String(e.message).slice(0, 120)})`); }
       typed = `📨 New operator message — please read ${bodyPath}`
         + (written.length ? ` and view the ${written.length} attached image(s): ${written.join(', ')}` : '')
         + (body ? `. Summary: ${body.replace(/\s+/g, ' ').slice(0, 160)}` : '');
+    }
+
+    // ── RESUMED: the turn has ENDED, so hand the message over as a PROMPT ───────────────────────
+    // Through nudgeCxell, the same shared delivery every landing/clearance/reflection continuation
+    // uses — which is where the PROVISION_MODE guard lives. That guard matters here for the same
+    // reason it does there: a NESTED queenzee walks a CLONE of the meta-DB, so `cxell_<slug>` off
+    // one of those rows is another zee's live cage. When it refuses, this reports `sent:false` with
+    // the dry-run reason rather than falling back to keystrokes: falling back would type the message
+    // into the very dead drop this whole change exists to stop claiming as delivered.
+    if (verdict.delivery === 'resumed') {
+      logline('message', `${zee.slug}: operator message by ${by} — ${rich ? `${written.length} file(s) to .zee-inbox, ` : ''}`
+        + `its turn has ENDED, so RESUMING its cxell session with the message as the prompt`);
+      const r = await nudgeCxell(xellId, {
+        by, mode, why: `message from ${by}`,
+        prompt: MESSAGE_PROMPT({ by, body, files: written, bodyPath }),
+        log: (slug, sid) => `${slug}: message from ${by} — resuming cxell session ${sid} to act on it`,
+        // The resume STARTED is all this call can honestly report; if the exec then dies, the zee
+        // row is put back and this puts the message's own receipt back with it.
+        onFail: (e) => messageUndelivered(messageId, zee.slug,
+          `the resumed session died on the way out — ${String(e.message).slice(0, 120)}`).catch(() => {}),
+      });
+      if (!r?.nudged) {
+        return { sent: false, delivery: 'none', rich, attachments: written, ...(failed.length ? { failed } : {}),
+                 ...(r?.dry_run ? { dry_run: true } : {}), ...(r?.paused ? { paused: true } : {}),
+                 reason: r?.reason || r?.error || 'the cxell session could not be resumed' };
+      }
+      return { sent: true, delivery: 'resumed', delivery_reason: verdict.reason,
+               zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written,
+               ...(failed.length ? { failed } : {}) };
     }
 
     logline('message', `${zee.slug}: operator message by ${by} — ${rich ? `${written.length} file(s) to .zee-inbox, ` : ''}typing into live cxell session over SSH (:${sshPort})`);
@@ -452,12 +667,56 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
       .then((r) => logline('message', r?.delivery === 'queued'
         ? `${zee.slug}: the zee is MID-TURN — operator message QUEUED in the cxell; it is typed into its session when the turn ends`
         : `${zee.slug}: delivered operator message to the live session`))
-      .catch((e) => logline('message', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`));
+      .catch((e) => {
+        logline('message', `${zee.slug}: could not type into the cxell (${String(e.message).slice(0, 160)}) — cxell/session may be down; no retry`);
+        // …and the same correction as the resume path above: the keystrokes are just as
+        // fire-and-forget, so a message whose SSH door never answered must stop reading as delivered.
+        messageUndelivered(messageId, zee.slug,
+          `the cxell session could not be typed into — ${String(e.message).slice(0, 120)}`).catch(() => {});
+      });
 
-    return { sent: true, zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written, ...(failed.length ? { failed } : {}) };
+    // The cage's own verdict (typed vs queued) arrives asynchronously above; the ANSWER carries the
+    // one decided from the zee's state, so a caller is never told "delivered" for all three.
+    return { sent: true, delivery: verdict.delivery, delivery_reason: verdict.reason,
+             zee_id: zee.id, session: zee.claude_session_id, rich, attachments: written,
+             ...(failed.length ? { failed } : {}) };
   } catch (e) {
     logline('message', `message for xell ${String(xellId).slice(0, 8)} failed: ${String(e.message).slice(0, 160)}`);
-    return { sent: false, error: e.message };
+    return { sent: false, delivery: 'none', error: e.message };
+  }
+}
+
+// A DELIVERY THAT FAILED MUST CORRECT ITS OWN RECORD (TKT-60) — the same rule staleNudgeUndelivered
+// and clearanceUndelivered already apply to a land_request's note, one table over.
+//
+// Every delivery here is fire-and-forget: `sent: true` says the resume STARTED or the keystrokes
+// were handed to SSH, never that either survived. When the exec dies, the ZEE row is corrected
+// (nudgeCxell's failure branch puts it back to idle with the reason) — but the zee_message row was
+// written delivered=true a moment earlier and nothing ever went back to it. So the durable record of
+// a conversation, which is exactly what a manager re-reads when a worker seems unresponsive, said
+// the worker had been told something it never heard.
+//
+// It only ever DOWNGRADES a receipt, it keeps whatever the original delivery recorded (the `||`
+// merge, so the first attempt's shape survives beside the correction), and it is a no-op without an
+// id — the console's 📨 button and the Hermes bridge write no row, and there is nothing to correct.
+// Never throws: this is already a failure path.
+async function messageUndelivered(messageId, slug = null, why = 'unknown') {
+  if (!messageId) return { corrected: false };
+  try {
+    const row = await one(
+      `UPDATE zee_message
+          SET delivered = false,
+              delivery = COALESCE(delivery, '{}'::jsonb) || $2::jsonb
+        WHERE id = $1 RETURNING *`,
+      [messageId, JSON.stringify({ sent: false, delivery: 'none', undelivered: true, reason: why })]);
+    if (!row) return { corrected: false };
+    broadcast('zee-message', { id: row.id, to_xell_id: row.to_xell_id, from_xell_id: row.from_xell_id, kind: row.kind });
+    logline('message', `${slug || row.to_slug || 'a zee'}: message ${String(row.id).slice(0, 8)} was NOT delivered `
+      + `after all (${why}) — the receipt is corrected; it is still in the durable inbox (\`zee inbox\`)`);
+    return { corrected: true, reason: why };
+  } catch (e) {
+    logline('message', `could not correct the receipt on message ${String(messageId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
+    return { corrected: false };
   }
 }
 
@@ -509,6 +768,21 @@ async function nudgeCxellByKeys(xellId, { by = 'human', text, why = 'nudge' } = 
   }
 }
 
+
+// File a resumed turn's death with the reviver, which decides what it deserves (another attempt on
+// the ladder, or a human). Imported DYNAMICALLY and only on this path: revive.js calls back into
+// nudgeXellForTurnDeath above, and a static pair of imports would be a module cycle — the same
+// reason, and the same shape, as fleet-pause.js reaching status.js for recordEvent. Never throws:
+// this is already the failure path.
+async function reportTurnDeath({ zeeId, xellId, slug, reason }) {
+  try {
+    const { noteTurnDeath } = await import('./revive.js');
+    await noteTurnDeath({ zeeId, xellId, slug, reason, source: 'resumed turn' });
+  } catch (e) {
+    logline('nudge', `${slug}: could not file the resumed turn's death (${String(e.message).slice(0, 120)})`);
+  }
+}
+
 // The shared delivery: resolve this xell's live cxell zee and resume its claude session with
 // `prompt`. Fire-and-forget (the turn can run for minutes), best-effort, NEVER throws.
 //
@@ -544,7 +818,21 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
     // (--continue) — so only the id-keyed runtimes refuse when no session id was captured.
     const adapter = adapterFor(zee.runtime_key);
     if (!adapter.resumable) return { nudged: false, reason: `runtime ${adapter.key} cannot resume a headless session` };
-    if (adapter.needsSid && !zee.claude_session_id) return { nudged: false, reason: 'cxell zee has no session id to resume' };
+
+    // ONE-SHOT HARNESSES (149). A persona may declare that its wearer gets a FRESH session every
+    // turn instead of resuming the last one — the router does, because it is the fleet's
+    // most-invoked agent and re-sending a transcript it does not need is the largest avoidable
+    // cost in the hive. For those wearers this turn carries no history at all, so:
+    //   • the session id is NOT passed (no --resume/-c), and the needsSid refusal below does not
+    //     apply — there is deliberately nothing to resume, which is not the same as "cannot";
+    //   • the prompt gets a short RE-ORIENTATION preamble, because a fresh session remembers
+    //     neither its persona nor that it is one-shot. It names the files the queenzee already
+    //     injected into the cage (the persona, its memory, the project manual) rather than
+    //     re-sending them, which is the whole economy of the thing.
+    const oneShot = await harnessIsOneShot(xellId);
+    if (!oneShot && adapter.needsSid && !zee.claude_session_id) {
+      return { nudged: false, reason: 'cxell zee has no session id to resume' };
+    }
 
     // Fallback token only — nudgeCxellZee prefers the tokens already in the cxell's /etc/environment
     // so a running `zee … --wait` poll keeps its identity.
@@ -563,19 +851,88 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
       return { nudged: false, dry_run: true, zee_id: zee.id,
         reason: 'PROVISION_MODE=simulate — this queenzee models the fleet; no cxell session was resumed' };
     }
-    logline('nudge', log ? log(zee.slug, sid) : `${zee.slug}: ${why} by ${by} — resuming cxell session ${sid}`);
+    logline('nudge', oneShot
+      ? `${zee.slug}: ${why} by ${by} — ONE-SHOT harness: starting a FRESH session (no resume of ${sid})`
+      : (log ? log(zee.slug, sid) : `${zee.slug}: ${why} by ${by} — resuming cxell session ${sid}`));
+    // THE TURN IS NOW REAL — say so on the zee row BEFORE the exec, so nothing can observe the gap.
+    // And claim it, not just mark it: the claim is the single-writer lock that refuses a second
+    // resume while this one is in flight (TKT-114-B). Two runs of one zee acting as one identity was
+    // the integrity incident — ten resumes in eleven minutes, two commits a worker never authored.
+    const claimed = await claimZeeTurn(zee.id, why);
+    if (!claimed) {
+      logline('nudge', `${zee.slug}: ${why} — REFUSED: a turn is ALREADY in flight for this zee `
+        + `(status=${zee.status}); not resuming a session that is already running (TKT-114-B)`);
+      return { nudged: false, refused: 'turn-in-flight', zee_id: zee.id, session: sid,
+               reason: `a turn is already in flight for this zee (status=${zee.status}) — refusing to `
+                 + 'resume the same session twice (single-writer lock per zee)' };
+    }
+    const startedAt = new Date();
     // Fire and forget: the continuation turn can run for minutes; do NOT block the caller on it.
     nudgeCxellZee({
-      ctx: 'default', name: cxellName(zee.slug), sessionId: zee.claude_session_id,
-      prompt, model: zee.model, adapter, token,
+      ctx: 'default', name: cxellName(zee.slug),
+      // one-shot: no session to resume, and the prompt says so up front (see harnessIsOneShot)
+      sessionId: oneShot ? null : zee.claude_session_id,
+      prompt: oneShot ? oneShotPreamble() + prompt : prompt,
+      model: zee.model, adapter, token,
     })
-      .then((r) => logline('nudge', `${zee.slug}: nudge session exited (code ${r?.code ?? '?'})`))
-      .catch((e) => {
+      .then(async (r) => {
+        // What this turn actually cost, off the vendor's own final result event (cxell.js parses it
+        // with the adapter that produced it). A turn that printed no result — or a runtime whose
+        // parser could not find one — books zero rather than losing the row's other columns.
+        const burn = usageFrom(r?.result);
+        const tok = burn.input + burn.output + burn.cacheRead + burn.cacheWrite;
+        logline('nudge', `${zee.slug}: nudge session exited (code ${r?.code ?? '?'}, ${tok} tok, $${burn.cost})`);
+        // A RESUMED TURN CAN DIE THE WAY A SPAWNED ONE DOES — and if nobody notices, the revive
+        // ladder is a lie: it promises three attempts and then a human, and neither the second
+        // attempt nor the human is reachable when attempt one's death is filed as 'end_turn'. The
+        // exec's own stdout is the CLI's stream-json, so the same final `result` event intake.js
+        // reads off a spawned turn is right here (lib/turn-death.js resumeTurnDeath).
+        const death = resumeTurnDeath(r || {});
+        // The BURN is booked either way, in the one statement that ends the turn: a turn that died
+        // on a 429 still spent everything it spent up to the 429, and a row that forgets that is the
+        // same understatement this ticket exists to end.
+        const row = await markZeeTurn(zee.id, death ? 'errored' : 'idle',
+                                      death ? death.message.slice(0, 200) : 'end_turn', burn);
+        // LANGFUSE: the resumed turn is a trace like any other (best-effort, never throws — the same
+        // call intake.js makes when a spawned turn returns). Without it every continuation a zee ran
+        // was missing from the observability stack, not just from the row.
+        await postTurnToLangfuse({
+          xell: { id: xellId, slug: zee.slug, project_id: zee.project_id },
+          zee: row || { id: zee.id, model: zee.model, claude_session_id: zee.claude_session_id },
+          sessionId: zee.claude_session_id, model: zee.model, result: r?.result || null,
+          startTime: startedAt, endTime: new Date(),
+        });
+        if (death) return reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message });
+        return row;
+      // The failure handler is the SECOND argument of this `then`, not a `.catch` after it, and that
+      // is load-bearing: a `.catch` would also catch anything the success handler above threw, and
+      // then report a turn that ran as one that "could not run" — putting the row back and, worse,
+      // firing onFail (a stale landing raises a TEND from there) and filing a turn death that never
+      // happened. It answers for the EXEC only.
+      }, (e) => {
         logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`);
+        // The exec that REJECTED may still have said what it did: dk() attaches both streams to
+        // `err.dk`, so the same one parser reads the same final result event off it (resultFrom).
+        // Two things then follow, and neither used to happen on this path:
+        //   • a turn that SPOKE before the exec died spent tokens, and they are charged — "the exec
+        //     exited non-zero" is not "nothing ran". Nothing at all on the streams still books zero.
+        //   • a resume that died on a 429 is a turn DEATH, not an unreachable cage, and belongs on
+        //     the revive ladder rather than in a log line.
+        const dk = e?.dk || { code: 1, err: e?.message || '' };
+        const result = resultFrom(adapter, dk);
+        // Put the row back where it was rather than leaving a zee 'working' on a turn that never
+        // started — a stuck 'working' is the same lie as a stuck 'idle', and it also blocks a reap.
+        markZeeTurn(zee.id, zee.status === 'working' ? 'working' : 'idle',
+                    `${why}: resume could not run — ${String(e.message).slice(0, 120)}`,
+                    usageFrom(result)).catch(() => {});
+        const death = resumeTurnDeath({ ...dk, result });
+        if (death) reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message }).catch(() => {});
         // The caller may need to KNOW the message never arrived (a stale landing has no other way
         // to reach its zee). Best-effort by construction: this is already the failure path.
         try { onFail?.(e); } catch { /* a failing handler must not become an unhandled rejection */ }
-      });
+      })
+      // …and a bookkeeping step that threw is still not allowed to become an unhandled rejection.
+      .catch((e) => logline('nudge', `${zee.slug}: could not record the finished turn (${String(e.message).slice(0, 120)})`));
 
     return { nudged: true, zee_id: zee.id, session: zee.claude_session_id, prompt };
   } catch (e) {

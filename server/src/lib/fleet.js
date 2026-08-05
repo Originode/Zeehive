@@ -1,5 +1,6 @@
 // Read model for the dashboard: project header, N-of-M status line, grouped container
 // inventory, and one entry per xell (container stack + its live zee + runtime badge).
+import { hostname } from 'node:os';
 import { q, one } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
@@ -7,10 +8,14 @@ import { hiveStatus, hiveLabel } from './hive-status.js';
 import { pauseState, projectPauseState, PAUSED_STOP_REASON } from './fleet-pause.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
 import { deviceConfig } from './devices.js';
-import { reasonPair } from './status.js';
+import { reasonPair, envAlertFrom } from './status.js';
 import { listDoneSuggestions } from './managers.js';
 import { holdingByRef } from '../queenzee/landgate.js';
 import { backupDue } from '../queenzee/maintenance.js';
+import { listXourceCleanRequests } from './xource-clean.js';
+import { listManagerMintRequests } from './manager-mint.js';
+import { listCredentialInjectRequests } from './credential-inject.js';
+import { resolveRealDbContainerCached } from './xell-db.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -60,9 +65,18 @@ async function fetchXellRows(pid) {
             -- zees it interrupted here (lib/fleet-pause.PAUSED_STOP_REASON), and that is what tells a
             -- paused hexagon apart from a merely idle one.
             z.last_stop_reason AS zee_last_stop_reason,
-            r.label AS runtime_label, r.key AS runtime_key,
-            -- the harness this xell wears (config layer — persona/skills), NULL = core only
-            hn.key AS harness_key, hn.label AS harness_label,
+            -- WHICH AI is thinking in this xell. The vendor rides along with the label because the
+            -- console draws it: a zee's badge is its PROVIDER's coin (web/src/providerArt.js), and
+            -- resolving 'anthropic'/'openai'/'moonshot' from the runtime row is house rule 7 —
+            -- the vendor is DATA in the meta-DB, never a name restated in the client.
+            r.label AS runtime_label, r.key AS runtime_key, r.vendor AS runtime_vendor,
+            -- the harness this xell wears (config layer — persona/skills), NULL = core only.
+            -- Its authored GLYPH and its chosen GEAR come too: worn over a provider coin, a harness
+            -- IS its costume (wings/hammer/necktie — web/src/harnessGear.js), and a card that knows
+            -- the harness but not which costume it wears cannot draw it. gear NULL = derive from
+            -- the key/label, which is what almost every harness does.
+            hn.key AS harness_key, hn.label AS harness_label, hn.bundle->>'glyph' AS harness_glyph,
+            hn.bundle->>'gear' AS harness_gear,
             -- RESOLVED ENVIRONMENT (migration 043): which env this xell is loaded with, by the same
             -- rule lib/environments.js uses — an explicit pin, else the default env of the computed
             -- tier (prod for a xell on production — live, read-only or being it — else dev).
@@ -80,6 +94,13 @@ async function fetchXellRows(pid) {
                FROM zee zb WHERE zb.xell_id = x.id) AS burn_cost,
             (SELECT t.id FROM task t WHERE t.xell_id = x.id
                AND t.status IN ('assigned','working') ORDER BY t.created_at DESC LIMIT 1) AS task_id,
+            -- The xell's own latest TASK BRIEF (prompt_text). For a MANAGER this is its DIRECTIVE:
+            -- the programme a human typed when adding it (or DEFAULT_MANAGER_BRIEF), surfaced so a
+            -- human can tell managers apart. For a worker it is the brief it was dispatched with.
+            -- Any status, not just the active one — the standing brief is what we show, not the
+            -- current run's. Deliberately NOT the same filter as task_id above.
+            (SELECT t.prompt_text FROM task t WHERE t.xell_id = x.id
+               ORDER BY t.created_at DESC LIMIT 1) AS task_text,
             -- LIVE SIGNALS the hive status derivation needs but the row itself doesn't hold: a
             -- land/ship request pending a human, the zee's tend (needs-attention) ping, and whether
             -- production's shields are down (a deploy holds the prod lock). Folded into the one row
@@ -105,12 +126,27 @@ async function fetchXellRows(pid) {
             EXISTS(SELECT 1 FROM prod_seed_request psr WHERE psr.xell_id = x.id
                      AND psr.status IN ('pending','approved','running')
                      AND psr.dismissed_at IS NULL) AS seed_pending,
+            -- A ROUTER asking a human for another MANAGER (149) — the same treatment as the two
+            -- prod-data asks above: a held decision with a button, so it lights the hexagon rather
+            -- than living in the queenzee log where a router could ask and never be answered.
+            EXISTS(SELECT 1 FROM manager_mint_request mmr WHERE mmr.xell_id = x.id
+                     AND mmr.status = 'pending'
+                     AND mmr.dismissed_at IS NULL) AS manager_mint_pending,
             tnd.hook_event_name = 'tend-request' AS tend_pending,
             -- …and WHY. A tend says "a human is needed here"; without the reason the console could
             -- only say that much, and the human had to open the session and read a transcript to
             -- find out what for. The zee gives one brief line when it raises (self.selfTend) — it
             -- rides here so the card and the "waiting on you" chip can show it.
             tnd.reason AS tend_reason, tnd.ts AS tend_at,
+            -- ENV-RECONCILE ALERT (ticket #44): the env reconcile FAILED for this xell while a zee
+            -- was live in it, so it is still running on the .zeehive.env it already had — in the
+            -- case that earned this, a full-write DSN to the fleet's own meta-DB. The refusal that
+            -- produced it is correct and unchanged; what was missing was anyone finding out, since
+            -- the only trace was one line in a boot digest. Latest-event-wins like tend, plus the
+            -- STREAK (every raise since the last clear) so the card can show its AGE — the state
+            -- outlives the boot, so a notification that fires once is the same bug one layer over.
+            eva.kind AS env_alert_kind, eva.reason AS env_alert_reason, eva.at AS env_alert_at,
+            eva.cleared_at AS env_alert_cleared_at, eva.raised_at AS env_alert_raised_at,
             -- readiness HINTS (zee said "this looks land/ship-ready" without calling the gated verb):
             -- same latest-event-wins ride as tend, one per kind.
             -- per-xell individual pause (xell_pause_state table, migration 102)
@@ -142,6 +178,20 @@ async function fetchXellRows(pid) {
           WHERE se.xell_id = x.id AND se.hook_event_name IN ('tend-request','tend-clear')
           ORDER BY se.ts DESC LIMIT 1
        ) tnd ON true
+       -- the xell's env-reconcile alert, in ONE scan of its env events: which kind came LAST (open
+       -- or cleared), the reason on it, when, and every raise so the streak can be folded in JS
+       -- (lib/status.envAlertFrom). A healthy xell has no rows here at all, so this aggregates over
+       -- an empty set and costs the same as the tend lateral beside it.
+       LEFT JOIN LATERAL (
+         SELECT (ARRAY_AGG(se.hook_event_name ORDER BY se.ts DESC))[1] AS kind,
+                (ARRAY_AGG(se.raw->>'reason'  ORDER BY se.ts DESC))[1] AS reason,
+                MAX(se.ts) AS at,
+                MAX(se.ts) FILTER (WHERE se.hook_event_name = 'env-alert-clear') AS cleared_at,
+                ARRAY_AGG(se.ts ORDER BY se.ts DESC)
+                  FILTER (WHERE se.hook_event_name = 'env-alert') AS raised_at
+           FROM session_event se
+          WHERE se.xell_id = x.id AND se.hook_event_name IN ('env-alert','env-alert-clear')
+       ) eva ON true
        LEFT JOIN harness hn ON hn.id = x.harness_id
        JOIN xource xo ON xo.id = x.xource_id
        -- The xell's zee, PREFERRING a living one but falling back to the most recent dead one.
@@ -193,14 +243,38 @@ function containerShellable(project, c) {
   return c.health === 'up';
 }
 
+// The copyable docker-exec command for this container's shell — the container analogue of a cxell
+// zee's `ssh -i … zee@host` footer line. Computed here (not in the webapp) because it must mirror
+// terminal-bridge.resolveShellTarget, which knows the REAL target:
+//   • a PER-XELL process role (runner:process, owner set) has no container of its own — its shell
+//     is the QUEENZEE's own container opened at the xell's worktree, so exec that container and cd
+//     to the worktree (the bridge's WorkingDir);
+//   • a db row carries a LOGICAL name — exec the REAL versioned container (resolveRealDbContainerCached);
+//   • everything else is a real compose-built container — its docker name IS the row's name.
+// A named docker context rides `--context` so the command works from the operator's machine.
+export function containerShellCmd(project, c) {
+  const ctx = c.docker_ctx && c.docker_ctx !== 'default' ? c.docker_ctx : null;
+  const prefix = ctx ? `docker --context ${ctx} exec -it` : 'docker exec -it';
+  if (c.role !== 'db' && c.owner_xell_id) {
+    const m = project?.manifest;
+    if ((m?.roles?.[c.role]?.runner || m?.tiers?.spinoff?.runner || null) === 'process') {
+      const cd = c.owner_worktree ? ` bash -c 'cd ${c.owner_worktree} && exec bash'` : ' bash';
+      return `${prefix} ${hostname()}${cd}`;
+    }
+  }
+  const name = c.role === 'db' ? resolveRealDbContainerCached(ctx || 'default', c.name) : c.name;
+  return `${prefix} ${name} bash`;
+}
+
 // Attach a xell's resolved container stack + xource/deploy heads. Mutates and returns `x`. One
 // stack query per xell — the streamable unit of work.
-async function decorateXell(x, heads, deployed, project, { paused = false, projectPaused = false } = {}) {
+async function decorateXell(x, heads, deployed, project, { paused = false, projectPaused = false, langfuseEnabled = false } = {}) {
   const stack = await q(
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id, c.isolation,
             c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
-            c.docker_ctx, c.build_ctx,
+            c.docker_ctx, c.build_ctx, c.host, c.host_port, c.conn_ref,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
+            (SELECT ox.worktree_path FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_worktree,
             c.prod_diff, c.prod_diff_at, c.data_check, c.data_check_at, c.restore_report, c.restored_at, uc.relation, ${INSTANCES_AGG}
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1
@@ -211,7 +285,7 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
   // the queenzee's container at the xell's worktree (terminal-bridge resolveShellTarget), which
   // works whenever the worktree exists — even while the process is down, which is exactly when you
   // want in to debug it. Everything else IS a docker container, so it needs to be running ('up').
-  for (const c of stack) c.shellable = containerShellable(project, c);
+  for (const c of stack) { c.shellable = containerShellable(project, c); c.shell_cmd = containerShellCmd(project, c); }
   x.stack = stack;
   // Does THIS project support device xhips (manifest device.enabled)? Drives whether the card shows
   // the attach-device affordance. device_kind is the project's default shape (emulator|physical), so
@@ -219,13 +293,30 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
   const dcfg = deviceConfig(project);
   x.device_enabled = !x.is_production && dcfg.enabled;
   x.device_kind = dcfg.kind;
+  // Is the Langfuse plugin enabled FLEET-WIDE? Gates the flower's "View Langfuse" verb (which also
+  // needs x.langfuse_tracking on) and the terminal-window knob. Read once per snapshot, set here so
+  // the pure petalVerbs(x, diff) can read it off the row it already gets.
+  x.langfuse_enabled = langfuseEnabled;
   // pretty-print the name column exactly like the mockup expects
   x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
+
+  // The ENV-RECONCILE ALERT (ticket #44), folded from this xell's raise/clear history: open, the
+  // refusal text VERBATIM (brief line + full), when it was last raised, and its AGE — since when,
+  // and across how many failed reconciles. Computed before hive_status because the hexagon needs
+  // the open flag. Null when there is nothing wrong, like x.tend.
+  const envAlert = envAlertFrom({
+    kind: x.env_alert_kind, reason: x.env_alert_reason, at: x.env_alert_at,
+    clearedAt: x.env_alert_cleared_at, raisedAt: x.env_alert_raised_at,
+  });
+  x.env_alert = envAlert.open ? envAlert : null;
+  delete x.env_alert_kind; delete x.env_alert_reason; delete x.env_alert_at;
+  delete x.env_alert_cleared_at; delete x.env_alert_raised_at;
 
   // DISPLAY status for the hive hexagon (lib/hive-status): the raw lifecycle status projected onto
   // the operator vocabulary, folding in the live gate/attention signals fetched with the row. The
   // label ships too so the web only owns the colour map, not a second copy of the wording.
   x.hive_status = hiveStatus(x, {
+    envAlert: envAlert.open,
     landPending: x.land_pending === true,
     shipPending: x.ship_pending === true,
     tendPending: x.tend_pending === true,
@@ -233,6 +324,7 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     shipHint: x.ship_hint === true,
     prodBindPending: x.prod_bind_pending === true,
     seedPending: x.seed_pending === true,
+    managerMintPending: x.manager_mint_pending === true,
     doneSuggested: x.done_suggested === true,
     landHolding: x.land_holding === true,
     // PAUSED — three levels (migrations 100–102):
@@ -242,6 +334,9 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
     paused: (paused || projectPaused) && x.zee_last_stop_reason === PAUSED_STOP_REASON,
     xellPaused: x.xell_paused === true,
     prodUnprotected: x.is_production && x.prod_lock_active === true,
+    // The readiness preflight's verdict (#53): a vacant xell whose DSN the queenzee wrote does not
+    // open must not read `ready`. The named check itself rides on x.preflight_error for the card.
+    preflightFailed: !!x.preflight_error,
   });
   x.hive_status_label = hiveLabel(x.hive_status);
   // The open TEND, with the reason the zee gave for calling a human (null when no tend is open).
@@ -258,7 +353,7 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
   delete x.tend_reason; delete x.tend_at;
   delete x.land_pending; delete x.ship_pending; delete x.tend_pending; delete x.prod_lock_active;
   delete x.land_hint; delete x.ship_hint;
-  delete x.prod_bind_pending; delete x.seed_pending;
+  delete x.prod_bind_pending; delete x.seed_pending; delete x.manager_mint_pending;
   // done_suggested stays on the row (not deleted): the console renders the decision card from it.
 
   // Fleet burn for THIS xell — sum across all its zees. pg returns bigint/numeric as strings; coerce
@@ -293,8 +388,12 @@ export async function streamXells(projectId, onXell) {
   const { paused } = await pauseState();
   const projPause = await projectPauseState(project.id);
   const projectPaused = projPause.paused;
+  // The LANGFUSE plugin's enabled state, read ONCE for the whole stream exactly as getFleet does —
+  // without it every STREAMED xell gets langfuse_enabled=false, and the console (whose gridXells
+  // prefers streamed rows) never renders the flower's "⚗ View Langfuse" verb.
+  const langfuseEnabled = !!(await one(`SELECT enabled FROM langfuse_config WHERE id=true`).catch(() => null))?.enabled;
   for (const x of rows) {
-    await decorateXell(x, heads, deployed, project, { paused, projectPaused });
+    await decorateXell(x, heads, deployed, project, { paused, projectPaused, langfuseEnabled });
     await onXell(x);
   }
   return project;
@@ -315,10 +414,11 @@ export async function getFleet(projectId) {
 
   // grouped container inventory
   const containers = await q(
-    `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host_port, c.health,
+    `SELECT c.id, c.role, c.tier, c.isolation, c.name, c.url, c.host, c.host_port, c.conn_ref, c.health,
             c.owner_xell_id, c.hot_build, c.last_build_commit, c.last_built_at,
             c.docker_ctx, c.build_ctx,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug,
+            (SELECT ox.worktree_path FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_worktree,
             -- where a PROCESS role (docker_ctx NULL) lives: its site's context, so the machine
             -- matrix can place it in the right column instead of 'elsewhere'
             (SELECT ds.docker_ctx FROM deploy_site ds WHERE ds.id = c.site_id) AS site_docker_ctx,
@@ -329,8 +429,9 @@ export async function getFleet(projectId) {
        FROM container c WHERE c.project_id = $1
        ORDER BY c.role, c.tier, c.name`, [pid]);
   // Same shell-capability the xell stack carries (decorateXell) — the MATRIX renders these rows,
-  // so without it every matrix chip reads "shell unavailable" even for an up process role.
-  for (const c of containers) c.shellable = containerShellable(project, c);
+  // so without it every matrix chip reads "shell unavailable" even for an up process role. The
+  // copyable docker-exec command rides along, so a chip's shell window can offer it in the footer.
+  for (const c of containers) { c.shellable = containerShellable(project, c); c.shell_cmd = containerShellCmd(project, c); }
   const groups = { db: [], server: [], webapp: [], device: [], other: [] };
   for (const c of containers) (groups[c.role] || groups.other).push(c);
 
@@ -346,7 +447,12 @@ export async function getFleet(projectId) {
   const pause = await pauseState();
   const projPause = await projectPauseState(project.id);
   const projectPaused = projPause.paused;
-  for (const x of xells) await decorateXell(x, heads, deployed, project, { paused: pause.paused, projectPaused });
+  // The LANGFUSE plugin's enabled state, read ONCE for the whole snapshot: the flower's "View
+  // Langfuse" verb shows only when the plugin is enabled AND the xell's own langfuse_tracking flag
+  // is on, and the terminal-window knob shows only when the plugin is on.
+  const langfuseEnabled = !!(await one(`SELECT enabled FROM langfuse_config WHERE id=true`).catch(() => null))?.enabled;
+  for (const x of xells) await decorateXell(x, heads, deployed, project,
+    { paused: pause.paused, projectPaused, langfuseEnabled });
 
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
@@ -386,6 +492,7 @@ export async function getFleet(projectId) {
       backup_interval_sec: pool?.backup_interval_sec ?? 86400,
       max_backups: pool?.max_backups ?? 14,
       backup_tables: pool?.backup_tables ?? null,   // null/[] ⇒ full-database backups (the default)
+      backup_plugins: pool?.backup_plugins ?? null, // null/[] ⇒ no extensions pre-created on restore
     },
     last: lastBackup,
     last_attempt: lastAttempt || null,
@@ -464,6 +571,18 @@ export async function getFleet(projectId) {
       return { xell_id: r.xell_id, xell_slug: r.xell_slug, at: r.ts, reason: why.brief, full: why.full };
     });
 
+  // ENV-RECONCILE ALERTS across the project (ticket #44) — the fleet-level answer to "a boot with
+  // 24 clean xells and one failure", so nobody has to parse the digest to find the one. Built from
+  // the DECORATED xell rows rather than re-queried: `xells` above already folded each streak, and a
+  // second query could disagree with the card rendered on the same screen.
+  //
+  // Deliberately NOT time-bounded, unlike ship_refused's 24 hours. A refused ship is a moment the
+  // zee moves on from; this is a STATE — the xell is still running on that file right now — and it
+  // stops being true only when a reconcile succeeds, which is exactly what lowers it.
+  const envAlerts = xells
+    .filter((x) => x.env_alert?.open)
+    .map((x) => ({ xell_id: x.id, xell_slug: x.slug, ...x.env_alert }));
+
   // PROD-DATA asks awaiting a human: a zee asking to be BOUND to the live production database, and
   // a zee asking the queenzee to run a landed SEED file against production. Both render on the
   // asking xell's card (App.jsx → ProdData.jsx). Recently-decided seeds ride along for 15 minutes,
@@ -482,6 +601,16 @@ export async function getFleet(projectId) {
              AND COALESCE(psr.finished_at, psr.decided_at) > now() - interval '15 minutes'))
       ORDER BY psr.requested_at DESC`, [pid]);
 
+  // VISUAL-VERIFY offers: a zee OFFERED its built webapp to a human in the console (an Open-link
+  // card with a dismiss). Open ones render on the offering xell's card / a small panel; a dismissed
+  // offer is a receipt and is filtered out. The xell rows themselves already carry the per-xell
+  // `visual_verify` boolean (fetchXellRows reads x.*); this is the set of live offers to show.
+  const visualVerifyOffers = await q(
+    `SELECT vv.*, x.slug AS live_xell_slug FROM visual_verify_offer vv
+       LEFT JOIN xell x ON x.id = vv.xell_id
+      WHERE vv.project_id = $1 AND vv.status = 'open'
+      ORDER BY vv.created_at DESC`, [pid]);
+
   // The LANDING PAD: landings + shipments merged into one chronological FIFO queue, with the item
   // currently on the pad (being processed) flagged so the UI can spin it.
   const landingPad = await buildLandingPad(pid);
@@ -489,6 +618,22 @@ export async function getFleet(projectId) {
   // A manager zee's open "this xell is finished" suggestions. Same altitude as the prod-data asks:
   // a decision only a human may make, on a xell that keeps working until they make it.
   const doneSuggestions = await listDoneSuggestions(pid, { open: true });
+
+  // XOURCE-CLEAN requests — a MANAGER asked for the project xource to be reset because a mangled
+  // main checkout is wedging landings/ships. Pending ones are a decision; recently-completed ones
+  // ride along as a receipt (like seeds/ships) so the "was it cleaned?" answer does not vanish.
+  const xourceClean = await listXourceCleanRequests(pid, { open: true });
+
+  // MANAGER-MINT requests — a ROUTER asked a human for another MANAGER (149). Pending ones are a
+  // decision (approve → the queenzee mints it); recently-created/failed ones ride along as the
+  // receipt naming the xell it produced.
+  const managerMint = await listManagerMintRequests(pid, { open: true });
+
+  // CREDENTIAL-INJECTION requests — the QUEENZEE raised one when a human connected/replaced an
+  // account (rotation: live cages predate the new key) or a zee died on a 401 (auth-death: scoped to
+  // that xell, quoting the vendor). Pending ones are a decision; recently-completed ones ride along
+  // as a receipt so "did the new key reach the cages?" does not vanish.
+  const credentialInject = await listCredentialInjectRequests(pid, { open: true });
 
   return {
     project,
@@ -504,11 +649,19 @@ export async function getFleet(projectId) {
     holding,
     shipping,
     ship_refused: shipRefused,
+    env_alerts: envAlerts,
     prod_bind: prodBind,
     prod_seed: prodSeed,
+    visual_verify_offers: visualVerifyOffers,
+    // The Langfuse plugin's enabled state (the console's terminal-window knob + the flower's View
+    // Langfuse gate both need it; xells carry the per-xell flag + x.langfuse_enabled).
+    langfuse: { enabled: langfuseEnabled },
     prod_lock: prodLock || null,
     landing_pad: landingPad,
     done_suggestions: doneSuggestions,
+    xource_clean: xourceClean,
+    manager_mint: managerMint,
+    credential_inject: credentialInject,
     // The pause/play switch, so the console's button and banner ride the poll every other control
     // already rides (there is no second endpoint to keep in step with the hexagons it explains).
     pause,

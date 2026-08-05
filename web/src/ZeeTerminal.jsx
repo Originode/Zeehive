@@ -6,6 +6,7 @@ import '@xterm/xterm/css/xterm.css';
 import FileExplorer from './FileExplorer.jsx';
 import FeedChips from './FeedChips.jsx';
 import MessageComposer from './MessageComposer.jsx';
+import { setXellLangfuseTracking } from './api.js';
 
 // A path-ish token a zee tends to "present" in the terminal: web/src/App.jsx, ./server/x.js,
 // /work/repo/…, package.json. Used to offer "show file" on a selection and to strip a pasted
@@ -36,11 +37,13 @@ const CTRL_PREFIX = '\u0000ZH';
 //   ContainerTerminal → /api/containers/:id/terminal (docker exec shell in ANY container)
 // TerminalModal is the shared body: xterm + fit + the resize/refit choreography, fullscreen,
 // and the status pill. The flavors differ only in title, footer, and prod styling.
-// `explorerZeeId` (cxell zees only) lights up the single 📁 file-explorer button (toggles the panel;
-// with a path-shaped selection it opens that file instead).
+// `explorerZeeId` (cxell zees) / `explorerContainer` (any container) light up the single 📁
+// file-explorer button (toggles the panel; with a path-shaped selection it opens that file instead)
+// and make path-shaped tokens in the output clickable. The zee door additionally gets the live-feed
+// ✱/⚒ chips (gated on `explorerZeeId` — a container shell has no feed to filter).
 // `xell` ({ id, slug }, cxell zees only) lights up 💬 talk — the composer that CONVERSES with the
 // zee whether or not it is mid-turn (see the talk block below).
-export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, xell = null, onClose }) {
+export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, explorerContainer = null, xell = null, langfuseEnabled = false, onToggleLangfuse = null, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
   const wsRef = useRef(null);
@@ -153,12 +156,13 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
       return true;
     });
 
-    // CLICKABLE PATHS. A zee constantly names files it touched ("edited web/src/App.jsx"); make
-    // those clickable so the human opens them in the explorer with ZERO copy-paste. A custom link
-    // provider scans each rendered line for path-shaped tokens and, on click, opens the file. Only
-    // for terminals that HAVE an explorer (a cxell zee); a container shell gets no file links.
+    // CLICKABLE PATHS. A zee constantly names files it touched ("edited web/src/App.jsx"); a
+    // container shell names configs and logs ("/var/log/…", "app/server.js"). Make those clickable
+    // so the human opens them in the explorer with ZERO copy-paste. A custom link provider scans
+    // each rendered line for path-shaped tokens and, on click, opens the file. Only for terminals
+    // that HAVE an explorer (a cxell zee or a shellable container).
     let linkDisp = null;
-    if (explorerZeeId) {
+    if (explorerZeeId || explorerContainer) {
       linkDisp = term.registerLinkProvider({
         provideLinks(y, cb) {
           const line = term.buffer.active.getLine(y - 1);
@@ -245,11 +249,16 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   // already know which of the two it will be — `feed.live` is the bridge telling us who owns the
   // pane — so the receipt printed into the terminal says the true one instead of a hopeful one.
   const talkReceipt = (r) => {
-    const queued = feed.live === true;
+    // The SERVER decides which of three deliveries this zee's state deserves (lib/zee-turn.js
+    // decideMessageDelivery) and says so in the answer, so the receipt reports the decision rather
+    // than re-deriving it here. `feed.live` stays as the fallback for an answer with no verdict.
+    const delivery = r?.delivery || (feed.live === true ? 'queued' : 'typed');
     const parts = [
-      queued
+      delivery === 'queued'
         ? '── the zee is MID-TURN, so this pane is a read-only feed: your message is QUEUED in its cxell and typed into its session the moment the turn ends ──'
-        : "── your message was typed into the zee's live session — its reply appears in this pane ──",
+        : delivery === 'resumed'
+          ? "── the zee's turn had ENDED, so the queenzee RESUMED its session with your message as the prompt: it is acting on it now, in a headless turn — the answer does not appear in this pane ──"
+          : "── your message was typed into the zee's live session — its reply appears in this pane ──",
     ];
     if (r?.attachments?.length) parts.push(`   ${r.attachments.length} attachment(s) handed over in its .zee-inbox`);
     // Dim, and on its own lines, so a receipt is never mistaken for something the zee said.
@@ -292,10 +301,22 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
                 💬 talk
               </button>
             )}
+            {/* PER-XELL LANGFUSE TRACKING knob (human side): shown when the Langfuse plugin is
+                enabled. Clicking flips the xell's switch — OFF means this zee's turns are not traced
+                to Langfuse and its cage gets no LANGFUSE_* env. */}
+            {xell?.id && langfuseEnabled && onToggleLangfuse && (
+              <button className={`term-x lf${xell.langfuse_tracking !== false ? ' on' : ''}`}
+                      data-testid="langfuse-toggle" onClick={onToggleLangfuse}
+                      title={xell.langfuse_tracking !== false
+                        ? 'Langfuse tracking is ON — traces of this zee\'s turns are posted to Langfuse. Click to turn OFF.'
+                        : 'Langfuse tracking is OFF — no traces are posted for this zee\'s turns and its cage gets no LANGFUSE_* env. Click to turn ON.'}>
+                ⚗ {xell.langfuse_tracking !== false ? 'on' : 'off'}
+              </button>
+            )}
             <button className={`term-x${clipOpen ? ' on' : ''}${clip && !clipOpen ? ' dot' : ''}`} data-testid="clip-toggle"
                     onClick={() => setClipOpen((v) => !v)}
                     title="Clipboard — selections you Shift+drag land here (works even when the OS clipboard is blocked)">📋</button>
-            {explorerZeeId && (
+            {(explorerZeeId || explorerContainer) && (
               <button className={`term-x${showFx ? ' on' : ''}`} data-testid="fx-toggle"
                       onClick={toggleExplorer}
                       title={showFx ? 'Hide file explorer (Shift+drag a path first to open that file)'
@@ -306,8 +327,8 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
           </span>
         </div>
         <div className="zeeterm-main">
-          {explorerZeeId && showFx && (
-            <FileExplorer zeeId={explorerZeeId} openReq={fxReq}
+          {(explorerZeeId || explorerContainer) && showFx && (
+            <FileExplorer zeeId={explorerZeeId} container={explorerContainer} openReq={fxReq}
                           onClose={() => setShowFx(false)} />
           )}
           <div className="zeeterm-body" ref={holder} onContextMenu={onContextMenu} />
@@ -347,8 +368,11 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 // cxell — so this is the same interactive `claude` you'd get over SSH, prompt by prompt, and
 // disconnecting leaves the session running (tmux). The SSH line below is that exact door for
 // Claude Code desktop's "Add SSH host" — the deeplink IS the SSH connection.
-export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, onClose }) {
+export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, langfuseTracking = true, langfuseEnabled = false, onClose }) {
   const [copied, setCopied] = useState(false);
+  // The Langfuse tracking switch, kept locally so the header knob reflects the click instantly and
+  // reverts if the server refuses. Initialised from the xell row's flag (default ON).
+  const [lf, setLf] = useState(!!langfuseTracking);
 
   // ssh://zee@127.0.0.1:PORT → a copy-pasteable ssh command (external attach)
   let sshCmd = null;
@@ -359,6 +383,20 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, onC
 
   const copy = async () => {
     try { await navigator.clipboard.writeText(sshCmd); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* */ }
+  };
+
+  // Flip the per-xell Langfuse tracking switch. Optimistic (the knob reflects the click at once);
+  // on a refusal the flag is reverted and the error logged — a console knob must never throw.
+  const toggleLangfuse = async () => {
+    if (!xellId) return;
+    const next = !lf;
+    setLf(next);
+    try {
+      await setXellLangfuseTracking(xellId, next);
+    } catch (e) {
+      setLf(!next);
+      console.error('langfuse tracking toggle failed', e);
+    }
   };
 
   const foot = (
@@ -375,14 +413,49 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, onC
   );
 
   return <TerminalModal wsPath={`/api/zees/${zeeId}/terminal`} title={slug} foot={foot}
-                        explorerZeeId={zeeId} xell={xellId ? { id: xellId, slug } : null}
+                        explorerZeeId={zeeId}
+                        xell={xellId ? { id: xellId, slug, langfuse_tracking: lf } : null}
+                        langfuseEnabled={langfuseEnabled} onToggleLangfuse={toggleLangfuse}
                         onClose={onClose} />;
 }
 
 // A shell inside a fleet container, opened from the chip's context menu. The bridge runs a
 // docker-exec TTY (bash, or sh where the image has no bash) — no sshd required in the target.
-// A PRODUCTION container's modal wears the fleet's gold warning, same as its chip.
+// It carries the SAME terminal features the xell door has: a file explorer into the container's
+// filesystem, clickable paths in the output, and a footer with a copyable docker-exec command so
+// a human can reach the same shell from their own machine. A PRODUCTION container's modal wears
+// the fleet's gold warning, same as its chip.
 export function ContainerTerminal({ c, onClose }) {
+  const [copied, setCopied] = useState(false);
+
+  // The copyable command: a docker exec into the same shell the bridge opens. Computed server-side
+  // (fleet.js containerShellCmd) because only the server knows the REAL target — a db's versioned
+  // name, a process role's queenzee-container + worktree. Fall back to the row name if the server
+  // is older and did not send it.
+  const dockerCmd = c.shell_cmd || (() => {
+    const ctx = c.docker_ctx && c.docker_ctx !== 'default' ? c.docker_ctx : null;
+    return (ctx ? `docker --context ${ctx} exec -it` : 'docker exec -it') + ` ${c.name} bash`;
+  })();
+
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(dockerCmd); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* */ }
+  };
+
+  const foot = (
+    <div className="zeeterm-foot">
+      {/* Same non-obvious-copy hint as the zee terminal: tmux/readline owns a plain drag, so a
+          browser selection needs Shift — and it is captured into the 📋 clipboard tray. */}
+      <span className="pc kbd-hint" title="A plain drag goes to the app; Shift+drag makes a selection, captured into the 📋 clipboard tray">
+        <b>Shift+drag</b> → 📋 clipboard · click a <b>path</b> to open it in the explorer
+      </span>
+      <input className="mono" readOnly value={dockerCmd || ''} onFocus={(e) => e.target.select()} />
+      <button type="button" onClick={copy} title="Copy the docker exec command to reach this shell from your own machine">
+        {copied ? '✓ copied' : '⧉ copy'}
+      </button>
+    </div>
+  );
+
   return <TerminalModal wsPath={`/api/containers/${c.id}/terminal`} title={c.name}
-                        prod={c.tier === 'prod'} onClose={onClose} />;
+                        prod={c.tier === 'prod'} foot={foot} explorerContainer={c}
+                        onClose={onClose} />;
 }

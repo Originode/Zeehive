@@ -2,16 +2,18 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import {
   createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject,
-  githubAccess, pushProject, pullRequestProject,
+  githubAccess, pushProject, pullRequestProject, squashHelps, squashOffer,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
   deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes, getHarnesses,
-  getMachines, getProviderTokens, addProviderToken, deleteProviderAccount, getReposHome, listFsDirs,
+  getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
+  pauseProviderAccount, resumeProviderAccount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
   getEnvironments, createEnvironment, updateEnvironment, deleteEnvironment,
   getEnvVars, setEnvVar, deleteEnvVar, importEnv, exportEnv, lintEnv,
   getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
   previewProjectDoc,
+  getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -22,7 +24,7 @@ import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 // template, and watch the readiness gates flip. Create mode collects the minimum then flows
 // straight into edit mode for the rest.
 const INGRESS_KINDS = [
-  { key: 'lan', label: 'LAN', hint: 'reached by host IP:port' },
+  { key: 'lan', label: 'LAN', hint: 'reached by host:port (IP or DNS)' },
   { key: 'reverse-proxy', label: 'Reverse proxy', hint: 'caddy/nginx in front, DNS points at the host' },
   { key: 'cloudflare-tunnel', label: 'Cloudflare tunnel', hint: 'cloudflared container; DNS at Cloudflare' },
   { key: 'wireguard', label: 'WireGuard', hint: 'site reached over a VPN mesh address' },
@@ -244,10 +246,10 @@ function CreateForm({ onCreated }) {
       <h3>Deployment</h3>
       <div className="setup-grid">
         <label>Dev docker context<input list="zh-docker-ctxs" value={f.docker_ctx_dev} onChange={set('docker_ctx_dev')} placeholder="default (this machine)" /></label>
-        <label>Dev host IP<input value={f.dev_host_ip} onChange={set('dev_host_ip')} placeholder="10.1.0.18" /></label>
+        <label>Dev host<input value={f.dev_host_ip} onChange={set('dev_host_ip')} placeholder="10.1.0.18 or host.local" /></label>
         <label>Prod docker context <span className="pc">(blank = add later)</span>
           <input list="zh-docker-ctxs" value={f.docker_ctx_prod} onChange={set('docker_ctx_prod')} placeholder="none yet" /></label>
-        <label>Prod host IP<input value={f.prod_host_ip} onChange={set('prod_host_ip')} placeholder="10.2.0.16" /></label>
+        <label>Prod host<input value={f.prod_host_ip} onChange={set('prod_host_ip')} placeholder="10.2.0.16 or host.local" /></label>
       </div>
       <p className="pc">The pool starts at 0 — no xells are pre-warmed until the readiness gates pass and you raise it.</p>
       {err && <div className="projpop-err">{err}</div>}
@@ -411,8 +413,163 @@ function EditSections({ project, onChanged, onProject }) {
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
       {tab === 'pool' && <SpawnSection project={project} run={run} />}
-      {tab === 'danger' && <DangerSection project={project} onChanged={() => { reload(); onChanged?.(); }} />}
+      {tab === 'danger' && <>
+        <XourceSection project={project} onChanged={() => { reload(); onChanged?.(); }} />
+        <DangerSection project={project} onChanged={() => { reload(); onChanged?.(); }} />
+      </>}
     </>
+  );
+}
+
+// ── Xource (main checkout) — the one tree every landing and ship builds from ──
+// When it gets MANGLED — a mid-deploy interruption, a conflict a sync left behind — a dirty or
+// conflicted checkout blocks EVERY landing (the gate refuses to push over it) and every ship (the
+// build runs from it), and the whole project wedges. This section shows the live state and gives
+// the human the two doors onto the fix:
+//   * "Clean up xource" — the queenzee resets the checkout to the main tip (aborting any
+//     in-progress merge/rebase/cherry-pick/revert, preserving every xell's worktree).
+//   * a MANAGER's `zee xource-clean` requests, decided here (approve → the queenzee cleans).
+// Both are destructive (uncommitted work in the main checkout is discarded) and both go through a
+// typed-word confirmation, like the purge below.
+function XourceSection({ project, onChanged }) {
+  const [state, setState] = useState(null);
+  const [requests, setRequests] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [result, setResult] = useState(null);
+  const load = useCallback(() => {
+    getXourceState(project.id).then(setState).catch(() => {});
+    getXourceCleanRequests(project.id).then(setRequests).catch(() => {});
+  }, [project.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const clean = async () => {
+    if (busy) return;
+    // A typed word, not a click — this discards whatever uncommitted work is sitting in the main
+    // checkout. The same bar the purge uses, because this is that act narrowed to one tree.
+    const typed = await showPrompt(
+      `Clean up ${project.name}'s xource (the main checkout)?\n\n`
+      + 'The queenzee will reset it to the main tip: abort any in-progress merge/rebase/cherry-pick, '
+      + 'discard uncommitted changes, and remove untracked junk — PRESERVING every xell\'s worktree. '
+      + 'This is what unblocks landings and ships when the checkout is mangled.\n\nType CLEAN to confirm.',
+      { title: 'Clean up xource?', okLabel: 'Clean up xource', variant: 'danger', placeholder: 'CLEAN' });
+    if (String(typed || '').trim().toUpperCase() !== 'CLEAN') return;
+    setBusy(true); setErr(null); setResult(null);
+    try {
+      const r = await cleanXourceNow(project.id, 'human@console requested cleanup');
+      setResult(r);
+      load();
+      onChanged?.();
+    } catch (e) { setErr(e?.error || e?.message || String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const decide = async (req, decision) => {
+    if (busy) return;
+    if (decision === 'approve') {
+      const typed = await showPrompt(
+        `Approve ${req.live_xell_slug || 'a manager'}'s request to clean up the xource?\n\n`
+        + 'The queenzee will reset the main checkout to the main tip (aborting merges, discarding '
+        + 'uncommitted changes, preserving xell worktrees) — unblocking the landings/ships it was '
+        + 'wedging.\n\nType APPROVE to confirm.',
+        { title: 'Clean up xource?', okLabel: 'Approve & clean', variant: 'danger', placeholder: 'APPROVE' });
+      if (String(typed || '').trim().toUpperCase() !== 'APPROVE') return;
+    }
+    setBusy(true); setErr(null);
+    try { await decideXourceClean(req.id, decision); load(); onChanged?.(); }
+    catch (e) { setErr(e?.error || e?.message || String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const pending = requests.filter((r) => r.status === 'pending');
+  const receipts = requests.filter((r) => r.status !== 'pending');
+  return (
+    <div className="setup-sec danger-sec" data-testid="xource-section">
+      <h3>Xource — the main checkout <span className="pc">every landing and ship builds from this one tree</span></h3>
+      {state && (
+        <div className="gates">
+          {state.ok ? (
+            state.clean
+              ? <span className="gate g-pass">✓ xource clean — {state.branch} is level and untouched</span>
+              : <span className="gate g-fail">✗ xource MANGLED — {state.summary}</span>
+          ) : <span className="gate g-warn">△ cannot read the xource: {state.error}</span>}
+          {!state.ok && <span className="pc">{state.error}</span>}
+          {state.ok && !state.clean && (
+            <span className="pc">
+              This is blocking landings and ships. Cleaning resets the checkout to the main tip —
+              uncommitted work in the main checkout is discarded (xell worktrees are preserved).
+            </span>
+          )}
+        </div>
+      )}
+      <div className="danger-box" data-testid="xource-clean">
+        <div className="danger-title">Clean up the xource</div>
+        <div className="pc danger-desc">
+          Aborts any in-progress merge/rebase/cherry-pick/revert, resets the index and working tree to
+          the main tip, and removes untracked junk. <b>Preserves every xell's worktree</b> under
+          <span className="mono"> .claude/worktrees/</span>. Discards uncommitted changes in the main
+          checkout. Production is never touched.
+        </div>
+        {err && <div className="projpop-err">{err}</div>}
+        {result && (
+          <div className="danger-result" data-testid="xource-clean-result">
+            {result.ok || result.dry_run
+              ? <>✓ xource cleaned{result.dry_run ? ' (DRY-RUN — this queenzee models the fleet)' : ''}</>
+              : <>✗ xource still not clean — {result.error || result.result?.error || 'see the queenzee log'}</>}
+            {Array.isArray(result.result?.steps) && result.result.steps.length > 0 && (
+              <ul className="pc" style={{ margin: '4px 0 0 16px' }}>
+                {result.result.steps.map((s, i) => <li key={i}>{s}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+        <button className="ctxdanger" data-testid="xource-clean-go" disabled={busy || !state?.ok || state?.clean}
+                title={state?.clean ? 'the xource is already clean' : 'reset the main checkout to the main tip'}
+                onClick={clean}>
+          {busy ? 'Cleaning…' : '🧹 Clean up xource'}
+        </button>
+      </div>
+
+      {(pending.length > 0 || receipts.length > 0) && (
+        <div className="danger-box" style={{ marginTop: 10 }} data-testid="xource-requests">
+          <div className="danger-title">
+            {pending.length
+              ? `⚠ ${pending.length} manager request${pending.length === 1 ? '' : 's'} to clean the xource`
+              : '✓ xource-clean requests'}
+          </div>
+          {(pending.length === 0 && receipts.length > 0) && (
+            <div className="pc danger-desc">No open requests — recently-decided ones are shown as receipts.</div>
+          )}
+          {[...pending, ...receipts].map((r) => (
+            <div className="siteed" key={r.id} data-testid={`xource-request-${r.status}`}>
+              <div className="setup-row">
+                <span className={`sitetier t-${r.status === 'pending' ? 'prod' : 'dev'}`}>{r.status}</span>
+                <span className="sitekey">{r.live_xell_slug || 'human'}</span>
+                <span className="pc">{new Date(r.requested_at).toLocaleString()}</span>
+                {r.decided_by && <span className="pc">· {r.status} by {r.decided_by}</span>}
+                {r.status !== 'pending' && (
+                  <button className="projpop-del" title="Hide this receipt"
+                          onClick={() => dismissXourceClean(r.id).then(load)}>✕</button>
+                )}
+              </div>
+              {r.reason && <div className="prod-ask-reason">“{r.reason}”</div>}
+              {r.status === 'pending' && (
+                <div className="land-actions">
+                  <button className="land-reject" disabled={busy} onClick={() => decide(r, 'reject')}>Reject</button>
+                  <button className="land-approve" disabled={busy}
+                          title="The queenzee resets the main checkout to the main tip (aborting merges, preserving xell worktrees)"
+                          onClick={() => decide(r, 'approve')}>{busy ? '…' : 'Approve & clean'}</button>
+                </div>
+              )}
+              {r.status === 'failed' && <div className="land-err">{r.result?.error || 'cleanup failed'}</div>}
+              {r.status === 'completed' && r.result?.dry_run && (
+                <div className="pc">DRY-RUN — this queenzee models the fleet; the real xource was not touched.</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -534,7 +691,10 @@ function BasicsSection({ project, run, onProject }) {
     if (!(await showConfirm(
       `Push local ${project.main_branch} of ${project.name} to the GitHub remote?\n\n`
       + `${project.remote_url}\n\nThis publishes your local history to the remote (fast-forward only — a `
-      + `diverged remote is refused, never force-pushed).`,
+      + `diverged remote is refused, never force-pushed).`
+      // the ruleset pre-flight (access.push_rule_block): GitHub will refuse this push by RULE, and
+      // it is worth saying so BEFORE the click rather than after the GH013 comes back
+      + (access?.push_rule_block ? `\n\n⚠ ${access.push_rule_block}.` : ''),
       { title: 'Push to remote?', okLabel: 'Push' }))) return;
     setPull(null); setOut({ busy: true, kind: 'push' });
     try {
@@ -556,7 +716,19 @@ function BasicsSection({ project, run, onProject }) {
     if (headBranch === null) return;   // cancelled
     setPull(null); setOut({ busy: true, kind: 'pr', merge });
     try {
-      const r = await run(() => pullRequestProject(project.id, { headBranch: headBranch.trim() || undefined, merge }));
+      const opts = { headBranch: headBranch.trim() || undefined, merge };
+      let r = await run(() => pullRequestProject(project.id, opts));
+      // A rule that scans the COMMITS (push protection, file size, signatures…) is not fixed by a
+      // clean tip, so offer the one remedy that does not need a bypass or a history rewrite — and
+      // only for the rules it can actually help with (see squashHelps).
+      if (squashHelps(r)) {
+        setOut({ ...r, kind: 'pr', merge });
+        if (await showConfirm(squashOffer(r, project.main_branch),
+          { title: 'Open the PR from a squashed snapshot?', okLabel: 'Open squashed PR' })) {
+          setOut({ busy: true, kind: 'pr', merge });
+          r = await run(() => pullRequestProject(project.id, { ...opts, squash: true }));
+        }
+      }
       setOut({ ...r, kind: 'pr', merge });
     } catch (e) { setOut({ kind: 'pr', merge, reason: e.message }); }
   };
@@ -604,7 +776,9 @@ function BasicsSection({ project, run, onProject }) {
                     onClick={doPull}>↓ Pull</button>
             {access?.can_push && (
               <button type="button" disabled={pull?.busy || out?.busy}
-                      title={`push local ${project.main_branch} to the remote (fast-forward only) — you'll be asked to confirm`}
+                      title={access?.push_rule_block
+                        ? `⚠ ${access.push_rule_block}`
+                        : `push local ${project.main_branch} to the remote (fast-forward only) — you'll be asked to confirm`}
                       onClick={doPush}>↑ Push</button>
             )}
             {access?.can_pr && (
@@ -620,12 +794,18 @@ function BasicsSection({ project, run, onProject }) {
           </span>
         </label>
       </div>
-      {(pullLabel || outLabel) && (
+      {(pullLabel || outLabel || access?.push_rule_block) && (
         <div className="gates">
-          {pullLabel && <span className={`gate ${pull.busy ? 'g-warn' : pull.pulled ? 'g-pass' : 'g-warn'}`}>{pullLabel}</span>}
+          {/* the ruleset pre-flight, standing even before anything has been clicked: a repo whose
+              rules require a PR will refuse ↑ Push every time, and the console should say which
+              button can actually work. The full sentence is in the title (the pill truncates). */}
+          {access?.push_rule_block && !out?.busy && (
+            <span className="gate g-warn" title={access.push_rule_block}>⚠ ruleset: use PR, not Push</span>
+          )}
+          {pullLabel && <span className={`gate ${pull.busy ? 'g-warn' : pull.pulled ? 'g-pass' : 'g-warn'}`} title={pull.reason || pullLabel}>{pullLabel}</span>}
           {outLabel && (out?.url && outOk
-            ? <a className="gate g-pass" href={out.url} target="_blank" rel="noreferrer">{outLabel}</a>
-            : <span className={`gate ${out.busy ? 'g-warn' : outOk ? 'g-pass' : 'g-warn'}`}>{outLabel}</span>)}
+            ? <a className="gate g-pass" href={out.url} target="_blank" rel="noreferrer" title={outLabel}>{outLabel}</a>
+            : <span className={`gate ${out.busy ? 'g-warn' : outOk ? 'g-pass' : 'g-warn'}`} title={out?.reason || outLabel}>{outLabel}</span>)}
         </div>
       )}
       <div className="projpop-formbtns"><button type="button" onClick={save}>Save project</button></div>
@@ -654,7 +834,7 @@ function ManifestSection({ project, run, onProject }) {
 function SitesSection({ project, run, busy }) {
   const [sites, setSites] = useState(null);
   const [machines, setMachines] = useState([]);
-  const [add, setAdd] = useState({ key: '', tier: 'prod', docker_ctx: '', host: '' });
+  const [add, setAdd] = useState({ key: '', tier: 'prod', docker_ctx: '', host: '', docker_endpoint: '' });
   const load = useCallback(() => getSites(project.id).then(setSites).catch(() => {}), [project.id]);
   useEffect(() => { load(); getMachines().then(setMachines).catch(() => {}); }, [load]);
   const wrapped = (fn) => run(async () => { await fn(); await load(); });
@@ -684,13 +864,17 @@ function SitesSection({ project, run, busy }) {
         )}
         <input value={add.key} placeholder="site key (e.g. vps)" onChange={(e) => setAdd({ ...add, key: e.target.value })} />
         <input list="zh-docker-ctxs" value={add.docker_ctx} placeholder="docker context" onChange={(e) => setAdd({ ...add, docker_ctx: e.target.value })} />
-        <input className="sitehost" value={add.host} placeholder="host IP" onChange={(e) => setAdd({ ...add, host: e.target.value })} />
+        <input className="sitehost" value={add.host} placeholder="host (IP or DNS)" onChange={(e) => setAdd({ ...add, host: e.target.value })} />
+        <input className="siteendpoint" value={add.docker_endpoint} placeholder="docker endpoint (e.g. tcp://10.2.0.16:2375)"
+               title="The full endpoint the queenzee reconciles this site's docker context to (the tab is the source of truth)"
+               onChange={(e) => setAdd({ ...add, docker_endpoint: e.target.value })} />
         <button type="button" disabled={busy || !add.key.trim()}
                 onClick={() => wrapped(() => createSite(project.id, {
                   ...add, docker_ctx: add.docker_ctx.trim() || 'default', host: add.host.trim() || null,
+                  docker_endpoint: add.docker_endpoint.trim() || null,
                   // the first prod site becomes the default target automatically
                   is_default: add.tier === 'prod' && !(sites || []).some((s) => s.tier === 'prod'),
-                })).then(() => setAdd({ key: '', tier: 'prod', docker_ctx: '', host: '' }))}>＋ Add site</button>
+                })).then(() => setAdd({ key: '', tier: 'prod', docker_ctx: '', host: '', docker_endpoint: '' }))}>＋ Add site</button>
       </div>
       {add.tier === 'prod' && (
         <div className="pc" style={{ marginTop: 4 }}>
@@ -706,12 +890,14 @@ function SiteEditor({ site, run, busy }) {
   const [open, setOpen] = useState(false);
   const [f, setF] = useState({
     docker_ctx: site.docker_ctx || '', host: site.host || '',
+    docker_endpoint: site.docker_endpoint || '',
     kind: site.ingress?.kind || 'lan', public_url: site.ingress?.public_url || '',
     provider_container: site.ingress?.provider_container || '', notes: site.ingress?.notes || '',
   });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const save = () => run(() => updateSite(site.id, {
     docker_ctx: f.docker_ctx.trim() || 'default', host: f.host.trim() || null,
+    docker_endpoint: f.docker_endpoint.trim() || null,
     ingress: {
       ...(site.ingress || {}), kind: f.kind,
       public_url: f.public_url.trim() || undefined,
@@ -731,7 +917,10 @@ function SiteEditor({ site, run, busy }) {
         <span className={`sitetier t-${site.tier}`}>{site.tier}</span>
         <span className="sitekey">{site.key}{site.is_default ? ' ●' : ''}</span>
         <input list="zh-docker-ctxs" value={f.docker_ctx} onChange={set('docker_ctx')} />
-        <input className="sitehost" value={f.host} placeholder="host IP" onChange={set('host')} />
+        <input className="sitehost" value={f.host} placeholder="host (IP or DNS)" onChange={set('host')} />
+        <input className="siteendpoint" value={f.docker_endpoint} placeholder="endpoint (e.g. ssh://mnrevelo@ssh.omnibiz.express)"
+               title="The full endpoint the queenzee reconciles this site's docker context to (the tab is the source of truth)"
+               onChange={set('docker_endpoint')} />
         <button type="button" className="ghost" onClick={() => setOpen(!open)}>{open ? '▾' : '▸'} ingress</button>
         <button type="button" disabled={busy} onClick={save}>Save</button>
         {!site.is_default && <button type="button" className="ghost" disabled={busy}
@@ -1377,6 +1566,154 @@ function SpawnSection({ project, run }) {
         <label>Refresh interval (sec)
           <input type="number" min="60" defaultValue={pc.refresh_interval_sec}
                  onBlur={(e) => Number(e.target.value) !== pc.refresh_interval_sec && save({ refresh_interval_sec: Number(e.target.value) })} /></label>
+      </div>
+      <PrepEditor pc={pc} save={save} />
+    </div>
+  );
+}
+
+// ── the spawn template's DEPENDENCIES and CACHE (migration 121) ────────────────────────────────
+// What gets installed into a fresh xell before its zee starts, and how that install is cached. Two
+// costs this replaces, both of them paid every single spawn:
+//   • the install list was hard-coded in the queenzee (npm ci + the web build, for every project of
+//     every fleet), so a project that also needs psql or build tools had every zee discover the gap
+//     mid-turn — `psql` is in a zee's own binding and was not in its cage;
+//   • the ONE lever that makes a spawn fast (a warm shared cache + --prefer-offline) was a
+//     fleet-wide env var, so it could not be tuned per project at all.
+// The steps are ordered, and they run in order: root steps (apt) first in their own root exec, then
+// the rest as the zee user in /work/repo. Everything here is best-effort at spawn — a step that
+// fails makes a slower zee, never a failed dispatch.
+// Exported for test/spawn-prep-console.test.mjs: this editor writes a template the QUEENZEE turns
+// into a script, so what it emits is asserted against the real normalizer rather than eyeballed.
+export function PrepEditor({ pc, save }) {
+  const prep = pc.spawn_prep || { steps: [], cache: {} };
+  const presets = pc.spawn_prep_presets || [];
+  const [adding, setAdding] = useState('');
+  const steps = prep.steps || [];
+  const cache = prep.cache || {};
+  // Always send the WHOLE template — steps, cache AND when. A save that posted only the field the
+  // human touched would silently reset the other two to their defaults, because the API normalizes
+  // what it is given rather than merging it.
+  const put = (next) => save({ spawn_prep: {
+    steps: next.steps ?? steps, cache: next.cache ?? cache, when: next.when ?? (prep.when || 'dispatch') } });
+  const patchStep = (i, patch) => put({ steps: steps.map((s, n) => (n === i ? { ...s, ...patch } : s)) });
+  const removeStep = (i) => put({ steps: steps.filter((_, n) => n !== i) });
+  const moveStep = (i, d) => {
+    const next = steps.slice();
+    const j = i + d;
+    if (j < 0 || j >= next.length) return;
+    [next[i], next[j]] = [next[j], next[i]];
+    put({ steps: next });
+  };
+  const addPreset = (key) => {
+    const preset = presets.find((x) => x.key === key);
+    if (!preset) return;
+    // A second copy of a preset needs its own key — the key is what the PREP_STEP timing markers are
+    // reported under, and two steps answering to one name is a report nobody can read.
+    let k = preset.key, n = 2;
+    while (steps.some((s) => s.key === k)) k = `${preset.key}-${n++}`;
+    const { hint, ...step } = preset;
+    put({ steps: [...steps, { ...step, key: k, enabled: true }] });
+    setAdding('');
+  };
+  return (
+    <div className="setup-sub" data-testid="spawn-prep">
+      <h4>Dependencies &amp; cache <span className="pc">
+        installed into every new xell before its zee starts
+        {pc.spawn_prep_custom ? '' : ' — currently the built-in default'}</span></h4>
+      <div className="setup-grid">
+        <label>Prep runs <span className="pc">(who pays for the install — the pool, or the waiting human)</span>
+          <select value={prep.when || 'dispatch'} data-testid="prep-when"
+                  onChange={(e) => put({ when: e.target.value })}>
+            <option value="dispatch">at dispatch — in the cage, while a human waits</option>
+            <option value="image">bake packages into an image — the pool builds it</option>
+            <option value="provision">at provision — the whole cage, prepped in the pool</option>
+          </select></label>
+        <label>npm cache <span className="pc">(the fleet volume is why a spawn is not a download)</span>
+          <select value={cache.npm || 'shared'} data-testid="prep-npm-cache"
+                  onChange={(e) => put({ cache: { ...cache, npm: e.target.value } })}>
+            <option value="shared">shared across the fleet (fast)</option>
+            <option value="container">per-container (cold every time)</option>
+          </select></label>
+        <label>apt cache <span className="pc">(only mounted when a step installs packages)</span>
+          <select value={cache.apt || 'shared'} data-testid="prep-apt-cache"
+                  onChange={(e) => put({ cache: { ...cache, apt: e.target.value } })}>
+            <option value="shared">shared archive volume</option>
+            <option value="off">off</option>
+          </select></label>
+        <label className="prep-check">
+          <span><input type="checkbox" checked={!!cache.npm_prefer_offline} data-testid="prep-prefer-offline"
+                       onChange={(e) => put({ cache: { ...cache, npm_prefer_offline: e.target.checked } })} />
+            {' '}npm --prefer-offline</span>
+          <span className="pc">skip registry revalidation — measured as no faster off a warm cache, keep for a slow one</span>
+        </label>
+        <label className="prep-check">
+          <span><input type="checkbox" checked={!!cache.npm_omit_dev} data-testid="prep-omit-dev"
+                       onChange={(e) => put({ cache: { ...cache, npm_omit_dev: e.target.checked } })} />
+            {' '}npm --omit=dev</span>
+          <span className="pc">skip devDependencies — faster, but a zee cannot run the tests</span>
+        </label>
+      </div>
+      <div className="prep-steps">
+        {steps.map((s, i) => (
+          <div className={`prep-step${s.enabled ? '' : ' off'}`} key={s.key} data-testid={`prep-step-${s.key}`}>
+            <div className="setup-row">
+              <input type="checkbox" checked={!!s.enabled} title="run this step at spawn"
+                     data-testid={`prep-toggle-${s.key}`}
+                     onChange={(e) => patchStep(i, { enabled: e.target.checked })} />
+              <span className={`sitetier t-${s.kind === 'apt' ? 'prod' : 'dev'}`}>{s.kind}</span>
+              <span className="sitekey">{s.label || s.key}</span>
+              {s.kind === 'apt' && (
+                <input className="prep-arg" defaultValue={(s.packages || []).join(' ')} spellCheck={false}
+                       data-testid={`prep-arg-${s.key}`} placeholder="package names, space separated"
+                       onBlur={(e) => e.target.value.trim() !== (s.packages || []).join(' ')
+                         && patchStep(i, { packages: e.target.value.trim().split(/[\s,]+/).filter(Boolean) })} />
+              )}
+              {s.kind === 'npm-run' && (
+                <input className="prep-arg" defaultValue={s.script} spellCheck={false}
+                       data-testid={`prep-arg-${s.key}`} placeholder="build --workspace web"
+                       onBlur={(e) => e.target.value.trim() !== s.script && patchStep(i, { script: e.target.value.trim() })} />
+              )}
+              {s.kind === 'shell' && (
+                <input className="prep-arg" defaultValue={s.run} spellCheck={false}
+                       data-testid={`prep-arg-${s.key}`} placeholder="a shell command, run in /work/repo"
+                       onBlur={(e) => e.target.value.trim() !== s.run && patchStep(i, { run: e.target.value.trim() })} />
+              )}
+              {s.kind === 'npm' && <span className="pc">npm ci (npm install only where there is no lockfile)</span>}
+              <span className="prep-actions">
+                <button className="projpop-del" title="move earlier" disabled={i === 0} onClick={() => moveStep(i, -1)}>↑</button>
+                <button className="projpop-del" title="move later" disabled={i === steps.length - 1} onClick={() => moveStep(i, 1)}>↓</button>
+                <button className="projpop-del" title="remove this step" data-testid={`prep-remove-${s.key}`}
+                        onClick={() => removeStep(i)}>✕</button>
+              </span>
+            </div>
+          </div>
+        ))}
+        {!steps.length && <div className="pc">No prep at all — every zee installs its own dependencies, on its own clock.</div>}
+        {prep.when === 'provision' && (
+          <div className="pc" data-testid="prep-when-note">
+            Provisioning creates and installs each pooled xell's cage, so a dispatch installs nothing —
+            at the cost of one live container per pooled xell. A dispatch still falls back to installing
+            in-cage if the pre-warmed cage is gone or the branch's lockfile moved.
+          </div>
+        )}
+        {prep.when === 'image' && (
+          <div className="pc" data-testid="prep-when-note">
+            The pool bakes the apt packages into a per-template image, so apt costs nothing at spawn.
+            The npm steps still run at dispatch — they depend on the branch's lockfile.
+          </div>
+        )}
+      </div>
+      <div className="setup-row prep-add">
+        <select value={adding} data-testid="prep-add" onChange={(e) => addPreset(e.target.value)}>
+          <option value="">+ add a step…</option>
+          {presets.map((x) => <option key={x.key} value={x.key}>{x.label}{x.hint ? ` — ${x.hint}` : ''}</option>)}
+        </select>
+        {pc.spawn_prep_custom && (
+          <button className="projpop-del" data-testid="prep-reset"
+                  title="back to the built-in default (npm ci + the web prebuild)"
+                  onClick={() => save({ spawn_prep: null })}>reset to default</button>
+        )}
       </div>
     </div>
   );

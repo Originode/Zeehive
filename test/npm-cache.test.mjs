@@ -107,8 +107,15 @@ try {
   console.log('\n── it is wired into the paths that actually pay the cost ──');
   const { readFileSync } = await import('node:fs');
   const provision = readFileSync('server/src/lib/provision.js', 'utf8');
-  ok(/warmWorktree\(worktree, \{ slug \}\)/.test(provision), 'provisionXell warms the worktree');
-  ok(/warmWorktree\([^)]*\)\.catch\(/.test(provision), 'NOT awaited and .catch()ed — provisioning never waits for npm, and never dies of it');
+  ok(/warmWorktree\(worktree, \{ slug[,}]/.test(provision), 'provisionXell warms the worktree');
+  // The template is read once and handed to BOTH provision-time paths (the worktree warm and, when
+  // the template asks for it, the cage prewarm), so this asserts the read and the hand-over rather
+  // than one call's spelling.
+  ok(/const prep = normalizeSpawnPrep\(cfg\?\.spawn_prep/.test(provision)
+     && /warmWorktree\(worktree, \{ slug, prep \}\)/.test(provision),
+     "…with the project's SPAWN TEMPLATE (migration 121), which decides whether it installs at all and with which flags");
+  ok(/warmWorktree\(worktree, \{[^;]*\}\)\s*\n?\s*\.catch\(/.test(provision),
+     'NOT awaited and .catch()ed — provisioning never waits for npm, and never dies of it');
   const build = readFileSync('server/src/lib/build.js', 'utf8');
   ok(/npmCacheEnv\(cleanGitEnv\(\)\)/.test(build), 'the process-role starter inherits the shared cache (no change to the script itself)');
   const dockerfile = readFileSync('docker/zeehive/Dockerfile.zee-agent', 'utf8');

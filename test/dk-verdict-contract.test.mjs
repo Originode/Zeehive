@@ -90,7 +90,22 @@ const say = ({ out = '', err = '', code = 0 }) => {
 try {
   process.env.PATH = `${bin}:${REAL_PATH}`;
   const C = await import('../server/src/lib/cxell.js');
+  const RT = await import('../server/src/lib/cxell-runtimes.js');
   const { recentLogs } = await import('../server/src/lib/logbus.js');
+  const SP = await import('../server/src/lib/spawn-prep.js');
+  // cloneIntoCxell bundles a REAL git branch before it touches docker, so its row needs a real
+  // worktree — the shim only stands in for the docker half.
+  const CLONE_WT = join(tmp, 'clone-wt');
+  mkdirSync(CLONE_WT, { recursive: true });
+  for (const args of [['init', '-q', '-b', 'zt-branch'], ['config', 'user.email', 't@t'], ['config', 'user.name', 't']]) {
+    execFileSync('git', ['-C', CLONE_WT, ...args], { encoding: 'utf8' });
+  }
+  writeFileSync(join(CLONE_WT, 'f.txt'), 'x\n');
+  execFileSync('git', ['-C', CLONE_WT, 'add', '-A'], { encoding: 'utf8' });
+  execFileSync('git', ['-C', CLONE_WT, 'commit', '-qm', 'base'], { encoding: 'utf8' });
+  // A project whose SPAWN TEMPLATE installs a package — the only shape that makes prepRootCxell run
+  // an exec at all (a default template asks for nothing as root, so the site is a no-op).
+  const APT_PREP = SP.normalizeSpawnPrep({ steps: [{ key: 'psql', kind: 'apt', packages: ['postgresql-client'] }] });
   const since = () => recentLogs(400).length;
   const linesSince = (n) => recentLogs(400).slice(n).map((l) => l.msg || String(l));
   const src = readFileSync(join(ROOT, 'server/src/lib/cxell.js'), 'utf8');
@@ -182,6 +197,80 @@ try {
       ],
     },
     {
+      // THE TURN-BOUNDARY HOOKS (installTurnHooksIntoCxell). This site landed on main WITHOUT a row
+      // here, which the count assertion at the bottom caught: 10 dkVerdict call sites, 9 rows. That
+      // is the guard doing exactly its job — a new marker-based exec cannot be added without saying
+      // how it reads its verdict — so the row is written here rather than the count relaxed.
+      // Its shape is the same as the auth/seed pair it sits beside: a cage that cannot say it
+      // installed the hooks did NOT install them, whatever the exit code was.
+      name: 'installTurnHooksIntoCxell',
+      markers: RT.TURN_HOOK_MARKERS,
+      cases: [
+        { what: 'TURNHOOK_OK + exit 1 + stderr noise is installed (the verdict, not the exit code)',
+          out: 'TURNHOOK_OK', err: 'docker: connection reset', code: 1,
+          run: () => C.installTurnHooksIntoCxell({ ctx: 'default', name: 'cxell_zt-v',
+                                                   adapter: RT.adapterFor('claude-code-cxell') }),
+          want: (r) => r?.ok === true && r?.verdict === 'TURNHOOK_OK' },
+        { what: 'TURNHOOK_FAILED + exit 0 is still a failure, carrying what the cage said',
+          out: 'could not write the hook\nTURNHOOK_FAILED', err: '', code: 0,
+          run: () => C.installTurnHooksIntoCxell({ ctx: 'default', name: 'cxell_zt-v',
+                                                   adapter: RT.adapterFor('claude-code-cxell') }),
+          want: (r) => r?.ok === false && r?.verdict === 'TURNHOOK_FAILED' && /could not write/.test(String(r?.said)) },
+        { what: 'and NO verdict is a failure that says what docker said, not a shrug',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.installTurnHooksIntoCxell({ ctx: 'default', name: 'cxell_zt-v',
+                                                   adapter: RT.adapterFor('claude-code-cxell') }),
+          want: (r) => r?.ok === false && !r?.verdict && /No such container/.test(String(r?.said)) },
+      ],
+    },
+    {
+      // CLONE INTO THE CAGE — and since the pre-warmed cage landed, it has TWO paths: a fresh clone,
+      // or a fetch+reset onto a checkout that is already there (which is what preserves the
+      // node_modules provisioning installed). Everything downstream assumes /work/repo is a
+      // checkout, so "no verdict" here must THROW rather than hand a zee half a repository — the one
+      // site in this table where the strict direction is the safe one.
+      name: 'cloneIntoCxell',
+      markers: C.CLONE_MARKERS,
+      cases: [
+        { what: 'CLONE_UPDATED + exit 1 is still an updated checkout (the verdict, not the exit code)',
+          out: 'CLONE_UPDATED', err: 'docker: connection reset', code: 1,
+          run: () => C.cloneIntoCxell({ ctx: 'default', name: 'cxell_zt-v', worktree: CLONE_WT }),
+          want: (r, logs) => logs.some((m) => /updated the existing checkout in place/.test(m)) },
+        { what: 'CLONE_FRESH is the ordinary path and says nothing extra',
+          out: 'CLONE_FRESH', err: '', code: 0,
+          run: () => C.cloneIntoCxell({ ctx: 'default', name: 'cxell_zt-v', worktree: CLONE_WT }),
+          want: (r, logs) => !logs.some((m) => /updated the existing checkout/.test(m)) },
+        { what: 'and NO verdict THROWS — a half-cloned cage must never be handed to a zee',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.cloneIntoCxell({ ctx: 'default', name: 'cxell_zt-v', worktree: CLONE_WT }),
+          want: (e) => e instanceof Error && /reported nothing/.test(e.message) && /No such container/.test(e.message) },
+      ],
+    },
+    {
+      // THE SPAWN TEMPLATE'S ROOT PREP (migration 121) — apt packages installed into a fresh cage
+      // before the zee starts. It is best-effort BY POLICY (a missing package is a slower zee, never
+      // a failed dispatch), and that is exactly the shape in which a misread verdict hides: nothing
+      // downstream fails, the cage simply comes up without the tool a human asked for and the log
+      // says the opposite. Hence a row.
+      name: 'prepRootCxell (spawn template, root half)',
+      markers: ['PREP_ROOT_DONE'],
+      cases: [
+        { what: 'PREP_ROOT_DONE + exit 1 is a prep that RAN (the verdict, not the exit code)',
+          out: 'PREP_STEP psql ok 4\nPREP_ROOT_DONE', err: 'docker: connection reset', code: 1,
+          run: () => C.prepRootCxell({ ctx: 'default', name: 'cxell_zt-v', prep: APT_PREP }),
+          want: (r) => r?.ran === true && r?.ok === true && r?.steps?.[0]?.key === 'psql' && r.steps[0].ok === true },
+        { what: 'a step that did NOT install is named in the log, and the dispatch still goes on',
+          out: 'PREP_STEP psql failed 9\nPREP_ROOT_DONE', err: '', code: 0,
+          run: () => C.prepRootCxell({ ctx: 'default', name: 'cxell_zt-v', prep: APT_PREP }),
+          want: (r, logs) => r?.ran === true && r?.steps?.[0]?.ok === false
+                             && logs.some((m) => /prep step\(s\) FAILED/.test(m) && /psql/.test(m)) },
+        { what: 'and an exec that reports NOTHING is still not a failed dispatch (best-effort, rule 1)',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.prepRootCxell({ ctx: 'default', name: 'cxell_zt-v', prep: APT_PREP }),
+          want: (r) => r?.ran === true && r?.ok === false && /No such container/.test(String(r?.error || '')) },
+      ],
+    },
+    {
       // The npm-cache fixup in ensureCxell — the sibling this file found. It has no return value: the
       // cage's answer is only ever a WARNING, which is exactly why nobody noticed it was reading the
       // marker out of a rejection and warning falsely.
@@ -267,6 +356,61 @@ try {
           want: (r) => r?.state === 'unknown' && /stopped container/.test(String(r?.output || '')) },
       ],
     },
+    {
+      // INSTALLING THE DISPATCHED PROVIDER'S CREDENTIAL (lib/cxell.js prepareCxellAuth) — the site
+      // that exists because `codex exec` authenticates from ~/.codex/auth.json, not from
+      // OPENAI_API_KEY, and a cage without it 401s on every turn with a message that reads like a
+      // bad key. Its verdict is a gate: spawnCxell REFUSES the dispatch on a failure, so reading it
+      // from the exit code would either strand good dispatches or start zees that cannot
+      // authenticate. `codex login` exits non-zero on some of its own error paths while still
+      // printing the verdict, which is this table's whole shape.
+      name: 'prepareCxellAuth (the provider credential install)',
+      markers: RT.AUTH_MARKERS,
+      cases: [
+        { what: 'AUTH_OK + exit 1 + stderr noise is an installed credential',
+          out: 'AUTH_OK', err: 'docker: connection reset', code: 1,
+          run: () => C.prepareCxellAuth({ ctx: 'default', name: 'cxell_zt-v',
+                                          adapter: RT.adapterFor('codex-cxell'), token: 'sk-proj-zt' }),
+          want: (r) => r?.required === true && r?.ok === true && r?.verdict === 'AUTH_OK' },
+        { what: 'AUTH_FAILED + exit 0 is still a failure, carrying what the cage said',
+          out: 'No API key provided via stdin.\nAUTH_FAILED', err: '', code: 0,
+          run: () => C.prepareCxellAuth({ ctx: 'default', name: 'cxell_zt-v',
+                                          adapter: RT.adapterFor('codex-cxell'), token: 'sk-proj-zt' }),
+          want: (r) => r?.ok === false && r?.verdict === 'AUTH_FAILED' && /No API key/.test(String(r?.said)) },
+        { what: 'and NO verdict is a FAILURE — "we could not tell" must never start a turn',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.prepareCxellAuth({ ctx: 'default', name: 'cxell_zt-v',
+                                          adapter: RT.adapterFor('codex-cxell'), token: 'sk-proj-zt' }),
+          want: (r) => r?.ok === false && !r?.verdict && /No such container/.test(String(r?.said)) },
+      ],
+    },
+    {
+      // PRE-ANSWERING THE RUNTIME'S FIRST-RUN PROMPTS (lib/cxell.js seedCxellFirstRun) — the auth
+      // install's twin, and deliberately the opposite POLICY: this one is not fatal, because a cage
+      // whose seed failed still works headless and the whole cost is a prompt in front of an
+      // attending human. Which makes reading the verdict correctly matter MORE, not less: nothing
+      // downstream fails, so a misread here is only ever visible as a human meeting a gate nobody
+      // said was there.
+      name: 'seedCxellFirstRun (the vendor first-run seed)',
+      markers: RT.SEED_MARKERS,
+      cases: [
+        { what: 'SEED_OK + exit 1 + stderr noise is a seeded cage',
+          out: 'SEED_OK', err: 'docker: connection reset', code: 1,
+          run: () => C.seedCxellFirstRun({ ctx: 'default', name: 'cxell_zt-v',
+                                           adapter: RT.adapterFor('codex-cxell') }),
+          want: (r) => r?.required === true && r?.ok === true && r?.verdict === 'SEED_OK' },
+        { what: 'SEED_FAILED + exit 0 is a failure that carries what the cage said',
+          out: 'could not write ~/.codex/config.toml\nSEED_FAILED', err: '', code: 0,
+          run: () => C.seedCxellFirstRun({ ctx: 'default', name: 'cxell_zt-v',
+                                           adapter: RT.adapterFor('codex-cxell') }),
+          want: (r) => r?.ok === false && r?.verdict === 'SEED_FAILED' && /config\.toml/.test(String(r?.said)) },
+        { what: 'and no verdict is reported, not assumed — silence is not a seeded cage',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.seedCxellFirstRun({ ctx: 'default', name: 'cxell_zt-v',
+                                           adapter: RT.adapterFor('codex-cxell') }),
+          want: (r) => r?.ok === false && !r?.verdict && /No such container/.test(String(r?.said)) },
+      ],
+    },
   ];
 
   for (const site of SITES) {
@@ -345,7 +489,10 @@ try {
   // EVERY marker a cage script prints must be DECLARED at the exec that runs it. This is the guard
   // that fires on the NEXT instance: add `echo NEW_MARKER` to a script and read it off the exit code,
   // and the token is undeclared and this fails.
-  const scriptSources = ['server/src/lib/cxell.js', 'server/src/lib/npm-cache.js'];
+  // spawn-prep.js is here because migration 121 MOVED the warm script into it: the markers a cage
+  // prints are generated from the project's spawn template now, and a guard that only reads cxell.js
+  // would have declared every WARM_* marker a ghost.
+  const scriptSources = ['server/src/lib/cxell.js', 'server/src/lib/npm-cache.js', 'server/src/lib/spawn-prep.js'];
   const printed = new Set();
   for (const f of scriptSources) {
     const s = readFileSync(join(ROOT, f), 'utf8');
@@ -355,7 +502,9 @@ try {
   }
   // Declared markers: the `markers:` lists at the dkVerdict call sites, plus the named constant one of
   // them passes (WARM_MARKERS lives beside the script that prints them).
-  const declared = new Set(C.WARM_MARKERS);
+  // The named-constant marker sets, which the `markers: [...]` regex below cannot see because the
+  // call site passes a CONSTANT. Each one lives beside the script that prints it.
+  const declared = new Set([...C.WARM_MARKERS, ...C.CLONE_MARKERS]);
   for (const m of src.matchAll(/markers:\s*\[([^\]]*)\]/g)) {
     for (const tok of m[1].matchAll(/'([A-Z][A-Z0-9_]*)'/g)) declared.add(tok[1]);
   }
@@ -368,6 +517,9 @@ try {
     // the message truncated became an operational error and ran `git merge --abort` on a zee's
     // in-progress resolution. The site is now a real dkVerdict caller with a row in the table above —
     // the last exemption of that kind, and the reason none is left.
+    // A per-step TIMING line, not a verdict: it is parsed into a report (how long each prep step
+    // cost) and NOTHING decides on it. Asserted below, because "it is only a report" is a claim.
+    PREP_STEP: 'a timing/report line from the spawn template, never a decision (asserted below)',
     __ZEE_TALK_QUEUED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_TALK_FAILED__: 'not run by dk at all — sshExecInCxell (asserted below)',
     __ZEE_KEYS_SENT__: 'not run by dk at all — sshExecInCxell (asserted below)',
@@ -386,6 +538,9 @@ try {
   // the exemptions' own claims
   ok(/stream\.on\('close', \(code\) => \{[^}]*done\(resolve, \{ code, out, err: errOut \}\)/.test(src),
      '__ZEE_*__: sshExecInCxell resolves { code, out, err } on ANY exit code, so its markers cannot be lost');
+  const prepSrc = readFileSync(join(ROOT, 'server/src/lib/spawn-prep.js'), 'utf8');
+  ok(/export function parsePrepSteps/.test(prepSrc) && !/verdicts.*PREP_STEP|PREP_STEP.*verdict/.test(src),
+     'PREP_STEP: parsed into the per-step timing report and never consulted as a verdict');
 
   // and the table above must cover every declared marker set — the anti-accident clause
   const tabled = new Set(SITES.flatMap((s) => s.markers));

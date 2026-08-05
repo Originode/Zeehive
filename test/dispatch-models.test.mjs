@@ -44,7 +44,7 @@ ok(claude.every((m) => m.label && m.note), 'every entry has a label and a note (
 const fable = claude.find((m) => m.key === 'fable');
 ok(fable.note !== claude.find((m) => m.key === 'sonnet').note, "Fable's note is its own, not Sonnet's copied");
 
-for (const p of ['openai', 'kimi', 'deepseek']) {
+for (const p of ['openai', 'kimi', 'deepseek', 'grok']) {
   const list = listDispatchModels(p);
   ok(!list.some((m) => m.key === 'fable'), `${p}'s list does not offer a claude alias`);
   ok(list[0].key === '' && list[0].default === true, `${p} still defaults to the vendor CLI's own model`);
@@ -59,7 +59,7 @@ const vendorCmd = (key, model) => {
 };
 for (const m of keys) {
   ok(CLAUDE_ADAPTER.execCmd({ model: m }).includes(`--model ${m}`), `claude runs --model ${m}`);
-  for (const rt of ['codex-cxell', 'kimi-code-cxell', 'deepseek-cxell']) {
+  for (const rt of ['codex-cxell', 'kimi-code-cxell', 'deepseek-cxell', 'grok-cxell']) {
     // a dropped alias leaves NO trace: not in the command line, not in the model env vars
     ok(!vendorCmd(rt, m).includes(m), `${rt} drops "${m}" (runs its own default)`);
   }

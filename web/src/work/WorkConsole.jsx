@@ -6,10 +6,12 @@ import { createWorkItem, getWorkStatuses, listWorkItems, patchWorkItem, vocabOf 
 import { ErrLine, KindGlyph, StatusDot } from './bits.jsx';
 import Board from './Board.jsx';
 import Tickets from './Tickets.jsx';
+import Reflections from './Reflections.jsx';
 import Gantt from './Gantt.jsx';
 import WorkItemDrawer from './WorkItemDrawer.jsx';
 
-// WORK TRACKER — THE CONSOLE. The one surface a human uses to run work: intake (tickets), the plan
+// WORK TRACKER — THE CONSOLE. The one surface a human uses to run work: intake (tickets and the
+// REFLECTIONS ledger — what the fleet's own zees reported after their work shipped), the plan
 // (board), and time (timeline), over a single hierarchy of work items.
 //
 // WHY A FULL-SCREEN OVERLAY: this console has no router — every heavyweight surface (the terminal,
@@ -46,6 +48,7 @@ import WorkItemDrawer from './WorkItemDrawer.jsx';
 const TAB_KEY = 'zeehive.work.tab';
 const TABS = [
   { id: 'tickets', label: 'Tickets' },
+  { id: 'reflections', label: 'Reflections' },
   { id: 'board', label: 'Board' },
   { id: 'timeline', label: 'Timeline' },
 ];
@@ -199,6 +202,10 @@ export default function WorkConsole({ projectId, projectName, onClose }) {
             {tab === 'tickets' && (
               <Tickets projectId={projectId} statuses={statuses} kinds={vocab.ticketKinds}
                        reloadKey={rev} onOpenItem={setOpenItem} />
+            )}
+            {tab === 'reflections' && (
+              <Reflections projectId={projectId} kinds={vocab.ticketKinds} reloadKey={rev}
+                           onOpenTickets={() => setTab('tickets')} />
             )}
             {tab === 'board' && (
               <Board projectId={projectId} rootId={rootId} statuses={statuses} reloadKey={rev}

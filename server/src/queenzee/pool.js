@@ -11,19 +11,89 @@
 // dev xells across EVERY project (the host only has so much muscle). Filled in dev_priority
 // order so the preferred machine warms first. With no machines, the legacy project-wide
 // `pool_config.target_ready` applies unchanged on the one dev site.
+//
+// The machine-aware path ALSO requires `project.compose_spinoff` — a project with no per-xell
+// app tier owns no server containers, so the machine-mode ready count (a JOIN on
+// container.role='server') is zero by construction and fill would pile up pool_size per tick.
+// That guard used to be SILENT (the "mardale-prod never gets pool xells" defect): an operator
+// who set per-machine numbers was never told they had no effect. It is now a rate-limited
+// `logline('pool', …)` naming the skipped machines and the missing field (test:
+// test/pool-machine-guard-silence.test.mjs).
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { provisionXell } from '../lib/provision.js';
 import { devMachines, liveXellCount, machinePoolSize } from '../lib/machines.js';
 import { reapXell } from './reaper.js';
 import { reconcileXell } from './landing.js';
+import { takeReadyXellForSweep, untakeSweptXell, explainSweepSkip, currentXells } from '../lib/xell-claim.js';
 import { logline } from '../lib/logbus.js';
+import { spawnPrepFor, bakesImage } from '../lib/spawn-prep.js';
+import { ensurePreppedImage } from '../lib/cxell.js';
+import { deviceConfig } from '../lib/devices.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
+// Say the machine-guard skip when it CHANGES, not every 15s tick — the same "say it when it
+// CHANGES" rule monitor.js uses for the census and stale-claim lines. Keyed per project so a
+// project that flips compose_spinoff on logs again the moment it becomes true, and a fleet with
+// several affected projects hears each one once.
+const lastMachineGuardSaid = new Map();
+
+// DECOMMISSION A XELL THIS SWEEP SCANNED — the take, the reap and the hand-back, in ONE place, so
+// both sweep sites (the reconcile pass and the trim below) obey the same rule.
+//
+// The rule: everything the caller decided was decided from the ROW IT SCANNED, and by the time we
+// get here that row can be minutes old — each reconcile is git work and each reap is spawnSync-
+// heavy. A dispatch may have CLAIMED and RENAMED this very xell in between, which is exactly how
+// five dispatched tasks were destroyed in three minutes on 2026-08-05 (TKT-88-D6B4): the rename
+// moved the worktree out from under the scan, `landOne` reported `no-worktree` against the path the
+// scan was holding, and the reap then ran against the freshly named, freshly dispatched xell —
+// naming the OLD slug in the pool line and the NEW one in the reaper line, one xell, two names.
+//
+// So the verdict is re-asked of the database ATOMICALLY before it is acted on: takeReadyXellForSweep
+// is a conditional UPDATE that only moves a xell that is STILL 'ready', STILL this slug and STILL
+// this worktree. A dispatch's claim is the same compare-and-set on the same row off the same value,
+// so exactly one of the two can win — in either order, with no window between a read and a write for
+// the other to slip through. Exported as the seam the regression test drives
+// (test/dispatch-claim-vs-pool-sweep.test.mjs).
+export async function sweepDecommission(scanned, reason, { what = null, verdict = null, failLabel = 'REAP' } = {}) {
+  const taken = await takeReadyXellForSweep(scanned);
+  if (!taken) {
+    const now = (await currentXells([scanned.id])).get(scanned.id) || null;
+    logline('pool', `NOT decommissioning ${scanned.slug}${verdict ? ` (${verdict})` : ''} — `
+      + `${explainSweepSkip(scanned, now)}; this sweep's verdict is stale and was discarded`);
+    return { reaped: false, skipped: explainSweepSkip(scanned, now) };
+  }
+  if (what) logline('pool', what);
+  // A reap that FAILS must be loud: it leaves the xell exactly where it was, and a console.error
+  // nobody reads is how a stuck xell survives for hours. The take above moved it to 'tearing-down',
+  // so hand it back — every refusal reapXell can return happens before it changes anything.
+  const r = await reapXell(scanned.id, reason).catch((e) => ({ ok: false, error: e.message }));
+  if (!r?.ok) {
+    await untakeSweptXell(scanned.id);
+    logline('pool', `${failLabel} FAILED for ${scanned.slug}: ${r?.error || 'refused'} — it stays ready and will be retried next tick`);
+    return { reaped: false, error: r?.error || 'refused' };
+  }
+  return { reaped: true };
+}
+
 async function reconcileProject(projectId, target) {
-  const project = await one(`SELECT main_branch, compose_spinoff FROM project WHERE id=$1`, [projectId]);
+  const project = await one(`SELECT main_branch, compose_spinoff, manifest FROM project WHERE id=$1`, [projectId]);
   const src = project?.main_branch || 'main';
+
+  // BAKE THE PREPPED CXELL IMAGE (spawn template `when: image|provision`) — here, because here is
+  // the pool's clock. Every cage of this project then starts from an image that already carries the
+  // template's packages, instead of running apt on the dispatch path while a human waits. It is a
+  // no-op unless the project asked for it, a no-op when the image already exists, and never fatal:
+  // a failed bake leaves dispatch installing the packages the way it always has.
+  if (MODE === 'real') {
+    const prep = await spawnPrepFor(projectId);
+    if (bakesImage(prep)) {
+      await ensurePreppedImage({ ctx: 'default', baseImage: deviceConfig(project).cxellImage || undefined,
+                                prep, label: `project ${projectId.slice(0, 8)}` })
+        .catch((e) => logline('pool', `prepped image: ${e.message}`));
+    }
+  }
 
   // 1+2. Reconcile pooled xells to the source. Only in real mode (simulate has no worktrees).
   if (MODE === 'real') {
@@ -37,11 +107,9 @@ async function reconcileProject(projectId, target) {
     for (const x of pooled) {
       const { verdict, res } = await reconcileXell(x, src);
       if (verdict === 'decommission') {
-        logline('pool', `decommissioning ${x.slug} — ${res?.reason || 'unreconcilable'} (behind ${res?.behind ?? '?'}); will reprovision fresh`);
-        // A reap that FAILS must be loud: it leaves the xell exactly where it was, and a
-        // console.error nobody reads is how a stuck xell survives for hours.
-        await reapXell(x.id, `stale:${res?.reason || 'drift'}`)
-          .catch((e) => logline('pool', `REAP FAILED for ${x.slug}: ${e.message} — it stays ready and will be retried next tick`));
+        await sweepDecommission(x, `stale:${res?.reason || 'drift'}`,
+          { what: `decommissioning ${x.slug} — ${res?.reason || 'unreconcilable'} (behind ${res?.behind ?? '?'}); will reprovision fresh`,
+            verdict: res?.reason || 'unreconcilable' });
       }
     }
   }
@@ -60,7 +128,36 @@ async function reconcileProject(projectId, target) {
   // Machine placement is meaningless for bare worktrees anyway (they live on the queenzee's
   // host), so such projects use the legacy project-wide target, whose count has no join.
   const machines = await devMachines(projectId);
-  if (!machines.length || !project?.compose_spinoff) return fillTrim(projectId, target, null);
+  if (!machines.length || !project?.compose_spinoff) {
+    // THE SILENT DISABLE (the "mardale-prod never gets pool xells" defect). When a machine_pool
+    // row exists (dev_priority>0, pool_size>0) but the project has no compose_spinoff, this guard
+    // takes the legacy path and the whole per-machine config is a dead letter — silently, until
+    // this line. Say it out loud: naming the skipped machines AND the missing field, so an operator
+    // can fix the project settings from the message alone. Rate-limited to once per state change
+    // (the same "say it when it CHANGES" rule monitor.js uses): the pool ticks every 15s, and a
+    // verbatim repeat would drown the lines that carry news.
+    const skipped = machines.map((m) => m.key);
+    if (skipped.length && !project?.compose_spinoff) {
+      // `!!!` is the house "loud" convention (ops-review.js ALERT_RE scans for it) — a manager's
+      // ops digest must catch this line, not just a human reading the terminal.
+      const msg = `!!! machine-aware pooling DISABLED for project ${String(projectId).slice(0, 8)}: `
+        + `machine(s) [${skipped.join(', ')}] are configured (dev_priority>0 / pool_size>0) but `
+        + `project.compose_spinoff is unset — machine placement is impossible without a per-xell `
+        + `app tier (the ready count is zero by construction). Set tiers.spinoff.compose in the `
+        + `project's zeehive.yml (or project.compose_spinoff) to enable per-machine pooling.`;
+      const first = !lastMachineGuardSaid.has(projectId);
+      if (lastMachineGuardSaid.get(projectId) !== msg) {
+        lastMachineGuardSaid.set(projectId, msg);
+        logline('pool', msg);
+        // The ring buffer is read in the console's terminal modal; stdout is the docker log.
+        // The FIRST occurrence is the "operator, look here" event; later state changes that alter
+        // the message log again but only to the ring, so a fix that rotates machines stays audible
+        // without repeating the same line every 15 seconds.
+        if (first) console.error(`[pool] ${msg}`);
+      }
+    }
+    return fillTrim(projectId, target, null);
+  }
   for (const m of machines) {
     const size = await machinePoolSize(m.id, projectId);
     await fillTrim(projectId, size, m).catch((e) => console.error(`[pool] ${m.key}:`, e.message));
@@ -71,11 +168,11 @@ async function reconcileProject(projectId, target) {
 async function fillTrim(projectId, target, m) {
   const ready = m
     ? await q(
-      `SELECT x.id, x.slug FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
+      `SELECT x.id, x.slug, x.worktree_path FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
         WHERE x.project_id=$1 AND x.status='ready' AND NOT x.is_production AND c.docker_ctx=$2
         ORDER BY x.ready_at DESC NULLS LAST, x.created_at DESC`, [projectId, m.docker_ctx])
     : await q(
-      `SELECT id, slug FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production
+      `SELECT id, slug, worktree_path FROM xell WHERE project_id=$1 AND status='ready' AND NOT is_production
         ORDER BY ready_at DESC NULLS LAST, created_at DESC`, [projectId]);
 
   if (ready.length < target) {
@@ -99,8 +196,12 @@ async function fillTrim(projectId, target, m) {
     const surplus = ready.slice(target); // freshest kept, oldest surplus reaped
     const batch = surplus.slice(0, 5);
     logline('pool', `trimming ${batch.length}/${surplus.length} surplus ready xell(s)${m ? ` on ${m.key}` : ''}: ${batch.map((s) => s.slug).join(', ')}`);
-    for (const s of batch) await reapXell(s.id, 'pool-surplus')
-      .catch((e) => logline('pool', `TRIM FAILED for ${s.slug}: ${e.message} — surplus xell stays`));
+    // Same take, same reason as the reconcile sweep above: this list was SELECTed before the reaps
+    // began, and a dispatch can claim any of it while the batch drains (a reap is spawnSync-heavy,
+    // so the last of five is decided on a list that is seconds old).
+    for (const s of batch) {
+      await sweepDecommission(s, 'pool-surplus', { what: null, verdict: 'surplus', failLabel: 'TRIM' });
+    }
   }
 }
 

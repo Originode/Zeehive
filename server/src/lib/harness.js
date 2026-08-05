@@ -24,6 +24,7 @@
 import { createHash } from 'node:crypto';
 import { q, one, pool } from '../db/pool.js';
 import { logline } from './logbus.js';
+import { mergePolicies } from './model-policy.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, and the
 // .zeehive.env reconcile in provision.js): 'real' touches machines, anything else models. The live
@@ -258,6 +259,29 @@ export async function resolveHarness(keyOrId) {
   return one(`SELECT * FROM harness WHERE ${byId ? 'id' : 'key'}=$1`, [keyOrId]);
 }
 
+// THE WEARER CAP (139): may this xell put the harness on, given how many LIVE xells on its project
+// already wear it? The `limit` knob lives in model_policy (min-wins down the parent chain — see
+// lib/model-policy.js), and THIS is its one wall: every path that hands out a persona — dispatch,
+// swap, the console chip — funnels through assignHarness. Counted on the exact harness row (a child
+// harness is its own persona with its own cap), excluding the xell being assigned, so re-assigning
+// the same persona to the same xell (a swap, a re-dispatch) is never refused by its own presence.
+export async function assertHarnessLimit(h, { projectId, excludeXellId = null } = {}) {
+  if (!h) return;
+  const { effectiveModelPolicy } = await import('./model-policy.js');
+  const limit = (await effectiveModelPolicy(h)).limit;
+  if (limit == null) return;
+  const wearers = await q(
+    `SELECT slug FROM xell
+      WHERE harness_id=$1 AND project_id=$2 AND status NOT IN ('retired','tearing-down','husk')
+        AND ($3::uuid IS NULL OR id <> $3::uuid)`,
+    [h.id, projectId, excludeXellId]);
+  if (wearers.length >= limit) {
+    throw new Error(`harness "${h.key}" is limited to ${limit} live xell(s) per project (its policy's `
+      + `\`limit\` knob) and ${wearers.length} already wear${wearers.length === 1 ? 's' : ''} it `
+      + `(${wearers.map((w) => w.slug).join(', ')}) — swap or retire one instead of adding another.`);
+  }
+}
+
 // Assign (or clear) a xell's harness — a human switch. Mutable by design (a harness decides config,
 // never a landing target). Returns { harness }.
 export async function assignHarness(xellId, keyOrId) {
@@ -274,6 +298,9 @@ export async function assignHarness(xellId, keyOrId) {
       const owner = await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]);
       throw new Error(scopeMismatchReason(h, owner?.name || null));
     }
+    // CAP last (139): the policy's `limit` knob — how many live xells may wear this persona per
+    // project. The router ships with 1; "the router" being singular is this line.
+    await assertHarnessLimit(h, { projectId: x?.project_id, excludeXellId: xellId });
   }
   await one(`UPDATE xell SET harness_id=$2 WHERE id=$1 RETURNING id`, [xellId, h?.id || null]);
   logline('harness', `xell ${String(xellId).slice(0, 8)} → harness ${h?.key || '(core only)'}`);
@@ -287,11 +314,28 @@ export async function listHarnesses({ zeeType = null, projectId = null } = {}) {
             (h.bundle->>'avatar_svg') IS NOT NULL AS has_avatar,
             (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
             h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
+            h.bundle->>'gear' AS gear,
             h.bundle->>'personality' AS personality,
+            h.model_policy,
+            h.upload_conversations_on_done, h.enable_reflection,
             p.key AS parent, pr.name AS project_name
        FROM harness h LEFT JOIN harness p ON p.id = h.parent_id
             LEFT JOIN project pr ON pr.id = h.project_id
       WHERE h.enabled ORDER BY h.is_law_core, h.key`);
+  // THE EFFECTIVE POLICY, computed from the rows we already have. A harness INHERITS its policy from
+  // its parent chain (model-policy.js), so the row's OWN `model_policy` is not what a wearer is
+  // subject to: a child of a "claude only" parent carries `{}` and would render as unrestricted in
+  // every picker. The console's prompt buttons are per harness and say what each persona may run
+  // on, so they need the merged answer — and it costs no query, because `rows` is every enabled
+  // harness and each one names its parent. (An ancestor that is DISABLED is absent here, and
+  // effectiveModelPolicy skips it too — `harnessChain` only walks `AND enabled`.)
+  const byKey = new Map(rows.map((r) => [r.key, r]));
+  const effectivePolicy = (row) => {
+    const chain = [];
+    let cur = row, hops = 0;
+    while (cur && hops++ < 32) { chain.unshift(cur); cur = cur.parent ? byKey.get(cur.parent) : null; }
+    return mergePolicies(chain.map((r) => r.model_policy));
+  };
   // `zeeType` narrows the list to what a xell of that type may actually WEAR — what every picker
   // must offer, so an operator is never shown a choice the assign path would then refuse.
   //
@@ -302,12 +346,25 @@ export async function listHarnesses({ zeeType = null, projectId = null } = {}) {
                          && (!projectId || harnessFitsProject(h.project_id, projectId))).map((h) => ({
     id: h.id, key: h.key, label: h.label, is_law_core: h.is_law_core, parent: h.parent,
     zee_type: h.zee_type,
+    // ARCHIVAL SETTINGS (112) — surfaced on every row so a picker can say what wearing this
+    // harness means for conversation capture and post-ship reflection. Same nullable-safe
+    // defaults as getHarnessFull: upload-on-done opt-in (false), reflection on by default.
+    upload_conversations_on_done: !!h.upload_conversations_on_done,
+    enable_reflection: h.enable_reflection !== false,
     // SCOPE, on every row: a picker that shows a project persona and a global one identically invites
     // an operator to edit the fleet's shared vocabulary thinking it is their own.
     project_id: h.project_id || null, project_name: h.project_name || null,
     scope: h.project_id ? 'project' : 'global',
     has_avatar: !!h.has_avatar, avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
-    head_commit: h.head_commit, summary: h.summary, glyph: h.glyph,
+    head_commit: h.head_commit, summary: h.summary, glyph: h.glyph, gear: h.gear || null,
+    // MODEL POLICY (110) — the restriction knobs on this harness, exposed so a picker can show
+    // exactly what a wearer may run on. Normalized (a raw jsonb is not a UI contract).
+    model_policy: (h.model_policy && typeof h.model_policy === 'object' ? h.model_policy : {}),
+    // …and the policy a WEARER is actually subject to (this row's knobs merged with every
+    // ancestor's). The console's prompt buttons are per harness and render from this: "＋ prompt ·
+    // Hermes" must be able to say which providers that persona allows BEFORE the composer opens,
+    // and a child that inherits "claude only" declares nothing of its own.
+    effective_model_policy: effectivePolicy(h),
     skill_count: Array.isArray(h.skills) ? h.skills.length : 0,
     // HONESTY about what this harness actually carries: a row that would brief a zee with NOTHING
     // looks identical to one carrying a 15k manual in every picker otherwise. Computed at read time,
@@ -386,6 +443,10 @@ export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } =
   if ('personality' in patch) bundle.personality = String(patch.personality || '');
   if ('summary' in patch) bundle.summary = String(patch.summary || '').slice(0, 200);
   if ('glyph' in patch) bundle.glyph = String(patch.glyph || '').slice(0, 4);
+  // WHICH COSTUME the badge wears (web/src/harnessGear.js): 'wings', 'hammer', 'necktie', … Empty
+  // means DERIVE it from the key/label, which is what most harnesses want — the dev crew already
+  // reads as job titles. Stored as a bare token; the client owns the artwork, this owns the choice.
+  if ('gear' in patch) bundle.gear = String(patch.gear || '').trim().toLowerCase().slice(0, 24);
   // The badge, as text. Refused unless it is an SVG document — this is served to a browser, and an
   // operator pasting the wrong thing should be told at the save, not by a broken image everywhere.
   if ('avatar_svg' in patch) {
@@ -398,6 +459,26 @@ export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } =
   if ('memory' in patch) bundle.memory = normalizeMemory(patch.memory);
   const label = 'label' in patch ? (String(patch.label || '').trim() || h.label) : h.label;
   const enabled = 'enabled' in patch ? !!patch.enabled : h.enabled;
+  // MODEL POLICY (110) — the restriction knobs on what a wearer may run on. Validated through
+  // the same normalizer dispatch uses, so a save can never store a shape the dispatch path
+  // would misread. `{}` (or a missing key) clears the policy.
+  let modelPolicy = h.model_policy && typeof h.model_policy === 'object' ? h.model_policy : {};
+  if ('model_policy' in patch) {
+    const { normalizePolicy } = await import('./model-policy.js');
+    modelPolicy = normalizePolicy(patch.model_policy || {});
+  }
+  // ROUTER POLICY (139) — the routing knobs on the router harness. Same normalize-at-save rule as
+  // model_policy, for the same reason: the routing path must never read a shape a save invented.
+  let routerPolicy = h.router_policy && typeof h.router_policy === 'object' ? h.router_policy : {};
+  if ('router_policy' in patch) {
+    const { normalizeRouterPolicy } = await import('./router-policy.js');
+    routerPolicy = normalizeRouterPolicy(patch.router_policy || {});
+  }
+  // ARCHIVAL SETTINGS (112) — the "upload conversations on done" and "enable reflection" checkboxes.
+  // Plain booleans, default-preserving: a save only writes what the caller sent, so an unset field
+  // leaves the current value (and a fresh row keeps its column default) untouched.
+  const uploadOnDone = 'upload_conversations_on_done' in patch ? !!patch.upload_conversations_on_done : h.upload_conversations_on_done;
+  const enableReflection = 'enable_reflection' in patch ? !!patch.enable_reflection : h.enable_reflection;
   // Retyping is allowed only while no xell of the other type is wearing it — the DB trigger decides
   // and its message names the xells that block it, so an operator is told what to move first.
   const type = 'zee_type' in patch ? normalizeZeeType(patch.zee_type, h.zee_type) : h.zee_type;
@@ -422,8 +503,10 @@ export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } =
   await assertNoInheritedPathCollision(key, bundle, parentId);
   if ('parent' in patch) await q(`UPDATE harness SET parent_id=$2 WHERE key=$1`, [key, parentId]);
   const hash = hashOf(JSON.stringify(bundle));
-  await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5 WHERE key=$1`,
-    [key, JSON.stringify(bundle), label, enabled, hash]);
+  await q(`UPDATE harness SET bundle=$2, label=$3, enabled=$4, bundle_hash=$5, model_policy=$6,
+           router_policy=$7, upload_conversations_on_done=$8, enable_reflection=$9 WHERE key=$1`,
+    [key, JSON.stringify(bundle), label, enabled, hash, JSON.stringify(modelPolicy),
+     JSON.stringify(routerPolicy), uploadOnDone, enableReflection]);
   logline('harness', `updated harness "${key}" (${(bundle.skills || []).length} skill(s), ${(bundle.memory || []).length} memory)`);
   // A SAVE IS NOW THE ONLY WAY THE TEXT MOVES, so it is also what has to reach the zees ALREADY
   // RUNNING. While a folder was the source, the boot refresh noticed the change and pushed it in;
@@ -502,14 +585,44 @@ export async function getHarnessFull(key) {
   // Which SCOPE this persona is in (084) — the editor states it, and its parent picker needs it: a
   // harness may only inherit a global one or one in its own project.
   const owner = h.project_id ? await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]) : null;
+  // The EFFECTIVE model policy (110) — this harness's own knobs merged with the whole parent
+  // chain. This is what a wearer is actually restricted by; the editor shows it read-only beside
+  // the row's own knobs. INHERITED is the parent chain alone (what this row gets before its own
+  // knobs), so the editor can show "what you inherit" vs "what you override" and let a field be
+  // reset back to inherit.
+  let effectiveModelPolicy = null;
+  let inheritedModelPolicy = null;
+  if (h.parent_id || (h.model_policy && typeof h.model_policy === 'object' && Object.keys(h.model_policy).length)) {
+    const { effectiveModelPolicy: emp, inheritedModelPolicy: imp } = await import('./model-policy.js');
+    effectiveModelPolicy = await emp(h);
+    inheritedModelPolicy = await imp(h);
+  }
   return {
     key: h.key, label: h.label, enabled: h.enabled, is_law_core: h.is_law_core,
+    // ARCHIVAL SETTINGS (112) — nullable-safe: upload-on-done is opt-in (default false),
+    // enable-reflection preserves the always-on behaviour (default true).
+    upload_conversations_on_done: !!h.upload_conversations_on_done,
+    enable_reflection: h.enable_reflection !== false,
     project_id: h.project_id || null, project_name: owner?.name || null,
     scope: h.project_id ? 'project' : 'global',
     avatar_svg: harnessAvatarSvg(b) || '',
-    parent, zee_type: h.zee_type, glyph: b.glyph || null, summary: b.summary || '', personality: b.personality || '',
+    parent, zee_type: h.zee_type, glyph: b.glyph || null, gear: b.gear || '',
+    summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
     inherited,
+    // MODEL POLICY (110) — this row's OWN knobs, for the editor. The EFFECTIVE policy (merged
+    // with the parent chain) is what actually restricts a wearer, so the editor shows both:
+    // what this row declares and what a wearer ends up subject to.
+    model_policy: (h.model_policy && typeof h.model_policy === 'object' ? h.model_policy : {}),
+    effective_model_policy: effectiveModelPolicy,
+    inherited_model_policy: inheritedModelPolicy,
+    // ROUTER POLICY (139) — the routing knobs, own + effective, same split as model_policy. The
+    // editor only shows these on the router chain, but the read model is uniform for every row.
+    router_policy: (h.router_policy && typeof h.router_policy === 'object' ? h.router_policy : {}),
+    effective_router_policy: await (async () => {
+      const { effectiveRouterPolicy } = await import('./router-policy.js');
+      return effectiveRouterPolicy(h);
+    })(),
     // same honesty as the list: is the folder readable from here, and does this bundle carry anything?
     ...harnessHealth({ ...h, ...b }),
   };

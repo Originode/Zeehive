@@ -33,6 +33,62 @@ export function roRoleName(slug) {
   return `zee_ro_${String(slug || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40)}`;
 }
 
+// Columns that hold STORED CREDENTIALS, per table — the reason a read-only role must not see them.
+// The rule (ticket TKT-96): if a column has a `*_hint` sibling, the raw column is a secret (the hint
+// is what a reader may see); plus the two measured columns that carry credentials but have no hint —
+// environment_var.value (the secret half of is_secret rows) and xell.prod_ro_dsn (every manager's
+// production DSN, which embeds a password). Every `*_hint`, is_secret, id, timestamp and non-secret
+// config column stays readable. Kept as DATA so a new secret column is a one-line addition here and
+// the re-grant below can compute the NON-secret list from the live schema.
+const SECRET_COLUMNS = {
+  provider_token: ['token'],
+  environment_var: ['value'],
+  langfuse_config: ['public_key', 'secret_key', 'admin_password', 'org_public_key', 'org_secret_key'],
+  langfuse_project_map: ['public_key', 'secret_key'],
+  xell: ['prod_ro_dsn'],
+};
+
+// The blanket `GRANT SELECT ON ALL TABLES` in readonlyRoleSql hands the reader EVERY column of these
+// tables, including the stored credentials. A column-level `REVOKE SELECT (col)` cannot claw that
+// back — a column-level revoke against a table-level grant is a silent no-op (the postgres trap). So
+// for each secret table we REVOKE table-level SELECT and re-GRANT SELECT on the NON-secret columns,
+// the column list computed from information_schema at runtime: a column added later FAILS CLOSED (a
+// column grant names specific columns) instead of silently re-opening a secret, and a column dropped
+// never breaks the grant. Idempotent by construction — re-running re-grants the same columns.
+//
+// Two rules decide what stays readable, so a column added later is handled without a code change:
+//   • any column whose name is `<col>_hint` is NOT a secret (the masked form a reader may see);
+//   • any column that HAS a `<col>_hint` sibling IS a secret (the raw value is never read out).
+// SECRET_COLUMNS above adds the two no-hint credentials the ticket measured; the NOT EXISTS below
+// makes the hint rule automatic for everything else.
+function secretTableSql(role, table, secretCols) {
+  const secrets = secretCols.map((c) => `'${c}'`).join(', ');
+  return [
+    `DO $$`,
+    `DECLARE _cols text;`,
+    `BEGIN`,
+    `  IF to_regclass('public.${table}') IS NOT NULL THEN`,
+    `    EXECUTE 'REVOKE SELECT ON public.${table} FROM ${role}';`,
+    `    SELECT string_agg(quote_ident(a.column_name), ', ' ORDER BY a.ordinal_position)`,
+    `      INTO _cols`,
+    `      FROM information_schema.columns a`,
+    `     WHERE a.table_schema = 'public'`,
+    `       AND a.table_name = '${table}'`,
+    `       AND a.column_name NOT IN (${secrets})`,
+    `       AND NOT EXISTS (`,
+    `         SELECT 1 FROM information_schema.columns b`,
+    `          WHERE b.table_schema = a.table_schema`,
+    `            AND b.table_name = a.table_name`,
+    `            AND b.column_name = a.column_name || '_hint')`,
+    `    ;`,
+    `    IF _cols IS NOT NULL THEN`,
+    `      EXECUTE format('GRANT SELECT (%s) ON public.${table} TO ${role}', _cols);`,
+    `    END IF;`,
+    `  END IF;`,
+    `END $$;`,
+  ].join('\n');
+}
+
 // The SQL that mints (or re-mints) the reader. Idempotent by construction and PURE — exported so a
 // test can read exactly what would run on production without running anything.
 //
@@ -41,6 +97,8 @@ export function roRoleName(slug) {
 // that ran it. Re-granting is cheap and keeps the reader honest as the schema moves.
 export function readonlyRoleSql(role, password, dbName, owner) {
   const pw = String(password).replace(/'/g, "''");
+  const secretTables = Object.entries(SECRET_COLUMNS)
+    .map(([table, cols]) => secretTableSql(role, table, cols));
   return [
     `DO $$ BEGIN`,
     `  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN`,
@@ -57,6 +115,8 @@ export function readonlyRoleSql(role, password, dbName, owner) {
     `GRANT USAGE ON SCHEMA public TO ${role};`,
     `GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${role};`,
     `GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO ${role};`,
+    // Claw the stored credentials back out of the blanket grant, column by column (see SECRET_COLUMNS).
+    ...secretTables,
     `ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public GRANT SELECT ON TABLES TO ${role};`,
     // Explicitly take away everything else that a default PUBLIC grant could have handed over.
     `REVOKE CREATE ON SCHEMA public FROM ${role};`,
@@ -104,7 +164,8 @@ export function networksCarryingAlias(networks, alias) {
 
 // PURE DECISION: the host:port a manager's read-only DSN should carry, or a refusal that says where
 // the missing address goes. `db` is prodDb()'s handle, `row` the raw container row (it alone carries
-// the inet `host` column). No I/O, exported so the whole decision is table-testable.
+// the `host` column — an IP or a DNS name, text since 107). No I/O, exported so the whole decision is
+// table-testable.
 //
 //   → { ok: true, mode: 'port',  host, port }              — published; nothing else to arrange
 //   → { ok: true, mode: 'alias', host, port, ctx }         — a docker network name; the cxell must
@@ -153,7 +214,7 @@ export async function mintProdReader(xell, project) {
   // manager is not one its cxell can dial, there is no point creating a role for it. Pure decision,
   // no I/O — and the ONE resolver (prodDbAddress) the ship/seed guards already use.
   const row = await one(
-    `SELECT c.name, c.docker_ctx, host(c.host) AS host, c.host_port, c.conn_ref FROM container c
+    `SELECT c.name, c.docker_ctx, c.host AS host, c.host_port, c.conn_ref FROM container c
       WHERE c.project_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [project.id]);
   const addr = decideReaderAddress({ db, row, project });
   if (!addr.ok) throw new Error(addr.error);
@@ -236,7 +297,7 @@ async function resolveAndJoinProdNetwork({ xellId, cxellName, cxellCtx }) {
   // manager exists, it just has nothing to read.
   if (!db) return { required: false, joined: false, reason: 'no prod db registered' };
   const row = await one(
-    `SELECT c.name, c.docker_ctx, host(c.host) AS host, c.host_port, c.conn_ref FROM container c
+    `SELECT c.name, c.docker_ctx, c.host AS host, c.host_port, c.conn_ref FROM container c
       WHERE c.project_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [project.id]);
 
   const addr = decideReaderAddress({ db, row, project, cxellCtx });
@@ -280,6 +341,31 @@ async function resolveAndJoinProdNetwork({ xellId, cxellName, cxellCtx }) {
   return { required: true, joined: true, network: net, alias: addr.host, networks: carrying };
 }
 
+// The SQL that un-mints the reader — the exact inverse of readonlyRoleSql. PURE and exported so a
+// test can prove the whole mint→drop round trip against a real postgres (mint the role with the
+// new SQL, run this, assert the role is GONE).
+//
+// DROP ROLE refuses a role that still holds ANY privilege, and readonlyRoleSql grants more than
+// table SELECT: it also grants SELECT on every SEQUENCE and an ALTER DEFAULT PRIVILEGES entry for
+// the owner's future tables. The old drop path revoked tables/schema/database only, so every reaped
+// manager's role stayed on the cluster — 13 of 16 zee_ro_* roles on production belong to RETIRED
+// xells. REVOKE ALL ON ALL TABLES covers both the table-level grant AND the column-level grants
+// this file now makes, so what DROP ROLE needs is the sequences and the default-privileges entry
+// added below. Idempotent by construction (guarded by IF EXISTS, and revoking a privilege that is
+// not held is a no-op).
+export function dropProdReaderSql(role, dbName, owner) {
+  return [
+    `DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${role}') THEN`,
+    `  EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${role}';`,
+    `  EXECUTE 'REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ${role}';`,
+    `  EXECUTE 'REVOKE ALL ON SCHEMA public FROM ${role}';`,
+    `  EXECUTE 'REVOKE ALL ON DATABASE ${dbName} FROM ${role}';`,
+    `  EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE ${owner} IN SCHEMA public REVOKE SELECT ON TABLES FROM ${role}';`,
+    `  EXECUTE 'DROP ROLE ${role}';`,
+    `END IF; END $$;`,
+  ].join('\n');
+}
+
 // Give the access back. Called by the reaper when a manager xell is torn down: a role that outlives
 // its agent is a credential nobody owns. Best-effort and never throws — a teardown must not wedge on
 // a database that is unreachable right now (the role is inert without its DSN either way).
@@ -298,17 +384,17 @@ export async function dropProdReader(xell) {
     }
     const db = await prodDb(project);
     if (!db) return { dropped: false, reason: 'no prod db' };
-    const sql = [
-      `DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${role}') THEN`,
-      `  EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${role}';`,
-      `  EXECUTE 'REVOKE ALL ON SCHEMA public FROM ${role}';`,
-      `  EXECUTE 'REVOKE ALL ON DATABASE ${db.name} FROM ${role}';`,
-      `  EXECUTE 'DROP ROLE ${role}';`,
-      `END IF; END $$;`,
-    ].join('\n');
+    const sql = dropProdReaderSql(role, db.name, db.user);
     const r = await psql(db, ['-v', 'ON_ERROR_STOP=1'], sql);
-    logline('prod-ro', r.ok ? `dropped read-only role ${role}` : `could not drop ${role}: ${String(r.err).trim().slice(0, 160)}`);
+    // A failed drop is LOGGED LOUDLY — a login role silently left behind is exactly the orphan
+    // TKT-102-8016 found (13 of 16 prod zee_ro_* roles belonged to retired xells).
+    if (!r.ok) logline('prod-ro', `could not drop read-only role ${role} on ${db.container}: ${String(r.err).trim().slice(0, 200)}`);
+    else logline('prod-ro', `dropped read-only role ${role} on ${db.container}`);
     await q(`UPDATE xell SET prod_ro_dsn=NULL WHERE id=$1`, [xell.id]);
     return { dropped: r.ok, role };
-  } catch (e) { return { dropped: false, error: e.message }; }
+  } catch (e) {
+    const msg = e?.message || String(e);
+    logline('prod-ro', `could not drop read-only role ${roRoleName(xell.slug)}: ${msg}`);
+    return { dropped: false, error: msg };
+  }
 }

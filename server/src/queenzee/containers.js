@@ -84,6 +84,37 @@ function matchState(psMap, c) {
   return best; // null if no candidate on that daemon
 }
 
+// WHERE A PROCESS ROLE ACTUALLY IS — ticket #8.
+//
+// A `runner: process` role has no container: the queenzee spawns it as its OWN child
+// (lib/build.js → scripts/start-xell-process.sh), so it listens on the QUEENZEE's localhost. But
+// `url` on the row carries the dev MACHINE's ip, stamped on every container at provision — and
+// that machine does not run this process and publishes nothing on its port. So the probe below
+// could never answer for a process role: every one of them was marked down within 30s of a start
+// the starter had just verified, which is where `zee build --wait` gets its "the build FAILED"
+// from and why 11 of 12 Zeehive spinoff containers read as never having come up. (Live: this
+// xell's webapp, up and serving HTML at 04:12:24Z, row 'down' by 04:13.)
+//
+// So ask localhost first — the same probe start-xell-process.sh uses to decide a start SUCCEEDED,
+// which is the only place that has ever been right about a process role — and keep the recorded
+// url as a fallback so a row whose url IS reachable behaves exactly as before.
+export function processProbeUrls(c) {
+  const urls = [];
+  if (c.host_port) urls.push(`http://127.0.0.1:${c.host_port}`);
+  if (c.url && !urls.includes(c.url)) urls.push(c.url);
+  return urls;
+}
+
+export async function probeProcessRole(c, { timeout = 5000 } = {}) {
+  for (const url of processProbeUrls(c)) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+      if (r.status < 500) return 'up';
+    } catch { /* not there — try the next place it could be */ }
+  }
+  return 'down';
+}
+
 // Orphan memory: which labeled-but-unmodeled containers we've already reported, so the log
 // says it once per appearance instead of every 30-second tick.
 let knownOrphans = '';
@@ -168,14 +199,10 @@ export async function checkContainers() {
   // Rows with NO docker_ctx but a url are local processes, not containers (Zeehive's own server
   // and web app). `docker ps` cannot see them; the URL answering IS their health.
   const procs = await q(
-    `SELECT id, name, url, health FROM container
+    `SELECT id, name, url, host_port, health FROM container
       WHERE docker_ctx IS NULL AND url IS NOT NULL AND health <> 'building'`);
   for (const c of procs) {
-    let health = 'down';
-    try {
-      const r = await fetch(c.url, { signal: AbortSignal.timeout(5000) });
-      health = r.status < 500 ? 'up' : 'down';
-    } catch { health = 'down'; }
+    const health = await probeProcessRole(c);
     if (health === 'up') up++; else down++;
     if (health !== c.health) {
       const row = await one(

@@ -21,6 +21,11 @@ export const HIVE_STATUS = {
   'occ-working':      { label: 'working',      group: 'occ' },
   'occ-idle':         { label: 'idle',         group: 'occ' },
   'occ-tendRequest':  { label: 'tend?',        group: 'occ' },
+  // The env reconcile FAILED for this xell while a zee is live in it (ticket #44). Not an ask the
+  // zee made and not one it can answer — the queenzee refused to rewrite its .zeehive.env and the
+  // zee kept running on the file it already had. Its own key because it is the only occ-* state
+  // raised BY the orchestrator ABOUT the environment rather than by (or about) the agent.
+  'occ-envAlert':     { label: 'env!',         group: 'occ' },
   'occ-landRequest':  { label: 'land?',        group: 'occ' },
   'occ-shipRequest':  { label: 'ship?',        group: 'occ' },
   // The two PROD-DATA asks. Both are held gates a human must answer, exactly like land/ship —
@@ -28,6 +33,11 @@ export const HIVE_STATUS = {
   // seed file against production on the zee's behalf (the narrow version of the same need).
   'occ-prodRequest':  { label: 'prod?',        group: 'occ' },
   'occ-seedRequest':  { label: 'seed?',        group: 'occ' },
+  // A ROUTER asked a human for ANOTHER MANAGER (149). Its own key rather than a tend, because it is
+  // a DECISION with a button behind it — approve and the queenzee mints a manager, reject and the
+  // router dispatches a worker instead — and because it is the one gate raised about the FLEET's
+  // shape rather than about this xell's own work.
+  'occ-mintRequest':  { label: 'manager?',     group: 'occ' },
   // A MANAGER zee suggested THIS xell is finished. It is a held decision like the others — a human
   // confirms (with a typed confirmation) and that confirmation is what reaps the cxell — but it was
   // raised by another agent rather than by this xell's own zee, hence its own key.
@@ -65,6 +75,7 @@ export function hiveStatus(x, sig = {}) {
     landPending = false, shipPending = false, tendPending = false, prodUnprotected = false,
     landHint = false, shipHint = false, prodBindPending = false, seedPending = false,
     doneSuggested = false, landHolding = false, paused = false, xellPaused = false,
+    envAlert = false, preflightFailed = false, managerMintPending = false,
   } = sig;
 
   // ── production ──
@@ -112,7 +123,17 @@ export function hiveStatus(x, sig = {}) {
 
   // ── vacant pool xells (no zee has claimed them yet) ──
   if (s === 'provisioning')              return 'vac-provisioning';
-  if (s === 'ready')                     return 'vac-ready';
+  // A xell whose READINESS PREFLIGHT failed must not read `ready` (ticket #53). The queenzee writes
+  // a xell's environment from meta-DB rows and then declares it ready; lib/preflight.js opens what
+  // it wrote, and when the DSN it handed out is rejected — seven zees met exactly that in one night
+  // (ticket #47) — `ready` is a lie that costs the next agent hours.
+  //
+  // It reuses `dirty` rather than adding a word: dirty already means "vacant and needs queenzee
+  // housekeeping", which is precisely true here, and the failing CHECK is named on the row
+  // (preflight_error) for the chip and `zee status` — a hexagon colour was never going to carry it.
+  // Deliberately only on a VACANT xell: an occupied one must keep showing what its zee is doing,
+  // and a xell still `provisioning` has not been claimed ready by anyone yet.
+  if (s === 'ready')                     return preflightFailed ? 'vac-dirty' : 'vac-ready';
 
   // ── occupied: a zee is on it. Human-actionable requests first, then live activity. ──
   if (shipPending)                       return 'occ-shipRequest';
@@ -123,6 +144,24 @@ export function hiveStatus(x, sig = {}) {
   // decision is the one the hexagon puts in front of you.
   if (seedPending)                       return 'occ-seedRequest';
   if (prodBindPending)                   return 'occ-prodRequest';
+  // A ROUTER's ask for another MANAGER (149) ranks with the held gates and above tend — there is a
+  // specific decision, and a button, waiting on a human. Below the two prod-data asks on purpose:
+  // those BLOCK the zee that raised them, while a router keeps routing perfectly well while it
+  // waits (its manual tells it to), so when a router has raised both, the blocking one is the one
+  // the hexagon puts in front of you.
+  if (managerMintPending)                return 'occ-mintRequest';
+  // THE ENVIRONMENT IS WRONG AND THE ZEE CANNOT KNOW (ticket #44). Ranked directly above tend, and
+  // the difference between the two is the argument: a tend is the zee's own ask, so the zee can
+  // lower it, restate it, or answer it by carrying on — this one nobody inside the xell can raise,
+  // clear or even see. It says the queenzee REFUSED to reconcile this xell's .zeehive.env and the
+  // xell is still running on the file it already had, which in the case that earned this was a
+  // full-write DSN to the fleet's own meta-DB. Below the held gates on purpose: those BLOCK a zee
+  // and have a button; this one asks for an environment fix, not a decision.
+  //
+  // It masks nothing it should not. The tend's own reason rides the payload separately (x.tend) and
+  // the console's "waiting on you" line counts tends from THAT, not from this key — so a xell with
+  // both still shows both, and only the one-word hexagon pill has to choose.
+  if (envAlert)                          return 'occ-envAlert';
   if (tendPending)                       return 'occ-tendRequest';
   // A manager's "this one looks finished" — a real decision waiting on a human, below the gates that
   // BLOCK the zee (it keeps working meanwhile) and above the readiness hints.

@@ -763,10 +763,23 @@ async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
   // change, and until now that knowledge died with the cxell. Re-invoke it to review what went live
   // and report improvements/errors to its MANAGER (or, with no manager, to the console). Opens no
   // gate, blocks nothing, and a torn-down cxell just logs — so it can never affect the ship itself.
+  //
+  // The reflection is a HARNESS SETTING (migration 112, `enable_reflection`): a harness whose
+  // wearers should not be re-invoked after a ship turns it OFF; the default keeps it ON, which is
+  // exactly how it always behaved.
   if (ok) {
-    setImmediate(() => nudgeXellForReflection(xell.id, { commit: ship.commit })
-      .then((r) => { if (!r?.nudged) logline('ship', `${xell.slug}: no reflection pass — ${r?.reason || r?.error || 'no live cxell'}`); })
-      .catch(() => {}));
+    let reflect = true;
+    try {
+      const { harnessArchivalSettings } = await import('../lib/conversations.js');
+      reflect = (await harnessArchivalSettings(xell)).enable_reflection;
+    } catch (e) { logline('ship', `${xell.slug}: could not read enable_reflection (${e.message}) — reflecting anyway`); }
+    if (reflect) {
+      setImmediate(() => nudgeXellForReflection(xell.id, { commit: ship.commit })
+        .then((r) => { if (!r?.nudged) logline('ship', `${xell.slug}: no reflection pass — ${r?.reason || r?.error || 'no live cxell'}`); })
+        .catch(() => {}));
+    } else {
+      logline('ship', `${xell.slug}: reflection skipped (harness enable_reflection = false)`);
+    }
   }
   // The runway is free — pull the next queued landing/ship onto the pad promptly (the pad tick is
   // the backstop). Best-effort so a failure here never affects the ship's own result.
