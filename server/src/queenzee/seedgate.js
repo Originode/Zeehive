@@ -190,6 +190,19 @@ export async function requestProdSeed({ xellId, zeeId = null, files = [], reason
     [project.id, xellId, xell.slug, zeeId, seedSite?.id || null, JSON.stringify(wanted), commit, reason]);
   broadcast('seed', row);
   broadcast('xell', { id: xellId });
+
+  // Operator policy: auto-approve seeds for this project → the queenzee approves and RUNS the seed
+  // with no human in the loop. Still goes through the SAME decideProdSeed → runSeed path (prod-lock
+  // check, PROVE-the-target guard, one-transaction-per-file) — nothing about the run is bypassed,
+  // only the human decision. The landed-file refusal above still applies, so an unlanded seed is
+  // refused even under auto-approve (mirrors shipgate's auto-approve).
+  if (project.auto_approve_seed) {
+    logline('seed', `AUTO-APPROVING seed from ${xell.slug} @ ${String(commit).slice(0, 8)}`
+      + `${seedSite ? ` → site ${seedSite.key}` : ''} — auto-approve policy (no human review)`);
+    const approved = await decideProdSeed(row.id, 'approved', 'auto-approve@policy');
+    return { ok: true, request: approved, note: 'auto-approved by policy — seeding production' };
+  }
+
   const prior = await priorRuns(project.id, wanted);
   const ship = await shipState(project, commit);
   logline('seed', `HELD seed request from ${xell.slug} @ ${commit.slice(0, 8)} — ${wanted.length} file(s): `

@@ -25,7 +25,7 @@ test -n "$ZEEHIVE_XELL_TOKEN" && echo "CXELL (caged zee)" || echo "HOST (or plai
 | workspace | `/work/repo` — a private clone of YOUR branch | a real checkout of the project |
 | docker | **none.** No CLI, no socket | the daemon, contexts, compose |
 | host filesystem | **none.** The repo is all you can see | all of it |
-| network | default-DROP egress: `api.anthropic.com`, your own containers, the queenzee API | whatever the machine has |
+| network | egress is OPEN (your provider's API, your own containers, the registries) — the fleet's live **prod DBs** are what is dropped | whatever the machine has |
 | verbs | the **`zee`** CLI (§2) | `scripts/xell-*.mjs`, `skill/`, the console, MCP |
 | main/master | **not a ref in here** — `git fetch`/`git rebase main` cannot work; use `zee sync` | normal git |
 | the API | **TWO servers answer the same paths** — see below | one server, no ambiguity |
@@ -197,8 +197,10 @@ docs/            specs and rationale (see the doc map)
 | a db chip says DRIFTED and you need to know why | [docs/schema-drift-triage.md](docs/schema-drift-triage.md) |
 | why a fresh restore still shows drift, and what a backup does **not** prove | [docs/data-completeness-check.md](docs/data-completeness-check.md) |
 | projects, manifests, deploy sites | [docs/deploy-topology-spec.md](docs/deploy-topology-spec.md) |
+| onboarding the `mardale-prod-alt` docker context (SSH over Cloudflare Access) | [docs/onboard-mardale-prod-alt.md](docs/onboard-mardale-prod-alt.md) |
 | what a NESTED queenzee can actually reach (loop by loop, read vs write) | [docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md) |
 | `config.repoRoot` = the server's OWN tree, never a project's files | [docs/repo-root-audit.md](docs/repo-root-audit.md) |
+| what a cxell carries (every provider's credential, namespaced) and how a zee reads it with `zee creds` | [docs/cxell-provider-env.md](docs/cxell-provider-env.md) |
 | **this file has a second copy** (`project_doc.body`) — which one is the source | [docs/entry-point-doc-source.md](docs/entry-point-doc-source.md) |
 | what runs where in production, and the cutover | [docker/zeehive/README.md](docker/zeehive/README.md) |
 | **why** a gate is shaped the way it is; traps already paid for | [HANDOFF.md](HANDOFF.md) — **history, not instructions** |

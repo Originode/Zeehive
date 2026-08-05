@@ -500,6 +500,23 @@ export async function createWorkItem(input = {}, { client = null, pending = null
     if (!parent) throw bad(`project ${projectId} has no root work item — cannot attach "${title}"`);
   }
   if (input.status && !isWorkStatus(input.status)) throw bad(`unknown status "${input.status}"`);
+  // The two constraints that used to answer in postgres's words. 058 declares them (the partial
+  // unique index work_item_one_project_root, and priority CHECK BETWEEN 1 AND 5) and they still do
+  // the enforcing — this only means a caller is told what to DO. `duplicate key value violates
+  // unique constraint "work_item_one_project_root"' reached a manager running `zee work --new --kind
+  // project`, which is a sentence about an index, not about a plan.
+  if (kind === 'project' && await projectRoot(projectId, client)) {
+    throw refuse(`project ${projectId} already has its root work item — a project has exactly ONE, and `
+      + `every card hangs under it. Cut "${title}" as an activity or a task instead (--kind activity, `
+      + 'or omit --kind), optionally under an existing item with --parent.');
+  }
+  if (input.priority != null) {
+    const p = Number(input.priority);
+    if (!Number.isInteger(p) || p < 1 || p > 5) {
+      throw bad(`priority "${input.priority}" is out of range — it is 1–5 (1 is the most urgent, 3 the `
+        + 'default).');
+    }
+  }
   assertSchedule(input.starts_on, input.due_on, title);
 
   const sortOrder = input.sort_order != null ? Number(input.sort_order) : await nextSortOrder(parent?.id ?? null, client);

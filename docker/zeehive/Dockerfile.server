@@ -59,6 +59,10 @@ RUN find scripts hooks -type f \( -name '*.sh' -o -name '*.mjs' -o -name 'zee' \
 # the server — see entrypoint-server.sh. CRLF-strip like the zee-agent scripts (repo is Windows).
 COPY docker/zeehive/entrypoint-server.sh /usr/local/bin/entrypoint-server.sh
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint-server.sh && chmod +x /usr/local/bin/entrypoint-server.sh
+# The Langfuse plugin's compose file + auto-login page — lib/langfuse.js resolves them via
+# config.repoRoot (/app), so a containerized queenzee must ship them (NOT covered by `COPY server/`).
+COPY docker/zeehive/docker-compose.langfuse.yml /app/docker/zeehive/docker-compose.langfuse.yml
+COPY docker/zeehive/langfuse-auto-login.html /app/docker/zeehive/langfuse-auto-login.html
 
 ENV NODE_NO_WARNINGS=1
 EXPOSE 4700

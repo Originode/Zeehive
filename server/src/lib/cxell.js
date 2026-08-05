@@ -4,9 +4,11 @@
 //
 // Why: host-side confinement is prompt + regex (hooks/prod-guard.mjs admits it is not
 // adversary-proof). The cxell makes it structural — the container sees a private clone of the
-// xell's branch, a default-DROP firewall allowing only api.anthropic.com, the queenzee API,
-// and its OWN stack's host:port pairs (proven 2026-07-19: without the firewall, Docker's
-// bridge NAT reaches the prod db on the LAN). No docker socket, no host mounts, non-root.
+// xell's branch, no docker socket, no host mounts, non-root, and an egress policy that DROPS the
+// fleet's live production databases (proven 2026-07-19: without it, Docker's bridge NAT reaches
+// the prod db on the LAN). The egress list is deliberately NOT a per-vendor allow-list: which AI
+// provider a zee runs on is decided at dispatch, and a cage that only let one vendor's API
+// through would silently be a claude-only cage — see docker/zeehive/cxell-firewall.sh.
 //
 // The clone is a git BUNDLE of the worktree's HEAD — a private object store, deliberately not
 // a mount: worktree .git files carry absolute host paths that don't resolve in Linux, and a
@@ -16,15 +18,20 @@
 // the same way, so a prompt that hands the zee an image path can actually Read it. Work products
 // stay in the container until collected (exportCxellDiff) — landing them is the human-gated step.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
-import { adapterFor, CLAUDE_ADAPTER, AGENT_PROC_PATTERN, HEADLESS_PROC_PATTERN } from './cxell-runtimes.js';
+import { adapterFor, CLAUDE_ADAPTER, AUTH_MARKERS, SEED_MARKERS, AGENT_PROC_PATTERN,
+         HEADLESS_PROC_PATTERN, resultFrom, TURN_HOOK_MARKERS } from './cxell-runtimes.js';
+import { credentialVendorMismatch, scrubEnvValue } from './provider-tokens.js';
 import { cxellCacheRunArgs, cxellCacheFixupCommand, CXELL_NPM_CACHE_DIR } from './npm-cache.js';
+import { prepUserScript, prepRootScript, parsePrepSteps, summarizePrepSteps,
+         hasAptStep, normalizeSpawnPrep, preppedImageTag, preppedDockerfile,
+         templateHash, bakesImage } from './spawn-prep.js';
 import { classifyMergeOutput } from '../queenzee/xellgit.js';
 
 // CXELL_IMAGE override: a bootstrap install (published images, no local build) points this at
@@ -482,6 +489,47 @@ export async function syncCxellWithXource({ ctx = 'default', slug, worktree, ref
 // One docker exec runs every git query and prints five newline-separated fields (echo "$(...)" keeps
 // an empty shortstat as a blank line, so the field positions never shift). Returns null if the cxell
 // is unreachable or `base` is unknown, so the caller can fall back to the host worktree.
+// Run ONE shell command inside a cxell container and return the raw { code, out, err }.
+// The generic escape hatch for a one-off read the rest of cxell.js does not wrap (today: the
+// conversation-archive path reading the zee's own session transcript, lib/conversations.js).
+// `cmd` runs under `bash -lc` as the container's default user, exactly like the execs above.
+export async function execInCxell({ ctx = 'default', slug, cmd, input = undefined, timeoutMs = 20000 } = {}) {
+  return dk(ctx, ['exec', cxellName(slug), 'bash', '-lc', cmd], { input, timeoutMs });
+}
+
+// Read a LIVE cage's /etc/environment — the credential projection openCxellSsh wrote at spawn. The
+// injection path (lib/credential-inject.js) reads it so it can rewrite ONLY the credential lines and
+// leave every other line (ZEEHIVE_XELL_TOKEN, ZEEHIVE_API, ZEE_RUNTIME, PATH, …) intact.
+export async function readCxellEnvironment({ ctx = 'default', slug, timeoutMs = 20000 } = {}) {
+  const r = await execInCxell({ ctx, slug, cmd: 'cat /etc/environment 2>/dev/null || true', timeoutMs });
+  return r.out;
+}
+
+// Write a LIVE cage's /etc/environment as ROOT — the other half of the injection path. `text` is the
+// full new file bytes (the pure rewriteCageEnv result). The write is ATOMIC (finding [4] of the
+// credential-injection review): the payload goes to a temp file in /etc first, then `mv` renames it
+// over /etc/environment. A plain `cat > /etc/environment` truncates before writing, so a dead exec
+// mid-write could strand a cage with an EMPTY file — no ZEEHIVE_XELL_TOKEN, no ZEEHIVE_API, and the
+// zee's `zee` CLI would refuse everything. With a rename, the old file stays fully intact until the
+// new one is complete. /etc/environment is root-owned and root-only (0600 — the spawn's
+// cxell-sshd.sh writes it `chmod 600`), so the exec runs as uid 0 and the temp file is mode-fixed
+// to 0600 (mktemp makes 0600, then `chmod` re-asserts it before the rename) — an injection must
+// NEVER widen the file from root-only to world-readable. Resolves { ok, path } and rejects only if
+// the exec never ran at all.
+export async function writeCxellEnvironment({ ctx = 'default', slug, text, timeoutMs = 30000 } = {}) {
+  const script = [
+    'set -e',
+    'tmp="$(mktemp /etc/environment.XXXXXX)"',
+    'cat > "$tmp"',
+    'chmod 0600 "$tmp"',
+    'mv -f "$tmp" /etc/environment',
+    'echo WROTE',
+  ].join('\n');
+  const r = await dkVerdict(ctx, ['exec', '-u', '0', '-i', cxellName(slug), 'bash', '-lc', script],
+                            { markers: ['WROTE'], input: String(text ?? ''), timeoutMs });
+  return { ok: r.verdict === 'WROTE', path: '/etc/environment' };
+}
+
 export async function cxellDiff({ ctx = 'default', slug, base }) {
   if (!base) return null;
   const b = String(base).replace(/[^0-9a-fA-F]/g, '');
@@ -572,19 +620,94 @@ export async function cxellPatch({ ctx = 'default', slug, base, kind = 'source',
 // The `docker run` argv for a cxell, as data — pure, so a test can assert what a cage is created
 // with (the shared npm cache mount included) without a daemon, the same way the file-install
 // commands are asserted.
-export function cxellRunArgs({ name, net, port, img, xellId }) {
+export function cxellRunArgs({ name, net, port, img, xellId, prep = null }) {
   return ['run', '-d', '--name', name, '--network', net, '--cap-add', 'NET_ADMIN',
     '-p', `127.0.0.1:${port}:22`,
     // ONE npm cache for the whole fleet: without it every cxell re-downloads the same tarballs
     // into its own empty ~/.npm, which is the repetition ticket #7 is about. Empty when disabled.
-    ...cxellCacheRunArgs(),
+    // The project's SPAWN TEMPLATE (migration 121) decides the mode, and whether an apt archive
+    // cache is mounted alongside — the second one only where the template installs packages, so a
+    // cage that never runs apt is unchanged.
+    ...cxellCacheRunArgs({ npm: prep?.cache?.npm, apt: prep?.cache?.apt, aptCache: hasAptStep(prep) }),
     '--label', 'zeehive.cxell=1', '--label', `zeehive.xell=${xellId || ''}`, img];
 }
 
-export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image }) {
+// ── THE PREPPED CXELL IMAGE (spawn template `when: image|provision`) ───────────────────────────
+//
+// The apt half of a project's prep, baked into an image ONCE instead of installed into every cage.
+// Two entry points, and which one you call is the whole point of the feature:
+//
+//   ensurePreppedImage() BUILDS if it is missing — called from the POOL, on the pool's clock, where
+//                        a two-minute apt run costs a human nothing.
+//   preppedImageIfPresent() NEVER builds — called from DISPATCH, which must not wait for apt. A
+//                        missing image there is not an error: the cage falls back to the base image
+//                        and the root prep installs the packages the old way. Slower, never wrong.
+//
+// BUILD_MODE=simulate (every nested queenzee, including the one a zee runs in its own xell) skips
+// the build entirely: this writes a real image to a real daemon, and a subject under test does not.
+const IMAGE_MODE = () => (process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real');
+
+export async function preppedImageIfPresent({ ctx = 'default', baseImage, prep }) {
+  const tag = preppedImageTag(baseImage || IMAGE, prep);
+  if (!tag) return null;
+  try {
+    await dk(ctx, ['image', 'inspect', tag], { timeoutMs: 20000 });
+    return tag;
+  } catch {
+    return null;   // not built yet (or a daemon that cannot answer) — the caller falls back
+  }
+}
+
+export async function ensurePreppedImage({ ctx = 'default', baseImage, prep, label = '' }) {
+  const base = baseImage || IMAGE;
+  const tag = preppedImageTag(base, prep);
+  if (!tag) return { tag: null, reason: 'the template installs no packages — the base image is the prepped image' };
+  if (IMAGE_MODE() === 'simulate') return { tag: null, reason: 'BUILD_MODE=simulate — no image is built' };
+  const have = await preppedImageIfPresent({ ctx, baseImage: base, prep });
+  if (have) return { tag: have, built: false };
+  const dockerfile = preppedDockerfile(base, prep);
+  const started = Date.now();
+  try {
+    // `docker build -` reads the Dockerfile from stdin with NO context — which is exactly right
+    // here: nothing is COPYed in, the whole recipe is FROM + one RUN.
+    await dk(ctx, ['build', '-t', tag, '-'], { input: dockerfile, timeoutMs: 1800000 });
+  } catch (e) {
+    // Never fatal: a fleet with no prepped image installs at dispatch, like it always did.
+    logline('pool', `${label || 'cxell'}: could not bake the prepped image ${tag} (${String(e.message).slice(0, 200)}) — `
+      + 'cages fall back to the base image and install their packages at dispatch');
+    return { tag: null, error: e.message };
+  }
+  logline('pool', `${label || 'cxell'}: baked ${tag} in ${Math.round((Date.now() - started) / 1000)}s — `
+    + 'every cage of this template now starts with its packages already installed');
+  return { tag, built: true };
+}
+
+// `reuse` keeps an EXISTING cage instead of recreating it — the dispatch half of a pre-warmed cage
+// (`when: 'provision'`), where the container was created and installed hours ago by provisioning.
+// It is honoured only when the cage is RUNNING and on the image we want; anything else (stopped,
+// stale image, unreadable) falls through to the recreate below, which is today's behaviour.
+export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image, prep = null, reuse = false }) {
   const name = cxellName(slug);
   const img = image || IMAGE;   // per-project override (e.g. the Android SDK variant); else the base
   const net = network || 'zee-hive-net';
+  if (reuse) {
+    // One inspect answers all three questions: is it running, is it the image we want, and which
+    // host port is its ssh already published on (we must return the port it HAS, not the port we
+    // would have picked — the attend door is already bound to it).
+    const kept = await dk(ctx, ['inspect', '-f',
+      '{{.State.Running}} {{.Config.Image}} {{(index (index .NetworkSettings.Ports "22/tcp") 0).HostPort}}', name],
+      { timeoutMs: 20000 }).catch(() => null);
+    const [running, onImage, port] = String(kept?.out || '').trim().split(/\s+/);
+    if (running === 'true' && onImage === img && Number(port) > 0) {
+      logline('cxell', `${name}: reusing the cage provisioning already prepared (image ${img}, ssh :${port}) — `
+        + 'nothing to install at dispatch');
+      return { name, sshPort: Number(port), reused: true };
+    }
+    if (kept) {
+      logline('cxell', `${name}: a pre-warmed cage exists but cannot be reused (running=${running}, image=${onImage}) — `
+        + 'rebuilding it, which is exactly what a dispatch has always done');
+    }
+  }
   await dk(ctx, ['network', 'create', '--label', 'zeehive.cxell=net', net]).catch((e) => {
     if (!/already exists/i.test(e.message)) throw e;
   });
@@ -592,11 +715,11 @@ export async function ensureCxell({ ctx, slug, xellId, network, sshPort, image }
   let port = sshPort || cxellSshPort(slug);
   for (let attempt = 0; attempt < 12; attempt++, port++) {
     try {
-      await dk(ctx, cxellRunArgs({ name, net, port, img, xellId }));
+      await dk(ctx, cxellRunArgs({ name, net, port, img, xellId, prep }));
       // A fresh named volume is root-owned; npm runs as `zee`. Fix it (cheap, idempotent) and SAY
       // when the cache came up read-only, because that turns every `npm ci` in this cage into a
       // failure a human would otherwise have to guess at. Best-effort: never fails the create.
-      const fixup = cxellCacheFixupCommand(name);
+      const fixup = cxellCacheFixupCommand(name, { npm: prep?.cache?.npm });
       if (fixup) {
         // The fixup SAYS whether the cache came out writable (CACHE_RW / CACHE_RO on stdout), so it is
         // a verdict exec and goes through dkVerdict. It used to read the marker out of a REJECTION —
@@ -827,9 +950,12 @@ export async function openCxellSsh({ ctx, name, publicKey, agentEnv = {}, xellTo
   // run used, AND the per-xell identity token so that human's `zee` CLI (and any command in the
   // login shell) can reach the queenzee's /api/xell/self/* verbs. A docker-exec -e run gets these
   // directly; an SSH login does not, so they must land in /etc/environment too.
+  // Every value is scrubbed of newlines (finding [9] of the credential-injection review): a label
+  // or token containing \n would write extra lines into /etc/environment and re-write the cage's
+  // env. Strip, never emit — the injection rewrite runs the same scrub.
   const envLines = Object.entries(agentEnv)
     .filter(([, v]) => v !== null && v !== undefined && v !== '')
-    .map(([k, v]) => `${k}=${v}`);
+    .map(([k, v]) => `${k}=${scrubEnvValue(v)}`);
   // which agent CLI owns this cxell — zee-attach.sh branches its resume/attach flow on it
   if (runtimeKey) envLines.push(`ZEE_RUNTIME=${runtimeKey}`);
   if (xellToken) envLines.push(`ZEEHIVE_XELL_TOKEN=${xellToken}`);
@@ -841,9 +967,118 @@ export async function openCxellSsh({ ctx, name, publicKey, agentEnv = {}, xellTo
   return r.out.trim();
 }
 
+// ── INSTALL THE DISPATCHED PROVIDER'S CREDENTIAL INTO THE CAGE ────────────────────────────────────
+//
+// A cxell is provider-AGNOSTIC by construction: the image carries every vendor CLI, nothing about a
+// provider is baked into it or into the xell, and the credential arrives at dispatch time as the
+// runtime adapter's env (docker exec -e for the headless run, /etc/environment for an attending
+// human's shell). For claude, kimi and deepseek that environment IS the login and there is nothing
+// to do here.
+//
+// `codex` breaks that assumption, and it broke it as an AUTH ERROR — which is why this function
+// exists rather than a comment. With OPENAI_API_KEY alone, `codex exec` sends no Authorization
+// header at all and every turn dies `401 … Missing bearer or basic authentication in header`: a
+// perfectly good key, reported to the human as an invalid one, on every OpenAI zee in the fleet.
+// Its adapter therefore declares authSetupCmd() (see lib/cxell-runtimes.js for the measurements),
+// and this runs it INSIDE the cage with the same credential env before the agent ever starts.
+//
+// Three properties this deliberately keeps:
+//   • the token is never on a command line — the setup command reads it from the env this exec
+//     carries, so it stays out of `ps`, out of the docker argv and out of every log;
+//   • the CONTAINER states the outcome (AUTH_MARKERS via dkVerdict), never the exit code;
+//   • no verdict at all is a FAILURE here, not a shrug. The whole point is to know, before a turn
+//     starts, that the agent can authenticate — guessing would restore the exact silence this fixes.
+//
+// Returns { required, ok, verdict, said } and never throws: the caller decides what a failure means
+// (spawn refuses the dispatch; the nudge path logs and carries on with whatever is already in the
+// cage). `required:false` means the adapter needs no setup — the ordinary case.
+export async function prepareCxellAuth({ ctx = 'default', name, adapter = CLAUDE_ADAPTER,
+                                         token = null, baseUrl = null, model = null } = {}) {
+  const cmd = adapter?.authSetupCmd?.();
+  if (!cmd) return { required: false, ok: true };
+  if (!token) {
+    return { required: true, ok: false,
+             said: `no ${adapter.provider} token to install — the ${adapter.bin} CLI cannot authenticate without one` };
+  }
+  // Same guarded door as the run itself — installing another vendor's key into the cage would
+  // write a 401 into ~/.codex/auth.json and call it AUTH_OK on the next rotation.
+  let env;
+  try { env = credentialEnvFor(adapter, { token, baseUrl, model }).flatMap(([k, v]) => ['-e', `${k}=${v}`]); }
+  catch (e) { return { required: true, ok: false, verdict: null, said: String(e.message).slice(0, 400) }; }
+  let r;
+  try {
+    r = await dkVerdict(ctx, ['exec', ...env, name, 'bash', '-lc', cmd],
+                        { markers: AUTH_MARKERS, label: `${name}: ${adapter.key} auth`, timeoutMs: 60000 });
+  } catch (e) {
+    // the exec never ran (no such container, docker gone, timeout) — there is no verdict to read
+    return { required: true, ok: false, verdict: null, said: String(e.message).slice(0, 300) };
+  }
+  const ok = r.verdict === 'AUTH_OK';
+  return { required: true, ok, verdict: r.verdict,
+           said: ok ? null : (dkSaid(r, 300) || 'the cage printed no AUTH_OK/AUTH_FAILED verdict') };
+}
+
+// ── PRE-ANSWER THE RUNTIME'S FIRST-RUN PROMPTS ───────────────────────────────────────────────────
+//
+// The twin of prepareCxellAuth, for the gate that comes AFTER authentication: the vendor's own
+// first-run questions (claude's onboarding/theme/trust/bypass, codex's "do you trust the contents of
+// this directory?"). It is invisible on the headless path — every adapter runs its CLI
+// non-interactively — and lands entirely on the HUMAN who attends the cage, because zee-attach.sh
+// hands the pane straight to `claude --resume` / `codex resume` / `kimi --continue`.
+//
+// The cage used to be pre-answered for claude ALONE (cxell-claude-seed.mjs, baked into the image),
+// which made it a claude cage wearing another vendor's CLI. Now each adapter declares its own
+// firstRunSeedCmd() — measured per vendor, see lib/cxell-runtimes.js — and this runs whichever one
+// the dispatched runtime brings.
+//
+// NOT FATAL, deliberately, and this is the difference from the auth install: a cage whose seed
+// failed still works headless, and the whole cost is a prompt in front of a human who can answer
+// it. So it reports and logs, and the dispatch carries on.
+export async function seedCxellFirstRun({ ctx = 'default', name, adapter = CLAUDE_ADAPTER } = {}) {
+  const cmd = adapter?.firstRunSeedCmd?.();
+  if (!cmd) return { required: false, ok: true };
+  let r;
+  try {
+    r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc', cmd],
+                        { markers: SEED_MARKERS, label: `${name}: ${adapter.key} first-run seed`, timeoutMs: 60000 });
+  } catch (e) {
+    return { required: true, ok: false, verdict: null, said: String(e.message).slice(0, 300) };
+  }
+  const ok = r.verdict === 'SEED_OK';
+  return { required: true, ok, verdict: r.verdict,
+           said: ok ? null : (dkSaid(r, 300) || 'the cage printed no SEED_OK/SEED_FAILED verdict') };
+}
+
+// ── INSTALL THE CAGE'S OWN TURN-BOUNDARY HOOKS ───────────────────────────────────────────────────
+//
+// The third member of the same family (prepareCxellAuth, seedCxellFirstRun), and the one that closes
+// a gap rather than answering a prompt: an INTERACTIVE turn — a human or a manager typing into the
+// session in the cage's pane — is a turn the queenzee does not start and no loop of its can observe
+// (queenzee/reaper.js, KNOWN GAP). The vendor's own turn hooks can see it, and the cage already holds
+// the `zee` CLI and its identity token, so it reports itself: `zee turn --start` / `--end`.
+//
+// Per-vendor and MEASURED (lib/cxell-runtimes.js turnHookCmd): claude declares the command, codex and
+// kimi declare nothing and are untouched. NOT FATAL, exactly like the first-run seed: a cage whose
+// hooks did not install works in every other respect, and the cost is the gap it had before.
+export async function installTurnHooksIntoCxell({ ctx = 'default', name, adapter = CLAUDE_ADAPTER } = {}) {
+  const cmd = adapter?.turnHookCmd?.();
+  if (!cmd) return { required: false, ok: true };
+  let r;
+  try {
+    r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc', cmd],
+                        { markers: TURN_HOOK_MARKERS, label: `${name}: ${adapter.key} turn hooks`, timeoutMs: 60000 });
+  } catch (e) {
+    return { required: true, ok: false, verdict: null, said: String(e.message).slice(0, 300) };
+  }
+  const ok = r.verdict === 'TURNHOOK_OK';
+  return { required: true, ok, verdict: r.verdict,
+           said: ok ? null : (dkSaid(r, 300) || 'the cage printed no TURNHOOK_OK/TURNHOOK_FAILED verdict') };
+}
+
 // Bundle the worktree's HEAD (its spinoff branch) into the cxell as a private clone at
 // /work/repo, then copy in the gitignored .zeehive.env projection (ports + DATABASE_URL).
 export async function cloneIntoCxell({ ctx, name, worktree }) {
+  let updated = false;   // did the checkout survive (fetch+reset) rather than being re-cloned?
   const tmp = mkdtempSync(join(tmpdir(), 'zee-cxell-'));
   const bundle = join(tmp, 'task.bundle');
   const git = (args) => new Promise((resolve, reject) => {
@@ -861,8 +1096,36 @@ export async function cloneIntoCxell({ ctx, name, worktree }) {
     if (branch === 'HEAD') throw new Error(`worktree ${worktree} is on a detached HEAD — nothing to cxell`);
     await git(['bundle', 'create', bundle, branch]);
     await dk(ctx, ['cp', bundle, `${name}:/tmp/task.bundle`]);
-    await dk(ctx, ['exec', name, 'bash', '-lc',
-      `rm -rf /work/repo && git clone -q -b '${branch.replace(/'/g, '')}' /tmp/task.bundle /work/repo`]);
+    // UPDATE IN PLACE when the cage already holds this branch, instead of `rm -rf` + clone.
+    //
+    // The wipe is right for a fresh cage and WRONG for a pre-warmed one: provisioning may have spent
+    // two minutes installing node_modules into that tree, and node_modules is untracked, so a
+    // re-clone throws away the entire point of `when: 'provision'`. Fetching the bundle and
+    // `reset --hard`ing onto it lands the same commit, byte for byte, and leaves untracked
+    // installed output alone. `git clean` still removes untracked JUNK (so the zee starts on the
+    // same pristine tree it always did) — with node_modules excluded by name, because a project that
+    // does not gitignore it would otherwise have it deleted here.
+    //
+    // Which path ran is a VERDICT, not a guess: CLONE_UPDATED vs CLONE_FRESH on stdout, so "why did
+    // my prepped cage reinstall?" is answerable from the log.
+    const b = branch.replace(/'/g, '');
+    const r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc',
+      `if [ -d /work/repo/.git ] && [ "$(git -C /work/repo rev-parse --abbrev-ref HEAD 2>/dev/null)" = '${b}' ]; then `
+      + `git -C /work/repo fetch -q /tmp/task.bundle '${b}' && git -C /work/repo reset -q --hard FETCH_HEAD `
+      + '&& git -C /work/repo clean -qfd -e node_modules && echo CLONE_UPDATED; '
+      + `else rm -rf /work/repo && git clone -q -b '${b}' /tmp/task.bundle /work/repo && echo CLONE_FRESH; fi`],
+      { markers: CLONE_MARKERS, label: `${name}: clone`, timeoutMs: 300000 });
+    if (!r.verdicts.length) {
+      // Neither path reported success — the tree is in an unknown state and everything downstream
+      // (the warm, the harness files, the zee itself) assumes /work/repo is a checkout. Fail here
+      // rather than hand a zee half a repository.
+      throw new Error(`clone into ${name} reported nothing (exit ${r.code}): ${dkSaid(r, 300)}`);
+    }
+    updated = r.verdicts.includes('CLONE_UPDATED');
+    if (updated) {
+      logline('cxell', `${name}: updated the existing checkout in place (fetch + reset --hard) — `
+        + 'anything provisioning already installed survives');
+    }
     await dk(ctx, ['exec', '-u', '0', name, 'rm', '-f', '/tmp/task.bundle']); // docker cp wrote it as root
     const envFile = join(worktree, '.zeehive.env');
     if (existsSync(envFile)) {
@@ -891,6 +1154,8 @@ export async function cloneIntoCxell({ ctx, name, worktree }) {
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
+  // Which path ran, for a caller that cares whether an installed node_modules survived.
+  return { updated };
 }
 
 // Apply the cxell egress policy (docker/zeehive/cxell-firewall.sh): default ALLOW, DROP only the
@@ -929,29 +1194,69 @@ export async function sealCxell({ ctx, name, blockTcp = [] }) {
 // other three the run produced.
 export const WARM_MARKERS = ['WARM_OK', 'WARM_CI_FAILED', 'WARM_INSTALL_FAILED', 'WARM_LOCK_DIRTY'];
 
-export function warmInstallScript(repoDir = '/work/repo') {
-  return `cd ${repoDir} && echo "npm cache: $(npm config get cache)" && `
-    // ONE definition of "is the lockfile still as we found it?", called on BOTH ways out of the
-    // locked branch — the successful one AND the failed one. The guarantee this ticket buys is "the
-    // warm never dirties the lockfile", so the check that proves it must not be reachable only when
-    // the install succeeded: a `ci` that died having already touched the lock is exactly the case
-    // nobody could see. Only in the LOCKED branch — where there was no lockfile, `npm install`
-    // legitimately CREATES one and `git status` would call that a change.
-    + 'lockstate() { if [ -n "$(git status --porcelain package-lock.json 2>/dev/null)" ]; then echo WARM_LOCK_DIRTY; fi; }; '
-    + 'if [ -f package-lock.json ]; then LOCKED=1; '
-    // no `|| npm install` — see above. The marker lets the caller tell lock drift from a network
-    // failure without parsing npm's prose twice.
-    + 'npm ci --no-audit --no-fund || { echo "WARM_CI_FAILED"; lockstate; exit 1; }; '
-    + 'else echo "no package-lock.json — npm install (nothing to rewrite)"; '
-    + 'npm install --no-audit --no-fund || { echo "WARM_INSTALL_FAILED"; exit 1; }; fi && '
-    + '(npm run build --workspace web >/dev/null 2>&1 || true) && '
-    // Prove the tree is as clean as we found it. Nothing above should touch the lockfile; if that
-    // ever changes, this is what says so instead of a zee discovering it in `git status`.
-    + 'if [ -n "$LOCKED" ]; then lockstate; fi && '
-    + 'echo WARM_OK';
+// The two ways a branch gets into a cage: a fresh clone, or a fetch+reset onto a checkout that is
+// already there (which is what preserves a pre-warmed cage's node_modules). Declared here for the
+// same reason WARM_MARKERS is: the exec that runs the script has to name what it prints.
+export const CLONE_MARKERS = ['CLONE_FRESH', 'CLONE_UPDATED'];
+
+export function warmInstallScript(repoDir = '/work/repo', prep = null) {
+  // GENERATED FROM THE PROJECT'S SPAWN TEMPLATE (migration 121, lib/spawn-prep.js) instead of being
+  // hard-coded here. With no template — every project until a human edits one — prepUserScript
+  // emits this same script, marker for marker: npm ci (never install, when a lockfile exists), the
+  // web prebuild, the lockstate proof, WARM_OK. What the template adds is the ability to say "this
+  // project also needs psql / build tools / one more npm script", and how npm should cache.
+  return prepUserScript(prep || normalizeSpawnPrep(null), repoDir);
 }
 
-export async function warmCxell({ ctx, name }) {
+// The ROOT half of the warm: apt packages (and anything a human marked root) from the spawn
+// template, run in their own `docker exec -u 0` BEFORE the user half — because apt needs uid 0 and
+// npm must NOT have it (root-owned files under /work/repo are files the zee cannot commit). Returns
+// { ran:false } when the template asks for nothing root, which is every project today: no exec
+// happens at all, so the default spawn path is untouched.
+export async function prepRootCxell({ ctx, name, prep, aptBaked = false }) {
+  const script = prepRootScript(prep, { aptCache: hasAptStep(prep), aptBaked });
+  if (!script) return { ran: false, steps: [] };
+  try {
+    const r = await dkVerdict(ctx, ['exec', '-u', '0', name, 'bash', '-lc', script],
+                              { markers: ['PREP_ROOT_DONE'], label: `${name}: prep (root)`, timeoutMs: 900000 });
+    const steps = parsePrepSteps(r.out);
+    const failed = steps.filter((x) => !x.ok);
+    // Rule 1: a package that would not install is a SLOWER zee, never a failed dispatch. Said out
+    // loud with the step name, because "psql is missing again" is otherwise unattributable.
+    if (failed.length) {
+      logline('cxell', `${name}: prep step(s) FAILED — ${failed.map((x) => x.key).join(', ')}; `
+        + 'the zee starts without them (add them by hand, or fix the project spawn template)');
+    }
+    // NO verdict means the script never got to its end — a cage that is not there, a docker hop that
+    // died. dkVerdict RESOLVES for an exec that ran and exited non-zero, so without this the failure
+    // would come back as a quiet { ok:false } with nothing in it, and the reason a project's packages
+    // are missing would exist nowhere. Still not fatal (rule 1): the zee starts, one tool short.
+    if (!r.verdicts.includes('PREP_ROOT_DONE')) {
+      const said = dkSaid(r, 200);
+      logline('cxell', `${name}: root prep did not finish (exit ${r.code}) — the zee starts without `
+        + `whatever the spawn template installs: ${said}`);
+      return { ran: true, ok: false, steps, error: said };
+    }
+    return { ran: true, ok: true, steps };
+  } catch (e) {
+    logline('cxell', `${name}: root prep did not run (${String(e.message).slice(0, 160)}) — `
+      + 'the zee starts without whatever the template installs');
+    return { ran: true, ok: false, steps: [], error: e.message };
+  }
+}
+
+// `stage` says WHICH clock this warm is running on, and it changes two things:
+//   'dispatch'  (default, today) — install, and REUSE what provisioning already installed if the
+//               marker in the cage still matches this lockfile and template.
+//   'provision' — the pool's clock, on a cage nobody has claimed: install and WRITE that marker.
+// `aptBaked` says the cage's image already carries the packages, so the root half is skipped.
+export async function warmCxell({ ctx, name, prep = null, stage = 'dispatch', aptBaked = false }) {
+  const template = prep && prep.steps ? prep : normalizeSpawnPrep(null);
+  const hash = templateHash(template);
+  // The ROOT half first (apt packages from the spawn template), while egress is still open — the
+  // firewall is sealed after the warm. A no-op for a project that installs no packages, and for one
+  // whose packages are already in the image.
+  const root = await prepRootCxell({ ctx, name, prep: template, aptBaked });
   let r;
   try {
     // `npm ci` here reads the SHARED cache volume mounted by ensureCxell, so this is an unpack from
@@ -964,16 +1269,28 @@ export async function warmCxell({ ctx, name }) {
     // this script prints goes to STDOUT, so the drift branch below could never be true — a broken
     // lockfile was reported as "warm incomplete — the zee will install as needed", which is the one
     // thing that will NOT fix it. Ticket #14.
-    r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc', warmInstallScript()],
+    r = await dkVerdict(ctx, ['exec', name, 'bash', '-lc',
+                              // reuse only on the dispatch side; the provision side is what CREATES
+                              // the thing to reuse, and re-running it there is the job, not waste.
+                              prepUserScript(template, '/work/repo',
+                                             { hash, reuse: stage === 'dispatch', mark: true })],
                         { markers: WARM_MARKERS, label: `${name}: warm`, timeoutMs: 900000 });
   } catch (e) {
     // No verdict at all because the exec never ran (no such container, docker gone, timeout).
     // Nothing to classify: the zee simply starts cold.
     logline('cxell', `${name}: warm (npm/build) incomplete — the zee will install as needed: ${String(e.message).slice(0, 160)}`);
-    return { warmed: false, error: e.message };
+    return { warmed: false, error: e.message, steps: root.steps };
   }
   const sharedCache = new RegExp(`npm cache: ${CXELL_NPM_CACHE_DIR}`).test(r.out);
   const lockDirty = r.verdicts.includes('WARM_LOCK_DIRTY');
+  // PER-STEP TIMINGS, root half + user half. Without them a slow spawn is one number and "which
+  // step costs the minute" is a guess — this is the evidence a human tunes the template from.
+  const steps = [...root.steps, ...parsePrepSteps(r.out)];
+  const reused = steps.filter((x) => x.status === 'reused').length;
+  if (steps.length) {
+    logline('cxell', `${name}: prep — ${summarizePrepSteps(steps, template)}`
+      + (reused ? ' — provisioning had already done this work; the dispatch installed nothing' : ''));
+  }
   if (lockDirty) {
     // Should be unreachable now that nothing in the warm writes the lock. Loud anyway: a dirty
     // lockfile at dispatch is a change the zee did not make and would land without noticing.
@@ -983,7 +1300,7 @@ export async function warmCxell({ ctx, name }) {
   // WARM_OK anywhere in the markers wins, whatever else the script printed and whatever the exec
   // exited with. (The "trusted but said out loud" line for a non-zero exit is dkVerdict's job now —
   // it was written by hand here and in writeFileIntoCxellIfChanged, which is two copies of one rule.)
-  if (r.verdicts.includes('WARM_OK')) return { warmed: true, sharedCache, lockDirty };
+  if (r.verdicts.includes('WARM_OK')) return { warmed: true, sharedCache, lockDirty, steps };
 
   // Failed, and the script said which failure it was. Lock drift is a repo problem a human or the
   // zee must fix deliberately, and it reads nothing like a registry timeout — so it gets its own
@@ -1002,7 +1319,35 @@ export async function warmCxell({ ctx, name }) {
   } else {
     logline('cxell', `${name}: warm (npm/build) incomplete — the zee will install as needed: ${error.slice(0, 160)}`);
   }
-  return { warmed: false, sharedCache, lockDirty, error, lockDrift: drift };
+  return { warmed: false, sharedCache, lockDirty, error, lockDrift: drift, steps };
+}
+
+// ── THE ONE DOOR A CREDENTIAL LEAVES BY ──────────────────────────────────────────────────────────
+//
+// Every path that puts a vendor key into a cage builds it the same way — `adapter.env({token,…})`
+// → `docker exec -e` — so this is the single place to ask the question the fleet learned to ask the
+// expensive way: is the token we are about to send unmistakably ANOTHER vendor's?
+//
+// Ten DeepSeek zees died on "401 … Your api key: ****CAAA is invalid" (2026-08-01 → 08-03) with a
+// CLAUDE OAuth token in ANTHROPIC_AUTH_TOKEN against api.deepseek.com. decideRuntimePairing now
+// stops the dispatch that CHOSE that pairing; this stops the credential itself, on every path,
+// including the two the pairing never sees: nudgeCxellZee's fallback (which reads the token back out
+// of the cage's /etc/environment under a key the claude and deepseek adapters SHARE, so it cannot
+// tell whose it is) and any adapter added later.
+//
+// It refuses only what it can NAME — lib/provider-tokens.js attributes a token by the vendor's own
+// `signature` prefix, else by a shape that exactly one vendor accepts, and answers null for anything
+// else. So an unrecognised or ambiguous token (a DeepSeek or OpenAI key, a format that changed
+// upstream) still goes to the vendor to answer for: this must cost a missed catch, never a refused
+// dispatch. The error is the sentence a human can act on, and it carries the MASKED token so it can
+// be matched to the account in Project setup; the token itself never reaches a log or a message.
+function credentialEnvFor(adapter, { token, baseUrl = null, model = null } = {}) {
+  const bad = credentialVendorMismatch({ provider: adapter?.provider, token });
+  if (bad) {
+    throw new Error(`refusing to start the ${adapter.bin} CLI with a ${bad.from} credential: ${bad.sentence}`);
+  }
+  return Object.entries(adapter.env({ token, baseUrl, model }))
+    .filter(([, v]) => v !== null && v !== undefined && v !== '');
 }
 
 // Run the zee: the runtime adapter's CLI headless inside the cxell (claude -p / codex exec /
@@ -1011,11 +1356,16 @@ export async function warmCxell({ ctx, name }) {
 // transport failure). onEvent(obj) fires per normalized event — init (session id), assistant
 // turns, result. Bypass/auto mode inside is safe HERE and only here — the cxell is the
 // permission system, and every adapter runs its CLI's equivalent of skip-permissions.
-export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, onEvent }) {
-  const agentEnv = adapter.env({ token, baseUrl, model });
+export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, token, xellToken, baseUrl = null, extraEnv = {}, onEvent }) {
+  // The credential goes through the ONE guarded door (credentialEnvFor): a token that is plainly
+  // another vendor's throws HERE, before docker is spawned, so the dispatch fails with a sentence
+  // naming both vendors instead of the cage burning a turn on the vendor's own "invalid api key".
+  const agentEnv = [
+    ...Object.entries(extraEnv || {}).filter(([, v]) => v !== null && v !== undefined && v !== ''),
+    ...credentialEnvFor(adapter, { token, baseUrl, model }),
+  ];
   const cmd = ['exec', '-i',
-    ...Object.entries(agentEnv).filter(([, v]) => v !== null && v !== undefined && v !== '')
-      .flatMap(([k, v]) => ['-e', `${k}=${v}`]),
+    ...agentEnv.flatMap(([k, v]) => ['-e', `${k}=${v}`]),
     // The per-xell identity token: the cxell zee's `zee` CLI (and any /api/xell/self/* call) reads
     // it to prove WHICH xell is calling. Injected alongside the vendor credential — same door, and
     // the firewall already allows the queenzee host:port.
@@ -1073,6 +1423,33 @@ export async function exportCxellDiff({ ctx, name, toDir }) {
   return out;
 }
 
+// A git index.lock older than this is STALE — no live git op holds one this long (a lock lives for
+// the duration of a single index-touching command: merge/stash/commit/…, seconds at most). A
+// crashed or killed process leaves one behind forever, and every later index-touching command then
+// dies with "Unable to create '.../index.lock': File exists". The 5-minute margin is generous
+// enough that a genuinely live op is never mistaken for a stale lock.
+const STALE_INDEX_LOCK_MS = 5 * 60 * 1000;
+
+// If a STALE index.lock exists in the worktree admin dir (for a linked worktree that is
+// <repo>/.git/worktrees/<name>, which is exactly where every `git -C <worktree>` index-touching
+// command looks for it), remove it and log the FULL path so `zee ops --alerts` finally names the
+// file. Returns true when a lock was removed. A FRESH lock is NEVER deleted — a live git process
+// may be holding it; the caller then fails exactly as today.
+function clearStaleIndexLock(adminDir, slug) {
+  const lockPath = join(adminDir, 'index.lock');
+  let st;
+  try { st = statSync(lockPath); } catch { return false; }
+  if (Date.now() - st.mtimeMs < STALE_INDEX_LOCK_MS) return false;
+  try {
+    rmSync(lockPath, { force: true });
+    logline('cxell', `${slug}: cleared a STALE index.lock at ${lockPath} `
+      + `(${Math.round((Date.now() - st.mtimeMs) / 1000)}s old) so the collect could retry`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // COLLECT the cxell's commits onto its HOST worktree so they can be landed through the normal gate.
 // This is the missing piece for a cxell zee: its work is committed INSIDE the container, but the
 // land gate pushes from the host worktree. exportCxellDiff bundles the cxell's branch (commits not in
@@ -1082,7 +1459,9 @@ export async function exportCxellDiff({ ctx, name, toDir }) {
 //
 // Best-effort by contract: a cxell with no new commits (already collected, or none made) is a no-op,
 // not an error. A worktree that has DIVERGED from the cxell (someone moved it) refuses rather than
-// force — the caller surfaces that to the zee.
+// force — the caller surfaces that to the zee. The pure-git core below (reconcileBundleIntoWorktree)
+// also self-heals a STALE index.lock in the worktree admin dir (TKT-86-B3B2), so a crashed git
+// process no longer takes the collect step — and with it the zee — out of service.
 export async function collectCxellDiffToWorktree({ ctx = 'default', slug, worktree }) {
   if (!worktree || !existsSync(worktree)) {
     return { collected: false, reason: `no host worktree on disk (${worktree || 'null'})` };
@@ -1108,14 +1487,32 @@ export async function collectCxellDiffToWorktree({ ctx = 'default', slug, worktr
 // durable `refs/zeehive/stranded/<slug>` so the work is anchored, GC-proof and recoverable, and we
 // name that ref in the thrown error. A failure is "blocked", never "lost".
 export async function reconcileBundleIntoWorktree(worktree, { bundle, slug }) {
-  const git = (args) => new Promise((resolve, reject) => {
-    const g = spawn('git', ['-C', worktree, ...args], { windowsHide: true });
-    let out = '', err = '';
-    g.stdout.on('data', (d) => (out += d.toString()));
-    g.stderr.on('data', (d) => (err += d.toString()));
-    g.on('error', reject);
-    g.on('close', (c) => (c === 0 ? resolve(out.trim()) : reject(new Error(`git ${args[0]} exited ${c}: ${err.slice(0, 300)}`))));
-  });
+  const git = (args) => {
+    const run = (a) => new Promise((resolve, reject) => {
+      const g = spawn('git', ['-C', worktree, ...a], { windowsHide: true });
+      let out = '', err = '';
+      g.stdout.on('data', (d) => (out += d.toString()));
+      g.stderr.on('data', (d) => (err += d.toString()));
+      g.on('error', reject);
+      g.on('close', (c) => (c === 0 ? resolve(out.trim()) : reject(new Error(`git ${a[0]} exited ${c}: ${err.slice(0, 300)}`))));
+    });
+    return run(args).catch(async (e) => {
+      // SELF-HEAL the collect path (TKT-86-B3B2): a STALE index.lock in the worktree admin dir makes
+      // every index-touching git op above die with "File exists", which a caged zee can neither see
+      // nor delete — previously one crashed git process took the zee fully out of service (every
+      // `zee build`/`zee land` failed at collect). Resolve where that lock lives
+      // (`git rev-parse --absolute-git-dir` — for a linked worktree that is <repo>/.git/worktrees/<name>),
+      // and if it is STALE (present + mtime older than STALE_INDEX_LOCK_MS — no live op), clear it,
+      // log the path, and retry the failed op ONCE. A FRESH lock is never deleted; then we fail
+      // exactly as today.
+      let admin = null;
+      try { admin = await run(['rev-parse', '--absolute-git-dir']); } catch { /* keep e */ }
+      if (admin && clearStaleIndexLock(admin, slug)) {
+        return run(args);
+      }
+      throw e;
+    });
+  };
   const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
   const strandedRef = `refs/zeehive/stranded/${String(slug).replace(/[^A-Za-z0-9._/-]/g, '-')}`;
   // Fetch the cxell branch into a private staging ref (never the checked-out branch directly), then
@@ -1174,20 +1571,51 @@ export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, 
     try {
       const r = await dk(ctx, ['exec', '-u', '0', name, 'cat', '/etc/environment'], { timeoutMs: 15000 });
       const pick = (k) => (r.out.match(new RegExp(`^${k}=(.*)$`, 'm')) || [])[1]?.trim();
-      vendorTok = vendorTok || pick(adapter.tokenEnvKey);
+      // Since every provider's key rides under its OWN namespaced var (ZEE_PROVIDER_<KEY>_TOKEN),
+      // read THAT first — it attributes the token to a vendor. adapter.tokenEnvKey is the OLD
+      // fallback for a cage spawned before the namespaced set existed, and it is exactly the key
+      // claude and deepseek SHARE, so a token read back under it cannot be attributed (the reason
+      // this guard is the last line — see the credentialEnvFor call below).
+      vendorTok = vendorTok
+        || pick(`ZEE_PROVIDER_${String(adapter.provider).toUpperCase()}_TOKEN`)
+        || pick(adapter.tokenEnvKey);
       identTok = identTok || pick('ZEEHIVE_XELL_TOKEN');
     } catch { /* fall through with whatever the caller gave us */ }
   }
-  const env = Object.entries(adapter.env({ token: vendorTok, model }))
-    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+  // Re-install the credential for a CLI that does not read it from the environment (codex). The
+  // spawn already did this, so it is normally a no-op rewrite of the same file — but a cage that
+  // was created before this existed, or one whose account token has since been rotated, would
+  // otherwise resume straight into a 401 that reads like a bad key. Best-effort by contract: if it
+  // fails we still resume with whatever the cage already holds, and SAY so rather than fail the
+  // continuation a human is waiting on.
+  if (adapter.authSetupCmd?.() && vendorTok) {
+    const auth = await prepareCxellAuth({ ctx, name, adapter, token: vendorTok, model });
+    if (!auth.ok) {
+      logline('cxell', `${name}: could not refresh the ${adapter.provider} credential before resuming `
+        + `(${auth.said}) — resuming on whatever is already in the cage; an auth error on this turn is `
+        + 'this, not a bad key');
+    }
+  }
+  // GUARDED, and this path is why the guard exists at all: the fallback above reads the token back
+  // out of the cage by `adapter.tokenEnvKey`, which is ANTHROPIC_AUTH_TOKEN for the claude AND the
+  // deepseek adapter — so a cage that was spawned on one of them and is being resumed on the other
+  // (a re-crewed cage, a cage older than the pairing fix, a project whose account was removed so
+  // tokenForSpawn returned null) hands over a token nobody can attribute. Refusing here turns that
+  // into a named sentence in the nudge log instead of a resume that dies on the vendor's 401.
+  const env = credentialEnvFor(adapter, { token: vendorTok, model })
     .flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);
   // the adapter sanitizes the session id before interpolating it (claude/codex); kimi resumes by
   // workdir (--continue) and ignores the id entirely
   const cmd = ['exec', '-i', ...env, name, 'bash', '-lc',
     `cd /work/repo && ${adapter.execCmd({ model, resumeSid: sessionId || '' })}`];
-  return dk(ctx, cmd, { input: adapter.stdinPayload ? adapter.stdinPayload(prompt) : prompt, timeoutMs });
+  const r = await dk(ctx, cmd, { input: adapter.stdinPayload ? adapter.stdinPayload(prompt) : prompt, timeoutMs });
+  // …and hand back the turn's own FINAL RESULT EVENT, not just its exit code: what it burned
+  // (usageFrom) and whether it died (resumeTurnDeath) are both read off this one object, parsed once
+  // by the adapter that produced it (lib/cxell-runtimes.js resultFrom).
+  return { ...r, result: resultFrom(adapter, r) };
 }
+
 
 // Run ONE command inside a cxell zee over the SAME inbound SSH door the browser terminal uses (the
 // fleet key, the host-published port). This reaches what a docker-exec cannot: the human's-eye-view

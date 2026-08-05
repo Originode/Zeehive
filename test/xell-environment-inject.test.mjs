@@ -16,6 +16,13 @@
 //      answers from the read model and three different renderings in the console. Both are asserted:
 //      the API's shape, and the REAL component rendered with react-dom/server.
 //
+//   3. THE URLS, OVER REAL HTTP. Added after the panel shipped 404ing on open: it asked for GET
+//      /api/xells/:id/environment, which no router.get ever declared (the read is env/resolved).
+//      Nothing above caught it, because the render above drives the component through a STUBBED
+//      fetch that answers any /xells/ url — a stub cannot disagree with the route table. So §6 takes
+//      the paths out of web/src/api.js and sends them at the REAL router: a path either exists or it
+//      404s, on both sides of the same fact.
+//
 // A prod-coupled xell resolving to the PROD environment — the second half of the ticket's sentence —
 // is exercised through the same read model, on a xell whose only difference is its db_coupling.
 //
@@ -25,6 +32,8 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+import express from 'express';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const { q, one, pool } = await import('../server/src/db/pool.js');
@@ -40,6 +49,7 @@ const tmp = mkdtempSync(join(tmpdir(), 'xenv-'));
 const PID = '00000000-0000-4000-8000-00000000e201';
 const XO = '00000000-0000-4000-8000-00000000e202';
 const cleanup = () => q(`DELETE FROM project WHERE id=$1`, [PID]).catch(() => {});
+let server = null;
 
 try {
   await cleanup();
@@ -304,7 +314,53 @@ try {
     ok(/data-testid="xenv-extract"/.test(src),
        'the raw .zeehive.env dump that button used to show is kept, one click away inside the panel');
   }
+
+  // ── 6. the CALLS the CONSOLE makes, at the REAL router ───────────────────
+  // The panel shipped asking for GET /api/xells/:id/environment — a path the router only ever
+  // declared for POST — so every open ended at "site GET failed (404)". The render above cannot see
+  // that: it stubs fetch, and a stub answers whatever url it is handed. So this drives the console's
+  // OWN client functions at the REAL route table.
+  //
+  // Two departures from how the rest of this repo tests console wiring, both about this bug: it
+  // IMPORTS web/src/api.js (React-free, so node takes it as-is) instead of grepping it, because a
+  // grep cannot tell a path that reaches a route from one that 404s; and the only stub is a fetch
+  // that prefixes the base url, so the request, the routing and the error handling are all real.
+  section("the panel's own calls, over real HTTP");
+  {
+    const { router } = await import('../server/src/api/routes.js');
+    const app = express();
+    app.use(express.json());
+    app.use('/api', router);
+    server = http.createServer(app);
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const API = `http://127.0.0.1:${server.address().port}`;
+
+    const api = await import('../web/src/api.js');
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (u, o) => realFetch(String(u).startsWith('/') ? `${API}${u}` : u, o);
+    // siteCall THROWS on a non-2xx (that throw is the red box the human photographed), so each call
+    // is captured rather than left to kill the run — a 404 must be a named failure, not a stack.
+    const call = async (fn) => { try { return { ok: true, value: await fn() }; } catch (e) { return { ok: false, error: e.message }; } };
+    try {
+      const read = await call(() => api.getXellEnvironment(dev.id));
+      ok(read.ok, `getXellEnvironment() reaches a route — ${read.ok ? 'answered' : `it threw "${read.error}", which is the red box on the panel`}`);
+      ok(read.ok && 'pinned' in read.value && Array.isArray(read.value.vars),
+         'and answers the resolvedEnvView read model the panel renders (pinned + vars[])');
+
+      const dump = await call(() => api.extractXellEnv(dev.id));
+      ok(dump.ok && typeof dump.value.text === 'string',
+         `extractXellEnv() serves the "view .zeehive.env" button — ${dump.ok ? `${dump.value.source}, ${dump.value.text.length} chars` : dump.error}`);
+
+      // and the WRITE half, which is what the picker's buttons send
+      const pin = await call(() => api.setXellEnvironment(dev.id, staging.id));
+      ok(pin.ok && pin.value.environment_id === staging.id, `setXellEnvironment() pins — ${pin.ok ? 'ok' : pin.error}`);
+      ok(varsIn(envFile()).includes('SHARED_TOKEN'), 'and the file on disk followed the HTTP pin');
+      const clear = await call(() => api.setXellEnvironment(dev.id, null));
+      ok(clear.ok && clear.value.environment_id === null, `and the clear-the-pin button too — ${clear.ok ? 'ok' : clear.error}`);
+    } finally { globalThis.fetch = realFetch; }
+  }
 } finally {
+  if (server) await new Promise((r) => server.close(r));
   await cleanup();
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
   await pool.end().catch(() => {});

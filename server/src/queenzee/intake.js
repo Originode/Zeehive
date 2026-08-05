@@ -12,50 +12,45 @@ import { remoteStart, remoteStartArgs } from '../lib/claude-cli.js';
 import { provisionXell } from '../lib/provision.js';
 import { sessionTitle } from '../lib/session-title.js';
 import { renameXellForTask } from '../lib/rename-xell.js';
+import { claimReadyXell, claimFirstReady } from '../lib/xell-claim.js';
 import { attachXellDb } from '../lib/xell-db.js';
 import { cloneInstanceFor } from '../lib/db-instances.js';
 import { resolveProjectId } from '../lib/project-resolve.js';
 import { dbIdentity } from '../lib/projects.js';
 import { landOne, isAtSourceTip } from './landing.js';
 import { logline } from '../lib/logbus.js';
-import { spawnCreds, assertProviderDispatchable } from '../lib/provider-tokens.js';
-import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName,
-         ensureZeehiveKeypair, openCxellSsh, writeFileIntoCxell, writeFileIntoCxellIfChanged,
+import { spawnCreds, assertProviderDispatchable, dispatchProviderFor,
+         credentialVendorMismatch, everyProviderEnv, allProviderTokenRows,
+         recordXellProviderGrant, scrubSecrets } from '../lib/provider-tokens.js';
+import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName, preppedImageIfPresent,
+         ensureZeehiveKeypair, openCxellSsh, prepareCxellAuth, seedCxellFirstRun,
+         installTurnHooksIntoCxell,
+         writeFileIntoCxell, writeFileIntoCxellIfChanged,
          writeGeneratedDocIntoCxell,
          installZeeCliIntoCxell, installZeeLiveIntoCxell, installZeeAttachIntoCxell } from '../lib/cxell.js';
-import { adapterFor, runtimeKeyForProvider, providerModels } from '../lib/cxell-runtimes.js';
+import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
+         usageFrom } from '../lib/cxell-runtimes.js';
+import { turnStopReason } from '../lib/turn-record.js';
+import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
+import { langfuseClientEnv, postTurnToLangfuse } from '../lib/langfuse.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
 import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harnessBridge, assignHarness, defaultHarnessId,
          resolveHarness, harnessFitsType, typeMismatchReason } from '../lib/harness.js';
+import { resolveDispatchModel, effectiveModelPolicy } from '../lib/model-policy.js';
 import { projectDocFiles } from '../lib/project-docs.js';
 import { bindManagerToProdReadonly, unbindManagerFromProdReadonly } from '../lib/manager-spawn.js';
 import { connectCxellToProdNetwork, roRoleName, PRODRO_MODE } from '../lib/prod-readonly.js';
 import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
+import { noteTurnDeath } from './revive.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 function norm(p) { return String(p || '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase(); }
-
-// Full per-run usage off a final `result` event, for the fleet burn tracker. The event carries
-// total_cost_usd plus a `usage` object; capture ALL of it (was: cost_usd only) so the dashboard
-// can show tokens too. NB: these are the FLEET's own consumption — NOT the account-wide %/limits
-// that only Anthropic's /usage exposes. Tolerant of shape drift: usage may sit on the result or
-// (SDK) alongside total_cost_usd, and any field may be absent → 0. Never throws.
-function usageFrom(result) {
-  const u = result?.usage || {};
-  return {
-    cost: Number(result?.total_cost_usd ?? u.total_cost_usd ?? 0) || 0,
-    input: Number(u.input_tokens || 0) || 0,
-    output: Number(u.output_tokens || 0) || 0,
-    cacheRead: Number(u.cache_read_input_tokens || 0) || 0,
-    cacheWrite: Number(u.cache_creation_input_tokens || 0) || 0,
-  };
-}
 
 // A xell's TYPE, normalized. Deliberately stricter than harness.js's normalizeZeeType (which also
 // admits 'any', a HARNESS-only value): a xell is a manager or it is a worker, and anything
@@ -276,7 +271,13 @@ function saveDispatchImages(worktreePath, images) {
 // per the runtime) to run the task. Human confirms in their session before this is called.
 export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode, session_id, title,
                                      headless = true, model, db, db_container, dump, images, harness,
-                                     provider = 'claude', provider_token_id = null,
+                                     // NULL, not 'claude'. "The caller named no provider" and "the
+                                     // caller asked for claude" are different inputs, and only the
+                                     // first may be resolved from what the project has actually
+                                     // connected (spawnHeadless → decideDispatchProvider). The old
+                                     // default made them indistinguishable — the same mistake, and
+                                     // the same fix, as zee_type two parameters down.
+                                     provider = null, provider_token_id = null,
                                      // A re-dispatch that must KEEP the xell exactly where it is —
                                      // `zee swap` (self.js), which replaces the zee inside a live
                                      // xell. The rename below moves the branch, the worktree folder,
@@ -287,7 +288,20 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
                                      // NULL, not 'worker': "the caller said nothing" and "the caller
                                      // said worker" are different inputs, and the old default made
                                      // them indistinguishable. See the effective-type block below.
-                                     zee_type = null, manager_xell_id = null }) {
+                                     zee_type = null, manager_xell_id = null,
+                                     // PER-XELL VISUAL VERIFICATION (opt-in at dispatch time): the human
+                                     // asked this xell's zee to build the webapp and OFFER the live link
+                                     // in the console. Stored on the xell so the binding and briefing can
+                                     // carry it. NULL, not false, so a re-dispatch that omits the flag
+                                     // leaves whatever the xell already has — a caller says nothing and
+                                     // gets nothing changed, exactly like zee_type above. An explicit
+                                     // true or false always lands.
+                                     visual_verify = null,
+                                     // PER-XELL LANGFUSE TRACKING (default ON): a human (or a manager)
+                                     // turns it off to stop this xell's turns being traced to Langfuse
+                                     // and to keep LANGFUSE_* out of its cage. Same NULL-preserves shape
+                                     // as visual_verify — a re-dispatch that says nothing changes nothing.
+                                     langfuse_tracking = null }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -316,151 +330,200 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
   // An explicit xell_id is authoritative (a human named that xell on purpose — the type block below
   // then does the right thing with it). An UNNAMED worker dispatch must not be handed a ready
   // MANAGER xell by accident: see readyXells.
-  const targetId = xell_id
-    || (await readyXells(projectId, { zeeType: askedType || 'worker' }))[0]?.id
-    || null;
-
-  // ── ONE EFFECTIVE TYPE, resolved BEFORE anything downstream reads it ─────────────────────────
-  // Everything below (the crew stamp, the database branch, the harness branch) is a consequence of
-  // "is this a manager or a worker?", and that question is about the TARGET XELL — not about what a
-  // caller happened to leave unset. The ordinary console dispatch route sends no zee_type at all
-  // (routes.js carries it only in the harness-list query; only POST /api/managers sends one), so
-  // with a `= 'worker'` default every re-dispatch into an existing MANAGER arrived claiming to be a
-  // worker. It then assigned the project's default WORKER harness — which 054's pairing correctly
-  // refused ("harness … is for worker zees, but this xell is a manager zee"), the refusal an
-  // operator hit in the console. Worse where it did NOT refuse: the prod read-only bind was skipped
-  // and the else-branch would have attached a non-prod db, silently taking a manager off production.
   //
-  // So: the explicit parameter when a caller gives one, else the xell's own current type.
-  const targetRow = targetId ? await one(`SELECT zee_type, harness_id, slug FROM xell WHERE id=$1`, [targetId]) : null;
-  const currentType = asZeeType(targetRow?.zee_type);
-  // A bare re-dispatch must never DOWNGRADE a manager, and an explicit one must not half-convert it
-  // (strip it off production, hand it a worker manual, while the DB row still says manager). There
-  // is no downgrade verb in this system, so say so and name the one path that does set a type.
-  if (askedType === 'worker' && currentType === 'manager') {
-    throw new Error(
-      `xell ${targetRow?.slug || targetId} is a MANAGER zee, and this dispatch asked for zee_type='worker'. `
-      + 'Dispatch does not convert a xell\'s type: doing it would strip the manager off production '
-      + 'read-only and hand it a worker manual while its crew, its landgate refusal and its DB row all '
-      + 'still say manager. There is no downgrade verb — a manager is CREATED by a human (POST '
-      + '/api/managers, the console\'s "⬢ + manager zee" button) and ENDED by marking it done. To '
-      + 're-task this manager, dispatch WITHOUT zee_type; to run a worker, dispatch into another xell.');
-  }
-  const effectiveType = askedType || currentType;
-  // A TYPE CHANGE invalidates the harness in the same breath: a harness IS that type's manual, and
-  // 054's trigger fires on the zee_type UPDATE itself — so promoting a xell that already wears a
-  // worker harness would fail at the trigger before the harness branch below could ever fix it.
-  const retyping = !!targetId && effectiveType !== currentType;
-
-  // Now that we know the job, give the worktree a human-trackable name — BEFORE spawning, so the
-  // zee's cwd is the final path and Claude Code's sidebar (which names a worktree by its folder)
-  // shows something findable instead of "calm-summit-403da6". Best-effort: if it can't rename
-  // (already built, name taken), the xell just keeps its pooled slug and the dispatch proceeds.
-  if (targetId && from && rename !== false) await renameXellForTask(targetId, from);
-
-  // ROLE + CREW, stamped BEFORE the zee starts: the honeycomb seats a worker next to its manager and
-  // the briefing tells it who it reports to, so both must be true from the first frame. The DB guard
-  // trigger (052) enforces the shape — one level deep, and a manager reports to nobody.
-  if (targetId && (effectiveType === 'manager' || manager_xell_id || retyping)) {
-    if (effectiveType === 'manager' && manager_xell_id) {
-      // Two different mistakes reach here; say which one it is. Asking for a manager that reports to
-      // a manager is a hierarchy error. INHERITING manager (the target xell already is one) means a
-      // crew dispatch landed on a manager xell — which used to be "fixed" by silently stamping it
-      // worker, i.e. by downgrading a manager off production without telling anybody.
-      throw new Error(askedType === 'manager'
-        ? 'a manager xell cannot itself report to a manager (the hierarchy is one level deep)'
-        : `xell ${targetRow?.slug || targetId} is already a MANAGER zee, so a worker cannot be `
-          + 'dispatched into it — that would downgrade a manager off production read-only. Dispatch '
-          + 'into a different (worker) xell; if the pool is dry, provision one first.');
-    }
-    // TYPE AND HARNESS MOVE IN ONE STATEMENT on a retype. Clearing harness_id first and assigning
-    // the new one afterwards left a window: anything that threw in between (the bind to production
-    // is right there, and it talks to a real cluster) stranded the xell wearing NOTHING — no manual
-    // at all, which is worse than the mismatched one it started with. 054's trigger compares
-    // NEW.harness_id against NEW.zee_type, both from the same row version, so writing them together
-    // is consistent by construction and needs no transaction. The harness branch below re-asserts the
-    // same value, which is a no-op; it stays the single place that OWNS the choice.
-    const retypeHarnessId = retyping ? await harnessIdForType({ projectId, targetId, effectiveType, harness }) : null;
-    await q(`UPDATE xell SET zee_type=$2, manager_xell_id=$3${retyping ? ', harness_id=$4' : ''} WHERE id=$1`,
-      retyping ? [targetId, effectiveType, manager_xell_id || null, retypeHarnessId]
-               : [targetId, effectiveType, manager_xell_id || null]);
-    if (manager_xell_id) {
-      const mgr = await one(`SELECT slug FROM xell WHERE id=$1`, [manager_xell_id]);
-      logline('intake', `dispatched xell reports to manager ${mgr?.slug || manager_xell_id}`);
+  // AND THE PICK IS A CLAIM, not a look (lib/xell-claim.js). A plain SELECT here left the xell
+  // status='ready' through the rename and all the way to the spawn — so the pool's sweep, whose
+  // scan predates this pick, could and did decommission the xell this dispatch was already
+  // renaming (TKT-88-D6B4: five tasks destroyed in three minutes). The conditional UPDATE takes it
+  // out of 'ready' in the same statement that chooses it, so the sweep's guard can no longer find
+  // it. A named xell_id is claimed the same way when it is pooled; when it is already occupied
+  // (a re-dispatch or `zee swap` into a live xell) there is nothing to claim and nothing at risk.
+  const claimed = xell_id ? await claimReadyXell(xell_id)
+    : await claimFirstReady(await readyXells(projectId, { zeeType: askedType || 'worker' }));
+  const targetId = xell_id || claimed?.id || null;
+  if (xell_id && !claimed) {
+    // Not fatal by itself — the xell is very often legitimately claimed already. It IS fatal when
+    // the xell is on its way out, and that is precisely the case a dispatch used to walk into.
+    const state = await one(`SELECT slug, status FROM xell WHERE id=$1`, [xell_id]);
+    if (!state || state.status === 'tearing-down' || state.status === 'retired') {
+      throw new Error(
+        `xell ${state?.slug || xell_id} is ${state?.status || 'gone'} — it is being decommissioned, so `
+        + 'dispatching into it would spawn a zee into a worktree that is about to be deleted. '
+        + 'Dispatch into another xell; the pool will have provisioned a fresh one.');
     }
   }
 
-  // Point the xell at the right database BEFORE the zee starts — a pooled xell comes up on the
-  // shared dev db, so "start from the latest prod dump" or "hotfix against prod" must be attached
-  // now or the zee spends its turn on the wrong data.
-  //
-  // A MANAGER is the one exception: its database is production READ-ONLY, minted for it here (its
-  // own SELECT-only postgres role) and NOT selectable by whoever dispatched it. A manager without a
-  // readable production is half-blind, and a manager that could be handed a writable one would be a
-  // way around the whole point of the role — so this path ignores db/db_container/dump entirely.
-  if (targetId && effectiveType === 'manager') {
-    // SAY IT OUT LOUD when this is a RE-mint. Resolving the type from the target xell means an
-    // ORDINARY console re-task of an existing manager now reaches this bind — and in PRODRO_MODE=real
-    // the bind runs `CREATE/ALTER ROLE … PASSWORD` against the LIVE production database and ROTATES
-    // the DSN, invalidating the one the previous cage was handed. That is the right behaviour (the
-    // re-mint is also what re-applies GRANTs as the schema moves), but per HANDOFF that SQL has never
-    // run against a live prod db, and it must not be something an operator discovers afterwards from
-    // a changed password. So it is announced BEFORE it happens, on the queenzee log the console
-    // renders, naming the role. No gate is added here — gating a production write is a policy call
-    // for a human, not something this path should decide on its own.
-    if (!retyping) {
-      const prior = await one(`SELECT slug, prod_ro_dsn FROM xell WHERE id=$1`, [targetId]);
-      if (prior?.prod_ro_dsn) {
-        logline('prod-ro', `RE-DISPATCH into the existing manager ${prior.slug}: about to RE-MINT its `
-          + `production reader ${roRoleName(prior.slug)}${PRODRO_MODE === 'real'
-            ? ' — this runs CREATE/ALTER ROLE on the LIVE production database and ROTATES its password,'
-              + ' so the DSN the previous cage held stops working'
-            : ' (PRODRO_MODE=simulate — nothing runs on production)'}`);
-      }
-    }
-    await bindManagerToProdReadonly(targetId);
-  } else if (targetId && (db || db_container || dump)) {
-    await attachXellDb(targetId, { coupling: db, container: db_container, dump });
-  }
-
-  // Assign the harness BEFORE the zee starts, so its persona/skills are in the very first briefing.
-  // Explicit --harness wins; otherwise a pooled xell with no harness inherits the project default
-  // (pool_config.default_harness_id), exactly like the runtime/db-coupling defaults.
-  //
-  // A harness is scoped to a zee TYPE (054): it carries that type's manual, so only a harness of the
-  // xell's own type is assignable. assignHarness refuses a mismatch with an explanation, and a
-  // dispatch must fail on that rather than start a zee wearing the wrong manual — a manager briefed
-  // as a worker would spend its turn reaching for `zee land`, which it is refused.
-  if (targetId) {
-    if (effectiveType === 'manager') {
-      // A manager wears a MANAGER harness — its own manual (dispatch/say/inbox/suggest-done, and the
-      // loophole rule). An explicit --harness still wins for an operator who authored their own
-      // manager persona; a WORKER harness named here is refused by assignHarness, by type.
-      await assignHarness(targetId, harness || 'manager');
-    } else if (harness !== undefined) {
-      await assignHarness(targetId, harness);
-    } else {
-      const cur = await one(`SELECT harness_id FROM xell WHERE id=$1`, [targetId]);
-      if (!cur?.harness_id) {
-        const def = await defaultHarnessId(projectId, { zeeType: effectiveType });
-        if (def) await assignHarness(targetId, def);
-      }
-    }
-  }
-
-  // Pasted images: save them into the (possibly just-renamed) target worktree and append a
-  // reference block so the zee is handed PATHS to Read, not a base64 blob in its prompt. Done
-  // AFTER the rename above, which moves the worktree folder — so we re-read the current path.
+  // EVERY STEP FROM HERE TO THE SPAWN RUNS ON A XELL THIS CALL HAS CLAIMED, and any of them can
+  // throw (a manager/worker type refusal, a harness the policy will not pair, a database attach, a
+  // prod read-only mint). Before the claim existed those failures left the xell exactly as they
+  // found it — ready, back in the pool. It must still end that way, or a refused dispatch leaks a
+  // pooled xell that nothing ever frees: the pool reconciler only looks at ready xells, and the
+  // monitor’s stale-claim reporter only looks at claims that HAD a zee (queenzee/monitor.js).
+  // (effectiveType and taskText are declared out here because the spawn below reads them.)
+  let effectiveType = null;
   let taskText = task;
-  if (targetId && Array.isArray(images) && images.length) {
-    const wt = (await one(`SELECT worktree_path FROM xell WHERE id=$1`, [targetId]))?.worktree_path;
-    const saved = saveDispatchImages(wt, images);
-    if (saved.length) {
-      taskText += `\n\n## Attached images\n`
-        + `The human pasted ${saved.length} image(s) into this prompt. They are saved in your `
-        + `worktree — open and read them (paths are relative to your worktree root):\n`
-        + saved.map((p) => `- ${p}`).join('\n');
+  try {
+    // ── ONE EFFECTIVE TYPE, resolved BEFORE anything downstream reads it ─────────────────────────
+    // Everything below (the crew stamp, the database branch, the harness branch) is a consequence of
+    // "is this a manager or a worker?", and that question is about the TARGET XELL — not about what a
+    // caller happened to leave unset. The ordinary console dispatch route sends no zee_type at all
+    // (routes.js carries it only in the harness-list query; only POST /api/managers sends one), so
+    // with a `= 'worker'` default every re-dispatch into an existing MANAGER arrived claiming to be a
+    // worker. It then assigned the project's default WORKER harness — which 054's pairing correctly
+    // refused ("harness … is for worker zees, but this xell is a manager zee"), the refusal an
+    // operator hit in the console. Worse where it did NOT refuse: the prod read-only bind was skipped
+    // and the else-branch would have attached a non-prod db, silently taking a manager off production.
+    //
+    // So: the explicit parameter when a caller gives one, else the xell's own current type.
+    const targetRow = targetId ? await one(`SELECT zee_type, harness_id, slug FROM xell WHERE id=$1`, [targetId]) : null;
+    const currentType = asZeeType(targetRow?.zee_type);
+    // A bare re-dispatch must never DOWNGRADE a manager, and an explicit one must not half-convert it
+    // (strip it off production, hand it a worker manual, while the DB row still says manager). There
+    // is no downgrade verb in this system, so say so and name the one path that does set a type.
+    if (askedType === 'worker' && currentType === 'manager') {
+      throw new Error(
+        `xell ${targetRow?.slug || targetId} is a MANAGER zee, and this dispatch asked for zee_type='worker'. `
+        + 'Dispatch does not convert a xell\'s type: doing it would strip the manager off production '
+        + 'read-only and hand it a worker manual while its crew, its landgate refusal and its DB row all '
+        + 'still say manager. There is no downgrade verb — a manager is CREATED by a human (POST '
+        + '/api/managers, the console\'s "⬢ + manager zee" button) and ENDED by marking it done. To '
+        + 're-task this manager, dispatch WITHOUT zee_type; to run a worker, dispatch into another xell.');
     }
+    effectiveType = askedType || currentType;
+    // A TYPE CHANGE invalidates the harness in the same breath: a harness IS that type's manual, and
+    // 054's trigger fires on the zee_type UPDATE itself — so promoting a xell that already wears a
+    // worker harness would fail at the trigger before the harness branch below could ever fix it.
+    const retyping = !!targetId && effectiveType !== currentType;
+
+    // Now that we know the job, give the worktree a human-trackable name — BEFORE spawning, so the
+    // zee's cwd is the final path and Claude Code's sidebar (which names a worktree by its folder)
+    // shows something findable instead of "calm-summit-403da6". Best-effort: if it can't rename
+    // (already built, name taken), the xell just keeps its pooled slug and the dispatch proceeds.
+    if (targetId && from && rename !== false) await renameXellForTask(targetId, from);
+
+    // ROLE + CREW, stamped BEFORE the zee starts: the honeycomb seats a worker next to its manager and
+    // the briefing tells it who it reports to, so both must be true from the first frame. The DB guard
+    // trigger (052) enforces the shape — one level deep, and a manager reports to nobody.
+    if (targetId && (effectiveType === 'manager' || manager_xell_id || retyping)) {
+      if (effectiveType === 'manager' && manager_xell_id) {
+        // Two different mistakes reach here; say which one it is. Asking for a manager that reports to
+        // a manager is a hierarchy error. INHERITING manager (the target xell already is one) means a
+        // crew dispatch landed on a manager xell — which used to be "fixed" by silently stamping it
+        // worker, i.e. by downgrading a manager off production without telling anybody.
+        throw new Error(askedType === 'manager'
+          ? 'a manager xell cannot itself report to a manager (the hierarchy is one level deep)'
+          : `xell ${targetRow?.slug || targetId} is already a MANAGER zee, so a worker cannot be `
+            + 'dispatched into it — that would downgrade a manager off production read-only. Dispatch '
+            + 'into a different (worker) xell; if the pool is dry, provision one first.');
+      }
+      // TYPE AND HARNESS MOVE IN ONE STATEMENT on a retype. Clearing harness_id first and assigning
+      // the new one afterwards left a window: anything that threw in between (the bind to production
+      // is right there, and it talks to a real cluster) stranded the xell wearing NOTHING — no manual
+      // at all, which is worse than the mismatched one it started with. 054's trigger compares
+      // NEW.harness_id against NEW.zee_type, both from the same row version, so writing them together
+      // is consistent by construction and needs no transaction. The harness branch below re-asserts the
+      // same value, which is a no-op; it stays the single place that OWNS the choice.
+      const retypeHarnessId = retyping ? await harnessIdForType({ projectId, targetId, effectiveType, harness }) : null;
+      await q(`UPDATE xell SET zee_type=$2, manager_xell_id=$3${retyping ? ', harness_id=$4' : ''} WHERE id=$1`,
+        retyping ? [targetId, effectiveType, manager_xell_id || null, retypeHarnessId]
+                 : [targetId, effectiveType, manager_xell_id || null]);
+      if (manager_xell_id) {
+        const mgr = await one(`SELECT slug FROM xell WHERE id=$1`, [manager_xell_id]);
+        logline('intake', `dispatched xell reports to manager ${mgr?.slug || manager_xell_id}`);
+      }
+    }
+
+    // PER-XELL VISUAL VERIFICATION: store the opt-in on the xell BEFORE the spawn, so the binding and
+    // briefing the zee is handed read it. Only written when the caller actually says something — a
+    // plain re-dispatch into an existing xell must not silently reset a flag a human set earlier.
+    if (targetId && visual_verify !== null) {
+      await q(`UPDATE xell SET visual_verify=$2 WHERE id=$1`, [targetId, !!visual_verify]);
+    }
+
+    // PER-XELL LANGFUSE TRACKING: store the switch on the xell BEFORE the spawn, so spawnCxell reads it
+    // when deciding whether to inject LANGFUSE_* (and postTurnToLangfuse skips its turns). Same
+    // NULL-preserves shape as visual_verify above.
+    if (targetId && langfuse_tracking !== null) {
+      await q(`UPDATE xell SET langfuse_tracking=$2 WHERE id=$1`, [targetId, !!langfuse_tracking]);
+    }
+
+    // Point the xell at the right database BEFORE the zee starts — a pooled xell comes up on the
+    // shared dev db, so "start from the latest prod dump" or "hotfix against prod" must be attached
+    // now or the zee spends its turn on the wrong data.
+    //
+    // A MANAGER is the one exception: its database is production READ-ONLY, minted for it here (its
+    // own SELECT-only postgres role) and NOT selectable by whoever dispatched it. A manager without a
+    // readable production is half-blind, and a manager that could be handed a writable one would be a
+    // way around the whole point of the role — so this path ignores db/db_container/dump entirely.
+    if (targetId && effectiveType === 'manager') {
+      // SAY IT OUT LOUD when this is a RE-mint. Resolving the type from the target xell means an
+      // ORDINARY console re-task of an existing manager now reaches this bind — and in PRODRO_MODE=real
+      // the bind runs `CREATE/ALTER ROLE … PASSWORD` against the LIVE production database and ROTATES
+      // the DSN, invalidating the one the previous cage was handed. That is the right behaviour (the
+      // re-mint is also what re-applies GRANTs as the schema moves), but per HANDOFF that SQL has never
+      // run against a live prod db, and it must not be something an operator discovers afterwards from
+      // a changed password. So it is announced BEFORE it happens, on the queenzee log the console
+      // renders, naming the role. No gate is added here — gating a production write is a policy call
+      // for a human, not something this path should decide on its own.
+      if (!retyping) {
+        const prior = await one(`SELECT slug, prod_ro_dsn FROM xell WHERE id=$1`, [targetId]);
+        if (prior?.prod_ro_dsn) {
+          logline('prod-ro', `RE-DISPATCH into the existing manager ${prior.slug}: about to RE-MINT its `
+            + `production reader ${roRoleName(prior.slug)}${PRODRO_MODE === 'real'
+              ? ' — this runs CREATE/ALTER ROLE on the LIVE production database and ROTATES its password,'
+                + ' so the DSN the previous cage held stops working'
+              : ' (PRODRO_MODE=simulate — nothing runs on production)'}`);
+        }
+      }
+      await bindManagerToProdReadonly(targetId);
+    } else if (targetId && (db || db_container || dump)) {
+      await attachXellDb(targetId, { coupling: db, container: db_container, dump });
+    }
+
+    // Assign the harness BEFORE the zee starts, so its persona/skills are in the very first briefing.
+    // Explicit --harness wins; otherwise a pooled xell with no harness inherits the project default
+    // (pool_config.default_harness_id), exactly like the runtime/db-coupling defaults.
+    //
+    // A harness is scoped to a zee TYPE (054): it carries that type's manual, so only a harness of the
+    // xell's own type is assignable. assignHarness refuses a mismatch with an explanation, and a
+    // dispatch must fail on that rather than start a zee wearing the wrong manual — a manager briefed
+    // as a worker would spend its turn reaching for `zee land`, which it is refused.
+    if (targetId) {
+      if (effectiveType === 'manager') {
+        // A manager wears a MANAGER harness — its own manual (dispatch/say/inbox/suggest-done, and the
+        // loophole rule). An explicit --harness still wins for an operator who authored their own
+        // manager persona; a WORKER harness named here is refused by assignHarness, by type.
+        await assignHarness(targetId, harness || 'manager');
+      } else if (harness !== undefined) {
+        await assignHarness(targetId, harness);
+      } else {
+        const cur = await one(`SELECT harness_id FROM xell WHERE id=$1`, [targetId]);
+        if (!cur?.harness_id) {
+          const def = await defaultHarnessId(projectId, { zeeType: effectiveType });
+          if (def) await assignHarness(targetId, def);
+        }
+      }
+    }
+
+    // Pasted images: save them into the (possibly just-renamed) target worktree and append a
+    // reference block so the zee is handed PATHS to Read, not a base64 blob in its prompt. Done
+    // AFTER the rename above, which moves the worktree folder — so we re-read the current path.
+    if (targetId && Array.isArray(images) && images.length) {
+      const wt = (await one(`SELECT worktree_path FROM xell WHERE id=$1`, [targetId]))?.worktree_path;
+      const saved = saveDispatchImages(wt, images);
+      if (saved.length) {
+        taskText += `\n\n## Attached images\n`
+          + `The human pasted ${saved.length} image(s) into this prompt. They are saved in your `
+          + `worktree — open and read them (paths are relative to your worktree root):\n`
+          + saved.map((p) => `- ${p}`).join('\n');
+      }
+    }
+
+  } catch (err) {
+    // The claim is this call's, so releasing it is this call's job too. Conditional on
+    // status='claimed' (releaseXell), so it can never repool a xell somebody else has moved on.
+    if (claimed) await releaseUnstartedClaim(claimed.id);
+    throw err;
   }
 
   // The prod read-only bind above is the only step of this dispatch that writes to a REAL cluster,
@@ -483,6 +546,10 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
     if (targetId && effectiveType === 'manager') {
       await unbindManagerFromProdReadonly(targetId, `the dispatch failed before the zee started: ${err.message}`);
     }
+    // …and the CLAIM goes back the same way, for the same reason: the spawn can throw on its way up
+    // (a paused fleet, no connected provider account, a model the harness policy forbids) before any
+    // zee row exists, and this call is what took the xell out of the pool.
+    if (claimed) await releaseUnstartedClaim(claimed.id);
     throw err;
   }
   const xell = await one(`SELECT slug, worktree_path FROM xell WHERE id=$1`, [spawned.xell_id]);
@@ -508,11 +575,13 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
 }
 
 // The JSON the /xell skill inlines so the Claude session becomes this xell's zee.
-async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
+// Exported as a test seam: the visual-verify test asserts the binding carries the per-xell
+// visual_verify field and prose ONLY when the flag is on.
+export async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
   const xell = await one(`SELECT x.*, xo.ref AS xource_ref FROM xell x JOIN xource xo ON xo.id=x.xource_id WHERE x.id=$1`, [xellId]);
   const dbid = await dbIdentity(xell.project_id);
   const rows = await q(
-    `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, c.docker_ctx, host(c.host) AS host,
+    `SELECT c.role, c.name, c.url, c.tier, c.conn_ref, c.docker_ctx, c.host AS host,
             c.host_port, uc.relation
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xellId]);
@@ -665,6 +734,8 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
       id: xell.id, slug: xell.slug, branch: xell.branch, worktree_path: xell.worktree_path,
       source: xell.xource_ref, source_coupling: xell.source_coupling, db_coupling: xell.db_coupling,
       ...(clone ? { clone_db_name: clone } : {}),
+      // PER-XELL VISUAL VERIFICATION — present only when ON, so false xells get no binding diff.
+      ...(xell.visual_verify ? { visual_verify: true } : {}),
     },
     zee: { id: zee.id, name: zee.name, viewer_url: zee.viewer_url },
     containers: stack,
@@ -729,6 +800,20 @@ async function bindingFor(xellId, zee, task, { cxell = false } = {}) {
          + 'schema changes, write them as files under server/sql/migrations/ — the queenzee detects '
          + 'those on your branch and auto-attaches your own clone database (watch for the db-clone '
          + 'switch, then rebuild your app tier so it picks up its own DATABASE_URL).']
+        : []),
+      // PER-XELL VISUAL VERIFICATION (a human turned it on at dispatch time): the zee builds the
+      // webapp and OFFERS the live link to a human in the console. An offer, not a gate — no
+      // approve/reject, no prod, no land/ship; a human opens the link or dismisses it.
+      ...(xell.visual_verify
+        ? [cxell
+            ? 'VISUAL VERIFICATION is ON for this xell: build the webapp with `zee build webapp --wait`, '
+              + 'then call `zee verify-webapp` to offer the live link to a human in the console (Open link '
+              + '/ dismiss). It is an OFFER only — nothing is landed or shipped to do this, and nothing is '
+              + 'irreversible.'
+            : 'VISUAL VERIFICATION is ON for this xell: build the webapp (see `build.webapp`), then offer '
+              + 'the live link to a human in the console (ask the queenzee: POST /api/xell/self/'
+              + 'verify-webapp). It is an OFFER only — nothing is landed or shipped to do this, and '
+              + 'nothing is irreversible.']
         : []),
       'VERIFY YOUR WORK IN THIS XELL — you already have everything you need. The containers listed '
       + 'above are YOURS: your own server, webapp and database, isolated from prod and from every '
@@ -1042,7 +1127,7 @@ export function listDispatchModels(provider = 'claude') {
 // and it defaults to 'worker' because every caller that reaches here without a xell (a queued task
 // in tasks.js, a dispatch whose pool was dry) is spawning a worker. Without it the dispatch path's
 // type-aware pick would be undone one function later by an unfiltered "take the freshest ready".
-export async function spawnHeadless({ projectId, xellId, task, runtime, model = DEFAULT_ZEE_MODEL, mode, title, headless = true, provider = 'claude', providerTokenId = null, zeeType = 'worker' }) {
+export async function spawnHeadless({ projectId, xellId, task, runtime, model = null, mode, title, headless = true, provider = null, providerTokenId = null, zeeType = 'worker' }) {
   // THE FLEET PAUSE stops turns from STARTING as well as from continuing. Every spawn path funnels
   // through here — the console's prompt buttons, a manager dispatching a worker, an MCP dispatch — so
   // this one check is what makes "paused" mean the fleet is still, rather than "the zees that existed
@@ -1055,13 +1140,20 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   // PROVIDER PAUSE: no dispatch on a paused provider, whatever surface asked for it. This is the
   // pre-flight that also catches runtimes which never read a meta-DB token (claude-code-remote,
   // the host SDK); the cxell path re-checks the exact account in spawnCreds → tokenForSpawn.
-  await assertProviderDispatchable(pid, provider, { tokenId: providerTokenId });
+  // Only for a provider the CALLER NAMED — a bare dispatch has not chosen one yet, and the same
+  // gate runs again on whatever the resolution picks (below), so nothing is skipped by waiting.
+  if (String(provider || '').trim()) await assertProviderDispatchable(pid, provider, { tokenId: providerTokenId });
   const xell = xellId
     ? await one(`SELECT * FROM xell WHERE id=$1`, [xellId])
     // No xell named → take the freshest ready one OF THE RIGHT TYPE. (readyXellForCwd matches a
     // caller's cwd to a worktree and takes the ready ARRAY — passing projectId here silently matched
     // nothing, so every dispatch without an explicit xell_id died with "no ready xell available".)
-    : (await readyXells(pid, { zeeType }))[0];
+    //
+    // CLAIMED, not looked at (lib/xell-claim.js). This is the same pick dispatchXell makes, reached
+    // by the callers that have no xell in hand — the task poller (queenzee/tasks.js) and a dispatch
+    // whose pool was dry a moment ago — so it races the pool sweep in exactly the same way, and is
+    // taken out of 'ready' the same way. The status write further down then only re-asserts it.
+    : await claimFirstReady(await readyXells(pid, { zeeType }));
   if (!xell) throw new Error('no ready xell available for headless spawn');
   if (!task) throw new Error('task (prompt) required for headless spawn');
 
@@ -1098,22 +1190,107 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
     }
   } catch (e) { logline('intake', `device auto-attach check failed for ${xell.slug}: ${e.message}`); }
 
+  // THE PROVIDER A BARE DISPATCH RUNS ON — resolved BEFORE the model policy, because the policy is
+  // asked "is this model allowed on this provider?" and a provider nobody chose would make that
+  // question meaningless. Every entry point used to hardcode 'claude' in its signature, so a project
+  // whose only connected account is Codex or Kimi failed a bare dispatch with "project has no claude
+  // token" — naming a vendor the human had deliberately not connected (lib/provider-tokens.js
+  // decideDispatchProvider carries the rule and the reasons).
+  //
+  // The CONFIGURED runtime has to be resolved first: `claude-code-remote` and the local SDK
+  // authenticate from the host's own claude session and read no meta-DB token, so a project with no
+  // claude ACCOUNT must not be moved off them onto another vendor's CLI. cfgRow is read here and
+  // reused below — the resolution further down is unchanged.
+  //
+  // It is the CONFIGURED runtime, not "the claude runtime" — which is what this variable was named
+  // for until 2026-08-03. The caller's `runtime` and pool_config.default_runtime_id can BOTH name
+  // another vendor's cxell runtime (this project's pool default was deepseek-cxell), and reading it
+  // as claude's is exactly what let a claude credential travel to the DeepSeek CLI — see the
+  // pairing below.
   const cfgRow = await one(`SELECT default_runtime_id FROM pool_config WHERE project_id=$1`, [pid]);
-  // A NON-CLAUDE provider picks its runtime by itself: an OpenAI key runs the Codex CLI, a Kimi
-  // key the Kimi Code CLI — the pool default and the runtime toggle are claude-world knobs that
-  // must not aim another vendor's credential at the claude CLI (or the host SDK).
-  const providerRtKey = runtimeKeyForProvider(provider);
-  if (providerRtKey) {
-    const rt = await runtimeByKey(providerRtKey);
-    if (!rt) throw new Error(`runtime ${providerRtKey} for provider "${provider}" is not in agent_runtime — run migrations`);
-    return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
+  const configuredRt = (runtime ? await runtimeByKey(runtime) : await runtimeById(cfgRow?.default_runtime_id))
+    || await runtimeByKey('claude-code-cxell');
+  const harnessRow = await harnessForXell(xell.id);
+  const providerNamed = !!String(provider || '').trim() || !!providerTokenId;
+  let policy = null;
+  if (!String(provider || '').trim()) {
+    policy = await effectiveModelPolicy(harnessRow).catch(() => null);
+    const picked = await dispatchProviderFor(pid, {
+      tokenId: providerTokenId,
+      claudeNeedsNoToken: configuredRt?.key === 'claude-code-remote' || configuredRt?.driver !== 'cxell-cli',
+      allowProviders: policy?.allow_providers || [],
+    });
+    provider = picked.provider;
+    if (picked.reason !== 'fallback' && picked.reason !== 'claude-account') {
+      logline('intake', `${xell.slug}: no provider named — dispatching on "${provider}" (${picked.reason})`);
+    }
+    // The pause gate ran above on the provider the CALLER named; re-run it on the one we just chose,
+    // or a resolved-to provider could route around a pause the named one obeyed.
+    await assertProviderDispatchable(pid, provider);
   }
+
+  // PROVIDER, RUNTIME AND CREDENTIAL MUST NAME THE SAME VENDOR. The three were decided separately
+  // and never compared: the credential is read for `provider` (spawnCxell → spawnCreds) but injected
+  // by the RUNTIME's adapter, so a claude token reached the DeepSeek CLI as ANTHROPIC_AUTH_TOKEN
+  // against api.deepseek.com and the vendor's "your api key … is invalid" blamed a healthy account.
+  // decideRuntimePairing (lib/cxell-runtimes.js) settles it, HERE — before the model policy, which is
+  // asked about this exact provider. A mismatch is never started silently: either the runtime's own
+  // provider wins and its credential is used, or the dispatch is refused with the sentence.
+  const pair = decideRuntimePairing({
+    provider, providerNamed,
+    runtimeKey: configuredRt?.key || null,
+    runtimeNamed: !!runtime,
+    runtimeIsCaged: configuredRt?.driver === 'cxell-cli',
+    allowProviders: policy?.allow_providers || [],
+  });
+  if (!pair.ok) throw new Error(pair.refuse);
+  if (pair.provider !== provider) {
+    logline('intake', `${xell.slug}: runtime "${pair.runtimeKey}" runs ${pair.provider} — dispatching on the `
+      + `${pair.provider} account instead of the inferred "${provider}" (a ${provider} credential cannot authenticate it)`);
+    provider = pair.provider;
+    // Same reason the resolution above re-checks: a provider the RUNTIME decided must obey the pause
+    // gate too, or a paused account is routed around by a pool default.
+    await assertProviderDispatchable(pid, provider);
+  }
+
+  // THE MODEL A ZEE RUNS — resolved against the harness's model policy (migration 110).
+  // A harness wears restriction knobs (allow_providers/allow_models, context/parameter bounds,
+  // deployment priorities, default_model), and dispatch MUST respect them: an explicit model a
+  // policy forbids is refused here — running a zee on a model its persona does not allow is the
+  // same class of bug as briefing it with the wrong manual — and a bare dispatch resolves to the
+  // highest-priority allowed model. resolveDispatchModel throws the sentence when a restriction
+  // is hit; with no harness and no policy it is a pass-through of the caller's model/default.
+  try {
+    const resolved = await resolveDispatchModel({
+      harnessRow,
+      provider,
+      requestedModel: model,   // null/'' = "no explicit model" → the policy (or fallback) decides
+      fallbackModel: DEFAULT_ZEE_MODEL,
+    });
+    model = resolved.model;
+  } catch (e) {
+    // A policy refusal before anything is claimed — the xell is still 'ready', so there is
+    // nothing to release; the error reaches the caller with the harness's sentence attached.
+    throw new Error(e.message);
+  }
+  logline('intake', `${xell.slug}: model policy resolved → "${model}" on provider "${provider}" (harness: ${harnessRow?.key || 'core'})`);
+
+  // THE RUNTIME THE PAIRING SETTLED ON. A non-claude provider picks its runtime by itself (an OpenAI
+  // key runs the Codex CLI, a Kimi key the Kimi Code CLI — the pool default and the runtime toggle
+  // are claude-world knobs that must not aim another vendor's credential at the claude CLI or the
+  // host SDK); anything else keeps the configured runtime, which the pairing has already agreed with.
+  //
   // CXELLD BY DESIGN: a xell is structurally confined unless a human EXPLICITLY opts out. So when no
   // runtime is named and the pool has no (or an unresolvable) default, the fallback is cxell — never
   // the uncxell local SDK. Running local is a deliberate choice (runtime='claude-code-local'), not
   // something a missing/misconfigured default can silently land a zee on with full host access.
-  const rt = (runtime ? await runtimeByKey(runtime) : await runtimeById(cfgRow?.default_runtime_id))
-    || await runtimeByKey('claude-code-cxell');
+  const rt = pair.runtimeKey === configuredRt?.key ? configuredRt : await runtimeByKey(pair.runtimeKey);
+  if (!rt) throw new Error(`runtime ${pair.runtimeKey} for provider "${provider}" is not in agent_runtime — run migrations`);
+  // A vendor-owned runtime (codex/kimi/deepseek — migrations 034/037) is always caged and goes
+  // straight to the cage, exactly as before: the claude-side branches below are claude's alone.
+  if (pair.reason === 'provider-runtime') {
+    return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
+  }
 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
   if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });
@@ -1172,7 +1349,7 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   } catch (err) {
     LIVE_QUERIES.delete(zee.id);
     const reason = `headless spawn failed: ${err.message}`;
-    const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
+    const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, scrubSecrets(reason).slice(0, 200)]);
     broadcast('zee', dead);
     await releaseXell(xell.id);
     return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
@@ -1207,6 +1384,7 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 
   // drive the REST of the stream in the background — do NOT block the caller
   (async () => {
+    let sawResult = false;
     try {
       for (let n = await iter.next(); !n.done; n = await iter.next()) {
         const msg = n.value;
@@ -1220,17 +1398,40 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
         }
         if (msg?.type === 'result') {
           // Persist full usage for the fleet burn tracker (was cost_usd only). Best-effort on the
-          // SDK path: if the result exposes `usage`, tokens land too; otherwise they stay 0.
+          // SDK path: if the result exposes `usage`, tokens land too. A result with NEITHER usage
+          // nor total_cost_usd is UNMETERED — the turn ran and the fleet cannot know what it cost,
+          // so the row records the marker instead of a silent zero (TKT-99-1390).
+          sawResult = true;
           const b = usageFrom(msg);
-          await q(
-            `UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
-                            cache_read_tokens=$5, cache_write_tokens=$6,
-                            status='idle', last_stop_reason='end_turn' WHERE id=$1`,
-            [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite]);
+          const stop = turnStopReason('end_turn', b.metered);
+          if (b.metered) {
+            await q(
+              `UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                              cache_read_tokens=$5, cache_write_tokens=$6,
+                              status='idle', last_stop_reason=$7 WHERE id=$1`,
+              [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, stop]);
+          } else {
+            // Unmetered: do NOT overwrite the burn columns with zeros — that would claim a measured
+            // zero. Only the marker and the idle transition are written.
+            await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, stop]);
+          }
+          // LANGFUSE: record the finished turn as a trace (best-effort, never blocks the completion).
+          await postTurnToLangfuse({
+            xell, zee, sessionId: sid, model, result: msg,
+            startTime: zee.attached_at || new Date(), endTime: new Date(),
+          });
         }
       }
+      // A stream that ENDED without ever producing a result event is still a turn that ran and
+      // stopped — it must not leave the zee 'working' with last_stop_reason NULL (the exact row
+      // that reads as "never ran" even though it commented/messaged/committed). Book an honest
+      // unmetered end so the row reflects reality.
+      if (!sawResult) {
+        await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`,
+                [zee.id, turnStopReason('end_turn', false)]);
+      }
     } catch (err) {
-      await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, String(err.message).slice(0, 200)]);
+      await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
     } finally {
       LIVE_QUERIES.delete(zee.id); // stream over → no live control channel to hand out
     }
@@ -1240,10 +1441,13 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
            mode: m.key, permission_mode: m.permissionMode };
 }
 
-// CXELLD spawn — the zee's claude CLI runs INSIDE a per-xell zee-agent container. This is the
-// runtime that makes confinement STRUCTURAL instead of prompted: the cxell sees a private clone
-// of the xell's branch, a default-DROP egress firewall (api.anthropic.com + the queenzee API +
-// its own stack's host:ports), no docker socket, no host filesystem. Because the walls are
+// CXELLD spawn — the zee's own vendor CLI (claude, codex, kimi — whichever the dispatched
+// PROVIDER resolves to, see lib/cxell-runtimes.js) runs INSIDE a per-xell zee-agent container.
+// The cage is provider-agnostic by construction: the image carries every CLI, nothing about a
+// vendor is baked into it, and the credential arrives with the dispatch. This is the runtime that
+// makes confinement STRUCTURAL instead of prompted: the cxell sees a private clone of the xell's
+// branch, an egress policy that drops the fleet's prod databases, no docker socket, no host
+// filesystem. Because the walls are
 // real, the CLI always runs bypassPermissions inside — the cxell IS the permission system, so
 // the dispatch mode's tool ladder is irrelevant here (there is nothing outside to protect).
 //
@@ -1259,7 +1463,18 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // container. providerTokenId pins the exact ACCOUNT whose button the human clicked (a
   // project can hold several of one type since 036); a CLI dispatch without one gets the
   // freshest account of the type.
-  const { token, baseUrl, accountLabel } = await spawnCreds(pid, provider, { tokenId: providerTokenId });
+  const { token, baseUrl, accountLabel, tokenId } = await spawnCreds(pid, provider, { tokenId: providerTokenId });
+  // …and the credential must match the CLI that is about to run it. The pairing above settles the
+  // DECISION (which provider/runtime/account this dispatch is), this is the FACT about the token
+  // itself — the two are not the same check, and only the fact caught the cage that was handed a
+  // claude key for api.deepseek.com. Refused HERE, before the xell is claimed or a container built,
+  // so nothing is spent on a turn the vendor will answer with "your api key is invalid" while
+  // naming the wrong account (lib/provider-tokens.js credentialVendorMismatch).
+  const wrongVendor = credentialVendorMismatch({ provider, token });
+  if (wrongVendor) {
+    throw new Error(`this dispatch would run the ${adapter.bin} CLI (${adapter.provider}) with a `
+      + `${wrongVendor.from} credential — ${wrongVendor.sentence}`);
+  }
   if (accountLabel) logline('intake', `dispatching on the "${accountLabel}" ${provider} account`);
 
   // Egress policy (simplified 2026-07-19): the container is the confinement boundary — a cxell
@@ -1279,7 +1494,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // joined to that network — the row belongs in blockTcp for every project except its own
   // prod-bound one, and this query must stop filtering on host/host_port to find it.
   const prodDbs = await q(
-    `SELECT DISTINCT host(c.host) AS host, c.host_port, c.project_id FROM container c
+    `SELECT DISTINCT c.host AS host, c.host_port, c.project_id FROM container c
       WHERE c.tier='prod' AND c.role='db' AND c.host IS NOT NULL AND c.host_port IS NOT NULL`);
   // A manager holds prod READ-ONLY ('db-prod-readonly') — it must reach the prod db host:port too,
   // or the SELECT-only role it was given is unusable and the whole binding is theatre.
@@ -1288,13 +1503,25 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     .filter((r) => !(prodBound && r.project_id === xell.project_id))
     .map((r) => `${r.host}:${r.host_port}`);
 
+  // RECORD THE MODEL THE CAGE WILL ACTUALLY RUN. A claude alias means nothing to a non-claude CLI,
+  // so the adapter drops it and runs the vendor's own — which left production holding deepseek-cxell
+  // zees recorded as `opus` (the manager harness's default_model): the console showed a model that
+  // never ran, the cost-per-model telemetry summed DeepSeek spend under claude's name, and the
+  // resume path fed that same string back. effectiveModelFor answers only for the vendors whose
+  // default is KNOWABLE (deepseek, kimi — codex's own routing is not ours to invent), and the ASK is
+  // kept in the log line so nothing about the human's choice is lost.
+  const ranModel = effectiveModelFor(adapter, model) || model;
+  if (ranModel !== model) {
+    logline('intake', `${xell.slug}: model "${model}" means nothing to the ${adapter.bin} CLI — this cage `
+      + `runs "${ranModel}", and that is what the zee is recorded as running`);
+  }
   const zeeTitle = title || `xell : ${xell.slug}`;
   const zee = await one(
     `INSERT INTO zee (xell_id, attach_mode, runtime_id, viewer_kind, status, kind, entrypoint,
                       model, permission_mode, cwd, title)
      VALUES ($1,'headless-spawn',$2,'none','spawning','headless','cxell-cli',$3,'bypassPermissions',$4,$5)
      RETURNING *`,
-    [xell.id, rt?.id || null, model, '/work/repo', zeeTitle]);
+    [xell.id, rt?.id || null, ranModel, '/work/repo', zeeTitle]);
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
   logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
@@ -1316,9 +1543,66 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // the skill-file materialization below and the "your skills come from your harness" line.
   const harnessRow = await harnessForXell(xell.id);
   const harness = harnessRow ? await effectiveHarness(harnessRow) : null;
+  // LANGFUSE: when the global observability plugin is enabled, every cxell zee is injected with
+  // LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL so anything in the cage can
+  // speak the instance (a manager's curl to the public API, worker instrumentation). Merged into
+  // the SAME agentEnv both openCxellSsh (/etc/environment for SSH logins) and runZee (-e for the
+  // headless CLI) read, so it reaches the headless run and an attending human's shell alike.
+  // PER-XELL SWITCH: when langfuse_tracking is OFF, no LANGFUSE_* is injected at all (the flag is
+  // default ON; a false here means the human/manager opted this xell out). Best-effort — never
+  // sinks a spawn.
+  const lfEnv = await langfuseClientEnv(xell.project_id, { tracking: xell.langfuse_tracking !== false })
+    .catch(() => ({}));
+  // THE EVERY-PROVIDER SET, BESIDE the dispatched vendor's env (which stays byte-identical to
+  // today): every DISPATCHABLE provider's freshest ACTIVE account, each under its own NON-COLLIDING
+  // namespaced var (ZEE_PROVIDER_<KEY>_TOKEN + a ZEE_PROVIDERS manifest). github is never in the set
+  // (infra credential); a mis-attributed token is skipped, never injected under the wrong vendor's
+  // name (everyProviderEnv applies the SAME credentialVendorMismatch the active env goes through).
+  // Best-effort, exactly like lfEnv: a DB read failure must not sink a cage that still has the
+  // dispatched provider's env. Both doors get it — /etc/environment (openCxellSsh, an attending
+  // human's shell) and the headless exec env (runZee) — so a zee finds its keys either way.
+  const everyEnv = await allProviderTokenRows(pid)
+    .then((rows) => everyProviderEnv(rows))
+    .catch((e) => {
+      logline('intake', `${xell.slug}: could not read the every-provider env (${String(e.message).slice(0, 120)}) — `
+        + 'the cage gets the dispatched provider’s env alone');
+      return { env: {}, skipped: [], accountsUsed: [] };
+    });
+  if (everyEnv.skipped.length) {
+    logline('intake', `${xell.slug}: skipped ${everyEnv.skipped.length} provider account(s) from the `
+      + `every-provider env — ${everyEnv.skipped.map((s) => `${s.provider} (${s.reason})`).join(', ')}`);
+  }
+  // RECORD THE GRANT LEDGER (xell_provider_grant — migration 136): WHICH account this cage was
+  // actually granted, per provider, at the ONE place every key in this cage is decided. The
+  // runnable-provider-env door (lib/provider-tokens.js providerRunEnv) later answers FROM this
+  // record, so a cage can only ever pull the exact account it was granted — never the project's
+  // current key after a rotation. The ACTIVE provider's account (tokenId) + every provider in the
+  // every-provider set (accountsUsed). Best-effort: a failed ledger write must not sink a spawn.
+  if (tokenId) await recordXellProviderGrant({ xellId: xell.id, provider, providerTokenId: tokenId, grantedBy: 'spawn' });
+  for (const g of everyEnv.accountsUsed || []) {
+    if (g.account_id && g.provider !== provider) {
+      await recordXellProviderGrant({ xellId: xell.id, provider: g.provider, providerTokenId: g.account_id, grantedBy: 'spawn' });
+    }
+  }
+  // The project's SPAWN TEMPLATE (migration 121): which dependencies this cage is prepped with
+  // (npm, an npm script, apt packages like postgresql-client, a shell line) and how npm/apt cache.
+  // It is read ONCE here and handed to both halves that need it — the container create (the cache
+  // MOUNTS have to be decided before the container exists) and the warm (the steps themselves).
+  // spawnPrepFor never throws: a spawn does not die because a config read did.
+  const prep = await spawnPrepFor(xell.project_id);
+  // The PREPPED IMAGE, if the pool has already baked one. Never built here: a dispatch must not wait
+  // for apt (that is the whole point), so a missing image simply falls back to the base one and the
+  // root prep installs the packages in-cage, exactly as before.
+  const preppedImage = bakesImage(prep)
+    ? await preppedImageIfPresent({ ctx: 'default', baseImage: cxellImage || undefined, prep }).catch(() => null)
+    : null;
   let sshPort = null;
   try {
-    const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id, image: cxellImage });
+    // reuse: keep the cage PROVISIONING already created and installed into (`when: 'provision'`).
+    // It is honoured only when that cage is running on the image we want; otherwise this is the
+    // create-from-scratch every dispatch has always done.
+    const created = await ensureCxell({ ctx, slug: xell.slug, xellId: xell.id,
+                                        image: preppedImage || cxellImage, prep, reuse: prewarmsCage(prep) });
     sshPort = created.sshPort;
     // A MANAGER holds production READ-ONLY, and where the prod db publishes no host:port its DSN is
     // built on a docker NETWORK ALIAS. ensureCxell just put this cage on zee-hive-net and nothing
@@ -1370,14 +1654,32 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
       .catch((e) => logline('project-doc', `${name}: project docs not injected (${String(e.message).slice(0, 120)})`));
     // Warm BEFORE sealing (egress fully open): install deps + prebuild so the zee starts working
     // right away instead of running npm itself. Queenzee-driven, so it costs no agent tokens.
-    logline('cxell', `${name}: warming (npm ci + web build) so the zee starts ready…`);
-    const warm = await warmCxell({ ctx, name });
-    logline('cxell', `${name}: ${warm.warmed ? 'warmed (deps + web build ready)'
+    // What this cage is ABOUT to do, from the template rather than from the sentence this line used
+    // to hard-code ("npm ci + web build"): a template can have neither, and announcing work that is
+    // not going to happen is how a spawn that installed nothing came to be reported as fully warmed.
+    const willRun = (prep.steps || []).filter((x) => x.enabled).map((x) => x.key);
+    logline('cxell', willRun.length
+      ? `${name}: warming (${willRun.join(' + ')}) so the zee starts ready…`
+      : `${name}: no prep to run — this project's spawn template has NO enabled steps, so the zee `
+        + 'starts with nothing installed (Project setup → Pool → Dependencies & cache)');
+    const warm = await warmCxell({ ctx, name, prep, stage: 'dispatch', aptBaked: !!preppedImage });
+    // …and what it ACTUALLY did. "warmed (deps + web build ready)" was a fixed string, so an empty
+    // template printed it after 0.8s of doing nothing at all — the most reassuring possible line for
+    // the one state a human most needs to see. It now says which of the three it was.
+    const didInstall = (warm.steps || []).some((x) => x.status === 'ok');
+    const reusedAll = (warm.steps || []).length > 0 && (warm.steps || []).every((x) => x.status === 'reused');
+    logline('cxell', `${name}: ${warm.warmed
+      ? (reusedAll ? 'ready — provisioning had already installed everything (nothing to do at dispatch)'
+        : didInstall ? 'warmed (deps + web build ready)'
+          : 'NOTHING WAS INSTALLED — the spawn template asks for no work; the zee starts on a bare checkout')
       // A lock-drift failure is not "slow" — it is a repo state the zee must be told about, because
       // it starts with no node_modules and the FIX is a deliberate commit, not a retry.
       : warm.lockDrift ? 'warm FAILED on lockfile drift — the zee starts WITHOUT node_modules and the lockfile was left alone'
         : 'warm incomplete — zee will install as needed'}`
       + `${warm.sharedCache ? ' [shared npm cache]' : ' [per-container npm cache — a cold download]'}`);
+    // …and WHERE the warm's time went, step by step. A four-minute spawn with no breakdown is a
+    // complaint; with one it is a template a human can tune (docs/spawn-prep.md).
+    if (warm.steps?.length) logline('cxell', `${name}: prep steps — ${summarizePrepSteps(warm.steps, prep)}`);
     const sealed = await sealCxell({ ctx, name, blockTcp });
     logline('cxell', `${name}: ${sealed[sealed.length - 1]}`);
     // Open the attend door: authorize the fleet key and start sshd with the token in the login
@@ -1385,11 +1687,45 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // viewer_url below becomes a literal ssh:// deeplink into this cxell. The xell identity token
     // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
+    if (Object.keys(lfEnv).length) logline('cxell', `${name}: LANGFUSE_* env injected (observability on)`);
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
-                         agentEnv: adapter.env({ token, baseUrl, model }) });
+                         agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...everyEnv.env } });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);
+    // INSTALL the dispatched provider's credential for a CLI that does not read it from the
+    // environment (today: codex — see lib/cxell.js prepareCxellAuth). This is the last thing before
+    // the turn starts, and it FAILS THE DISPATCH rather than starting a zee that cannot
+    // authenticate: an OpenAI zee without it 401s on every turn with "Missing bearer …", which is
+    // indistinguishable from the human having pasted a bad key. Same stance as spawnCreds above —
+    // a credential problem is reported at dispatch, with the fix in the sentence.
+    const auth = await prepareCxellAuth({ ctx, name, adapter, token, baseUrl, model });
+    if (auth.required && !auth.ok) {
+      throw new Error(`could not install the ${provider} credential into the cage: ${auth.said}. `
+        + `The ${adapter.bin} CLI does not authenticate from the environment alone, so the zee would `
+        + 'have failed every turn with a 401 that looks like a bad key. Check the account in Project setup.');
+    }
+    if (auth.required) {
+      logline('cxell', `${name}: ${provider} credential installed in-cage `
+        + `(${adapter.bin} does not read its key from the environment)`);
+    }
+    // …and pre-answer THIS runtime's first-run prompts, so an attending human gets the session and
+    // not a "do you trust this directory?" gate. Not fatal (see seedCxellFirstRun): it costs a human
+    // one keypress, never a dispatch.
+    const seed = await seedCxellFirstRun({ ctx, name, adapter });
+    if (seed.required && !seed.ok) {
+      logline('cxell', `${name}: could not pre-answer ${adapter.bin}'s first-run prompts (${seed.said}) — `
+        + 'the zee is unaffected, but a human attending this cage may have to answer them by hand');
+    }
+    // …and the cage's own TURN-BOUNDARY hooks: an INTERACTIVE turn (a human or a manager typing into
+    // the pane) is the one turn the queenzee neither starts nor can observe, so the vendor's hooks
+    // report it themselves (`zee turn --start|--end`). Same contract as the seed above — per-vendor,
+    // measured, and never fatal: a cage whose hooks did not install simply keeps the old blindness.
+    const hooks = await installTurnHooksIntoCxell({ ctx, name, adapter });
+    if (hooks.required && !hooks.ok) {
+      logline('cxell', `${name}: could not install the turn-boundary hooks (${hooks.said}) — an `
+        + 'INTERACTIVE turn in this cage will still read as idle to the fleet');
+    }
   } catch (err) {
     await removeCxell({ ctx, slug: xell.slug });
     // COMPENSATE the prod read-only bind. It happened BEFORE this function was even called (in
@@ -1400,7 +1736,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // production holding a live credential. Best-effort and never throws (lib/manager-spawn.js).
     await unbindManagerFromProdReadonly(xell.id, 'the cage build failed');
     const reason = `cxell build failed: ${err.message}`;
-    const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
+    const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, scrubSecrets(reason).slice(0, 200)]);
     broadcast('zee', dead);
     await releaseXell(xell.id);
     return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
@@ -1416,8 +1752,10 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  (worktree_path and friends) refer to the same code from the outside; ignore them.',
     '- You have NO docker CLI. Where the binding says `docker exec … psql`, connect over TCP',
     '  instead: your assigned containers are reachable at the host:port pairs in the binding',
-    '  (and via DATABASE_URL in /work/repo/.zeehive.env). Nothing else on the network resolves —',
-    '  that is by design, not an outage.',
+    '  (and via DATABASE_URL in /work/repo/.zeehive.env). Nothing on the host, the xource or another',
+    '  xell is reachable from here — that is by design, not an outage. Egress itself is open (your',
+    "  provider's API, the registries a build needs); the fleet's live prod databases are what is",
+    '  dropped, unless a human has bound you to one.',
     '- Commit your work on your branch as you go. Your commits are collected from this container',
     '  when the job completes; nothing you do here can touch the host, other xells, or prod.',
     '',
@@ -1446,10 +1784,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  - `zee status`               → where you stand: your task, and whether a land/ship/prod/done is pending a human.',
     '  - `zee working [--note "…"]` → ping "I am actively working" (asserts live activity the passive poller can\'t see for a cxell, and clears any open tend). NOT gated.',
     '  - `zee env`                  → which environment this xell resolved to — the var NAMES merged into .zeehive.env (values live in the file, never echoed). Read-only, opens no gate.',
+    '  - `zee creds [--provider <key>] [--json]` → what PROVIDER CREDENTIALS this cage holds (every connected provider\'s key is here, each under its own ZEE_PROVIDER_<KEY>_TOKEN — not just the one this dispatch runs on). Read-only, opens no gate; --provider prints the source-able env for one.',
     '  - `zee build [server|webapp|all]` → (re)build your OWN app tier so you can run e2e tests against your change. NOT gated — build freely. Add --wait (background) to be told when it is serving your HEAD; --watch reports without building. COMMIT first — it builds your cxell commits.',
     '  - `zee device [--detach|--status]` → attach a MOBILE DEVICE (Android) to build/install/run your app on. NOT gated (throwaway target). Returns the adb address + the build→install→launch→screenshot loop; a human can watch its screen in a web viewer. Only for projects that support one.',
     '  - `zee sync [--no-rebuild]`  → CATCH UP / REBASE your branch onto current main. NOT gated. This is the ONLY way to reconcile in the cage: your cxell was seeded from a bundle of your branch alone (no main/master ref, `origin` is a consumed bundle), so `git fetch`/`git rebase main` cannot work in here. `zee sync` has the queenzee deliver current main IN as origin/main and MERGE it into your branch, then rebuilds. Reach for it whenever you are asked to rebase or catch up your code, or before landing if main has moved. A genuine merge CONFLICT is left in place for YOU to resolve (edit, git add/commit), then land; a clean sync leaves your HEAD descending from current main.',
     '  - `zee db-catchup [--restore]` → the db counterpart of `zee sync`: roll your OWN (clone/isolated) database FORWARD to prod\'s CURRENT schema by applying the prod-ledger migrations it lacks. NOT gated (writes only your throwaway db; reads prod read-only). `--restore` (isolated dbs only) instead rebuilds from the latest full prod snapshot — exact schema+data, but it DISCARDS your db\'s current contents.',
+    '  - `zee db-sandbox [--migrate] [--status] [--stop]` → start a REAL throwaway postgres INSIDE this cage (127.0.0.1 only) and print its DSN — this is how you VERIFY database work in here when your assigned db is unusable. NOT gated, nothing to ask for: it dies with the container. `--migrate` applies db/migrations to it; a second start returns the SAME DSN. It never replaces your assigned DATABASE_URL and is never a fallback — pass the DSN to the command you meant, and REPORT a broken assigned db rather than working around it silently.',
     '  - `zee migration-number [--name "…"]` → ASK for the next free db/migrations number. NOT gated. Your worktree shows you what is LANDED plus what YOU wrote, and nothing about the siblings writing migrations on branches you cannot see — which is how several numbers came to be claimed twice or more (one of them three ways). The queenzee counts main + every live xell\'s worktree + other zees\' claims, and records yours. Advisory: it hands out a number, it does not gate your landing.',
     '  - `zee land`                 → collect your commits out of the cxell and run the gated push to main. HELD for a human. If main moved since your cage was cut, land self-heals by running a `zee sync` first.',
     '  - `zee land --withdraw`      → UN-ASK a landing you already raised (nothing lands, nothing is rejected, your commits are untouched). NEVER stack land requests: if you asked to land and are not done, WITHDRAW the open one first, then land again — a human must only ever have ONE card from you to decide.',
@@ -1458,6 +1798,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     '  - `zee tend --reason "…"`    → raise "I need a human in the console" (blocks nothing, opens no gate); `zee tend --clear` (or any `zee working`) lowers it.',
     '  - `zee prod --reason "..."`  → ASK to be bound to the prod database (the WHOLE live db). Recorded only — a human confirms, then the cxell is re-sealed to reach prod. Until then you cannot.',
     '  - `zee seed --file server/sql/seeds/<name>.sql --reason "..."` → ASK a human to approve a LANDED seed file; the QUEENZEE then runs it against PRODUCTION for you. This is the NARROW prod-data verb — when a shipment needs rows in prod (reference data, a lookup the new screen reads), reach for this, not `zee prod`: you never hold the production database, and a human reads the exact SQL before it runs. Land the file first (a seed runs FROM main) and write it IDEMPOTENT — seeds are not ledgered. `--status` reports where your request got to.',
+    ...(xell.visual_verify ? [
+      '  - `zee verify-webapp`      → offer your built webapp URL to a human in the console (Open link / dismiss). VISUAL VERIFICATION is ON for this xell: build the webapp (`zee build webapp --wait`), then call this. NOT gated, nothing irreversible — never land/ship for this.',
+    ] : []),
     '  - `zee done --summary "..."` → propose your job is done. A human confirms with "Mark done"; THAT tears the cxell down. Never try to despawn yourself.',
     // The CREW verbs. A manager gets the whole set (and is told what it may NOT do); a worker with a
     // manager gets the two that let it talk back. A worker with no manager sees neither — an unusable
@@ -1513,7 +1856,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
-  const handle = runZee({ ctx, name, prompt, model, adapter, token, xellToken, baseUrl, onEvent: feed });
+  const handle = runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
+                          extraEnv: { ...lfEnv, ...everyEnv.env }, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.
@@ -1532,9 +1876,14 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   } catch (err) {
     await removeCxell({ ctx, slug: xell.slug });
     const reason = `cxell spawn failed: ${String(err.message).slice(0, 300)}`;
-    const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
+    const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, scrubSecrets(reason).slice(0, 200)]);
     broadcast('zee', dead);
     await releaseXell(xell.id);
+    // A vendor CLI that died on startup is where a DEAD CREDENTIAL shows up (six zees, none of which
+    // ever landed anything, and nobody was told which account). Nothing is resumable here — the cage
+    // has just been removed — but a terminal death still owes a human the account and the message.
+    await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug, reason: String(err.message),
+                          resumable: false, source: 'spawn' });
     return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };
   }
 
@@ -1568,16 +1917,38 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         return;
       }
       const errored = result?.is_error;
-      await q(
-        `UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
-                        cache_read_tokens=$5, cache_write_tokens=$6,
-                        status=$7, last_stop_reason=$8 WHERE id=$1`,
-        [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite,
-         errored ? 'errored' : 'idle', errored ? String(result?.result || 'error').slice(0, 200) : 'end_turn']);
+      // A result with NEITHER usage nor total_cost_usd is UNMETERED — the turn ran and the fleet
+      // cannot know what it cost (kimi, or a provider whose result carries no meter). The marker is
+      // recorded rather than a silent zero, and the burn columns are NOT overwritten with zeros:
+      // this row may already carry earlier turns' burn, and claiming a measured zero would erase it.
+      const stop = turnStopReason(errored ? scrubSecrets(String(result?.result || 'error')).slice(0, 200) : 'end_turn', b.metered);
+      if (b.metered) {
+        await q(
+          `UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                          cache_read_tokens=$5, cache_write_tokens=$6,
+                          status=$7, last_stop_reason=$8 WHERE id=$1`,
+          [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite,
+           errored ? 'errored' : 'idle', stop]);
+      } else {
+        await q(`UPDATE zee SET status=$2, last_stop_reason=$3 WHERE id=$1`,
+                [zee.id, errored ? 'errored' : 'idle', stop]);
+      }
       const row = await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]);
       broadcast('zee', row);
       const tok = b.input + b.output + b.cacheRead + b.cacheWrite;
-      logline('intake', `cxell zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})`);
+      logline('intake', `cxell zee in ${xell.slug} finished (${errored ? 'errored' : 'ok'}, ${tok} tok, $${b.cost})${b.metered ? '' : ' [usage unreported]'}`);
+      // A turn that ended on a PROVIDER error did not end on a decision of this zee's, and until now
+      // that was where the story stopped. The reviver classifies it: transient → resumed on a
+      // 5/15/45 ladder with no human involved, terminal → a tend naming the account (revive.js).
+      if (errored) {
+        await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                              reason: String(result?.result || 'error'), source: 'turn' });
+      }
+      // LANGFUSE: record the finished turn as a trace (best-effort, never blocks the completion).
+      await postTurnToLangfuse({
+        xell, zee: row, sessionId: sid, model, result,
+        startTime: zee.attached_at || new Date(), endTime: new Date(),
+      });
     })
     .catch(async (err) => {
       // Same reasoning as the resolve path above: while the fleet is paused, a headless run that ends
@@ -1589,8 +1960,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
         return;
       }
-      await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, String(err.message).slice(0, 200)]);
+      await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
       logline('intake', `cxell zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
+      // The other half of the same question (see the resolve path above): a run that died on the way
+      // — a connection closed mid-response, the exec killed — is a provider/infrastructure death too.
+      await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
+                            reason: String(err.message), source: 'turn' });
     });
 
   return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: name, session: sid,
@@ -1601,6 +1976,21 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
 async function releaseXell(xellId) {
   const row = await one(`UPDATE xell SET status='ready', is_pooled=true WHERE id=$1 AND status='claimed' RETURNING *`, [xellId]);
   if (row) broadcast('xell', row);
+}
+
+// GIVE BACK A CLAIM THAT NEVER BECAME A ZEE. dispatchXell now claims its xell at the moment it
+// PICKS it (lib/xell-claim.js — that is what the pool sweep can no longer take), so a spawn that
+// throws on its way up must hand the xell back or a refused dispatch leaks a pooled xell forever:
+// the pool reconciler only looks at 'ready', and the monitor's stale-claim reporter only looks at
+// claims that HAD a zee. Before the claim existed those failures simply left the xell 'ready', and
+// that is the state this restores. Guarded on "no zee row exists yet", because once a zee has been
+// created the xell is legitimately occupied and repooling it would hand a live cage's workspace to
+// the trimmer — the failures AFTER that point are the ones spawnHeadless/spawnCxell already own.
+async function releaseUnstartedClaim(xellId) {
+  if (!xellId) return;
+  const started = await one(`SELECT id FROM zee WHERE xell_id=$1 LIMIT 1`, [xellId]);
+  if (started) return;
+  await releaseXell(xellId);
 }
 
 // REMOTE spawn — runs the literal `claude remote` command (Remote Control). Records the
@@ -1635,7 +2025,7 @@ async function spawnRemote({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], 
     ? 'claude remote: not logged in to claude.ai (Remote Control requires a subscription). '
       + 'Switch the runtime to "Claude Code (local)" or run `claude /login`.'
     : `claude remote start failed (exit ${res.status}): ${(res.stderr || '').slice(0, 160) || 'no output / timed out'}`;
-  const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, reason.slice(0, 200)]);
+  const dead = await one(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1 RETURNING *`, [zee.id, scrubSecrets(reason).slice(0, 200)]);
   broadcast('zee', dead);
   await releaseXell(xell.id); // a dead zee must not hold the xell hostage
   return { ok: false, zee_id: zee.id, xell_id: xell.id, error: reason };

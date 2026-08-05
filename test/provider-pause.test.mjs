@@ -28,6 +28,53 @@ const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) 
 const { setProviderAccountPaused, listProviderTokens, tokenForSpawn, spawnCreds, assertProviderDispatchable }
   = await import('../server/src/lib/provider-tokens.js');
 
+// ── WEB WIRING: every api.js function CALLED in a console file must be imported ──────────────
+// Shipped 2026-07-31 with a ReferenceError: ProjectSetup.jsx called pauseProviderAccount /
+// resumeProviderAccount (added in the same change) but never imported them. esbuild leaves an
+// undeclared identifier as a global reference and still builds, so the bundle deployed with the
+// calls present and the definitions absent — the pause button threw and nothing happened, and the
+// resume button could never appear because the paused state was never reached. This scan is the
+// guard: for every web/src/*.jsx, any api.js export that the file CALLS must be imported from
+// './api.js' (or declared locally — local helpers/props with the same name live there too).
+import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+const webSrc = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'web', 'src');
+const apiSrc = readFileSync(resolve(webSrc, 'api.js'), 'utf8');
+const apiExports = new Set([
+  ...[...apiSrc.matchAll(/export\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)/g)].map((m) => m[1]),
+  ...[...apiSrc.matchAll(/export\s+(?:async\s+)?const\s+([A-Za-z0-9_]+)/g)].map((m) => m[1]),
+]);
+const importedFromApi = (src) => {
+  // union ALL `import { … } from './api.js'` blocks — a file may have several (Dispatch.jsx does)
+  const out = new Set();
+  for (const m of src.matchAll(/import\s*\{([^}]*)\}\s*from\s*'[^']*api\.js'/g)) {
+    for (const s of m[1].split(',')) {
+      const name = s.trim().split(/\s+as\s+/)[0];
+      if (name) out.add(name);
+    }
+  }
+  return out;
+};
+const locallyDeclared = (src, name) =>
+  new RegExp(`\\b(?:function|class|const|let|var)\\s+${name}\\b`).test(src)
+  || new RegExp(`\\b${name}\\s*=`).test(src);
+const missing = [];
+for (const f of readdirSync(webSrc).filter((f) => f.endsWith('.jsx') || f.endsWith('.js'))) {
+  if (f === 'api.js') continue;   // defines the exports; nothing to import
+  const src = readFileSync(resolve(webSrc, f), 'utf8');
+  const imported = importedFromApi(src);
+  for (const name of apiExports) {
+    if (!new RegExp(`\\b${name}\\s*\\(`).test(src)) continue;   // not CALLED → nothing to import
+    if (imported.has(name)) continue;
+    if (locallyDeclared(src, name)) continue;                    // a local fn/prop of that name
+    missing.push(`${f} calls ${name} but never imports it from './api.js'`);
+  }
+}
+console.log('\n── the console never CALLS an api.js function it did not import ──');
+ok(missing.length === 0, missing.length ? `MISSING IMPORTS: ${missing.join(' · ')}` : 'every api.js function a console file calls is imported or declared locally');
+
 const client = new pg.Client({ connectionString: url });
 await client.connect();
 const PID = randomUUID();

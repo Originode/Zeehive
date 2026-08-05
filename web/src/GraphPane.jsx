@@ -47,7 +47,8 @@ export function anchorRing({ ring = null, hovered = false, related = null }) {
 
 export default function GraphPane({ timeline, xells = [], orientation, honeySide, hexPosRef, prodIds = [],
                                    expandedId = null, subscribeGeom,
-                                   hoverRef, setHover, subscribeHover, onFlip, onReposition }) {
+                                   hoverRef, setHover, subscribeHover, onFlip, onReposition,
+                                   showHarness = true, onToggleHarness }) {
   const groupRef = useRef(null);
   const portrait = orientation === 'portrait';
   const [, forceHover] = useReducer((x) => x + 1, 0);
@@ -264,15 +265,31 @@ export default function GraphPane({ timeline, xells = [], orientation, honeySide
       </svg>
       <span className="graph-branch" data-orient={orientation}>⎇ {timeline.branch}</span>
       {/* flip button lives IN the middle pane, at the end opposite the ⎇ branch label (which sits at
-          the top in landscape / the left in portrait, so flip sits at the bottom / right). */}
-      {onFlip && (
-        <button className="graph-flip" data-orient={orientation} data-testid="flip-btn" onClick={onFlip}
-                title={`Flip the honeycomb to the other side (timeline follows so merge points keep facing it). Now: ${orientation}, honeycomb ${honeySide === 'a' ? (portrait ? 'top' : 'left') : (portrait ? 'bottom' : 'right')}`}
-                style={portrait
-                  ? { position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)' }
-                  : { position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)' }}>
-          ⇄ flip
-        </button>
+          the top in landscape / the left in portrait, so flip sits at the bottom / right). The SHOW
+          HARNESS toggle stacks immediately above it — the one view control that belongs with the
+          honeycomb's middle divider, because turning it off re-draws the traces this pane hosts. */}
+      {(onFlip || onToggleHarness) && (
+        <div className="graph-flip-stack" data-orient={orientation}
+             style={{ position: 'absolute', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6,
+                      ...(portrait
+                        ? { right: 8, top: '50%', transform: 'translateY(-50%)' }
+                        : { bottom: 8, left: '50%', transform: 'translateX(-50%)' }) }}>
+          {onToggleHarness && (
+            <button className={`graph-harness-toggle${showHarness ? ' on' : ''}`} data-orient={orientation}
+                    data-testid="harness-toggle" aria-pressed={!!showHarness} onClick={onToggleHarness}
+                    title={showHarness
+                      ? 'Hide the harness hexagons — each wire then runs straight from its commit dot to its xell'
+                      : 'Show the harness hexagons — a consumer wire routes through the badge it wears'}>
+              show harness{showHarness ? ' ✓' : ''}
+            </button>
+          )}
+          {onFlip && (
+            <button className="graph-flip" data-orient={orientation} data-testid="flip-btn" onClick={onFlip}
+                    title={`Flip the honeycomb to the other side (timeline follows so merge points keep facing it). Now: ${orientation}, honeycomb ${honeySide === 'a' ? (portrait ? 'top' : 'left') : (portrait ? 'bottom' : 'right')}`}>
+              ⇄ flip
+            </button>
+          )}
+        </div>
       )}
       {/* drag the panels-facing edge to resize; squeeze it to collapse subjects to heads only */}
       <div className={`graph-resize${compressed && !portrait ? ' compressed' : ''}`} data-orient={orientation}

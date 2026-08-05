@@ -5,12 +5,15 @@
 //
 //   zee status [--wait]
 //   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]
+//   zee db-sandbox [--migrate] [--status] [--stop]   a REAL throwaway postgres on 127.0.0.1 IN this cage
 //   zee working [--note "what you are doing"]
+//   zee turn --start | --end   (an INTERACTIVE turn boundary — the cage's own hooks call this)
 //   zee tend --reason "why you need a human"   |   zee tend --clear      (the reason is required: it is what the console shows)
 //   zee sync [--no-rebuild]
 //   zee land [--wait]   |   zee land --withdraw [--reason "…"]   (un-ask a held landing)
 //   zee ship [--targets server webapp] --reason "what you are shipping"
 //   zee prod --reason "why you need the prod database"
+//   zee verify-webapp   (offer your built webapp to a human in the console — Open link / dismiss)
 //   zee done --summary "what you finished"   |   zee done --clear   (withdraw the proposal)
 //
 // --wait (on `land` and `status`) BLOCKS, polling until the landing is decided (landed/rejected/
@@ -29,11 +32,37 @@
 import http from 'node:http';
 import https from 'node:https';
 // `zee harness` takes persona TEXT, and text belongs in a file rather than a shell flag (--spec /
-// --personality-file). Nothing else here reads the filesystem.
-import { readFileSync } from 'node:fs';
+// --personality-file). `zee upload-conversation` reads the zee's own session transcript.
+import { readFileSync, readdirSync, statSync, existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join, resolve as resolvePath, dirname } from 'node:path';
+import os from 'node:os';
+// `zee db-sandbox` runs postgres's own binaries (initdb/pg_ctl) and `npm` — the ONE verb that
+// executes something instead of asking the queenzee for it, because what it starts lives and dies
+// inside this container.
+import { spawnSync } from 'node:child_process';
+import net from 'node:net';
 
 const api = process.env.ZEEHIVE_API || 'http://host.docker.internal:4700';
-const token = process.env.ZEEHIVE_XELL_TOKEN || '';
+// The identity token is injected into the cage's env at spawn, and that is where it is read from.
+// /etc/environment is the SAME value, written into the cage at spawn as well (the nudge path reads
+// it back from there), and it is the fallback for a process whose env did not inherit it — a hook
+// spawned by the vendor CLI, a cron-ish shell, a human's `sh` that never sourced a login profile.
+// Without it those simply fail as "unauthorized", which reads like a broken token rather than a
+// missing one. Best-effort and silent: an unreadable file just leaves the token empty, as before.
+function tokenFromEnvFile() {
+  try { return (readFileSync('/etc/environment', 'utf8').match(/^ZEEHIVE_XELL_TOKEN=(.*)$/m) || [])[1]?.trim() || ''; }
+  catch { return ''; }
+}
+// Read one env var from the process env OR /etc/environment. The every-provider credentials land in
+// BOTH (the headless exec's `-e` and the SSH login's /etc/environment — see openCxellSsh), so
+// `zee creds` finds them whether it runs in a queenzee-spawned turn or in a human's login shell.
+function envVar(name) {
+  const v = process.env[name];
+  if (v !== undefined && v !== null && v !== '') return v;
+  try { return (readFileSync('/etc/environment', 'utf8').match(new RegExp(`^${name}=(.*)$`, 'm')) || [])[1]?.trim() || ''; }
+  catch { return ''; }
+}
+const token = process.env.ZEEHIVE_XELL_TOKEN || tokenFromEnvFile();
 const [cmd, ...rest] = process.argv.slice(2);
 
 function flag(name) { const i = rest.indexOf(`--${name}`); return i >= 0 ? rest[i + 1] : null; }
@@ -50,6 +79,11 @@ function waitFlag() {
   return { on: rest.includes('--wait'), secs: 3600 };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Shell-quote a value for eval-safe `KEY=value` output: single-quote and escape embedded single
+// quotes, so a value with spaces, `$`, backticks or quotes can never break `eval "$(...)"`.
+// Source-ability must be structural, not luck (credential-injection export follow-up).
+const shellQuote = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
 
 // THE HOLDING PATTERN (067). Another xell's landing is open on this ref, so the gate queued this
 // push instead of raising a second card — one runway, one card, no races. There is NOTHING to wait
@@ -211,6 +245,232 @@ function out(r, what = cmd) {
   process.exit(r.code >= 400 ? 1 : 0);
 }
 
+// ── zee db-sandbox: a REAL postgres of your own, inside the cage ─────────────────────────────────
+//
+// Three zees in one night independently invented the same workaround (ticket #62): the DATABASE_URL
+// the queenzee writes into .zeehive.env was refused by the shared dev db (ticket #47), so they
+// `npm i embedded-postgres` in /tmp, ran a real PostgreSQL on 127.0.0.1, migrated it and pointed the
+// tests there. Two other zees never found it and verified nothing in three hours. This is that
+// workaround, made a verb — so it is one command instead of a discovery.
+//
+// THE RULE THIS VERB IS BUILT AROUND: it prints a DSN and NOTHING ELSE. It never writes
+// .zeehive.env, never exports DATABASE_URL for anyone but the `--migrate` child it is explicitly
+// asked to run, and is never consulted as a fallback when the assigned database is unreachable. A
+// broken assigned db must stay visible — that is ticket #47's actual bug and the readiness preflight
+// (#53) that reports it; a silent substitution would delete the only signal anyone has.
+//
+// AND IT CANNOT REACH A FLEET DATABASE. Every connection parameter is a literal here: the host is
+// `127.0.0.1`, the port is one this process just bound on the loopback, and the server is started
+// with `-h 127.0.0.1` so it does not listen anywhere else. Nothing reads DATABASE_URL, nothing takes
+// a --host, and the whole thing dies with the container.
+const SANDBOX_HOME = process.env.ZEE_DB_SANDBOX_HOME || join(os.homedir(), '.zeehive', 'db-sandbox');
+// Pinned, and pinned to SEVENTEEN because the fleet runs postgres:17-alpine (docker-compose*.yml):
+// a sandbox is only worth having if the schema it accepts is the schema production accepts. Bump it
+// deliberately, with the fleet — this exact spec is what the spawn-prep preset warms
+// (server/src/lib/spawn-prep.js), and the two are asserted equal by test/db-sandbox.test.mjs.
+const SANDBOX_PKG = 'embedded-postgres@17.10.0-beta.17';
+const SANDBOX_DIRS = {
+  deps: join(SANDBOX_HOME, 'deps'),      // an npm prefix of its OWN — never the repo's package.json
+  data: join(SANDBOX_HOME, 'data'),      // PGDATA
+  run: join(SANDBOX_HOME, 'run'),        // the unix socket dir (/var/run/postgresql is not writable here)
+  log: join(SANDBOX_HOME, 'postgres.log'),
+  state: join(SANDBOX_HOME, 'sandbox.json'),
+};
+// Same platform map as embedded-postgres's own binary.js — the binaries ship in a per-platform
+// optional dependency, and we run them directly rather than through the JS wrapper: the wrapper
+// stops postgres when its node process exits, and a sandbox that dies with the CLI invocation that
+// started it is no use to the next command.
+function sandboxBinDir() {
+  const plat = os.platform() === 'win32' ? 'windows' : os.platform();
+  return join(SANDBOX_DIRS.deps, 'node_modules', '@embedded-postgres', `${plat}-${os.arch()}`, 'native', 'bin');
+}
+const sandboxBin = (name) => join(sandboxBinDir(), name);
+const sandboxDsn = (port) => `postgresql://postgres@127.0.0.1:${port}/postgres`;
+
+function sandboxState() {
+  try { return JSON.parse(readFileSync(SANDBOX_DIRS.state, 'utf8')); } catch { return null; }
+}
+// postgres's own lock file: pid on line 1, port on line 4. It is the record of where a server
+// started from THIS data dir is listening — our state file is only a note beside it, and a cage that
+// was restarted has the note and no postgres.
+function sandboxLock() {
+  try {
+    const [pid, , , port] = readFileSync(join(SANDBOX_DIRS.data, 'postmaster.pid'), 'utf8').split('\n');
+    return Number(pid) > 0 ? { pid: Number(pid), port: Number(port) > 0 ? Number(port) : null } : null;
+  } catch { return null; }
+}
+// Does anything ACCEPT on that port? A bare TCP connect, deliberately: it needs no credentials, and a
+// server still in crash recovery accepts the connection (and refuses the session), which is alive.
+function portAccepts(port, ms = 1000) {
+  return new Promise((res) => {
+    const s = net.connect({ host: '127.0.0.1', port });
+    s.on('connect', () => { s.destroy(); res(true); });
+    s.on('error', () => res(false));
+    s.setTimeout(ms, () => { s.destroy(); res(false); });
+  });
+}
+// "Is it up" is a question about the PORT, not about a pid. pg_ctl answers it from `kill(pid, 0)`
+// (0 = running, 3 = not, 4 = no such data dir) — and PID 1 in a cxell is `sleep infinity`, which
+// reaps nothing, so a postgres that dies leaves a ZOMBIE whose pid answers forever. Measured in a
+// cage: after the postmaster was killed, pg_ctl still said "server is running (PID 1940)" and this
+// verb handed back a DSN that refused every connection. A sandbox nobody can connect to being
+// reported healthy is the same invisible-broken-database this verb exists to abolish, so pg_ctl is
+// kept as the cheap first question and the port has the last word.
+async function sandboxRunning() {
+  if (!existsSync(sandboxBin('pg_ctl')) || !existsSync(SANDBOX_DIRS.data)) return false;
+  if (spawnSync(sandboxBin('pg_ctl'), ['-D', SANDBOX_DIRS.data, 'status'], { encoding: 'utf8' }).status !== 0) return false;
+  const lock = sandboxLock();
+  return lock?.port ? portAccepts(lock.port) : false;
+}
+// A lock file nothing answers on is STALE, and it has to be cleared before a start: postgres refuses
+// to start while one names a pid it believes is alive ("lock file postmaster.pid already exists"),
+// and a zombie's pid is alive for as long as the container is. Without this, one crashed postgres
+// ends the cage's ability to have a sandbox at all — and the only way out was knowing to delete the
+// file, which is exactly the discovery this verb exists to make unnecessary. The condition is the
+// port and nothing else, so a LIVE server's lock is never removed.
+async function clearStaleSandboxLock() {
+  const lock = sandboxLock();
+  if (!lock || (lock.port && await portAccepts(lock.port))) return false;
+  console.error(`  … clearing a stale postmaster.pid (pid ${lock.pid}, port ${lock.port ?? 'unknown'}) — `
+    + 'the previous sandbox died without shutting down');
+  rmSync(join(SANDBOX_DIRS.data, 'postmaster.pid'), { force: true });
+  return true;
+}
+// A port the loopback is willing to give us. Bound and released, so there is a race in theory; in
+// practice postgres refuses to start on a taken port and says so, which is the honest failure.
+function freeLoopbackPort() {
+  return new Promise((res, rej) => {
+    const srv = net.createServer();
+    srv.on('error', rej);
+    srv.listen({ host: '127.0.0.1', port: 0 }, () => {
+      const { port } = srv.address();
+      srv.close(() => res(port));
+    });
+  });
+}
+const sandboxFail = (why, extra = {}) => {
+  console.log(JSON.stringify({ ok: false, verb: 'db-sandbox', error: why, ...extra }, null, 2));
+  console.error(`\n  ✗ DB-SANDBOX DID NOT START: ${why}\n`);
+  process.exit(1);
+};
+// The repo whose db/migrations `--migrate` applies: the tree we are standing in, or the cage's
+// /work/repo. Never a path from the binding — those name the HOST's copy, which is not in here.
+function sandboxRepoRoot() {
+  let dir = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(join(dir, 'db', 'migrations')) && existsSync(join(dir, 'package.json'))) return dir;
+    const up = dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return '/work/repo';
+}
+
+async function dbSandbox() {
+  const stop = rest.includes('--stop');
+  const status = rest.includes('--status');
+  const migrate = rest.includes('--migrate');
+  const state = sandboxState();
+  const running = await sandboxRunning();
+
+  if (status) {
+    console.log(JSON.stringify({
+      ok: true, verb: 'db-sandbox', running,
+      dsn: running && state ? state.dsn : null, port: running && state ? state.port : null,
+      home: SANDBOX_HOME, data_dir: SANDBOX_DIRS.data, log: SANDBOX_DIRS.log,
+      binaries: existsSync(sandboxBin('pg_ctl')) ? sandboxBinDir() : null,
+      package: SANDBOX_PKG, started_at: running && state ? state.started_at : null,
+    }, null, 2));
+    process.exit(0);
+  }
+
+  if (stop) {
+    // Stopping something that is not running is not an error — `--stop` twice is the normal way a
+    // test's cleanup runs. The DATA DIR is left in place so a later start reuses the schema you
+    // already migrated; the whole directory dies with the container anyway.
+    if (running) spawnSync(sandboxBin('pg_ctl'), ['-D', SANDBOX_DIRS.data, '-m', 'fast', '-w', 'stop'],
+      { encoding: 'utf8', stdio: ['ignore', 2, 2] });
+    if (existsSync(SANDBOX_DIRS.state)) rmSync(SANDBOX_DIRS.state, { force: true });
+    console.log(JSON.stringify({ ok: true, verb: 'db-sandbox', running: false,
+      stopped: running, data_dir: SANDBOX_DIRS.data }, null, 2));
+    process.exit(0);
+  }
+
+  // ── start ───────────────────────────────────────────────────────────────────────────────────
+  let dsn = null;
+  let port = null;
+  let already = false;
+  if (running && state?.dsn) {
+    // A SECOND start is not refused — it hands back the DSN of the one you already have. That is
+    // the only thing this verb refuses to do twice, and refusing it loudly would just make callers
+    // write their own "is it up?" check, badly.
+    ({ dsn, port } = state);
+    already = true;
+    console.error(`  … a sandbox is already running on port ${port} — returning its DSN`);
+  } else {
+    if (!existsSync(sandboxBin('initdb'))) {
+      console.error(`  … installing ${SANDBOX_PKG} into ${SANDBOX_DIRS.deps} (warm this in spawn prep to skip it)`);
+      mkdirSync(SANDBOX_DIRS.deps, { recursive: true });
+      const inst = spawnSync('npm', ['install', '--prefix', SANDBOX_DIRS.deps, '--no-audit', '--no-fund', SANDBOX_PKG],
+        { encoding: 'utf8', stdio: ['ignore', 2, 2] });
+      if (inst.status !== 0 || !existsSync(sandboxBin('initdb'))) {
+        return sandboxFail(`could not install ${SANDBOX_PKG} (npm exit ${inst.status ?? inst.error?.message})`,
+          { deps: SANDBOX_DIRS.deps });
+      }
+    }
+    if (!existsSync(join(SANDBOX_DIRS.data, 'PG_VERSION'))) {
+      mkdirSync(SANDBOX_HOME, { recursive: true });
+      console.error(`  … initdb ${SANDBOX_DIRS.data}`);
+      const init = spawnSync(sandboxBin('initdb'),
+        ['-D', SANDBOX_DIRS.data, '-U', 'postgres', '-A', 'trust', '-E', 'UTF8', '--no-sync'],
+        { encoding: 'utf8', stdio: ['ignore', 2, 2] });
+      if (init.status !== 0) return sandboxFail(`initdb failed (exit ${init.status ?? init.error?.message})`);
+    }
+    mkdirSync(SANDBOX_DIRS.run, { recursive: true });
+    // We are here because nothing is answering, so any lock file left in the data dir belongs to a
+    // sandbox that died rather than one that is running — clear it, or postgres will refuse to start.
+    await clearStaleSandboxLock();
+    port = await freeLoopbackPort();
+    // -h 127.0.0.1 is listen_addresses: the loopback of THIS container and nothing else. There is no
+    // flag to widen it, deliberately.
+    const start = spawnSync(sandboxBin('pg_ctl'),
+      ['-D', SANDBOX_DIRS.data, '-l', SANDBOX_DIRS.log,
+       '-o', `-p ${port} -h 127.0.0.1 -k ${SANDBOX_DIRS.run}`, '-w', '-t', '60', 'start'],
+      { encoding: 'utf8', stdio: ['ignore', 2, 2] });
+    if (start.status !== 0 || !(await sandboxRunning())) {
+      let tail = '';
+      try { tail = readFileSync(SANDBOX_DIRS.log, 'utf8').split('\n').slice(-8).join('\n'); } catch { /* no log yet */ }
+      return sandboxFail(`postgres did not start (pg_ctl exit ${start.status ?? start.error?.message})`,
+        { log: SANDBOX_DIRS.log, log_tail: tail });
+    }
+    dsn = sandboxDsn(port);
+    writeFileSync(SANDBOX_DIRS.state, `${JSON.stringify(
+      { dsn, port, data_dir: SANDBOX_DIRS.data, package: SANDBOX_PKG, started_at: new Date().toISOString() }, null, 2)}\n`);
+  }
+
+  let migrated = null;
+  if (migrate) {
+    const repo = sandboxRepoRoot();
+    console.error(`  … npm run db:migrate against the sandbox (cwd ${repo})`);
+    // The ONE place DATABASE_URL is set, and it is set on a CHILD this invocation was explicitly
+    // asked for. Nothing is written to .zeehive.env and nothing outlives this process — a caller
+    // who wants the sandbox in their own environment types it themselves.
+    const r = spawnSync('npm', ['run', 'db:migrate'],
+      { cwd: repo, encoding: 'utf8', env: { ...process.env, DATABASE_URL: dsn }, stdio: ['ignore', 2, 2] });
+    migrated = r.status === 0;
+    if (!migrated) console.error(`\n  ✗ the migrations FAILED (npm exit ${r.status ?? r.error?.message}) — the sandbox is up regardless`);
+  }
+
+  console.log(JSON.stringify({ ok: migrated !== false, verb: 'db-sandbox', running: true, already, dsn, port,
+    home: SANDBOX_HOME, data_dir: SANDBOX_DIRS.data, log: SANDBOX_DIRS.log, package: SANDBOX_PKG,
+    ...(migrate ? { migrated } : {}) }, null, 2));
+  console.error(`\n  ✓ postgres on 127.0.0.1:${port}, inside this cage only. Use it EXPLICITLY:`);
+  console.error(`      DATABASE_URL="${dsn}" node test/<name>.test.mjs`);
+  console.error('    It does NOT replace your assigned DATABASE_URL — if that one is broken, say so.');
+  console.error('    Stop it with `zee db-sandbox --stop`.\n');
+  process.exit(migrated === false ? 1 : 0);
+}
+
 function usage() {
   console.log(`zee — cxell-zee ↔ queenzee verbs (each is a REQUEST that lands on a human gate)
 
@@ -218,10 +478,13 @@ function usage() {
   zee build [server|webapp|all] [--hot] [--wait[=secs]] [--watch]   (re)build your OWN app tier to run e2e tests (NOT gated; acts now). --wait blocks until it serves your HEAD (run in background); --watch reports without building; --hot bounces the old image (no code change)
   zee device [--detach|--status]      attach a MOBILE DEVICE (Android) to build/install/run your app on (NOT gated; throwaway). Returns the adb address + build→install→launch→screenshot loop; --status shows the current one; --detach gives it back
   zee env [--export]                  which ENVIRONMENT your xell is loaded with (its key + var names; values live in .zeehive.env, never echoed). --export dumps the FULL current env text. Read-only. A live-prod/production xell gets the prod env, else the dev env
+  zee creds [--provider <key>] [--export] [--json]   what PROVIDER CREDENTIALS this cage holds — every connected provider's key, each under its own ZEE_PROVIDER_<KEY>_TOKEN (not just the one this dispatch runs on). Read straight from the cage's own env, no API. --provider prints the source-able env for one; --provider <key> --export prints the RUNNABLE vendor env for that provider (server-computed through the runtime adapter — the exact KIMI_MODEL_*/OPENAI_API_KEY/ANTHROPIC_* vars the vendor CLI needs; codex's in-cage install is PRINTED, never run); --json prints the list. Read-only, opens no gate
   zee working [--note "..."]          ping that you are actively working (hive shows occ-working); clears any open tend. NOT gated
+  zee turn --start | --end           report an INTERACTIVE turn boundary (a human or a manager typing into this cage's pane) — the ONE kind of turn the queenzee does not start and cannot see. The vendor CLI's own turn hooks call this for you; NOT gated, and it records NO cost (a hook knows a turn happened, not what it cost)
   zee tend --reason "..." | --clear   flag that you NEED A HUMAN in the console (hive shows occ-tendRequest); opens no gate, blocks nothing. The BRIEF reason is required and is what the console shows beside the ask — one line, say what you need a human FOR. --clear lowers it
   zee sync [--no-rebuild]            reconcile on your own: deliver current main INTO your cxell, merge it, rebuild. NOT gated. A genuine conflict is left for YOU to resolve (git add/commit), then land
   zee db-catchup [--restore]         roll your OWN db (clone/isolated) forward to prod's CURRENT schema — apply the prod-ledger migrations it lacks. NOT gated (writes only your db, reads prod read-only). --restore rebuilds an isolated db from the latest full prod snapshot instead (schema+data; discards your db contents)
+  zee db-sandbox [--migrate] [--status] [--stop]   start a REAL throwaway postgres INSIDE this cage (127.0.0.1 only) and print its DSN — how you verify database work when your assigned db is unusable. NOT gated, nothing to ask for: it dies with the container. --migrate applies db/migrations to it; --stop stops it; a second start returns the SAME DSN. It NEVER replaces your assigned DATABASE_URL — pass the DSN yourself, and report a broken assigned db rather than working around it
   zee migration-number [--name "..."] [--again]   ASK for the next free db/migrations number: the queenzee counts what is LANDED plus what every other LIVE xell's worktree and claims already hold — the sibling branches you cannot see (ticket #9). NOT gated. Advisory: it hands out a number, it does not gate your landing. Asking twice returns the SAME number; --again gets a second one
   zee land [--wait]                  collect + catch up + gated push to main (HELD for a human); self-heals a "moved since caging" miss by syncing main in; --wait blocks until decided (run in background)
                                      ONE runway per ref: if another xell's landing is already open on main you are put in a HOLDING pattern with a position (no second card, nothing rejected) and RESUMED when it clears — then "zee sync", then "zee land"
@@ -231,6 +494,8 @@ function usage() {
   zee hint-ship [--reason "..."] | --clear   flag "this looks ship-ready" — lights the ship? button for a human WITHOUT shipping. Use when NOT 100% certain the job is done
   zee prod --reason "..."            ASK to be bound to the prod database (a human confirms). The BIG prod-data ask — prefer \`zee seed\` when you only need rows in prod
   zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
+  zee verify-webapp                    OFFER your built webapp to a human in the console (Open link / dismiss). For a VISUAL-VERIFICATION xell: build with \`zee build webapp --wait\`, then call this. NOT gated, nothing irreversible — never land/ship for this
+  zee upload-conversation [--reason "…"]   UPLOAD this xell's conversation to the queenzee (archived; a manager can review it). NOT gated. Reads your own session transcript and stores it — the "upload conversations on done" harness setting does this automatically at \`zee done\`
   zee done --summary "..." | --clear   propose done (a human confirms with "Mark done"); --clear WITHDRAWS the proposal if you are back at work
 
  crew (a zee that has a manager, or IS one):
@@ -239,24 +504,36 @@ function usage() {
 
  the work tracker (the PLAN this job is part of):
   zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
+  zee work --new --title "..." [--body "..."] [--kind task|activity] [--parent <id>] [--ticket <code|id>] [--priority 1..5] [--status s]   MANAGER-only: CUT ONE CARD in your own project's plan and print its ID, so it pipes straight into "zee assign --item <id>". Creating a card dispatches nobody
   zee item [<id>] --status <s> [--progress N] [--note "..."]   report where the WORK has got to. A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
 
  MANAGER-only (refused for a worker, with an explanation):
-  zee zees                           YOUR CREW: every worker you dispatched — hive status, what it waits on, its last message
-  zee dispatch --task "..." [--model m] [--mode 1..5] [--harness key] [--title "..."]   spawn a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness
-  zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key]   DEPLOY a worker for a WORK ITEM: same dispatch path as "zee dispatch", but the brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text. Returns the new worker's slug
+  zee conversations [--xell <slug>] [--full]   review your crew's uploaded CONVERSATION ARCHIVES (who said what while they worked). --xell narrows to one worker; --full prints its newest transcript
+  zee zees                           YOUR CREW: every worker you dispatched — slug, branch, hive status, what it waits on, WHAT IT HAS PRODUCED (landings + its unlanded diff) and its last message
+  zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse]   DEPLOY a worker for a WORK ITEM — the ONLY way a manager deploys. The brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text; the item admits at most one live worker, so a second deploy on the same item is REFUSED. Cut a card with \`zee work --new --title "…"\` (or break a ticket down) and pipe its id here: \`zee assign --item <id> --task "…"\`. Returns the new worker's slug. --visual-verify turns on per-xell VISUAL VERIFICATION (see dispatch); --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (see dispatch)
+  zee dispatch --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse] [--title "..."]   REFUSED for a manager (the ROUTER's verb — a router routes prompts with it; a manager deploys through the board: \`zee assign\`). It spawns a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness. --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and offers the live link to a human in the console; --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (default ON — --no-langfuse stops this xell's turns being traced to Langfuse)
+  zee breakdown --ticket <code|id> --items <file.json>   turn a TICKET into a whole work-item TREE in one call (a JSON array of {title, kind?, body?, parent_id?, ref?, priority?, starts_on?, due_on?} — those keys and no others, so an entry naming a zee/status/progress is refused; a later item may name an earlier one's "ref" as its parent_id). One transaction — either the whole plan exists or the ticket is untouched. ADDITIVE: running it twice cuts a second set
+  zee unassign --item <id> [--reason "..."]   take the zee OFF a work item, freeing the card for a new "zee assign" (the verb the "unassign it first" refusal has been asking for). The item's STATUS is left alone and the xell is untouched — this reaps nobody
   zee swap --to <slug> --harness <key> [--task "..."] [--model m] [--mode 1..5]   replace the ZEE working one of YOUR xells with a fresh one wearing a different worker harness, KEEPING the xell: same branch, same commits, same containers, same db, same card. How one piece of work gets a Scout, then a Builder, then a Reviewer. The outgoing zee's commits are collected out of its cage FIRST (refused rather than risked) and the incoming zee is briefed on what it INHERITED. REFUSED: a xell that is not your crew, a manager target, a manager harness, and any xell with a human gate open on it (a landing, a ship, a done suggestion)
   zee say --to <slug> --message "..."   type a message straight into that worker's LIVE session
   zee harness [<key>] [--delete] [--label "..."] [--parent <key>] [--summary "..."] [--glyph x] [--personality "..." | --personality-file <path>] [--spec <file.json>] [--enabled on|off] [--full|--json]   ·   zee harness --new --label "..." [same persona flags]
                                      YOUR PROJECT'S WORKER PERSONAS: bare LISTS what you may use (the system-wide harnesses, plus your own project's — only the latter are yours to edit); "zee harness <key>" READS one (--full for the raw JSON). --new mints one scoped to YOUR project and its KEY is DERIVED from your project + label — you do not pass one, and a key you send is refused. --parent inherits a global worker harness (zee-base carries the cxell manual, dev-base the dev craft), --spec loads {personality,summary,skills[],memory[]} from a JSON file, --delete removes one of yours. Then "zee dispatch --harness <key>". REFUSED: a manager persona, any system-wide harness, another project's, and deleting or DISABLING one a live zee wears or inherits
   zee suggest-done --to <slug> --reason "..."   ask a HUMAN to mark that worker done (they confirm; that is what reaps it)
+  zee mint-manager --reason "..." [--task "..."] [--harness key] [--title "..."] | --status | --withdraw   ROUTER-only: ASK a human for ANOTHER MANAGER zee when a prompt is a PROGRAMME, not a task (several strands, a crew, work that outlives one cage). You mint NOTHING: it records a request, a human approves it in the console, and the QUEENZEE adds the manager (its own xell, read-only prod, the manager persona). --reason is required and is the whole of what a human reads — name the strands and what blocks what. --task is the programme the new manager is briefed with. ONE open ask at a time; --withdraw un-asks it, --status reads where it got to. A rejection normally means "dispatch a worker"
+  zee xource-clean --reason "..."   ask a HUMAN to clean up the PROJECT XOURCE (the main checkout) — a mangled checkout blocks EVERY landing and ship; on approval the queenzee resets it to main (aborting merges, preserving xell worktrees). MANAGER-only: you never run git on the xource yourself
+  zee ops [--hours N] [--logs N] [--alerts]   REVIEW THE QUEENZEE ITSELF: its recent log (with the warning/error lines pre-filtered), every landing/ship/seed/prod-bind and how long each waited on a human, the fleet's token BURN (top spenders + window totals) and the backup ledger — one read-only digest (the minister's verb; see the queenzee-minister harness). --hours widens the window (default 24), --logs caps the log tail (default 300), --alerts prints ONLY the alert lines
+  zee ticket --title "..." [--body "..."] [--kind bug|feature|chore|question|incident] [--priority 1..5] [--labels a,b] [--notify]   FILE A TICKET in YOUR OWN project's tracker (reporter = your slug) — the one write an ops critique gets: a ticket opens no gate and changes nothing until a human or a manager breaks it down and takes it up. --notify also drops it into every OTHER live manager's inbox. \`zee ticket --list [--status s] [--q text]\` reads what is already filed, so you never file the same criticism twice
   NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — dispatch a worker instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused.
 
 env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (default host.docker.internal:4700)`);
   process.exit(cmd ? 1 : 0);
 }
 
-if (!token && cmd && cmd !== 'help') {
+// `db-sandbox` and `creds` are exempt: they call no API, so there is nothing to authenticate as.
+// `db-sandbox` starts a postgres on this machine's loopback and prints a DSN, as true in a plain
+// checkout as in a cage. `creds` reads the credentials the cage was GIVEN from its own env
+// (/etc/environment), which a plain checkout does not have — it simply answers "none" there.
+if (!token && cmd && cmd !== 'help' && cmd !== 'db-sandbox' && cmd !== 'creds') {
   console.error('no ZEEHIVE_XELL_TOKEN in the environment — this shell is not an authenticated cxell.');
   process.exit(1);
 }
@@ -345,6 +622,17 @@ switch (cmd) {
     out(await req('POST', '/api/xell/self/working', { note: flag('note') || null }));
     break;
   }
+  case 'turn': {
+    // Report an INTERACTIVE turn boundary — the one kind of turn the queenzee does not start and so
+    // cannot see (a human or a manager typing into this cage's pane). Called BY the vendor CLI's own
+    // turn hooks, installed at spawn; you do not normally run it by hand, but an attending human can
+    // when a session's status is plainly lying. NOT gated, and it records no cost: a hook knows a
+    // turn happened, not what it cost.
+    const state = rest.includes('--end') ? 'end' : rest.includes('--start') ? 'start' : null;
+    if (!state) { console.error('usage: zee turn --start | --end'); process.exit(2); }
+    out(await req('POST', '/api/xell/self/turn', { state }));
+    break;
+  }
   case 'db-catchup': {
     // Roll your OWN db (clone/isolated) FORWARD to prod's current schema — apply the prod-ledger
     // migrations it doesn't yet reflect. NOT gated (writes only your throwaway db; reads prod
@@ -353,6 +641,12 @@ switch (cmd) {
     const r = await req('POST', '/api/xell/self/catchup', { restore: rest.includes('--restore') });
     console.log(JSON.stringify(r.json, null, 2));
     process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
+    break;
+  }
+  case 'db-sandbox': {
+    // The one verb that touches no API at all: it starts a postgres on this container's loopback.
+    // See dbSandbox() above for why it prints a DSN and never installs one.
+    await dbSandbox(); // exits
     break;
   }
   case 'migration-number': {
@@ -373,6 +667,110 @@ switch (cmd) {
     // var NAMES only. `--export` extracts the FULL current env (.zeehive.env values), for piping to
     // a file. Read-only, opens no gate.
     out(await req('GET', rest.includes('--export') ? '/api/xell/self/env/export' : '/api/xell/self/env'));
+    break;
+  }
+  case 'creds': {
+    // WHAT THIS CAGE HOLDS: every connected provider's credential, not just the one this dispatch
+    // runs on. Read straight from the cage's own env (ZEE_PROVIDER_<KEY>_TOKEN + the ZEE_PROVIDERS
+    // manifest injected at spawn into /etc/environment AND the headless exec env) — no API call, so
+    // a zee does not need the queenzee to see the keys its own cage was given.
+    //
+    //   zee creds                       → which providers are present, with account label + hint
+    //   zee creds --provider claude     → the source-able env for ONE provider (TOKEN/LABEL/HINT)
+    //   zee creds --provider kimi --export → the RUNNABLE vendor env for that provider (server-
+    //                                     computed through the runtime adapter — KIMI_MODEL_*,
+    //                                     OPENAI_API_KEY, ANTHROPIC_*; codex's install is PRINTED,
+    //                                     never run). stdout is source-able lines ONLY.
+    //   zee creds --json                → the list as JSON
+    const want = flag('provider') || positional();
+    const present = (envVar('ZEE_PROVIDERS') || '').split(',').filter(Boolean);
+    if (!want && rest.includes('--export')) {
+      console.error('creds --export needs --provider <key> — export which provider\'s runnable env?');
+      process.exit(1);
+    }
+    if (want) {
+      const K = want.toUpperCase();
+      if (rest.includes('--export')) {
+        // The RUNNABLE env is SERVER-COMPUTED — the vendor mapping lives in the runtime adapters
+        // (lib/cxell-runtimes.js), and this CLI never carries a second copy (the exact drift class
+        // test/cxell-cli-drift.test.mjs exists to catch). The endpoint is read-only and token-scoped,
+        // and it is GATED on the xell_provider_grant ledger: the server answers ONLY for the exact
+        // account this cage was granted, so after a rotation the fresh key does not reach old cages
+        // through this door — the credential-inject card is the only one. No challenge value is
+        // sent (a masked hint is public and proves nothing); the cage's identity token names it.
+        if (!token) { // module-level token — the namespaced read below is never reached on this path
+          console.error('no ZEEHIVE_XELL_TOKEN in the environment — the runnable env is server-computed; run this inside your cxell.');
+          process.exit(1);
+        }
+        const r = await req('GET', `/api/xell/self/provider-env?provider=${encodeURIComponent(want)}`);
+        if (r.code >= 400 || r.json?.ok === false) {
+          const why = r.json?.error || r.json?.message || 'the queenzee could not build that env';
+          console.error(`no runnable ${want} env: ${why}`);
+          console.error(`  this cage holds: ${present.join(', ') || '(none — only the dispatched provider\'s own env)'}`);
+          process.exit(1);
+        }
+        // stdout is SOURCE-ABLE KEY=value LINES AND NOTHING ELSE — the eval contract; notes go to
+        // stderr. Every value is SHELL-QUOTED so a value with spaces/`$`/quotes can never break
+        // eval: source-ability must be structural, not luck.
+        const env = r.json.env || {};
+        for (const [k, v] of Object.entries(env)) console.log(`${k}=${shellQuote(String(v))}`);
+        const auth = r.json.auth_setup;
+        if (auth?.required && auth.command) {
+          console.error(`\n  NOTE: the ${r.json.label} CLI (${r.json.bin || r.json.provider}) does not read its key from the`);
+          console.error('  environment alone — install it once in this cage before running it (idempotent, prints AUTH_OK):');
+          console.error(`    ${auth.command}`);
+          // FAIL NON-ZERO until the in-cage auth install has been done: a hasty zee must not read
+          // exit 0 and walk into a silent 401. The structural check is whether the vendor's auth
+          // file exists (codex writes ~/.codex/auth.json on `codex login --with-api-key`); the key
+          // itself is never read here.
+          const authFile = auth.required && (r.json.bin || r.json.provider) === 'codex'
+            ? join(os.homedir(), '.codex', 'auth.json') : null;
+          let authFileOk = true;
+          if (authFile && !envVar('SKIP_AUTH_CHECK')) {
+            try { authFileOk = existsSync(authFile); } catch { authFileOk = false; }
+          }
+          if (!authFileOk) {
+            console.error('\n  ✗ the in-cage auth install has NOT been done — `codex exec` will 401.');
+            console.error('    Run the command above once, then re-run `zee creds --provider openai --export`.');
+            process.exit(1);
+          }
+        }
+        if (r.json.account) console.error(`\n  ${r.json.label} account: ${r.json.account}`);
+        console.error(`  eval this output, then run \`${r.json.bin || r.json.provider}\`.`);
+        process.exit(0);
+      }
+      const providerToken = envVar(`ZEE_PROVIDER_${K}_TOKEN`);
+      if (!providerToken) {
+        console.error(`no ${want} credential in this cage — ZEE_PROVIDERS="${present.join(',') || '(none)'}"`
+          + ' (the set carries every DISPATCHABLE provider’s freshest ACTIVE account; github and paused accounts are never in it)');
+        process.exit(1);
+      }
+      console.log(`ZEE_PROVIDER_${K}_TOKEN=${providerToken}`);
+      const label = envVar(`ZEE_PROVIDER_${K}_LABEL`);
+      const hint = envVar(`ZEE_PROVIDER_${K}_HINT`);
+      if (label) console.log(`ZEE_PROVIDER_${K}_LABEL=${label}`);
+      if (hint) console.log(`ZEE_PROVIDER_${K}_HINT=${hint}`);
+      process.exit(0);
+    }
+    const providers = present.map((k) => {
+      const K = k.toUpperCase();
+      return { provider: k, label: envVar(`ZEE_PROVIDER_${K}_LABEL`) || null,
+               hint: envVar(`ZEE_PROVIDER_${K}_HINT`) || null,
+               token: envVar(`ZEE_PROVIDER_${K}_TOKEN`) ? 'present' : null };
+    });
+    if (rest.includes('--json')) {
+      console.log(JSON.stringify({ ok: true, providers, manifest: present.join(',') || null }, null, 2));
+      process.exit(0);
+    }
+    if (!providers.length) {
+      console.log('this cage holds no extra provider credentials — only the dispatched provider’s own env.');
+      process.exit(0);
+    }
+    for (const p of providers) {
+      console.log(`  ${p.provider.padEnd(10)} ${String(p.label || '').padEnd(24)} ${p.hint ? `(${p.hint})` : ''}`);
+    }
+    console.log(`\n  run \`zee creds --provider <key>\` to print the env for one provider.`);
+    process.exit(0);
     break;
   }
   case 'device': {
@@ -447,6 +845,85 @@ switch (cmd) {
     process.exit(r.code >= 400 || r.json?.ok === false ? 1 : 0);
     break;
   }
+  case 'verify-webapp': {
+    // OFFER your built webapp to a human in the console (Open link / dismiss). A human turned on
+    // VISUAL VERIFICATION for this xell at dispatch time; build the webapp first (`zee build
+    // webapp --wait`), then call this. NOT gated (it acts now) and nothing is landed or shipped —
+    // the whole point is a human gets to SEE the running webapp this xell built.
+    out(await req('POST', '/api/xell/self/verify-webapp'));
+    break;
+  }
+  case 'upload-conversation': {
+    // UPLOAD this xell's conversation to the queenzee. The conversation IS this zee's session
+    // transcript inside the cage (~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl, one zee
+    // per cxell so the NEWEST file is the current one). Read it and POST the raw text; the server
+    // parses + stores it as a xell_conversation row for a manager (`zee conversations`) or a human
+    // to review. NOT gated (an archive is a fact, like `zee working`). The "upload on done" harness
+    // setting does the same automatically when you `zee done` — this verb is for capturing earlier.
+    const homedir = os.homedir();
+    const projDir = join(homedir, '.claude', 'projects');
+    let newest = null;
+    try {
+      for (const dir of readdirSync(projDir)) {
+        const full = join(projDir, dir);
+        let st;
+        for (const f of readdirSync(full)) {
+          if (!f.endsWith('.jsonl')) continue;
+          const p = join(full, f);
+          st = statSync(p);
+          if (!newest || st.mtimeMs > newest.mtime) newest = { p, f, mtime: st.mtimeMs, bytes: st.size };
+        }
+      }
+    } catch { /* no transcript dir yet */ }
+    if (!newest) {
+      console.error('no conversation transcript found in ~/.claude/projects — nothing to upload.');
+      process.exit(1);
+    }
+    let content;
+    try { content = readFileSync(newest.p, 'utf8'); }
+    catch (e) { console.error(`could not read the transcript: ${e.message}`); process.exit(1); }
+    if (newest.bytes > 25 * 1024 * 1024) {
+      console.error(`the transcript is ${newest.bytes} bytes — too large to POST through the API. `
+        + 'Enable the "upload conversations on done" harness setting instead (the queenzee reads it '
+        + 'directly from the cxell, with no API size limit), or upload a shorter session.');
+      process.exit(1);
+    }
+    // Title = Claude Code's own custom-title line, last one wins (same source session-title.js uses).
+    let title = null;
+    for (const line of content.split('\n')) {
+      if (!line.includes('"custom-title"')) continue;
+      try { const j = JSON.parse(line); if (j?.type === 'custom-title' && j.customTitle) title = j.customTitle; } catch { /* skip */ }
+    }
+    const sessionId = newest.f.replace(/\.jsonl$/, '') || null;
+    out(await req('POST', '/api/xell/self/upload-conversation', {
+      content, session_id: sessionId, title, reason: flag('reason') || null }));
+    break;
+  }
+  case 'conversations': {
+    // MANAGER only: review the conversation archives of your crew (`zee upload-conversation` or the
+    // "upload on done" harness setting). Scoped like every crew verb — you only ever see xells you
+    // dispatched. `--xell <slug>` narrows to one worker; `--full` returns its newest transcript.
+    const xell = flag('xell');
+    const r = await req('GET', `/api/xell/self/conversations?${xell ? `xell=${encodeURIComponent(xell)}&` : ''}${rest.includes('--full') ? 'full=1' : ''}`);
+    if (rest.includes('--json')) { out(r); break; }
+    const j = r.json || {};
+    if (j.ok === false) { console.error(j.error || 'refused'); process.exit(1); }
+    for (const c of j.conversations || []) {
+      console.log(`— ${String(c.uploaded_at || '').slice(0, 16)} ${c.xell}${c.title ? ` · ${c.title}` : ''}`
+        + `${c.session_id ? ` (${String(c.session_id).slice(0, 8)})` : ''}`);
+      console.log(`  ${c.line_count} lines · ${c.byte_count} bytes · via ${c.uploaded_by}${c.reason ? ` · ${c.reason}` : ''}`);
+      if (c.content) {
+        console.log('');
+        console.log('── transcript ──');
+        console.log(String(c.content).slice(0, 20000));
+        console.log('── end (truncated at 20000 chars; the full archive is in the meta-DB) ──');
+        console.log('');
+      }
+    }
+    if (j.message) console.log(j.message);
+    process.exit(r.code >= 400 ? 1 : 0);
+    break;
+  }
   case 'zees': {
     // YOUR CREW (manager only). Read this before interrupting anyone: a worker showing occ-working
     // is working, and 'waiting_on_human' is the list that actually needs you.
@@ -457,7 +934,19 @@ switch (cmd) {
     console.log(`crew of ${j.manager?.slug || '?'} — ${j.count} worker(s)`);
     for (const c of j.crew || []) {
       console.log(`  ${c.slug.padEnd(28)} ${String(c.hive_status_label).padEnd(10)} ${c.working ? 'working' : (c.zee_status || '—')}`);
+      if (c.branch) console.log(`      branch: ${c.branch}`);
       if (c.task) console.log(`      task: ${c.task}`);
+      // WHAT IT HAS PRODUCED — the two lines that do not come from the zee row, and so are true at
+      // the moment of the read rather than at the end of its last turn. `landed` is the ledger; `git`
+      // is what has not landed yet, and an unmeasurable diff says so instead of reading as 0.
+      console.log(`      landed: ${c.landings?.count
+        ? `${c.landings.count} — last ${String(c.landings.last_sha || '?').slice(0, 8)}`
+          + `${c.landings.landed_at ? ` at ${String(c.landings.landed_at).slice(0, 16).replace('T', ' ')}` : ''}`
+        : 'nothing on main yet'}`);
+      console.log(`      git: ${c.diff
+        ? `↑${c.diff.ahead} unlanded commit(s) · ${c.diff.dirty} dirty file(s)`
+          + ` · +${c.diff.insertions}/−${c.diff.deletions} in ${c.diff.files} file(s) (read from its ${c.diff.source})`
+        : 'not measurable (no worktree on disk and no live cxell) — do NOT read that as "produced nothing"'}`);
       if (c.waiting_on_human?.length) console.log(`      ⚠ waiting: ${c.waiting_on_human.join('; ')}`);
       if (c.last_message) console.log(`      last message: ${c.last_message.replace(/\s+/g, ' ').slice(0, 120)}`);
     }
@@ -473,6 +962,18 @@ switch (cmd) {
     out(await req('POST', '/api/xell/self/dispatch', {
       task, model: flag('model') || null, mode: flag('mode') || null,
       harness: flag('harness') || null, title: flag('title') || null,
+      // --provider names WHICH AI PROVIDER the worker runs on (claude|codex|kimi|…) — the ROUTER's
+      // whole job is deciding this; omitted = the project default, exactly as before (139).
+      ...(flag('provider') ? { provider: flag('provider') } : {}),
+      // --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and
+      // offers the live link to a human in the console (`zee verify-webapp`).
+      ...(rest.includes('--visual-verify') ? { visual_verify: true } : {}),
+      // --langfuse / --no-langfuse sets the per-xell LANGFUSE TRACKING switch (default ON). The
+      // explicit pair, not a single flag: the default is ON, so "turn it off" (--no-langfuse) is
+      // the interesting verb and must be representable; neither flag → the target keeps what it has.
+      ...(rest.includes('--no-langfuse') ? { langfuse_tracking: false }
+        : rest.includes('--langfuse') ? { langfuse_tracking: true }
+        : {}),
     }));
     break;
   }
@@ -601,6 +1102,30 @@ switch (cmd) {
     // THE PLAN you are part of. A MANAGER sees its project's work items in tree order (--board drops
     // the project root, which is not a card); a WORKER sees the ONE item it is assigned to, with the
     // ancestors, ticket and history it was briefed from. --item <id> reads one item.
+    //
+    // --new CUTS a card instead of reading one (MANAGER only). It lives under `work` rather than as
+    // its own verb because it is the write half of the same noun — and the ID is printed on its own
+    // line FIRST, so the next command is a copy-paste: `zee assign --item <id> --task "…"`.
+    if (rest.includes('--new')) {
+      const title = flag('title');
+      if (!title) { console.error('work --new needs --title "…" (the one line that becomes the card; detail goes in --body)'); process.exit(1); }
+      // `--priority high` is Number('high') → NaN → JSON.stringify writes null → the server saw no
+      // priority at all and the card silently took the default 3. A typo must not be a silent default.
+      const priority = flag('priority');
+      if (priority != null && !/^[1-5]$/.test(String(priority).trim())) {
+        console.error(`work --new: --priority "${priority}" is not a number 1-5 (1 is the most urgent, 3 the default)`);
+        process.exit(1);
+      }
+      const r = await req('POST', '/api/xell/self/work/new', {
+        title, body: flag('body') || null, kind: flag('kind') || null,
+        parent: flag('parent') || null, ticket: flag('ticket') || null,
+        priority: priority == null ? null : Number(priority), status: flag('status') || null,
+      });
+      if (rest.includes('--json')) { out(r); break; }
+      if (r.json?.id) console.log(r.json.id);
+      out(r, 'work --new');
+      break;
+    }
     const item = flag('item') || positional();
     const r = await req('GET', `/api/xell/self/work?${item ? `item=${encodeURIComponent(item)}&` : ''}${rest.includes('--board') ? 'board=1' : ''}`);
     if (rest.includes('--json')) { out(r); break; }
@@ -642,7 +1167,44 @@ switch (cmd) {
     out(await req('POST', '/api/xell/self/work/assign', {
       item, task: flag('task') || null, model: flag('model') || null, mode: flag('mode') || null,
       harness: flag('harness') || null, title: flag('title') || null,
+      // Same per-xell VISUAL VERIFICATION opt-in as `zee dispatch --visual-verify`.
+      ...(rest.includes('--visual-verify') ? { visual_verify: true } : {}),
+      // Same per-xell LANGFUSE TRACKING switch as `zee dispatch --langfuse|--no-langfuse`.
+      ...(rest.includes('--no-langfuse') ? { langfuse_tracking: false }
+        : rest.includes('--langfuse') ? { langfuse_tracking: true }
+        : {}),
     }));
+    break;
+  }
+  case 'breakdown': {
+    // MANAGER only: a TICKET becomes a work-item TREE, in one call and one transaction. The items
+    // come from a FILE because a tree is nested JSON and a shell flag is the wrong shape for it —
+    // the same reasoning as `zee harness --spec`. Either the whole plan exists or the ticket is
+    // untouched, so a malformed entry costs nothing but the error message.
+    const ticket = flag('ticket');
+    const file = flag('items');
+    if (!ticket) { console.error('breakdown needs --ticket <code|id> (the code is what a human reads: TKT-52-2518)'); process.exit(1); }
+    if (!file) { console.error('breakdown needs --items <file.json>: a JSON array of {title, kind?, body?, parent_id?, ref?, …}'); process.exit(1); }
+    let items;
+    try { items = JSON.parse(readFileSync(file, 'utf8')); }
+    catch (e) { console.error(`cannot read ${file}: ${e.message}`); process.exit(1); }
+    // {items:[…]} is accepted too — it is the body the API takes, so a file copied from a request works.
+    if (items && !Array.isArray(items) && Array.isArray(items.items)) items = items.items;
+    if (!Array.isArray(items) || !items.length) {
+      console.error(`${file} must hold a NON-EMPTY JSON array of items (or an object with an "items" array)`);
+      process.exit(1);
+    }
+    out(await req('POST', '/api/xell/self/work/breakdown', { ticket, items }));
+    break;
+  }
+  case 'unassign': {
+    // MANAGER only: detach the xell from a card. The card goes back to being plan — its STATUS is
+    // kept (work that happened, happened) and the xell is not touched, let alone reaped. This is the
+    // verb `zee assign`'s "unassign it first" refusal has been naming, e.g. after a worker died at
+    // spawn and left its item locked to a dead xell.
+    const item = flag('item') || positional();
+    if (!item) { console.error('unassign needs --item <work-item-id> (run `zee work` to list them)'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/work/unassign', { item, reason: flag('reason') || null }));
     break;
   }
   case 'item': {
@@ -657,10 +1219,77 @@ switch (cmd) {
     }));
     break;
   }
+  case 'mint-manager': {
+    // ROUTER-only. A REQUEST and nothing else: no agent may create a manager — a human approves and
+    // the queenzee mints it (the same call the console button makes).
+    if (rest.includes("--status")) { out(await req("POST", "/api/xell/self/mint-manager", { status: true })); break; }
+    if (rest.includes("--withdraw") || rest.includes("--clear")) {
+      out(await req("POST", "/api/xell/self/mint-manager", { withdraw: true, reason: flag("reason") || null }));
+      break;
+    }
+    const reason = flag("reason");
+    if (!reason) {
+      console.error("mint-manager needs --reason \"why one well-briefed worker will NOT do\" — it is the whole of what a human reads");
+      process.exit(1);
+    }
+    out(await req("POST", "/api/xell/self/mint-manager", {
+      reason, task: flag("task") || null, harness: flag("harness") || null, title: flag("title") || null,
+    }));
+    break;
+  }
   case 'suggest-done': {
     const to = flag('to');
     if (!to) { console.error('suggest-done needs --to <worker-slug> (and --reason "why it is finished")'); process.exit(1); }
     out(await req('POST', '/api/xell/self/suggest-done', { to, reason: flag('reason') || null }));
+    break;
+  }
+  case 'xource-clean': {
+    // MANAGER only: ask a HUMAN to clean up the project xource (the main checkout). A mangled
+    // checkout — a mid-deploy interruption, a conflict a sync left behind — blocks EVERY landing
+    // and ship, and only a human's approve resets it. You never run git on the xource yourself.
+    const reason = flag('reason');
+    if (!reason) { console.error('xource-clean needs --reason "why the xource needs cleaning" (it is what a human reads on the card)'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/xource-clean', { reason }));
+    break;
+  }
+  case 'ops': {
+    // MANAGER only: the queenzee's own operations as ONE read-only digest — log tail + alert lines,
+    // landings/ships/seeds/prod-binds with their waits, fleet token burn, backups. This is the
+    // minister's read: criticise from evidence, then file the criticism with `zee ticket`.
+    const hours = flag('hours'); const logs = flag('logs');
+    const qs = new URLSearchParams();
+    if (hours) qs.set('hours', hours);
+    if (logs) qs.set('logs', logs);
+    const r = await req('GET', `/api/xell/self/ops${qs.size ? `?${qs}` : ''}`);
+    if (r.json?.ok === false) { console.error(r.json.error || 'refused'); process.exit(1); }
+    if (rest.includes('--alerts')) {
+      // just the trouble: the pre-filtered warning/error lines, one per row, oldest first
+      for (const l of r.json?.alerts?.lines || []) console.log(`${new Date(l.ts).toISOString()} [${l.scope}] ${l.msg}`);
+      process.exit(r.code >= 400 ? 1 : 0);
+    }
+    out(r);
+    break;
+  }
+  case 'ticket': {
+    // MANAGER only: file (or list) tickets in YOUR OWN project. Filing is the only write the ops
+    // critique gets — a ticket opens no gate; humans and managers decide what to do with it.
+    if (rest.includes('--list')) {
+      const qs = new URLSearchParams();
+      if (flag('status')) qs.set('status', flag('status'));
+      if (flag('q')) qs.set('q', flag('q'));
+      out(await req('GET', `/api/xell/self/tickets${qs.size ? `?${qs}` : ''}`));
+      break;
+    }
+    const title = flag('title');
+    if (!title) { console.error('ticket needs --title "…" (one line a human can judge on the board; evidence goes in --body) — or --list to read what is already filed'); process.exit(1); }
+    const labels = flag('labels');
+    const priority = flag('priority');
+    out(await req('POST', '/api/xell/self/ticket', {
+      title, body: flag('body') || null, kind: flag('kind') || null,
+      priority: priority == null ? null : Number(priority),
+      labels: labels ? labels.split(',').map((s) => s.trim()).filter(Boolean) : null,
+      notify: rest.includes('--notify'),
+    }));
     break;
   }
   case 'done': {

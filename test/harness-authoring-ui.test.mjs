@@ -35,9 +35,18 @@ const ok = (cond, msg) => { console.log(`  ${cond ? '✓' : '✗ FAIL'} ${msg}`)
 const tag = randomUUID().slice(0, 8);
 const key = `zt-author-${tag}`;
 const compiled = [];
+// Node cannot load a raw .jsx, so a component is transformed beside itself — and so is every SIBLING
+// component it imports (the harness editor now renders <ZeeAvatar>, the provider-coin badge), with
+// the specifier rewritten to the compiled copy. Plain .js imports are left alone: node loads those.
 const compile = (rel, name) => {
   const file = join(ROOT, dirname(rel), `.${name}.test-build.mjs`);
-  writeFileSync(file, transformSync(read(rel), { loader: 'jsx', format: 'esm', jsx: 'transform' }).code);
+  let code = transformSync(read(rel), { loader: 'jsx', format: 'esm', jsx: 'transform' }).code;
+  code = code.replace(/(['"])\.\/([A-Za-z0-9_-]+)\.jsx\1/g, (_m, _q, dep) => {
+    const depName = `${name}-${dep.toLowerCase()}`;
+    compile(join(dirname(rel), `${dep}.jsx`), depName);
+    return `"./.${depName}.test-build.mjs"`;
+  });
+  writeFileSync(file, code);
   compiled.push(file);
   return `file://${file}`;
 };

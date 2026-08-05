@@ -12,6 +12,7 @@ import { config } from '../config.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import { cleanGitEnv, headCommit, isAncestor } from './git.js';
+import { normalizeSpawnPrep, STEP_PRESETS } from './spawn-prep.js';
 import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
          remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
@@ -355,6 +356,10 @@ export async function pushProject(id, by = 'human@console') {
     branch: p.main_branch, remoteUrl: p.remote_url, token,
   });
   if (r.pushed) logline('projects', `${by} pushed ${p.name}: local ${p.main_branch} → origin/${p.main_branch} (${(r.sha || '').slice(0, 8)}) [${r.state}]`);
+  // A refusal was previously invisible outside the one console pill that asked for it: the human
+  // saw "repository rule violations" once and had nothing to point anyone at. Log the state AND
+  // the reason so the rail carries why an outbound push did not happen.
+  else logline('projects', `${by} push REFUSED on ${p.name} [${r.state || 'error'}]: ${r.reason || 'no reason given'}`);
   return r;
 }
 
@@ -363,7 +368,7 @@ export async function pushProject(id, by = 'human@console') {
 // ('merge' | 'squash' | 'rebase'). The merge is a separate GitHub call after the PR is opened, so a
 // refused merge (branch protection, not-yet-mergeable) still leaves an OPEN PR the human can finish
 // by hand — the outcome is reported as r.merge = {merged, state, reason}.
-export async function pullRequestProject(id, { headBranch = null, title = null, base = null, merge = false, mergeMethod = 'merge' } = {}, by = 'human@console') {
+export async function pullRequestProject(id, { headBranch = null, title = null, base = null, merge = false, mergeMethod = 'merge', squash = false } = {}, by = 'human@console') {
   const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
   if (!p) throw new Error('project not found');
   if (!p.remote_url) return { opened: false, reason: 'project has no remote_url — set one in Project setup first' };
@@ -381,9 +386,13 @@ export async function pullRequestProject(id, { headBranch = null, title = null, 
   const r = await openPullRequest({
     repoRoot: String(p.repo_root).replace(/\\/g, '/'),
     remoteUrl: p.remote_url, token, branch: p.main_branch,
-    headBranch, title, base,
+    headBranch, title, base, squash,
   });
-  if (r.opened) logline('projects', `${by} opened PR on ${p.name}: ${r.head} → ${r.base}${r.number ? ` (#${r.number})` : ''} [${r.state}]`);
+  if (r.opened) logline('projects', `${by} opened PR on ${p.name}: ${r.head} → ${r.base}${r.number ? ` (#${r.number})` : ''} [${r.state}]`
+    // the head that was actually pushed can differ from the one asked for when a ruleset blocked
+    // the force refresh (remote-git falls back to a fresh sha-suffixed branch) — say which
+    + ((r.tried || []).length > 1 ? ` — head fell back from ${r.tried[0]} (ruleset blocked the update)` : ''));
+  else logline('projects', `${by} PR REFUSED on ${p.name}${r.rule ? ` [rule: ${r.rule}]` : ''}: ${r.reason || 'no reason given'}`);
 
   if (merge && r.opened && r.number) {
     const m = await mergePullRequest({ remoteUrl: p.remote_url, token, number: r.number, method: mergeMethod, title });
@@ -542,13 +551,26 @@ export async function projectReadiness(id) {
 
 // ── the dev spawn template: what a NEW xell gets by default ─────────────────
 export async function getPoolConfig(projectId) {
-  return one(
+  const row = await one(
     `SELECT pc.*, r.key AS runtime_key, r.label AS runtime_label,
             h.key AS harness_key, h.label AS harness_label
        FROM pool_config pc
        LEFT JOIN agent_runtime r ON r.id = pc.default_runtime_id
        LEFT JOIN harness h ON h.id = pc.default_harness_id
       WHERE pc.project_id=$1`, [projectId]);
+  if (!row) return row;
+  // spawn_prep is served EFFECTIVE, never raw: a NULL column is the built-in default (npm ci + the
+  // web prebuild, shared npm cache), and an editor that had to know that would be a second copy of
+  // the rule. `spawn_prep_custom` is how the console says "this project has been edited" without
+  // comparing structures, and the presets ride along so the "add a step" menu is server-defined —
+  // a new step kind appears in the UI by shipping the server, not by shipping both.
+  return {
+    ...row,
+    spawn_prep: normalizeSpawnPrep(row.spawn_prep ?? null),
+    spawn_prep_custom: !!row.spawn_prep,
+    spawn_prep_presets: STEP_PRESETS,
+    spawn_prep_defaults: normalizeSpawnPrep(null),
+  };
 }
 
 const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
@@ -593,6 +615,16 @@ export async function updatePoolConfig(projectId, body = {}) {
     }
   }
   const sets = [], vals = [projectId];
+  // SPAWN PREP (migration 121): the dependency steps a fresh xell is prepped with, and the cache
+  // knobs that decide how fast that is. Normalized (and REFUSED, loudly) here rather than at
+  // dispatch: a template that cannot be turned into a script must fail at the edit, in front of the
+  // human who made it, not at 3am inside a cage nobody is watching. `null` restores the default.
+  if (body.spawn_prep !== undefined) {
+    const value = body.spawn_prep === null || body.spawn_prep === 'default' ? null
+      : normalizeSpawnPrep(body.spawn_prep);
+    vals.push(value === null ? null : JSON.stringify(value));
+    sets.push(`spawn_prep = $${vals.length}::jsonb`);
+  }
   for (const f of POOL_PATCHABLE) {
     if (body[f] === undefined) continue;
     vals.push(body[f]);
@@ -657,6 +689,7 @@ const PATCHABLE = [
   'db_name', 'db_user', 'ship_ref',
   'registry',   // OCI registry for split builds (compile on one docker context, run on another)
   'auto_approve_land', 'auto_approve_ship',   // operator policy: skip the human gate (default off)
+  'auto_approve_seed', 'auto_done',           // …and the seed/done policies (122): auto-run seeds, auto-confirm manager-suggested done
   'remote_url', // inbound-only fetch source (migration 032) — re-pointing it is safe, unlike repo_root
 ];
 

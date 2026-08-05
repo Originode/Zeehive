@@ -101,7 +101,10 @@ export function buildListScript(dir) {
 }
 
 // Turn the tab-separated `type<TAB>size<TAB>name` lines into sorted {name,type,size} entries.
-export function parseListOutput(buf, dir) {
+// `root` is the explorer's home — the directory the ⌂ button and a bare request land on, and the
+// one dir whose parent is null. Defaults to the cxell worktree (the zee door); the container door
+// passes its own root (the container filesystem root, or a process-role worktree).
+export function parseListOutput(buf, dir, root = CXELL_ROOT) {
   const entries = [];
   for (const line of buf.toString('utf8').split('\n')) {
     if (!line) continue;
@@ -114,8 +117,8 @@ export function parseListOutput(buf, dir) {
   }
   entries.sort((a, b) =>
     a.type !== b.type ? (a.type === 'dir' ? -1 : 1) : a.name.localeCompare(b.name, undefined, { numeric: true }));
-  const parent = dir === '/' ? null : dir.slice(0, dir.lastIndexOf('/')) || '/';
-  return { path: dir, parent, root: CXELL_ROOT, entries };
+  const parent = dir === root ? null : dir.slice(0, dir.lastIndexOf('/')) || '/';
+  return { path: dir, parent, root, entries };
 }
 
 // Read a text file, capped. Emits the true size on stderr so we can flag truncation even though

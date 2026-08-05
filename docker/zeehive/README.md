@@ -39,14 +39,17 @@ New Project → Clone from GitHub. Staged, each step reversible:
    New Project → Clone from GitHub + per-project ↓ Pull in the console, `github` read-only-PAT
    provider token for private repos.
 2. **Container parity** — the image/compose carry everything the host had: entrypoint creates
-   the `ugreen-nas`/`mardale-prod` TCP contexts from env; `DOCKER_HOST` points the `default`
-   context at the mounted socket; volumes for the fleet SSH keypair (`zeehive_ssh`) and prod
-   dumps (`zeehive_backups`); `REPOS_DIR=/repos` makes clones land on the repos volume;
-   `ZEEHIVE_CXELL_SSH=network` makes the queenzee SSH to cxells by container name over
-   `zee-hive-net` (the human's `127.0.0.1:<port>` door is unchanged); cxells get `ZEEHIVE_API`
-   injected from `CXELL_API_BASE`. Container self-ship is `scripts/self-ship-container.sh`
-   (sync → build → sibling `docker:cli` recreate) — selected per-site via the container row's
-   `build_script`, so host and container eras coexist as data.
+   the `ugreen-nas`/`mardale-prod` TCP contexts (and the `mardale-prod-alt` SSH context when
+   `ZEEHIVE_CTX_MARDALE_ALT` is set) from env; `ZEEHIVE_CTX_MARDALE` is overridable via the
+   compose `.env` so `mardale-prod` can be re-pointed at the SSH endpoint while the LAN route
+   to the NAS is down (see `docs/onboard-mardale-prod-alt.md` → Failover); `DOCKER_HOST` points
+   the `default` context at the mounted socket; volumes for the fleet SSH keypair
+   (`zeehive_ssh`) and prod dumps (`zeehive_backups`); `REPOS_DIR=/repos` makes clones land on
+   the repos volume; `ZEEHIVE_CXELL_SSH=network` makes the queenzee SSH to cxells by container
+   name over `zee-hive-net` (the human's `127.0.0.1:<port>` door is unchanged); cxells get
+   `ZEEHIVE_API` injected from `CXELL_API_BASE`. Container self-ship is
+   `scripts/self-ship-container.sh` (sync → build → sibling `docker:cli` recreate) — selected
+   per-site via the container row's `build_script`, so host and container eras coexist as data.
    ⚠ **Harness FILES are not in the image** (and must not be): `harnesses/<key>/` is read from the
    ZEEHIVE PROJECT's clone (`project.repo_root`, i.e. `/repos/Zeehive`), which is why the Zeehive
    project must be onboarded and the repos volume readable before a manager zee gets its manual.

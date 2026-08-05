@@ -157,6 +157,14 @@ try {
   ok(/warm\.lockDrift \?/.test(intake) && /lockfile drift/.test(intake),
      'the dispatch report keeps a distinct lock-drift branch (source assertion — intake needs a queenzee to run)');
   ok(/warm\.sharedCache \?/.test(intake), 'and still reports which npm cache the warm used');
+  // …and it no longer hard-codes "warmed (deps + web build ready)". That string was printed whatever
+  // ran, so a project whose template asks for NOTHING got the most reassuring line in the file after
+  // 0.8s of doing nothing — seen live on 2026-08-03, when an empty template was reported as fully
+  // warmed. The report now reads the STEPS the warm actually returned.
+  ok(/NOTHING WAS INSTALLED/.test(intake) && /didInstall/.test(intake),
+     'a spawn that installed nothing says so, instead of borrowing the happy sentence');
+  ok(/reusedAll/.test(intake) && /provisioning had already installed everything/.test(intake),
+     'and a spawn that reused a pre-warmed cage is its own line, not "warmed" either');
 } finally {
   process.env.PATH = REAL_PATH;
   delete process.env.FAKE_WARM_REPO; delete process.env.FAKE_WARM_MODE; delete process.env.npm_config_audit;

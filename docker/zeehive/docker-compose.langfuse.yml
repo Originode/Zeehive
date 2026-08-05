@@ -1,0 +1,163 @@
+# LANGFUSE — the single system-wide LLM observability stack (langfuse/langfuse:4 + worker +
+# postgres + clickhouse + redis + minio). Provisioned ONCE by lib/langfuse.js (`docker compose
+# up -d`), never per-project, never per-xell. This file is a trimmed, secret-interpolated twin of
+# Langfuse's official docker-compose (langfuse.com/self-hosting) — same six services, same data
+# volumes — so the same stack is what the official docs describe.
+#
+# EVERY value is interpolated from the env the provisioner passes (-p project, --env-file), so no
+# secret lives in this file. The `-p zeehive-langfuse` project name keeps the volumes/network
+# namespaced and lets teardown (`compose down -v`) remove them.
+#
+# Ports mirror the official file: langfuse-web on 3000 (published to the HOST at the port
+# lib/langfuse.js computes), minio on 9000/9001 (published to a host minio port). postgres,
+# clickhouse and redis are 127.0.0.1-only — the components reach them over the compose network,
+# and nothing outside the stack needs them directly.
+#
+# The init-user env block is how a fresh Langfuse gets its admin login + the trace project whose
+# public/secret key the queenzee stores in langfuse_config — set from the provisioner.
+
+services:
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:4
+    restart: always
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "0.0.0.0:${LANGFUSE_WEB_PORT:-3000}:3000"
+    environment: &langfuse-web-env
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "${LANGFUSE_TELEMETRY_ENABLED:-false}"
+      # v4 migration write mode: DEFAULT to `dual` so the traces API (/api/public/traces) stays
+      # enabled — Langfuse's own default (`events_only`) disables it, which made the console's
+      # "recent traces" read error instead of showing traces. dual writes to both storage paths
+      # (safe migration) and keeps the read API live; ALLOW_PREVIEW_OPT_IN is required for it.
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: "${LANGFUSE_MIGRATION_V4_WRITE_MODE:-dual}"
+      LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: "${LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN:-true}"
+      DATABASE_URL: ${LANGFUSE_DATABASE_URL}
+      CLICKHOUSE_MIGRATION_URL: ${LANGFUSE_CLICKHOUSE_MIGRATION_URL}
+      CLICKHOUSE_URL: ${LANGFUSE_CLICKHOUSE_URL}
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: ${LANGFUSE_REDIS_HOST:-redis}
+      REDIS_PORT: ${LANGFUSE_REDIS_PORT:-6379}
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH}
+      LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_USER:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_INTERNAL_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_USER:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-zeehive}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-ZeeHive}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-zeehive}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-ZeeHive}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-ZeeHive Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:4
+    restart: always
+    depends_on: *langfuse-depends-on
+    environment: *langfuse-web-env
+
+  postgres:
+    image: docker.io/postgres:${LANGFUSE_POSTGRES_VERSION:-17}
+    restart: always
+    environment:
+      POSTGRES_USER: ${LANGFUSE_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${LANGFUSE_POSTGRES_DB:-langfuse}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LANGFUSE_POSTGRES_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    restart: always
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  redis:
+    image: docker.io/redis:7
+    restart: always
+    command: >
+      --requirepass ${LANGFUSE_REDIS_AUTH}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${LANGFUSE_REDIS_AUTH}", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    restart: always
+    entrypoint: sh
+    # create the 'langfuse' bucket before starting the service
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_MINIO_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD}
+    ports:
+      - "${LANGFUSE_MINIO_PORT:-9090}:9000"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+volumes:
+  langfuse_postgres_data:
+    driver: local
+  langfuse_clickhouse_data:
+    driver: local
+  langfuse_clickhouse_logs:
+    driver: local
+  langfuse_minio_data:
+    driver: local
+  langfuse_redis_data:
+    driver: local

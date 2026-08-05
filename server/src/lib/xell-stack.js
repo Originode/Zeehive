@@ -52,7 +52,7 @@ export async function xellStackMarkdown(xellId, { cxell = true } = {}) {
       WHERE x.id = $1`, [xellId]);
   if (!xell) return null;
   const rows = await q(
-    `SELECT c.role, c.name, c.url, c.tier, c.docker_ctx, host(c.host) AS host, c.host_port
+    `SELECT c.role, c.name, c.url, c.tier, c.docker_ctx, c.host AS host, c.host_port
        FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xellId]);
   // Resolved at the boundary, exactly as bindingFor does it: the row carries a LOGICAL db container

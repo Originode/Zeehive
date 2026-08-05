@@ -18,6 +18,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { getDispatchModes, getDispatchModels, getHarnesses, getProviderTokens } from './api.js';
 import { emptyWarning } from './harnessHealth.js';
+import ZeeAvatar from './ZeeAvatar.jsx';
 
 export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap }) {
   const editorRef = useRef(null);
@@ -191,6 +192,10 @@ export default function SwapZee({ xell, projectId, diff = null, onClose, onSwap 
                             data-testid={`swap-account-${a.id}`}
                             title={`Run the incoming zee on ${a.name} (${a.typeLabel})`}
                             onClick={() => setAcct(a)}>
+                      {/* the vendor's own coin: this row IS the choice of which AI thinks next, and
+                          the account LABEL is a human's nickname for it, not a picture of it */}
+                      <ZeeAvatar provider={a.provider} harness={harnesses.find((h) => h.key === harness) || null}
+                                 size={20} />
                       {a.name}
                     </button>
                   ))}

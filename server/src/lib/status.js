@@ -3,6 +3,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { codenameFor } from './names.js';
+import { scrubSecrets } from './provider-tokens.js';
 
 const ACTIVE = ['spawning', 'online', 'working', 'idle'];
 
@@ -26,6 +27,9 @@ export async function recordEvent(ev) {
 // Set a zee's status + apply the "named only while working" rule + mirror to its xell.
 export async function setZeeStatus(zee, status, { stopReason } = {}) {
   if (!zee) return;
+  // A stop reason can echo the provider's raw error — scrub at the FIRST write of last_stop_reason
+  // (finding [10]), so the broadcast row never carries a key. setZeeStatus is a shared turn writer.
+  if (stopReason) stopReason = scrubSecrets(stopReason);
   // working zees are named (stable codename); everything else is nameless
   const name = status === 'working' ? (zee.name || codenameFor(zee.id)) : null;
   const decommission = status === 'stopped' ? ', decommissioned_at = now()' : '';
@@ -276,6 +280,93 @@ export async function shipRefusalState(xellId) {
   const refused = row?.hook_event_name === 'ship-refused';
   const { brief, full } = refused ? reasonPair(row.reason) : { brief: null, full: null };
   return { refused, reason: brief, full, at: refused ? row.ts : null };
+}
+
+// ── the ENV-RECONCILE ALERT: a guard refused, and the xell it protected is still running ────────
+// TICKET #44. The env reconcile REFUSED to rewrite a live xell's .zeehive.env because that xell's
+// DATABASE_URL resolves to the managing instance's own meta-DB (provision.js §6.2). The refusal is
+// correct — a nested queenzee on the real meta-DB reaps live xells — and it protected the FILE it
+// was about to write. It did not protect the XELL, which kept running on the file it already had:
+// a full-write DSN to the fleet's own database. The only signal anyone got was one line in a boot
+// digest, and the digest scrolls while the state persists across boots.
+//
+// So a failed reconcile on a LIVE xell now raises a tend-like card the console renders (fleet.js →
+// App.jsx), carrying the refusal text VERBATIM — it is already written for a human ("Re-point the
+// xell db first"), so nothing here rewords it.
+//
+// Three properties this shape exists for, each one a way the same bug comes back:
+//
+//   • REPEATED, NOT DEDUPLICATED. Every failed reconcile appends another 'env-alert'. A card that
+//     appears once and never again for a state that OUTLIVES the notification is the bug being
+//     fixed, one layer over. The streak (how many, since when) is what the card shows as AGE.
+//   • NOT THE ZEE'S TO CLEAR. Deliberately its own event kind rather than a tend: `zee working`
+//     auto-clears a tend (pingWorking), so riding tend would have let the affected zee silence the
+//     alarm about its own environment by simply carrying on. Only a reconcile that SUCCEEDS lowers
+//     this — i.e. the cause is actually gone.
+//   • BEST-EFFORT AT THE CALL SITE. The reconcile is the product; this is instrumentation. Every
+//     caller swallows failures here (see provision.reconcileXellEnvs) — raising a card must never
+//     fail a reconcile or a boot.
+//
+// No DDL: it rides the append-only session_event log exactly like tend / the hints / a refused
+// ship, latest-event-wins between 'env-alert' and 'env-alert-clear', reason in raw.
+export async function raiseEnvAlert(xellId, reason, { zeeId = null, source = 'env' } = {}) {
+  const why = storeReason(reason);
+  await recordEvent({
+    source, hook_event_name: 'env-alert',
+    zee_id: zeeId, xell_id: xellId, raw: why ? { reason: why } : null,
+  });
+  broadcast('xell', { id: xellId });
+  return { xell_id: xellId, open: true, reason: briefReason(why), reason_full: why };
+}
+
+// Lowered ONLY by a reconcile that succeeded — the cause is gone, so the card must go with it (a
+// stale "this xell holds a write DSN to the meta-DB" competing with a real one is its own bug).
+// A no-op when nothing is open, so a healthy fleet does not append a clear per xell per boot.
+export async function clearEnvAlert(xellId, { zeeId = null, source = 'env' } = {}) {
+  const st = await envAlertState(xellId);
+  if (!st.open) return { xell_id: xellId, open: false, cleared: false };
+  await recordEvent({
+    source, hook_event_name: 'env-alert-clear',
+    zee_id: zeeId, xell_id: xellId, raw: null,
+  });
+  broadcast('xell', { id: xellId });
+  return { xell_id: xellId, open: false, cleared: true };
+}
+
+// Fold a xell's raise/clear history into the card the console renders. `raisedAt` is every raise
+// (newest first), `clearedAt` the last clear: the STREAK is the raises since that clear, which is
+// what makes the card say "failed 4 times, first seen 2 days ago" instead of "something happened".
+// Shared with fleet.js, which reads the same three columns in one lateral rather than re-querying.
+export function envAlertFrom({ kind, reason, at, clearedAt, raisedAt } = {}) {
+  const open = kind === 'env-alert';
+  if (!open) return { open: false, reason: null, full: null, at: null, since: null, count: 0 };
+  const cleared = clearedAt ? new Date(clearedAt).getTime() : null;
+  const streak = (raisedAt || [])
+    .map((t) => new Date(t).getTime())
+    .filter((t) => cleared === null || t > cleared)
+    .sort((a, b) => a - b);
+  const { brief, full } = reasonPair(reason);
+  return {
+    open: true, reason: brief, full, at: at || null,
+    since: streak.length ? new Date(streak[0]).toISOString() : (at || null),
+    count: streak.length || 1,
+  };
+}
+
+// The xell's env alert as the console/`zee status` need it. Latest-event-wins for the OPEN state,
+// plus the streak — one scan of this xell's env events (there are none at all for a healthy xell).
+export async function envAlertState(xellId) {
+  const row = await one(
+    `SELECT (ARRAY_AGG(se.hook_event_name ORDER BY se.ts DESC))[1] AS kind,
+            (ARRAY_AGG(se.raw->>'reason'  ORDER BY se.ts DESC))[1] AS reason,
+            MAX(se.ts) AS at,
+            MAX(se.ts) FILTER (WHERE se.hook_event_name = 'env-alert-clear') AS cleared_at,
+            ARRAY_AGG(se.ts ORDER BY se.ts DESC)
+              FILTER (WHERE se.hook_event_name = 'env-alert') AS raised_at
+       FROM session_event se
+      WHERE se.xell_id = $1 AND se.hook_event_name IN ('env-alert','env-alert-clear')`, [xellId]);
+  return envAlertFrom({ kind: row?.kind, reason: row?.reason, at: row?.at,
+                        clearedAt: row?.cleared_at, raisedAt: row?.raised_at });
 }
 
 // A zee PINGS that it is actively working. Mirrors what a harness UserPromptSubmit hook would do

@@ -14,7 +14,9 @@ import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
 import { removeCxell, cxellName } from '../lib/cxell.js';
 import { stopAndRemoveContainer } from '../lib/docker.js';
+import { MID_TURN_STATUSES } from '../lib/zee-turn.js';
 import { releaseXellShips } from './shipgate.js';
+import { collectDispatchLoss, reportDispatchLoss } from '../lib/dispatch-loss.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines, harness,
 // the .zeehive.env reconcile): 'real' touches machines, anything else models. A teardown is the
@@ -77,13 +79,23 @@ export async function recoverOrphanTeardowns() {
 // status the old test refused on it still refuses on, force is still required to get past it, and
 // force is still not the default anywhere.
 //
-// KNOWN GAP, stated rather than papered over: an INTERACTIVE turn (a message typed into the resting
-// pane session) starts a turn nothing in the fleet observes — no hook, no poller, and the pgrep
-// cannot tell a generating TUI from one at its prompt — so such a zee reads 'idle' here. It is not
-// observable from the queenzee today; closing it needs the cage itself to report turn-start/turn-end
-// (the `zee` CLI and token are already in there). Until then that race is what `force` and the human
-// typed confirmation in front of this are for.
-export const MID_TURN_STATUSES = ['spawning', 'online', 'working'];
+// THE GAP THIS USED TO NAME, and what now covers it — with the part that still does not. An
+// INTERACTIVE turn (a message typed into the resting pane session) starts a turn no hook, no poller
+// and no pgrep of ours can observe, so such a zee read 'idle' here for the whole of it. Closing it
+// needed "the cage itself to report turn-start/turn-end (the `zee` CLI and token are already in
+// there)", and that is now what happens: the vendor CLI's own turn hooks call `zee turn --start` /
+// `--end` (queenzee/self.js selfTurn), installed into the cage at spawn.
+//
+// What it does NOT cover, so nobody reads more into a row than it can carry: cages spawned BEFORE
+// that install (their hooks were never written), runtimes with no measured hook of their own (codex,
+// kimi — lib/cxell-runtimes.js turnHookCmd declares none rather than guessing), and a session whose
+// hook simply failed. In all of those the old blindness stands — so `force` and the human's typed
+// confirmation in front of this remain what that race is for.
+//
+// The list itself lives in lib/zee-turn.js — the MESSAGE router asks the same question ("is a
+// headless run going on in that cage right now?") to decide queue-vs-resume, and two copies of
+// these three statuses is two answers waiting to disagree. Re-exported so this file still names it.
+export { MID_TURN_STATUSES };
 
 const agoText = (ts) => {
   if (!ts) return 'never';
@@ -145,6 +157,12 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
       };
     }
   }
+
+  // WAS THIS A DISPATCH NOBODY WILL EVER HEAR ABOUT? Read the evidence NOW — the teardown below
+  // stamps every zee row and deletes the containers, so afterwards the question "did a zee ever run
+  // in here?" is answered by the very thing being reported on. The verdict is delivered at the end,
+  // once the xell is actually gone (lib/dispatch-loss.js).
+  const loss = await collectDispatchLoss(xell, reason).catch(() => ({ lost: false }));
 
   // ── SHIPS AND THE PROD LOCK GO WITH THE XELL ────────────────────────────────
   // Open ship requests are withdrawn, a stranded 'shipping' row is completed from evidence, and
@@ -349,7 +367,13 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
     logline('reaper', `retired ${xell.slug}: zee decommissioned, worktree + containers removed ✓`);
   }
 
+  // AND IF IT WAS A DISPATCH THAT NEVER RAN, say so to whoever dispatched it — a manager in its
+  // inbox, anyone else as a ticket. One log line was all this used to be, and a human retried the
+  // same destroyed dispatch four times over it (TKT-88-D6B4).
+  const lossReport = await reportDispatchLoss(loss).catch(() => ({ reported: false }));
+
   return { ok: true, reason, orphaned_worktree: orphaned ? xell.worktree_path : null, despawn,
+           dispatch_loss: loss?.lost ? { ...lossReport, why: loss.why } : null,
            // The zee this teardown stopped (the newest, when a cxell xell hosted several) plus how
            // many rows were stamped — a caller that only ever saw one id could not tell that a
            // second, differently-statused row had been left behind.

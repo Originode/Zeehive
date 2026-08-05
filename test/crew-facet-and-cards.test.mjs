@@ -164,7 +164,7 @@ ok(/const cw = hitCrew\(wx, wy\);[\s\S]{0,2400}emitHover\(\{ id: hx\?\.id \?\? c
 ok(/const cw = hitCrew\(wx, wy\);\n\s*if \(cw && cw\.id !== expandedId\) \{ setExpandedId\(cw\.id\); return; \}/.test(src.canvas),
    'and a click on one opens that worker’s own bloom');
 ok(/cursor = cw \|\| b \|\|/.test(src.canvas), 'the cursor becomes a pointer over a dot, as it does over every other target');
-ok(/\{ hoverId: H\.id \}/.test(src.canvas), 'and the facet is told which dot is hovered, so it can ring and name it');
+ok(/\{ hoverId: H\.id[,\s}]/.test(src.canvas), 'and the facet is told which dot is hovered, so it can ring and name it');
 
 // ── 4. the DOM chip: a list gets a WORD, not a highlight ────────────────────
 console.log('\n── the card/chip rows: the relation as a persistent word ──');

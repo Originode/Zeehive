@@ -32,7 +32,7 @@
 //   • the ZEE CHIP: liveZees() already derives a xell's hive status from the same signals fleet.js
 //     feeds it. It is used verbatim rather than re-derived a second way.
 //   • the ID CONTRACT: assertId — malformed → 400 naming the field, well-formed but unknown → 404.
-import { q, one } from '../db/pool.js';
+import { q, one, pool } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
 import {
@@ -58,6 +58,17 @@ const httpError = (status, message) => Object.assign(new Error(message), { statu
 const bad = (m) => httpError(400, m);
 const missing = (m) => httpError(404, m);
 const refuse = (m) => httpError(409, m);
+
+// A per-item advisory-lock key, derived from the work item's UUID. Used by deployWorkItem
+// (TKT-110-3DA9) so two DEPLOYS on the SAME item can never overlap — a slow first deploy that
+// outlives the caller's timeout, plus a retry of it, would both pass the "already deployed"
+// guard below (both read xell_id=NULL), both spawn a worker, and whichever links LAST wins
+// while the other worker is an orphaned crew with no card. The lock is taken BEFORE the guard
+// and held through the spawn, so the retry is refused while the first is still in flight:
+// one worker per item per deploy window, no orphan. Advisory locks are cluster-wide in
+// Postgres, so the guard holds across multiple queenzee processes; a crash releases it with
+// the connection.
+const deployLockKeySql = `hashtextextended($1::text, 0)`;
 
 // ── reads ────────────────────────────────────────────────────────────────────
 // The plain row (not getWorkItem's rich read model): assignment logic needs project/status/xell and
@@ -178,7 +189,10 @@ export async function assignWorkItem(id, { xell_id, actor = 'human@console' } = 
 // Deliberately does NOT change the status. An item that reached `working` did so because work
 // happened; taking the zee off it does not un-happen that, and guessing a status backwards would
 // overwrite the one thing the history is for.
-export async function unassignWorkItem(id, { actor = 'human@console' } = {}) {
+//
+// `reason` is optional and rides in the ledger entry: the interesting unassign is "its zee died at
+// spawn", and a card that lost its zee with no explanation is a card nobody can date afterwards.
+export async function unassignWorkItem(id, { actor = 'human@console', reason = null } = {}) {
   const item = await getItem(id);
   if (!item.xell_id) {
     return { ok: true, already: true, item: await getWorkItem(id),
@@ -193,11 +207,12 @@ export async function unassignWorkItem(id, { actor = 'human@console' } = {}) {
     // dialect to learn: naming (or un-naming) a zee is an 'assigned' event, and the detail says which.
     await logWorkEvent(item.id, 'assigned', { actor,
       detail: { unassigned: true, xell_id: item.xell_id, xell_slug: xell?.slug || null,
-                status_kept: item.status } }, { client });
+                status_kept: item.status, ...(reason ? { reason } : {}) } }, { client });
   });
   const shaped = await announceWorkItem('assigned', item.id);
   if (xell) broadcast('xell', { id: xell.id });
-  logline('work', `${xell?.slug || item.xell_id} taken off work item "${item.title}" by ${actor}`);
+  logline('work', `${xell?.slug || item.xell_id} taken off work item "${item.title}" by ${actor}`
+    + (reason ? ` — ${reason}` : ''));
   return {
     ok: true, item: shaped, was: xell ? { id: xell.id, slug: xell.slug } : null,
     message: `${xell?.slug || 'that zee'} is no longer on "${item.title}". Its status (${item.status}) is `
@@ -260,13 +275,46 @@ export function briefForWorkItem({ item, ancestors = [], ticket = null, extra = 
 // `dispatchFn` is a TEST SEAM (and only that): the test suite must be able to prove the brief, the
 // stamping and the assignment without spawning a real agent. Production callers never pass it.
 export async function deployWorkItem(id, { task = null, model = null, mode = null, harness = null,
-                                           title = null, actor = 'human@console', managerXellId = null,
+                                           title = null, visual_verify = false, langfuse_tracking = null,
+                                           actor = 'human@console', managerXellId = null,
                                            dispatchFn = null } = {}) {
   const plain = await getItem(id);
   if (isTerminal(plain.status)) {
     throw refuse(`"${plain.title}" is ${plain.status} — deploying a zee onto a finished item would spend a `
       + 'whole worker on work somebody has already decided is over. Reopen it first if that is wrong.');
   }
+
+  // ── ONE DEPLOY IN FLIGHT PER ITEM (TKT-110-3DA9) ────────────────────────────
+  // The "already deployed" guard below reads xell_id, and the link that sets it happens AFTER
+  // the (slow) spawn — so two deploys that overlap that window both read xell_id=NULL, both
+  // spawn, and whichever links last wins while the other worker is an orphaned crew with no
+  // card. Take a per-item advisory lock BEFORE the guard and hold it through the spawn: the
+  // retry is refused here, before anything is spawned. A dedicated client is used (the lock is
+  // per-session); the finally releases it on every exit, and a crash drops the connection and
+  // frees the lock with it.
+  const lockClient = await pool.connect();
+  try {
+    const got = await lockClient.query(
+      `SELECT pg_try_advisory_lock(${deployLockKeySql}) AS got`, [id]);
+    if (!got.rows[0].got) {
+      throw refuse(`another deploy for "${plain.title}" is already in flight — a worker is being spawned `
+        + 'for this item right now. Wait for it to settle, or unassign the item first.');
+    }
+    return await deployWorkItemHeld(id, plain, { task, model, mode, harness, title, visual_verify,
+                                                 langfuse_tracking, actor, managerXellId, dispatchFn });
+  } finally {
+    await lockClient.query(`SELECT pg_advisory_unlock(${deployLockKeySql})`, [id]).catch(() => {});
+    lockClient.release();
+  }
+}
+
+// The guarded half of deployWorkItem — the lock in the outer function is held for the whole of
+// this: the "already deployed" check, the brief, the (slow) spawn, and the link. Kept as its own
+// function so the outer lock has one caller and one finally, and the body below is unchanged.
+async function deployWorkItemHeld(id, plain, { task = null, model = null, mode = null, harness = null,
+                                               title = null, visual_verify = false, langfuse_tracking = null,
+                                               actor = 'human@console', managerXellId = null,
+                                               dispatchFn = null } = {}) {
   const current = await liveXell(plain.xell_id);
   if (current && !GOING.includes(current.status)) {
     throw refuse(`${current.slug} is already deployed on "${plain.title}". Talk to it, or unassign it `
@@ -287,12 +335,17 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
   // intake/self reach back into provisioning (a top-level import here would make lib ↔ queenzee circular).
   let out;
   if (dispatchFn) {
-    out = await dispatchFn({ task: brief, title: title || full.title, model, mode, harness, item: full });
+    out = await dispatchFn({ task: brief, title: title || full.title, model, mode, harness,
+                             visual_verify, langfuse_tracking, item: full });
   } else if (managerXellId) {
     const manager = await one(`SELECT * FROM xell WHERE id=$1`, [managerXellId]);
     if (!manager) throw missing(`no manager xell ${managerXellId}`);
     const { selfDispatch } = await import('../queenzee/self.js');
-    out = await selfDispatch(manager, { task: brief, title: title || full.title, model, mode, harness });
+    // The ITEM travels with the dispatch (#64): selfDispatch's overlap check keys on it to say what has
+    // already LANDED on this card, and the brief alone cannot carry that — briefForWorkItem writes the
+    // ticket as a bare "(#64)", which the brief reader deliberately ignores.
+    out = await selfDispatch(manager, { task: brief, title: title || full.title, model, mode, harness,
+                                        visual_verify, langfuse_tracking, work_item_id: full.id });
     if (out?.ok === false) throw refuse(out.error || 'the dispatch was refused');
   } else {
     const { dispatchXell } = await import('../queenzee/intake.js');
@@ -300,6 +353,9 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
       task: brief, project: full.project_id, title: title || full.title,
       ...(model ? { model } : {}), ...(mode ? { mode } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
+      ...(visual_verify ? { visual_verify: true } : {}),
+      // --langfuse / --no-langfuse: explicit true/false lands; omission (null) preserves the target.
+      ...(langfuse_tracking === true || langfuse_tracking === false ? { langfuse_tracking } : {}),
     });
   }
   const newXellId = out?.xell_id || out?.xell?.id || out?.id || null;

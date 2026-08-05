@@ -18,7 +18,11 @@ import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
 import { warmWorktree } from './npm-cache.js';
+import { normalizeSpawnPrep, prewarmsCage, templateHash } from './spawn-prep.js';
+import { ensureCxell, cloneIntoCxell, warmCxell, preppedImageIfPresent, ensurePreppedImage, cxellName } from './cxell.js';
+import { deviceConfig } from './devices.js';
 import { logline } from './logbus.js';
+import { raiseEnvAlert, clearEnvAlert } from './status.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines): 'real'
 // touches machines, anything else models. The fleet-wide .zeehive.env reconcile below obeys it.
@@ -81,6 +85,123 @@ function sameDatabase(a, b) {
   return host(ua) === host(ub) && ua.port === ub.port && ua.pathname === ub.pathname;
 }
 
+// WHICH DATABASE THIS XELL IS MEANT TO TALK TO — the one rule, in one place.
+//
+// Extracted out of writeXellEnv unchanged, because a second reader needs the SAME answer: the
+// readiness preflight (lib/preflight.js) opens the DSN the queenzee wrote and reports whether it
+// actually answers. A preflight that recomputed the binding its own way would be checking a
+// different string from the one the zee is handed, which is the class of bug it exists to catch.
+// `containers` is the xell's own server/webapp/db rows (role + conn_ref), as writeXellEnv reads them.
+//
+// Answers { dsn, source, binding_is_prod }: `source` names WHICH rule produced the DSN, so a caller
+// can say where the string came from without re-deriving it.
+//
+// HARD GUARD (spec §6.2) lives in writeXellEnv, not here: never EMIT the managing instance's
+// meta-DB — two queenzees reconciling one meta-DB reap each other's xells; that failure class has
+// destroyed live work before, so it is a refusal, not a warning. This function only resolves.
+//
+// FIRST, before the xell's own db container: PRODUCTION, when the COUPLING says the xell holds
+// it. A xell on prod is an ordinary pooled spinoff — owned db container and all — that was THEN
+// re-pointed (attachXellDb links the prod container and flips the coupling together), so taking
+// the owned container first meant the file quietly named the throwaway spinoff database while
+// the binding advertised production (ticket #15). The binding is what the zee was TOLD it has,
+// so the binding wins. Emitted at all because a cxell zee has no docker and reaches postgres
+// over TCP.
+//
+// The two prod couplings are the same link and DIFFERENT credentials, and that distinction is a
+// safety boundary, not a detail:
+//   • db-shared-prod  — a full human-granted bind: the prod container's own conn_ref.
+//   • db-prod-readonly — the manager binding: ONLY the SELECT-only DSN lib/prod-readonly.js
+//     minted for this xell. Never the prod owner's connection string — following the binding
+//     must never widen a reader into a writer — and never its own clone either. If the reader
+//     was not minted (or was dropped) while the xell is still LINKED to prod, we emit no
+//     DATABASE_URL at all: no database is a fixable state, the wrong database is a silent one.
+// A coupling with NO prod db linked (a project with no production registered — bindManagerTo-
+// ProdReadonly skips the bind there) is not "on prod" in any usable sense, so it falls through
+// to the ordinary resolution below and keeps whatever database it really has.
+export async function resolveXellDsn(xell, project, containers = []) {
+  const xellId = xell.id;
+  let dbUrl = null;
+  let source = null;
+  let bindingIsProd = false;                 // linked to prod → the owned container is NOT a fallback
+  if (xell.db_coupling === 'db-shared-prod' || xell.db_coupling === 'db-prod-readonly') {
+    const linkedProd = await one(
+      `SELECT c.conn_ref, c.host AS host, c.host_port
+         FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
+        WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [xellId]);
+    bindingIsProd = !!linkedProd || !!xell.prod_ro_dsn;
+    // db-shared-prod with a conn_ref-less prod row falls back to the row's PUBLISHED ADDRESS
+    // (host:host_port). This is the omnibiz bug: its prod db records no conn_ref (only host +
+    // host_port, on another machine's docker context), so the projection emitted NO DATABASE_URL,
+    // the binding's psql said `docker exec` — impossible in a cage — and a prod-bound cxell zee
+    // concluded the online production db was unreachable. The address was reachable over TCP all
+    // along; the file just never said so. db-prod-readonly is deliberately NOT widened: the minted
+    // SELECT-only DSN or nothing — following the binding must never turn a reader into a writer.
+    dbUrl = xell.db_coupling === 'db-prod-readonly'
+      ? (xell.prod_ro_dsn || null)
+      : (linkedProd?.conn_ref
+        || derivedTcpDsn(linkedProd, await dbIdentity(xell.project_id))
+        || xell.prod_ro_dsn || null);
+    if (dbUrl) source = xell.db_coupling === 'db-prod-readonly' ? 'prod-readonly-dsn' : 'prod-linked';
+    if (bindingIsProd && !dbUrl) {
+      logline('prod-ro', `${xell.slug}: coupled ${xell.db_coupling} but no usable production DSN `
+        + '(no minted reader / the prod container row records no conn_ref and publishes no '
+        + 'host:host_port) — .zeehive.env is emitted with NO DATABASE_URL rather than a database '
+        + 'the binding does not mean');
+    }
+  }
+  // …else the xell's OWN db container, when it has one.
+  if (!dbUrl && !bindingIsProd) {
+    dbUrl = containers.find((c) => c.role === 'db')?.conn_ref || null;
+    if (dbUrl) source = 'own-db-container';
+  }
+  // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
+  // dev postgres — the shared container's conn_ref with the database name swapped for the
+  // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
+  if (!dbUrl && xell.db_coupling === 'db-clone') {
+    const inst = await one(
+      `SELECT di.name, c.conn_ref FROM db_instance di JOIN container c ON c.id = di.container_id
+        WHERE di.owner_xell_id=$1 AND di.kind='clone' AND c.conn_ref IS NOT NULL LIMIT 1`, [xellId]);
+    if (inst?.conn_ref) {
+      try {
+        const u = new URL(String(inst.conn_ref).replace(/^postgres(ql)?:/, 'http:'));
+        u.pathname = `/${inst.name}`;
+        dbUrl = String(u).replace(/^http:/, 'postgresql:');
+        source = 'clone-instance';
+      } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
+    }
+  }
+  // db-shared-dev on a PROCESS-runner project: the xell's server is a bare process, so unlike a
+  // compose stack there is no network alias handing it a database — the projection must carry
+  // the shared dev db's conn_ref outright. Scoped to process runners so compose projects keep
+  // their env exactly as it was. The §6.2 guard still applies unchanged.
+  const spin = project?.manifest?.tiers?.spinoff || {};
+  const spinRunner = spin.runner || null;
+  if (!dbUrl && xell.db_coupling === 'db-shared-dev' && spinRunner === 'process') {
+    const used = await one(
+      `SELECT c.conn_ref FROM xell_uses_container xuc JOIN container c ON c.id = xuc.container_id
+        WHERE xuc.xell_id=$1 AND xuc.relation='uses' AND c.role='db' AND c.conn_ref IS NOT NULL LIMIT 1`,
+      [xellId]);
+    if (used?.conn_ref) { dbUrl = used.conn_ref; source = 'shared-dev-container'; }
+  }
+  // conn_refs are stored passwordless ("parameters, not secrets") — fine for docker-exec psql,
+  // fatal for a bare process that must SCRAM-authenticate over TCP. The manifest's db block may
+  // carry the committed dev credential (the same one the compose files already commit); inject
+  // it for process xells when the ref has none. Anything genuinely secret stays out of manifests.
+  const manifestDb = project?.manifest?.db || {};
+  if (dbUrl && spinRunner === 'process' && manifestDb.password) {
+    try {
+      const u = new URL(String(dbUrl).replace(/^postgres(ql)?:/, 'http:'));
+      if (!u.password) {
+        if (!u.username && manifestDb.user) u.username = manifestDb.user;
+        u.password = manifestDb.password;
+        dbUrl = String(u).replace(/^http:/, 'postgresql:');
+      }
+    } catch { /* unparseable ref — emit as-is and let the guard/consumer complain */ }
+  }
+  return { dsn: dbUrl, source, binding_is_prod: bindingIsProd };
+}
+
 // Write a xell's .zeehive.env. Throws on refusal/failure; the wrapper below records the outcome.
 // The two "there is nothing on disk to write to" throws are marked `no_worktree`: they are the
 // ordinary state of a pooled xell, not a projection failure worth flagging to a human.
@@ -112,101 +233,8 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
     `ZEEHIVE_DOCKER_CONTEXT=${xellCtx || site?.docker_ctx || config.dockerCtx}`,
   ];
 
-  // DATABASE_URL — the one database this xell's zee is meant to talk to, in binding order. HARD
-  // GUARD (spec §6.2, below): never emit the managing instance's meta-DB — two queenzees
-  // reconciling one meta-DB reap each other's xells; that failure class has destroyed live work
-  // before, so it is a refusal, not a warning.
-  //
-  // FIRST, before the xell's own db container: PRODUCTION, when the COUPLING says the xell holds
-  // it. A xell on prod is an ordinary pooled spinoff — owned db container and all — that was THEN
-  // re-pointed (attachXellDb links the prod container and flips the coupling together), so taking
-  // the owned container first meant the file quietly named the throwaway spinoff database while
-  // the binding advertised production (ticket #15). The binding is what the zee was TOLD it has,
-  // so the binding wins. Emitted at all because a cxell zee has no docker and reaches postgres
-  // over TCP. The §6.2 refusal below applies to whatever this resolves to, like any other DSN.
-  //
-  // The two prod couplings are the same link and DIFFERENT credentials, and that distinction is a
-  // safety boundary, not a detail:
-  //   • db-shared-prod  — a full human-granted bind: the prod container's own conn_ref.
-  //   • db-prod-readonly — the manager binding: ONLY the SELECT-only DSN lib/prod-readonly.js
-  //     minted for this xell. Never the prod owner's connection string — following the binding
-  //     must never widen a reader into a writer — and never its own clone either. If the reader
-  //     was not minted (or was dropped) while the xell is still LINKED to prod, we emit no
-  //     DATABASE_URL at all: no database is a fixable state, the wrong database is a silent one.
-  // A coupling with NO prod db linked (a project with no production registered — bindManagerTo-
-  // ProdReadonly skips the bind there) is not "on prod" in any usable sense, so it falls through
-  // to the ordinary resolution below and keeps whatever database it really has.
-  let dbUrl = null;
-  let bindingIsProd = false;                 // linked to prod → the owned container is NOT a fallback
-  if (xell.db_coupling === 'db-shared-prod' || xell.db_coupling === 'db-prod-readonly') {
-    const linkedProd = await one(
-      `SELECT c.conn_ref, host(c.host) AS host, c.host_port
-         FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
-        WHERE uc.xell_id=$1 AND c.role='db' AND c.tier='prod' LIMIT 1`, [xellId]);
-    bindingIsProd = !!linkedProd || !!xell.prod_ro_dsn;
-    // db-shared-prod with a conn_ref-less prod row falls back to the row's PUBLISHED ADDRESS
-    // (host:host_port). This is the omnibiz bug: its prod db records no conn_ref (only host +
-    // host_port, on another machine's docker context), so the projection emitted NO DATABASE_URL,
-    // the binding's psql said `docker exec` — impossible in a cage — and a prod-bound cxell zee
-    // concluded the online production db was unreachable. The address was reachable over TCP all
-    // along; the file just never said so. db-prod-readonly is deliberately NOT widened: the minted
-    // SELECT-only DSN or nothing — following the binding must never turn a reader into a writer.
-    dbUrl = xell.db_coupling === 'db-prod-readonly'
-      ? (xell.prod_ro_dsn || null)
-      : (linkedProd?.conn_ref
-        || derivedTcpDsn(linkedProd, await dbIdentity(xell.project_id))
-        || xell.prod_ro_dsn || null);
-    if (bindingIsProd && !dbUrl) {
-      logline('prod-ro', `${xell.slug}: coupled ${xell.db_coupling} but no usable production DSN `
-        + '(no minted reader / the prod container row records no conn_ref and publishes no '
-        + 'host:host_port) — .zeehive.env is emitted with NO DATABASE_URL rather than a database '
-        + 'the binding does not mean');
-    }
-  }
-  // …else the xell's OWN db container, when it has one.
-  if (!dbUrl && !bindingIsProd) dbUrl = cs.find((c) => c.role === 'db')?.conn_ref || null;
-  // db-clone: no owned db container, but its OWN database (db_instance row) inside the shared
-  // dev postgres — the shared container's conn_ref with the database name swapped for the
-  // clone's. The bare conn_ref must never be emitted for a clone xell: it names the SHARED db.
-  if (!dbUrl && xell.db_coupling === 'db-clone') {
-    const inst = await one(
-      `SELECT di.name, c.conn_ref FROM db_instance di JOIN container c ON c.id = di.container_id
-        WHERE di.owner_xell_id=$1 AND di.kind='clone' AND c.conn_ref IS NOT NULL LIMIT 1`, [xellId]);
-    if (inst?.conn_ref) {
-      try {
-        const u = new URL(String(inst.conn_ref).replace(/^postgres(ql)?:/, 'http:'));
-        u.pathname = `/${inst.name}`;
-        dbUrl = String(u).replace(/^http:/, 'postgresql:');
-      } catch { /* unparseable conn_ref — emit nothing rather than the shared db */ }
-    }
-  }
-  // db-shared-dev on a PROCESS-runner project: the xell's server is a bare process, so unlike a
-  // compose stack there is no network alias handing it a database — the projection must carry
-  // the shared dev db's conn_ref outright. Scoped to process runners so compose projects keep
-  // their env exactly as it was. The §6.2 guard below still applies unchanged.
-  const spinRunner = spin.runner || null;
-  if (!dbUrl && xell.db_coupling === 'db-shared-dev' && spinRunner === 'process') {
-    const used = await one(
-      `SELECT c.conn_ref FROM xell_uses_container xuc JOIN container c ON c.id = xuc.container_id
-        WHERE xuc.xell_id=$1 AND xuc.relation='uses' AND c.role='db' AND c.conn_ref IS NOT NULL LIMIT 1`,
-      [xellId]);
-    if (used?.conn_ref) dbUrl = used.conn_ref;
-  }
-  // conn_refs are stored passwordless ("parameters, not secrets") — fine for docker-exec psql,
-  // fatal for a bare process that must SCRAM-authenticate over TCP. The manifest's db block may
-  // carry the committed dev credential (the same one the compose files already commit); inject
-  // it for process xells when the ref has none. Anything genuinely secret stays out of manifests.
-  const manifestDb = project?.manifest?.db || {};
-  if (dbUrl && spinRunner === 'process' && manifestDb.password) {
-    try {
-      const u = new URL(String(dbUrl).replace(/^postgres(ql)?:/, 'http:'));
-      if (!u.password) {
-        if (!u.username && manifestDb.user) u.username = manifestDb.user;
-        u.password = manifestDb.password;
-        dbUrl = String(u).replace(/^http:/, 'postgresql:');
-      }
-    } catch { /* unparseable ref — emit as-is and let the guard/consumer complain */ }
-  }
+  // DATABASE_URL — the one database this xell's zee is meant to talk to (resolveXellDsn above).
+  const { dsn: dbUrl } = await resolveXellDsn(xell, project, cs);
   if (dbUrl) {
     if (sameDatabase(dbUrl, config.databaseUrl)) {
       // §6.2, and the ONE exemption — the minted READ-ONLY reader.
@@ -382,6 +410,42 @@ async function refreshLiveCxellEnv(xell, text, { dryRun }) {
 // keep a file pointing at its own throwaway spinoff db, with nothing a human could look at (ticket
 // #15). env_projected_at / env_projection_error (migration 078) are that read model; fleet.js
 // selects x.*, so the console's env chip carries them for free.
+// PREPARE A POOLED XELL'S CAGE, on the pool's clock (spawn template `when: 'provision'`).
+//
+// Everything a dispatch would do to make the cage USABLE — create it (on the prepped image, baking
+// it first if the pool has not yet), clone the branch in, run the prep — happens here instead, hours
+// before anyone claims the xell. Dispatch then reuses the container, updates the checkout in place
+// and finds the marker still valid, so it installs nothing.
+//
+// What it deliberately does NOT do: mint the identity token, inject the harness, open the attend
+// door, seal the firewall or start the agent. Those are per-DISPATCH facts (which zee, which
+// harness, which provider credential) and they are cheap; the expensive, zee-independent part is
+// what moves. The cage is left UNSEALED — same as a cage between create and seal today — and it
+// holds no credential and no token until a dispatch puts one in it.
+//
+// Never throws (the caller does not await it, and a provision must not die of a slow mirror).
+export async function prewarmCage({ slug, worktree, project, prep }) {
+  const ctx = 'default';
+  const name = cxellName(slug);
+  const baseImage = deviceConfig(project).cxellImage || undefined;
+  try {
+    // Bake the apt half here if it is not baked yet — the pool's clock is exactly where that
+    // belongs, and it makes the FIRST prewarm of a new template pay for every one after it.
+    const baked = await ensurePreppedImage({ ctx, baseImage, prep, label: slug });
+    const image = baked.tag || baseImage;
+    const created = await ensureCxell({ ctx, slug, xellId: null, image, prep, reuse: true });
+    await cloneIntoCxell({ ctx, name: created.name, worktree });
+    const warm = await warmCxell({ ctx, name: created.name, prep, stage: 'provision', aptBaked: !!baked.tag });
+    logline('pool', `${slug}: cage prepped at provision time (${image || 'base image'}${baked.tag ? ', packages baked in' : ''}) — `
+      + `${warm.warmed ? 'a dispatch here will install nothing' : 'prep incomplete, a dispatch will install as usual'}`);
+    return { ...warm, image, template: templateHash(prep) };
+  } catch (e) {
+    logline('pool', `${slug}: cage prewarm did not finish (${String(e.message).slice(0, 200)}) — `
+      + 'nothing is broken; its dispatch installs the way it always has');
+    return { warmed: false, error: e.message };
+  }
+}
+
 export async function emitXellEnv(xellId, { dryRun = false } = {}) {
   try {
     const r = await writeXellEnv(xellId, { dryRun });
@@ -460,17 +524,30 @@ async function noteEnvProjection(xellId, error = null, cxell = null) {
 // for its own sake: a xell's database is a CLONE of the meta-DB, so a nested queenzee's fleet rows
 // are the REAL fleet's rows, worktree paths and all. Unguarded, the first zee to run the server in
 // its own xell would have reconciled every other zee's .zeehive.env from a snapshot of the meta-DB.
+//
+// AND A FAILURE ON A LIVE XELL RAISES A CARD (ticket #44). The §6.2 refusal below is CORRECT and is
+// not touched here — but a guard that refuses to write a dangerous file has protected the FILE, not
+// the xell, which keeps running on the dangerous file it already has. That is the whole class: the
+// refusal is safe, the OUTCOME is a live zee holding a full-write DSN to the fleet's own meta-DB,
+// and the only trace was one line in a boot digest that scrolls while the state persists across
+// boots. So every failed reconcile on a LIVE xell appends an 'env-alert' (lib/status.raiseEnvAlert)
+// the console renders as a tend-like card, carrying this reason VERBATIM. Repeated, never
+// deduplicated; cleared only by a reconcile that succeeds; and best-effort in every direction, since
+// the reconcile is the product and the card is instrumentation.
 export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE } = {}) {
   const dryRun = mode !== 'real';
   const xells = await q(
     `SELECT x.id, x.slug, x.worktree_path,
+            (SELECT z.id FROM zee z WHERE z.xell_id = x.id AND z.decommissioned_at IS NULL
+                AND z.status IN ('spawning','online','working','idle')
+              ORDER BY z.created_at DESC LIMIT 1) AS live_zee_id,
             EXISTS(SELECT 1 FROM zee z WHERE z.xell_id = x.id AND z.decommissioned_at IS NULL
                      AND z.status IN ('spawning','online','working','idle')) AS live
        FROM xell x
       WHERE x.status NOT IN ('retired','tearing-down','husk') AND x.worktree_path IS NOT NULL
       ORDER BY x.created_at`);
   let checked = 0, rewritten = 0, failed = 0, skipped = 0;
-  const broken = [], stale = [];
+  const broken = [], stale = [], alerted = [];
   // The CAGE half, counted separately: a xell's host file and the copy its zee reads are two
   // different files with two different failure modes (emitXellEnv → refreshLiveCxellEnv), and a
   // sweep that reported only the host would say "0 rewritten" on the very fleet it just repaired.
@@ -486,6 +563,12 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       if (r.cxell?.error) { cxellFailed++; cxellBroken.push(`${x.slug} (${r.cxell.error})`); }
       else if (r.cxell?.would_refresh) { cxellWould++; cxellStale.push(x.slug); }
       else if (r.cxell?.changed) { cxellRefreshed++; cxellStale.push(x.slug); }
+      // The projection SUCCEEDED, so any card this xell was carrying is answered: the DSN it
+      // alerted about no longer resolves to the meta-DB (or whatever else failed is fixed). Lowered
+      // even in simulate — a dry run that computed the file cleanly proves the cause is gone just as
+      // well as a write does, and it is the only lowering path there is (the zee cannot clear it).
+      // A no-op when nothing is open, so a clean fleet writes no events at all.
+      await clearEnvAlert(x.id, { zeeId: x.live_zee_id }).catch(() => { /* instrumentation */ });
       if (!r.changed) continue;
       rewritten++;
       stale.push(x.slug);
@@ -502,6 +585,24 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
       logline('env', `${x.slug}: .zeehive.env could NOT be reconciled — ${e.message}. That xell is `
         + 'still running on whatever its file already said.');
       console.error(`[env] ${x.slug}: .zeehive.env projection FAILED — ${e.message}`);
+      // …and, for a LIVE xell, a card a human actually meets (ticket #44). The log line above is
+      // the record; this is the notification. LIVE is the whole condition — a retired, reaped or
+      // never-claimed xell is running nothing, so its stale file endangers nobody and a card on it
+      // would be noise a human learns to skim past. Same liveness rule the board and the crew
+      // highlight use (a zee row that is not decommissioned and is spawning/online/working/idle).
+      //
+      // Raised in SIMULATE too, on purpose: the refusal is computed identically in both modes, and
+      // the dangerous state it reports is a fact about the xell, not about whether this queenzee
+      // would have written a file. (A nested queenzee raises it in its own clone meta-DB, where it
+      // is visible in that zee's own console and reaches nothing real.)
+      //
+      // Best-effort, and that is a hard requirement: the reconcile is the product, the card is
+      // instrumentation. A card that cannot be written must not fail a reconcile or a boot.
+      if (x.live) {
+        const raised = await raiseEnvAlert(x.id, e.message, { zeeId: x.live_zee_id })
+          .then(() => true).catch(() => false);
+        if (raised) alerted.push(x.slug);
+      }
     }
   }
   // ONE summary line, always — a reconcile that found nothing must still say it ran, or "no news"
@@ -516,7 +617,17 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
     // one of them is the one that scrolls away.
     + ` · live cxells: ${dryRun ? `${cxellWould} would be refreshed` : `${cxellRefreshed} refreshed`}`
     + `${cxellStale.length ? ` [${cxellStale.slice(0, 5).join(', ')}${cxellStale.length > 5 ? ', …' : ''}]` : ''}`
-    + `, ${cxellFailed} UNREACHABLE${cxellBroken.length ? ` [${cxellBroken.slice(0, 3).join('; ')}]` : ''}`);
+    + `, ${cxellFailed} UNREACHABLE${cxellBroken.length ? ` [${cxellBroken.slice(0, 3).join('; ')}]` : ''}`
+    // "24 clean, 1 FAILED" is the digest a human has to PARSE. This clause says where the answer
+    // already is — on the hive, as a card — so the boot line stops being the thing anyone must read.
+    + (alerted.length
+      ? ` · ⚠ ${alerted.length} LIVE xell(s) raised an env card in the console [${alerted.slice(0, 3).join(', ')}]`
+      : '')
+    // A failure on a xell with NO live zee is the same refusal with nobody in the room. Said plainly
+    // rather than silently omitted, so "why is there no card?" has an answer in the same line.
+    + (failed > alerted.length
+      ? ` · ${failed - alerted.length} failure(s) on xells with no live zee (no card raised — nothing is running on them)`
+      : ''));
   if (failed) {
     console.error(`[env] ${failed} xell(s) are running on a .zeehive.env that could not be `
       + `reconciled with the meta-DB: ${broken.join('; ')}`);
@@ -525,7 +636,11 @@ export async function reconcileXellEnvs({ reason = 'boot', mode = PROVISION_MODE
     console.error(`[env] ${cxellFailed} LIVE cxell(s) could not be handed the refreshed .zeehive.env — `
       + `those zees are still reading their old copy: ${cxellBroken.join('; ')}`);
   }
-  return { checked, rewritten, failed, skipped, broken, stale, dry_run: dryRun,
+  if (alerted.length) {
+    console.error(`[env] ${alerted.length} LIVE xell(s) are running on an unreconcilable .zeehive.env `
+      + `and now carry a card in the console: ${alerted.join(', ')}`);
+  }
+  return { checked, rewritten, failed, skipped, broken, stale, alerted, dry_run: dryRun,
            cxell_refreshed: cxellRefreshed, cxell_failed: cxellFailed, cxell_would_refresh: cxellWould,
            cxell_broken: cxellBroken, cxell_stale: cxellStale };
 }
@@ -807,6 +922,15 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {
       await emitXellEnv(xell.id).catch((e) => console.error(`[provision] .zeehive.env: ${e.message}`));
+      // …and OPEN what was just written, before anyone treats this xell as ready (#53). Writing a
+      // DATABASE_URL and that DATABASE_URL answering are two different facts, and the gap is what
+      // let seven zees in one night be handed a credential the shared dev db rejects (#47).
+      // Awaited, because the verdict is only worth having before the pool hands the xell out — and
+      // safe to await because every probe is bounded (PREFLIGHT_TIMEOUT_MS) and runPreflight never
+      // throws. Imported dynamically: preflight.js reads resolveXellDsn from here, and this is how
+      // the repo already breaks that cycle (environments.js → provision.js).
+      const { runPreflight } = await import('./preflight.js');
+      await runPreflight(xell.id);
       // WARM THE WORKTREE ON THE POOL'S CLOCK, not the zee's. A pooled xell sits `ready` for
       // minutes or hours; doing its `npm ci` now costs nobody anything, fills the SHARED package
       // cache for every xell that follows, and means the first build of a process role is not also
@@ -814,7 +938,22 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
       // a cache was cold would be a far worse bug than the one this fixes. `npm ci` only: a
       // worktree with no lockfile is skipped rather than `npm install`ed, because install rewrites
       // the lock and the pool reaps a dirty worktree (the 2026-07-20 provision→build→reap loop).
-      warmWorktree(worktree, { slug }).catch((e) => logline('pool', `${slug}: worktree warm errored (ignored): ${e.message}`));
+      // …with the PROJECT'S SPAWN TEMPLATE (migration 121) deciding whether that install happens at
+      // all and with which npm flags (--prefer-offline off a warm shared cache is most of what makes
+      // a spawn fast). A NULL template is the built-in default, i.e. exactly this call before 121.
+      const prep = normalizeSpawnPrep(cfg?.spawn_prep ?? null);
+      warmWorktree(worktree, { slug, prep })
+        .catch((e) => logline('pool', `${slug}: worktree warm errored (ignored): ${e.message}`));
+      // …and, when the template says `when: 'provision'`, PREPARE THE CAGE ITSELF here rather than
+      // at dispatch. This is the whole point of that setting: the container is created, the branch
+      // is cloned into it and everything is installed while the xell sits in the pool, so a human
+      // waiting for a zee is not also waiting for npm. Fire-and-forget and never fatal, exactly like
+      // the worktree warm — a provision that died because a package mirror was slow would be a far
+      // worse bug than the one this fixes.
+      if (prewarmsCage(prep)) {
+        prewarmCage({ slug, worktree, project, prep })
+          .catch((e) => logline('pool', `${slug}: cage prewarm errored (ignored): ${e.message}`));
+      }
     }
     return { ...xell, ports, url, mode };
   } catch (err) {

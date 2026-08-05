@@ -3,16 +3,36 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
-         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
-         pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject } from './api.js';
+         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee, getHarnesses,
+         pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject,
+         getXellLangfuseSession, routePrompt, deployRouter, redeployRouter,
+         squashHelps, squashOffer } from './api.js';
+import { emptyWarning } from './harnessHealth.js';
+import { promptButtons, hasAnyAccount } from './promptButtons.js';
 import MessageComposer from './MessageComposer.jsx';
 import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
+import Directives from './Directives.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import { showDiff } from './DiffViewer.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
+
+// The server's /xells/:id/langfuse-session refusal codes are machine reasons; a human gets a line
+// that says WHAT is missing and what to do about it. 'no-project' used to hide five different
+// states behind one code (TKT-127) — the server now distinguishes them, and this maps each to an
+// actionable sentence (a bare reason string is shown as-is rather than inventing one).
+function langfuseSessionRefusal(r) {
+  switch (r?.reason) {
+    case 'no-session': return 'This zee has no Langfuse session yet — one is recorded after its first finished turn.';
+    case 'no-project': return 'Langfuse has never told us its project id, and it could not be learned. Check the Langfuse stack / provisioning.';
+    case 'langfuse-unreachable': return 'The Langfuse instance is unreachable — is the stack healthy?';
+    case 'langfuse-disabled': return 'Langfuse is not enabled on this fleet.';
+    case 'langfuse-tracking-off': return 'Langfuse tracking is off for this xell.';
+    default: return r?.reason || r?.error || 'Langfuse session unavailable for this xell';
+  }
+}
 import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
@@ -27,6 +47,10 @@ import ProjectMenu from './ProjectMenu.jsx';
 import BackupsPanel, { BackupsModal } from './Backups.jsx';
 import LandingPanel, { LandCard, holdsRunway } from './Landing.jsx';
 import ProdAsksPanel, { ProdBindCard, SeedCard } from './ProdData.jsx';
+import XourceCleanPanel from './XourceClean.jsx';
+import ManagerMintPanel from './ManagerMint.jsx';
+import CredentialInjectPanel from './CredentialInject.jsx';
+import VisualVerifyPanel from './VisualVerify.jsx';
 import { AddManagerButton, DoneSuggestionCard } from './Manager.jsx';
 import ShipPanel, { LockBadge } from './Ship.jsx';
 import LandingPad from './LandingPad.jsx';
@@ -35,9 +59,12 @@ import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.j
 import MachineMatrix from './Machines.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
+// a zee's badge: the AI PROVIDER's coin, wearing its harness (the honeycomb draws the same thing)
+import ZeeAvatar from './ZeeAvatar.jsx';
 import FleetPause from './FleetPause.jsx';
 import Dispatch from './Dispatch.jsx';
 import WorkConsole from './work/WorkConsole.jsx';
+import DeliveryTelemetry from './DeliveryTelemetry.jsx';
 import Toasts from './Toasts.jsx';
 
 const PROJECT_KEY = 'zeehive.project';
@@ -78,6 +105,18 @@ const clip = (s, n = 60) => {
   return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t;
 };
 const capitalise = (s) => String(s || '').charAt(0).toUpperCase() + String(s || '').slice(1);
+// How long a state has been true, coarsely. DAYS are the point of this one rather than a nicety:
+// it renders the age of an env-reconcile alert, and that state survives reboots — "1d ago" and
+// "4m ago" are the difference between a blip and something the fleet has been living with. Empty
+// string for no timestamp, so a caller can concatenate it without guarding twice.
+const fmtAgo = (ts) => {
+  if (!ts) return '';
+  const s = Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000);
+  if (s < 60) return `${Math.floor(s)}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+};
 
 // FLEET BURN formatters. Compact token counts (1.2M, 890K, 4.2k → keep it short on a card) and a
 // dollar figure that keeps cents but never a distracting tail of zeros. These render fleet-OWN
@@ -182,8 +221,13 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
-  const [showDispatch, setShowDispatch] = useState(false); // false | { provider } — the "+" prompt composer
+  // false | { harness } — the "+" prompt composer, opened FROM a persona's own button (harness is
+  // three-state exactly like the dispatch payload: undefined = project default, '' = core only, a
+  // key = that harness).
+  const [showDispatch, setShowDispatch] = useState(false);
+  const [harnesses, setHarnesses] = useState([]);  // the worker personas this project may dispatch — one prompt button each
   const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
+  const [showDelivery, setShowDelivery] = useState(false); // DELIVERY TELEMETRY (cycle time, waste, gate waits)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
@@ -196,6 +240,10 @@ export default function App() {
   // ── honeycomb shell ──────────────────────────────────────────────────────────
   const orientation = useOrientation();          // 'portrait' | 'landscape'
   const [honeySide, setHoneySide] = useState('a'); // which half is the honeycomb (flip swaps it)
+  // whether the HARNESS hexagons are shown (default ON). Flipped OFF, the harness badges hide and the
+  // connector wires trace straight from each git-graph commit dot to its xell — no harness cell to route
+  // through. A view preference only: it changes nothing about the fleet or the payload.
+  const [showHarness, setShowHarness] = useState(true);
   // honey pane's fraction of the two OUTER panes' combined size — the grip in the graph pane slides
   // this to move the centre divider (null → the CSS 3:2 default). Persisted per orientation.
   const [split, setSplit] = useState(null);
@@ -204,6 +252,7 @@ export default function App() {
   const [termXell, setTermXell] = useState(null);  // cxell-zee terminal modal, opened from the flower
   const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
   const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
+  const [directivesXell, setDirectivesXell] = useState(null); // manager-directives panel, opened from the flower's 🧭 button
   // ♻ swap composer, opened from the flower's BRANCH petal: replace the ZEE working this xell and
   // keep the xell (same branch, commits, containers, database, card). It carries the xell's diff so the
   // composer can warn about uncommitted work — the collect saves COMMITS, and only commits.
@@ -271,14 +320,28 @@ export default function App() {
   // LAST update stream land one frame late and repaint the previous project's remnants.
   const projectIdRef = useRef(null);
   projectIdRef.current = projectId;
-  // Which AI provider ACCOUNTS this project can dispatch on — drives the per-account prompt
-  // buttons. NB: read the fallback id off `fleet` (state), NOT the `project` const destructured
+  // Which AI provider ACCOUNTS this project can dispatch on. Since the prompt buttons became
+  // per-PERSONA this no longer draws them — it decides whether a persona's button is dispatchable
+  // at all (an account of a provider its policy allows), and it is still what "add provider" keys
+  // off. NB: read the fallback id off `fleet` (state), NOT the `project` const destructured
   // from it further down — referencing that in this deps array is a temporal-dead-zone crash
   // that white-screened the whole console on first render (found 2026-07-21).
   useEffect(() => {
     const pid = projectId || fleet?.project?.id;
     if (!pid) return;
     getProviderTokens(pid).then((t) => setProviders(Array.isArray(t) ? t : [])).catch(() => setProviders([]));
+  }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
+  // THE PERSONAS THIS PROJECT MAY DISPATCH — one prompt button each. Worker harnesses only
+  // (054: a xell wears a harness of its own type) and scoped to THIS project (084: the system-wide
+  // personas plus its own, never another project's), so a button can never offer a choice the
+  // assign path would refuse. Re-read when the harness manager or a dispatch closes, the same way
+  // the provider list is.
+  useEffect(() => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid) { setHarnesses([]); return; }
+    getHarnesses('worker', pid)
+      .then((hs) => setHarnesses((Array.isArray(hs) ? hs : []).filter((h) => !h.is_law_core)))
+      .catch(() => setHarnesses([]));
   }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
   // GitHub access check: does the stored token let us push / open PRs to the remote?
   // Re-fetches when the project or the setup modal closes (the operator may have added a token there).
@@ -346,26 +409,52 @@ export default function App() {
   // Update-only for cases where the toast is guaranteed to already exist.
   const updateToast = useCallback((id, patch) =>
     setToasts((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t))), []);
+  // Append a raw log line to a db-op panel card, creating a minimal running card if it does not
+  // exist yet (a log event can race ahead of the first progress event). Capped so a chatty
+  // pg_restore cannot eat the tab. Functional update, so bursts of lines never lose an append.
+  const appendToastLine = useCallback((id, line) => {
+    setToasts((ts) => {
+      const idx = ts.findIndex((t) => t.id === id);
+      if (idx < 0) {
+        return [...ts, { id, kind: 'dbop', status: 'running', title: 'Database operation', body: 'working…', lines: [line] }];
+      }
+      const updated = [...ts];
+      const cur = updated[idx];
+      updated[idx] = { ...cur, lines: [...(cur.lines || []), line].slice(-400) };
+      return updated;
+    });
+  }, []);
 
-  // Live progress of db backup / restore / copy operations — maps SSE events to progress toasts.
-  // The toast id is `dbop-<op>-<id>` so all events for the same operation update the same toast.
+  // Live progress of db backup / restore / copy — maps SSE events to a WIDE persistent panel card
+  // (kind 'dbop') in the notification stack, not a one-line toast. The card id is
+  // `dbop-<op>-<id>` so all events for the same operation converge on one card. A running card
+  // stays until it finishes; a finished/failed one lingers with its full log and a ✕ (and
+  // auto-dismisses, so a settled job does not stack up forever).
   const onDbOpProgress = useCallback((p) => {
     if (!p?.op || !p?.id) return;
     const tid = `dbop-${p.op}-${p.id}`;
     if (p.status === 'finished') {
-      upsertToast(tid, { kind: 'success', title: `${capitalise(p.op)} complete`, body: p.msg, pct: 100, onRetry: null });
-      setTimeout(() => dismissToast(tid), 6000);
-    } else if (p.status === 'failed') {
-      upsertToast(tid, { kind: 'error', title: `${capitalise(p.op)} failed`, body: p.error || p.msg, pct: 0, onRetry: null });
-      setTimeout(() => dismissToast(tid), 12000);
+      upsertToast(tid, { kind: 'dbop', status: 'finished', title: `${capitalise(p.op)} complete`, body: p.msg, pct: 100, onRetry: null });
+      setTimeout(() => dismissToast(tid), 15000);
+    } else if (p.status === 'failed' || p.status === 'cancelled') {
+      const label = p.status === 'cancelled' ? 'cancelled' : 'failed';
+      upsertToast(tid, { kind: 'dbop', status: p.status, title: `${capitalise(p.op)} ${label}`, body: p.error || p.msg, pct: 0, onRetry: null });
+      setTimeout(() => dismissToast(tid), 30000);
     } else {
-      // running — upsert with progress
+      // running — upsert the card with the current phase + progress
       const title = p.label
         ? `${capitalise(p.op)} — ${p.label}`
         : `${capitalise(p.op)} in progress`;
-      upsertToast(tid, { kind: 'progress', title, body: p.msg, pct: p.pct ?? 0 });
+      upsertToast(tid, { kind: 'dbop', status: 'running', title, body: p.msg, pct: p.pct ?? 0, onRetry: null });
     }
   }, [upsertToast, dismissToast]);
+
+  // Raw output lines of the same operations — the actual pg_dump / pg_restore / docker log,
+  // appended to the operation's toast so it reads like a build log (the ship card's live feed).
+  const onDbOpLog = useCallback((p) => {
+    if (!p?.op || !p?.id || p.line == null) return;
+    appendToastLine(`dbop-${p.op}-${p.id}`, p.line);
+  }, [appendToastLine]);
 
   // Fire-and-forget dispatch. The composer hands us the whole payload and closes IMMEDIATELY; the
   // slow bits (uploading a pasted image, renaming the worktree, spawning + awaiting the zee) run
@@ -374,8 +463,21 @@ export default function App() {
   const runDispatch = useCallback(async (payload) => {
     const id = `disp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const nImg = payload.images?.length || 0;
-    pushToast({ id, kind: 'progress', title: 'Dispatching a zee…',
-      body: nImg
+    // THE ROUTER PAYLOADS (139) ride the same fire-and-forget toast machinery: the composer closed
+    // already, so progress/failure/Retry live here whichever door the payload goes through.
+    //   via_router      → hand the RAW prompt to the live router (POST /api/router/route)
+    //   deploy_router   → deploy the router zee (no prompt — provider/model only)
+    //   redeploy_router → same xell, new zee (the "swap it with a better model" button)
+    const routerVerb = payload.via_router ? 'route' : payload.deploy_router ? 'deploy'
+      : payload.redeploy_router ? 'redeploy' : null;
+    pushToast({ id, kind: 'progress',
+      title: routerVerb === 'route' ? 'Routing your prompt…'
+        : routerVerb ? `${routerVerb === 'redeploy' ? 'Redeploying' : 'Deploying'} the router…`
+        : 'Dispatching a zee…',
+      body: routerVerb === 'route'
+        ? 'Handing the raw prompt to the router zee — it recomposes and dispatches.'
+        : routerVerb ? 'Claiming a xell and spawning the router (prod read-only, no land/ship)…'
+        : nImg
         ? `Uploading ${nImg} image${nImg === 1 ? '' : 's'}, claiming a xell and spawning…`
         : 'Claiming a ready xell and spawning…' });
     // YIELD before the network call. dispatchTask() runs synchronously up to its first await —
@@ -386,32 +488,38 @@ export default function App() {
     // first; the heavy serialization then runs with the UI already updated.
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     try {
-      const r = await dispatchTask(payload);
-      updateToast(id, { kind: 'success', title: 'Zee dispatched', onRetry: null,
-        body: r?.slug ? `Running in ${r.slug}.` : 'The zee is on it.' });
+      const r = routerVerb === 'route' ? await routePrompt(payload)
+        : routerVerb === 'deploy' ? await deployRouter(payload)
+        : routerVerb === 'redeploy' ? await redeployRouter(payload)
+        : await dispatchTask(payload);
+      updateToast(id, { kind: 'success', onRetry: null,
+        title: routerVerb === 'route' ? 'Prompt routed' : routerVerb ? 'Router deployed' : 'Zee dispatched',
+        body: routerVerb === 'route'
+          ? `Handed to the router${r?.router?.slug ? ` in ${r.router.slug}` : ''}${r?.delivered === false ? ' — stored; it reads it on its next turn' : ' — it recomposes and dispatches'}.`
+          : r?.slug ? `Running in ${r.slug}.` : 'The zee is on it.' });
       refresh();
       setTimeout(() => dismissToast(id), 7000);
     } catch (e) {
-      updateToast(id, { kind: 'error', title: 'Dispatch failed', body: e?.message || String(e),
+      updateToast(id, { kind: 'error', body: e?.message || String(e),
+        title: routerVerb === 'route' ? 'Routing failed' : routerVerb ? 'Router deploy failed' : 'Dispatch failed',
         onRetry: () => { dismissToast(id); runDispatch(payload); } });
     }
   }, [pushToast, updateToast, dismissToast, refresh]);
 
   // Fire a prod backup from a db chip's "Back up now" menu item. Same async job as the backups
-  // panel's button (POST /backups/run) — a running row appears immediately and finalizes over SSE;
-  // we report start/refusal through a toast and refresh so the panel's spinner shows.
+  // panel's button (POST /backups/run) — the server creates the running row and broadcasts
+  // db-op-progress / db-op-log, which drive the LIVE panel card in the notification stack. No
+  // "Starting…" toast here: the panel IS the progress. A refusal (already running, prod busy)
+  // still surfaces as an error toast.
   const runBackupNow = useCallback(async (c) => {
     const id = `bk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    pushToast({ id, kind: 'progress', title: 'Starting backup…',
-      body: `Dumping ${c?.name || 'the production database'}` });
     try {
       await runBackup(projectId || fleet?.project?.id);
-      updateToast(id, { kind: 'success', title: 'Backup started',
-        body: 'It runs in the background — watch the backups panel for its spinner.' });
       refresh();
-      setTimeout(() => dismissToast(id), 7000);
     } catch (e) {
-      updateToast(id, { kind: 'error', title: 'Backup not started', body: e?.error || e?.message || String(e) });
+      pushToast({ id, kind: 'error', title: 'Backup not started',
+        body: e?.error || e?.message || String(e) });
+      setTimeout(() => dismissToast(id), 10000);
     }
     // Reads `fleet?.project`, NOT the destructured `project` — and this is not a style choice.
     // `const { project } = fleet` happens far below, after the `if (!fleet) return` early return;
@@ -420,7 +528,7 @@ export default function App() {
     // whole console rendered blank (2026-07-22). Moving this hook below that destructure is not the
     // fix either — it sits after an early return, and hooks must run unconditionally. `fleet` is
     // state declared at the top of the component, so it is always safe to reference here.
-  }, [pushToast, updateToast, dismissToast, refresh, projectId, fleet]);
+  }, [pushToast, dismissToast, refresh, projectId, fleet]);
 
   // ── GitHub outbound (push / open PR) ───────────────────────────────────────
   // Same flow as ProjectSetup's BasicsSection — confirm, call API, report the outcome.
@@ -430,7 +538,9 @@ export default function App() {
     if (!(await showConfirm(
       `Push local ${fleet?.project?.main_branch || 'main'} of ${fleet?.project?.name} to the GitHub remote?\n\n`
       + `${fleet?.project?.remote_url || ''}\n\nThis publishes your local history to the remote (fast-forward only — a `
-      + `diverged remote is refused, never force-pushed).`,
+      + `diverged remote is refused, never force-pushed).`
+      // ruleset pre-flight: GitHub will refuse this by RULE (GH013) — say so before the click
+      + (githubAccessState?.push_rule_block ? `\n\n⚠ ${githubAccessState.push_rule_block}.` : ''),
       { title: 'Push to remote?', okLabel: 'Push' }))) return;
     setGithubOut({ busy: true, kind: 'push' });
     try {
@@ -463,7 +573,19 @@ export default function App() {
     if (headBranch === null) return;
     setGithubOut({ busy: true, kind: 'pr', merge });
     try {
-      const r = await pullRequestProject(pid, { headBranch: headBranch.trim() || undefined, merge });
+      const opts = { headBranch: headBranch.trim() || undefined, merge };
+      let r = await pullRequestProject(pid, opts);
+      // A rule that scans the COMMITS (push protection, file size, signatures…) is not fixed by a
+      // clean tip — offer the squashed snapshot, which needs neither a secret-scanning bypass nor a
+      // rewrite of main. Only for the rules it can actually help with (squashHelps).
+      if (squashHelps(r)) {
+        setGithubOut({ ...r, kind: 'pr', merge });
+        if (await showConfirm(squashOffer(r, fleet?.project?.main_branch || 'main'),
+          { title: 'Open the PR from a squashed snapshot?', okLabel: 'Open squashed PR' })) {
+          setGithubOut({ busy: true, kind: 'pr', merge });
+          r = await pullRequestProject(pid, { ...opts, squash: true });
+        }
+      }
       setGithubOut({ ...r, kind: 'pr', merge });
     } catch (e) { setGithubOut({ kind: 'pr', merge, reason: e.message }); }
   }, [projectId, fleet?.project?.id, fleet?.project?.main_branch, githubAccessState]);
@@ -499,9 +621,11 @@ export default function App() {
       onShipLog: (l) => setShipLogs((prev) => ({ ...prev, [l.id]: [...(prev[l.id] || []).slice(-399), l] })),
       // Live progress of db backup / restore / copy — drives progress toasts.
       onDbOpProgress,
+      // Raw command output lines of the same operations — appended to their toast as a build log.
+      onDbOpLog,
     });
     return () => { live = false; unsub(); };
-  }, [projectId, refresh, applyFleet, onDbOpProgress]);
+  }, [projectId, refresh, applyFleet, onDbOpProgress, onDbOpLog]);
 
   const selectProject = useCallback((id) => {
     setProjectId(id);
@@ -678,12 +802,30 @@ export default function App() {
     const src = x.remote_source?.ref || 'its xource';
     if (kind === 'terminal') { setTermChoice(x); return; }   // ask: in-house vs deep-linked
     if (kind === 'message') { setMsgXell(x); return; }       // open the long-text/image composer
+    if (kind === 'directives') { setDirectivesXell(x); return; } // read the manager⇄worker conversation
     if (kind === 'env') {
       // Opens the ENVIRONMENT panel (ticket #20): which environment this xell resolved to and why,
       // its var names, and the pin/clear. The raw .zeehive.env dump this used to show is still one
       // click away inside it — but the file alone could not answer "why is it unchanged?", which is
       // the question that actually gets asked.
       setEnvXell(x);
+      return;
+    }
+    if (kind === 'langfuse') {
+      // "View Langfuse" — opens THIS zee's Langfuse SESSION in a new window. The URL is computed
+      // SERVER-side (ui_url + the Langfuse project + the zee's session id); the flower only shows
+      // this verb when the plugin is enabled AND the xell's langfuse_tracking flag is on. The url
+      // is opened THROUGH the /api/langfuse/signin auto-login popup (?next=…), so the new window
+      // lands on the session already signed in — a human is never dumped on a login page. When the
+      // server refuses, it names WHICH thing is missing (TKT-127) — shown as a line a human can act
+      // on rather than a bare reason code.
+      getXellLangfuseSession(x.id, x.zee_id || null).then((r) => {
+        if (r?.ok && r.url) {
+          window.open(`/api/langfuse/signin?next=${encodeURIComponent(r.url)}`, '_blank');
+        } else {
+          showAlert(langfuseSessionRefusal(r), { variant: 'info' });
+        }
+      }).catch((e) => showAlert('Could not open the Langfuse session: ' + (e?.message || e), { variant: 'error' }));
       return;
     }
     if (kind === 'build') {
@@ -802,7 +944,7 @@ export default function App() {
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} onGeometry={fireGeom}
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
-                    redrawKey={version} />
+                    showHarness={showHarness} redrawKey={version} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs
             DOM, so it opens as a modal from the flower's ⌨ button. */}
@@ -828,16 +970,30 @@ export default function App() {
             it is mid-turn (the pane is a read-only feed then, so typing reaches nobody). */}
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
-                       xellId={termXell.id} onClose={() => setTermXell(null)} />
+                       xellId={termXell.id}
+                       langfuseTracking={termXell.langfuse_tracking !== false}
+                       langfuseEnabled={!!fleet?.langfuse?.enabled}
+                       onClose={() => setTermXell(null)} />
         )}
         {envXell && (
           <XellEnvironment xell={envXell} onClose={() => setEnvXell(null)} onChanged={refresh} />
         )}
+        {directivesXell && (
+          <Directives xell={directivesXell} onClose={() => setDirectivesXell(null)} />
+        )}
         {msgXell && (
           <MessageComposer xell={msgXell} initialText={msgXell.initialText || ''} onClose={() => setMsgXell(null)}
                            onSent={(r) => { const id = `msg-${msgXell.id}-${Date.now()}`;
+                             // WHICH delivery — the server decided it from the zee's state
+                             // (lib/zee-turn.js), and the three do not promise the same thing:
+                             // only 'typed' means it is reading this in the session you can watch.
+                             const said = r?.delivery === 'resumed'
+                               ? 'its turn had ended — the queenzee RESUMED its session with your message as the prompt'
+                               : r?.delivery === 'queued'
+                                 ? 'it is MID-TURN — QUEUED in its cxell, typed in the moment the turn ends'
+                                 : 'typed into its live session';
                              pushToast({ id, kind: 'success', title: `Message sent to ${msgXell.slug}`, onRetry: null,
-                               body: r?.attachments?.length ? `${r.attachments.length} attachment(s) delivered to its .zee-inbox` : 'typed into its live session' });
+                               body: r?.attachments?.length ? `${said} · ${r.attachments.length} attachment(s) in its .zee-inbox` : said });
                              setTimeout(() => dismissToast(id), 6000); }} />
         )}
         {/* ♻ SWAP THE ZEE — the console half of `zee swap`. FIRE-AND-FORGET, like the dispatch
@@ -876,13 +1032,14 @@ export default function App() {
       <GraphPane timeline={timeline} xells={xells} orientation={orientation} honeySide={honeySide}
                  hexPosRef={hexPosRef} prodIds={prodIds} expandedId={expandedId} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                 showHarness={showHarness} onToggleHarness={() => setShowHarness((s) => !s)}
                  onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
       <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
-                  hoverRef={hoverRef} subscribeHover={subscribeHover} />
+                  hoverRef={hoverRef} subscribeHover={subscribeHover} showHarness={showHarness} />
 
       <section className="hive-pane panels" style={split != null ? { flex: `${1 - split} 1 0` } : undefined}>
       <div className="content">
@@ -908,7 +1065,10 @@ export default function App() {
                 <button className={`gh-btn ${githubOut?.kind === 'push' && githubOut?.busy ? 'busy' : ''}`}
                         disabled={githubOut?.busy}
                         onClick={doGitHubPush}
-                        title="Push local main to the GitHub remote (fast-forward only)">↑ Push</button>
+                        title={githubAccessState?.push_rule_block
+                          ? `⚠ ${githubAccessState.push_rule_block}`
+                          : 'Push local main to the GitHub remote (fast-forward only)'}>
+                  {githubAccessState?.push_rule_block ? '↑ Push ⚠' : '↑ Push'}</button>
               )}
               {githubAccessState?.can_pr && (
                 <button className={`gh-btn ${githubOut?.kind === 'pr' && githubOut?.busy ? 'busy' : ''}`}
@@ -975,51 +1135,70 @@ export default function App() {
         {(!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0) || !project.compose_spinoff)
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
-        {/* ONE PROMPT BUTTON PER CONNECTED ACCOUNT — click = compose for THAT account, no
-            second AI choice anywhere. A project can hold several accounts of one provider type
-            (two Claude subscriptions, say): each is its own button, named by its account label
-            (falling back to the provider name + token tail when several share it). Each runs
-            its VENDOR'S OWN CLI inside the cxell (claude / codex / kimi; see server
-            lib/cxell-runtimes.js). Visibility IS the token store: no accounts → the one honest
-            button is "add provider", straight into Project setup. */}
+        {/* ONE PROMPT BUTTON PER PERSONA — click = compose for THAT harness, and everything the
+            composer then offers (providers, accounts, models, what the autonomy scale means) is
+            derived from its EFFECTIVE model policy: GET /api/dispatch/options, server
+            lib/dispatch-options.js.
+
+            It used to be one button per connected ACCOUNT, with the persona as the last segmented
+            control inside the modal. That put the credential first and the manual last, and the two
+            could contradict each other — opening from a Claude button and then picking a persona
+            whose policy allows only deepseek dispatched a refusal (resolveDispatchModel) after the
+            prompt was already written. The harness is the consequential choice, so it is the button.
+
+            Visibility is still the token store: no dispatchable ACCOUNT at all → the one honest
+            button is "add provider", straight into Project setup. And a persona whose policy allows
+            no connected provider keeps its button, disabled, carrying the reason — the same rule as
+            the paused account before it: a control that vanishes reads as "it disappeared". */}
         {(() => {
-          const ai = providers.filter((p) => p.provider !== 'github' && p.dispatch);
-          const buttons = ai.flatMap((p) => (p.accounts || []).map((a) => {
-            const dupes = (p.accounts || []).length > 1;
-            const name = a.label || (dupes ? `${p.label} ·${(a.token_hint || '').slice(-4)}` : p.label);
-            return { id: a.id, provider: p.provider, name, typeLabel: p.label, paused: !!a.paused };
-          }));
-          if (!buttons.length) {
+          if (!hasAnyAccount(providers)) {
             return (
               <button className="new-prompt-btn" data-testid="add-provider-btn"
                       title="No AI provider connected — add a Claude, Codex, or Kimi token to dispatch zees"
                       onClick={() => setShowSetup(true)}>＋ add provider</button>
             );
           }
-          // A paused account keeps its button so it stays VISIBLE as disabled — hiding it would
-          // read as "the account vanished", and the pause is deliberately reversible. The server
-          // refuses a dispatch on it regardless (spawnCreds → tokenForSpawn).
-          return buttons.map((b) => (
-            <button key={b.id} className="new-prompt-btn" data-testid={`new-prompt-btn-${b.provider}`}
-                    disabled={b.paused}
-                    title={b.paused
-                      ? `⏸ ${b.typeLabel} (${b.name}) is PAUSED — resume it in Project setup to dispatch on it`
-                      : `Compose a prompt and dispatch a ${b.typeLabel} zee (account: ${b.name}) into a ready xell`}
-                    onClick={() => setShowDispatch({ provider: b.provider, tokenId: b.id, label: b.name })}>
-              {b.paused ? '⏸' : '＋'} prompt · {b.name}
-            </button>
-          ));
+          // WHICH buttons, and whether each can be pressed, is a pure decision — promptButtons.js,
+          // so it is testable in plain node and every surface that offers "start a zee" agrees.
+          return promptButtons(harnesses, providers,
+                               { emptyWarning, defaultHarnessId: fleet.pool?.default_harness_id }).map((b) => {
+            const why = b.blocked
+              ? `${b.label}: ${b.blocked} — connect one in Project setup, or change the persona's model policy`
+              : `Compose a prompt and dispatch a zee wearing ${b.label} into a ready xell`
+                + `\n${b.title}`
+                + `\nruns on: ${b.runsOn.map((p) => p.label).join(', ')}`
+                + (b.isDefault ? "\nthis project's DEFAULT persona — what a bare dispatch attaches" : '')
+                + (b.warn ? `\n${b.warn.chip} — ${b.warn.why}` : '');
+            return (
+              // THE BADGE IS NOT IN THE BUTTON. A persona's face is the thing you scan the toolbar
+              // for, and a glyph shrunk to fit inside a 12px pill is not a face — so the avatar is
+              // the button's SIBLING at a readable size, and the pill carries the name alone. (No
+              // "＋ prompt ·" prefix either: it was the same three words on every one of these, and
+              // the only word that differs is the persona's.)
+              <span key={b.key || 'core'} className={`np-persona${b.blocked ? ' np-blocked' : ''}`} title={why}>
+                {b.key
+                  ? <ZeeAvatar harness={{ key: b.key, label: b.label, glyph: b.glyph, bundle_empty: !!b.warn }} size={30} />
+                  : <span className="np-core" aria-hidden="true">○</span>}
+                <button className="new-prompt-btn" data-testid={`new-prompt-btn-${b.key || 'core'}`}
+                        disabled={!!b.blocked} title={why}
+                        onClick={() => setShowDispatch({ harness: b.key })}>
+                  {b.label}{b.scope === 'project' ? ' ⌂' : ''}{b.isDefault ? ' ·default' : ''}{b.warn ? ` ${b.warn.chip}` : ''}
+                </button>
+              </span>
+            );
+          });
         })()}
         {/* ADD A MANAGER ZEE — unlimited, and only from here: a manager coordinates workers, holds
             production READ-ONLY and cannot push to the xource, and `zee dispatch` refuses the role
             so managers can never mint managers. Sits beside the prompt buttons because it is the
             same act one level up: starting an agent. */}
         {/* It opens the SAME composer the "+ prompt" buttons do (Dispatch, manager variant) — a
-            manager's programme is a prompt, and it used to get a one-line input box. `providers`
-            rides along so the one manager button can still choose WHICH connected account runs it,
-            the choice the per-account prompt buttons make by being clicked. */}
+            manager's programme is a prompt, and it used to get a one-line input box. The PERSONA is
+            chosen inside it (one manager button for the fleet, where a worker's persona IS the
+            button), and the provider/account/model choices follow from that persona's model policy
+            exactly as they do for a worker — the composer reads them itself. */}
         <AddManagerButton projectId={projectId || project.id} projectName={project.name}
-                          providers={providers} onAdded={refresh} />
+                          onAdded={refresh} />
         {/* THE WORK TRACKER — tickets in, a plan on a board, a timeline over it. It sits with the
             prompt buttons because it is the other half of the same question: the prompt buttons
             start work, this is where the work being done is decided and tracked. It opens as a
@@ -1029,6 +1208,17 @@ export default function App() {
         {showWork && (
           <WorkConsole projectId={projectId || project.id} projectName={project.name}
                        onClose={() => setShowWork(false)} />
+        )}
+        {/* DELIVERY TELEMETRY — the same altitude as the work tracker, and the other half of the
+            same question: the tracker says what work exists, this says how that work is actually
+            going (cycle time, rework, what dies, what a landing costs, how long a human takes).
+            Read-only, portalled like every other heavyweight surface. */}
+        <button className="dt-btn-open" data-testid="delivery-btn"
+                title="Open delivery telemetry — cycle time, turn deaths, cost per landing, rework, gate waits"
+                onClick={() => setShowDelivery(true)}>◷ delivery</button>
+        {showDelivery && (
+          <DeliveryTelemetry projectId={projectId || project.id} projectName={project.name}
+                             onClose={() => setShowDelivery(false)} />
         )}
         <button className="term-btn" data-testid="term-btn" title="Open queenzee terminal"
                 onClick={() => setShowTerm(true)}>▚_</button>
@@ -1051,6 +1241,27 @@ export default function App() {
                        || ['seeded', 'failed'].includes(r.status))}
                      onDecided={refresh} />
 
+      {/* VISUAL VERIFICATION — a zee built its webapp and OFFERED the live link to a human in the
+          console (a human turned it on at dispatch time). Not a gate: there is nothing to approve,
+          only a link to open (or a card to dismiss). The small panel carries every open offer. */}
+      <VisualVerifyPanel offers={fleet.visual_verify_offers} onDone={refresh} />
+
+      {/* XOURCE CLEAN-UP — a manager asked for the main checkout to be reset because a mangled
+          tree is wedging every landing and ship. A decision (approve → the queenzee cleans) or a
+          recent receipt, exactly like the prod-data asks. */}
+      <XourceCleanPanel requests={fleet.xource_clean} onDone={refresh} />
+
+      {/* MANAGER MINT — a ROUTER asked for another MANAGER zee (149). The router sees a raw prompt
+          before anyone has sized it, so it is the zee that spots a PROGRAMME rather than a task; it
+          may ask, and only a human may say yes. Approve → the queenzee adds the manager itself. */}
+      <ManagerMintPanel requests={fleet.manager_mint} onDone={refresh} />
+
+      {/* CREDENTIAL INJECTION — the queenzee raised a request (a human rotated an account; a zee
+          died on a 401) and a human decides here. Approve → the queenzee injects the current key
+          into the named live cages and re-runs the adapter's auth setup. A decision or a recent
+          receipt, exactly like xource-clean and the prod-data asks. */}
+      <CredentialInjectPanel requests={fleet.credential_inject} onDone={refresh} />
+
       {/* Production: ship approvals + the prod lock's countdown. Same altitude as landings —
           both are decisions only a human may make, and both block a zee until made. */}
       <ShipPanel shipping={fleet.shipping} prodLock={fleet.prod_lock} shipLogs={shipLogs}
@@ -1066,7 +1277,8 @@ export default function App() {
       {/* The inventory as a role × machine MATRIX: one column per machine, so what-runs-where is
           the panel's shape. Chips sit where they RUN; the ⇄ marker says where they compile. */}
       <MachineMatrix machines={fleet.machines} containers={containers}
-                     projectId={projectId || project.id} onMenu={openMenu} onChanged={refresh} />
+                     projectId={projectId || project.id} composeSpinoff={project.compose_spinoff}
+                     onMenu={openMenu} onChanged={refresh} />
 
       {/* The decision UI (held landing / open PR, with Approve/Reject) now renders INLINE under the
           "waiting on you" bar when its chip is clicked — next to nothing else, and the flower on the
@@ -1076,8 +1288,7 @@ export default function App() {
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
-                  provider={showDispatch.provider || 'claude'} providerLabel={showDispatch.label}
-                  tokenId={showDispatch.tokenId || null}
+                  harness={showDispatch.harness}
                   onClose={() => setShowDispatch(false)}
                   onDispatch={(payload) => { setShowDispatch(false); runDispatch(payload); }} />
       )}
@@ -1124,15 +1335,24 @@ function PoolTarget({ pool, projectId }) {
   );
 }
 
-// Operator policy: auto-approve landings and/or ships. Two independent switches — landing→main is
-// far lower stakes than shipping→prod, so they toggle separately. Enabling ships asks first (it
-// puts code LIVE with no human review). Reads the flags off the project row in the fleet snapshot.
+// Operator policy: auto-approve landings, ships, seeds and auto-DONE. Independent switches —
+// landing→main is far lower stakes than shipping→prod or seeding→prod, so they toggle separately.
+// Enabling ships/seeds/done asks first (ships and seeds put data/code LIVE, done tears xells down,
+// all with no human review). Reads the flags off the project row in the fleet snapshot.
 function AutoApprove({ project, projectId, onChanged }) {
   const [busy, setBusy] = useState(false);
   const set = async (field, checked) => {
-    if (field === 'auto_approve_ship' && checked
-      && !(await showConfirm('Auto-approve PRODUCTION ships?\n\nEvery ship request will deploy to prod immediately with NO human review. The queenzee still only builds landed work from main, but nobody signs off per ship.',
-        { variant: 'danger', okLabel: 'Enable auto-approve' }))) return;
+    if (checked) {
+      if (field === 'auto_approve_ship'
+        && !(await showConfirm('Auto-approve PRODUCTION ships?\n\nEvery ship request will deploy to prod immediately with NO human review. The queenzee still only builds landed work from main, but nobody signs off per ship.',
+          { variant: 'danger', okLabel: 'Enable auto-approve' }))) return;
+      if (field === 'auto_approve_seed'
+        && !(await showConfirm('Auto-approve PRODUCTION seeds?\n\nEvery seed request will run its SQL against the live production database immediately with NO human reading it. The queenzee still only runs files already on main from server/sql/seeds/, but nobody reviews per seed.',
+          { variant: 'danger', okLabel: 'Enable auto-seed' }))) return;
+      if (field === 'auto_done'
+        && !(await showConfirm('Auto-done xells?\n\nA DONE SUGGESTION from a MANAGER zee will be confirmed immediately with NO human review — marking the task done and tearing that xell down. A worker\'s own `zee done` still needs a human. The reap\'s own guards (e.g. an actively-working xell) still apply.',
+          { variant: 'danger', okLabel: 'Enable auto-done' }))) return;
+    }
     setBusy(true);
     try { await updateProject(projectId, { [field]: checked }); onChanged?.(); }
     catch (e) { showAlert('Auto-approve change failed: ' + e.message, { variant: 'error' }); }
@@ -1152,6 +1372,10 @@ function AutoApprove({ project, projectId, onChanged }) {
               title="Automatically approve every push to main — the landing gate lets it through with no human review." />
       <Switch field="auto_approve_ship" label="ships" danger
               title="Automatically approve every production ship — code goes LIVE with no human review (still built from landed main)." />
+      <Switch field="auto_approve_seed" label="seeds" danger
+              title="Automatically approve every production seed — SQL runs on the LIVE database with no human reading it (still only files already on main, from server/sql/seeds/)." />
+      <Switch field="auto_done" label="done" danger
+              title="Automatically confirm a MANAGER's done suggestion — the xell is marked done and torn down with no human review (a worker's own `zee done` still needs a human)." />
     </span>
   );
 }
@@ -1356,6 +1580,10 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
           on EACH OTHER whenever a non-prod xell held the prod lock. Laying them out puts the stack
           naturally below and makes the overlap unrepresentable rather than tuned-around. */}
       <div className="cardtop">
+        {/* WHO is thinking in this xell, and what it is dressed as — the provider's coin wearing its
+            harness (ZeeAvatar). The same badge the hexagon carries, so a card and its cell in the
+            honeycomb are recognisably the same zee. Production runs no zee, so it gets none. */}
+        {!isProd && <ZeeAvatar xell={x} size={32} />}
         {isProd && <span className="prodtag" data-testid="prod-tag" title="Production — protected, untouchable by zees">🛡 PRODUCTION</span>}
         {/* whose crew this is, or how big a crew it runs — the one relationship in the fleet that is a
             real relationship, stated in words because a list is scanned rather than pointed at */}
@@ -1466,7 +1694,10 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
         )}
         {cxell && termOpen && (
           <ZeeTerminal zeeId={x.zee_id} slug={x.slug} viewerUrl={x.viewer_url}
-                       xellId={x.id} onClose={() => setTermOpen(false)} />
+                       xellId={x.id}
+                       langfuseTracking={x.langfuse_tracking !== false}
+                       langfuseEnabled={!!fleet?.langfuse?.enabled}
+                       onClose={() => setTermOpen(false)} />
         )}
         {!isProd && <Row k="zee" v={working ? x.zee_name : '—'} highlight={working} testid="zee-name" />}
         {isProd
@@ -1557,6 +1788,34 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
             </span>
           </div>
         )}
+        {/* ENV RECONCILE FAILED, AND A ZEE IS LIVE IN HERE (ticket #44). The queenzee refused to
+            rewrite this xell's .zeehive.env — correctly; in the case that earned this row, the
+            xell's DATABASE_URL resolved to the fleet's own meta-DB with a full-write role — and the
+            xell kept running on the file it already had. Nobody raised this and nobody in the xell
+            can lower it: it clears when a reconcile SUCCEEDS, i.e. when a human re-points the db.
+            The reason is the refusal text VERBATIM (it was already written for a human), and the
+            AGE is on it because this state survives reboots: "still failing, 6 reconciles, since
+            Tuesday" is a different sentence from "something failed just now". */}
+        {x.env_alert?.open && (
+          <div className="row"><span className="rk">env</span>
+            <span className="envalert" data-testid="env-alert"
+                  title={`${x.env_alert.full || x.env_alert.reason || 'The projection failed with no reason recorded.'}\n\n`
+                    + 'The queenzee could NOT reconcile this xell\'s .zeehive.env, and a zee is live in it — '
+                    + 'so it is still running on whatever that file already said. Nothing was rewritten '
+                    + '(rewriting a running zee\'s DSN underneath it is the more dangerous act). Fix the '
+                    + 'cause — usually re-point the xell\'s database — and the next reconcile clears this.'}>
+              ⚠ .zeehive.env NOT reconciled — {x.env_alert.reason ? clip(x.env_alert.reason, 64) : 'no reason recorded'}
+            </span>
+          </div>
+        )}
+        {x.env_alert?.open && (
+          <div className="row"><span className="rk"></span>
+            <span className="envalert-age" data-testid="env-alert-age">
+              {x.env_alert.count} failed reconcile{x.env_alert.count === 1 ? '' : 's'}
+              {x.env_alert.since ? `, first seen ${fmtAgo(x.env_alert.since)}` : ''} · the zee cannot clear this
+            </span>
+          </div>
+        )}
         {/* FLEET BURN — what every zee this xell hosted consumed (tokens + $), summed. Compact by
             design (Σ 1.2M tok · $8.90). This is the xell's OWN spend; account-wide %/limits are not
             available to us (only Anthropic's /usage shows those). Shown once there's anything to show. */}
@@ -1582,7 +1841,10 @@ function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, 
         })()}
         {!isProd && x.runtime_label && (
           <div className="row"><span className="rk">runtime</span>
-            <span className="runtime">{x.runtime_label}</span></div>
+            <span className="runtime rt-worn">
+              <ZeeAvatar xell={x} size={22} />
+              {x.runtime_label}{x.harness_label ? ` · ${x.harness_label}` : ''}
+            </span></div>
         )}
         {!isProd && x.zee_id && x.cli_active != null && (
           <div className="row"><span className="rk">monitor</span>
@@ -1683,9 +1945,21 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
   const waiting = xells.map((x) => {
     const held = (landingByXell[x.id] || []).filter((r) => r.status === 'pending').length;
     const prs = (prsFor(x) || []).filter((r) => r.status === 'pending').length;
-    // A zee's TEND ping (occ-tendRequest): it asked for a human in the console. No approve/reject —
-    // the chip just takes you to it; the zee (or you) clears the tend once handled.
-    const tend = x.hive_status === 'occ-tendRequest' ? 1 : 0;
+    // A zee's TEND ping: it asked for a human in the console. No approve/reject — the chip just
+    // takes you to it; the zee (or you) clears the tend once handled.
+    //
+    // Read from x.tend, NOT from hive_status. The hexagon pill can only show ONE word, so any newer
+    // signal that outranks tend there (the env alert, #44) would have silently emptied this line of
+    // a tend that is still open — the bar and the pill answer different questions, and the bar's is
+    // "everything waiting on you", not "the single most urgent thing".
+    const tend = x.tend?.open ? 1 : 0;
+    // ENV RECONCILE FAILED on a LIVE xell (#44): the queenzee refused to write this xell's
+    // .zeehive.env and the zee kept running on the old one. Nobody in the xell raised it and nobody
+    // in the xell can clear it, so if it is not on this line it is on no line at all — which is the
+    // entire bug: the only previous signal was one line in a boot digest.
+    const envAlert = x.env_alert?.open ? 1 : 0;
+    const envWhy = envAlert ? (x.env_alert?.reason || null) : null;
+    const envFull = envAlert ? (x.env_alert?.full || x.env_alert?.reason || null) : null;
     // …and WHY: the brief reason the zee gave when it raised the tend (fleet: x.tend.reason). The
     // whole point of being called is knowing what you were called for — without it this line could
     // only say "somebody wants you", and the human had to open the session to find out what for.
@@ -1710,8 +1984,13 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
     const blocking = (landingByXell[x.id] || []).filter((r) => r.status === 'approved' && holdsRunway(r));
     const blocked = blocking.length;
     const blockedBy = blocking[0]?.holders || 0;
-    return { x, held, prs, tend, tendWhy, tendFull, bind, seed, doneSug, blocked, blockedBy,
-      n: held + prs + tend + bind + seed + doneSug + blocked };
+    return { x, held, prs, tend, tendWhy, tendFull, envAlert, envWhy, envFull,
+      bind, seed, doneSug, blocked, blockedBy,
+      // envAlert is APPENDED rather than slotted in beside tend: test/prod-asks-console.test.mjs
+      // pins the head of this sum literally (`n: held + prs + tend + bind + seed`) to prove a
+      // prod-only ask still reaches this line, and a new term in the middle breaks that reading
+      // without breaking anything real. Order in a sum is arbitrary; that assertion is not.
+      n: held + prs + tend + bind + seed + doneSug + blocked + envAlert };
   }).filter((w) => w.n > 0);
   if (!waiting.length) return null;
 
@@ -1732,7 +2011,7 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
         <span className="ny-t">⚠ waiting on you:</span>
         {waiting.map((w) => (
           <button key={w.x.id} className={`ny-chip ${w.x.id === expandedId ? 'active' : ''}`} onClick={() => go(w.x.id)}
-                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.blocked && `an APPROVED landing is holding the runway with ${w.blockedBy} zee(s) queued behind it — it never landed`, w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
+                  title={`${[w.held && `${w.held} landing held`, w.prs && `${w.prs} PR`, w.bind && 'wants the PRODUCTION database', w.seed && 'wants production SEEDED', w.blocked && `an APPROVED landing is holding the runway with ${w.blockedBy} zee(s) queued behind it — it never landed`, w.tend && `tend (needs a human)${w.tendFull ? `: ${w.tendFull}` : ''}`, w.envAlert && `.zeehive.env could NOT be reconciled and a zee is live in it${w.envFull ? `: ${w.envFull}` : ''}`].filter(Boolean).join(' · ')} — click to review`}>
             {w.x.slug}
             {/* WHOSE crew is asking. A held landing from a crew member is a different decision from one
                 by a lone xell — there is an agent whose plan it belongs to — and this line was the one
@@ -1746,6 +2025,7 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
               w.doneSug > 0 && '⬢ manager says done',
               w.blocked > 0 && `⛔ holds the runway${w.blockedBy ? ` · ${w.blockedBy} queued` : ''}`,
               w.tend > 0 && `🖐 tend${w.tendWhy ? `: ${clip(w.tendWhy, 60)}` : ''}`,
+              w.envAlert > 0 && `⚠ env NOT reconciled${w.envWhy ? `: ${clip(w.envWhy, 60)}` : ''}`,
             ].filter(Boolean).join(' · ')}</span>
           </button>
         ))}
@@ -1762,6 +2042,23 @@ function NeedsYouBar({ xells, links, landingByXell, prsFor, onJump, expandedId, 
             <div className="ny-note">🖐 <b>{open.x.slug}</b> raised a <b>tend</b> — its zee asked for a human
               {open.tendFull ? <>: <b className="ny-why">{open.tendFull}</b></> : ' (it gave no reason)'}.
               {' '}Open its session for the detail; it clears when the zee reports working or runs <code>zee tend --clear</code>.</div>
+          )}
+          {/* The env alert's opened form. Unconditional on the other cards, unlike the tend note
+              above: this one is not a request competing for the same slot, it is a statement about
+              the machine underneath a xell that may ALSO have a landing held. There is no button
+              because there is nothing here a click can decide — the fix is to re-point the xell's
+              database, and the next reconcile lowers it by itself. */}
+          {open.envAlert > 0 && (
+            <div className="ny-note" data-testid="env-alert-note">⚠ <b>{open.x.slug}</b>: the queenzee could
+              {' '}<b>NOT reconcile its .zeehive.env</b>, and a zee is live in it — so it is still running on
+              whatever that file already said
+              {open.envFull ? <>: <b className="ny-why">{open.envFull}</b></> : ' (no reason was recorded)'}.
+              {' '}{open.x.env_alert?.count > 1
+                ? `Reported on ${open.x.env_alert.count} reconciles, first seen ${fmtAgo(open.x.env_alert.since)}.`
+                : 'Reported on the last reconcile.'}
+              {' '}Nothing was rewritten — changing a running zee's DSN underneath it is the more dangerous act.
+              {' '}Fix the cause (usually: re-point this xell&apos;s database) and the next reconcile clears this;
+              the zee cannot.</div>
           )}
         </div>
       )}

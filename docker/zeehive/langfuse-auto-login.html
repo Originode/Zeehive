@@ -1,0 +1,86 @@
+<!doctype html>
+<!--
+  ZEEHIVE auto-login page, served FROM the Langfuse origin (mounted into the
+  langfuse-web container's public/generated/ at provision). It is the ONLY way to
+  auto-sign a human into Langfuse without a password prompt: the page is same-origin
+  to Langfuse, so its fetch to /api/auth/csrf carries/returns the CSRF cookie on the
+  Langfuse origin, and the credentials form POST below is a same-origin request whose
+  cookie is accepted. NextAuth double-submit CSRF then passes and the session cookie
+  (next-auth.session-token) lands on the Langfuse origin.
+
+  Query params (set by the ZEEHIVE queenzee when it 302-redirects the popup here):
+    token  — a ONE-TIME, short-TTL signin token (NEVER the credential — TKT-95)
+    redeem — the ZEEHIVE server's redemption endpoint (a browser-reachable /api URL)
+
+  The page POSTs the token to `redeem` and receives the credential + callback ONCE,
+  server-side. The credential is held only in this page's memory and the form POST
+  body below — it never appears in a URL, query string or Location header.
+-->
+<html><head><meta charset="utf-8"><title>Signing you into Langfuse…</title></head>
+<body style="font-family:system-ui;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+  <div style="text-align:center">
+    <p>Signing you into <b>Langfuse</b>…</p>
+    <p id="status" style="color:#8b949e;font-size:13px">Contacting Langfuse…</p>
+  </div>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var token = q.get('token') || '';
+  var redeem = q.get('redeem') || '';
+  var status = document.getElementById('status');
+  var callback = '/';
+
+  function fail(msg) {
+    status.textContent = 'Sign-in failed: ' + msg + '. You can close this tab and sign in manually.';
+    status.style.color = '#ff7b72';
+  }
+
+  if (!token || !redeem) { fail('missing signin token'); return; }
+
+  // 1. redeem the ONE-TIME token against the ZEEHIVE server — the only place the
+  //    credential ever exists in transit. It never rides in a URL.
+  fetch(redeem, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: token }),
+    credentials: 'omit',
+  })
+    .then(function (r) {
+      if (!r.ok) throw new Error('token rejected (' + r.status + ')');
+      return r.json();
+    })
+    .then(function (j) {
+      if (!j.email || !j.password || !j.callback) throw new Error('no credentials');
+      callback = j.callback;
+      // 2. same-origin CSRF — the cookie lands on THIS origin (Langfuse)
+      return fetch('/api/auth/csrf', { credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw new Error('CSRF ' + r.status); return r.json(); })
+        .then(function (c) {
+          if (!c.csrfToken) throw new Error('no csrf token');
+          // 3. same-origin credentials POST — cookie accepted, session set
+          var body = new URLSearchParams({
+            csrfToken: c.csrfToken,
+            email: j.email,
+            password: j.password,
+            callbackUrl: callback,
+            json: 'true',
+          });
+          return fetch('/api/auth/callback/credentials', {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: body.toString(),
+            credentials: 'same-origin',
+            redirect: 'follow',
+          });
+        });
+    })
+    .then(function (r) {
+      if (r.status >= 400 && r.status < 500) throw new Error('credentials rejected (' + r.status + ')');
+      status.textContent = '✓ Signed in — opening the dashboard…';
+      // follow to the callback (the session cookie is now in this origin's jar)
+      location.href = callback;
+    })
+    .catch(function (e) { fail(e.message || String(e)); });
+})();
+</script>
+</body></html>

@@ -77,6 +77,13 @@ ok(probe.test('claude --bare -p --output-format stream-json --verbose --dangerou
    'it matches the claude headless run the queenzee actually spawns');
 ok(probe.test('codex exec --json --dangerously-bypass-approvals-and-sandbox -'), 'and the codex one');
 ok(probe.test('kimi -p "$(cat)" --output-format stream-json'), 'and the kimi one');
+ok(probe.test('grok -p "$(cat)" -m grok-4.5 --output-format streaming-messages-json --always-approve'),
+   'and the grok one');
+ok(probe.test('grok -r 019fcf30-623d-7cf3-97b8-037cfc465042 -p "$(cat)" -m grok-4.5 '
+              + '--output-format streaming-messages-json --always-approve'),
+   '…INCLUDING a resumed grok turn, which puts the session id in front of the headless flag');
+ok(!probe.test('grok -r 019fcf30-623d-7cf3-97b8-037cfc465042 --always-approve'),
+   'but not the grok session a human is attached to — that pane can hear you');
 ok(!probe.test('claude --resume aaaa --dangerously-skip-permissions'),
    'but NOT the interactive session a human drives — that pane can hear you, and must be typed into');
 ok(!probe.test(cmd),
@@ -102,6 +109,7 @@ ok(attach.includes('TALK_DIR="${ZEE_TALK_DIR:-/tmp/zee-talk}"')
 const branches = attach.slice(attach.indexOf('case "$RUNTIME" in')).split(';;');
 for (const [branch, wait, tail] of [['codex', 'wait_live', 'codex resume'],
                                     ['kimi', 'wait_live', 'kimi --continue'],
+                                    ['grok', 'wait_live', 'grok -r "$SID"'],
                                     ['claude', 'follow_live', 'claude --resume']]) {
   const b = branches.find((x) => x.includes(tail)) || '';
   const iWait = b.indexOf(wait);

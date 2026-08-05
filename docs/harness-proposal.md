@@ -209,6 +209,72 @@ ports, database coupling and build verbs, resolved from the meta-DB at injection
 rule 7 applied to the one audience it had been missing — a non-ZEEHIVE agent reading `CLAUDE.md` in a
 xell had no way to learn which containers were its own.
 
+### 3.2c MODEL POLICY — restriction knobs on what a wearer may run on (migration 110)
+
+A harness is the config layer a zee wears, so it is the natural place to say *what AI model* that
+zee may run on. Since 110 a harness carries a `model_policy` jsonb:
+
+```
+{
+  "allow_providers": ["claude"],          // empty = all connected providers
+  "allow_models":    ["opus", "sonnet"],  // empty = all models on the allowed providers
+  "min_context":     200000,              // tokens; NULL = unset
+  "max_context":     null,
+  "min_params":      null,                // parameter count in BILLIONS
+  "max_params":      405,
+  "priorities":      { "opus": 10, "sonnet": 2 },   // default 1; higher deploys FIRST
+  "default_model":   "opus"               // what a bare dispatch runs
+}
+```
+
+- **Enforced at dispatch**, in `lib/model-policy.js` `resolveDispatchModel()` — the one decision
+  every spawn path funnels through (`spawnHeadless`). An explicit model a policy forbids is
+  refused with a sentence naming the harness; a bare dispatch resolves to `default_model`, else
+  the highest-priority allowed model, else the code default.
+- **Inherited like persona/skills/memory** — the effective policy is the whole parent chain
+  merged. Restriction lists INTERSECT (a child cannot widen what its parent forbids); scalar
+  bounds, priorities and `default_model` are leaf-wins.
+- **Priorities are deployment priority.** 1 by default; higher-priority models are picked first
+  on a bare dispatch. The ticket's example works out of the box: a manager harness with
+  `priorities: { opus: 10 }` sends managers to the claude flagship, a worker harness with
+  `priorities: { "deepseek-chat": 10 }` sends workers to deepseek.
+- The **AI MODEL SPEC REGISTRY** (`ai_model_spec`, migration 110) is the meta-DB source for what
+  each model *is* — provider, key/alias, label, context window, max output, parameter count.
+  `min/max_context` and `min/max_params` measure against these rows, so an operator records the
+  model's numbers once and every harness policy that bounds on them sees the same facts.
+- The model picker (`GET /api/xell/models`) still serves the code-default lists; the harness
+  manager's **model-policy editor** reads `/api/ai-models` for the spec rows and offers the
+  bounds/priorities as form fields.
+- Every row `GET /api/harnesses` returns carries **`effective_model_policy`** as well as its own
+  `model_policy` — the parent chain merged, computed from the rows already read. A child that
+  inherits "claude only" declares nothing of its own, so a picker rendering `model_policy` would
+  show it as unrestricted.
+
+### 3.2d THE PROMPT BUTTON IS THE PERSONA (the console's dispatch flow)
+
+The console shows **one "＋ prompt" button per harness** — not one per connected AI account, which
+is what it used to be, with the persona as the last segmented control inside the composer. That put
+the credential first and the manual last, and the two could contradict each other: open the composer
+from a Claude account button, pick a persona whose policy allows only deepseek, and `resolveDispatchModel`
+refused the spawn *after* the whole prompt had been written.
+
+So the button is the persona, and everything under it is DERIVED from it —
+`GET /api/dispatch/options?project=&harness=&zee_type=` (`lib/dispatch-options.js`), which answers
+with the same code the dispatch path enforces:
+
+| the composer shows | derived from |
+|---|---|
+| **providers** — pickable, or disabled with the reason | the effective policy's `allow_providers` ∩ the project's connected, unpaused accounts |
+| **accounts** of the chosen provider | `provider_token` rows of that type (the spawn uses precisely that one's token) |
+| **models** for the chosen provider, `·default` marked | `allowedModelsForProvider` (priority order) + `resolveDispatchModel` for the default |
+| **autonomy 1–5**, annotated per provider | the RUNTIME that provider resolves to: inside a cxell the scale is **not enforced** (`spawnCxell` stores `bypassPermissions` and only logs what was asked), so those segments say so |
+
+`harness` is three-state everywhere it travels — omitted = the default for the zee type (the
+project's `default_harness_id`, or the manager harness), `''` = core only, a key = that harness — and
+"core only" keeps its own prompt button so a dispatch with no persona stays possible. A **manager**
+still has ONE button for the fleet, so it picks its persona inside the composer and the options
+re-resolve when it changes.
+
 ### 3.2 A xell is ASSIGNED one harness; a human may switch it
 
 ```

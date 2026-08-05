@@ -65,7 +65,7 @@ export function deviceConfig(project) {
 // The device already attached to this xell, if any (the resolved handle a zee/binding reads).
 export async function deviceForXell(xellId) {
   const c = await one(
-    `SELECT c.*, host(c.host) AS host_addr FROM xell_uses_container uc
+    `SELECT c.*, c.host AS host_addr FROM xell_uses_container uc
        JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 AND c.role = 'device' LIMIT 1`, [xellId]);
   if (!c) return null;
@@ -237,7 +237,7 @@ async function runEmulatorDevice(xell, project, cfg) {
 // PHYSICAL — link a pre-registered shared device that is not already in use by another live xell.
 async function linkPhysicalDevice(xell, project) {
   const free = await one(
-    `SELECT c.*, host(c.host) AS host_addr FROM container c
+    `SELECT c.*, c.host AS host_addr FROM container c
       WHERE c.project_id=$1 AND c.role='device' AND c.isolation='shared'
         AND NOT EXISTS (
           SELECT 1 FROM xell_uses_container uc JOIN xell x ON x.id = uc.xell_id
@@ -428,7 +428,7 @@ export async function listAdbDevices(machineId, { projectId = null } = {}) {
     .map((l) => { const [serial, state] = l.split(/\s+/); return { serial, state: state || 'unknown' }; });
 
   const existing = projectId
-    ? await q(`SELECT host(host) AS host, host_port, conn_ref FROM container
+    ? await q(`SELECT host AS host, host_port, conn_ref FROM container
                 WHERE project_id=$1 AND role='device' AND isolation='shared'`, [projectId])
     : [];
   const devices = parsed.map((d) => {

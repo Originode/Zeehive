@@ -102,6 +102,32 @@ tunnel tokens — those are facts about *your machines*, not about the project (
 And anything compose already declares (dockerfiles, internal ports, service deps,
 network wiring) — read via `docker compose config --format json`, never copied.
 
+#### `tiers.spinoff.compose` is what ENABLES machine placement
+
+The pool maintainer only runs the **machine-aware** path (per-machine pool sizes,
+`machine_pool.dev_priority`, the machine-wide `max_xells` cap) when the project has a
+per-xell **app tier** — i.e. when `project.compose_spinoff` is set (from
+`tiers.spinoff.compose` in the manifest, or the legacy `project.compose_spinoff` column).
+It must be a path (relative to the repo root, e.g. `docker-compose.spinoff.yml`) to the
+compose file that brings up ONE xell's server + webapp on a docker context.
+
+Why the guard exists: machine mode counts a project's ready xells *through their owned
+server container* (`fillTrim`'s join on `container.role='server'` + the machine's
+`docker_ctx`). A project with no per-xell app tier (no `compose_spinoff` — e.g. Zeehive
+itself, whose xells are bare worktrees) owns no such containers, so that count is always
+ZERO: fill would provision `pool_size` more every tick, trim would never see a surplus,
+and `max_xells` would never cap it. That is exactly how 167 ready Zeehive xells piled up
+on 2026-07-19. So such projects keep the legacy project-wide `pool_config.target_ready`,
+and an operator who set per-machine numbers for them must be TOLD they are not in effect —
+the pool logs `machine-aware pooling DISABLED … compose_spinoff is unset` (once per state
+change), and the console's container matrix shows the same warning.
+
+To ENABLE machine placement for a project: add the spinoff compose to the manifest
+(`tiers.spinoff.compose: <path>`) and refresh it (console → Project setup → Manifest →
+↻ Refresh from repo). The field must name a real compose file whose services match the
+project's `roles` — the build path (`build-container.sh`) resolves it from the container
+row stamped at provision.
+
 ### 3.2 Meta-DB (owns INSTANCES and SITES)
 
 What a static file cannot express: which xells exist, which containers belong to whom,
@@ -215,10 +241,10 @@ Supported kinds and what ZEEHIVE does with each:
 
 | kind | Meaning | ZEEHIVE behavior |
 |---|---|---|
-| `lan` | Reached by host IP:port (the dev NAS today) | URL health = TCP/HTTP probe on `host:port`. |
+| `lan` | Reached by host:port — an IP or a DNS name (the dev NAS today) | URL health = TCP/HTTP probe on `host:port`. |
 | `reverse-proxy` | Caddy/nginx in front, DNS → host | Probe `public_url`; the proxy container's health gates "site reachable". |
 | `cloudflare-tunnel` | `cloudflared` container with `TUNNEL_TOKEN`, DNS at Cloudflare | The tunnel container is part of the modeled stack (`role=infra`, `provider_container`); **site reachability = tunnel container up AND `public_url` answers**. Caveats recorded in `notes` surface on the console site card (e.g. LiveKit media needs TURN — signaling-only through the tunnel). Token lives in the site env file, never the DB. |
-| `wireguard` | Site joined to a WG mesh — containers/hosts reach each other over the tunnel network | `deploy_site.host` may be a WG address (e.g. `10.8.0.x`); docker context endpoints may ride it (`ssh://user@10.8.0.x`). If WG itself runs as a container, model it `role=infra` so its health gates cross-site features (e.g. prod→dev db pulls, site-to-site backups). |
+| `wireguard` | Site joined to a WG mesh — containers/hosts reach each other over the tunnel network | `deploy_site.host` may be a WG address (e.g. `10.8.0.x`); docker context endpoints may ride it (`ssh://user@10.8.0.x`). If WG itself runs as a container, model it `role=infra` so its health gates cross-site features (e.g. prod→dev db pulls, site-to-site backups). An SSH-through-Cloudflare path (the `mardale-prod-alt` context, `ssh://mnrevelo@ssh.omnibiz.express`) is the same family: the daemon is reached through a tunnel, so it is a *CLI-only* context — `lib/docker.js` refuses `ssh://` endpoints over the HTTP API with an explicit error (see `docs/onboard-mardale-prod-alt.md`). |
 
 Reachability joins the monitor loop: per site, probe `public_url` (or host:port) on the
 containers cadence and stamp `deploy_site.reachable_at` — so the console can say "prod
@@ -241,7 +267,7 @@ CREATE TABLE deploy_site (
   key          text NOT NULL,               -- 'dev' | 'mardale-prod' | 'vps' | ...
   tier         container_tier NOT NULL,     -- dev | prod   (spinoff instances live on the dev site)
   docker_ctx   text NOT NULL DEFAULT 'default',  -- 'default' = THIS machine's daemon; never NULL
-  host         inet,                        -- LAN or WG address of the daemon host
+  host         text,                        -- LAN or WG address of the daemon host (IP or DNS name)
   compose_file text,                        -- overrides manifest tier compose (vps → docker-compose.prod.yml)
   env_file     text,                        -- site secrets file (path, content never stored)
   ingress      jsonb NOT NULL DEFAULT '{}'::jsonb,   -- §4.4

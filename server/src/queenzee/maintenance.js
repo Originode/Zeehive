@@ -8,8 +8,9 @@
 //
 // Jobs run ASYNCHRONOUSLY: the heavy docker work is a non-blocking child process (spawn, not
 // spawnSync — spawnSync would freeze the whole server event loop for the ~minutes a dump takes).
-// A backup row is created 'running' and finalized 'finished'/'failed'; the container doing the
-// work is flagged busy_since/busy_op. Both drive live spinners in the UI over SSE.
+// A backup row is created 'running' and finalized 'finished'/'failed'/'cancelled' (a human stopped
+// it); the container doing the work is flagged busy_since/busy_op. Both drive live spinners in the
+// UI over SSE.
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -52,27 +53,95 @@ function broadcastDbOpProgress({ op, id, project_id, label, msg, pct, status, er
   broadcast('db-op-progress', { op, id, project_id, label, msg, pct, status, error: error || null });
 }
 
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+// Broadcast ONE raw output line of a db operation (pg_dump / pg_restore / docker) over SSE so
+// the notification pane can show the ACTUAL log, not just the phase labels. Mirrors the ship-log
+// pattern: the op key ({op},{id}) ties lines to the same toast the progress events drive.
+function broadcastDbOpLog({ op, id, project_id, line }) {
+  if (line == null || String(line).trim() === '') return;
+  const s = String(line);
+  broadcast('db-op-log', { op, id, project_id, line: s });
+  logline('maint', `[${op}] ${s.slice(0, 500)}`);
+}
+
+// ── cancellation of an in-flight backup ──────────────────────────────────────────
+// A human "Cancel" on a running backup is a REQUEST: the route (cancelBackup) aborts this job's
+// AbortController, the in-flight child process (pg_dump / docker cp / …) is SIGKILLed, and the job
+// finalizes the row 'cancelled' — partial file removed, container un-busied. backupJobs maps a
+// snapshot id to its controller so the route can reach the job; it is held only for the life of the
+// job, in the process that runs it.
+const backupJobs = new Map();
+
+// The sentinel a cancelled job throws, and the catch in runBackupJob looks for, so it finalizes the
+// row as 'cancelled' rather than 'failed' — a human stopping a dump is not a dump failure, even
+// though the retry scheduler treats the two the same for timing (the next attempt must not wait out
+// a whole policy interval just because someone stopped one).
+const CANCELLED = Object.assign(new Error('cancelled by operator'), { cancelled: true });
+
+// A short sleep, optionally interrupted by an AbortSignal. When `signal` aborts, REJECTS with the
+// CANCELLED sentinel above so a simulate-mode job stops promptly when the operator cancels it — the
+// same "a cancelled job must not keep running" rule the real-mode child processes obey.
+const wait = (ms, { signal } = {}) => new Promise((resolveP, rejectP) => {
+  const done = () => { if (signal) signal.removeEventListener('abort', onAbort); resolveP(); };
+  const onAbort = () => { clearTimeout(timer); if (signal) signal.removeEventListener('abort', onAbort); rejectP(CANCELLED); };
+  const timer = setTimeout(done, ms);
+  if (signal?.aborted) { clearTimeout(timer); rejectP(CANCELLED); }
+  else if (signal) signal.addEventListener('abort', onAbort, { once: true });
+});
 
 // Non-blocking child process → { status, stdout, stderr }. Never rejects (resolves status=-1 on
 // spawn/timeout error) so a job's own try/catch owns the outcome. This is what keeps backups
 // async: the event loop stays free while docker runs.
-function execAsync(cmd, args, { timeout = 600000 } = {}) {
+//
+// `onLine` (optional): called with each COMPLETE output line (stdout and stderr) as it arrives,
+// so a caller can live-feed what pg_dump/pg_restore actually printed. Lines are delimited by
+// '\n'; a trailing partial line is dropped (its tail rides the accumulated stdout/stderr as
+// before). Never throws — a broken listener must not take a job down with it.
+//
+// `signal` (optional): an AbortSignal. When it aborts, the child is SIGKILLed and the promise
+// resolves with `cancelled: true` (never rejects — same "a job's own try/catch owns the outcome"
+// rule). A cancelled result carries the same shape as a timeout, so a caller that does not care
+// about cancellation can ignore the flag and still handle the non-zero status safely.
+function execAsync(cmd, args, { timeout = 600000, onLine, signal } = {}) {
   return new Promise((resolveP) => {
-    let out = '', err = '', timedOut = false;
+    let out = '', err = '', timedOut = false, cancelled = false;
+    let bufOut = '', bufErr = '';
     let child;
+    const killIt = () => { try { child.kill('SIGKILL'); } catch { /* already gone */ } };
+    const onAbort = () => { cancelled = true; killIt(); };
     try { child = spawn(cmd, args, { windowsHide: true }); }
-    catch (e) { return resolveP({ status: -1, stdout: '', stderr: String(e?.message || e) }); }
-    const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch { /* already gone */ } }, timeout);
-    child.stdout?.on('data', (d) => { out += d; });
-    child.stderr?.on('data', (d) => { err += d; });
-    child.on('error', (e) => { clearTimeout(timer); resolveP({ status: -1, stdout: out, stderr: String(e?.message || e), timedOut }); });
+    catch (e) { return resolveP({ status: -1, stdout: '', stderr: String(e?.message || e), timedOut, cancelled }); }
+    if (signal) {
+      if (signal.aborted) { cancelled = true; killIt(); }
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const timer = setTimeout(() => { timedOut = true; killIt(); }, timeout);
+    const feedLines = (text, buf) => {
+      let b = buf + text;
+      if (!onLine) return b;
+      let nl;
+      while ((nl = b.indexOf('\n')) >= 0) {
+        const line = b.slice(0, nl);
+        b = b.slice(nl + 1);
+        try { onLine(line); } catch { /* never break the job for a listener */ }
+      }
+      return b;
+    };
+    child.stdout?.on('data', (d) => { out += d; bufOut = feedLines(d, bufOut); });
+    child.stderr?.on('data', (d) => { err += d; bufErr = feedLines(d, bufErr); });
+    const settle = (r) => { if (signal) signal.removeEventListener('abort', onAbort); resolveP(r); };
+    child.on('error', (e) => { clearTimeout(timer); settle({ status: -1, stdout: out, stderr: String(e?.message || e), timedOut, cancelled }); });
     // A SIGKILLed child closes with code null and NOTHING on stderr — which rendered a day of
     // slow-link backup failures as "docker cp failed: " and sent the debugging at the share
-    // instead of the wire. Say it was the timeout.
+    // instead of the wire. Say it was the timeout (or that the operator cancelled it).
     child.on('close', (code) => {
       clearTimeout(timer);
-      resolveP({ status: code, stdout: out, stderr: timedOut ? `killed at the ${Math.round(timeout / 1000)}s timeout${err ? ` · ${err}` : ''}` : err, timedOut });
+      settle({
+        status: code, stdout: out,
+        stderr: cancelled ? 'cancelled by operator'
+          : timedOut ? `killed at the ${Math.round(timeout / 1000)}s timeout${err ? ` · ${err}` : ''}`
+          : err,
+        timedOut, cancelled,
+      });
     });
   });
 }
@@ -84,33 +153,60 @@ function execAsync(cmd, args, { timeout = 600000 } = {}) {
 // (the dump) flows through the queenzee only as bytes-in-transit into the dst's stdin (which
 // writes it to the destination host's bind mount). Resolves with BOTH child statuses + the dst's
 // captured stdout (used to read back the written size) and stderr from either side. Never rejects.
-function execPipe(a, b, { timeout = 1800000 } = {}) {
+//
+// `onLine` (optional): the same live line feed execAsync provides — called with each complete
+// line of the src's stderr, the dst's stdout and the dst's stderr as it arrives. The src's stdout
+// is the DATA stream (it is piped straight into the dst, and a 1.2 GB dump is not line-shaped),
+// so it is deliberately not fed to onLine.
+//
+// `signal` (optional): an AbortSignal. When it aborts, BOTH children are SIGKILLed and the promise
+// resolves with `cancelled: true` — the src (the dump) stops immediately, and the dst (the writer)
+// is torn down so it cannot finalize a truncated file as "ok".
+function execPipe(a, b, { timeout = 1800000, onLine, signal } = {}) {
   return new Promise((resolveP) => {
-    let dstOut = '', srcErr = '', dstErr = '', timedOut = false, srcDone = false, dstDone = false;
+    let dstOut = '', srcErr = '', dstErr = '', timedOut = false, cancelled = false, srcDone = false, dstDone = false;
+    let bufSrcErr = '', bufDstOut = '', bufDstErr = '';
     let srcStatus = null, dstStatus = null, src, dst;
+    const killBoth = () => {
+      try { src.kill('SIGKILL'); } catch { /* gone */ }
+      try { dst.kill('SIGKILL'); } catch { /* gone */ }
+    };
     const finish = () => {
       if (!srcDone || !dstDone) return;
       clearTimeout(timer);
-      resolveP({ srcStatus, dstStatus, dstStdout: dstOut, srcStderr: srcErr, dstStderr: dstErr, timedOut });
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolveP({ srcStatus, dstStatus, dstStdout: dstOut, srcStderr: srcErr, dstStderr: dstErr, timedOut, cancelled });
     };
     try {
       src = spawn(a.cmd, a.args, { windowsHide: true });
       dst = spawn(b.cmd, b.args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     } catch (e) {
-      return resolveP({ srcStatus: -1, dstStatus: -1, dstStdout: '', srcStderr: String(e?.message || e), dstStderr: '', timedOut });
+      return resolveP({ srcStatus: -1, dstStatus: -1, dstStdout: '', srcStderr: String(e?.message || e), dstStderr: '', timedOut, cancelled });
     }
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { src.kill('SIGKILL'); } catch { /* gone */ }
-      try { dst.kill('SIGKILL'); } catch { /* gone */ }
-    }, timeout);
+    const onAbort = () => { cancelled = true; killBoth(); };
+    if (signal) {
+      if (signal.aborted) { cancelled = true; killBoth(); }
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const timer = setTimeout(() => { timedOut = true; killBoth(); }, timeout);
+    const feedLines = (text, buf) => {
+      let b = buf + text;
+      if (!onLine) return b;
+      let nl;
+      while ((nl = b.indexOf('\n')) >= 0) {
+        const line = b.slice(0, nl);
+        b = b.slice(nl + 1);
+        try { onLine(line); } catch { /* never break the job for a listener */ }
+      }
+      return b;
+    };
     src.stdout.pipe(dst.stdin);
     // if pg_dump dies, tear down the writer so it can't finalize a truncated file as "ok"
     src.stdout.on('error', () => { try { dst.stdin.destroy(); } catch { /* gone */ } });
     dst.stdin.on('error', () => { /* dst exited early; src close will surface the real status */ });
-    src.stderr?.on('data', (d) => { srcErr += d; });
-    dst.stdout?.on('data', (d) => { dstOut += d; });
-    dst.stderr?.on('data', (d) => { dstErr += d; });
+    src.stderr?.on('data', (d) => { srcErr += d; bufSrcErr = feedLines(d, bufSrcErr); });
+    dst.stdout?.on('data', (d) => { dstOut += d; bufDstOut = feedLines(d, bufDstOut); });
+    dst.stderr?.on('data', (d) => { dstErr += d; bufDstErr = feedLines(d, bufDstErr); });
     src.on('error', (e) => { srcErr += String(e?.message || e); srcStatus = srcStatus ?? -1; srcDone = true; finish(); });
     dst.on('error', (e) => { dstErr += String(e?.message || e); dstStatus = dstStatus ?? -1; dstDone = true; finish(); });
     src.on('close', (code) => { srcStatus = code; srcDone = true; finish(); });
@@ -275,6 +371,29 @@ export function validTableSelection(input, label = 'tables') {
         + `identifiers (letters, digits, _ , $), no wildcards or quoting`);
     }
     out.push(t);
+  }
+  return [...new Set(out)];
+}
+
+// Validate + normalise a PLUGIN (postgres extension) selection from the API. Returns a clean array
+// (possibly empty ⇒ no plugins) or throws with a precise reason. Extension names are plain
+// identifiers — letters/digits/underscore — and are folded to lowercase (postgres folds unquoted
+// identifiers, so 'PostGIS' and 'postgis' are the same extension). No dots, dashes, wildcards,
+// quotes, whitespace or shell/pattern metacharacters.
+const PLUGIN_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export function validPluginSelection(input, label = 'plugins') {
+  if (input == null) return [];
+  if (!Array.isArray(input)) throw new Error(`${label} must be an array of postgres extension names`);
+  const out = [];
+  for (const raw of input) {
+    if (typeof raw !== 'string') throw new Error(`${label}: every entry must be a string`);
+    const p = raw.trim().toLowerCase();
+    if (!p) continue;
+    if (!PLUGIN_IDENT.test(p)) {
+      throw new Error(`${label}: "${raw}" is not a valid postgres extension name — plain identifiers `
+        + `only (letters, digits, _), no dots, dashes, wildcards or quoting`);
+    }
+    out.push(p);
   }
   return [...new Set(out)];
 }
@@ -449,11 +568,15 @@ async function clearBusy(containerId) {
 // ── prod is IN USE → no backups ───────────────────────────────────────────────
 // A pg_dump is not a free observer: it holds ACCESS SHARE on every table for the whole dump, so
 // a ship's migration (ACCESS EXCLUSIVE ALTERs) wedges behind a long dump — and a dump taken
-// mid-ship or mid-data-fix preserves a half-finished job as if it were a good restore point.
-// So prod is off-limits to backups while EITHER:
+// mid-ship or mid-seed preserves a half-finished job as if it were a good restore point.
+// A xell BOUND to the prod database (db-shared-prod) does NOT make prod busy for a DUMP: its
+// hotfix/data work is row-level, which ACCESS SHARE does not contend with, so a backup may run
+// while one is attached (a parked binding whose zee stopped is doubly irrelevant). A
+// RESTORE-OVER-PROD still refuses a live bound xell separately (boundLiveXellReason) — a restore
+// clobbers what the xell wrote, which is a different collision from a read-only dump.
+// So prod is off-limits to dumps while EITHER:
 //   • the prod deploy lock is held (a ship is deploying, or its verification window is open), or
-//   • a live work xell is BOUND to the prod database (db-shared-prod — a human-granted
-//     hotfix/data binding; it may write at any moment while it holds that coupling).
+//   • a prod seed is being applied (a queenzee-run data write that is mid-apply).
 // Returns the human-readable reason, or null when prod is free.
 export async function prodBusyReason(projectId) {
   const lock = await one(
@@ -463,11 +586,37 @@ export async function prodBusyReason(projectId) {
     return `the prod deploy lock is held${lock.slug ? ` by ${lock.slug}` : ''}`
       + `${lock.phase ? ` (${lock.phase})` : ''}`;
   }
-  // NOT is_production: the production pseudo-xell IS prod — only a work xell pointed at prod
-  // (via /xell-prod or --db shared-prod) counts as someone operating on it. And only while a
-  // zee is actually IN there (live zee row): a binding whose zee stopped days ago is a parked
-  // grant, not an operation — blocking on it would silently stop backups forever (found live on
-  // day one: pautang-express held db-shared-prod with a zee stopped since the day before).
+  // A seed writes to production as the QUEENZEE, so it cannot be seen through a bound xell — it
+  // must be checked on its own. Only 'running' is checked, deliberately: 'pending' is just a
+  // request awaiting a human (nothing is being written), and 'approved' is a transient blink
+  // before runSeed flips it to 'running' — if a crash landed between those two UPDATEs, an
+  // 'approved' row would sit forever with no recovery path, and a check that included it would
+  // block backups forever (the pautang-express failure mode this loop already learned once). The
+  // boundary race (a backup starting in that blink) is safe: postgres MVCC gives the dump a
+  // consistent pre-seed snapshot, and a seed that needs DDL simply waits for ACCESS SHARE.
+  // dismissed_at is NOT consulted either: dismissing a seed card hides it from the console but
+  // does not stop a seed that is already applying — a running seed is seeding, whatever the UI says.
+  const seeding = await one(
+    `SELECT psr.xell_slug FROM prod_seed_request psr
+      WHERE psr.project_id=$1 AND psr.status='running'
+      LIMIT 1`, [projectId]);
+  if (seeding) {
+    return `a prod seed ${seeding.xell_slug ? `from ${seeding.xell_slug} ` : ''}is being applied — `
+      + 'a dump taken mid-seed would preserve a half-applied data write as a restore point';
+  }
+  return null;
+}
+
+// A live work xell BOUND to the prod database (db-shared-prod). NOT is_production: the production
+// pseudo-xell IS prod — only a work xell pointed at prod (via /xell-prod or --db shared-prod)
+// counts as someone operating on it. And only while a zee is actually IN there (live zee row): a
+// binding whose zee stopped days ago is a parked grant, not an operation — blocking on it would
+// silently stop a restore forever (found live on day one: pautang-express held db-shared-prod with
+// a zee stopped since the day before).
+// This does NOT block a backup (a dump may run while a bound xell is attached — row-level data
+// work does not contend with pg_dump's ACCESS SHARE), but a RESTORE-OVER-PROD still refuses it: a
+// restore clobbers whatever the bound xell wrote, which is a different and worse collision.
+export async function boundLiveXellReason(projectId) {
   const bound = await one(
     `SELECT x.slug FROM xell x
       WHERE x.project_id=$1 AND x.status <> 'retired' AND NOT x.is_production
@@ -542,10 +691,10 @@ export async function backupProd(projectId) {
 //      table locks, touches no heap, and runs AFTER pg_dump has already let go.
 //   3. It is never an exact count(*) here. Minutes of I/O on a 1.3 GB production database for a number
 //      that only has to be good enough for a trend is not a trade worth making.
-async function sourceRowCounts(ctx, container, dbUser, dbName) {
+async function sourceRowCounts(ctx, container, dbUser, dbName, signal) {
   const r = await execAsync('docker',
     ['--context', ctx, 'exec', container, 'psql', '-U', dbUser, '-d', dbName, '-tAq', '-c', ROW_COUNT_SQL],
-    { timeout: 120000 });
+    { timeout: 120000, signal });
   if (r.status !== 0) {
     logline('maint', `row-count probe of ${container}/${dbName} failed (exit ${r.status}) — the BACKUP is `
       + `unaffected, but this dump records no row counts: ${(r.stderr || '').trim().split('\n').pop()?.slice(0, 160)}`);
@@ -559,9 +708,20 @@ async function sourceRowCounts(ctx, container, dbUser, dbName) {
 }
 
 async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, fullPath, destCtx, tables = [], keep }) {
-  let size = null, error = null, tocText = null, tocSummary = null, rowCounts = null, rowStats = null;
+  let size = null, error = null, tocText = null, tocSummary = null, rowCounts = null, rowStats = null, cancelled = false;
   const scoped = Array.isArray(tables) && tables.length > 0;   // a partial, table-scoped dump
   const tArgs = dumpTableArgs(tables);                          // [] for a full-database dump
+  // Live-feed every raw command line (pg_dump / pg_restore / docker) to the notification pane —
+  // the same TWICE the ship-log pattern uses: logbus (the ▚ terminal firehose) AND the op's own
+  // toast lane, so watching a backup is not fishing its lines out of everything else the hive says.
+  const emitLog = (line) => broadcastDbOpLog({ op: 'backup', id: snap.id, project_id: snap.project_id, line });
+  // The operator's "Cancel" reaches this job through backupJobs (cancelBackup aborts this
+  // controller); every child process takes the signal, and the checks below make the job stop at a
+  // phase boundary even when no child is mid-flight. Registered for the life of the job so the
+  // route can find it, unregistered in the finally so a finished job leaks nothing.
+  const ac = new AbortController();
+  backupJobs.set(snap.id, ac);
+  const checkCancelled = () => { if (ac.signal.aborted) throw CANCELLED; };
   try {
     if (MODE === 'real') {
       if (!dbc?.name) throw new Error('no production db container modeled for this project');
@@ -587,7 +747,8 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName] },
           { cmd: 'docker', args: ['--context', destCtx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'sh', '-c', writer] },
-          { timeout: 1800000 });
+          { timeout: 1800000, onLine: emitLog, signal: ac.signal });
+        checkCancelled();   // a cancelled pipe resolves here — stop before validating a partial
         if (piped.srcStatus !== 0 || piped.dstStatus !== 0) {
           await removeRemoteFile(destCtx, dir, file);   // never leave a truncated partial behind
           const why = piped.timedOut ? 'timed out' : `pg_dump exit ${piped.srcStatus}, writer exit ${piped.dstStatus}`;
@@ -605,7 +766,8 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         const toolsImage = src.image || PG_TOOLS_IMAGE;
         const list = await execAsync('docker',
           ['--context', destCtx, 'run', '--rm', '-v', `${dir}:/out`, toolsImage, 'pg_restore', '--list', `/out/${file}`],
-          { timeout: 600000 });
+          { timeout: 600000, onLine: emitLog, signal: ac.signal });
+        checkCancelled();
         if (list.status !== 0) {
           await removeRemoteFile(destCtx, dir, file);
           throw new Error(`the written dump is not a readable pg_dump archive (pg_restore --list exit ${list.status}): `
@@ -620,22 +782,32 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
           label: `${project.name} prod`, msg: 'Dumping database…', pct: 30, status: 'running',
         });
         const remoteTmp = `/tmp/${file}`;
+        // Clean the in-container dump on the way out, WHATEVER happened — the rm used to run only
+        // after a good cp, so every failed copy leaked ~870MB into the container's writable layer
+        // (16 dumps / 13GB found in prod's /tmp on 2026-07-17, overlay at 86%). A CANCELLED dump is
+        // no different: the job must still clean the container's tmp before it stops. The rm takes
+        // no signal, so it runs even when the abort has already fired.
+        const rmTmp = () => execAsync('docker', ['--context', srcCtx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
+        // Stop for a cancel, cleaning the container's tmp first (the host-side partial cleanup is
+        // the outer catch's job). Only safe where remoteTmp still exists in the container — after
+        // the unconditional rm below, a plain throw is enough.
+        const cancelStop = async () => { if (ac.signal.aborted) { await rmTmp(); throw CANCELLED; } };
         const dump = await execAsync('docker',
           ['--context', srcCtx, 'exec', container, 'pg_dump', '-U', dbUser, '-Fc', ...tArgs, '-d', dbName, '-f', remoteTmp],
-          { timeout: 1200000 });
+          { timeout: 1200000, onLine: emitLog, signal: ac.signal });
+        await cancelStop();
         if (dump.status !== 0) {
-          await execAsync('docker', ['--context', srcCtx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
+          await rmTmp();
           throw new Error(`pg_dump of ${container}/${dbName} failed (exit ${dump.status}): `
             + `${((dump.stderr || dump.stdout) || '(no output)').slice(-300)}`);
         }
         // TOC while the file is still in the container (its own pg_restore reads its own dump).
         const list = await execAsync('docker',
-          ['--context', srcCtx, 'exec', container, 'pg_restore', '--list', remoteTmp], { timeout: 300000 });
-        const cp = await execAsync('docker', ['--context', srcCtx, 'cp', `${container}:${remoteTmp}`, fullPath], { timeout: 1200000 });
-        // rm the in-container dump WHATEVER the cp did — the rm used to run only after a good cp,
-        // so every failed copy leaked ~870MB into the container's writable layer (16 dumps / 13GB
-        // found in prod's /tmp on 2026-07-17, overlay at 86%).
-        await execAsync('docker', ['--context', srcCtx, 'exec', container, 'rm', '-f', remoteTmp], { timeout: 60000 });
+          ['--context', srcCtx, 'exec', container, 'pg_restore', '--list', remoteTmp], { timeout: 300000, onLine: emitLog, signal: ac.signal });
+        await cancelStop();
+        const cp = await execAsync('docker', ['--context', srcCtx, 'cp', `${container}:${remoteTmp}`, fullPath], { timeout: 1200000, signal: ac.signal });
+        await rmTmp();   // WHATEVER the cp did — the tmp is cleaned even when it never made it out
+        if (ac.signal.aborted) throw CANCELLED;   // tmp already cleaned; the outer catch removes the host partial
         if (cp.status !== 0) {
           throw new Error(`docker cp failed (exit ${cp.status}): `
             + `${((cp.stderr || cp.stdout) || '(no output)').slice(-300)}`);
@@ -646,6 +818,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
           op: 'backup', id: snap.id, project_id: snap.project_id,
           label: `${project.name} prod`, msg: 'Reading table of contents…', pct: 70, status: 'running',
         });
+        checkCancelled();
         if (list.status !== 0) {
           throw new Error(`pg_restore --list of the dump failed (exit ${list.status}) — the file is not a usable archive: `
             + `${((list.stderr || list.stdout) || '(no output)').slice(-300)}`);
@@ -661,8 +834,9 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       // anything of prod's, and inside the same try only so a probe error is logged like any other
       // (sourceRowCounts itself never throws). Deliberately not gated on `scoped`: a scoped dump's
       // counts still describe the source, and the restore check reads only the tables it holds.
-      const probed = await sourceRowCounts(srcCtx, container, dbUser, dbName)
+      const probed = await sourceRowCounts(srcCtx, container, dbUser, dbName, ac.signal)
         .catch((e) => { logline('maint', `row-count probe errored (backup unaffected): ${e.message}`); return null; });
+      checkCancelled();
       rowCounts = probed?.counts ?? null;
       rowStats = probed?.stats ?? null;
 
@@ -671,6 +845,7 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         op: 'backup', id: snap.id, project_id: snap.project_id,
         label: `${project.name} prod`, msg: 'Validating content…', pct: 80, status: 'running',
       });
+      checkCancelled();   // an abort that landed between commands stops before the finalization writes
       const toc = parseDumpToc(tocText);
       // The full-database table list this dump captured, as 'schema.table' strings — feeds the
       // restore picker (exactly what can be restored) and, for a scoped dump, records the selection.
@@ -706,12 +881,15 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         op: 'backup', id: snap.id, project_id: snap.project_id,
         label: `${project.name} prod`, msg: 'Simulating backup…', pct: 10, status: 'running',
       });
-      await wait(Math.round(SIM_BACKUP_MS * 0.6));   // simulate: hold 'running' briefly so the spinner is visible
+      emitLog(`pg_dump: last built-in OID is 16383 (simulated)`);
+      emitLog(`pg_dump: reading schemas from the database (simulated)`);
+      await wait(Math.round(SIM_BACKUP_MS * 0.6), { signal: ac.signal });   // simulate: hold 'running' briefly so the spinner is visible
       broadcastDbOpProgress({
         op: 'backup', id: snap.id, project_id: snap.project_id,
         label: `${project.name} prod`, msg: 'Writing simulated dump…', pct: 60, status: 'running',
       });
-      await wait(Math.round(SIM_BACKUP_MS * 0.4));
+      emitLog(`pg_dump: dumping contents of table "${dbName}.app" (simulated)`);
+      await wait(Math.round(SIM_BACKUP_MS * 0.4), { signal: ac.signal });
       const body = `-- ZEEHIVE simulated backup of ${project.name} PRODUCTION database\n`
         + `-- target: ${dbc?.name || '(prod db container)'} / db=${dbName} user=${dbUser}\n`
         + `-- destination: ${destCtx ? `[${destCtx}] ` : '(local) '}${fullPath}\n`
@@ -720,25 +898,44 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
       size = Buffer.byteLength(body);
     }
   } catch (e) {
+    cancelled = e === CANCELLED || !!e?.cancelled;
     error = e.message;
+  } finally {
+    // The job is over, however it ended: stop accepting cancellations for this snapshot. abort()
+    // here also clears the signal listeners the child helpers still hold (a no-op for one that
+    // already aborted), so a finished job leaks nothing.
+    backupJobs.delete(snap.id);
+    ac.abort();
   }
 
   if (error) {
     // Clean up whatever partial exists on whichever host it would be on.
     if (destCtx) { await removeRemoteFile(destCtx, dir, file); }
     else { try { rmSync(fullPath, { force: true }); } catch { /* partial may not exist */ } }
-    const row = await one(`UPDATE db_snapshot SET status='failed', error=$2, mode=$3 WHERE id=$1 RETURNING *`,
-      [snap.id, String(error).slice(0, 500), MODE]);
+    // A human stopping a dump is NOT a dump failure: the row is finalised 'cancelled' so the UI
+    // and the log say so. Scheduling treats it like a failure (the next attempt must not wait out
+    // a whole policy interval just because someone stopped one) — that is backup-schedule's job,
+    // not this one's.
+    const status = cancelled ? 'cancelled' : 'failed';
+    const row = await one(`UPDATE db_snapshot SET status=$2, error=$3, mode=$4 WHERE id=$1 RETURNING *`,
+      [snap.id, status, String(error).slice(0, 500), MODE]);
     if (dbc) await clearBusy(dbc.id);
     broadcast('task', { kind: 'db_snapshot', snap: row });
     broadcastDbOpProgress({
       op: 'backup', id: snap.id, project_id: snap.project_id,
-      label: `${project.name} prod`, msg: 'Backup failed', pct: 0, status: 'failed', error,
+      label: `${project.name} prod`, msg: cancelled ? 'Backup cancelled' : 'Backup failed',
+      pct: 0, status, error,
     });
-    logline('maint', `backup FAILED → ${error}`);
+    logline('maint', cancelled ? `backup CANCELLED → ${error}` : `backup FAILED → ${error}`);
     return;
   }
 
+  // Housekeeping progress is emitted BEFORE the finished event: a progress frame sent after
+  // 'finished' would flip the toast back from "Backup complete" to a spinner.
+  broadcastDbOpProgress({
+    op: 'backup', id: snap.id, project_id: snap.project_id,
+    label: `${project.name} prod`, msg: 'Housekeeping…', pct: 95, status: 'running',
+  });
   const row = await one(
     `UPDATE db_snapshot SET status='finished', size_bytes=$2, mode=$3, toc_summary=$4,
                             row_counts=$5::jsonb, row_total=$6, row_stats=$7::jsonb
@@ -780,10 +977,6 @@ async function runBackupJob({ snap, project, dbc, dbName, dbUser, dir, file, ful
         + `. These are planner ESTIMATES, so a small drop can be noise — an emptied table is not. Worth a look.`);
     }
   }
-  broadcastDbOpProgress({
-    op: 'backup', id: snap.id, project_id: snap.project_id,
-    label: `${project.name} prod`, msg: 'Housekeeping…', pct: 95, status: 'running',
-  });
   await housekeepBackups(snap.project_id, keep);
 }
 
@@ -825,9 +1018,47 @@ export async function deleteBackup(snapshotId) {
   return { ok: true, id: snap.id };
 }
 
-// Update a project's backup settings (folder / interval / retention), then apply housekeeping
-// immediately so lowering max_backups takes effect at once.
-export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables }) {
+// Cancel a RUNNING backup (the cancel button next to a running row in the backups modal). "Cancel"
+// is not "delete": it asks the in-flight job to STOP — the child process is killed, the partial
+// file removed, the prod db container un-busied, and the row finalised 'cancelled'. Returns
+// immediately; the job does the rest asynchronously (the UI sees the row flip to 'cancelled' on
+// its next poll / SSE event).
+//
+// Edge cases handled deliberately:
+//   • a backup that is not running has nothing to cancel — refused (a race where the job finished
+//     between the click and this read lands here, and the UI flashes the reason);
+//   • a 'running' row with no live job in this process (a restart's reconcile missed it, or the
+//     process died mid-job) is finalised 'cancelled' and cleaned up here, so a spinner can never
+//     survive the job that owned it.
+export async function cancelBackup(snapshotId) {
+  const snap = await one(
+    `SELECT id, project_id, dump_path, dest_ctx, status FROM db_snapshot WHERE id=$1`, [snapshotId]);
+  if (!snap) throw new Error('backup not found');
+  if (snap.status !== 'running') {
+    throw new Error('this backup is not running — nothing to cancel');
+  }
+  const ac = backupJobs.get(snapshotId);
+  if (!ac) {
+    // No live job to abort. There is no child to kill and no cleanup the job will do, so do it
+    // here — the alternative is a 'running' row spinning forever with no owner.
+    await removeDumpFile(snap);
+    await q(`UPDATE db_snapshot SET status='cancelled', error='cancelled — no running job found' WHERE id=$1`, [snapshotId]);
+    const dbc = await one(
+      `SELECT c.id FROM container c JOIN db_snapshot s ON s.project_id=c.project_id
+         WHERE s.id=$1 AND c.role='db' AND c.tier='prod' AND c.busy_op='backup' LIMIT 1`, [snapshotId]);
+    if (dbc) await clearBusy(dbc.id);
+    broadcast('task', { kind: 'db_snapshot', snap: { ...snap, status: 'cancelled', error: 'cancelled — no running job found' } });
+    logline('maint', `backup CANCELLED (no running job found) → ${snap.dump_path || '(no file)'}`);
+    return { ok: true, status: 'cancelled' };
+  }
+  ac.abort();
+  logline('maint', `backup cancel requested → ${snap.dump_path || '(no file)'}`);
+  return { ok: true, status: 'cancelling' };
+}
+
+// Update a project's backup settings (folder / interval / retention / tables / plugins), then apply
+// housekeeping immediately so lowering max_backups takes effect at once.
+export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables, backup_plugins }) {
   const proj = project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
   if (!proj) throw new Error('no project');
   const interval = Number(backup_interval_sec);
@@ -836,6 +1067,8 @@ export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_
   if (!Number.isInteger(maxB) || maxB < 1 || maxB > 1000) throw new Error('max_backups must be an integer 1–1000');
   // The default table selection for this project's backups. [] ⇒ full-database dump (stored as NULL).
   const tables = validTableSelection(backup_tables, 'backup_tables');
+  // The default PLUGIN (extension) list for this project's restores. [] ⇒ none (stored as NULL).
+  const plugins = validPluginSelection(backup_plugins, 'backup_plugins');
   const dir = backup_dir && String(backup_dir).trim() ? String(backup_dir).trim() : null;
   const ctx = backup_ctx && String(backup_ctx).trim() ? String(backup_ctx).trim() : null;
   // A network destination is a docker CONTEXT + a directory on that context's host. A context
@@ -849,15 +1082,16 @@ export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_
   }
 
   const row = await one(
-    `UPDATE pool_config SET backup_dir=$2, backup_ctx=$3, backup_interval_sec=$4, max_backups=$5, backup_tables=$6
+    `UPDATE pool_config SET backup_dir=$2, backup_ctx=$3, backup_interval_sec=$4, max_backups=$5, backup_tables=$6, backup_plugins=$7
        WHERE project_id=$1
-       RETURNING backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables`,
-    [proj, dir, ctx, interval, maxB, tables.length ? JSON.stringify(tables) : null]);
+       RETURNING backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables, backup_plugins`,
+    [proj, dir, ctx, interval, maxB, tables.length ? JSON.stringify(tables) : null, plugins.length ? JSON.stringify(plugins) : null]);
   if (!row) throw new Error('no pool_config for project');
 
   broadcast('project', { id: proj, backup: row });
   logline('maint', `backup config → ${row.backup_ctx ? `[${row.backup_ctx}] ` : ''}dir=${row.backup_dir || '(default)'} every ${row.backup_interval_sec}s keep ${row.max_backups}`
-    + `${tables.length ? ` · scoped to ${tables.length} table(s)` : ' · full database'}`);
+    + `${tables.length ? ` · scoped to ${tables.length} table(s)` : ' · full database'}`
+    + `${plugins.length ? ` · plugins: ${plugins.join(', ')}` : ''}`);
   await housekeepBackups(proj, row.max_backups);
   return row;
 }
@@ -909,13 +1143,15 @@ export async function restoreBackup({ snapshot, container, confirmProd = false, 
   if (!c) throw new Error('container not found');
   if (c.role !== 'db') throw new Error(`target is not a db container (role=${c.role})`);
   // Restoring OVER production overwrites live data — irreversible. Two backstops behind the UI's
-  // typed confirmation: the caller MUST pass confirmProd, and prod must be free (the same window
-  // that blocks a backup — a ship deploying, or a live zee bound to prod — would be clobbered).
+  // typed confirmation: the caller MUST pass confirmProd, and prod must be free — a ship deploying
+  // or a seed running (prodBusyReason) and a live xell BOUND to prod (boundLiveXellReason) would
+  // both be clobbered by a restore, so unlike a backup (which may run while one is bound) a
+  // restore-over-prod still refuses a live bound xell.
   if (c.tier === 'prod') {
     if (!confirmProd) {
       throw new Error('restoring over the PRODUCTION database requires explicit human confirmation');
     }
-    const busy = await prodBusyReason(c.project_id);
+    const busy = (await prodBusyReason(c.project_id)) || (await boundLiveXellReason(c.project_id));
     if (busy) {
       throw new Error(`refusing to restore over prod: ${busy} — a restore would clobber live prod work. `
         + 'Try again once prod is released.');
@@ -927,10 +1163,26 @@ export async function restoreBackup({ snapshot, container, confirmProd = false, 
   const dbName = proj?.db_name || config.prodDbName || proj?.name?.toLowerCase() || 'postgres';
   const dbUser = proj?.db_user || config.prodDbUser;
 
+  // PLUGINS (extensions) to pre-create in the restore target BEFORE the archive is loaded — the
+  // "Plugins" field of the backup settings. Read from BOTH the target's project (the database
+  // being written) and the backup's own project (the database the dump was taken from — usually
+  // the same project; a cross-project restore still gets whatever the source database needed).
+  const [pcTgt, pcSrc] = await Promise.all([
+    one(`SELECT backup_plugins FROM pool_config WHERE project_id=$1`, [c.project_id]),
+    snap.project_id && snap.project_id !== c.project_id
+      ? one(`SELECT backup_plugins FROM pool_config WHERE project_id=$1`, [snap.project_id])
+      : Promise.resolve(null),
+  ]);
+  const plugins = validPluginSelection([
+    ...(Array.isArray(pcTgt?.backup_plugins) ? pcTgt.backup_plugins : []),
+    ...(Array.isArray(pcSrc?.backup_plugins) ? pcSrc.backup_plugins : []),
+  ]);
+
   await setBusy(c.id, 'restore');
   logline('maint', `restore started → ${c.name} from ${snap.dest_ctx ? `[${snap.dest_ctx}] ` : ''}${snap.dump_path} (${MODE})`
-    + `${pick.length ? ` · ONLY ${pick.length} table(s): ${pick.join(', ')}` : ''}`);
-  runRestoreJob({ snap, c, dbName, dbUser, tables: pick }).catch((e) => console.error('[restore]', e.message));
+    + `${pick.length ? ` · ONLY ${pick.length} table(s): ${pick.join(', ')}` : ''}`
+    + `${plugins.length ? ` · plugins: ${plugins.join(', ')}` : ''}`);
+  runRestoreJob({ snap, c, dbName, dbUser, tables: pick, plugins }).catch((e) => console.error('[restore]', e.message));
   return { ok: true, status: 'started', container: c.name };
 }
 
@@ -950,11 +1202,14 @@ async function noteRestoredFrom(containerId, snapshotId, note = null, report = n
   }
 }
 
-async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
+async function runRestoreJob({ snap, c, dbName, dbUser, tables = [], plugins = [] }) {
   let restored = false, report = null;
   const tArgs = restoreTableArgs(tables);   // [] ⇒ restore the whole archive
   const opLabel = c.name || c.id;
   const progressBase = { op: 'restore', id: c.id, project_id: c.project_id, label: opLabel };
+  // Live-feed pg_restore's own lines (and the docker cp / rm chatter around it) to the notification
+  // pane — the actual log, not just the phase labels.
+  const emitLog = (line) => broadcastDbOpLog({ ...progressBase, line });
   // A prod dump records GRANTs for prod-only roles (read-only managers' `zee_ro_*`, etc.). A DEV
   // server has none of those roles, so replaying the GRANTs makes pg_restore exit 1 with "role does
   // not exist" and the restore reports itself "completed with holes" for ACL objects that have no
@@ -967,6 +1222,29 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
       const t = await resolveRunningContainer({ ...c });   // identity resolution (ctx + host_port)
       const target = t.name;
       broadcastDbOpProgress({ ...progressBase, msg: 'Starting restore…', pct: 5, status: 'running' });
+      // PLUGINS — ensure the extensions a dump from this project needs actually EXIST in the
+      // target database BEFORE pg_restore runs. A full dump records `CREATE EXTENSION postgis`
+      // (pg_restore replays it), but a TABLE-SCOPED dump does NOT — and either way the
+      // extension's TYPES must be present before pg_restore creates the tables that use them
+      // ("type geometry does not exist" is exactly the restore failure this fixes). Configurable
+      // in the backup settings ("Plugins"). CREATE EXTENSION IF NOT EXISTS is idempotent, so
+      // pre-creating is harmless when the archive also creates them (pg_restore --clean drops
+      // and recreates either way).
+      if (plugins.length) {
+        broadcastDbOpProgress({ ...progressBase, msg: 'Ensuring plugins (extensions)…', pct: 8, status: 'running' });
+        for (const ext of plugins) {
+          const r = await execAsync('docker',
+            ['--context', ctx, 'exec', target, 'psql', '-U', dbUser, '-d', dbName, '-c', `CREATE EXTENSION IF NOT EXISTS ${ext}`],
+            { timeout: 120000, onLine: emitLog });
+          if (r.status !== 0) {
+            throw new Error(`could not create plugin/extension "${ext}" in ${target}/${dbName} before the restore: `
+              + `${((r.stderr || r.stdout) || '').slice(-300)} — install "${ext}" in the target's postgres `
+              + 'image, or remove it from the backup settings Plugins list');
+          }
+          emitLog(`created extension ${ext}`);
+        }
+        broadcastDbOpProgress({ ...progressBase, msg: 'Restoring database…', pct: 12, status: 'running' });
+      }
       if (snap.dest_ctx) {
         // The dump lives on ANOTHER host (the NAS). Stream it straight into the target's pg_restore
         // stdin — same "never stage 1.2 GB on the queenzee host" principle as the backup. A reader
@@ -977,7 +1255,7 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         const piped = await execPipe(
           { cmd: 'docker', args: ['--context', snap.dest_ctx, 'run', '-i', '--rm', '-v', `${dir}:/out`, STREAM_IMAGE, 'cat', `/out/${file}`] },
           { cmd: 'docker', args: ['--context', ctx, 'exec', '-i', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...aclArg, ...tArgs, '-d', dbName] },
-          { timeout: 1800000 });
+          { timeout: 1800000, onLine: emitLog });
         // The READER is unconditional: if cat/the mount failed, no archive reached pg_restore at all.
         if (piped.srcStatus !== 0) {
           throw new Error(`streamed restore into ${target}/${dbName} from [${snap.dest_ctx}] failed to read the `
@@ -992,13 +1270,13 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
         }
       } else {
         const remoteTmp = `/tmp/restore_${randomBytes(3).toString('hex')}.dump`;
-        const cp = await execAsync('docker', ['--context', ctx, 'cp', resolve(snap.dump_path), `${target}:${remoteTmp}`], { timeout: 1200000 });
+        const cp = await execAsync('docker', ['--context', ctx, 'cp', resolve(snap.dump_path), `${target}:${remoteTmp}`], { timeout: 1200000, onLine: emitLog });
         if (cp.status !== 0) throw new Error(`docker cp into ${target} failed: ${(cp.stderr || '').slice(-300)}`);
         broadcastDbOpProgress({ ...progressBase, msg: 'Restoring database…', pct: 40, status: 'running' });
         const rest = await execAsync('docker',
           ['--context', ctx, 'exec', target, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', ...aclArg, ...tArgs, '-d', dbName, remoteTmp],
-          { timeout: 1800000 });
-        await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000 });
+          { timeout: 1800000, onLine: emitLog });
+        await execAsync('docker', ['--context', ctx, 'exec', target, 'rm', '-f', remoteTmp], { timeout: 60000, onLine: emitLog });
         report = restoreOutcome({ status: rest.status, stderr: rest.stderr });
         if (!report.ok) {
           throw new Error(`pg_restore into ${target}/${dbName} failed: ${report.reason}: ${(rest.stderr || '').slice(-300)}`);
@@ -1006,8 +1284,15 @@ async function runRestoreJob({ snap, c, dbName, dbUser, tables = [] }) {
       }
     } else {
       broadcastDbOpProgress({ ...progressBase, msg: 'Simulating restore…', pct: 30, status: 'running' });
+      if (plugins.length) {
+        emitLog(`psql: CREATE EXTENSION IF NOT EXISTS ${plugins.join(', ')} (simulated)`);
+        await wait(100);
+      }
+      emitLog(`pg_restore: connecting to database for restore (simulated)`);
+      emitLog(`pg_restore: dropping TABLE core.app (simulated)`);
       await wait(Math.round(SIM_RESTORE_MS * 0.7));   // simulate: show progress stepping
       broadcastDbOpProgress({ ...progressBase, msg: 'Restoring database…', pct: 65, status: 'running' });
+      emitLog(`pg_restore: creating TABLE core.app (simulated)`);
       await wait(Math.round(SIM_RESTORE_MS * 0.3));
     }
     broadcastDbOpProgress({ ...progressBase, msg: 'Finalizing restore…', pct: 85, status: 'running' });
@@ -1120,8 +1405,9 @@ export async function duplicateProdInto({ container }) {
   }
   if (prodDbc?.busy_since) throw new Error('the production database is busy (a backup/restore is already running)');
 
-  // Don't dump prod while it's mid-ship or bound to a live zee — the same window that blocks a
-  // scheduled backup. A dump would contend with live prod work.
+  // Don't dump prod while it's mid-ship or mid-seed — the same window that blocks a scheduled
+  // backup. A bound xell does NOT make prod busy for a dump (it is a read; its row-level data
+  // work does not contend with pg_dump).
   const busy = await prodBusyReason(c.project_id);
   if (busy) {
     throw new Error(`prod duplicate refused: ${busy} — a dump would contend with live prod work `
@@ -1132,20 +1418,27 @@ export async function duplicateProdInto({ container }) {
   const dbName = project.db_name || config.prodDbName || project.name.toLowerCase();
   const dbUser = project.db_user || config.prodDbUser;
 
+  // The target project's configured plugins — the same pre-create a restore does, so a dev copy
+  // gets the extensions prod's dump needs before pg_restore replays it.
+  const pc = await one(`SELECT backup_plugins FROM pool_config WHERE project_id=$1`, [c.project_id]);
+  const plugins = validPluginSelection(Array.isArray(pc?.backup_plugins) ? pc.backup_plugins : []);
+
   // Both endpoints spin while the copy runs: prod is being READ (busy_op='backup'), the target is
   // being OVERWRITTEN (busy_op='restore'). The chips spin and lock out builds for the duration, and
   // flagging prod busy serializes this against a concurrent scheduled backup of the same database.
   await setBusy(c.id, 'restore');
   if (prodDbc) await setBusy(prodDbc.id, 'backup');
-  logline('maint', `duplicate prod → ${c.name} (${MODE})`);
-  runDuplicateJob({ project, prodDbc, target: c, dbName, dbUser })
+  logline('maint', `duplicate prod → ${c.name} (${MODE})${plugins.length ? ` · plugins: ${plugins.join(', ')}` : ''}`);
+  runDuplicateJob({ project, prodDbc, target: c, dbName, dbUser, plugins })
     .catch((e) => console.error('[duplicate]', e.message));
   return { ok: true, status: 'started', container: c.name };
 }
 
-async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
+async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser, plugins = [] }) {
   let restored = false, report = null;
   const progressBase = { op: 'duplicate', id: target.id, project_id: target.project_id, label: `${target.name} ← prod` };
+  // Live-feed the pg_dump / pg_restore pipe's lines to the notification pane, like backup/restore.
+  const emitLog = (line) => broadcastDbOpLog({ ...progressBase, line });
   try {
     if (MODE === 'real') {
       // Resolve BOTH endpoints by IDENTITY (ctx + host_port), never name shape — the same rule the
@@ -1154,6 +1447,23 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
       const src = await resolveRunningContainer({ ...prodDbc, docker_ctx: srcCtx });
       const dstCtx = target.docker_ctx;
       const dst = await resolveRunningContainer({ ...target });
+      // PLUGINS — ensure the extensions prod uses exist in the target BEFORE pg_dump → pg_restore
+      // pipes. Same reason as a restore: the dump's CREATE EXTENSION needs the package present,
+      // and the extension's TYPES must exist before pg_restore creates tables that use them.
+      if (plugins.length) {
+        broadcastDbOpProgress({ ...progressBase, msg: 'Ensuring plugins (extensions)…', pct: 10, status: 'running' });
+        for (const ext of plugins) {
+          const r = await execAsync('docker',
+            ['--context', dstCtx, 'exec', dst.name, 'psql', '-U', dbUser, '-d', dbName, '-c', `CREATE EXTENSION IF NOT EXISTS ${ext}`],
+            { timeout: 120000, onLine: emitLog });
+          if (r.status !== 0) {
+            throw new Error(`could not create plugin/extension "${ext}" in ${dst.name}/${dbName} before the duplicate: `
+              + `${((r.stderr || r.stdout) || '').slice(-300)} — install "${ext}" in the target's postgres image, `
+              + 'or remove it from the backup settings Plugins list');
+          }
+          emitLog(`created extension ${ext}`);
+        }
+      }
       broadcastDbOpProgress({ ...progressBase, msg: 'Dumping production…', pct: 20, status: 'running' });
       // Stream pg_dump (prod) straight into pg_restore (dev). --clean --if-exists --no-owner
       // --no-privileges mirror the restore job: drop-and-recreate every object, ignore prod's role
@@ -1164,7 +1474,7 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
       const piped = await execPipe(
         { cmd: 'docker', args: ['--context', srcCtx, 'exec', src.name, 'pg_dump', '-U', dbUser, '-Fc', '-d', dbName] },
         { cmd: 'docker', args: ['--context', dstCtx, 'exec', '-i', dst.name, 'pg_restore', '-U', dbUser, '--clean', '--if-exists', '--no-owner', '--no-privileges', '-d', dbName] },
-        { timeout: 1800000 });
+        { timeout: 1800000, onLine: emitLog });
       // The SOURCE side is unconditional: a failed pg_dump means nothing reached the target.
       if (piped.srcStatus !== 0 || piped.timedOut) {
         const why = piped.timedOut ? 'timed out' : `pg_dump exit ${piped.srcStatus}`;
@@ -1182,8 +1492,14 @@ async function runDuplicateJob({ project, prodDbc, target, dbName, dbUser }) {
       broadcastDbOpProgress({ ...progressBase, msg: 'Copy complete, validating…', pct: 85, status: 'running' });
     } else {
       broadcastDbOpProgress({ ...progressBase, msg: 'Simulating duplicate…', pct: 35, status: 'running' });
+      if (plugins.length) {
+        emitLog(`psql: CREATE EXTENSION IF NOT EXISTS ${plugins.join(', ')} (simulated)`);
+        await wait(100);
+      }
+      emitLog(`pg_dump: dumping database "${dbName}" (simulated)`);
       await wait(Math.round(SIM_RESTORE_MS * 0.6));
       broadcastDbOpProgress({ ...progressBase, msg: 'Piping production to target…', pct: 70, status: 'running' });
+      emitLog(`pg_restore: connecting to database for restore (simulated)`);
       await wait(Math.round(SIM_RESTORE_MS * 0.4));
     }
     const trouble = restoreErrorLine(report);
@@ -1259,11 +1575,13 @@ export async function backupDue(projectId, now = Date.now()) {
   const lastGood = await one(
     `SELECT id, taken_at FROM db_snapshot WHERE project_id=$1 AND source='prod' AND status='finished'
       ORDER BY taken_at DESC LIMIT 1`, [projectId]);
-  // Consecutive failures SINCE the last success — the backoff's exponent. Counted in SQL so a restart
-  // cannot reset it back to "first retry" and start the 10-minute cadence over.
+  // Consecutive attempts SINCE the last success that did not produce a dump — the backoff's
+  // exponent. A CANCELLED attempt counts exactly like a failed one: the operator stopped it, so no
+  // restore point was made, and the next retry must back off with the rest. Counted in SQL so a
+  // restart cannot reset it back to "first retry" and start the 10-minute cadence over.
   const streak = await one(
     `SELECT count(*)::int AS n FROM db_snapshot
-      WHERE project_id=$1 AND source='prod' AND status='failed'
+      WHERE project_id=$1 AND source='prod' AND status IN ('failed','cancelled')
         AND ($2::timestamptz IS NULL OR taken_at > $2::timestamptz)`,
     [projectId, lastGood?.taken_at ?? null]);
 
@@ -1298,7 +1616,7 @@ export async function checkBackupFreshness(projectId, now = Date.now()) {
     if (d.fire) {
       const streak = await one(
         `SELECT count(*)::int AS n FROM db_snapshot
-          WHERE project_id=$1 AND source='prod' AND status='failed' AND taken_at > $2::timestamptz`,
+          WHERE project_id=$1 AND source='prod' AND status IN ('failed','cancelled') AND taken_at > $2::timestamptz`,
         [projectId, lastGood.taken_at]);
       logline('maint', `⚠ ${project?.name || projectId}: PROD RESTORE POINT IS STALE — ${d.reason}. `
         + 'Telling a human off-screen (a stale restore point is not visible to anyone who is not looking '

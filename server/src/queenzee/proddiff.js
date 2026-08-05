@@ -334,6 +334,7 @@ export async function diffCandidates(containerId) {
   // REAL ContainerChip for each candidate instead of a second, drifting rendering of a container.
   const rows = await q(
     `SELECT c.id, c.role, c.name, c.tier, c.isolation, c.docker_ctx, c.health,
+            c.host, c.host_port, c.conn_ref,
             c.busy_since, c.busy_op, c.prod_diff, c.prod_diff_at,
             (SELECT ox.slug FROM xell ox WHERE ox.id = c.owner_xell_id) AS owner_slug
        FROM container c

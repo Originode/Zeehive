@@ -1,0 +1,15 @@
+-- PostgreSQL extensions ("plugins") a restore target must have before a backup can be loaded
+-- into it — the "Plugins" option in the backup/restore settings (TKT: restoring the omnibiz
+-- prod backup fails because postgis is not in the target database).
+--
+-- A pg_dump of an extension-bearing database (postgis, h3, …) records `CREATE EXTENSION`, and
+-- pg_restore replays it — but only when the target server actually HAS the extension package,
+-- and a TABLE-SCOPED dump does not record the extension at all, so the extension's TYPES must
+-- already exist before pg_restore creates the tables that use them. Without this the restore
+-- dies with "type geometry does not exist" / "extension postgis is not available".
+--
+-- backup_plugins — the DEFAULT list of extensions a restore INTO this project's db containers
+-- should pre-create (`CREATE EXTENSION IF NOT EXISTS`) before the archive is loaded. NULL or []
+-- means "no plugins" (a stock-postgres project, today's behaviour). Non-empty array of
+-- extension names (plain identifiers, e.g. ['postgis','h3']).
+ALTER TABLE pool_config ADD COLUMN IF NOT EXISTS backup_plugins jsonb;

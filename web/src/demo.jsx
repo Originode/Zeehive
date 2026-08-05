@@ -19,9 +19,9 @@ const commits = Array.from({ length: 12 }, (_, i) => ({
 commits[2].parents = ['h3', 'h5'];          // a merge → a second lane, to show the weave
 
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff'];
-// eight xells, eight different heads (prods on h0,h2; then the manager on h1 and its reaped worker on
-// h8 — a husk needs a dot of its OWN or the "a husk lends nothing" story lands on the manager's dot)
-const BASES = ['h0', 'h2', 'h4', 'h6', 'h9', 'h3', 'h1', 'h8'];
+// nine xells on distinct heads (prods on h0,h2; the manager on h1 and its reaped worker on h8 — a husk
+// needs a dot of its OWN or the "a husk lends nothing" story lands on the manager's dot; the router on h7)
+const BASES = ['h0', 'h2', 'h4', 'h6', 'h9', 'h3', 'h1', 'h8', 'h7'];
 const NAMES = ['swift-atlas', 'sunny-ember', 'calm-ridge', 'bold-harbor', 'lucid-fern', 'brave-quill'];
 
 const xells = NAMES.map((slug, i) => ({
@@ -32,6 +32,10 @@ const xells = NAMES.map((slug, i) => ({
   created_at: new Date(Date.now() - i * 3600e3).toISOString(),
   branch: 'spinoff/' + slug, viewer_url: 'http://x/' + i, viewer_kind: 'web',
   remote_source: { ref: 'master' },
+  // one xell per vendor, so the demo shows what the honeycomb actually shows: the AI PROVIDER is the
+  // badge (its coin) and the harness is worn over it (web/src/providerArt.js)
+  runtime_key: ['claude-code-cxell', 'claude-code-cxell', 'codex-cxell', 'kimi-code-cxell',
+                'deepseek-cxell', 'codex-cxell'][i],
   stack: [
     { role: 'db', name: 'db-' + slug, health: 'up', docker_ctx: 'ugreen' },
     { role: 'server', name: 'srv-' + slug, health: ['up', 'up', 'building', 'up', 'up', 'down'][i], docker_ctx: 'ugreen' },
@@ -45,9 +49,21 @@ xells.push({
   id: 'x6', slug: 'wise-cove-d6af', zee_type: 'manager', status: 'working', zee_status: 'working',
   cli_active: true, hive_status: 'occ-working', hive_status_label: 'working',
   db_coupling: 'db-prod-readonly', branch: 'spinoff/wise-cove-d6af', created_at: new Date(Date.now() - 5 * 3600e3).toISOString(),
-  head_commit: 'ab99f00d', remote_source: { ref: 'master' }, viewer_kind: 'ssh-terminal', viewer_url: 'ssh://x6',
+  head_commit: 'ab99f00d', remote_source: { ref: 'master' }, runtime_key: 'claude-code-cxell', viewer_kind: 'ssh-terminal', viewer_url: 'ssh://x6',
   zee_title: 'run the refactor crew', task_id: 'demo-task',
   stack: [{ role: 'db', name: 'db-wise-cove', health: 'up', docker_ctx: 'ugreen' }],
+});
+// THE ROUTER — a manager-type xell wearing the `router` harness (migration 139): the front door that
+// recomposes a human's prompt and decides dispatch. It renders WHITE (HiveCanvas statusColor → COL.router),
+// the same IDENTITY treatment production gets in lime green, so the demo can show both identity fills
+// side by side.
+xells.push({
+  id: 'x8', slug: 'router-4f31', zee_type: 'manager', harness_key: 'router', status: 'working',
+  zee_status: 'working', cli_active: true, hive_status: 'occ-working', hive_status_label: 'working',
+  db_coupling: 'db-prod-readonly', branch: 'spinoff/router-4f31', created_at: new Date(Date.now() - 4 * 3600e3).toISOString(),
+  head_commit: 'ab7f00d1', remote_source: { ref: 'master' }, runtime_key: 'claude-code-cxell',
+  viewer_kind: 'ssh-terminal', viewer_url: 'ssh://x8', task_id: 'router-task',
+  stack: [{ role: 'db', name: 'db-router', health: 'up', docker_ctx: 'ugreen' }],
 });
 xells[3].manager_xell_id = 'x6';   // bold-harbor reports to it (idle → "1 waiting")
 xells[5].manager_xell_id = 'x6';   // brave-quill too (working)
@@ -68,7 +84,8 @@ xells.push({
   stack: [{ role: 'db', name: 'db-stale-glade', health: 'down', docker_ctx: 'ugreen' }],
 });
 
-// x0/x1 are the two prods (gold), on h0 & h2 → the graph tracks the median of the pair
+// x0/x1 are the two prods (lime hex fill, orange trace accent), on h0 & h2 → the graph tracks the
+// median of the pair
 const timeline = {
   branch: 'master', commits,
   xells: xells.map((x, i) => ({ id: x.id, base_commit: BASES[i] || 'h1',
@@ -76,8 +93,17 @@ const timeline = {
   // The manager wears a manager harness — its badge art is what the manager HEXAGON shows, and that
   // is the whole appearance of this harness in the grid: a manager is a `wearer` but never a
   // `consumer`, so this harness takes NO cell of its own (it would seat the same avatar twice).
-  harnesses: [{ id: 'h-mgr', key: 'manager', label: 'Manager', glyph: '🧭', color: '#9b8cff',
-    base_commit: 'h1', wearer_ids: ['x6'], consumer_ids: [] }],
+  harnesses: [
+    { id: 'h-mgr', key: 'manager', label: 'Manager', glyph: '🧭', color: '#9b8cff',
+      base_commit: 'h1', wearer_ids: ['x6'], consumer_ids: [] },
+    // a WORKER harness with real consumers — the one the show-harness toggle exists to show: its badge
+    // takes a grid cell and the wires of these two xells route THROUGH it (one continuous trace), and
+    // flipping the toggle off hides the badge and runs those wires straight from each dot to its hex.
+    // Its two wearers also run on DIFFERENT vendors (kimi and codex above), which is the provider
+    // badge's whole point: the same tool pip hanging off two different provider coins.
+    { id: 'h-work', key: 'builder', label: 'Builder', glyph: '⚒', color: '#35c46b',
+      base_commit: 'h4', wearer_ids: ['x3', 'x5'], consumer_ids: ['x3', 'x5'] },
+  ],
 };
 const diffs = Object.fromEntries(xells.map((x, i) => {
   const baseRow = commits.findIndex((c) => c.hash === BASES[i]);
@@ -89,10 +115,12 @@ const machines = [{ docker_ctx: 'ugreen', key: 'ugreen-nas' }];
 function Demo() {
   const [orientation, setOrientation] = useState('landscape');
   const [honeySide, setHoneySide] = useState('a');
+  const [showHarness, setShowHarness] = useState(true);
   const [expandedId, setExpandedId] = useState(null);
   const [split, setSplit] = useState(null);
   const layoutRef = useRef(null);
   const hexPosRef = useRef({});
+  const harnessPosRef = useRef({});
   const geomListeners = useRef(new Set());
   const subscribeGeom = React.useCallback((fn) => { geomListeners.current.add(fn); return () => geomListeners.current.delete(fn); }, []);
   const fireGeom = React.useCallback(() => { geomListeners.current.forEach((fn) => { try { fn(); } catch {} }); }, []);
@@ -113,8 +141,9 @@ function Demo() {
         <HiveCanvas xells={xells} diffs={diffs} timeline={timeline} orientation={orientation} honeySide={honeySide}
                     machines={machines} onOpenSession={() => {}}
                     expandedId={expandedId} onExpand={setExpandedId}
-                    hexPosRef={hexPosRef} onGeometry={fireGeom}
-                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover} />
+                    hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} onGeometry={fireGeom}
+                    hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                    showHarness={showHarness} />
       </section>
 
       {/* `xells` to BOTH of these as well as the canvas: the manager↔crew relation is drawn in all
@@ -123,13 +152,14 @@ function Demo() {
       <GraphPane timeline={timeline} xells={xells} orientation={orientation} honeySide={honeySide}
                  hexPosRef={hexPosRef} prodIds={prodIds} expandedId={expandedId} subscribeGeom={subscribeGeom}
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
+                 showHarness={showHarness} onToggleHarness={() => { setShowHarness((s) => !s); setVersion((v) => v + 1); }}
                  onFlip={() => { setHoneySide((s) => s === 'a' ? 'b' : 'a'); setVersion((v) => v + 1); }}
                  onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
 
       <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
-                  hexPosRef={hexPosRef} orientation={orientation} honeySide={honeySide}
+                  hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
                   expandedId={expandedId} prodIds={prodIds} subscribeGeom={subscribeGeom}
-                  hoverRef={hoverRef} subscribeHover={subscribeHover} />
+                  hoverRef={hoverRef} subscribeHover={subscribeHover} showHarness={showHarness} />
 
       <section className="hive-pane panels" style={split != null ? { flex: `${1 - split} 1 0` } : undefined}>
         <div className="content" style={{ padding: 16 }}>
@@ -139,6 +169,9 @@ function Demo() {
             </button>
             <button className="flip-btn" onClick={() => { setHoneySide((s) => s === 'a' ? 'b' : 'a'); setVersion((v) => v + 1); }}>
               ⇄ flip (honey {honeySide})
+            </button>
+            <button className="flip-btn" onClick={() => { setShowHarness((s) => !s); setVersion((v) => v + 1); }}>
+              show harness: {showHarness ? 'on' : 'off'}
             </button>
           </div>
           <p style={{ color: 'var(--muted)', font: "13px 'Segoe UI', sans-serif", lineHeight: 1.6 }}>

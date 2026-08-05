@@ -54,6 +54,9 @@ knowing before changing either file:
 | `POST` | `/api/work-items/:id/deploy` | **dispatch a fresh worker** for this item and assign it |
 | `GET` | `/api/work-items/:id/candidates` | who could take it — so a picker offers xells, not a uuid box |
 | `GET` | `/api/xell/self/work` | `zee work` — token-scoped |
+| `POST` | `/api/xell/self/work/new` | `zee work --new` — **manager only** |
+| `POST` | `/api/xell/self/work/breakdown` | `zee breakdown` — **manager only** |
+| `POST` | `/api/xell/self/work/unassign` | `zee unassign` — **manager only** |
 | `POST` | `/api/xell/self/work/assign` | `zee assign` — **manager only** |
 | `POST` | `/api/xell/self/work/item` | `zee item` — token-scoped |
 
@@ -214,7 +217,7 @@ tick 3 → {scanned:1, moved:0, noted:0}
 
 The event is `kind: 'assigned'` with `detail: {zee_gone: true, xell_id, xell_slug, reason, status_kept}`.
 
-## The three cxell verbs
+## The cxell verbs
 
 A verb that is not in the manual does not exist to a zee — which is why **migration 059** patches the
 two manuals (surgical, idempotent, anchored replacements, exactly as 053): the **manager** manual
@@ -263,6 +266,59 @@ repo refuses.
 Writes are one transaction: a status change logs a `status` event; a note without a status change
 logs a `comment` event; `progress` rides along.
 
+### `zee work --new` · `zee breakdown` · `zee unassign` — CUTTING the plan *(MANAGER only)*
+
+The three above let a manager READ the plan, deploy onto an item and move a card; these three let it
+**make** one. Until they landed a manager was ordered by its own manual to break a ticket down before
+dispatching anybody and had no verb that could — `createWorkItem` and `breakdownTicket` were on the
+console surface only — and a card whose worker died at spawn stayed locked to the dead xell, because
+`assign`'s "unassign it first" named a verb no manager had.
+
+- **`zee work --new --title "…"`** (`POST /api/xell/self/work/new`) → `createWorkItem` in the
+  caller's own project. `--parent` hangs it under an existing item, `--ticket` takes the CODE a human
+  reads (`TKT-52-2518`), the ref (`#52`) or the uuid — `resolveTicket` in `lib/tickets.js`. It answers
+  with `id` at the top level and the CLI prints that id on its own first line, so it pipes into
+  `zee assign --item <id>`.
+- **`zee breakdown --ticket <code|id> --items <file.json>`** (`.../work/breakdown`) → `breakdownTicket`
+  verbatim, refs and all: one transaction, one tree, and no second tree builder. The items come from a
+  FILE because a tree is nested JSON. An item may carry `{title, kind?, body?, parent_id?, ref?,
+  priority?, starts_on?, due_on?}` and **nothing else** — see the whitelist below.
+- **`zee unassign --item <id> [--reason "…"]`** (`.../work/unassign`) → `unassignWorkItem`. The status
+  is kept and the xell is untouched; `--reason` rides in the `assigned` event's detail. When the xell
+  is still LIVE the answer says so and names it: the verb exists for a xell that died at spawn, so it
+  is not refused, but detaching a running zee leaves that worker with a blank `zee work` and a refused
+  `zee item` and it is not told — `xell_was_live` carries the same fact as data.
+
+Same scoping rule as the rest of the file, and it is the whole security story: **the project comes
+from the TOKEN**, so a parent, a ticket or an item in another project is refused by name and nothing
+is written. A worker gets the manager-verb sentence, not a 403. And all three are PLAN ROWS ONLY —
+none of them dispatches, lands, ships, marks a xell done or opens a gate.
+
+Two things a review (TKT-52 follow-up) found that the happy path could not, both now closed and both
+worth knowing before touching this code:
+
+1. **A ticket UUID is a scope hole if you let it be.** `resolveTicket` scoped only the NUMBER branch
+   by project (numbers are per project; ids are globally unique), so `--ticket <another project's id>`
+   linked a card to somebody else's ticket — and `zee breakdown` took its items into the OTHER
+   project's plan, because `breakdownTicket` reads `project_id` off the TICKET. Every cross-project
+   refusal had been asserted by CODE, where the number scoping hid it. `projectId` now scopes both
+   branches; unscoped (the console) still reads the whole table.
+2. **A file is untrusted input.** `breakdownTicket` spreads each entry into `createWorkItem`, whose
+   surface is wider than this verb advertises, so `xell_id` in the JSON produced a card in the
+   caller's project owned by a LIVE worker in another one (`itemForXell` resolves by
+   `work_item.xell_id` first, so that worker's `zee work` answered with the card and its `zee item`
+   wrote to it) — with no `assigned` event and none of `assignWorkItem`'s guards. `selfWorkBreakdown`
+   now whitelists the keys above and refuses the rest by name, before the transaction. Putting a zee
+   on a card stays `zee assign`.
+
+The manager manual moves with them, in the same commit and as a migration
+(`123_manager_manual_plan_verbs.sql`, appended through `harness_memory_put`) — house rules 8 and 9,
+and what `test/cxell-cli-drift.test.mjs` §e fails the build over. `124_manager_manual_plan_verbs_guard.sql`
+re-anchors that append on the section HEADING: 123 guarded on the string `zee breakdown`, which a human
+editing the manual in the console could have written themselves, and the section would then have
+silently never landed on that database — with §e still green, because it lints that the verb is
+mentioned, not that the section is there.
+
 ## How this was verified
 
 Against a real server built from this branch (`zee build server --wait`), over HTTP, using tokens
@@ -278,6 +334,13 @@ driven directly through its fence and its dead-zee branch.
 itself is not), and the exact brief text `briefForWorkItem` produces.
 
 All fixtures were removed afterwards.
+
+**The three plan-cutting verbs (TKT-52) were verified separately**, by `test/manager-plan-verbs.test.mjs`
+and then over HTTP with `curl` and the real `scripts/zee` against a server run from this branch: a card
+cut and its id piped into `zee assign` (which accepted it and got as far as the dispatch itself), a
+ticket broken down by code and by ref, a card freed and re-assigned, and the worker/cross-project
+refusals. Its database was a throwaway postgres **inside the cxell**, not the shared dev one — that
+database's credentials were rejecting the queenzee's own DSN at the time (TKT-47).
 
 ## Follow-ups this reconstruction surfaced
 

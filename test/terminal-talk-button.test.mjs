@@ -48,11 +48,15 @@ ok(!/sendXellMessage|fetch\(/.test(src),
 
 console.log('\n── the receipt tells the truth about delivery ──');
 const receipt = src.slice(src.indexOf('const talkReceipt'), src.indexOf('const toggleExplorer'));
-ok(/const queued = feed\.live === true/.test(receipt),
-   'it reads who owns the pane from the bridge, rather than assuming a happy path');
+ok(/r\?\.delivery \|\| \(feed\.live === true/.test(receipt),
+   "it reports the SERVER's delivery verdict (lib/zee-turn.js), falling back to who owns the pane "
+   + 'rather than assuming a happy path');
 ok(/QUEUED/.test(receipt) && /the moment the turn ends/.test(receipt),
    'a mid-turn message is reported as QUEUED, and says when it will arrive');
-ok(/typed into the zee's live session/.test(receipt), 'an idle zee is reported as typed in');
+ok(/RESUMED/.test(receipt) && /does not appear in this pane/.test(receipt),
+   'a message to a zee whose turn ENDED is reported as RESUMED — and says the answer lands in a '
+   + 'headless turn, not in this pane');
+ok(/typed into the zee's live session/.test(receipt), 'an idle, attached zee is reported as typed in');
 ok(/attachments/.test(receipt), 'and attachments handed over to .zee-inbox are named');
 ok(/\\x1b\[2m/.test(receipt), 'printed dim, so a receipt is never mistaken for something the zee said');
 

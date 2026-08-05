@@ -101,9 +101,9 @@ export async function getDiffs(projectId) {
 
 // stable, distinct connector colors per xell
 const COLORS = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff', '#e5554e', '#3bc6c0'];
-// production's orange — matches its hexagon (COL.prod / live-protected in HiveCanvas) so its ring +
-// wire read as prod. Orange is the hive's "production" temperature: hotter than working green, cooler
-// than a held land/ship red.
+// production's trace colour stays ORANGE (the "production temperature" accent) even though the
+// hexagon FILL is now lime (HiveCanvas COL.prodFill): the ring + wire + commit dot read as the accent
+// ON the lime hexagon, which keeps them visible and distinct from the fill.
 const PROD_COLOR = '#f0913b';
 // harness wires read as a distinct family (cooler, avatar-badge palette) — not xell, not prod.
 const HARNESS_COLORS = ['#5b8cff', '#9b8cff', '#3bc6c0', '#7bd0e0'];
@@ -171,14 +171,14 @@ export async function getTimeline(projectId, n = 250) {
     // honeycomb, which is how the deployed queenzee hid it for weeks.
     const hrows = await q(
       `SELECT id, key, label, head_commit, is_law_core, (bundle->>'avatar_svg') IS NOT NULL AS has_avatar,
-              bundle->>'summary' AS summary, bundle->>'glyph' AS glyph,
+              bundle->>'summary' AS summary, bundle->>'glyph' AS glyph, bundle->>'gear' AS gear,
               bundle->>'personality' AS personality, (bundle->'skills') AS skills, (bundle->'memory') AS memory
          FROM harness WHERE id = ANY($1::uuid[]) AND enabled`, [assignedHarnessIds]);
     harnesses = hrows.map((h, i) => {
       const hbase = h.head_commit && known.has(h.head_commit) ? h.head_commit : allCommits[0]?.hash;
       const wearers = anchored.filter((a) => a.harness_id === h.id);
       return {
-        id: h.id, key: h.key, label: h.label, summary: h.summary, glyph: h.glyph,
+        id: h.id, key: h.key, label: h.label, summary: h.summary, glyph: h.glyph, gear: h.gear,
         ...harnessHealth(h),
         avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
         base_commit: hbase,

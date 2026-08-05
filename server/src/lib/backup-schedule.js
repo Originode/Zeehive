@@ -52,6 +52,11 @@ export function retryDelaySec(consecutiveFailures, intervalSec) {
 //   'policy'  — the normal schedule elapsed
 //   'retry'   — the last attempt FAILED and the (shorter) retry interval has elapsed
 //   'running' — an attempt is in flight; NEVER due, at any age
+//
+// A 'cancelled' attempt counts as a failure here, deliberately: a human stopped that dump, so it
+// produced no restore point, and the next attempt must NOT wait out a whole policy interval just
+// because someone stopped one. It reads as a retry (soon), which is the safe direction — the prod
+// window guard still defers it if prod is actually busy.
 export function backupDecision({ lastAttempt, lastGood, failStreak = 0, intervalSec, now }) {
   const policy = Math.max(1, Number(intervalSec) || 0);
   const t = Number(now);
@@ -68,18 +73,19 @@ export function backupDecision({ lastAttempt, lastGood, failStreak = 0, interval
     return { due: true, kind: 'first', dueAt: t, waitSec: 0, reason: 'no backup has ever been taken for this project' };
   }
 
-  const failed = lastAttempt.status === 'failed';
+  const failed = lastAttempt.status === 'failed' || lastAttempt.status === 'cancelled';
   const waitFor = failed ? retryDelaySec(failStreak || 1, policy) : policy;
   const since = new Date(lastAttempt.taken_at).getTime();
   const dueAt = since + waitFor * 1000;
   const due = t >= dueAt;
   const waitSec = Math.max(0, Math.ceil((dueAt - t) / 1000));
   const goodAgeSec = lastGood ? Math.floor((t - new Date(lastGood.taken_at).getTime()) / 1000) : null;
+  const what = lastAttempt.status === 'cancelled' ? 'was CANCELLED' : 'FAILED';
 
   return {
     due, kind: failed ? 'retry' : 'policy', dueAt, waitSec,
     reason: failed
-      ? `the last attempt FAILED ${Math.floor((t - since) / 60000)} min ago; retry interval is `
+      ? `the last attempt ${what} ${Math.floor((t - since) / 60000)} min ago; retry interval is `
         + `${Math.round(waitFor / 60)} min (attempt ${failStreak || 1} since the last success`
         + `${goodAgeSec != null ? `, whose dump is ${Math.round(goodAgeSec / 3600)}h old` : ''})`
       : `the policy interval is ${Math.round(policy / 60)} min`,

@@ -106,6 +106,49 @@ export async function getDispatchModels(provider = 'claude') {
   const r = await fetch(`/api/xell/models?provider=${encodeURIComponent(provider)}`);
   return r.ok ? r.json() : [];
 }
+// WHAT A HARNESS MAY DISPATCH — the composer's whole read model, in one call, derived from the
+// persona the prompt BUTTON chose. The console's "＋ prompt" buttons are per HARNESS (the persona
+// is the consequential choice; an account is a credential), so the providers, the accounts, the
+// models and the meaning of the autonomy scale all follow from it — see server
+// lib/dispatch-options.js. `harness` is three-state exactly like the composer's own value:
+// undefined = the default for this zee type, '' = core only, a key = that harness.
+export async function getDispatchOptions({ project, harness, zeeType = 'worker' } = {}) {
+  const qs = [`project=${encodeURIComponent(project)}`,
+              `zee_type=${encodeURIComponent(zeeType)}`,
+              harness === undefined ? null : `harness=${encodeURIComponent(harness || '')}`]
+    .filter(Boolean).join('&');
+  const r = await fetch(`/api/dispatch/options?${qs}`);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `dispatch options failed (${r.status})`);
+  return r.json();
+}
+// THE ROUTER (139) — the project's front door. `status` answers the composer's gate (no live
+// router → Dispatch disabled, "Deploy router" shown), `deploy`/`redeploy` are the no-prompt
+// provider+model buttons, and `route` hands a RAW prompt to the live router as a routing request.
+const routerCall = (path, body) => fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(body) }).then((r) => jorrejectRouter(r));
+const jorrejectRouter = async (r) => (r.ok ? r.json()
+  : Promise.reject(new Error((await r.json().catch(() => ({}))).error || `router call failed (${r.status})`)));
+export const getRouterStatus = (project) =>
+  fetch(`/api/router/status?project=${encodeURIComponent(project)}`).then((r) => jorrejectRouter(r));
+export const deployRouter = (body) => routerCall('/api/router/deploy', body);
+export const redeployRouter = (body) => routerCall('/api/router/redeploy', body);
+export const routePrompt = (body) => routerCall('/api/router/route', body);
+// The AI MODEL SPEC REGISTRY (migration 110) — the meta-DB rows (label/note/context/parameters)
+// that the harness manager's policy editor reads. Not the picker list — that stays
+// /api/xell/models, which resolves through the same registry plus the code defaults.
+export async function getModelSpecs(provider = null) {
+  const r = await fetch(`/api/ai-models${provider ? `?provider=${encodeURIComponent(provider)}` : ''}`);
+  return r.ok ? r.json() : [];
+}
+export async function updateModelSpec(provider, key, patch) {
+  const r = await fetch(`/api/ai-models/${encodeURIComponent(provider)}/${encodeURIComponent(key)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `update model spec failed (${r.status})`);
+  return data;
+}
 // Harnesses — the system-wide config layers (persona/skills) a xell can wear. Listed for the
 // composer picker + the switch-harness control on a xell card.
 //
@@ -332,9 +375,14 @@ export const lintEnv = (envId) => fetch(`/api/environments/${envId}/lint`).then(
 // by tier), its var NAMES and counts — never values — and the pin/clear that re-projects
 // .zeehive.env. Names-and-counts only: full values leave the meta-DB through exactly two doors
 // (the .zeehive.env projection and the deploy materializer) and a picker must not become a third.
-export const getXellEnvironment = (xellId) => siteCall(`/api/xells/${xellId}/environment`, 'GET');
+// The READ is GET /xells/:id/env/resolved — it sits with the other env/* reads (env/export) and NOT
+// on the POST's path, which is the asymmetry that made this panel 404 on open for its first outing.
+export const getXellEnvironment = (xellId) => siteCall(`/api/xells/${xellId}/env/resolved`, 'GET');
 export const setXellEnvironment = (xellId, environmentId) =>
   siteCall(`/api/xells/${xellId}/environment`, 'POST', { environment_id: environmentId || null });
+// A xell's message history — the manager⇄worker conversation (directives a manager sent, reports a
+// worker sent back). Human-facing audit: marks NOTHING read (only the agent's own `zee inbox` does).
+export const getXellMessages = (xellId) => siteCall(`/api/xells/${xellId}/messages`, 'GET');
 // Extract a xell's CURRENT environment (its live .zeehive.env, else the resolved meta-DB env) as
 // full .env text — the "pull out what this xell is running with" reveal.
 export const extractXellEnv = (xellId) => siteCall(`/api/xells/${xellId}/env/export`, 'GET');
@@ -365,6 +413,25 @@ export const pullProject = (projectId) => siteCall(`/api/projects/${projectId}/p
 export const githubAccess = (projectId) => fetch(`/api/projects/${projectId}/github-access`).then((r) => r.json());
 export const pushProject = (projectId) => siteCall(`/api/projects/${projectId}/push`, 'POST', {});
 export const pullRequestProject = (projectId, opts = {}) => siteCall(`/api/projects/${projectId}/pr`, 'POST', opts);
+
+// ── the squashed-snapshot offer ───────────────────────────────────────────────
+// Some repository rules scan the COMMITS in the push, not the ref: secret-scanning push protection,
+// file size, signatures, commit-message patterns. For those, a clean tip is not enough — the string
+// (or the file, or the unsigned commit) is still back in the range. Zeehive can open the PR from a
+// one-commit SQUASHED SNAPSHOT instead: same tree, same review diff, built on the remote base, so
+// the offending commits are simply not part of the push. It is not a bypass — it is GitHub's own
+// "remove it from the commits", done to the commits being pushed.
+// Rules where that actually helps (a pull-request-required or branch-name rule is about the REF and
+// would refuse the squashed push too, so it must not be offered there — an offer that cannot work is
+// worse than none).
+export const SQUASHABLE_RULES = new Set(['secrets', 'file-size', 'signatures', 'commit-message', 'linear-history', 'author-email']);
+export const squashHelps = (r) => !!(r && r.opened === false && r.rule && SQUASHABLE_RULES.has(r.rule) && !r.squashed);
+export const squashOffer = (r, branch = 'main') =>
+  `${r?.rule === 'secrets' ? 'GitHub push protection' : 'A repository rule'} refused this because of something in the `
+  + `COMMITS being pushed${(r?.rule_locations || []).length ? ` (${r.rule_locations.join(', ')})` : ''} — not the branch tip, which is why a `
+  + `later fix does not clear it.\n\nOpen the PR from a SQUASHED SNAPSHOT instead? One commit carrying the current tree of `
+  + `${branch}, on top of the remote base. The review diff is identical, the intermediate commits are not pushed, and `
+  + `nothing local is rewritten.`;
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);
@@ -378,13 +445,13 @@ export const draftProjectManifest = (projectId, write = false) => siteCall(`/api
 
 // Subscribe to /api/stream for the selected project. Calls onSnapshot(fleet) on the
 // initial snapshot and onChange() on every subsequent event (the app re-fetches on change).
-export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork, onDbOpProgress }) {
+export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork, onDbOpProgress, onDbOpLog }) {
   const es = new EventSource(`/api/stream${pq(projectId)}`);
   es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
   // 'fleet-pause' rides this list because a pause is the one change that can move NOTHING else: a
   // fleet with no live cage broadcasts no zee/xell event, so without it the button would stay on
   // 'pause' in every other open tab (and in this one, if the press came from elsewhere).
-  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work', 'fleet-pause']) {
+  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work', 'fleet-pause', 'visual-verify', 'xource-clean', 'credential-inject', 'manager-mint']) {
     es.addEventListener(type, () => onChange());
   }
   // The WORK channel, delivered WITH its payload as well as counted as a change. Every other
@@ -402,6 +469,11 @@ export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, on
   // Shown as a progress toast that updates as the operation moves through its phases.
   if (onDbOpProgress) es.addEventListener('db-op-progress', (e) => {
     try { onDbOpProgress(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
+  });
+  // RAW output lines of the same operations ({op, id, project_id, line}) — pg_dump / pg_restore
+  // / docker's actual log, appended to the operation's toast so it reads like a build log.
+  if (onDbOpLog) es.addEventListener('db-op-log', (e) => {
+    try { onDbOpLog(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
   });
   es.onopen = () => onStatus?.('live');
   es.onerror = () => onStatus?.('reconnecting');
@@ -546,6 +618,12 @@ export async function updateMachine(id, patch) {
 export async function deleteMachine(id) {
   const r = await fetch(`/api/machines/${id}`, { method: 'DELETE' });
   return jsonOrThrow(r, 'delete machine');
+}
+// Probe whether the queenzee can actually REACH this machine with the settings on its row —
+// resolves with { ok, docker_ctx, endpoint, reachable, ... } even when the daemon is down.
+export async function checkMachineConnection(id) {
+  const r = await fetch(`/api/machines/${id}/check`);
+  return jsonOrThrow(r, 'check machine connection');
 }
 // Per-project pool size on a machine — how many ready xells THIS project keeps warm there.
 export async function setMachinePool(machineId, projectId, pool_size) {
@@ -741,6 +819,15 @@ export async function deleteBackup(id) {
   const r = await fetch(`/api/backups/${id}`, { method: 'DELETE' });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `delete failed (${r.status})`);
+  return data;
+}
+
+// Cancel a RUNNING backup: the in-flight dump is killed, the partial file removed, and the row
+// finalised 'cancelled'. Not the same as delete — the row stays so a human can see it was stopped.
+export async function cancelBackup(id) {
+  const r = await fetch(`/api/backups/${id}/cancel`, { method: 'POST' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `cancel failed (${r.status})`);
   return data;
 }
 
@@ -949,6 +1036,22 @@ export async function readCxellFile(zeeId, path) {
   return data;
 }
 
+// ── container file explorer: read-only view into a container's filesystem (rides the shell modal) ──
+export async function listContainerDir(containerId, path) {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : '';
+  const r = await fetch(`/api/containers/${containerId}/fs${qs}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `list failed (${r.status})`);
+  return data;
+}
+
+export async function readContainerFile(containerId, path) {
+  const r = await fetch(`/api/containers/${containerId}/file?path=${encodeURIComponent(path)}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data?.error || `read failed (${r.status})`);
+  return data;
+}
+
 // ── PROD-DATA asks: the two things a zee may only REQUEST about production DATA ──
 // Both are decided here, by a human, and performed by the queenzee — never by the zee.
 //
@@ -995,6 +1098,152 @@ export async function dismissSeed(id) {
   return r.ok ? r.json() : null;
 }
 
+// ── XOURCE CLEAN-UP — the project main checkout is mangled; landings/ships are blocked ─────────
+// The console's two doors onto lib/xource-clean.js:
+//   * read the state (clean/dirty/merge-in-progress …) for Project setup → Xource,
+//   * a HUMAN directly cleans the xource (the console IS the human; the queenzee performs it),
+//   * approve/reject a MANAGER's `zee xource-clean` request (same engine, one extra gate).
+export async function getXourceState(projectId) {
+  const r = await fetch(`/api/projects/${projectId}/xource`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `xource state failed (${r.status})`);
+  return data;
+}
+export async function cleanXourceNow(projectId, reason) {
+  const r = await fetch(`/api/projects/${projectId}/xource/clean`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console', reason: reason || null }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data?.ok === false) throw new Error(data.error || `xource clean failed (${r.status})`);
+  return data;
+}
+export async function getXourceCleanRequests(projectId, all = false) {
+  const r = await fetch(`/api/xource-clean/requests?project=${encodeURIComponent(projectId)}${all ? '&all=1' : ''}`);
+  const data = await r.json().catch(() => ([]));
+  if (!r.ok) throw new Error(data.error || `xource-clean requests failed (${r.status})`);
+  return data;
+}
+export async function decideXourceClean(id, decision, by = 'human@console') {
+  const r = await fetch(`/api/xource-clean/requests/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+export async function dismissXourceClean(id, by = 'human@console') {
+  const r = await fetch(`/api/xource-clean/requests/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
+  return data;
+}
+
+// ── MANAGER MINT (human gate, 149) ────────────────────────────────────────────
+// A ROUTER asked for another MANAGER zee. A human decides here: approve → the QUEENZEE mints it
+// (the same createManagerZee the "Add manager" button calls); reject → the router dispatches a
+// worker instead. No agent may create a manager, and nothing on this path changes that.
+export async function getManagerMints(projectId, all = false) {
+  const r = await fetch(`/api/manager-mints?project=${encodeURIComponent(projectId)}${all ? '&all=1' : ''}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `manager-mint requests failed (${r.status})`);
+  return data;
+}
+export async function decideManagerMint(id, decision, by = 'human@console') {
+  const r = await fetch(`/api/manager-mints/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+export async function dismissManagerMint(id, by = 'human@console') {
+  const r = await fetch(`/api/manager-mints/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
+  return data;
+}
+
+// ── CREDENTIAL INJECTION (human gate) ──────────────────────────────────────────
+// A request the QUEENZEE raised (a human connected/replaced an account → live cages hold an older
+// key; a zee died on a 401 → scoped to that xell, quoting the vendor). A human decides here;
+// approve → the queenzee recomputes the credential env from the meta-DB, rewrites ONLY the
+// credential lines in each named cage's /etc/environment, re-runs the adapter's auth setup, and
+// records a per-xell receipt. No zee path to approve — a zee never injects, asks for, or approves
+// an injection.
+export async function getCredentialInjectRequests(projectId, all = false) {
+  const r = await fetch(`/api/credential-inject/requests?project=${encodeURIComponent(projectId)}${all ? '&all=1' : ''}`);
+  const data = await r.json().catch(() => ([]));
+  if (!r.ok) throw new Error(data.error || `credential-inject requests failed (${r.status})`);
+  return data;
+}
+export async function decideCredentialInject(id, decision, by = 'human@console') {
+  const r = await fetch(`/api/credential-inject/requests/${id}/${decision}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `${decision} failed (${r.status})`);
+  return data;
+}
+export async function dismissCredentialInject(id, by = 'human@console') {
+  const r = await fetch(`/api/credential-inject/requests/${id}/dismiss`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
+  return data;
+}
+
+// ── VISUAL VERIFICATION (per-xell) ─────────────────────────────────────────────
+// A human turned on "visual verification" for a xell at dispatch time; the zee built the webapp
+// and OFFERED the live link to a human in the console (an Open-link card with a dismiss). This is
+// the human side of that offer: turn the per-xell flag on/off, and dismiss an offer once looked at.
+export async function setXellVisualVerify(id, visualVerify, by = 'human@console') {
+  const r = await fetch(`/api/xells/${id}/visual-verify`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ visual_verify: visualVerify, by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `visual-verify update failed (${r.status})`);
+  return data;
+}
+
+// Dismiss a visual-verify offer (the card's ✕). offerId may be an id or true (all open offers of
+// the xell). View-only — the offer is a receipt, dismissing it just stops the card rendering.
+export async function dismissVisualVerify(xellId, offerId, by = 'human@console') {
+  const r = await fetch(`/api/xells/${xellId}/visual-verify`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ dismiss: offerId || true, by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
+  return data;
+}
+
+// ── LANGFUSE TRACKING (per-xell) ─────────────────────────────────────────────
+// The per-xell Langfuse tracking switch (default ON). A human flips it from the terminal window
+// header; a manager sets it at dispatch/assign. When OFF the queenzee records no trace for the
+// xell's turns and injects no LANGFUSE_* into its cage.
+export async function setXellLangfuseTracking(id, langfuseTracking, by = 'human@console') {
+  const r = await fetch(`/api/xells/${id}/langfuse-tracking`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ langfuse_tracking: !!langfuseTracking, by }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `langfuse-tracking update failed (${r.status})`);
+  return data;
+}
+// The "View Langfuse" session link for one xell — computed SERVER-side (ui_url + the Langfuse
+// project + the zee's session id → /project/<lfProjectId>/sessions/<id>). The console opens the
+// url (via the auto-login popup) in a new window.
+export const getXellLangfuseSession = (id, zeeId = null) =>
+  fetch(`/api/xells/${id}/langfuse-session${zeeId ? `?zee_id=${encodeURIComponent(zeeId)}` : ''}`)
+    .then((r) => r.json());
+
 // ── MANAGER ZEES ─────────────────────────────────────────────────────────────
 // Adding a manager is a HUMAN act and there is no limit on how many you add — but only from here
 // (a zee's dispatch verb refuses the role, so managers can never mint managers).
@@ -1033,3 +1282,31 @@ export async function dismissDoneSuggestion(id, by = 'human@console') {
   if (!r.ok) throw new Error(data.error || `dismiss failed (${r.status})`);
   return data;
 }
+
+// ── LANGFUSE PLUGIN — the single system-wide LLM observability stack ──────────
+// Config is masked server-side; provision/teardown are human actions (mode-gated); reveal is the
+// human-only full-value door. Traces are a read from the instance's public API, best-effort.
+export const getLangfuseConfig = () => fetch('/api/langfuse/config').then((r) => r.json());
+export const getLangfuseStatus = () => fetch('/api/langfuse/status').then((r) => r.json());
+export const provisionLangfuse = (body = {}) =>
+  siteCall('/api/langfuse/provision', 'POST', { by: 'human@console', ...body });
+export const teardownLangfuse = (by = 'human@console') =>
+  siteCall('/api/langfuse/teardown', 'POST', { by });
+export const getLangfuseTraces = (limit = 20) =>
+  fetch(`/api/langfuse/traces?limit=${limit}`).then((r) => r.json());
+export const revealLangfuse = async (by = 'human@console') => {
+  // TKT-104 / TKT-108-E589: /langfuse/reveal no longer returns the credential directly — it mints
+  // a ONE-TIME, short-TTL token (refusing a caged zee and any caller that cannot present the console
+  // origin), and the credential leaves the server only on a same-origin redemption of that token.
+  // The browser sends the Origin header automatically, so the panel flow is unchanged.
+  const minted = await siteCall('/api/langfuse/reveal', 'POST', { by });
+  if (!minted.redeem || !minted.token) throw new Error(minted.error || 'reveal refused — no redemption URL');
+  return siteCall(minted.redeem, 'POST', { token: minted.token });
+};
+export const getLangfuseProjects = () => fetch('/api/langfuse/projects').then((r) => r.json());
+export const syncLangfuseProjects = (by = 'human@console') =>
+  siteCall('/api/langfuse/projects/sync', 'POST', { by });
+export const reinjectLangfuseAutoLogin = (by = 'human@console') =>
+  siteCall('/api/langfuse/reinject', 'POST', { by });
+export const healLangfuseWriteMode = (by = 'human@console') =>
+  siteCall('/api/langfuse/heal', 'POST', { by });

@@ -104,6 +104,16 @@ export const getTicketManagers = (id) => call(`/api/tickets/${encodeURIComponent
 export const notifyTicketManager = (id, xellId) =>
   send(`/api/tickets/${encodeURIComponent(id)}/notify`, 'POST', { xell_id: xellId });
 
+// ── the reflections ledger ───────────────────────────────────────────────────
+// Every post-ship reflection this project's zees have written, newest first. READING IT MARKS
+// NOTHING READ — `read_at` is the agent's own `zee inbox` receipt, and the server keeps it that way;
+// this client must never grow a "mark read" call. `fileReflection` turns one into a ticket through
+// the same createTicket path everything else uses, and answers { ticket, code, note }.
+export const listReflections = (projectId, { limit, since } = {}) =>
+  call(`/api/reflections${pq({ project: projectId, limit, since })}`);
+export const fileReflection = (id, { kind, priority } = {}) =>
+  send(`/api/reflections/${encodeURIComponent(id)}/ticket`, 'POST', { kind, priority });
+
 // ── work items: the hierarchy ────────────────────────────────────────────────
 export const listWorkItems = (projectId, { tree, status, kind, root, ticket } = {}) =>
   call(`/api/work-items${pq({ project: projectId, tree: tree ? 1 : undefined, status, kind, root, ticket })}`);
