@@ -112,8 +112,8 @@ console.log('the two files GitHub named on 2026-08-04 stay clean');
 for (const f of ['test/cxell-credential-vendor.test.mjs', 'test/cxell-provider-env.test.mjs']) {
   const text = readFileSync(resolve(repo, f), 'utf8');
   ok(!PATTERNS.some((p) => p.re.test(text)), `${f}: carries no vendor pattern`);
-  ok(/DEEPSEEK_TOK\s*=\s*'sk-[A-Za-z0-9]{20,}'/.test(text),
-    `${f}: and its DeepSeek fixture is still a shape our own predicates accept`);
+  ok(/fakeTokens\.deepseek\(\)/.test(text),
+    `${f}: and its DeepSeek shape is GENERATED (test/_bin/tokens.mjs), not a hand-written literal`);
 }
 
 // ── the HISTORY half — a string ADDED anywhere in this branch's history stays in the push range ──

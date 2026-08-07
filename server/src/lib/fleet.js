@@ -17,6 +17,7 @@ import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
 import { xellWebappPath } from './webapp-proxy.js';
+import { containerShellSessionName } from './terminal-bridge.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -255,18 +256,26 @@ function containerShellable(project, c) {
 //   • a db row carries a LOGICAL name — exec the REAL versioned container (resolveRealDbContainerCached);
 //   • everything else is a real compose-built container — its docker name IS the row's name.
 // A named docker context rides `--context` so the command works from the operator's machine.
+// The inner command is tmux attach-or-create (same session the bridge opens) so a human who
+// pastes this from the footer lands in the SAME retained pane the dashboard was showing.
 export function containerShellCmd(project, c) {
   const ctx = c.docker_ctx && c.docker_ctx !== 'default' ? c.docker_ctx : null;
   const prefix = ctx ? `docker --context ${ctx} exec -it` : 'docker exec -it';
+  const sess = containerShellSessionName(c.id);
+  // Prefer tmux when the image has it (queenzee, node apps); the bridge falls back to bash for
+  // images that don't. The footer shows the retained-session form so the copyable command matches
+  // what the dashboard does on a queenzee/node target — the common case this window is for.
+  const shell = `tmux new -A -s ${sess}`;
   if (c.role !== 'db' && c.owner_xell_id) {
     const m = project?.manifest;
     if ((m?.roles?.[c.role]?.runner || m?.tiers?.spinoff?.runner || null) === 'process') {
-      const cd = c.owner_worktree ? ` bash -c 'cd ${c.owner_worktree} && exec bash'` : ' bash';
-      return `${prefix} ${hostname()}${cd}`;
+      // -w matches the bridge's WorkingDir so a freshly-created session starts at the worktree.
+      const w = c.owner_worktree ? ` -w ${c.owner_worktree}` : '';
+      return `${prefix}${w} ${hostname()} ${shell}`;
     }
   }
   const name = c.role === 'db' ? resolveRealDbContainerCached(ctx || 'default', c.name) : c.name;
-  return `${prefix} ${name} bash`;
+  return `${prefix} ${name} ${shell}`;
 }
 
 // Attach a xell's resolved container stack + xource/deploy heads. Mutates and returns `x`. One

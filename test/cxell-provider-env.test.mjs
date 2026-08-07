@@ -31,16 +31,16 @@ const section = (t) => console.log(`\n── ${t} ──`);
 const { everyProviderEnv, providerRunEnvFromAccount } = await import('../server/src/lib/provider-tokens.js');
 const rt = await import('../server/src/lib/cxell-runtimes.js');
 
-// Real shapes (same ones test/cxell-credential-vendor.test.mjs uses), so the collisions are real.
-const CLAUDE_TOK   = 'sk-ant-oat01-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789ab-CAAA';
-// NOT hex: GitHub secret-scanning push protection keys DeepSeek on `sk-` + 32 HEX characters, and
-// the invented hex fixture that used to live here matched it exactly — GH013, every push refused
-// (2026-08-04). Letters past 'f' keep our own shape predicates happy and can never be that pattern.
-const DEEPSEEK_TOK = 'sk-notArealDeepseekKeyZZQQWWVVUU';
-const OPENAI_TOK   = 'sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789';
-const KIMI_TOK     = 'kc0123456789abcdefghijklmnop';
-const GITHUB_TOK   = `github_pat_11${'A'.repeat(40)}`;
-const GROK_TOK     = `xai-${'aBcDeFgHiJkLmNoPqRsTuVwXyZ'.repeat(2)}0123`;
+// Real shapes (same generator test/cxell-credential-vendor.test.mjs uses), so the collisions are
+// real. Generated at runtime (test/_bin/tokens.mjs) so no vendor-secret-pattern literal exists —
+// a hand-written fake that matches a vendor's shape is what GH013'd every push on 2026-08-04.
+import { fakeTokens } from './_bin/tokens.mjs';
+const CLAUDE_TOK   = fakeTokens.claude();
+const DEEPSEEK_TOK = fakeTokens.deepseek();
+const OPENAI_TOK   = fakeTokens.openaiProject();
+const KIMI_TOK     = fakeTokens.kimi();
+const GITHUB_TOK   = fakeTokens.github();
+const GROK_TOK     = fakeTokens.grok();
 
 // account rows in the shape allProviderTokenRows hands everyProviderEnv (freshest first)
 const A = (provider, token, { label = null, hint = null, paused = false } = {}) =>

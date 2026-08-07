@@ -207,6 +207,33 @@ async function openTerminal(ws, zeeId) {
 // answers 101 and the SAME connection becomes a raw byte pipe to the shell (docker's "hijack").
 // With a TTY the stream is unmultiplexed, so bytes go straight through in both directions —
 // exactly the shape the xterm client already speaks. Resize is a separate POST /exec/:id/resize.
+//
+// Session retention (same shape as the zee door above): when the target has `tmux`, the shell is
+// `tmux new -A -s zh-<id>` — first open creates the session, reconnects re-attach it, and closing
+// the modal only kills THIS attach client (the ZEEHIVE_SHELL_MARK reaper below). Without that, every
+// open of the queenzee node (or any container chip shell) was a fresh bash that died with the
+// modal — the opposite of how cxell zee terminals behave. Images without tmux (postgres, alpine)
+// fall back to a one-shot bash/sh and still reap it on close.
+
+// Stable tmux session name for one modeled container row. Unique per row so a process-role xell's
+// shell (all of which exec into the SAME queenzee container) does not collide with another xell's,
+// or with the fleet prod server's own shell. Sanitised for shell interpolation + tmux name rules.
+export function containerShellSessionName(containerId) {
+  const hex = String(containerId || '').replace(/[^0-9a-fA-F]/g, '').toLowerCase();
+  return 'zh-' + (hex.slice(0, 16) || 'shell');
+}
+
+// The command run INSIDE the container (docker exec Cmd, or the copyable footer). `sessionName`
+// must already be sanitised (containerShellSessionName). WorkingDir is set on the exec itself so
+// a freshly-created tmux session inherits it; reattach keeps the session's existing cwd.
+export function containerShellInnerCmd(sessionName) {
+  const s = String(sessionName || '').replace(/[^a-zA-Z0-9_-]/g, '') || 'zh-shell';
+  // tmux flags match the zee door: mouse (wheel scroll in alt-screen), deep history, size to the
+  // most recent client so a lingering half-closed attach cannot clamp a fresh bigger panel.
+  return 'if command -v tmux >/dev/null 2>&1; then '
+    + `exec tmux new -A -s ${s} \\; set -g mouse on \\; set -g history-limit 50000 \\; set -g window-size latest; `
+    + 'else command -v bash >/dev/null && exec bash || exec sh; fi';
+}
 
 // One-shot JSON request to a daemon (create/resize). Tolerates an empty 2xx body (resize).
 export function dockerReq(conn, method, path, body, timeout = 15000) {
@@ -287,17 +314,22 @@ async function openContainerShell(ws, containerId) {
 
   // Docker NEVER kills an exec'd process when its attach connection drops (moby#9098) — an
   // interactive bash on a TTY just idles on forever, so every closed modal would leave one
-  // behind in the target (seen live: a dozen strays after a test session). Tag the shell with
-  // a unique env marker so teardown can find and kill exactly it, nothing else.
+  // behind in the target (seen live: a dozen strays after a test session). Tag THIS attach
+  // client with a unique env marker so teardown can find and kill exactly it, nothing else.
+  // With tmux the mark sits on the client only (exec replaces the shell with `tmux`); killing
+  // it detaches and leaves the named session running for the next open. Without tmux the mark
+  // sits on the one-shot bash and the reap ends the shell, same as before.
   const mark = 'ZEEHIVE_SHELL_' + randomUUID().replace(/-/g, '');
+  const sessionName = containerShellSessionName(c.id);
+  const innerCmd = containerShellInnerCmd(sessionName);
   let execId;
   try {
     const created = await dockerReq(conn, 'POST', `/containers/${encodeURIComponent(name)}/exec`, {
       AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: true,
       Env: ['TERM=xterm-256color', `ZEEHIVE_SHELL_MARK=${mark}`],
       ...(workingDir ? { WorkingDir: workingDir } : {}),
-      // bash where the image has it (postgres, node), sh where it doesn't (alpine)
-      Cmd: ['/bin/sh', '-c', 'command -v bash >/dev/null && exec bash || exec sh'],
+      // Prefer tmux attach-or-create (session survives the modal); fall back to bash/sh.
+      Cmd: ['/bin/sh', '-c', innerCmd],
     });
     execId = created?.Id;
     if (!execId) throw new Error('daemon returned no exec id');
@@ -313,9 +345,10 @@ async function openContainerShell(ws, containerId) {
     return fail(`cannot exec into ${name}: ${e.message}`);
   }
 
-  // Reap the shell (and anything it spawned that inherited the marker, e.g. an open psql) via a
-  // one-shot detached exec. -a: /proc/*/environ is NUL-separated, so grep must read it as text.
-  // Pure POSIX sh + busybox-safe — no pgrep/pkill assumptions about the target image.
+  // Reap THIS attach client (and anything it spawned that inherited the marker, e.g. an open
+  // psql under a no-tmux fallback) via a one-shot detached exec. Does NOT kill a tmux session —
+  // only the marked client — so reconnect finds the same pane. -a: /proc/*/environ is
+  // NUL-separated, so grep must read it as text. Pure POSIX sh + busybox-safe.
   let reaped = false;
   const reap = () => {
     if (reaped) return;
@@ -354,7 +387,7 @@ async function openContainerShell(ws, containerId) {
   });
   req.on('upgrade', (_res, s, head) => {
     sock = s;
-    logline('api', `container shell attached to ${name} (${ctx}, ${lastSize.cols}x${lastSize.rows})`);
+    logline('api', `container shell attached to ${name} (${ctx}, session ${sessionName}, ${lastSize.cols}x${lastSize.rows})`);
     resize();   // TTY starts at the daemon's default size — set the real one before the prompt draws
     if (banner) send(banner);   // say when the shell is the queenzee-at-worktree, not a own container
     if (head?.length) send(head);

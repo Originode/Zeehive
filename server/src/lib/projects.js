@@ -14,7 +14,7 @@ import { logline } from './logbus.js';
 import { cleanGitEnv, headCommit, isAncestor } from './git.js';
 import { normalizeSpawnPrep, STEP_PRESETS } from './spawn-prep.js';
 import { resolveBash } from './bash.js';
-import { probeRemote, cloneFromRemote, pullRemote, reconcileRemote, parseGitProgress,
+import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
          remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest, planComposeOnboarding,
@@ -319,38 +319,6 @@ export async function pullProject(id, by = 'human@console') {
     broadcast('project', p);
   }
   return regression ? { ...r, ...regression } : r;
-}
-
-// RECONCILE local main to the recorded remote — the human action that makes an ordinary PR work
-// again when the remote was squashed clean but the local branch still carries the old (dirty)
-// range. Human-triggered from the console behind a confirm dialog; PROVISION_MODE-gated like every
-// other verb that touches a real checkout (a nested queenzee must not re-point a real xource).
-export async function reconcileProject(id, by = 'human@console') {
-  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
-  if (!p) throw new Error('project not found');
-  if (!p.remote_url) return { reconciled: false, state: 'refused', reason: 'project has no remote_url — set one in Project setup first' };
-  if (PROVISION_MODE !== 'real') {
-    logline('projects', `${p.name}: RECONCILE to origin NOT run — PROVISION_MODE=simulate (this queenzee models the fleet)`);
-    return { reconciled: false, state: 'refused', dry_run: true, reason: outboundRefusal('re-point a real xource at its remote', p) };
-  }
-
-  let token = null;
-  try { token = (await tokenForSpawn(p.id, 'github'))?.token || null; } catch { /* no token = anonymous fetch (public repo) */ }
-
-  const r = await reconcileRemote({
-    repoRoot: String(p.repo_root).replace(/\\/g, '/'),
-    branch: p.main_branch, remoteUrl: p.remote_url, token,
-  });
-  // Record the head on any successful read of the ref — reconciled or up-to-date is a fact about
-  // the xource, and recordXourceHead is what the regression monitor compares against.
-  if (r.reconciled || r.state === 'up-to-date') {
-    await recordXourceHead(p, p.main_branch, r.to || headCommit(p.repo_root, p.main_branch));
-  }
-  if (r.reconciled) {
-    logline('projects', `${by} reconciled ${p.name}: origin/${p.main_branch} → ${(r.to || '').slice(0, 8)} (dropped ${r.dropped ?? '?'} local commit${r.dropped === 1 ? '' : 's'})`);
-    broadcast('project', p);
-  }
-  return r;
 }
 
 // ── OUTBOUND (opt-in, human-gated): does this project's PAT carry write access? ──

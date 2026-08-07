@@ -439,8 +439,10 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, lan
                         onClose={onClose} />;
 }
 
-// A shell inside a fleet container, opened from the chip's context menu. The bridge runs a
-// docker-exec TTY (bash, or sh where the image has no bash) — no sshd required in the target.
+// A shell inside a fleet container, opened from the chip's context menu (and the queenzee node).
+// The bridge runs a docker-exec TTY — no sshd required in the target. When the image has tmux
+// (the queenzee does), it is `tmux new -A -s zh-<id>` so reconnecting re-attaches the same
+// session, matching cxell zee terminals; images without tmux fall back to a one-shot bash/sh.
 // It carries the SAME terminal features the xell door has: a file explorer into the container's
 // filesystem, clickable paths in the output, and a footer with a copyable docker-exec command so
 // a human can reach the same shell from their own machine. A PRODUCTION container's modal wears

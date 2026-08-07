@@ -42,7 +42,7 @@ import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
          getComposeOnboardingPlan, applyComposeOnboarding,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
-         cloneProject, pullProject, reconcileProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
+         cloneProject, pullProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
 import { probeRemote } from '../lib/remote-git.js';
 import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
@@ -93,7 +93,7 @@ import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addCo
 import { listReflections, fileReflectionAsTicket } from '../lib/reflections.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
-import { xourceState, cleanXourceNow, commitXourceStaged, stashXource, listXourceCleanRequests,
+import { xourceState, cleanXourceNow, commitXourceStaged, commitXourceDirty, stashXource, listXourceCleanRequests,
          decideXourceClean, dismissXourceClean } from '../lib/xource-clean.js';
 import { listManagerMintRequests, decideManagerMint, dismissManagerMint } from '../lib/manager-mint.js';
 import { listCredentialInjectRequests, decideCredentialInject, dismissCredentialInject,
@@ -521,13 +521,6 @@ router.post('/projects/clone', async (req, res) => {
 // Refusals are {pulled:false, reason} with HTTP 200 — the console shows the reason.
 router.post('/projects/:id/pull', async (req, res) => {
   try { res.json(await pullProject(req.params.id, req.body?.by || 'human@console')); }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-// Human-triggered reconcile: re-point local main at the recorded remote's tip when they have
-// DIVERGED (a fast-forward Pull cannot, and Xource Clean resets to the dirty LOCAL tip). The action
-// that makes an ordinary PR work again after the remote was squashed clean. Same gates as Pull.
-router.post('/projects/:id/reconcile', async (req, res) => {
-  try { res.json(await reconcileProject(req.params.id, req.body?.by || 'human@console')); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // ── GitHub OUTBOUND (opt-in, human-gated) — only when the PAT carries write access ────────────
@@ -2030,6 +2023,17 @@ router.post('/projects/:id/xource/commit', async (req, res) => {
 router.post('/projects/:id/xource/stash', async (req, res) => {
   try {
     res.json(await stashXource(req.params.id, {
+      message: req.body?.message || null,
+      by: req.body?.by || 'human@console',
+    }));
+  } catch (err) { res.status(409).json({ error: err.message }); }
+});
+// Commit the xource's DIRTY work in ONE step (stage tracked changes, then commit) — the "commit
+// locally" door. Unlike /xource/commit (staged-only), this needs no separate staging step, so a
+// human can commit their local work and then push. Same guards (on main, PROVISION_MODE).
+router.post('/projects/:id/xource/commit-dirty', async (req, res) => {
+  try {
+    res.json(await commitXourceDirty(req.params.id, {
       message: req.body?.message || null,
       by: req.body?.by || 'human@console',
     }));
