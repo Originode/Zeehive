@@ -151,3 +151,53 @@ Two honesty rules are built in:
 Proven end to end in `test/github-pr-squash.test.mjs`, against a bare repo whose pre-receive hook
 scans the push range with `git log -S` the way push protection does: the ordinary PR is refused, the
 squashed one opens, the pushed tree is byte-identical, and the local repo comes out unchanged.
+
+## The recurring case — and the lint that now catches it before it ships (2026-08-05)
+
+The 2026-08-04 incident had a second half nobody wanted to relearn: the hex fixture was removed in
+`df10664`, the TIP was clean, and the range STILL refused every push because push protection scans
+the commits, not the tip. That is not a one-off — it is the shape of the recurring failure:
+
+1. a test adds a secret-shaped fixture (`sk-` + 32 invented hex chars is enough);
+2. a later commit removes it again, so the tree is clean;
+3. every push from that branch re-scans the range, finds the string, and refuses (GH013);
+4. the only way forward is the squashed snapshot, which silently drops the branch's own history.
+
+**`test/secret-shaped-fixtures.test.mjs` now scans the HISTORY as well as the tree.** It pipes
+`git log -p` and checks every ADDED line against the same twelve vendor patterns, so a string that
+was ever introduced into the branch's history fails the build the moment it lands — before it can
+sit in a range for 112 commits. The two known 2026-08-04 introductions are grandfathered by commit
+sha (a forward-only repo does not rewrite history), and each grandfather entry is verified to still
+be exactly that incident, so the list cannot rot into a licence for the next one.
+
+The fix for a branch that ALREADY carries a secret-shaped string in its range is still the same as
+it was: rewrite the introducing commit out of the history (a human call — it rewrites branch
+history), or open the PR from the squashed snapshot. The lint is what stops the *next* branch from
+ever being in that position.
+
+## The RECONCILE verb — the ordinary-PR fix for a branch that is already dirty (2026-08-06)
+
+The lint prevents FUTURE incidents, but a branch that already carries the string in its range still
+forces the squash today. There are three remedies, and the first two were the only console paths:
+
+- **rewrite the history** — a human call, and it rewrites the branch's own history;
+- **the squashed snapshot** — works, but silently drops the branch's history;
+- **`⟲ Reconcile`** (Project setup → GitHub remote) — the new third option.
+
+Reconcile re-points the **checked-out local `main`** at the recorded remote's tip. It is the answer
+when the remote was **squashed or re-written clean** while the local branch kept the old dirty
+range: the fast-forward Pull refuses ("reconcile by hand"), Xource Clean resets to the dirty LOCAL
+tip, and an ordinary PR keeps getting refused because push protection scans the range. Reconcile is
+the one action that makes the ordinary (non-squashed) PR work again.
+
+It is deliberately narrow, and a human confirms it first because **local-only commits are
+discarded** (that is the point — they are the dirty range):
+
+- only ever re-points the checked-out `main` to `origin/<main>` — no other ref, worktree or xell;
+- refuses a dirty tree (same stance as Pull: never discard uncommitted work);
+- refuses when local is strictly BEHIND the remote (that is a fast-forward Pull, not a reconcile);
+- up-to-date → nothing dropped, reported as such;
+- PROVISION_MODE-gated and human-confirmed like every outbound verb.
+
+Proven end to end in `test/github-reconcile.test.mjs`: the diverged branch reconciles, the ordinary
+PR then opens (no squash body), and the guards (dirty tree, wrong branch, behind) all hold.

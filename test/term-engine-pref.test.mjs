@@ -108,6 +108,7 @@ ok(pref.TERM_THEME_PALETTES.dark.colors[7] === pref.TERM_THEME_PALETTES.dark.for
    "dark palette: color-7 matches fg (wterm DEFAULT bg → 7)");
 ok(pref.TERM_THEME_PALETTES.light.background !== pref.TERM_THEME_PALETTES.light.foreground,
    "light palette has contrasting bg/fg");
+ok(host.includes("wheel") && host.includes("[<"), "wterm forwards mouse-wheel to the PTY (SGR) when DOM cannot scroll");
 ok(host.includes("setTheme") && host.includes("applyWtermPalette"),
    "termHost exposes setTheme and applies the full wterm CSS palette");
 ok(/term-theme-toggle/.test(read('../web/src/styles.css')),

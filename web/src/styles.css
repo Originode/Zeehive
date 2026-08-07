@@ -882,16 +882,30 @@ a.cbox:hover { border-color: var(--accent); }
 .term-xterm .xterm, .term-xterm .xterm-viewport { height: 100%; }
 /* wterm host: drop the library's demo chrome (padding/radius/shadow) so it sits flush inside
    the modal the same way xterm does. The holder keeps ITS layout (absolute for the firehose
-   .term-xterm, flex child for .zeeterm-body) — we only restyle the wterm skin. */
+   .term-xterm, flex child for .zeeterm-body) — we only restyle the wterm skin.
+   overflow-y MUST stay scrollable: wterm paints scrollback ABOVE the viewport rows and
+   scrolls the host element; vendor CSS defaults to overflow:hidden and loads AFTER us when
+   the engine is first picked, so we pin it with !important. */
 .term-wterm-host.wterm {
   width: 100%; height: 100%;
+  max-height: 100%;
+  min-height: 0;
   padding: 0 !important; border-radius: 0 !important; box-shadow: none !important;
-  overflow: auto; box-sizing: border-box;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  overscroll-behavior: contain;
+  box-sizing: border-box;
   background: var(--term-bg, #0b0e14);
 }
-.zeeterm-body.term-wterm-host { min-height: 0; /* stay a flex child */ }
-.term-wterm-host .term-grid { min-height: 100%; }
-.term-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+.term-wterm-host.wterm.has-scrollback { overflow-y: auto !important; }
+.zeeterm-body.term-wterm-host {
+  min-height: 0; /* stay a flex child */
+  /* padding ate into the grid and confused height; keep chrome outside the scrollport */
+  padding: 0;
+}
+/* Do NOT min-height:100% the grid — that can pin content to the viewport height and make
+   scrollHeight == clientHeight so the host never becomes a scrollport. */
+.term-wterm-host .term-grid { min-height: 0; }.term-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--muted); font-family: 'Cascadia Code', monospace; font-size: 12px; pointer-events: none; }
 
 /* which engine this open terminal is on (xterm | wterm) — set in Console settings ⚙ */

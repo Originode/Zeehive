@@ -256,6 +256,52 @@ async function mountWterm(el, opts) {
   };
   el.addEventListener('click', onPathClick);
 
+  // SCROLL. wterm has no built-in wheel handler. Two cases:
+  //   1. Normal screen + DOM scrollback → browser-scroll the host (overflow-y: auto).
+  //   2. Alt screen, or no DOM room to scroll, or tmux mouse mode → send SGR wheel
+  //      events to the PTY so tmux/less/claude can scroll (xterm does this natively).
+  // Without (2) a live zee terminal feels frozen: the wheel does nothing.
+  const sendData = opts.disableStdin ? null : (opts.onData || null);
+  const onWheel = (e) => {
+    const bridge = term.bridge;
+    const alt = !!bridge?.usingAltScreen?.();
+    const sb = bridge?.getScrollbackCount?.() || 0;
+    const maxScroll = el.scrollHeight - el.clientHeight;
+    const canDom = !alt && maxScroll > 2;
+    if (canDom) {
+      const atTop = el.scrollTop <= 0;
+      const atBottom = el.scrollTop >= maxScroll - 2;
+      // Room to move inside history — let the browser scroll the host.
+      if ((e.deltaY < 0 && !atTop) || (e.deltaY > 0 && !atBottom)) return;
+      // At the top of history, scrolling up is a no-op (don't leak to the page).
+      if (e.deltaY < 0 && atTop) { e.preventDefault(); return; }
+      // At the bottom scrolling down with no alt screen: nothing to do in history.
+      // Fall through to PTY only when the app might want the wheel (tmux mouse).
+    }
+    if (!sendData) { e.preventDefault(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    // deltaMode: 0=pixel, 1=line, 2=page
+    const lineDelta = e.deltaMode === 1 ? e.deltaY
+      : e.deltaMode === 2 ? e.deltaY * (term.rows || 24)
+      : e.deltaY / 40;
+    const steps = Math.min(12, Math.max(1, Math.round(Math.abs(lineDelta)) || 1));
+    const btn = e.deltaY < 0 ? 64 : 65; // SGR extended: wheel up / wheel down
+    let col = 1, row = 1;
+    try {
+      const rh = parseFloat(getComputedStyle(el).getPropertyValue('--term-row-height')) || 17;
+      const ch = measureCh(el) || 8;
+      const rect = el.getBoundingClientRect();
+      col = Math.max(1, Math.min(term.cols || 80, Math.floor((e.clientX - rect.left) / ch) + 1));
+      // row is viewport-relative (not scrollTop) — mouse protocol is about the grid
+      row = Math.max(1, Math.min(term.rows || 24, Math.floor((e.clientY - rect.top) / rh) + 1));
+    } catch { /* layout mid-teardown */ }
+    let payload = '';
+    for (let i = 0; i < steps; i++) payload += `\x1b[<${btn};${col};${row}M`;
+    sendData(payload);
+  };
+  el.addEventListener('wheel', onWheel, { passive: false });
+
   const handle = {
     engine: 'wterm',
     get cols() { return term.cols; },
@@ -307,6 +353,7 @@ async function mountWterm(el, opts) {
     dispose() {
       document.removeEventListener('selectionchange', onSelChange);
       el.removeEventListener('click', onPathClick);
+      el.removeEventListener('wheel', onWheel);
       selCb = null;
       pathActivate = null;
       try { term.destroy(); } catch { /* */ }

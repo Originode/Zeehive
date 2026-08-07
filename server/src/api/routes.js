@@ -42,7 +42,7 @@ import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
          getComposeOnboardingPlan, applyComposeOnboarding,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
-         cloneProject, pullProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
+         cloneProject, pullProject, reconcileProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
 import { probeRemote } from '../lib/remote-git.js';
 import { listHostMounts, mountHostFolder } from '../lib/self-mount.js';
 import { config } from '../config.js';
@@ -521,6 +521,13 @@ router.post('/projects/clone', async (req, res) => {
 // Refusals are {pulled:false, reason} with HTTP 200 — the console shows the reason.
 router.post('/projects/:id/pull', async (req, res) => {
   try { res.json(await pullProject(req.params.id, req.body?.by || 'human@console')); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Human-triggered reconcile: re-point local main at the recorded remote's tip when they have
+// DIVERGED (a fast-forward Pull cannot, and Xource Clean resets to the dirty LOCAL tip). The action
+// that makes an ordinary PR work again after the remote was squashed clean. Same gates as Pull.
+router.post('/projects/:id/reconcile', async (req, res) => {
+  try { res.json(await reconcileProject(req.params.id, req.body?.by || 'human@console')); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // ── GitHub OUTBOUND (opt-in, human-gated) — only when the PAT carries write access ────────────

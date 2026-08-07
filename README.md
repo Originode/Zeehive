@@ -1,110 +1,185 @@
-# ZEEHIVE
+<p align="center">
+  <img src="web/public/zeehive-logo.svg" width="120" alt="ZEEHIVE logo">
+</p>
 
-A deterministic agent-environment orchestrator that **runs itself**: start it against nothing,
-and it clones this repo from GitHub, onboards itself as its first project, and is ready to cut
-isolated environments for AI agents to work in.
+<h1 align="center">ZEEHIVE</h1>
 
-## Self-start
+<p align="center">
+  <strong>A deterministic agent-environment orchestrator that runs itself.</strong><br>
+  Start it against nothing — it clones this repo, onboards itself as its first project,
+  and is ready to cut isolated environments for AI agents to work in.
+</p>
 
-Requirements: Docker (with compose). No checkout, no build — published images:
+<p align="center">
+  <a href="#quickstart"><img alt="Quickstart" src="https://img.shields.io/badge/-Quickstart-35c46b?style=for-the-badge"></a>
+  <a href="#how-it-works"><img alt="How it works" src="https://img.shields.io/badge/-How_it_works-5b8cff?style=for-the-badge"></a>
+  <a href="#the-gates"><img alt="The gates" src="https://img.shields.io/badge/-The_gates-e5554e?style=for-the-badge"></a>
+  <a href="#developing-zeehive"><img alt="Develop" src="https://img.shields.io/badge/-Develop-e0a53b?style=for-the-badge"></a>
+</p>
+
+---
+
+## What is ZEEHIVE?
+
+ZEEHIVE is the control plane for a **fleet of AI agents that write code**. It gives each agent an
+isolated, reproducible workspace — a **xell** — with its own git branch, database and containers,
+and puts a human gate in front of every irreversible action (landing on `main`, shipping to
+production, touching production data).
+
+The core idea is simple:
+
+> **Provisioning is deterministic and belongs in a script; the AI should only do the actual work,
+> starting from a proven-correct environment — and anything irreversible needs a human's click.**
+
+It is built in Node.js and React (ES modules throughout), uses PostgreSQL as its single source of
+truth, and runs entirely on Docker. No external AI platform is required to *run* it — you connect
+your own AI provider credentials (Claude, OpenAI Codex, Kimi, Grok, DeepSeek, Gemini, Z.ai) to
+dispatch agents.
+
+## Key features
+
+- **🧱 Isolated workspaces per task** — every agent gets its own xell: a git worktree, branch,
+  database and app containers. No shared state, no cross-agent interference, and no
+  "works on my machine".
+- **🔒 Human gates on everything irreversible** — landing on `main`, shipping to production and
+  touching production data are held until a human approves the exact sha in the console.
+- **🧠 Provider-agnostic** — dispatch the same task to Claude, Codex, Kimi, Grok, DeepSeek, Gemini
+  or Z.ai; each runs in its own hardened cxell container with a default-deny firewall.
+- **🎛️ Live honeycomb console** — watch the whole fleet as colour-coded hexagons: provisioning,
+  working, idle, holding, or asking a human for a land/ship/prod decision.
+- **⚙️ Deterministic core** — the queenzee is pure script, no AI. Provisioning, pooling, monitoring
+  and teardown are reproducible by construction; AI is invoked only at dispatch.
+
+## Quickstart
+
+**Requirements:** Docker with Compose. No checkout, no build — published images:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Originode/Zeehive/master/docker-compose.bootstrap.yml
 docker compose -f docker-compose.bootstrap.yml up -d
 ```
 
-(Developing ZEEHIVE itself? Clone the repo and build from source instead:
-`docker network create zee-hive-net`, then
-`docker compose -f docker/zeehive/docker-compose.prod.yml up -d --build meta-db server web`.
+On first boot, ZEEHIVE migrates its own fresh database and **self-onboards**: it clones this repo
+from GitHub, registers it as the `Zeehive` project, installs the landing gate, and sets the spawn
+template. Then:
+
+1. Open the console at **http://localhost:5180** (API on `:4700`)
+2. Go to **Project setup → Tokens** and connect your AI provider — for Claude: run `claude setup-token` and paste the long-lived token it prints
+3. Raise the **pool target** to pre-warm xells
+4. Type a task into **+ new prompt** — a zee goes to work in one
+
+> **Run your own fork:** set `ZEEHIVE_SELF_REMOTE` (and `ZEEHIVE_GITHUB_TOKEN` for a private repo —
+> a fine-grained PAT with Contents: Read-only) in a `.env` file next to the bootstrap compose.
+> A truly fresh re-run: delete the `zeehive_meta_data` + `zeehive_repos` volumes and `up -d` again.
+
+**Developing ZEEHIVE itself?** Clone the repo and build from source instead:
+
+```sh
+docker network create zee-hive-net
+docker compose -f docker/zeehive/docker-compose.prod.yml up -d --build meta-db server web
+```
+
 That file is the build-from-source twin of the bootstrap one — same project name, same container
-names, same ports — so a stack booted either way is shippable by the same scripts.)
+names, same ports — so a stack booted either way is shippable by the same scripts.
 
-That's the whole loop. On first boot the server migrates its **own fresh meta-DB**
-(`zeehive_meta_data` volume), then **self-onboards**: it clones this repo into the `zeehive_repos`
-volume, registers it as the `Zeehive` project with a pull-only GitHub remote, installs the
-landing gate, and sets the spawn template. The console is on **http://localhost:5180**
-(API :4700; the from-source developer compose uses :4701 to coexist with a live instance).
+---
 
-To actually dispatch an agent you need one credential: Project setup → **Tokens** → connect
-Claude (`claude setup-token`). Then raise the **pool target** and pre-warmed xells appear —
-each with its own worktree, branch, and database container. Type a task into **+ new prompt**
-and a zee goes to work in one.
+## How it works
 
-- Self-onboard from a fork: set `ZEEHIVE_SELF_REMOTE` (and `ZEEHIVE_GITHUB_TOKEN` for a private
-  repo — a fine-grained PAT with Contents: Read-only) in `docker/zeehive/.env`.
-- A truly fresh re-run is: delete the `zeehive_meta_data` + `zeehive_repos` volumes and
-  `up -d` again.
+### The architecture
 
-## The vocabulary
+```mermaid
+flowchart LR
+  subgraph Human["Human"]
+    CONSOLE["Web console :5180"]
+    HUMAN["Human reviewer"]
+  end
 
-- **xource** — the source a *xell* branches from: the project's local clone and its main branch.
-  Read-only to xells. Synced from GitHub **inbound by default** (clone + fast-forward pull).
-  Pushing out stays a **human act**: outbound Push / open-PR only surface when the project's PAT
-  carries write access, and each one is a confirmed click in the console — never a zee's to make.
-- **xell** — an isolated environment: a git worktree + its own branch + its own containers
-  (per-xell database, server, webapp) + generated config (`.zeehive.env`). The unit the
-  orchestrator pools, spawns, tracks, and tears down.
-- **cxell** — a *caged xell*: the locked-down container a headless zee actually works in
-  (`cxell_<slug>` on the `zee-hive-net` network). No docker socket, no host filesystem, a
-  default-deny egress firewall — the queenzee API is its only door out, and every privileged
-  verb behind that door lands on a human gate. The repo enters as a git bundle; commits leave
-  the same way. The zee's manual is not a file in this repo: it lives in the **meta-DB** (harness
-  `zee-base`, seeded and amended by `db/migrations/`) and is delivered into every xell at
-  `.zeehive/harness/memory/cxell-zee-manual.md`, so it can never drift from the API it documents.
-- **zee** — an agent (a Claude session) bound to exactly one xell, running inside its cxell.
-- **manager zee** — a zee whose job is running OTHER zees: it dispatches workers, talks to them in
-  real time, reads their post-ship reflections, and suggests when one is done (a human confirms).
-  It holds the production database **read-only** (its own SELECT-only postgres role) and has **zero
-  push/PR access to the xource** — it writes no code and lands none. Humans add them, unlimited;
-  a manager can never mint another. See [docs/manager-zees.md](docs/manager-zees.md).
-- **queenzee** — the orchestrator. **Pure script, no AI.** It provisions/reaps deterministically,
-  keeps the pool warm, monitors health, runs maintenance, and executes the privileged actions
-  humans approve. AI is invoked only at dispatch — never in routine loops.
+  subgraph Orchestrator["Orchestrator"]
+    QZ["Queenzee :4700 (pure script, no AI)"]
+    DB[("Meta-DB PostgreSQL")]
+    POOL["Pool maintainer"]
+    MON["Monitor"]
+    REAP["Reaper"]
+    LAND["Landing gate"]
+    SHIP["Ship gate"]
+  end
 
-The insight: **provisioning is 100% deterministic and belongs in a script; the AI should only do
-the actual work, starting from a proven-correct environment — and anything irreversible needs a
-human's click.**
+  subgraph Fleet["Agent fleet"]
+    direction LR
+    X1["Xell (worktree + branch)"]
+    X2["Xell (worktree + branch)"]
+    X3["...more xells"]
+    CX1["Cxell (caged container)"]
+    CX2["Cxell (caged container)"]
+    CX3["...more cxells"]
+  end
 
-## The gates (how nothing irreversible happens on an agent's say-so)
+  subgraph Providers["AI providers"]
+    P1["Claude"]
+    P2["Codex"]
+    P3["Kimi / Grok / DeepSeek / Gemini / Z.ai"]
+  end
 
-- **Landing gate** — a zee lands work with `git push . HEAD:main` inside its xell; a git `update`
-  hook on the xource asks the queenzee, and the push is **held** until a human approves that
-  exact sha in the console. Fails closed. Installed automatically on every onboarded project.
-- **Ship gate** — production deploys are requests; a human approves, and the *queenzee* builds
-  from the landed main and deploys. A zee never holds the prod lock or runs a prod build.
-- **Prod data** — binding a xell to a production database is a per-xell human grant.
-- **Done** — a zee proposes it's finished (and can withdraw that with `zee done --clear` if it is
-  handed more work); a human's "Mark done" is what tears the cxell down
-  (commits are collected first). A **manager zee** may only *suggest* that another xell is done —
-  the same human click, with a typed confirmation, is still what ends it.
+  CONSOLE --> QZ
+  HUMAN --> CONSOLE
+  QZ <--> DB
+  QZ --> POOL
+  QZ --> MON
+  QZ --> REAP
+  QZ <--> LAND
+  QZ <--> SHIP
+  POOL --> X1 & X2 & X3
+  X1 --> CX1
+  X2 --> CX2
+  X3 --> CX3
+  CX1 & CX2 & CX3 --> P1 & P2 & P3
+  CX1 & CX2 & CX3 -- "zee CLI (requests only)" --> QZ
+  LAND -- "human approves" --> HUMAN
+  SHIP -- "human approves" --> HUMAN
+```
 
-And one control that is the opposite of a gate — a gate holds ONE act until a human agrees; this
-stops everything until they say otherwise:
+### The vocabulary
 
-- **Pause / play** — one button in the console statusline, fleet-wide across every project. **Pause**
-  interrupts the running turn in every live cxell (workers *and* manager zees) with a SIGINT, and
-  holds down everything that would start another: no dispatch, no landing/clearance/reflection nudge,
-  no operator or manager message reaching a session. It touches nothing else — no commit, no branch,
-  no request, no gate — so a paused zee loses the remainder of its turn and nothing more, and the
-  paused hexagons say `paused` rather than going quiet. **Play** lowers the flag and calls back
-  exactly the zees the pause interrupted, each with a prompt telling it what happened (an interrupted
-  turn is otherwise indistinguishable from a crash) and sending it to `zee status` for anything that
-  changed while it was stopped. It is a HUMAN verb only: there is no `zee pause`, because a zee that
-  could stop the fleet could stop the zee about to land a rival change.
+| Term | What it is |
+|---|---|
+| **xource** | The source a *xell* branches from: the project's local clone and its main branch. Read-only to xells. Synced from GitHub inbound; pushing out stays a **human act**. |
+| **xell** | An isolated environment: a git worktree + its own branch + its own containers (per-xell database, server, webapp) + generated config (`.zeehive.env`). The unit the orchestrator pools, spawns, tracks, and tears down. |
+| **cxell** | A *caged xell*: the locked-down container a headless zee actually works in. No docker socket, no host filesystem, a default-deny egress firewall — the queenzee API is its only door out, and every privileged verb behind that door lands on a human gate. |
+| **zee** | An agent (an AI model session) bound to exactly one xell, running inside its cxell. |
+| **queenzee** | The orchestrator. **Pure script, no AI.** It provisions/reaps deterministically, keeps the pool warm, monitors health, runs maintenance, and executes the privileged actions humans approve. |
 
-## GitHub-centric, inbound by default — outbound opt-in
+The console shows the fleet as a **honeycomb of hexagons**, colour-coded by activity: cold violet
+(provisioning) → blue (ready/claimed) → green (working) → amber (needs attention) → orange
+(production) → red (land/ship/prod being touched).
+
+### The gates
+
+| Gate | What it does |
+|---|---|
+| **Landing gate** | A zee lands work with `git push . HEAD:main` inside its xell; a git `update` hook on the xource asks the queenzee, and the push is **held** until a human approves that exact sha in the console. Fails closed. |
+| **Ship gate** | Production deploys are requests; a human approves, and the *queenzee* builds from the landed main and deploys. A zee never holds the prod lock or runs a prod build. |
+| **Prod data** | Binding a xell to a production database is a per-xell human grant. |
+| **Done** | A zee proposes it's finished; a human's "Mark done" is what tears the cxell down. |
+
+Plus one control that is the opposite of a gate — it stops everything until a human says otherwise:
+
+- **Pause / play** — one button in the console statusline, fleet-wide. **Pause** interrupts every
+  live zee mid-turn; **Play** calls them back with a prompt telling them what happened. Nothing is
+  lost: no commit, no branch, no request, no gate is touched.
+
+---
+
+## GitHub-centric, inbound by default
 
 The code lives on GitHub; every instance is born from it (self-onboard) and refreshed from it
-(the console's ff-only **Pull**). The dev cycle itself — landing, integration, prod builds —
-runs entirely on the local xource and never depends on GitHub being reachable.
+(the console's fast-forward-only **Pull**). The dev cycle itself — landing, integration, prod
+builds — runs entirely on the local xource and never depends on GitHub being reachable.
 
-Publishing local main *out* to GitHub is opt-in and human-gated. The console probes the
-project's stored GitHub PAT (`GET …/github-access`): only when it actually carries **write**
-access do a **Push** (local main → the remote branch, fast-forward only) and an **open-PR**
-(push a side branch + open a pull request) appear in Project setup, and each fires only from a
-human's confirmed click. A read-only (Contents: read) token — the recommended default — never
-lights those buttons, and a **zee can never reach them**: outbound lives only on the console's
-human surface, behind a `showConfirm`, exactly like every other irreversible act.
+Publishing local `main` *out* to GitHub is opt-in and human-gated. Only when the project's stored
+GitHub PAT carries **write** access do a **Push** and **open-PR** appear in Project setup — and each
+fires only from a human's confirmed click. A read-only (Contents: read) token — the recommended
+default — never lights those buttons, and **a zee can never reach them**.
 
 ## Layout
 
@@ -119,26 +194,32 @@ web/             the console (React + Vite) — honeycomb fleet view, gates, ter
 docker/zeehive/  Dockerfile.server (the queenzee), Dockerfile.zee-agent (the cxell image),
                  Dockerfile.web, docker-compose.prod.yml, migration playbook (README.md)
 scripts/         provisioning/despawn/build/ship scripts + `zee`, the ONE copy of the in-cxell
-                 CLI (the zee-agent image COPYs it from the repo-root build context; the
-                 queenzee also installs it into each cxell at spawn — never a second copy)
+                 CLI
 docs/            deploy-topology spec, manager zees, the work tracker, harnesses
 ```
 
-**Working on ZEEHIVE (human or zee)? Start at [CLAUDE.md](CLAUDE.md)** — how to tell which surface
-you are on, the verbs that are actually yours, how to run and verify, and a map of the docs.
+---
 
-## Developing ZEEHIVE with ZEEHIVE
+## Developing ZEEHIVE
+
+Working on ZEEHIVE (human or zee)? Start at **[CLAUDE.md](CLAUDE.md)** — it tells you which surface
+you're on, the verbs that are actually yours, how to run and verify, and a map of the docs.
+
+```sh
+# Local development — one command each:
+npm install
+npm run db:migrate     # apply db/migrations/*.sql
+npm run dev            # API (queenzee + routes) + web console together
+```
+
+Tests are standalone Node scripts in `test/` — run one directly:
+`node test/<name>.test.mjs`. There is no `npm test`.
 
 ZEEHIVE is its own first project: work on it happens in xells like any other project. A Zeehive
-xell gets its own per-xell meta-DB container (`zeehive_db_spin_<slug>`), and the nested queenzee
-inside it runs with simulate-mode safety defaults (`zeehive.yml`) — every provisioning, teardown,
-build, deploy-file and backup path is mode-gated, so it provisions and deploys nothing. It is **not**
-fully sealed off, though: its meta-DB is a clone of the real one, the flags gate actions rather than
-reads, and `proddiff` reads real production databases with no mode gate
-([docs/nested-queenzee-containment.md](docs/nested-queenzee-containment.md) is the loop-by-loop
-audit). Landed work reaches the running instance via its **self-ship**: the approved ref is
-rebuilt and the server replaces itself, finishing the ship record on the new boot.
+xell gets its own per-xell meta-DB container, and the nested queenzee inside it runs with
+simulate-mode safety defaults — every provisioning, teardown, build, deploy-file and backup path is
+mode-gated, so it provisions and deploys nothing.
 
-Legacy note: a host-process deployment mode (the pre-container era) still exists alongside the
-container mode during the migration — [docker/zeehive/README.md](docker/zeehive/README.md) is
-the authoritative playbook for what runs where and what remains before full cutover.
+## License
+
+UNLICENSED — all rights reserved.
