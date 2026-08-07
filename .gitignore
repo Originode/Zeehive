@@ -1,5 +1,8 @@
 node_modules/
 dist/
+# Vendored third-party packages ship their own dist/ — keep those (wterm is one).
+!web/vendor/**/dist/
+!web/vendor/**/dist/**
 build/
 .env
 .env.local

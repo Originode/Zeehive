@@ -6,7 +6,8 @@
 // shows a spinner), the build runs via async spawn, and the row + SSE update when it finishes.
 // BUILD_MODE=simulate opts out of Docker entirely (demo escape hatch); default is REAL.
 import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
@@ -14,6 +15,10 @@ import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
 import { npmCacheEnv } from '../lib/npm-cache.js';
+import {
+  processRoleReachableHost, processRolePublishedUrl,
+  probePublishedRole, publishedUrl,
+} from '../queenzee/containers.js';
 
 const MODE = process.env.BUILD_MODE === 'simulate' ? 'simulate' : 'real';
 const BUILDABLE = new Set(['server', 'webapp']); // db is shared infra — not a per-xell build
@@ -184,6 +189,20 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   return { status: 'building', container: c.name, role: c.role, hot, mode: MODE };
 }
 
+// Last lines of the process-role boot log (worktree/.zeehive-<role>.log). Surfaced by
+// getBuildStatus when the published port refuses, so --wait can tell a zee WHY.
+export function processBootLogTail(worktree, role, { lines = 30 } = {}) {
+  if (!worktree || !role) return null;
+  const p = join(worktree, `.zeehive-${role}.log`);
+  if (!existsSync(p)) return null;
+  try {
+    const text = readFileSync(p, 'utf8');
+    const all = text.trimEnd().split(/\r?\n/);
+    if (!all.length || (all.length === 1 && all[0] === '')) return null;
+    return all.slice(-lines).join('\n');
+  } catch { return null; }
+}
+
 // (Re)start a process role in its worktree — the process-runner twin of the docker build above.
 // Same lifecycle contract: health='building' while the script runs, terminal 'up'/'down' set ONLY
 // by this callback (the monitor skips 'building'), same strand-guard, same recorded commit. The
@@ -193,9 +212,15 @@ function startProcessRole(c, xell, project) {
   const startCmd = project?.manifest?.roles?.[c.role]?.start
     || (c.role === 'server' ? 'npm run server' : 'npm run web');
   return (async () => {
-    const building = await one(`UPDATE container SET health='building' WHERE id=$1 RETURNING *`, [c.id]);
+    // Heal a stale published host (pre-TKT-136 rows stamped the dev machine's ip). The process
+    // lives in the queenzee's namespace — the binding must say so before --wait probes it.
+    const reachHost = processRoleReachableHost();
+    const reachUrl = processRolePublishedUrl(c.host_port);
+    const building = await one(
+      `UPDATE container SET health='building', host=$2, url=$3 WHERE id=$1 RETURNING *`,
+      [c.id, reachHost, reachUrl]);
     broadcast('container', building);
-    logline('build', `process start: ${c.name} (${MODE}) — "${startCmd}" in ${xell.slug} @ :${c.host_port}`);
+    logline('build', `process start: ${c.name} (${MODE}) — "${startCmd}" in ${xell.slug} @ ${reachHost}:${c.host_port}`);
 
     // background — do NOT await; npm install on a cold worktree takes minutes
     (async () => {
@@ -263,23 +288,63 @@ export async function getBuildStatus(xellId) {
 
   const cs = await q(
     `SELECT c.id, c.name, c.role, c.health, c.last_build_commit, c.last_built_at, c.hot_build,
-            c.docker_ctx, c.build_ctx, c.project_id
+            c.docker_ctx, c.build_ctx, c.project_id, c.url, c.host, c.host_port
        FROM container c WHERE c.owner_xell_id=$1 AND c.role = ANY($2) ORDER BY c.role`,
     [xellId, [...BUILDABLE]]);
 
   // The registry that a split build would use (project's own, else the global default). Reported so
   // a zee can tell whether a foreign build_ctx is even possible before it tries.
   const registry = cs.length ? await registryFor(cs[0].project_id) : (config.registry || null);
-  const containers = cs.map((c) => ({
-    ...c,
-    // where it COMPILES vs where it RUNS — 'split' when they differ (the image rides the registry).
-    build_ctx: c.build_ctx || c.docker_ctx,
-    run_ctx: c.docker_ctx,
-    split_build: !!c.build_ctx && c.build_ctx !== c.docker_ctx,
-    // A HOT build re-used the old image, so its recorded commit does NOT mean the code is live.
-    serving_head: !!head && !c.hot_build && c.health === 'up' && sameCommit(c.last_build_commit, head),
-    never_built: !c.last_build_commit,
-  }));
+
+  // TKT-136 defect #2: --wait must not report UP from a readiness signal that does not prove the
+  // published port serves. Live-probe each settled container at its PUBLISHED host:port (no
+  // localhost shortcut). A refused/timed-out port is DOWN for --wait, with the boot-log tail so
+  // the zee sees why — even if the monitor row still says 'up' from a localhost-only answer.
+  const containers = [];
+  for (const c of cs) {
+    // Process roles (docker_ctx NULL): restamp a pre-TKT-136 host (dev machine ip) to the
+    // queenzee-reachable address before probing, so --watch after ship heals the binding without
+    // forcing a rebuild. Compose-backed roles keep their stamped host.
+    if (c.docker_ctx == null && c.host_port) {
+      const host = processRoleReachableHost();
+      const url = processRolePublishedUrl(c.host_port);
+      if (c.host !== host || c.url !== url) {
+        await one(
+          `UPDATE container SET host=$2, url=$3 WHERE id=$1 AND docker_ctx IS NULL`,
+          [c.id, host, url]);
+        c.host = host;
+        c.url = url;
+      }
+    }
+    let published_health = null;
+    let boot_log_tail = null;
+    let health = c.health;
+    if (c.health !== 'building') {
+      published_health = await probePublishedRole(c);
+      if (published_health === 'down') {
+        health = 'down';
+        boot_log_tail = processBootLogTail(xell.worktree_path, c.role);
+      } else if (published_health === 'up') {
+        health = 'up';
+      }
+    }
+    containers.push({
+      ...c,
+      health,
+      // where it COMPILES vs where it RUNS — 'split' when they differ (the image rides the registry).
+      build_ctx: c.build_ctx || c.docker_ctx,
+      run_ctx: c.docker_ctx,
+      split_build: !!c.build_ctx && c.build_ctx !== c.docker_ctx,
+      published_url: publishedUrl(c),
+      published_health,
+      boot_log_tail,
+      // A HOT build re-used the old image, so its recorded commit does NOT mean the code is live.
+      // serving_head also requires the published port to answer — not just a health row.
+      serving_head: !!head && !c.hot_build && health === 'up' && published_health === 'up'
+        && sameCommit(c.last_build_commit, head),
+      never_built: !c.last_build_commit,
+    });
+  }
   return {
     xell: { id: xell.id, slug: xell.slug },
     head,

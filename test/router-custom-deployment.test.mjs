@@ -236,6 +236,44 @@ try {
      && /data-testid=\{`dispatch-model-\$\{m\.key\}`\}/.test(disp)
      && /data-testid=\{`dispatch-mode-\$\{m\.mode\}`\}/.test(disp),
      'and the DIRECT panel keeps its own pickers, untouched');
+
+  // ── 7. INSTANT DEPLOY — the second door when something is pinned ──
+  // Custom pins used to travel only via the router. Instant deploy is the path that skips the
+  // router ZEE and POSTs /api/xell/dispatch with those settings; Route via router is unchanged.
+  // "Bypass" means the router zee only — server-side validation and harness provider-lanes stay.
+  console.log('\n── Instant deploy (skip the router zee when custom is pinned) ──');
+  ok(/data-testid="dispatch-instant"/.test(disp),
+     'the footer has an Instant deploy button (data-testid=dispatch-instant)');
+  ok(/wantsInstant/.test(disp) && /customCount > 0 \|\| prodDb/.test(disp),
+     'Instant deploy renders when a live router is present AND (something is pinned OR LIVE PROD is on)');
+  ok(/const instantDeploy = \(\) =>/.test(disp),
+     'Instant deploy is its own handler, not a flag on the via-router submit');
+  // The payload must be a DIRECT dispatch (no via_router) so App.jsx takes POST /api/xell/dispatch.
+  const instantBody = disp.slice(disp.indexOf('const instantDeploy = () =>'),
+                                 disp.indexOf('const submit = () =>'));
+  ok(instantBody.length > 80, 'instantDeploy is a distinct block before submit');
+  // The flag itself must not appear as a payload key. A comment may name it (to say we skip it);
+  // the assertion is about the JSON the parent receives, not the prose around the call.
+  ok(!/via_router\s*:/.test(instantBody),
+     'Instant deploy never sets via_router: — that is the whole point of the button');
+  ok(/instantDispatchOnce\(directPayload\(task,/.test(instantBody),
+     'Instant deploy hands a direct-dispatch payload to onDispatch (through the one-shot door)');
+  // THE IN-FLIGHT GUARD (150): every fire path goes through a one-shot `makeDoor` that refuses a
+  // second call of the same door — the double-click that produced the double-deploy. Assert the
+  // door exists and guards the two submit doors.
+  ok(/const makeDoor = \(\) =>/.test(disp) && /fired = true/.test(disp),
+     'the one-shot door guards every fire path');
+  ok(/instantDispatchOnce = makeDoor\(\)/.test(disp) && /submitDispatchOnce = makeDoor\(\)/.test(disp),
+     'Instant and Route each have their own one-shot door (a double-click fires onDispatch once)');
+  // Route via router must still carry custom pins the way it always has.
+  ok(/\.\.\.\(customCount \? \{ custom \} : \{\}\)/.test(disp) && /via_router:\s*true/.test(disp),
+     'Route via router still carries custom pins on the routing request');
+  // Cmd/Ctrl+Enter stays on the via-router path — Instant is the explicit second button only.
+  ok(/onKeyDown[\s\S]{0,120}submit\(\)/.test(disp),
+     '⌘/Ctrl+Enter still calls submit (via router), not instantDeploy');
+  const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'web/src/styles.css'), 'utf8');
+  ok(/\.disp-submit\.disp-instant\b/.test(css),
+     'Instant deploy has its own style (working-green) so it is not confused with Route via router');
 } finally {
   await cleanup();
   await pool.end();

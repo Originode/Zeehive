@@ -1,14 +1,13 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { getFleet, getTimeline, getDiffs, getLogs, subscribe, markDone,
+import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDone,
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
-         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee, getHarnesses,
+         extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject,
          getXellLangfuseSession, routePrompt, deployRouter, redeployRouter,
          squashHelps, squashOffer } from './api.js';
-import { emptyWarning } from './harnessHealth.js';
-import { promptButtons, hasAnyAccount } from './promptButtons.js';
+import { promptButton, hasAnyAccount } from './promptButtons.js';
 import MessageComposer from './MessageComposer.jsx';
 import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
@@ -43,7 +42,9 @@ import GraphPane from './GraphPane.jsx';
 import { beginPaneReposition, readSplit } from './paneSplit.js';
 import Connectors from './Connectors.jsx';
 import Terminal from './Terminal.jsx';
+import ConsoleSettings from './ConsoleSettings.jsx';
 import ProjectMenu from './ProjectMenu.jsx';
+
 import BackupsPanel, { BackupsModal } from './Backups.jsx';
 import LandingPanel, { LandCard, holdsRunway } from './Landing.jsx';
 import ProdAsksPanel, { ProdBindCard, SeedCard } from './ProdData.jsx';
@@ -148,9 +149,14 @@ function useOrientation() {
 }
 
 // The honeycomb's xell list, streamed in lazily as NDJSON so hexagons appear as their data arrives
-// rather than after the whole fleet resolves. Returns [xells, restream]: `restream` re-runs the
-// stream (called on every live change so the grid stays current). Each pass upserts by id while it
-// streams — existing hexes never flicker — then prunes ids the pass didn't see.
+// rather than after the whole fleet resolves. Returns [xells, restream, syncXells]:
+//   `restream`  re-runs the NDJSON stream (once per project selection — the full-resolve pass).
+//   `syncXells` ADOPTS an already-decorated fleet.xells array into the map without a re-stream.
+//                Called from snapshot delivery so a live change (which brings the whole fleet read
+//                model with it) updates the honeycomb with zero extra /fleet/xells-stream HTTP
+//                requests — the "spamming the fleet stream per event" this refactor stops.
+// Each pass upserts by id while it streams — existing hexes never flicker — then prunes ids the
+// pass didn't see.
 function useStreamedXells(projectId) {
   const [xells, setXells] = useState([]);
   const mapRef = useRef(new Map());
@@ -198,6 +204,18 @@ function useStreamedXells(projectId) {
     } catch (e) { /* aborted or transient — keep the last good set */ }
   }, [projectId]);
 
+  // Adopt a whole decorated xells array (from a fleet snapshot) into the map, dropping the ids the
+  // snapshot doesn't carry. The snapshot IS the authoritative fleet read, so this keeps the map in
+  // lockstep with it — the same prune a stream completion does.
+  const syncXells = useCallback((rows) => {
+    if (pidRef.current !== projectId) return;   // a stale snapshot must not paint the new project
+    if (!Array.isArray(rows)) return;
+    const next = new Map();
+    for (const x of rows) next.set(x.id, x);
+    mapRef.current = next;
+    setXells(Array.from(next.values()));
+  }, [projectId]);
+
   useEffect(() => {
     mapRef.current = new Map();
     setXells([]);
@@ -205,7 +223,7 @@ function useStreamedXells(projectId) {
     return () => acRef.current?.abort();
   }, [projectId, runStream]);
 
-  return [xells, runStream];
+  return [xells, runStream, syncXells];
 }
 
 export default function App() {
@@ -221,16 +239,22 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [shipLogs, setShipLogs] = useState({});   // ship id → live build lines (this sitting only)
   const [showTerm, setShowTerm] = useState(false);
-  // false | { harness } — the "+" prompt composer, opened FROM a persona's own button (harness is
-  // three-state exactly like the dispatch payload: undefined = project default, '' = core only, a
-  // key = that harness).
+  // Queenzee↔xell activity events from the SSE stream — the honeycomb's animated lines. Each new
+  // event is drained by <HiveCanvas> and becomes a short-lived arrow; the buffer stays tiny.
+  const [qzActivity, setQzActivity] = useState([]);
+  const qzSeq = useRef(0);
+  // false | {} — the single "+" prompt composer. No harness is pinned on open: on a router-gated
+  // fleet the router picks the persona; on a fleet with no router feature the human chooses it
+  // inside the composer (Dispatch.jsx). (Object rather than `true` so a future pin can ride along
+  // without flipping the truthy check.)
   const [showDispatch, setShowDispatch] = useState(false);
-  const [harnesses, setHarnesses] = useState([]);  // the worker personas this project may dispatch — one prompt button each
   const [showWork, setShowWork] = useState(false);   // the WORK TRACKER console (tickets · board · timeline)
   const [showDelivery, setShowDelivery] = useState(false); // DELIVERY TELEMETRY (cycle time, waste, gate waits)
   const [providers, setProviders] = useState([]);  // provider-token read model (masked) for the buttons
   const [showSetup, setShowSetup] = useState(false); // Project setup opened from "add provider"
+  const [showConsoleSettings, setShowConsoleSettings] = useState(false); // ⚙ browser-local prefs (term engine)
   const [toasts, setToasts] = useState([]);        // async-dispatch progress notifications
+
   const [githubAccessState, setGithubAccessState] = useState(null); // {can_push, can_pr, default_branch, reason}
   const [githubOut, setGithubOut] = useState(null); // last push/PR outcome {kind, busy, pushed, opened, url, reason}
   const [menu, setMenu] = useState(null); // container context menu {x,y,c}
@@ -258,7 +282,7 @@ export default function App() {
   // composer can warn about uncommitted work — the collect saves COMMITS, and only commits.
   const [swapXell, setSwapXell] = useState(null);
   const [termChoice, setTermChoice] = useState(null);  // ⌨ clicked → pick in-house vs deep-linked
-  const [streamedXells, restreamXells] = useStreamedXells(projectId);
+  const [streamedXells, restreamXells, syncXells] = useStreamedXells(projectId);
   // hex screen positions published by HiveCanvas each draw. GraphPane + Connectors subscribe to a
   // per-frame "geometry changed" fire so a pan/zoom re-tracks the graph and re-routes the wires
   // WITHOUT re-rendering the whole app.
@@ -293,6 +317,14 @@ export default function App() {
   // open the container context menu at the cursor — passed down to each xell's ContainerChips.
   // onMenu stops propagation so opening one doesn't trip the document closer below.
   const openMenu = useCallback((e, c) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, c }); }, []);
+  // The QUEENZEE node's terminal: a docker-exec shell into the queenzee's own server container
+  // (tier 'prod', the row the terminal bridge resolves process roles into). Same ContainerTerminal
+  // the inventory chips open, so the auth/gating is exactly the existing human-console door.
+  const openQueenzeeTerminal = useCallback(() => {
+    const qz = (fleet?.containers?.server || []).find((c) => c.tier === 'prod' && c.health !== 'down')
+      || (fleet?.containers?.server || []).find((c) => c.tier === 'prod');
+    if (qz) setShellFor(qz);
+  }, [fleet]);
   // Close on any outside interaction — NO full-screen scrim (that could block the whole UI).
   // Effect is keyed on `menu`, so listeners attach only while a menu is open and after the
   // opening event has finished (so it can't immediately close itself).
@@ -320,28 +352,18 @@ export default function App() {
   // LAST update stream land one frame late and repaint the previous project's remnants.
   const projectIdRef = useRef(null);
   projectIdRef.current = projectId;
-  // Which AI provider ACCOUNTS this project can dispatch on. Since the prompt buttons became
-  // per-PERSONA this no longer draws them — it decides whether a persona's button is dispatchable
-  // at all (an account of a provider its policy allows), and it is still what "add provider" keys
-  // off. NB: read the fallback id off `fleet` (state), NOT the `project` const destructured
-  // from it further down — referencing that in this deps array is a temporal-dead-zone crash
-  // that white-screened the whole console on first render (found 2026-07-21).
+  // Debounce handle for streamChange — one pending re-read at a time, cleared when the next event
+  // (or an explicit refresh) supersedes it. Lives in a ref so the debounce survives re-renders.
+  const refreshTimer = useRef(null);
+  // Which AI provider ACCOUNTS this project can dispatch on. Decides whether the single "+ prompt"
+  // button is pressable (or the honest "add provider" fallback) — visibility IS the token store.
+  // NB: read the fallback id off `fleet` (state), NOT the `project` const destructured from it
+  // further down — referencing that in this deps array is a temporal-dead-zone crash that
+  // white-screened the whole console on first render (found 2026-07-21).
   useEffect(() => {
     const pid = projectId || fleet?.project?.id;
     if (!pid) return;
     getProviderTokens(pid).then((t) => setProviders(Array.isArray(t) ? t : [])).catch(() => setProviders([]));
-  }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
-  // THE PERSONAS THIS PROJECT MAY DISPATCH — one prompt button each. Worker harnesses only
-  // (054: a xell wears a harness of its own type) and scoped to THIS project (084: the system-wide
-  // personas plus its own, never another project's), so a button can never offer a choice the
-  // assign path would refuse. Re-read when the harness manager or a dispatch closes, the same way
-  // the provider list is.
-  useEffect(() => {
-    const pid = projectId || fleet?.project?.id;
-    if (!pid) { setHarnesses([]); return; }
-    getHarnesses('worker', pid)
-      .then((hs) => setHarnesses((Array.isArray(hs) ? hs : []).filter((h) => !h.is_law_core)))
-      .catch(() => setHarnesses([]));
   }, [projectId, fleet?.project?.id, showSetup, showDispatch]);
   // GitHub access check: does the stored token let us push / open PRs to the remote?
   // Re-fetches when the project or the setup modal closes (the operator may have added a token there).
@@ -367,7 +389,11 @@ export default function App() {
     return ps;
   }, []);
 
-  const refresh = useCallback(async () => {
+  // Load EVERYTHING for the selected project: the fleet snapshot, the git graph and the diffs.
+  // This is the full-resolve path — a project switch, or a landing/ship (which moves main, so the
+  // graph and diffs all change at once). Live churn routes through the cheaper streamChange below,
+  // which re-reads only the read models that event type can have changed.
+  const loadAll = useCallback(async () => {
     const pid = projectId;
     try {
       const [f, t, d] = await Promise.all([getFleet(pid), getTimeline(pid), getDiffs(pid)]);
@@ -379,11 +405,46 @@ export default function App() {
       applyFleet(f);
       if (t) setTimeline(t);
       if (d) setDiffs(d);
-      restreamXells();              // re-stream the honeycomb's xells so the grid stays current
+      syncXells(f?.xells || []);    // adopt the snapshot's decorated xells — no extra NDJSON stream
       loadProjects();               // keep the switcher's xell counts fresh
       setVersion((v) => v + 1);
     } catch { /* keep last */ }
-  }, [projectId, loadProjects, applyFleet, restreamXells]);
+  }, [projectId, loadProjects, applyFleet, syncXells]);
+
+  // An EXPLICIT re-read (the caller just acted — dispatch, build, pause, a gate decision…): full.
+  const refresh = useCallback(async () => {
+    await loadAll();
+  }, [loadAll]);
+
+  // A LIVE stream event, debounced and type-scoped: this is the "stop spamming timeline, diffs and
+  // fleet API requests" path. Most events (a zee's status, a container health flap) can only move
+  // the FLEET snapshot, so they re-read fleet alone. A `land`/`ship`/`project` event moved main or
+  // production, so those re-read the git graph and diffs too. Bursts of same-type events collapse
+  // into one re-read, and a burst that overlaps an explicit refresh skips the stale one entirely.
+  const streamChange = useCallback((type) => {
+    const pid = projectIdRef.current;
+    if (!pid) return;
+    clearTimeout(refreshTimer.current);
+    const git = GIT_TYPES.includes(type);
+    const work = () => {
+      if (pid !== projectIdRef.current) return;   // project switched while debouncing — drop it
+      // The honeycomb renders from streamedXells (not fleet.xells), so the fresh snapshot must
+      // ALSO adopt its xells into the honeycomb — the same sync onSnapshot does — or the hexagons
+      // would go stale the moment a live event lands.
+      const f = getFleet(pid).then((fl) => {
+        if (projectIdRef.current !== pid) return;
+        applyFleet(fl);
+        syncXells(fl?.xells || []);
+      });
+      if (git) {
+        getTimeline(pid).then((t) => { if (projectIdRef.current === pid && t) { setTimeline(t); setVersion((v) => v + 1); } });
+        getDiffs(pid).then((d) => { if (projectIdRef.current === pid && d) setDiffs(d); });
+      }
+      f.catch(() => {});
+      loadProjects();
+    };
+    refreshTimer.current = setTimeout(work, git ? 120 : 400);
+  }, [applyFleet, syncXells, loadProjects]);
 
   // ── toast plumbing ───────────────────────────────────────────────────────────
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
@@ -609,14 +670,20 @@ export default function App() {
   useEffect(() => {
     setConn('connecting');
     setTimeline(null); setDiffs({});   // don't show the previous project's git graph while loading
-    let live = true;   // a fetch/stream from a PREVIOUS project must never paint over the new one
-    getTimeline(projectId).then((t) => { if (live && t) { setTimeline(t); setVersion((v) => v + 1); } });
-    getDiffs(projectId).then((d) => { if (live && d) setDiffs(d); });
+    loadAll();   // full resolve for the NEW project — timeline, diffs, fleet + the honeycomb's xells
     const unsub = subscribe(projectId, {
-      onSnapshot: (f) => { applyFleet(f); setConn('live'); },
-      onChange: refresh,
+      // The snapshot delivers the WHOLE fleet read model (the server sends one per connection), so
+      // it adopts the xells straight into the honeycomb — no separate NDJSON re-stream per event.
+      onSnapshot: (f) => { applyFleet(f); syncXells(f?.xells || []); setConn('live'); },
+      // Every later event names its type; re-read only what that type can have moved (fleet alone
+      // for most; the git graph too for land/ship/project). Debounced, so a burst collapses.
+      onChange: streamChange,
       onStatus: setConn,
       onLog: (l) => setLogs((prev) => [...prev.slice(-1999), l]),
+      // Queenzee↔xell activity → the honeycomb's animated lines. The id makes each event unique so
+      // HiveCanvas can drain exactly the ones it has not drawn yet (a burst of same-second events
+      // for one xell must not collapse into a single line).
+      onQueenzeeActivity: (a) => setQzActivity((prev) => [...prev.slice(-31), { ...a, _id: ++qzSeq.current }]),
       // Per-ship build feed, keyed by ship id, capped so a chatty build can't eat the tab.
       onShipLog: (l) => setShipLogs((prev) => ({ ...prev, [l.id]: [...(prev[l.id] || []).slice(-399), l] })),
       // Live progress of db backup / restore / copy — drives progress toasts.
@@ -624,8 +691,8 @@ export default function App() {
       // Raw command output lines of the same operations — appended to their toast as a build log.
       onDbOpLog,
     });
-    return () => { live = false; unsub(); };
-  }, [projectId, refresh, applyFleet, onDbOpProgress, onDbOpLog]);
+    return () => { clearTimeout(refreshTimer.current); unsub(); };
+  }, [projectId, loadAll, streamChange, applyFleet, syncXells, onDbOpProgress, onDbOpLog]);
 
   const selectProject = useCallback((id) => {
     setProjectId(id);
@@ -944,7 +1011,11 @@ export default function App() {
                     expandedId={expandedId} onExpand={setExpandedId}
                     hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} onGeometry={fireGeom}
                     hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
-                    showHarness={showHarness} redrawKey={version} />
+                    showHarness={showHarness} redrawKey={version}
+                    queenzeeActivity={qzActivity}
+                    shipping={fleet.shipping || []}
+                    onQueenzeeTerminal={openQueenzeeTerminal}
+                    onQueenzeeLogs={() => setShowTerm(true)} />
         {/* The per-xell actions (build/pull/push/PR/terminal/mark-done) are drawn ON the flower now
             and hit-tested there — no DOM toolbar. The cxell-zee terminal is the one piece that needs
             DOM, so it opens as a modal from the flower's ⌨ button. */}
@@ -1034,7 +1105,10 @@ export default function App() {
                  hoverRef={hoverRef} setHover={setHover} subscribeHover={subscribeHover}
                  showHarness={showHarness} onToggleHarness={() => setShowHarness((s) => !s)}
                  onFlip={() => setHoneySide((s) => (s === 'a' ? 'b' : 'a'))}
-                 onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })} />
+                 onReposition={(e) => beginPaneReposition(e, { layoutRef, orientation, honeySide, setSplit })}
+                 xource={fleet.xource || null}
+                 projectId={projectId || project?.id || null}
+                 onXourceChanged={refresh} />
 
       <Connectors timeline={timeline} xells={xells} layoutRef={layoutRef} version={version}
                   hexPosRef={hexPosRef} harnessPosRef={harnessPosRef} orientation={orientation} honeySide={honeySide}
@@ -1097,11 +1171,16 @@ export default function App() {
             </span>
           )}
           {/* the flip button now lives IN the middle graph pane, opposite the ⎇ branch label */}
-          {/* No runtime toggle here: WHICH AI answers a prompt is decided by clicking that
-              account's own prompt button in the status line — one click, no second choice. */}
+          {/* No runtime toggle here: WHICH AI answers a prompt is decided in the composer
+              (or by the router on a router-gated fleet), opened from the single "+ prompt" button. */}
+          {/* Console settings (browser-local): terminal engine xterm↔wterm, etc. Not project setup. */}
+          <button type="button" className="cs-gear" data-testid="console-settings-btn"
+                  title="Console settings — terminal engine and other browser-local preferences"
+                  onClick={() => setShowConsoleSettings(true)}>⚙</button>
           <span className={`conn ${conn}`}>{conn === 'live' ? '● live' : '○ ' + conn}</span>
         </div>
       </header>
+      {showConsoleSettings && <ConsoleSettings onClose={() => setShowConsoleSettings(false)} />}
 
       <div className="statusline" data-testid="statusline">
         {/* FIRST in the line, before anything that starts work: the one control that stops all of it.
@@ -1126,30 +1205,26 @@ export default function App() {
         )}
         {/* The prewarmed-pool knob, right here in the status line so it never hides in project
             settings. Per-machine pool sizes (matrix column headers) replace this project-wide
-            target ONLY when they actually govern — i.e. a dev machine exists AND the project has a
-            per-xell app tier to place on it (compose_spinoff). A bare-worktree project (no
-            compose_spinoff, e.g. Zeehive itself) always pools by the project-wide target no matter
-            how many machines exist (see queenzee/pool.js), so its knob must stay visible here —
-            otherwise the ONLY working control is buried in the ⚙ Spawn-template modal. Mirrors the
-            server's own `!machines.length || !compose_spinoff` branch exactly. */}
-        {(!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0) || !project.compose_spinoff)
+            target ONLY when they actually govern — i.e. a dev machine exists AND the spinoff
+            server is NOT runner:process (compose-backed app tier that stamps docker_ctx). A
+            process-runner project (e.g. Zeehive itself) always pools by the project-wide target
+            no matter how many machines exist (see queenzee/pool.js), so its knob must stay
+            visible here — otherwise the ONLY working control is buried in the ⚙ Spawn-template
+            modal. Mirrors the server's own `!machines.length || serverRoleIsProcess` branch. */}
+        {(!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0)
+          || (project.manifest?.roles?.server?.runner || project.manifest?.tiers?.spinoff?.runner) === 'process')
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
-        {/* ONE PROMPT BUTTON PER PERSONA — click = compose for THAT harness, and everything the
-            composer then offers (providers, accounts, models, what the autonomy scale means) is
-            derived from its EFFECTIVE model policy: GET /api/dispatch/options, server
-            lib/dispatch-options.js.
-
-            It used to be one button per connected ACCOUNT, with the persona as the last segmented
-            control inside the modal. That put the credential first and the manual last, and the two
-            could contradict each other — opening from a Claude button and then picking a persona
-            whose policy allows only deepseek dispatched a refusal (resolveDispatchModel) after the
-            prompt was already written. The harness is the consequential choice, so it is the button.
+        {/* ONE "+ prompt" BUTTON — opens the composer with no pinned harness. The router layer
+            (Dispatch.jsx → routerGate) recomposes the prompt and decides provider/model/mode/
+            harness itself on a router-gated fleet; on a fleet with no router feature the human
+            picks the persona inside the composer. Persona-level policy is enforced there (and in
+            Custom deployment), not by a row of per-persona toolbar buttons.
 
             Visibility is still the token store: no dispatchable ACCOUNT at all → the one honest
-            button is "add provider", straight into Project setup. And a persona whose policy allows
-            no connected provider keeps its button, disabled, carrying the reason — the same rule as
-            the paused account before it: a control that vanishes reads as "it disappeared". */}
+            button is "add provider", straight into Project setup. Every account paused → this
+            button stays, disabled, carrying the reason — a control that vanishes reads as
+            "it disappeared". */}
         {(() => {
           if (!hasAnyAccount(providers)) {
             return (
@@ -1158,50 +1233,35 @@ export default function App() {
                       onClick={() => setShowSetup(true)}>＋ add provider</button>
             );
           }
-          // WHICH buttons, and whether each can be pressed, is a pure decision — promptButtons.js,
+          // Whether the single button can be pressed is a pure decision — promptButton() —
           // so it is testable in plain node and every surface that offers "start a zee" agrees.
-          return promptButtons(harnesses, providers,
-                               { emptyWarning, defaultHarnessId: fleet.pool?.default_harness_id }).map((b) => {
-            const why = b.blocked
-              ? `${b.label}: ${b.blocked} — connect one in Project setup, or change the persona's model policy`
-              : `Compose a prompt and dispatch a zee wearing ${b.label} into a ready xell`
-                + `\n${b.title}`
-                + `\nruns on: ${b.runsOn.map((p) => p.label).join(', ')}`
-                + (b.isDefault ? "\nthis project's DEFAULT persona — what a bare dispatch attaches" : '')
-                + (b.warn ? `\n${b.warn.chip} — ${b.warn.why}` : '');
-            return (
-              // THE BADGE IS NOT IN THE BUTTON. A persona's face is the thing you scan the toolbar
-              // for, and a glyph shrunk to fit inside a 12px pill is not a face — so the avatar is
-              // the button's SIBLING at a readable size, and the pill carries the name alone. (No
-              // "＋ prompt ·" prefix either: it was the same three words on every one of these, and
-              // the only word that differs is the persona's.)
-              <span key={b.key || 'core'} className={`np-persona${b.blocked ? ' np-blocked' : ''}`} title={why}>
-                {b.key
-                  ? <ZeeAvatar harness={{ key: b.key, label: b.label, glyph: b.glyph, bundle_empty: !!b.warn }} size={30} />
-                  : <span className="np-core" aria-hidden="true">○</span>}
-                <button className="new-prompt-btn" data-testid={`new-prompt-btn-${b.key || 'core'}`}
-                        disabled={!!b.blocked} title={why}
-                        onClick={() => setShowDispatch({ harness: b.key })}>
-                  {b.label}{b.scope === 'project' ? ' ⌂' : ''}{b.isDefault ? ' ·default' : ''}{b.warn ? ` ${b.warn.chip}` : ''}
-                </button>
-              </span>
-            );
-          });
+          const btn = promptButton(providers);
+          const why = btn.blocked
+            ? btn.blocked
+            : 'Compose a prompt and dispatch a zee into a ready xell'
+              + (btn.runsOn.length ? `\nruns on: ${btn.runsOn.map((p) => p.label || p.provider).join(', ')}` : '');
+          return (
+            <button className="new-prompt-btn" data-testid="new-prompt-btn"
+                    disabled={!!btn.blocked} title={why}
+                    onClick={() => setShowDispatch({})}>
+              ＋ prompt
+            </button>
+          );
         })()}
         {/* ADD A MANAGER ZEE — unlimited, and only from here: a manager coordinates workers, holds
             production READ-ONLY and cannot push to the xource, and `zee dispatch` refuses the role
-            so managers can never mint managers. Sits beside the prompt buttons because it is the
+            so managers can never mint managers. Sits beside the prompt button because it is the
             same act one level up: starting an agent. */}
-        {/* It opens the SAME composer the "+ prompt" buttons do (Dispatch, manager variant) — a
+        {/* It opens the SAME composer the "+ prompt" button does (Dispatch, manager variant) — a
             manager's programme is a prompt, and it used to get a one-line input box. The PERSONA is
-            chosen inside it (one manager button for the fleet, where a worker's persona IS the
-            button), and the provider/account/model choices follow from that persona's model policy
-            exactly as they do for a worker — the composer reads them itself. */}
+            chosen inside it (one manager button for the fleet), and the provider/account/model
+            choices follow from that persona's model policy exactly as they do for a worker — the
+            composer reads them itself. */}
         <AddManagerButton projectId={projectId || project.id} projectName={project.name}
                           onAdded={refresh} />
         {/* THE WORK TRACKER — tickets in, a plan on a board, a timeline over it. It sits with the
-            prompt buttons because it is the other half of the same question: the prompt buttons
-            start work, this is where the work being done is decided and tracked. It opens as a
+            prompt button because it is the other half of the same question: the prompt button
+            starts work, this is where the work being done is decided and tracked. It opens as a
             portalled overlay (no router in this console), so nothing else on this page moves. */}
         <button className="work-btn-open" data-testid="work-btn" title="Open the work tracker — tickets, board, timeline"
                 onClick={() => setShowWork(true)}>▦ work</button>
@@ -1277,7 +1337,9 @@ export default function App() {
       {/* The inventory as a role × machine MATRIX: one column per machine, so what-runs-where is
           the panel's shape. Chips sit where they RUN; the ⇄ marker says where they compile. */}
       <MachineMatrix machines={fleet.machines} containers={containers}
-                     projectId={projectId || project.id} composeSpinoff={project.compose_spinoff}
+                     projectId={projectId || project.id}
+                     spinoffIsProcess={(project.manifest?.roles?.server?.runner
+                       || project.manifest?.tiers?.spinoff?.runner) === 'process'}
                      onMenu={openMenu} onChanged={refresh} />
 
       {/* The decision UI (held landing / open PR, with Approve/Reject) now renders INLINE under the
@@ -1288,7 +1350,6 @@ export default function App() {
       {showTerm && <Terminal logs={logs} onClose={() => setShowTerm(false)} />}
       {showDispatch && (
         <Dispatch projectId={projectId || project.id} projectName={project.name}
-                  harness={showDispatch.harness}
                   onClose={() => setShowDispatch(false)}
                   onDispatch={(payload) => { setShowDispatch(false); runDispatch(payload); }} />
       )}
@@ -1537,7 +1598,7 @@ async function markXellDone(x, diff, onDone, ctx = {}) {
 // (The old DOM FlowerToolbar was removed: its build/pull/push/PR/mark-done buttons are now drawn
 // directly on the flower by HiveCanvas and hit-tested there — see handleFlowerAction above.)
 
-function XellCard({ x, diff, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines, onEnv, links }) {
+function XellCard({ x, diff, fleet, onDone, onMenu, prodLock, projectId, landing, prs, ship, onDismiss, machines, onEnv, links }) {
   const working = x.zee_status === 'working';
   const isProd = x.is_production;
   const [termOpen, setTermOpen] = useState(false);

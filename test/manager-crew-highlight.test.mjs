@@ -204,8 +204,8 @@ ok(mgrMarked.dash.includes('2,4'), 'it gets the same dashed tie-ring');
 ok(mgrMarked.dash.includes('5,3') && mgrPlain.dash.includes('5,3'),
    'and KEEPS its dashed persona seat + prod wall — the manager hexagon that landed today is untouched');
 ok(mgrMarked.text.some((t) => t.t === '⬢ wise-cove') && mgrMarked.text.some((t) => /read-only/.test(t.t))
-   && mgrMarked.text.some((t) => t.t === '🧭'),
-   'identity, its read-only hold on prod and its persona glyph all still paint');
+   && mgrMarked.text.some((t) => t.t === 'M'),
+   'identity, its read-only hold on prod and its persona face all still paint');
 ok(mgrMarked.text.every((t) => Math.abs(t.y - 200) <= 70), 'and nothing it paints leaves the hexagon');
 const mgrWord = (rec) => rec.text.find((t) => /^⬢ manager/.test(t.t));
 ok(((mgrWord(mgrMarked).y - 200) / 70) < -0.7,

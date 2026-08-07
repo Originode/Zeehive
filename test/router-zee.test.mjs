@@ -83,7 +83,10 @@ try {
   ok(router?.model_policy?.limit === 1, 'its model_policy carries limit 1 — "the router" is singular');
   const bundle = typeof router?.bundle === 'string' ? JSON.parse(router.bundle) : (router?.bundle || {});
   ok(/ROUTING REQUEST/.test(bundle.personality || ''), 'its persona teaches the 🧭 ROUTING REQUEST intake');
-  ok(/zee dispatch/.test(bundle.personality || ''), '…and dispatching workers with `zee dispatch`');
+  ok(/zee work --new/.test(bundle.personality || '') && /zee assign/.test(bundle.personality || ''),
+     '…and deploying workers onto CARDS with `zee work --new` + `zee assign` (151 — a router routes onto the board)');
+  ok(/do not manage the zees you route/.test(bundle.personality || ''),
+     '…and that it does NOT manage the zees it deploys (151)');
   ok(/zee sync/.test(bundle.personality || ''), '…and keeping its worktree current with `zee sync`');
 
   // ── 1. the `limit` knob normalizes and merges min-wins ──

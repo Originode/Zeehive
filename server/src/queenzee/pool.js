@@ -12,13 +12,17 @@
 // order so the preferred machine warms first. With no machines, the legacy project-wide
 // `pool_config.target_ready` applies unchanged on the one dev site.
 //
-// The machine-aware path ALSO requires `project.compose_spinoff` — a project with no per-xell
-// app tier owns no server containers, so the machine-mode ready count (a JOIN on
-// container.role='server') is zero by construction and fill would pile up pool_size per tick.
-// That guard used to be SILENT (the "mardale-prod never gets pool xells" defect): an operator
-// who set per-machine numbers was never told they had no effect. It is now a rate-limited
-// `logline('pool', …)` naming the skipped machines and the missing field (test:
-// test/pool-machine-guard-silence.test.mjs).
+// The machine-aware path ALSO requires a placeable per-xell app tier: the server role must
+// NOT be `runner: process`. Machine mode counts ready xells through their owned server
+// container (JOIN on role='server' + docker_ctx), and a process server is stamped with
+// docker_ctx=NULL (provision.js), so that count is zero by construction and fill would pile
+// up pool_size per tick. That used to be gated on `project.compose_spinoff` — the wrong
+// predicate. Compose projects stamp docker_ctx even when compose_spinoff is unset (the compose
+// file is a build detail; build-container.sh defaults to docker-compose.spinoff.yml), so the
+// old guard left mardale-prod's per-machine pool sizes as a dead letter on every compose
+// project that had not refreshed tiers.spinoff.compose into the column. The guard is now the
+// process-runner check (serverRoleIsProcess); when it fires it is rate-limited and LOUD
+// (test: test/pool-machine-guard-silence.test.mjs).
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { provisionXell } from '../lib/provision.js';
@@ -30,13 +34,14 @@ import { logline } from '../lib/logbus.js';
 import { spawnPrepFor, bakesImage } from '../lib/spawn-prep.js';
 import { ensurePreppedImage } from '../lib/cxell.js';
 import { deviceConfig } from '../lib/devices.js';
+import { serverRoleIsProcess } from '../lib/manifest.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
 // Say the machine-guard skip when it CHANGES, not every 15s tick — the same "say it when it
 // CHANGES" rule monitor.js uses for the census and stale-claim lines. Keyed per project so a
-// project that flips compose_spinoff on logs again the moment it becomes true, and a fleet with
-// several affected projects hears each one once.
+// project that leaves process-runner (or gains machines) logs again the moment it becomes
+// true, and a fleet with several affected projects hears each one once.
 const lastMachineGuardSaid = new Map();
 
 // DECOMMISSION A XELL THIS SWEEP SCANNED — the take, the reap and the hand-back, in ONE place, so
@@ -80,6 +85,9 @@ export async function sweepDecommission(scanned, reason, { what = null, verdict 
 async function reconcileProject(projectId, target) {
   const project = await one(`SELECT main_branch, compose_spinoff, manifest FROM project WHERE id=$1`, [projectId]);
   const src = project?.main_branch || 'main';
+  // Process-runner server ⇒ docker_ctx NULL on the server row ⇒ machine-mode counts are zero.
+  // Compose projects (no process runner) are placeable even when compose_spinoff is unset.
+  const placeable = !serverRoleIsProcess(project?.manifest);
 
   // BAKE THE PREPPED CXELL IMAGE (spawn template `when: image|provision`) — here, because here is
   // the pool's clock. Every cage of this project then starts from an image that already carries the
@@ -119,32 +127,39 @@ async function reconcileProject(projectId, target) {
   // high-load project pools bigger than a quiet one on the same host); legacy project-wide
   // target otherwise.
   // Machine mode counts a project's ready xells THROUGH their owned server container
-  // (fillTrim's join on role='server' + docker_ctx). A project with no per-xell app tier
-  // (no compose_spinoff — e.g. Zeehive itself: its xells are bare worktrees) owns no such
-  // containers, so that count is ALWAYS ZERO no matter how many ready xells exist: fill
-  // provisions pool_size more every tick, trim never sees a surplus, and max_xells (counted
-  // the same way) never caps it. That is exactly how 167 ready Zeehive xells piled up by
-  // 2026-07-19 — and the per-tick reconcile sweep over all of them is what froze the API.
-  // Machine placement is meaningless for bare worktrees anyway (they live on the queenzee's
-  // host), so such projects use the legacy project-wide target, whose count has no join.
+  // (fillTrim's join on role='server' + docker_ctx). A process-runner project (e.g. Zeehive
+  // itself: bare worktree + process server/webapp) stamps docker_ctx=NULL on those rows, so
+  // that count is ALWAYS ZERO no matter how many ready xells exist: fill provisions pool_size
+  // more every tick, trim never sees a surplus, and max_xells (counted the same way) never
+  // caps it. That is exactly how 167 ready Zeehive xells piled up by 2026-07-19 — and the
+  // per-tick reconcile sweep over all of them is what froze the API. Machine placement is
+  // meaningless for bare processes anyway (they live on the queenzee's host), so such
+  // projects use the legacy project-wide target, whose count has no join.
+  //
+  // compose_spinoff is NOT the predicate: a compose project with machines configured but an
+  // empty compose_spinoff column still stamps docker_ctx at provision, and must take the
+  // machine path — otherwise mardale-prod's pool_size is a dead letter until someone happens
+  // to refresh tiers.spinoff.compose into the column (the "mardale-prod never gets pool xells"
+  // defect under its second diagnosis).
   const machines = await devMachines(projectId);
-  if (!machines.length || !project?.compose_spinoff) {
-    // THE SILENT DISABLE (the "mardale-prod never gets pool xells" defect). When a machine_pool
-    // row exists (dev_priority>0, pool_size>0) but the project has no compose_spinoff, this guard
-    // takes the legacy path and the whole per-machine config is a dead letter — silently, until
-    // this line. Say it out loud: naming the skipped machines AND the missing field, so an operator
-    // can fix the project settings from the message alone. Rate-limited to once per state change
+  if (!machines.length || !placeable) {
+    // When a machine_pool row exists (dev_priority>0, pool_size>0) but the project cannot place
+    // (process-runner server), this guard takes the legacy path and the whole per-machine config
+    // is a dead letter. Say it out loud: naming the skipped machines AND the reason, so an
+    // operator can fix the project from the message alone. Rate-limited to once per state change
     // (the same "say it when it CHANGES" rule monitor.js uses): the pool ticks every 15s, and a
     // verbatim repeat would drown the lines that carry news.
     const skipped = machines.map((m) => m.key);
-    if (skipped.length && !project?.compose_spinoff) {
+    if (skipped.length && !placeable) {
       // `!!!` is the house "loud" convention (ops-review.js ALERT_RE scans for it) — a manager's
       // ops digest must catch this line, not just a human reading the terminal.
       const msg = `!!! machine-aware pooling DISABLED for project ${String(projectId).slice(0, 8)}: `
         + `machine(s) [${skipped.join(', ')}] are configured (dev_priority>0 / pool_size>0) but `
-        + `project.compose_spinoff is unset — machine placement is impossible without a per-xell `
-        + `app tier (the ready count is zero by construction). Set tiers.spinoff.compose in the `
-        + `project's zeehive.yml (or project.compose_spinoff) to enable per-machine pooling.`;
+        + `the spinoff server is runner:process — machine placement needs a docker-backed app tier `
+        + `(server containers get docker_ctx=NULL for process roles, so the ready count is zero by `
+        + `construction). Per-machine pool sizes have no effect; the project-wide pool target applies. `
+        + `To place on machines, give roles.server (or tiers.spinoff) a compose runner and a spinoff `
+        + `compose file, then refresh the manifest.`;
       const first = !lastMachineGuardSaid.has(projectId);
       if (lastMachineGuardSaid.get(projectId) !== msg) {
         lastMachineGuardSaid.set(projectId, msg);

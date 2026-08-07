@@ -19,7 +19,7 @@
 // SINGULARITY is policy, not code: the `router` harness ships with model_policy `{"limit": 1}`
 // (the per-project wearer cap, enforced in assignHarness), so "the router" is one zee unless an
 // operator deliberately raises the cap.
-import { q, one } from '../db/pool.js';
+import { q, one, pool } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { broadcast } from './events.js';
 import { resolveHarness } from './harness.js';
@@ -159,7 +159,8 @@ export const DEFAULT_ROUTER_BRIEF = [
   'In short: humans hand you RAW PROMPTS (messages marked 🧭 ROUTING REQUEST, each carrying a',
   'snapshot of your router policy). You recompose each into a brief a zee can execute, decide the',
   'dispatch — provider (by the policy\'s weights/schedule), model, autonomy mode, worker harness —',
-  'dispatch it with `zee dispatch`, and report what you routed and why.',
+  'then deploy it onto a CARD (`zee work --new` if none covers it, then `zee assign --item <id>`)',
+  'and report what you routed and why. You do NOT manage the zees you deploy — the card follows them.',
   '',
   'You land nothing and ship nothing (structurally refused), production is read-only to you, and',
   '`zee sync` keeps your worktree current with the xource. Orient now (`zee status`, `zee harness`,',
@@ -332,14 +333,60 @@ export function auditBody(head, prompt, tail = '') {
 // `custom` is the composer's optional CUSTOM DEPLOYMENT panel (see resolveCustomDeployment): the
 // human's explicit provider/model/mode/harness decision, rendered as its own block after the
 // prompt. With none configured the body is byte-for-byte what it always was.
+//
+// IDEMPOTENCY (150): the composer is fire-and-forget — App.jsx runDispatch closes the modal and
+// reports through a toast, and a double-click (or Cmd+Enter landing in the same tick) can fire
+// onDispatch twice for ONE human action. Without a guard here that was two 🧭 ROUTING REQUEST
+// messages for one prompt, and the router dispatched a worker for each: the double-deploy.
+// `client_request_id` is the composer's per-composition key (stable across a double-submit); the
+// FIRST call wins and records the key, and a SECOND call that names a key already recorded for
+// the same project within the dedup window is refused LOUDLY — never silently dropped — so a
+// human who genuinely wants to re-send can tell the refusal from the double-submit. The wall is
+// the partial UNIQUE index on router_route_dedup (migration 150): two concurrent calls with the
+// same key race there, and postgres lets exactly one through.
+const ROUTE_DEDUP_WINDOW_MS = 60_000;   // the composer is one click; a window far larger than that
+                                        // still cannot collide with a genuine later re-send.
+
+// Prune the dedup ledger opportunistically (the window is short; a sweep on every route keeps the
+// table from growing past ~a minute of routing traffic). Best-effort — a failed prune never
+// refuses a route.
+async function pruneRouteDedup(projectId) {
+  try {
+    await q(`DELETE FROM router_route_dedup WHERE project_id=$1 AND created_at < now() - ($2::int || ' seconds')::interval`,
+      [projectId, Math.ceil(ROUTE_DEDUP_WINDOW_MS / 1000)]);
+  } catch (e) { logline('router', `could not prune route-dedup ledger: ${e.message}`); }
+}
+
 export async function routeRawPrompt({ project, prompt, images = [], harness_hint = null,
-                                       custom = null, by = 'human@console' } = {}) {
+                                       custom = null, by = 'human@console',
+                                       client_request_id = null } = {}) {
   const projectId = await routerProjectId(project);
   const text = String(prompt || '').trim();
   if (!text && !(Array.isArray(images) && images.length)) throw new Error('a routing request needs a prompt');
   const status = await routerStatus(projectId);
   if (!status.present) throw new Error(NO_LIVE_ROUTER);
   const router = status.routers[0];
+
+  // THE DEDUP GATE — one routing request per human action (150). Runs BEFORE any message is
+  // written, so a refused duplicate costs nothing. A caller with no key is a caller outside the
+  // composer (a CLI, a script, an MCP client): there is nothing to dedupe, and the route behaves
+  // exactly as it always did.
+  const key = String(client_request_id || '').trim();
+  if (key) {
+    await pruneRouteDedup(projectId);
+    const prior = await one(
+      `SELECT dm.message_id, dm.to_xell_id, m.body
+         FROM router_route_dedup dm JOIN zee_message m ON m.id = dm.message_id
+        WHERE dm.project_id=$1 AND dm.client_request_id=$2`, [projectId, key]);
+    if (prior) {
+      throw new Error(
+        `this routing request (client_request_id "${key}") was already enqueued for ${router.slug} `
+        + `a moment ago — it looks like a double-submit of ONE action, so it was not enqueued again. `
+        + 'If you genuinely mean to send it a second time, re-open the composer (a fresh composition '
+        + 'carries a fresh request id).');
+    }
+  }
+
   const policy = status.policy || {};
   const deployment = await resolveCustomDeployment(projectId, custom);
   const head = [
@@ -359,11 +406,54 @@ export async function routeRawPrompt({ project, prompt, images = [], harness_hin
   // The audit row first (kind 'directive' — the human→zee kind zee_message already knows), then
   // the real delivery, then the row corrected with what actually happened — the same shape as
   // managers.postMessage, carried here because a routing request also has IMAGES to deliver.
-  const row = await one(
-    `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
-     VALUES ($1, NULL, $2, $3, $4, 'directive', $5, $6::jsonb) RETURNING *`,
-    [projectId, by, router.xell_id, router.slug, auditBody(head, text, tail),
-     JSON.stringify({ by, routing_request: true, ...(deployment ? { custom_deployment: deployment } : {}) })]);
+  //
+  // ATOMICITY of the message row and the dedup ledger row. The message insert and the dedup insert
+  // run on ONE client inside ONE transaction: a concurrent call with the same key either (a) sees
+  // the committed ledger row at its pre-check and is refused before writing anything, or (b) races
+  // our transaction, in which case the ledger's UNIQUE index refuses its insert and ITS transaction
+  // rolls its message back. Either way exactly one message row survives for one key — the duplicate
+  // is never left in zee_message. A non-key path (no client_request_id) skips the ledger entirely
+  // and is a plain single insert, byte-for-byte what it always was.
+  const row = await (async () => {
+    if (!key) {
+      return one(
+        `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
+         VALUES ($1, NULL, $2, $3, $4, 'directive', $5, $6::jsonb) RETURNING *`,
+        [projectId, by, router.xell_id, router.slug, auditBody(head, text, tail),
+         JSON.stringify({ by, routing_request: true,
+                          ...(deployment ? { custom_deployment: deployment } : {}) })]);
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const run = async (text, params) => (await client.query(text, params)).rows;
+      const [msg] = await run(
+        `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
+         VALUES ($1, NULL, $2, $3, $4, 'directive', $5, $6::jsonb) RETURNING *`,
+        [projectId, by, router.xell_id, router.slug, auditBody(head, text, tail),
+         JSON.stringify({ by, routing_request: true, client_request_id: key,
+                          ...(deployment ? { custom_deployment: deployment } : {}) })]);
+      await run(
+        `INSERT INTO router_route_dedup (project_id, to_xell_id, client_request_id, message_id)
+         VALUES ($1,$2,$3,$4)`,
+        [projectId, router.xell_id, key, msg.id]);
+      await client.query('COMMIT');
+      return msg;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      // A UNIQUE violation on the ledger means a concurrent call with the same key won — its
+      // transaction committed, its message row is the one that stands. Our transaction rolled back,
+      // so nothing of ours survives; refuse LOUDLY, exactly as the pre-insert gate would have.
+      if (e?.code === '23505') {
+        throw new Error(
+          `this routing request (client_request_id "${key}") was already enqueued for ${router.slug} `
+          + `a moment ago — it looks like a double-submit of ONE action, so it was not enqueued again. `
+          + 'If you genuinely mean to send it a second time, re-open the composer (a fresh composition '
+          + 'carries a fresh request id).');
+      }
+      throw e;
+    } finally { client.release(); }
+  })();
   const { sendMessageToXell } = await import('../queenzee/nudge.js');
   const delivery = await sendMessageToXell(router.xell_id, { text: body, images, by, messageId: row.id });
   await q(

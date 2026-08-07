@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { computeGraph } from './hive/graph.js';
 import { crewLinks, relatedTo, focusIdOf, REL_DASH_ATTR } from './hive/crew.js';
+import { cleanXourceNow, commitXourceStaged, stashXourceNow, getXourceState } from './api.js';
+// Dialog + DiffViewer are loaded on click (dynamic import) so GraphPane stays a plain-ESM-friendly
+// module for the SSR unit tests that transform only this file — those are JSX and would break them.
 
 // The git graph as the centre divider — proper GitLens-style lanes (ported from GitRail), oriented
 // by aspect: a VERTICAL spine in landscape, a HORIZONTAL one in portrait. It is a fixed-step spine
@@ -45,10 +49,319 @@ export function anchorRing({ ring = null, hovered = false, related = null }) {
   return { show: !!ring, stroke: ring, width: 2, dash: null };
 }
 
+// Broken-pipe glyph — two pipe halves with a crack. Drawn as inline SVG so it stays crisp at the
+// 14px tip size and does not depend on an emoji font. Used when the xource index has staged paths
+// (which should never happen on main, but does when a ship/projection/interrupted merge leaves
+// dirt behind).
+function BrokenPipeIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" aria-hidden="true" className="graph-broken-pipe-icon">
+      {/* upper pipe half */}
+      <path d="M3 1.5 h4 v5.2 l-1.2 1.2 H3 z" fill="currentColor" opacity="0.95" />
+      <path d="M3 1.5 h4" stroke="currentColor" strokeWidth="1.2" fill="none" />
+      {/* lower pipe half, offset to read as broken */}
+      <path d="M9 8.2 l1.3-1.2 H13 v7.5 H9 z" fill="currentColor" opacity="0.95" />
+      {/* crack / X between the halves */}
+      <path d="M5.5 7.2 L10.5 10.8 M10.5 7.2 L5.5 10.8" stroke="currentColor" strokeWidth="1.4"
+            strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// Proper-sized modal from the broken-pipe tip: status, clickable diffs (open DiffViewer preview),
+// rogue files (click → preview that file), Clear / Stash / Commit. Portaled to <body> so the
+// graph pane's stacking context cannot bury it (same lesson as Dispatch / Project setup).
+function XourceStagedModal({ projectId, xource, onClose, onChanged }) {
+  const [state, setState] = useState(xource || null);
+  const [busy, setBusy] = useState(null);   // 'clear' | 'commit' | 'stash' | 'reload' | null
+  const [err, setErr] = useState(null);
+  const [note, setNote] = useState(null);
+
+  const reload = useCallback(async () => {
+    if (!projectId) return;
+    setBusy('reload'); setErr(null);
+    try {
+      const s = await getXourceState(projectId);
+      setState(s);
+      if (s?.ok && !s.has_staged && s.clean) onClose?.();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(null); }
+  }, [projectId, onClose]);
+
+  useEffect(() => { if (xource) setState(xource); }, [xource]);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); onClose?.(); } };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Open the shared DiffViewer on a xource scope (and optional file). Dynamic import keeps
+  // GraphPane's SSR unit tests from having to bundle DiffViewer.jsx.
+  const openDiff = async (scope, focusPath = null) => {
+    if (!projectId) return;
+    const { showDiff } = await import('./DiffViewer.jsx');
+    const labels = {
+      staged: 'Xource · staged (what Commit would land)',
+      unstaged: 'Xource · unstaged + untracked',
+      all: 'Xource · all uncommitted',
+    };
+    showDiff({
+      kind: 'xource',
+      projectId,
+      scope: scope || 'all',
+      focusPath: focusPath || undefined,
+      title: focusPath ? `${focusPath}` : (labels[scope] || labels.all),
+      subtitle: focusPath
+        ? `${labels[scope] || labels.all} · click another file in the rail to jump`
+        : 'live dirty tree on the main checkout',
+    });
+  };
+
+  const clear = async () => {
+    if (busy || !projectId) return;
+    const { showPrompt } = await import('./Dialog.jsx');
+    const typed = await showPrompt(
+      'Clear the xource (discard staged / uncommitted work on the main checkout)?\n\n'
+      + 'The queenzee will reset the main checkout to the main tip: abort any in-progress '
+      + 'merge/rebase, discard staged and unstaged changes, remove untracked junk — PRESERVING '
+      + 'every xell\'s worktree. This unblocks landings and ships.\n\nType CLEAR to confirm.',
+      { title: 'Clear xource?', okLabel: 'Clear xource', variant: 'danger', placeholder: 'CLEAR' });
+    if (String(typed || '').trim().toUpperCase() !== 'CLEAR') return;
+    setBusy('clear'); setErr(null); setNote(null);
+    try {
+      const r = await cleanXourceNow(projectId, 'cleared from git-graph broken-pipe tip');
+      setNote(r?.dry_run
+        ? '✓ cleared (DRY-RUN — this queenzee models the fleet; the real xource was not touched)'
+        : '✓ xource cleared — index and worktree reset to the main tip');
+      await reload();
+      onChanged?.();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(null); }
+  };
+
+  const stash = async () => {
+    if (busy || !projectId) return;
+    if (!state?.ok || state.clean || !state.dirty) {
+      setErr('nothing dirty to stash');
+      return;
+    }
+    const { showConfirm } = await import('./Dialog.jsx');
+    const go = await showConfirm(
+      `Stash ${state.dirty} dirty path(s) on the xource?\n\n`
+      + 'Staged, unstaged and untracked files are parked on the stash stack (ignored paths like '
+      + '.claude/ worktrees stay put). The checkout becomes clean so landings/ships can move. '
+      + 'Recover later with `git stash pop` on the host — this console does not pop stashes.\n\n'
+      + 'Continue?',
+      { title: 'Stash xource dirt?', okLabel: 'Stash it', variant: 'danger' });
+    if (!go) return;
+    setBusy('stash'); setErr(null); setNote(null);
+    try {
+      const r = await stashXourceNow(projectId);
+      setNote(r?.dry_run
+        ? `✓ would stash (DRY-RUN) — ${r.note || 'simulate mode'}`
+        : `✓ stashed — ${r.stash_count != null ? `${r.stash_count} stash(es) on the stack` : 'checkout should be clean'}`);
+      await reload();
+      onChanged?.();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(null); }
+  };
+
+  const commit = async () => {
+    if (busy || !projectId) return;
+    if (!state?.has_staged) {
+      setErr('nothing is staged — stage the paths you want, or Clear/Stash to remove them');
+      return;
+    }
+    const { showPrompt, showConfirm } = await import('./Dialog.jsx');
+    const n = state.staged_count || state.staged?.length || 0;
+    const msg = await showPrompt(
+      `Commit ${n} staged path(s) on the xource (main checkout)?\n\n`
+      + 'This creates a REAL commit on main from whatever is currently in the index. Unstaged '
+      + 'and untracked paths are left alone. Prefer Clear or Stash if the staged work was accidental.\n\n'
+      + 'Commit message:',
+      { title: 'Commit staged xource work', okLabel: 'Commit on main',
+        placeholder: 'e.g. chore: keep projected .env out of the dirty index',
+        defaultValue: '' });
+    if (msg == null) return;
+    if (!String(msg).trim()) { setErr('a commit message is required'); return; }
+    const go = await showConfirm(
+      `Commit to ${state.branch || state.main_branch || 'main'} with message:\n\n“${String(msg).trim()}”\n\n`
+      + `${n} staged path(s) will land on main. Continue?`,
+      { title: 'Confirm xource commit', okLabel: 'Commit on main', variant: 'danger' });
+    if (!go) return;
+    setBusy('commit'); setErr(null); setNote(null);
+    try {
+      const r = await commitXourceStaged(projectId, String(msg).trim());
+      setNote(r?.dry_run
+        ? `✓ would commit (DRY-RUN) — ${r.note || 'simulate mode'}`
+        : `✓ committed ${r.short || ''} on ${state.branch || 'main'}`);
+      await reload();
+      onChanged?.();
+    } catch (e) { setErr(e.message); }
+    finally { setBusy(null); }
+  };
+
+  const s = state || {};
+  const files = Array.isArray(s.files) ? s.files : [];
+  const stagedDiff = s.diff?.staged || null;
+  const unstagedDiff = s.diff?.unstaged || null;
+  const kindLabel = (f) => {
+    if (f.kind === 'untracked') return 'untracked';
+    if (f.kind === 'staged') return `staged · ${f.status || 'changed'}`;
+    if (f.kind === 'unstaged') return `unstaged · ${f.status || 'changed'}`;
+    if (f.kind === 'staged+unstaged') return `staged+dirty · ${f.status || 'changed'}`;
+    return f.kind || f.status || 'changed';
+  };
+  // Which patch scope a file click should open: staged-only files → staged; pure untracked →
+  // unstaged (includes untracked synth); mixed or unstaged → all so both halves show.
+  const scopeForFile = (f) => {
+    if (f.kind === 'staged') return 'staged';
+    if (f.kind === 'untracked' || f.kind === 'unstaged') return 'unstaged';
+    return 'all';
+  };
+  const fmtStat = (d) => {
+    if (!d) return null;
+    const f = d.files || 0;
+    return `${f} file${f === 1 ? '' : 's'} · +${d.insertions || 0}/−${d.deletions || 0}`;
+  };
+
+  // Portal to body: GraphPane sits inside a stacking context the honeycomb wires sit above.
+  return createPortal(
+    <div className="xource-modal-overlay" data-testid="xource-staged-overlay"
+         onMouseDown={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
+      <div className="xource-modal" data-testid="xource-staged-pop" role="dialog" aria-modal="true"
+           aria-label="Xource staged changes" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="xource-modal-head">
+          <div className="xource-modal-title">
+            <BrokenPipeIcon size={16} />
+            <div>
+              <div>Broken pipe — xource has staged work</div>
+              <div className="xource-modal-sub">
+                Main checkout dirt wedges every landing and ship. Inspect the diff, then Clear,
+                Stash, or Commit.
+              </div>
+            </div>
+          </div>
+          <button className="xource-modal-x" onClick={onClose} title="Close (Esc)" aria-label="Close">✕</button>
+        </div>
+
+        <div className="xource-modal-body">
+          <div className="xource-modal-status" data-testid="xource-staged-status">
+            {s.ok === false && <div className="xource-modal-err">cannot read xource: {s.error}</div>}
+            {s.ok && (
+              <>
+                <div className="xource-modal-summary">{s.summary}</div>
+                <div className="xource-modal-meta">
+                  <span>branch <b className="mono">{s.branch || '—'}</b></span>
+                  {s.head && <span>HEAD <b className="mono">{String(s.head).slice(0, 10)}</b></span>}
+                  {!!s.stash_count && <span>stash stack <b>{s.stash_count}</b></span>}
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Diff chips — click opens the full DiffViewer preview. */}
+          <div className="xource-modal-diffs" data-testid="xource-staged-diffs">
+            <div className="xource-modal-sec-h">Diff <span className="pc">click to preview the changes</span></div>
+            <div className="xource-modal-diff-row">
+              <button type="button" className="xource-diff-chip" data-testid="xource-diff-staged"
+                      disabled={!s.ok || !(stagedDiff?.files > 0 || s.has_staged)}
+                      title="Preview the staged index — what Commit it would land on main"
+                      onClick={() => openDiff('staged')}>
+                <span className="xource-diff-chip-k">Staged</span>
+                <span className="xource-diff-chip-v">
+                  {fmtStat(stagedDiff) || (s.has_staged ? `${s.staged_count || s.staged?.length || 0} path(s)` : 'none')}
+                </span>
+                <span className="xource-diff-chip-go">preview →</span>
+              </button>
+              <button type="button" className="xource-diff-chip" data-testid="xource-diff-unstaged"
+                      disabled={!s.ok || !((unstagedDiff?.files > 0) || (s.untracked?.length > 0)
+                        || files.some((f) => f.kind === 'unstaged' || f.kind === 'untracked'))}
+                      title="Preview unstaged tracked changes and untracked files"
+                      onClick={() => openDiff('unstaged')}>
+                <span className="xource-diff-chip-k">Unstaged</span>
+                <span className="xource-diff-chip-v">
+                  {fmtStat(unstagedDiff)
+                    || (s.untracked?.length ? `${s.untracked.length} untracked` : 'none')}
+                  {!!s.untracked?.length && unstagedDiff?.files > 0
+                    ? ` · ${s.untracked.length} untracked` : ''}
+                </span>
+                <span className="xource-diff-chip-go">preview →</span>
+              </button>
+              <button type="button" className="xource-diff-chip xource-diff-chip-all"
+                      data-testid="xource-diff-all"
+                      disabled={!s.ok || s.clean || !s.dirty}
+                      title="Preview everything uncommitted on the xource"
+                      onClick={() => openDiff('all')}>
+                <span className="xource-diff-chip-k">All changes</span>
+                <span className="xource-diff-chip-v">
+                  {s.dirty ? `${s.dirty} path(s)` : 'none'}
+                </span>
+                <span className="xource-diff-chip-go">preview →</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="xource-modal-files" data-testid="xource-staged-files">
+            <div className="xource-modal-sec-h">
+              Rogue files <span className="pc">click a path to preview its diff</span>
+            </div>
+            {!files.length && <div className="pc">no rogue paths right now</div>}
+            <ul>
+              {files.map((f) => (
+                <li key={`${f.kind}:${f.path}`} data-kind={f.kind}>
+                  <button type="button" className="xource-file-btn"
+                          title={`Preview diff for ${f.path}`}
+                          onClick={() => openDiff(scopeForFile(f), f.path)}>
+                    <span className={`graph-xource-kind k-${(f.kind || '').split('+')[0]}`}>{kindLabel(f)}</span>
+                    <span className="mono graph-xource-path">
+                      {f.old_path ? `${f.old_path} → ${f.path}` : f.path}
+                    </span>
+                    <span className="xource-file-go">diff →</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {err && <div className="xource-modal-err" data-testid="xource-staged-err">{err}</div>}
+          {note && <div className="xource-modal-note" data-testid="xource-staged-note">{note}</div>}
+        </div>
+
+        <div className="xource-modal-actions">
+          <button className="graph-xource-clear" data-testid="xource-staged-clear"
+                  disabled={!!busy || !s.ok || s.clean}
+                  title="Discard staged/uncommitted work — reset the main checkout to the main tip"
+                  onClick={clear}>
+            {busy === 'clear' ? 'Clearing…' : 'Clear it'}
+          </button>
+          <button className="graph-xource-stash" data-testid="xource-staged-stash"
+                  disabled={!!busy || !s.ok || s.clean || !s.dirty}
+                  title="Park dirty work on the stash stack so the checkout is clean (recover with git stash pop on the host)"
+                  onClick={stash}>
+            {busy === 'stash' ? 'Stashing…' : 'Stash it'}
+          </button>
+          <span className="xource-modal-actions-spacer" />
+          <button className="graph-xource-commit" data-testid="xource-staged-commit"
+                  disabled={!!busy || !s.ok || !s.has_staged}
+                  title="Create a commit on main from the staged index (unstaged paths stay dirty)"
+                  onClick={commit}>
+            {busy === 'commit' ? 'Committing…' : 'Commit it'}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 export default function GraphPane({ timeline, xells = [], orientation, honeySide, hexPosRef, prodIds = [],
                                    expandedId = null, subscribeGeom,
                                    hoverRef, setHover, subscribeHover, onFlip, onReposition,
-                                   showHarness = true, onToggleHarness }) {
+                                   showHarness = true, onToggleHarness,
+                                   xource = null, projectId = null, onXourceChanged }) {
+  const [pipeOpen, setPipeOpen] = useState(false);
   const groupRef = useRef(null);
   const portrait = orientation === 'portrait';
   const [, forceHover] = useReducer((x) => x + 1, 0);
@@ -264,6 +577,31 @@ export default function GraphPane({ timeline, xells = [], orientation, honeySide
         </g>
       </svg>
       <span className="graph-branch" data-orient={orientation}>⎇ {timeline.branch}</span>
+      {/* BROKEN PIPE at the git-graph tip — the xource (main checkout) has staged items, which
+          should never happen (landings refuse over a dirty tree; ships build from this checkout).
+          Click opens the status / rogue-files / Clear / Commit popover. Hidden when the index is
+          clean so the tip stays quiet on a healthy xource. */}
+      {xource?.ok && xource.has_staged && (
+        <button type="button"
+                className={`graph-broken-pipe${pipeOpen ? ' open' : ''}`}
+                data-orient={orientation}
+                data-testid="graph-broken-pipe"
+                aria-expanded={pipeOpen}
+                aria-label={`Xource has ${xource.staged_count || xource.staged?.length || 0} staged path(s) — open to inspect, clear or commit`}
+                title={`Broken pipe — ${xource.staged_count || xource.staged?.length || 0} staged path(s) on the xource. Click for status, rogue files, Clear or Commit.`}
+                onClick={(e) => { e.stopPropagation(); setPipeOpen((o) => !o); }}>
+          <BrokenPipeIcon size={15} />
+          <span className="graph-broken-pipe-n">{xource.staged_count || xource.staged?.length || 0}</span>
+        </button>
+      )}
+      {pipeOpen && (
+        <XourceStagedModal
+          projectId={projectId}
+          xource={xource}
+          onClose={() => setPipeOpen(false)}
+          onChanged={() => onXourceChanged?.()}
+        />
+      )}
       {/* flip button lives IN the middle pane, at the end opposite the ⎇ branch label (which sits at
           the top in landscape / the left in portrait, so flip sits at the bottom / right). The SHOW
           HARNESS toggle stacks immediately above it — the one view control that belongs with the

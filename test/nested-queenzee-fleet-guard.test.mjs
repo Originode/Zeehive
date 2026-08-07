@@ -62,6 +62,8 @@ mkdirSync(bin, { recursive: true });
 writeFileSync(join(bin, 'docker'), `#!/bin/sh
 printf '%s\\n' "$*" >> ${DOCKER_LOG}
 case "$*" in
+  *dangling=true*) : ;;                                    # no rebuild residue in this fixture
+  *"image prune"*) echo 'Total reclaimed space: 0B' ;;     # dangling-only prune (never -a)
   *images*) echo 'zt-fakerepo-${tag}:zt-dead-${tag}' ;;   # one image, tagged with a slug nobody has
   *"ps -a"*) : ;;                                          # nothing running -> nothing protects it
 esac

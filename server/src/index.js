@@ -22,6 +22,8 @@ import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
+import { attachWebappUpgrade } from './lib/webapp-proxy.js';
+import { attachStreamWebSocket } from './lib/stream.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
@@ -121,8 +123,12 @@ try {
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }
 }
 
-const server = app.listen(config.port, () => {
-  console.log(`[zeehive] API on http://localhost:${config.port}  (db: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);
+// Bind 0.0.0.0 explicitly: a process-role spinoff must answer on the queenzee's published
+// interface (the hostname CXELL_API_BASE resolves to from a cage), not only on loopback.
+// Default listen(port) is usually dual-stack, but an IPv6-only :: with ipv6only=1 was one of
+// the ways TKT-136 defect #2 left the published host:port refusing while localhost answered.
+const server = app.listen(config.port, '0.0.0.0', () => {
+  console.log(`[zeehive] API on http://0.0.0.0:${config.port}  (db: ${config.databaseUrl.replace(/:[^:@/]+@/, ':***@')})`);
   if (!config.queenzeeInproc) {
     // API-ONLY (QUEENZEE_INPROC=false): no single-queenzee lock, no background loops, and NONE of
     // the boot reconciles that assume this process is THE queenzee (recoverOrphan*, the cxell
@@ -189,4 +195,11 @@ const server = app.listen(config.port, () => {
 // Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
 // existing /api proxy (vite dev + the prod nginx bundle) with no extra port to expose.
 attachTerminalBridge(server);
+// Xell webapp review: /xell-web/<slug>/* websockets (Vite HMR + the xell server's terminal bridge)
+// ride the same http server, next to the terminal bridge on the 'upgrade' event.
+attachWebappUpgrade(server);
+// The dashboard's live stream over a websocket: /api/stream/ws on the same server, so the same
+// ws-aware proxies carry it. The SSE /api/stream route stays for old clients; the console
+// prefers this channel (docs/live-stream-websocket-decision-record.md).
+attachStreamWebSocket(server);
 export { app };

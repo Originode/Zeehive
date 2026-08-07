@@ -54,7 +54,9 @@ ok(!(petalVerbs(mgr, clean)[1] || []).includes('swap'),
    'a MANAGER is offered no swap — the server refuses to re-crew one (it re-mints its prod reader)');
 ok(Object.keys(petalVerbs({ ...worker, is_production: true }, clean)).length === 0,
    'and production still gets no buttons at all');
-ok(/swap: '♻ swap zee'/.test(canvas), 'the button is labelled (VERB_LABEL) so it draws with a word, not a kind');
+// Flower draws icon-only (so swap+done fit inside the branch petal); the context menu keeps the word.
+ok(/swap: '♻'/.test(canvas), 'the flower draws ♻ icon-only (VERB_LABEL) so the branch petal stays inside the hexagon');
+ok(/swap: '♻ Swap zee'/.test(canvas), 'the context menu still names it "Swap zee" (VERB_MENU_LABEL)');
 
 // ── 2. clicking it opens the composer, and the composer only COLLECTS A CHOICE ────────────────
 console.log('\nApp routes the click to the composer, and the composer decides nothing');

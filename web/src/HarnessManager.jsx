@@ -3,7 +3,11 @@ import { getHarnesses, getHarnessFull, createHarness, updateHarness, deleteHarne
 import { emptyWarning } from './harnessHealth.js';
 import ZeeAvatar from './ZeeAvatar.jsx';
 import { PROVIDER_ART } from './providerArt.js';
-import { GEAR_ART, GEAR_KEYS, gearKeyFor } from './harnessGear.js';
+import {
+  GEAR_ART, GEAR_KEYS, gearKeyFor,
+  ACCESSORY_ART, ACCESSORY_CATEGORIES, MAX_ACCESSORIES,
+  accessoriesByCategory, accessoriesFor,
+} from './harnessGear.js';
 
 // Author harnesses — the personas an AI assumes as a zee. A harness = personality + skills + memory,
 // layered into a zee's briefing beneath the law (the manual + binding rules). Unlimited; the `core`
@@ -16,7 +20,14 @@ import { GEAR_ART, GEAR_KEYS, gearKeyFor } from './harnessGear.js';
 // can actually be read here (it was a char count, while the docs told people to "read it in the
 // harness manager"). What a wearer is briefed with is shown as one total, because that is what the
 // harness costs on every dispatch.
-const blank = () => ({ label: '', glyph: '', gear: '', summary: '', personality: '', avatar_svg: '', parent: null, zee_type: 'worker', scope: 'global', project_id: null, project_name: null, skills: [], memory: [], model_policy: {}, router_policy: {}, enabled: true, upload_conversations_on_done: false, enable_reflection: true, inherited: { skills: [], memory: [], chain: [] } });
+const blank = () => ({
+  label: '', glyph: '', gear: '', accessories: [], custom_accessories: [],
+  summary: '', personality: '', avatar_svg: '', parent: null, zee_type: 'worker',
+  scope: 'global', project_id: null, project_name: null, skills: [], memory: [],
+  model_policy: {}, router_policy: {}, enabled: true,
+  upload_conversations_on_done: false, enable_reflection: true,
+  inherited: { skills: [], memory: [], chain: [] },
+});
 
 const chars = (t) => `${String(t || '').length.toLocaleString()} chars`;
 const fileSafe = (s) => String(s || 'note').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'note';
@@ -93,22 +104,63 @@ export function AvatarField({ svg, onChange }) {
 
 // HOW THIS HARNESS WILL BE WORN — the badge art above is only half of what a human sees in the
 // console. Everywhere a zee is drawn, the AI PROVIDER is the coin and THIS harness is the COSTUME
-// framed around it (web/src/harnessGear.js): wings for a scout, a hammer for a builder, a necktie
-// for a manager. So the editor shows exactly that, on three vendors at once — the point being that
-// the costume is the part that stays the same — and lets an author PICK it.
+// framed around it (web/src/harnessGear.js). A harness may wear UP TO THREE accessories, each in a
+// category that decides where it lands: borders frame the coin, hats sit on top, equipment follows
+// the old single-gear language (tools on the belt, glasses on the face).
 //
-// The default is derived from the key/label, and that is deliberate: the dev crew already reads as
-// job titles (dev-scout, dev-builder, dev-reviewer), so a good default beats a field every author
-// has to remember. The picker exists for the harness whose name does not say its job — and it shows
-// which costume the NAME would have chosen, so "derive" is never a mystery.
-export function WornPreview({ label, glyph, gear, onGear, keys = ['claude', 'openai', 'kimi'] }) {
-  const harness = { label: label || 'this harness', glyph, gear };
+// Empty accessories → the legacy single `gear` (or the name-derived costume) is what is worn, so
+// every existing harness keeps looking the same until someone picks a multi-accessory set.
+export function WornPreview({
+  label, glyph, gear, accessories = [], custom_accessories = [],
+  onGear, onAccessories, onCustomAccessories,
+  keys = ['claude', 'openai', 'kimi'],
+}) {
+  const harness = {
+    label: label || 'this harness', glyph, gear,
+    accessories, custom_accessories,
+  };
   const derived = gearKeyFor({ label, glyph });
+  const worn = accessoriesFor(harness);
+  const selected = new Set((accessories || []).map((k) => String(k).toLowerCase()));
+  const atCap = selected.size >= MAX_ACCESSORIES;
+
+  const toggle = (key) => {
+    if (!onAccessories) return;
+    const k = String(key).toLowerCase();
+    if (selected.has(k)) {
+      onAccessories((accessories || []).filter((x) => String(x).toLowerCase() !== k));
+      // clearing the multi-set entirely falls back to name-derived gear
+      return;
+    }
+    if (atCap) return;
+    // Picking an accessory leaves the legacy gear alone (back-compat) but the accessories list
+    // becomes the source of truth for what is drawn.
+    onAccessories([...(accessories || []), k].slice(0, MAX_ACCESSORIES));
+  };
+
+  const clearAccessories = () => { if (onAccessories) onAccessories([]); };
+
+  const addCustom = ({ label: lab, category, svg }) => {
+    if (!onCustomAccessories || !onAccessories) return;
+    if (atCap) return;
+    const key = `custom-${String(lab || 'acc').toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24)}-${Math.random().toString(36).slice(2, 6)}`;
+    const next = [...(custom_accessories || []), { key, label: lab || key, category, svg }];
+    onCustomAccessories(next);
+    onAccessories([...(accessories || []), key].slice(0, MAX_ACCESSORIES));
+  };
+
+  const catLabel = { border: 'Borders', hat: 'Hats', equipment: 'Equipment' };
+  const catHint = {
+    border: 'frame the provider coin (behind it)',
+    hat: 'sit on top of the provider',
+    equipment: 'tools & face gear — same language as the old single costume',
+  };
+
   return (
     <div className="disp-field" data-testid="harness-worn-preview">
       <label className="disp-label">
         Worn <span className="disp-hint">how a zee wearing it is drawn: the AI provider is the coin,
-          this harness is the costume around it</span>
+          this harness wears up to {MAX_ACCESSORIES} accessories around it</span>
       </label>
       <div className="zav-worn">
         {keys.filter((k) => PROVIDER_ART[k]).map((k) => (
@@ -118,8 +170,73 @@ export function WornPreview({ label, glyph, gear, onGear, keys = ['claude', 'ope
           </span>
         ))}
       </div>
-      {onGear && (
-        <div className="disp-models hm-gear-pick" role="group" aria-label="Costume">
+
+      <div className="hm-acc-summary" data-testid="harness-accessories-summary">
+        {worn.length
+          ? <>Wearing: {worn.map((a) => a.label).join(' · ')}
+              <span className="disp-hint"> ({worn.length}/{MAX_ACCESSORIES})</span></>
+          : <span className="disp-hint">no accessories yet — falls back to the name-derived costume</span>}
+        {(accessories || []).length > 0 && (
+          <button type="button" className="hm-del" data-testid="accessories-clear"
+                  onClick={clearAccessories} title="Clear accessories — fall back to name-derived gear">clear</button>
+        )}
+      </div>
+
+      {onAccessories && ACCESSORY_CATEGORIES.map((cat) => {
+        const builtIn = accessoriesByCategory(cat)
+          // hide legacy gear duplicates that are not the "default set" for the category pickers
+          // when they are only there for back-compat (necktie, shovel, … still pickable under equipment)
+          .filter((k) => ACCESSORY_ART[k]);
+        const customs = (custom_accessories || []).filter((c) => c.category === cat);
+        return (
+          <div key={cat} className="hm-acc-cat" data-testid={`accessory-cat-${cat}`}>
+            <div className="hm-acc-cat-head">
+              <b>{catLabel[cat]}</b>
+              <span className="disp-hint"> — {catHint[cat]}</span>
+            </div>
+            <div className="disp-models hm-gear-pick" role="group" aria-label={catLabel[cat]}>
+              {builtIn.map((k) => {
+                const on = selected.has(k);
+                const disabled = !on && atCap;
+                return (
+                  <button type="button" key={k}
+                          className={`disp-seg ${on ? 'on' : ''}`}
+                          data-testid={`acc-${k}`}
+                          disabled={disabled}
+                          title={on ? `Remove ${ACCESSORY_ART[k].label}` : (disabled ? `Already wearing ${MAX_ACCESSORIES}` : `Wear ${ACCESSORY_ART[k].label}`)}
+                          onClick={() => toggle(k)}>
+                    {ACCESSORY_ART[k].label}
+                  </button>
+                );
+              })}
+              {customs.map((c) => {
+                const on = selected.has(c.key);
+                const disabled = !on && atCap;
+                return (
+                  <button type="button" key={c.key}
+                          className={`disp-seg ${on ? 'on' : ''}`}
+                          data-testid={`acc-${c.key}`}
+                          disabled={disabled}
+                          title={c.label}
+                          onClick={() => toggle(c.key)}>
+                    {c.label} <span className="disp-hint">custom</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+
+      {onCustomAccessories && (
+        <CustomAccessoryAdd atCap={atCap} onAdd={addCustom} />
+      )}
+
+      {/* Legacy single-gear picker kept as a compact escape hatch: empty accessories + an
+          explicit gear still works, and "from the name" is how almost every crew harness is dressed. */}
+      {onGear && (accessories || []).length === 0 && (
+        <div className="disp-models hm-gear-pick" role="group" aria-label="Legacy single costume">
+          <span className="disp-hint hm-acc-legacy">Single costume (when no accessories picked):</span>
           <button type="button" className={`disp-seg ${gear ? '' : 'on'}`} data-testid="gear-derive"
                   title={`Choose the costume from the harness's name — this one reads as "${GEAR_ART[derived].label}"`}
                   onClick={() => onGear('')}>from the name · {GEAR_ART[derived].label}</button>
@@ -129,6 +246,100 @@ export function WornPreview({ label, glyph, gear, onGear, keys = ['claude', 'ope
                     onClick={() => onGear(k)}>{GEAR_ART[k].label}</button>
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+// Paste a freeform SVG as a custom accessory on THIS harness. It is stored in the harness bundle
+// (like badge art), not in a global catalog — a costume a persona invented for itself.
+export function CustomAccessoryAdd({ atCap, onAdd }) {
+  const [open, setOpen] = useState(false);
+  const [label, setLabel] = useState('');
+  const [category, setCategory] = useState('hat');
+  const [svg, setSvg] = useState('');
+  const [err, setErr] = useState(null);
+  const submit = () => {
+    const t = String(svg || '').trim();
+    if (!t || !/^<svg[\s>]/i.test(t)) { setErr('paste an SVG document (it must start with <svg …>)'); return; }
+    if (!label.trim()) { setErr('give it a short name'); return; }
+    setErr(null);
+    onAdd({ label: label.trim(), category, svg: t });
+    setLabel(''); setSvg(''); setOpen(false);
+  };
+  if (atCap) {
+    return <div className="disp-hint" data-testid="custom-acc-capped">Already wearing {MAX_ACCESSORIES} — remove one to add a custom SVG.</div>;
+  }
+  return (
+    <div className="hm-custom-acc" data-testid="custom-accessory-add">
+      <button type="button" className="hm-add" onClick={() => setOpen(!open)} aria-expanded={open}>
+        {open ? '▾' : '▸'} Add custom SVG accessory
+      </button>
+      {open && (
+        <div className="hm-custom-acc-body">
+          <div className="hm-row2">
+            <input className="disp-input" value={label} onChange={(e) => setLabel(e.target.value)}
+                   placeholder="name (e.g. monocle)" maxLength={40} />
+            <select className="disp-input" value={category} onChange={(e) => setCategory(e.target.value)}
+                    aria-label="Accessory category">
+              {ACCESSORY_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <textarea className="disp-input hm-ta hm-mono" rows={3} value={svg} spellCheck={false}
+                    placeholder="<svg xmlns=…> — the accessory art"
+                    onChange={(e) => setSvg(e.target.value)} />
+          {err && <div className="disp-hint hm-avatar-err">{err}</div>}
+          <button type="button" className="hm-add" data-testid="custom-acc-save" onClick={submit}>
+            ＋ Add to this harness
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Collapsible section used for the customization panel (and anywhere the editor is getting long).
+export function HmFold({ title, hint, testid, defaultOpen = true, children }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className={`hm-fold ${open ? 'open' : 'closed'}`} data-testid={testid || undefined}>
+      <button type="button" className="hm-fold-head" onClick={() => setOpen(!open)}
+              aria-expanded={open}>
+        <span className="hm-inh-caret">{open ? '▾' : '▸'}</span>
+        <span className="hm-fold-title">{title}</span>
+        {hint ? <span className="disp-hint"> — {hint}</span> : null}
+      </button>
+      {open && <div className="hm-fold-body">{children}</div>}
+    </div>
+  );
+}
+
+// One skill row — collapsed to its name by default so a harness with many skills is scannable;
+// expand to edit when/body. Mirrors InheritedEntry's open/close, but the body is editable.
+export function SkillEditor({ skill, onChange, onRemove }) {
+  const [open, setOpen] = useState(!skill.name); // brand-new empty skills start open so you can fill them
+  return (
+    <div className="hm-sub hm-skill" data-testid="harness-skill">
+      <div className="hm-row2">
+        <button type="button" className="hm-skill-toggle" onClick={() => setOpen(!open)}
+                aria-expanded={open} title={open ? 'collapse skill' : 'expand skill'}>
+          <span className="hm-inh-caret">{open ? '▾' : '▸'}</span>
+        </button>
+        <input className="disp-input" value={skill.name}
+               onChange={(e) => onChange('name', e.target.value)}
+               placeholder="skill name" />
+        <button className="hm-del" onClick={onRemove} title="Remove skill">🗑</button>
+      </div>
+      {open && (
+        <>
+          <input className="disp-input" value={skill.when}
+                 onChange={(e) => onChange('when', e.target.value)}
+                 placeholder="when to use it" />
+          <textarea className="disp-input hm-ta hm-mono" rows={10} value={skill.body}
+                    onChange={(e) => onChange('body', e.target.value)}
+                    spellCheck={false} placeholder="the instructions — a procedure the wearer follows" />
+          <div className="disp-hint">{chars(skill.body)} · lands in the xell as <code>.claude/skills/{skillFile(skill.name)}/SKILL.md</code></div>
+        </>
       )}
     </div>
   );
@@ -675,12 +886,22 @@ export default function HarnessManager({ onClose }) {
                   </div>
                 </div>
 
-                {/* The BADGE ART, stored in the meta-DB like everything else (082). It used to be a
-                    file in the Zeehive repo, which meant the badge vanished on any queenzee that could
-                    not read that repo — so it is editable here, and it travels with the harness. */}
-                <AvatarField svg={form.avatar_svg || ''} onChange={(v) => set('avatar_svg', v)} />
-                <WornPreview label={form.label} glyph={form.glyph} gear={form.gear || ''}
-                             onGear={(v) => set('gear', v)} />
+                {/* CUSTOMIZATION — badge art + how the harness is worn. Collapsed by default on a
+                    long persona so the text editors stay reachable; open when you are dressing it. */}
+                <HmFold title="Customization" testid="harness-customization"
+                        hint="badge art, accessories (border · hat · equipment), worn preview"
+                        defaultOpen>
+                  {/* The BADGE ART, stored in the meta-DB like everything else (082). It used to be a
+                      file in the Zeehive repo, which meant the badge vanished on any queenzee that could
+                      not read that repo — so it is editable here, and it travels with the harness. */}
+                  <AvatarField svg={form.avatar_svg || ''} onChange={(v) => set('avatar_svg', v)} />
+                  <WornPreview label={form.label} glyph={form.glyph} gear={form.gear || ''}
+                               accessories={form.accessories || []}
+                               custom_accessories={form.custom_accessories || []}
+                               onGear={(v) => set('gear', v)}
+                               onAccessories={(v) => set('accessories', v)}
+                               onCustomAccessories={(v) => set('custom_accessories', v)} />
+                </HmFold>
 
                 {/* WHICH ZEE TYPE this persona is for. A harness carries the MANUAL for a type's
                     verbs and refusals, so a xell may only wear one of its own type — a manager
@@ -762,18 +983,13 @@ export default function HarnessManager({ onClose }) {
                 </div>
 
                 <div className="disp-field">
-                  <label className="disp-label">Skills ({form.skills.length})</label>
+                  <label className="disp-label">Skills ({form.skills.length})
+                    <span className="disp-hint"> — each skill collapses to its name; expand to edit</span>
+                  </label>
                   {form.skills.map((s, i) => (
-                    <div key={i} className="hm-sub">
-                      <div className="hm-row2">
-                        <input className="disp-input" value={s.name} onChange={(e) => setSkill(i, 'name', e.target.value)} placeholder="skill name" />
-                        <button className="hm-del" onClick={() => rmSkill(i)} title="Remove skill">🗑</button>
-                      </div>
-                      <input className="disp-input" value={s.when} onChange={(e) => setSkill(i, 'when', e.target.value)} placeholder="when to use it" />
-                      <textarea className="disp-input hm-ta hm-mono" rows={10} value={s.body} onChange={(e) => setSkill(i, 'body', e.target.value)}
-                                spellCheck={false} placeholder="the instructions — a procedure the wearer follows" />
-                      <div className="disp-hint">{chars(s.body)} · lands in the xell as <code>.claude/skills/{skillFile(s.name)}/SKILL.md</code></div>
-                    </div>
+                    <SkillEditor key={i} skill={s}
+                                 onChange={(k, v) => setSkill(i, k, v)}
+                                 onRemove={() => rmSkill(i)} />
                   ))}
                   <button className="hm-add" onClick={addSkill}>＋ Add skill</button>
                 </div>

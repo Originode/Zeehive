@@ -64,10 +64,8 @@ ok(/manager = false/.test(disp), 'Dispatch takes a `manager` variant flag (defau
 // picker left in here is the manager's — one manager button serves the whole fleet. Both lists are
 // still type-scoped (054 refuses a mismatch) and project-scoped (084: the system-wide personas plus
 // this project's own, never another project's — anything else is a button that produces a refusal).
-ok(/getHarnesses\('manager', projectId\)/.test(disp),
-   'the composer offers MANAGER harnesses in its manager variant (054), scoped to this project (084)');
-ok(/getHarnesses\('worker', pid\)/.test(app),
-   "and App.jsx builds the worker prompt buttons from this project's worker harnesses");
+ok(/getHarnesses\(manager \? 'manager' : 'worker', projectId\)/.test(disp),
+   'the composer loads type-scoped harnesses (manager variant → manager; worker → worker) for the in-composer picker (054 + 084)');
 ok(/!task && !manager/.test(disp),
    'a blank brief is allowed for a manager (the server then applies DEFAULT_MANAGER_BRIEF) and refused for a worker');
 ok(/\.\.\.\(task \? \{ task \} : \{\}\)/.test(disp),
@@ -76,12 +74,15 @@ ok(/data-testid="manager-proddb-note"/.test(disp) && !/manager[\s\S]{0,80}dispat
    'a manager gets the read-only-production FACT, not a prod-DB toggle that would be a lie either way');
 ok(/\{!manager && prodDb &&/.test(disp), 'the LIVE-PROD warning banner can never render in the manager composer');
 // A manager is never offered "core only" — its manual IS the manager harness (the crew verbs, the
-// read-only-prod and no-push law it must know). The persona picker in here is manager-only and
-// carries no core-only segment; core-only is a WORKER prompt button in App.jsx.
-ok(/\{manager && harnesses\.length > 0 && \(/.test(disp) && !/dispatch-harness-none/.test(disp),
-   'a manager is never offered "core only" — its manual IS the manager harness');
-ok(/data-testid="new-prompt-btn-core"|new-prompt-btn-\$\{b\.key \|\| 'core'\}/.test(app),
-   'while a WORKER can still be dispatched with no persona at all — "core only" is its own prompt button');
+// read-only-prod and no-push law it must know). The core-only segment is gated on workerPersonaPicker.
+ok(/\{manager && harnesses\.length > 0 && \(/.test(disp)
+   && /workerPersonaPicker/.test(disp)
+   && /data-testid="dispatch-harness-none"/.test(disp),
+   'a manager is never offered "core only" — that segment lives on the worker persona picker only');
+ok(/data-testid="dispatch-harness-none"/.test(disp) && /core only/.test(disp),
+   'while a WORKER can still be dispatched with no persona at all — "core only" is in the composer picker');
+ok(/data-testid="new-prompt-btn"/.test(app) && /＋ prompt/.test(app),
+   'the toolbar has one "+ prompt" button (not one per persona)');
 ok(/provider: activeProvider/.test(disp) && /activeTokenId \? \{ provider_token_id: activeTokenId \}/.test(disp),
    'the payload carries the ACCOUNT actually chosen in the composer');
 ok(/data-testid=\{manager \? 'manager-submit' : 'dispatch-submit'\}/.test(disp),

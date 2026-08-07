@@ -20,11 +20,15 @@ is the entire safety story, because every wall a router needs already exists for
 | "no ability to land" | the landgate declines a manager push without raising a request (052); `zee land` → `refuseForManager` |
 | "no ability to ship" | **added in 139**: `selfShip` refuses a router by name (`isRouterXell`) — a plain manager may still ask, a router may not |
 | "can sync its worktree to the xource" | `zee sync` has no manager refusal — the queenzee delivers current main into its cage |
-| decides + performs dispatches | the manager crew verbs (`zee dispatch`, now with `--provider`, plus `zee zees` / `zee say`) |
+| decides + performs dispatches | the board deployment verbs (`zee work --new` + `zee assign`, now with `--provider`) — the ONLY path any manager has |
 
 A new `zee_type` was rejected for 120's reason verbatim: **types exist for refusals**, and the
 router needs no refusal the manager type does not already have — except the ship ask, which is one
-predicate (`isRouterXell`) rather than a type.
+predicate (`isRouterXell`) rather than a type. **151 added the second structural exception: a router
+is not a crew lead.** The crew verbs (`zee zees`, `zee say`, `zee swap`, `zee suggest-done`,
+`zee conversations`) are refused for a router by name, a router-deployed worker is NOT stamped with
+`manager_xell_id`, and the worker's brief carries no "Your manager" block — the card is its anchor
+and progress goes to the board, never to the router.
 
 ## Singularity: the `limit` policy knob
 
@@ -62,8 +66,10 @@ are structural (above), never in this file.
    `zee_message` (kind `directive`) and delivered into its live session. The message carries the
    raw prompt **verbatim**, the effective policy snapshot, the providers currently outside their
    schedule window, and the persona button the human pressed (marked *hint, not decision*).
-3. The router recomposes, decides, dispatches (`zee dispatch --provider … --model … --mode …
-   --harness …`) and **reports what it routed and why**.
+3. The router recomposes, decides, and deploys onto a CARD — `zee work --new --title "…" --body "…"`
+   if none covers the work, then `zee assign --item <id> --task "…" --provider … --model … --mode …
+   --harness …` — and **reports what it routed and why**. It does NOT manage the worker it deployed:
+   the card follows it, and a PROGRAMME escalates to a human-approved manager (`zee mint-manager`).
 4. **Redeploy / "swap it with a better model"** — the composer's router chip (`⇄ redeploy / swap
    model`) reuses the human swap path: same xell row, same branch, same read-only prod bind, a NEW
    zee on the provider/model picked (`POST /api/router/redeploy`; falls back to a fresh deploy when
@@ -84,7 +90,8 @@ before — a gate that bricked every project the day it shipped would be worse t
 - `server/src/lib/harness.js` — `assertHarnessLimit` in `assignHarness`; `router_policy` in
   save/read models
 - `server/src/api/routes.js` — `/api/router/{status,deploy,redeploy,route}`
-- `server/src/queenzee/self.js` — `zee dispatch --provider`; the router ship refusal
+- `server/src/queenzee/self.js` — `zee dispatch`/`zee assign --provider`; the router ship refusal;
+  `refuseRouterCrew` (151) blocks the crew verbs for a router
 - `web/src/Dispatch.jsx` (the gate + deploy sub-mode) · `web/src/App.jsx` (toasts) ·
   `web/src/HarnessManager.jsx` (limit field + `RouterPolicyEditor`) · `web/src/api.js`
 - `test/router-zee.test.mjs` — the whole contract, against a real database

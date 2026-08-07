@@ -320,3 +320,64 @@ export async function xellPatch(xellId, { kind = 'source' } = {}) {
   }
   return { ...meta, ok: false, error: 'no worktree on disk for this xell' };
 }
+
+// The XOURCE's live dirty patch — what the broken-pipe modal previews. Three scopes match the
+// three buckets a human acts on from that tip:
+//   staged   — `git diff --cached` (what Commit it would land)
+//   unstaged — worktree vs index + untracked (what is dirty but not in the index)
+//   all      — worktree vs HEAD + untracked (the whole wedge landings refuse over)
+// Read-only, same caps as every other patch. .claude/ untracked paths are filtered out — those
+// are xell worktrees, never "rogue" xource dirt.
+export async function xourcePatch(projectId, { scope = 'all' } = {}) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+  if (!project) throw new Error('no such project');
+  const dir = project.repo_root;
+  if (!dir || !existsSync(dir)) return { ok: false, error: 'the project xource is not on disk here' };
+  const want = scope === 'staged' ? 'staged' : scope === 'unstaged' ? 'unstaged' : 'all';
+  const main = project.main_branch || 'main';
+  const meta = { kind: 'xource', scope: want, project: project.id, source: 'xource' };
+
+  let args;
+  if (want === 'staged') args = ['diff', '--no-color', '-M', '--cached'];
+  else if (want === 'unstaged') args = ['diff', '--no-color', '-M'];
+  else args = ['diff', '--no-color', '-M', 'HEAD'];
+
+  const r = await gitOut(dir, args);
+  // git diff exits 0 with empty output when clean; non-zero is a real failure (bad repo, etc.).
+  if (r.status !== 0) {
+    return { ...meta, ok: false, error: (r.err || 'git diff failed').trim().split('\n')[0],
+      base: want === 'staged' ? 'HEAD' : (want === 'all' ? 'HEAD' : 'index'),
+      head: want === 'staged' ? 'index' : 'worktree' };
+  }
+
+  let extra = [];
+  if (want !== 'staged') {
+    const ut = await untrackedFiles(dir);
+    // Xell worktrees live under .claude/ and must never appear as "rogue xource files".
+    extra = ut.filter((f) => f && f.path && !String(f.path).startsWith('.claude'));
+  }
+
+  const hd = await gitOut(dir, ['rev-parse', 'HEAD'], { maxBytes: 200 });
+  const head = hd.status === 0 ? hd.out.trim() : null;
+  const labels = {
+    staged: `${project.name} · xource staged (what Commit would land)`,
+    unstaged: `${project.name} · xource unstaged + untracked`,
+    all: `${project.name} · xource all uncommitted`,
+  };
+  return {
+    ...meta,
+    ...payload({
+      source: 'xource',
+      base_ref: want === 'staged' ? (head || 'HEAD') : (want === 'all' ? (head || 'HEAD') : 'index'),
+      head_ref: want === 'staged' ? 'index' : 'worktree',
+      label: labels[want],
+      text: r.out, capped: r.capped, extra,
+      note: want === 'staged'
+        ? 'staged index on the main checkout — landings refuse over this'
+        : (extra.length
+          ? `${extra.length} untracked file(s) included (.claude/ worktrees excluded)`
+          : null),
+    }),
+    main_branch: main,
+  };
+}

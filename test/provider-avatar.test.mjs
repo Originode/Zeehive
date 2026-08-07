@@ -321,10 +321,12 @@ ok(renderToStaticMarkup(React.createElement(ZeeAvatar, { xell: { slug: 'ready-ce
 section('the console actually wears it');
 const app = read('web/src/App.jsx');
 ok(/<ZeeAvatar xell=\{x\} size=\{\d+\} \/>/.test(app), 'the xell card leads with the badge');
-// The prompt buttons are PER PERSONA now (docs/harness-proposal.md §3.2d), so the vendor coin moved
-// to where the vendor is actually chosen — the composer's provider and account pickers — and the
-// button itself WEARS the persona it dispatches. Same rule, same registry, one step later.
-ok(/<ZeeAvatar harness=\{\{ key: b\.key/.test(app), 'a prompt button wears the persona it dispatches');
+// The per-persona prompt buttons were collapsed into ONE "+ prompt" (fd43282): the button no
+// longer wears the persona it dispatches — the persona is chosen inside the composer. The vendor
+// coin lives where the vendor is actually picked (the composer's provider/account pickers, asserted
+// below), and the badge that survives is the xell card's, asserted above. Pin that the old
+// per-persona avatar row did NOT come back.
+ok(!/<ZeeAvatar harness=\{\{ key: b\.key/.test(app), 'no per-persona prompt-button avatar row in App');
 const dispSrc = read('web/src/Dispatch.jsx');
 ok(/<ZeeAvatar provider=\{p\.provider\} size=\{18\} \/>/.test(dispSrc),
    'and the composer carries the coin on the provider it will run on');

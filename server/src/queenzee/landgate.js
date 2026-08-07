@@ -9,7 +9,7 @@
 // the queenzee — the script enforces, the human judges.
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
-import { logline } from '../lib/logbus.js';
+import { logline, activity } from '../lib/logbus.js';
 import { gitLog, diffStat, cleanGitEnv, headCommit } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
@@ -246,6 +246,8 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
         JSON.stringify(commits), stat ? JSON.stringify(stat) : null]);
     broadcast('land', row);
     await syncXellAfterLand(xell?.id, newSha);
+    // the honeycomb's xell→queenzee line: this xell pushed a land request
+    activity('x2q', xell?.id, 'land');
     logline('landgate',
       `AUTO-APPROVED ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
       + `${xell?.slug || 'unknown'} (auto-approve policy, no human review)`);
@@ -275,6 +277,7 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
       [projectId, xell.id, ref, oldSha || null, newSha,
         JSON.stringify(commits), stat ? JSON.stringify(stat) : null, occupant.id]);
     broadcast('land', held);
+    activity('x2q', xell?.id, 'land');
     const position = await holdingPosition(held);
     logline('landgate',
       `HOLDING ${ref.replace('refs/heads/', '')} → ${newSha.slice(0, 8)} on ${project.name} — ${xell.slug} is `
@@ -290,6 +293,8 @@ export async function checkPush({ projectId, ref, oldSha, newSha }, { mode = PRO
       JSON.stringify(commits), stat ? JSON.stringify(stat) : null]);
 
   broadcast('land', row);
+  // the honeycomb's xell→queenzee line: this xell pushed a land request
+  activity('x2q', xell?.id, 'land');
   logline('landgate',
     `HELD ${ref} → ${newSha.slice(0, 8)} on ${project.name} — ${commits.length} commit(s) from `
     + `${xell?.slug || 'unknown'} awaiting human verification`);

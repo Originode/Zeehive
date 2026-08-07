@@ -102,31 +102,57 @@ tunnel tokens — those are facts about *your machines*, not about the project (
 And anything compose already declares (dockerfiles, internal ports, service deps,
 network wiring) — read via `docker compose config --format json`, never copied.
 
-#### `tiers.spinoff.compose` is what ENABLES machine placement
+#### A docker-backed spinoff server is what ENABLES machine placement
 
 The pool maintainer only runs the **machine-aware** path (per-machine pool sizes,
-`machine_pool.dev_priority`, the machine-wide `max_xells` cap) when the project has a
-per-xell **app tier** — i.e. when `project.compose_spinoff` is set (from
-`tiers.spinoff.compose` in the manifest, or the legacy `project.compose_spinoff` column).
-It must be a path (relative to the repo root, e.g. `docker-compose.spinoff.yml`) to the
-compose file that brings up ONE xell's server + webapp on a docker context.
+`machine_pool.dev_priority`, the machine-wide `max_xells` cap) when the project's spinoff
+**server role is not `runner: process`**. Compose-shaped projects (no process runner on
+`roles.server` / `tiers.spinoff`) stamp `docker_ctx` on the per-xell server container at
+provision, so the pool can count ready xells per machine. `project.compose_spinoff` (from
+`tiers.spinoff.compose` in the manifest) is the compose *file* the build path uses — it is
+stamped onto the container row and defaults to `docker-compose.spinoff.yml` when unset; it
+is **not** the placement predicate.
 
 Why the guard exists: machine mode counts a project's ready xells *through their owned
 server container* (`fillTrim`'s join on `container.role='server'` + the machine's
-`docker_ctx`). A project with no per-xell app tier (no `compose_spinoff` — e.g. Zeehive
-itself, whose xells are bare worktrees) owns no such containers, so that count is always
-ZERO: fill would provision `pool_size` more every tick, trim would never see a surplus,
-and `max_xells` would never cap it. That is exactly how 167 ready Zeehive xells piled up
-on 2026-07-19. So such projects keep the legacy project-wide `pool_config.target_ready`,
-and an operator who set per-machine numbers for them must be TOLD they are not in effect —
-the pool logs `machine-aware pooling DISABLED … compose_spinoff is unset` (once per state
-change), and the console's container matrix shows the same warning.
+`docker_ctx`). A process-runner project (e.g. Zeehive itself: bare worktree + process
+server/webapp) stamps `docker_ctx=NULL` on those rows, so that count is always ZERO: fill
+would provision `pool_size` more every tick, trim would never see a surplus, and
+`max_xells` would never cap it. That is exactly how 167 ready Zeehive xells piled up on
+2026-07-19. So such projects keep the legacy project-wide `pool_config.target_ready`, and
+an operator who set per-machine numbers for them must be TOLD they are not in effect —
+the pool logs `machine-aware pooling DISABLED … runner:process` (once per state change),
+and the console's container matrix shows the same warning.
 
-To ENABLE machine placement for a project: add the spinoff compose to the manifest
-(`tiers.spinoff.compose: <path>`) and refresh it (console → Project setup → Manifest →
-↻ Refresh from repo). The field must name a real compose file whose services match the
-project's `roles` — the build path (`build-container.sh`) resolves it from the container
-row stamped at provision.
+A compose project with machines configured is placeable **even when `compose_spinoff` is
+unset** — requiring that column was the "mardale-prod never gets pool xells" defect under
+its second diagnosis (every per-machine pool size was a dead letter until someone refreshed
+`tiers.spinoff.compose` into the column). To place on machines: keep the server as a compose
+role (not `runner: process`). To name the compose file explicitly: set
+`tiers.spinoff.compose: <path>` and refresh (console → Project setup → Manifest → ↻ Refresh
+from repo). The field must name a real compose file whose services match the project's
+`roles` — the build path (`build-container.sh`) resolves it from the container row stamped
+at provision.
+
+#### Compose onboarding (detect → plan → human approves → meta-DB)
+
+When a project has `docker-compose*.yml` at the repo root but the meta-DB has not absorbed
+them yet, Project setup → Manifest → **Plan compose onboarding** builds a transparent plan:
+
+1. **Detect** compose files and guess tier (`spin` → spinoff, `prod` → prod, `dev` → dev).
+2. **Show** every file that would be created/updated (`zeehive.yml` only) and every
+   `project` column that would change (`compose_spinoff`, `compose_prod`, manifest cache, …).
+3. **Guarantee** production/spinoff **container rows** and `deploy_site.compose_file` are
+   **not** modified — live stacks keep the `compose_file` stamped at provision/ship.
+4. **Apply only after** the human confirms (`approved: true` on
+   `POST /projects/:id/manifest/compose-apply`). Without it the server refuses and writes
+   nothing.
+
+Existing `zeehive.yml` is merged, not replaced: missing `tiers.*.compose` paths are filled;
+`runner: process` and other declared keys stay put. A process-runner project that also has
+a prod compose therefore gains `compose_prod` without becoming machine-placeable (and the
+plan says so). The readiness checklist surfaces a `compose_onboarding` warn gate when the
+plan is applicable.
 
 ### 3.2 Meta-DB (owns INSTANCES and SITES)
 

@@ -6,7 +6,7 @@ import { projectHook } from '../lib/status.js';
 import { getFleet, getFleetBurn, listRuntimes, streamXells } from '../lib/fleet.js';
 import { getTimeline, getDiffs } from '../lib/timeline.js';
 import { deliveryTelemetry } from '../lib/delivery-telemetry.js';
-import { xellPatch, landRequestPatch } from '../lib/diffview.js';
+import { xellPatch, landRequestPatch, xourcePatch } from '../lib/diffview.js';
 import { recentLogs } from '../lib/logbus.js';
 import { listCxellDir, readCxellFile } from '../lib/cxell-fs.js';
 import { listContainerDir, readContainerFile } from '../lib/container-fs.js';
@@ -40,6 +40,7 @@ import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
+         getComposeOnboardingPlan, applyComposeOnboarding,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
          cloneProject, pullProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
 import { probeRemote } from '../lib/remote-git.js';
@@ -92,8 +93,8 @@ import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addCo
 import { listReflections, fileReflectionAsTicket } from '../lib/reflections.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
-import { xourceState, cleanXourceNow, listXourceCleanRequests, decideXourceClean,
-         dismissXourceClean } from '../lib/xource-clean.js';
+import { xourceState, cleanXourceNow, commitXourceStaged, stashXource, listXourceCleanRequests,
+         decideXourceClean, dismissXourceClean } from '../lib/xource-clean.js';
 import { listManagerMintRequests, decideManagerMint, dismissManagerMint } from '../lib/manager-mint.js';
 import { listCredentialInjectRequests, decideCredentialInject, dismissCredentialInject,
          raiseRotationRequest } from '../lib/credential-inject.js';
@@ -106,6 +107,8 @@ import { langfuseConfig, langfuseStatus, provisionLangfuse, teardownLangfuse,
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkAssign,
          selfWorkItem } from '../queenzee/self.js';
+import { webappProxy, webappApiProxy } from '../lib/webapp-proxy.js';
+import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
 
 export const router = Router();
 
@@ -582,6 +585,34 @@ router.delete('/project-docs/:docId', async (req, res) => {
 });
 
 router.get('/projects/:id/sites', async (req, res) => res.json(await listSites(req.params.id)));
+// ── WireGuard mesh — the human's door onto the ZEEHIVE network ───────────────────────────────
+// Decision 5.4 (docs/common-xell-network-plan.md): ZEEHIVE operates a WG server; a human (or
+// another machine) downloads a ready .conf and joins the tunnel. These are HUMAN surface routes
+// (no zee verb): the mesh identity and peer keys are minted server-side with Node's native x25519.
+// Status is a read; mint returns a download; re-endpoint re-points the server's dial-in address.
+router.get('/projects/:id/wireguard', async (req, res) => {
+  try { res.json(await wireguardStatus(req.params.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Mint a peer config and return it AS A DOWNLOAD (Content-Disposition). The private key lives only
+// in this response — the peer row stores the public key alone.
+router.post('/projects/:id/wireguard/peer', async (req, res) => {
+  try {
+    const { config, peer } = await mintPeerConfig(req.params.id, { name: req.body?.name, dns: req.body?.dns });
+    await markPeerDownloaded(peer.id);
+    res.setHeader('Content-Type', 'application/x-wireguard-profile');
+    res.setHeader('Content-Disposition', `attachment; filename="zeehive-${peer.name}.conf"`);
+    res.send(config);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+// (Re)point the mesh server's endpoint (e.g. after the fleet's reachable address changes). The
+// server identity (keys) is unchanged — existing peer configs keep dialing their snapshot address.
+router.patch('/projects/:id/wireguard/endpoint', async (req, res) => {
+  try {
+    const server = await ensureWireguardServer(req.params.id, { endpoint: req.body?.endpoint });
+    res.json({ ok: true, endpoint: server.endpoint, public_key: server.public_key });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 router.post('/projects/:id/sites', async (req, res) => {
   try { res.json(await createSite(req.params.id, req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
@@ -762,6 +793,23 @@ router.post('/projects/:id/manifest/draft', async (req, res) => {
   try { res.json(await draftProjectManifest(await resolveProjectParam(req.params.id), { write: req.body?.write === true })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Compose onboarding — detect docker-compose*.yml, propose meta-DB (+ optional yml) changes,
+// apply only after the human approves. Production container rows are never written.
+//   GET  …/manifest/compose-plan     → the plan (read-only)
+//   POST …/manifest/compose-apply    → { approved: true, write_yml?, apply_meta? }
+router.get('/projects/:id/manifest/compose-plan', async (req, res) => {
+  try { res.json(await getComposeOnboardingPlan(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/projects/:id/manifest/compose-apply', async (req, res) => {
+  try {
+    res.json(await applyComposeOnboarding(await resolveProjectParam(req.params.id), {
+      approved: req.body?.approved === true,
+      write_yml: req.body?.write_yml !== false,   // default ON — yml is the truth
+      apply_meta: req.body?.apply_meta !== false, // default ON — meta-DB is what the pool reads
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 // ── onboarding surface (Project Setup panel) ──────────────────────────────────
 // Probe a FOLDER (works before the project exists): git state, manifest, compose files, env.
@@ -822,6 +870,14 @@ router.get('/xells/:id/diff', async (req, res) => {
 router.get('/land/requests/:id/diff', async (req, res) => {
   try { res.json(await landRequestPatch(req.params.id)); }
   catch (err) { res.status(404).json({ ok: false, error: err.message }); }
+});
+// The xource's live dirty patch — broken-pipe modal "show the diff" / per-file preview.
+// scope=staged|unstaged|all (default all).
+router.get('/projects/:id/xource/diff', async (req, res) => {
+  try {
+    const scope = ['staged', 'unstaged', 'all'].includes(req.query.scope) ? req.query.scope : 'all';
+    res.json(await xourcePatch(req.params.id, { scope }));
+  } catch (err) { res.status(404).json({ ok: false, error: err.message }); }
 });
 
 // queenzee activity log (the terminal modal)
@@ -1951,6 +2007,27 @@ router.post('/projects/:id/xource/clean', async (req, res) => {
     res.json(await cleanXourceNow(req.params.id, { by: req.body?.by || 'human@console', reason: req.body?.reason || null }));
   } catch (err) { res.status(409).json({ error: err.message }); }
 });
+// Commit STAGED work on the xource (the keep half of the broken-pipe modal on the git-graph
+// tip). Clear is /xource/clean above; this is the other door. Message is required — it lands on
+// main. Refused in simulate mode (nested queenzee) the same way clean is.
+router.post('/projects/:id/xource/commit', async (req, res) => {
+  try {
+    res.json(await commitXourceStaged(req.params.id, {
+      message: req.body?.message || null,
+      by: req.body?.by || 'human@console',
+    }));
+  } catch (err) { res.status(409).json({ error: err.message }); }
+});
+// Stash dirty xource work (staged + unstaged + untracked). Third recovery door: park the dirt so
+// the checkout is clean without discarding it. Refused in simulate mode like clean/commit.
+router.post('/projects/:id/xource/stash', async (req, res) => {
+  try {
+    res.json(await stashXource(req.params.id, {
+      message: req.body?.message || null,
+      by: req.body?.by || 'human@console',
+    }));
+  } catch (err) { res.status(409).json({ error: err.message }); }
+});
 router.get('/xource-clean/requests', async (req, res) => {
   if (!req.query.project) return res.status(400).json({ error: 'project required' });
   res.json(await listXourceCleanRequests(req.query.project, { open: req.query.all !== '1' }));
@@ -2491,7 +2568,8 @@ router.post('/xell/self/work/assign', async (req, res) => {
     const b = req.body || {};
     res.json(await selfWorkAssign(x, { item: b.item || null, task: b.task || null, model: b.model || null,
       mode: b.mode || null, harness: b.harness || null, title: b.title || null,
-      visual_verify: b.visual_verify || false, langfuse_tracking: b.langfuse_tracking ?? null })); }
+      visual_verify: b.visual_verify || false, langfuse_tracking: b.langfuse_tracking ?? null,
+      provider: b.provider || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Report an item's status/progress. A manager may report any item in its own project; a worker only
@@ -2642,3 +2720,14 @@ router.get('/stream', async (req, res) => {
   const ping = setInterval(() => res.write(': ping\n\n'), 20000);
   req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); });
 });
+
+// ── XELL WEBAPP REVIEW — /xell-web/<slug>/* ────────────────────────────────────────────────────
+// Reverse proxy to a xell's app tier (docs/common-xell-network-plan.md). The console nginx
+// forwards /xell-web/<slug>/* → /api/xell-web/<slug>/*; express strips the /xell-web/<slug> mount
+// and proxies the rest. Two upstreams, one route: /api/* → the xell's OWN server (so a reviewed
+// console's API calls hit its own queenzee, not the outer one), everything else → the xell's Vite
+// dev server (which Vite serves under its base prefix). Read-only GET/HEAD/stream to a throwaway
+// per-xell dev server — the same class as opening a URL in a new tab, so it needs no gate.
+// Websockets are handled separately in index.js (attachWebappUpgrade).
+router.use('/xell-web/:slug/api', webappApiProxy);                    // the xell's own server
+router.use('/xell-web/:slug', webappProxy);                            // the xell's Vite dev server

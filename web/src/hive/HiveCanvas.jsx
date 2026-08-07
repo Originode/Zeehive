@@ -21,6 +21,17 @@ const COL = {
   rel: '#c8d3e8',
 };
 const HEALTH = { up: '#35c46b', building: '#e0a53b', down: '#e5554e', unknown: '#6b7688', starting: '#5b8cff' };
+// The QUEENZEE node — the host/machine the orchestrator lives on. A distinct amber so it never
+// reads as one of the xells it watches: it IS the fleet's engine, not a work-cell.
+const QZ = { fill: '#20180a', stroke: '#e8b34b', text: '#f2c76b', line: '#e8b34b', accent: '#e8b34b' };
+// How long a queenzee↔xell activity arrow stays on screen, and the cap that keeps a busy fleet
+// from burying the honeycomb in lines (a burst of provisioning + landings must not clutter it).
+// SHIP arrows are the exception: they stay for the whole deploy (sticky), driven by fleet.shipping
+// status rather than this TTL — a 45-minute prod build must not go dark after 3.8 seconds.
+const QZ_LINE_MS = 3800;
+const QZ_LINE_MAX = 14;
+// The QUEENZEE node's brand mark — static asset next to the provider coins under public/.
+const QZ_LOGO = '/zeehive-logo.svg';
 const LANE = ['#e0a53b', '#e26fae', '#9ccf3f', '#5b8cff', '#35c46b', '#9b8cff',
   '#e5554e', '#3bc6c0', '#d98c5f', '#7bd0e0', '#c98cff', '#8cd98c'];
 // role tint, matching the DOM chip's icon colours (Container.jsx / styles.css .cbox[data-role]) —
@@ -557,7 +568,8 @@ const WIRE_PITCH = 6;
 
 export default function HiveCanvas({ xells, diffs, timeline, orientation, honeySide, onOpenSession, machines,
                                     expandedId, onExpand, hexPosRef, harnessPosRef, onGeometry, onAction, onContainerMenu,
-                                    hoverRef, setHover, subscribeHover, redrawKey, showHarness = true }) {
+                                    hoverRef, setHover, subscribeHover, redrawKey, showHarness = true,
+                                    queenzeeActivity = [], shipping = [], onQueenzeeTerminal, onQueenzeeLogs }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
   const geomRef = useRef({ hexes: [], harnesses: [], flower: null, buttons: null, containers: null });
@@ -577,6 +589,14 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
   // no flower required. DOM (not canvas): it is a clickable list, and a canvas-drawn one would be
   // swallowed by the next redraw.
   const [ctxXell, setCtxXell] = useState(null);
+  // ── the QUEENZEE node's right-click menu (DOM, like the xell one): {x,y} at the cursor ──
+  const [ctxQueenzee, setCtxQueenzee] = useState(null);
+  // ── queenzee↔xell activity arrows: xell_id → {dir,kind,t0,_id}. Fed by the SSE stream's
+  //    queenzee-activity events (App.jsx → queenzeeActivity prop), drained here, drawn as
+  //    animated dashed lines in a RAF loop while any are alive. ──
+  const interactionsRef = useRef(new Map());
+  const drainedRef = useRef(new Set());        // event _ids already turned into arrows
+  const hoverWorldRef = useRef({ x: NaN, y: NaN });   // last pointer pos in world space (queenzee hover)
   // ── canvas button tooltip: DOM overlay created imperatively so onPointerMove never re-renders ──
   const tipRef = useRef({ el: null, kind: null, tip: null });  // .el = DOM element, .kind/.tip = current verb
   // ── xell hover tooltip: the directive + status of the xell under the cursor. The same imperative
@@ -660,7 +680,9 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // stroke doesn't clip against the pane border, and let hexes grow bigger (raised `max`) when
     // there are few enough xells that the honeycomb was previously capped well under the pane size.
     const pad = 6;
-    const lay = layoutHoneycomb(list.length, w - pad * 2, h - pad * 2, { min: 24, max: 168, pad: 6 });
+    // One extra cell in the layout: the QUEENZEE node occupies the top-left cell (0,0), so the
+    // grid must size for xells + the node or the last xell would overflow the pane.
+    const lay = layoutHoneycomb(list.length + 1, w - pad * 2, h - pad * 2, { min: 24, max: 168, pad: 6 });
     const cellSize = lay.size;                    // gapless layout cell → the routing lattice
     // corridor gap: room for `count` traces to pass (cols in portrait, rows in landscape). Shrink the
     // drawn hex within its cell to open it, but keep enough hex to stay legible.
@@ -674,8 +696,11 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // seat once to learn where the expanded xell sits, then re-seat with its six neighbours reserved
     // and its own cell pinned, so the bloom opens exactly where the hexagon already was.
     const cols = Math.max(1, lay.cols);
-    const baseCells = seatXells(list, cols);
-    const reserved = new Set();
+    // The QUEENZEE node is not a work-cell: its cell is reserved before any xell is seated, so a
+    // xell (or a manager's crew reaching for its nearest free cell) can never sit on it.
+    const qzKey = cellKey(0, 0);
+    const baseCells = seatXells(list, cols, { reserved: new Set([qzKey]) });
+    const reserved = new Set([qzKey]);
     let cells = baseCells;
     if (expanded && baseCells[expanded.id]) {
       const [er, ec] = baseCells[expanded.id];
@@ -832,6 +857,31 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // record harness cells (drawn radius) so a hover/click can hit-test them like a hex
     geomRef.current.harnesses = harnessCells;
 
+    // ── the QUEENZEE node: the orchestrator's host, at the reserved top-left cell ───────────────
+    // Not a work-cell: distinct amber hex + a "▚ logs" button under it. Its geometry is recorded
+    // (like the flower's buttons) so onPointerUp/onContextMenu can hit-test it, and its world
+    // centre is what the activity arrows below originate from / point at.
+    const [qzCx, qzCy] = cellCenter(0, 0, cellSize, originX, originY);
+    const qzHover = pointInHex(hoverWorldRef.current.x, hoverWorldRef.current.y, qzCx, qzCy, drawSize);
+    const qzLogsRect = drawQueenzeeNode(ctx, qzCx, qzCy, drawSize, {
+      hover: qzHover, logo: getImg(QZ_LOGO),
+    });
+    geomRef.current.queenzee = { cx: qzCx, cy: qzCy, size: drawSize };
+    geomRef.current.queenzeeLogs = qzLogsRect;
+
+    // ── queenzee↔xell activity arrows (animated dashed lines, driven by SSE events) ─────────────
+    // Prune expired lines first so the RAF loop can see when nothing is left and stop. STICKY
+    // arrows (a live ship → production) never expire here — they ride fleet.shipping status and
+    // are cleared by the shipping effect below. Drawn AFTER the hexes so the arrows ride on top;
+    // the dash offset animates direction (→xell for q2x, →queenzee for x2q) and the arrowhead
+    // lands on the target.
+    const now = Date.now();
+    for (const [key, it] of interactionsRef.current) {
+      if (it.sticky) continue;
+      if (now - it.t0 > QZ_LINE_MS) interactionsRef.current.delete(key);
+    }
+    drawActivityLines(ctx, hexes, geomRef.current.queenzee, interactionsRef.current, now);
+
     // publish each hex's live CLIENT-space geometry so <Connectors> can route its wires here and
     // re-route on pan/zoom. `size` is the full CELL radius (the gapless routing lattice); `draw` is
     // the shrunk drawn radius (the visible hex the corridors run between).
@@ -886,6 +936,100 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     return () => cancelAnimationFrame(raf);
   }, [xells, draw]);
 
+  // ── queenzee↔xell activity: drain the SSE-fed events into the arrow map ─────────────────────
+  // Each queenzee-activity frame ({dir, xell_id, kind, _id}) becomes a short-lived line. The _id
+  // (assigned in App.jsx) makes the buffer idempotent: a re-render never re-adds an arrow already
+  // drained. Same xell+dir replaces the active arrow (a provision and its follow-up land are two
+  // arrows, but two provisions are one), and the total is capped so a busy fleet cannot clutter it.
+  // A ship→production event is marked sticky so the TTL below does not kill it mid-deploy; the
+  // shipping-status effect is what holds and releases it.
+  useEffect(() => {
+    const interactions = interactionsRef.current;
+    const drained = drainedRef.current;
+    let added = false;
+    for (const ev of queenzeeActivity || []) {
+      if (ev._id == null || drained.has(ev._id)) continue;
+      drained.add(ev._id);
+      if (drained.size > 128) drained.delete(drained.values().next().value);   // keep the seen-set tiny
+      if (!ev.xell_id || !ev.dir) continue;
+      const key = `${ev.xell_id}:${ev.dir}`;
+      const sticky = ev.kind === 'ship' && ev.dir === 'q2x';
+      // Do not demote a sticky ship arrow back to a flash if a non-ship event shares the key.
+      const prev = interactions.get(key);
+      interactions.set(key, {
+        xell_id: ev.xell_id, dir: ev.dir, kind: ev.kind, t0: Date.now(), _id: ev._id,
+        sticky: sticky || !!prev?.sticky,
+      });
+      added = true;
+    }
+    while (interactions.size > QZ_LINE_MAX) {
+      // Prefer pruning a non-sticky flash over a live ship→prod line.
+      let oldest = null;
+      for (const [, it] of interactions) {
+        if (it.sticky) continue;
+        if (!oldest || it.t0 < oldest.t0) oldest = it;
+      }
+      if (!oldest) break;
+      interactions.delete(`${oldest.xell_id}:${oldest.dir}`);
+    }
+    if (added) draw();
+  }, [queenzeeActivity, draw]);
+
+  // ── sticky ship→production arrows: live for the whole deploy, not a 3.8s flash ──────────────
+  // fleet.shipping is the truth (status 'shipping' = the queenzee holds the lock and is building
+  // prod). The SSE event starts the line; this effect keeps one q2x arrow on every production
+  // hexagon for as long as any ship is shipping, and drops them the moment none are. Without this
+  // a 45-minute prod build would go dark after QZ_LINE_MS and the honeycomb would look idle.
+  useEffect(() => {
+    const interactions = interactionsRef.current;
+    const shippingNow = (shipping || []).some((s) => s.status === 'shipping');
+    const prodIds = (xells || []).filter((x) => x.is_production).map((x) => x.id);
+    let changed = false;
+    // Drop sticky ship arrows that no longer apply (ship finished, or that prod hex is gone).
+    for (const [key, it] of [...interactions]) {
+      if (!it.sticky || it.kind !== 'ship') continue;
+      if (!shippingNow || !prodIds.includes(it.xell_id)) {
+        interactions.delete(key);
+        changed = true;
+      }
+    }
+    if (shippingNow) {
+      for (const id of prodIds) {
+        const key = `${id}:q2x`;
+        const prev = interactions.get(key);
+        // Refresh t0 so a sticky ship arrow stays at full alpha (drawActivityLines fades by age).
+        interactions.set(key, {
+          xell_id: id, dir: 'q2x', kind: 'ship', sticky: true,
+          t0: Date.now(), _id: prev?._id || `ship-sticky-${id}`,
+        });
+        changed = true;
+      }
+    }
+    if (changed) draw();
+  }, [shipping, xells, draw]);
+
+  // ── the arrow RAF loop: runs ONLY while at least one interaction is alive ────────────────────
+  // Throttled to ~22fps (a full honeycomb redraw is not free) and self-terminating: once every
+  // arrow has expired (pruned by the draw), the loop sees an empty map and stops. Sticky ship
+  // arrows count as alive for as long as they stay in the map (cleared by the shipping effect).
+  useEffect(() => {
+    const interactions = interactionsRef.current;
+    if (interactions.size === 0) return undefined;
+    let raf = 0, last = 0;
+    const loop = (t) => {
+      let alive = 0;
+      const now = Date.now();
+      for (const [, it] of interactions) {
+        if (it.sticky || now - it.t0 < QZ_LINE_MS) alive++;
+      }
+      if (alive === 0) { interactions.clear(); return; }   // nothing left to animate — stop
+      if (t - last > 45) { last = t; draw(); }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [draw, xells, queenzeeActivity, shipping]);
+
   // ── sizing ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     const el = wrapRef.current;
@@ -909,6 +1053,14 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
   const hitHarness = useCallback((wx, wy) => {
     for (const hb of geomRef.current.harnesses || []) if (pointInHex(wx, wy, hb.cx, hb.cy, hb.size)) return hb;
     return null;
+  }, []);
+  const hitQueenzee = useCallback((wx, wy) => {
+    const qz = geomRef.current.queenzee;
+    return qz && pointInHex(wx, wy, qz.cx, qz.cy, qz.size) ? qz : null;
+  }, []);
+  const hitQueenzeeLogs = useCallback((wx, wy) => {
+    const r = geomRef.current.queenzeeLogs;
+    return r && wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h ? r : null;
   }, []);
   const hitFlower = useCallback((wx, wy) => {
     const f = geomRef.current.flower;
@@ -966,6 +1118,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
     // A LEFT-press on the canvas closes an open context menu (right-press must NOT — it is what
     // opened it; the browser fires contextmenu after pointerdown, so closing here would race it).
     if (ctxXell && e.button === 0) setCtxXell(null);
+    if (ctxQueenzee && e.button === 0) setCtxQueenzee(null);
     const [mx, my] = relPos(e);
     pointersRef.current.set(e.pointerId, { x: mx, y: my });
     if (pointersRef.current.size === 1) {
@@ -1009,6 +1162,7 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       }
     }
     const [wx, wy] = toWorld(mx, my);
+    hoverWorldRef.current = { x: wx, y: wy };   // queenzee-node hover + tooltip
     let cursor = 'default';
     if (expandedId) {
       // A CREW dot answers first: it is the smallest target in the bloom and the only one that means
@@ -1066,17 +1220,25 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       else if (hx) showXellTooltip(xellOf(hx.id), e);
       else hideXellTooltip();
     } else {
-      const hx = hitHex(wx, wy);
-      if (hx) {
-        emitHover({ id: hx.id, commit: null, harness: null });   // a hex is ONE xell → key on id
-        cursor = 'pointer';
-        showXellTooltip(xellOf(hx.id), e);
-      } else {
-        // no hex under the cursor → a harness badge lights up its consumer xells (reverse highlight)
-        const hb = hitHarness(wx, wy);
-        emitHover({ id: null, commit: null, harness: hb?.id || null });
-        cursor = hb ? 'pointer' : 'default';
-        hideXellTooltip();
+      const qzb = hitQueenzeeLogs(wx, wy);
+      if (qzb) { cursor = 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
+      else {
+        const hx = hitHex(wx, wy);
+        if (hx) {
+          emitHover({ id: hx.id, commit: null, harness: null });   // a hex is ONE xell → key on id
+          cursor = 'pointer';
+          showXellTooltip(xellOf(hx.id), e);
+        } else {
+          const qz = hitQueenzee(wx, wy);
+          if (qz) { cursor = 'pointer'; hideXellTooltip(); emitHover({ id: null, commit: null, harness: null }); }
+          else {
+            // no hex or queenzee under the cursor → a harness badge lights up its consumer xells
+            const hb = hitHarness(wx, wy);
+            emitHover({ id: null, commit: null, harness: hb?.id || null });
+            cursor = hb ? 'pointer' : 'default';
+            hideXellTooltip();
+          }
+        }
       }
       const tooltip = tipRef.current;                                  // no bloom → no button tooltip
       if (tooltip.el) { tooltip.kind = null; tooltip.el.style.display = 'none'; }
@@ -1133,9 +1295,16 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       }
       const hx = hitHex(wx, wy);
       if (hx && hx.id !== expandedId) { setExpandedId(hx.id); return; }
+      // the QUEENZEE node stays reachable even while a bloom is open: the logs button opens the
+      // activity log, the node itself opens a shell into the queenzee machine.
+      if (hitQueenzeeLogs(wx, wy)) { onQueenzeeLogs?.(); return; }
+      if (hitQueenzee(wx, wy)) { onQueenzeeTerminal?.(); return; }
       setExpandedId(null);
       return;
     }
+    // the QUEENZEE node — logs button first (the smaller target), then the node itself.
+    if (hitQueenzeeLogs(wx, wy)) { onQueenzeeLogs?.(); return; }
+    if (hitQueenzee(wx, wy)) { onQueenzeeTerminal?.(); return; }
     const hx = hitHex(wx, wy);
     if (hx) {
       if (e.shiftKey) {
@@ -1201,11 +1370,19 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       setCtxXell({ x: e.clientX, y: e.clientY, id: hx.id });
       return;
     }
+    // right-click on the QUEENZEE node (or its logs button) → the queenzee context menu
+    if (hitQueenzee(wx, wy) || hitQueenzeeLogs(wx, wy)) {
+      e.preventDefault(); e.stopPropagation();
+      setCtxXell(null);
+      setCtxQueenzee({ x: e.clientX, y: e.clientY });
+      return;
+    }
   };
 
   const onLeave = () => {
     emitHover({ id: null, commit: null }); dragRef.current = null;
     pointersRef.current.clear(); pinchRef.current = null;
+    hoverWorldRef.current = { x: NaN, y: NaN };   // queenzee-node hover glow fades
     if (tipRef.current.el) { tipRef.current.kind = null; tipRef.current.el.style.display = 'none'; }
     hideXellTooltip();
   };
@@ -1240,6 +1417,23 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
       window.removeEventListener('keydown', onKey);
     };
   }, [ctxXell]);
+
+  // Same close-on-anything for the QUEENZEE node's menu.
+  useEffect(() => {
+    if (!ctxQueenzee) return;
+    const close = () => setCtxQueenzee(null);
+    const onKey = (e) => e.key === 'Escape' && close();
+    document.addEventListener('click', close);
+    document.addEventListener('contextmenu', close);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('contextmenu', close);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [ctxQueenzee]);
 
   // wheel must be non-passive to preventDefault page scroll
   useEffect(() => {
@@ -1286,6 +1480,16 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
           </div>
         );
       })()}
+      {/* The QUEENZEE node's right-click menu — logs + terminal, the two surfaces this node owns. */}
+      {ctxQueenzee && (
+        <div className="ctxmenu hive-queenzee-ctx" style={{ left: ctxQueenzee.x, top: ctxQueenzee.y }} role="menu"
+             onClick={(e) => e.stopPropagation()}
+             onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}>
+          <div className="ctxhead">⌂ QUEENZEE <span className="ctxsub">· the orchestrator's host</span></div>
+          <button role="menuitem" onClick={() => { setCtxQueenzee(null); onQueenzeeLogs?.(); }}>▚ logs</button>
+          <button role="menuitem" onClick={() => { setCtxQueenzee(null); onQueenzeeTerminal?.(); }}>⌨ terminal</button>
+        </div>
+      )}
       {(!xells || xells.length === 0) && (
         <p className="hive-empty">No active xells. The pool maintainer will fill it shortly…</p>
       )}
@@ -1508,10 +1712,12 @@ export function drawCompactHex(ctx, hx, { hover, dim, diff, machines, related = 
   // ── lower half ──
   // Live head (diff.head, read from the worktree) over the frozen head_commit provisioning base, so
   // a xell that has committed/rebased/landed shows where it actually is, not its old fork sha.
+  // Kept SMALL on purpose: the compact card's lower half also carries the diffstat and status pill,
+  // and a large monospace sha was crowding them out of the hexagon.
   const sha = (x.is_production ? x.deployed_commit : (diff?.head || x.head_commit))?.slice(0, 8);
   if (full) {
     if (sha) {
-      ctx.font = `600 ${Math.max(8.5, size * 0.155)}px 'Cascadia Code', monospace`;
+      ctx.font = `600 ${Math.max(7, size * 0.11)}px 'Cascadia Code', monospace`;
       // the trace colour would vanish on a lime/white identity fill, so those hexes read the sha in ink
       ctx.fillStyle = isIdentityFill(x) ? inkOf(x) : shaCol;
       ctx.fillText(sha, cx, cy + size * (zeeTitle ? 0.2 : 0.14));
@@ -1682,13 +1888,42 @@ export function drawAvatarDisc(ctx, cx, cy, r, col, { img, glyph, letter, coin, 
 //
 // Parts marked `behind` are painted BEFORE the coin (wings tuck behind it, so they read as strapped
 // on rather than pasted over the logo), and `detail` parts are dropped when the badge is too small
-// for them to be anything but noise. With no provider resolved the harness's own face takes the
-// coin's place, costume and all. ZeeAvatar.jsx is the DOM twin of this drawing.
+// for them to be anything but noise. A harness may wear UP TO THREE accessories (border / hat /
+// equipment): borders always under the coin, hats always on top, equipment honouring each part's
+// `behind` flag — same split ZeeAvatar.jsx uses in the DOM. With no provider resolved the
+// harness's own face takes the coin's place, costume and all.
+//
+// paintAccessories normalises each accessory into a temporary gear whose selected parts all have
+// `behind: false`, then hands them to drawGearLayer with behind:false so the layer decision we
+// already made is what gets painted (drawGearLayer itself filters on part.behind).
+function paintAccessories(ctx, cx, cy, r, gear, { behind, detail }) {
+  const items = gear.accessories?.length
+    ? gear.accessories
+    : (gear.art ? [{ key: gear.gear, category: 'equipment', art: gear.art }] : []);
+  const color = gear.empty ? '#e5554e' : gear.color;
+  let n = 0;
+  for (const acc of items) {
+    if (!acc.art?.parts) continue;              // custom SVG stamps are DOM-only (no path walk)
+    const parts = acc.art.parts
+      .filter((part) => {
+        if (acc.category === 'hat') return !behind;
+        if (acc.category === 'border') return behind;
+        return !!part.behind === behind;
+      })
+      .filter((part) => !(part.detail && !detail))
+      .map((part) => ({ ...part, behind: false }));
+    if (!parts.length) continue;
+    n += drawGearLayer(ctx, cx, cy, r, { art: { parts }, color, empty: false },
+      { behind: false, detail: true });
+  }
+  return n;
+}
+
 export function drawZeeAvatar(ctx, cx, cy, r, { provider = null, providerImg = null, gear = null,
                                                 harnessImg = null, ring = null } = {}) {
   const detail = r >= 13;                       // below this a feather notch is three grey pixels
-  // 1. the costume's back half — wings and anything else that belongs UNDER the coin
-  if (gear && r >= 5) drawGearLayer(ctx, cx, cy, r, gear, { behind: true, detail });
+  // 1. borders + equipment-behind — everything that belongs UNDER the coin
+  if (gear && r >= 5) paintAccessories(ctx, cx, cy, r, gear, { behind: true, detail });
 
   // 2. the coin. Provider art when we know the vendor; otherwise the harness's own face (legacy).
   if (provider) {
@@ -1706,12 +1941,14 @@ export function drawZeeAvatar(ctx, cx, cy, r, { provider = null, providerImg = n
   }
   if (!gear || r < 5) return;                   // too small to dress — the coin alone is the badge
 
-  // 3. the costume's front half — the tool on the belt, the glasses on the face, the tie down the front
-  drawGearLayer(ctx, cx, cy, r, gear, { behind: false, detail });
+  // 3. hats + equipment-front — the tool on the belt, glasses on the face, hat on the crown
+  paintAccessories(ctx, cx, cy, r, gear, { behind: false, detail });
 
   // 4. …and for a harness with no costume of its own, its glyph on the fallback ribbon's plate:
-  //    the nameplate is the shape, the glyph is what is written on it.
-  const spot = gear.art?.glyphOn;
+  //    the nameplate is the shape, the glyph is what is written on it. Also honour a ribbon worn
+  //    as one of several accessories.
+  const ribbon = (gear.accessories || []).find((a) => a.art?.glyphOn) || (gear.art?.glyphOn ? gear : null);
+  const spot = ribbon?.art?.glyphOn || gear.art?.glyphOn;
   if (spot && gear.mark && r >= 11) {
     ctx.save();
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -1989,6 +2226,125 @@ function drawPetalRow(ctx, cx, cy, btns, { h, padX, gap, accent }) {
   return rects;
 }
 
+// ── the QUEENZEE node: the orchestrator's host, drawn as a distinct amber hex ────────────────
+// Not a work-cell: it has no git state, no flower, no crew. The Zeehive logo + "QUEENZEE" label, a
+// glow that lifts on hover, and a "▚ logs" pill button beneath the hex (hit-tested like the
+// flower's buttons, so a click opens the queenzee activity log). Returns the logs button's world
+// rect. `logo` is a preloaded HTMLImageElement of the brand mark (same getImg path harness
+// avatars use); when it is not yet loaded the ⌂ glyph stands in so the node never draws empty.
+export function drawQueenzeeNode(ctx, cx, cy, size, { hover = false, logo = null } = {}) {
+  const s = size;
+  ctx.save();
+  hexPath(ctx, cx, cy, s);
+  const g = ctx.createLinearGradient(cx, cy - s, cx, cy + s);
+  g.addColorStop(0, hover ? '#2e2009' : QZ.fill);
+  g.addColorStop(1, '#120d05');
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = hover ? 2.6 : 1.6;
+  ctx.strokeStyle = QZ.stroke;
+  ctx.shadowColor = QZ.stroke;
+  ctx.shadowBlur = hover ? 20 : 9;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  // Brand mark above the word — the node is the MACHINE, and the logo is how a human spots it
+  // across the honeycomb without reading the label. Falls back to ⌂ until the image lands.
+  const logoR = Math.max(10, size * 0.28);
+  const logoCy = cy - size * 0.22;
+  if (logo && logo.complete && logo.naturalWidth) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, logoCy, logoR, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.drawImage(logo, cx - logoR, logoCy - logoR, logoR * 2, logoR * 2);
+    ctx.restore();
+    // thin amber ring so the mark sits on the same language as the hex stroke
+    ctx.beginPath();
+    ctx.arc(cx, logoCy, logoR, 0, Math.PI * 2);
+    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = withAlpha(QZ.stroke, hover ? 0.95 : 0.7);
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = QZ.text;
+    ctx.font = `600 ${Math.max(9, size * 0.16)}px 'Segoe UI', sans-serif`;
+    ctx.fillText('⌂', cx, logoCy);
+  }
+  ctx.fillStyle = QZ.text;
+  ctx.font = `700 ${Math.max(7, size * 0.115)}px 'Segoe UI', sans-serif`;
+  ctx.fillText('QUEENZEE', cx, cy + size * 0.18);
+
+  // the "▚ logs" button — the SAME shape as a flower action button so a human who knows one
+  // recognises the other. Returns its rect for hit-testing.
+  ctx.font = `600 ${Math.max(8, size * 0.115)}px 'Segoe UI', sans-serif`;
+  const bh = Math.max(14, size * 0.2);
+  const rect = drawPetalBtn(ctx, cx, cy + size * 0.52, '▚ logs', 'qz-logs', QZ.accent, bh, size * 0.11);
+  ctx.restore();
+  return rect;
+}
+
+// ── queenzee↔xell activity arrows ─────────────────────────────────────────────
+// Animated dashed line + arrowhead for each live interaction: q2x runs queenzee→xell (amber, dashes
+// flowing toward the xell), x2q runs xell→queenzee (blue, dashes flowing toward the queenzee). The
+// line fades over its last stretch (alpha from the caller), and the arrowhead lands on the target
+// so the direction is readable even when a burst of lines crosses. `interactions` is a Map keyed
+// `${xell_id}:${dir}` → {dir, kind, t0, sticky?}.
+//
+// SHIP is special: kind==='ship' + dir==='q2x' is the queenzee→PRODUCTION deploy line. Sticky
+// entries keep full alpha and skip the age fade — a ship can run for many minutes and the line
+// must stay lit the whole time. Colour: ship uses the production-lock orange (COL.prod) so it
+// reads as "deploy", not as a routine provision flash.
+export function drawActivityLines(ctx, hexes, qz, interactions, now) {
+  if (!qz || !interactions || interactions.size === 0) return;
+  const hexById = {};
+  for (const hx of hexes) hexById[hx.id] = hx;
+  for (const [, it] of interactions) {
+    const hx = hexById[it.xell_id];
+    if (!hx) continue;
+    const age = now - it.t0;
+    let a;
+    if (it.sticky) {
+      a = 1;
+    } else {
+      if (age < 0 || age >= QZ_LINE_MS) continue;
+      // hold full alpha for the first ~half of the life, then fade out to zero
+      a = 1 - Math.max(0, age - QZ_LINE_MS * 0.5) / (QZ_LINE_MS * 0.5);
+    }
+    if (a <= 0) continue;
+    const from = it.dir === 'q2x' ? qz : { cx: hx.cx, cy: hx.cy };
+    const to = it.dir === 'q2x' ? { cx: hx.cx, cy: hx.cy } : qz;
+    // ship→prod is the deploy line (prod orange); other q2x stays amber; x2q stays blue
+    const col = it.kind === 'ship' && it.dir === 'q2x' ? COL.prod
+      : (it.dir === 'q2x' ? QZ.line : '#5bc6ff');
+    const lw = it.kind === 'ship' && it.dir === 'q2x' ? 2.6 : 2;
+    ctx.save();
+    ctx.strokeStyle = withAlpha(col, a);
+    ctx.lineWidth = lw;
+    // the dash offset animates the flow DIRECTION: decreasing moves the dashes toward +x/y
+    // (q2x → the xell), increasing moves them back (x2q → the queenzee).
+    ctx.setLineDash([5, 7]);
+    ctx.lineDashOffset = it.dir === 'q2x' ? -now / 45 : now / 45;
+    ctx.beginPath();
+    ctx.moveTo(from.cx, from.cy);
+    ctx.lineTo(to.cx, to.cy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // arrowhead at the target end, pointing along the line
+    const ang = Math.atan2(to.cy - from.cy, to.cx - from.cx);
+    const ah = Math.max(7, Math.min(13, hx.size * 0.17));
+    ctx.fillStyle = withAlpha(col, a);
+    ctx.beginPath();
+    ctx.moveTo(to.cx, to.cy);
+    ctx.lineTo(to.cx - ah * Math.cos(ang - 0.42), to.cy - ah * Math.sin(ang - 0.42));
+    ctx.lineTo(to.cx - ah * Math.cos(ang + 0.42), to.cy - ah * Math.sin(ang + 0.42));
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
 // The flower's per-xell actions, drawn INSIDE the facet each verb belongs to and hit-tested in
 // onPointerUp (no DOM toolbar). Placement mirrors meaning: build in CONTAINERS(3), terminal+nudge in
 // SESSION(2), pull(+land) in COMMIT(5), PR(+ship) in DIFF·AGE(6), mark-done in BRANCH(1).
@@ -2023,11 +2379,11 @@ export function petalVerbs(x, diff) {
   v[2] = cxell
     ? (xPaused ? ['resume', 'terminal', 'nudge'] : ['pause', 'terminal', 'nudge'])
     : (xPaused ? ['resume'] : ['pause']);
-  v[4] = cxell ? ['env', 'message'] : ['env'];                    // MACHINE petal
-  // MANAGER DIRECTIVES — the manager⇄worker conversation, read from the console. A worker that has
-  // a manager (manager_slug is set) or a manager itself is part of that conversation; the button
-  // opens it read-only. Sits with the other communication verbs on the MACHINE petal.
-  if (x.manager_slug || manager) v[4] = [...v[4], 'directives'];
+  // MACHINE petal — env / message / directives / langfuse. Directives is ALWAYS offered: every xell
+  // has a brief it was given (task_text), and the panel shows that first even when there is no
+  // manager⇄worker conversation yet. Hiding it for "unmanaged" workers made the button look missing
+  // on the majority of hexes, and the context menu inherits this list.
+  v[4] = cxell ? ['env', 'message', 'directives'] : ['env', 'directives'];
   // LANGFUSE — "View Langfuse" opens THIS zee's Langfuse SESSION in a new window. Shown whenever
   // the plugin is enabled AND this xell's per-xell langfuse_tracking flag is on (the toggle lives
   // in the terminal window header and the dispatch prompt). A session-less zee still gets the verb
@@ -2060,11 +2416,14 @@ export function petalVerbs(x, diff) {
   return v;
 }
 
-// kind → the label and accent it is drawn with (the verb list above stays pure/testable).
+// kind → the label drawn ON the flower. Crowded petals (MACHINE with env/message/directives/langfuse,
+// BRANCH with swap+done) overflowed the hexagon when the labels carried words — so the flower is
+// icon-only for those verbs, matching terminal/nudge/pause. The context menu keeps the full words
+// (VERB_MENU_LABEL); hover tooltips (VERB_TOOLTIP) name the icon on the canvas.
 const VERB_LABEL = {
-  build: '🔨 build', terminal: '⌨', nudge: '💬', env: '❖ env', message: '📨 message',
-  pull: '↓ pull', land: '⬆ land', pr: 'PR', ship: '🚀 ship', swap: '♻ swap zee',
-  pause: '⏸', resume: '▶', directives: '🧭', langfuse: '⚗ langfuse',
+  build: '🔨', terminal: '⌨', nudge: '💬', env: '❖', message: '📨',
+  pull: '↓', land: '⬆', pr: 'PR', ship: '🚀', swap: '♻',
+  pause: '⏸', resume: '▶', directives: '🧭', langfuse: '⚗',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
   done: 'error', swap: 'working', pause: 'error', resume: 'working' };
@@ -2089,21 +2448,29 @@ const VERB_TOOLTIP = {
 
 // The RIGHT-CLICK context menu (a DOM overlay on the honeycomb) reuses the SAME verb list as the
 // flower — one source of truth, two surfaces. The flower draws icon-only buttons (⌨ / ⏸ / 💬…) that
-// read fine on the canvas, but a menu row needs a word, so the menu gets its own full-text label for
-// the icon-only kinds and inherits the flower's wordy labels for the rest.
+// read fine on the canvas, but a menu row needs a word, so the menu gets its own full-text label.
 const VERB_MENU_LABEL = {
-  ...VERB_LABEL,
-  terminal: '⌨ Terminal', nudge: '💬 Nudge', pause: '⏸ Pause', resume: '▶ Resume',
+  build: '🔨 Build', terminal: '⌨ Terminal', nudge: '💬 Nudge',
   env: '❖ Environment', message: '📨 Message', directives: '🧭 Directives',
   langfuse: '⚗ View Langfuse',
+  pull: '↓ Pull', land: '⬆ Land', pr: 'PR', ship: '🚀 Ship',
+  swap: '♻ Swap zee', pause: '⏸ Pause', resume: '▶ Resume',
 };
 // Which menu rows carry the destructive tone (the flower paints the same kinds with COL.error).
 const VERB_MENU_TONE = { done: 'danger', pause: 'danger' };
 
-// Mark-done reads its state (confirm / mark / clean up); every other verb has a fixed label. Shared
-// by the flower's button row and the xell context menu so the two surfaces can never drift apart.
+// Mark-done reads its state (confirm / mark / clean up). The FLOWER draws a short icon (doneIcon)
+// so the branch petal stays inside the hexagon next to ♻; the CONTEXT MENU keeps the full words
+// (doneLabel) so a right-click row still names the action.
+function doneIcon(x) {
+  return x.status === 'awaiting-done' ? '✓' : (x.task_id ? '✓' : '✕');
+}
 function doneLabel(x) {
   return x.status === 'awaiting-done' ? '✓ confirm done' : (x.task_id ? '✓ mark done' : '✕ clean up');
+}
+function doneTip(x) {
+  return x.status === 'awaiting-done' ? 'Confirm this xell is done'
+    : (x.task_id ? 'Mark this xell done' : 'Clean up this xell (no task to mark done)');
 }
 
 // The xell context menu's items — the "existing actions available in its flower", listed without
@@ -2172,18 +2539,22 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
 
   const accent = { working: G, prod: P, error: D };
   for (const [petal, kinds] of Object.entries(verbs)) {
-    row(Number(petal), (kinds || []).map((kind) => ({
-      kind,
-      label: kind === 'done' ? doneLabel(x) : VERB_LABEL[kind] || kind,
-      accent: accent[VERB_ACCENT[kind]] || R,
-      // The langfuse verb is shown even for a session-less zee (petalVerbs no longer hides it), so
-      // the tooltip carries WHY there is nothing to open yet instead of silently dropping the verb.
-      tip: kind === 'langfuse'
-        ? (x.claude_session_id || x.session_name
-            ? VERB_TOOLTIP.langfuse
-            : 'No Langfuse session recorded for this zee yet — one appears after its first finished turn')
-        : null,
-    })));
+    row(Number(petal), (kinds || []).map((kind) => {
+      // Dynamic tips: done reads its state; langfuse explains a session-less zee instead of hiding.
+      let tip = null;
+      if (kind === 'done') tip = doneTip(x);
+      else if (kind === 'langfuse') {
+        tip = (x.claude_session_id || x.session_name)
+          ? VERB_TOOLTIP.langfuse
+          : 'No Langfuse session recorded for this zee yet — one appears after its first finished turn';
+      }
+      return {
+        kind,
+        label: kind === 'done' ? doneIcon(x) : VERB_LABEL[kind] || kind,
+        accent: accent[VERB_ACCENT[kind]] || R,
+        tip,
+      };
+    }));
   }
   return rects;
 }
@@ -2359,10 +2730,10 @@ function drawFacet(ctx, cx, cy, size, facet, col, isCenter, x, traceColor, { hov
     // the head sha reads in the git graph's trace colour for this xell (its wire + commit-dot ring),
     // tying the bloom to its line in the graph the same way the compact hex does.
     ctx.fillStyle = traceColor || COL.text;
-    // sha grows to fill the petal width (this facet is crowded with the burn line + pull/push
-    // buttons below, so it stays single-line — width-fill only, no wrap).
+    // sha stays modest — this facet also carries the source diffstat, burn line and pull/land
+    // buttons, and a large monospace head was eating the room the other text needs.
     const shaW = hexHalfWidthAt(size, size * 0.16) * 2 * 0.9;
-    fillFont(ctx, facet.lines[0] || '—', shaW, 9, size * 0.22,
+    fillFont(ctx, facet.lines[0] || '—', shaW, 8, size * 0.155,
       (px) => `600 ${px}px 'Cascadia Code', monospace`);
     ctx.fillText(facet.lines[0] || '—', cx, cy - size * 0.16);
     const d = facet.diff;

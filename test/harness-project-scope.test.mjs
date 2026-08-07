@@ -325,11 +325,18 @@ try {
 
   // ── 7. DISPATCH ────────────────────────────────────────────────────────────
   console.log('\n── dispatch: a manager hands out its own project\'s persona, never another\'s ──');
-  refused(await S.selfDispatch(mgr, { task: 'do a thing', harness: keys.theirs }),
+  // The board is the ONLY deployment path (TKT-b14934 / 151) — even a ROUTER's free-form
+  // `zee dispatch` is refused. The harness-scope guards live BEHIND the board gate, so reach them
+  // the way `zee assign` does: with a work_item_id (the guarded board path).
+  const { createWorkItem } = await import('../server/src/lib/work-items.js');
+  const card = await createWorkItem({ project_id: P1.id, kind: 'task', title: `zt-dispatch-card-${tag}`, actor: mgr.slug });
+  refused(await S.selfDispatch(mgr, { task: 'do a thing', harness: keys.theirs, work_item_id: card.id }),
           /belongs to project/, "dispatching a worker into another project's persona is refused");
-  refused(await S.selfDispatch(mgr, { task: 'do a thing', harness: 'manager' }),
+  refused(await S.selfDispatch(mgr, { task: 'do a thing', harness: 'manager', work_item_id: card.id }),
           /added by a human/, 'and the existing manager-harness refusal is untouched');
   refused(await S.selfDispatch(mgr, {}), /--task/, 'and so is a dispatch with no brief');
+  refused(await S.selfDispatch(mgr, { task: 'do a thing' }), /work-items board/,
+          "a router's free-form `zee dispatch` is REFUSED too — the board is the only deployment path (151)");
 
   // ── a project's personas die WITH the project ───────────────────────────────
   console.log('\n── scoped personas are cascaded with their project ──');

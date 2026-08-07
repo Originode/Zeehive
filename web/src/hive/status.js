@@ -48,6 +48,7 @@ export const HIVE_COLORS = {
   'live-protected':   '#f0913b',   // orange — production, shields up
   'occ-seedRequest':  '#e0563f',   // red-orange — a zee asked the queenzee to write DATA to prod
   'occ-prodRequest':  '#d9455f',   // crimson — a zee asked to be handed the LIVE prod database
+  'occ-mintRequest':  '#e34b5e',   // red-rose — a router asked a human for ANOTHER manager (held decision)
   'occ-landRequest':  '#e5554e',   // red — a landing is held (main is being touched)
   'occ-shipRequest':  '#ef5a3c',   // red-orange — a ship is held (prod is being touched)
   'live-unprotected': '#e5554e',   // red — prod shields down / a deploy is touching it
@@ -77,6 +78,7 @@ export const HIVE_HEAT = {
   'live-protected':   0.86,
   'occ-seedRequest':  1.00,
   'occ-prodRequest':  1.00,
+  'occ-mintRequest':  1.00,
   'occ-landRequest':  1.00,
   'occ-shipRequest':  1.00,
   'live-unprotected': 1.00,
@@ -99,6 +101,7 @@ export const HIVE_LABELS = {
   'occ-shipRequest':  'ship?',
   'occ-prodRequest':  'prod?',
   'occ-seedRequest':  'seed?',
+  'occ-mintRequest':  'manager?',
   'occ-landHint':     'land?',
   'occ-shipHint':     'ship?',
   'occ-landHolding':  'holding',

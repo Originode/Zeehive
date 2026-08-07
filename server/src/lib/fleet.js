@@ -12,10 +12,11 @@ import { reasonPair, envAlertFrom } from './status.js';
 import { listDoneSuggestions } from './managers.js';
 import { holdingByRef } from '../queenzee/landgate.js';
 import { backupDue } from '../queenzee/maintenance.js';
-import { listXourceCleanRequests } from './xource-clean.js';
+import { listXourceCleanRequests, xourceState } from './xource-clean.js';
 import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
+import { xellWebappPath } from './webapp-proxy.js';
 
 export async function defaultProject() {
   return one(`SELECT * FROM project ORDER BY created_at LIMIT 1`);
@@ -77,6 +78,8 @@ async function fetchXellRows(pid) {
             -- the key/label, which is what almost every harness does.
             hn.key AS harness_key, hn.label AS harness_label, hn.bundle->>'glyph' AS harness_glyph,
             hn.bundle->>'gear' AS harness_gear,
+            hn.bundle->'accessories' AS harness_accessories,
+            hn.bundle->'custom_accessories' AS harness_custom_accessories,
             -- RESOLVED ENVIRONMENT (migration 043): which env this xell is loaded with, by the same
             -- rule lib/environments.js uses — an explicit pin, else the default env of the computed
             -- tier (prod for a xell on production — live, read-only or being it — else dev).
@@ -286,6 +289,16 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
   // works whenever the worktree exists — even while the process is down, which is exactly when you
   // want in to debug it. Everything else IS a docker container, so it needs to be running ('up').
   for (const c of stack) { c.shellable = containerShellable(project, c); c.shell_cmd = containerShellCmd(project, c); }
+  // A spinoff xell webapp's stored url (10.2.0.16:5383) is a LAN address nothing publishes. The
+  // reachable URL is /xell-web/<slug>/ on the console origin, served by the queenzee proxy
+  // (webapp-proxy.js). Derive it here so the chip link, the "↗ Open URL" menu and the verify offer
+  // all point at something a human (or a cxell) can actually open. db never has a url; prod
+  // webapps keep their stored one (they are real published services).
+  if (!x.is_production) {
+    for (const c of stack) {
+      if (c.role === 'webapp' && c.tier === 'spinoff') c.url = xellWebappPath(x.slug);
+    }
+  }
   x.stack = stack;
   // Does THIS project support device xhips (manifest device.enabled)? Drives whether the card shows
   // the attach-device affordance. device_kind is the project's default shape (emulator|physical), so
@@ -624,6 +637,14 @@ export async function getFleet(projectId) {
   // ride along as a receipt (like seeds/ships) so the "was it cleaned?" answer does not vanish.
   const xourceClean = await listXourceCleanRequests(pid, { open: true });
 
+  // Live xource checkout state (clean / staged / mangled). Cheap pure-git reads; the git-graph
+  // tip paints a broken-pipe icon when has_staged is true so a human sees the wedge without
+  // opening Project setup. Full file list rides along so the popover does not need a second fetch
+  // on first click (a refresh after clear/commit re-reads via the fleet poll).
+  const xource = project.repo_root
+    ? xourceState(project.repo_root, project.main_branch || 'main')
+    : { ok: false, error: 'no repo_root' };
+
   // MANAGER-MINT requests — a ROUTER asked a human for another MANAGER (149). Pending ones are a
   // decision (approve → the queenzee mints it); recently-created/failed ones ride along as the
   // receipt naming the xell it produced.
@@ -660,6 +681,8 @@ export async function getFleet(projectId) {
     landing_pad: landingPad,
     done_suggestions: doneSuggestions,
     xource_clean: xourceClean,
+    // Live main-checkout state — GraphPane reads has_staged for the broken-pipe tip icon.
+    xource,
     manager_mint: managerMint,
     credential_inject: credentialInject,
     // The pause/play switch, so the console's button and banner ride the poll every other control

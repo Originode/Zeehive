@@ -1,12 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import '@xterm/xterm/css/xterm.css';
 import FileExplorer from './FileExplorer.jsx';
 import FeedChips from './FeedChips.jsx';
 import MessageComposer from './MessageComposer.jsx';
-import { setXellLangfuseTracking } from './api.js';
+import { setXellLangfuseTracking, baseUrl } from './api.js';
+import { mountTerm } from './termHost.js';
+import { getTermEngine, getTermTheme, setTermTheme } from './termPref.js';
 
 // A path-ish token a zee tends to "present" in the terminal: web/src/App.jsx, ./server/x.js,
 // /work/repo/…, package.json. Used to offer "show file" on a selection and to strip a pasted
@@ -20,12 +19,6 @@ function pathFromSelection(sel) {
   return null;
 }
 
-// Path tokens to make CLICKABLE in terminal output. Two shapes: (1) a multi-segment path (has a
-// slash) with an optional leading ./ or /, and an optional :line:col; (2) a bare filename with a
-// known code/text extension. Kept deliberately conservative so ordinary prose ("Node.js", "e.g.")
-// doesn't turn into a sea of links.
-const PATH_RE = /(?:\.{0,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+(?::\d+(?::\d+)?)?|\b[A-Za-z0-9_-]+\.(?:jsx?|tsx?|mjs|cjs|json|css|md|py|sh|ya?ml|html?|sql|txt|toml|ini|env|lock)\b/g;
-
 // Frames from the bridge that are CONTROL, not terminal bytes: a NUL-tagged JSON string (terminal
 // output arrives as binary, so the two can never be confused). Must match CTRL_PREFIX in
 // server/src/lib/terminal-bridge.js.
@@ -35,8 +28,9 @@ const CTRL_PREFIX = '\u0000ZH';
 // {t:'r'} resizes up, raw bytes down):
 //   ZeeTerminal       → /api/zees/:id/terminal       (SSH → tmux inside a cxell)
 //   ContainerTerminal → /api/containers/:id/terminal (docker exec shell in ANY container)
-// TerminalModal is the shared body: xterm + fit + the resize/refit choreography, fullscreen,
-// and the status pill. The flavors differ only in title, footer, and prod styling.
+// TerminalModal is the shared body: terminal engine (xterm OR wterm — Console settings) + fit +
+// the resize/refit choreography, fullscreen, and the status pill. The flavors differ only in
+// title, footer, and prod styling.
 // `explorerZeeId` (cxell zees) / `explorerContainer` (any container) light up the single 📁
 // file-explorer button (toggles the panel; with a path-shaped selection it opens that file instead)
 // and make path-shaped tokens in the output clickable. The zee door additionally gets the live-feed
@@ -45,7 +39,7 @@ const CTRL_PREFIX = '\u0000ZH';
 // zee whether or not it is mid-turn (see the talk block below).
 export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, explorerContainer = null, xell = null, langfuseEnabled = false, onToggleLangfuse = null, onClose }) {
   const holder = useRef(null);
-  const termRef = useRef(null);
+  const termRef = useRef(null);   // termHost handle (xterm or wterm) — write/focus/getSelection/…
   const wsRef = useRef(null);
   const clipTaRef = useRef(null);
   const reqN = useRef(0);
@@ -61,6 +55,12 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   // cage: true = a feed is running and a chip repaints it now, false = the feed is not up (the
   // turn ended and the interactive session owns the pane), null = we have not been told yet.
   const [feed, setFeed] = useState({ thinking: true, moves: true, live: null, filterable: null });
+  // Shown in the status pill so the operator can see which engine this session is on without
+  // reopening settings. Read once at mount — a live PTY keeps the engine it was born with.
+  const [engine] = useState(() => getTermEngine());
+  // dark | light — toggled next to the engine pill; applies live via termRef.setTheme and
+  // persists for the next open. Default dark (light text on dark bg); light is the inverse.
+  const [theme, setTheme] = useState(() => getTermTheme());
 
   // Open a path in the explorer (opening the panel if needed). The bumping `n` makes every request
   // distinct so clicking the SAME path again re-opens it (identity, not value, drives the effect).
@@ -88,31 +88,29 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   const capture = (t) => { if (!t) return; setClip(t); setClipOpen(true); toOsClipboard(t); };
 
   useEffect(() => {
-    const term = new Terminal({
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 13,
-      theme: { background: '#0b0e14' }, cursorBlink: true, scrollback: 5000,
-    });
-    termRef.current = term;
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(holder.current);
-    const refit = () => { try { fit.fit(); } catch { /* mid-teardown */ } };
-    refit();
-    term.focus();
+    let cancelled = false;
+    let term = null;
+    let unsubSel = null;
+    let unsubLinks = null;
+    let raf = 0;
+    let settle = 0;
+    let ro = null;
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}${wsPath}`);
+    // baseUrl rides the app's own base so the terminal's websocket targets THIS xell's server
+    // through the proxy (/xell-web/<slug>/api/...), not the outer console's — same rule as fetch.
+    const ws = new WebSocket(`${proto}://${location.host}${baseUrl(wsPath)}`);
     wsRef.current = ws;
     ws.binaryType = 'arraybuffer';
-    const sendResize = () => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
 
-    // The mount-time fit races the modal's layout: measured too early it computes a small grid,
-    // tells the PTY that size, and NOTHING corrects it later (the ResizeObserver only fires on
-    // changes — the panel is already at its final size). Seen live: the terminal filled half the
-    // panel until a fullscreen toggle forced a refit. Refit on the next frame and once more after
-    // layout settles, re-sending the PTY size each time.
-    const raf = requestAnimationFrame(() => { refit(); sendResize(); });
-    const settle = setTimeout(() => { refit(); sendResize(); }, 250);
+    // Bytes that arrive before the engine finishes init (wterm loads WASM async) are buffered
+    // so a fast first frame is never dropped on the floor.
+    const pending = [];
+    const sendResize = () => {
+      if (!term || ws.readyState !== 1) return;
+      ws.send(JSON.stringify({ t: 'r', cols: term.cols, rows: term.rows }));
+    };
+    const refit = () => { try { term?.fit(); } catch { /* mid-teardown */ } };
 
     ws.onopen = () => { setStatus('live'); refit(); sendResize(); };
     ws.onmessage = (e) => {
@@ -127,77 +125,91 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
         } catch { /* a malformed control frame must not kill the terminal */ }
         return;
       }
-      term.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data));
+      const chunk = typeof e.data === 'string' ? e.data : new Uint8Array(e.data);
+      if (!term) { pending.push(chunk); return; }
+      term.write(chunk);
     };
     ws.onclose = () => setStatus('closed');
     ws.onerror = () => setStatus('error');
-    term.onData((d) => ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d })));
-    term.onResize(sendResize);
 
-    // CLIPBOARD. xterm renders to a canvas, so a highlight is xterm's OWN selection, not a browser
-    // text selection — the browser's copy has nothing to grab (reported: "Ctrl+Shift+C doesn't
-    // work, I can't copy"). And the OS clipboard is itself unreachable on a remote http origin. So:
-    //  • copy-on-select CAPTURES the selection into the IN-APP clipboard tray (real page text the
-    //    operator can always read/copy) and mirrors to the OS clipboard where allowed. Shift+drag,
-    //    since tmux mouse mode owns a plain drag.
-    term.onSelectionChange(() => { const s = term.getSelection(); if (s) capture(s); });
-    //  • explicit shortcuts as a fallback: Ctrl+Shift+C / Cmd+C copy the selection; Ctrl+Shift+V /
-    //    Cmd+V paste into the PTY. We swallow these so they don't reach the shell (plain Ctrl+C stays
-    //    SIGINT — we never touch it). attachCustomKeyEventHandler returning false blocks the key.
-    term.attachCustomKeyEventHandler((e) => {
-      if (e.type !== 'keydown') return true;
-      const combo = (e.ctrlKey && e.shiftKey) || e.metaKey;   // Linux/Win: Ctrl+Shift+_, mac: Cmd+_
-      if (!combo) return true;
-      if (e.code === 'KeyC' && term.hasSelection()) { capture(term.getSelection()); return false; }
-      if (e.code === 'KeyV') {
-        try { navigator.clipboard?.readText().then((t) => t && ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d: t }))); } catch { /* denied */ }
-        return false;
+    (async () => {
+      try {
+        term = await mountTerm(holder.current, {
+          engine,   // frozen at modal open — preference changes apply next time
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          fontSize: 13,
+          theme,    // dark|light palette (toggle beside the engine pill)
+          cursorBlink: true,
+          scrollback: 5000,
+          onData: (d) => { if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'i', d })); },
+          onResize: () => sendResize(),
+        });
+      } catch (err) {
+        console.error('terminal engine failed to mount', err);
+        if (!cancelled) setStatus('error');
+        return;
       }
-      return true;
-    });
+      if (cancelled) { try { term.dispose(); } catch { /* */ } return; }
+      termRef.current = term;
+      for (const c of pending) term.write(c);
+      pending.length = 0;
+      term.focus();
+      refit();
+      sendResize();
 
-    // CLICKABLE PATHS. A zee constantly names files it touched ("edited web/src/App.jsx"); a
-    // container shell names configs and logs ("/var/log/…", "app/server.js"). Make those clickable
-    // so the human opens them in the explorer with ZERO copy-paste. A custom link provider scans
-    // each rendered line for path-shaped tokens and, on click, opens the file. Only for terminals
-    // that HAVE an explorer (a cxell zee or a shellable container).
-    let linkDisp = null;
-    if (explorerZeeId || explorerContainer) {
-      linkDisp = term.registerLinkProvider({
-        provideLinks(y, cb) {
-          const line = term.buffer.active.getLine(y - 1);
-          if (!line) return cb(undefined);
-          const text = line.translateToString(true);
-          const links = [];
-          PATH_RE.lastIndex = 0;
-          let m;
-          while ((m = PATH_RE.exec(text)) !== null) {
-            const raw = m[0];
-            const x = m.index + 1;   // xterm buffer x is 1-based
-            links.push({
-              text: raw,
-              range: { start: { x, y }, end: { x: x + raw.length - 1, y } },
-              activate: (_e, t) => openInExplorer(t.replace(/:\d+(?::\d+)?$/, '')),
-            });
-          }
-          cb(links.length ? links : undefined);
-        },
+      // CLIPBOARD. xterm paints to a canvas so a highlight is the engine's own selection (browser
+      // copy has nothing to grab). wterm paints to the DOM so native selection works — but we still
+      // mirror into the in-app tray, because the OS clipboard is unreachable on a remote http origin.
+      // Shift+drag under tmux mouse mode for both engines.
+      unsubSel = term.onSelectionChange((s) => capture(s));
+      // xterm-only shortcuts (Ctrl+Shift+C/V); wterm already handles native copy/paste.
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type !== 'keydown') return true;
+        const combo = (e.ctrlKey && e.shiftKey) || e.metaKey;
+        if (!combo) return true;
+        if (e.code === 'KeyC' && term.hasSelection()) { capture(term.getSelection()); return false; }
+        if (e.code === 'KeyV') {
+          try { navigator.clipboard?.readText().then((t) => t && ws.readyState === 1 && ws.send(JSON.stringify({ t: 'i', d: t }))); } catch { /* denied */ }
+          return false;
+        }
+        return true;
       });
-    }
+
+      // CLICKABLE PATHS — only when this door has an explorer (cxell zee or shellable container).
+      if (explorerZeeId || explorerContainer) {
+        unsubLinks = term.registerPathLinks((p) => openInExplorer(p));
+      }
+
+      // The mount-time fit races the modal's layout: measured too early it computes a small grid,
+      // tells the PTY that size, and NOTHING corrects it later. Refit next frame + after settle.
+      raf = requestAnimationFrame(() => { refit(); sendResize(); });
+      settle = setTimeout(() => { refit(); sendResize(); }, 250);
+    })();
 
     const onWin = () => { refit(); };
     window.addEventListener('resize', onWin);
-    const ro = new ResizeObserver(() => { refit(); });
+    ro = new ResizeObserver(() => { refit(); });
     if (holder.current) ro.observe(holder.current);
 
     return () => {
+      cancelled = true;
       cancelAnimationFrame(raf); clearTimeout(settle);
-      window.removeEventListener('resize', onWin); ro.disconnect();
-      try { linkDisp?.dispose(); } catch {}
-      try { ws.close(); } catch {} term.dispose();
+      window.removeEventListener('resize', onWin);
+      try { ro?.disconnect(); } catch { /* */ }
+      try { unsubSel?.(); } catch { /* */ }
+      try { unsubLinks?.(); } catch { /* */ }
+      try { ws.close(); } catch { /* */ }
+      try { term?.dispose(); } catch { /* */ }
       termRef.current = null; wsRef.current = null;
     };
-  }, [wsPath]);
+  }, [wsPath, engine]); // theme toggles live via setTheme on the handle — do not remount
+
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    setTermTheme(next);
+    try { termRef.current?.setTheme?.(next); } catch { /* torn down */ }
+  };
 
   // ── clipboard tray actions ──
   const flashMsg = (m) => { setFlash(m); setTimeout(() => setFlash(''), 1200); };
@@ -285,6 +297,14 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
           <span className="term-title">⌨ {title}
             {prod && <span className="term-prodtag" data-testid="term-prodtag">PRODUCTION</span>}
             <span className={`tstat t-${status}`}>{status}</span>
+            <span className="term-engine" data-testid="term-engine-pill" title={`Terminal engine: ${engine} (change in Console settings ⚙)`}>{engine}</span>
+            <button type="button" className={`term-theme-toggle ${theme}`} data-testid="term-theme-toggle"
+                    onClick={toggleTheme}
+                    title={theme === 'dark'
+                      ? 'Theme: dark (light text on dark bg). Click for light.'
+                      : 'Theme: light (dark text on light bg). Click for dark.'}>
+              {theme === 'dark' ? '☾ dark' : '☀ light'}
+            </button>
           </span>
           {/* Only the zee door has a feed to filter — a container shell is just a shell. */}
           {explorerZeeId && <FeedChips feed={feed} onToggle={setFeedFlag} />}
@@ -363,11 +383,11 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
   );
 }
 
-// A live terminal INTO a cxell zee. The browser xterm talks to /api/zees/:id/terminal (a
-// websocket), which the queenzee bridges over SSH to a PTY on `tmux new -A -s zee` inside the
-// cxell — so this is the same interactive `claude` you'd get over SSH, prompt by prompt, and
-// disconnecting leaves the session running (tmux). The SSH line below is that exact door for
-// Claude Code desktop's "Add SSH host" — the deeplink IS the SSH connection.
+// A live terminal INTO a cxell zee. The browser terminal (xterm or wterm — Console settings)
+// talks to /api/zees/:id/terminal (a websocket), which the queenzee bridges over SSH to a PTY on
+// `tmux new -A -s zee` inside the cxell — so this is the same interactive `claude` you'd get over
+// SSH, prompt by prompt, and disconnecting leaves the session running (tmux). The SSH line below
+// is that exact door for Claude Code desktop's "Add SSH host" — the deeplink IS the SSH connection.
 export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, langfuseTracking = true, langfuseEnabled = false, onClose }) {
   const [copied, setCopied] = useState(false);
   // The Langfuse tracking switch, kept locally so the header knob reflects the click instantly and

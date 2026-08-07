@@ -174,6 +174,29 @@ try {
       ],
     },
     {
+      // THE CREDENTIAL-INJECTION ENGINE'S /etc/environment WRITE (lib/credential-inject.js). Its
+      // verdict decides whether a human-approved key rotation reached a live cage: a cage that cannot
+      // say it wrote the file did NOT get the new key, and the receipt must say so. Same shape as its
+      // sibling writeFileIntoCxellIfChanged — WROTE wins over a non-zero exit, and silence is a FAILED
+      // write, never an assumed one.
+      name: 'writeCxellEnvironment (credential injection)',
+      markers: ['WROTE'],
+      cases: [
+        { what: 'WROTE + exit 1 + stderr noise is a written environment (the verdict, not the exit code)',
+          out: 'WROTE', err: 'docker: connection reset', code: 1,
+          run: () => C.writeCxellEnvironment({ ctx: 'default', slug: 'zt-v', text: 'A=1\n' }),
+          want: (r) => r?.ok === true && r?.path === '/etc/environment' },
+        { what: 'an unrecognised answer is NOT a write, however the exec exited',
+          out: 'something unexpected', err: '', code: 0,
+          run: () => C.writeCxellEnvironment({ ctx: 'default', slug: 'zt-v', text: 'A=1\n' }),
+          want: (r) => r?.ok === false && r?.path === '/etc/environment' },
+        { what: 'and NO verdict is a failed write — silence never means the key landed',
+          out: '', err: 'No such container: cxell_zt-v', code: 1,
+          run: () => C.writeCxellEnvironment({ ctx: 'default', slug: 'zt-v', text: 'A=1\n' }),
+          want: (r) => r?.ok === false && r?.path === '/etc/environment' },
+      ],
+    },
+    {
       name: 'warmCxell',
       markers: C.WARM_MARKERS,
       cases: [
