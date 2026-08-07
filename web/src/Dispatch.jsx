@@ -5,6 +5,11 @@ import { getDispatchOptions, getHarnesses, getRouterStatus } from './api.js';
 import { emptyWarning } from './harnessHealth.js';
 import ZeeAvatar from './ZeeAvatar.jsx';
 
+// Same ceiling as the 📨 MessageComposer: pasted images ride the dispatch JSON body as base64 data
+// URLs, and base64 inflates ~33% — so keep the total image payload well under the server's 30mb
+// json limit (server/src/index.js) and the webapp nginx's client_max_body_size (nginx-web.conf).
+const MAX_BYTES = 20 * 1024 * 1024;
+
 // The "+" composer. A human writes a prompt (rich text, paste-friendly, images welcome) and picks
 // the autonomy mode / model / attended flag — then SUBMIT dispatches it exactly like a /xell
 // dispatch: the queenzee claims a ready xell for this project and spawns a zee into its worktree
@@ -342,9 +347,24 @@ export default function Dispatch({ projectId, projectName,
     return () => window.removeEventListener('keydown', onKey);
   }, [empty, images.length, onClose]);
 
+  // Same per-attachment ceiling as the 📨 MessageComposer (MAX_BYTES there): a pasted screenshot is
+  // sent as base64 INSIDE the JSON body, so an oversized image fails the whole dispatch with an
+  // opaque 413. Say so here, before the POST. Base64 inflates ~33%, and the server's json limit is
+  // 30mb — 20mb of images stays comfortably under it. The ceiling is enforced in the functional
+  // updater (not from the render closure) so two images pasted in the same tick are summed against
+  // it correctly — the same shape MessageComposer's addFiles uses.
   const addImage = (img) =>
-    setImages((prev) => [...prev, { id: `${Date.now()}-${prev.length}`, ...img }]);
-  const removeImage = (id) => setImages((prev) => prev.filter((im) => im.id !== id));
+    setImages((prev) => {
+      const next = [...prev, { id: `${Date.now()}-${prev.length}`, ...img }];
+      const total = next.reduce((n, im) => n + (im.size || 0), 0);
+      if (total > MAX_BYTES) {
+        setErr(`Attachments exceed 20 MB — remove one before dispatching (${(total / (1024 * 1024)).toFixed(1)} MB).`);
+        return prev;
+      }
+      setErr(null);
+      return next;
+    });
+  const removeImage = (id) => { setErr(null); setImages((prev) => prev.filter((im) => im.id !== id)); };
 
   const syncEmpty = () => {
     setEmpty(!(editorRef.current?.innerText || '').trim());
