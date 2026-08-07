@@ -237,6 +237,75 @@ export async function commitXourceStaged(projectId, {
   };
 }
 
+// COMMIT the xource's DIRTY work in one step (stage-then-commit) — the "commit locally" door.
+//
+// The existing commitXourceStaged commits only what is ALREADY staged, which is right for the
+// broken-pipe modal but needs a staging step the console does not expose. This verb is the
+// one-click "commit my local work": stage every dirty TRACKED path (staged, unstaged — never
+// untracked junk, never ignored .claude/ worktrees, which git add -A would not pick up anyway
+// since .claude/ is gitignored), then commit with the message. Same guards as commitXourceStaged
+// (on main, no mid-merge, PROVISION_MODE), same landed-on-main semantics.
+export async function commitXourceDirty(projectId, {
+  message = null, by = 'human@console', mode = PROVISION_MODE,
+} = {}) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+  if (!project) throw new Error('unknown project');
+  const main = project.main_branch || 'main';
+  const before = xourceState(project.repo_root, main);
+  if (!before.ok) throw new Error(before.error || 'cannot read xource');
+  if (before.clean || before.dirty === 0) {
+    throw new Error('the xource is already clean — there is nothing to commit');
+  }
+  const msg = String(message || '').trim();
+  if (!msg) throw new Error('a commit message is required — this lands on main and is the line the next landing/ship sees');
+
+  if (mode !== 'real') {
+    logline('xource-commit', `commit on ${project.name} NOT run — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return {
+      ok: true, dry_run: true, mode, before, after: before,
+      commit: null, message: msg, by,
+      note: 'NOT run — simulate mode models the fleet; the real xource index was not committed',
+    };
+  }
+
+  if (before.merge_in_progress || before.rebase_in_progress
+      || before.cherry_pick_in_progress || before.revert_in_progress) {
+    throw new Error('a merge/rebase/cherry-pick/revert is in progress on the xource — '
+      + 'Clear it (abort + reset) rather than committing a half-finished resolution from here');
+  }
+  if (!before.on_main) {
+    throw new Error(`xource is not on ${main} (on '${before.branch || 'DETACHED'}') — `
+      + 'check out main (or Clear) before committing work onto the tip');
+  }
+
+  // stage every dirty TRACKED path. `git add -A` includes untracked files, which is NOT wanted
+  // (untracked junk like scratch should not ride into a commit); `git add -u` stages only tracked
+  // modifications/deletions, and because .claude/ is gitignored its worktrees are never tracked.
+  const add = git(project.repo_root, ['add', '-u'], 60000);
+  if (!add.ok) {
+    throw new Error(`git add failed: ${lastErr(add, 'no output')}`);
+  }
+
+  const r = git(project.repo_root, ['commit', '-m', msg], 60000);
+  if (!r.ok) {
+    throw new Error(`git commit failed: ${lastErr(r, 'no output')}`);
+  }
+  const newHead = git(project.repo_root, ['rev-parse', 'HEAD']).out || null;
+  try {
+    await recordXourceHead(project, main, newHead || headCommit(project.repo_root, main));
+  } catch { /* advisory — a commit must never fail on bookkeeping */ }
+
+  const after = xourceState(project.repo_root, main);
+  broadcast('xource-clean', { project_id: projectId, kind: 'commit', commit: newHead });
+  broadcast('project', { id: projectId });
+  logline('xource-commit', `xource commit by ${by} on ${project.name}: ${String(newHead || '').slice(0, 8)} — ${msg.slice(0, 80)}`);
+  return {
+    ok: true, dry_run: false, before, after,
+    commit: newHead, short: newHead ? newHead.slice(0, 7) : null,
+    message: msg, by, output: (r.out || '').trim(),
+  };
+}
+
 // STASH the xource's dirty work (staged + unstaged + untracked, excluding ignored .claude/).
 // The third recovery door on the broken-pipe modal: Clear discards, Commit keeps on main, Stash
 // parks the dirt on the stash stack so the checkout is clean and landings/ships can move — the

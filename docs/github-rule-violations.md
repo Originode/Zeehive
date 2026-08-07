@@ -167,6 +167,13 @@ the commits, not the tip. That is not a one-off — it is the shape of the recur
 `git log -p` and checks every ADDED line against the same twelve vendor patterns, so a string that
 was ever introduced into the branch's history fails the build the moment it lands — before it can
 sit in a range for 112 commits. The two known 2026-08-04 introductions are grandfathered by commit
+
+**Credential test fixtures are now GENERATED, not hand-written (2026-08-07).**
+`test/_bin/tokens.mjs` builds every vendor's token SHAPE at runtime (`fakeTokens.claude()`,
+`.deepseek()`, `.openaiProject()`, `.github()`, …), so no credential-shaped literal can ever exist
+in a test file again — the whole "a fake that accidentally matches a vendor pattern" class is gone
+by construction. The generator's outputs satisfy OUR shape predicates and are verified never to
+match any of the twelve lint patterns.
 sha (a forward-only repo does not rewrite history), and each grandfather entry is verified to still
 be exactly that incident, so the list cannot rot into a licence for the next one.
 
@@ -175,29 +182,18 @@ it was: rewrite the introducing commit out of the history (a human call — it r
 history), or open the PR from the squashed snapshot. The lint is what stops the *next* branch from
 ever being in that position.
 
-## The RECONCILE verb — the ordinary-PR fix for a branch that is already dirty (2026-08-06)
+## The COMMIT verb — "commit locally, then push" (2026-08-07)
 
 The lint prevents FUTURE incidents, but a branch that already carries the string in its range still
-forces the squash today. There are three remedies, and the first two were the only console paths:
+forces the squash today. The permanent fix for that is GitHub's own **push-protection bypass list**
+(repo Settings → Code security → Secret scanning → Push protection): add the specific
+secret-shaped value and pushes containing it stop being blocked — no squash, no history rewrite,
+no local change. For an org repo the setting lives at the ORG level.
 
-- **rewrite the history** — a human call, and it rewrites the branch's own history;
-- **the squashed snapshot** — works, but silently drops the branch's history;
-- **`⟲ Reconcile`** (Project setup → GitHub remote) — the new third option.
-
-Reconcile re-points the **checked-out local `main`** at the recorded remote's tip. It is the answer
-when the remote was **squashed or re-written clean** while the local branch kept the old dirty
-range: the fast-forward Pull refuses ("reconcile by hand"), Xource Clean resets to the dirty LOCAL
-tip, and an ordinary PR keeps getting refused because push protection scans the range. Reconcile is
-the one action that makes the ordinary (non-squashed) PR work again.
-
-It is deliberately narrow, and a human confirms it first because **local-only commits are
-discarded** (that is the point — they are the dirty range):
-
-- only ever re-points the checked-out `main` to `origin/<main>` — no other ref, worktree or xell;
-- refuses a dirty tree (same stance as Pull: never discard uncommitted work);
-- refuses when local is strictly BEHIND the remote (that is a fast-forward Pull, not a reconcile);
-- up-to-date → nothing dropped, reported as such;
-- PROVISION_MODE-gated and human-confirmed like every outbound verb.
-
-Proven end to end in `test/github-reconcile.test.mjs`: the diverged branch reconciles, the ordinary
-PR then opens (no squash body), and the guards (dirty tree, wrong branch, behind) all hold.
+For the everyday "I want to commit my local work and push it" flow, the console's header now has a
+**⚑ Commit** button (and the git-graph broken-pipe modal keeps its Clear / Stash / Commit doors).
+⚑ Commit stages every dirty TRACKED path on the xource (`git add -u`, so untracked junk and
+ignored `.claude/` worktrees never ride along) and creates a real commit on `main` with the message
+you type — then ↑ Push or ⇅ PR carries it. `commitXourceDirty` in `server/src/lib/xource-clean.js`
+is the one-step door; it is PROVISION_MODE-gated and refuses mid-merge / off-main exactly like
+commitXourceStaged.

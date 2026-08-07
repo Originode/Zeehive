@@ -57,17 +57,17 @@ const section = (t) => console.log(`\n── ${t} ──`);
 const readLog = () => (existsSync(DOCKER_LOG) ? readFileSync(DOCKER_LOG, 'utf8') : '');
 const clearLog = () => { rmSync(DOCKER_LOG, { force: true }); };
 
-// The real shapes, not invented ones: a claude setup-token, a DeepSeek platform key, an OpenAI
-// project key, a Kimi coding key, a GitHub fine-grained PAT.
-const CLAUDE_TOK   = 'sk-ant-oat01-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789ab-CAAA';
-// NOT hex: GitHub secret-scanning push protection keys DeepSeek on `sk-` + 32 HEX characters, and
-// the invented hex fixture that used to live here matched it exactly — GH013, every push refused
-// (2026-08-04). Letters past 'f' keep our own shape predicates happy and can never be that pattern.
-const DEEPSEEK_TOK = 'sk-notArealDeepseekKeyZZQQWWVVUU';
-const OPENAI_TOK   = 'sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789';
-const KIMI_TOK     = 'kc0123456789abcdefghijklmnop';
-const GITHUB_TOK   = `github_pat_11${'A'.repeat(40)}`;
-const GROK_TOK     = `xai-${'aBcDeFgHiJkLmNoPqRsTuVwXyZ'.repeat(2)}0123`;
+// The real SHAPES, generated at runtime (test/_bin/tokens.mjs) so no vendor-secret-pattern literal
+// exists in this file — a hand-written fake that matches a vendor's shape is what GH013'd every
+// push on 2026-08-04. The generator guarantees our predicates accept the shape and GitHub's
+// patterns never match it.
+import { fakeTokens } from './_bin/tokens.mjs';
+const CLAUDE_TOK   = fakeTokens.claude();
+const DEEPSEEK_TOK = fakeTokens.deepseek();
+const OPENAI_TOK   = fakeTokens.openaiProject();
+const KIMI_TOK     = fakeTokens.kimi();
+const GITHUB_TOK   = fakeTokens.github();
+const GROK_TOK     = fakeTokens.grok();
 
 try {
   const RT = await import('../server/src/lib/cxell-runtimes.js');

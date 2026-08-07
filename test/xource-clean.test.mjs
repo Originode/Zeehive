@@ -24,7 +24,7 @@ process.env.PROVISION_MODE = 'real';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
-const { xourceState, performXourceClean, commitXourceStaged, stashXource, requestXourceClean,
+const { xourceState, performXourceClean, commitXourceStaged, commitXourceDirty, stashXource, requestXourceClean,
         decideXourceClean, listXourceCleanRequests, xourceCleanStatusFor }
   = await import('../server/src/lib/xource-clean.js');
 const { xourcePatch } = await import('../server/src/lib/diffview.js');
@@ -205,6 +205,34 @@ try {
     .then(() => null).catch((e) => e);
   ok(nothing instanceof Error && /nothing is staged/i.test(nothing.message),
      'commit with an empty index is refused');
+
+  // ── 8b. commitXourceDirty — the one-step "commit locally" door ──────────────
+  console.log('\n── commitXourceDirty: stage + commit in one step ──');
+  writeFileSync(join(src, 'tracked-dirty.txt'), 'tracked, modified\n');
+  git(src, ['add', 'tracked-dirty.txt']);
+  git(src, ['commit', '-m', 'chore: base for dirty-commit']);
+  writeFileSync(join(src, 'tracked-dirty.txt'), 'tracked, modified again\n');   // tracked + dirty
+  writeFileSync(join(src, 'untracked-junk.txt'), 'should NOT ride along\n');    // untracked
+  const dirtyState = xourceState(src, 'main');
+  ok(dirtyState.dirty >= 1, 'the tree has dirty tracked work');
+
+  const noMsgDirty = await commitXourceDirty(project.id, { message: '', by: 'human@test' })
+    .then(() => null).catch((e) => e);
+  ok(noMsgDirty instanceof Error && /message is required/i.test(noMsgDirty.message),
+     'commitXourceDirty without a message is refused');
+
+  const dirtyCommit = await commitXourceDirty(project.id, {
+    message: 'feat: commit my local work', by: 'human@test',
+  });
+  ok(dirtyCommit?.ok === true && dirtyCommit.dry_run !== true, 'commitXourceDirty lands a real commit');
+  ok(!!dirtyCommit.commit, `returns the new head (${dirtyCommit.short})`);
+  const afterDirty = xourceState(src, 'main');
+  ok(afterDirty.head === dirtyCommit.commit, 'xource HEAD is the new commit');
+  ok(afterDirty.untracked.includes('untracked-junk.txt') || afterDirty.files?.some((f) => f.path === 'untracked-junk.txt'),
+     'tracked dirt is committed; the untracked junk is LEFT for the human to decide');
+  const dirtyShow = git(src, ['show', '--name-only', '--pretty=format:', dirtyCommit.commit]);
+  ok(dirtyShow.out.includes('tracked-dirty.txt'), 'the commit contains the tracked dirty file');
+  ok(!dirtyShow.out.includes('untracked-junk.txt'), 'and does NOT sweep untracked junk in');
 
   // ── 9. xourcePatch (diff preview) + stashXource ────────────────────────────
   console.log('\n── xourcePatch preview + stashXource ──');

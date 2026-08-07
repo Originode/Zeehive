@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject, reconcileProject,
+  createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject,
   githubAccess, pushProject, pullRequestProject, squashHelps, squashOffer,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
@@ -689,24 +689,6 @@ function BasicsSection({ project, run, onProject }) {
       setPull(r);
     } catch (e) { setPull({ state: 'error', reason: e.message }); }
   };
-  // Reconcile is OUTBOUND and human-gated: re-point local main at the remote's tip. It is the fix
-  // for the DIVERGED case a fast-forward Pull refuses ("reconcile by hand") — and, because the
-  // remote was often squashed clean while the local branch kept the old dirty range, it is also the
-  // fix that makes an ORDINARY (non-squashed) PR work again. It discards local-only commits, so it
-  // is confirmed like every outbound verb.
-  const doReconcile = async () => {
-    if (!(await showConfirm(
-      `Re-point local ${project.main_branch} of ${project.name} at the GitHub remote's tip?\n\n`
-      + `${project.remote_url}\n\nLocal commits NOT on the remote are discarded. Use this when the remote was `
-      + `squashed/re-written and an ordinary PR keeps being refused (push protection scanning the old commits). `
-      + `A fast-forward Pull would be the non-destructive choice when the remote is simply AHEAD.`,
-      { title: 'Reconcile to remote?', okLabel: 'Reconcile', variant: 'danger' }))) return;
-    setPull(null); setOut({ busy: true, kind: 'reconcile' });
-    try {
-      const r = await run(() => reconcileProject(project.id));
-      setOut({ ...r, kind: 'reconcile' });
-    } catch (e) { setOut({ kind: 'reconcile', reason: e.message }); }
-  };
   // Push is OUTBOUND and human-gated: confirm first, then local main → the remote (ff-only). A
   // refusal ({pushed:false, reason}) shows in the same status pill.
   const doPush = async () => {
@@ -769,16 +751,12 @@ function BasicsSection({ project, run, onProject }) {
       : `${opened} — merge refused: ${o.merge?.reason || 'not mergeable'}${o.url ? ' (finish on GitHub ↗)' : ''}`;
   };
   const outLabel = !out ? null
-    : out.busy ? (out.kind === 'push' ? 'pushing…' : out.kind === 'reconcile' ? 'reconciling…' : out.merge ? 'opening & merging PR…' : 'opening PR…')
+    : out.busy ? (out.kind === 'push' ? 'pushing…' : out.merge ? 'opening & merging PR…' : 'opening PR…')
     : out.kind === 'push'
       ? (out.pushed ? (out.state === 'up-to-date' ? '✓ remote already up to date' : `✓ pushed ${project.main_branch} → remote`) : (out.reason || 'push refused'))
-      : out.kind === 'reconcile'
-        ? (out.reconciled
-            ? `✓ reconciled ${project.main_branch} → remote (dropped ${out.dropped ?? '?'} local commit${out.dropped === 1 ? '' : 's'}) — you can now open a normal PR`
-            : (out.reason || 'reconcile refused'))
-        : prLabel(out);
+      : prLabel(out);
   // Green only when fully done: an opened-but-not-merged "PR & merge" is a partial success (warn).
-  const outOk = out && (out.pushed || out.reconciled || (out.opened && (!out.merge || out.merge?.merged)));
+  const outOk = out && (out.pushed || (out.opened && (!out.merge || out.merge?.merged)));
   return (
     <div className="setup-sec">
       <h3>Project</h3>
@@ -793,16 +771,13 @@ function BasicsSection({ project, run, onProject }) {
         <label>Build registry <span className="pc">(blank = split builds off; host:port on the LAN, e.g. 10.1.0.18:5000)</span>
           <input value={f.registry} onChange={set('registry')} placeholder="none — compile on the run host" /></label>
         <label>GitHub remote <span className="pc">{access?.can_push
-            ? '(write access — Pull, Reconcile, or Push / open a PR; every outbound action is confirmed)'
+            ? '(write access — Pull, or Push / open a PR; every outbound action is confirmed)'
             : '(pull-only fetch source — connect a write-scoped PAT to enable Push / PR)'}</span>
           <span className="setup-row">
             <input value={f.remote_url} onChange={set('remote_url')} placeholder="https://github.com/org/repo (none)" />
             <button type="button" disabled={!(project.remote_url || '').trim() || pull?.busy || out?.busy}
                     title={`fetch + fast-forward ${project.main_branch} from the remote (refuses on divergence)`}
                     onClick={doPull}>↓ Pull</button>
-            <button type="button" className="ghost" disabled={!(project.remote_url || '').trim() || pull?.busy || out?.busy}
-                    title={`re-point local ${project.main_branch} at the remote's tip — the fix when Pull says "reconcile by hand" and an ordinary PR keeps getting refused (discards local-only commits — confirmed first)`}
-                    onClick={doReconcile}>⟲ Reconcile</button>
             {access?.can_push && (
               <button type="button" disabled={pull?.busy || out?.busy}
                       title={access?.push_rule_block
