@@ -5,9 +5,9 @@
 <h1 align="center">ZEEHIVE</h1>
 
 <p align="center">
-  <strong>A deterministic agent-environment orchestrator that runs itself.</strong><br>
-  Start it against nothing — it clones this repo, onboards itself as its first project,
-  and is ready to cut isolated environments for AI agents to work in.
+  <strong>A deterministic agent-environment orchestrator that evolves itself.</strong><br>
+  Start it — it clones this repo, onboards itself as its first project, and is ready to
+  onboard other projects and cut isolated environments for AI agents to work in.
 </p>
 
 <p align="center">
@@ -21,10 +21,14 @@
 
 ## What is ZEEHIVE?
 
-ZEEHIVE is the control plane for a **fleet of AI agents that write code**. It gives each agent an
-isolated, reproducible workspace — a **xell** — with its own git branch, database and containers,
-and puts a human gate in front of every irreversible action (landing on `main`, shipping to
-production, touching production data).
+ZEEHIVE is a control plane for **a fleet of AI agents that write code** — and it uses itself to
+build its own improvements. On first boot it clones this repo, onboards itself as its first
+project, and is then ready to onboard **any other project** on your machine or from GitHub, cutting
+isolated environments (**xells**) for AI agents to work in.
+
+Each agent gets a reproducible workspace with its own git branch, database and containers, and a
+human gate stands in front of every irreversible action — landing on `main`, shipping to
+production, touching production data.
 
 The core idea is simple:
 
@@ -32,9 +36,10 @@ The core idea is simple:
 > starting from a proven-correct environment — and anything irreversible needs a human's click.**
 
 It is built in Node.js and React (ES modules throughout), uses PostgreSQL as its single source of
-truth, and runs entirely on Docker. No external AI platform is required to *run* it — you connect
-your own AI provider credentials (Claude, OpenAI Codex, Kimi, Grok, DeepSeek, Gemini, Z.ai) to
-dispatch agents.
+truth, and runs on Docker. It is **local-first**: everything runs on your own machine; GitHub is
+just one optional way to pull a project in. No external AI platform is required to *run* it — you
+connect your own AI provider credentials (Claude, OpenAI Codex, Kimi, Grok, DeepSeek, Gemini,
+Z.ai) to dispatch agents.
 
 ## Key features
 
@@ -43,8 +48,19 @@ dispatch agents.
   "works on my machine".
 - **🔒 Human gates on everything irreversible** — landing on `main`, shipping to production and
   touching production data are held until a human approves the exact sha in the console.
-- **🧠 Provider-agnostic** — dispatch the same task to Claude, Codex, Kimi, Grok, DeepSeek, Gemini
-  or Z.ai; each runs in its own hardened cxell container with a default-deny firewall.
+- **🧠 Provider-agnostic with model policy** — dispatch the same task to any AI provider. Each
+  project can set **harnesses** — persona + skills + memory layers that also carry *policy* on
+  which providers and models suit which job, enforced at dispatch.
+
+  <p align="center">
+    <img src="web/public/providers/claude.png" width="28" alt="Claude" title="Claude">
+    <img src="web/public/providers/openai.png" width="28" alt="OpenAI Codex" title="OpenAI Codex">
+    <img src="web/public/providers/kimi.png" width="28" alt="Kimi" title="Kimi">
+    <img src="web/public/providers/grok.png" width="28" alt="Grok" title="Grok">
+    <img src="web/public/providers/deepseek.png" width="28" alt="DeepSeek" title="DeepSeek">
+    <img src="web/public/providers/gemini.png" width="28" alt="Gemini" title="Gemini">
+    <img src="web/public/providers/zai.png" width="28" alt="Z.ai" title="Z.ai">
+  </p>
 - **🎛️ Live honeycomb console** — watch the whole fleet as colour-coded hexagons: provisioning,
   working, idle, holding, or asking a human for a land/ship/prod decision.
 - **⚙️ Deterministic core** — the queenzee is pure script, no AI. Provisioning, pooling, monitoring
@@ -52,21 +68,24 @@ dispatch agents.
 
 ## Quickstart
 
-**Requirements:** Docker with Compose. No checkout, no build — published images:
+**Requirements:** Docker. No checkout, no build — published images:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Originode/Zeehive/master/docker-compose.bootstrap.yml
 docker compose -f docker-compose.bootstrap.yml up -d
 ```
 
-On first boot, ZEEHIVE migrates its own fresh database and **self-onboards**: it clones this repo
-from GitHub, registers it as the `Zeehive` project, installs the landing gate, and sets the spawn
-template. Then:
+On first boot, ZEEHIVE migrates its own fresh database and **self-onboards**: it clones this repo,
+registers it as the `Zeehive` project, installs the landing gate, and sets the spawn template.
+Then:
 
 1. Open the console at **http://localhost:5180** (API on `:4700`)
 2. Go to **Project setup → Tokens** and connect your AI provider — for Claude: run `claude setup-token` and paste the long-lived token it prints
 3. Raise the **pool target** to pre-warm xells
 4. Type a task into **+ new prompt** — a zee goes to work in one
+
+**Onboard another project** the same way — **Project setup → New Project**: clone one from GitHub,
+or mount an existing folder from your machine.
 
 > **Run your own fork:** set `ZEEHIVE_SELF_REMOTE` (and `ZEEHIVE_GITHUB_TOKEN` for a private repo —
 > a fine-grained PAT with Contents: Read-only) in a `.env` file next to the bootstrap compose.
@@ -143,9 +162,10 @@ flowchart LR
 
 | Term | What it is |
 |---|---|
-| **xource** | The source a *xell* branches from: the project's local clone and its main branch. Read-only to xells. Synced from GitHub inbound; pushing out stays a **human act**. |
+| **xource** | The source a *xell* branches from: the project's local clone and its main branch. Read-only to xells. Pushing out stays a **human act**. |
 | **xell** | An isolated environment: a git worktree + its own branch + its own containers (per-xell database, server, webapp) + generated config (`.zeehive.env`). The unit the orchestrator pools, spawns, tracks, and tears down. |
 | **cxell** | A *caged xell*: the locked-down container a headless zee actually works in. No docker socket, no host filesystem, a default-deny egress firewall — the queenzee API is its only door out, and every privileged verb behind that door lands on a human gate. |
+| **harness** | A config layer a zee wears — persona, skills, memory — plus a **model policy**: which providers and models suit which job, enforced at dispatch. |
 | **zee** | An agent (an AI model session) bound to exactly one xell, running inside its cxell. |
 | **queenzee** | The orchestrator. **Pure script, no AI.** It provisions/reaps deterministically, keeps the pool warm, monitors health, runs maintenance, and executes the privileged actions humans approve. |
 
@@ -170,16 +190,14 @@ Plus one control that is the opposite of a gate — it stops everything until a 
 
 ---
 
-## GitHub-centric, inbound by default
+## Local-first, GitHub-optional
 
-The code lives on GitHub; every instance is born from it (self-onboard) and refreshed from it
-(the console's fast-forward-only **Pull**). The dev cycle itself — landing, integration, prod
-builds — runs entirely on the local xource and never depends on GitHub being reachable.
-
-Publishing local `main` *out* to GitHub is opt-in and human-gated. Only when the project's stored
-GitHub PAT carries **write** access do a **Push** and **open-PR** appear in Project setup — and each
-fires only from a human's confirmed click. A read-only (Contents: read) token — the recommended
-default — never lights those buttons, and **a zee can never reach them**.
+Everything ZEEHIVE does runs on your own machine. The console's **Pull** button keeps a cloned
+project in step with its remote (fast-forward only); the **Push** / **open-PR** buttons appear only
+when the project's stored GitHub PAT actually carries write access — and each fires only from a
+human's confirmed click. A read-only token (Contents: read) is the recommended default; **a zee can
+never reach those buttons**. The dev cycle itself — landing, integration, prod builds — runs
+entirely on the local xource and never depends on GitHub being reachable.
 
 ## Layout
 
