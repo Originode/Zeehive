@@ -31,6 +31,7 @@ import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell,
 import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
          usageFrom } from '../lib/cxell-runtimes.js';
 import { turnStopReason } from '../lib/turn-record.js';
+import { startTurn, endTurn, lastAssistantText } from '../lib/turn-ledger.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
 import { langfuseClientEnv, postTurnToLangfuse } from '../lib/langfuse.js';
 import { mintXellToken } from '../lib/xell-token.js';
@@ -1314,6 +1315,10 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
   logline('intake', `spawning zee in ${xell.slug} — mode ${m.key} (${m.permissionMode})`);
+  // PER-TURN LEDGER: a spawned turn is one unit of observability. The turn row is started
+  // before the stream so the play-by-play events can be attributed to it (turn_id on
+  // session_event). Best-effort — a null turn just means no per-turn attribution.
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model, meta: { mode: m.key } });
 
   const it = sdk.query({
     prompt: await briefing(xell.id, zee, task, { headless }), // the binding + rules, not a bare task
@@ -1420,6 +1425,13 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
             xell, zee, sessionId: sid, model, result: msg,
             startTime: zee.attached_at || new Date(), endTime: new Date(),
           });
+          // PER-TURN LEDGER: close the spawned turn with ITS OWN burn and a summary of what it said.
+          await endTurn(turn?.id, {
+            status: msg?.is_error ? 'errored' : 'ended',
+            burn: b, stopReason: stop,
+            summary: lastAssistantText(msg),
+            meta: { errored: !!msg?.is_error },
+          });
         }
       }
       // A stream that ENDED without ever producing a result event is still a turn that ran and
@@ -1429,9 +1441,11 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
       if (!sawResult) {
         await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`,
                 [zee.id, turnStopReason('end_turn', false)]);
+        await endTurn(turn?.id, { status: 'ended', burn: { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, metered: false }, stopReason: turnStopReason('end_turn', false) });
       }
     } catch (err) {
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
+      await endTurn(turn?.id, { status: 'errored', burn: null, stopReason: String(err.message).slice(0, 200) });
     } finally {
       LIVE_QUERIES.delete(zee.id); // stream over → no live control channel to hand out
     }
@@ -1525,6 +1539,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   await one(`UPDATE xell SET status='claimed', is_pooled=false WHERE id=$1`, [xell.id]);
   broadcast('zee', zee);
   logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
+  // PER-TURN LEDGER: same shape as the SDK spawn — one turn row per spawn, threaded into the
+  // play-by-play events. Best-effort.
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model: ranModel, meta: { mode: m.key } });
 
   // The cxell runs on the queenzee's local daemon for now — its network reach is the firewall
   // allow-list, so co-location with the xell's app tier is unnecessary (they meet over TCP).
@@ -1852,6 +1869,17 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         if (b.type === 'tool_use') logline(`zee:${xell.slug}`, `[${b.name}] ${JSON.stringify(b.input || {}).slice(0, 160)}`);
       }
     }
+    // THE PLAY-BY-PLAY LEDGER: persist the same feed events the SSE bus carries, attributed to the
+    // current turn (turn_id) so a human can replay one turn's moves. Best-effort — never blocks or
+    // fails the feed. The raw event is stored in `raw`, exactly like the hook log stores its own.
+    if (turn?.id && ev?.type && ev.type !== 'system') {
+      q(`INSERT INTO session_event (source, hook_event_name, zee_id, xell_id, turn_id, agent_id, tool_name, raw)
+         VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)`,
+        ['cxell-feed', ev.type, zee.id, xell.id, turn.id,
+         ev.session_id || sid || null,
+         ev.type === 'assistant' ? (ev.message?.content?.[0]?.type === 'tool_use' ? ev.message.content[0].name : null) : null,
+         JSON.stringify(ev)]).catch(() => {});
+    }
     // the raw feed for a future per-zee pane — small envelope, full event
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
@@ -1914,6 +1942,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
           [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, PAUSED_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
+        await endTurn(turn?.id, { status: 'paused', burn: b, stopReason: PAUSED_STOP_REASON });
         return;
       }
       const errored = result?.is_error;
@@ -1949,6 +1978,13 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         xell, zee: row, sessionId: sid, model, result,
         startTime: zee.attached_at || new Date(), endTime: new Date(),
       });
+      // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
+      await endTurn(turn?.id, {
+        status: errored ? 'errored' : 'ended',
+        burn: b, stopReason: stop,
+        summary: lastAssistantText(result),
+        meta: { errored },
+      });
     })
     .catch(async (err) => {
       // Same reasoning as the resolve path above: while the fleet is paused, a headless run that ends
@@ -1958,10 +1994,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, PAUSED_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
+        await endTurn(turn?.id, { status: 'paused', burn: null, stopReason: PAUSED_STOP_REASON });
         return;
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);
       logline('intake', `cxell zee in ${xell.slug} died: ${String(err.message).slice(0, 160)}`);
+      await endTurn(turn?.id, { status: 'errored', burn: null, stopReason: String(err.message).slice(0, 200) });
       // The other half of the same question (see the resolve path above): a run that died on the way
       // — a connection closed mid-response, the exec killed — is a provider/infrastructure death too.
       await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,

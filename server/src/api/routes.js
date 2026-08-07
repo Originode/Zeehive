@@ -1878,6 +1878,31 @@ router.get('/xells/:id/conversations', async (req, res) => {
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// THE XELL OBSERVABILITY VIEW — per-TURN usage + cost + play-by-play events, for the console's
+// right-click "Observability" action. Read-only: turns are written by the turn ledger
+// (lib/turn-ledger.js) at spawn/resume/interactive boundaries; this endpoint just reads them.
+// Same 503-not-throw contract as /fleet — a read model must never take the queenzee down.
+router.get('/xells/:id/observability', async (req, res) => {
+  try {
+    const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    const { turnsForXell } = await import('../lib/turn-ledger.js');
+    const turns = await turnsForXell(req.params.id, { zeeId: req.query.zee_id || null, limit: req.query.limit || 50 });
+    // Per-turn event counts ride along so the UI can show "N events" without fetching them all.
+    res.json({ ok: true, xell_id: req.params.id, turns });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// The PLAY-BY-PLAY events for ONE turn (the `turn_id` side of the observability view).
+router.get('/turns/:id/events', async (req, res) => {
+  try {
+    const t = await one(`SELECT id FROM zee_turn WHERE id=$1`, [req.params.id]);
+    if (!t) return res.status(404).json({ error: 'no such turn' });
+    const { eventsForTurn } = await import('../lib/turn-ledger.js');
+    res.json({ ok: true, turn_id: req.params.id, events: await eventsForTurn(req.params.id) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // DONE SUGGESTIONS — a manager proposed a xell is finished; a human decides. Approving MARKS THE
 // TASK DONE and reaps the cxell (the console asks for a typed confirmation first), so this is the
 // same class of irreversible act as a landing: no zee path to the decision, ever.
