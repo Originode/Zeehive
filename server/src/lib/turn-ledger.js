@@ -121,7 +121,7 @@ export async function eventsForTurn(turnId, { limit = 500 } = {}) {
   if (!turnId) return [];
   try {
     return await q(
-      `SELECT ts, source, hook_event_name, claude_session_id, zee_id, xell_id,
+      `SELECT id, ts, source, hook_event_name, claude_session_id, zee_id, xell_id, turn_id,
               tool_name, permission_mode, stop_reason, raw
          FROM session_event
         WHERE turn_id = $1
