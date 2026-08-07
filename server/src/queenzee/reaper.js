@@ -8,7 +8,7 @@ import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { cleanGitEnv } from '../lib/git.js';
 import { removeXellImages } from '../lib/images.js';
-import { logline } from '../lib/logbus.js';
+import { logline, activity } from '../lib/logbus.js';
 import { resolveBash } from '../lib/bash.js';
 import { resolveSite } from '../lib/sites.js';
 import { dropCloneDb } from '../lib/xell-db.js';
@@ -214,6 +214,8 @@ export async function reapXell(xellId, reason = 'task-done', { force = false, mo
     + ` [liveness: ${verdict ? verdict.why : 'FORCED — the guard was not consulted'}]`);
   await one(`UPDATE xell SET status='tearing-down' WHERE id=$1 RETURNING *`, [xellId])
     .then((x) => x && broadcast('xell', x));
+  // the honeycomb's queenzee→xell line: the queenzee is reaping/decommissioning this xell
+  activity('q2x', xellId, 'reap');
 
   // A db-clone xell owns a DATABASE inside the shared dev postgres (its db_instance row) — drop
   // it, or every retired schema-work xell leaks a full copy of dev into the container. Best-

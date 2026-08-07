@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Terminal as XTerm } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import '@xterm/xterm/css/xterm.css';
+import { mountTerm } from './termHost.js';
+import { getTermEngine, getTermTheme, setTermTheme } from './termPref.js';
 
 const SCOPE = {
   poller: '#5b8cff', monitor: '#35c46b', pool: '#9ccf3f', maint: '#e0a53b',
@@ -20,7 +19,7 @@ function shortScope(scope) {
   return `${s.slice(0, SCOPE_MAX - 7)}…${s.slice(-6)}`;
 }
 
-// ── ANSI helpers: the firehose renders into a real xterm now, not a div stack, so the same
+// ── ANSI helpers: the firehose renders into a real terminal now, not a div stack, so the same
 // per-scope colour + dim timestamp the DOM version drew are written as truecolor escapes. ─────────
 const RESET = '\x1b[0m';
 const hexRgb = (hex) => {
@@ -43,11 +42,12 @@ function fmtLine(l) {
 // Modal terminal streaming the queenzee's live activity (checks, updates, maintenance…).
 // One firehose, but filterable: the scope chips in the header toggle channels on and off, so
 // "just the ship" or "everything but the monitor" is one click, not a scroll hunt. The body is a
-// real xterm (same engine as the cxell-zee terminal) — ANSI colour, native scrollback + selection.
+// real terminal (xterm or wterm — same engine as the cxell-zee terminal, chosen in Console
+// settings) — ANSI colour, scrollback + selection.
 export default function Terminal({ logs, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);
-  // What the xterm currently shows: the filter key + the LAST DRAWN LOG OBJECT. Identity, not a
+  // What the terminal currently shows: the filter key + the LAST DRAWN LOG OBJECT. Identity, not a
   // count: the app caps the log buffer (slice(-1999)), so at cap every new line SLIDES the
   // window while the length stays put — a count-based reconcile saw "no growth" and stopped
   // writing entirely (the firehose froze the moment it filled). Object identity survives the
@@ -55,47 +55,78 @@ export default function Terminal({ logs, onClose }) {
   const drawn = useRef({ key: null, last: null });
   const [only, setOnly] = useState(() => new Set());   // empty = show everything
   const [full, setFull] = useState(false);
+  const [engine] = useState(() => getTermEngine());
+  const [theme, setTheme] = useState(() => getTermTheme());
+  const [ready, setReady] = useState(false);
   const scopes = [...new Set(logs.map((l) => l.scope).filter(Boolean))].sort();
   const shown = only.size ? logs.filter((l) => only.has(l.scope)) : logs;
 
-  // Create the xterm ONCE and keep it across log/filter changes. A read-only viewer: no stdin, and
-  // the cursor is painted the background colour so it never shows as a stray block.
+  // Create the terminal ONCE and keep it across log/filter changes. A read-only viewer: no stdin,
+  // and (for xterm) the cursor is painted the background colour so it never shows as a stray block.
   useEffect(() => {
-    const term = new XTerm({
-      fontFamily: "'Cascadia Code', ui-monospace, SFMono-Regular, Menlo, monospace",
-      fontSize: 12, lineHeight: 1.2, scrollback: 5000, disableStdin: true, cursorBlink: false,
-      convertEol: true, theme: { background: '#0a0d12', foreground: '#c9d3e0', cursor: '#0a0d12' },
-    });
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(holder.current);
-    termRef.current = term;
+    let cancelled = false;
+    let term = null;
+    let raf = 0;
+    let settle = 0;
+    let ro = null;
 
-    const refit = () => { try { fit.fit(); } catch { /* holder not laid out yet / mid-teardown */ } };
-    refit();
-    // mount-time fit races the modal layout (same lesson as ZeeTerminal): refit next frame + settle
-    const raf = requestAnimationFrame(refit);
-    const settle = setTimeout(refit, 250);
-    window.addEventListener('resize', refit);
-    const ro = new ResizeObserver(refit);
-    if (holder.current) ro.observe(holder.current);
+    const refit = () => { try { term?.fit(); } catch { /* holder not laid out yet / mid-teardown */ } };
+
+    (async () => {
+      try {
+        term = await mountTerm(holder.current, {
+          engine,
+          fontFamily: "'Cascadia Code', ui-monospace, SFMono-Regular, Menlo, monospace",
+          fontSize: 12,
+          lineHeight: 1.2,
+          scrollback: 5000,
+          disableStdin: true,
+          cursorBlink: false,
+          convertEol: true,
+          theme, // dark|light — toggled beside the engine pill
+        });
+      } catch (err) {
+        console.error('firehose terminal failed to mount', err);
+        return;
+      }
+      if (cancelled) { try { term.dispose(); } catch { /* */ } return; }
+      termRef.current = term;
+      setReady(true);
+
+      refit();
+      raf = requestAnimationFrame(refit);
+      settle = setTimeout(refit, 250);
+      window.addEventListener('resize', refit);
+      ro = new ResizeObserver(refit);
+      if (holder.current) ro.observe(holder.current);
+    })();
+
     return () => {
+      cancelled = true;
       cancelAnimationFrame(raf); clearTimeout(settle);
       window.removeEventListener('resize', refit);
-      ro.disconnect();
-      term.dispose();
+      try { ro?.disconnect(); } catch { /* */ }
+      try { term?.dispose(); } catch { /* */ }
       termRef.current = null;
       drawn.current = { key: null, last: null };
+      setReady(false);
     };
-  }, []);
+  }, [engine]); // theme toggles live via setTheme on the handle — do not remount
 
-  // Reconcile the xterm with the current filtered view. Same filter → write only what follows the
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    setTermTheme(next);
+    try { termRef.current?.setTheme?.(next); } catch { /* torn down */ }
+  };
+
+  // Reconcile the terminal with the current filtered view. Same filter → write only what follows the
   // last drawn line (found by OBJECT identity, so the capped/sliding buffer keeps appending and the
   // scroll position holds); filter change, or the last drawn line slid out of the buffer → reset
-  // and repaint. xterm auto-scrolls on write only when the viewport is already at the bottom.
+  // and repaint. Both engines auto-scroll on write only when the viewport is already at the bottom.
   useEffect(() => {
     const term = termRef.current;
-    if (!term) return;
+    if (!term || !ready) return;
     const key = only.size ? [...only].sort().join('|') : '*';
     const st = drawn.current;
     let start = 0;
@@ -108,7 +139,7 @@ export default function Terminal({ logs, onClose }) {
     for (let i = start; i < shown.length; i++) term.writeln(fmtLine(shown[i]));
     if (shown.length) st.last = shown[shown.length - 1];
     else st.last = null;
-  }, [shown, only]);
+  }, [shown, only, ready]);
 
   const toggle = (s) => setOnly((prev) => {
     const next = new Set(prev);
@@ -120,7 +151,16 @@ export default function Terminal({ logs, onClose }) {
     <div className="term-overlay" onClick={onClose}>
       <div className={`term${full ? ' full' : ''}`} onClick={(e) => e.stopPropagation()}>
         <div className="term-head">
-          <span className="term-title">▚ queenzee — live activity ({shown.length}{only.size ? ` of ${logs.length}` : ''})</span>
+          <span className="term-title">▚ queenzee — live activity ({shown.length}{only.size ? ` of ${logs.length}` : ''})
+            <span className="term-engine" data-testid="term-engine-pill" title={`Terminal engine: ${engine} (change in Console settings ⚙)`}>{engine}</span>
+            <button type="button" className={`term-theme-toggle ${theme}`} data-testid="term-theme-toggle"
+                    onClick={toggleTheme}
+                    title={theme === 'dark'
+                      ? 'Theme: dark (light text on dark bg). Click for light.'
+                      : 'Theme: light (dark text on light bg). Click for dark.'}>
+              {theme === 'dark' ? '☾ dark' : '☀ light'}
+            </button>
+          </span>
           <span className="term-filters">
             {scopes.map((s) => (
               <button key={s} className={`term-chip${only.size && !only.has(s) ? ' off' : ''}`}

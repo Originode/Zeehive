@@ -83,10 +83,19 @@ export const providerArtOf = (src) => PROVIDER_ART[providerKeyOf(src)] || null;
 // not a paragraph. Re-exported here so a surface that needs BOTH halves of a zee's badge still has
 // one import, and the two registries stay named side by side.
 export { harnessGear, GEAR_ART, GEAR_KEYS, GEAR_EXTENT, gearKeyFor, GEAR_FALLBACK_COLOR,
-         gearPathD, drawGearLayer, toneColor } from './harnessGear.js';
+         gearPathD, drawGearLayer, toneColor,
+         ACCESSORY_ART, ACCESSORY_KEYS, ACCESSORY_CATEGORIES, MAX_ACCESSORIES,
+         accessoriesFor, accessoriesByCategory, resolveAccessory,
+         normalizeAccessories, normalizeCustomAccessories } from './harnessGear.js';
 
 // One sentence for a tooltip, in the badge's own grammar: WHO is thinking · WHAT it is dressed as.
+// When the harness wears several accessories the list is named; otherwise the persona label.
 export function avatarTitle(provider, gear) {
   const p = provider ? provider.label : 'no provider';
-  return gear ? `${p} · wearing ${gear.label}${gear.empty ? ' (empty)' : ''}` : p;
+  if (!gear) return p;
+  const accs = gear.accessories || [];
+  const worn = accs.length > 1
+    ? accs.map((a) => a.label).join(' + ')
+    : (accs[0]?.label && accs[0].key !== gear.gear ? accs[0].label : gear.label);
+  return `${p} · wearing ${worn}${gear.empty ? ' (empty)' : ''}`;
 }

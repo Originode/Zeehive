@@ -7,6 +7,7 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { dockerPs, stopAndRemoveContainer, removeImage } from '../lib/docker.js';
 import { deviceBootState } from '../lib/devices.js';
+import { config } from '../config.js';
 
 // Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
 // role } (the zeehive.* identity labels, null when the container is unlabeled) and a null map
@@ -84,20 +85,43 @@ function matchState(psMap, c) {
   return best; // null if no candidate on that daemon
 }
 
-// WHERE A PROCESS ROLE ACTUALLY IS — ticket #8.
+// WHERE A PROCESS ROLE ACTUALLY IS — ticket #8 + TKT-136 defect #2.
 //
 // A `runner: process` role has no container: the queenzee spawns it as its OWN child
-// (lib/build.js → scripts/start-xell-process.sh), so it listens on the QUEENZEE's localhost. But
-// `url` on the row carries the dev MACHINE's ip, stamped on every container at provision — and
-// that machine does not run this process and publishes nothing on its port. So the probe below
-// could never answer for a process role: every one of them was marked down within 30s of a start
-// the starter had just verified, which is where `zee build --wait` gets its "the build FAILED"
-// from and why 11 of 12 Zeehive spinoff containers read as never having come up. (Live: this
-// xell's webapp, up and serving HTML at 04:12:24Z, row 'down' by 04:13.)
+// (lib/build.js → scripts/start-xell-process.sh), so it shares the QUEENZEE's network namespace.
+// It is reachable on the queenzee's localhost AND on whatever hostname a cxell already uses to
+// reach the queenzee API (CXELL_API_BASE — `zeehive_server` on the hive net, or
+// `host.docker.internal` in the host-era).
 //
-// So ask localhost first — the same probe start-xell-process.sh uses to decide a start SUCCEEDED,
-// which is the only place that has ever been right about a process role — and keep the recorded
-// url as a fallback so a row whose url IS reachable behaves exactly as before.
+// Ticket #8: the health sweep used to probe only the row's `url`, which was stamped from the
+// dev MACHINE's ip — a real host that does not run this process. Every process role flipped to
+// 'down' within 30s of a start the starter had just verified on localhost. Fix: ask localhost
+// first for the *monitor* (process alive?), keep the recorded url as fallback.
+//
+// TKT-136 defect #2: `zee build --wait` then reported UP from that localhost signal while the
+// *published* host:port (still the machine ip) refused every connection from the cage. A false
+// UP is worse than no signal — it sends the zee on to probe an endpoint that cannot answer.
+// Fix: stamp process-role host/url from processRoleReachableHost() (provision + build), and
+// make --wait prove the PUBLISHED url via probePublishedRole() (lib/build.getBuildStatus).
+
+// Hostname a CXELL (and anything else on the hive net) already uses to reach THIS queenzee.
+// A process-role child shares that namespace, so the same host reaches its ports. Never the
+// dev machine's host_ip — that is a different box and is the lie defect #2 measured.
+export function processRoleReachableHost() {
+  try {
+    const u = new URL(config.cxellApiBase || '');
+    if (u.hostname) return u.hostname;
+  } catch { /* fall through */ }
+  return '127.0.0.1';
+}
+
+// The URL stamped on the row / offered to a zee. Process roles: the reachable host above.
+export function processRolePublishedUrl(hostPort) {
+  return `http://${processRoleReachableHost()}:${hostPort}`;
+}
+
+// Monitor probe targets (process ALIVE on the queenzee). Localhost first — start-xell-process.sh
+// is the only place that has always been right about a just-started process role.
 export function processProbeUrls(c) {
   const urls = [];
   if (c.host_port) urls.push(`http://127.0.0.1:${c.host_port}`);
@@ -113,6 +137,45 @@ export async function probeProcessRole(c, { timeout = 5000 } = {}) {
     } catch { /* not there — try the next place it could be */ }
   }
   return 'down';
+}
+
+// PUBLISHED url only — what a zee / human is told to curl. No localhost shortcut.
+// Used by getBuildStatus so --wait cannot say UP while the binding refuses.
+export function publishedUrl(c) {
+  if (c?.url) return c.url;
+  if (c?.host && c?.host_port) return `http://${c.host}:${c.host_port}`;
+  return null;
+}
+
+// Where to HTTP-probe the published binding. Server roles prefer /health (index.js serves it);
+// webapp and anything else get the url as stamped (vite answers on /).
+export function publishedProbeTarget(c) {
+  const base = publishedUrl(c);
+  if (!base) return null;
+  if (c.role === 'server') {
+    try {
+      const u = new URL(base);
+      if (!u.pathname || u.pathname === '/') {
+        u.pathname = '/health';
+        return u.href;
+      }
+    } catch {
+      return `${String(base).replace(/\/?$/, '')}/health`;
+    }
+  }
+  return base;
+}
+
+export async function probePublishedRole(c, { timeout = 3000 } = {}) {
+  const url = publishedProbeTarget(c);
+  if (!url) return 'unknown';
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+    if (r.status < 500) return 'up';
+    return 'down';
+  } catch {
+    return 'down';
+  }
 }
 
 // Orphan memory: which labeled-but-unmodeled containers we've already reported, so the log

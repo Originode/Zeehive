@@ -333,7 +333,15 @@ export function harnessGear(h) {
   if (!h) return null;
   const glyph = String(h.glyph || h.harness_glyph || '').trim();
   const label = String(h.label || h.harness_label || h.key || h.harness_key || 'harness');
-  const gearKey = gearKeyFor(h);
+  // accessoriesFor is defined later in this module; at call time it is bound. The primary
+  // `gear` key stays the single-costume answer (data-gear=, name derivation, old callers).
+  // When the harness names an accessories list, prefer the first equipment item as primary
+  // so a multi-dressed badge still has one costume word for tooltips.
+  const worn = accessoriesFor(h);
+  const primary = worn.find((a) => a.category === 'equipment' && a.art && GEAR_ART[a.key])
+    || worn.find((a) => a.art && GEAR_ART[a.key])
+    || null;
+  const gearKey = primary?.key && GEAR_ART[primary.key] ? primary.key : gearKeyFor(h);
   return {
     key: h.key || h.harness_key || null,
     label,
@@ -343,6 +351,7 @@ export function harnessGear(h) {
     empty: !!h.bundle_empty,
     gear: gearKey,
     art: GEAR_ART[gearKey],
+    accessories: worn,
   };
 }
 
@@ -385,4 +394,463 @@ export function drawGearLayer(ctx, cx, cy, r, gear, { behind = false, detail = t
     n++;
   }
   return n;
+}
+
+// ── ACCESSORIES ──────────────────────────────────────────────────────────────
+// A harness used to wear ONE gear costume. It can now wear UP TO THREE accessories,
+// each in a category that decides WHERE it is drawn relative to the provider coin:
+//
+//   border     — frames the coin (cog teeth, wings, sun rays, shield outline). Behind.
+//   hat        — sits on TOP of the coin. Front, authored in the upper half.
+//   equipment  — tools / face gear: same language as the old single gear (diagonal
+//                tools, glasses on the face, necktie). Honours each part's `behind`.
+//
+// Built-ins live here as path art (one definition, two renderers — same rule as gear).
+// A harness may also carry CUSTOM SVG accessories in `bundle.custom_accessories`; those
+// are stamped as images by category slot rather than path-walked.
+//
+// Back-compat: when `bundle.accessories` is empty/absent, the old single `gear` (or the
+// name-derived costume) becomes the one accessory worn. Existing harnesses keep looking
+// the same until someone picks a multi-accessory set.
+
+export const ACCESSORY_CATEGORIES = ['border', 'hat', 'equipment'];
+export const MAX_ACCESSORIES = 3;
+
+// Which category a legacy GEAR_ART key belongs to when promoted to an accessory.
+const GEAR_CATEGORY = {
+  wings: 'border',
+  necktie: 'equipment', hammer: 'equipment', shovel: 'equipment', wrench: 'equipment',
+  glasses: 'equipment', flask: 'equipment', quill: 'equipment', anchor: 'equipment',
+  setsquare: 'equipment', magnifier: 'equipment', gavel: 'equipment', shield: 'equipment',
+  ribbon: 'equipment',
+};
+
+// ── new path art (borders, hats, L/R equipment) ──────────────────────────────
+// Authoring notes match GEAR_ART: unit space, coin radius = 1, reach ≤ GEAR_EXTENT.
+// Hats live in the UPPER half (negative y). Borders enclose the coin (behind). L-hand
+// tools are the flip of their R-hand twins (which hang at 4 o'clock like the old set).
+
+const hatBrim = (y, halfW, thick = 0.12) => ({
+  fill: 'dark',
+  d: [M(-halfW, y), L(halfW, y), L(halfW, y + thick), L(-halfW, y + thick), Z()],
+});
+
+export const ACCESSORY_ART = {
+  // ── BORDERS ──────────────────────────────────────────────────────────────
+  // COG — a toothed ring that encloses the badge. Teeth sit just outside the coin so the
+  // logo is the hub of a gear, not a sticker on one.
+  cog: {
+    label: 'cog', category: 'border',
+    parts: (() => {
+      const teeth = 10;
+      const parts = [];
+      // the rim (annulus approximated as a thick stroked circle via many short arcs as lines)
+      const rim = [];
+      for (let i = 0; i <= 24; i++) {
+        const a = (i / 24) * Math.PI * 2 - Math.PI / 2;
+        const r = 1.18;
+        rim.push(i === 0 ? M(Math.cos(a) * r, Math.sin(a) * r) : L(Math.cos(a) * r, Math.sin(a) * r));
+      }
+      rim.push(Z());
+      parts.push({ behind: true, stroke: 'main', width: 0.16, cap: 'butt', d: rim.slice(0, -1) });
+      for (let i = 0; i < teeth; i++) {
+        const a = (i / teeth) * Math.PI * 2 - Math.PI / 2;
+        const c = Math.cos(a), s = Math.sin(a);
+        const px = -s, py = c; // perpendicular
+        const r0 = 1.10, r1 = 1.42;
+        const hw = 0.14;
+        parts.push({
+          behind: true, fill: 'main',
+          d: [
+            M(c * r0 + px * hw, s * r0 + py * hw),
+            L(c * r1 + px * hw * 0.7, s * r1 + py * hw * 0.7),
+            L(c * r1 - px * hw * 0.7, s * r1 - py * hw * 0.7),
+            L(c * r0 - px * hw, s * r0 - py * hw),
+            Z(),
+          ],
+        });
+      }
+      return parts;
+    })(),
+  },
+
+  // WINGS — same art as GEAR_ART.wings; categorised as a border (frames the coin from behind).
+  wings: { label: 'wings', category: 'border', parts: null /* filled below from GEAR_ART */ },
+
+  // RAYS — sunburst around the coin. Spokes start on the rim so they read as worn, not floating.
+  rays: {
+    label: 'rays', category: 'border',
+    parts: (() => {
+      const n = 12;
+      const parts = [];
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+        const c = Math.cos(a), s = Math.sin(a);
+        const long = i % 2 === 0;
+        const r0 = 1.02, r1 = long ? 1.55 : 1.32;
+        const hw = long ? 0.09 : 0.06;
+        const px = -s, py = c;
+        parts.push({
+          behind: true, fill: long ? 'main' : 'light',
+          d: [
+            M(c * r0 + px * hw, s * r0 + py * hw),
+            L(c * r1, s * r1),
+            L(c * r0 - px * hw, s * r0 - py * hw),
+            Z(),
+          ],
+        });
+      }
+      return parts;
+    })(),
+  },
+
+  // SHIELD border — a heraldic outline that encloses the whole coin (not the corner pip).
+  'border-shield': {
+    label: 'shield', category: 'border',
+    parts: [
+      { behind: true, fill: 'main', d: [
+        M(0, -1.35), L(1.20, -0.85), L(1.20, 0.35),
+        Q(1.20, 1.10, 0, 1.50), Q(-1.20, 1.10, -1.20, 0.35),
+        L(-1.20, -0.85), Z(),
+      ] },
+      { behind: true, detail: true, stroke: 'light', width: 0.10, cap: 'round', d: [
+        M(0, -1.18), L(1.02, -0.75), L(1.02, 0.32),
+        Q(1.02, 0.95, 0, 1.30), Q(-1.02, 0.95, -1.02, 0.32),
+        L(-1.02, -0.75), Z(),
+      ] },
+    ],
+  },
+
+  // ── HATS ─────────────────────────────────────────────────────────────────
+  'hard-hat': {
+    label: 'hard hat', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.70, -0.55), Q(-0.70, -1.25, 0, -1.30), Q(0.70, -1.25, 0.70, -0.55), Z()] },
+      hatBrim(-0.55, 1.05, 0.14),
+      { detail: true, fill: 'light', d: [M(-0.12, -1.28), L(0.12, -1.28), L(0.10, -0.55), L(-0.10, -0.55), Z()] },
+    ],
+  },
+  cowboy: {
+    label: 'cowboy', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.55, -0.50), Q(-0.50, -1.15, 0, -1.05), Q(0.50, -1.15, 0.55, -0.50), Z()] },
+      { fill: 'dark', d: [M(-1.35, -0.48), Q(-0.70, -0.70, 0, -0.50), Q(0.70, -0.70, 1.35, -0.48),
+                          Q(0.70, -0.30, 0, -0.38), Q(-0.70, -0.30, -1.35, -0.48), Z()] },
+      { detail: true, stroke: 'light', width: 0.08, cap: 'round', d: [M(-0.40, -0.72), L(0.40, -0.72)] },
+    ],
+  },
+  'scribe-hat': {
+    label: 'scribe', category: 'hat',
+    parts: [
+      // flat scholar cap
+      { fill: 'main', d: [M(-0.70, -0.70), L(0.70, -0.70), L(0.70, -0.55), L(-0.70, -0.55), Z()] },
+      { fill: 'dark', d: [M(-0.95, -0.70), L(0.95, -0.70), L(0.70, -0.95), L(-0.70, -0.95), Z()] },
+      { fill: 'main', d: [M(0.55, -0.82), L(1.15, -0.55), L(1.05, -0.48), L(0.50, -0.72), Z()] }, // tassel stick
+      { fill: 'light', d: [M(1.05, -0.55), L(1.25, -0.40), L(1.10, -0.35), Z()] },
+    ],
+  },
+  police: {
+    label: 'police', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.65, -0.55), L(-0.55, -1.15), L(0.55, -1.15), L(0.65, -0.55), Z()] },
+      hatBrim(-0.55, 0.95, 0.12),
+      { fill: 'light', d: [M(-0.22, -0.95), L(0.22, -0.95), L(0.22, -0.72), L(-0.22, -0.72), Z()] }, // badge plate
+      { detail: true, stroke: 'dark', width: 0.06, d: [M(0, -0.92), L(0, -0.75), M(-0.10, -0.84), L(0.10, -0.84)] },
+    ],
+  },
+  wizard: {
+    label: 'wizard', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.70, -0.50), L(0.70, -0.50), L(0.08, -1.55), L(-0.08, -1.55), Z()] },
+      hatBrim(-0.50, 0.95, 0.12),
+      { detail: true, fill: 'light', d: [M(-0.05, -1.40), L(0.18, -1.20), L(0.05, -1.18), L(-0.12, -1.35), Z()] }, // star
+    ],
+  },
+  baseball: {
+    label: 'baseball cap', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.65, -0.45), Q(-0.60, -1.05, 0.05, -1.10), Q(0.55, -1.00, 0.55, -0.50),
+                          L(0.55, -0.45), Z()] },
+      { fill: 'dark', d: [M(-0.15, -0.48), L(1.15, -0.42), L(1.10, -0.28), L(-0.20, -0.35), Z()] }, // brim forward
+    ],
+  },
+  captain: {
+    label: 'captain hat', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.75, -0.55), L(-0.70, -1.00), L(0.70, -1.00), L(0.75, -0.55), Z()] },
+      hatBrim(-0.55, 1.00, 0.12),
+      { fill: 'light', d: [M(-0.30, -0.92), L(0.30, -0.92), L(0.30, -0.70), L(-0.30, -0.70), Z()] },
+      { detail: true, stroke: 'dark', width: 0.07, cap: 'round', d: [M(-0.18, -0.81), L(0.18, -0.81)] },
+    ],
+  },
+  crown: {
+    label: 'crown', category: 'hat',
+    parts: [
+      { fill: 'main', d: [
+        M(-0.75, -0.45), L(-0.75, -0.85), L(-0.45, -0.65), L(-0.20, -1.20),
+        L(0, -0.70), L(0.20, -1.20), L(0.45, -0.65), L(0.75, -0.85), L(0.75, -0.45), Z(),
+      ] },
+      { detail: true, fill: 'light', d: [M(-0.08, -0.95), L(0.08, -0.95), L(0, -1.12), Z()] },
+    ],
+  },
+  'cat-ears': {
+    label: 'cat ears', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.85, -0.55), L(-0.55, -1.25), L(-0.25, -0.55), Z()] },
+      { fill: 'main', d: flip([M(-0.85, -0.55), L(-0.55, -1.25), L(-0.25, -0.55), Z()]) },
+      { detail: true, fill: 'light', d: [M(-0.70, -0.65), L(-0.55, -1.05), L(-0.40, -0.65), Z()] },
+      { detail: true, fill: 'light', d: flip([M(-0.70, -0.65), L(-0.55, -1.05), L(-0.40, -0.65), Z()]) },
+    ],
+  },
+  graduate: {
+    label: 'graduate hat', category: 'hat',
+    parts: [
+      { fill: 'dark', d: [M(-0.85, -0.85), L(0.85, -0.85), L(0.85, -0.70), L(-0.85, -0.70), Z()] }, // board
+      { fill: 'main', d: [M(-0.40, -0.70), L(0.40, -0.70), L(0.35, -0.50), L(-0.35, -0.50), Z()] }, // skull cap
+      { stroke: 'main', width: 0.07, cap: 'round', d: [M(0.55, -0.78), L(1.05, -0.55)] },
+      { fill: 'light', d: [M(1.00, -0.58), L(1.22, -0.40), L(1.05, -0.35), Z()] },
+    ],
+  },
+  'top-hat': {
+    label: 'top hat', category: 'hat',
+    parts: [
+      { fill: 'main', d: [M(-0.48, -0.55), L(-0.42, -1.40), L(0.42, -1.40), L(0.48, -0.55), Z()] },
+      hatBrim(-0.55, 0.95, 0.14),
+      { detail: true, stroke: 'light', width: 0.08, cap: 'butt', d: [M(-0.42, -0.78), L(0.42, -0.78)] },
+    ],
+  },
+
+  // ── EQUIPMENT (L / R hand tools + face props) ────────────────────────────
+  // R-hand tools hang at 4 o'clock (same diagonal frame as GEAR_ART). L-hand = flip.
+  'r-hammer': {
+    label: 'R hammer', category: 'equipment',
+    parts: [
+      shaft(0.40, 1.10, 0.16),
+      dpoly([[1.04, -0.44], [1.46, -0.44], [1.46, 0.44], [1.04, 0.44]]),
+      { detail: true, fill: 'light', d: dpoly([[1.34, -0.44], [1.46, -0.44], [1.46, 0.44], [1.34, 0.44]], 'light').d },
+    ],
+  },
+  'l-hammer': { label: 'L hammer', category: 'equipment', parts: null },
+  'r-wrench': {
+    label: 'R wrench', category: 'equipment',
+    parts: [
+      shaft(0.34, 1.00, 0.13),
+      dpoly([[0.92, -0.38], [1.52, -0.38], [1.52, -0.15], [1.16, -0.15],
+             [1.16, 0.15], [1.52, 0.15], [1.52, 0.38], [0.92, 0.38]]),
+    ],
+  },
+  'l-wrench': { label: 'L wrench', category: 'equipment', parts: null },
+  'r-feather': {
+    label: 'R feather', category: 'equipment',
+    parts: [
+      { fill: 'main', d: [
+        dM(0.56, 0.02), dQ(0.84, -0.56, 1.46, -0.14), dQ(1.02, 0.14, 0.56, 0.02), Z()] },
+      { stroke: 'dark', width: 0.09, cap: 'round', d: [dM(0.30, 0.14), dL(1.50, -0.12)] },
+      { fill: 'dark', d: dpoly([[0.20, 0.18], [0.42, 0.04], [0.40, 0.26]], 'dark').d },
+    ],
+  },
+  'l-feather': { label: 'L feather', category: 'equipment', parts: null },
+  'r-book': {
+    label: 'R book', category: 'equipment',
+    parts: [
+      { fill: 'main', d: [dM(0.55, -0.35), dL(1.25, -0.35), dL(1.25, 0.40), dL(0.55, 0.40), Z()] },
+      { fill: 'dark', d: [dM(0.55, -0.35), dL(0.70, -0.45), dL(1.40, -0.45), dL(1.25, -0.35), Z()] },
+      { detail: true, stroke: 'light', width: 0.06, cap: 'round',
+        d: [dM(0.70, -0.15), dL(1.10, -0.15), dM(0.70, 0.05), dL(1.10, 0.05), dM(0.70, 0.25), dL(1.00, 0.25)] },
+    ],
+  },
+  'l-book': { label: 'L book', category: 'equipment', parts: null },
+  'r-magnifier': {
+    label: 'R magnifying glass', category: 'equipment',
+    parts: [
+      { stroke: 'main', width: 0.14, d: [
+        M(0.44, 0.44), Q(0.86, 0.16, 1.14, 0.44), Q(1.36, 0.80, 1.04, 1.08),
+        Q(0.66, 1.30, 0.42, 0.94), Q(0.30, 0.66, 0.44, 0.44), Z()] },
+      { stroke: 'dark', width: 0.16, cap: 'round', d: [M(0.44, 1.04), L(0.14, 1.32)] },
+    ],
+  },
+  'l-magnifier': { label: 'L magnifying glass', category: 'equipment', parts: null },
+  'r-wand': {
+    label: 'R wand', category: 'equipment',
+    parts: [
+      { stroke: 'dark', width: 0.11, cap: 'round', d: [dM(0.35, 0), dL(1.45, 0)] },
+      { fill: 'main', d: dpoly([[1.40, -0.18], [1.58, 0], [1.40, 0.18], [1.28, 0]], 'main').d },
+      { detail: true, fill: 'light', d: [
+        M(...dg(1.55, 0)), L(...dg(1.70, -0.12)), L(...dg(1.68, 0)), L(...dg(1.70, 0.12)), Z()] },
+    ],
+  },
+  'l-wand': { label: 'L wand', category: 'equipment', parts: null },
+  stethoscope: {
+    label: 'stethoscope', category: 'equipment',
+    parts: [
+      { stroke: 'main', width: 0.10, cap: 'round', d: [M(-0.55, -0.35), Q(-0.70, 0.20, -0.25, 0.55)] },
+      { stroke: 'main', width: 0.10, cap: 'round', d: flip([M(-0.55, -0.35), Q(-0.70, 0.20, -0.25, 0.55)]) },
+      { stroke: 'main', width: 0.10, cap: 'round', d: [M(-0.25, 0.55), Q(0, 0.85, 0.35, 0.70)] },
+      { fill: 'dark', d: [M(0.22, 0.55), Q(0.55, 0.55, 0.55, 0.85), Q(0.55, 1.15, 0.22, 1.15),
+                          Q(-0.10, 1.15, -0.10, 0.85), Q(-0.10, 0.55, 0.22, 0.55), Z()] },
+      { fill: 'main', d: [M(-0.62, -0.42), L(-0.48, -0.42), L(-0.48, -0.28), L(-0.62, -0.28), Z()] },
+      { fill: 'main', d: flip([M(-0.62, -0.42), L(-0.48, -0.42), L(-0.48, -0.28), L(-0.62, -0.28), Z()]) },
+    ],
+  },
+  // glasses — same as GEAR_ART (on the face)
+  glasses: { label: 'glasses', category: 'equipment', parts: null },
+  moustache: {
+    label: 'moustache', category: 'equipment',
+    parts: [
+      { fill: 'dark', d: [
+        M(-0.55, 0.28), Q(-0.35, 0.10, -0.12, 0.22), Q(0, 0.32, 0.12, 0.22),
+        Q(0.35, 0.10, 0.55, 0.28), Q(0.30, 0.48, 0.10, 0.38), Q(0, 0.42, -0.10, 0.38),
+        Q(-0.30, 0.48, -0.55, 0.28), Z(),
+      ] },
+    ],
+  },
+};
+
+// Wire up parts borrowed from GEAR_ART / flips, then enforce GEAR_EXTENT on every new accessory.
+ACCESSORY_ART.wings.parts = GEAR_ART.wings.parts;
+ACCESSORY_ART.glasses.parts = GEAR_ART.glasses.parts;
+const flipPart = (prt) => ({
+  ...prt,
+  d: flip(prt.d),
+});
+for (const [rKey, lKey] of [
+  ['r-hammer', 'l-hammer'], ['r-wrench', 'l-wrench'], ['r-feather', 'l-feather'],
+  ['r-book', 'l-book'], ['r-magnifier', 'l-magnifier'], ['r-wand', 'l-wand'],
+]) {
+  ACCESSORY_ART[lKey].parts = ACCESSORY_ART[rKey].parts.map(flipPart);
+}
+
+// Legacy GEAR_ART entries that are not already in ACCESSORY_ART become equipment accessories,
+// so a harness that still names `gear: 'necktie'` (or picks it as an accessory key) resolves.
+for (const [k, g] of Object.entries(GEAR_ART)) {
+  if (ACCESSORY_ART[k]) continue;
+  ACCESSORY_ART[k] = {
+    label: g.label,
+    category: GEAR_CATEGORY[k] || 'equipment',
+    parts: g.parts,
+    ...(g.glyphOn ? { glyphOn: g.glyphOn } : {}),
+  };
+}
+
+for (const acc of Object.values(ACCESSORY_ART)) {
+  if (!acc.parts?.length) continue;
+  const reach = radiusOf(acc.parts);
+  if (reach <= GEAR_EXTENT) continue;
+  const k = GEAR_EXTENT / reach;
+  acc.parts = acc.parts.map((prt) => ({
+    ...prt,
+    d: prt.d.map((c) => scaleCmd(c, k)),
+    ...(prt.width ? { width: Number((prt.width * k).toFixed(4)) } : {}),
+  }));
+  if (acc.glyphOn) acc.glyphOn = acc.glyphOn.map((v) => Number((v * k).toFixed(4)));
+}
+
+export const ACCESSORY_KEYS = Object.keys(ACCESSORY_ART);
+export const accessoriesByCategory = (cat) =>
+  ACCESSORY_KEYS.filter((k) => ACCESSORY_ART[k].category === cat);
+
+// ── resolve what a harness is wearing ────────────────────────────────────────
+// custom_accessories: [{ key, label, category, svg }] stored on the harness bundle.
+// accessories: string[] of up to MAX_ACCESSORIES keys (built-in or custom).
+function customMap(h) {
+  const raw = h?.custom_accessories || h?.harness_custom_accessories || [];
+  const map = new Map();
+  if (!Array.isArray(raw)) return map;
+  for (const c of raw) {
+    const key = String(c?.key || '').trim().toLowerCase().slice(0, 40);
+    const cat = String(c?.category || '').trim().toLowerCase();
+    const svg = String(c?.svg || '').trim();
+    if (!key || !ACCESSORY_CATEGORIES.includes(cat)) continue;
+    if (svg && !/^<svg[\s>]/i.test(svg)) continue;
+    map.set(key, {
+      key,
+      label: String(c?.label || key).slice(0, 40),
+      category: cat,
+      svg: svg || '',
+      custom: true,
+      parts: null,
+    });
+  }
+  return map;
+}
+
+export function resolveAccessory(key, h = null) {
+  const k = String(key || '').trim().toLowerCase();
+  if (!k) return null;
+  if (ACCESSORY_ART[k]) {
+    const a = ACCESSORY_ART[k];
+    return { key: k, label: a.label, category: a.category, art: a, svg: null, custom: false };
+  }
+  const c = customMap(h).get(k);
+  if (c) return { key: c.key, label: c.label, category: c.category, art: null, svg: c.svg, custom: true };
+  return null;
+}
+
+// The list a harness wears — max MAX_ACCESSORIES, order preserved, unknowns dropped.
+// Empty/absent accessories → fall back to the single legacy gear (named or derived).
+export function accessoriesFor(h) {
+  if (!h) return [];
+  const raw = h.accessories ?? h.harness_accessories;
+  let keys = Array.isArray(raw) ? raw.map((x) => String(x || '').trim().toLowerCase()).filter(Boolean) : [];
+  if (!keys.length) {
+    // legacy single gear
+    const gk = gearKeyFor(h);
+    keys = gk ? [gk] : [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (const k of keys) {
+    if (seen.has(k)) continue;
+    const a = resolveAccessory(k, h);
+    if (!a) continue;
+    seen.add(k);
+    out.push(a);
+    if (out.length >= MAX_ACCESSORIES) break;
+  }
+  return out;
+}
+
+// Normalise a write: unique keys, max 3, only known built-ins or supplied custom keys.
+export function normalizeAccessories(list, custom = []) {
+  const customKeys = new Set(
+    (Array.isArray(custom) ? custom : [])
+      .map((c) => String(c?.key || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const out = [];
+  const seen = new Set();
+  for (const raw of (Array.isArray(list) ? list : [])) {
+    const k = String(raw || '').trim().toLowerCase().slice(0, 40);
+    if (!k || seen.has(k)) continue;
+    if (!ACCESSORY_ART[k] && !customKeys.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+    if (out.length >= MAX_ACCESSORIES) break;
+  }
+  return out;
+}
+
+export function normalizeCustomAccessories(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const c of list) {
+    const key = String(c?.key || '').trim().toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    const category = String(c?.category || '').trim().toLowerCase();
+    const svg = String(c?.svg || '').trim();
+    if (!key || seen.has(key) || ACCESSORY_ART[key]) continue;
+    if (!ACCESSORY_CATEGORIES.includes(category)) continue;
+    if (!svg || !/^<svg[\s>]/i.test(svg)) continue;
+    if (svg.length > 100_000) continue;
+    seen.add(key);
+    out.push({
+      key,
+      label: String(c?.label || key).trim().slice(0, 40) || key,
+      category,
+      svg,
+    });
+    if (out.length >= 24) break; // a harness does not need a wardrobe of dozens
+  }
+  return out;
 }

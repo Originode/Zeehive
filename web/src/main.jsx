@@ -3,7 +3,18 @@ import { createRoot } from 'react-dom/client';
 import App from './App.jsx';
 import { DialogHost } from './Dialog.jsx';
 import { DiffViewerHost } from './DiffViewer.jsx';
+import { baseUrl } from './api.js';
 import './styles.css';
+
+// A xell webapp is served under /xell-web/<slug>/ when reviewed through the queenzee proxy. Every
+// `fetch('/api/...')` the app issues must then hit /xell-web/<slug>/api/... (THIS xell's own
+// server), not the outer console's API — the "two servers answer the same paths" trap in reverse,
+// browser-side. One global wrapper covers api.js, DeliveryTelemetry.jsx and any other caller in one
+// place; absolute URLs and non-/api paths pass through untouched. The live console (BASE_URL '/')
+// is the identity. See docs/common-xell-network-plan.md.
+const origFetch = window.fetch.bind(window);
+window.fetch = (input, init) =>
+  origFetch(typeof input === 'string' && input.startsWith('/api') ? baseUrl(input) : input, init);
 
 // DialogHost is mounted once at the root (a singleton store backs showAlert), so any module —
 // even the module-level error helpers — can raise a non-blocking modal without hook plumbing.

@@ -17,7 +17,8 @@ import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
          remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
-import { loadManifest, projectDefaultsFromManifest, draftManifest } from './manifest.js';
+import { loadManifest, projectDefaultsFromManifest, draftManifest, planComposeOnboarding,
+         manifestHash, parseManifest } from './manifest.js';
 import { resolveSite } from './sites.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, nudge, harness, reaper,
@@ -520,6 +521,24 @@ export async function projectReadiness(id) {
         ? (probe.manifest.valid ? `${probe.manifest.file} valid` : `${probe.manifest.file} INVALID: ${probe.manifest.errors.join('; ')}`)
         : 'no zeehive.yml — running on form/DB config (a draft can be generated)',
       probe.manifest.found ? null : 'warn');
+    // Compose files on disk that the meta-DB has not absorbed yet — the Project → Manifest
+    // "Compose onboarding" plan is the door. Warn only when the plan is applicable (something
+    // would actually change); silent when already configured.
+    if (probe.compose_files?.length) {
+      const cplan = planComposeOnboarding(p.repo_root, p.name, p);
+      if (cplan.applicable) {
+        const files = probe.compose_files.join(', ');
+        const cols = cplan.meta_changes.filter((c) => c.column !== 'manifest').map((c) => c.column);
+        gate('compose_onboarding', false,
+          `${probe.compose_files.length} compose file(s) detected (${files}) not fully in the meta-DB`
+            + (cols.length ? ` — would set ${cols.join(', ')}` : '')
+            + '. Project setup → Manifest → Plan compose onboarding (human approves before any write).',
+          'warn');
+      } else {
+        gate('compose_onboarding', true,
+          `compose file(s) reflected in meta-DB (${probe.compose_files.join(', ')})`);
+      }
+    }
   }
 
   const sites = await q(`SELECT * FROM deploy_site WHERE project_id=$1`, [id]);
@@ -677,6 +696,113 @@ export async function draftProjectManifest(id, { write = false } = {}) {
     writeFileSync(resolve(String(p.repo_root).replace(/\\/g, '/'), 'zeehive.yml'), draft);
   }
   return { draft, written: !!write, already_has: existing.found || false };
+}
+
+// ── compose onboarding: detect compose files → plan → human approves → apply ─
+// The plan is a pure read of the repo + the project row. Apply refuses without
+// `approved: true`, re-computes the plan server-side (never trusts a client plan),
+// and only touches: (optional) zeehive.yml + the project row's manifest/compose_*
+// columns. Container rows and deploy_site.compose_file are NEVER written — a live
+// prod stack keeps the compose_file stamped on it at provision/ship.
+export async function getComposeOnboardingPlan(id) {
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  return planComposeOnboarding(p.repo_root, p.name, p);
+}
+
+export async function applyComposeOnboarding(id, {
+  approved = false,
+  write_yml = true,
+  apply_meta = true,
+} = {}) {
+  if (approved !== true) {
+    throw new Error('human approval required — re-call with { approved: true } after reviewing the plan '
+      + '(files_to_modify + meta_changes). Nothing was written.');
+  }
+  if (!write_yml && !apply_meta) {
+    throw new Error('nothing to do — set write_yml and/or apply_meta');
+  }
+
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  // Re-plan at apply time so a stale UI preview cannot write a different shape than the human saw
+  // the *intent* of. The human approved "run compose onboarding for this project now", not a
+  // client-supplied blob.
+  const plan = planComposeOnboarding(p.repo_root, p.name, p);
+  if (!plan.applicable) {
+    throw new Error(plan.reason || 'compose onboarding has nothing to apply');
+  }
+
+  const dir = String(p.repo_root).replace(/\\/g, '/');
+  const written = [];
+
+  if (write_yml && plan.yml.action !== 'unchanged' && plan.yml.action !== 'none') {
+    // Validate the proposed YAML before touching disk.
+    const parsed = parseManifest(plan.proposed_yml, { dir });
+    if (parsed.errors?.length) {
+      throw new Error(`proposed zeehive.yml is invalid: ${parsed.errors.join('; ')}`);
+    }
+    const target = resolve(dir, plan.yml.path || 'zeehive.yml');
+    // Create is always fine. Update only rewrites when the plan said we would — and only the
+    // merge result (gaps filled), never a from-scratch draft over a process-runner yml.
+    if (plan.yml.action === 'create' && existsSync(target)) {
+      throw new Error(`${plan.yml.path} appeared on disk since the plan was built — refusing to overwrite; refresh the plan`);
+    }
+    writeFileSync(target, plan.proposed_yml);
+    written.push({ path: plan.yml.path, action: plan.yml.action });
+    logline('projects', `compose onboarding wrote ${plan.yml.path} (${plan.yml.action}) for ${p.name}`);
+  }
+
+  let updated = p;
+  if (apply_meta) {
+    // Prefer the ON-DISK file after a write (yml is the truth); otherwise apply the proposed
+    // manifest object directly so meta-only onboarding still works when the human declined a
+    // repo write (e.g. read-only checkout). A later ↻ Refresh from repo will reconcile.
+    let manifest = plan.proposed_manifest;
+    let hash = plan.proposed_hash;
+    if (write_yml || plan.yml.exists) {
+      const repo = loadManifest(dir);
+      if (repo.found && !repo.errors.length) {
+        manifest = repo.manifest;
+        hash = repo.hash;
+      } else if (repo.found && repo.errors.length) {
+        throw new Error(`${repo.file} is invalid after write: ${repo.errors.join('; ')}`);
+      }
+    } else {
+      hash = manifestHash(plan.proposed_yml).slice(0, 16);
+    }
+    const md = projectDefaultsFromManifest(manifest);
+    const sets = ['manifest = $2', 'manifest_hash = $3', 'manifest_at = now()'];
+    const vals = [id, JSON.stringify(manifest), hash];
+    // Only SET columns the plan listed — never blank an unrelated field, never invent a change
+    // the human did not see in meta_changes.
+    for (const change of plan.meta_changes) {
+      if (change.column === 'manifest') continue;
+      const v = md[change.column];
+      if (v === undefined || v === null) continue;
+      vals.push(v);
+      sets.push(`${change.column} = $${vals.length}`);
+    }
+    updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, vals);
+    broadcast('project', updated);
+    logline('projects', `compose onboarding applied meta-DB manifest for ${p.name} `
+      + `(compose_spinoff=${updated.compose_spinoff || '—'}, compose_prod=${updated.compose_prod || '—'})`);
+  }
+
+  return {
+    ok: true,
+    project: updated,
+    written,
+    // Echo the guarantee so the console can show it next to the success toast.
+    containers_untouched: true,
+    deploy_sites_untouched: true,
+    plan: {
+      compose_files: plan.compose_files,
+      meta_changes: plan.meta_changes,
+      files_to_modify: plan.files_to_modify,
+      warnings: plan.warnings,
+    },
+  };
 }
 
 // Editable after creation — deployment/config facts a human discovers were wrong only once the

@@ -62,6 +62,35 @@ tree_needs_install() {
     echo "node_modules exists but npm's completion marker (node_modules/.package-lock.json) is missing — an interrupted install left a partial tree; clearing it and installing properly" >&2
     return 0
   fi
+  # Lockfile grew new deps (e.g. a zee added @wterm/*) but node_modules is from the previous
+  # lock. Without this, process-runner starts vite against a tree that cannot resolve the new
+  # imports and the role dies mid-boot (seen as "dependencies are imported but could not be
+  # resolved" + exit 137). mtime is honest when collect/ff writes package-lock.json fresh;
+  # the resolve check below catches the case where mtimes were preserved or a prior boot
+  # already raced past a half-updated tree.
+  if [ -f "$WT/package-lock.json" ] && [ -f "$WT/node_modules/.package-lock.json" ] \
+     && [ "$WT/package-lock.json" -nt "$WT/node_modules/.package-lock.json" ]; then
+    echo "package-lock.json is newer than the installed tree — npm ci again so new deps land" >&2
+    return 0
+  fi
+  # Truth, not mtime: every dependency listed in web/package.json must resolve from the
+  # worktree. A missing one means the lock moved and node_modules did not follow.
+  if [ -f "$WT/web/package.json" ]; then
+    # Path is embedded (not passed as argv): node -e argv layout differs across versions
+    # (some put the first user arg at [1], others insert a literal "[eval]" first).
+    _web_pkg_json=$(printf '%s' "$WT/web/package.json" | sed "s/'/'\\\\''/g")
+    if ! node -e "
+      const { createRequire } = require('module');
+      const pkg = '${_web_pkg_json}';
+      const r = createRequire(pkg);
+      const deps = Object.keys(require(pkg).dependencies || {});
+      for (const d of deps) { try { r.resolve(d); } catch { process.exit(2); } }
+    " 2>/dev/null; then
+      echo "web/ package.json has dependencies that do not resolve in node_modules — npm ci again" >&2
+      return 0
+    fi
+    unset _web_pkg_json
+  fi
   return 1
 }
 NM_LOCK=""

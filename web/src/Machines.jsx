@@ -18,7 +18,7 @@ const BASE_ROLES = ['db', 'server', 'webapp', 'other'];
 
 const fail = (what) => (e) => showAlert(`${what} failed: ${e?.error || e?.message || e}`, { variant: 'error' });
 
-export default function MachineMatrix({ machines, containers, projectId, composeSpinoff, onMenu, onChanged }) {
+export default function MachineMatrix({ machines, containers, projectId, spinoffIsProcess, onMenu, onChanged }) {
   const ms = machines || [];
   // The device row is opt-in: shown only when this project actually uses devices (a device chip
   // exists, or a machine is marked can_device), so ordinary projects keep a 4-row matrix.
@@ -26,12 +26,14 @@ export default function MachineMatrix({ machines, containers, projectId, compose
   const ROLES = usesDevices ? ['db', 'server', 'webapp', 'device', 'other'] : BASE_ROLES;
   const all = ROLES.flatMap((r) => (containers[r] || []).map((c) => ({ ...c, _role: r })));
 
-  // THE SILENT DISABLE — the "mardale-prod never gets pool xells" defect. A machine is a dev
-  // spawn target for THIS project (dev_priority>0) but the project has no compose_spinoff, so
-  // the pool maintainer takes the legacy project-wide path and every per-machine pool/priority
-  // knob in this matrix is a dead letter. Same message as the server's pool logline, so an
-  // operator reading one can fix the project from the other.
-  const machinePoolingDisabled = ms.some((m) => m.enabled && m.dev_priority > 0) && !composeSpinoff;
+  // THE SILENT DISABLE — the "mardale-prod never gets pool xells" defect (process-runner form).
+  // A machine is a dev spawn target for THIS project (dev_priority>0) but the spinoff server is
+  // runner:process, so the pool maintainer takes the legacy project-wide path and every
+  // per-machine pool/priority knob in this matrix is a dead letter. Same message as the
+  // server's pool logline, so an operator reading one can fix the project from the other.
+  // Compose projects (no process runner) ARE placeable even when compose_spinoff is unset —
+  // do not warn on that column alone.
+  const machinePoolingDisabled = ms.some((m) => m.enabled && m.dev_priority > 0) && !!spinoffIsProcess;
   const disabledMachines = ms.filter((m) => m.enabled && m.dev_priority > 0).map((m) => m.key);
 
   // Where a container lives, for column placement: its own run context — or, for a PROCESS role
@@ -80,14 +82,16 @@ export default function MachineMatrix({ machines, containers, projectId, compose
              style={{ gridTemplateColumns: `max-content repeat(${cols.length}, minmax(120px, 1fr)) max-content` }}>
       {/* The machine-pooling-DISABLED banner: an operator who configured per-machine pooling must
           be able to SEE why it is not happening. The same message as the server's pool logline
-          (queenzee/pool.js), naming the field to set — so reading one lets you fix the project
-          from the other. */}
+          (queenzee/pool.js), naming the process-runner reason — so reading one lets you fix the
+          project from the other. */}
       {machinePoolingDisabled && (
         <div className="mx-warn" data-testid="mx-pooling-disabled">
           ⚠ Machine-aware pooling is DISABLED: {disabledMachines.join(', ')} is configured for this
-          project (dev_priority&gt;0) but <b>compose_spinoff</b> is unset — per-machine pool sizes and
-          priorities have no effect until <span className="mono">tiers.spinoff.compose</span> is set in
-          the project's <span className="mono">zeehive.yml</span> (project settings → Manifest → refresh).
+          project (dev_priority&gt;0) but the spinoff server is <span className="mono">runner:process</span>
+          {' '}— per-machine pool sizes and priorities have no effect (process roles get no
+          docker_ctx, so the ready count is zero by construction). The project-wide pool target
+          applies. To place on machines, give the server a compose runner and a spinoff compose
+          file in <span className="mono">zeehive.yml</span>, then refresh the manifest.
         </div>
       )}
       {/* header row */}

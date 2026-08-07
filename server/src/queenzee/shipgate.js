@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
-import { logline } from '../lib/logbus.js';
+import { logline, activity } from '../lib/logbus.js';
 import { cleanGitEnv, headCommit } from '../lib/git.js';
 import { resolveBash } from '../lib/bash.js';
 import { notifyShipRequest, notifyShipDone } from '../lib/notify.js';
@@ -213,6 +213,8 @@ export async function requestShip({ xellId, zeeId = null, reason = null, targets
   // The ask is now a row a human can see, so any earlier refusal on this xell is history.
   await clearShipRefusal(xellId, { zeeId });
   broadcast('ship', row);
+  // the honeycomb's xell→queenzee line: this xell raised a ship request
+  activity('x2q', xellId, 'ship');
 
   // Operator policy: auto-approve ships for this project → the queenzee approves and deploys with
   // no human in the loop. Still goes through the SAME decideShip → runShip path (lock, build from
@@ -605,6 +607,14 @@ async function runShipBody(ship, xell, project, site, lockKey, mode = MODE) {
   const shipping = await one(
     `UPDATE ship_request SET status='shipping', started_at=now() WHERE id=$1 RETURNING *`, [ship.id]);
   broadcast('ship', shipping);
+
+  // Honeycomb: queenzee → PRODUCTION while the deploy runs. The ask was xell→queenzee (x2q at
+  // request time); the act is the reverse direction onto the production hexagon — that is the
+  // line a human watches for the whole ship, not a flash on the work-xell that filed the request.
+  const prods = await q(
+    `SELECT id FROM xell WHERE project_id=$1 AND is_production AND status <> 'retired'`,
+    [project.id]);
+  for (const p of prods) activity('q2x', p.id, 'ship');
 
   // Production's BUILD SOURCE is local main — not the xell's worktree, and not the xource
   // checkout's wandering HEAD (which is what this actually built until 2026-07-16). origin is a

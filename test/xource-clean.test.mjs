@@ -24,8 +24,10 @@ process.env.PROVISION_MODE = 'real';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const { q, one, pool } = await import('../server/src/db/pool.js');
-const { xourceState, performXourceClean, requestXourceClean, decideXourceClean,
-        listXourceCleanRequests, xourceCleanStatusFor } = await import('../server/src/lib/xource-clean.js');
+const { xourceState, performXourceClean, commitXourceStaged, stashXource, requestXourceClean,
+        decideXourceClean, listXourceCleanRequests, xourceCleanStatusFor }
+  = await import('../server/src/lib/xource-clean.js');
+const { xourcePatch } = await import('../server/src/lib/diffview.js');
 const { selfXourceClean } = await import('../server/src/queenzee/self.js');
 
 let failures = 0;
@@ -159,6 +161,79 @@ try {
      'the receipt names the manager who asked (live_xell_slug)');
   const all = await listXourceCleanRequests(project.id, { open: false });
   ok(all.some((r) => r.id === rejected.id), 'the rejected one IS in the all/history view');
+
+  // ── 8. staged items: has_staged + commit-the-index recovery ────────────────
+  // The broken-pipe tip on the git graph fires on has_staged; Commit keeps the
+  // staged work as a real main commit instead of discarding it.
+  console.log('\n── staged items: has_staged read + commitXourceStaged ──');
+  writeFileSync(join(src, 'kept.txt'), 'keep me on main\n');
+  git(src, ['add', 'kept.txt']);
+  writeFileSync(join(src, 'loose.txt'), 'unstaged only\n');   // not staged
+  const stagedState = xourceState(src, 'main');
+  ok(stagedState.has_staged === true, 'has_staged is true when the index has paths');
+  ok(stagedState.staged_count >= 1, `staged_count ≥ 1 (${stagedState.staged_count})`);
+  ok(Array.isArray(stagedState.files) && stagedState.files.some((f) => f.path === 'kept.txt' && f.kind.includes('staged')),
+     'files[] lists the staged path with kind=staged');
+  ok(stagedState.files.some((f) => f.path === 'loose.txt' && f.kind === 'untracked'),
+     'and the untracked rogue path too');
+  ok(stagedState.diff?.staged?.files >= 1, 'diff.staged carries a shortstat (files ≥ 1)');
+  ok((stagedState.summary || '').includes('staged'), 'summary names the staged paths');
+
+  const noMsg = await commitXourceStaged(project.id, { message: '', by: 'human@test' })
+    .then(() => null).catch((e) => e);
+  ok(noMsg instanceof Error && /message is required/i.test(noMsg.message),
+     'commit without a message is refused');
+
+  const committed = await commitXourceStaged(project.id, {
+    message: 'chore: keep accidental staged work', by: 'human@test',
+  });
+  ok(committed?.ok === true && committed.dry_run !== true, 'commitXourceStaged lands a real commit');
+  ok(!!committed.commit && committed.short?.length >= 7, `returns the new head (${committed.short})`);
+  const afterCommit = xourceState(src, 'main');
+  ok(afterCommit.has_staged === false, 'has_staged is false after the commit');
+  ok(afterCommit.head === committed.commit, 'xource HEAD is the new commit');
+  // unstaged/untracked left alone — commit only consumes the index
+  ok(afterCommit.untracked.includes('loose.txt') || afterCommit.files?.some((f) => f.path === 'loose.txt'),
+     'unstaged/untracked paths were NOT swept into the commit');
+  const show = git(src, ['show', '--name-only', '--pretty=format:', committed.commit]);
+  ok(show.out.split('\n').filter(Boolean).includes('kept.txt'),
+     'the commit contains the staged file');
+  ok(!show.out.includes('loose.txt'), 'and does NOT contain the untracked file');
+
+  // nothing staged → refuse
+  const nothing = await commitXourceStaged(project.id, { message: 'nope', by: 'human@test' })
+    .then(() => null).catch((e) => e);
+  ok(nothing instanceof Error && /nothing is staged/i.test(nothing.message),
+     'commit with an empty index is refused');
+
+  // ── 9. xourcePatch (diff preview) + stashXource ────────────────────────────
+  console.log('\n── xourcePatch preview + stashXource ──');
+  writeFileSync(join(src, 'stage-me.txt'), 'staged body\n');
+  git(src, ['add', 'stage-me.txt']);
+  writeFileSync(join(src, 'loose-me.txt'), 'untracked body\n');
+  const patchStaged = await xourcePatch(project.id, { scope: 'staged' });
+  ok(patchStaged.ok === true, 'xourcePatch(staged) returns ok');
+  ok(patchStaged.files.some((f) => f.path === 'stage-me.txt'),
+     'staged patch lists stage-me.txt');
+  ok(patchStaged.files.every((f) => f.path !== 'loose-me.txt'),
+     'staged patch does NOT include the untracked file');
+  const patchAll = await xourcePatch(project.id, { scope: 'all' });
+  ok(patchAll.ok === true && patchAll.files.some((f) => f.path === 'stage-me.txt'),
+     'xourcePatch(all) includes the staged file');
+  ok(patchAll.files.some((f) => f.path === 'loose-me.txt' && f.status === 'untracked'),
+     'and synthesises the untracked file into the preview');
+
+  const stashed = await stashXource(project.id, { by: 'human@test', message: 'park the dirt' });
+  ok(stashed?.ok === true && stashed.dry_run !== true, 'stashXource parks the dirt');
+  const afterStash = xourceState(src, 'main');
+  ok(afterStash.clean === true || afterStash.dirty === 0,
+     'xource is clean after stash');
+  ok(afterStash.has_staged === false, 'has_staged is false after stash');
+  ok((afterStash.stash_count || 0) >= 1, `stash stack grew (${afterStash.stash_count})`);
+  const emptyStash = await stashXource(project.id, { by: 'human@test' })
+    .then(() => null).catch((e) => e);
+  ok(emptyStash instanceof Error && /nothing to stash|already clean/i.test(emptyStash.message),
+     'stash on a clean xource is refused');
 
   console.log(failures ? `\n${failures} FAILED` : '\nall good');
   process.exit(failures ? 1 : 0);

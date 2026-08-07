@@ -167,12 +167,22 @@ async function pollBuild(role, secs, { watch = false } = {}) {
     if (want.some((c) => c.health === 'building')) continue;
 
     // Settled. Report per container, and be explicit about WHY one isn't serving HEAD — "not your
-    // code" with no reason is what sends a zee hunting for a phantom bug.
+    // code" with no reason is what sends a zee hunting for a phantom bug. TKT-136 defect #2: a
+    // published port that refuses is NOT "UP" — surface the boot-log tail and exit non-zero.
     console.error('');
     let ok = true;
     for (const c of want) {
       if (c.health === 'up' && c.serving_head) {
         console.error(`  ✓ ${c.role} (${c.name}) is UP and serving your HEAD ${String(st.head).slice(0, 8)}`);
+      } else if (c.published_health === 'down') {
+        const where = c.published_url || 'its published URL';
+        console.error(`  ✗ ${c.role} (${c.name}) did not serve at ${where} — the published port refused or timed out. The server is not reachable from where a zee must use it.`);
+        if (c.boot_log_tail) {
+          console.error('  ── last boot-log lines ──');
+          for (const line of String(c.boot_log_tail).split('\n')) console.error(`  ${line}`);
+          console.error('  ────────────────────────');
+        }
+        ok = false;
       } else if (c.health === 'up' && c.hot_build) {
         console.error(`  ⚠ ${c.role} (${c.name}) is UP but was a --hot bounce: it re-used the old image and is NOT running your code. Rebuild without --hot.`); ok = false;
       } else if (c.health === 'up' && c.never_built) {
@@ -510,8 +520,8 @@ function usage() {
  MANAGER-only (refused for a worker, with an explanation):
   zee conversations [--xell <slug>] [--full]   review your crew's uploaded CONVERSATION ARCHIVES (who said what while they worked). --xell narrows to one worker; --full prints its newest transcript
   zee zees                           YOUR CREW: every worker you dispatched — slug, branch, hive status, what it waits on, WHAT IT HAS PRODUCED (landings + its unlanded diff) and its last message
-  zee assign --item <id> --task "..." [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse]   DEPLOY a worker for a WORK ITEM — the ONLY way a manager deploys. The brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text; the item admits at most one live worker, so a second deploy on the same item is REFUSED. Cut a card with \`zee work --new --title "…"\` (or break a ticket down) and pipe its id here: \`zee assign --item <id> --task "…"\`. Returns the new worker's slug. --visual-verify turns on per-xell VISUAL VERIFICATION (see dispatch); --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (see dispatch)
-  zee dispatch --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse] [--title "..."]   REFUSED for a manager (the ROUTER's verb — a router routes prompts with it; a manager deploys through the board: \`zee assign\`). It spawns a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness. --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and offers the live link to a human in the console; --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (default ON — --no-langfuse stops this xell's turns being traced to Langfuse)
+  zee assign --item <id> --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse]   DEPLOY a worker for a WORK ITEM — the ONLY way any manager (router included) deploys. The brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text; the item admits at most one live worker, so a second deploy on the same item is REFUSED. Cut a card with \`zee work --new --title "…"\` (or break a ticket down) and pipe its id here: \`zee assign --item <id> --task "…"\`. Returns the new worker's slug. --provider names the AI provider the worker runs on (a ROUTER's decision, riding the board deploy). --visual-verify turns on per-xell VISUAL VERIFICATION (see dispatch); --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (see dispatch)
+  zee dispatch --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse] [--title "..."]   REFUSED for EVERY manager, router included (the board — \`zee work --new\` + \`zee assign --item <id> --task "…"\` — is the only deployment path; a router routes prompts onto cards and does not manage the workers it deploys). It spawns a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness. --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and offers the live link to a human in the console; --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (default ON — --no-langfuse stops this xell's turns being traced to Langfuse)
   zee breakdown --ticket <code|id> --items <file.json>   turn a TICKET into a whole work-item TREE in one call (a JSON array of {title, kind?, body?, parent_id?, ref?, priority?, starts_on?, due_on?} — those keys and no others, so an entry naming a zee/status/progress is refused; a later item may name an earlier one's "ref" as its parent_id). One transaction — either the whole plan exists or the ticket is untouched. ADDITIVE: running it twice cuts a second set
   zee unassign --item <id> [--reason "..."]   take the zee OFF a work item, freeing the card for a new "zee assign" (the verb the "unassign it first" refusal has been asking for). The item's STATUS is left alone and the xell is untouched — this reaps nobody
   zee swap --to <slug> --harness <key> [--task "..."] [--model m] [--mode 1..5]   replace the ZEE working one of YOUR xells with a fresh one wearing a different worker harness, KEEPING the xell: same branch, same commits, same containers, same db, same card. How one piece of work gets a Scout, then a Builder, then a Reviewer. The outgoing zee's commits are collected out of its cage FIRST (refused rather than risked) and the incoming zee is briefed on what it INHERITED. REFUSED: a xell that is not your crew, a manager target, a manager harness, and any xell with a human gate open on it (a landing, a ship, a done suggestion)
@@ -523,7 +533,7 @@ function usage() {
   zee xource-clean --reason "..."   ask a HUMAN to clean up the PROJECT XOURCE (the main checkout) — a mangled checkout blocks EVERY landing and ship; on approval the queenzee resets it to main (aborting merges, preserving xell worktrees). MANAGER-only: you never run git on the xource yourself
   zee ops [--hours N] [--logs N] [--alerts]   REVIEW THE QUEENZEE ITSELF: its recent log (with the warning/error lines pre-filtered), every landing/ship/seed/prod-bind and how long each waited on a human, the fleet's token BURN (top spenders + window totals) and the backup ledger — one read-only digest (the minister's verb; see the queenzee-minister harness). --hours widens the window (default 24), --logs caps the log tail (default 300), --alerts prints ONLY the alert lines
   zee ticket --title "..." [--body "..."] [--kind bug|feature|chore|question|incident] [--priority 1..5] [--labels a,b] [--notify]   FILE A TICKET in YOUR OWN project's tracker (reporter = your slug) — the one write an ops critique gets: a ticket opens no gate and changes nothing until a human or a manager breaks it down and takes it up. --notify also drops it into every OTHER live manager's inbox. \`zee ticket --list [--status s] [--q text]\` reads what is already filed, so you never file the same criticism twice
-  NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — dispatch a worker instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused.
+  NOTE: "zee land" and every push/PR path are REFUSED for a manager (zero push access to the xource — deploy a worker onto a card instead), and so is "zee prod" (you hold production READ-ONLY already). "zee ship" is NOT refused. A ROUTER additionally has NO crew verbs — \`zee zees\`, \`zee say\`, \`zee swap\`, \`zee suggest-done\`, \`zee conversations\` are refused (it routes prompts onto cards and does not manage the workers it deploys).
 
 env: ZEEHIVE_XELL_TOKEN (identity, injected at spawn), ZEEHIVE_API (default host.docker.internal:4700)`);
   process.exit(cmd ? 1 : 0);
@@ -1167,6 +1177,9 @@ switch (cmd) {
     out(await req('POST', '/api/xell/self/work/assign', {
       item, task: flag('task') || null, model: flag('model') || null, mode: flag('mode') || null,
       harness: flag('harness') || null, title: flag('title') || null,
+      // --provider names WHICH AI PROVIDER the worker runs on — the ROUTER's decision, riding the
+      // board deploy the same way it rides `zee dispatch` (139/151).
+      ...(flag('provider') ? { provider: flag('provider') } : {}),
       // Same per-xell VISUAL VERIFICATION opt-in as `zee dispatch --visual-verify`.
       ...(rest.includes('--visual-verify') ? { visual_verify: true } : {}),
       // Same per-xell LANGFUSE TRACKING switch as `zee dispatch --langfuse|--no-langfuse`.

@@ -1,25 +1,21 @@
 // PROJECT MANIFEST REFRESH — name-vs-uuid (the "Manifest refresh does not work" report).
 //
-// The operator's remedy for the machine-aware-pooling DISABLED warning (mardale-prod never gets
-// pool xells) is: add `tiers.spinoff.compose` to the repo's zeehive.yml, then Project settings →
-// Manifest → ↻ Refresh from repo. That refresh is POST /projects/:id/manifest/refresh, and the
-// :id is the project UUID OR NAME — the manifest verbs are addressed from the same places the rest
-// of the API is (the console, scripts, a human's ad-hoc curl).
+// Manifest refresh is POST /projects/:id/manifest/refresh, and the :id is the project UUID OR
+// NAME — the manifest verbs are addressed from the same places the rest of the API is (the
+// console, scripts, a human's ad-hoc curl). Refresh maps tiers.spinoff.compose →
+// project.compose_spinoff (the compose file stamped onto container rows at provision) and
+// caches the parsed manifest (including runner: process, which IS the pool's placement
+// predicate — see test/pool-machine-placeable-without-compose.test.mjs).
 //
 // THE DEFECT: the route fed req.params.id straight into a `WHERE id = $1` lookup, so a caller that
 // named its project got `invalid input syntax for type uuid` — the exact name-vs-uuid 400 the
 // /api/router/* handlers used to ship (lib/router.js resolves through lib/project-resolve.js;
-// these routes did not). That is "the REFRESH action does not work" from the operator's console:
-// the pool warning names the remedy ("project settings -> Manifest -> refresh"), the operator
-// follows it, and a caller that addressed the project by NAME gets a 400 instead of the manifest
-// refresh. The refresh itself (UUID path) maps tiers.spinoff.compose → project.compose_spinoff
-// correctly — the gap is that the remedy is not reachable by name.
+// these routes did not). That is "the REFRESH action does not work" from the operator's console.
 //
 // This mounts the REAL routes router and drives the REAL HTTP verb (no lib function under test,
 // no mock of the route): a temp repo with a zeehive.yml, a real project row, and both spellings
 // of the refresh call. It asserts:
-//   1. refresh by UUID works and maps tiers.spinoff.compose → project.compose_spinoff (the
-//      operator's end-to-end remedy — this is what makes the pool warning clear);
+//   1. refresh by UUID works and maps tiers.spinoff.compose → project.compose_spinoff;
 //   2. refresh by NAME now works too (the fix) and returns the same composed value;
 //   3. GET /manifest and POST /manifest/draft by NAME resolve the same way;
 //   4. an UNKNOWN name still refuses with a helpful message, not a uuid syntax error.
@@ -92,7 +88,7 @@ try {
 
   const row = await one(`SELECT compose_spinoff FROM project WHERE id=$1`, [projId]);
   ok(row.compose_spinoff === 'docker-compose.spinoff.yml',
-     'and the project row actually holds compose_spinoff (the pool guard reads THIS)');
+     'and the project row actually holds compose_spinoff (stamped onto containers at provision)');
 
   console.log('\n── the DEFECT + FIX: refresh by NAME ──');
   r = await fetchJSON(`${BASE}/projects/${projName}/manifest/refresh`, { method: 'POST' });

@@ -1,12 +1,11 @@
-// ONE PROMPT BUTTON PER HARNESS — and every choice under it derived from that persona.
+// ONE "+ prompt" BUTTON — and the composer (or the router) chooses the persona.
 //
-// The flow this locks down (and the bug it closes): the console showed one "＋ prompt" button per
-// connected AI ACCOUNT, and the persona (harness) was the LAST segmented control inside the
-// composer. That puts the credential first and the manual last, and the two could contradict each
-// other — open the composer from a Claude account button, pick a persona whose model policy allows
-// only deepseek, and the spawn refused it (resolveDispatchModel) AFTER the whole prompt had been
-// written. The harness is the consequential choice (it carries the manual, the skills and the model
-// policy), so the harness is the button, and the composer derives the rest from it.
+// The flow this locks down: the console used to show one "＋ prompt" button per PERSONA (and
+// before that, one per AI ACCOUNT). The router layer recomposes the prompt and decides
+// provider/model/mode/harness itself, so a toolbar pin was only a hint. The toolbar now shows a
+// single "+ prompt" button that opens the composer with no pinned harness. On a router-gated fleet
+// the router picks the persona; on a fleet with no router feature the human picks it inside the
+// composer (including "core only").
 //
 // Four halves, in the order a human meets them:
 //
@@ -21,11 +20,11 @@
 //      dispatched a zee that could do anything. modesForRuntime says so per runtime.
 //   3. THE EFFECTIVE POLICY ON EVERY LISTED HARNESS (lib/harness.js), because a child that
 //      inherits "claude only" declares nothing of its own and would render as unrestricted.
-//   4. THE CONSOLE: WHICH BUTTONS THERE ARE is a pure function (web/src/promptButtons.js) and is
-//      RUN here, not regexed — a persona with no usable provider is disabled *with a sentence*
-//      rather than hidden, "core only" survives as its own button, and an empty persona is labelled
-//      on the button itself. The wiring around it (the composer asking the options endpoint, the
-//      click pinning the persona) is read from source, because this suite has no DOM.
+//   4. THE CONSOLE: the single toolbar button is a pure function (web/src/promptButtons.js) and is
+//      RUN here, not regexed — no account → "add provider"; all paused → disabled with a sentence;
+//      otherwise one enabled "+ prompt". The composer wiring (opens with no pin; worker persona
+//      picker on the no-router path including core only; router path leaves persona to the router)
+//      is read from source, because this suite has no DOM.
 //
 // What is NOT covered here, and how it was covered instead: the composer's live behaviour — click a
 // provider, watch the model list and the account list follow, submit and read the payload — needs a
@@ -67,67 +66,57 @@ ok(/VALUES \(\$1,'headless-spawn',\$2,'none','spawning','headless','cxell-cli',\
    'sanity: the cxell spawn really does hard-code bypassPermissions (the fact this annotation reports)');
 
 // ── 4. the console wiring (source-read: there is no browser in this suite) ──────────────────────
-console.log('\n── the console: the button IS the persona ──');
+console.log('\n── the console: one "+ prompt" button, persona chosen in the composer or by the router ──');
 const app = read('web/src/App.jsx');
 const disp = read('web/src/Dispatch.jsx');
-// WHICH buttons there are is a pure function, so RUN it rather than regex the JSX.
-const { promptButtons, hasAnyAccount } = await import('../web/src/promptButtons.js');
-const { emptyWarning } = await import('../web/src/harnessHealth.js');
+// WHETHER the single button can be pressed is a pure function, so RUN it rather than regex the JSX.
+const { promptButton, hasAnyAccount } = await import('../web/src/promptButtons.js');
 const PROVIDERS = [
   { provider: 'claude', label: 'Claude', dispatch: true, accounts: [{ id: 'a1', paused: false }] },
   { provider: 'openai', label: 'ChatGPT Codex', dispatch: true, accounts: [{ id: 'o1', paused: true }] },
   { provider: 'github', label: 'GitHub', accounts: [{ id: 'g1', paused: false }] },
 ];
-const HARNESSES = [
-  { id: 'h1', key: 'hermes', label: 'Hermes', scope: 'global', effective_model_policy: { allow_providers: [] } },
-  { id: 'h2', key: 'coder', label: 'Coder', scope: 'project', effective_model_policy: { allow_providers: ['openai'] } },
-  { id: 'h3', key: 'hollow', label: 'Hollow', scope: 'global', bundle_empty: true, effective_model_policy: {} },
-];
-const btns = promptButtons(HARNESSES, PROVIDERS, { emptyWarning, defaultHarnessId: 'h3' });
-ok(btns.map((b) => b.key).join() === 'hollow,hermes,coder,',
-   'one button per WORKER persona — and no longer one per AI ACCOUNT (the credential is not the choice)');
-ok(btns[0].key === 'hollow' && btns[0].isDefault,
-   "the project's DEFAULT persona leads and is marked (it is what a bare dispatch attaches anyway)");
-ok(btns.at(-1).key === '' && btns.at(-1).label === 'core only' && !btns.at(-1).blocked,
-   '"core only" survives as its own button — a dispatch with no persona must not become impossible');
-ok(!btns.find((b) => b.key === 'hermes').blocked,
-   'an unrestricted persona runs on whatever the project has connected');
-ok(/every openai account on this project is PAUSED/.test(btns.find((b) => b.key === 'coder').blocked),
-   'a persona whose policy allows only a provider with no LIVE account is blocked, with the reason '
-   + '(its one openai account is PAUSED — the spawn refuses that too)');
-ok(btns.find((b) => b.key === 'hermes').runsOn.map((p) => p.provider).join() === 'claude',
-   'and the button can say what it will actually run on (paused and non-dispatch providers excluded)');
+const live = promptButton(PROVIDERS);
+ok(!live.blocked && live.runsOn.map((p) => p.provider).join() === 'claude',
+   'with a live AI account the single button is enabled and names what it can run on '
+   + '(paused and non-dispatch providers excluded)');
 // A PAUSE is not an absence — the button must not send a human to add a token they already have.
-const paused = promptButtons(
-  [{ id: 'h1', key: 'hermes', label: 'Hermes', effective_model_policy: {} }],
-  [{ provider: 'claude', label: 'Claude', dispatch: true, accounts: [{ id: 'a1', paused: true }] }],
-  { emptyWarning });
-ok(/every AI provider account on this project is PAUSED/.test(paused[0].blocked),
+const paused = promptButton(
+  [{ provider: 'claude', label: 'Claude', dispatch: true, accounts: [{ id: 'a1', paused: true }] }]);
+ok(/every AI provider account on this project is PAUSED/.test(paused.blocked),
    'an all-paused project says PAUSED (reversible, and the spawn refuses a paused account anyway) '
    + 'rather than "nothing is connected"');
-ok(btns.find((b) => b.key === 'hollow').warn?.chip === '⚠ empty',
-   'an EMPTY persona is labelled on its own button — the zee you dispatch is the one who pays for it');
+const none = promptButton([]);
+ok(/no AI provider account is connected/.test(none.blocked),
+   'no accounts at all → blocked with the connected-account sentence (caller may still prefer "add provider")');
 ok(hasAnyAccount(PROVIDERS) && !hasAnyAccount([{ provider: 'github', accounts: [{ id: 'g' }] }]),
    'visibility is still the token store: no dispatchable account at all → "add provider" instead');
 // …and the JSX really uses it (a pure function nothing calls is dead code).
-ok(/promptButtons\(harnesses, providers,/.test(app) && /defaultHarnessId: fleet\.pool\?\.default_harness_id/.test(app) && /hasAnyAccount\(providers\)/.test(app),
-   'App renders the buttons FROM that function');
-ok(/getHarnesses\('worker', pid\)/.test(app) && /data-testid=\{`new-prompt-btn-\$\{b\.key \|\| 'core'\}`\}/.test(app),
-   "built from THIS project's worker personas (054 + 084)");
-ok(/disabled=\{!!b\.blocked\}/.test(app),
-   'a blocked persona is DISABLED with the reason, not hidden (a control that vanishes reads as "it disappeared")');
-// THE BADGE IS NOT IN THE BUTTON, and the button says only the name. A persona's face is what a
-// human scans this row for, and shrunk inside a pill it reads as decoration; and "＋ prompt ·" was
-// the same three words on every button, so the only word that differed had to compete with them.
-ok(/className=\{`np-persona/.test(app) && /<ZeeAvatar harness=\{\{[^}]*\}\} size=\{30\} \/>/.test(app),
-   "the persona's badge is the button's SIBLING, at a size you can actually read");
-// the button's whole content, asserted where it is written: the label first, nothing before it
-ok(/>\s*\n?\s*\{b\.label\}\{b\.scope === 'project'/.test(app),
-   'and the button carries the persona NAME alone — no repeated "＋ prompt ·" prefix in front of it');
-ok(/setShowDispatch\(\{ harness: b\.key \}\)/.test(app) && /<Dispatch[\s\S]{0,200}harness=\{showDispatch\.harness\}/.test(app),
-   'and the click pins that persona on the composer');
+ok(/promptButton\(providers\)/.test(app) && /hasAnyAccount\(providers\)/.test(app),
+   'App renders the single button FROM that function');
+ok(/data-testid="new-prompt-btn"/.test(app) && /＋ prompt/.test(app),
+   'exactly one "+ prompt" button (not one per persona)');
+ok(/data-testid="add-provider-btn"/.test(app) && /＋ add provider/.test(app),
+   'and the "add provider" fallback survives when nothing is connected');
+ok(/disabled=\{!!btn\.blocked\}/.test(app),
+   'a blocked button is DISABLED with the reason, not hidden (a control that vanishes reads as "it disappeared")');
+ok(/setShowDispatch\(\{\}\)/.test(app),
+   'the click opens the composer with no pinned harness');
+ok(/<Dispatch[\s\S]{0,200}onClose=/.test(app) && !/harness=\{showDispatch\.harness\}/.test(app),
+   'and App does not pin a harness prop on Dispatch');
+// No per-persona toolbar row left behind.
+ok(!/new-prompt-btn-\$\{b\.key/.test(app) && !/np-persona/.test(app),
+   'no per-persona toolbar buttons or badge siblings remain');
 
-console.log('\n── the composer: providers, models and autonomy all follow from it ──');
+console.log('\n── the composer: persona picker on the no-router path; router picks otherwise ──');
+ok(/workerPersonaPicker/.test(disp) && /!routerGate/.test(disp),
+   'a WORKER persona picker exists only on the direct (no-router-feature) path');
+ok(/data-testid="dispatch-harness-none"/.test(disp) && /core only/.test(disp),
+   'and it still offers "core only" — a dispatch with no persona must not become impossible');
+ok(/getHarnesses\(manager \? 'manager' : 'worker', projectId\)/.test(disp),
+   'the composer loads WORKER harnesses for that picker (and manager harnesses in the manager variant)');
+ok(/routerGate && liveRouter/.test(disp) || /handed raw to the router/.test(disp),
+   'on a live-router fleet the title says the router decides, not a pinned persona');
 // Since 139 the same call serves the router-deploy sub-mode too (harness 'router', a manager-type
 // zee), so the persona branch is the ternary's ELSE arm — the contract is unchanged: one call,
 // derived from the persona, re-asked when it changes.
@@ -227,7 +216,11 @@ try {
   console.log('\n── the same persona, with no policy at all ──');
   const bare = await dispatchOptions({ projectId: projId, harness: '' });   // '' = core only
   ok(bare.harness === null, "an explicit empty harness means CORE ONLY, not 'the default'");
-  ok(bare.providers.every((p) => !p.blocked_reason), 'with no policy, every connected provider is pickable');
+  // Disconnected providers still appear, disabled with a reason (so a human sees the full roster).
+  // What "no policy" means is: nothing the project CAN dispatch on is blocked by a harness rule.
+  ok(bare.providers.filter((p) => p.provider === 'claude' || p.provider === 'openai')
+       .every((p) => !p.blocked_reason),
+     'with no policy, every CONNECTED provider is pickable');
   ok(bare.providers.find((p) => p.provider === 'claude').default_model === 'opus',
      'and claude still defaults to Opus (DEFAULT_ZEE_MODEL — unchanged behaviour)');
 
@@ -236,7 +229,7 @@ try {
   const child = list.find((h) => h.key === childKey);
   ok(JSON.stringify(child.model_policy) === '{}', "the child declares no policy of its own…");
   ok(child.effective_model_policy.allow_providers.join() === 'openai',
-     '…but its EFFECTIVE policy carries the parent\'s restriction — what the button must render');
+     '…but its EFFECTIVE policy carries the parent\'s restriction — what the composer must render');
 } catch (e) {
   console.error('\n✗ threw:', e?.stack || e?.message || e);
   fail++;

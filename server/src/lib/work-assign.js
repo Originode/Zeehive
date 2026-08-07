@@ -276,6 +276,7 @@ export function briefForWorkItem({ item, ancestors = [], ticket = null, extra = 
 // stamping and the assignment without spawning a real agent. Production callers never pass it.
 export async function deployWorkItem(id, { task = null, model = null, mode = null, harness = null,
                                            title = null, visual_verify = false, langfuse_tracking = null,
+                                           provider = null,
                                            actor = 'human@console', managerXellId = null,
                                            dispatchFn = null } = {}) {
   const plain = await getItem(id);
@@ -301,7 +302,7 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
         + 'for this item right now. Wait for it to settle, or unassign the item first.');
     }
     return await deployWorkItemHeld(id, plain, { task, model, mode, harness, title, visual_verify,
-                                                 langfuse_tracking, actor, managerXellId, dispatchFn });
+                                                 langfuse_tracking, provider, actor, managerXellId, dispatchFn });
   } finally {
     await lockClient.query(`SELECT pg_advisory_unlock(${deployLockKeySql})`, [id]).catch(() => {});
     lockClient.release();
@@ -313,6 +314,7 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
 // function so the outer lock has one caller and one finally, and the body below is unchanged.
 async function deployWorkItemHeld(id, plain, { task = null, model = null, mode = null, harness = null,
                                                title = null, visual_verify = false, langfuse_tracking = null,
+                                               provider = null,
                                                actor = 'human@console', managerXellId = null,
                                                dispatchFn = null } = {}) {
   const current = await liveXell(plain.xell_id);
@@ -336,7 +338,7 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
   let out;
   if (dispatchFn) {
     out = await dispatchFn({ task: brief, title: title || full.title, model, mode, harness,
-                             visual_verify, langfuse_tracking, item: full });
+                             visual_verify, langfuse_tracking, provider, item: full });
   } else if (managerXellId) {
     const manager = await one(`SELECT * FROM xell WHERE id=$1`, [managerXellId]);
     if (!manager) throw missing(`no manager xell ${managerXellId}`);
@@ -345,7 +347,7 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
     // already LANDED on this card, and the brief alone cannot carry that — briefForWorkItem writes the
     // ticket as a bare "(#64)", which the brief reader deliberately ignores.
     out = await selfDispatch(manager, { task: brief, title: title || full.title, model, mode, harness,
-                                        visual_verify, langfuse_tracking, work_item_id: full.id });
+                                        visual_verify, langfuse_tracking, provider, work_item_id: full.id });
     if (out?.ok === false) throw refuse(out.error || 'the dispatch was refused');
   } else {
     const { dispatchXell } = await import('../queenzee/intake.js');
@@ -356,6 +358,7 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
       ...(visual_verify ? { visual_verify: true } : {}),
       // --langfuse / --no-langfuse: explicit true/false lands; omission (null) preserves the target.
       ...(langfuse_tracking === true || langfuse_tracking === false ? { langfuse_tracking } : {}),
+      ...(provider ? { provider } : {}),
     });
   }
   const newXellId = out?.xell_id || out?.xell?.id || out?.id || null;

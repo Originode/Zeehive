@@ -73,11 +73,21 @@ async function waitForBuild() {
 
     // Settled. Report per container, and be explicit about WHY a container isn't serving HEAD —
     // "not serving your code" with no reason is what sends a zee hunting for a phantom bug.
+    // TKT-136 defect #2: a published port that refuses is NOT "UP" — surface the boot-log tail.
     console.log('');
     let ok = true;
     for (const c of want) {
       if (c.health === 'up' && c.serving_head) {
         console.log(`  ✓ ${c.role} (${c.name}) is UP and serving your HEAD ${String(st.head).slice(0, 8)}`);
+      } else if (c.published_health === 'down') {
+        const where = c.published_url || 'its published URL';
+        console.log(`  ✗ ${c.role} (${c.name}) did not serve at ${where} — the published port refused or timed out. The server is not reachable from where a zee must use it.`);
+        if (c.boot_log_tail) {
+          console.log('  ── last boot-log lines ──');
+          for (const line of String(c.boot_log_tail).split('\n')) console.log(`  ${line}`);
+          console.log('  ────────────────────────');
+        }
+        ok = false;
       } else if (c.health === 'up' && c.hot_build) {
         console.log(`  ⚠ ${c.role} (${c.name}) is UP but was a --hot bounce: it re-used the old image and is NOT running your code. Rebuild without --hot.`);
         ok = false;

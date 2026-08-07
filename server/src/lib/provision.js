@@ -21,8 +21,9 @@ import { warmWorktree } from './npm-cache.js';
 import { normalizeSpawnPrep, prewarmsCage, templateHash } from './spawn-prep.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, preppedImageIfPresent, ensurePreppedImage, cxellName } from './cxell.js';
 import { deviceConfig } from './devices.js';
-import { logline } from './logbus.js';
+import { logline, activity } from './logbus.js';
 import { raiseEnvAlert, clearEnvAlert } from './status.js';
+import { processRoleReachableHost, processRolePublishedUrl } from '../queenzee/containers.js';
 
 // Same switch every other real-side-effect module reads (intake, pool, xell-db, machines): 'real'
 // touches machines, anything else models. The fleet-wide .zeehive.env reconcile below obeys it.
@@ -267,6 +268,37 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
     lines.push(`DATABASE_URL=${dbUrl}`);
   }
 
+  // QUEENZEE_INPROC=false — API-only when this xell shares THE queenzee's meta-DB (TKT-136-FE32).
+  //
+  // index.js takes advisory lock 715533001 on whatever DATABASE_URL it opens. A spinoff whose
+  // DATABASE_URL is the same meta-DB THE live queenzee already holds that lock on waits 90s and
+  // restart-loops, while `zee build server --wait` may still report UP. The flag (config.js /
+  // index.js) starts the server without the lock and without any loop — every route still serves.
+  //
+  // WHEN we project it (both signals mean the same physical fact — "this xell's db IS the
+  // managing meta-DB"):
+  //   • db_coupling === 'db-shared-dev' — the shared-dev coupling for process-runner Zeehive
+  //     xells (resolveXellDsn source 'shared-dev-container'). sameDatabase() alone is not enough
+  //     here: the published host:port (10.x:32768) and the queenzee's in-network DSN (meta-db:5432)
+  //     name the same postgres with different host strings, so the §6.2 helper returns false while
+  //     the lock still collides.
+  //   • sameDatabase(dbUrl, config.databaseUrl) — covers the db-prod-readonly exemption (and any
+  //     future path) that emits the managing meta-DB DSN under a different coupling name.
+  //
+  // WHAT we deliberately leave alone: a xell on its OWN db (clone / isolated / owned container)
+  // keeps the default (inproc=true) so a nested queenzee on a private meta still takes the lock
+  // and runs loops under the §6.2 simulate safety flags. THE real queenzee has no .zeehive.env
+  // and stays default-true.
+  //
+  // Both eras read this projection: start-xell-process.sh unsets every key the file owns so
+  // dotenv re-reads it (process runner); compose spinoffs that load the worktree projection get
+  // the same value. A structural key — reserved below so an environment cannot flip it back.
+  if (xell.db_coupling === 'db-shared-dev'
+      || (dbUrl && sameDatabase(dbUrl, config.databaseUrl))) {
+    lines.push('# —— QUEENZEE_INPROC=false: shared meta-DB → API-only (no lock 715533001, no loops; TKT-136) ——');
+    lines.push('QUEENZEE_INPROC=false');
+  }
+
   // Environment vars — the meta-DB source of truth for the untracked .env (migration 043).
   // Resolved by tier: a xell ON PRODUCTION (environments.isOnProduction — writing it, reading it
   // read-only, or being it) gets the project's default PROD environment, else the default DEV one;
@@ -297,7 +329,8 @@ async function writeXellEnv(xellId, { dryRun = false } = {}) {
       // environment introduce its own DATABASE_URL and slip past the §6.2 guard; these names are
       // never an environment's to set, present in the file or not.
       const reserved = new Set([
-        'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', serverEnv, webEnv,
+        'SPINOFF_SLUG', 'DATABASE_URL', 'ZEEHIVE_SITE', 'ZEEHIVE_DOCKER_CONTEXT', 'QUEENZEE_INPROC',
+        serverEnv, webEnv,
         ...lines.filter((l) => /^[A-Za-z_]/.test(l)).map((l) => l.split('=')[0]),
       ]);
       for (const k of Object.keys(spin.env || {})) reserved.add(k);
@@ -810,11 +843,15 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     const mk = async (role, hostPort, intPort, curl) => {
       const nm = namingFor(project, role, slug);
       const isProc = runnerOf(role) === 'process';
+      // Process roles share the queenzee's network namespace — stamp the host a cxell already
+      // reaches the queenzee on (CXELL_API_BASE), not the dev machine's ip (TKT-136 defect #2).
+      const roleHost = isProc ? processRoleReachableHost() : devHost;
+      const roleUrl = isProc ? processRolePublishedUrl(hostPort) : curl;
       const { rows: [c] } = await client.query(
         `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,build_ctx,host,host_port,internal_port,url,compose_project,compose_file,owner_xell_id,site_id,health)
          VALUES ($1,$2,'spinoff','per-xell',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
         [projectId, role, nm.container, isProc ? null : nm.image,
-         isProc ? null : devCtx, isProc ? null : defaultBuildCtx, devHost, hostPort, intPort, curl,
+         isProc ? null : devCtx, isProc ? null : defaultBuildCtx, roleHost, hostPort, intPort, roleUrl,
          isProc ? null : nm.composeProject, isProc ? null : project.compose_spinoff,
          xell.id, devSiteId, isProc ? 'down' : health]);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, c.id]);
@@ -918,6 +955,8 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
     }
     await client.query('COMMIT');
     broadcast('xell', xell);
+    // the honeycomb's queenzee→xell line: the queenzee just provisioned this xell
+    activity('q2x', xell.id, 'provision');
     // the harness-free projection rides every REAL provision; failure is logged, never fatal
     // (the xell works without it — the file only serves ZEEHIVE-less compose runs)
     if (mode === 'real') {

@@ -13,7 +13,7 @@
 import { spawnSync, spawn } from 'node:child_process';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
-import { logline } from '../lib/logbus.js';
+import { logline, activity } from '../lib/logbus.js';
 import { cleanGitEnv, worktreeBound } from '../lib/git.js';
 
 // The catch-up creates COMMITS in the host worktree — a stash of stray worktree noise, and the
@@ -235,6 +235,8 @@ export async function pushToXource(xellId, by = 'human@console', { mode = PROVIS
   if (!head.ok) throw new Error('cannot read the xell HEAD');
 
   logline('landgate', `${by} pushed ${x.slug} → ${ref}`);
+  // the honeycomb's xell→queenzee line: this xell pushed to the xource
+  activity('x2q', x.id, 'push');
   // ASYNC push (see gitAsyncPush): this is the call whose `update` hook curls back into this server,
   // so a synchronous push self-deadlocks and the gate raises nothing.
   const r = await gitAsyncPush(x.worktree_path, ['push', '.', `HEAD:${fullRef}`]);

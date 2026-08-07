@@ -447,9 +447,12 @@ try {
   const api = read('web/src/api.js');
   ok(/export async function pauseFleet/.test(api) && /export async function resumeFleet/.test(api),
      'the client has both calls');
-  ok(/'fleet-pause'\]/.test(api),
-     "and 'fleet-pause' rides the SSE change list — a pause on an empty fleet moves nothing else, so "
-     + 'without it every other tab keeps showing the wrong button');
+  // subscribe() went WebSocket-first: the event-type list lives once in STREAM_TYPES and BOTH the
+  // websocket handler and the SSE fallback read it, so 'fleet-pause' must be in that shared list.
+  const stTypes = api.match(/export const STREAM_TYPES = \[([^\]]*)\]/);
+  ok(stTypes && /'fleet-pause'/.test(stTypes[1]),
+     "and 'fleet-pause' rides the live-stream change list — a pause on an empty fleet moves nothing "
+     + 'else, so without it every other tab keeps showing the wrong button');
 
   // ── 8. the control, RENDERED ────────────────────────────────────────────────────────────────────
   // Static greps prove the props are passed; they cannot prove the thing draws. Both states are

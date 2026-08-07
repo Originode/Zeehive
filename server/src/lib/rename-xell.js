@@ -18,6 +18,7 @@ import { computePorts, emitXellEnv } from '../lib/provision.js';
 import { namingFor } from '../lib/manifest.js';
 import { logline } from '../lib/logbus.js';
 import { resolveBash } from './bash.js';
+import { processRoleReachableHost, processRolePublishedUrl } from '../queenzee/containers.js';
 
 const MAX_BASE = 44; // keep the folder name (and the container names built from it) sane
 
@@ -92,8 +93,10 @@ export async function renameXellForTask(xellId, title) {
       `UPDATE xell SET slug=$2, branch=$3, worktree_path=$4, git_dir=$5 WHERE id=$1 RETURNING *`,
       [xellId, newSlug, `spinoff/${newSlug}`, worktree, `${worktree}/.git`]);
     // Names are a pure function of (project naming templates, slug) — same source provision uses.
-    // The URL keeps the row's OWN host (project.dev_host_ip is NULL for machine-placed xells —
-    // interpolating it wrote literal "http://null:PORT" once already); localhost is the fallback.
+    // Process roles: host/url are the queenzee-reachable address (CXELL_API_BASE hostname), not
+    // the dev machine ip — TKT-136 defect #2. Compose roles keep the row's OWN host (project.
+    // dev_host_ip is NULL for machine-placed xells; interpolating it wrote literal "http://null:
+    // PORT" once already); localhost is the fallback.
     for (const [role, port] of [['server', ports.serverPort], ['webapp', ports.webPort]]) {
       const nm = namingFor(project, role, newSlug);
       const isProc = runnerOf(role) === 'process';
@@ -101,12 +104,20 @@ export async function renameXellForTask(xellId, title) {
       // casts Postgres refuses the statement outright ("inconsistent types deduced for
       // parameter $5"), which rolled the whole rename back AFTER the git move (2026-07-19:
       // the first two cxell dispatches each stranded a renamed worktree this way).
-      await client.query(
-        `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5::int,
-                url = 'http://' || COALESCE(host, $6) || ':' || $5::text
-           WHERE owner_xell_id=$1 AND role=$7`,
-        [xellId, nm.container, isProc ? null : nm.image, isProc ? null : nm.composeProject,
-         port, project.dev_host_ip || 'localhost', role]);
+      if (isProc) {
+        await client.query(
+          `UPDATE container SET name=$2, image_tag=NULL, compose_project=NULL, host_port=$3::int,
+                  host=$4, url=$5
+             WHERE owner_xell_id=$1 AND role=$6`,
+          [xellId, nm.container, port, processRoleReachableHost(), processRolePublishedUrl(port), role]);
+      } else {
+        await client.query(
+          `UPDATE container SET name=$2, image_tag=$3, compose_project=$4, host_port=$5::int,
+                  url = 'http://' || COALESCE(host, $6) || ':' || $5::text
+             WHERE owner_xell_id=$1 AND role=$7`,
+          [xellId, nm.container, nm.image, nm.composeProject,
+           port, project.dev_host_ip || 'localhost', role]);
+      }
     }
     await client.query('COMMIT');
     broadcast('xell', row);

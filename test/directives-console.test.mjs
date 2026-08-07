@@ -22,14 +22,17 @@ const require_ = createRequire(import.meta.url);
 const SRC = { canvas: 'web/src/hive/HiveCanvas.jsx', directives: 'web/src/Directives.jsx', app: 'web/src/App.jsx', routes: 'server/src/api/routes.js', fleet: 'server/src/lib/fleet.js' };
 const src = Object.fromEntries(Object.entries(SRC).map(([k, f]) => [k, readFileSync(f, 'utf8')]));
 
-// ── 1. the flower verb: a managed worker and a manager get 🧭, an unmanaged worker does not ──
+// ── 1. the flower verb: EVERY non-prod xell gets 🧭 (its own brief + any conversation) ──
+// The panel leads with the xell's OWN directive (task_text); the manager⇄worker thread is secondary.
+// Hiding 🧭 on unmanaged workers made the button look missing on most hexes — and the context menu
+// reuses petalVerbs, so both surfaces must offer it.
 let mod;
 const tmp = 'web/src/hive/.directives.test-build.mjs';
 try {
   writeFileSync(tmp, transformSync(src.canvas, { loader: 'jsx', format: 'esm' }).code);
   mod = await import('../' + tmp);
 } finally { rmSync(tmp, { force: true }); }
-const { petalVerbs, xellTooltipParts } = mod;
+const { petalVerbs, xellTooltipParts, xellContextMenuItems } = mod;
 
 const base = { stack: [{ role: 'server', name: 's', health: 'up' }], viewer_kind: 'ssh-terminal', viewer_url: 'ssh://x' };
 const managed = { ...base, slug: 'alpha', zee_type: 'worker', manager_slug: 'wise-cove' };
@@ -37,9 +40,14 @@ const unmanaged = { ...base, slug: 'solo', zee_type: 'worker', manager_slug: nul
 const mgr = { ...base, slug: 'wise-cove', zee_type: 'manager' };
 
 const kinds = (x) => Object.values(petalVerbs(x, null)).flat();
+const menuKinds = (x) => xellContextMenuItems(x, null).map((it) => it.kind);
 ok(kinds(managed).includes('directives'), `a worker with a manager is offered 🧭 directives (${kinds(managed).join(',')})`);
 ok(kinds(mgr).includes('directives'), `a manager is offered 🧭 directives (${kinds(mgr).join(',')})`);
-ok(!kinds(unmanaged).includes('directives'), 'a worker nobody manages is not offered a conversation it does not have');
+ok(kinds(unmanaged).includes('directives'),
+   `an unmanaged worker is ALSO offered 🧭 — every xell has a brief (${kinds(unmanaged).join(',')})`);
+ok(menuKinds(unmanaged).includes('directives') && menuKinds(managed).includes('directives')
+   && menuKinds(mgr).includes('directives'),
+   'and the right-click context menu carries 🧭 for the same xells (one source of truth)');
 ok(!kinds({ ...base, is_production: true }).length, 'production still gets no flower buttons at all');
 
 // the HOVER TOOLTIP every xell gets — directive + status, pure

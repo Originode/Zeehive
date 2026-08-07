@@ -68,11 +68,16 @@ ok(/data-testid="work-btn"/.test(app), 'App.jsx has the ▦ work button (data-te
 ok(/projectId=\{[^}]*\}[\s\S]{0,120}projectName=/.test(app.slice(app.indexOf('<WorkConsole'))),
    'the console is given projectId + projectName');
 
-// ── the SSE seam: `work` must be a type subscribe() listens for ──
+// ── the STREAM seam: `work` must be a type the live stream listens for ──
+// subscribe() went WebSocket-first (docs/live-stream-websocket-decision-record.md): the event-type
+// list now lives once in STREAM_TYPES and both the websocket handler and the SSE fallback read it,
+// so this asserts the shared authority rather than one channel's copy.
 const api = read('web/src/api.js');
-const types = api.match(/for \(const type of \[([^\]]*)\]\)/);
-ok(!!types && /'work'/.test(types[1]), "api.js subscribe() listens for the 'work' event type");
-ok(/subscribe/.test(read('web/src/work/WorkConsole.jsx')), 'WorkConsole subscribes to the SSE stream');
+ok(/export const STREAM_TYPES = \[/.test(api), "api.js declares STREAM_TYPES (the one event-type authority)");
+const st = api.match(/export const STREAM_TYPES = \[([^\]]*)\]/);
+ok(!!st && /'work'/.test(st[1]), "STREAM_TYPES includes the 'work' event type");
+ok(/\/api\/stream\/ws/.test(api), 'api.js connects to the /api/stream/ws websocket');
+ok(/subscribe/.test(read('web/src/work/WorkConsole.jsx')), 'WorkConsole subscribes to the live stream');
 
 // ── 3. the status vocabulary is the SERVER'S, not a copy ──
 const board = read('web/src/work/Board.jsx');

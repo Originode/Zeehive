@@ -5,7 +5,9 @@ import {
   githubAccess, pushProject, pullRequestProject, squashHelps, squashOffer,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
-  deleteSharedContainer, refreshProjectManifest, draftProjectManifest, getDockerContexts, getRuntimes, getHarnesses,
+  deleteSharedContainer, refreshProjectManifest, draftProjectManifest,
+  getComposeOnboardingPlan, applyComposeOnboarding,
+  getDockerContexts, getRuntimes, getHarnesses,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
   pauseProviderAccount, resumeProviderAccount, getReposHome, listFsDirs,
   mountHostFolder, purgeDevXells, subscribeCloneProgress, discoverSite, adoptContainers,
@@ -14,6 +16,7 @@ import {
   getProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc, getAgentDocTargets,
   previewProjectDoc,
   getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
+  getWireguard, mintWireguardPeer, setWireguardEndpoint,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -362,7 +365,7 @@ function ProbeChips({ probe }) {
 // gates point AT the tabs — a red 'shippable' is fixed under Deploy, a missing token under
 // Providers). Clicking a gate jumps to the tab that owns it.
 const SETUP_TABS = [
-  { key: 'project', label: 'Project', gates: ['repo', 'main_branch', 'env', 'manifest'] },
+  { key: 'project', label: 'Project', gates: ['repo', 'main_branch', 'env', 'manifest', 'compose_onboarding'] },
   { key: 'deploy', label: 'Deploy', gates: ['dev_site', 'prod_site', 'shippable'] },
   { key: 'docs', label: 'Docs', gates: [] },
   { key: 'env', label: 'Environments', gates: [] },
@@ -407,6 +410,7 @@ function EditSections({ project, onChanged, onProject }) {
       </>}
       {tab === 'deploy' && <>
         <SitesSection project={project} run={run} busy={busy} />
+        <WireguardSection project={project} run={run} busy={busy} />
         <InventorySection project={project} run={run} busy={busy} />
       </>}
       {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
@@ -815,18 +819,208 @@ function BasicsSection({ project, run, onProject }) {
 
 function ManifestSection({ project, run, onProject }) {
   const [draft, setDraft] = useState(null);
-  const refresh = () => run(async () => { const p = await refreshProjectManifest(project.id); onProject(p); setDraft(null); });
+  const [plan, setPlan] = useState(null);
+  const [writeYml, setWriteYml] = useState(true);
+  const [applyMeta, setApplyMeta] = useState(true);
+  const [planErr, setPlanErr] = useState(null);
+
+  const refresh = () => run(async () => { const p = await refreshProjectManifest(project.id); onProject(p); setDraft(null); setPlan(null); });
   const makeDraft = () => run(async () => setDraft((await draftProjectManifest(project.id, false)).draft));
-  const writeDraft = () => run(async () => { await draftProjectManifest(project.id, true); setDraft(null); });
+  const writeDraft = async () => {
+    if (!(await showConfirm(
+      `Write zeehive.yml into ${project.repo_root}?\n\n`
+      + 'This is the ONE file ZEEHIVE may create in a project repo. It will be refused if one already exists. '
+      + 'You still need to commit it. Production containers are not touched.',
+      { okLabel: 'Write zeehive.yml', title: 'Write draft to repo' }))) return;
+    await run(async () => { await draftProjectManifest(project.id, true); setDraft(null); });
+  };
+
+  // Compose onboarding: detect compose files → show the plan → human approves → apply.
+  // The server re-plans on apply and refuses without approved:true.
+  const loadPlan = () => run(async () => {
+    setPlanErr(null);
+    try {
+      const p = await getComposeOnboardingPlan(project.id);
+      setPlan(p);
+      // Default the write toggle to ON only when the plan would actually touch a file.
+      setWriteYml((p.files_to_modify || []).length > 0);
+      setApplyMeta(true);
+    } catch (e) {
+      setPlan(null);
+      setPlanErr(e.message || String(e));
+    }
+  });
+
+  const applyPlan = async () => {
+    if (!plan?.applicable) return;
+    const files = (plan.files_to_modify || []);
+    const meta = (plan.meta_changes || []).filter((c) => c.column !== 'manifest');
+    const lines = [
+      `Apply compose onboarding for ${project.name}?`,
+      '',
+      writeYml && files.length
+        ? `Files that WILL be written:\n${files.map((f) => `  • ${f.action.toUpperCase()} ${f.path} — ${f.detail}`).join('\n')}`
+        : 'Files: none (write zeehive.yml is off)',
+      '',
+      applyMeta
+        ? `Meta-DB project row columns that WILL change:\n${(plan.meta_changes || []).map((c) => `  • ${c.column}: ${c.from ?? '—'} → ${c.to}`).join('\n') || '  (manifest cache only)'}`
+        : 'Meta-DB: none (apply meta-DB is off)',
+      '',
+      'NOT modified (guaranteed):',
+      '  • production / spinoff container rows (live stacks keep their stamped compose_file)',
+      '  • deploy_site.compose_file',
+      ...(plan.warnings || []).length ? ['', 'Warnings:', ...plan.warnings.map((w) => `  ⚠ ${w}`)] : [],
+      '',
+      'Nothing is written until you confirm.',
+    ].filter((x) => x !== false);
+    if (!(await showConfirm(lines.join('\n'), {
+      title: 'Approve compose onboarding',
+      okLabel: 'Apply approved plan',
+      variant: files.some((f) => f.action === 'update') ? 'danger' : undefined,
+    }))) return;
+
+    const result = await run(async () => applyComposeOnboarding(project.id, {
+      approved: true,
+      write_yml: writeYml,
+      apply_meta: applyMeta,
+    }));
+    if (result?.project) onProject(result.project);
+    setPlan(null);
+    await showAlert(
+      `Compose onboarding applied.`
+      + (result?.written?.length ? `\nWrote: ${result.written.map((w) => `${w.action} ${w.path}`).join(', ')}` : '\nNo files written.')
+      + '\nProduction containers were not touched.',
+      { title: 'Onboarding complete' });
+  };
+
   return (
-    <div className="setup-sec">
+    <div className="setup-sec" data-testid="manifest-section">
       <h3>Manifest <span className="pc">{project.manifest_hash ? `cached @ ${project.manifest_hash}` : 'none cached'}</span></h3>
+      <p className="setup-hint">
+        The repo&apos;s <span className="mono">zeehive.yml</span> is the shape truth; the meta-DB holds a
+        cache (<span className="mono">project.manifest</span> + compose columns) the pool and provision
+        paths read. Compose onboarding detects <span className="mono">docker-compose*.yml</span>, shows
+        every file and column that would change, and applies only after you approve — live production
+        containers are never rewritten.
+      </p>
       <div className="setup-row">
-        <button type="button" onClick={refresh}>↻ Refresh from repo</button>
+        <button type="button" onClick={refresh} title="Re-read zeehive.yml into the meta-DB cache">↻ Refresh from repo</button>
         <button type="button" className="ghost" onClick={makeDraft}>Generate draft</button>
-        {draft && <button type="button" onClick={writeDraft}>Write zeehive.yml to repo</button>}
+        {draft && <button type="button" onClick={writeDraft}>Write zeehive.yml to repo…</button>}
+        <button type="button" data-testid="compose-plan-btn"
+                title="Detect compose files and preview meta-DB + yml changes before anything is written"
+                onClick={loadPlan}>Plan compose onboarding</button>
       </div>
       {draft && <textarea className="setup-draft" readOnly value={draft} rows={12} />}
+      {planErr && <div className="projpop-err" data-testid="compose-plan-err">{planErr}</div>}
+      {plan && (
+        <div className="compose-plan" data-testid="compose-plan">
+          <h4>Compose onboarding plan</h4>
+          {!plan.applicable && (
+            <div className="setup-hint">{plan.reason || 'Nothing to apply — already configured.'}</div>
+          )}
+          <div className="compose-plan-block">
+            <div className="compose-plan-label">Detected compose files</div>
+            {(plan.compose_files || []).length === 0
+              ? <div className="setup-hint">none at repo root</div>
+              : <ul className="compose-plan-list">
+                  {plan.compose_files.map((f) => (
+                    <li key={f.file}>
+                      <span className="mono">{f.file}</span>
+                      {f.tier_guess ? <span className="pc"> → tier {f.tier_guess}</span> : <span className="pc"> → (no tier guess)</span>}
+                      {f.services?.length ? <span className="pc"> · services: {f.services.join(', ')}</span> : null}
+                    </li>
+                  ))}
+                </ul>}
+          </div>
+          <div className="compose-plan-block">
+            <div className="compose-plan-label">Files that would be modified</div>
+            {(plan.files_to_modify || []).length === 0
+              ? <div className="setup-hint">none — meta-DB only (or already in sync)</div>
+              : <ul className="compose-plan-list">
+                  {plan.files_to_modify.map((f) => (
+                    <li key={f.path}>
+                      <b>{f.action.toUpperCase()}</b>{' '}
+                      <span className="mono">{f.path}</span>
+                      <div className="pc">{f.detail}</div>
+                    </li>
+                  ))}
+                </ul>}
+          </div>
+          <div className="compose-plan-block">
+            <div className="compose-plan-label">Meta-DB project row changes</div>
+            {(plan.meta_changes || []).length === 0
+              ? <div className="setup-hint">none</div>
+              : <ul className="compose-plan-list">
+                  {plan.meta_changes.map((c) => (
+                    <li key={c.column}>
+                      <span className="mono">{c.column}</span>
+                      {': '}
+                      <span className="pc">{c.from == null || c.from === '' ? '—' : String(c.from)}</span>
+                      {' → '}
+                      <b>{String(c.to)}</b>
+                    </li>
+                  ))}
+                </ul>}
+          </div>
+          <div className="compose-plan-block compose-plan-safe">
+            <div className="compose-plan-label">Guaranteed untouched</div>
+            <ul className="compose-plan-list">
+              <li>Production and spinoff <b>container rows</b> (live stacks keep their stamped compose_file)</li>
+              <li><span className="mono">deploy_site.compose_file</span></li>
+            </ul>
+          </div>
+          {(plan.warnings || []).length > 0 && (
+            <div className="compose-plan-block">
+              <div className="compose-plan-label">Warnings</div>
+              <ul className="compose-plan-list">
+                {plan.warnings.map((w, i) => <li key={i} className="compose-plan-warn">⚠ {w}</li>)}
+              </ul>
+            </div>
+          )}
+          {plan.proposed_yml && (
+            <details className="compose-plan-yml">
+              <summary>Proposed zeehive.yml preview</summary>
+              <textarea className="setup-draft" readOnly value={plan.proposed_yml} rows={14} />
+            </details>
+          )}
+          {plan.applicable && (
+            <div className="compose-plan-actions">
+              <label className="compose-plan-check">
+                <input type="checkbox" checked={writeYml} onChange={(e) => setWriteYml(e.target.checked)}
+                       disabled={(plan.files_to_modify || []).length === 0} />
+                Write / update <span className="mono">zeehive.yml</span> in the repo
+                {(plan.files_to_modify || []).length === 0 ? ' (nothing to write)' : ''}
+              </label>
+              <label className="compose-plan-check">
+                <input type="checkbox" checked={applyMeta} onChange={(e) => setApplyMeta(e.target.checked)} />
+                Apply manifest + compose columns to the meta-DB project row
+              </label>
+              <div className="setup-row">
+                <button type="button" data-testid="compose-apply-btn"
+                        disabled={!writeYml && !applyMeta}
+                        onClick={applyPlan}>
+                  Review &amp; approve…
+                </button>
+                <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss plan</button>
+              </div>
+            </div>
+          )}
+          {!plan.applicable && (
+            <div className="setup-row">
+              <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss</button>
+            </div>
+          )}
+        </div>
+      )}
+      <div className="setup-grid" style={{ marginTop: 8 }}>
+        <label>compose_spinoff <span className="pc">(meta-DB)</span>
+          <input readOnly value={project.compose_spinoff || ''} placeholder="(unset)" /></label>
+        <label>compose_prod <span className="pc">(meta-DB)</span>
+          <input readOnly value={project.compose_prod || ''} placeholder="(unset)" /></label>
+        <label>compose_dev <span className="pc">(meta-DB)</span>
+          <input readOnly value={project.compose_dev || ''} placeholder="(unset)" /></label>
+      </div>
     </div>
   );
 }
@@ -882,6 +1076,161 @@ function SitesSection({ project, run, busy }) {
           (the approve dialog offers the choice when there is more than one).
         </div>
       )}
+    </div>
+  );
+}
+
+// WIREGUARD MESH — ZEEHIVE operated (docs/common-xell-network-plan.md, Decision 5.4). The human's
+// door onto the network: a ready .conf to download and import into their WG client. The mesh server
+// (public key, endpoint, address space) is minted lazily on first download; peers are keypairs the
+// server allocates and hands out. The private key lives ONLY in the downloaded file, never stored.
+//
+// The inline section is a compact STATUS SUMMARY; the full mesh state (server identity, every peer,
+// the download + endpoint editor) lives in a proper MODAL — WireguardModal below — so the summary
+// stays one glance and the detail opens on demand, matching how Deploy sites unfold their editors.
+function WireguardSection({ project, run, busy }) {
+  const [state, setState] = useState(null);
+  const [open, setOpen] = useState(false);
+  const load = useCallback(() => getWireguard(project.id).then(setState).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const srv = state?.server;
+  return (
+    <div className="setup-sec">
+      <h3>WireGuard <span className="pc">(the ZEEHIVE network — download a config to join)</span></h3>
+      {!state?.enabled ? (
+        <div className="pc">Not set up yet. The first download mints the mesh identity and gives you a peer config.</div>
+      ) : (
+        <div className="setup-row">
+          <span className="mono" title="the mesh server's public key">🔑 {srv.public_key.slice(0, 12)}…</span>
+          <span className="mono" title="where peers dial">{srv.endpoint}</span>
+          <span className="mono" title="the mesh address space">{srv.address}</span>
+          <span className="pc">{state.peers.length} peer{state.peers.length === 1 ? '' : 's'}</span>
+        </div>
+      )}
+      <div className="setup-row">
+        <button type="button" onClick={() => setOpen(true)}>🗀 Open status</button>
+      </div>
+      {open && <WireguardModal project={project} run={run} busy={busy}
+                               onClose={() => setOpen(false)} onChanged={load} />}
+    </div>
+  );
+}
+
+// The full WireGuard status as a modal — the "proper modalstatus". A real dialog (portaled, click-
+// outside / Esc to close, reusing the term-overlay pattern already in this file) showing:
+//   • the mesh server: public key (full, copyable), endpoint, address space;
+//   • every joined peer (name, tunnel IP, public key, when it was downloaded);
+//   • the two actions that change the mesh — download a config (mints a peer) and re-point the
+//     endpoint. The private key appears ONLY in the downloaded file, never here.
+function WireguardModal({ project, run, busy, onClose, onChanged }) {
+  const [state, setState] = useState(null);
+  const [peerName, setPeerName] = useState('');
+  const [endpoint, setEndpoint] = useState('');
+  const [err, setErr] = useState(null);
+  const load = useCallback(() => getWireguard(project.id).then(setState).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const download = async () => {
+    setErr(null);
+    try {
+      const { blob, filename } = await mintWireguardPeer(project.id, { name: peerName.trim() || null });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      await load(); onChanged?.();
+    } catch (e) { setErr(e.message); }
+  };
+
+  const saveEndpoint = async () => {
+    setErr(null);
+    try { await setWireguardEndpoint(project.id, endpoint.trim()); await load(); }
+    catch (e) { setErr(e.message); }
+  };
+
+  const srv = state?.server;
+  return (
+    <div className="term-overlay" onClick={onClose} data-testid="wireguard-modal">
+      <div className="wg-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="term-head">
+          <span className="term-title">🛡 WireGuard — {project.name}</span>
+          <button className="term-x" onClick={onClose} title="Close">✕</button>
+        </div>
+        <div className="setup-body">
+          {!state?.enabled ? (
+            <div className="pc">
+              This project has no WireGuard mesh yet. The first download mints the mesh identity
+              (server key + address space) and gives you a peer config to import.
+            </div>
+          ) : (
+            <>
+              <div className="setup-sec">
+                <h3>Server <span className="pc">(what peers dial)</span></h3>
+                <div className="setup-grid">
+                  <label>Public key
+                    <input className="mono" readOnly value={srv.public_key}
+                           onFocus={(e) => e.target.select()} title="the mesh server's public key" />
+                  </label>
+                  <label>Endpoint
+                    <input className="mono" value={endpoint || srv.endpoint}
+                           placeholder={srv.endpoint}
+                           onChange={(e) => setEndpoint(e.target.value)} />
+                  </label>
+                  <label>Address space
+                    <input className="mono" readOnly value={srv.address} />
+                  </label>
+                  <label>Listen port
+                    <input className="mono" readOnly value={srv.listen_port} />
+                  </label>
+                </div>
+                {endpoint.trim() && endpoint.trim() !== srv.endpoint && (
+                  <div className="setup-row">
+                    <button type="button" disabled={busy} onClick={saveEndpoint}>Save endpoint</button>
+                  </div>
+                )}
+              </div>
+
+              <div className="setup-sec">
+                <h3>Peers <span className="pc">(who has joined)</span></h3>
+                {state.peers.length === 0 ? (
+                  <div className="pc">No peers yet — download a config below to join the mesh.</div>
+                ) : (
+                  <table className="wg-peers">
+                    <thead><tr><th>name</th><th>tunnel IP</th><th>public key</th><th>downloaded</th></tr></thead>
+                    <tbody>
+                      {state.peers.map((p) => (
+                        <tr key={p.id}>
+                          <td>{p.name}</td>
+                          <td className="mono">{p.address}</td>
+                          <td className="mono" title={p.public_key}>{p.public_key.slice(0, 12)}…</td>
+                          <td>{p.downloaded_at ? new Date(p.downloaded_at).toLocaleString() : 'never'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </>
+          )}
+
+          <div className="setup-sec">
+            <h3>Join <span className="pc">(mint a peer config — the private key is only in the file)</span></h3>
+            <div className="setup-row">
+              <input placeholder="peer name (e.g. my-laptop)" value={peerName}
+                     onChange={(e) => setPeerName(e.target.value)} />
+              <button type="button" disabled={busy} onClick={download}>⬇ Download config</button>
+            </div>
+          </div>
+          {err && <div className="land-err">{err}</div>}
+        </div>
+      </div>
     </div>
   );
 }

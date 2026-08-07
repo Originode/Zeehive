@@ -51,9 +51,50 @@ const lastErr = (r, fallback) => (r.err || r.out || '').trim().split('\n').filte
 
 const hasDir = (repoRoot, name) => existsSync(join(repoRoot, '.git', name));
 
+// Parse one `git status --porcelain` line into { path, index, worktree, kind }.
+// XY path  — X = index (staged) status, Y = worktree (unstaged) status; '??' is untracked.
+// A rename is "R  old -> new"; we keep the new path and note the old.
+function parsePorcelainLine(line) {
+  if (!line || line.length < 3) return null;
+  const x = line[0], y = line[1];
+  let rest = line.slice(3);
+  let path = rest, old_path = null;
+  if ((x === 'R' || x === 'C' || y === 'R' || y === 'C') && rest.includes(' -> ')) {
+    const parts = rest.split(' -> ');
+    old_path = parts[0];
+    path = parts.slice(1).join(' -> ');
+  }
+  path = path.trim();
+  if (!path) return null;
+  if (x === '?' && y === '?') return { path, index: '?', worktree: '?', kind: 'untracked' };
+  const kinds = [];
+  if (x !== ' ' && x !== '?') kinds.push('staged');
+  if (y !== ' ' && y !== '?') kinds.push('unstaged');
+  return { path, old_path, index: x, worktree: y, kind: kinds.join('+') || 'other',
+    status: statusLetter(x !== ' ' && x !== '?' ? x : y) };
+}
+
+function statusLetter(c) {
+  return ({ M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied',
+    U: 'unmerged', T: 'typechange' })[c] || (c === '?' ? 'untracked' : 'changed');
+}
+
+// Shortstat of a diff → { files, insertions, deletions, shortstat }. Empty tree → zeros.
+function parseShortstat(text) {
+  const s = String(text || '').trim();
+  return {
+    files: +(s.match(/(\d+) files? changed/)?.[1] || 0),
+    insertions: +(s.match(/(\d+) insertions?/)?.[1] || 0),
+    deletions: +(s.match(/(\d+) deletions?/)?.[1] || 0),
+    shortstat: s || 'no changes',
+  };
+}
+
 // READ-ONLY — what state is the xource in? Pure git reads, never a write. The console renders
 // this beside the Clean button (so a human sees WHY a clean is needed, and can confirm the fix
-// afterwards), and the request card carries the before/after.
+// afterwards), the request card carries the before/after, and the git-graph tip paints a broken
+// pipe when anything is STAGED on main (which should never happen — landings and ships both
+// assume a clean index).
 export function xourceState(repoRoot, mainBranch = 'main') {
   const dir = String(repoRoot || '').trim();
   if (!dir) return { ok: false, error: 'no repo_root' };
@@ -65,9 +106,17 @@ export function xourceState(repoRoot, mainBranch = 'main') {
   const branch = branchR.ok ? branchR.out || null : null;
   const head = git(dir, ['rev-parse', 'HEAD']).out || null;
   const porcelain = git(dir, ['status', '--porcelain']).out.split('\n').filter(Boolean);
-  const staged = git(dir, ['diff', '--cached', '--name-only']).out.split('\n').filter(Boolean);
-  const unstaged = git(dir, ['diff', '--name-only']).out.split('\n').filter(Boolean);
-  const untracked = porcelain.filter((l) => l.startsWith('??')).map((l) => l.slice(3).trim());
+  const entries = porcelain.map(parsePorcelainLine).filter(Boolean);
+  // .claude/ worktrees are NOT dirt: every xell's worktree lives under it and a clean must never
+  // read them as something to wipe. Filter them out of every rogue-file list.
+  const visible = entries.filter((e) => !e.path.startsWith('.claude'));
+  const staged = visible.filter((e) => e.kind.includes('staged'));
+  const unstaged = visible.filter((e) => e.kind.includes('unstaged'));
+  const untracked = visible.filter((e) => e.kind === 'untracked');
+  // Keep the legacy path-string shapes the Project-setup section and older callers already read.
+  const stagedPaths = staged.map((e) => e.path);
+  const unstagedPaths = unstaged.map((e) => e.path);
+  const untrackedPaths = untracked.map((e) => e.path);
   const stash = git(dir, ['stash', 'list']).out.split('\n').filter(Boolean).length;
   const onMain = branch === mainBranch;
   const detached = branch === null && head !== null && git(dir, ['symbolic-ref', '-q', 'HEAD']).out === '';
@@ -76,24 +125,38 @@ export function xourceState(repoRoot, mainBranch = 'main') {
     || git(dir, ['rev-parse', '--verify', '-q', 'REBASE_HEAD']).ok;
   const cherryPickInProgress = hasDir(dir, 'CHERRY_PICK_HEAD');
   const revertInProgress = hasDir(dir, 'REVERT_HEAD');
-  // The "uncommitted work in the main checkout" count — TRACKED changes plus untracked junk. A
-  // .claude/ worktree is NOT counted: it is the one untracked thing that is SUPPOSED to be there
-  // (every xell's worktree lives under it), and a clean must never read it as dirt.
-  const untrackedVisible = untracked.filter((p) => !p.startsWith('.claude'));
-  const dirty = staged.length + unstaged.length + untrackedVisible.length;
+  // TRACKED changes plus untracked junk — the count that blocks landings/ships.
+  const dirty = stagedPaths.length + unstagedPaths.length + untrackedPaths.length;
+  // Diff stats for the two buckets a human acts on (clear vs commit). Pure reads.
+  const stagedDiff = parseShortstat(git(dir, ['diff', '--cached', '--shortstat']).out);
+  const unstagedDiff = parseShortstat(git(dir, ['diff', '--shortstat']).out);
   const clean = !mergeInProgress && !rebaseInProgress && !cherryPickInProgress
     && !revertInProgress && dirty === 0 && !detached && onMain;
   return {
     ok: true, repo_root: dir.replace(/\\/g, '/'), main_branch: mainBranch,
     branch, head, clean, blocked: !clean, dirty,
-    staged: staged.map((p) => ({ path: p, kind: 'staged' })),
-    unstaged, untracked: untrackedVisible, stash_count: stash,
+    // has_staged is the git-graph tip signal: anything in the index on the xource is a broken
+    // pipe — landings refuse over a dirty tree, and the tip should say so without a dig into
+    // Project setup.
+    has_staged: stagedPaths.length > 0,
+    staged_count: stagedPaths.length,
+    // Rich file rows for the broken-pipe popover (path + status letter meaning).
+    files: visible.map((e) => ({
+      path: e.path, old_path: e.old_path || null,
+      kind: e.kind, status: e.status,
+      index: e.index, worktree: e.worktree,
+    })),
+    // Legacy shapes (Project setup / older tests): staged as {path,kind}, unstaged/untracked as paths.
+    staged: stagedPaths.map((p) => ({ path: p, kind: 'staged' })),
+    unstaged: unstagedPaths, untracked: untrackedPaths, stash_count: stash,
+    diff: { staged: stagedDiff, unstaged: unstagedDiff },
     merge_in_progress: mergeInProgress, rebase_in_progress: rebaseInProgress,
     cherry_pick_in_progress: cherryPickInProgress, revert_in_progress: revertInProgress,
     detached, on_main: onMain,
     // A one-line human sentence for the console/request card.
     summary: summaryOf({ clean, branch, mainBranch, dirty, mergeInProgress, rebaseInProgress,
-      cherryPickInProgress, revertInProgress, detached, onMain, stash }),
+      cherryPickInProgress, revertInProgress, detached, onMain, stash,
+      staged: stagedPaths.length }),
   };
 }
 
@@ -101,6 +164,7 @@ function summaryOf(s) {
   const bits = [];
   if (s.clean) return `clean — ${s.branch} is level and untouched`;
   if (!s.onMain) bits.push(s.detached ? `DETACHED HEAD (not on ${s.mainBranch})` : `on '${s.branch}', not ${s.mainBranch}`);
+  if (s.staged) bits.push(`${s.staged} staged path(s)`);
   if (s.dirty) bits.push(`${s.dirty} uncommitted path(s)`);
   if (s.mergeInProgress) bits.push('a MERGE is in progress');
   if (s.rebaseInProgress) bits.push('a REBASE is in progress');
@@ -108,6 +172,119 @@ function summaryOf(s) {
   if (s.revertInProgress) bits.push('a REVERT is in progress');
   if (s.stash) bits.push(`${s.stash} stash(es)`);
   return bits.join(' · ') + ' — landings/ships are BLOCKED until this is cleaned';
+}
+
+// COMMIT the xource's STAGED index as a real commit on main. The rare recovery path when
+// something left work in the index that a human wants to KEEP rather than discard: the broken-
+// pipe popover on the git-graph tip offers "Commit it" next to "Clear it". Clear is
+// performXourceClean (discard); this is the keep. Never auto-stages — only what is already in
+// the index lands in the commit, so a half-edited worktree does not ride along by accident.
+//
+// Same PROVISION_MODE guard as clean: a nested queenzee must not move the real main tip.
+export async function commitXourceStaged(projectId, {
+  message = null, by = 'human@console', mode = PROVISION_MODE,
+} = {}) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+  if (!project) throw new Error('unknown project');
+  const main = project.main_branch || 'main';
+  const before = xourceState(project.repo_root, main);
+  if (!before.ok) throw new Error(before.error || 'cannot read xource');
+  if (!before.has_staged) {
+    throw new Error('nothing is staged on the xource — there is nothing to commit. '
+      + 'If the tree is dirty but unstaged, stage the paths you want (or Clear to discard them).');
+  }
+  const msg = String(message || '').trim();
+  if (!msg) throw new Error('a commit message is required — this lands on main and is the line the next landing/ship sees');
+
+  if (mode !== 'real') {
+    logline('xource-commit', `commit on ${project.name} NOT run — PROVISION_MODE=simulate (this queenzee models the fleet)`);
+    return {
+      ok: true, dry_run: true, mode, before, after: before,
+      commit: null, message: msg, by,
+      note: 'NOT run — simulate mode models the fleet; the real xource index was not committed',
+    };
+  }
+
+  // Refuse mid-merge/rebase etc.: a commit there would be a merge-resolution commit the human
+  // did not mean to author from this popover. Clear (abort + reset) is the right door for those.
+  if (before.merge_in_progress || before.rebase_in_progress
+      || before.cherry_pick_in_progress || before.revert_in_progress) {
+    throw new Error('a merge/rebase/cherry-pick/revert is in progress on the xource — '
+      + 'Clear it (abort + reset) rather than committing a half-finished resolution from here');
+  }
+  if (!before.on_main) {
+    throw new Error(`xource is not on ${main} (on '${before.branch || 'DETACHED'}') — `
+      + 'check out main (or Clear) before committing staged work onto the tip');
+  }
+
+  const r = git(project.repo_root, ['commit', '-m', msg], 60000);
+  if (!r.ok) {
+    throw new Error(`git commit failed: ${lastErr(r, 'no output')}`);
+  }
+  const newHead = git(project.repo_root, ['rev-parse', 'HEAD']).out || null;
+  try {
+    await recordXourceHead(project, main, newHead || headCommit(project.repo_root, main));
+  } catch { /* advisory — a commit must never fail on bookkeeping */ }
+
+  const after = xourceState(project.repo_root, main);
+  broadcast('xource-clean', { project_id: projectId, kind: 'commit', commit: newHead });
+  broadcast('project', { id: projectId });
+  logline('xource-commit', `xource commit by ${by} on ${project.name}: ${String(newHead || '').slice(0, 8)} — ${msg.slice(0, 80)}`);
+  return {
+    ok: true, dry_run: false, before, after,
+    commit: newHead, short: newHead ? newHead.slice(0, 7) : null,
+    message: msg, by, output: (r.out || '').trim(),
+  };
+}
+
+// STASH the xource's dirty work (staged + unstaged + untracked, excluding ignored .claude/).
+// The third recovery door on the broken-pipe modal: Clear discards, Commit keeps on main, Stash
+// parks the dirt on the stash stack so the checkout is clean and landings/ships can move — the
+// human can `git stash pop` later from a shell if they still want it. Same PROVISION_MODE guard.
+export async function stashXource(projectId, {
+  message = null, by = 'human@console', mode = PROVISION_MODE,
+} = {}) {
+  const project = await one(`SELECT * FROM project WHERE id=$1`, [projectId]);
+  if (!project) throw new Error('unknown project');
+  const main = project.main_branch || 'main';
+  const before = xourceState(project.repo_root, main);
+  if (!before.ok) throw new Error(before.error || 'cannot read xource');
+  if (before.clean || before.dirty === 0) {
+    throw new Error('the xource is already clean — there is nothing to stash');
+  }
+  // Mid-merge/rebase: stash can refuse or leave the tree worse. Clear (abort) is the right door.
+  if (before.merge_in_progress || before.rebase_in_progress
+      || before.cherry_pick_in_progress || before.revert_in_progress) {
+    throw new Error('a merge/rebase/cherry-pick/revert is in progress on the xource — '
+      + 'Clear it (abort + reset) rather than stashing a half-finished resolution');
+  }
+
+  const msg = String(message || '').trim()
+    || `zeehive: xource stash by ${by} (${before.dirty} path(s))`;
+
+  if (mode !== 'real') {
+    logline('xource-stash', `stash on ${project.name} NOT run — PROVISION_MODE=simulate`);
+    return {
+      ok: true, dry_run: true, mode, before, after: before, message: msg, by,
+      note: 'NOT run — simulate mode models the fleet; the real xource was not stashed',
+    };
+  }
+
+  // -u includes untracked junk (the same dirt landings refuse over). Ignored paths (.claude/,
+  // .env when ignored) stay put — xell worktrees must never ride into a stash.
+  const r = git(project.repo_root, ['stash', 'push', '-u', '-m', msg], 60000);
+  if (!r.ok) {
+    throw new Error(`git stash failed: ${lastErr(r, 'no output')}`);
+  }
+  const after = xourceState(project.repo_root, main);
+  broadcast('xource-clean', { project_id: projectId, kind: 'stash' });
+  broadcast('project', { id: projectId });
+  logline('xource-stash', `xource stashed by ${by} on ${project.name}: ${msg.slice(0, 80)}`);
+  return {
+    ok: true, dry_run: false, before, after, message: msg, by,
+    output: (r.out || '').trim(),
+    stash_count: after.stash_count,
+  };
 }
 
 // THE CLEANUP — pure git, run on the xource. Returns { ok, before, after, steps }. `ok` is the

@@ -70,9 +70,18 @@ ok(wm.find((it) => it.kind === 'terminal')?.label === '⌨ Terminal',
    'terminal reads as a word (the flower draws just ⌨)');
 ok(wm.find((it) => it.kind === 'pause')?.label === '⏸ Pause', 'pause reads as a word');
 ok(wm.find((it) => it.kind === 'nudge')?.label === '💬 Nudge', 'nudge reads as a word');
-ok(wm.find((it) => it.kind === 'build')?.label === '🔨 build', 'build keeps its flower label');
+ok(wm.find((it) => it.kind === 'build')?.label === '🔨 Build',
+   'build reads as a word (the flower draws just 🔨)');
+ok(wm.find((it) => it.kind === 'env')?.label === '❖ Environment',
+   'env reads as a word (the flower draws just ❖)');
+ok(wm.find((it) => it.kind === 'message')?.label === '📨 Message',
+   'message reads as a word (the flower draws just 📨)');
+ok(wm.find((it) => it.kind === 'swap')?.label === '♻ Swap zee',
+   'swap reads as a word (the flower draws just ♻)');
+ok(wm.find((it) => it.kind === 'directives')?.label === '🧭 Directives',
+   'directives is on the menu (and the flower) for every non-prod xell');
 ok(wm.find((it) => it.kind === 'done')?.label === '✓ mark done',
-   'done carries the stateful label (confirm/mark/clean-up), the same string the flower draws');
+   'done carries the stateful full-word label (confirm/mark/clean-up) — the flower draws just ✓/✕');
 ok(wm.find((it) => it.kind === 'done')?.tone === 'danger', 'done is marked destructive (red row)');
 ok(wm.find((it) => it.kind === 'pause')?.tone === 'danger', 'pause is marked destructive too');
 

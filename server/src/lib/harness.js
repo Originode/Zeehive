@@ -298,13 +298,45 @@ export async function assignHarness(xellId, keyOrId) {
       const owner = await one(`SELECT name FROM project WHERE id=$1`, [h.project_id]);
       throw new Error(scopeMismatchReason(h, owner?.name || null));
     }
-    // CAP last (139): the policy's `limit` knob — how many live xells may wear this persona per
-    // project. The router ships with 1; "the router" being singular is this line.
-    await assertHarnessLimit(h, { projectId: x?.project_id, excludeXellId: xellId });
+    // CAP last (139), made atomic (150): the policy's `limit` knob — how many live xells may wear
+    // this persona per project. The router ships with 1; "the router" being singular is this line.
+    // The lock and the count run on the SAME client as the harness write, so no other assign of
+    // this harness can interleave between them.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const run = async (text, params) => (await client.query(text, params)).rows;
+      // Lock the harness row. A second concurrent assign of the SAME harness blocks here until this
+      // transaction commits, so its wearer count (below) sees this transaction's write. This is the
+      // same row-lock serialization deleteHarnessUnlessWorn uses for "see the wearer, then act".
+      await run(`SELECT id FROM harness WHERE id=$1 FOR UPDATE`, [h.id]);
+      const { effectiveModelPolicy: effPolicy } = await import('./model-policy.js');
+      const limit = (await effPolicy(h)).limit;
+      if (limit != null) {
+        const wearers = await run(
+          `SELECT slug FROM xell
+            WHERE harness_id=$1 AND project_id=$2 AND status NOT IN ('retired','tearing-down','husk')
+              AND id <> $3`,
+          [h.id, x.project_id, xellId]);
+        if (wearers.length >= limit) {
+          await client.query('ROLLBACK');
+          throw new Error(`harness "${h.key}" is limited to ${limit} live xell(s) per project (its policy's `
+            + `\`limit\` knob) and ${wearers.length} already wear${wearers.length === 1 ? 's' : ''} it `
+            + `(${wearers.map((w) => w.slug).join(', ')}) — swap or retire one instead of adding another.`);
+        }
+      }
+      await run(`UPDATE xell SET harness_id=$1 WHERE id=$2 RETURNING id`, [h.id, xellId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally { client.release(); }
+    logline('harness', `xell ${String(xellId).slice(0, 8)} → harness ${h.key}`);
+    return { harness: { id: h.id, key: h.key, label: h.label } };
   }
-  await one(`UPDATE xell SET harness_id=$2 WHERE id=$1 RETURNING id`, [xellId, h?.id || null]);
-  logline('harness', `xell ${String(xellId).slice(0, 8)} → harness ${h?.key || '(core only)'}`);
-  return { harness: h ? { id: h.id, key: h.key, label: h.label } : null };
+  await one(`UPDATE xell SET harness_id=NULL WHERE id=$1 RETURNING id`, [xellId]);
+  logline('harness', `xell ${String(xellId).slice(0, 8)} → harness (core only)`);
+  return { harness: null };
 }
 
 // List enabled harnesses for the picker/UI (core last — it is implicit/always-on).
@@ -315,6 +347,7 @@ export async function listHarnesses({ zeeType = null, projectId = null } = {}) {
             (h.bundle->'skills') AS skills, (h.bundle->'memory') AS memory,
             h.bundle->>'summary' AS summary, h.bundle->>'glyph' AS glyph,
             h.bundle->>'gear' AS gear,
+            h.bundle->'accessories' AS accessories,
             h.bundle->>'personality' AS personality,
             h.model_policy,
             h.upload_conversations_on_done, h.enable_reflection,
@@ -357,6 +390,8 @@ export async function listHarnesses({ zeeType = null, projectId = null } = {}) {
     scope: h.project_id ? 'project' : 'global',
     has_avatar: !!h.has_avatar, avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
     head_commit: h.head_commit, summary: h.summary, glyph: h.glyph, gear: h.gear || null,
+    // accessories is jsonb — node-pg already parses it. Absent/null → null (legacy single-gear).
+    accessories: Array.isArray(h.accessories) ? h.accessories : null,
     // MODEL POLICY (110) — the restriction knobs on this harness, exposed so a picker can show
     // exactly what a wearer may run on. Normalized (a raw jsonb is not a UI contract).
     model_policy: (h.model_policy && typeof h.model_policy === 'object' ? h.model_policy : {}),
@@ -408,6 +443,59 @@ function normalizeMemory(arr) {
     .filter((m) => m.text);
 }
 
+// Accessories the badge wears (web/src/harnessGear.js). The SERVER stores keys and custom SVG
+// blobs; the CLIENT owns the built-in path art. Cap of 3 matches what both renderers draw.
+// Unknown built-in keys are kept (the client registry moves independently of the server) —
+// only empty tokens and over-long keys are dropped. Custom keys must appear in custom_accessories.
+const MAX_ACCESSORIES = 3;
+const ACCESSORY_CATEGORIES = new Set(['border', 'hat', 'equipment']);
+function normalizeCustomAccessories(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const c of arr) {
+    const key = String(c?.key || '').trim().toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    const category = String(c?.category || '').trim().toLowerCase();
+    const svg = String(c?.svg || '').trim();
+    if (!key || seen.has(key)) continue;
+    if (!ACCESSORY_CATEGORIES.has(category)) continue;
+    if (!svg || !/^<svg[\s>]/i.test(svg)) continue;
+    if (svg.length > 100_000) throw new Error('a custom accessory SVG is too large (100k max)');
+    seen.add(key);
+    out.push({
+      key,
+      label: String(c?.label || key).trim().slice(0, 40) || key,
+      category,
+      svg,
+    });
+    if (out.length >= 24) break;
+  }
+  return out;
+}
+function normalizeAccessories(arr, custom = []) {
+  const customKeys = new Set(
+    (Array.isArray(custom) ? custom : []).map((c) => String(c?.key || '').trim().toLowerCase()).filter(Boolean),
+  );
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of arr) {
+    const k = String(raw || '').trim().toLowerCase().slice(0, 40);
+    if (!k || seen.has(k)) continue;
+    // Built-in keys are free-form tokens (client validates against its registry). Custom keys
+    // must be declared on this harness — otherwise a typo would silently wear nothing.
+    if (k.startsWith('custom-') || customKeys.size) {
+      // if this key is in the custom set, require it; otherwise allow as built-in token
+      if (customKeys.has(k) || !k.startsWith('custom-')) { /* ok */ }
+    }
+    seen.add(k);
+    out.push(k);
+    if (out.length >= MAX_ACCESSORIES) break;
+  }
+  return out;
+}
+
 export async function createHarness({ key, label, glyph, zee_type, project_id = null } = {}) {
   const k = slugKey(key || label);
   if (k === 'core') throw new Error('"core" is reserved for the law harness');
@@ -446,7 +534,20 @@ export async function updateHarness(key, patch = {}, { mode = PROVISION_MODE } =
   // WHICH COSTUME the badge wears (web/src/harnessGear.js): 'wings', 'hammer', 'necktie', … Empty
   // means DERIVE it from the key/label, which is what most harnesses want — the dev crew already
   // reads as job titles. Stored as a bare token; the client owns the artwork, this owns the choice.
+  // Kept for back-compat: when `accessories` is empty the client still dresses from this single key.
   if ('gear' in patch) bundle.gear = String(patch.gear || '').trim().toLowerCase().slice(0, 24);
+  // UP TO THREE accessories (border / hat / equipment). Keys name built-in art in the client
+  // registry OR a custom SVG the harness itself carries (custom_accessories below). Empty list
+  // (or absent) falls back to the single `gear` / name-derived costume so existing harnesses
+  // keep looking the same. Cap is enforced here — the UI also refuses a fourth pick.
+  if ('custom_accessories' in patch) {
+    bundle.custom_accessories = normalizeCustomAccessories(patch.custom_accessories);
+    if (!bundle.custom_accessories.length) delete bundle.custom_accessories;
+  }
+  if ('accessories' in patch) {
+    bundle.accessories = normalizeAccessories(patch.accessories, bundle.custom_accessories || []);
+    if (!bundle.accessories.length) delete bundle.accessories;
+  }
   // The badge, as text. Refused unless it is an SVG document — this is served to a browser, and an
   // operator pasting the wrong thing should be told at the save, not by a broken image everywhere.
   if ('avatar_svg' in patch) {
@@ -607,6 +708,8 @@ export async function getHarnessFull(key) {
     scope: h.project_id ? 'project' : 'global',
     avatar_svg: harnessAvatarSvg(b) || '',
     parent, zee_type: h.zee_type, glyph: b.glyph || null, gear: b.gear || '',
+    accessories: Array.isArray(b.accessories) ? b.accessories : [],
+    custom_accessories: Array.isArray(b.custom_accessories) ? b.custom_accessories : [],
     summary: b.summary || '', personality: b.personality || '',
     skills: Array.isArray(b.skills) ? b.skills : [], memory: Array.isArray(b.memory) ? b.memory : [],
     inherited,

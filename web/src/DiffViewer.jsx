@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { getXellPatch, getLandPatch } from './api.js';
+import { getXellPatch, getLandPatch, getXourcePatch } from './api.js';
 
 // ── THE DIFF VIEWER — click a diffstat, read the diff ───────────────────────────────────────────
 //
@@ -15,6 +15,7 @@ import { getXellPatch, getLandPatch } from './api.js';
 //
 //   showDiff({ kind: 'xell', xellId, diffKind: 'source'|'own', title, subtitle })
 //   showDiff({ kind: 'land', landId, title, subtitle })
+//   showDiff({ kind: 'xource', projectId, scope: 'staged'|'unstaged'|'all', focusPath?, title, subtitle })
 //
 // Read-only, always: it renders a patch the server read. Nothing here can change what lands.
 
@@ -125,10 +126,25 @@ function Viewer({ target, onClose }) {
   useEffect(() => {
     let dead = false;
     setState({ loading: true });
+    setClosed(new Set());
     const p = target.kind === 'land'
       ? getLandPatch(target.landId)
-      : getXellPatch(target.xellId, target.diffKind || 'source');
-    p.then((d) => { if (!dead) setState({ loading: false, data: d }); })
+      : target.kind === 'xource'
+        ? getXourcePatch(target.projectId, target.scope || 'all')
+        : getXellPatch(target.xellId, target.diffKind || 'source');
+    p.then((d) => {
+      if (dead) return;
+      setState({ loading: false, data: d });
+      // Optional focusPath (broken-pipe file click): collapse every other file and scroll to it.
+      const focus = target.focusPath;
+      if (focus && Array.isArray(d?.files) && d.files.length) {
+        const others = d.files.map((f) => f.path).filter((p) => p !== focus);
+        setClosed(new Set(others));
+        requestAnimationFrame(() => {
+          fileRefs.current[focus]?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        });
+      }
+    })
      .catch((e) => { if (!dead) setState({ loading: false, error: e?.message || String(e) }); });
     return () => { dead = true; };
   }, [target.seq]);
@@ -178,6 +194,7 @@ function Viewer({ target, onClose }) {
           <div className="dv-meta" data-testid="diff-meta">
             {data.source === 'cxell' ? 'read from inside the cxell'
               : data.source === 'worktree' ? 'read from the xell worktree'
+              : data.source === 'xource' ? 'read from the xource checkout (live dirty tree)'
               : 'read from the xource'}
             {data.base && <> · <code>{String(data.base).slice(0, 10)}</code></>}
             {data.head && <> → <code>{String(data.head).slice(0, 10)}</code></>}

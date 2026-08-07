@@ -172,6 +172,8 @@ export async function getTimeline(projectId, n = 250) {
     const hrows = await q(
       `SELECT id, key, label, head_commit, is_law_core, (bundle->>'avatar_svg') IS NOT NULL AS has_avatar,
               bundle->>'summary' AS summary, bundle->>'glyph' AS glyph, bundle->>'gear' AS gear,
+              bundle->'accessories' AS accessories,
+              bundle->'custom_accessories' AS custom_accessories,
               bundle->>'personality' AS personality, (bundle->'skills') AS skills, (bundle->'memory') AS memory
          FROM harness WHERE id = ANY($1::uuid[]) AND enabled`, [assignedHarnessIds]);
     harnesses = hrows.map((h, i) => {
@@ -179,6 +181,8 @@ export async function getTimeline(projectId, n = 250) {
       const wearers = anchored.filter((a) => a.harness_id === h.id);
       return {
         id: h.id, key: h.key, label: h.label, summary: h.summary, glyph: h.glyph, gear: h.gear,
+        accessories: Array.isArray(h.accessories) ? h.accessories : null,
+        custom_accessories: Array.isArray(h.custom_accessories) ? h.custom_accessories : null,
         ...harnessHealth(h),
         avatar_url: h.has_avatar ? `/api/harnesses/${h.key}/avatar` : null,
         base_commit: hbase,

@@ -144,6 +144,7 @@ try {
     { match: /npm install --no-audit --no-fund\) >&2/, why: 'start-xell-process.sh: the NO-lockfile branch' },
     { match: /'npm install'|`npm install`/, why: 'prose inside a message string, not a command' },
     { match: /echo "no package-lock\.json/, why: 'the echo that ANNOUNCES the no-lockfile branch' },
+    { match: /npm install --prefix "\$HOME\/\.zeehive\/db-sandbox\/deps"/, why: 'db-sandbox preset: installs embedded-postgres into its OWN prefix dir under $HOME, never a tree the zee lands from' },
   ];
   const unexplained = hits.filter((h) => !allowed.some((a) => a.match.test(h.code)));
   ok(unexplained.length === 0,

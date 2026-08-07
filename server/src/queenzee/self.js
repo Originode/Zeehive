@@ -36,6 +36,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
+import { xellWebappPath } from '../lib/webapp-proxy.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -876,10 +877,13 @@ export async function selfVerifyWebapp(xell) {
     `SELECT c.role, c.url FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xell.id]);
   const webapp = rows.find((c) => c.role === 'webapp');
-  if (!webapp?.url) {
-    return { ok: false, error: 'this xell has no webapp container URL to offer — build the webapp '
+  // The stored url is a LAN address nothing publishes. The REACHABLE url is /xell-web/<slug>/ on
+  // the console origin (webapp-proxy.js). Offer that, not the dead stored one.
+  if (!webapp) {
+    return { ok: false, error: 'this xell has no webapp container to offer — build the webapp '
       + 'first (`zee build webapp --wait`), then try again.' };
   }
+  const webappUrl = xellWebappPath(xell.slug);
   const zee = await liveZee(xell.id);
   // One OPEN offer per xell, like prod_seed_request's one-open-ask guard: a zee that calls this
   // twice must not flood the console with cards. The existing open offer is handed back, not a
@@ -895,13 +899,13 @@ export async function selfVerifyWebapp(xell) {
   const row = await one(
     `INSERT INTO visual_verify_offer (project_id, xell_id, xell_slug, url, commit)
      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [xell.project_id, xell.id, xell.slug, webapp.url, xell.head_commit || null]);
+    [xell.project_id, xell.id, xell.slug, webappUrl, xell.head_commit || null]);
   broadcast('visual-verify', row);
   broadcast('xell', { id: xell.id });
-  logline('self', `${xell.slug} offered its webapp for visual verification @ ${webapp.url}`);
+  logline('self', `${xell.slug} offered its webapp for visual verification @ ${webappUrl}`);
   return {
     ok: true, offer: row,
-    message: `Offered your webapp at ${webapp.url} to a human in the console — they can open the `
+    message: `Offered your webapp at ${webappUrl} to a human in the console — they can open the `
       + 'link in a new tab or dismiss it. Nothing was landed or shipped.',
   };
 }
@@ -928,6 +932,8 @@ export async function selfUploadConversation(xell, { content = null, session_id 
 export async function selfConversations(xell, { xell: slug = null, full = false } = {}) {
   // Pure read, exactly like `zee zees`: no broadcast, no side effect — the caller just wants
   // to know what its crew archived.
+  const routerGuard = await refuseRouterCrew(xell, 'conversations', '`zee conversations` reads a worker\'s archive');
+  if (routerGuard) return routerGuard;
   return conversationsForManager(xell, { xell: slug, full });
 }
 
@@ -1319,6 +1325,8 @@ export async function selfBuildStatus(xell) {
 export async function selfCrew(xell) {
   const guard = requireManager(xell, 'zees');
   if (guard) return guard;
+  const routerGuard = await refuseRouterCrew(xell, 'zees');
+  if (routerGuard) return routerGuard;
   const crew = await crewFor(xell.id);
   const waiting = crew.filter((c) => c.waiting_on_human.length);
   // UNLANDED work is the one thing that must not be closed out (`zee suggest-done` reaps the xell,
@@ -1382,28 +1390,23 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   const text = String(task || '').trim();
   if (!text) return { ok: false, error: 'dispatch needs --task "…" — the brief the worker will work from' };
 
-  // THE BOARD IS THE ONLY MANAGER DEPLOYMENT PATH (TKT-b14934). A free-form `zee dispatch` has no
+  // THE BOARD IS THE ONLY DEPLOYMENT PATH (TKT-b14934). A free-form `zee dispatch` has no
   // per-item guard — two dispatches for one unit of work each spawn a worker and the board never
   // sees either, which is exactly how the fleet produced duplicate workers (TKT-104/TKT-110/TKT-114).
   // The work-items board closes that: deployWorkItem holds a per-item advisory lock and refuses a
-  // second worker on an item that already has one. So a MANAGER's deployment goes through
+  // second worker on an item that already has one. So EVERYONE's deployment goes through
   // `zee assign` (which routes through that guard) and a free-form `zee dispatch` is refused for
-  // managers. Two exceptions, both deliberate:
-  //   • work_item_id is set — this is `zee assign` reaching back through deployWorkItem; it IS the
-  //     guarded board path, and refusing it would break the very verb the refusal points at;
-  //   • the xell is a ROUTER (lib/router.js) — routing a prompt IS its job, one worker per request,
-  //     each a fresh unit of work; the router is the project's front door, not a manager deploying a
-  //     unit, and the task names its routing dispatches a legitimate itemless path to keep working.
+  // managers. ONE exception, deliberate: work_item_id is set — this is `zee assign` reaching back
+  // through deployWorkItem; it IS the guarded board path, and refusing it would break the very verb
+  // the refusal points at. A ROUTER is NOT exempt: its job is to route a prompt onto a card, and
+  // the card is where the work is tracked — never an itemless worker of its own (151).
   if (!work_item_id) {
-    const { isRouterXell } = await import('../lib/router.js');
-    if (!(await isRouterXell(xell))) {
-      return { ok: false, status: 'refused', error:
-        '`zee dispatch` is the ROUTER\'s verb. Deploying a worker must go through the work-items board, '
-        + 'which is what prevents two workers on one unit of work — an item admits at most one live '
-        + 'worker and a second deploy on the same item is refused with a sentence. Cut a card '
-        + '(`zee work --new --title "…"`) or break a ticket down, then '
-        + '`zee assign --item <id> --task "…"`.' };
-    }
+    return { ok: false, status: 'refused', error:
+      '`zee dispatch` is REFUSED for every manager, router included. Deploying a worker must go through '
+      + 'the work-items board, which is what prevents two workers on one unit of work — an item admits '
+      + 'at most one live worker and a second deploy on the same item is refused with a sentence. Cut '
+      + 'a card (`zee work --new --title "…"`) or break a ticket down, then '
+      + '`zee assign --item <id> --task "…"`.' };
   }
 
   // A worker gets a WORKER harness — checked by TYPE, not by key, so renaming or adding a manager
@@ -1429,10 +1432,17 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
     }
   }
 
-  // The brief the worker actually receives: its own task, plus who it reports to and how to reach
-  // them. Without this a dispatched worker has no idea a manager exists, and the reflection loop
-  // (and every question it could have asked) dies quietly.
-  const brief = [text, '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
+  // WHO is dispatching? A ROUTER dispatches a worker onto a card but is NOT that worker's manager —
+  // the router is the front door, not a crew lead, and it must not tend the zees it routes (151). A
+  // worker it deploys reports to NOBODY: the card is its anchor, and progress goes to the board
+  // (`zee work` / `zee item`), never to the router. A MANAGER's dispatched worker, by contrast, is
+  // stamped into its crew and told who it reports to — without that a dispatched worker has no idea
+  // a manager exists, and the reflection loop (and every question it could have asked) dies quietly.
+  const { isRouterXell } = await import('../lib/router.js');
+  const router = await isRouterXell(xell);
+  const brief = router
+    ? text
+    : [text, '', managerBriefBlock(xell.slug, 'dispatched you and is watching this xell')].join('\n');
 
   // A DRY POOL must not be a dead end for a manager. A human dispatching from the console can raise
   // the pool target or wait; a caged manager can do neither — it would just be told "no ready xell"
@@ -1494,7 +1504,10 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
       // whatever the target xell already has (dispatchXell's NULL-preserves shape).
       ...(langfuse_tracking === true || langfuse_tracking === false ? { langfuse_tracking } : {}),
       ...(provider ? { provider } : {}),
-      manager_xell_id: xell.id,
+      // A ROUTER does not stamp its dispatched worker into a crew (151): the worker is deployed onto
+      // a card, not under the router. A manager stamps itself so the honeycomb seats the worker next
+      // to it and the worker knows who it reports to.
+      ...(router ? {} : { manager_xell_id: xell.id }),
     });
   } catch (e) {
     // The overlap was READ before the spawn was attempted, and it is a fact about the WORK rather than
@@ -1506,10 +1519,15 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
   logline('crew', `${xell.slug} dispatched a worker into ${out.slug}`);
   return {
     ok: true, ...out, overlap,
-    message: `Dispatched a worker into ${out.slug} — it reports to you and is seated next to you in the `
-      + 'honeycomb. Watch it with `zee zees`, talk to it with `zee say --to ' + out.slug + ' --message "…"`. '
-      + 'It lands its OWN work (a human approves); you cannot land for it.'
-      + (note ? `\n\n${note}` : ''),
+    message: router
+      ? `Deployed a worker into ${out.slug} onto the card. It does NOT report to you — the card is its `
+        + 'anchor and progress goes to the board (`zee work` / `zee item`). You do not tend it: if the work '
+        + 'needs a crew, ask a human for a manager (`zee mint-manager`) and let the manager run it.'
+        + (note ? `\n\n${note}` : '')
+      : `Dispatched a worker into ${out.slug} — it reports to you and is seated next to you in the `
+        + 'honeycomb. Watch it with `zee zees`, talk to it with `zee say --to ' + out.slug + ' --message "…"`. '
+        + 'It lands its OWN work (a human approves); you cannot land for it.'
+        + (note ? `\n\n${note}` : ''),
   };
 }
 
@@ -1669,6 +1687,8 @@ export async function selfSwap(xell, { to = null, harness = null, task = null, m
                                        provider = null, provider_token_id = null } = {}) {
   const guard = requireManager(xell, 'swap');
   if (guard) return guard;
+  const routerGuard = await refuseRouterCrew(xell, 'swap', '`zee swap` re-crews a worker');
+  if (routerGuard) return routerGuard;
 
   // ── 1. WHOSE xell is it? Only ever one of mine, resolved from my own token ──────────────────
   const target = await workerOf(xell.id, to);
@@ -2057,6 +2077,8 @@ export async function swapXellZeeAsHuman({ xellId, harness = null, task = null, 
 export async function selfSay(xell, { to = null, message = null, kind = 'directive' } = {}) {
   const guard = requireManager(xell, 'say');
   if (guard) return guard;
+  const routerGuard = await refuseRouterCrew(xell, 'say', '`zee say` types a message into a worker\'s live session');
+  if (routerGuard) return routerGuard;
   const worker = await workerOf(xell.id, to);
   if (!worker) {
     return { ok: false, error: `no worker "${to}" in your crew — \`zee zees\` lists the ones you dispatched. `
@@ -2116,6 +2138,8 @@ export async function selfInbox(xell, { all = false } = {}) {
 export async function selfSuggestDone(xell, { to = null, reason = null } = {}) {
   const guard = requireManager(xell, 'suggest-done');
   if (guard) return guard;
+  const routerGuard = await refuseRouterCrew(xell, 'suggest-done', '`zee suggest-done` closes a worker out');
+  if (routerGuard) return routerGuard;
   const worker = await workerOf(xell.id, to);
   if (!worker) {
     return { ok: false, error: `no worker "${to}" in your crew — you may only suggest done for a xell you dispatched.` };
@@ -2195,6 +2219,23 @@ function requireManager(xell, verb) {
     + 'job in their own xell; dispatching, monitoring and closing out other zees belongs to a manager '
     + '(a human adds those in the console). You CAN talk to your manager, if you have one: `zee report '
     + '--message "…"` and `zee inbox`.' };
+}
+
+// THE ROUTER'S EXTRA WALL (151): a router is manager-type so it can route prompts and deploy workers
+// onto the board, but it is NOT a crew lead — its job ends when the worker is deployed. Every verb
+// that would let it tend, watch, message or close out a deployed zee is refused by name, so the
+// router is told it routes and does not manage. This is the structural half of the trainer's rule;
+// the persona (151) is the prose half.
+async function refuseRouterCrew(xell, verb, what = null) {
+  const { isRouterXell } = await import('../lib/router.js');
+  if (!(await isRouterXell(xell))) return null;
+  const why = what || `\`zee ${verb}\` tends a crew`;
+  return { ok: false, status: 'refused', error:
+    `${why} — a router does not tend the zees it routes. The router's job is the front door: `
+    + 'recompose the prompt, pick the harness, and deploy the worker onto a card (`zee work --new` + '
+    + '`zee assign`). After that the card follows the worker (`zee work` / `zee item` on the board) — '
+    + 'you do not watch, message, swap or close it out. If the work needs a crew, ask a human for a '
+    + 'manager (`zee mint-manager`) and let the manager run it.' };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2557,11 +2598,18 @@ export async function selfWorkUnassign(xell, { item = null, reason = null } = {}
 // extra the manager types, so a well-cut plan briefs a worker for free.
 export async function selfWorkAssign(xell, { item = null, task = null, model = null, mode = null,
                                              harness = null, title = null, visual_verify = false,
-                                             langfuse_tracking = null } = {}) {
+                                             langfuse_tracking = null,
+                                             // WHICH AI PROVIDER the worker runs on (139): the
+                                             // ROUTER's whole job is deciding this, so it must reach
+                                             // the board deployment the same way it reaches any other
+                                             // dispatch. null = the project default, as before.
+                                             provider = null } = {}) {
   const guard = requireManager(xell, 'assign');
   if (guard) return guard;
   if (!item) return { ok: false, error: 'assign needs --item <work-item-id> (see `zee work`)' };
   const { deployWorkItem, getItem } = await import('../lib/work-assign.js');
+  const { isRouterXell } = await import('../lib/router.js');
+  const router = await isRouterXell(xell);
   let row;
   try { row = await getItem(item); }
   catch (e) { return { ok: false, error: e.message }; }
@@ -2571,12 +2619,18 @@ export async function selfWorkAssign(xell, { item = null, task = null, model = n
   }
   try {
     const out = await deployWorkItem(row.id, {
-      task, model, mode, harness, title, visual_verify, langfuse_tracking,
+      task, model, mode, harness, title, visual_verify, langfuse_tracking, provider,
       actor: xell.slug, managerXellId: xell.id });
+    // A ROUTER deploys a worker onto a card but is NOT its manager (151): the worker reports to
+    // nobody, and the card is what follows it. A MANAGER's deploy stamps the worker into its crew.
     return {
       ok: true, ...out,
-      message: `${out.message} It reports to you (\`zee zees\`, \`zee say --to ${out.xell.slug} …\`), it `
-        + 'lands its OWN work, and the item now follows its hive status — you do not have to move the card.',
+      message: router
+        ? `${out.message} The worker is NOT yours to tend — it reports to nobody and the card follows it `
+          + '(`zee work` / `zee item` on the board). If the work outgrows one worker, ask a human for a '
+          + 'manager (`zee mint-manager`) and let the manager run it.'
+        : `${out.message} It reports to you (\`zee zees\`, \`zee say --to ${out.xell.slug} …\`), it `
+          + 'lands its OWN work, and the item now follows its hive status — you do not have to move the card.',
     };
   } catch (e) {
     return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };

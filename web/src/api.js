@@ -3,6 +3,19 @@
 // falls back to the first project).
 const pq = (projectId) => (projectId ? `?project=${encodeURIComponent(projectId)}` : '');
 
+// A xell webapp can be reviewed through the queenzee proxy at <origin>/xell-web/<slug>/ (see
+// docs/common-xell-network-plan.md). Vite then emits the app under `import.meta.env.BASE_URL`,
+// and a bare `/api/...` call would hit the OUTER console's API — the wrong server answering the
+// same paths (the exact trap CLAUDE.md warns about, now browser-side). Every server-bound URL the
+// console issues must ride the app's own base: at the live console (BASE_URL '/') this is the
+// identity; under '/xell-web/<slug>/' it turns '/api/foo' into '/xell-web/<slug>/api/foo', which
+// the queenzee proxy forwards to THIS xell's own server. Kept here (not in every caller) so the
+// three transports — fetch, EventSource, WebSocket — all agree on one answer.
+export function baseUrl(path) {
+  const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+  return `${base}${path}`;
+}
+
 export async function getFleet(projectId) {
   const r = await fetch(`/api/fleet${pq(projectId)}`);
   if (!r.ok) throw new Error(`fleet ${r.status}`);
@@ -254,6 +267,16 @@ export async function getLandPatch(requestId) {
   return d;
 }
 
+// Xource dirty patch (broken-pipe modal preview). scope: 'staged' | 'unstaged' | 'all'.
+export async function getXourcePatch(projectId, scope = 'all') {
+  const q = new URLSearchParams({ scope: scope || 'all' });
+  const r = await fetch(`/api/projects/${projectId}/xource/diff?${q}`);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok && d.error) return { ok: false, ...d };
+  if (!r.ok) throw new Error(`xource diff ${r.status}`);
+  return d;
+}
+
 export async function getLogs(n = 200) {
   const r = await fetch(`/api/logs?n=${n}`);
   return r.ok ? r.json() : [];
@@ -302,6 +325,34 @@ export async function getDockerContexts() {
 export async function getSites(projectId) {
   const r = await fetch(`/api/projects/${projectId}/sites`);
   return r.ok ? r.json() : [];
+}
+
+// ── WIREGUARD MESH (Decision 5.4) — the human's door onto the ZEEHIVE network ─────────────────
+// ZEEHIVE operates a WG server; a human (or another machine) downloads a ready .conf and joins the
+// tunnel. Status is a read; the peer mint returns the .conf as a blob download (the private key
+// lives only in that file); re-endpoint re-points the mesh server's dial-in address.
+export async function getWireguard(projectId) {
+  const r = await fetch(`/api/projects/${projectId}/wireguard`);
+  return r.ok ? r.json() : { enabled: false, server: null, peers: [] };
+}
+export async function mintWireguardPeer(projectId, { name = null, dns = null } = {}) {
+  const r = await fetch(`/api/projects/${projectId}/wireguard/peer`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name, dns }),
+  });
+  if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).error) || `mint peer failed (${r.status})`);
+  const blob = await r.blob();
+  const cd = r.headers.get('Content-Disposition') || '';
+  const fn = (cd.match(/filename="([^"]+)"/) || [])[1] || 'zeehive-wireguard.conf';
+  return { blob, filename: fn };
+}
+export async function setWireguardEndpoint(projectId, endpoint) {
+  const r = await fetch(`/api/projects/${projectId}/wireguard/endpoint`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ endpoint }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `set endpoint failed (${r.status})`);
+  return data;
 }
 
 async function siteCall(url, method, body) {
@@ -442,27 +493,117 @@ export const deleteSharedContainer = (id, force = false) => siteCall(`/api/conta
 export const getProjectManifestInfo = (projectId) => fetch(`/api/projects/${projectId}/manifest`).then((r) => r.json());
 export const refreshProjectManifest = (projectId) => siteCall(`/api/projects/${projectId}/manifest/refresh`, 'POST');
 export const draftProjectManifest = (projectId, write = false) => siteCall(`/api/projects/${projectId}/manifest/draft`, 'POST', { write });
+// Compose onboarding: plan is read-only; apply refuses without approved:true (server-enforced).
+export const getComposeOnboardingPlan = (projectId) =>
+  fetch(`/api/projects/${projectId}/manifest/compose-plan`).then(async (r) => {
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw Object.assign(new Error(data.error || r.statusText), { status: r.status, ...data });
+    return data;
+  });
+export const applyComposeOnboarding = (projectId, body = {}) =>
+  siteCall(`/api/projects/${projectId}/manifest/compose-apply`, 'POST', body);
 
-// Subscribe to /api/stream for the selected project. Calls onSnapshot(fleet) on the
-// initial snapshot and onChange() on every subsequent event (the app re-fetches on change).
-export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork, onDbOpProgress, onDbOpLog }) {
-  const es = new EventSource(`/api/stream${pq(projectId)}`);
-  es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
-  // 'fleet-pause' rides this list because a pause is the one change that can move NOTHING else: a
-  // fleet with no live cage broadcasts no zee/xell event, so without it the button would stay on
-  // 'pause' in every other open tab (and in this one, if the press came from elsewhere).
-  for (const type of ['zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work', 'fleet-pause', 'visual-verify', 'xource-clean', 'credential-inject', 'manager-mint']) {
-    es.addEventListener(type, () => onChange());
+// The event types a live change is worth acting on — the ONE authority for both live channels
+// (the websocket and the SSE fallback) so they can never drift apart. 'fleet-pause' rides this
+// list because a pause is the one change that can move NOTHING else: a fleet with no live cage
+// broadcasts no zee/xell event, so without it the button would stay on 'pause' in every other
+// open tab (and in this one, if the press came from elsewhere).
+// test/work-console.test.mjs greps this name as the SSE seam.
+export const STREAM_TYPES = [
+  'zee', 'xell', 'container', 'task', 'project', 'land', 'ship', 'work', 'fleet-pause',
+  'visual-verify', 'xource-clean', 'credential-inject', 'manager-mint',
+];
+
+// The event types that can move the GIT GRAPH: a landing moves main, a ship moves production's
+// deployed commit, a project pull moves the xource heads. Every other type only moves the fleet
+// snapshot, so the console re-reads the graph for these alone (App.jsx streamChange).
+export const GIT_TYPES = ['land', 'ship', 'project'];
+
+// Subscribe to the live stream for the selected project, WebSocket-first.
+//
+// The websocket /api/stream/ws carries the SAME wire contract as the SSE route (a leading
+// `snapshot` frame, then one frame per event type, project-scoped via ?project=), so the two are
+// interchangeable to a caller. It is preferred because it is a single multiplexed connection that
+// opens and reconnects without per-tab EventSource fan-out, and it lets the server push the fleet
+// snapshot on connect instead of the client polling for it.
+//
+// Callbacks:
+//   onSnapshot(fleet)   — the leading fleet read model (the server sends one per connection).
+//   onChange(type)      — every later event, with the EVENT TYPE named so the caller can re-read
+//                         only what that event can have changed (fleet alone for most; the git
+//                         graph too for land/ship/project).
+//   onStatus('live'|'reconnecting')
+//   onLog(l) onWork(w) onShipLog(l) onDbOpProgress(p) onDbOpLog(l) onQueenzeeActivity(a)
+//
+// Returns an unsubscribe function. If the websocket cannot open (an old proxy, a network that
+// drops the upgrade), it falls back to the SSE route — which reconnects natively — with the same
+// callbacks, so no consumer ever sees the difference.
+export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork, onDbOpProgress, onDbOpLog, onQueenzeeActivity }) {
+  const cbs = { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork, onDbOpProgress, onDbOpLog, onQueenzeeActivity };
+  let es = null;
+  let closed = false;    // the caller unsubscribed — stop everything, do not reconnect
+  let fellBack = false;  // SSE already owns the callbacks — don't open a second one
+
+  // One frame handler for both channels: payload-bearing types call their callback, `work` ALSO
+  // counts as a change (it is in STREAM_TYPES), and only the STREAM_TYPES trigger onChange — the
+  // rest (tick, machine, site, environment, …) have no client interest, exactly as the old SSE
+  // client treated them. The poller broadcasts `tick` every few seconds; treating it as a change
+  // would re-read the fleet on a cadence, which is the spam this refactor exists to stop.
+  const handleFrame = (msg) => {
+    if (!msg || !msg.type) return;
+    const data = msg.payload;
+    switch (msg.type) {
+      case 'ping': return;   // the server's keep-alive frame — nothing to do
+      case 'snapshot': return onSnapshot?.(data);
+      case 'log': return onLog?.(data);
+      case 'ship-log': return onShipLog?.(data);
+      case 'db-op-progress': return onDbOpProgress?.(data);
+      case 'db-op-log': return onDbOpLog?.(data);
+      case 'queenzee-activity': return onQueenzeeActivity?.(data);
+      case 'work': onWork?.(data); return onChange?.('work');   // work is BOTH a payload and a change
+      default: return STREAM_TYPES.includes(msg.type) ? onChange?.(msg.type) : undefined;
+    }
+  };
+
+  // baseUrl rides the app's own base: a reviewed xell webapp (/xell-web/<slug>/) routes its stream
+  // to THIS xell's own server through the queenzee proxy, not the outer console's.
+  const wsPath = baseUrl(`/api/stream/ws${pq(projectId)}`);
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${wsPath}`);
+  ws.onopen = () => onStatus?.('live');
+  ws.onmessage = (e) => { try { handleFrame(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ } };
+  ws.onerror = () => fallbackToSSE();
+  ws.onclose = () => fallbackToSSE();
+
+  function fallbackToSSE() {
+    if (closed || fellBack) return;
+    fellBack = true;
+    try { ws.close(); } catch { /* already closed */ }
+    es = subscribeSSE(projectId, cbs);
   }
-  // The WORK channel, delivered WITH its payload as well as counted as a change. Every other
-  // consumer of this stream only needs "something moved, re-read"; the work tracker needs to tell a
-  // work event apart from ordinary fleet churn, because the queenzee's tick moves cards on the board
-  // and that should land at once, while a container health flap should not cost a board refetch.
-  // Optional, so nothing else on the page changes behaviour by this existing.
+
+  return () => {
+    closed = true;
+    try { ws.close(); } catch { /* already closed */ }
+    if (es) es();
+  };
+}
+
+// The SSE route (/api/stream) — the resilient fallback, kept because EventSource reconnects
+// natively and needs no client retry logic. Same callbacks, same frames as the websocket.
+function subscribeSSE(projectId, { onSnapshot, onChange, onStatus, onLog, onShipLog, onWork, onDbOpProgress, onDbOpLog, onQueenzeeActivity }) {
+  const es = new EventSource(baseUrl(`/api/stream${pq(projectId)}`));
+  es.addEventListener('snapshot', (e) => onSnapshot(JSON.parse(e.data)));
+  for (const type of STREAM_TYPES) {
+    es.addEventListener(type, () => onChange(type));
+  }
   if (onWork) es.addEventListener('work', (e) => {
     try { onWork(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
   });
   if (onLog) es.addEventListener('log', (e) => onLog(JSON.parse(e.data)));
+  // Queenzee↔xell activity ({dir:'q2x'|'x2q', xell_id, kind}) — the honeycomb's animated lines.
+  if (onQueenzeeActivity) es.addEventListener('queenzee-activity', (e) => {
+    try { onQueenzeeActivity(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
+  });
   // Per-ship build feed ({id, role, line}) — rendered live on that ship's own card.
   if (onShipLog) es.addEventListener('ship-log', (e) => onShipLog(JSON.parse(e.data)));
   // Live progress of db backup / restore / copy operations ({op, id, project_id, label, msg, pct, status, error}).
@@ -484,7 +625,7 @@ export function subscribe(projectId, { onSnapshot, onChange, onStatus, onLog, on
 // Its own EventSource rather than a hook into subscribe(): the onboard modal runs before the
 // project it is creating exists, so there is no project stream for it to ride on yet.
 export function subscribeCloneProgress(onProgress) {
-  const es = new EventSource('/api/stream');
+  const es = new EventSource(baseUrl('/api/stream'));
   es.addEventListener('clone-progress', (e) => {
     try { onProgress(JSON.parse(e.data)); } catch { /* a malformed frame must not kill the stream */ }
   });
@@ -1116,6 +1257,26 @@ export async function cleanXourceNow(projectId, reason) {
   });
   const data = await r.json().catch(() => ({}));
   if (!r.ok || data?.ok === false) throw new Error(data.error || `xource clean failed (${r.status})`);
+  return data;
+}
+// Commit STAGED paths on the xource (broken-pipe modal "Commit it"). Message is required.
+export async function commitXourceStaged(projectId, message) {
+  const r = await fetch(`/api/projects/${projectId}/xource/commit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console', message: message || null }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data?.ok === false) throw new Error(data.error || `xource commit failed (${r.status})`);
+  return data;
+}
+// Stash dirty xource work (broken-pipe modal "Stash it") — parks dirt so the checkout is clean.
+export async function stashXourceNow(projectId, message) {
+  const r = await fetch(`/api/projects/${projectId}/xource/stash`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ by: 'human@console', message: message || null }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data?.ok === false) throw new Error(data.error || `xource stash failed (${r.status})`);
   return data;
 }
 export async function getXourceCleanRequests(projectId, all = false) {
