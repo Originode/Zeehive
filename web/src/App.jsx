@@ -12,6 +12,7 @@ import MessageComposer from './MessageComposer.jsx';
 import SwapZee from './SwapZee.jsx';
 import XellEnvironment from './XellEnvironment.jsx';
 import Directives from './Directives.jsx';
+import XellObservability from './XellObservability.jsx';
 import { showAlert, showConfirm, showPrompt } from './Dialog.jsx';
 import { showDiff } from './DiffViewer.jsx';
 import ProjectSetup from './ProjectSetup.jsx';
@@ -277,6 +278,7 @@ export default function App() {
   const [msgXell, setMsgXell] = useState(null);    // message-composer modal, opened from the flower's 📨 button
   const [envXell, setEnvXell] = useState(null);    // environment panel (ticket #20) — see/pin/clear what a xell resolves to
   const [directivesXell, setDirectivesXell] = useState(null); // manager-directives panel, opened from the flower's 🧭 button
+  const [obsXell, setObsXell] = useState(null); // observability panel, opened from the flower's ◉ button (per-turn ledger)
   // ♻ swap composer, opened from the flower's BRANCH petal: replace the ZEE working this xell and
   // keep the xell (same branch, commits, containers, database, card). It carries the xell's diff so the
   // composer can warn about uncommitted work — the collect saves COMMITS, and only commits.
@@ -898,6 +900,13 @@ export default function App() {
       setEnvXell(x);
       return;
     }
+    if (kind === 'observability') {
+      // THE PER-TURN LEDGER — the observability panel. Read-only: the server's turn-ledger rows
+      // (zee_turn) with their play-by-play events. Opened from the flower's ◉ button and the
+      // right-click context menu.
+      setObsXell(x);
+      return;
+    }
     if (kind === 'langfuse') {
       // "View Langfuse" — opens THIS zee's Langfuse SESSION in a new window. The URL is computed
       // SERVER-side (ui_url + the Langfuse project + the zee's session id); the flower only shows
@@ -1071,6 +1080,9 @@ export default function App() {
         )}
         {directivesXell && (
           <Directives xell={directivesXell} onClose={() => setDirectivesXell(null)} />
+        )}
+        {obsXell && (
+          <XellObservability xell={obsXell} onClose={() => setObsXell(null)} />
         )}
         {msgXell && (
           <MessageComposer xell={msgXell} initialText={msgXell.initialText || ''} onClose={() => setMsgXell(null)}
