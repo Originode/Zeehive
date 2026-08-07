@@ -37,7 +37,12 @@ ok(containerShellSessionName('not a uuid!!!') === 'zh-shell'
 
 console.log('inner cmd is tmux attach-or-create with a bash fallback (images without tmux):');
 const inner = containerShellInnerCmd(sessA);
-ok(inner.includes(`tmux new -A -s ${sessA}`), 'attach-or-creates the named session');
+ok(inner.includes(`tmux new-session -d -s ${sessA}`), 'creates the named session detached when missing');
+ok(inner.includes(`tmux attach-session -t ${sessA}`), 'every open attaches (session survives the modal)');
+ok(/env -u ZEEHIVE_SHELL_MARK tmux new-session/.test(inner),
+   'create strips ZEEHIVE_SHELL_MARK so the pane shell is not reaped on modal close');
+ok(/exec tmux attach-session/.test(inner),
+   'attach keeps the mark on THIS client (exec replaces sh; reap can still detach it)');
 ok(/set -g mouse on/.test(inner), 'enables mouse (wheel scroll under alt-screen)');
 ok(/window-size latest/.test(inner), 'sizes to the most recent client');
 ok(/command -v tmux/.test(inner) && /exec bash/.test(inner),

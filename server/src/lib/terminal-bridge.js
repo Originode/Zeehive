@@ -209,11 +209,15 @@ async function openTerminal(ws, zeeId) {
 // exactly the shape the xterm client already speaks. Resize is a separate POST /exec/:id/resize.
 //
 // Session retention (same shape as the zee door above): when the target has `tmux`, the shell is
-// `tmux new -A -s zh-<id>` — first open creates the session, reconnects re-attach it, and closing
-// the modal only kills THIS attach client (the ZEEHIVE_SHELL_MARK reaper below). Without that, every
-// open of the queenzee node (or any container chip shell) was a fresh bash that died with the
-// modal — the opposite of how cxell zee terminals behave. Images without tmux (postgres, alpine)
-// fall back to a one-shot bash/sh and still reap it on close.
+// a named session `zh-<id>` — first open creates it, reconnects re-attach, and closing the modal
+// only kills THIS attach client (the ZEEHIVE_SHELL_MARK reaper below). Without that, every open of
+// the queenzee node (or any container chip shell) was a fresh bash that died with the modal — the
+// opposite of how cxell zee terminals behave. Images without tmux (postgres, alpine) fall back to a
+// one-shot bash/sh and still reap it on close.
+//
+// The create path deliberately strips ZEEHIVE_SHELL_MARK from the env the NEW pane inherits.
+// `tmux new -A` used to copy the docker-exec client env (mark included) into the session; reap()
+// then kill -9'd the pane shell on modal close, so every reopen looked like a reset.
 
 // Stable tmux session name for one modeled container row. Unique per row so a process-role xell's
 // shell (all of which exec into the SAME queenzee container) does not collide with another xell's,
@@ -230,8 +234,14 @@ export function containerShellInnerCmd(sessionName) {
   const s = String(sessionName || '').replace(/[^a-zA-Z0-9_-]/g, '') || 'zh-shell';
   // tmux flags match the zee door: mouse (wheel scroll in alt-screen), deep history, size to the
   // most recent client so a lingering half-closed attach cannot clamp a fresh bigger panel.
+  //
+  // Create detached under `env -u ZEEHIVE_SHELL_MARK`, then attach. The attach client (this process
+  // after `exec`) KEEPS the mark so reap() can detach it; the pane shell never sees the mark, so
+  // reap cannot murder the session. `new-session -d` is a no-op when the session already exists
+  // (|| true) — attach is what every open actually does.
   return 'if command -v tmux >/dev/null 2>&1; then '
-    + `exec tmux new -A -s ${s} \\; set -g mouse on \\; set -g history-limit 50000 \\; set -g window-size latest; `
+    + `env -u ZEEHIVE_SHELL_MARK tmux new-session -d -s ${s} 2>/dev/null || true; `
+    + `exec tmux attach-session -t ${s} \\; set -g mouse on \\; set -g history-limit 50000 \\; set -g window-size latest; `
     + 'else command -v bash >/dev/null && exec bash || exec sh; fi';
 }
 
