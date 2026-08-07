@@ -124,7 +124,6 @@ export default function XellObservability({ xell, onClose }) {
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
   const [openId, setOpenId] = useState(null);
-  const [openTurn, setOpenTurn] = useState(null);
 
   const load = useCallback(async () => {
     if (!xell?.id) return;
@@ -175,7 +174,7 @@ export default function XellObservability({ xell, onClose }) {
                 : <div className="xob-turns">
                     {turns.map((t) => (
                       <TurnRow key={t.id} turn={t} open={openId === t.id}
-                               onToggle={() => { if (openId === t.id) { setOpenId(null); setOpenTurn(null); } else { setOpenId(t.id); setOpenTurn(t.id); } }} />
+                               onToggle={() => setOpenId(openId === t.id ? null : t.id)} />
                     ))}
                   </div>}
             </>
