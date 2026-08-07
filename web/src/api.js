@@ -1416,6 +1416,26 @@ export const getXellLangfuseSession = (id, zeeId = null) =>
   fetch(`/api/xells/${id}/langfuse-session${zeeId ? `?zee_id=${encodeURIComponent(zeeId)}` : ''}`)
     .then((r) => r.json());
 
+// ── XELL OBSERVABILITY — the per-turn ledger the console's right-click action renders ──────────
+// Read-only: turns are written by the turn ledger (server/src/lib/turn-ledger.js) at turn
+// boundaries. `getXellObservability` lists turns newest-first; `getTurnEvents` fetches the
+// play-by-play events for one turn.
+export async function getXellObservability(xellId, { zeeId = null, limit = 50 } = {}) {
+  const qs = new URLSearchParams();
+  if (zeeId) qs.set('zee_id', zeeId);
+  if (limit) qs.set('limit', String(limit));
+  const r = await fetch(`/api/xells/${xellId}/observability${qs.toString() ? `?${qs}` : ''}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `observability unavailable (${r.status})`);
+  return data;
+}
+export async function getTurnEvents(turnId) {
+  const r = await fetch(`/api/turns/${turnId}/events`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `turn events unavailable (${r.status})`);
+  return data;
+}
+
 // ── MANAGER ZEES ─────────────────────────────────────────────────────────────
 // Adding a manager is a HUMAN act and there is no limit on how many you add — but only from here
 // (a zee's dispatch verb refuses the role, so managers can never mint managers).

@@ -49,6 +49,7 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
 // The zee-row-only turn writer — the same one intake's spawn and nudge's resume use, so an
 // interactive turn is recorded exactly like the two the queenzee starts (lib/turn-record.js).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
+import { startTurn, endTurn } from '../lib/turn-ledger.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
@@ -1171,8 +1172,18 @@ export async function selfTurn(xell, { state = null } = {}) {
                message: 'This zee is already recorded as WORKING (a queenzee-started turn is in flight) — '
                  + 'the interactive turn boundary was not written over it.' };
     }
+    // PER-TURN LEDGER: an interactive turn (a human/manager typing into the pane) is one unit of
+    // observability, even though the queenzee cannot know its cost (no meter on this door). The
+    // row is started so the turn exists in the timeline; its cost stays zero and metered=true is
+    // left defaulted — it IS measured (measured zero), unlike an unmetered headless turn.
+    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model });
   } else {
     row = await markZeeTurn(zee.id, 'idle', 'end_turn');
+    // Close the OPEN interactive turn (the latest one for this zee that is still 'started').
+    const open = await one(
+      `SELECT id FROM zee_turn WHERE zee_id=$1 AND kind='interactive' AND status='started'
+        ORDER BY started_at DESC LIMIT 1`, [zee.id]).catch(() => null);
+    await endTurn(open?.id, { status: 'ended', stopReason: 'end_turn' });
   }
   await recordEvent({ source: 'cxell-hook', hook_event_name: `interactive-turn-${want}`,
                       zee_id: zee.id, xell_id: xell.id, stop_reason: want === 'end' ? 'end_turn' : null });

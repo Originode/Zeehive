@@ -24,6 +24,7 @@ import { predecessorActionDigest } from '../lib/predecessor-digest.js';
 // is the TURN LOCK half of the same module: a resume must CLAIM the turn atomically (refusing if one
 // is already in flight) instead of blindly marking 'working' over a live session (TKT-114-B).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
+import { startTurn, endTurn, lastAssistantText } from '../lib/turn-ledger.js';
 import { tokenForSpawn } from '../lib/provider-tokens.js';
 import { setTend } from '../lib/status.js';
 import { broadcast } from '../lib/events.js';
@@ -867,6 +868,10 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
                  + 'resume the same session twice (single-writer lock per zee)' };
     }
     const startedAt = new Date();
+    // PER-TURN LEDGER: a resume is its own turn (kind='resume'), distinct from the spawn that
+    // created the session. Best-effort.
+    const turn = await startTurn({ zee, xell: { id: xellId, slug: zee.slug, project_id: zee.project_id },
+                                   kind: 'resume', sessionId: zee.claude_session_id, model: zee.model });
     // Fire and forget: the continuation turn can run for minutes; do NOT block the caller on it.
     nudgeCxellZee({
       ctx: 'default', name: cxellName(zee.slug),
@@ -902,6 +907,12 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
           sessionId: zee.claude_session_id, model: zee.model, result: r?.result || null,
           startTime: startedAt, endTime: new Date(),
         });
+        // PER-TURN LEDGER: close the resumed turn with its own burn + summary.
+        await endTurn(turn?.id, {
+          status: death ? 'errored' : 'ended',
+          burn, stopReason: death ? death.message.slice(0, 200) : 'end_turn',
+          summary: lastAssistantText(r?.result),
+        });
         if (death) return reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message });
         return row;
       // The failure handler is the SECOND argument of this `then`, not a `.catch` after it, and that
@@ -909,7 +920,7 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
       // then report a turn that ran as one that "could not run" — putting the row back and, worse,
       // firing onFail (a stale landing raises a TEND from there) and filing a turn death that never
       // happened. It answers for the EXEC only.
-      }, (e) => {
+      }, async (e) => {
         logline('nudge', `${zee.slug}: nudge could not run (${String(e.message).slice(0, 160)}) — cxell may be down; no retry`);
         // The exec that REJECTED may still have said what it did: dk() attaches both streams to
         // `err.dk`, so the same one parser reads the same final result event off it (resultFrom).
@@ -926,6 +937,13 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
                     `${why}: resume could not run — ${String(e.message).slice(0, 120)}`,
                     usageFrom(result)).catch(() => {});
         const death = resumeTurnDeath({ ...dk, result });
+        // PER-TURN LEDGER: close the failed resume — errored if it died on a provider/infra error,
+        // else just 'ended' (the exec never started, but the row must not sit 'started' forever).
+        await endTurn(turn?.id, {
+          status: death ? 'errored' : 'ended',
+          burn: usageFrom(result),
+          stopReason: `${why}: resume could not run — ${String(e.message).slice(0, 120)}`,
+        }).catch(() => {});
         if (death) reportTurnDeath({ zeeId: zee.id, xellId, slug: zee.slug, reason: death.message }).catch(() => {});
         // The caller may need to KNOW the message never arrived (a stale landing has no other way
         // to reach its zee). Best-effort by construction: this is already the failure path.
