@@ -162,10 +162,8 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
       // mirror into the in-app tray, because the OS clipboard is unreachable on a remote http origin.
       // Shift+drag under tmux mouse mode for both engines.
       unsubSel = term.onSelectionChange((s) => capture(s));
-      // xterm-only COPY shortcut (Ctrl+Shift+C / Cmd+C). PASTE must NOT be intercepted here:
-      // xterm already turns the browser's paste event into onData (→ the PTY). A second path that
-      // read navigator.clipboard on KeyV and also returned false WITHOUT preventDefault made every
-      // Ctrl/Cmd+V land twice ("pasting pastes text twice"). wterm already handles native copy/paste.
+      // xterm-only COPY shortcut (Ctrl+Shift+C / Cmd+C). PASTE is owned by termHost
+      // (attachOwnedPaste — capture phase, once); do not add a KeyV/clipboard path here.
       term.attachCustomKeyEventHandler((e) => {
         if (e.type !== 'keydown') return true;
         const combo = (e.ctrlKey && e.shiftKey) || e.metaKey;
