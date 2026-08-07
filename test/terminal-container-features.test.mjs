@@ -58,18 +58,20 @@ const fe = readFileSync(resolve(here, '../web/src/FileExplorer.jsx'), 'utf8');
 ok(/listContainerDir/.test(fe) && /readContainerFile/.test(fe), 'FileExplorer imports the container fs API');
 ok(/if \(container\) return listContainerDir\(container\.id, path\)/.test(fe), 'and lists against a container when one is the target');
 
-// PASTE: xterm already turns the browser paste event into onData → the PTY. A custom KeyV handler
-// that ALSO read navigator.clipboard and sent {t:'i'} made every Ctrl/Cmd+V land twice. Copy still
-// needs the custom path (canvas selection is not a browser selection).
+// PASTE: owned once in termHost/termPaste (capture-phase). ZeeTerminal must not add a second
+// KeyV/clipboard path. Copy still needs the custom key handler (canvas selection).
 console.log('\n── paste is a single path (no double-paste on Ctrl/Cmd+V) ──');
 ok(/attachCustomKeyEventHandler/.test(src), 'custom key handler still installed (for copy)');
 ok(/e\.code === 'KeyC'/.test(src) && /capture\(term\.getSelection\(\)\)/.test(src),
    'Ctrl/Cmd+C still captures the xterm selection into the tray');
 ok(!/e\.code === 'KeyV'/.test(src) && !/clipboard\?\.readText/.test(src),
-   'no KeyV / clipboard.readText path — paste rides onData only, once');
-ok(/onData:\s*\(d\)\s*=>\s*\{[^}]*ws\.send\(JSON\.stringify\(\{\s*t:\s*'i'/.test(src)
-   || /onData: \(d\) => \{ if \(ws\.readyState === 1\) ws\.send\(JSON\.stringify\(\{ t: 'i', d \}\)\)/.test(src),
-   'keystrokes and native paste still go out as {t:\'i\'} frames');
+   'no KeyV / clipboard.readText path in ZeeTerminal');
+ok(/onData: \(d\) => \{ if \(ws\.readyState === 1\) ws\.send\(JSON\.stringify\(\{ t: 'i', d \}\)\)/.test(src),
+   'keystrokes go out as {t:\'i\'} frames (paste is injected the same way via termHost)');
+const host = readFileSync(resolve(here, '../web/src/termHost.js'), 'utf8');
+const paste = readFileSync(resolve(here, '../web/src/termPaste.js'), 'utf8');
+ok(/attachOwnedPaste/.test(host) && /export function attachOwnedPaste/.test(paste),
+   'termHost owns paste through termPaste.attachOwnedPaste');
 
 console.log(failures === 0 ? '\nALL PASSED ✓' : `\n${failures} FAILURE(S) ✗`);
 process.exit(failures ? 1 : 0);

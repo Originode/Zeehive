@@ -13,6 +13,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 
 import { getTermEngine, getTermTheme, TERM_THEME_PALETTES } from './termPref.js';
+import { attachOwnedPaste } from './termPaste.js';
 
 // Resolve a named theme (dark|light) or a raw xterm-style theme object into the
 // palette shape both engines understand. Named themes carry a full ANSI 0–15 so
@@ -131,10 +132,16 @@ function mountXterm(el, opts) {
   el.classList.add('term-xterm-host');
   el.classList.add(`term-theme-${palette.name === 'light' ? 'light' : 'dark'}`);
 
+  // Keyboard still rides xterm.onData; paste is owned above the engine (see attachOwnedPaste).
   const dataDisp = opts.onData ? term.onData(opts.onData) : null;
   const resizeDisp = opts.onResize
     ? term.onResize(({ cols, rows }) => opts.onResize(cols, rows))
     : null;
+  const detachPaste = attachOwnedPaste(el, {
+    onData: opts.onData,
+    disableStdin: !!opts.disableStdin,
+    bracketed: () => !!term.modes?.bracketedPasteMode,
+  });
 
   const handle = {
     engine: 'xterm',
@@ -161,8 +168,8 @@ function mountXterm(el, opts) {
       const d = term.onSelectionChange(() => { const s = term.getSelection(); if (s) cb(s); });
       return () => { try { d.dispose(); } catch { /* */ } };
     },
-    // Custom key handler: return false to swallow. xterm-only; wterm uses native
-    // browser copy/paste so the same chords already work without us.
+    // Custom key handler: return false to swallow. xterm-only; copy still needs this
+    // (canvas selection is not a browser selection). Paste is owned by attachOwnedPaste.
     attachCustomKeyEventHandler(fn) { term.attachCustomKeyEventHandler(fn); },
     registerPathLinks(activate) {
       const disp = term.registerLinkProvider({
@@ -188,6 +195,7 @@ function mountXterm(el, opts) {
       return () => { try { disp.dispose(); } catch { /* */ } };
     },
     dispose() {
+      try { detachPaste?.(); } catch { /* */ }
       try { dataDisp?.dispose(); } catch { /* */ }
       try { resizeDisp?.dispose(); } catch { /* */ }
       try { term.dispose(); } catch { /* */ }
@@ -222,10 +230,18 @@ async function mountWterm(el, opts) {
     cursorBlink: opts.cursorBlink !== false && !opts.disableStdin,
     // Always pass onData so wterm does NOT echo keystrokes (the PTY echoes).
     // Firehose (disableStdin) still gets a no-op so typing never paints locally.
+    // Paste is owned by attachOwnedPaste (capture phase) so wterm's paste+input
+    // double-path cannot fire twice into onData.
     onData: opts.disableStdin ? () => {} : (opts.onData || (() => {})),
     onResize: opts.onResize || null,
   });
   await term.init();
+
+  const detachPaste = attachOwnedPaste(el, {
+    onData: opts.onData,
+    disableStdin: !!opts.disableStdin,
+    bracketed: () => !!term.bridge?.bracketedPaste?.(),
+  });
 
   // Selection: DOM-native. Mirror into the in-app clipboard tray the same way
   // xterm's onSelectionChange does.
@@ -351,6 +367,7 @@ async function mountWterm(el, opts) {
       return () => { if (pathActivate === activate) pathActivate = null; };
     },
     dispose() {
+      try { detachPaste?.(); } catch { /* */ }
       document.removeEventListener('selectionchange', onSelChange);
       el.removeEventListener('click', onPathClick);
       el.removeEventListener('wheel', onWheel);
