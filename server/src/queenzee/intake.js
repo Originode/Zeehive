@@ -1401,6 +1401,16 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
             await q(`UPDATE zee SET claude_session_id=$2, session_name=$2, viewer_url=$3 WHERE id=$1`, [zee.id, s, v.url]);
           }
         }
+        // THE PLAY-BY-PLAY LEDGER (SDK path): persist the same events the cxell feed persists,
+        // attributed to the current turn (turn_id). Best-effort — never blocks the stream.
+        if (turn?.id && msg?.type && msg.type !== 'system') {
+          q(`INSERT INTO session_event (source, hook_event_name, zee_id, xell_id, turn_id, agent_id, tool_name, raw)
+             VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)`,
+            ['cxell-feed', msg.type, zee.id, xell.id, turn.id,
+             sid || null,
+             msg.type === 'assistant' ? (msg.message?.content?.[0]?.type === 'tool_use' ? msg.message.content[0].name : null) : null,
+             JSON.stringify(msg)]).catch(() => {});
+        }
         if (msg?.type === 'result') {
           // Persist full usage for the fleet burn tracker (was cost_usd only). Best-effort on the
           // SDK path: if the result exposes `usage`, tokens land too. A result with NEITHER usage
