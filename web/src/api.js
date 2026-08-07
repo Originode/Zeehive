@@ -461,6 +461,10 @@ export const mountHostFolder = (host_path, name) => siteCall('/api/projects/moun
 export const probeRemote = (url, token) => siteCall('/api/projects/probe-remote', 'POST', { url, token: token || undefined });
 export const cloneProject = (body) => siteCall('/api/projects/clone', 'POST', body);
 export const pullProject = (projectId) => siteCall(`/api/projects/${projectId}/pull`, 'POST', {});
+// Reconcile: re-point local <main> at the recorded remote's tip when they have diverged — the
+// action that makes an ordinary PR work again after the remote was squashed clean. Destructive to
+// local-only commits (that is the point), so it is human-confirmed like Push/PR.
+export const reconcileProject = (projectId) => siteCall(`/api/projects/${projectId}/reconcile`, 'POST', {});
 export const githubAccess = (projectId) => fetch(`/api/projects/${projectId}/github-access`).then((r) => r.json());
 export const pushProject = (projectId) => siteCall(`/api/projects/${projectId}/push`, 'POST', {});
 export const pullRequestProject = (projectId, opts = {}) => siteCall(`/api/projects/${projectId}/pr`, 'POST', opts);
@@ -480,9 +484,13 @@ export const squashHelps = (r) => !!(r && r.opened === false && r.rule && SQUASH
 export const squashOffer = (r, branch = 'main') =>
   `${r?.rule === 'secrets' ? 'GitHub push protection' : 'A repository rule'} refused this because of something in the `
   + `COMMITS being pushed${(r?.rule_locations || []).length ? ` (${r.rule_locations.join(', ')})` : ''} — not the branch tip, which is why a `
-  + `later fix does not clear it.\n\nOpen the PR from a SQUASHED SNAPSHOT instead? One commit carrying the current tree of `
-  + `${branch}, on top of the remote base. The review diff is identical, the intermediate commits are not pushed, and `
-  + `nothing local is rewritten.`;
+  + `later fix does not clear it.\n\nTwo ways forward:\n`
+  + `• ⟲ Reconcile (Project setup → GitHub remote) — re-points local ${branch} at the remote's tip and `
+  + `discards the local-only commits. Right when those commits are old/garbage (e.g. a remote that was `
+  + `squashed clean under a dirty branch): an ordinary, non-squashed PR works again afterwards.\n`
+  + `• Open the PR from a SQUASHED SNAPSHOT instead — one commit carrying the current tree of ${branch}, on top `
+  + `of the remote base. The review diff is identical, the intermediate commits are not pushed, and nothing `
+  + `local is rewritten.`;
 export const getReadiness = (projectId) => fetch(`/api/projects/${projectId}/readiness`).then((r) => r.json());
 export const getPoolConfig = (projectId) => fetch(`/api/projects/${projectId}/pool-config`).then((r) => r.json());
 export const patchPoolConfig = (projectId, body) => siteCall(`/api/projects/${projectId}/pool-config`, 'PATCH', body);

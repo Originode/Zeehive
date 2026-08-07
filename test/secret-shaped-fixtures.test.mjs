@@ -1,5 +1,5 @@
-// NO SECRET-SHAPED STRINGS IN THE TREE — the lint that keeps GitHub's push protection from
-// refusing a push over a string nobody ever meant as a credential.
+// NO SECRET-SHAPED STRINGS IN THE TREE OR IN THE HISTORY — the lint that keeps GitHub's push
+// protection from refusing a push over a string nobody ever meant as a credential.
 //
 // WHAT IT COST (2026-08-04). A PR from the console failed with GH013 "repository rule violations",
 // twice, and nobody could say why: the reason surfaced was git's last 300 characters, which on a
@@ -16,12 +16,23 @@
 //     code and does not exist as a literal in any file GitHub scans.
 //
 // SCOPE, stated so nobody reads more into a green run: these are the HIGH-CONFIDENCE partner
-// patterns, matched on the source of every tracked file. It is a fixture lint, not a secret scanner
-// — it cannot see git HISTORY (where the 2026-08-04 block actually lived), it does not know a real
-// credential from an invented one, and GitHub scans hundreds of patterns this does not carry. A
-// green run means "no tracked file carries one of THESE shapes", nothing wider.
+// patterns, matched on (a) the source of every tracked file and (b) every ADDED line in the
+// reachable history (`git log -p` `+` lines). It is a fixture lint, not a secret scanner — it does
+// not know a real credential from an invented one, and GitHub scans hundreds of patterns this does
+// not carry. A green run means "no tracked file carries one of THESE shapes, and no commit in this
+// branch's history ever INTRODUCED one".
+//
+// WHY THE HISTORY HALF EXISTS (2026-08-05). Push protection scans every commit in the push RANGE,
+// not the tip. A string added in one commit and removed in a later one is invisible to a tree scan
+// but still refuses every push from that branch — exactly the 2026-08-04 incident, where the hex
+// fixture sat in the range for 112 commits after its removal was a clean tip. The history scan
+// catches the string at the moment it is ADDED, so the range can never quietly carry it again. The
+// two known introductions are GRANDFATHERED by commit sha (the same reasoning migration-numbers and
+// harness-memory-migrations grandfather landed collisions: a forward-only repo does not rewrite
+// history) — and, like those lists, each entry must still describe a real incident or the list
+// becomes a licence for the next one.
 import { readFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -103,6 +114,74 @@ for (const f of ['test/cxell-credential-vendor.test.mjs', 'test/cxell-provider-e
   ok(!PATTERNS.some((p) => p.re.test(text)), `${f}: carries no vendor pattern`);
   ok(/DEEPSEEK_TOK\s*=\s*'sk-[A-Za-z0-9]{20,}'/.test(text),
     `${f}: and its DeepSeek fixture is still a shape our own predicates accept`);
+}
+
+// ── the HISTORY half — a string ADDED anywhere in this branch's history stays in the push range ──
+console.log('and no commit in the history ever INTRODUCED a vendor secret pattern');
+{
+  // The two commits that introduced the 2026-08-04 hex fixture. They are already in the repo's
+  // history — a forward-only repo does not rewrite it — so they are recorded here as the KNOWN
+  // incident, and each is verified below to still be exactly that (a real addition of the hex).
+  // This is the migration-numbers / harness-memory-migrations grandfather pattern: a record of the
+  // bug, not permission to add to it.
+  const GRANDFATHERED = new Set([
+    'a87222150d1225809a21b960c5e8b31c6a213a54',   // add hex to cxell-credential-vendor
+    'e79197122949b110caf6d4ac237ce1448ec7e179',   // add hex to cxell-provider-env
+  ]);
+
+  // `git log -p` pipes every commit's diff; the `+` (added) lines are what a future push would
+  // carry. `+++` is the file header, not an addition. Lockfiles are exempt for the same reason as
+  // the tree scan. `--max-count` is set to the ACTUAL commit count (not a hardcoded ceiling) so the
+  // scan can never silently truncate on a bigger repo. ~2s for this repo's 1.2k commits — cheap
+  // enough to run on every check.
+  const commitCount = +execFileSync('git', ['-C', repo, 'rev-list', '--count', 'HEAD'],
+    { encoding: 'utf8' }).trim();
+  const patch = execFileSync('git', ['-C', repo, 'log', '-p',
+    `--max-count=${commitCount}`, '--', '.', ':!package-lock.json'],
+    { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+  const lines = patch.split('\n');
+
+  const histHits = [];   // {commit, pattern, line}
+  let curCommit = null;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const cm = /^commit ([0-9a-f]{40})/.exec(l);
+    if (cm) { curCommit = cm[1]; continue; }
+    if (!l.startsWith('+') || l.startsWith('+++')) continue;
+    for (const p of PATTERNS) {
+      if (p.re.test(l)) {
+        histHits.push({ commit: curCommit, pattern: p.name, line: l.trim().slice(0, 110) });
+        break;
+      }
+    }
+  }
+
+  // Known incidents are the two hex introductions. Verify each grandfathered sha REALLY introduced
+  // the hex — a stale grandfather entry is a standing permit for the next one. Each commit created
+  // one of the two test files, so check the file that commit touched. A checkout cut from a
+  // rewritten history (e.g. the squashed remote master) may not CONTAIN the commit at all — that is
+  // fine, it means there is nothing to grandfather — so the check is skipped when the sha is absent.
+  const hex = PATTERNS.find((p) => p.name === 'DeepSeek API key');
+  const GRANDFATHERED_PATHS = [
+    ['a87222150d1225809a21b960c5e8b31c6a213a54', 'test/cxell-credential-vendor.test.mjs'],
+    ['e79197122949b110caf6d4ac237ce1448ec7e179', 'test/cxell-provider-env.test.mjs'],
+  ];
+  for (const [sha, path] of GRANDFATHERED_PATHS) {
+    const probe = spawnSync('git', ['-C', repo, 'cat-file', '-e', `${sha}^{commit}`], { encoding: 'utf8' });
+    if (probe.status !== 0) continue;   // commit not in this checkout → nothing to grandfather
+    const tree = execFileSync('git', ['-C', repo, 'show', `${sha}:${path}`],
+      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+    ok(hex.re.test(tree), `grandfathered commit ${sha.slice(0, 8)} really carries the 2026-08-04 hex fixture`);
+  }
+
+  const unexpected = histHits.filter((h) => !GRANDFATHERED.has(h.commit));
+  ok(unexpected.length === 0,
+    unexpected.length === 0
+      ? 'no commit introduced a vendor secret pattern beyond the recorded 2026-08-04 incident'
+      : `${unexpected.length} commit(s) INTRODUCED a vendor secret pattern — GitHub push protection will refuse a push from this branch, even with a clean tip:\n`
+        + `      ${unexpected.map((h) => `${h.commit.slice(0, 8)} — ${h.pattern}: ${h.line}`).join('\n      ')}\n`
+        + `    Fix: remove the string from the introducing commit's history (the tip is not enough) — `
+        + `rewrite it out, or open the PR from a squashed snapshot of the current tree.`);
 }
 
 console.log(failures === 0 ? '\nALL GREEN' : `\n${failures} FAILURE(S)`);

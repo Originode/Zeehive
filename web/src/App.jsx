@@ -4,7 +4,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
          extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
-         pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject,
+         pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, reconcileProject,
          getXellLangfuseSession, routePrompt, deployRouter, redeployRouter,
          squashHelps, squashOffer } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
@@ -621,6 +621,25 @@ export default function App() {
     } catch (e) { setGithubOut({ kind: 'pull', reason: e.message }); }
   }, [projectId, fleet?.project?.id]);
 
+  // Reconcile — re-point local main at the remote's tip. The fix when Pull says "reconcile by hand"
+  // and an ordinary PR keeps getting refused (push protection scanning the old commits in the range).
+  // Discards local-only commits (that is the point), so it is confirmed first.
+  const doGitHubReconcile = useCallback(async () => {
+    const pid = projectId || fleet?.project?.id;
+    if (!pid || !(fleet?.project?.remote_url)) return;
+    if (!(await showConfirm(
+      `Re-point local ${fleet?.project?.main_branch || 'main'} of ${fleet?.project?.name} at the GitHub remote's tip?\n\n`
+      + `${fleet?.project?.remote_url || ''}\n\nLocal commits NOT on the remote are discarded. Use this when the remote was `
+      + `squashed/re-written and an ordinary PR keeps being refused (push protection scanning the old commits). `
+      + `A fast-forward Pull would be the non-destructive choice when the remote is simply AHEAD.`,
+      { title: 'Reconcile to remote?', okLabel: 'Reconcile', variant: 'danger' }))) return;
+    setGithubOut({ busy: true, kind: 'reconcile' });
+    try {
+      const r = await reconcileProject(pid);
+      setGithubOut({ ...r, kind: 'reconcile' });
+    } catch (e) { setGithubOut({ kind: 'reconcile', reason: e.message }); }
+  }, [projectId, fleet?.project?.id, fleet?.project?.main_branch, fleet?.project?.name, fleet?.project?.remote_url]);
+
   const doGitHubPR = useCallback(async (merge = false) => {
     const pid = projectId || fleet?.project?.id;
     if (!pid || !githubAccessState?.can_pr) return;
@@ -1135,6 +1154,10 @@ export default function App() {
                       disabled={githubOut?.busy}
                       onClick={doGitHubPull}
                       title="Fetch + fast-forward from the GitHub remote">↓ Pull</button>
+              <button className={`gh-btn ${githubOut?.kind === 'reconcile' && githubOut?.busy ? 'busy' : ''}`}
+                      disabled={githubOut?.busy}
+                      onClick={doGitHubReconcile}
+                      title="Re-point local main at the remote's tip — the fix when Pull says 'reconcile by hand' and an ordinary PR keeps getting refused (discards local-only commits — confirmed first)">⟲ Reconcile</button>
               {githubAccessState?.can_push && (
                 <button className={`gh-btn ${githubOut?.kind === 'push' && githubOut?.busy ? 'busy' : ''}`}
                         disabled={githubOut?.busy}
@@ -1157,13 +1180,14 @@ export default function App() {
                         title="Open a PR AND merge it into the default branch on GitHub">⇅ PR ⟳</button>
               )}
               {githubOut && !githubOut.busy && (
-                <a className={`gh-out${!githubOut.pushed && !githubOut.opened && !githubOut.pulled ? ' bad' : ''}`}
+                <a className={`gh-out${!githubOut.pushed && !githubOut.opened && !githubOut.pulled && !githubOut.reconciled ? ' bad' : ''}`}
                    href={githubOut?.url || null} target="_blank" rel="noreferrer"
                    title={githubOut?.pushed ? 'Pushed successfully'
                      : githubOut?.opened ? (githubOut?.merge?.merged ? 'PR opened & merged' : 'PR opened')
                      : githubOut?.pulled ? (githubOut?.state === 'up-to-date' ? 'Remote already up to date' : 'Pulled from remote')
+                     : githubOut?.reconciled ? `Reconciled — dropped ${githubOut?.dropped ?? '?'} local commit${githubOut?.dropped === 1 ? '' : 's'}, you can now open a normal PR`
                      : githubOut?.reason || 'result'}>
-                  {githubOut?.pushed || githubOut?.pulled ? '✓'
+                  {githubOut?.pushed || githubOut?.pulled || githubOut?.reconciled ? '✓'
                     : githubOut?.opened ? `#${githubOut?.number || '✓'}`
                     : '✗'}
                 </a>
