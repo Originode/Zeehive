@@ -424,12 +424,22 @@ function modelFromBody(body) {
 }
 
 // ── the gateway's own read model ─────────────────────────────────────────────────────────────
-// Per-xell request list (the observability panel's gateway tab): newest-first.
+// Per-xell request list (the observability panel's gateway tab): newest-first. Each row is one
+// llm_gateway_request plus its zee's name and — when the request was attributed to a turn — that
+// turn's ledger metadata (kind/status/model/summary/timing). The observability panel groups the
+// per-request rows under their turn, so the transport-level calls read together with the per-turn
+// ledger; the turn_* columns are NULL for older rows recorded before turn_id was populated.
 export async function requestsForXell(xellId, { limit = 50 } = {}) {
   try {
     return await q(
-      `SELECT r.*, z.name AS zee_name FROM llm_gateway_request r
+      `SELECT r.*, z.name AS zee_name,
+              t.kind AS turn_kind, t.status AS turn_status, t.model AS turn_model,
+              t.summary AS turn_summary, t.started_at AS turn_started_at,
+              t.ended_at AS turn_ended_at, t.stop_reason AS turn_stop_reason,
+              t.session_id AS turn_session_id, t.cost_usd AS turn_cost_usd
+         FROM llm_gateway_request r
          LEFT JOIN zee z ON z.id = r.zee_id
+         LEFT JOIN zee_turn t ON t.id = r.turn_id
         WHERE r.xell_id = $1
         ORDER BY r.requested_at DESC
         LIMIT $2`,

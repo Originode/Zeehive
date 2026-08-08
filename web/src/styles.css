@@ -3065,3 +3065,21 @@ a.langfuse-ui:hover { text-decoration: underline; }
 .xob-tab.on { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel2)); }
 .xob-tab-n { opacity: .7; margin-left: 4px; font-size: 11px; }
 .xob-gw { display: flex; flex-direction: column; gap: 8px; }
+/* Gateway-call per-turn grouping: a group header reads like a turn-ledger row, with the
+   individual request rows beneath it. Same column widths as .ob-turn-h so the two line up. */
+.ob-gw-group { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.ob-gw-group-h { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px 10px; font-size: 12px; background: color-mix(in srgb, var(--panel2) 70%, var(--accent) 6%); border-bottom: 1px solid var(--line); }
+.ob-gw-group-h .ob-turn-kind, .ob-gw-group-h .ob-turn-status { font-weight: 600; }
+.ob-gw-group-h.null { background: var(--panel2); border-bottom: 1px solid var(--line); }
+.ob-gw-group-h.null .ob-turn-kind { color: var(--muted); font-weight: 600; }
+.ob-gw-count { color: var(--muted); min-width: 64px; text-align: right; margin-left: auto; }
+.ob-gw-group-sub { display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; padding: 6px 10px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--line); background: var(--panel2); }
+.ob-gw-group-sub .ob-summary { font-size: 11px; }
+.ob-gw-group-sub.muted { color: var(--muted); font-style: italic; }
+.ob-gw-group-sub code { font-size: 11px; }
+.ob-gw-calls { display: flex; flex-direction: column; }
+.ob-gw-call { border-bottom: 1px solid var(--line); }
+.ob-gw-call:last-child { border-bottom: none; }
+.ob-gw-call .ob-turn-h { cursor: default; }
+.ob-gw-attrib { display: flex; gap: 12px; flex-wrap: wrap; padding: 2px 10px 6px 10px; font-size: 10px; color: var(--muted); }
+.ob-gw-attrib code { font-size: 10px; }

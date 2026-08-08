@@ -119,10 +119,39 @@ function TurnRow({ turn, open, onToggle }) {
   );
 }
 
+// One gateway-call row — a single HTTP request (a messages or chat-completions POST) with the
+// upstream's exact usage. Renders the transport columns plus any zee/session attribution the row
+// carries (older rows recorded before attribution landed have none, and degrade gracefully).
+function GatewayCallRow({ r }) {
+  const tokens = Number(r.total_tokens || 0);
+  return (
+    <div className="ob-gw-call">
+      <div className="ob-turn-h">
+        <span className="ob-turn-kind">{r.kind === 'chat-completions' ? '⚙ chat' : '📨 messages'}</span>
+        <span className="ob-turn-status">{r.status === 200 ? '✓' : `✗ ${r.status || '?'}`}</span>
+        <span className="ob-turn-model">{r.provider} · {r.model || '—'}</span>
+        <span className="ob-turn-tok">{fmtTok(tokens)} tok</span>
+        <span className="ob-turn-cost">{fmtUsd(r.cost_usd)}</span>
+        <span className="ob-turn-dur">{r.duration_ms ? `${r.duration_ms}ms` : '—'}</span>
+        <span className="ob-turn-dt">{fmtDt(r.requested_at)}</span>
+      </div>
+      {(r.zee_name || r.session_id) && (
+        <div className="ob-gw-attrib">
+          {r.zee_name && <span>🐝 {r.zee_name}</span>}
+          {r.session_id && <code>session {r.session_id}</code>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The gateway calls tab — every AI request that crossed the queenzee's transparent gateway,
-// newest first. Each row is one HTTP request (a messages or chat-completions POST) with the
-// upstream's exact usage. This is the grain that captures ALL turn kinds: a spawn, a resume,
-// and an interactive TUI session all make the same calls through the gateway.
+// newest first, grouped under the turn that produced it. This is the grain that captures ALL
+// turn kinds: a spawn, a resume, and an interactive TUI session all make the same calls through
+// the gateway. Each group header reads like the per-turn ledger's row (kind/status/model plus
+// the aggregate of the calls beneath it), so the transport-level calls and the turn ledger tell
+// one coherent story. Calls recorded before turn_id was populated (or whose turn row was reaped)
+// fall into a trailing "No turn" group — still attributed to their zee when the row has one.
 function GatewayCalls({ requests }) {
   if (!requests.length) {
     return (
@@ -136,6 +165,29 @@ function GatewayCalls({ requests }) {
     cost: a.cost + Number(r.cost_usd || 0),
     tokens: a.tokens + Number(r.total_tokens || 0),
   }), { cost: 0, tokens: 0 });
+
+  // Group the newest-first request list under its turn, preserving request order within a group
+  // and group order by each group's newest request. Requests without a turn_id form a catch-all
+  // group moved to the end (older rows / a reaped turn row).
+  const groups = [];
+  const byKey = new Map();
+  for (const r of requests) {
+    const key = r.turn_id || '__no-turn__';
+    let g = byKey.get(key);
+    if (!g) {
+      g = { key, requests: [], turn: r.turn_id ? {
+        id: r.turn_id, kind: r.turn_kind, status: r.turn_status, model: r.turn_model,
+        summary: r.turn_summary, started_at: r.turn_started_at, ended_at: r.turn_ended_at,
+        stop_reason: r.turn_stop_reason, session_id: r.turn_session_id, zee_name: r.zee_name,
+      } : null };
+      byKey.set(key, g);
+      groups.push(g);
+    }
+    g.requests.push(r);
+  }
+  const unatt = groups.findIndex((g) => g.key === '__no-turn__');
+  if (unatt !== -1) groups.push(groups.splice(unatt, 1)[0]);
+
   return (
     <div className="xob-gw">
       <div className="xob-summary">
@@ -144,19 +196,46 @@ function GatewayCalls({ requests }) {
         <span><b>{fmtUsd(sum.cost)}</b> cost (shown window)</span>
       </div>
       <div className="xob-turns">
-        {requests.map((r) => {
-          const tokens = Number(r.total_tokens || 0);
+        {groups.map((g) => {
+          const gSum = g.requests.reduce((a, r) => ({
+            cost: a.cost + Number(r.cost_usd || 0),
+            tokens: a.tokens + Number(r.total_tokens || 0),
+          }), { cost: 0, tokens: 0 });
           return (
-            <div key={r.id} className="ob-turn">
-              <button className="ob-turn-h" aria-expanded={false}>
-                <span className="ob-turn-kind">{r.kind === 'chat-completions' ? '⚙ chat' : '📨 messages'}</span>
-                <span className="ob-turn-status">{r.status === 200 ? '✓' : `✗ ${r.status || '?'}`}</span>
-                <span className="ob-turn-model">{r.provider} · {r.model || '—'}</span>
-                <span className="ob-turn-tok">{fmtTok(tokens)} tok</span>
-                <span className="ob-turn-cost">{fmtUsd(r.cost_usd)}</span>
-                <span className="ob-turn-dur">{r.duration_ms ? `${r.duration_ms}ms` : '—'}</span>
-                <span className="ob-turn-dt">{fmtDt(r.requested_at)}</span>
-              </button>
+            <div key={g.key} className="ob-gw-group">
+              <div className={`ob-gw-group-h${g.turn ? '' : ' null'}`}>
+                {g.turn ? (
+                  <>
+                    <span className="ob-turn-kind">{kindLabel(g.turn.kind)}</span>
+                    <span className="ob-turn-status">{statusLabel(g.turn.status)}</span>
+                    <span className="ob-turn-model">{g.turn.model || '—'}</span>
+                    <span className="ob-turn-tok">{fmtTok(gSum.tokens)} tok</span>
+                    <span className="ob-turn-cost">{fmtUsd(gSum.cost)}</span>
+                    <span className="ob-turn-dur">{fmtDur(g.turn.started_at, g.turn.ended_at)}</span>
+                    <span className="ob-gw-count">{g.requests.length} call{g.requests.length === 1 ? '' : 's'}</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="ob-turn-kind">◌ No turn</span>
+                    <span className="ob-gw-count">{g.requests.length} call{g.requests.length === 1 ? '' : 's'}</span>
+                  </>
+                )}
+              </div>
+              {(g.turn?.summary || g.turn?.zee_name || g.turn?.session_id) && (
+                <div className="ob-gw-group-sub">
+                  {g.turn.zee_name && <span>🐝 {g.turn.zee_name}</span>}
+                  {g.turn.session_id && <code>session {g.turn.session_id}</code>}
+                  {g.turn.summary && <span className="ob-summary"><b>said:</b> {g.turn.summary}</span>}
+                </div>
+              )}
+              {!g.turn && (
+                <div className="ob-gw-group-sub muted">
+                  Older rows recorded before turn attribution — no turn to group under.
+                </div>
+              )}
+              <div className="ob-gw-calls">
+                {g.requests.map((r) => <GatewayCallRow key={r.id} r={r} />)}
+              </div>
             </div>
           );
         })}
