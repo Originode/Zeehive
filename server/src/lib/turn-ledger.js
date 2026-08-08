@@ -70,6 +70,11 @@ export async function startTurn({ zee, xell = null, kind = 'spawn', sessionId = 
 // ({ cost, input, output, cacheRead, cacheWrite, metered }). `summary` is the last
 // assistant text the turn produced (its answer). `stopReason` is the turn's end reason
 // (end_turn, an error message, PAUSED_STOP_REASON, …). Returns the updated row or null.
+//
+// `ended_at IS NULL` in the WHERE makes the end a ONE-SHOT act: a turn that already ended
+// (ended_at set) is never re-stamped — a second writer (the spin detector racing intake, a
+// double-fired completion handler) gets null back instead of overwriting the ending state. A
+// ledger we are building trust in must not let a late writer relabel a turn that ended naturally.
 export async function endTurn(turnId, { status = 'ended', burn = null, stopReason = null,
                                         summary = null, endedAt = null, meta = null } = {}) {
   if (!turnId) return null;
@@ -83,11 +88,11 @@ export async function endTurn(turnId, { status = 'ended', burn = null, stopReaso
               metered = $9, stop_reason = COALESCE($10, stop_reason),
               summary = COALESCE($11, summary),
               meta = meta || COALESCE($12, '{}'::jsonb)
-        WHERE id = $1 RETURNING *`,
+        WHERE id = $1 AND ended_at IS NULL RETURNING *`,
       [turnId, status, endedAt || null, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite,
        b.metered !== false, stopReason || null, summary || null,
        meta ? JSON.stringify(meta) : null]);
-    if (!row) logline('turn', `endTurn: no zee_turn row ${String(turnId).slice(0, 8)} to close`);
+    if (!row) logline('turn', `endTurn: no OPEN zee_turn row ${String(turnId).slice(0, 8)} to close (already ended, or absent)`);
     return row;
   } catch (e) {
     logline('turn', `could not end turn ${String(turnId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);

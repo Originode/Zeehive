@@ -47,6 +47,7 @@ import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 import { noteTurnDeath } from './revive.js';
+import { SPIN_STOP_REASON } from '../lib/spin-detector.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -1958,6 +1959,26 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await endTurn(turn?.id, { status: 'paused', burn: b, stopReason: PAUSED_STOP_REASON });
         return;
       }
+      // A turn the SPIN DETECTOR ended is not an error either. Judge it from the TURN row, not the
+      // zee's last_stop_reason: that persists across turns, so a PREVIOUS spin-ended turn's marker
+      // would mislabel a later clean exit as a spin — the exact observability lie the review named.
+      // The detector closes THIS turn with stop_reason='spin-detector' (endTurn, one-shot), so the
+      // turn row is the single source of truth for what ended it. Preserve the spin end exactly as
+      // the fleet-pause branch above does: book the burn on the zee row (a spin turn spent what it
+      // spent), keep the zee idle. The turn row needs no touch — the detector already closed it, and
+      // a closed turn is never re-stamped (endTurn's ended_at IS NULL guard).
+      const spinClosed = turn?.id
+        ? (await one(`SELECT stop_reason FROM zee_turn WHERE id=$1`, [turn.id]).catch(() => null))?.stop_reason === SPIN_STOP_REASON
+        : false;
+      if (spinClosed) {
+        await q(`UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                                cache_read_tokens=$5, cache_write_tokens=$6,
+                                status='idle', last_stop_reason=$7 WHERE id=$1`,
+          [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, SPIN_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (repetition without progress)`);
+        return;
+      }
       const errored = result?.is_error;
       // A result with NEITHER usage nor total_cost_usd is UNMETERED — the turn ran and the fleet
       // cannot know what it cost (kimi, or a provider whose result carries no meter). The marker is
@@ -2008,6 +2029,19 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
         await endTurn(turn?.id, { status: 'paused', burn: null, stopReason: PAUSED_STOP_REASON });
+        return;
+      }
+      // Same spin-detector guard as the resolve path — keyed on the TURN row, never the zee's stale
+      // last_stop_reason (a previous spin-ended turn's marker must not mislabel a later clean exit):
+      // a SIGINT'd exec usually REJECTS, so this is the branch a spin end most often lands in. The
+      // detector already closed the turn; keep the zee idle.
+      const spinClosed = turn?.id
+        ? (await one(`SELECT stop_reason FROM zee_turn WHERE id=$1`, [turn.id]).catch(() => null))?.stop_reason === SPIN_STOP_REASON
+        : false;
+      if (spinClosed) {
+        await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, SPIN_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (its exec died)`);
         return;
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);

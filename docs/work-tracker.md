@@ -430,7 +430,8 @@ table above.
 { root, project_id, unscheduled_count,
   span: { start, end, days } | null,
   rows: [ { id, parent_id, depth, kind, title, status, status_label,
-            starts_on, due_on, computed_start, computed_end, span_days,
+            starts_on, due_on, actual_start, actual_end,
+            computed_start, computed_end, computed_actual_start, computed_actual_end, span_days,
             progress, rolled_progress, estimate_hours, assignee, xell_id,
             unscheduled, deps: [id…] } ] }
 ```
@@ -442,6 +443,15 @@ root-inclusion table). Roll-ups:
   `min(children start) … max(children end)`. A parent **with** its own dates keeps them: someone
   stated them on purpose. Only the missing end is rolled — a parent with a `starts_on` and no
   `due_on` keeps its start and rolls its end.
+- `actual_start` / `actual_end` — the **DERIVED** actuals, from migration 159. These are what the
+  record *proves* happened (the first event into assigned/working, or the first zee_turn of a linked
+  xell = start; the terminal event, or the first landed landing = end), maintained by triggers as a
+  byproduct of the queenzee's own event writes — **never agent-submitted**. They are distinct from
+  `starts_on`/`due_on` (the PLAN) and the gantt draws them as a separate read-only bar. A null
+  `actual_end` is "still in flight".
+- `computed_actual_start` / `computed_actual_end` — the actual span rolled up the same way as the
+  plan: a parent whose own ledger is silent (a project/activity is rarely assigned to a zee) still
+  gets the real bar its subtree earned. A parent **with** its own actuals keeps them.
 - `rolled_progress` — a parent with no explicit progress is the **leaf-count-weighted** average of
   its children's rolled progress (each child weighs the number of leaves beneath it, *not* its
   number of direct children), so a branch with nine subtasks outweighs a branch with one.
@@ -449,13 +459,16 @@ root-inclusion table). Roll-ups:
   **"No explicit progress" is implemented as `progress === 0`.** There is no way to state a
   deliberate 0% on a parent — it will always show the rolled average instead. Leaves always report
   their own `progress` as `rolled_progress`.
-- `unscheduled: true` — no dates anywhere in the subtree. Those rows come back with **nulls** and
-  the flag, and `unscheduled_count` totals them. The UI **lists** them; it does not invent dates,
-  because an invented date is indistinguishable from a real one the moment it is on screen.
+- `unscheduled: true` — **no dates anywhere in the subtree, planned OR actual**. Those rows come back
+  with **nulls** and the flag, and `unscheduled_count` totals them. The UI **lists** them; it does
+  not invent dates, because an invented date is indistinguishable from a real one the moment it is
+  on screen. A row whose PLAN is empty but whose RECORD has actuals draws a real bar and is not
+  listed.
 - `span_days` (per row) and `span: {start, end, days}` (per model) — how wide the bar is, and how
   wide the whole chart is, in **whole inclusive days** (a task starting and ending the same day is
   `1`, not `0`). `null` when the row is unscheduled, and `span` is `null` when nothing is scheduled
-  at all.
+  at all. The model's `span` includes the actual extent too — a chart whose bars are all actuals
+  (the 470-item / 0-plan case this exists for) still gets a window.
 
 ### The schedule invariant, and the span that is *not* one
 

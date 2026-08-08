@@ -2669,6 +2669,12 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   cursor: grab; z-index: 2; touch-action: none; }
 .work-gbar.rolled, .work-gsum { cursor: default; }
 .work-gsum { top: 8px; height: 10px; }
+/* The ACTUAL bar — what the record PROVES happened, read-only. A thin line under the plan's bar
+   (ROW is 30px, the plan sits at top 5–21, so the actual sits at 22–27) and never draggable:
+   actuals are derived facts, not a submission surface. */
+.work-gbar.actual { top: 22px; height: 5px; cursor: default; border-radius: 2px; z-index: 1; }
+.work-gbar.actual .work-gfill-bg { opacity: .55; border-radius: 2px; }
+.work-gbar.actual .work-gopen { border-radius: 2px; }
 .work-gbar.ghosting, .work-gsum.ghosting { opacity: .8; outline: 1px dashed var(--accent); }
 .work-gbar.hot, .work-gsum.hot { box-shadow: 0 0 0 1px var(--accent); }
 .work-gbar.over, .work-gsum.over { box-shadow: 0 0 0 1px var(--down); }

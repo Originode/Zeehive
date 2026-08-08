@@ -261,12 +261,16 @@ ok(ts.scheduleWindow({}, D(2026, 7, 29)).due_on === '2026-07-30',
 const ROWS = [
   { id: 'p', parent_id: null, depth: 0, kind: 'project', title: 'Project', status: serverKeys[0],
     starts_on: null, due_on: null, computed_start: '2026-07-20', computed_end: '2026-08-05',
+    computed_actual_start: '2026-07-21', computed_actual_end: '2026-08-04',
     progress: 0, rolled_progress: 40, deps: [], unscheduled: false },
   { id: 'a', parent_id: 'p', depth: 1, kind: 'activity', title: 'Activity', status: serverKeys[2],
     starts_on: null, due_on: null, computed_start: '2026-07-20', computed_end: '2026-08-05',
+    computed_actual_start: '2026-07-21', computed_actual_end: '2026-08-04',
     progress: 0, rolled_progress: 40, deps: [], unscheduled: false },
   { id: 't1', parent_id: 'a', depth: 2, kind: 'task', title: 'First task', status: serverKeys[2],
     starts_on: '2026-07-20', due_on: '2026-07-24', computed_start: '2026-07-20', computed_end: '2026-07-24',
+    actual_start: '2026-07-21T09:30:00.000Z', actual_end: '2026-07-23T16:00:00.000Z',
+    computed_actual_start: '2026-07-21', computed_actual_end: '2026-07-23',
     progress: 80, rolled_progress: 80, estimate_hours: 8, deps: [], unscheduled: false },
   { id: 't2', parent_id: 'a', depth: 2, kind: 'task', title: 'Second task', status: serverKeys[0],
     starts_on: '2026-07-28', due_on: '2026-08-05', computed_start: '2026-07-28', computed_end: '2026-08-05',
@@ -274,6 +278,13 @@ const ROWS = [
   { id: 't3', parent_id: 'a', depth: 2, kind: 'task', title: 'Undated task', status: serverKeys[0],
     starts_on: null, due_on: null, computed_start: null, computed_end: null,
     progress: 0, rolled_progress: 0, estimate_hours: 4, deps: [], unscheduled: true },
+  // the case the whole feature exists for: a row whose PLAN is empty but whose RECORD is not — it
+  // draws an ACTUAL bar and is NOT listed in the undated tray (the tray is for truly dateless rows).
+  { id: 't4', parent_id: 'a', depth: 2, kind: 'task', title: 'Actual only', status: serverKeys[2],
+    starts_on: null, due_on: null, computed_start: null, computed_end: null,
+    actual_start: '2026-07-22T10:00:00.000Z', actual_end: null,
+    computed_actual_start: '2026-07-22', computed_actual_end: null,
+    progress: 0, rolled_progress: 0, deps: [], unscheduled: false },
 ];
 const statuses = serverKeys.map((key, i) => ({ key, label: key, order: i, terminal: i >= serverKeys.length - 2 }));
 
@@ -314,7 +325,10 @@ try {
     rows: ROWS, statuses, zees: new Map(), unscheduledCount: 1, today,
   }));
   const bars = (chart.match(/data-testid="work-gbar"/g) || []).length;
-  ok(bars === 4, `one bar per DATED row and none for the undated one (${bars} bars for 4 dated rows)`);
+  ok(bars === 4, `one plan bar per DATED row and none for the undated one (${bars} plan bars)`);
+  const actualBars = (chart.match(/data-testid="work-gbar-actual"/g) || []).length;
+  ok(actualBars === 4, `one ACTUAL bar per row the RECORD has dates for (${actualBars} actual bars — parents roll up, t1 has both, t4 is actual-only)`);
+  ok(/work-gbar actual/.test(chart), 'an actual bar carries the read-only `actual` class');
   ok(/work-gsum/.test(chart), 'a parent draws as a SUMMARY bracket, not a solid bar');
   ok(/work-gbar[^"]*"/.test(chart), 'a leaf draws as a bar');
   ok(chart.includes(`work-st-${serverKeys[2]}`), 'bars carry the shared status colour class');
@@ -325,6 +339,8 @@ try {
      'the undated row is LISTED in the tray with a schedule action');
   ok(!/2026-07-29/.test(chart.split('work-gtray')[1] || ''), 'the tray shows no invented dates on the row itself');
   ok(/Undated task/.test(chart), 'and the undated row is still named, not hidden');
+  ok(/Actual only/.test(chart) && !/Actual only/.test(chart.split('work-gtray')[1] || ''),
+     'a row whose PLAN is empty but whose RECORD has dates draws a real bar and is NOT in the undated tray');
 
   const emptyChart = renderToString(el(GanttChart, { rows: [], statuses, today }));
   ok(/Tickets/.test(emptyChart) && /work-gempty/.test(emptyChart),
@@ -352,6 +368,15 @@ try {
        'a computed-only row explains why it cannot be dragged');
     ok(/waits for/.test(tip({ hidden: [{ title: 'blocker', why: 'has no dates yet' }] })),
        'and an undrawable dependency is spelled out where a human is already looking');
+    // the ACTUAL span is a separate line, only when the record has one — and it says in flight.
+    // React splits text nodes with <!-- --> comment separators, so strip them before matching.
+    const plain = (p) => tip(p).replace(/<!-- -->/g, '');
+    ok(/actual 2026-07-21 → 2026-07-23/.test(plain({ row: {
+      ...row, computed_actual_start: '2026-07-21T09:30:00.000Z', computed_actual_end: '2026-07-23T16:00:00.000Z' } })),
+       'the tooltip shows the actual span, normalised to the day the bar sits on');
+    ok(/actual 2026-07-22 → … · in flight/.test(plain({ row: {
+      ...row, computed_actual_start: '2026-07-22T10:00:00.000Z', computed_actual_end: null } })),
+       'and an in-flight actual (no end yet) is marked in flight, not silently complete');
   }
 
   // ── the four UI fixes, rendered ───────────────────────────────────────────────────────────
@@ -386,6 +411,18 @@ try {
     ok(/has no dates yet/.test(h) && /outside the scope/.test(h), 'and the marker says WHY it cannot be drawn');
     ok(hiddenTitle([{ title: 'x', why: 'has no dates yet' }]).startsWith('waits for 1 item'),
        'the marker and the tooltip describe it with the SAME sentence (one function)');
+  }
+  // a dependency whose predecessor has ACTUAL but no PLAN dates is undrawable for a NEW reason —
+  // an arrow needs a plan bar, and the marker must say so rather than claiming the row is dateless
+  {
+    const h = renderToString(el(GanttChart, { today, statuses, unscheduledCount: 0, rows: [
+      R({ id: 'u', title: 'actual only', unscheduled: false, computed_start: null, computed_end: null,
+          computed_actual_start: '2026-07-22', computed_actual_end: null }),
+      R({ id: 'b', title: 'blocked', starts_on: '2026-08-01', due_on: '2026-08-05',
+          computed_start: '2026-08-01', computed_end: '2026-08-05', deps: ['u'] }),
+    ] }));
+    ok(/no planned dates to draw an arrow from/.test(h),
+       'an actual-only predecessor explains the undrawable arrow (no PLAN bar to draw from)');
   }
   // an inverted row is painted as inverted
   {

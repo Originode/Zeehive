@@ -61,7 +61,9 @@ import WorkItemDrawer from './WorkItemDrawer.jsx';
 // resolves LIVE xells (policy 4 — a reaped xell lends a work item nothing), because `/api/gantt`
 // carries only `xell_id` and a corpse must not be rendered as an agent.
 
-const ROW = 26;          // one row's height, shared by the name cell, the track and the arrow maths
+const ROW = 30;          // one row's height, shared by the name cell, the track and the arrow maths.
+                         // 30px leaves room for BOTH bars the gantt can draw per row: the PLAN (a
+                         // human's dates, draggable) and the ACTUAL (what the record proves, read-only).
 const LEFT = 292;        // the name column's width; the canvas starts here
 const ZOOM_KEY = 'zeehive.work.gantt.zoom';
 
@@ -235,11 +237,17 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
     return true;
   }), [rows, collapsed, byId]);
 
-  const dated = useMemo(() => rows.filter((r) => r.computed_start || r.computed_end), [rows]);
+  // A row is "dated" when it has a PLAN bar, an ACTUAL bar, or both — the whole point of the
+  // actuals is that a 470-item schedule with 0 plan dates still gets a window. `unscheduled`
+  // (server-derived) is now "no dates at all, planned OR actual", so the tray lists the truly
+  // dateless rows and nothing else.
+  const dated = useMemo(() => rows.filter((r) =>
+    r.computed_start || r.computed_end || r.computed_actual_start || r.computed_actual_end), [rows]);
   const unscheduled = useMemo(() => rows.filter((r) => r.unscheduled), [rows]);
 
   const win = useMemo(() => windowFor(
-    dated.flatMap((r) => [parseDay(r.computed_start), parseDay(r.computed_end)]),
+    dated.flatMap((r) => [parseDay(r.computed_start), parseDay(r.computed_end),
+                           parseDay(r.computed_actual_start), parseDay(r.computed_actual_end)]),
     { today: t0, zoom },
   ), [dated, t0, zoom]);
   const axis = useMemo(() => bands(win.start, win.end, zoom, px), [win, zoom, px]);
@@ -254,6 +262,17 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
       // Clamped to the canvas: see clampSpan. A bar that reaches past the window is drawn to the
       // edge and marked, and one entirely outside it draws nothing — the clamp notice counts it.
       const span = clampSpan(barSpan(parseDay(r.computed_start), parseDay(r.computed_end), win.start, px), width);
+      m.set(r.id, { i, top: i * ROW, span });
+    });
+    return m;
+  }, [visible, win, px, width]);
+
+  // The ACTUAL bar's geometry — the same shape as the plan's, from the same clamp, so the two bars
+  // of one row share a coordinate space and never disagree about where "today" is.
+  const actualGeom = useMemo(() => {
+    const m = new Map();
+    visible.forEach((r, i) => {
+      const span = clampSpan(barSpan(parseDay(r.computed_actual_start), parseDay(r.computed_actual_end), win.start, px), width);
       m.set(r.id, { i, top: i * ROW, span });
     });
     return m;
@@ -380,9 +399,12 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
         miss.push({
           id: depId,
           title: known?.title || null,
+          // An arrow is drawn from the predecessor's PLAN bar; an item whose plan is empty but whose
+          // record has actuals (unscheduled=false) still has no plan bar to draw an arrow from.
           why: !known ? 'outside the scope you are looking at'
-            : (known.unscheduled || !known.computed_start ? 'has no dates yet'
-              : 'inside a collapsed parent'),
+            : (known.unscheduled ? 'has no dates yet'
+              : (!known.computed_start ? 'has actual dates but no planned dates to draw an arrow from'
+                : 'inside a collapsed parent')),
         });
       }
       if (miss.length) m.set(r.id, miss);
@@ -407,8 +429,10 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
   // Rows the clamped window cannot show. Counting them is the difference between "we are hiding
   // something" and "there is nothing there".
   const outside = useMemo(() => (win.clamped ? dated.filter((r) => {
-    const s = parseDay(r.computed_start) || parseDay(r.computed_end);
-    const e = parseDay(r.computed_end) || parseDay(r.computed_start);
+    const s = parseDay(r.computed_start) || parseDay(r.computed_actual_start)
+           || parseDay(r.computed_end) || parseDay(r.computed_actual_end);
+    const e = parseDay(r.computed_end) || parseDay(r.computed_actual_end)
+           || parseDay(r.computed_start) || parseDay(r.computed_actual_start);
     return diffDays(win.start, e) < 0 || diffDays(s, win.end) < 0;
   }).length : 0), [win, dated]);
 
@@ -499,6 +523,7 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
                 const span = gh
                   ? clampSpan(barSpan(parseDay(gh.starts_on), parseDay(gh.due_on), win.start, px), width)
                   : g?.span;
+                const actualSpan = actualGeom.get(r.id)?.span || null;
                 const hot = focus === r.id || ghost?.id === r.id || ghost?.target === r.id;
                 return (
                   <div key={r.id} className={`work-grow${hot ? ' hot' : ''}`} style={{ height: ROW }}
@@ -547,6 +572,22 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
                           {span.open && <i className="work-gopen" title="no due date — this end is open" />}
                           {span.cutLeft && <i className="work-gcut l" title="it starts before this window" />}
                           {span.cutRight && <i className="work-gcut r" title="it continues past this window" />}
+                        </div>
+                      )}
+                      {/* The ACTUAL bar — what the record PROVES happened, read-only. No handles, no
+                          drag, no dependency link: actuals are derived facts, never agent-submitted.
+                          It draws only when there is evidence (actual_start/actual_end from the
+                          ledger), and it is a thin line under the plan's bar so the two read side by
+                          side. A null actual_end (still in flight) draws open-ended. */}
+                      {actualSpan && (
+                        <div className="work-gbar actual" data-testid="work-gbar-actual"
+                             style={{ left: actualSpan.x, width: actualSpan.w }}
+                             onMouseEnter={(e) => setTip({ row: r, x: e.clientX, y: e.clientY })}
+                             onMouseLeave={() => setTip(null)}>
+                          <span className="work-gfill-bg actual" />
+                          {actualSpan.open && <i className="work-gopen" title="still in flight — no actual end yet" />}
+                          {actualSpan.cutLeft && <i className="work-gcut l" title="it starts before this window" />}
+                          {actualSpan.cutRight && <i className="work-gcut r" title="it continues past this window" />}
                         </div>
                       )}
                       {span && hiddenDeps.has(r.id) && (
@@ -671,6 +712,15 @@ export function Tip({ row, x, y, statuses, zee, zeesKnown = true, crumb, summary
       <div className={`work-gtip-r${late ? ' late' : ''}`}>
         {row.computed_start || '—'} → {end || '—'}{late ? ' · overdue' : ''}
       </div>
+      {/* The ACTUAL span, when the record has one. dayKey(parseDay(iso)) normalises a timestamptz to
+          the YYYY-MM-DD the gantt draws it at — the same day the bar sits on. */}
+      {!!row.computed_actual_start && (
+        <div className="work-gtip-r actual">
+          actual {dayKey(parseDay(row.computed_actual_start))} →
+          {row.computed_actual_end ? ` ${dayKey(parseDay(row.computed_actual_end))}` : ' …'}
+          {!row.computed_actual_end ? ' · in flight' : ''}
+        </div>
+      )}
       {/* Three DIFFERENT facts, and the third one used to be told as the second: a zee is on it, a
           zee is not on it, or the board did not answer and this chart does not know. */}
       {zee ? <ZeeChip zee={zee} /> : (
