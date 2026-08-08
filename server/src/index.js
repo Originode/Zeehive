@@ -24,6 +24,7 @@ import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { attachWebappUpgrade } from './lib/webapp-proxy.js';
 import { attachStreamWebSocket } from './lib/stream.js';
+import { gatewayProxy, GATEWAY_PORT } from './lib/gateway.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
@@ -192,6 +193,32 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   startWorkSync();
   startHarnessBridge();
 });
+// THE LLM GATEWAY — the transparent LiteLLM-style door every cxell CLI points its base URL at.
+// A SEPARATE http listener (gateway.js), so /v1/messages + /v1/chat/completions can never shadow
+// an API route and the gateway's port stays distinct from the API's. Mounted with express.json
+// (the proxy reads req.body for the model name) and the gateway proxy for the two dialect paths.
+// Bind 0.0.0.0 like the API so a process-role spinoff answers on the published interface.
+if (config.gatewayPort !== config.port) {
+  const gatewayApp = express();
+  gatewayApp.use(express.json({ limit: '30mb' }));
+  gatewayApp.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Zeehive-Provider');
+    res.header('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
+  gatewayApp.post(['/v1/messages', '/v1/chat/completions'], gatewayProxy);
+  gatewayApp.use((_req, res) => res.status(404).json({ error: 'gateway: only /v1/messages and /v1/chat/completions are proxied' }));
+  const gatewayServer = gatewayApp.listen(GATEWAY_PORT, '0.0.0.0', () => {
+    console.log(`[zeehive] LLM gateway on http://0.0.0.0:${GATEWAY_PORT}  (cxells point their provider base-urls here)`);
+    logline('api', `LLM gateway online — :${GATEWAY_PORT} (/v1/messages, /v1/chat/completions)`);
+  });
+  gatewayServer.on('error', (e) => {
+    console.error(`[zeehive] LLM gateway could not bind :${GATEWAY_PORT} — ${e.message}`);
+    logline('api', `LLM gateway bind FAILED :${GATEWAY_PORT} — ${e.message}`);
+  });
+}
 // Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
 // existing /api proxy (vite dev + the prod nginx bundle) with no extra port to expose.
 attachTerminalBridge(server);

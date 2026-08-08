@@ -35,6 +35,10 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL || 'postgres://zeehive:zeehive@localhost:5433/zeehive',
   port: int(process.env.PORT, 4700),
   apiBase: process.env.ZEEHIVE_API || `http://localhost:${int(process.env.PORT, 4700)}`,
+  // THE LLM GATEWAY'S OWN PORT — the transparent LiteLLM-style door cxell CLIs point their base
+  // URLs at (ANTHROPIC_BASE_URL etc → host.docker.internal:<gatewayPort>). A SEPARATE listener so
+  // it can never shadow API routes (the API is on PORT). See lib/gateway.js.
+  gatewayPort: int(process.env.GATEWAY_PORT, 4701),
   // QUEENZEE_INPROC=false starts an API-ONLY instance (the pre-phase-1 slice of the gateway split,
   // docs/queenzee-gateway-split.md): it serves every HTTP route but does NOT take the
   // single-queenzee advisory lock (715533001) and starts NONE of the background loops. The flag

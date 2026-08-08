@@ -1903,6 +1903,18 @@ router.get('/turns/:id/events', async (req, res) => {
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// THE LLM GATEWAY LEDGER for one xell — the transport-layer record of every AI call that crossed
+// the queenzee gateway (lib/gateway.js → llm_gateway_request). Read-only; the gateway writes it.
+// Same 503-not-throw contract as the other read models.
+router.get('/xells/:id/gateway-requests', async (req, res) => {
+  try {
+    const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    const { requestsForXell } = await import('../lib/gateway.js');
+    res.json({ ok: true, xell_id: req.params.id, requests: await requestsForXell(req.params.id) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // DONE SUGGESTIONS — a manager proposed a xell is finished; a human decides. Approving MARKS THE
 // TASK DONE and reaps the cxell (the console asks for a typed confirmation first), so this is the
 // same class of irreversible act as a landing: no zee path to the decision, ever.
