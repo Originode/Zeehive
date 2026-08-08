@@ -45,6 +45,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS spin_config_one_default  ON spin_detector_conf
 CREATE UNIQUE INDEX IF NOT EXISTS spin_config_project_uq   ON spin_detector_config (project_id) WHERE scope = 'project';
 CREATE UNIQUE INDEX IF NOT EXISTS spin_config_harness_uq   ON spin_detector_config (harness_id) WHERE scope = 'harness';
 
+-- SELF-HEAL: the knob columns must be NULLABLE ("NULL = inherit"). A database that saw an early
+-- draft of this migration (during development, before 158 landed) may carry the NOT NULL shape with
+-- baked-in column defaults; repair it so every database agrees. Idempotent — no-ops on a fresh
+-- table, where the CREATE above already made the columns nullable with no defaults.
+ALTER TABLE spin_detector_config ALTER COLUMN enabled DROP DEFAULT;
+ALTER TABLE spin_detector_config ALTER COLUMN min_calls DROP NOT NULL, ALTER COLUMN min_calls DROP DEFAULT;
+ALTER TABLE spin_detector_config ALTER COLUMN min_tokens DROP NOT NULL, ALTER COLUMN min_tokens DROP DEFAULT;
+ALTER TABLE spin_detector_config ALTER COLUMN max_size_spread DROP NOT NULL, ALTER COLUMN max_size_spread DROP DEFAULT;
+ALTER TABLE spin_detector_config ALTER COLUMN same_path DROP NOT NULL, ALTER COLUMN same_path DROP DEFAULT;
+
 -- The fleet default, so the knob is visible/editable in the console rather than hidden in code.
 -- Every knob is set here so a scope with no explicit value always resolves to the sane default.
 INSERT INTO spin_detector_config (scope, enabled, min_calls, min_tokens, max_size_spread, same_path)
