@@ -85,6 +85,11 @@ const asDate = (v) => (v instanceof Date
   ? `${String(v.getFullYear()).padStart(4, '0')}-${pad(v.getMonth() + 1)}-${pad(v.getDate())}`
   : (v ?? null));
 
+// A TIMESTAMPTZ column (actual_start / actual_end) → ISO 8601 on the wire. Unlike asDate, the
+// instant is absolute — node-pg hands it to us as a Date and toISOString() is the one format every
+// client parses without a timezone guess.
+const asTs = (v) => (v instanceof Date ? v.toISOString() : (v ?? null));
+
 // Whole days from one YYYY-MM-DD to another, INCLUSIVE (a task starting and ending the same day is
 // 1 day, not 0). Parsed as UTC so a DST boundary cannot add or drop a day. Null unless both ends
 // are present and parse.
@@ -137,6 +142,8 @@ function shapeItem(row) {
     ...row,
     starts_on: asDate(row.starts_on),
     due_on: asDate(row.due_on),
+    actual_start: asTs(row.actual_start),
+    actual_end: asTs(row.actual_end),
     estimate_hours: asNum(row.estimate_hours),
     sort_order: asNum(row.sort_order),
     ancestor_ids: ancestorIds(row.path),
@@ -161,7 +168,7 @@ export function assertId(v, what = 'work item id') {
 
 const COLS = `id, project_id, parent_id, kind, title, body, status, priority, ticket_id, xell_id,
               assignee, starts_on, due_on, estimate_hours, progress, sort_order, path, depth,
-              created_by, created_at, updated_at, closed_at`;
+              created_by, created_at, updated_at, closed_at, actual_start, actual_end`;
 
 // ── running inside somebody else's transaction ───────────────────────────────
 //
@@ -759,7 +766,7 @@ export async function boardModel({ projectId, rootId } = {}) {
       id: r.id, project_id: r.project_id, parent_id: r.parent_id, kind: r.kind, title: r.title,
       status: r.status, status_label: r.status_label, priority: r.priority, progress: r.progress,
       sort_order: r.sort_order, depth: r.depth, assignee: r.assignee,
-      starts_on: r.starts_on, due_on: r.due_on,
+      starts_on: r.starts_on, due_on: r.due_on, actual_start: r.actual_start, actual_end: r.actual_end,
       breadcrumb: r.ancestor_ids.map((a) => titles.get(a)).filter(Boolean),
       ticket: r.ticket_id
         ? (tickets.get(r.ticket_id) ? { id: r.ticket_id, number: tickets.get(r.ticket_id).number,
@@ -826,6 +833,11 @@ export async function ganttModel({ projectId, rootId } = {}) {
   const roll = (node) => {
     let start = node.starts_on || null;
     let end = node.due_on || null;
+    // The ACTUAL span rolls up the same way, so a parent whose children were worked (but whose own
+    // ledger is silent — a project/activity is rarely assigned to a zee) still gets the real bar
+    // its subtree earned. A parent WITH its own actuals keeps them, exactly like the plan dates.
+    let actualStart = node.actual_start || null;
+    let actualEnd = node.actual_end || null;
     let weight = 0;
     let acc = 0;
     let leaves = 0;
@@ -833,16 +845,23 @@ export async function ganttModel({ projectId, rootId } = {}) {
       const r = roll(c);
       if (!node.starts_on) start = min(start, r.computed_start);
       if (!node.due_on) end = max(end, r.computed_end);
+      if (!node.actual_start) actualStart = min(actualStart, r.computed_actual_start);
+      if (!node.actual_end) actualEnd = max(actualEnd, r.computed_actual_end);
       acc += r.rolled_progress * r.weight;
       weight += r.weight;
       leaves += r.leaves;
     }
     node.computed_start = start;
     node.computed_end = end;
+    node.computed_actual_start = actualStart;
+    node.computed_actual_end = actualEnd;
     node.rolled_progress = (node.progress > 0 || !(node.children || []).length || !weight)
       ? node.progress
       : Math.round(acc / weight);
-    node.unscheduled = !start && !end;
+    // unscheduled means "nothing to draw, planned OR actual" — an item whose work HAPPENED is not
+    // undated, however empty its plan is. The gantt lists the truly dateless rows and offers the
+    // "schedule" action for them; a real bar needs no such offer.
+    node.unscheduled = !start && !end && !actualStart && !actualEnd;
     node.weight = (node.children || []).length ? weight : 1;
     node.leaves = (node.children || []).length ? leaves : 1;
     return node;
@@ -853,7 +872,9 @@ export async function ganttModel({ projectId, rootId } = {}) {
     id: n.id, parent_id: n.parent_id, depth: n.depth, kind: n.kind, title: n.title,
     status: n.status, status_label: n.status_label,
     starts_on: n.starts_on, due_on: n.due_on,
+    actual_start: n.actual_start || null, actual_end: n.actual_end || null,
     computed_start: n.computed_start || null, computed_end: n.computed_end || null,
+    computed_actual_start: n.computed_actual_start || null, computed_actual_end: n.computed_actual_end || null,
     progress: n.progress, rolled_progress: n.rolled_progress,
     estimate_hours: n.estimate_hours, assignee: n.assignee, xell_id: n.xell_id,
     unscheduled: n.unscheduled === true,
@@ -868,10 +889,19 @@ export async function ganttModel({ projectId, rootId } = {}) {
   }));
   // The whole chart's extent, stated once so a client does not have to min/max the rows itself —
   // and so it can decide whether to clamp BEFORE it lays anything out, rather than discovering the
-  // scale by trying to draw it. Null when nothing in the model is scheduled at all.
-  const scheduled = ganttRows.filter((r) => r.computed_start && r.computed_end);
-  const chartStart = scheduled.reduce((a, r) => (a && a <= r.computed_start ? a : r.computed_start), null);
-  const chartEnd = scheduled.reduce((a, r) => (a && a >= r.computed_end ? a : r.computed_end), null);
+  // scale by trying to draw it. Null when nothing in the model is scheduled at all. Includes the
+  // ACTUAL span too — a chart whose bars are all actuals (the 470-item/0-plan case this exists for)
+  // must still get a window.
+  const scheduled = ganttRows.filter((r) =>
+    (r.computed_start && r.computed_end) || (r.computed_actual_start && r.computed_actual_end));
+  const chartStart = scheduled.reduce((a, r) => {
+    const s = min(r.computed_start, r.computed_actual_start);
+    return (a && a <= s ? a : s);
+  }, null);
+  const chartEnd = scheduled.reduce((a, r) => {
+    const e = max(r.computed_end, r.computed_actual_end);
+    return (a && a >= e ? a : e);
+  }, null);
 
   return {
     root: root ? shapeItem(root) : null,
