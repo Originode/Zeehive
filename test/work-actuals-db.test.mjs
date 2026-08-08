@@ -82,6 +82,10 @@ try {
 
   // ── 3. the land_request trigger: a landed landing is an end ───────────────
   section('the land_request trigger backfills an end');
+  // The app enforces ONE item per xell ("one zee, one item" — work-assign's busy check), and the
+  // land trigger resolves the item through the CURRENT link, so take the xell off the turn item
+  // first: a real zee lands the item it is actually on.
+  await W.updateWorkItem(turnItem.id, { xell_id: null }, { actor: 'test' });
   const landItem = await W.createWorkItem({ project_id: PID, title: 'land-driven', kind: 'task' });
   await W.updateWorkItem(landItem.id, { xell_id: xell.id }, { actor: 'test' });
   await client.query(
