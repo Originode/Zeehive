@@ -9,8 +9,11 @@
 // exercises it for real against a mock upstream.
 //
 // What this file covers (all against DATABASE_URL, torn down in a finally — house rule 1):
-//   A. Anthropic dialect (claude): POST /x/<token>/claude/v1/messages → the SSE stream is
+//   A. Anthropic dialect (deepseek): POST /x/<token>/deepseek/v1/messages → the SSE stream is
 //      forwarded verbatim AND the upstream's message_delta usage lands in llm_gateway_request.
+//      (Claude itself is NOT mocked here: providerUpstreamUrl hard-codes claude to
+//      api.anthropic.com, so the test uses deepseek, which speaks the same /v1/messages dialect
+//      and respects its own base-url env.)
 //   B. OpenAI dialect (openai): POST /x/<token>/openai/v1/chat/completions → the stream is
 //      forwarded and usage recorded, and the upstream receives /v1/chat/completions — NOT
 //      /v1/v1/chat/completions (the version-segment doubling joinUpstreamPath fixes).
@@ -107,16 +110,23 @@ const gw = await startGatewayApp();
 process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
 process.env.OPENAI_BASE_URL = `http://127.0.0.1:${mock.port}/v1`;
 process.env.KIMI_CODE_BASE_URL = `http://127.0.0.1:${mock.port}/coding/v1`;
+process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
+// NOTE: claude's upstream is deliberately NOT mocked here — providerUpstreamUrl hard-codes claude
+// to api.anthropic.com (main), and setting ANTHROPIC_BASE_URL would be a no-op for it.
 
 const fixtures = [];
 try {
-  console.log('\n── A. Anthropic dialect — /v1/messages through the proxy ──');
-  const fx = await makeFixture('claude', 'sk-ant-mocktoken123456789');
+  // The Anthropic-dialect section runs through the DEEPSEEK provider, not claude: providerUpstreamUrl
+  // deliberately hard-codes claude to api.anthropic.com (main), so a claude call cannot be pointed
+  // at a mock upstream from a test. deepseek speaks the SAME Anthropic /v1/messages dialect, respects
+  // its own base-url env, and exercising it also covers the deepseek routing fix.
+  console.log('\n── A. Anthropic dialect (deepseek) — /v1/messages through the proxy ──');
+  const fx = await makeFixture('deepseek', 'sk-mockdeepseek123456789');
   fixtures.push(fx);
-  const res = await fetch(`http://127.0.0.1:${gw.port}/x/${fx.xellToken}/claude/v1/messages?beta=true`, {
+  const res = await fetch(`http://127.0.0.1:${gw.port}/x/${fx.xellToken}/deepseek/v1/messages?beta=true`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-ant-mocktoken123456789' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockdeepseek123456789' },
+    body: JSON.stringify({ model: 'deepseek-chat', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
   });
   const body = await res.text();
   ok(res.status === 200, 'the SSE stream is forwarded with 200');
@@ -125,8 +135,8 @@ try {
   const rows = await requestsForXell(fx.xellId);
   eq(rows.length, 1, 'the proxy recorded the request');
   const row = await completedRow(fx.xellId);
-  eq(row?.provider, 'claude', 'provider is claude');
-  eq(row?.model, 'claude-sonnet-4-20250514', 'model is read from the body');
+  eq(row?.provider, 'deepseek', 'provider is deepseek');
+  eq(row?.model, 'deepseek-chat', 'model is read from the body');
   eq(Number(row?.input_tokens), 11, 'input tokens from the upstream usage');
   eq(Number(row?.output_tokens), 5, 'output tokens from the upstream usage');
   eq(Number(row?.cache_read_tokens), 2, 'cache read tokens');
@@ -135,7 +145,7 @@ try {
   eq(Number(row?.cost_usd), 0.0005, 'cost from the upstream total_cost_usd');
   eq(row?.status, 200, 'status 200');
   eq(mock.seen.at(-1)?.url, '/v1/messages?beta=true', 'the upstream received the stripped forward path');
-  ok(mock.seen.at(-1)?.auth?.includes('sk-ant-mocktoken123456789'), 'the upstream got the PROVIDER key, not the xell token');
+  ok(mock.seen.at(-1)?.auth?.includes('sk-mockdeepseek123456789'), 'the upstream got the PROVIDER key, not the xell token');
 
   console.log('\n── B. OpenAI dialect — /v1/chat/completions through the proxy ──');
   const fx2 = await makeFixture('openai', 'sk-mockopenai123456789012');
@@ -191,12 +201,12 @@ try {
   eq(mock.seen.length, before, 'nothing was forwarded to the upstream for an unknown xell');
 
   console.log('\n── D. dead upstream → 502, error row, no hang ──');
-  process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${await (async () => { const s = http.createServer(() => {}); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const p = s.address().port; s.close(); return p; })()}`;
-  const fx4 = await makeFixture('claude', 'sk-ant-mocktoken123456789');
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${await (async () => { const s = http.createServer(() => {}); await new Promise((r) => s.listen(0, '127.0.0.1', r)); const p = s.address().port; s.close(); return p; })()}`;
+  const fx4 = await makeFixture('deepseek', 'sk-mockdeepseek123456789');
   fixtures.push(fx4);
-  const res4 = await fetch(`http://127.0.0.1:${gw.port}/x/${fx4.xellToken}/claude/v1/messages`, {
+  const res4 = await fetch(`http://127.0.0.1:${gw.port}/x/${fx4.xellToken}/deepseek/v1/messages`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-ant-mocktoken123456789' },
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockdeepseek123456789' },
     body: JSON.stringify({ model: 'x', messages: [] }),
   });
   ok(res4.status === 502, 'dead upstream → 502');

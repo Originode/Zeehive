@@ -14,14 +14,17 @@
 //   D. gatewayEnv — the base URLs cxells get.
 //   E. The WIRING — the index.js gateway mount exists and the proxy is registered.
 //   F. usageFromStream — the proxy reads usage from SSE/JSON response text (pure).
-//   G. joinUpstreamPath — the forward path must not double the dialect's version segment
-//      (openai/kimi upstreams already carry /v1; claude/deepseek do not overlap).
+//   G. upstream path composition — providerUpstreamUrl strips a trailing /v1 so the naive
+//      pathname+forward join never doubles the dialect's version segment.
+//   H. joinUpstreamPath — the proxy's own path join (used by gatewayProxy) stays correct even
+//      when the upstream base DOES carry a version segment (an operator-set base with /v1).
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
-         requestsForXell, gatewayHello, usageFromStream, joinUpstreamPath } from '../server/src/lib/gateway.js';
+         requestsForXell, gatewayHello, usageFromStream, joinUpstreamPath,
+         providerUpstreamUrl } from '../server/src/lib/gateway.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -51,18 +54,40 @@ console.log('\n── D. gatewayEnv — the base URLs cxells get ──');
 const env = gatewayEnv({ xellToken: 'abc123' });
 ok(env.ANTHROPIC_BASE_URL.includes('/x/abc123/claude'), 'claude base url carries the xell identity');
 ok(env.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'openai base url carries the xell identity');
-ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'kimi base url carries the KIMI identity (not openai)');
-ok(!env.KIMI_MODEL_BASE_URL.includes('/openai'), 'a kimi zee is never pointed at the openai provider route');
-// A deepseek zee runs the claude CLI against DeepSeek's Anthropic-compatible endpoint. Its
-// ANTHROPIC_BASE_URL must name the DEEPSEEK provider in the path — otherwise the gateway would
-// attribute the call to claude and forward it with a CLAUDE key (the cross-provider misrouting
-// the credential gates exist to stop).
-const dsEnv = gatewayEnv({ xellToken: 'abc123', provider: 'deepseek' });
-ok(dsEnv.ANTHROPIC_BASE_URL.includes('/x/abc123/deepseek'), 'deepseek base url carries the DEEPSEEK identity, not claude');
-ok(!dsEnv.ANTHROPIC_BASE_URL.includes('/claude'), 'a deepseek zee is never pointed at the claude provider route');
+ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/openai'), 'kimi base url points at the openai dialect (default provider is claude)');
+// The path provider segment drives the gateway's ACCOUNT resolution, so it must name the xell's
+// ACTUAL provider — a deepseek cxell must not hit /claude (or the gateway uses the claude key).
+const denv = gatewayEnv({ xellToken: 'abc123', provider: 'deepseek' });
+ok(denv.ANTHROPIC_BASE_URL.includes('/x/abc123/deepseek'), 'a deepseek cxell is pointed at /deepseek, not /claude');
+ok(!denv.ANTHROPIC_BASE_URL.includes('/claude'), 'a deepseek zee is never pointed at the claude provider route');
+const kenv = gatewayEnv({ xellToken: 'abc123', provider: 'kimi' });
+ok(kenv.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'a kimi cxell is pointed at /kimi, not /openai');
+ok(!kenv.KIMI_MODEL_BASE_URL.includes('/openai'), 'a kimi zee is never pointed at the openai provider route');
+const oenv = gatewayEnv({ xellToken: 'abc123', provider: 'openai' });
+ok(oenv.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'a codex cxell stays at /openai');
 
-// ── G. joinUpstreamPath — the forward path must not double the version segment ──────────────
-console.log('\n── G. joinUpstreamPath — upstream base + CLI forward path ──');
+// ── G. upstream path composition — the double-/v1 + provider attribution regression ──────────
+console.log('\n── G. upstream path composition (the proxy forwards upstream.pathname + forward) ──');
+// The proxy composes the upstream URL as `${upstream.pathname}${parsed.forward}`. The CLI's
+// forward path already carries the API version (/v1/chat/completions, /v1/messages), so the
+// upstream base must not ALSO end in /v1. This is the exact expression gatewayProxy uses.
+const compose = (provider, fwd) => {
+  const target = new URL(providerUpstreamUrl(provider));
+  return `${target.pathname === '/' ? '' : target.pathname}${fwd}`;
+};
+eq(compose('openai', '/v1/chat/completions'), '/v1/chat/completions', 'openai upstream has NO double /v1');
+eq(compose('kimi', '/v1/chat/completions'), '/coding/v1/chat/completions', 'kimi upstream path is /coding/v1/chat/completions');
+eq(compose('deepseek', '/v1/messages'), '/anthropic/v1/messages', 'deepseek upstream keeps its /anthropic base');
+eq(compose('claude', '/v1/messages'), '/v1/messages', 'claude upstream is the plain /v1/messages');
+// The claude provider's upstream is api.anthropic.com regardless of the SERVER's own
+// ANTHROPIC_BASE_URL (which may legitimately point at deepseek, as this very cage's does).
+ok(!providerUpstreamUrl('claude').includes('deepseek'), 'claude upstream is never the deepseek URL');
+
+// ── H. joinUpstreamPath — the proxy's own path join must not double the version segment ─────
+console.log('\n── H. joinUpstreamPath — upstream base + CLI forward path ──');
+// providerUpstreamUrl already strips a trailing /v1 (main), so joinUpstreamPath usually sees a
+// bare upstream path. It is ALSO correct when the base DOES carry a version segment (an
+// operator-set OPENAI_BASE_URL that includes /v1): the duplicate is dropped, not doubled.
 // claude: upstream has no base path; the forward /v1/messages passes through untouched.
 eq(joinUpstreamPath('https://api.anthropic.com', '/v1/messages?beta=true'), '/v1/messages?beta=true', 'claude: no base path, forward passes through');
 // deepseek: upstream base /anthropic is a prefix, not a version overlap; keep both.
