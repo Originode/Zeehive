@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { getXellObservability, getTurnEvents } from './api.js';
+import { getXellObservability, getTurnEvents, getXellGatewayRequests } from './api.js';
 
 // XELL OBSERVABILITY — the per-turn ledger behind a xell's right-click action.
 //
@@ -119,16 +119,70 @@ function TurnRow({ turn, open, onToggle }) {
   );
 }
 
+// The gateway calls tab — every AI request that crossed the queenzee's transparent gateway,
+// newest first. Each row is one HTTP request (a messages or chat-completions POST) with the
+// upstream's exact usage. This is the grain that captures ALL turn kinds: a spawn, a resume,
+// and an interactive TUI session all make the same calls through the gateway.
+function GatewayCalls({ requests }) {
+  if (!requests.length) {
+    return (
+      <div className="xob-empty">
+        No gateway calls recorded yet. When the gateway is live, every AI call this xell's CLIs
+        make (spawn, resume, or interactive) crosses it and is recorded here with exact usage.
+      </div>
+    );
+  }
+  const sum = requests.reduce((a, r) => ({
+    cost: a.cost + Number(r.cost_usd || 0),
+    tokens: a.tokens + Number(r.total_tokens || 0),
+  }), { cost: 0, tokens: 0 });
+  return (
+    <div className="xob-gw">
+      <div className="xob-summary">
+        <span><b>{requests.length}</b> call(s)</span>
+        <span><b>{fmtTok(sum.tokens)}</b> tok total</span>
+        <span><b>{fmtUsd(sum.cost)}</b> cost (shown window)</span>
+      </div>
+      <div className="xob-turns">
+        {requests.map((r) => {
+          const tokens = Number(r.total_tokens || 0);
+          return (
+            <div key={r.id} className="ob-turn">
+              <button className="ob-turn-h" aria-expanded={false}>
+                <span className="ob-turn-kind">{r.kind === 'chat-completions' ? '⚙ chat' : '📨 messages'}</span>
+                <span className="ob-turn-status">{r.status === 200 ? '✓' : `✗ ${r.status || '?'}`}</span>
+                <span className="ob-turn-model">{r.provider} · {r.model || '—'}</span>
+                <span className="ob-turn-tok">{fmtTok(tokens)} tok</span>
+                <span className="ob-turn-cost">{fmtUsd(r.cost_usd)}</span>
+                <span className="ob-turn-dur">{r.duration_ms ? `${r.duration_ms}ms` : '—'}</span>
+                <span className="ob-turn-dt">{fmtDt(r.requested_at)}</span>
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function XellObservability({ xell, onClose }) {
   const [data, setData] = useState(null);
+  const [gwData, setGwData] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
   const [openId, setOpenId] = useState(null);
+  const [tab, setTab] = useState('turns');   // 'turns' | 'calls'
 
   const load = useCallback(async () => {
     if (!xell?.id) return;
     setBusy(true); setErr(null);
-    try { setData(await getXellObservability(xell.id)); }
+    try {
+      const [t, g] = await Promise.all([
+        getXellObservability(xell.id),
+        getXellGatewayRequests(xell.id).catch(() => null),   // the gateway ledger is best-effort
+      ]);
+      setData(t); setGwData(g);
+    }
     catch (e) { setErr(e?.message || String(e)); }
     finally { setBusy(false); }
   }, [xell?.id]);
@@ -160,23 +214,42 @@ export default function XellObservability({ xell, onClose }) {
           {!err && !data && <div className="disp-note">reading the per-turn ledger…</div>}
           {!err && data && (
             <>
-              <div className="xob-summary">
-                <span><b>{turns.length}</b> turn(s) recorded</span>
-                <span><b>{fmtUsd(sum.cost)}</b> total (shown window)</span>
-                <span><b>{fmtTok(sum.tokens)}</b> tok (shown window)</span>
+              {/* Two tabs: the per-turn ledger (what a turn cost as a whole) and the LLM gateway
+                  calls (every AI request that crossed the queenzee, per request). They are two
+                  grains of the same observability — the gateway calls are the individual requests
+                  that add up to a turn. */}
+              <div className="xob-tabs">
+                <button className={`xob-tab${tab === 'turns' ? ' on' : ''}`} onClick={() => setTab('turns')}>
+                  Turns <span className="xob-tab-n">{turns.length}</span>
+                </button>
+                <button className={`xob-tab${tab === 'calls' ? ' on' : ''}`} onClick={() => setTab('calls')}>
+                  Gateway calls {gwData?.requests?.length != null && <span className="xob-tab-n">{gwData.requests.length}</span>}
+                </button>
               </div>
-              {turns.length === 0
-                ? <div className="xob-empty">
-                    No turns recorded yet. A turn appears when a zee starts working in this xell
-                    (a spawn, a resume, or an interactive turn). The per-turn ledger was added in
-                    migration 153 — turns that ran before then have no row.
+
+              {tab === 'turns' && (
+                <>
+                  <div className="xob-summary">
+                    <span><b>{turns.length}</b> turn(s) recorded</span>
+                    <span><b>{fmtUsd(sum.cost)}</b> total (shown window)</span>
+                    <span><b>{fmtTok(sum.tokens)}</b> tok (shown window)</span>
                   </div>
-                : <div className="xob-turns">
-                    {turns.map((t) => (
-                      <TurnRow key={t.id} turn={t} open={openId === t.id}
-                               onToggle={() => setOpenId(openId === t.id ? null : t.id)} />
-                    ))}
-                  </div>}
+                  {turns.length === 0
+                    ? <div className="xob-empty">
+                        No turns recorded yet. A turn appears when a zee starts working in this xell
+                        (a spawn, a resume, or an interactive turn). The per-turn ledger was added in
+                        migration 153 — turns that ran before then have no row.
+                      </div>
+                    : <div className="xob-turns">
+                        {turns.map((t) => (
+                          <TurnRow key={t.id} turn={t} open={openId === t.id}
+                                   onToggle={() => setOpenId(openId === t.id ? null : t.id)} />
+                        ))}
+                      </div>}
+                </>
+              )}
+
+              {tab === 'calls' && <GatewayCalls requests={gwData?.requests || []} />}
             </>
           )}
         </div>

@@ -1435,6 +1435,15 @@ export async function getTurnEvents(turnId) {
   if (!r.ok) throw new Error(data.error || `turn events unavailable (${r.status})`);
   return data;
 }
+// The LLM gateway request ledger for one xell — the transport-layer record of every AI call
+// (lib/gateway.js → llm_gateway_request). Read-only; the gateway writes it.
+export async function getXellGatewayRequests(xellId, { limit = 50 } = {}) {
+  const qs = limit ? `?limit=${limit}` : '';
+  const r = await fetch(`/api/xells/${xellId}/gateway-requests${qs}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `gateway requests unavailable (${r.status})`);
+  return data;
+}
 
 // ── MANAGER ZEES ─────────────────────────────────────────────────────────────
 // Adding a manager is a HUMAN act and there is no limit on how many you add — but only from here
