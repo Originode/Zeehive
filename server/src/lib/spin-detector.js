@@ -44,7 +44,6 @@ export const PROGRESS_EVENT_NAMES = [
   'tend-request',            // zee raised a human (`zee tend`)
   'ship-refused',            // zee tried to ship (`zee ship`)
   'interactive-turn-start',  // a human/manager typed into the pane (`zee turn --start`)
-  'interactive-turn-end',    // ...and the hook that ends it
 ];
 
 // Sane fleet defaults, and the values the migration's 'default' row ships. A row in
@@ -217,9 +216,13 @@ export async function endSpinningTurn({ turn, zee, xell, burn = null, evidence =
     //    (queenzee/intake.js) so it preserves the spin end instead of filing the killed CLI as a
     //    provider error. The burn is NOT booked here — intake is the authoritative burn booker for a
     //    spawned turn, and booking it twice would overstate the zee's lifetime burn.
+    //    `decommissioned_at IS NULL` is the same guard markZeeTurn/claimZeeTurn carry: a zee reaped
+    //    between the sweep's SELECT and this UPDATE must not have its status resurrected (the reaper
+    //    keeps whatever status it stopped in, and a reaped zee is nobody's to wake).
     if (zee?.id) {
       await q(
-        `UPDATE zee SET status='idle', last_event_at=now(), last_stop_reason=$2, name=NULL WHERE id=$1`,
+        `UPDATE zee SET status='idle', last_event_at=now(), last_stop_reason=$2, name=NULL
+          WHERE id=$1 AND decommissioned_at IS NULL`,
         [zee.id, SPIN_STOP_REASON]).catch((e) => logline('spin', `could not idle zee ${String(zee.id).slice(0, 8)} (${String(e.message).slice(0, 100)})`));
     }
 

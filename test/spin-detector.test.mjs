@@ -23,6 +23,14 @@
 //   C. the END (database): a spun turn is booked ended with stop_reason='spin-detector', its zee
 //      is idle (NOT errored, NOT reaped), the evidence rides a session_event, and the manager is
 //      sent a report — or a TEND is raised when there is no manager.
+//   E. the LOOP (database): the global spinTick() sweep ends a spinning turn end to end.
+//
+// ⚠ NEVER RUN AGAINST A LIVE/SHARED DATABASE. Section E calls the GLOBAL spinTick() sweep, which
+// judges every open turn in the database and ENDS any that look like spins. Against a throwaway db
+// (db-sandbox, a per-xell clone) the only open turns are this test's and the sweep is safe; against
+// a shared/live db it would end REAL turns belonging to other zees. Section E carries a RUNTIME
+// GUARD, not just this warning: it refuses the global sweep when any open turn belongs to another
+// project, and skips the assertions that depend on it.
 //
 // Everything it creates is deleted in a finally, whatever happens (house rule 1).
 import { randomUUID } from 'node:crypto';
@@ -96,9 +104,22 @@ if (!url) { console.error('DATABASE_URL required for sections B–D'); process.e
 const PID = randomUUID();
 let createdHarnessId = null;
 const cleanup = async () => {
-  // A harness is GLOBAL (not project-scoped), so deleting the project does not cascade to it —
-  // delete the test's harness row explicitly (house rule 1: clean up what you create).
+  // House rule 1, in a finally, whatever happened. Three kinds of row need explicit cleanup:
+  //
+  // 1. The HARNESS is GLOBAL (not project-scoped), so deleting the project does not cascade to it —
+  //    delete the test's harness row explicitly.
+  // 2. session_event.xell_id/zee_id are `REFERENCES xell ON DELETE SET NULL`, so dropping the project
+  //    NULLS the link instead of removing the row — the spin-detector events this test raises would
+  //    survive as orphans in the SHARED dev database, forever. Collect them by JOIN on the project
+  //    BEFORE the project goes (scoped to rows this run made, never "orphans of this kind", which
+  //    would also sweep a sibling xell's run) and delete them explicitly.
+  // 3. The project itself, which cascades to its xell/zee/zee_turn/llm_gateway_request/zee_message.
   try { if (createdHarnessId) await q(`DELETE FROM harness WHERE id=$1`, [createdHarnessId]); } catch { /* already gone */ }
+  const mine = PID
+    ? await q(`SELECT se.id FROM session_event se JOIN xell x ON x.id = se.xell_id
+                WHERE x.project_id = $1`, [PID]).catch(() => [])
+    : [];
+  if (mine.length) await q(`DELETE FROM session_event WHERE id = ANY($1::bigint[])`, [mine.map((r) => r.id)]).catch(() => {});
   try { await q(`DELETE FROM project WHERE id=$1`, [PID]); } catch { /* already gone */ }
 };
 
@@ -183,6 +204,17 @@ try {
   ok(z.status === 'idle' && z.last_stop_reason === SPIN_STOP_REASON && z.decommissioned_at === null,
      'the zee is IDLE with stop_reason=spin-detector and NOT decommissioned (never reaped)');
 
+  // endTurn is a ONE-SHOT act now: a turn that already ended is never re-stamped. Call it again
+  // with a different stop reason and prove the ending state is untouched (review fix #2 — a wrong
+  // label in a ledger we are building trust in is not cosmetic).
+  const { endTurn } = await import('../server/src/lib/turn-ledger.js');
+  const restamped = await endTurn(turn.id, { status: 'errored', burn: { cost: 9, input: 999, output: 0, cacheRead: 0, cacheWrite: 0 }, stopReason: 'late-writer' });
+  ok(restamped === null, 'a SECOND endTurn on an ended turn returns null (no re-stamp)');
+  const afterRestamp = await turnRow(turn.id);
+  ok(afterRestamp.status === 'ended' && afterRestamp.stop_reason === SPIN_STOP_REASON
+     && Number(afterRestamp.cost_usd) !== 9,
+     'the ended turn keeps status/stop_reason/burn from the FIRST end — the late writer changed nothing');
+
   const ev = await one(`SELECT raw FROM session_event WHERE turn_id=$1 AND hook_event_name='spin-detector'`, [turn.id]);
   ok(ev?.raw?.stop_reason === SPIN_STOP_REASON && ev?.raw?.windowCalls === 30,
      'a session_event carries the evidence (raw.stop_reason + windowCalls) for the console to replay');
@@ -215,23 +247,40 @@ try {
   // A fresh, still-'started' turn with 25 similar calls and NO progress. spinTick must find it,
   // judge it a spin, end it and tell the manager — the whole DB half of the loop, with no docker
   // (PROVISION_MODE in this cage is simulate, so the CLI interrupt is skipped by design).
+  //
+  // RUNTIME GUARD (not just the header warning): spinTick() is the GLOBAL sweep — it judges EVERY
+  // open turn in the database. Against a throwaway db the only open turns are this test's; against a
+  // live/shared db it would END real turns belonging to other zees. So before calling it, refuse
+  // when any open turn belongs to a foreign project, and skip the assertions that depend on the
+  // sweep. (This test's own fixture turn is still created and verified as 'started' below; on a
+  // clean throwaway db the guard passes and the sweep runs.)
   const spinXell = await mkXell('spin-loop-worker');
   await q(`UPDATE xell SET manager_xell_id=$2 WHERE id=$1`, [spinXell.id, man.id]);
   const spinZee = await mkZee(spinXell.id, { n: 3, status: 'working' });
   const spinTurn = await mkTurn(spinZee.id, spinXell.id);
   for (let i = 0; i < 25; i++) await mkGatewayRow(spinTurn.id, 70000 + (i % 3) * 200);
-  const { spinTick } = await import('../server/src/queenzee/spin.js');
-  const tick = await spinTick();
-  ok(tick.checked >= 1 && tick.ended === 1,
-     `spinTick judged the open turns and ended the one that was spinning (checked=${tick.checked}, ended=${tick.ended})`);
-  const closed = await turnRow(spinTurn.id);
-  ok(closed.status === 'ended' && closed.stop_reason === SPIN_STOP_REASON,
-     'spinTick closed the spinning turn with stop_reason=spin-detector');
-  const loopZee = await zeeRow(spinZee.id);
-  ok(loopZee.status === 'idle' && loopZee.last_stop_reason === SPIN_STOP_REASON,
-     'spinTick idled the spinning zee (stop_reason=spin-detector, not errored)');
-  const loopMsg = await one(`SELECT body FROM zee_message WHERE to_xell_id=$1 AND kind='report' ORDER BY created_at DESC LIMIT 1`, [man.id]);
-  ok(loopMsg?.body && /spin/i.test(loopMsg.body), 'spinTick told the manager');
+  const foreignOpen = await one(
+    `SELECT count(*)::int AS n FROM zee_turn t
+       JOIN zee z ON z.id=t.zee_id
+       JOIN xell x ON x.id=t.xell_id
+      WHERE t.status='started' AND x.project_id <> $1`, [PID]);
+  if ((foreignOpen?.n || 0) > 0) {
+    console.log(`  ⚠ ${foreignOpen.n} foreign open turn(s) present — REFUSING the global spinTick sweep `
+      + '(it would end real turns). Section E skipped; the fixture turn stays open for the finally to clean.');
+  } else {
+    const { spinTick } = await import('../server/src/queenzee/spin.js');
+    const tick = await spinTick();
+    ok(tick.checked >= 1 && tick.ended === 1,
+       `spinTick judged the open turns and ended the one that was spinning (checked=${tick.checked}, ended=${tick.ended})`);
+    const closed = await turnRow(spinTurn.id);
+    ok(closed.status === 'ended' && closed.stop_reason === SPIN_STOP_REASON,
+       'spinTick closed the spinning turn with stop_reason=spin-detector');
+    const loopZee = await zeeRow(spinZee.id);
+    ok(loopZee.status === 'idle' && loopZee.last_stop_reason === SPIN_STOP_REASON,
+       'spinTick idled the spinning zee (stop_reason=spin-detector, not errored)');
+    const loopMsg = await one(`SELECT body FROM zee_message WHERE to_xell_id=$1 AND kind='report' ORDER BY created_at DESC LIMIT 1`, [man.id]);
+    ok(loopMsg?.body && /spin/i.test(loopMsg.body), 'spinTick told the manager');
+  }
 
   console.log('\n── D. lastProgressAtForTurn: a report resets the detector window ──');
   const noProgress = await lastProgressAtForTurn({ xellId: worker.id, startedAt: t.started_at });
