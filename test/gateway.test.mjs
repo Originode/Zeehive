@@ -16,6 +16,9 @@
 //   D2. providerUpstreamUrl + forward path — one path per provider, NO doubled /v1.
 //   E. The WIRING — the index.js gateway mount exists and the proxy is registered.
 //   F. usageFromStream — the proxy reads usage from SSE/JSON response text (pure).
+//   G2. The read model carries turn attribution — requestsForXell LEFT JOINs zee_turn so the
+//      observability panel can group calls under their turn (turn_kind/status/model/etc., null
+//      for older rows recorded before turn_id was populated).
 //   G. zee/turn linkage — recordRequest resolves the live zee + open turn when zeeId is absent.
 //   H. joinUpstreamPath — the proxy's own path join (used by gatewayProxy) stays correct even
 //      when the upstream base DOES carry a version segment (an operator-set base with /v1).
@@ -237,6 +240,19 @@ try {
   const autoRow = await one(`SELECT zee_id, turn_id FROM llm_gateway_request WHERE id=$1`, [autoRid]);
   eq(autoRow?.zee_id, zeeId, 'the auto-recorded request carries zee_id');
   eq(autoRow?.turn_id, tr.id, 'the auto-recorded request carries turn_id');
+
+  // ── G2. the read model carries turn attribution (requestsForXell LEFT JOIN zee_turn) ─────────
+  console.log('\n── G2. read model turn attribution — turn_* columns on requestsForXell ──');
+  const withTurn = (await requestsForXell(xellId)).find((r) => r.id === autoRid);
+  eq(withTurn?.turn_id, tr.id, 'attributed row carries turn_id');
+  eq(withTurn?.turn_kind, 'spawn', 'attributed row carries turn_kind');
+  eq(withTurn?.turn_status, 'started', 'attributed row carries turn_status');
+  eq(withTurn?.turn_model, 'opus', 'attributed row carries turn_model');
+  eq(withTurn?.zee_name, null, 'attributed row carries zee_name (this zee has no name)');
+  const noTurn = (await requestsForXell(xellId)).find((r) => r.id === rid);
+  eq(noTurn?.turn_id, null, 'un-attributed request has null turn_id');
+  eq(noTurn?.turn_kind, null, 'un-attributed request has null turn_kind (degrades)');
+  eq(noTurn?.turn_status, null, 'un-attributed request has null turn_status (degrades)');
 
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
