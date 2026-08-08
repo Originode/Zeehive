@@ -94,7 +94,9 @@ eq(compose('openai', '/v1/chat/completions'), '/v1/chat/completions', 'openai up
 eq(compose('kimi', '/v1/chat/completions'), '/coding/v1/chat/completions', 'kimi upstream path is /coding/v1/chat/completions');
 eq(compose('deepseek', '/v1/messages'), '/anthropic/v1/messages', 'deepseek upstream keeps its /anthropic base');
 eq(compose('claude', '/v1/messages'), '/v1/messages', 'claude upstream is the plain /v1/messages');
-eq(compose('grok', '/responses'), '/responses', 'grok upstream forwards the Responses API path');
+// grok is the exception to the /v1 strip: its CLI appends /responses DIRECTLY to the base (no
+// version in the forward path), so the upstream KEEPS its own /v1 → https://api.x.ai/v1/responses.
+eq(compose('grok', '/responses'), '/v1/responses', 'grok upstream keeps its /v1 (the CLI appends /responses bare)');
 ok(providerUpstreamUrl('grok').includes('api.x.ai'), 'grok upstream resolves to xAI (not the anthropic default)');
 // The claude provider's upstream is api.anthropic.com regardless of the SERVER's own
 // ANTHROPIC_BASE_URL (which may legitimately point at deepseek, as this very cage's does).
@@ -186,10 +188,14 @@ try {
 
   // ── G. zee/turn linkage — a request is attributed to the live zee + open turn ──────────────
   console.log('\n── G. zee/turn linkage — zee_id + turn_id at record time ──');
-  // The zee created above is status='idle' (NOT live), so zeeTurnForXell must find no live zee.
+  // The zee created above is status='idle'. Per one_active_zee_per_xell (at most one zee in
+  // spawning/online/working/idle per xell), an idle zee IS the xell's active zee — an interactive
+  // TUI in a hook-less cage keeps the zee idle and must still be attributed. So zeeTurnForXell
+  // resolves the zee, but with no open turn yet the turn_id stays null (xell/zee-only record).
   const none = await zeeTurnForXell(xellId);
-  eq(none.zeeId, null, 'an idle zee is not live — no zee_id (xell-only record)');
-  // A live zee (status='working') + an open turn (status='started') → both resolved.
+  eq(none.zeeId, zeeId, 'an idle zee is the xell\'s active zee — zee_id resolves');
+  eq(none.turnId, null, 'no open turn yet — turn_id stays null (xell/zee-only record)');
+  // A working zee + an open turn (status='started') → both resolved.
   const live = await one(`UPDATE zee SET status='working' WHERE id=$1 RETURNING id`, [zeeId]);
   ok(!!live?.id, 'the zee is now live (working)');
   const tr = await one(
