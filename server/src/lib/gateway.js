@@ -250,26 +250,29 @@ async function resolveUpstream(xell, kind, providerKey) {
 
 // The provider's real API base, by provider key — the value the cxell adapters inject today.
 //
-// The upstream URL deliberately carries NO trailing `/v1` for the OpenAI-compatible providers
-// (openai, kimi, grok). The gateway forwards `parsed.forward` — the CLI's own request path
-// (`/v1/chat/completions` or `/v1/messages`) — straight on to the upstream, so the upstream's
-// own `/v1` would DOUBLE (openai `/v1` + forward `/v1/chat/completions` → `/v1/v1/chat/completions`,
-// a 404). Stripping it here restores the real endpoint: `https://api.openai.com/v1/chat/completions`
-// and `https://api.kimi.com/coding/v1/chat/completions` (the `/coding` prefix is kept — the CLI's
-// path does not carry it). claude + deepseek send `/v1/messages` and their upstream base has no
-// `/v1` to double.
-function stripTrailingV1(u) {
-  return String(u || '').replace(/\/v1\/?$/, '').replace(/\/+$/, '');
-}
-
+// NOTE the trailing `/v1` is STRIPPED: the CLI's forward path (after /x/<token>/<provider>) already
+// carries the API version — `/v1/chat/completions` from the OpenAI SDK (base ends /v1) and
+// `/v1/messages` from the Anthropic SDK — so the upstream base must not ALSO end in /v1 or the
+// forwarded path doubles it (`/v1/v1/chat/completions` → 404 from the upstream). Verified with a
+// mock upstream: the proxy forwarded `/v1/v1/chat/completions` for a codex call before this.
 export function providerUpstreamUrl(provider) {
+  let base;
   switch (provider) {
-    case 'openai': return stripTrailingV1(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1');
-    case 'kimi': return stripTrailingV1(process.env.KIMI_CODE_BASE_URL || 'https://api.kimi.com/coding/v1');
-    case 'deepseek': return process.env.DEEPSEEK_ANTHROPIC_BASE_URL || 'https://api.deepseek.com/anthropic';
-    case 'grok': return stripTrailingV1(process.env.XAI_BASE_URL || 'https://api.x.ai/v1');
-    default: return process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+    case 'openai': base = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'; break;
+    case 'kimi': base = process.env.KIMI_CODE_BASE_URL || 'https://api.kimi.com/coding/v1'; break;
+    case 'deepseek': base = process.env.DEEPSEEK_ANTHROPIC_BASE_URL || 'https://api.deepseek.com/anthropic'; break;
+    // grok (Grok Build) reads GROK_XAI_API_BASE_URL for its endpoint — EMPIRICALLY verified on
+    // grok 0.2.118 in this cage: XAI_API_BASE_URL is ignored (the CLI still hit api.x.ai), while
+    // GROK_XAI_API_BASE_URL redirects to the mock. The CLI speaks the OpenAI Responses API
+    // (/models + /responses), so the upstream base is the bare xAI host (no /v1 to strip).
+    case 'grok': base = process.env.GROK_XAI_API_BASE_URL || 'https://api.x.ai'; break;
+    // The claude provider's upstream is ALWAYS api.anthropic.com — NOT the server's own
+    // ANTHROPIC_BASE_URL, which is the queenzee's default-provider knob and can legitimately point
+    // at deepseek (as this very cage's does). Using it here would send every claude cxell call to
+    // the wrong vendor with the wrong key.
+    default: base = 'https://api.anthropic.com'; break;
   }
+  return base.replace(/\/v1\/?$/, '');
 }
 
 // Proxy one gateway request: authenticate the caller, resolve the upstream, forward, stream the
@@ -294,8 +297,11 @@ export async function gatewayProxy(req, res) {
   if (!xell) {
     return res.status(401).json({ error: 'gateway: unknown xell identity (the token in the path does not match a live xell)' });
   }
-  // Which dialect is the forward path? /v1/messages → Anthropic, /v1/chat/completions → OpenAI.
-  const kind = parsed.forward.startsWith('/v1/chat/completions') ? 'chat-completions' : 'messages';
+  // Which dialect does the provider speak? openai + kimi are the OpenAI-compatible CLIs
+  // (/v1/chat/completions); claude + deepseek run the claude CLI (Anthropic dialect, /v1/messages).
+  // Derived from the PROVIDER (now authoritative in the path), not the forward path — the forward
+  // path shape changes with the CLI's base-url suffix, the provider does not.
+  const kind = (parsed.provider === 'openai' || parsed.provider === 'kimi') ? 'chat-completions' : 'messages';
 
   const upstream = await resolveUpstream(xell, kind, parsed.provider).catch(() => null);
   if (!upstream) {
@@ -303,8 +309,14 @@ export async function gatewayProxy(req, res) {
   }
 
   // ── record the request fact ──
+  // zee_id is denormalised at request time so the read model's zee join is populated (the migration
+  // 154 comment says "the live zee of that xell at request time" — without this, requestsForXell's
+  // LEFT JOIN zee always renders null zee_name). Best-effort: a missing live zee still records.
+  const liveZee = await one(
+    `SELECT id FROM zee WHERE xell_id=$1 AND status IN ('spawning','online','working','idle')
+      ORDER BY created_at DESC LIMIT 1`, [xell.id]).catch(() => null);
   const rowId = await recordRequest({
-    xell, kind, provider: upstream.provider, model: modelFromBody(req.body),
+    xell, zeeId: liveZee?.id || null, kind, provider: upstream.provider, model: modelFromBody(req.body),
     method: req.method, path: parsed.forward,
   });
 
@@ -428,22 +440,29 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, reque
 //   ANTHROPIC_BASE_URL  = <gateway>/x/<xellToken>/claude   (or /deepseek for a deepseek cage)
 //   → HEAD <gateway>/x/<token>/claude/api/hello
 //   → POST <gateway>/x/<token>/claude/v1/messages?beta=true
-//   OPENAI_BASE_URL     = <gateway>/x/<xellToken>/openai/v1 → POST .../openai/v1/chat/completions
-//   KIMI_MODEL_BASE_URL = <gateway>/x/<xellToken>/kimi/v1   → POST .../kimi/v1/chat/completions
-//   XAI_BASE_URL        = <gateway>/x/<xellToken>/grok      → POST .../grok/v1/messages
+//
+// The <provider> segment MUST be the xell's ACTUAL provider key, because the gateway resolves the
+// provider ACCOUNT from the path (resolveUpstream → tokenForSpawn). A deepseek cxell pointed at
+// /claude would be forwarded with the project's CLAUDE key; a kimi cxell pointed at /openai with
+// the OPENAI key — both wrong (and refused when the project has no such account). So the spawn
+// passes the dispatched provider through and the path names it.
+//
+// The OpenAI-dialect vars are FIXED per CLI (OPENAI_BASE_URL → /openai, KIMI_MODEL_BASE_URL → /kimi)
+// rather than derived from the dispatched provider: a claude cage also carries the codex/kimi base
+// URLs (the every-provider env lets a zee switch CLIs), and each must resolve to its OWN provider's
+// account. The grok CLI (Grok Build) reads GROK_XAI_API_BASE_URL for its endpoint — EMPIRICALLY
+// verified on grok 0.2.118 (XAI_API_BASE_URL is ignored; GROK_XAI_API_BASE_URL redirects).
 export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
   if (config.gatewayPort === config.port) return {};
   const base = gatewayBaseUrl();
   const ident = xellToken ? `/x/${encodeURIComponent(xellToken)}` : '';
-  const anthropic = provider === 'deepseek' ? 'deepseek' : 'claude';
+  // Anthropic-dialect providers run the claude CLI: claude → /claude, deepseek → /deepseek.
+  const anthro = provider === 'deepseek' ? 'deepseek' : 'claude';
   return {
-    ANTHROPIC_BASE_URL: `${base}${ident}/${anthropic}`,
+    ANTHROPIC_BASE_URL: `${base}${ident}/${anthro}`,
     OPENAI_BASE_URL: `${base}${ident}/openai/v1`,
     KIMI_MODEL_BASE_URL: `${base}${ident}/kimi/v1`,
-    // The grok CLI (Grok Build) reads XAI_BASE_URL for its endpoint — the same XAI_ prefix its
-    // auth uses (XAI_API_KEY, measured on grok 0.2.118). The gateway path segment is `/grok` so
-    // the gateway resolves the grok account/upstream, not openai.
-    XAI_BASE_URL: `${base}${ident}/grok`,
+    GROK_XAI_API_BASE_URL: `${base}${ident}/grok`,
   };
 }
 

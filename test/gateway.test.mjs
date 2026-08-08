@@ -29,7 +29,7 @@ import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRe
 // This test must assert the DEFAULTS, so clear any the caller's shell may have set (e.g. a zee
 // cage has ANTHROPIC_BASE_URL pointed at its own dispatch endpoint) — providerUpstreamUrl reads
 // them lazily, so clearing now is enough.
-for (const k of ['ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'KIMI_CODE_BASE_URL', 'XAI_BASE_URL', 'DEEPSEEK_ANTHROPIC_BASE_URL']) {
+for (const k of ['ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'KIMI_CODE_BASE_URL', 'DEEPSEEK_ANTHROPIC_BASE_URL', 'GROK_XAI_API_BASE_URL']) {
   delete process.env[k];
 }
 
@@ -62,43 +62,52 @@ const env = gatewayEnv({ xellToken: 'abc123' });
 ok(env.ANTHROPIC_BASE_URL.includes('/x/abc123/claude'), 'claude base url carries the xell identity');
 ok(env.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'openai base url carries the xell identity');
 ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'kimi base url points at the kimi segment (not openai)');
-ok(env.XAI_BASE_URL?.includes('/x/abc123/grok'), 'grok base url carries the xell identity');
+ok(env.GROK_XAI_API_BASE_URL?.includes('/x/abc123/grok'), 'grok base url carries the xell identity');
 ok(!env.ANTHROPIC_BASE_URL.includes('/openai'), 'anthropic base url does not point at the openai segment');
 const de = gatewayEnv({ xellToken: 'abc123', provider: 'deepseek' });
 ok(de.ANTHROPIC_BASE_URL.includes('/x/abc123/deepseek'), 'deepseek base url points at the deepseek segment (not claude)');
 ok(de.OPENAI_BASE_URL.includes('/x/abc123/openai') && de.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi')
-  && de.XAI_BASE_URL?.includes('/x/abc123/grok'), 'deepseek env still carries the other providers gateway URLs');
+  && de.GROK_XAI_API_BASE_URL?.includes('/x/abc123/grok'), 'deepseek env still carries the other providers gateway URLs');
+// The path provider segment drives the gateway's ACCOUNT resolution, so it must name the xell's
+// ACTUAL provider — a deepseek cxell must not hit /claude (or the gateway uses the claude key).
+const kenv = gatewayEnv({ xellToken: 'abc123', provider: 'kimi' });
+ok(kenv.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'a kimi cxell is pointed at /kimi, not /openai');
+const oenv = gatewayEnv({ xellToken: 'abc123', provider: 'openai' });
+ok(oenv.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'a codex cxell stays at /openai');
 // Dialect composition: OpenAI-compatible CLIs (codex, kimi) carry the /v1 in the BASE and append
 // /chat/completions; Anthropic CLIs (claude/deepseek/grok) append /v1/messages to a bare base.
 ok(env.OPENAI_BASE_URL.endsWith('/openai/v1'), 'openai base url carries /v1 (codex appends /chat/completions)');
 ok(env.KIMI_MODEL_BASE_URL.endsWith('/kimi/v1'), 'kimi base url carries /v1 (kimi appends /chat/completions)');
 ok(!env.ANTHROPIC_BASE_URL.endsWith('/v1'), 'claude base url has no /v1 (claude appends /v1/messages)');
-ok(!env.XAI_BASE_URL.endsWith('/v1'), 'grok base url has no /v1 (grok appends /v1/messages)');
+ok(!env.GROK_XAI_API_BASE_URL.endsWith('/v1'), 'grok base url has no /v1 (grok appends /v1/messages)');
 
-// ── D2. forward path construction — one path per provider, no doubled /v1 ─────────────────────
+// ── D2. upstream path composition — one path per provider, no doubled /v1 ─────────────────────
 console.log('\n── D2. providerUpstreamUrl + forward path — no doubled /v1 ──');
 // The gateway forwards parsed.forward (the CLI's own request path) straight upstream; the upstream
 // path is its base pathname + that forward. This is what must NOT double the /v1 the CLI already
 // sends (the original bug: openai /v1 + /v1/chat/completions → /v1/v1/chat/completions → 404).
-const forwardPath = (provider, cliPath) => {
+const compose = (provider, fwd) => {
   const target = new URL(providerUpstreamUrl(provider));
-  return `${target.pathname === '/' ? '' : target.pathname}${cliPath}`;
+  return `${target.pathname === '/' ? '' : target.pathname}${fwd}`;
 };
-eq(forwardPath('claude', '/v1/messages?beta=true'), '/v1/messages?beta=true', 'claude forward is the CLI path alone');
-eq(forwardPath('deepseek', '/v1/messages'), '/anthropic/v1/messages', 'deepseek forward keeps its /anthropic prefix');
-eq(forwardPath('openai', '/v1/chat/completions'), '/v1/chat/completions', 'openai forward does NOT double /v1');
-eq(forwardPath('kimi', '/v1/chat/completions'), '/coding/v1/chat/completions', 'kimi forward does NOT double /v1');
-eq(forwardPath('grok', '/v1/messages'), '/v1/messages', 'grok forward is the CLI path alone');
+eq(compose('openai', '/v1/chat/completions'), '/v1/chat/completions', 'openai upstream has NO double /v1');
+eq(compose('kimi', '/v1/chat/completions'), '/coding/v1/chat/completions', 'kimi upstream path is /coding/v1/chat/completions');
+eq(compose('deepseek', '/v1/messages'), '/anthropic/v1/messages', 'deepseek upstream keeps its /anthropic base');
+eq(compose('claude', '/v1/messages'), '/v1/messages', 'claude upstream is the plain /v1/messages');
+eq(compose('grok', '/responses'), '/responses', 'grok upstream forwards the Responses API path');
 ok(providerUpstreamUrl('grok').includes('api.x.ai'), 'grok upstream resolves to xAI (not the anthropic default)');
+// The claude provider's upstream is api.anthropic.com regardless of the SERVER's own
+// ANTHROPIC_BASE_URL (which may legitimately point at deepseek, as this very cage's does).
+ok(!providerUpstreamUrl('claude').includes('deepseek'), 'claude upstream is never the deepseek URL');
 // And parseGatewayPath pairs with the gateway base URLs from D: the CLI's request against the
-// gateway base URL must parse to the CLI path that forwardPath consumes. OpenAI-style CLIs append
+// gateway base URL must parse to the CLI path that compose consumes. OpenAI-style CLIs append
 // /chat/completions to a /v1-carrying base; Anthropic-style append /v1/messages to a bare base.
 const pair = (base, cliPath) => parseGatewayPath(new URL(base).pathname + cliPath);
 eq(pair(env.OPENAI_BASE_URL, '/chat/completions')?.provider, 'openai', 'openai request resolves provider from the path');
 eq(pair(env.OPENAI_BASE_URL, '/chat/completions')?.forward, '/v1/chat/completions', 'openai request forward is the CLI path');
 eq(pair(env.KIMI_MODEL_BASE_URL, '/chat/completions')?.provider, 'kimi', 'kimi request resolves to the kimi provider');
 eq(pair(env.KIMI_MODEL_BASE_URL, '/chat/completions')?.forward, '/v1/chat/completions', 'kimi request forward is the CLI path');
-eq(pair(env.XAI_BASE_URL, '/v1/messages')?.provider, 'grok', 'grok request resolves to the grok provider');
+eq(pair(env.GROK_XAI_API_BASE_URL, '/responses')?.provider, 'grok', 'grok request resolves to the grok provider');
 eq(pair(de.ANTHROPIC_BASE_URL, '/v1/messages')?.provider, 'deepseek', 'deepseek request resolves to the deepseek provider');
 eq(pair(env.ANTHROPIC_BASE_URL, '/v1/messages')?.provider, 'claude', 'claude request resolves to the claude provider');
 
