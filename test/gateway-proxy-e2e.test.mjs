@@ -28,6 +28,7 @@ import express from 'express';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken } from '../server/src/lib/xell-token.js';
 import { gatewayProxy, gatewayHello, requestsForXell } from '../server/src/lib/gateway.js';
+import { bodiesForRequest, gatewayBodyCaptureEnabled } from '../server/src/lib/gateway-bodies.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -146,6 +147,16 @@ try {
   eq(row?.status, 200, 'status 200');
   eq(mock.seen.at(-1)?.url, '/v1/messages?beta=true', 'the upstream received the stripped forward path');
   ok(mock.seen.at(-1)?.auth?.includes('sk-mockdeepseek123456789'), 'the upstream got the PROVIDER key, not the xell token');
+  // BODY CAPTURE (migration 162, lib/gateway-bodies.js): the request DELTA + the REASSEMBLED
+  // response SSE. The default switch (no pool_config row) is ON.
+  const aBody = await bodiesForRequest(row.id);
+  ok(!!aBody, 'the proxy captured the request/response bodies');
+  eq(aBody?.request_body, '{"role":"user","content":"hi"}', 'the request body is the DELTA (the last message), not the whole conversation');
+  eq(aBody?.request_truncated, false, 'a small request body is not truncated');
+  ok(aBody?.response_body?.includes('event: message_start'), 'the response body is the REASSEMBLED SSE text');
+  ok(aBody?.response_body?.includes('event: message_stop'), 'the response body carries the final SSE event');
+  ok(aBody?.response_body?.includes('"input_tokens":11'), 'the usage event is in the reassembled response body');
+  eq(aBody?.response_truncated, false, 'a short SSE response is not truncated');
 
   console.log('\n── B. OpenAI dialect — /v1/chat/completions through the proxy ──');
   const fx2 = await makeFixture('openai', 'sk-mockopenai123456789012');
@@ -220,6 +231,23 @@ try {
   }
   ok(!!row4, 'the failed forward is still recorded');
   eq(row4?.status, 502, 'the row carries the 502 status');
+
+  console.log('\n── F. per-project switch OFF → the proxy stores no bodies ──');
+  // Section D pointed DEEPSEEK_ANTHROPIC_BASE_URL at a DEAD port — point it back at the mock.
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
+  const fxOff = await makeFixture('deepseek', 'sk-mockdeepseek123456789');
+  fixtures.push(fxOff);
+  await one(`INSERT INTO pool_config (project_id, gateway_body_capture) VALUES ($1, false)`, [fxOff.projectId]);
+  eq(await gatewayBodyCaptureEnabled(fxOff.projectId), false, 'the switch reads OFF');
+  const resOff = await fetch(`http://127.0.0.1:${gw.port}/x/${fxOff.xellToken}/deepseek/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockdeepseek123456789' },
+    body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  ok(resOff.status === 200, 'a call still succeeds with capture OFF');
+  const offRow = await completedRow(fxOff.xellId);
+  eq(offRow?.status, 200, 'the ledger row is written even with capture OFF');
+  eq(await bodiesForRequest(offRow?.id), null, 'NO body row is stored while the switch is OFF');
 
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
