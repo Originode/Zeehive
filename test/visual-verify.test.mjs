@@ -21,6 +21,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import http from 'node:http';
 import pg from 'pg';
 
 const url = process.env.DATABASE_URL;
@@ -38,6 +39,19 @@ const XID = '00000000-0000-4000-8000-00000000d222';
 const XOURCE = '00000000-0000-4000-8000-00000000d333';
 const WEBAPP = '00000000-0000-4000-8000-00000000d444';
 const ZID = '00000000-0000-4000-8000-00000000d555';
+const SRV = '00000000-0000-4000-8000-00000000d666';
+
+// selfVerifyWebapp PROBES the same upstream the /xell-web proxy dials before it offers — a card in
+// front of a human must never be a dead link. So the fake webapp container needs something actually
+// listening; any HTTP answer counts as alive.
+const appTier = http.createServer((_req, res) => res.end('ok'));
+await new Promise((r) => appTier.listen(0, '127.0.0.1', r));
+const LIVE_PORT = appTier.address().port;
+// A port with provably nothing on it: bind a second listener, note its port, close it.
+const deadPortProbe = http.createServer(() => {});
+await new Promise((r) => deadPortProbe.listen(0, '127.0.0.1', r));
+const DEAD_PORT = deadPortProbe.address().port;
+await new Promise((r) => deadPortProbe.close(r));
 
 async function cleanup() {
   try { await client.query(`DELETE FROM project WHERE id=$1`, [PID]); } catch { /* */ }
@@ -59,9 +73,9 @@ try {
        VALUES ($1,$2,$3,'vvy','spinoff/vvy','/tmp/vv-wt','working',false,true,$4)`,
     [XID, PID, XOURCE, 'abc123def456']);
   await client.query(
-    `INSERT INTO container (id, project_id, role, tier, isolation, name, url, health, owner_xell_id)
-       VALUES ($1,$2,'webapp','spinoff','per-xell','vv_webapp','http://localhost:5331','up',$3)`,
-    [WEBAPP, PID, XID]);
+    `INSERT INTO container (id, project_id, role, tier, isolation, name, url, health, owner_xell_id, host_port)
+       VALUES ($1,$2,'webapp','spinoff','per-xell','vv_webapp','http://localhost:5331','up',$3,$4)`,
+    [WEBAPP, PID, XID, LIVE_PORT]);
   await client.query(
     `INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'owns')`,
     [XID, WEBAPP]);
@@ -85,7 +99,8 @@ try {
   const offered = await selfVerifyWebapp(xell);
   ok(offered.ok === true && offered.offer?.status === 'open',
      'selfVerifyWebapp records an OPEN offer');
-  ok(offered.offer?.url === 'http://localhost:5331', `the offer carries the webapp container url (${offered.offer?.url})`);
+  ok(offered.offer?.url === '/xell-web/vvy/',
+     `the offer carries the DERIVED proxied path, never the stored LAN url (${offered.offer?.url})`);
   ok(offered.offer?.xell_slug === 'vvy' && offered.offer?.xell_id === XID, 'the offering xell is stamped on the row');
   ok(offered.offer?.project_id === PID, 'the project is stamped on the row');
   ok(offered.offer?.commit === 'abc123def456', 'the offer carries the xell head commit');
@@ -106,6 +121,32 @@ try {
   await client.query(
     `INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'owns')`,
     [XID, WEBAPP]);
+
+  // ── 1b. OFFER-TIME LIVENESS: a dead upstream is refused, never offered ──
+  console.log('\n── offer-time liveness ──');
+  // webapp row exists but nothing listens on its port → refuse (the card would 502)
+  await client.query(`UPDATE container SET host_port=$2 WHERE id=$1`, [WEBAPP, DEAD_PORT]);
+  const deadWeb = await selfVerifyWebapp(xell);
+  ok(deadWeb.ok === false && /webapp is not answering/.test(deadWeb.error || '')
+     && /zee build webapp --wait/.test(deadWeb.error || ''),
+     'a dead webapp upstream is REFUSED, naming the build command');
+  await client.query(`UPDATE container SET host_port=$2 WHERE id=$1`, [WEBAPP, LIVE_PORT]);
+  // a server ROLE that exists but is down → refuse (the reviewed page would be a hollow shell)
+  await client.query(
+    `INSERT INTO container (id, project_id, role, tier, isolation, name, url, health, owner_xell_id, host_port)
+       VALUES ($1,$2,'server','spinoff','per-xell','vv_server','http://localhost:5332','up',$3,$4)`,
+    [SRV, PID, XID, DEAD_PORT]);
+  await client.query(
+    `INSERT INTO xell_uses_container (xell_id, container_id, relation) VALUES ($1,$2,'owns')`, [XID, SRV]);
+  const deadSrv = await selfVerifyWebapp(xell);
+  ok(deadSrv.ok === false && /server is not answering/.test(deadSrv.error || '')
+     && /zee build server --wait/.test(deadSrv.error || ''),
+     'a live webapp with a DEAD server role is refused (hollow shell), naming the build command');
+  // a live server role passes again
+  await client.query(`UPDATE container SET host_port=$2 WHERE id=$1`, [SRV, LIVE_PORT]);
+  const bothUp = await selfVerifyWebapp(xell);
+  ok(bothUp.ok === true, 'with both roles answering, the offer stands again');
+  await client.query(`DELETE FROM container WHERE id=$1`, [SRV]);
 
   // ── 2. dismiss settles the offer ──
   console.log('\n── the dismiss ──');
@@ -215,6 +256,7 @@ try {
 } finally {
   await cleanup();
   await client.end().catch(() => {});
+  await new Promise((r) => appTier.close(r));
 }
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');

@@ -36,7 +36,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
-import { xellWebappPath } from '../lib/webapp-proxy.js';
+import { xellWebappPath, probeRoleUpstream } from '../lib/webapp-proxy.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -885,10 +885,33 @@ export async function selfVerifyWebapp(xell) {
       + 'first (`zee build webapp --wait`), then try again.' };
   }
   const webappUrl = xellWebappPath(xell.slug);
+  // OFFER-TIME LIVENESS — the reason "visual verification still does not work" kept being true:
+  // an offer used to be inserted on the strength of a container ROW existing, so the card a human
+  // clicked could be a dead 502 (webapp never built / torn down) or a hollow shell (webapp up,
+  // xell server down → every /api call in the reviewed page fails). Probe the SAME upstreams the
+  // /xell-web proxy will dial, and refuse to offer a link that is not actually alive — the fix is
+  // always one build command, and the message names it.
+  const [webProbe, apiProbe] = await Promise.all([
+    probeRoleUpstream(xell.slug, 'webapp'),
+    probeRoleUpstream(xell.slug, 'server'),
+  ]);
+  if (!webProbe.up) {
+    return { ok: false, error: `your webapp is not answering${webProbe.upstream ? ` at ${webProbe.upstream}` : ''} — `
+      + 'the offered link would be a dead 502 in front of a human. Build it (`zee build webapp --wait`), '
+      + 'then offer again.' };
+  }
+  // A server ROLE that exists but is down makes the reviewed page a hollow shell (the webapp
+  // proxies its own /api to the xell server). No server role at all is fine — nothing to require.
+  if (apiProbe.resolved && !apiProbe.up) {
+    return { ok: false, error: `your webapp is up but your server is not answering at ${apiProbe.upstream} — `
+      + 'the reviewed page would render with every /api call failing. Build it (`zee build server --wait`), '
+      + 'then offer again.' };
+  }
   const zee = await liveZee(xell.id);
   // One OPEN offer per xell, like prod_seed_request's one-open-ask guard: a zee that calls this
   // twice must not flood the console with cards. The existing open offer is handed back, not a
-  // second row.
+  // second row. (The probes above already ran, so a re-offer with a dead app tier is refused
+  // rather than reasserting a live link that no longer is.)
   const existing = await one(
     `SELECT * FROM visual_verify_offer WHERE xell_id=$1 AND status='open'
       ORDER BY created_at DESC LIMIT 1`, [xell.id]);

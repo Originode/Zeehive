@@ -78,6 +78,29 @@ async function resolveRoleUpstream(slug, role) {
 const webappUpstream = (slug) => resolveRoleUpstream(slug, 'webapp');
 const serverUpstream = (slug) => resolveRoleUpstream(slug, 'server');
 
+// Liveness probe for one role's upstream — the offer-time truth check behind `zee verify-webapp`
+// (selfVerifyWebapp). ANY HTTP response (even a 404) proves a process is listening on the port the
+// proxy would dial; ECONNREFUSED/timeout proves the offered link would be a dead 502. This module
+// owns upstream resolution, so the probe lives here: the offer and the proxy can never disagree
+// about which address "up" means.
+//   { resolved:false }            — no row / no port for that role (nothing to probe; the caller
+//                                   decides whether that role is required)
+//   { resolved:true, up, upstream } — a dialable upstream, and whether anything answered
+export async function probeRoleUpstream(slug, role, { timeoutMs = 1500 } = {}) {
+  const web = await resolveRoleUpstream(slug, role).catch(() => null);
+  if (!web) return { resolved: false, up: false, upstream: null };
+  const path = role === 'webapp' ? `${basePath(slug)}/` : '/api/';
+  const up = await new Promise((done) => {
+    const req = http.request(web.upstream, {
+      method: 'GET', path, headers: { host: web.hostHeader }, timeout: timeoutMs,
+    }, (res) => { res.resume(); done(true); });
+    req.on('timeout', () => { req.destroy(); done(false); });
+    req.on('error', () => done(false));
+    req.end();
+  });
+  return { resolved: true, up, upstream: web.upstream };
+}
+
 // Proxy one HTTP request. `req.url` here is the path AFTER the router stripped the matched prefix
 // (mounted with router.use). `forward` is the path to dial upstream: for Vite it is the base-prefixed
 // path (Vite answers /xell-web/<slug>/...); for the xell's own server it is the plain /api/... the
