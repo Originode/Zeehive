@@ -54,9 +54,8 @@ async function ledgerBurnForTurn(turnId) {
 // One sweep: judge every open turn, end the ones that are spinning. Returns the number ended.
 export async function spinTick() {
   const turns = await q(
-    `SELECT t.id AS turn_id, t.zee_id, t.xell_id, t.started_at, t.kind,
-            z.status AS zee_status, z.entrypoint,
-            x.slug, x.project_id, x.harness_id, x.manager_xell_id, x.status AS xell_status
+    `SELECT t.id AS turn_id, t.zee_id, t.xell_id, t.started_at,
+            x.slug, x.project_id, x.harness_id, x.manager_xell_id
        FROM zee_turn t
        JOIN zee z ON z.id = t.zee_id
        JOIN xell x ON x.id = t.xell_id
