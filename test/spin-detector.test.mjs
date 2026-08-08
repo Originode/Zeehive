@@ -218,6 +218,39 @@ try {
      && Number(afterRestamp.cost_usd) !== 9,
      'the ended turn keeps status/stop_reason/burn from the FIRST end — the late writer changed nothing');
 
+  // The #2 back-off: endSpinningTurn on a turn that ALREADY ended cleanly must NOT label it a spin.
+  // This is the "clean exit mislabelled as spin-detector" race — a natural end racing the sweep. The
+  // detector closes the turn FIRST (endTurn one-shot); when the close finds the turn already ended it
+  // backs off entirely: no zee marker, no evidence event, no notification.
+  const reportsBefore = (await one(
+    `SELECT count(*)::int AS n FROM zee_message WHERE to_xell_id=$1 AND kind='report'`, [man.id])).n;
+  const cleanXell = await mkXell('spin-clean-exit');
+  const cleanZee = await mkZee(cleanXell.id, { n: 4 });
+  const cleanTurn = await mkTurn(cleanZee.id, cleanXell.id);
+  await endTurn(cleanTurn.id, { status: 'ended', stopReason: 'end_turn',
+                                burn: { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
+  const outClean = await endSpinningTurn({
+    turn: { id: cleanTurn.id }, zee: { id: cleanZee.id },
+    xell: { id: cleanXell.id, slug: cleanXell.slug, project_id: PID },
+    burn: { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    evidence: { windowCalls: 25, windowTokens: 1750000, maxSizeRatio: 1 },
+    manager: man, by: 'spin-detector',
+  });
+  ok(outClean.alreadyEnded === true && outClean.ended === false && outClean.notified === null,
+     `a turn that already ended cleanly is NOT relabelled — endSpinningTurn backs off (${JSON.stringify(outClean)})`);
+  const cleanTRow = await turnRow(cleanTurn.id);
+  ok(cleanTRow.status === 'ended' && cleanTRow.stop_reason === 'end_turn',
+     'the clean turn keeps its OWN stop_reason (end_turn), not spin-detector');
+  const cleanZRow = await zeeRow(cleanZee.id);
+  ok(cleanZRow.last_stop_reason !== SPIN_STOP_REASON,
+     'the zee is NOT marked spin-detector for a turn that ended naturally');
+  const cleanEv = await one(
+    `SELECT count(*)::int AS n FROM session_event WHERE turn_id=$1 AND hook_event_name='spin-detector'`, [cleanTurn.id]);
+  ok(cleanEv.n === 0, 'no spin-detector evidence event for a turn that was never closed as a spin');
+  const reportsAfter = (await one(
+    `SELECT count(*)::int AS n FROM zee_message WHERE to_xell_id=$1 AND kind='report'`, [man.id])).n;
+  ok(reportsAfter === reportsBefore, 'and the manager was NOT told about a non-spin (no new report)');
+
   const ev = await one(`SELECT raw FROM session_event WHERE turn_id=$1 AND hook_event_name='spin-detector'`, [turn.id]);
   ok(ev?.raw?.stop_reason === SPIN_STOP_REASON && ev?.raw?.windowCalls === 30,
      'a session_event carries the evidence (raw.stop_reason + windowCalls) for the console to replay');

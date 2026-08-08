@@ -1965,21 +1965,23 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await endTurn(turn?.id, { status: 'paused', burn: b, stopReason: PAUSED_STOP_REASON });
         return;
       }
-      // A turn the SPIN DETECTOR ended is not an error either. The detector books the end (turn row
-      // with its CUMULATIVE ledger burn + stop_reason='spin-detector') and then interrupts the CLI;
-      // this handler is what runs as the exec dies. Preserve the spin end exactly as the fleet-pause
-      // branch above does: book the burn on the zee row (a spin turn spent what it spent), keep the
-      // zee idle, and only close the turn row if the detector's own close did not land (a conditional
-      // UPDATE, so a good row with the cumulative burn is never clobbered by the final call's usage).
-      if ((await one(`SELECT last_stop_reason FROM zee WHERE id=$1`, [zee.id]))?.last_stop_reason === SPIN_STOP_REASON) {
+      // A turn the SPIN DETECTOR ended is not an error either. Judge it from the TURN row, not the
+      // zee's last_stop_reason: that persists across turns, so a PREVIOUS spin-ended turn's marker
+      // would mislabel a later clean exit as a spin — the exact observability lie the review named.
+      // The detector closes THIS turn with stop_reason='spin-detector' (endTurn, one-shot), so the
+      // turn row is the single source of truth for what ended it. Preserve the spin end exactly as
+      // the fleet-pause branch above does: book the burn on the zee row (a spin turn spent what it
+      // spent), keep the zee idle. The turn row needs no touch — the detector already closed it, and
+      // a closed turn is never re-stamped (endTurn's ended_at IS NULL guard).
+      const spinClosed = turn?.id
+        ? (await one(`SELECT stop_reason FROM zee_turn WHERE id=$1`, [turn.id]).catch(() => null))?.stop_reason === SPIN_STOP_REASON
+        : false;
+      if (spinClosed) {
         await q(`UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
                                 cache_read_tokens=$5, cache_write_tokens=$6,
                                 status='idle', last_stop_reason=$7 WHERE id=$1`,
           [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, SPIN_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
-        await q(`UPDATE zee_turn SET status='ended', ended_at=COALESCE(ended_at, now()),
-                                     stop_reason=COALESCE(stop_reason, $2)
-                   WHERE id=$1 AND status='started'`, [turn?.id, SPIN_STOP_REASON]).catch(() => {});
         logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (repetition without progress)`);
         return;
       }
@@ -2035,14 +2037,16 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await endTurn(turn?.id, { status: 'paused', burn: null, stopReason: PAUSED_STOP_REASON });
         return;
       }
-      // Same spin-detector guard as the resolve path: a SIGINT'd exec usually REJECTS, so this is the
-      // branch a spin end most often lands in. The detector already booked the end; keep the zee idle.
-      if ((await one(`SELECT last_stop_reason FROM zee WHERE id=$1`, [zee.id]))?.last_stop_reason === SPIN_STOP_REASON) {
+      // Same spin-detector guard as the resolve path — keyed on the TURN row, never the zee's stale
+      // last_stop_reason (a previous spin-ended turn's marker must not mislabel a later clean exit):
+      // a SIGINT'd exec usually REJECTS, so this is the branch a spin end most often lands in. The
+      // detector already closed the turn; keep the zee idle.
+      const spinClosed = turn?.id
+        ? (await one(`SELECT stop_reason FROM zee_turn WHERE id=$1`, [turn.id]).catch(() => null))?.stop_reason === SPIN_STOP_REASON
+        : false;
+      if (spinClosed) {
         await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, SPIN_STOP_REASON]);
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
-        await q(`UPDATE zee_turn SET status='ended', ended_at=COALESCE(ended_at, now()),
-                                     stop_reason=COALESCE(stop_reason, $2)
-                   WHERE id=$1 AND status='started'`, [turn?.id, SPIN_STOP_REASON]).catch(() => {});
         logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (its exec died)`);
         return;
       }
