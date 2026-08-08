@@ -94,7 +94,11 @@ const url = process.env.DATABASE_URL;
 if (!url) { console.error('DATABASE_URL required for sections B–D'); process.exit(2); }
 
 const PID = randomUUID();
+let createdHarnessId = null;
 const cleanup = async () => {
+  // A harness is GLOBAL (not project-scoped), so deleting the project does not cascade to it —
+  // delete the test's harness row explicitly (house rule 1: clean up what you create).
+  try { if (createdHarnessId) await q(`DELETE FROM harness WHERE id=$1`, [createdHarnessId]); } catch { /* already gone */ }
   try { await q(`DELETE FROM project WHERE id=$1`, [PID]); } catch { /* already gone */ }
 };
 
@@ -137,6 +141,7 @@ try {
      'a PROJECT row overrides min_calls/min_tokens and inherits the rest');
   // Harness override beats project.
   const harness = await one(`INSERT INTO harness (key, label) VALUES ($1,$2) RETURNING *`, [`spin-h-${PID.slice(0, 8)}`, 'spin test harness']);
+  createdHarnessId = harness.id;
   await q(`INSERT INTO spin_detector_config (scope, harness_id, min_calls) VALUES ('harness',$1,3)`, [harness.id]);
   const har = await spinConfigFor({ projectId: PID, harnessId: harness.id });
   ok(har.minCalls === 3 && har.minTokens === 777,
