@@ -77,11 +77,11 @@ export function detectSpin({ requests = [], lastProgressAt = null, cfg = DEFAULT
     .filter((r) => !r.requested_at || new Date(r.requested_at).getTime() >= since);
 
   const windowCalls = window.length;
+  const windowTokens = window.reduce((s, r) => s + r.total_tokens, 0);
   if (windowCalls < c.minCalls) {
-    return { spinning: false, reason: 'not-enough-calls', windowCalls, windowTokens: 0, maxSizeRatio: 1, samePath: true };
+    return { spinning: false, reason: 'not-enough-calls', windowCalls, windowTokens, maxSizeRatio: 1, samePath: true };
   }
 
-  const windowTokens = window.reduce((s, r) => s + r.total_tokens, 0);
   if (windowTokens < c.minTokens) {
     return { spinning: false, reason: 'not-enough-tokens', windowCalls, windowTokens, maxSizeRatio: 1, samePath: true };
   }
@@ -201,21 +201,44 @@ export async function endSpinningTurn({ turn, zee, xell, burn = null, evidence =
   const reason = 'repeated gateway calls without progress (a poll loop)';
   const summary = `ended by the spin detector — ${reason}`
     + (evidence?.windowCalls != null ? ` (${evidence.windowCalls} calls / ${evidence.windowTokens} tokens in the suspect window)` : '');
-  const outcome = { ended: false, interrupted: false, notified: null };
+  const outcome = { ended: false, alreadyEnded: false, interrupted: false, notified: null };
 
   try {
-    // 1. THE EVIDENCE first — a session_event the console can replay, with the raw numbers. Written
-    //    before the turn/ze row so a crash in the middle still leaves the "why".
+    // 1. CLOSE THE TURN FIRST — the act everything else hangs on, and the one that is honest about
+    //    whether this was a spin at all. endTurn's WHERE `ended_at IS NULL` (turn-ledger.js) makes it
+    //    one-shot: if the turn already ended cleanly between the sweep's SELECT and here, endTurn
+    //    returns null and the detector backs off ENTIRELY — no evidence event, no zee marker, no
+    //    notification. A turn that is no longer spinning is not a spin, and labelling it as one is
+    //    the exact observability lie this feature exists to end (manager finding #2).
+    const closed = turn?.id
+      ? await endTurn(turn.id, {
+          status: 'ended', burn: b, stopReason: SPIN_STOP_REASON, summary,
+          meta: { spin_detected: true, ...(evidence || {}) },
+        })
+      : null;
+    if (!closed) {
+      if (turn?.id) {
+        logline('spin', `turn ${String(turn.id).slice(0, 8)} already ended before the detector could close it — backing off, not labelling`);
+      }
+      outcome.alreadyEnded = true;
+      return outcome;
+    }
+    outcome.ended = true;
+
+    // 2. THE EVIDENCE — a session_event the console can replay, with the raw numbers. Written AFTER
+    //    the close, so a turn that was never actually closed by the detector never gets a false
+    //    'spin-detector' event. The turn row above already carries the why (stop_reason + summary +
+    //    meta); this is the replayable copy.
     await recordEvent({
       source: by, hook_event_name: 'spin-detector',
-      zee_id: zee?.id || null, xell_id: xell?.id || null, turn_id: turn?.id || null,
+      zee_id: zee?.id || null, xell_id: xell?.id || null, turn_id: turn.id,
       raw: { reason, ...(evidence || {}), stop_reason: SPIN_STOP_REASON },
     });
 
-    // 2. The ZEE row: idle + SPIN_STOP_REASON. This is the marker intake's completion handler reads
-    //    (queenzee/intake.js) so it preserves the spin end instead of filing the killed CLI as a
-    //    provider error. The burn is NOT booked here — intake is the authoritative burn booker for a
-    //    spawned turn, and booking it twice would overstate the zee's lifetime burn.
+    // 3. The ZEE row: idle + SPIN_STOP_REASON. This is the marker a completion handler (intake.js)
+    //    can cross-check against the TURN row to preserve a spin end instead of filing the killed CLI
+    //    as a provider error. The burn is NOT booked here — intake is the authoritative burn booker
+    //    for a spawned turn, and booking it twice would overstate the zee's lifetime burn.
     //    `decommissioned_at IS NULL` is the same guard markZeeTurn/claimZeeTurn carry: a zee reaped
     //    between the sweep's SELECT and this UPDATE must not have its status resurrected (the reaper
     //    keeps whatever status it stopped in, and a reaped zee is nobody's to wake).
@@ -224,15 +247,6 @@ export async function endSpinningTurn({ turn, zee, xell, burn = null, evidence =
         `UPDATE zee SET status='idle', last_event_at=now(), last_stop_reason=$2, name=NULL
           WHERE id=$1 AND decommissioned_at IS NULL`,
         [zee.id, SPIN_STOP_REASON]).catch((e) => logline('spin', `could not idle zee ${String(zee.id).slice(0, 8)} (${String(e.message).slice(0, 100)})`));
-    }
-
-    // 3. The TURN row: ended, with the reason and its OWN burn off the ledger. `meta` merges, so the
-    //    evidence rides alongside anything intake already wrote.
-    if (turn?.id) {
-      await endTurn(turn.id, {
-        status: 'ended', burn: b, stopReason: SPIN_STOP_REASON, summary,
-        meta: { spin_detected: true, ...(evidence || {}) },
-      }).catch((e) => logline('spin', `could not end turn ${String(turn.id).slice(0, 8)} (${String(e.message).slice(0, 100)})`));
     }
 
     // 4. REPORT to the manager, or raise a TEND when there is none. The notification is the point of
@@ -261,8 +275,6 @@ export async function endSpinningTurn({ turn, zee, xell, burn = null, evidence =
         outcome.notified = { kind: 'tend', ok: false, error: String(e.message).slice(0, 120) };
       }
     }
-
-    outcome.ended = true;
   } catch (e) {
     logline('spin', `endSpinningTurn failed for ${xell?.slug || turn?.id}: ${String(e.message).slice(0, 160)}`);
   }

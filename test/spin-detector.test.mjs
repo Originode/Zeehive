@@ -63,8 +63,11 @@ ok(diverse.spinning === false && diverse.reason === 'not-similar',
    `30 calls of genuinely diverse size → NOT a spin (max/min ${diverse.maxSizeRatio.toFixed(1)}) — a real turn's context grows`);
 
 // Edge cases.
-ok(detectSpin({ requests: SPIN_ROWS.slice(0, 19), cfg }).spinning === false,
+const underFloor = detectSpin({ requests: SPIN_ROWS.slice(0, 19), cfg });
+ok(underFloor.spinning === false && underFloor.reason === 'not-enough-calls',
    'UNDER the call floor (19 calls) → not a spin — no verdict before there is a budget to spend');
+ok(underFloor.windowTokens === SPIN_ROWS.slice(0, 19).reduce((s, r) => s + r.total_tokens, 0),
+   'the not-enough-calls verdict reports the REAL token sum, not a placeholder zero');
 const small = Array.from({ length: 30 }, (_, i) => req(20000));
 ok(detectSpin({ requests: small, cfg }).spinning === false,
    'UNDER the token floor (30×20k = 600k < 1M) → not a spin');
