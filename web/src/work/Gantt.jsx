@@ -399,9 +399,12 @@ export function GanttChart({ rows = [], statuses = [], zees, unscheduledCount,
         miss.push({
           id: depId,
           title: known?.title || null,
+          // An arrow is drawn from the predecessor's PLAN bar; an item whose plan is empty but whose
+          // record has actuals (unscheduled=false) still has no plan bar to draw an arrow from.
           why: !known ? 'outside the scope you are looking at'
-            : (known.unscheduled || !known.computed_start ? 'has no dates yet'
-              : 'inside a collapsed parent'),
+            : (known.unscheduled ? 'has no dates yet'
+              : (!known.computed_start ? 'has actual dates but no planned dates to draw an arrow from'
+                : 'inside a collapsed parent')),
         });
       }
       if (miss.length) m.set(r.id, miss);

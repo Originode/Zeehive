@@ -412,6 +412,18 @@ try {
     ok(hiddenTitle([{ title: 'x', why: 'has no dates yet' }]).startsWith('waits for 1 item'),
        'the marker and the tooltip describe it with the SAME sentence (one function)');
   }
+  // a dependency whose predecessor has ACTUAL but no PLAN dates is undrawable for a NEW reason —
+  // an arrow needs a plan bar, and the marker must say so rather than claiming the row is dateless
+  {
+    const h = renderToString(el(GanttChart, { today, statuses, unscheduledCount: 0, rows: [
+      R({ id: 'u', title: 'actual only', unscheduled: false, computed_start: null, computed_end: null,
+          computed_actual_start: '2026-07-22', computed_actual_end: null }),
+      R({ id: 'b', title: 'blocked', starts_on: '2026-08-01', due_on: '2026-08-05',
+          computed_start: '2026-08-01', computed_end: '2026-08-05', deps: ['u'] }),
+    ] }));
+    ok(/no planned dates to draw an arrow from/.test(h),
+       'an actual-only predecessor explains the undrawable arrow (no PLAN bar to draw from)');
+  }
   // an inverted row is painted as inverted
   {
     const h = renderToString(el(GanttChart, { today, statuses, rows: [
