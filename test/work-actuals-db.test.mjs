@@ -44,6 +44,11 @@ try {
   const item = await W.createWorkItem({ project_id: PID, title: 'event-driven', kind: 'task' });
   ok((await client.query(`SELECT actual_start FROM work_item WHERE id=$1`, [item.id])).rows[0].actual_start === null,
      'a freshly created item has no actual_start (a created event is not a start)');
+  // PATCH {xell_id:null} writes an 'assigned' event naming NO xell — it clears a link and must not
+  // start the clock (the same event shape an unassign or a zee-gone note produces)
+  await W.updateWorkItem(item.id, { xell_id: null }, { actor: 'test' });
+  ok((await client.query(`SELECT actual_start FROM work_item WHERE id=$1`, [item.id])).rows[0].actual_start === null,
+     'a PATCH that clears the xell link does NOT set actual_start (a zee left; nothing started)');
   await W.setStatus(item.id, 'assigned', { actor: 'test' });
   await W.setStatus(item.id, 'working', { actor: 'test' });
   let row = (await client.query(`SELECT actual_start, actual_end FROM work_item WHERE id=$1`, [item.id])).rows[0];

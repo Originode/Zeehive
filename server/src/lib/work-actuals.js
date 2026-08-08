@@ -50,10 +50,16 @@ function minDate(a, b) {
 
 // Is this event row evidence the work STARTED? A status transition into assigned/working, or an
 // 'assigned' event that is a real assignment. An unassign ('unassigned') and a zee-gone note are
-// BOTH kind='assigned' — and both say a zee LEFT, so neither starts the clock.
+// BOTH kind='assigned' — and both say a zee LEFT, so neither starts the clock. Clearing a link via
+// PATCH also writes kind='assigned' with detail.xell_id=null (or detail.assignee=null) and says a
+// zee is NOT on it, so a real assignment is one that names a non-null xell_id or assignee.
 function isStartEvent(e) {
   if (e?.kind === 'status') return START_STATUSES.has(e.to_status);
-  if (e?.kind === 'assigned') return !e.detail?.unassigned && !e.detail?.zee_gone;
+  if (e?.kind === 'assigned') {
+    if (e.detail?.unassigned || e.detail?.zee_gone) return false;
+    const d = e.detail || {};
+    return Boolean(d.xell_id) || Boolean(d.assignee);
+  }
   return false;
 }
 

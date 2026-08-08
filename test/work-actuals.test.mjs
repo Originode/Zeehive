@@ -58,6 +58,15 @@ section('actual_start — an unassign or a zee-gone note is NOT a start');
      `leavings do not start the clock — only the real assignment/transition does (${start?.toISOString()})`);
   ok(actualStartFrom([EV('assigned', T('2026-07-01T10:00:00Z'), null, { unassigned: true })], []) === null,
      'an item with ONLY an unassign and nothing else has NO actual start (nothing ever started)');
+  // a PATCH that CLEARS the link (updateWorkItem {xell_id:null}) writes kind='assigned' with
+  // detail.xell_id=null — that says a zee is NOT on it, so it is not a start either
+  ok(actualStartFrom([EV('assigned', T('2026-07-01T10:00:00Z'), null, { xell_id: null })], []) === null,
+     'an assigned event naming NO xell or assignee is not a start (a cleared link)');
+  ok(actualStartFrom([EV('assigned', T('2026-07-01T10:00:00Z'), null, { assignee: null })], []) === null,
+     'nor is one naming a null assignee');
+  ok(eq(actualStartFrom([EV('assigned', T('2026-07-01T10:00:00Z'), null, { xell_id: 'x' })], []),
+        T('2026-07-01T10:00:00Z')),
+     'an assigned event naming a real xell IS a start');
 }
 
 section('actual_start — the zee_turn fallback, and earliest-of-events-vs-turns');

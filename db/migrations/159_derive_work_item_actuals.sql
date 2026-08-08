@@ -67,9 +67,14 @@ BEGIN
         SELECT e.ts FROM work_item_event e
           WHERE e.work_item_id = target_id
             AND ( (e.kind = 'status' AND e.to_status IN ('assigned','working'))
+                  -- a real assignment names a non-null xell_id or assignee: an unassign, a zee-gone
+                  -- note, and a PATCH that clears the link (detail.xell_id = json null) all write
+                  -- kind='assigned' and all say a zee is NOT on it.
                   OR (e.kind = 'assigned'
                       AND coalesce((e.detail->>'unassigned')::boolean, false) = false
-                      AND coalesce((e.detail->>'zee_gone')::boolean, false) = false) )
+                      AND coalesce((e.detail->>'zee_gone')::boolean, false) = false
+                      AND (coalesce(e.detail->>'xell_id', '') NOT IN ('', 'null')
+                           OR coalesce(e.detail->>'assignee', '') NOT IN ('', 'null'))) )
         UNION ALL
         -- the first turn of any xell that worked this item
         SELECT zt.started_at FROM zee_turn zt
