@@ -1915,6 +1915,46 @@ router.get('/xells/:id/gateway-requests', async (req, res) => {
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// THE BODIES of ONE gateway request (lib/gateway-bodies.js → llm_gateway_body, migration 162).
+// The list endpoint ships NO body text (bodies are big and cold); a human expanding one call
+// fetches exactly that call's request/response bodies here. Scoped to the xell so a request id
+// from another xell is not readable.
+router.get('/xells/:id/gateway-requests/:requestId/body', async (req, res) => {
+  try {
+    const reqRow = await one(
+      `SELECT id FROM llm_gateway_request WHERE id=$1 AND xell_id=$2`,
+      [req.params.requestId, req.params.id]);
+    if (!reqRow) return res.status(404).json({ error: 'no such request for this xell' });
+    const { bodiesForRequest } = await import('../lib/gateway-bodies.js');
+    const body = await bodiesForRequest(req.params.requestId);
+    if (!body) return res.status(404).json({ error: 'no bodies captured for this request (the project switch may be off, or it predates capture)' });
+    res.json({ ok: true, xell_id: req.params.id, ...body });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// THE PER-PROJECT BODY-CAPTURE SWITCH (pool_config.gateway_body_capture, migration 162) —
+// default ON. Read returns the current value; POST flips it. A human turns capture off for a
+// project whose bodies they do not want stored (privacy/size); the ledger row is written either way.
+router.get('/gateway/body-capture', async (req, res) => {
+  try {
+    const proj = req.query.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+    const { gatewayBodyCaptureEnabled } = await import('../lib/gateway-bodies.js');
+    res.json({ ok: true, project_id: proj, gateway_body_capture: await gatewayBodyCaptureEnabled(proj) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/gateway/body-capture', async (req, res) => {
+  try {
+    const proj = req.body?.project;
+    if (!proj) return res.status(400).json({ error: 'project required' });
+    const enabled = req.body?.gateway_body_capture !== false;
+    const { setGatewayBodyCapture } = await import('../lib/gateway-bodies.js');
+    const val = await setGatewayBodyCapture(proj, enabled);
+    broadcast('project', { id: proj, gateway_body_capture: val });
+    res.json({ ok: true, project_id: proj, gateway_body_capture: val });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // DONE SUGGESTIONS — a manager proposed a xell is finished; a human decides. Approving MARKS THE
 // TASK DONE and reaps the cxell (the console asks for a typed confirmation first), so this is the
 // same class of irreversible act as a landing: no zee path to the decision, ever.

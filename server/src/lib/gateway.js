@@ -46,11 +46,17 @@
 // the proxy itself is the only thing that can fail the request (a dead provider is a 502).
 import http from 'node:http';
 import https from 'node:https';
+import { StringDecoder } from 'node:string_decoder';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
 import { xellForToken } from './xell-token.js';
 import { tokenForSpawn, PROVIDERS } from './provider-tokens.js';
+// Body capture lives in its OWN module (gateway-bodies.js) so a future rewrite of the
+// proxy path — e.g. the meter fix landing on this file in parallel — merges cleanly: the
+// gateway only calls a handful of named functions, it does not own the capture logic.
+import { BODY_CAP, gatewayBodyCaptureEnabled, secretValuesForProject, captureRequestText,
+         scrubBodyText, persistBodies } from './gateway-bodies.js';
 
 // The gateway's own port. The queenzee API stays on PORT; the gateway is a SEPARATE listener so
 // it can never shadow API routes (/v1/messages is not an API route, but keeping the two doors
@@ -354,6 +360,24 @@ export async function gatewayProxy(req, res) {
     method: req.method, path: parsed.forward,
   });
 
+  // ── body capture (the cold half — gateway-bodies.js) ──
+  // Bodies go on a SEPARATE table keyed by the request row, capped ~32KB, scrubbed of
+  // secrets, and switched per-project (pool_config.gateway_body_capture, default ON). All
+  // best-effort: a capture failure must never fail the AI call, and the ledger row above
+  // is written whether or not the bodies land. The request body is the DELTA (the last
+  // message), not the whole resent conversation prefix. `secrets` is fetched once and used
+  // by BOTH bodies, so a capture does not read provider_token twice.
+  let captureOn = false;
+  let requestCap = null;        // { text, truncated } — the scrubbed, capped request delta
+  let secretValues = [];        // this project's provider tokens, for scrubbing the response
+  if (rowId) {
+    captureOn = await gatewayBodyCaptureEnabled(xell?.project_id);
+    if (captureOn) {
+      secretValues = await secretValuesForProject(xell?.project_id);
+      requestCap = captureRequestText(req.body, { secretValues });
+    }
+  }
+
   // ── forward ──
   const hopByHop = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
     'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length']);
@@ -392,18 +416,44 @@ export async function gatewayProxy(req, res) {
     // event and records 0 tokens (verified with a fragmenting mock upstream).
     let usage = null;
     let sseTail = '';
+    // The response BODY capture, gated on captureOn (the per-project switch). The REASSEMBLED
+    // text (raw chunks appended, NOT the sseTail-carry text — that would repeat the tail on
+    // every chunk) is accumulated up to the cap, then the truncated flag latches and the
+    // buffer stops growing — the "never buffer unbounded" half of the spec. A StringDecoder
+    // joins the chunks, so a multi-byte UTF-8 char split across a TCP segment reassembles
+    // correctly instead of becoming a replacement char. 4096 bytes of sseTail continue to
+    // ride regardless, so usage parsing is unaffected by the cap.
+    let respText = '';
+    let respTruncated = false;
+    const decoder = new StringDecoder('utf8');
     proxyRes.on('data', (chunk) => {
       const text = sseTail + chunk.toString();
       sseTail = text.slice(-4096);
       const u = usageFromStream(text, upstream.kind);
       if (u) usage = u;
+      if (captureOn && !respTruncated) {
+        respText += decoder.write(chunk);
+        if (respText.length > BODY_CAP) {
+          respText = respText.slice(0, BODY_CAP);
+          respTruncated = true;
+        }
+      }
     });
     proxyRes.on('end', () => {
+      if (captureOn && !respTruncated) respText += decoder.end();
       const u = normalizeUsage(usage, upstream.kind);
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
         cost: costOf({ upstreamCost: usage?.total_cost_usd ?? null }),
       });
+      if (captureOn) {
+        const resp = scrubBodyText(respText, { secretValues });
+        persistBodies({
+          rowId, projectId: xell?.project_id,
+          requestBody: requestCap?.text ?? null, requestTruncated: requestCap?.truncated ?? false,
+          responseBody: resp || null, responseTruncated: respTruncated,
+        });
+      }
     });
   });
   proxyReq.on('error', (e) => {
@@ -411,6 +461,15 @@ export async function gatewayProxy(req, res) {
       res.status(502).json({ error: `gateway upstream unreachable: ${e.message}` });
     } else { try { res.destroy(); } catch { /* already gone */ } }
     completeRequest(rowId, { status: 502, error: e.message, durationMs: Date.now() - t0 });
+    // The request body is already captured (it was read before the forward); persist it with
+    // no response — the call failed before producing one.
+    if (captureOn) {
+      persistBodies({
+        rowId, projectId: xell?.project_id,
+        requestBody: requestCap?.text ?? null, requestTruncated: requestCap?.truncated ?? false,
+        responseBody: null, responseTruncated: false,
+      });
+    }
   });
   if (body) proxyReq.write(body);
   proxyReq.end();

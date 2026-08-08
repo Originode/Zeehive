@@ -3080,6 +3080,13 @@ a.langfuse-ui:hover { text-decoration: underline; }
 .ob-gw-calls { display: flex; flex-direction: column; }
 .ob-gw-call { border-bottom: 1px solid var(--line); }
 .ob-gw-call:last-child { border-bottom: none; }
-.ob-gw-call .ob-turn-h { cursor: default; }
+/* The whole header is the expander now — clicking a call toggles its bodies. */
+.ob-gw-call .ob-turn-h { cursor: pointer; }
+.ob-gw-call .ob-turn-h:hover { background: color-mix(in srgb, var(--panel2) 80%, var(--accent) 8%); }
+.ob-gw-body-btn { color: var(--accent); font-size: 10px; margin-left: auto; min-width: 44px; text-align: right; }
 .ob-gw-attrib { display: flex; gap: 12px; flex-wrap: wrap; padding: 2px 10px 6px 10px; font-size: 10px; color: var(--muted); }
 .ob-gw-attrib code { font-size: 10px; }
+.ob-gw-bodies { display: flex; flex-direction: column; gap: 6px; padding: 6px 10px 10px 10px; background: var(--panel); border-top: 1px solid var(--line); }
+.ob-gw-body-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.ob-gw-body { margin: 0; padding: 6px 8px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; max-height: 220px; overflow-y: auto; }
+.ob-gw-trunc { display: block; color: #e0a53b; font-size: 10px; margin-bottom: 4px; }

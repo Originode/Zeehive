@@ -1455,6 +1455,15 @@ export async function getXellGatewayRequests(xellId, { limit = 50 } = {}) {
   if (!r.ok) throw new Error(data.error || `gateway requests unavailable (${r.status})`);
   return data;
 }
+// The request/response BODIES of ONE gateway call (lib/gateway-bodies.js → llm_gateway_body,
+// migration 162). The list endpoint ships no body text — a human expanding one call fetches
+// that call's bodies here. Returns null when no bodies were captured.
+export async function getGatewayRequestBody(xellId, requestId) {
+  const r = await fetch(`/api/xells/${xellId}/gateway-requests/${requestId}/body`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) return null;
+  return data;
+}
 
 // ── MANAGER ZEES ─────────────────────────────────────────────────────────────
 // Adding a manager is a HUMAN act and there is no limit on how many you add — but only from here

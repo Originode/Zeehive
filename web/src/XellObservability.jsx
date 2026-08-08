@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { getXellObservability, getTurnEvents, getXellGatewayRequests } from './api.js';
+import { getXellObservability, getTurnEvents, getXellGatewayRequests, getGatewayRequestBody } from './api.js';
 
 // XELL OBSERVABILITY — the per-turn ledger behind a xell's right-click action.
 //
@@ -122,11 +122,30 @@ function TurnRow({ turn, open, onToggle }) {
 // One gateway-call row — a single HTTP request (a messages or chat-completions POST) with the
 // upstream's exact usage. Renders the transport columns plus any zee/session attribution the row
 // carries (older rows recorded before attribution landed have none, and degrade gracefully).
-function GatewayCallRow({ r }) {
+// Expanding the row fetches THAT call's request/response bodies (llm_gateway_body, migration
+// 162) — the input/output panel the drill-down renders. Bodies are cold, so they are fetched
+// only on expand, never shipped in the list.
+function GatewayCallRow({ r, xellId }) {
   const tokens = Number(r.total_tokens || 0);
+  const [open, setOpen] = useState(false);
+  const [body, setBody] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const toggle = async () => {
+    if (open) { setOpen(false); return; }
+    setOpen(true);
+    if (!body) {
+      setBusy(true);
+      try { setBody(await getGatewayRequestBody(xellId, r.id)); }
+      finally { setBusy(false); }
+    }
+  };
+  const showBody = (text, truncated) => text
+    ? <pre className="ob-gw-body">{truncated ? <span className="ob-gw-trunc">… ({Math.round(text.length / 1024)}KB shown, truncated)</span> : null}{text}</pre>
+    : <span className="ob-hint">—</span>;
   return (
     <div className="ob-gw-call">
-      <div className="ob-turn-h">
+      <div className="ob-turn-h" onClick={toggle} role="button" tabIndex={0}
+           onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } }}>
         <span className="ob-turn-kind">{r.kind === 'chat-completions' ? '⚙ chat' : '📨 messages'}</span>
         <span className="ob-turn-status">{r.status === 200 ? '✓' : `✗ ${r.status || '?'}`}</span>
         <span className="ob-turn-model">{r.provider} · {r.model || '—'}</span>
@@ -134,11 +153,26 @@ function GatewayCallRow({ r }) {
         <span className="ob-turn-cost">{fmtUsd(r.cost_usd)}</span>
         <span className="ob-turn-dur">{r.duration_ms ? `${r.duration_ms}ms` : '—'}</span>
         <span className="ob-turn-dt">{fmtDt(r.requested_at)}</span>
+        <span className="ob-gw-body-btn">{open ? '▾ body' : '▸ body'}</span>
       </div>
       {(r.zee_name || r.session_id) && (
         <div className="ob-gw-attrib">
           {r.zee_name && <span>🐝 {r.zee_name}</span>}
           {r.session_id && <code>session {r.session_id}</code>}
+        </div>
+      )}
+      {open && (
+        <div className="ob-gw-bodies">
+          {busy && <div className="ob-hint">loading bodies…</div>}
+          {!busy && !body && <div className="ob-hint">No bodies captured for this call (the per-project switch may be off, or it predates capture).</div>}
+          {!busy && body && (
+            <>
+              <div className="ob-gw-body-label">request (delta)</div>
+              {showBody(body.request_body, body.request_truncated)}
+              <div className="ob-gw-body-label">response</div>
+              {showBody(body.response_body, body.response_truncated)}
+            </>
+          )}
         </div>
       )}
     </div>
@@ -152,7 +186,7 @@ function GatewayCallRow({ r }) {
 // the aggregate of the calls beneath it), so the transport-level calls and the turn ledger tell
 // one coherent story. Calls recorded before turn_id was populated (or whose turn row was reaped)
 // fall into a trailing "No turn" group — still attributed to their zee when the row has one.
-export function GatewayCalls({ requests }) {
+export function GatewayCalls({ requests, xellId }) {
   if (!requests.length) {
     return (
       <div className="xob-empty">
@@ -234,7 +268,7 @@ export function GatewayCalls({ requests }) {
                 </div>
               )}
               <div className="ob-gw-calls">
-                {g.requests.map((r) => <GatewayCallRow key={r.id} r={r} />)}
+                {g.requests.map((r) => <GatewayCallRow key={r.id} r={r} xellId={xellId} />)}
               </div>
             </div>
           );
@@ -328,7 +362,7 @@ export default function XellObservability({ xell, onClose }) {
                 </>
               )}
 
-              {tab === 'calls' && <GatewayCalls requests={gwData?.requests || []} />}
+              {tab === 'calls' && <GatewayCalls requests={gwData?.requests || []} xellId={xell.id} />}
             </>
           )}
         </div>

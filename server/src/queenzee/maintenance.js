@@ -33,6 +33,9 @@ import { backupDecision, staleAlertDecision } from '../lib/backup-schedule.js';
 import { restoreOutcome, restoreErrorLine } from '../lib/restore-errors.js';
 import { checkContainerData } from './datadiff.js';
 import { notifyBackupStale, notifyBackupRecovered } from '../lib/notify.js';
+// Gateway body capture's retention sweep — bodies are cold and only kept 14 days (migration
+// 162). Lives in its own module so the sweep is testable without the maintenance machinery.
+import { sweepGatewayBodies } from '../lib/gateway-bodies.js';
 
 const MODE = process.env.MAINTENANCE_MODE === 'real' ? 'real' : 'simulate';
 const DEFAULT_MAX_BACKUPS = 14;
@@ -1719,6 +1722,9 @@ export function startMaintenance() {
         await checkBackupFreshness(p.id);
         await refreshStaleXellDbs(p.id);
       }
+      // The gateway BODY sweep is global (not per-project): delete bodies older than 14 days.
+      // Never throws — a sweep failure logs and moves on.
+      await sweepGatewayBodies();
     } catch (e) { console.error('[maintenance]', e.message); }
   };
   // Short tick; each project backs up only when its interval has elapsed (backupDue).
