@@ -29,6 +29,7 @@ import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
 import { startRevive } from './queenzee/revive.js';
+import { startSpinDetector } from './queenzee/spin.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
 
@@ -184,6 +185,9 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // on a 5/15/45-minute ladder; a turn a dead CREDENTIAL cut is never resumed and raises a human
   // naming the account (queenzee/revive.js).
   startRevive();
+  // A per-turn budget from the gateway ledger: end a turn that is burning tokens on a poll loop and
+  // tell its manager (queenzee/spin.js — the interim alarm; the lease/await model is the cure).
+  startSpinDetector();
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();

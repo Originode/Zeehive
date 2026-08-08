@@ -47,6 +47,7 @@ import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 import { noteTurnDeath } from './revive.js';
+import { SPIN_STOP_REASON } from '../lib/spin-detector.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -1964,6 +1965,24 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await endTurn(turn?.id, { status: 'paused', burn: b, stopReason: PAUSED_STOP_REASON });
         return;
       }
+      // A turn the SPIN DETECTOR ended is not an error either. The detector books the end (turn row
+      // with its CUMULATIVE ledger burn + stop_reason='spin-detector') and then interrupts the CLI;
+      // this handler is what runs as the exec dies. Preserve the spin end exactly as the fleet-pause
+      // branch above does: book the burn on the zee row (a spin turn spent what it spent), keep the
+      // zee idle, and only close the turn row if the detector's own close did not land (a conditional
+      // UPDATE, so a good row with the cumulative burn is never clobbered by the final call's usage).
+      if ((await one(`SELECT last_stop_reason FROM zee WHERE id=$1`, [zee.id]))?.last_stop_reason === SPIN_STOP_REASON) {
+        await q(`UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                                cache_read_tokens=$5, cache_write_tokens=$6,
+                                status='idle', last_stop_reason=$7 WHERE id=$1`,
+          [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, SPIN_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        await q(`UPDATE zee_turn SET status='ended', ended_at=COALESCE(ended_at, now()),
+                                     stop_reason=COALESCE(stop_reason, $2)
+                   WHERE id=$1 AND status='started'`, [turn?.id, SPIN_STOP_REASON]).catch(() => {});
+        logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (repetition without progress)`);
+        return;
+      }
       const errored = result?.is_error;
       // A result with NEITHER usage nor total_cost_usd is UNMETERED — the turn ran and the fleet
       // cannot know what it cost (kimi, or a provider whose result carries no meter). The marker is
@@ -2014,6 +2033,17 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
         await endTurn(turn?.id, { status: 'paused', burn: null, stopReason: PAUSED_STOP_REASON });
+        return;
+      }
+      // Same spin-detector guard as the resolve path: a SIGINT'd exec usually REJECTS, so this is the
+      // branch a spin end most often lands in. The detector already booked the end; keep the zee idle.
+      if ((await one(`SELECT last_stop_reason FROM zee WHERE id=$1`, [zee.id]))?.last_stop_reason === SPIN_STOP_REASON) {
+        await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, SPIN_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        await q(`UPDATE zee_turn SET status='ended', ended_at=COALESCE(ended_at, now()),
+                                     stop_reason=COALESCE(stop_reason, $2)
+                   WHERE id=$1 AND status='started'`, [turn?.id, SPIN_STOP_REASON]).catch(() => {});
+        logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (its exec died)`);
         return;
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);

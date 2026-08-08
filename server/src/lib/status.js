@@ -15,10 +15,10 @@ export async function zeeBySession(sessionId) {
 export async function recordEvent(ev) {
   await q(
     `INSERT INTO session_event
-       (source,hook_event_name,claude_session_id,zee_id,xell_id,pid,cwd,agent_id,tool_name,permission_mode,stop_reason,raw)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       (source,hook_event_name,claude_session_id,zee_id,xell_id,turn_id,pid,cwd,agent_id,tool_name,permission_mode,stop_reason,raw)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
     [ev.source, ev.hook_event_name || null, ev.claude_session_id || null, ev.zee_id || null,
-     ev.xell_id || null, ev.pid || null, ev.cwd || null, ev.agent_id || null,
+     ev.xell_id || null, ev.turn_id || null, ev.pid || null, ev.cwd || null, ev.agent_id || null,
      ev.tool_name || null, ev.permission_mode || null, ev.stop_reason || null,
      ev.raw ? JSON.stringify(ev.raw) : null]
   );
