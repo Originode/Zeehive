@@ -105,17 +105,22 @@ services:
     # the web container's nginx does not proxy to.
     container_name: zeehive_server
     restart: unless-stopped
-    # 4700 is the API. The RANGES are xell webapp PREVIEW ports (docs/visual-verification-
+    # 4700 is the API. The RANGE is xell webapp PREVIEW ports (docs/visual-verification-
     # diagnosis.md §7): the meta-DB allocates each xell webapp a unique fleet-wide port
-    # (project.port_web_base + slot, mod port_slot_mod — Zeehive 5300-5389, omnibiz 5200-5289),
-    # the app-tier processes run INSIDE this container, and lib/preview-ports.js makes every such
-    # port answer on this container's external interface. Publishing the ranges is what carries
+    # (project.port_web_base + slot, mod port_slot_mod — Zeehive 5300-5389), the app-tier
+    # processes run INSIDE this container, and lib/preview-ports.js makes every such port
+    # answer on this container's external interface. Publishing the range is what carries
     # them to the host, so a human opens http://<this-host>:<port>/ directly — no path prefix.
-    # A NEW PROJECT with a different port_web_base needs its range added here (and a server
-    # recreate); keep this file and its sibling compose in lockstep.
+    # THE RULE (outage 2026-08-08): the server publishes ranges ONLY for process-runner (xhip)
+    # projects, whose app tiers run inside THIS container. Never publish a COMPOSE project's
+    # container range — those projects' spin containers publish their own host ports
+    # (port_web_base + slot), so mapping the same range here makes docker refuse this service's
+    # entire network endpoint the moment any spin container holds one port of it (omnibiz's
+    # 5200-5289 held 5263 → the queenzee came up with zero networks and crash-looped on
+    # EAI_AGAIN to the meta-db). Adding a new project's range requires checking it cannot
+    # collide with fleet container ports; keep this file and any sibling compose in lockstep.
     ports:
       - "4700:4700"
-      - "5200-5289:5200-5289"
       - "5300-5389:5300-5389"
     depends_on:
       meta-db: { condition: service_healthy }
