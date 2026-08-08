@@ -90,6 +90,14 @@ const asDate = (v) => (v instanceof Date
 // client parses without a timezone guess.
 const asTs = (v) => (v instanceof Date ? v.toISOString() : (v ?? null));
 
+// The UTC DAY of a timestamptz, as YYYY-MM-DD. Used where the chart needs a DATE (the extent, the
+// span) rather than the instant: spanDays() insists on a whole-string date (its regex is $-anchored
+// on purpose), so a raw ISO timestamp fed to it reads as unparseable and the extent silently becomes
+// null — exactly the bug a chart with only actual bars would hit.
+const tsDay = (v) => (v instanceof Date
+  ? `${String(v.getUTCFullYear()).padStart(4, '0')}-${pad(v.getUTCMonth() + 1)}-${pad(v.getUTCDate())}`
+  : (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v) ? v.slice(0, 10) : null));
+
 // Whole days from one YYYY-MM-DD to another, INCLUSIVE (a task starting and ending the same day is
 // 1 day, not 0). Parsed as UTC so a DST boundary cannot add or drop a day. Null unless both ends
 // are present and parse.
@@ -895,11 +903,11 @@ export async function ganttModel({ projectId, rootId } = {}) {
   const scheduled = ganttRows.filter((r) =>
     (r.computed_start && r.computed_end) || (r.computed_actual_start && r.computed_actual_end));
   const chartStart = scheduled.reduce((a, r) => {
-    const s = min(r.computed_start, r.computed_actual_start);
+    const s = min(r.computed_start, tsDay(r.computed_actual_start));
     return (a && a <= s ? a : s);
   }, null);
   const chartEnd = scheduled.reduce((a, r) => {
-    const e = max(r.computed_end, r.computed_actual_end);
+    const e = max(r.computed_end, tsDay(r.computed_actual_end));
     return (a && a >= e ? a : e);
   }, null);
 
