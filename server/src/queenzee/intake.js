@@ -31,7 +31,7 @@ import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell,
 import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
          usageFrom } from '../lib/cxell-runtimes.js';
 import { turnStopReason } from '../lib/turn-record.js';
-import { startTurn, endTurn, lastAssistantText } from '../lib/turn-ledger.js';
+import { startTurn, endTurn, lastAssistantText, recordFeedEvent } from '../lib/turn-ledger.js';
 import { gatewayEnv } from '../lib/gateway.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
 import { langfuseClientEnv, postTurnToLangfuse } from '../lib/langfuse.js';
@@ -1405,14 +1405,11 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
         }
         // THE PLAY-BY-PLAY LEDGER (SDK path): persist the same events the cxell feed persists,
         // attributed to the current turn (turn_id). Best-effort — never blocks the stream.
-        if (turn?.id && msg?.type && msg.type !== 'system') {
-          q(`INSERT INTO session_event (source, hook_event_name, zee_id, xell_id, turn_id, agent_id, tool_name, raw)
-             VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)`,
-            ['cxell-feed', msg.type, zee.id, xell.id, turn.id,
-             sid || null,
-             msg.type === 'assistant' ? (msg.message?.content?.[0]?.type === 'tool_use' ? msg.message.content[0].name : null) : null,
-             JSON.stringify(msg)]).catch(() => {});
-        }
+        // Failures are counted + logged inside recordFeedEvent (never a silent catch — that is
+        // exactly how the fleet-wide empty play-by-play went unnoticed).
+        if (turn?.id) void recordFeedEvent({
+          turnId: turn.id, zeeId: zee.id, xellId: xell.id, event: msg, sessionId: sid,
+        });
         if (msg?.type === 'result') {
           // Persist full usage for the fleet burn tracker (was cost_usd only). Best-effort on the
           // SDK path: if the result exposes `usage`, tokens land too. A result with NEITHER usage
@@ -1891,15 +1888,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     }
     // THE PLAY-BY-PLAY LEDGER: persist the same feed events the SSE bus carries, attributed to the
     // current turn (turn_id) so a human can replay one turn's moves. Best-effort — never blocks or
-    // fails the feed. The raw event is stored in `raw`, exactly like the hook log stores its own.
-    if (turn?.id && ev?.type && ev.type !== 'system') {
-      q(`INSERT INTO session_event (source, hook_event_name, zee_id, xell_id, turn_id, agent_id, tool_name, raw)
-         VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)`,
-        ['cxell-feed', ev.type, zee.id, xell.id, turn.id,
-         ev.session_id || sid || null,
-         ev.type === 'assistant' ? (ev.message?.content?.[0]?.type === 'tool_use' ? ev.message.content[0].name : null) : null,
-         JSON.stringify(ev)]).catch(() => {});
-    }
+    // fails the feed. Failures are counted + logged inside recordFeedEvent (never a silent catch —
+    // the previous VALUES ('cxell-feed', $2, … $8) shape failed every insert with "could not
+    // determine data type of parameter $1", and .catch(() => {}) hid it fleet-wide).
+    if (turn?.id) void recordFeedEvent({
+      turnId: turn.id, zeeId: zee.id, xellId: xell.id, event: ev, sessionId: sid,
+    });
     // the raw feed for a future per-zee pane — small envelope, full event
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };

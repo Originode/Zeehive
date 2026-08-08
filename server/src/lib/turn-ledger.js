@@ -139,4 +139,73 @@ export async function eventsForTurn(turnId, { limit = 500 } = {}) {
   }
 }
 
-export default { startTurn, endTurn, turnsForXell, eventsForTurn, TURN_KIND, TURN_STATUS };
+// ── play-by-play feed persistence ─────────────────────────────────────────────────────────────
+//
+// intake.js's feed() (cxell path) and the SDK stream loop both call this so the same stream-json
+// events the SSE bus carries as 'zee-output' also land in session_event WITH turn_id. Without
+// that column the Turns tab's expandable log is empty by construction.
+//
+// THE BUG THIS REPLACES: the original hot-path INSERT used
+//   VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)
+// with an 8-element params array whose $1 was never referenced. Postgres rejects that with
+// "could not determine data type of parameter $1", and the call was `.catch(() => {})` — so every
+// feed event failed invisibly forever. Fleet evidence (2026-08-08): 1,815 session_event rows,
+// zero with turn_id, and the 'cxell-feed' source never appeared. Observability that cannot be
+// told apart from "never shipped" is not observability.
+//
+// CONTRACT: best-effort, never throws, never blocks the feed (callers fire-and-forget). A failure
+// is LOUD — a process-local counter + a logline on every miss — so a silent empty play-by-play
+// cannot happen again without a trail.
+
+let _feedOk = 0;
+let _feedFail = 0;
+
+/** Process-local counters for the play-by-play writer. Exposed so a test (and ops) can see silence. */
+export function feedWriteStats() {
+  return { ok: _feedOk, failed: _feedFail };
+}
+
+/** Test/ops helper — reset the counters without restarting the process. */
+export function resetFeedWriteStats() {
+  _feedOk = 0;
+  _feedFail = 0;
+}
+
+/**
+ * Persist one stream-json feed event against a turn. Skips system/init noise (same filter the
+ * original inline INSERT used). Returns the inserted row, or null when skipped/failed.
+ *
+ * @param {{ turnId: string, zeeId?: string, xellId?: string, event: object, sessionId?: string }} args
+ */
+export async function recordFeedEvent({ turnId, zeeId = null, xellId = null, event = null, sessionId = null } = {}) {
+  if (!turnId || !event?.type || event.type === 'system') return null;
+  const toolName = event.type === 'assistant'
+    && event.message?.content?.[0]?.type === 'tool_use'
+    ? (event.message.content[0].name || null)
+    : null;
+  try {
+    // $1..$8 contiguous — do NOT start at $2 with a literal source. Postgres cannot type an
+    // unreferenced $1 and the insert then fails every time (the fleet-empty play-by-play bug).
+    const row = await one(
+      `INSERT INTO session_event
+         (source, hook_event_name, zee_id, xell_id, turn_id, claude_session_id, tool_name, raw)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, ts, source, hook_event_name, turn_id, zee_id, xell_id, tool_name`,
+      ['cxell-feed', event.type, zeeId || null, xellId || null, turnId,
+       event.session_id || sessionId || null, toolName,
+       JSON.stringify(event)]);
+    _feedOk += 1;
+    return row;
+  } catch (e) {
+    _feedFail += 1;
+    logline('turn', `play-by-play write FAILED (#${_feedFail} total, ok=${_feedOk}): `
+      + `${String(e.message).slice(0, 160)}`);
+    return null;
+  }
+}
+
+export default {
+  startTurn, endTurn, turnsForXell, eventsForTurn,
+  recordFeedEvent, feedWriteStats, resetFeedWriteStats,
+  TURN_KIND, TURN_STATUS,
+};

@@ -119,10 +119,13 @@ in the console** — without requiring Langfuse or an upload.
   stays findable after a zee is decommissioned.
 
 ### What this makes hard
-- **The feed persistence is best-effort** — it is an un-awaited `INSERT ... catch(() => {})`
-  in the hot feed path. A pg blip silently drops events (the turn row itself still lands, so
-  the cost/token numbers survive). This is the deliberate contract: observability must never
-  slow or fail a zee's live feed.
+- **The feed persistence is best-effort but LOUD** — `recordFeedEvent` (lib/turn-ledger.js) is
+  fire-and-forget from the hot feed path so observability never slows a zee, but a write miss
+  increments a process-local counter and emits a `turn` logline. A silent `.catch(() => {})` on
+  the original INSERT hid a parameter-binding bug (`VALUES ('cxell-feed', $2, … $8)` — Postgres
+  cannot type an unreferenced `$1`) that emptied the play-by-play fleet-wide (1,815 session_event
+  rows, zero with `turn_id`, source `cxell-feed` never appeared). The contract is: never block the
+  feed, never hide a miss.
 - **Interactive turns have no meter** — `zee turn --start/--end` reports a boundary, not a
   cost (the cage's hook cannot see what the vendor charged). The turn row is started and ended
   with measured-zero burn. This is the same honesty rule TKT-99-1390 established for unmetered
