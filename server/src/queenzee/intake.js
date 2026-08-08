@@ -1722,8 +1722,8 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // adapter's own base URL (the adapter.env baseUrl above is the provider's real URL; the gateway
     // replaces it). The token stays the provider key (adapter.env's token) — unchanged credential
     // model, the identity travels in the URL.
-    const gwEnv = gatewayEnv({ xellToken });
-    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL})`);
+    const gwEnv = gatewayEnv({ xellToken, provider: adapter.provider });
+    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
                          agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env } });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;

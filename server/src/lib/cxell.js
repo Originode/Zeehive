@@ -28,6 +28,7 @@ import { config } from '../config.js';
 import { adapterFor, CLAUDE_ADAPTER, AUTH_MARKERS, SEED_MARKERS, AGENT_PROC_PATTERN,
          HEADLESS_PROC_PATTERN, resultFrom, TURN_HOOK_MARKERS } from './cxell-runtimes.js';
 import { credentialVendorMismatch, scrubEnvValue } from './provider-tokens.js';
+import { gatewayEnv } from './gateway.js';
 import { cxellCacheRunArgs, cxellCacheFixupCommand, CXELL_NPM_CACHE_DIR } from './npm-cache.js';
 import { prepUserScript, prepRootScript, parsePrepSteps, summarizePrepSteps,
          hasAptStep, normalizeSpawnPrep, preppedImageTag, preppedDockerfile,
@@ -1363,6 +1364,14 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
   const agentEnv = [
     ...Object.entries(extraEnv || {}).filter(([, v]) => v !== null && v !== undefined && v !== ''),
     ...credentialEnvFor(adapter, { token, baseUrl, model }),
+    // THE LLM GATEWAY — point the provider base-urls at the queenzee gateway carrying this xell's
+    // identity in the PATH (/x/<xellToken>/<provider>/...), so EVERY AI call this headless spawn
+    // makes (claude -p / codex exec / kimi -p / grok -p) crosses the gateway and is recorded.
+    // Added AFTER credentialEnvFor so it OVERRIDES the adapter's own base URL (the deepseek
+    // adapter sets ANTHROPIC_BASE_URL unconditionally; the gateway must win). When the gateway is
+    // off (GATEWAY_PORT === PORT), gatewayEnv returns {} and the adapter's real URLs are kept.
+    ...Object.entries(gatewayEnv({ xellToken, provider: adapter.provider }))
+      .filter(([, v]) => v !== null && v !== undefined && v !== ''),
   ];
   const cmd = ['exec', '-i',
     ...agentEnv.flatMap(([k, v]) => ['-e', `${k}=${v}`]),
@@ -1602,8 +1611,17 @@ export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, 
   // (a re-crewed cage, a cage older than the pairing fix, a project whose account was removed so
   // tokenForSpawn returned null) hands over a token nobody can attribute. Refusing here turns that
   // into a named sentence in the nudge log instead of a resume that dies on the vendor's 401.
-  const env = credentialEnvFor(adapter, { token: vendorTok, model })
-    .flatMap(([k, v]) => ['-e', `${k}=${v}`]);
+  //
+  // THE LLM GATEWAY — the resume exec must cross the gateway too, so the resumed claude --resume
+  // (codex exec resume / kimi -c / grok -r) records a row attributed to this xell. Same shape as
+  // runZee: the provider base-urls carry /x/<identTok>/<provider> in the PATH, added AFTER
+  // credentialEnvFor so the gateway overrides the adapter's own base URL. Empty when the gateway
+  // is off (GATEWAY_PORT === PORT) — the adapter's real URLs then stay.
+  const env = [
+    ...credentialEnvFor(adapter, { token: vendorTok, model }),
+    ...Object.entries(gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
+      .filter(([, v]) => v !== null && v !== undefined && v !== ''),
+  ].flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);
   // the adapter sanitizes the session id before interpolating it (claude/codex); kimi resumes by
   // workdir (--continue) and ignores the id entirely

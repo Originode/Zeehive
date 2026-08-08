@@ -11,15 +11,27 @@
 //   A. parseGatewayPath — the identity/provider from the gateway path (pure).
 //   B. normalizeUsage — Anthropic vs OpenAI usage shapes (pure).
 //   C. The record → complete → read round-trip (like the proxy does per request).
-//   D. gatewayEnv — the base URLs cxells get.
+//   D. gatewayEnv — the base URLs cxells get, per provider (deepseek → /deepseek, kimi → /kimi,
+//      grok → /grok, and NO trailing /v1 on the OpenAI-dialect URLs).
+//   D2. providerUpstreamUrl + forward path — one path per provider, NO doubled /v1.
 //   E. The WIRING — the index.js gateway mount exists and the proxy is registered.
 //   F. usageFromStream — the proxy reads usage from SSE/JSON response text (pure).
+//   G. zee/turn linkage — recordRequest resolves the live zee + open turn when zeeId is absent.
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
-         requestsForXell, gatewayHello, usageFromStream } from '../server/src/lib/gateway.js';
+         requestsForXell, gatewayHello, usageFromStream, providerUpstreamUrl,
+         zeeTurnForXell } from '../server/src/lib/gateway.js';
+
+// providerUpstreamUrl reads these from the PROCESS env (the queenzee's own operator overrides).
+// This test must assert the DEFAULTS, so clear any the caller's shell may have set (e.g. a zee
+// cage has ANTHROPIC_BASE_URL pointed at its own dispatch endpoint) — providerUpstreamUrl reads
+// them lazily, so clearing now is enough.
+for (const k of ['ANTHROPIC_BASE_URL', 'OPENAI_BASE_URL', 'KIMI_CODE_BASE_URL', 'XAI_BASE_URL', 'DEEPSEEK_ANTHROPIC_BASE_URL']) {
+  delete process.env[k];
+}
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -44,12 +56,51 @@ const o = normalizeUsage({ prompt_tokens: 100, completion_tokens: 50 }, 'chat-co
 eq(o.input, 100, 'openai prompt'); eq(o.output, 50, 'openai completion');
 eq(o.cacheRead, 0, 'openai has no cache read'); eq(o.cacheWrite, 0, 'openai has no cache write');
 
-// ── D. gatewayEnv ────────────────────────────────────────────────────────────────────────────
+// ── D. gatewayEnv — the base URLs cxells get ─────────────────────────────────────────────────
 console.log('\n── D. gatewayEnv — the base URLs cxells get ──');
 const env = gatewayEnv({ xellToken: 'abc123' });
 ok(env.ANTHROPIC_BASE_URL.includes('/x/abc123/claude'), 'claude base url carries the xell identity');
 ok(env.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'openai base url carries the xell identity');
-ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/openai'), 'kimi base url points at the openai dialect');
+ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'kimi base url points at the kimi segment (not openai)');
+ok(env.XAI_BASE_URL?.includes('/x/abc123/grok'), 'grok base url carries the xell identity');
+ok(!env.ANTHROPIC_BASE_URL.includes('/openai'), 'anthropic base url does not point at the openai segment');
+const de = gatewayEnv({ xellToken: 'abc123', provider: 'deepseek' });
+ok(de.ANTHROPIC_BASE_URL.includes('/x/abc123/deepseek'), 'deepseek base url points at the deepseek segment (not claude)');
+ok(de.OPENAI_BASE_URL.includes('/x/abc123/openai') && de.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi')
+  && de.XAI_BASE_URL?.includes('/x/abc123/grok'), 'deepseek env still carries the other providers gateway URLs');
+// Dialect composition: OpenAI-compatible CLIs (codex, kimi) carry the /v1 in the BASE and append
+// /chat/completions; Anthropic CLIs (claude/deepseek/grok) append /v1/messages to a bare base.
+ok(env.OPENAI_BASE_URL.endsWith('/openai/v1'), 'openai base url carries /v1 (codex appends /chat/completions)');
+ok(env.KIMI_MODEL_BASE_URL.endsWith('/kimi/v1'), 'kimi base url carries /v1 (kimi appends /chat/completions)');
+ok(!env.ANTHROPIC_BASE_URL.endsWith('/v1'), 'claude base url has no /v1 (claude appends /v1/messages)');
+ok(!env.XAI_BASE_URL.endsWith('/v1'), 'grok base url has no /v1 (grok appends /v1/messages)');
+
+// ── D2. forward path construction — one path per provider, no doubled /v1 ─────────────────────
+console.log('\n── D2. providerUpstreamUrl + forward path — no doubled /v1 ──');
+// The gateway forwards parsed.forward (the CLI's own request path) straight upstream; the upstream
+// path is its base pathname + that forward. This is what must NOT double the /v1 the CLI already
+// sends (the original bug: openai /v1 + /v1/chat/completions → /v1/v1/chat/completions → 404).
+const forwardPath = (provider, cliPath) => {
+  const target = new URL(providerUpstreamUrl(provider));
+  return `${target.pathname === '/' ? '' : target.pathname}${cliPath}`;
+};
+eq(forwardPath('claude', '/v1/messages?beta=true'), '/v1/messages?beta=true', 'claude forward is the CLI path alone');
+eq(forwardPath('deepseek', '/v1/messages'), '/anthropic/v1/messages', 'deepseek forward keeps its /anthropic prefix');
+eq(forwardPath('openai', '/v1/chat/completions'), '/v1/chat/completions', 'openai forward does NOT double /v1');
+eq(forwardPath('kimi', '/v1/chat/completions'), '/coding/v1/chat/completions', 'kimi forward does NOT double /v1');
+eq(forwardPath('grok', '/v1/messages'), '/v1/messages', 'grok forward is the CLI path alone');
+ok(providerUpstreamUrl('grok').includes('api.x.ai'), 'grok upstream resolves to xAI (not the anthropic default)');
+// And parseGatewayPath pairs with the gateway base URLs from D: the CLI's request against the
+// gateway base URL must parse to the CLI path that forwardPath consumes. OpenAI-style CLIs append
+// /chat/completions to a /v1-carrying base; Anthropic-style append /v1/messages to a bare base.
+const pair = (base, cliPath) => parseGatewayPath(new URL(base).pathname + cliPath);
+eq(pair(env.OPENAI_BASE_URL, '/chat/completions')?.provider, 'openai', 'openai request resolves provider from the path');
+eq(pair(env.OPENAI_BASE_URL, '/chat/completions')?.forward, '/v1/chat/completions', 'openai request forward is the CLI path');
+eq(pair(env.KIMI_MODEL_BASE_URL, '/chat/completions')?.provider, 'kimi', 'kimi request resolves to the kimi provider');
+eq(pair(env.KIMI_MODEL_BASE_URL, '/chat/completions')?.forward, '/v1/chat/completions', 'kimi request forward is the CLI path');
+eq(pair(env.XAI_BASE_URL, '/v1/messages')?.provider, 'grok', 'grok request resolves to the grok provider');
+eq(pair(de.ANTHROPIC_BASE_URL, '/v1/messages')?.provider, 'deepseek', 'deepseek request resolves to the deepseek provider');
+eq(pair(env.ANTHROPIC_BASE_URL, '/v1/messages')?.provider, 'claude', 'claude request resolves to the claude provider');
 
 // ── E. the wiring ────────────────────────────────────────────────────────────────────────────
 console.log('\n── E. the gateway is wired ──');
@@ -87,7 +138,7 @@ eq(usageFromStream(frag1 + frag2, 'messages')?.input_tokens, 10, 'concatenated s
 
 // ── C. the round-trip ────────────────────────────────────────────────────────────────────────
 console.log('\n── C. record → complete → read ──');
-let projectId = null, xourceId = null, xellId = null, zeeId = null, rid = null;
+let projectId = null, xourceId = null, xellId = null, zeeId = null, rid = null, autoRid = null;
 try {
   const name = 'gateway-' + randomUUID().slice(0, 8);
   const proj = await one(`INSERT INTO project (name, repo_root) VALUES ($1, $2) RETURNING id`, [name, `/tmp/${name}`]);
@@ -124,9 +175,34 @@ try {
   gatewayHello(null, helloRes);
   ok(helloRes.statusCode === 200 && helloRes.body?.ok === true, 'the hello probe answers 200');
 
+  // ── G. zee/turn linkage — a request is attributed to the live zee + open turn ──────────────
+  console.log('\n── G. zee/turn linkage — zee_id + turn_id at record time ──');
+  // The zee created above is status='idle' (NOT live), so zeeTurnForXell must find no live zee.
+  const none = await zeeTurnForXell(xellId);
+  eq(none.zeeId, null, 'an idle zee is not live — no zee_id (xell-only record)');
+  // A live zee (status='working') + an open turn (status='started') → both resolved.
+  const live = await one(`UPDATE zee SET status='working' WHERE id=$1 RETURNING id`, [zeeId]);
+  ok(!!live?.id, 'the zee is now live (working)');
+  const tr = await one(
+    `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, status, model)
+     VALUES ($1,$2,$3,'spawn','started','opus') RETURNING id`, [zeeId, xellId, projectId]);
+  const linked = await zeeTurnForXell(xellId);
+  eq(linked.zeeId, zeeId, 'the live zee is resolved from the xell');
+  eq(linked.turnId, tr.id, 'the open turn is resolved from the live zee');
+  // recordRequest WITHOUT a zeeId looks it up — the row carries zee_id + turn_id.
+  autoRid = await recordRequest({
+    xell: resolved, kind: 'messages', provider: 'claude', model: 'opus',
+    method: 'POST', path: '/v1/messages',
+  });
+  ok(!!autoRid, 'recordRequest without a zeeId still returns an id');
+  const autoRow = await one(`SELECT zee_id, turn_id FROM llm_gateway_request WHERE id=$1`, [autoRid]);
+  eq(autoRow?.zee_id, zeeId, 'the auto-recorded request carries zee_id');
+  eq(autoRow?.turn_id, tr.id, 'the auto-recorded request carries turn_id');
+
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
   if (rid) await q(`DELETE FROM llm_gateway_request WHERE id=$1`, [rid]).catch(() => {});
+  if (autoRid) await q(`DELETE FROM llm_gateway_request WHERE id=$1`, [autoRid]).catch(() => {});
   if (zeeId) await q(`DELETE FROM zee WHERE id=$1`, [zeeId]).catch(() => {});
   if (xellId) await q(`DELETE FROM xell WHERE id=$1`, [xellId]).catch(() => {});
   if (xourceId) await q(`DELETE FROM xource WHERE id=$1`, [xourceId]).catch(() => {});
