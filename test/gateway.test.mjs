@@ -17,13 +17,15 @@
 //   E. The WIRING — the index.js gateway mount exists and the proxy is registered.
 //   F. usageFromStream — the proxy reads usage from SSE/JSON response text (pure).
 //   G. zee/turn linkage — recordRequest resolves the live zee + open turn when zeeId is absent.
+//   H. joinUpstreamPath — the proxy's own path join (used by gatewayProxy) stays correct even
+//      when the upstream base DOES carry a version segment (an operator-set base with /v1).
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
          requestsForXell, gatewayHello, usageFromStream, providerUpstreamUrl,
-         zeeTurnForXell } from '../server/src/lib/gateway.js';
+         joinUpstreamPath, zeeTurnForXell } from '../server/src/lib/gateway.js';
 
 // providerUpstreamUrl reads these from the PROCESS env (the queenzee's own operator overrides).
 // This test must assert the DEFAULTS, so clear any the caller's shell may have set (e.g. a zee
@@ -70,8 +72,12 @@ ok(de.OPENAI_BASE_URL.includes('/x/abc123/openai') && de.KIMI_MODEL_BASE_URL.inc
   && de.GROK_XAI_API_BASE_URL?.includes('/x/abc123/grok'), 'deepseek env still carries the other providers gateway URLs');
 // The path provider segment drives the gateway's ACCOUNT resolution, so it must name the xell's
 // ACTUAL provider — a deepseek cxell must not hit /claude (or the gateway uses the claude key).
+const denv = gatewayEnv({ xellToken: 'abc123', provider: 'deepseek' });
+ok(denv.ANTHROPIC_BASE_URL.includes('/x/abc123/deepseek'), 'a deepseek cxell is pointed at /deepseek, not /claude');
+ok(!denv.ANTHROPIC_BASE_URL.includes('/claude'), 'a deepseek zee is never pointed at the claude provider route');
 const kenv = gatewayEnv({ xellToken: 'abc123', provider: 'kimi' });
 ok(kenv.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'a kimi cxell is pointed at /kimi, not /openai');
+ok(!kenv.KIMI_MODEL_BASE_URL.includes('/openai'), 'a kimi zee is never pointed at the openai provider route');
 const oenv = gatewayEnv({ xellToken: 'abc123', provider: 'openai' });
 ok(oenv.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'a codex cxell stays at /openai');
 // Dialect composition: OpenAI-compatible CLIs (codex, kimi) carry the /v1 in the BASE and append
@@ -112,6 +118,24 @@ eq(pair(env.KIMI_MODEL_BASE_URL, '/chat/completions')?.forward, '/v1/chat/comple
 eq(pair(env.GROK_XAI_API_BASE_URL, '/responses')?.provider, 'grok', 'grok request resolves to the grok provider');
 eq(pair(de.ANTHROPIC_BASE_URL, '/v1/messages')?.provider, 'deepseek', 'deepseek request resolves to the deepseek provider');
 eq(pair(env.ANTHROPIC_BASE_URL, '/v1/messages')?.provider, 'claude', 'claude request resolves to the claude provider');
+
+// ── H. joinUpstreamPath — the proxy's own path join must not double the version segment ─────
+console.log('\n── H. joinUpstreamPath — upstream base + CLI forward path ──');
+// providerUpstreamUrl already strips a trailing /v1 (main), so joinUpstreamPath usually sees a
+// bare upstream path. It is ALSO correct when the base DOES carry a version segment (an
+// operator-set OPENAI_BASE_URL that includes /v1): the duplicate is dropped, not doubled.
+// claude: upstream has no base path; the forward /v1/messages passes through untouched.
+eq(joinUpstreamPath('https://api.anthropic.com', '/v1/messages?beta=true'), '/v1/messages?beta=true', 'claude: no base path, forward passes through');
+// deepseek: upstream base /anthropic is a prefix, not a version overlap; keep both.
+eq(joinUpstreamPath('https://api.deepseek.com/anthropic', '/v1/messages'), '/anthropic/v1/messages', 'deepseek: base prefix kept, forward appended');
+// openai: upstream base ALREADY ends in /v1 and the forward starts with /v1 — must NOT double.
+eq(joinUpstreamPath('https://api.openai.com/v1', '/v1/chat/completions'), '/v1/chat/completions', 'openai: /v1 NOT doubled');
+// kimi: upstream base /coding/v1 ends in /v1 too — the forward must lose its /v1.
+eq(joinUpstreamPath('https://api.kimi.com/coding/v1', '/v1/chat/completions'), '/coding/v1/chat/completions', 'kimi: /coding/v1 kept, duplicate /v1 dropped');
+// an operator-set openai base WITHOUT /v1 still works (no overlap to drop).
+eq(joinUpstreamPath('https://api.openai.com', '/v1/chat/completions'), '/v1/chat/completions', 'openai base without /v1 → forward intact');
+// the forward path still carries its query string through every join.
+eq(joinUpstreamPath('https://api.openai.com/v1', '/v1/chat/completions?model=x'), '/v1/chat/completions?model=x', 'query string survives the overlap drop');
 
 // ── E. the wiring ────────────────────────────────────────────────────────────────────────────
 console.log('\n── E. the gateway is wired ──');
