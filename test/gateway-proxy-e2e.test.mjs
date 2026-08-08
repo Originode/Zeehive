@@ -161,9 +161,16 @@ try {
     body: JSON.stringify({ model: 'x', messages: [] }),
   });
   ok(res4.status === 502, 'dead upstream → 502');
-  const rows4 = await requestsForXell(fx4.xellId);
-  eq(rows4.length, 1, 'the failed forward is still recorded');
-  eq(rows4[0]?.status, 502, 'the row carries the 502 status');
+  // The completion is BEST-EFFORT (the proxy answers the client first, then writes the row), so
+  // the DB write may land a beat after the response. Poll rather than race it.
+  let row4 = null;
+  for (let i = 0; i < 40; i++) {
+    const rows4 = await requestsForXell(fx4.xellId);
+    if (rows4.length && rows4[0]?.status != null) { row4 = rows4[0]; break; }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  ok(!!row4, 'the failed forward is still recorded');
+  eq(row4?.status, 502, 'the row carries the 502 status');
 
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
