@@ -226,6 +226,24 @@ export function providerUpstreamUrl(provider) {
   }
 }
 
+// Join the upstream's base URL with the CLI's forward path WITHOUT doubling the version
+// segment. The forward path from the CLI ALREADY carries the dialect's version prefix
+// (/v1/messages for Anthropic, /v1/chat/completions for OpenAI), and the upstream base URL may
+// ALSO carry one — api.openai.com/v1, api.kimi.com/coding/v1, api.deepseek.com/anthropic. A
+// naive string join produces /v1/v1/chat/completions (openai) or /coding/v1/v1/chat/completions
+// (kimi), which 404s upstream. When the upstream base path already ends with the forward's first
+// segment, that segment is dropped from the forward before joining. Pure so the proxy's mapping
+// is testable without an upstream (test/gateway.test.mjs).
+export function joinUpstreamPath(upstreamUrl, forward) {
+  const target = new URL(upstreamUrl);
+  const basePath = target.pathname === '/' ? '' : target.pathname;
+  const firstSeg = forward.startsWith('/') ? '/' + (forward.split('/')[1] || '') : '';
+  const fwd = basePath && firstSeg && basePath.endsWith(firstSeg)
+    ? (forward.slice(firstSeg.length) || '/')
+    : forward;
+  return `${basePath}${fwd}`;
+}
+
 // Proxy one gateway request: authenticate the caller, resolve the upstream, forward, stream the
 // response, and record the request + the upstream's usage. This is the express middleware for
 // /v1/messages and /v1/chat/completions (mounted on the gateway's OWN http listener).
@@ -281,9 +299,12 @@ export async function gatewayProxy(req, res) {
 
   const target = new URL(upstream.upstreamUrl);
   const transporter = target.protocol === 'https:' ? https : http;
-  // The upstream URL may carry a base PATH (deepseek's api.deepseek.com/anthropic). The forward
-  // path is the upstream's pathname + the CLI's path (which already carries ?query).
-  const forwardPath = `${target.pathname === '/' ? '' : target.pathname}${parsed.forward}`;
+  // The upstream URL may carry a base PATH (deepseek's api.deepseek.com/anthropic, or an
+  // operator-set OPENAI_BASE_URL that already includes /v1). The forward path from the CLI also
+  // starts with the dialect's version segment, so a naive join doubles it — joinUpstreamPath
+  // drops the overlap. The forward path is the upstream's pathname + the CLI's path (which
+  // already carries ?query).
+  const forwardPath = joinUpstreamPath(upstream.upstreamUrl, parsed.forward);
   const proxyReq = transporter.request({
     hostname: target.hostname, port: target.port || (target.protocol === 'https:' ? 443 : 80),
     method: req.method, headers, path: forwardPath,
@@ -347,7 +368,7 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
                  normalizeUsage, usageFromStream, modelPrice, costOf, providerUpstreamUrl,
-                 parseGatewayPath, recordRequest, completeRequest, gatewayEnv };
+                 joinUpstreamPath, parseGatewayPath, recordRequest, completeRequest, gatewayEnv };
 
 // ── the cxell-facing env ──────────────────────────────────────────────────────────────────────
 // The base URL every cxell CLI points at the gateway, per provider, carrying the xell's identity
@@ -356,17 +377,28 @@ export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, reque
 // every call to the xell WITHOUT parsing the bearer (which stays the real provider key, unchanged
 // from today). The identity is URL-safe (the token is hex from lib/xell-token.js mintToken).
 //
+// `provider` is the dispatched provider key (adapter.provider). It matters for ANTHROPIC_BASE_URL:
+// the Anthropic dialect is spoken by claude AND deepseek (the deepseek adapter is the claude CLI
+// aimed at DeepSeek's Anthropic-compatible endpoint), and the provider in the PATH is what tells
+// the gateway which upstream + credential to use. A deepseek zee pointed at /x/<token>/claude
+// would have its calls attributed to claude and forwarded with a CLAUDE key — exactly the
+// cross-provider misrouting the credential gates exist to stop.
+//
 // Path shape (measured: claude 2.1.222 preserves the base-url path prefix on both the /api/hello
 // probe and the /v1/messages POST):
-//   ANTHROPIC_BASE_URL = <gateway>/x/<xellToken>/claude
+//   ANTHROPIC_BASE_URL = <gateway>/x/<xellToken>/<claude|deepseek>
 //   → HEAD <gateway>/x/<token>/claude/api/hello
 //   → POST <gateway>/x/<token>/claude/v1/messages?beta=true
-export function gatewayEnv({ xellToken = null } = {}) {
+export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
   const base = gatewayBaseUrl();
   const ident = xellToken ? `/x/${encodeURIComponent(xellToken)}` : '';
+  // The two Anthropic-dialect providers (their CLIs read ANTHROPIC_BASE_URL). Every other
+  // provider's CLI reads its own base-url var and never sees this value, so the /claude default
+  // is harmless for them.
+  const anthropic = provider === 'deepseek' ? 'deepseek' : 'claude';
   return {
     // claude + deepseek (Anthropic dialect) → the gateway's /v1/messages
-    ANTHROPIC_BASE_URL: `${base}${ident}/claude`,
+    ANTHROPIC_BASE_URL: `${base}${ident}/${anthropic}`,
     // codex + kimi (OpenAI dialect) → the gateway's /v1/chat/completions
     OPENAI_BASE_URL: `${base}${ident}/openai/v1`,
     KIMI_MODEL_BASE_URL: `${base}${ident}/openai/v1`,
