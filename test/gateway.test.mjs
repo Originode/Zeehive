@@ -13,12 +13,13 @@
 //   C. The record → complete → read round-trip (like the proxy does per request).
 //   D. gatewayEnv — the base URLs cxells get.
 //   E. The WIRING — the index.js gateway mount exists and the proxy is registered.
+//   F. usageFromStream — the proxy reads usage from SSE/JSON response text (pure).
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
-         requestsForXell, gatewayHello } from '../server/src/lib/gateway.js';
+         requestsForXell, gatewayHello, usageFromStream } from '../server/src/lib/gateway.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -57,6 +58,25 @@ ok(/gatewayApp\.all\('\/x\/\*', gatewayProxy\)/.test(index), 'the gateway proxie
 ok(/gatewayApp\.(get|head)\('\/api\/hello'/.test(index), 'the hello probe is answered');
 const gw = readFileSync('server/src/lib/gateway.js', 'utf8');
 ok(/xellForToken\(parsed\.xellToken\)/.test(gw), 'the proxy resolves the xell from the path token');
+
+// ── F. usageFromStream — the proxy reads usage from the response text ───────────────────────
+console.log('\n── F. usageFromStream — the stream usage parser ──');
+const antStream = 'event: message_start\ndata: {"type":"message_start","message":{}}\n\n'
+  + 'event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":5}}\n\n'
+  + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+const antUsage = usageFromStream(antStream, 'messages');
+eq(antUsage?.input_tokens, 10, 'anthropic SSE: input tokens from message_delta');
+eq(antUsage?.output_tokens, 5, 'anthropic SSE: output tokens from message_delta');
+// The event NAME (m[1]) must NOT be parsed as JSON — this is the bug that silently dropped usage.
+ok(antUsage !== null, 'anthropic SSE usage is captured (the m[1] vs m[2] regression)');
+const nonStream = JSON.stringify({ id: 'x', type: 'message', usage: { input_tokens: 3, output_tokens: 2 } });
+eq(usageFromStream(nonStream, 'messages')?.input_tokens, 3, 'anthropic non-streaming JSON body usage');
+eq(usageFromStream('event: message_stop\ndata: {"type":"message_stop"}\n\n', 'messages'), null, 'no usage event → null');
+const oaiStream = 'data: {"choices":[]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\ndata: [DONE]\n\n';
+eq(usageFromStream(oaiStream, 'chat-completions')?.prompt_tokens, 7, 'openai SSE: prompt tokens');
+eq(usageFromStream(oaiStream, 'chat-completions')?.completion_tokens, 3, 'openai SSE: completion tokens');
+ok(usageFromStream('', 'messages') === null, 'empty text → null');
+ok(usageFromStream(null, 'messages') === null, 'null text → null');
 
 // ── C. the round-trip ────────────────────────────────────────────────────────────────────────
 console.log('\n── C. record → complete → read ──');

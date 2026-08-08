@@ -89,6 +89,40 @@ export function normalizeUsage(usage = {}, kind = 'messages') {
   };
 }
 
+// Extract the upstream's usage object from a response STREAM chunk (SSE) or a single JSON body.
+// Returns the raw upstream usage (the shape normalizeUsage understands) or null when the text
+// carries none. `kind` = 'messages' (Anthropic dialect) | 'chat-completions' (OpenAI dialect).
+//
+// Two dialect shapes:
+//   Anthropic SSE: `event: message_delta\ndata: {"type":"message_delta","usage":{...}}` — usage
+//     rides the final message_delta (or a non-streaming single `message` object with inline usage).
+//   OpenAI SSE: `data: {"choices":[],"usage":{...}}` — usage rides the last chunk before [DONE]
+//     when the request set stream_options.include_usage.
+// Pure so the proxy's parsing is testable without an upstream (test/gateway.test.mjs).
+export function usageFromStream(text = '', kind = 'messages') {
+  if (!text) return null;
+  if (kind === 'chat-completions') {
+    for (const m of text.matchAll(/data: (\{.*\})/g)) {
+      try { const j = JSON.parse(m[1]); if (j.usage) return j.usage; } catch { /* partial */ }
+    }
+    return null;
+  }
+  // Anthropic dialect: the JSON is the SECOND capture group (the first is the event NAME — parsing
+  // the name was the original bug that silently dropped every stream's usage).
+  for (const m of text.matchAll(/event: (\w+)\n?data: (\{.*\})/g)) {
+    try {
+      const j = JSON.parse(m[2]);
+      if (j.type === 'message_delta' && j.usage) return j.usage;
+      if (j.type === 'message' && j.usage) return j.usage;
+    } catch { /* partial event at a chunk boundary — the next chunk carries the rest */ }
+  }
+  // A non-SSE JSON body (a single message response).
+  if (!text.includes('event:') && !text.includes('data: {')) {
+    try { const j = JSON.parse(text); if (j.usage) return j.usage; } catch { /* not JSON or partial */ }
+  }
+  return null;
+}
+
 // Look up a model's $/1M input + output price from ai_model_spec. Returns null when unknown.
 export async function modelPrice(provider, model) {
   if (!provider || !model) return null;
@@ -259,33 +293,10 @@ export async function gatewayProxy(req, res) {
     proxyRes.pipe(res);
     // Read the upstream's final usage from the stream for the completion UPDATE.
     let usage = null;
-    if (upstream.kind === 'chat-completions') {
-      // OpenAI stream: the last data: chunk before [DONE] carries usage when stream_options.include_usage
-      proxyRes.on('data', (chunk) => {
-        const text = chunk.toString();
-        for (const m of text.matchAll(/data: (\{.*\})/g)) {
-          try { const j = JSON.parse(m[1]); if (j.usage) usage = j.usage; } catch { /* partial */ }
-        }
-      });
-    } else {
-      // Anthropic stream: the final message_delta / message_stop event carries usage. A
-      // NON-streaming response (some providers ignore stream:false semantics) is a single
-      // `message` object with inline usage — handle both so tokens are never missed.
-      proxyRes.on('data', (chunk) => {
-        const text = chunk.toString();
-        for (const m of text.matchAll(/event: (\w+)\n?data: (\{.*\})/g)) {
-          try {
-            const j = JSON.parse(m[1]);
-            if (j.type === 'message_delta' && j.usage) usage = j.usage;
-            if (j.type === 'message' && j.usage) usage = j.usage;
-          } catch { /* partial */ }
-        }
-        // A non-SSE JSON body (a single message response).
-        if (!text.includes('event:') && !text.includes('data: {')) {
-          try { const j = JSON.parse(text); if (j.usage) usage = j.usage; } catch { /* not JSON or partial */ }
-        }
-      });
-    }
+    proxyRes.on('data', (chunk) => {
+      const u = usageFromStream(chunk.toString(), upstream.kind);
+      if (u) usage = u;
+    });
     proxyRes.on('end', () => {
       const u = normalizeUsage(usage, upstream.kind);
       completeRequest(rowId, {
@@ -329,8 +340,8 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 }
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
-                 normalizeUsage, modelPrice, costOf, providerUpstreamUrl, parseGatewayPath,
-                 recordRequest, completeRequest, gatewayEnv };
+                 normalizeUsage, usageFromStream, modelPrice, costOf, providerUpstreamUrl,
+                 parseGatewayPath, recordRequest, completeRequest, gatewayEnv };
 
 // ── the cxell-facing env ──────────────────────────────────────────────────────────────────────
 // The base URL every cxell CLI points at the gateway, per provider, carrying the xell's identity
