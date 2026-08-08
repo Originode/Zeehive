@@ -163,6 +163,7 @@ function GatewayCallRow({ r, xellId }) {
       )}
       {open && (
         <div className="ob-gw-bodies">
+          <div className="ob-gw-warn">⚠ Raw agent traffic — best-effort scrubbed, NOT sanitised. Known provider-key shapes, this project's credential values and sensitive header keys are redacted; a secret that never entered the environment (typed in a prompt, pasted in an error, quoted from a file) can still appear. Do not treat these bodies as safe to share.</div>
           {busy && <div className="ob-hint">loading bodies…</div>}
           {!busy && !body && <div className="ob-hint">No bodies captured for this call (the per-project switch may be off, or it predates capture).</div>}
           {!busy && body && (

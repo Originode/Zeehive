@@ -3089,6 +3089,7 @@ a.langfuse-ui:hover { text-decoration: underline; }
 .ob-gw-attrib { display: flex; gap: 12px; flex-wrap: wrap; padding: 2px 10px 6px 10px; font-size: 10px; color: var(--muted); }
 .ob-gw-attrib code { font-size: 10px; }
 .ob-gw-bodies { display: flex; flex-direction: column; gap: 6px; padding: 6px 10px 10px 10px; background: var(--panel); border-top: 1px solid var(--line); }
+.ob-gw-warn { font-size: 10px; line-height: 1.5; color: #b8860b; background: color-mix(in srgb, #b8860b 8%, var(--panel2)); border: 1px solid color-mix(in srgb, #b8860b 35%, var(--line)); border-radius: 6px; padding: 5px 8px; }
 .ob-gw-body-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .ob-gw-body { margin: 0; padding: 6px 8px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; max-height: 220px; overflow-y: auto; }
 .ob-gw-trunc { display: block; color: #e0a53b; font-size: 10px; margin-bottom: 4px; }
