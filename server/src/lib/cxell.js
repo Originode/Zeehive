@@ -1370,8 +1370,10 @@ export function runZee({ ctx, name, prompt, model, adapter = CLAUDE_ADAPTER, tok
     // Added AFTER credentialEnvFor so it OVERRIDES the adapter's own base URL (the deepseek
     // adapter sets ANTHROPIC_BASE_URL unconditionally; the gateway must win). When the gateway is
     // off (GATEWAY_PORT === PORT), gatewayEnv returns {} and the adapter's real URLs are kept.
-    ...Object.entries(gatewayEnv({ xellToken, provider: adapter.provider }))
-      .filter(([, v]) => v !== null && v !== undefined && v !== ''),
+    // Without the xell identity token the gateway would 401 every call, so the env is only added
+    // when one is present — a caller with no token keeps the adapter's direct URLs.
+    ...(xellToken ? Object.entries(gatewayEnv({ xellToken, provider: adapter.provider }))
+      .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ];
   const cmd = ['exec', '-i',
     ...agentEnv.flatMap(([k, v]) => ['-e', `${k}=${v}`]),
@@ -1616,11 +1618,13 @@ export async function nudgeCxellZee({ ctx = 'default', name, sessionId, prompt, 
   // (codex exec resume / kimi -c / grok -r) records a row attributed to this xell. Same shape as
   // runZee: the provider base-urls carry /x/<identTok>/<provider> in the PATH, added AFTER
   // credentialEnvFor so the gateway overrides the adapter's own base URL. Empty when the gateway
-  // is off (GATEWAY_PORT === PORT) — the adapter's real URLs then stay.
+  // is off (GATEWAY_PORT === PORT) — the adapter's real URLs then stay. Only added when the xell
+  // identity token is known — without it the gateway would 401 the resume (the adapter's direct
+  // URLs are kept).
   const env = [
     ...credentialEnvFor(adapter, { token: vendorTok, model }),
-    ...Object.entries(gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
-      .filter(([, v]) => v !== null && v !== undefined && v !== ''),
+    ...(identTok ? Object.entries(gatewayEnv({ xellToken: identTok, provider: adapter.provider }))
+      .filter(([, v]) => v !== null && v !== undefined && v !== '') : []),
   ].flatMap(([k, v]) => ['-e', `${k}=${v}`]);
   if (identTok) env.push('-e', `ZEEHIVE_XELL_TOKEN=${identTok}`);
   // the adapter sanitizes the session id before interpolating it (claude/codex); kimi resumes by
