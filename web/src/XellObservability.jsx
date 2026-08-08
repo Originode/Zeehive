@@ -152,7 +152,7 @@ function GatewayCallRow({ r }) {
 // the aggregate of the calls beneath it), so the transport-level calls and the turn ledger tell
 // one coherent story. Calls recorded before turn_id was populated (or whose turn row was reaped)
 // fall into a trailing "No turn" group — still attributed to their zee when the row has one.
-function GatewayCalls({ requests }) {
+export function GatewayCalls({ requests }) {
   if (!requests.length) {
     return (
       <div className="xob-empty">
