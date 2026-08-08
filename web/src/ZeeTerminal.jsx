@@ -98,7 +98,7 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     // baseUrl rides the app's own base so the terminal's websocket targets THIS xell's server
-    // through the proxy (/xell-web/<slug>/api/...), not the outer console's — same rule as fetch.
+    // via baseUrl (identity at base '/') — same rule as fetch.
     const ws = new WebSocket(`${proto}://${location.host}${baseUrl(wsPath)}`);
     wsRef.current = ws;
     ws.binaryType = 'arraybuffer';

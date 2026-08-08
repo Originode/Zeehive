@@ -891,7 +891,7 @@ export async function selfVerifyWebapp(xell) {
   // an offer used to be inserted on the strength of a container ROW existing, so the card a human
   // clicked could be a dead 502 (webapp never built / torn down) or a hollow shell (webapp up,
   // xell server down → every /api call in the reviewed page fails). Probe the SAME upstreams the
-  // /xell-web proxy will dial, and refuse to offer a link that is not actually alive — the fix is
+  // preview routing will dial, and refuse to offer a link that is not actually alive — the fix is
   // always one build command, and the message names it.
   const [webProbe, apiProbe] = await Promise.all([
     probeRoleUpstream(xell.slug, 'webapp'),
