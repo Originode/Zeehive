@@ -32,6 +32,7 @@ import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
          usageFrom } from '../lib/cxell-runtimes.js';
 import { turnStopReason } from '../lib/turn-record.js';
 import { startTurn, endTurn, lastAssistantText } from '../lib/turn-ledger.js';
+import { gatewayEnv } from '../lib/gateway.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
 import { langfuseClientEnv, postTurnToLangfuse } from '../lib/langfuse.js';
 import { mintXellToken } from '../lib/xell-token.js';
@@ -1715,8 +1716,16 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
     if (Object.keys(lfEnv).length) logline('cxell', `${name}: LANGFUSE_* env injected (observability on)`);
+    // THE LLM GATEWAY — point every provider base-url at the queenzee gateway carrying this
+    // xell's identity in the PATH (/x/<xellToken>/<provider>/...). The gateway then records EVERY
+    // AI call (spawn, resume, interactive) attributed to this xell. The gateway env OVERRIDES the
+    // adapter's own base URL (the adapter.env baseUrl above is the provider's real URL; the gateway
+    // replaces it). The token stays the provider key (adapter.env's token) — unchanged credential
+    // model, the identity travels in the URL.
+    const gwEnv = gatewayEnv({ xellToken });
+    logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL})`);
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
-                         agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...everyEnv.env } });
+                         agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env } });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);

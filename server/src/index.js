@@ -24,7 +24,7 @@ import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
 import { attachWebappUpgrade } from './lib/webapp-proxy.js';
 import { attachStreamWebSocket } from './lib/stream.js';
-import { gatewayProxy, GATEWAY_PORT } from './lib/gateway.js';
+import { gatewayProxy, gatewayHello, GATEWAY_PORT } from './lib/gateway.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
@@ -208,8 +208,13 @@ if (config.gatewayPort !== config.port) {
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
-  gatewayApp.post(['/v1/messages', '/v1/chat/completions'], gatewayProxy);
-  gatewayApp.use((_req, res) => res.status(404).json({ error: 'gateway: only /v1/messages and /v1/chat/completions are proxied' }));
+  // The CLI's connectivity probe + the two dialect POSTs. The probe and the calls carry the
+  // /x/<xellToken>/<provider> prefix (measured: claude preserves the base-url path prefix), so
+  // express mounts a wildcard; gatewayProxy parses the identity/provider from req.url.
+  gatewayApp.get('/api/hello', gatewayHello);
+  gatewayApp.head('/api/hello', gatewayHello);
+  gatewayApp.all('/x/*', gatewayProxy);
+  gatewayApp.use((_req, res) => res.status(404).json({ error: 'gateway: expected /x/<xell-token>/<provider>/v1/…' }));
   const gatewayServer = gatewayApp.listen(GATEWAY_PORT, '0.0.0.0', () => {
     console.log(`[zeehive] LLM gateway on http://0.0.0.0:${GATEWAY_PORT}  (cxells point their provider base-urls here)`);
     logline('api', `LLM gateway online — :${GATEWAY_PORT} (/v1/messages, /v1/chat/completions)`);

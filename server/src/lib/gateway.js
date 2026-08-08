@@ -44,6 +44,7 @@
 // not fail the AI call the human is waiting on. Every write is awaited but catch-guarded, and
 // the proxy itself is the only thing that can fail the request (a dead provider is a 502).
 import http from 'node:http';
+import https from 'node:https';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { xellForToken } from './xell-token.js';
@@ -152,17 +153,24 @@ export async function completeRequest(rowId, fields) {
 
 // ── the proxy ─────────────────────────────────────────────────────────────────────────────────
 
+// The CLI's connectivity PROBE. claude sends `HEAD <base>/api/hello` to a custom ANTHROPIC_BASE_URL
+// before the first POST (measured: claude 2.1.222 does this with no auth header). Because the base
+// URL is path-prefixed (/x/<token>/<provider>), the probe arrives at /x/<token>/<provider>/api/hello
+// and lands on the gatewayProxy route. It is answered HERE, by the gateway itself (a connectivity
+// check needs no provider round-trip and must not be recorded as an LLM call). The caller strips
+// the /x/<token>/<provider> prefix before calling.
+export function gatewayHello(_req, res) {
+  return res.status(200).json({ ok: true, service: 'zeehive-llm-gateway' });
+}
+
 // Resolve the upstream for a request: which provider URL + credential. `path` is the gateway
 // path (/v1/messages or /v1/chat/completions). Returns { provider, upstreamUrl, token, kind }
 // or null when the caller is not a known xell / the project has no account for the provider.
-async function resolveUpstream(xell, path, requestedProvider = null) {
-  const kind = path.startsWith('/v1/chat/completions') ? 'chat-completions' : 'messages';
-  // Which provider does the CLI's base-url point at? The gateway is reached via ONE base URL
-  // (the same gateway host:port for every provider), so the provider is identified by the
-  // Authorization token's SIGNATURE (sk-ant- → claude, sk- non-ant → openai/deepseek, etc.) or
-  // by a ZEEHIVE-provider header the env sets. Default: the request path decides the dialect,
-  // and the xell's project credential for that dialect's natural provider is used.
-  const p = PROVIDERS[requestedProvider || 'claude'];
+async function resolveUpstream(xell, kind, providerKey) {
+  // The provider comes from the PATH (/x/<token>/<provider>/...) — the gateway's own URL, so it is
+  // authoritative. claude + deepseek speak the Anthropic dialect (/v1/messages); openai + kimi the
+  // OpenAI dialect (/v1/chat/completions). A provider with no dispatch runtime is refused.
+  const p = PROVIDERS[providerKey];
   if (!p || !p.dispatch) return null;
   const acct = await tokenForSpawn(xell.project_id, p.key).catch(() => null);
   if (!acct) {
@@ -175,7 +183,7 @@ async function resolveUpstream(xell, path, requestedProvider = null) {
 }
 
 // The provider's real API base, by provider key — the value the cxell adapters inject today.
-function providerUpstreamUrl(provider) {
+export function providerUpstreamUrl(provider) {
   switch (provider) {
     case 'openai': return process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
     case 'kimi': return process.env.KIMI_CODE_BASE_URL || 'https://api.kimi.com/coding/v1';
@@ -189,45 +197,62 @@ function providerUpstreamUrl(provider) {
 // /v1/messages and /v1/chat/completions (mounted on the gateway's OWN http listener).
 export async function gatewayProxy(req, res) {
   const t0 = Date.now();
-  // ── authenticate the caller by xell identity token ──
-  const auth = String(req.headers.authorization || '');
-  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  const xell = bearer ? await xellForToken(bearer).catch(() => null) : null;
-  if (!xell) {
-    return res.status(401).json({ error: 'unknown xell identity — the gateway requires ZEEHIVE_XELL_TOKEN as Bearer' });
+  // ── identity + provider FROM THE PATH ──
+  // The CLI is pointed at /x/<xellToken>/<provider>/... so the identity travels in the URL, not in
+  // the bearer (which stays the provider key). Resolve the xell from the token in the path.
+  const parsed = parseGatewayPath(req.url);
+  logline('gateway', `gatewayProxy hit: ${req.method} ${req.url} → parsed=${parsed ? JSON.stringify(parsed) : 'null'}`);
+  if (!parsed) {
+    return res.status(404).json({ error: 'gateway: path must be /x/<xell-token>/<provider>/v1/…' });
   }
+  // The CLI's connectivity probe — answer 200 locally, never forward it to the provider.
+  if (parsed.forward === '/api/hello' || parsed.forward.startsWith('/api/hello')) {
+    logline('gateway', `hello probe answered for ${parsed.provider} (${req.method})`);
+    return res.status(200).json({ ok: true, service: 'zeehive-llm-gateway' });
+  }
+  const xell = await xellForToken(parsed.xellToken).catch(() => null);
+  if (!xell) {
+    return res.status(401).json({ error: 'gateway: unknown xell identity (the token in the path does not match a live xell)' });
+  }
+  // Which dialect is the forward path? /v1/messages → Anthropic, /v1/chat/completions → OpenAI.
+  const kind = parsed.forward.startsWith('/v1/chat/completions') ? 'chat-completions' : 'messages';
 
-  // ── which provider? ──
-  // The cxell's env sets ZEEHIVE_PROVIDER=<key> beside the base url, so the gateway knows which
-  // provider's dialect the caller speaks. Fallback: the path dialect decides (claude for /v1/messages).
-  const providerHeader = String(req.headers['x-zeehive-provider'] || '');
-  const requestedProvider = providerHeader || (req.url.startsWith('/v1/chat/completions') ? 'openai' : 'claude');
-
-  const upstream = await resolveUpstream(xell, req.url, requestedProvider).catch(() => null);
+  const upstream = await resolveUpstream(xell, kind, parsed.provider).catch(() => null);
   if (!upstream) {
-    return res.status(502).json({ error: `gateway: cannot forward for xell ${xell.slug} (no ${requestedProvider} account)` });
+    return res.status(502).json({ error: `gateway: cannot forward for xell ${xell.slug} (provider ${parsed.provider})` });
   }
 
   // ── record the request fact ──
   const rowId = await recordRequest({
-    xell, kind: upstream.kind, provider: upstream.provider, model: modelFromBody(req.body),
-    method: req.method, path: req.url,
+    xell, kind, provider: upstream.provider, model: modelFromBody(req.body),
+    method: req.method, path: parsed.forward,
   });
 
   // ── forward ──
   const hopByHop = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailer', 'transfer-encoding', 'upgrade', 'host']);
+    'te', 'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length']);
   const headers = { ...req.headers };
   for (const h of hopByHop) delete headers[h];
-  // The upstream credential: replace the xell bearer with the provider key. The provider never
-  // sees the xell identity token; the xell never needs the provider key over the wire.
+  // The upstream credential: the provider key from the meta-DB. The provider never sees the xell
+  // identity token (it is in the path, not the auth header); the xell never handles the provider
+  // key over the wire beyond what it already holds in its cage env.
   headers.authorization = `Bearer ${upstream.token}`;
   headers.host = new URL(upstream.upstreamUrl).host;
+  // The body is already parsed (express.json); forward it as a string with an explicit
+  // content-length. Piping req (a chunked stream) to an https request without content-length is
+  // what made the upstream hang up. The AI request body is JSON text; reserialize it.
+  const body = typeof req.body === 'string' ? req.body : (req.body ? JSON.stringify(req.body) : '');
+  headers['content-length'] = Buffer.byteLength(body);
+  logline('gateway', `forward ${req.method} ${parsed.forward} → ${upstream.upstreamUrl} (body ${Buffer.byteLength(body)}B, provider ${upstream.provider})`);
 
   const target = new URL(upstream.upstreamUrl);
-  const proxyReq = http.request({
-    hostname: target.hostname, port: target.port || 443,
-    method: req.method, headers, path: req.url,
+  const transporter = target.protocol === 'https:' ? https : http;
+  // The upstream URL may carry a base PATH (deepseek's api.deepseek.com/anthropic). The forward
+  // path is the upstream's pathname + the CLI's path (which already carries ?query).
+  const forwardPath = `${target.pathname === '/' ? '' : target.pathname}${parsed.forward}`;
+  const proxyReq = transporter.request({
+    hostname: target.hostname, port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    method: req.method, headers, path: forwardPath,
   }, (proxyRes) => {
     // Stream the response through. For SSE, this must be unbuffered.
     res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
@@ -243,11 +268,21 @@ export async function gatewayProxy(req, res) {
         }
       });
     } else {
-      // Anthropic stream: the final message_delta / message_stop event carries usage.
+      // Anthropic stream: the final message_delta / message_stop event carries usage. A
+      // NON-streaming response (some providers ignore stream:false semantics) is a single
+      // `message` object with inline usage — handle both so tokens are never missed.
       proxyRes.on('data', (chunk) => {
         const text = chunk.toString();
         for (const m of text.matchAll(/event: (\w+)\n?data: (\{.*\})/g)) {
-          try { const j = JSON.parse(m[2]); if (j.type === 'message_delta' && j.usage) usage = j.usage; } catch { /* partial */ }
+          try {
+            const j = JSON.parse(m[1]);
+            if (j.type === 'message_delta' && j.usage) usage = j.usage;
+            if (j.type === 'message' && j.usage) usage = j.usage;
+          } catch { /* partial */ }
+        }
+        // A non-SSE JSON body (a single message response).
+        if (!text.includes('event:') && !text.includes('data: {')) {
+          try { const j = JSON.parse(text); if (j.usage) usage = j.usage; } catch { /* not JSON or partial */ }
         }
       });
     }
@@ -265,7 +300,8 @@ export async function gatewayProxy(req, res) {
     } else { try { res.destroy(); } catch { /* already gone */ } }
     completeRequest(rowId, { status: 502, error: e.message, durationMs: Date.now() - t0 });
   });
-  req.pipe(proxyReq);
+  if (body) proxyReq.write(body);
+  proxyReq.end();
 }
 
 // The model name from a request body, if the body carries one. The body is read by express.json
@@ -292,23 +328,43 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
   }
 }
 
-export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, requestsForXell,
-                 normalizeUsage, modelPrice, costOf, providerUpstreamUrl };
+export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
+                 normalizeUsage, modelPrice, costOf, providerUpstreamUrl, parseGatewayPath,
+                 recordRequest, completeRequest, gatewayEnv };
 
 // ── the cxell-facing env ──────────────────────────────────────────────────────────────────────
-// The base URLs every cxell CLI should point at the gateway, per provider. These REPLACE the
-// provider's real URL in adapter.env() when the gateway is enabled, so ALL traffic (spawn, resume,
-// interactive) crosses the queenzee. The provider the CLI actually talks to is carried as
-// X-Zeehive-Provider (the gateway uses it to resolve the upstream + credential). The xell identity
-// token is NOT put here — it is already ZEEHIVE_XELL_TOKEN in the cage env, and the gateway reads
-// it from the Authorization header the CLI sends.
-export function gatewayEnv() {
+// The base URL every cxell CLI points at the gateway, per provider, carrying the xell's identity
+// in the PATH (/x/<xell-identity>/<provider>/...). The queenzee mints this URL at spawn from the
+// xell's identity token and injects it as the provider's base-url env — so the gateway attributes
+// every call to the xell WITHOUT parsing the bearer (which stays the real provider key, unchanged
+// from today). The identity is URL-safe (the token is hex from lib/xell-token.js mintToken).
+//
+// Path shape (measured: claude 2.1.222 preserves the base-url path prefix on both the /api/hello
+// probe and the /v1/messages POST):
+//   ANTHROPIC_BASE_URL = <gateway>/x/<xellToken>/claude
+//   → HEAD <gateway>/x/<token>/claude/api/hello
+//   → POST <gateway>/x/<token>/claude/v1/messages?beta=true
+export function gatewayEnv({ xellToken = null } = {}) {
   const base = gatewayBaseUrl();
+  const ident = xellToken ? `/x/${encodeURIComponent(xellToken)}` : '';
   return {
     // claude + deepseek (Anthropic dialect) → the gateway's /v1/messages
-    ANTHROPIC_BASE_URL: base,
+    ANTHROPIC_BASE_URL: `${base}${ident}/claude`,
     // codex + kimi (OpenAI dialect) → the gateway's /v1/chat/completions
-    OPENAI_BASE_URL: `${base}/v1`,
-    KIMI_MODEL_BASE_URL: `${base}/v1`,
+    OPENAI_BASE_URL: `${base}${ident}/openai/v1`,
+    KIMI_MODEL_BASE_URL: `${base}${ident}/openai/v1`,
+  };
+}
+
+// Parse the xell identity + provider from a gateway path. Returns { xellToken, provider, forward }
+// or null when the path is not a gateway path. The forward path is what the upstream actually
+// receives (the /x/<token>/<provider> prefix stripped).
+export function parseGatewayPath(path = '') {
+  const m = /^\/x\/([^/]+)\/([^/]+)(\/.*)?$/.exec(path);
+  if (!m) return null;
+  return {
+    xellToken: decodeURIComponent(m[1]),
+    provider: m[2],
+    forward: m[3] || '/',
   };
 }
