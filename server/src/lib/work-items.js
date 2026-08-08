@@ -892,7 +892,9 @@ export async function ganttModel({ projectId, rootId } = {}) {
     // it here would invent dates exactly as inventing a start for an unscheduled row would.
     // Stating the number lets a chart clamp its WINDOW honestly (and say that it did) instead of
     // deriving it from dates that may be null, or discovering the scale by trying to draw it.
-    span_days: spanDays(n.computed_start, n.computed_end),
+    // A row with no PLAN but a real ACTUAL span reports the actual bar's width — the bar it draws.
+    span_days: spanDays(n.computed_start, n.computed_end)
+      || spanDays(tsDay(n.computed_actual_start), tsDay(n.computed_actual_end)),
     deps: depsBy.get(n.id) || [],
   }));
   // The whole chart's extent, stated once so a client does not have to min/max the rows itself —
