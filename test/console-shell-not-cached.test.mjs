@@ -40,5 +40,19 @@ ok(/try_files\s+\$uri\s+\/index\.html/.test(conf),
 ok(/proxy_pass\s+http:\/\/host\.docker\.internal:4700/.test(conf),
    'and /api still proxies to the queenzee (this file also carries the SSE + websocket contract)');
 
+// The "+ prompt" composer posts pasted screenshots as base64 INSIDE the JSON body. The queenzee's
+// express accepts 30mb for exactly that; nginx defaults to 1mb, which made every image-attached
+// dispatch 413 at the webapp before the queenzee ever saw it. The webapp nginx must never be the
+// smaller door — assert it carries a client_max_body_size >= the server's express limit, so the
+// two cannot drift apart.
+console.log('\n── the webapp nginx accepts the bodies the composer sends ──');
+const serverSrc = readFileSync(resolve(ROOT, 'server/src/index.js'), 'utf8');
+const expressLimit = (serverSrc.match(/express\.json\(\{\s*limit:\s*'(\d+)mb'\s*\}\)/) || [])[1];
+ok(!!expressLimit, `the queenzee's express json limit is readable (limit=${expressLimit || '?'}mb)`);
+const nginxLimit = (conf.match(/client_max_body_size\s+(\d+)m\s*;/) || [])[1];
+ok(!!nginxLimit, `the webapp nginx sets client_max_body_size (${nginxLimit || 'missing'}m)`);
+ok(expressLimit && nginxLimit && Number(nginxLimit) >= Number(expressLimit),
+   `…and it is >= the server's ${expressLimit || '?'}mb so the proxy is not the smaller door`);
+
 console.log(failures ? `\n${failures} FAILED` : '\nall good');
 process.exit(failures ? 1 : 0);

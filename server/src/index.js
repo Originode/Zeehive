@@ -22,8 +22,9 @@ import { pool, q } from './db/pool.js';
 import { startShipReaper, recoverOrphanShips } from './queenzee/shipgate.js';
 import { recoverOrphanTeardowns } from './queenzee/reaper.js';
 import { attachTerminalBridge } from './lib/terminal-bridge.js';
-import { attachWebappUpgrade } from './lib/webapp-proxy.js';
+import { startPreviewPorts } from './lib/preview-ports.js';
 import { attachStreamWebSocket } from './lib/stream.js';
+import { gatewayProxy, gatewayHello, GATEWAY_PORT } from './lib/gateway.js';
 import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
@@ -192,12 +193,44 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   startWorkSync();
   startHarnessBridge();
 });
+// THE LLM GATEWAY — the transparent LiteLLM-style door every cxell CLI points its base URL at.
+// A SEPARATE http listener (gateway.js), so /v1/messages + /v1/chat/completions can never shadow
+// an API route and the gateway's port stays distinct from the API's. Mounted with express.json
+// (the proxy reads req.body for the model name) and the gateway proxy for the two dialect paths.
+// Bind 0.0.0.0 like the API so a process-role spinoff answers on the published interface.
+if (config.gatewayPort !== config.port) {
+  const gatewayApp = express();
+  gatewayApp.use(express.json({ limit: '30mb' }));
+  gatewayApp.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Zeehive-Provider');
+    res.header('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
+  // The CLI's connectivity probe + the two dialect POSTs. The probe and the calls carry the
+  // /x/<xellToken>/<provider> prefix (measured: claude preserves the base-url path prefix), so
+  // express mounts a wildcard; gatewayProxy parses the identity/provider from req.url.
+  gatewayApp.get('/api/hello', gatewayHello);
+  gatewayApp.head('/api/hello', gatewayHello);
+  gatewayApp.all('/x/*', gatewayProxy);
+  gatewayApp.use((_req, res) => res.status(404).json({ error: 'gateway: expected /x/<xell-token>/<provider>/v1/…' }));
+  const gatewayServer = gatewayApp.listen(GATEWAY_PORT, '0.0.0.0', () => {
+    console.log(`[zeehive] LLM gateway on http://0.0.0.0:${GATEWAY_PORT}  (cxells point their provider base-urls here)`);
+    logline('api', `LLM gateway online — :${GATEWAY_PORT} (/v1/messages, /v1/chat/completions)`);
+  });
+  gatewayServer.on('error', (e) => {
+    console.error(`[zeehive] LLM gateway could not bind :${GATEWAY_PORT} — ${e.message}`);
+    logline('api', `LLM gateway bind FAILED :${GATEWAY_PORT} — ${e.message}`);
+  });
+}
 // Browser terminal into cxell zees: ws ↔ SSH-PTY on the SAME http server, so it rides the
 // existing /api proxy (vite dev + the prod nginx bundle) with no extra port to expose.
 attachTerminalBridge(server);
-// Xell webapp review: /xell-web/<slug>/* websockets (Vite HMR + the xell server's terminal bridge)
-// ride the same http server, next to the terminal bridge on the 'upgrade' event.
-attachWebappUpgrade(server);
+// Xell webapp preview: keep every xell webapp's port answering on this container's external
+// interface (docker's published ranges carry it to the host) — lib/preview-ports.js. Websockets
+// need no special handling: the direct port carries them natively.
+startPreviewPorts();
 // The dashboard's live stream over a websocket: /api/stream/ws on the same server, so the same
 // ws-aware proxies carry it. The SSE /api/stream route stays for old clients; the console
 // prefers this channel (docs/live-stream-websocket-decision-record.md).

@@ -6,12 +6,11 @@ import { DiffViewerHost } from './DiffViewer.jsx';
 import { baseUrl } from './api.js';
 import './styles.css';
 
-// A xell webapp is served under /xell-web/<slug>/ when reviewed through the queenzee proxy. Every
-// `fetch('/api/...')` the app issues must then hit /xell-web/<slug>/api/... (THIS xell's own
-// server), not the outer console's API — the "two servers answer the same paths" trap in reverse,
-// browser-side. One global wrapper covers api.js, DeliveryTelemetry.jsx and any other caller in one
-// place; absolute URLs and non-/api paths pass through untouched. The live console (BASE_URL '/')
-// is the identity. See docs/common-xell-network-plan.md.
+// Every `fetch('/api/...')` rides the app's Vite base via baseUrl. Base is '/' everywhere today
+// (xell webapps are direct ports, not path prefixes — docs/visual-verification-diagnosis.md §7),
+// so this wrapper is the identity; it stays as the one seam a future non-root base would need,
+// covering api.js, DeliveryTelemetry.jsx and any other caller in one place. Absolute URLs and
+// non-/api paths pass through untouched.
 const origFetch = window.fetch.bind(window);
 window.fetch = (input, init) =>
   origFetch(typeof input === 'string' && input.startsWith('/api') ? baseUrl(input) : input, init);

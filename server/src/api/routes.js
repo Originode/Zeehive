@@ -107,7 +107,7 @@ import { langfuseConfig, langfuseStatus, provisionLangfuse, teardownLangfuse,
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkAssign,
          selfWorkItem } from '../queenzee/self.js';
-import { webappProxy, webappApiProxy } from '../lib/webapp-proxy.js';
+import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
 
 export const router = Router();
@@ -1878,6 +1878,43 @@ router.get('/xells/:id/conversations', async (req, res) => {
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// THE XELL OBSERVABILITY VIEW — per-TURN usage + cost + play-by-play events, for the console's
+// right-click "Observability" action. Read-only: turns are written by the turn ledger
+// (lib/turn-ledger.js) at spawn/resume/interactive boundaries; this endpoint just reads them.
+// Same 503-not-throw contract as /fleet — a read model must never take the queenzee down.
+router.get('/xells/:id/observability', async (req, res) => {
+  try {
+    const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    const { turnsForXell } = await import('../lib/turn-ledger.js');
+    const turns = await turnsForXell(req.params.id, { zeeId: req.query.zee_id || null, limit: req.query.limit || 50 });
+    // Per-turn event counts ride along so the UI can show "N events" without fetching them all.
+    res.json({ ok: true, xell_id: req.params.id, turns });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// The PLAY-BY-PLAY events for ONE turn (the `turn_id` side of the observability view).
+router.get('/turns/:id/events', async (req, res) => {
+  try {
+    const t = await one(`SELECT id FROM zee_turn WHERE id=$1`, [req.params.id]);
+    if (!t) return res.status(404).json({ error: 'no such turn' });
+    const { eventsForTurn } = await import('../lib/turn-ledger.js');
+    res.json({ ok: true, turn_id: req.params.id, events: await eventsForTurn(req.params.id) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// THE LLM GATEWAY LEDGER for one xell — the transport-layer record of every AI call that crossed
+// the queenzee gateway (lib/gateway.js → llm_gateway_request). Read-only; the gateway writes it.
+// Same 503-not-throw contract as the other read models.
+router.get('/xells/:id/gateway-requests', async (req, res) => {
+  try {
+    const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
+    if (!x) return res.status(404).json({ error: 'no such xell' });
+    const { requestsForXell } = await import('../lib/gateway.js');
+    res.json({ ok: true, xell_id: req.params.id, requests: await requestsForXell(req.params.id) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // DONE SUGGESTIONS — a manager proposed a xell is finished; a human decides. Approving MARKS THE
 // TASK DONE and reaps the cxell (the console asks for a typed confirmation first), so this is the
 // same class of irreversible act as a landing: no zee path to the decision, ever.
@@ -2732,13 +2769,9 @@ router.get('/stream', async (req, res) => {
   req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); });
 });
 
-// ── XELL WEBAPP REVIEW — /xell-web/<slug>/* ────────────────────────────────────────────────────
-// Reverse proxy to a xell's app tier (docs/common-xell-network-plan.md). The console nginx
-// forwards /xell-web/<slug>/* → /api/xell-web/<slug>/*; express strips the /xell-web/<slug> mount
-// and proxies the rest. Two upstreams, one route: /api/* → the xell's OWN server (so a reviewed
-// console's API calls hit its own queenzee, not the outer one), everything else → the xell's Vite
-// dev server (which Vite serves under its base prefix). Read-only GET/HEAD/stream to a throwaway
-// per-xell dev server — the same class as opening a URL in a new tab, so it needs no gate.
-// Websockets are handled separately in index.js (attachWebappUpgrade).
-router.use('/xell-web/:slug/api', webappApiProxy);                    // the xell's own server
-router.use('/xell-web/:slug', webappProxy);                            // the xell's Vite dev server
+// ── XELL WEBAPP REVIEW — /xell-web/<slug>/* (compatibility redirect) ──────────────────────────
+// Xell webapps are reached DIRECTLY on their own port now (docs/visual-verification-diagnosis.md
+// §7): http://<console-hostname>:<host_port>/. This route survives only so old links — open
+// visual-verify offers, bookmarks, the console nginx /xell-web block — 302 onto the direct port,
+// path preserved. New URLs are minted as direct ports and never come here.
+router.use('/xell-web/:slug', webappRedirect);

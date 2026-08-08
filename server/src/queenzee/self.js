@@ -36,7 +36,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
-import { xellWebappPath } from '../lib/webapp-proxy.js';
+import { probeRoleUpstream } from '../lib/webapp-proxy.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -49,6 +49,7 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
 // The zee-row-only turn writer — the same one intake's spawn and nudge's resume use, so an
 // interactive turn is recorded exactly like the two the queenzee starts (lib/turn-record.js).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
+import { startTurn, endTurn } from '../lib/turn-ledger.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
@@ -877,17 +878,42 @@ export async function selfVerifyWebapp(xell) {
     `SELECT c.role, c.url FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xell.id]);
   const webapp = rows.find((c) => c.role === 'webapp');
-  // The stored url is a LAN address nothing publishes. The REACHABLE url is /xell-web/<slug>/ on
-  // the console origin (webapp-proxy.js). Offer that, not the dead stored one.
-  if (!webapp) {
+  // The stored url IS the offer now — the xell's own port, published on the queenzee container /
+  // forwarded by preview-ports.js (docs/visual-verification-diagnosis.md §7). The console card
+  // swaps the hostname for the one the human's browser reached the console at; the PORT is the
+  // truth the meta-DB tracks.
+  if (!webapp || !webapp.url) {
     return { ok: false, error: 'this xell has no webapp container to offer — build the webapp '
       + 'first (`zee build webapp --wait`), then try again.' };
   }
-  const webappUrl = xellWebappPath(xell.slug);
+  const webappUrl = webapp.url;
+  // OFFER-TIME LIVENESS — the reason "visual verification still does not work" kept being true:
+  // an offer used to be inserted on the strength of a container ROW existing, so the card a human
+  // clicked could be a dead 502 (webapp never built / torn down) or a hollow shell (webapp up,
+  // xell server down → every /api call in the reviewed page fails). Probe the SAME upstreams the
+  // preview routing will dial, and refuse to offer a link that is not actually alive — the fix is
+  // always one build command, and the message names it.
+  const [webProbe, apiProbe] = await Promise.all([
+    probeRoleUpstream(xell.slug, 'webapp'),
+    probeRoleUpstream(xell.slug, 'server'),
+  ]);
+  if (!webProbe.up) {
+    return { ok: false, error: `your webapp is not answering${webProbe.upstream ? ` at ${webProbe.upstream}` : ''} — `
+      + 'the offered link would be a dead 502 in front of a human. Build it (`zee build webapp --wait`), '
+      + 'then offer again.' };
+  }
+  // A server ROLE that exists but is down makes the reviewed page a hollow shell (the webapp
+  // proxies its own /api to the xell server). No server role at all is fine — nothing to require.
+  if (apiProbe.resolved && !apiProbe.up) {
+    return { ok: false, error: `your webapp is up but your server is not answering at ${apiProbe.upstream} — `
+      + 'the reviewed page would render with every /api call failing. Build it (`zee build server --wait`), '
+      + 'then offer again.' };
+  }
   const zee = await liveZee(xell.id);
   // One OPEN offer per xell, like prod_seed_request's one-open-ask guard: a zee that calls this
   // twice must not flood the console with cards. The existing open offer is handed back, not a
-  // second row.
+  // second row. (The probes above already ran, so a re-offer with a dead app tier is refused
+  // rather than reasserting a live link that no longer is.)
   const existing = await one(
     `SELECT * FROM visual_verify_offer WHERE xell_id=$1 AND status='open'
       ORDER BY created_at DESC LIMIT 1`, [xell.id]);
@@ -1171,8 +1197,18 @@ export async function selfTurn(xell, { state = null } = {}) {
                message: 'This zee is already recorded as WORKING (a queenzee-started turn is in flight) — '
                  + 'the interactive turn boundary was not written over it.' };
     }
+    // PER-TURN LEDGER: an interactive turn (a human/manager typing into the pane) is one unit of
+    // observability, even though the queenzee cannot know its cost (no meter on this door). The
+    // row is started so the turn exists in the timeline; its cost stays zero and metered=true is
+    // left defaulted — it IS measured (measured zero), unlike an unmetered headless turn.
+    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model });
   } else {
     row = await markZeeTurn(zee.id, 'idle', 'end_turn');
+    // Close the OPEN interactive turn (the latest one for this zee that is still 'started').
+    const open = await one(
+      `SELECT id FROM zee_turn WHERE zee_id=$1 AND kind='interactive' AND status='started'
+        ORDER BY started_at DESC LIMIT 1`, [zee.id]).catch(() => null);
+    await endTurn(open?.id, { status: 'ended', stopReason: 'end_turn' });
   }
   await recordEvent({ source: 'cxell-hook', hook_event_name: `interactive-turn-${want}`,
                       zee_id: zee.id, xell_id: xell.id, stop_reason: want === 'end' ? 'end_turn' : null });

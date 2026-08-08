@@ -2392,6 +2392,10 @@ export function petalVerbs(x, diff) {
   if (x.langfuse_enabled && x.langfuse_tracking !== false) {
     v[4] = [...v[4], 'langfuse'];
   }
+  // OBSERVABILITY — the per-turn ledger is always available: every xell can have turns recorded
+  // (a spawn, a resume, an interactive turn). Read-only, so it shows even on a production xell
+  // (production has no working tree but can have a burn history).
+  v[4] = [...v[4], 'observability'];
   // BRANCH petal — the two ways a xell's current job ENDS, side by side, because they are each
   // other's alternative: SWAP keeps the xell and changes who is in it (same branch, same commits,
   // same containers, same db, same card), DONE tears it down. A human reaching for "mark done"
@@ -2423,7 +2427,7 @@ export function petalVerbs(x, diff) {
 const VERB_LABEL = {
   build: '🔨', terminal: '⌨', nudge: '💬', env: '❖', message: '📨',
   pull: '↓', land: '⬆', pr: 'PR', ship: '🚀', swap: '♻',
-  pause: '⏸', resume: '▶', directives: '🧭', langfuse: '⚗',
+  pause: '⏸', resume: '▶', directives: '🧭', langfuse: '⚗', observability: '◉',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
   done: 'error', swap: 'working', pause: 'error', resume: 'working' };
@@ -2444,6 +2448,7 @@ const VERB_TOOLTIP = {
   resume: 'Resume this xell — calls the zee back',
   directives: 'See this xell\'s directive — the brief it was given (a manager\'s programme), and the conversation around it',
   langfuse: 'Open this zee\'s Langfuse session in a new window',
+  observability: 'Open the per-turn observability ledger — what the zee did, what it cost',
 };
 
 // The RIGHT-CLICK context menu (a DOM overlay on the honeycomb) reuses the SAME verb list as the
@@ -2452,7 +2457,7 @@ const VERB_TOOLTIP = {
 const VERB_MENU_LABEL = {
   build: '🔨 Build', terminal: '⌨ Terminal', nudge: '💬 Nudge',
   env: '❖ Environment', message: '📨 Message', directives: '🧭 Directives',
-  langfuse: '⚗ View Langfuse',
+  langfuse: '⚗ View Langfuse', observability: '◉ Observability',
   pull: '↓ Pull', land: '⬆ Land', pr: 'PR', ship: '🚀 Ship',
   swap: '♻ Swap zee', pause: '⏸ Pause', resume: '▶ Resume',
 };
