@@ -51,7 +51,8 @@ console.log('\n── D. gatewayEnv — the base URLs cxells get ──');
 const env = gatewayEnv({ xellToken: 'abc123' });
 ok(env.ANTHROPIC_BASE_URL.includes('/x/abc123/claude'), 'claude base url carries the xell identity');
 ok(env.OPENAI_BASE_URL.includes('/x/abc123/openai'), 'openai base url carries the xell identity');
-ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/openai'), 'kimi base url points at the openai dialect');
+ok(env.KIMI_MODEL_BASE_URL.includes('/x/abc123/kimi'), 'kimi base url carries the KIMI identity (not openai)');
+ok(!env.KIMI_MODEL_BASE_URL.includes('/openai'), 'a kimi zee is never pointed at the openai provider route');
 // A deepseek zee runs the claude CLI against DeepSeek's Anthropic-compatible endpoint. Its
 // ANTHROPIC_BASE_URL must name the DEEPSEEK provider in the path — otherwise the gateway would
 // attribute the call to claude and forward it with a CLAUDE key (the cross-provider misrouting

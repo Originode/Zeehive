@@ -14,6 +14,9 @@
 //   B. OpenAI dialect (openai): POST /x/<token>/openai/v1/chat/completions → the stream is
 //      forwarded and usage recorded, and the upstream receives /v1/chat/completions — NOT
 //      /v1/v1/chat/completions (the version-segment doubling joinUpstreamPath fixes).
+//   B2. Kimi dialect (kimi): POST /x/<token>/kimi/v1/chat/completions → resolved as the KIMI
+//      provider (not openai), forwarded to the kimi upstream's /coding/v1 base, and recorded
+//      with the kimi key.
 //   C. Unknown xell identity → 401, and NO row is written.
 //   D. The gateway is best-effort: a dead upstream → 502 with a completed error row, never a hang.
 import http from 'node:http';
@@ -37,7 +40,7 @@ function startMockUpstream() {
       const rec = { method: req.method, url: req.url, auth: req.headers.authorization || null };
       seen.push(rec);
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
-      if (req.url.startsWith('/v1/chat/completions')) {
+      if (req.url.includes('/chat/completions')) {
         res.write('data: {"choices":[]}\n\n');
         res.write('data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n');
         res.write('data: [DONE]\n\n');
@@ -84,12 +87,26 @@ function startGatewayApp() {
   });
 }
 
+// The proxy answers the client first and writes the best-effort completion row a beat later
+// (observability never blocks the AI call). Read the row once it has a status — poll rather than
+// race the async write.
+async function completedRow(xellId) {
+  for (let i = 0; i < 40; i++) {
+    const rows = await requestsForXell(xellId);
+    if (rows.length && rows[0]?.status != null) return rows[0];
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return (await requestsForXell(xellId))[0] || null;
+}
+
 const mock = await startMockUpstream();
 const gw = await startGatewayApp();
-// Point the gateway at the mock. The openai base CARRIES /v1 like the real api.openai.com/v1, so
-// the doubling bug joinUpstreamPath fixes is exercised rather than dodged.
+// Point the gateway at the mock. The openai/kimi bases CARRY their version path like the real
+// upstreams (api.openai.com/v1, api.kimi.com/coding/v1), so the doubling bug joinUpstreamPath
+// fixes is exercised rather than dodged.
 process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
 process.env.OPENAI_BASE_URL = `http://127.0.0.1:${mock.port}/v1`;
+process.env.KIMI_CODE_BASE_URL = `http://127.0.0.1:${mock.port}/coding/v1`;
 
 const fixtures = [];
 try {
@@ -107,15 +124,16 @@ try {
   ok(body.includes('"input_tokens":11'), 'the usage event is in the forwarded stream');
   const rows = await requestsForXell(fx.xellId);
   eq(rows.length, 1, 'the proxy recorded the request');
-  eq(rows[0]?.provider, 'claude', 'provider is claude');
-  eq(rows[0]?.model, 'claude-sonnet-4-20250514', 'model is read from the body');
-  eq(Number(rows[0]?.input_tokens), 11, 'input tokens from the upstream usage');
-  eq(Number(rows[0]?.output_tokens), 5, 'output tokens from the upstream usage');
-  eq(Number(rows[0]?.cache_read_tokens), 2, 'cache read tokens');
-  eq(Number(rows[0]?.cache_write_tokens), 1, 'cache write tokens');
-  eq(Number(rows[0]?.total_tokens), 19, 'total = input + output + cache read + cache write');
-  eq(Number(rows[0]?.cost_usd), 0.0005, 'cost from the upstream total_cost_usd');
-  eq(rows[0]?.status, 200, 'status 200');
+  const row = await completedRow(fx.xellId);
+  eq(row?.provider, 'claude', 'provider is claude');
+  eq(row?.model, 'claude-sonnet-4-20250514', 'model is read from the body');
+  eq(Number(row?.input_tokens), 11, 'input tokens from the upstream usage');
+  eq(Number(row?.output_tokens), 5, 'output tokens from the upstream usage');
+  eq(Number(row?.cache_read_tokens), 2, 'cache read tokens');
+  eq(Number(row?.cache_write_tokens), 1, 'cache write tokens');
+  eq(Number(row?.total_tokens), 19, 'total = input + output + cache read + cache write');
+  eq(Number(row?.cost_usd), 0.0005, 'cost from the upstream total_cost_usd');
+  eq(row?.status, 200, 'status 200');
   eq(mock.seen.at(-1)?.url, '/v1/messages?beta=true', 'the upstream received the stripped forward path');
   ok(mock.seen.at(-1)?.auth?.includes('sk-ant-mocktoken123456789'), 'the upstream got the PROVIDER key, not the xell token');
 
@@ -132,11 +150,32 @@ try {
   ok(body2.includes('[DONE]'), 'openai SSE passes through');
   const rows2 = await requestsForXell(fx2.xellId);
   eq(rows2.length, 1, 'the proxy recorded the openai request');
-  eq(Number(rows2[0]?.input_tokens), 7, 'prompt tokens from the usage chunk');
-  eq(Number(rows2[0]?.output_tokens), 3, 'completion tokens from the usage chunk');
-  eq(Number(rows2[0]?.total_tokens), 10, 'openai total tokens');
+  const row2 = await completedRow(fx2.xellId);
+  eq(Number(row2?.input_tokens), 7, 'prompt tokens from the usage chunk');
+  eq(Number(row2?.output_tokens), 3, 'completion tokens from the usage chunk');
+  eq(Number(row2?.total_tokens), 10, 'openai total tokens');
   eq(mock.seen.at(-1)?.url, '/v1/chat/completions', 'the upstream got /v1/chat/completions — NOT /v1/v1/…');
-  eq(rows2[0]?.path, '/v1/chat/completions', 'the recorded path is the forward path');
+  eq(row2?.path, '/v1/chat/completions', 'the recorded path is the forward path');
+
+  console.log('\n── B2. Kimi dialect — /kimi/v1/chat/completions through the proxy ──');
+  const fxK = await makeFixture('kimi', 'kimi-mocktoken1234567890');
+  fixtures.push(fxK);
+  const resK = await fetch(`http://127.0.0.1:${gw.port}/x/${fxK.xellToken}/kimi/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer kimi-mocktoken1234567890' },
+    body: JSON.stringify({ model: 'kimi-k2', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const bodyK = await resK.text();
+  ok(resK.status === 200, 'kimi stream forwarded with 200');
+  ok(bodyK.includes('[DONE]'), 'kimi SSE passes through');
+  const rowsK = await requestsForXell(fxK.xellId);
+  eq(rowsK.length, 1, 'the proxy recorded the kimi request');
+  const rowK = await completedRow(fxK.xellId);
+  eq(rowK?.provider, 'kimi', 'provider is kimi — NOT openai');
+  eq(rowK?.model, 'kimi-k2', 'kimi model recorded');
+  eq(Number(rowK?.total_tokens), 10, 'kimi total tokens');
+  eq(mock.seen.at(-1)?.url, '/coding/v1/chat/completions', 'the kimi upstream got /coding/v1/chat/completions — the kimi base path, no doubled /v1');
+  ok(mock.seen.at(-1)?.auth?.includes('kimi-mocktoken1234567890'), 'the kimi upstream got the KIMI key, not the openai key');
 
   console.log('\n── C. unknown xell identity → 401, no row ──');
   const res3 = await fetch(`http://127.0.0.1:${gw.port}/x/definitely-not-a-real-token/claude/v1/messages`, {

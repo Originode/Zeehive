@@ -399,9 +399,13 @@ export function gatewayEnv({ xellToken = null, provider = 'claude' } = {}) {
   return {
     // claude + deepseek (Anthropic dialect) → the gateway's /v1/messages
     ANTHROPIC_BASE_URL: `${base}${ident}/${anthropic}`,
-    // codex + kimi (OpenAI dialect) → the gateway's /v1/chat/completions
+    // codex (OpenAI dialect) → the gateway's /v1/chat/completions, resolved as the openai provider
     OPENAI_BASE_URL: `${base}${ident}/openai/v1`,
-    KIMI_MODEL_BASE_URL: `${base}${ident}/openai/v1`,
+    // kimi (OpenAI dialect) → a KIMI-specific route. Its CLI reads only KIMI_MODEL_BASE_URL, and
+    // the provider in the path is what picks the upstream + credential — pointing it at /openai/v1
+    // would forward kimi calls with the project's OPENAI key to api.openai.com (the deepseek
+    // misrouting, one provider over).
+    KIMI_MODEL_BASE_URL: `${base}${ident}/kimi/v1`,
   };
 }
 
