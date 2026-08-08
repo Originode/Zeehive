@@ -1915,6 +1915,11 @@ function SpawnSection({ project, run }) {
         <label>Refresh interval (sec)
           <input type="number" min="60" defaultValue={pc.refresh_interval_sec}
                  onBlur={(e) => Number(e.target.value) !== pc.refresh_interval_sec && save({ refresh_interval_sec: Number(e.target.value) })} /></label>
+        <label className="setup-check">Capture LLM gateway bodies
+          <input type="checkbox" checked={pc.gateway_body_capture !== false}
+                 onChange={(e) => save({ gateway_body_capture: e.target.checked })} />
+          <span className="pc">(store the request/response body behind each gateway call for the observability drill-down — 14-day retention, secrets scrubbed)</span>
+        </label>
       </div>
       <PrepEditor pc={pc} save={save} />
     </div>

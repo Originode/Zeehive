@@ -125,6 +125,8 @@ body { margin: 0; background: var(--bg); color: var(--text); }
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
   border-radius: 6px; padding: 5px 8px; font-size: 12px; min-width: 0; }
 .setup-grid input:focus, .setup-row input:focus { outline: none; border-color: var(--accent); }
+.setup-grid label.setup-check { flex-direction: row; align-items: center; gap: 6px; }
+.setup-grid label.setup-check .pc { flex-basis: 100%; }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
 
 /* Docs tab: one editor per SOURCE text, with the provider files it generates ticked below it. A

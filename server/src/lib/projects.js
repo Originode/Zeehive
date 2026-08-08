@@ -593,7 +593,7 @@ export async function getPoolConfig(projectId) {
 }
 
 const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
-                        'refresh_interval_sec', 'default_build_ctx'];
+                        'refresh_interval_sec', 'default_build_ctx', 'gateway_body_capture'];
 // Every coupling a xell can hold. The two prod ones are listed so a bad value still gets the honest
 // "must be one of" error, then refused individually below as DEFAULTS (prod access is per-xell).
 const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod', 'db-prod-readonly'];
