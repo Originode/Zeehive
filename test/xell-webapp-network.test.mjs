@@ -1,11 +1,13 @@
-// XELL-WEBAPP-NETWORK test — the queenzee-proxied webapp review URL and the ZEEHIVE-operated
+// XELL-WEBAPP-NETWORK test — the direct-port xell webapp preview URL and the ZEEHIVE-operated
 // WireGuard mesh (docs/common-xell-network-plan.md, Decisions 5.1–5.4).
 //
 // Two halves, both pure/logic where they can be and DB-backed where they must be:
 //
-//   a) the webapp URL derivation (xellWebappPath) — the reachable URL a human (or another cxell)
-//      opens for a xell webapp. It replaced the stored container url (10.2.0.16:5383), which
-//      nothing publishes; it must be the stable /xell-web/<slug>/ path on the console origin.
+//   a) the direct-port preview routing (docs/visual-verification-diagnosis.md §7) — a xell webapp
+//      is opened at http://<console-hostname>:<host_port>/ directly. redirectTarget maps an old
+//      /xell-web/<slug>/ link onto the caller's own hostname + the xell's port, and targetFor
+//      (preview-ports.js) splits same-daemon rows from remote-context rows the same way the
+//      upstream resolver does.
 //
 //   b) the WireGuard config layer — Node's native x25519 mints a real WG keypair, the rendered
 //      .conf has the exact [Interface]/[Peer] shape a WG client imports, and mintPeerConfig (DB-
@@ -17,17 +19,26 @@
 // rule 1). The pure parts need no database and run anywhere.
 
 import { wgKeyPair, renderPeerConfig, mintPeerConfig, wireguardStatus } from '../server/src/lib/wireguard.js';
-import { xellWebappPath } from '../server/src/lib/webapp-proxy.js';
+import { redirectTarget } from '../server/src/lib/webapp-proxy.js';
+import { targetFor } from '../server/src/lib/preview-ports.js';
 import { q, pool } from '../server/src/db/pool.js';
 
 let failed = 0;
 const ok = (cond, name) => { if (cond) console.log(`  ✓ ${name}`); else { console.log(`  ✗ FAIL ${name}`); failed++; } };
 
-// ── (a) the webapp URL derivation ───────────────────────────────────────────────────────────────
-console.log('\n── the reachable xell webapp URL is /xell-web/<slug>/ ──');
-ok(xellWebappPath('calm-harbor-abc123') === '/xell-web/calm-harbor-abc123/', 'a slug maps to its proxied path');
-ok(xellWebappPath('i-want-all-xells-to-have-a-common-network-wi-fa2518') === '/xell-web/i-want-all-xells-to-have-a-common-network-wi-fa2518/', 'the real long slug maps too');
-ok(!xellWebappPath('x').includes('10.2.0.16'), 'the derived URL never names the stored LAN port');
+// ── (a) direct-port preview routing ─────────────────────────────────────────────────────────────
+console.log('\n── the xell webapp URL is its own PORT on the caller\'s hostname ──');
+ok(redirectTarget('localhost:5180', 5379, '/') === 'http://localhost:5379/',
+   'an old path link redirects to the port on the hostname the caller used');
+ok(redirectTarget('10.2.0.16:5180', 5379, '/src/main.jsx') === 'http://10.2.0.16:5379/src/main.jsx',
+   'deep links keep their path, LAN callers keep their LAN hostname');
+ok(redirectTarget('', 5379, '/') === 'http://localhost:5379/', 'a missing Host falls back to localhost');
+ok(JSON.stringify(targetFor({ host: '10.2.0.16', host_port: 5379, docker_ctx: null }))
+   === JSON.stringify({ host: '127.0.0.1', port: 5379, sameDaemon: true }),
+   'a same-daemon row targets the in-container loopback, never the stored LAN host');
+ok(JSON.stringify(targetFor({ host: '10.1.0.18', host_port: 5220, docker_ctx: 'ugreen-nas' }))
+   === JSON.stringify({ host: '10.1.0.18', port: 5220, sameDaemon: false }),
+   'a remote-context row targets host:host_port from the row');
 
 // ── (b) WireGuard key + config layer ─────────────────────────────────────────────────────────────
 console.log('\n── WireGuard keys are real Curve25519 ──');

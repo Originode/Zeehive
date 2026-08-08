@@ -99,8 +99,8 @@ try {
   const offered = await selfVerifyWebapp(xell);
   ok(offered.ok === true && offered.offer?.status === 'open',
      'selfVerifyWebapp records an OPEN offer');
-  ok(offered.offer?.url === '/xell-web/vvy/',
-     `the offer carries the DERIVED proxied path, never the stored LAN url (${offered.offer?.url})`);
+  ok(offered.offer?.url === 'http://localhost:5331',
+     `the offer carries the stored container url — the direct port; the console swaps the hostname (${offered.offer?.url})`);
   ok(offered.offer?.xell_slug === 'vvy' && offered.offer?.xell_id === XID, 'the offering xell is stamped on the row');
   ok(offered.offer?.project_id === PID, 'the project is stamped on the row');
   ok(offered.offer?.commit === 'abc123def456', 'the offer carries the xell head commit');
@@ -238,6 +238,8 @@ try {
   const vv = read('web/src/VisualVerify.jsx');
   ok(/Open link/.test(vv) && /Dismiss/.test(vv), 'VisualVerify card renders Open link + Dismiss');
   ok(/window\.open/.test(vv), 'Open link opens the webapp url in a new tab');
+  ok(/previewHref\(offer\.url\)/.test(vv),
+     'the card opens the hostname-swapped preview href (the port on the hostname the human reached the console at)');
   ok(/dismissVisualVerify/.test(vv), 'the card calls the dismiss API');
   const app = read('web/src/App.jsx');
   ok(/from '\.\/VisualVerify\.jsx'/.test(app), 'App.jsx imports VisualVerify');

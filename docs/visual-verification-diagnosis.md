@@ -125,3 +125,72 @@ mappings at provision — the tracking idea lands there, and the proxy still nee
 - `test/xell-webapp-network.test.mjs` — ALL PASSED (webapp-proxy.js edit did not disturb it).
 - Live fleet probes in §1, including a real open offer (`zee verify-webapp`) whose URL was verified
   to serve HTML 200 / assets 200 / own-API 200 / websocket 101 **before** offering it.
+
+---
+
+## 7. Decision record — direct ports replace the path prefix (supersedes §4 and common-xell-network-plan Decision 5.1)
+
+**Date:** 2026-08-08 (same day, after the human's decision)
+
+#### Decision
+A xell webapp is opened at **`http://<console-hostname>:<host_port>/`** — the xell's own port, on
+the same hostname the human loaded the console from. The meta-DB's `container.host_port` (already
+allocated per xell: `project.port_web_base + slot`, fleet-unique because projects' ranges are
+disjoint) IS the port mapping; the queenzee server container **publishes the per-project web
+ranges** (compose `ports:` — Zeehive 5300-5389, omnibiz 5200-5289) and `lib/preview-ports.js`
+makes every tracked port answer on the container's external interface: wildcard-bound processes
+are reached by docker publishing alone; loopback-only and remote-context upstreams get a TCP
+forward on the same port number. `/xell-web/<slug>/*` survives only as a **302 redirect** onto the
+port (path preserved) so old cards and bookmarks keep working. Vite `base` returns to `'/'`.
+
+#### Context
+The human rejected the path-prefix presentation after the deploy of the offer-liveness fix itself
+tore down every process-runner webapp (they live inside the queenzee container; recreating it on a
+ship kills them) and their card 502'd: *"stop hiding it in a path. just route the port directly"*,
+with the example — console at `localhost:5180`, queenzee maps a local port to the xell's webapp,
+human opens `localhost:<port>`. This is a presentation decision that was the human's to make, and
+it is now made.
+
+#### Options considered
+- **A. A dedicated preview-port pool (the example's literal `5181 → cell:5180`).** For: ports can
+  be dense and separate from the app-tier allocation. Against: needs new allocation state (a
+  column or table, so a migration), a second port ledger to drift from the first, and the number a
+  human sees differs from the number every binding, doc and probe already names. Rejected: cost
+  with no payer — the meta-DB already allocates a unique fleet-wide web port per xell.
+- **B. Same-port publishing + forwarder** (chosen). For: zero new state — `container.host_port` is
+  already the mapping; docker does the routing for wildcard binders; ~130 lines of forwarder cover
+  loopback-only and remote upstreams; the port a zee is told is the port a human types. Against:
+  compose must publish a range per project (a new project's web range is a compose edit + server
+  recreate — documented in the compose files), and ~180 published ports cost one docker-proxy
+  process each under the default userland proxy (small; disable the userland proxy or narrow the
+  ranges if it ever matters).
+- **C. Keep the path proxy.** Rejected by the human, explicitly. Kept only as a 302.
+
+#### Consequences
+- **Easy:** `http://localhost:5379` next to `http://localhost:5180` — no path, no Vite base, no
+  base-aware fetch wrapper doing real work, no websocket proxying (the direct port carries HMR
+  natively). The console card/chip swap only the hostname (`previewHref`), so LAN and localhost
+  users both work with one stored URL.
+- **Hard:** the ranges are fixed at container-create; a new project needs its web range added to
+  both compose files. The forwarder must never squat a port a restarting process wants back — it
+  binds only while the upstream answers, releases on death (tick-wide race, mitigated by
+  close-on-refused-dial; recorded in preview-ports.js).
+- **Impossible:** nothing removed — the redirect keeps every old URL alive.
+
+#### Reversibility
+Fully reversible: revert the compose ranges, the forwarder wiring and the redirect, restore the
+proxy middlewares from git history. No schema change in either direction.
+
+#### What would change our mind
+- If xell app tiers move OUT of the queenzee container into per-xell containers, docker publishes
+  their ports at provision and the forwarder (not the port scheme) retires.
+- If the fleet ever spans hosts a LAN/WG route cannot reach, a hostname-swapped port cannot work
+  from the human's browser and the path-on-console-origin presentation would need to return for
+  exactly those xells.
+
+## 8. Still true after this change
+
+- Offer-time liveness (§3) — unchanged; the probe dials the same upstreams.
+- The restart mortality: a queenzee redeploy still kills process-runner webapps. Direct ports do
+  not change that; the liveness probe keeps dead offers from being MADE, and settling open offers
+  at teardown (follow-up §5.1) is still the missing piece.

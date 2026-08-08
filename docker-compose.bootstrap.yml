@@ -52,7 +52,18 @@ services:
     image: ${ZEEHIVE_SERVER_IMAGE:-ghcr.io/originode/zeehive-server:latest}
     container_name: zeehive_server
     restart: unless-stopped
-    ports: ["4700:4700"]
+    # 4700 is the API. The RANGES are xell webapp PREVIEW ports (docs/visual-verification-
+    # diagnosis.md §7): the meta-DB allocates each xell webapp a unique fleet-wide port
+    # (project.port_web_base + slot, mod port_slot_mod — Zeehive 5300-5389, omnibiz 5200-5289),
+    # the app-tier processes run INSIDE this container, and lib/preview-ports.js makes every such
+    # port answer on this container's external interface. Publishing the ranges is what carries
+    # them to the host, so a human opens http://<this-host>:<port>/ directly — no path prefix.
+    # A NEW PROJECT with a different port_web_base needs its range added here (and a server
+    # recreate); keep this file and its sibling compose in lockstep.
+    ports:
+      - "4700:4700"
+      - "5200-5289:5200-5289"
+      - "5300-5389:5300-5389"
     depends_on:
       meta-db: { condition: service_healthy }
     environment:

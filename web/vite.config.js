@@ -19,14 +19,11 @@ try {
 } catch { /* no projection — the live checkout */ }
 const env = (k) => process.env[k] ?? proj[k];
 
-// In a xell worktree, the webapp is served through the queenzee reverse proxy at
-// <console-origin>/xell-web/<slug>/ (docs/common-xell-network-plan.md). Vite must emit every
-// asset URL under that prefix, so a browser loading the proxied page requests
-// /xell-web/<slug>/src/main.jsx — which the proxy strips back to /src/main.jsx upstream. The
-// live checkout (no SPINOFF_SLUG) stays at root. The slug is a pure lowercase slug: safe to
-// interpolate into a URL path segment.
-const slug = env('SPINOFF_SLUG');
-const base = slug ? `/xell-web/${slug}/` : '/';
+// Xell webapps are reached DIRECTLY on their own port now (docs/visual-verification-diagnosis.md
+// §7): http://<console-hostname>:<ZEEHIVE_WEB_PORT>/. No path prefix — base stays '/' everywhere,
+// in a xell worktree and the live checkout alike. (The /xell-web/<slug>/ prefix era is over; the
+// old route 302s to the port.)
+const base = '/';
 
 // wterm is VENDORED under web/vendor/wterm (not an npm install) so a process-runner spinoff
 // whose host node_modules pre-dates the dep still resolves it — the fleet's start-xell-process

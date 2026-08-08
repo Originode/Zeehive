@@ -36,7 +36,7 @@ import { attachProdStack } from '../lib/xell-prod.js';
 const PROVISION_MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 import { catchUpXellToProd } from './shipmigrate.js';
 import { attachXellDb } from '../lib/xell-db.js';
-import { xellWebappPath, probeRoleUpstream } from '../lib/webapp-proxy.js';
+import { probeRoleUpstream } from '../lib/webapp-proxy.js';
 import { claimMigrationNumber, formatNumber, CLAIM_TTL_DAYS } from '../lib/migration-numbers.js';
 import { diffXellDbAgainstProd } from './proddiff.js';
 import { emitXellEnv } from '../lib/provision.js';
@@ -878,13 +878,15 @@ export async function selfVerifyWebapp(xell) {
     `SELECT c.role, c.url FROM xell_uses_container uc JOIN container c ON c.id = uc.container_id
       WHERE uc.xell_id = $1 ORDER BY c.role`, [xell.id]);
   const webapp = rows.find((c) => c.role === 'webapp');
-  // The stored url is a LAN address nothing publishes. The REACHABLE url is /xell-web/<slug>/ on
-  // the console origin (webapp-proxy.js). Offer that, not the dead stored one.
-  if (!webapp) {
+  // The stored url IS the offer now — the xell's own port, published on the queenzee container /
+  // forwarded by preview-ports.js (docs/visual-verification-diagnosis.md §7). The console card
+  // swaps the hostname for the one the human's browser reached the console at; the PORT is the
+  // truth the meta-DB tracks.
+  if (!webapp || !webapp.url) {
     return { ok: false, error: 'this xell has no webapp container to offer — build the webapp '
       + 'first (`zee build webapp --wait`), then try again.' };
   }
-  const webappUrl = xellWebappPath(xell.slug);
+  const webappUrl = webapp.url;
   // OFFER-TIME LIVENESS — the reason "visual verification still does not work" kept being true:
   // an offer used to be inserted on the strength of a container ROW existing, so the card a human
   // clicked could be a dead 502 (webapp never built / torn down) or a hollow shell (webapp up,

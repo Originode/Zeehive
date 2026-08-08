@@ -16,7 +16,6 @@ import { listXourceCleanRequests, xourceState } from './xource-clean.js';
 import { listManagerMintRequests } from './manager-mint.js';
 import { listCredentialInjectRequests } from './credential-inject.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
-import { xellWebappPath } from './webapp-proxy.js';
 import { containerShellSessionName } from './terminal-bridge.js';
 
 export async function defaultProject() {
@@ -298,16 +297,11 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
   // works whenever the worktree exists — even while the process is down, which is exactly when you
   // want in to debug it. Everything else IS a docker container, so it needs to be running ('up').
   for (const c of stack) { c.shellable = containerShellable(project, c); c.shell_cmd = containerShellCmd(project, c); }
-  // A spinoff xell webapp's stored url (10.2.0.16:5383) is a LAN address nothing publishes. The
-  // reachable URL is /xell-web/<slug>/ on the console origin, served by the queenzee proxy
-  // (webapp-proxy.js). Derive it here so the chip link, the "↗ Open URL" menu and the verify offer
-  // all point at something a human (or a cxell) can actually open. db never has a url; prod
-  // webapps keep their stored one (they are real published services).
-  if (!x.is_production) {
-    for (const c of stack) {
-      if (c.role === 'webapp' && c.tier === 'spinoff') c.url = xellWebappPath(x.slug);
-    }
-  }
+  // A spinoff xell webapp's stored url (host:port) is direct truth now: the port is published on
+  // the queenzee server container (compose `ports:` ranges) and carried to loopback-only/remote
+  // upstreams by preview-ports.js. The console swaps the hostname for the one the browser reached
+  // the console at (previewHref in web/src/api.js); the PORT is what the meta-DB tracks.
+  // docs/visual-verification-diagnosis.md §7.
   x.stack = stack;
   // Does THIS project support device xhips (manifest device.enabled)? Drives whether the card shows
   // the attach-device affordance. device_kind is the project's default shape (emulator|physical), so

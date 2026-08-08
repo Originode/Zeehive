@@ -3,17 +3,28 @@
 // falls back to the first project).
 const pq = (projectId) => (projectId ? `?project=${encodeURIComponent(projectId)}` : '');
 
-// A xell webapp can be reviewed through the queenzee proxy at <origin>/xell-web/<slug>/ (see
-// docs/common-xell-network-plan.md). Vite then emits the app under `import.meta.env.BASE_URL`,
-// and a bare `/api/...` call would hit the OUTER console's API — the wrong server answering the
-// same paths (the exact trap CLAUDE.md warns about, now browser-side). Every server-bound URL the
-// console issues must ride the app's own base: at the live console (BASE_URL '/') this is the
-// identity; under '/xell-web/<slug>/' it turns '/api/foo' into '/xell-web/<slug>/api/foo', which
-// the queenzee proxy forwards to THIS xell's own server. Kept here (not in every caller) so the
-// three transports — fetch, EventSource, WebSocket — all agree on one answer.
+// Every server-bound URL rides the app's own Vite base so the three transports — fetch,
+// EventSource, WebSocket — agree on one answer. Base is '/' everywhere today (the /xell-web
+// path-prefix era is over — xell webapps are direct ports now), so this is the identity; it stays
+// because it is the one seam a future non-root base would need.
 export function baseUrl(path) {
   const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   return `${base}${path}`;
+}
+
+// The href a HUMAN can open for a xell webapp. The stored url names the host the app tier runs on
+// (a LAN ip the browser may not reach — e.g. the console is open at localhost); the PORT is the
+// truth the meta-DB tracks, published on the queenzee host (docs/visual-verification-diagnosis.md
+// §7). So: keep the port, swap the hostname for the one the browser provably reaches — the one
+// this console was loaded from. Old-style path urls (/xell-web/<slug>/) resolve same-origin and
+// hit the server's 302 onto the port, so they keep working too.
+export function previewHref(url) {
+  if (!url) return url;
+  try {
+    const u = new URL(url, window.location.href);
+    if (u.port && u.port !== window.location.port) u.hostname = window.location.hostname;
+    return u.toString();
+  } catch { return url; }
 }
 
 export async function getFleet(projectId) {

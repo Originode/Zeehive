@@ -9,7 +9,7 @@
 //    all build affordances are withdrawn/disabled — you can't (re)build a container mid-operation
 //    and mangle it.
 import React, { useState, useEffect } from 'react';
-import { buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, getDiffCandidates, checkContainerData, getDataCheckReadiness, duplicateProd } from './api.js';
+import { previewHref, buildContainer, getDockerContexts, setContainerBuildCtx, decommissionContainer, checkContainerDiff, getDiffCandidates, checkContainerData, getDataCheckReadiness, duplicateProd } from './api.js';
 import { nick } from './nick.js';
 import { diffReportText, driftDirection, SCOPE_LINE, dataReportText, dataText } from './drift.js';
 import { showAlert, showConfirm } from './Dialog.jsx';
@@ -523,7 +523,7 @@ export function ContainerMenu({ menu, onClose, projectName, onDecommissioned, on
           ))}
         </>
       )}
-      {c.url && <a role="menuitem" href={c.url} target="_blank" rel="noopener" onClick={onClose}>↗ Open URL</a>}
+      {c.url && <a role="menuitem" href={previewHref(c.url)} target="_blank" rel="noopener" onClick={onClose}>↗ Open URL</a>}
 
       {/* Shell: a terminal INSIDE this container. `shellable` is computed server-side (fleet.js):
           a real container needs to be running ('up'); a PROCESS-ROLE server/webapp is always

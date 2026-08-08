@@ -4,7 +4,7 @@
 // DISMISSES the card. Rendered on the offering xell's card / a small panel, like ProdData's cards
 // but deliberately lighter — the "decision" is a look, not an approval.
 import React, { useState } from 'react';
-import { dismissVisualVerify } from './api.js';
+import { dismissVisualVerify, previewHref } from './api.js';
 
 const ago = (ts) => {
   if (!ts) return '';
@@ -18,7 +18,7 @@ export function VisualVerifyCard({ offer, onDone }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
-  const open = () => { window.open(offer.url, '_blank', 'noopener'); };
+  const open = () => { window.open(previewHref(offer.url), '_blank', 'noopener'); };
   const dismiss = async () => {
     setBusy(true); setErr(null);
     try { await dismissVisualVerify(offer.xell_id, offer.id); onDone?.(); }

@@ -107,7 +107,7 @@ import { langfuseConfig, langfuseStatus, provisionLangfuse, teardownLangfuse,
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkAssign,
          selfWorkItem } from '../queenzee/self.js';
-import { webappProxy, webappApiProxy } from '../lib/webapp-proxy.js';
+import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
 
 export const router = Router();
@@ -2769,13 +2769,9 @@ router.get('/stream', async (req, res) => {
   req.on('close', () => { clearInterval(ping); bus.off('event', onEvent); });
 });
 
-// ── XELL WEBAPP REVIEW — /xell-web/<slug>/* ────────────────────────────────────────────────────
-// Reverse proxy to a xell's app tier (docs/common-xell-network-plan.md). The console nginx
-// forwards /xell-web/<slug>/* → /api/xell-web/<slug>/*; express strips the /xell-web/<slug> mount
-// and proxies the rest. Two upstreams, one route: /api/* → the xell's OWN server (so a reviewed
-// console's API calls hit its own queenzee, not the outer one), everything else → the xell's Vite
-// dev server (which Vite serves under its base prefix). Read-only GET/HEAD/stream to a throwaway
-// per-xell dev server — the same class as opening a URL in a new tab, so it needs no gate.
-// Websockets are handled separately in index.js (attachWebappUpgrade).
-router.use('/xell-web/:slug/api', webappApiProxy);                    // the xell's own server
-router.use('/xell-web/:slug', webappProxy);                            // the xell's Vite dev server
+// ── XELL WEBAPP REVIEW — /xell-web/<slug>/* (compatibility redirect) ──────────────────────────
+// Xell webapps are reached DIRECTLY on their own port now (docs/visual-verification-diagnosis.md
+// §7): http://<console-hostname>:<host_port>/. This route survives only so old links — open
+// visual-verify offers, bookmarks, the console nginx /xell-web block — 302 onto the direct port,
+// path preserved. New URLs are minted as direct ports and never come here.
+router.use('/xell-web/:slug', webappRedirect);
