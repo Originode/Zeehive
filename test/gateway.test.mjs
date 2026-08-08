@@ -77,6 +77,13 @@ eq(usageFromStream(oaiStream, 'chat-completions')?.prompt_tokens, 7, 'openai SSE
 eq(usageFromStream(oaiStream, 'chat-completions')?.completion_tokens, 3, 'openai SSE: completion tokens');
 ok(usageFromStream('', 'messages') === null, 'empty text → null');
 ok(usageFromStream(null, 'messages') === null, 'null text → null');
+// A split event (TCP segmentation): the proxy keeps a bounded tail and parses tail+chunk, so the
+// concatenated text must recover usage that each fragment alone cannot.
+const frag1 = 'event: message_delta\ndata: {"type":"message_de';
+const frag2 = 'lta","usage":{"input_tokens":10,"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+eq(usageFromStream(frag1, 'messages'), null, 'a partial event alone → null');
+eq(usageFromStream(frag2, 'messages'), null, 'the completing fragment alone has no event header → null');
+eq(usageFromStream(frag1 + frag2, 'messages')?.input_tokens, 10, 'concatenated split event → usage recovered');
 
 // ── C. the round-trip ────────────────────────────────────────────────────────────────────────
 console.log('\n── C. record → complete → read ──');

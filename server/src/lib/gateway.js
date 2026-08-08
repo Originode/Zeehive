@@ -291,10 +291,16 @@ export async function gatewayProxy(req, res) {
     // Stream the response through. For SSE, this must be unbuffered.
     res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
     proxyRes.pipe(res);
-    // Read the upstream's final usage from the stream for the completion UPDATE.
+    // Read the upstream's final usage from the stream for the completion UPDATE. A bounded tail is
+    // kept across chunks so an SSE event SPLIT by a TCP segment (event header in one chunk, the
+    // rest in the next) is still parsed — per-chunk parsing alone silently misses a split usage
+    // event and records 0 tokens (verified with a fragmenting mock upstream).
     let usage = null;
+    let sseTail = '';
     proxyRes.on('data', (chunk) => {
-      const u = usageFromStream(chunk.toString(), upstream.kind);
+      const text = sseTail + chunk.toString();
+      sseTail = text.slice(-4096);
+      const u = usageFromStream(text, upstream.kind);
       if (u) usage = u;
     });
     proxyRes.on('end', () => {
