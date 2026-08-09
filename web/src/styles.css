@@ -2124,7 +2124,7 @@ a.cbox:hover { border-color: var(--accent); }
 .fx-crumb:disabled { opacity: .3; cursor: default; }
 .fx-cwd { flex: 1; min-width: 0; color: var(--muted); font-family: 'Cascadia Code', monospace;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
-.fx-list, .fx-file { flex: 1; min-height: 0; overflow: auto; }
+.fx-list { flex: 1; min-height: 0; overflow: auto; }
 .fx-row { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
   background: none; border: 0; color: var(--text); cursor: pointer; padding: 3px 10px;
   font-family: 'Cascadia Code', monospace; font-size: 12px; }
@@ -2136,13 +2136,43 @@ a.cbox:hover { border-color: var(--accent); }
 .fx-empty, .fx-err { padding: 10px; color: var(--muted); font-size: 12px;
   font-family: 'Cascadia Code', monospace; }
 .fx-err { color: #e5554e; white-space: pre-wrap; }
-.fx-fhead { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
-  border-bottom: 1px solid var(--line); background: var(--panel2); position: sticky; top: 0; }
-.fx-fname { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
-  flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.fx-fmeta { color: var(--muted); font-size: 11px; }
-.fx-code { margin: 0; padding: 8px 10px; font-family: 'Cascadia Code', monospace; font-size: 12px;
+
+/* ── the ROUTED FILE VIEWER (opens a file from the explorer in a modal chosen by file type) ──
+   Files no longer dump raw text into the explorer sidebar — they open in FileViewer.jsx, which
+   routes by extension (markdown → @uiw/react-markdown-preview, json → formatted, diff → the
+   dv-* row renderer, else plain text). Reuses the dv-* styles for the diff kind. */
+.fview-overlay { position: fixed; inset: 0; z-index: 96; display: flex; align-items: center;
+  justify-content: center; padding: 4vh 3vw; background: rgba(4,6,10,.66);
+  backdrop-filter: blur(3px); animation: dlg-fade .14s ease-out; }
+.fview { display: flex; flex-direction: column; width: min(1200px, 94vw); height: min(88vh, 900px);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+.fview-head { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel2); flex: 0 0 auto; }
+.fview-fname { font-family: 'Cascadia Code', monospace; font-size: 13px; font-weight: 600; color: var(--text); }
+.fview-path { font-size: 11.5px; color: var(--muted); min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.fview-meta { font-family: 'Cascadia Code', monospace; font-size: 11.5px; color: var(--muted); }
+.fview-kind { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--accent); border: 1px solid var(--line); border-radius: 8px; padding: 0 6px;
+  font-family: 'Cascadia Code', monospace; }
+.fview-spacer { flex: 1 1 auto; }
+.fview-x { background: none; border: 0; color: var(--muted); font-size: 15px; cursor: pointer;
+  padding: 0 4px; }
+.fview-x:hover { color: var(--text); }
+.fview-body { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+.fview-empty { padding: 24px; color: var(--muted); font-size: 12.5px;
+  font-family: 'Cascadia Code', monospace; }
+.fview-empty.err { color: #e5554e; white-space: pre-wrap; }
+.fview-note { padding: 6px 14px; font-size: 11.5px; color: var(--muted); }
+.fview-note.warn { color: var(--building); }
+.fview-code { margin: 0; padding: 12px 14px; font-family: 'Cascadia Code', monospace; font-size: 12px;
   color: #c9d3e0; white-space: pre; }
+.fview-diff { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; line-height: 1.45;
+  padding: 8px 0; }
+.fview-json .fview-code { color: #c9d3e0; }
+/* The markdown preview fills the body and scrolls with it. */
+.fview-body > .wmde-markdown { flex: 1 1 auto; min-height: 0; padding: 12px 16px; }
 
 /* ── "show file" path box in the explorer ── */
 .fx-go { display: flex; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
