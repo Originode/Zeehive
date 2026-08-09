@@ -58,6 +58,20 @@ DO $$ BEGIN
   );
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+-- When this file runs on a database where the sibling stage-1 set (167) created
+-- child_semantics first, the enum exists with only sequence/parallel/freeform and the
+-- CREATE TYPE above is a no-op. Bring it to the full design set here — this migration is
+-- the enum's home, and the values must be COMMITTED before 176 adds the loop/map CHECK
+-- constraints that reference them (PostgreSQL forbids using a new enum value in the same
+-- transaction that added it). On a fresh database the values already exist, so each of
+-- these is a no-op. Placing each BEFORE 'freeform' keeps the final order identical to the
+-- CREATE TYPE above on both paths.
+ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'choice' BEFORE 'freeform';
+ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'race'   BEFORE 'freeform';
+ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'map'    BEFORE 'freeform';
+ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'loop'   BEFORE 'freeform';
+ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'try'    BEFORE 'freeform';
+
 DO $$ BEGIN
   CREATE TYPE try_role AS ENUM ('body', 'catch', 'finally', 'compensate');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;

@@ -13,25 +13,29 @@
 -- CANONICAL = the WIDE shape, and convergence toward it is purely ADDITIVE: the narrow
 -- work_node gains the full column set (all of them nullable or defaulted, so existing
 -- rows are untouched), the missing CHECK constraints, the calendar FK that 166 declares
--- inline, the two GIN/btree indexes 166 adds, and the child_semantics enum gains the
--- five stage-4+/9 values the full design carries. Nothing is dropped anywhere.
+-- inline, and the two GIN/btree indexes 166 adds. Nothing is dropped anywhere.
+--
+-- (The child_semantics enum values the full design carries — choice/race/map/loop/try —
+-- are added by 165, not here: PostgreSQL forbids using a new enum value in the same
+-- transaction that added it, and the loop/map CHECK constraints below reference those
+-- values, so the ADD VALUEs must commit in 165's transaction before this file runs.)
 --
 -- This file is a NO-OP on a database that already ran 165/166 first (every object it
 -- adds already exists; ADD COLUMN IF NOT EXISTS / ADD CONSTRAINT in a duplicate_object
--- DO-block / CREATE INDEX IF NOT EXISTS / ADD VALUE IF NOT EXISTS all no-op), and it is
--- the CONVERGENCE that turns a narrow-first database into exactly the same shape — a
--- pg_dump of the two paths after this migration must be identical.
+-- DO-block / CREATE INDEX IF NOT EXISTS all no-op), and it is the CONVERGENCE that turns
+-- a narrow-first database into exactly the same shape — a pg_dump of the two paths after
+-- this migration must be identical.
 --
 -- Alignment decisions (see the reconcile card, step 1):
 --   • calendar_id — 166 declares `REFERENCES calendar(id)` inline; 172 declares a plain
 --     uuid with the FK deferred to a later stage. Aligned by ADD CONSTRAINT with the
 --     SAME name postgres would generate for the inline FK (work_node_calendar_id_fkey),
 --     so the schema dump matches the fresh path.
---   • child_semantics — 165 creates the full 8-value enum; 167 creates only
---     sequence/parallel/freeform. Aligned with ALTER TYPE ... ADD VALUE, placed BEFORE
---     'freeform' so the enum order matches the fresh path byte-for-byte. (167's narrow
---     enum exists only on the narrow-first path; ADD VALUE IF NOT EXISTS is a no-op on
---     the fresh path.)
+--   • child_semantics — 165 creates the full 8-value enum on every path (its CREATE TYPE
+--     on a narrow-first database is a no-op, so 165 also carries the ADD VALUE IF NOT
+--     EXISTS statements that complete the enum); 167 created only sequence/parallel/
+--     freeform. This file's loop/map CHECK constraints therefore reference values that
+--     were committed by 165.
 --   • dependency UNIQUE name — dependency_from_to_type_unique (166) vs the auto-generated
 --     dependency_from_id_to_id_type_key (172). Aligned with RENAME CONSTRAINT (no drop).
 --   • plan_version UNIQUE name — plan_version_plan_version_unique (165) vs
@@ -43,16 +47,6 @@
 -- Types referenced below (selection_policy, allocation_mode, try_role, expansion_state,
 -- calendar) are all created by 165, which applies before this file on BOTH paths, so no
 -- dependency is introduced on the narrow-first path.
-
--- ── child_semantics: add the five stage-4+/9 values the full design carries ────────
--- Inserted BEFORE 'freeform' so the final enum order equals 165's: sequence, parallel,
--- choice, race, map, loop, try, freeform. IF NOT EXISTS keeps this a no-op on a database
--- where 165 already created the full enum.
-ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'choice' BEFORE 'freeform';
-ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'race'   BEFORE 'freeform';
-ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'map'    BEFORE 'freeform';
-ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'loop'   BEFORE 'freeform';
-ALTER TYPE child_semantics ADD VALUE IF NOT EXISTS 'try'    BEFORE 'freeform';
 
 -- ── work_node: add every WIDE column the NARROW shape lacks ────────────────────────
 -- Entity-binding block (actions describe what they NEED, not who does it).
@@ -150,3 +144,99 @@ EXCEPTION WHEN undefined_object THEN NULL; END $$;
 DO $$ BEGIN
   ALTER TABLE plan_version RENAME CONSTRAINT plan_version_plan_id_version_key TO plan_version_plan_version_unique;
 EXCEPTION WHEN undefined_object THEN NULL; END $$;
+
+-- ── canonical function bodies (CREATE OR REPLACE — the last writer wins) ─────────────
+-- The two stage-1 sets define wn_is_atom, wn_first_leaves and wn_duration differently:
+-- 166 carries the full-design bodies (loop/map/try-aware); 173/175 carry the stage-1-only
+-- bodies. Which one survives depends on apply order — on a fresh database 173/175 run
+-- AFTER 166 and overwrite it, on a narrow-first database 166 runs AFTER 173/175 and
+-- overwrites them. This file is the LAST migration on BOTH paths, so it re-asserts the
+-- canonical (full-design) bodies and the two paths dump identically. These are the
+-- reviewed docs/hierarchical-workflow-schema.sql definitions; 166's versions verbatim
+-- (wn_is_atom uses child_semantics::text so it parses even before 165's ADD VALUEs commit).
+CREATE OR REPLACE FUNCTION wn_is_atom(p_node uuid)
+RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT kind <> 'container' OR child_semantics::text IN ('loop', 'map')
+    FROM work_node WHERE id = p_node;
+$$;
+
+CREATE OR REPLACE FUNCTION wn_first_leaves(p_node uuid)
+RETURNS TABLE (id uuid)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_sem child_semantics;
+    v_child uuid;
+BEGIN
+    IF wn_is_atom(p_node) THEN
+        RETURN QUERY SELECT p_node; RETURN;
+    END IF;
+
+    SELECT child_semantics INTO v_sem FROM work_node WHERE work_node.id = p_node;
+
+    IF v_sem = 'sequence' THEN
+        SELECT w.id INTO v_child FROM work_node w
+        WHERE w.parent_id = p_node ORDER BY w.sibling_rank LIMIT 1;
+        IF v_child IS NULL THEN RETURN QUERY SELECT p_node; RETURN; END IF;
+        RETURN QUERY SELECT * FROM wn_first_leaves(v_child);
+    ELSIF v_sem = 'try' THEN
+        FOR v_child IN
+            SELECT w.id FROM work_node w
+            WHERE w.parent_id = p_node AND w.try_role = 'body' ORDER BY w.sibling_rank
+        LOOP
+            RETURN QUERY SELECT * FROM wn_first_leaves(v_child);
+        END LOOP;
+    ELSE
+        FOR v_child IN
+            SELECT w.id FROM work_node w WHERE w.parent_id = p_node ORDER BY w.sibling_rank
+        LOOP
+            RETURN QUERY SELECT * FROM wn_first_leaves(v_child);
+        END LOOP;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION wn_duration(p_node uuid)
+RETURNS interval
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_kind node_kind; v_sem child_semantics;
+    v_est interval;   v_spec jsonb;
+    v_total interval := '0'; v_child_dur interval; v_child uuid;
+BEGIN
+    SELECT kind, child_semantics, estimate,
+           COALESCE(loop_spec, map_spec)
+      INTO v_kind, v_sem, v_est, v_spec
+    FROM work_node WHERE id = p_node;
+
+    IF v_kind <> 'container' THEN
+        RETURN COALESCE(v_est, '0'::interval);
+    END IF;
+
+    IF v_sem = 'sequence' THEN
+        SELECT COALESCE(sum(wn_duration(w.id)), '0') INTO v_total
+        FROM work_node w WHERE w.parent_id = p_node;
+    ELSIF v_sem IN ('parallel', 'map', 'try') THEN
+        SELECT COALESCE(max(wn_duration(w.id)), '0') INTO v_total
+        FROM work_node w WHERE w.parent_id = p_node;
+    ELSIF v_sem = 'choice' THEN
+        -- worst case for planning; substitute the selected branch at runtime
+        SELECT COALESCE(max(wn_duration(w.id)), '0') INTO v_total
+        FROM work_node w WHERE w.parent_id = p_node;
+    ELSIF v_sem = 'race' THEN
+        SELECT COALESCE(min(wn_duration(w.id)), '0') INTO v_total
+        FROM work_node w WHERE w.parent_id = p_node;
+    ELSIF v_sem = 'loop' THEN
+        SELECT wn_duration(w.id) INTO v_child_dur
+        FROM work_node w WHERE w.parent_id = p_node LIMIT 1;
+        v_total := COALESCE(v_child_dur, '0') *
+                   COALESCE((v_spec->>'expected_iterations')::numeric,
+                            (v_spec->>'max_iterations')::numeric, 1);
+    ELSE  -- freeform: CPM longest path is computed by the scheduler, not here
+        SELECT COALESCE(max(wn_duration(w.id)), '0') INTO v_total
+        FROM work_node w WHERE w.parent_id = p_node;
+    END IF;
+
+    RETURN v_total;
+END;
+$$;

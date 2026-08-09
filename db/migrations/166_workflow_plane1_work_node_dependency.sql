@@ -124,8 +124,20 @@ CREATE TABLE IF NOT EXISTS work_node (
 
 CREATE INDEX IF NOT EXISTS wn_parent_idx       ON work_node (parent_id, sibling_rank);
 CREATE INDEX IF NOT EXISTS wn_version_idx      ON work_node (plan_version_id);
-CREATE INDEX IF NOT EXISTS wn_capabilities_idx ON work_node USING gin (req_capabilities);
-CREATE INDEX IF NOT EXISTS wn_stable_key_idx   ON work_node (plan_version_id, stable_key);
+-- The two indexes below reference columns 172 (the sibling stage-1 set) never created on
+-- work_node. On a narrow-first database (167…175 applied before this file), those columns
+-- do not exist yet — 176 adds them — so the index is guarded: if the column is missing the
+-- CREATE raises undefined_column, which the DO-block swallows and 176's convergence brings
+-- the index in. On a fresh database (165/166 first) the columns exist and the index is
+-- created as before. 176 remains the single place convergence happens; this is only
+-- tolerance for the narrow shape.
+DO $$ BEGIN
+  CREATE INDEX IF NOT EXISTS wn_capabilities_idx ON work_node USING gin (req_capabilities);
+EXCEPTION WHEN undefined_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE INDEX IF NOT EXISTS wn_stable_key_idx   ON work_node (plan_version_id, stable_key);
+EXCEPTION WHEN undefined_column THEN NULL; END $$;
 
 -- Root nodes: exactly one per plan_version.
 CREATE UNIQUE INDEX IF NOT EXISTS wn_one_root_per_version
@@ -198,7 +210,7 @@ $$;
 CREATE OR REPLACE FUNCTION wn_is_atom(p_node uuid)
 RETURNS boolean
 LANGUAGE sql STABLE AS $$
-    SELECT kind <> 'container' OR child_semantics IN ('loop', 'map')
+    SELECT kind <> 'container' OR child_semantics::text IN ('loop', 'map')
     FROM work_node WHERE id = p_node;
 $$;
 
