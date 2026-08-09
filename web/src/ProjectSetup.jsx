@@ -1143,8 +1143,7 @@ function ManifestSection({ project, run, onProject }) {
       {planErr && <div className="projpop-err" data-testid="compose-plan-err">{planErr}</div>}
 
       {/* Advanced: compose onboarding — the automatic detect → plan → approve path. */}
-      {!repoValid && (
-        <details className="manifest-advanced" data-testid="manifest-advanced">
+      <details className="manifest-advanced" data-testid="manifest-advanced">
           <summary>Advanced — auto-detect from compose files (onboarding plan)</summary>
           <div className="setup-hint">
             Scans <span className="mono">docker-compose*.yml</span>, shows every file and meta-DB column that
@@ -1254,7 +1253,6 @@ function ManifestSection({ project, run, onProject }) {
             </div>
           )}
         </details>
-      )}
 
       <div className="setup-grid" style={{ marginTop: 8 }}>
         <label>compose_spinoff <span className="pc">(meta-DB)</span>
