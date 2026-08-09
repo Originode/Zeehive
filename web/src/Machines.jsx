@@ -36,6 +36,34 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
   const machinePoolingDisabled = ms.some((m) => m.enabled && m.dev_priority > 0) && !!spinoffIsProcess;
   const disabledMachines = ms.filter((m) => m.enabled && m.dev_priority > 0).map((m) => m.key);
 
+  // The warning's "I don't want machine placement" exit: this project runs as bare processes, so
+  // the per-machine pool/priority rows it has can never take effect. Zero them (both knobs — a
+  // pool_size left >0 is read nowhere once dev_priority is 0) so the dead config stops tripping the
+  // warning everywhere: this banner, the server's pool logline, and any future matrix render. An
+  // operator who DOES want machine placement ignores the button and follows the compose-runner path
+  // the warning text names. Uses the same per-(machine,project) writers the knobs themselves call.
+  const [clearing, setClearing] = useState(false);
+  const clearDeadPooling = async () => {
+    const names = disabledMachines.join(', ');
+    if (!(await showConfirm(
+      `Clear per-machine pooling for this project on: ${names}?\n\n`
+      + `This project's spinoff server is runner:process, so these machines' dev_priority and pool_size `
+      + `for THIS project are a dead letter — the pool always takes the project-wide target. Clearing `
+      + `sets both to 0 here and silences this warning. The machines themselves are untouched, and no `
+      + `other project's settings change.`,
+      { okLabel: 'Clear per-machine pooling' }))) return;
+    setClearing(true);
+    try {
+      for (const m of ms) {
+        if (!m.enabled || m.dev_priority <= 0) continue;
+        if (m.pool_size > 0) await setMachinePool(m.id, projectId, 0);
+        await setMachinePriority(m.id, projectId, 0);
+      }
+      onChanged?.();
+    } catch (e) { fail('Clear per-machine pooling')(e); }
+    finally { setClearing(false); }
+  };
+
   // Where a container lives, for column placement: its own run context — or, for a PROCESS role
   // (docker_ctx NULL, probed by URL: the self-shipped queenzee), its deploy site's context. A
   // process on machine 'local' belongs in local's column, not in limbo.
@@ -86,12 +114,19 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
           project from the other. */}
       {machinePoolingDisabled && (
         <div className="mx-warn" data-testid="mx-pooling-disabled">
-          ⚠ Machine-aware pooling is DISABLED: {disabledMachines.join(', ')} is configured for this
-          project (dev_priority&gt;0) but the spinoff server is <span className="mono">runner:process</span>
-          {' '}— per-machine pool sizes and priorities have no effect (process roles get no
-          docker_ctx, so the ready count is zero by construction). The project-wide pool target
-          applies. To place on machines, give the server a compose runner and a spinoff compose
-          file in <span className="mono">zeehive.yml</span>, then refresh the manifest.
+          <span>
+            ⚠ Machine-aware pooling is DISABLED: {disabledMachines.join(', ')} is configured for this
+            project (dev_priority&gt;0) but the spinoff server is <span className="mono">runner:process</span>
+            {' '}— per-machine pool sizes and priorities have no effect (process roles get no
+            docker_ctx, so the ready count is zero by construction). The project-wide pool target
+            applies. To place on machines, give the server a compose runner and a spinoff compose
+            file in <span className="mono">zeehive.yml</span>, then refresh the manifest — or, to
+            keep the project-wide pool, clear per-machine pooling on the right.
+          </span>
+          <button className="mx-warn-clear" data-testid="mx-pooling-clear" disabled={clearing}
+                  onClick={clearDeadPooling} title="Zero dev_priority and pool_size on the named machines for THIS project — removes the dead config and this warning">
+            {clearing ? 'clearing…' : '✕ clear per-machine pooling'}
+          </button>
         </div>
       )}
       {/* header row */}
