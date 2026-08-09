@@ -127,9 +127,15 @@ export function usageFromStream(text = '', kind = 'messages') {
   }
   // Any other `data: {…}` SSE carrying a usage object — the xAI Responses API (grok, which routes
   // through /responses and reports usage as input_tokens/output_tokens in its completed event), and
-  // any future Anthropic-dialect variant. Same shape as the chat-completions branch.
+  // any future Anthropic-dialect variant. The xAI Responses API nests usage under `response.usage`
+  // (its completed event carries the WHOLE response object), so BOTH the flat and the nested shape
+  // are checked — a top-level-only check is how grok tokens would read 0 after decompression.
   for (const m of text.matchAll(/data: (\{.*\})/g)) {
-    try { const j = JSON.parse(m[1]); if (j.usage) return j.usage; } catch { /* partial */ }
+    try {
+      const j = JSON.parse(m[1]);
+      if (j.usage) return j.usage;
+      if (j.response?.usage) return j.response.usage;
+    } catch { /* partial */ }
   }
   // A non-SSE JSON body (a single message response).
   if (!text.includes('event:') && !text.includes('data: {')) {
@@ -138,9 +144,24 @@ export function usageFromStream(text = '', kind = 'messages') {
   return null;
 }
 
-// Look up a model's $/1M token prices from ai_model_spec (migration 163). Returns null when
-// the provider/model is unknown, the spec query fails (a DB predating the price columns), or
-// the model has no price rows. The prices are per MILLION tokens (mtok) — costOf divides by 1e6.
+// The model id from a response body/SSE text — used when the REQUEST carried no model (grok's
+// CLI omits it; the ledger then recorded model NULL, and those rows can never price). Every
+// dialect names the model in its first response object: Anthropic message_start carries
+// `message.model`, OpenAI's first chunk carries `model`, and the xAI Responses API completed
+// event carries `model`. Grep the FIRST `"model"` key. Pure so the capture is testable.
+export function modelFromStream(text = '') {
+  if (!text) return null;
+  const m = /"model"\s*:\s*"([^"]+)"/.exec(text);
+  return m ? m[1] : null;
+}
+
+// Look up a model's $/1M token prices from ai_model_spec (migration 163). The ledger records the
+// WIRE id the CLI sent (claude-opus-5); the spec row is keyed by the SHORT alias (opus) and lists
+// its known wire ids in wire_ids (migration 164 — GROUND TRUTH, an explicit per-id alias, never a
+// regex/strip: an id absent from the list is UNPRICED, not guessed, so a repriced claude-opus-6 is
+// loud instead of silently priced at the opus-5 row). Matches key OR wire_ids. Returns null when
+// the provider/model is unknown, the spec query fails (a DB predating the price columns), or the
+// model has no price rows. The prices are per MILLION tokens (mtok) — costOf divides by 1e6.
 const asNum = (v) => (v == null ? null : Number(v));
 export async function modelPrice(provider, model) {
   if (!provider || !model) return null;
@@ -148,7 +169,8 @@ export async function modelPrice(provider, model) {
     `SELECT key, label,
             input_price_per_mtok, output_price_per_mtok,
             cache_read_price_per_mtok, cache_write_price_per_mtok
-       FROM ai_model_spec WHERE provider=$1 AND key=$2 AND enabled`, [provider, model])
+       FROM ai_model_spec
+      WHERE provider=$1 AND enabled AND (key=$2 OR $2 = ANY(wire_ids))`, [provider, model])
     .catch(() => null);
   if (!spec) return null;
   return {
@@ -234,6 +256,9 @@ export async function recordRequest({ xell, zeeId = null, turnId = null, kind, p
 }
 
 // Complete a recorded request with the upstream's verdict. Never throws. Exported for the test.
+// `fields.meta` is MERGED into the row's existing meta jsonb (used to flag unpriced models);
+// `fields.model` UPDATES the model column when non-null (used when the model was only found in
+// the response, not the request). Neither is required — existing callers pass neither.
 export async function completeRequest(rowId, fields) {
   if (!rowId) return;
   try {
@@ -241,15 +266,28 @@ export async function completeRequest(rowId, fields) {
       `UPDATE llm_gateway_request
           SET status=$2, input_tokens=$3, output_tokens=$4, cache_read_tokens=$5,
               cache_write_tokens=$6, total_tokens=$7, cost_usd=$8, duration_ms=$9,
-              error=$10, completed_at=now()
+              error=$10, model=COALESCE($11, model), meta = meta || $12::jsonb,
+              completed_at=now()
         WHERE id=$1`,
       [rowId, fields.status ?? null,
        fields.input || 0, fields.output || 0, fields.cacheRead || 0, fields.cacheWrite || 0,
        (fields.input || 0) + (fields.output || 0) + (fields.cacheRead || 0) + (fields.cacheWrite || 0),
-       fields.cost ?? 0, fields.durationMs ?? null, fields.error ?? null]);
+       fields.cost ?? 0, fields.durationMs ?? null, fields.error ?? null,
+       fields.model ?? null, JSON.stringify(fields.meta || {})]);
   } catch (e) {
     logline('gateway', `could not complete gateway request ${String(rowId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
   }
+}
+
+// An unpriced model is LOUD, not silent: the first row whose tokens are nonzero but whose model
+// has no ai_model_spec price logs (provider, model) ONCE per process and flags the row in meta
+// (completeRequest) — so the next mismatch is visible in the ledger instead of a believable $0.
+const seenUnpriced = new Set();
+export function logUnpriced(provider, model) {
+  const key = `${provider}|${model}`;
+  if (seenUnpriced.has(key)) return;
+  seenUnpriced.add(key);
+  logline('gateway', `no ai_model_spec price for ${provider}/${model} — cost recorded 0 (see meta.unpriced)`);
 }
 
 // ── the proxy ─────────────────────────────────────────────────────────────────────────────────
@@ -485,10 +523,29 @@ export async function gatewayProxy(req, res) {
       finished = true;
       if (captureOn && !respTruncated) respText += decoder.end();
       const u = normalizeUsage(usage, upstream.kind);
-      const price = await pricePromise;
+      // The model may exist in the RESPONSE when the request did not carry one (grok's CLI omits
+      // it — the ledger then recorded model NULL, which can never price). Extract it and price
+      // against it; the row's model column is updated to match. Nothing else re-runs: a response
+      // model found here changes the price lookup, never the request facts.
+      let m = model;
+      let price = await pricePromise;
+      if (!m && respText) m = modelFromStream(respText);
+      if (m && m !== model) price = await modelPrice(upstream.provider, m).catch(() => null);
+      // An unpriced model is LOUD, not silent: tokens moved, no spec price AND no upstream cost,
+      // so cost is a believable $0. Log it once and flag the row so the ledger shows why. When the
+      // upstream reported its own cost, the row is priced — no flag, no noise.
+      const upstreamCost = usage?.total_cost_usd ?? null;
+      const hasTokens = (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) > 0;
+      let metaPatch = null;
+      if (hasTokens && upstreamCost == null && !price) {
+        logUnpriced(upstream.provider, m);
+        metaPatch = { unpriced: { provider: upstream.provider, model: m } };
+      }
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
-        cost: costOf({ upstreamCost: usage?.total_cost_usd ?? null, price, usage: u }),
+        cost: costOf({ upstreamCost, price, usage: u }),
+        model: (m && m !== model) ? m : undefined,
+        meta: metaPatch || undefined,
       });
       if (captureOn) {
         const resp = scrubBodyText(respText, { secretValues });
@@ -559,9 +616,9 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 }
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
-                 normalizeUsage, usageFromStream, modelPrice, costOf, providerUpstreamUrl,
-                 joinUpstreamPath, parseGatewayPath, recordRequest, completeRequest, gatewayEnv,
-                 zeeTurnForXell };
+                 normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
+                 providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
+                 completeRequest, gatewayEnv, zeeTurnForXell };
 
 // ── the cxell-facing env ──────────────────────────────────────────────────────────────────────
 // The base URL every cxell CLI points at the gateway, per provider, carrying the xell's identity
