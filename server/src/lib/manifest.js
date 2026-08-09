@@ -293,7 +293,7 @@ export function draftManifest(repoRoot, projectName) {
 // no compose files at all (the "generic yaml that does nothing" complaint: the old draft
 // was empty unless compose files existed).
 const KNOB_TIERS = ['dev', 'spinoff', 'prod'];
-const KNOB_ROLES = [['server', 'server'], ['webapp', 'webapp'], ['db', 'db']];
+const KNOB_ROLES = ['server', 'webapp', 'db'];
 
 export function buildManifestFromKnobs(projectName, knobs = {}) {
   const p = sanitizeName(projectName);
@@ -316,7 +316,7 @@ export function buildManifestFromKnobs(projectName, knobs = {}) {
     if (Object.keys(ports).length) tiers.spinoff.ports = ports;
   }
   const roles = {};
-  for (const [role] of KNOB_ROLES) {
+  for (const role of KNOB_ROLES) {
     const svc = String(knobs?.roles?.[role]?.service || '').trim();
     if (svc) roles[role] = { service: svc };
   }
