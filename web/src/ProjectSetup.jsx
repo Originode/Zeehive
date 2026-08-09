@@ -837,6 +837,9 @@ function ManifestSection({ project, run, onProject }) {
   const [writeYml, setWriteYml] = useState(true);
   const [applyMeta, setApplyMeta] = useState(true);
   const [planErr, setPlanErr] = useState(null);
+  // 'create' = no manifest yet; 'regenerate' = an INVALID manifest is being rebuilt (write
+  // passes overwrite:true). The wizard itself is identical; only the intro + write differ.
+  const [mode, setMode] = useState('create');
 
   const loadInfo = useCallback(() => {
     getProjectManifestInfo(project.id).then(setInfo).catch(() => {});
@@ -846,6 +849,7 @@ function ManifestSection({ project, run, onProject }) {
   const repo = info?.repo;
   const repoFound = repo?.found === true;
   const repoValid = repoFound && !(repo.errors || []).length;
+  const regenerating = mode === 'regenerate';
 
   // Seed the wizard's compose-file scan once, so the form can offer detected files and
   // role guesses. Only meaningful when there's no manifest yet (the wizard is hidden otherwise).
@@ -860,8 +864,8 @@ function ManifestSection({ project, run, onProject }) {
     }).catch(() => {});
   }, [project.id, project]);
   useEffect(() => {
-    if (info && !repoFound) loadSuggest();
-  }, [info, repoFound, loadSuggest]);
+    if (info && !repoValid) loadSuggest();
+  }, [info, repoValid, loadSuggest]);
 
   // Wrap a wizard mutation: local busy for button disabling, surface errors inline (the parent
   // `run` helper only covers the section-level buttons, not the wizard's), then re-read state.
@@ -950,15 +954,19 @@ function ManifestSection({ project, run, onProject }) {
 
   const writeDraft = async () => {
     if (!(await showConfirm(
-      `Create zeehive.yml in ${project.repo_root}?\n\n`
-      + 'This is the ONE file ZEEHIVE writes into a project repo. It will be refused if a valid one '
-      + 'already exists. After it is written you still need to commit it in the repo.\n\n'
+      `${regenerating ? 'Replace' : 'Create'} zeehive.yml in ${project.repo_root}?\n\n`
+      + 'This is the ONE file ZEEHIVE writes into a project repo. '
+      + (regenerating
+        ? 'The current file is invalid and WILL be overwritten.'
+        : 'It will be refused if a valid one already exists. ')
+      + 'After it is written you still need to commit it in the repo.\n\n'
       + 'The meta-DB project row is updated to match (compose files, ports, roles). '
       + 'Production containers are not touched.',
-      { okLabel: 'Create zeehive.yml', title: 'Write manifest to repo' }))) return;
+      { okLabel: regenerating ? 'Replace zeehive.yml' : 'Create zeehive.yml', title: 'Write manifest to repo' }))) return;
     await wizard(async () => {
-      const p = await writeProjectManifest(project.id, { yaml: editableYaml, apply_meta: true });
+      const p = await writeProjectManifest(project.id, { yaml: editableYaml, apply_meta: true, overwrite: regenerating });
       onProject(p);
+      setMode('create');
       setStep('idle');
       setStatusMsg('✓ zeehive.yml created and applied to the meta-DB. Commit it in the repo, then come back any time to ↻ Re-read it.');
     });
@@ -992,7 +1000,7 @@ function ManifestSection({ project, run, onProject }) {
           </div>
           {statusMsg && <div className="manifest-msg" data-testid="manifest-msg">{statusMsg}</div>}
         </>
-      ) : repoFound ? (
+      ) : (repoFound && !regenerating) ? (
         <>
           <div className="gates"><span className="gate g-fail">✗ {repo.file} INVALID</span></div>
           <div className="projpop-err" data-testid="manifest-invalid-err">
@@ -1000,16 +1008,29 @@ function ManifestSection({ project, run, onProject }) {
           </div>
           <div className="setup-row">
             <button type="button" onClick={refresh}>↻ Re-read from repo</button>
-            <span className="setup-hint" style={{ margin: 0 }}>Fix the file in the repo, then re-read here.</span>
+            <button type="button" className="ghost" onClick={() => { setMode('regenerate'); setStep('knobs'); setWizardErr(null); }}
+                    title="Rebuild zeehive.yml from the form — the generated file replaces the invalid one">Regenerate from the form</button>
+            <span className="setup-hint" style={{ margin: 0 }}>Fix the file in the repo, or rebuild it from the form.</span>
           </div>
         </>
       ) : (
         <>
-          {/* ── the "no manifest yet" wizard ─────────────────────────────── */}
+          {/* ── the "no manifest yet" wizard (also shown when regenerating an INVALID manifest) ── */}
           <p className="setup-hint">
-            No <span className="mono">zeehive.yml</span> yet — the project is running on form defaults.
-            Build one in two steps: describe the shape, review the generated file, then write it to the repo.
+            {regenerating ? (
+              <>Your <span className="mono">zeehive.yml</span> is invalid. Rebuild it in two steps — the generated
+              file will <b>replace</b> the broken one.</>
+            ) : (
+              <>No <span className="mono">zeehive.yml</span> yet — the project is running on form defaults.
+              Build one in two steps: describe the shape, review the generated file, then write it to the repo.</>
+            )}
           </p>
+          {regenerating && (
+            <div className="setup-row" style={{ margin: '0 0 6px' }}>
+              <button type="button" className="ghost" onClick={() => { setMode('create'); setStep('idle'); setWizardErr(null); }}
+                      disabled={localBusy}>← Cancel — keep the invalid file</button>
+            </div>
+          )}
 
           {suggest?.files?.length > 0 && (
             <div className="manifest-detect">

@@ -98,6 +98,12 @@ try {
 
   console.log('\n── an INVALID manifest can be replaced with overwrite:true ──');
   writeFileSync(join(dir, 'zeehive.yml'), 'version: 9\nnot: valid\n');
+  // The regenerate wizard still builds a preview over an INVALID manifest (build only refuses a
+  // valid one) — that is how the console recovers a broken file.
+  r = await fetchJSON(`${BASE}/projects/${projId}/manifest/build`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ knobs }),
+  });
+  ok(r.status === 200 && !!r.data?.yaml, `build still works over an INVALID manifest (${r.status})`);
   r = await fetchJSON(`${BASE}/projects/${projId}/manifest/write`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: preview, overwrite: true }),
   });
