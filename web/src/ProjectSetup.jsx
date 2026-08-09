@@ -831,6 +831,7 @@ function ManifestSection({ project, run, onProject }) {
   const [step, setStep] = useState('idle');       // idle | knobs | preview (wizard states)
   const [editableYaml, setEditableYaml] = useState('');
   const [localBusy, setLocalBusy] = useState(false);
+  const [wizardErr, setWizardErr] = useState(null);
   const [statusMsg, setStatusMsg] = useState(null);
   const [plan, setPlan] = useState(null);
   const [writeYml, setWriteYml] = useState(true);
@@ -862,10 +863,12 @@ function ManifestSection({ project, run, onProject }) {
     if (info && !repoFound) loadSuggest();
   }, [info, repoFound, loadSuggest]);
 
-  // Wrap a wizard mutation: local busy for button disabling, then re-read the manifest state.
+  // Wrap a wizard mutation: local busy for button disabling, surface errors inline (the parent
+  // `run` helper only covers the section-level buttons, not the wizard's), then re-read state.
   const wizard = async (fn) => {
-    setLocalBusy(true); setStatusMsg(null);
+    setLocalBusy(true); setWizardErr(null); setStatusMsg(null);
     try { const r = await fn(); loadInfo(); return r; }
+    catch (e) { setWizardErr(e.message || String(e)); throw e; }
     finally { setLocalBusy(false); }
   };
 
@@ -1026,13 +1029,14 @@ function ManifestSection({ project, run, onProject }) {
                 </div>
               </div>
               <textarea className="setup-draft manifest-editor" value={editableYaml} rows={16}
-                        onChange={(e) => setEditableYaml(e.target.value)} spellCheck={false} />
+                        onChange={(e) => { setEditableYaml(e.target.value); setWizardErr(null); }} spellCheck={false} />
               <div className="setup-row">
-                <button type="button" className="ghost" onClick={() => setStep('knobs')} disabled={localBusy}>← Back to step 1</button>
+                <button type="button" className="ghost" onClick={() => { setStep('knobs'); setWizardErr(null); }} disabled={localBusy}>← Back to step 1</button>
                 <button type="button" data-testid="manifest-write-btn" onClick={writeDraft} disabled={localBusy}>
                   Write zeehive.yml to repo + apply…
                 </button>
               </div>
+              {wizardErr && <div className="projpop-err" data-testid="manifest-write-err">{wizardErr}</div>}
             </div>
           ) : (
             <div className="manifest-step" data-testid="manifest-knobs">
@@ -1107,6 +1111,7 @@ function ManifestSection({ project, run, onProject }) {
                 </button>
                 {statusMsg && <span className="manifest-msg">{statusMsg}</span>}
               </div>
+              {wizardErr && <div className="projpop-err" data-testid="manifest-preview-err">{wizardErr}</div>}
             </div>
           )}
 
