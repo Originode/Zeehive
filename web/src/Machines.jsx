@@ -120,7 +120,8 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
             {' '}— per-machine pool sizes and priorities have no effect (process roles get no
             docker_ctx, so the ready count is zero by construction). The project-wide pool target
             applies. To place on machines, give the server a compose runner and a spinoff compose
-            file in <span className="mono">zeehive.yml</span>, then refresh the manifest.
+            file in <span className="mono">zeehive.yml</span>, then refresh the manifest — or, to
+            keep the project-wide pool, clear per-machine pooling on the right.
           </span>
           <button className="mx-warn-clear" data-testid="mx-pooling-clear" disabled={clearing}
                   onClick={clearDeadPooling} title="Zero dev_priority and pool_size on the named machines for THIS project — removes the dead config and this warning">

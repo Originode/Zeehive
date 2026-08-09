@@ -61,6 +61,7 @@ try {
   ok(/runner:process/.test(warned), '…and the process-runner reason');
   ok(/mx-pooling-clear/.test(warned), '…and offers the "clear per-machine pooling" exit (data-testid=mx-pooling-clear)');
   ok(/clear per-machine pooling/.test(warned), '…whose label says what it does');
+  ok(/keep the project-wide pool/.test(warned), '…and the text names BOTH exits: the compose-runner path and the clear-to-keep-project-wide-pool path');
 
   console.log('\n── compose project (no process runner) with the SAME machines ──');
   const placeable = render({ machines, spinoffIsProcess: false });
