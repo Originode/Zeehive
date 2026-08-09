@@ -40,6 +40,7 @@ import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
          getProjectManifest, refreshProjectManifest, draftProjectManifest,
+         buildManifestDraft, writeProjectManifest,
          getComposeOnboardingPlan, applyComposeOnboarding,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
          cloneProject, pullProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
@@ -792,6 +793,24 @@ router.post('/projects/:id/manifest/refresh', async (req, res) => {
 router.post('/projects/:id/manifest/draft', async (req, res) => {
   try { res.json(await draftProjectManifest(await resolveProjectParam(req.params.id), { write: req.body?.write === true })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// The "no manifest yet" wizard: build a zeehive.yml PREVIEW from console form values (knobs),
+// without writing anything. The human reviews/edits the YAML, then POSTs it to …/manifest/write.
+router.post('/projects/:id/manifest/build', async (req, res) => {
+  try { res.json(await buildManifestDraft(await resolveProjectParam(req.params.id), req.body?.knobs || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Write the human-approved zeehive.yml into the repo root and apply it to the meta-DB row.
+// Refused when a valid manifest already exists (the repo file is the truth); the human edits
+// that file and ↻ Refreshes instead.
+router.post('/projects/:id/manifest/write', async (req, res) => {
+  try {
+    res.json(await writeProjectManifest(await resolveProjectParam(req.params.id), {
+      yaml: req.body?.yaml,
+      apply_meta: req.body?.apply_meta !== false,
+      overwrite: req.body?.overwrite === true,
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Compose onboarding — detect docker-compose*.yml, propose meta-DB (+ optional yml) changes,
 // apply only after the human approves. Production container rows are never written.

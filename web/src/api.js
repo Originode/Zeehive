@@ -504,6 +504,10 @@ export const deleteSharedContainer = (id, force = false) => siteCall(`/api/conta
 export const getProjectManifestInfo = (projectId) => fetch(`/api/projects/${projectId}/manifest`).then((r) => r.json());
 export const refreshProjectManifest = (projectId) => siteCall(`/api/projects/${projectId}/manifest/refresh`, 'POST');
 export const draftProjectManifest = (projectId, write = false) => siteCall(`/api/projects/${projectId}/manifest/draft`, 'POST', { write });
+// The "no manifest yet" wizard: build a yml PREVIEW from console form values (no write), then
+// write the human-approved text to the repo root and apply it to the meta-DB row.
+export const buildProjectManifest = (projectId, knobs) => siteCall(`/api/projects/${projectId}/manifest/build`, 'POST', { knobs });
+export const writeProjectManifest = (projectId, body = {}) => siteCall(`/api/projects/${projectId}/manifest/write`, 'POST', body);
 // Compose onboarding: plan is read-only; apply refuses without approved:true (server-enforced).
 export const getComposeOnboardingPlan = (projectId) =>
   fetch(`/api/projects/${projectId}/manifest/compose-plan`).then(async (r) => {

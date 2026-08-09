@@ -17,8 +17,9 @@ import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
          remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
-import { loadManifest, projectDefaultsFromManifest, draftManifest, planComposeOnboarding,
-         manifestHash, parseManifest } from './manifest.js';
+import { loadManifest, projectDefaultsFromManifest, draftManifest, draftManifestFromKnobs,
+         planComposeOnboarding, manifestHash, parseManifest, listComposeFiles,
+         detectComposeSuggestions } from './manifest.js';
 import { resolveSite } from './sites.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, nudge, harness, reaper,
@@ -696,6 +697,68 @@ export async function draftProjectManifest(id, { write = false } = {}) {
     writeFileSync(resolve(String(p.repo_root).replace(/\\/g, '/'), 'zeehive.yml'), draft);
   }
   return { draft, written: !!write, already_has: existing.found || false };
+}
+
+// The knob-driven draft (the "no manifest yet" wizard): the console's form values become a
+// zeehive.yml PREVIEW without writing anything. The human reviews/edits the YAML, then calls
+// writeProjectManifest with the final text.
+export async function buildManifestDraft(id, knobs = {}) {
+  const p = await one(`SELECT id, name, repo_root FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  const existing = loadManifest(p.repo_root);
+  if (existing.found && !existing.errors.length) {
+    throw new Error(`${existing.file} already exists — this project already has a manifest; `
+      + 'edit the file in the repo and ↻ Refresh from repo instead');
+  }
+  const { manifest, yaml } = draftManifestFromKnobs(p.name, knobs);
+  return {
+    yaml,
+    manifest,
+    already_has: existing.found || false,
+    compose_files: listComposeFiles(p.repo_root),
+    suggestions: detectComposeSuggestions(p.repo_root),
+  };
+}
+
+// Write a zeehive.yml the human built in the wizard (or hand-edited) into the repo root, and
+// apply its declared fields to the meta-DB row — the same projection refreshProjectManifest
+// performs, in the same function that already owns the ONE file ZEEHIVE may write into a
+// project repo. Refused when a valid manifest already exists (the repo file is the truth);
+// `overwrite` is only honoured when the existing file is INVALID (parse errors) — a human
+// replacing a broken file, never a clobber of a working one.
+export async function writeProjectManifest(id, { yaml, apply_meta = true, overwrite = false } = {}) {
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  const text = String(yaml || '').trim();
+  if (!text) throw new Error('manifest YAML is required');
+  const dir = String(p.repo_root).replace(/\\/g, '/');
+  const existing = loadManifest(dir);
+  if (existing.found && !existing.errors.length && !overwrite) {
+    throw new Error(`${existing.file} already exists — edit it in the repo and ↻ Refresh from repo instead`);
+  }
+  const parsed = parseManifest(text, { dir });
+  if (parsed.errors?.length) {
+    throw new Error(`invalid zeehive.yml: ${parsed.errors.join('; ')}`);
+  }
+  const target = resolve(dir, existing.file || 'zeehive.yml');
+  writeFileSync(target, text);
+
+  let updated = p;
+  if (apply_meta) {
+    const md = projectDefaultsFromManifest(parsed.manifest);
+    const sets = ['manifest = $2', 'manifest_hash = $3', 'manifest_at = now()'];
+    const vals = [id, JSON.stringify(parsed.manifest), manifestHash(text)];
+    for (const [k, v] of Object.entries(md)) {
+      if (v === undefined || v === null) continue;
+      vals.push(v);
+      sets.push(`${k} = $${vals.length}`);
+    }
+    updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, vals);
+    broadcast('project', updated);
+  }
+  logline('projects', `wrote ${existing.file || 'zeehive.yml'} + applied manifest for ${p.name}`
+    + (apply_meta ? '' : ' (meta-DB skipped)'));
+  return { ...updated, written: true, file: existing.file || 'zeehive.yml', applied_meta: apply_meta };
 }
 
 // ── compose onboarding: detect compose files → plan → human approves → apply ─
