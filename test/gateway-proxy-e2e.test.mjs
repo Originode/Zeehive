@@ -27,6 +27,11 @@
 //      it to identity upstream, and the mock STILL gzips. Both dialects (messages + chat-completions)
 //      must record NONZERO tokens AND cost from the decompressed stream, and the accept-encoding
 //      override must reach the upstream.
+//   G. GROK response-model capture — the request omits the model (grok's CLI does), the RESPONSE
+//      carries grok-4.5; the gateway must capture it into the row (model no longer NULL) and price
+//      it (grok-4.5 has a spec price → cost > 0). grok's upstream is mockable via GROK_XAI_API_BASE_URL.
+//   H. An UNKNOWN model is LOUD, not a believable $0: tokens record but no spec price exists, so
+//      cost stays 0 AND meta.unpriced names the model — the note that announces a future mismatch.
 import http from 'node:http';
 import zlib from 'node:zlib';
 import { randomUUID } from 'node:crypto';
@@ -104,6 +109,30 @@ function startGzipMockUpstream() {
   });
 }
 
+// A mock for the xAI RESPONSES API (grok): answers /responses with an Anthropic-shaped SSE whose
+// completed event carries BOTH the model and the usage — exactly what the real grok CLI gets. The
+// mock's request bodies are echoed into the usage/model so the test can drive the request/response
+// split (a request that omits the model → the model comes from the response).
+function startGrokMockUpstream({ model = 'grok-4.5' } = {}) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => body += c);
+    req.on('end', () => {
+      const rec = { method: req.method, url: req.url, auth: req.headers.authorization || null };
+      seen.push(rec);
+      const sse = `event: response.created\ndata: {"type":"response.created","response":{"id":"rsp_1","model":"${model}"}}\n\n`
+        + `event: response.completed\ndata: {"type":"response.completed","response":{"id":"rsp_1","model":"${model}","usage":{"input_tokens":12,"output_tokens":7}}}\n\n`;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write(sse);
+      res.end();
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({ server, seen, port: server.address().port }));
+  });
+}
+
 // A throwaway project + xell + provider token. Returns the fixture ids + the xell's identity token.
 async function makeFixture(provider, token) {
   const name = `gw-proxy-${provider}-` + randomUUID().slice(0, 8);
@@ -160,6 +189,7 @@ process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
 // to api.anthropic.com (main), and setting ANTHROPIC_BASE_URL would be a no-op for it.
 
 const fixtures = [];
+let gkMock = null;   // section G — a grok /responses upstream (closed in the finally)
 try {
   // The Anthropic-dialect section runs through the DEEPSEEK provider, not claude: providerUpstreamUrl
   // deliberately hard-codes claude to api.anthropic.com (main), so a claude call cannot be pointed
@@ -343,6 +373,54 @@ try {
   process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
   process.env.OPENAI_BASE_URL = `http://127.0.0.1:${mock.port}/v1`;
 
+  console.log('\n── G. grok — the model comes from the RESPONSE, not the request ──');
+  // grok's CLI omits the model from the request (4 of 6 prod grok rows carry model NULL — those
+  // rows can never price). The gateway must capture the model the RESPONSE names, update the row,
+  // and price it. grok's upstream IS mockable via GROK_XAI_API_BASE_URL (unlike claude).
+  gkMock = await startGrokMockUpstream();
+  process.env.GROK_XAI_API_BASE_URL = `http://127.0.0.1:${gkMock.port}`;
+  const fxGk = await makeFixture('grok', 'xai-grokmocktoken1234567890');
+  fixtures.push(fxGk);
+  const gkRes = await fetch(`http://127.0.0.1:${gw.port}/x/${fxGk.xellToken}/grok/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer xai-grokmocktoken1234567890' },
+    body: JSON.stringify({ input: 'hi', max_output_tokens: 10 }),   // NO model field — grok's shape
+  });
+  const gkBody = await gkRes.text();
+  ok(gkRes.status === 200, 'grok /responses forwarded with 200');
+  ok(gkBody.includes('response.completed'), 'the grok SSE passes through');
+  ok(gkMock.seen.at(-1)?.url === '/responses', 'the grok upstream received /responses');
+  ok(gkMock.seen.at(-1)?.auth?.includes('xai-grokmocktoken1234567890'), 'the grok upstream got the XAI key');
+  const gkRow = await completedRow(fxGk.xellId);
+  eq(gkRow?.provider, 'grok', 'provider is grok');
+  eq(gkRow?.model, 'grok-4.5', 'the model is captured from the RESPONSE (the request had none) — no longer NULL');
+  eq(Number(gkRow?.input_tokens), 12, 'grok input tokens (from the nested response.usage)');
+  eq(Number(gkRow?.output_tokens), 7, 'grok output tokens');
+  eq(Number(gkRow?.total_tokens), 19, 'grok total tokens');
+  ok(Number(gkRow?.cost_usd) > 0, `grok cost is nonzero — the captured model priced against grok-4.5 (got ${Number(gkRow?.cost_usd)})`);
+  ok(Number(gkRow?.cost_usd) > 0.0001 && Number(gkRow?.cost_usd) < 0.0002,
+    `grok cost = 12×3 + 7×15 per mtok = 1.41e-4 (got ${Number(gkRow?.cost_usd)})`);
+
+  console.log('\n── H. an UNKNOWN model is loud, not a believable $0 ──');
+  // tokens move but no spec price exists AND the upstream reports no cost → cost stays 0 AND the
+  // row records meta.unpriced, so a future mismatch announces itself instead of reading as $0.
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${gzMock.port}`;
+  const fxUnk = await makeFixture('deepseek', 'sk-mockdeepseek123456789');
+  fixtures.push(fxUnk);
+  const unkRes = await fetch(`http://127.0.0.1:${gw.port}/x/${fxUnk.xellToken}/deepseek/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockdeepseek123456789' },
+    body: JSON.stringify({ model: 'no-such-model-xyz', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  ok(unkRes.status === 200, 'an unknown model still streams 200');
+  const unkRow = await completedRow(fxUnk.xellId);
+  eq(Number(unkRow?.total_tokens), 18, 'tokens still record for an unknown model');
+  eq(Number(unkRow?.cost_usd), 0, 'cost stays 0 — never a wrong estimate');
+  eq(unkRow?.meta?.unpriced?.model, 'no-such-model-xyz', 'the row says WHY it is unpriced (meta.unpriced)');
+  eq(unkRow?.meta?.unpriced?.provider, 'deepseek', 'meta.unpriced names the provider');
+  // Point deepseek back at the plain mock for the remaining sections.
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
+
   console.log('\n── F. per-project switch OFF → the proxy stores no bodies ──');
   // Section D pointed DEEPSEEK_ANTHROPIC_BASE_URL at a DEAD port — point it back at the mock.
   process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
@@ -372,6 +450,7 @@ try {
   gw.server.close();
   mock.server.close();
   if (typeof gzMock !== 'undefined' && gzMock.server) gzMock.server.close();
+  if (typeof gkMock !== 'undefined' && gkMock.server) gkMock.server.close();
   await pool.end();
 }
 process.exit(fail ? 1 : 0);
