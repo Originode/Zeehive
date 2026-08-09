@@ -196,6 +196,30 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .compose-plan-check { display: flex; align-items: center; gap: 8px; font-size: 12px;
   margin: 4px 0; color: var(--text); cursor: pointer; }
 .compose-plan-check .mono { font-family: 'Cascadia Code', monospace; font-size: 11px; }
+/* Manifest wizard — the "no zeehive.yml yet" two-step flow + the existing-manifest digest */
+.manifest-msg { color: var(--up, #35c46b); font-size: 12px; line-height: 1.4; }
+.manifest-detect { font-size: 12px; color: var(--muted); background: rgba(53,196,107,.06);
+  border: 1px solid rgba(53,196,107,.3); border-radius: 6px; padding: 6px 10px; margin: 6px 0; }
+.manifest-detect .mono { font-family: 'Cascadia Code', monospace; font-size: 11px; }
+.manifest-step { margin: 10px 0; padding: 10px 12px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; }
+.manifest-step-head { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px; }
+.manifest-step-num { flex: none; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--accent); color: #0b0e14; font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center; }
+.manifest-step-head b { font-size: 13px; }
+.manifest-editor { margin-top: 0; }
+.manifest-knob-group { margin: 10px 0 4px; }
+.manifest-knob-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); margin-bottom: 4px; }
+.manifest-knob-label .pc { text-transform: none; letter-spacing: 0; }
+.manifest-advanced { margin-top: 10px; font-size: 12px; }
+.manifest-advanced > summary { cursor: pointer; color: var(--muted); }
+.manifest-advanced > summary:hover { color: var(--text); }
+.manifest-summary { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.manifest-summary-item { font-size: 12px; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 5px; padding: 3px 8px; color: var(--text); }
+.manifest-summary-item .pc { color: var(--muted); margin-right: 4px; }
 /* readiness gates + probe chips */
 .gates { display: flex; flex-wrap: wrap; gap: 6px; }
 .gate { border-radius: 5px; border: 1px solid var(--line); padding: 2px 8px; font-size: 11px;

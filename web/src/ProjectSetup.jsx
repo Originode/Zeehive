@@ -1,11 +1,12 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
   createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject,
   githubAccess, pushProject, pullRequestProject, squashHelps, squashOffer,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
-  deleteSharedContainer, refreshProjectManifest, draftProjectManifest,
+  deleteSharedContainer, getProjectManifestInfo, refreshProjectManifest,
+  buildProjectManifest, writeProjectManifest,
   getComposeOnboardingPlan, applyComposeOnboarding,
   getDockerContexts, getRuntimes, getHarnesses,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
@@ -818,22 +819,61 @@ function BasicsSection({ project, run, onProject }) {
 }
 
 function ManifestSection({ project, run, onProject }) {
-  const [draft, setDraft] = useState(null);
+  // GET /manifest — { stored, repo, drift } — is the "is there a manifest in the repo" truth.
+  const [info, setInfo] = useState(null);
+  // Wizard data: the compose-file scan (file list + tier/role guesses) that pre-fills the form.
+  const [suggest, setSuggest] = useState(null);
+  const [knobs, setKnobs] = useState(() => emptyManifestKnobs(project));
+  // The untouched form, captured once, so the compose-scan pre-fill can't clobber a human who
+  // already started typing by the time the scan comes back.
+  const untouchedKnobs = useRef(null);
+  if (untouchedKnobs.current === null) untouchedKnobs.current = emptyManifestKnobs(project);
+  const [step, setStep] = useState('idle');       // idle | knobs | preview (wizard states)
+  const [editableYaml, setEditableYaml] = useState('');
+  const [localBusy, setLocalBusy] = useState(false);
+  const [statusMsg, setStatusMsg] = useState(null);
   const [plan, setPlan] = useState(null);
   const [writeYml, setWriteYml] = useState(true);
   const [applyMeta, setApplyMeta] = useState(true);
   const [planErr, setPlanErr] = useState(null);
 
-  const refresh = () => run(async () => { const p = await refreshProjectManifest(project.id); onProject(p); setDraft(null); setPlan(null); });
-  const makeDraft = () => run(async () => setDraft((await draftProjectManifest(project.id, false)).draft));
-  const writeDraft = async () => {
-    if (!(await showConfirm(
-      `Write zeehive.yml into ${project.repo_root}?\n\n`
-      + 'This is the ONE file ZEEHIVE may create in a project repo. It will be refused if one already exists. '
-      + 'You still need to commit it. Production containers are not touched.',
-      { okLabel: 'Write zeehive.yml', title: 'Write draft to repo' }))) return;
-    await run(async () => { await draftProjectManifest(project.id, true); setDraft(null); });
+  const loadInfo = useCallback(() => {
+    getProjectManifestInfo(project.id).then(setInfo).catch(() => {});
+  }, [project.id]);
+  useEffect(() => { loadInfo(); }, [loadInfo]);
+
+  const repo = info?.repo;
+  const repoFound = repo?.found === true;
+  const repoValid = repoFound && !(repo.errors || []).length;
+
+  // Seed the wizard's compose-file scan once, so the form can offer detected files and
+  // role guesses. Only meaningful when there's no manifest yet (the wizard is hidden otherwise).
+  const loadSuggest = useCallback(() => {
+    buildProjectManifest(project.id, {}).then((r) => {
+      if (!r?.suggestions) return;
+      setSuggest(r.suggestions);
+      // Pre-fill from the scan ONLY if the human hasn't typed anything yet.
+      setKnobs((k) => (JSON.stringify(k) === JSON.stringify(untouchedKnobs.current)
+        ? { ...k, ...knobsFromSuggestions(r.suggestions, project) }
+        : k));
+    }).catch(() => {});
+  }, [project.id, project]);
+  useEffect(() => {
+    if (info && !repoFound) loadSuggest();
+  }, [info, repoFound, loadSuggest]);
+
+  // Wrap a wizard mutation: local busy for button disabling, then re-read the manifest state.
+  const wizard = async (fn) => {
+    setLocalBusy(true); setStatusMsg(null);
+    try { const r = await fn(); loadInfo(); return r; }
+    finally { setLocalBusy(false); }
   };
+
+  const refresh = () => run(async () => {
+    const p = await refreshProjectManifest(project.id);
+    onProject(p);
+    setStatusMsg('✓ Re-read zeehive.yml — the meta-DB cache now matches the repo.');
+  });
 
   // Compose onboarding: detect compose files → show the plan → human approves → apply.
   // The server re-plans on apply and refuses without approved:true.
@@ -842,7 +882,6 @@ function ManifestSection({ project, run, onProject }) {
     try {
       const p = await getComposeOnboardingPlan(project.id);
       setPlan(p);
-      // Default the write toggle to ON only when the plan would actually touch a file.
       setWriteYml((p.files_to_modify || []).length > 0);
       setApplyMeta(true);
     } catch (e) {
@@ -886,6 +925,7 @@ function ManifestSection({ project, run, onProject }) {
     }));
     if (result?.project) onProject(result.project);
     setPlan(null);
+    loadInfo();
     await showAlert(
       `Compose onboarding applied.`
       + (result?.written?.length ? `\nWrote: ${result.written.map((w) => `${w.action} ${w.path}`).join(', ')}` : '\nNo files written.')
@@ -893,126 +933,303 @@ function ManifestSection({ project, run, onProject }) {
       { title: 'Onboarding complete' });
   };
 
+  const fillFromCompose = () => {
+    if (!suggest) return;
+    setKnobs((k) => ({ ...k, ...knobsFromSuggestions(suggest, project) }));
+    setStatusMsg('Filled the tiers and roles from the detected compose files. Adjust anything, then Preview.');
+  };
+
+  const previewDraft = () => wizard(async () => {
+    const r = await buildProjectManifest(project.id, knobs);
+    setEditableYaml(r.yaml);
+    setStep('preview');
+  });
+
+  const writeDraft = async () => {
+    if (!(await showConfirm(
+      `Create zeehive.yml in ${project.repo_root}?\n\n`
+      + 'This is the ONE file ZEEHIVE writes into a project repo. It will be refused if a valid one '
+      + 'already exists. After it is written you still need to commit it in the repo.\n\n'
+      + 'The meta-DB project row is updated to match (compose files, ports, roles). '
+      + 'Production containers are not touched.',
+      { okLabel: 'Create zeehive.yml', title: 'Write manifest to repo' }))) return;
+    await wizard(async () => {
+      const p = await writeProjectManifest(project.id, { yaml: editableYaml, apply_meta: true });
+      onProject(p);
+      setStep('idle');
+      setStatusMsg('✓ zeehive.yml created and applied to the meta-DB. Commit it in the repo, then come back any time to ↻ Re-read it.');
+    });
+  };
+
+  // ── render ────────────────────────────────────────────────────────────────
+  const composeListId = `zh-cf-${project.id}`;
+  const svcListId = `zh-svc-${project.id}`;
+  const allServices = [...new Set((suggest?.files || []).flatMap((f) => f.services || []))];
+
   return (
     <div className="setup-sec" data-testid="manifest-section">
-      <h3>Manifest <span className="pc">{project.manifest_hash ? `cached @ ${project.manifest_hash}` : 'none cached'}</span></h3>
-      <p className="setup-hint">
-        The repo&apos;s <span className="mono">zeehive.yml</span> is the shape truth; the meta-DB holds a
-        cache (<span className="mono">project.manifest</span> + compose columns) the pool and provision
-        paths read. Compose onboarding detects <span className="mono">docker-compose*.yml</span>, shows
-        every file and column that would change, and applies only after you approve — live production
-        containers are never rewritten.
-      </p>
-      <div className="setup-row">
-        <button type="button" onClick={refresh} title="Re-read zeehive.yml into the meta-DB cache">↻ Refresh from repo</button>
-        <button type="button" className="ghost" onClick={makeDraft}>Generate draft</button>
-        {draft && <button type="button" onClick={writeDraft}>Write zeehive.yml to repo…</button>}
-        <button type="button" data-testid="compose-plan-btn"
-                title="Detect compose files and preview meta-DB + yml changes before anything is written"
-                onClick={loadPlan}>Plan compose onboarding</button>
-      </div>
-      {draft && <textarea className="setup-draft" readOnly value={draft} rows={12} />}
-      {planErr && <div className="projpop-err" data-testid="compose-plan-err">{planErr}</div>}
-      {plan && (
-        <div className="compose-plan" data-testid="compose-plan">
-          <h4>Compose onboarding plan</h4>
-          {!plan.applicable && (
-            <div className="setup-hint">{plan.reason || 'Nothing to apply — already configured.'}</div>
-          )}
-          <div className="compose-plan-block">
-            <div className="compose-plan-label">Detected compose files</div>
-            {(plan.compose_files || []).length === 0
-              ? <div className="setup-hint">none at repo root</div>
-              : <ul className="compose-plan-list">
-                  {plan.compose_files.map((f) => (
-                    <li key={f.file}>
-                      <span className="mono">{f.file}</span>
-                      {f.tier_guess ? <span className="pc"> → tier {f.tier_guess}</span> : <span className="pc"> → (no tier guess)</span>}
-                      {f.services?.length ? <span className="pc"> · services: {f.services.join(', ')}</span> : null}
-                    </li>
-                  ))}
-                </ul>}
+      <h3>Manifest <span className="pc">(zeehive.yml — the repo&apos;s shape truth)</span></h3>
+
+      {!info ? (
+        <div className="setup-hint">Checking the repo for a manifest…</div>
+      ) : repoValid ? (
+        <>
+          <div className="gates">
+            <span className="gate g-pass">✓ {repo.file} valid</span>
+            {info.drift
+              ? <span className="gate g-warn" title="The repo file changed since it was last read into the meta-DB">△ cached @ {project.manifest_hash || '—'} — repo differs, re-read</span>
+              : <span className="gate g-pass" title="The meta-DB cache matches the repo file">✓ cached @ {project.manifest_hash || '—'}</span>}
           </div>
-          <div className="compose-plan-block">
-            <div className="compose-plan-label">Files that would be modified</div>
-            {(plan.files_to_modify || []).length === 0
-              ? <div className="setup-hint">none — meta-DB only (or already in sync)</div>
-              : <ul className="compose-plan-list">
-                  {plan.files_to_modify.map((f) => (
-                    <li key={f.path}>
-                      <b>{f.action.toUpperCase()}</b>{' '}
-                      <span className="mono">{f.path}</span>
-                      <div className="pc">{f.detail}</div>
-                    </li>
-                  ))}
-                </ul>}
+          <ManifestSummary manifest={project.manifest} />
+          <div className="setup-row">
+            <button type="button" onClick={refresh}
+                    title="Re-read zeehive.yml into the meta-DB cache (the pool and provision paths read the cache)">
+              ↻ Re-read from repo</button>
+            <span className="setup-hint" style={{ margin: 0 }}>The repo file is the truth — edit <span className="mono">zeehive.yml</span> in the repo, then re-read here.</span>
           </div>
-          <div className="compose-plan-block">
-            <div className="compose-plan-label">Meta-DB project row changes</div>
-            {(plan.meta_changes || []).length === 0
-              ? <div className="setup-hint">none</div>
-              : <ul className="compose-plan-list">
-                  {plan.meta_changes.map((c) => (
-                    <li key={c.column}>
-                      <span className="mono">{c.column}</span>
-                      {': '}
-                      <span className="pc">{c.from == null || c.from === '' ? '—' : String(c.from)}</span>
-                      {' → '}
-                      <b>{String(c.to)}</b>
-                    </li>
-                  ))}
-                </ul>}
+          {statusMsg && <div className="manifest-msg" data-testid="manifest-msg">{statusMsg}</div>}
+        </>
+      ) : repoFound ? (
+        <>
+          <div className="gates"><span className="gate g-fail">✗ {repo.file} INVALID</span></div>
+          <div className="projpop-err" data-testid="manifest-invalid-err">
+            {(repo.errors || []).map((e, i) => <div key={i}>{e}</div>)}
           </div>
-          <div className="compose-plan-block compose-plan-safe">
-            <div className="compose-plan-label">Guaranteed untouched</div>
-            <ul className="compose-plan-list">
-              <li>Production and spinoff <b>container rows</b> (live stacks keep their stamped compose_file)</li>
-              <li><span className="mono">deploy_site.compose_file</span></li>
-            </ul>
+          <div className="setup-row">
+            <button type="button" onClick={refresh}>↻ Re-read from repo</button>
+            <span className="setup-hint" style={{ margin: 0 }}>Fix the file in the repo, then re-read here.</span>
           </div>
-          {(plan.warnings || []).length > 0 && (
-            <div className="compose-plan-block">
-              <div className="compose-plan-label">Warnings</div>
-              <ul className="compose-plan-list">
-                {plan.warnings.map((w, i) => <li key={i} className="compose-plan-warn">⚠ {w}</li>)}
-              </ul>
+        </>
+      ) : (
+        <>
+          {/* ── the "no manifest yet" wizard ─────────────────────────────── */}
+          <p className="setup-hint">
+            No <span className="mono">zeehive.yml</span> yet — the project is running on form defaults.
+            Build one in two steps: describe the shape, review the generated file, then write it to the repo.
+          </p>
+
+          {suggest?.files?.length > 0 && (
+            <div className="manifest-detect">
+              Detected {suggest.files.length} compose file{suggest.files.length === 1 ? '' : 's'}:
+              {' '}<span className="mono">{suggest.files.map((f) => f.file).join(', ')}</span>
+              {' '}<button type="button" className="ghost" onClick={fillFromCompose} disabled={localBusy}>Use them to fill the form</button>
             </div>
           )}
-          {plan.proposed_yml && (
-            <details className="compose-plan-yml">
-              <summary>Proposed zeehive.yml preview</summary>
-              <textarea className="setup-draft" readOnly value={plan.proposed_yml} rows={14} />
-            </details>
-          )}
-          {plan.applicable && (
-            <div className="compose-plan-actions">
-              <label className="compose-plan-check">
-                <input type="checkbox" checked={writeYml} onChange={(e) => setWriteYml(e.target.checked)}
-                       disabled={(plan.files_to_modify || []).length === 0} />
-                Write / update <span className="mono">zeehive.yml</span> in the repo
-                {(plan.files_to_modify || []).length === 0 ? ' (nothing to write)' : ''}
-              </label>
-              <label className="compose-plan-check">
-                <input type="checkbox" checked={applyMeta} onChange={(e) => setApplyMeta(e.target.checked)} />
-                Apply manifest + compose columns to the meta-DB project row
-              </label>
+
+          {step === 'preview' ? (
+            <div className="manifest-step" data-testid="manifest-preview">
+              <div className="manifest-step-head">
+                <span className="manifest-step-num">2</span>
+                <div>
+                  <b>Review the generated zeehive.yml</b>
+                  <div className="setup-hint">Edit anything before writing — the text below is what gets written to the repo.</div>
+                </div>
+              </div>
+              <textarea className="setup-draft manifest-editor" value={editableYaml} rows={16}
+                        onChange={(e) => setEditableYaml(e.target.value)} spellCheck={false} />
               <div className="setup-row">
-                <button type="button" data-testid="compose-apply-btn"
-                        disabled={!writeYml && !applyMeta}
-                        onClick={applyPlan}>
-                  Review &amp; approve…
+                <button type="button" className="ghost" onClick={() => setStep('knobs')} disabled={localBusy}>← Back to step 1</button>
+                <button type="button" data-testid="manifest-write-btn" onClick={writeDraft} disabled={localBusy}>
+                  Write zeehive.yml to repo + apply…
                 </button>
-                <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss plan</button>
+              </div>
+            </div>
+          ) : (
+            <div className="manifest-step" data-testid="manifest-knobs">
+              <div className="manifest-step-head">
+                <span className="manifest-step-num">1</span>
+                <div>
+                  <b>Describe the shape</b>
+                  <div className="setup-hint">Which compose file runs each environment, which service plays each role. Blank = not used.</div>
+                </div>
+              </div>
+
+              <datalist id={composeListId}>
+                {(suggest?.files || []).map((f) => <option key={f.file} value={f.file} />)}
+              </datalist>
+              <datalist id={svcListId}>
+                {allServices.map((s) => <option key={s} value={s} />)}
+              </datalist>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Compose files — which file runs each environment</div>
+                <div className="setup-grid">
+                  {MANIFEST_TIERS.map((tier) => (
+                    <label key={tier}>{tier} <span className="pc">({tierHint(tier)})</span>
+                      <input list={composeListId} placeholder="none"
+                             value={knobs.tiers[tier].compose}
+                             onChange={(e) => setKnobs({ ...knobs, tiers: { ...knobs.tiers, [tier]: { compose: e.target.value } } })} />
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Roles — which compose service plays each role</div>
+                <div className="setup-grid">
+                  {MANIFEST_ROLES.map(([role, label]) => (
+                    <label key={role}>{label} <span className="pc">({role})</span>
+                      <input list={svcListId} placeholder="none"
+                             value={knobs.roles[role].service}
+                             onChange={(e) => setKnobs({ ...knobs, roles: { ...knobs.roles, [role]: { service: e.target.value } } })} />
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Ports <span className="pc">(spinoff — per-xell ports are base + slot % mod)</span></div>
+                <div className="setup-grid">
+                  <label>Server port base
+                    <input type="number" value={knobs.ports.server_base} placeholder="3100"
+                           onChange={(e) => setKnobs({ ...knobs, ports: { ...knobs.ports, server_base: e.target.value } })} /></label>
+                  <label>Webapp port base
+                    <input type="number" value={knobs.ports.webapp_base} placeholder="5200"
+                           onChange={(e) => setKnobs({ ...knobs, ports: { ...knobs.ports, webapp_base: e.target.value } })} /></label>
+                  <label>Slot mod
+                    <input type="number" value={knobs.ports.slot_mod} placeholder="90"
+                           onChange={(e) => setKnobs({ ...knobs, ports: { ...knobs.ports, slot_mod: e.target.value } })} /></label>
+                </div>
+              </div>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Environment</div>
+                <div className="setup-grid">
+                  <label>Env file
+                    <input value={knobs.env_file} placeholder=".env"
+                           onChange={(e) => setKnobs({ ...knobs, env_file: e.target.value })} /></label>
+                </div>
+              </div>
+
+              <div className="setup-row">
+                <button type="button" data-testid="manifest-preview-btn" onClick={previewDraft} disabled={localBusy}>
+                  Preview zeehive.yml →
+                </button>
+                {statusMsg && <span className="manifest-msg">{statusMsg}</span>}
               </div>
             </div>
           )}
-          {!plan.applicable && (
-            <div className="setup-row">
-              <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss</button>
+
+          {statusMsg && step !== 'knobs' && <div className="manifest-msg" data-testid="manifest-msg">{statusMsg}</div>}
+        </>
+      )}
+
+      {planErr && <div className="projpop-err" data-testid="compose-plan-err">{planErr}</div>}
+
+      {/* Advanced: compose onboarding — the automatic detect → plan → approve path. */}
+      {!repoValid && (
+        <details className="manifest-advanced" data-testid="manifest-advanced">
+          <summary>Advanced — auto-detect from compose files (onboarding plan)</summary>
+          <div className="setup-hint">
+            Scans <span className="mono">docker-compose*.yml</span>, shows every file and meta-DB column that
+            would change, and applies only after you approve. Live production containers are never rewritten.
+          </div>
+          <button type="button" data-testid="compose-plan-btn"
+                  title="Detect compose files and preview meta-DB + yml changes before anything is written"
+                  onClick={loadPlan}>Plan compose onboarding</button>
+          {plan && (
+            <div className="compose-plan" data-testid="compose-plan">
+              <h4>Compose onboarding plan</h4>
+              {!plan.applicable && (
+                <div className="setup-hint">{plan.reason || 'Nothing to apply — already configured.'}</div>
+              )}
+              <div className="compose-plan-block">
+                <div className="compose-plan-label">Detected compose files</div>
+                {(plan.compose_files || []).length === 0
+                  ? <div className="setup-hint">none at repo root</div>
+                  : <ul className="compose-plan-list">
+                      {plan.compose_files.map((f) => (
+                        <li key={f.file}>
+                          <span className="mono">{f.file}</span>
+                          {f.tier_guess ? <span className="pc"> → tier {f.tier_guess}</span> : <span className="pc"> → (no tier guess)</span>}
+                          {f.services?.length ? <span className="pc"> · services: {f.services.join(', ')}</span> : null}
+                        </li>
+                      ))}
+                    </ul>}
+              </div>
+              <div className="compose-plan-block">
+                <div className="compose-plan-label">Files that would be modified</div>
+                {(plan.files_to_modify || []).length === 0
+                  ? <div className="setup-hint">none — meta-DB only (or already in sync)</div>
+                  : <ul className="compose-plan-list">
+                      {plan.files_to_modify.map((f) => (
+                        <li key={f.path}>
+                          <b>{f.action.toUpperCase()}</b>{' '}
+                          <span className="mono">{f.path}</span>
+                          <div className="pc">{f.detail}</div>
+                        </li>
+                      ))}
+                    </ul>}
+              </div>
+              <div className="compose-plan-block">
+                <div className="compose-plan-label">Meta-DB project row changes</div>
+                {(plan.meta_changes || []).length === 0
+                  ? <div className="setup-hint">none</div>
+                  : <ul className="compose-plan-list">
+                      {plan.meta_changes.map((c) => (
+                        <li key={c.column}>
+                          <span className="mono">{c.column}</span>
+                          {': '}
+                          <span className="pc">{c.from == null || c.from === '' ? '—' : String(c.from)}</span>
+                          {' → '}
+                          <b>{String(c.to)}</b>
+                        </li>
+                      ))}
+                    </ul>}
+              </div>
+              <div className="compose-plan-block compose-plan-safe">
+                <div className="compose-plan-label">Guaranteed untouched</div>
+                <ul className="compose-plan-list">
+                  <li>Production and spinoff <b>container rows</b> (live stacks keep their stamped compose_file)</li>
+                  <li><span className="mono">deploy_site.compose_file</span></li>
+                </ul>
+              </div>
+              {(plan.warnings || []).length > 0 && (
+                <div className="compose-plan-block">
+                  <div className="compose-plan-label">Warnings</div>
+                  <ul className="compose-plan-list">
+                    {plan.warnings.map((w, i) => <li key={i} className="compose-plan-warn">⚠ {w}</li>)}
+                  </ul>
+                </div>
+              )}
+              {plan.proposed_yml && (
+                <details className="compose-plan-yml">
+                  <summary>Proposed zeehive.yml preview</summary>
+                  <textarea className="setup-draft" readOnly value={plan.proposed_yml} rows={14} />
+                </details>
+              )}
+              {plan.applicable && (
+                <div className="compose-plan-actions">
+                  <label className="compose-plan-check">
+                    <input type="checkbox" checked={writeYml} onChange={(e) => setWriteYml(e.target.checked)}
+                           disabled={(plan.files_to_modify || []).length === 0} />
+                    Write / update <span className="mono">zeehive.yml</span> in the repo
+                    {(plan.files_to_modify || []).length === 0 ? ' (nothing to write)' : ''}
+                  </label>
+                  <label className="compose-plan-check">
+                    <input type="checkbox" checked={applyMeta} onChange={(e) => setApplyMeta(e.target.checked)} />
+                    Apply manifest + compose columns to the meta-DB project row
+                  </label>
+                  <div className="setup-row">
+                    <button type="button" data-testid="compose-apply-btn"
+                            disabled={!writeYml && !applyMeta}
+                            onClick={applyPlan}>
+                      Review &amp; approve…
+                    </button>
+                    <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss plan</button>
+                  </div>
+                </div>
+              )}
+              {!plan.applicable && (
+                <div className="setup-row">
+                  <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss</button>
+                </div>
+              )}
             </div>
           )}
-        </div>
+        </details>
       )}
+
       <div className="setup-grid" style={{ marginTop: 8 }}>
         <label>compose_spinoff <span className="pc">(meta-DB)</span>
           <input readOnly value={project.compose_spinoff || ''} placeholder="(unset)" /></label>
@@ -1021,6 +1238,65 @@ function ManifestSection({ project, run, onProject }) {
         <label>compose_dev <span className="pc">(meta-DB)</span>
           <input readOnly value={project.compose_dev || ''} placeholder="(unset)" /></label>
       </div>
+    </div>
+  );
+}
+
+// ── manifest wizard helpers ────────────────────────────────────────────────
+const MANIFEST_TIERS = ['dev', 'spinoff', 'prod'];
+const MANIFEST_ROLES = [['server', 'Server (API)'], ['webapp', 'Webapp (UI)'], ['db', 'Database']];
+const tierHint = (t) => ({ dev: 'your machine / dev site', spinoff: 'per-xell sandbox', prod: 'deploy target' }[t] || t);
+
+function emptyManifestKnobs(project) {
+  return {
+    env_file: project.env_file || '.env',
+    tiers: { dev: { compose: '' }, spinoff: { compose: '' }, prod: { compose: '' } },
+    roles: { server: { service: '' }, webapp: { service: '' }, db: { service: '' } },
+    ports: { server_base: project.port_server_base || 3100, webapp_base: project.port_web_base || 5200, slot_mod: project.port_slot_mod || 90 },
+  };
+}
+function knobsFromSuggestions(suggest, project) {
+  const base = emptyManifestKnobs(project);
+  return {
+    ...base,
+    tiers: {
+      dev: { compose: suggest.compose?.dev || '' },
+      spinoff: { compose: suggest.compose?.spinoff || '' },
+      prod: { compose: suggest.compose?.prod || '' },
+    },
+    roles: {
+      server: { service: suggest.roles?.server || '' },
+      webapp: { service: suggest.roles?.webapp || '' },
+      db: { service: suggest.roles?.db || '' },
+    },
+  };
+}
+
+// A human-readable digest of what a manifest DECLARES — the "what will this actually do"
+// answer for an existing zeehive.yml, instead of the raw cached hash.
+function ManifestSummary({ manifest }) {
+  if (!manifest || typeof manifest !== 'object') return null;
+  const tiers = manifest.tiers || {};
+  const roles = manifest.roles || {};
+  const ports = tiers.spinoff?.ports || {};
+  const items = [];
+  for (const t of ['dev', 'spinoff', 'prod']) {
+    if (tiers[t]?.compose) items.push([`tier ${t}`, `compose ${tiers[t].compose}`]);
+  }
+  for (const [r, label] of MANIFEST_ROLES) {
+    if (roles[r]?.service) items.push([`role ${r}`, `service “${roles[r].service}”${roles[r].buildable === false ? ' (shared, not built)' : ''}`]);
+  }
+  if (ports.server?.base) items.push(['server port', `base ${ports.server.base}${ports.server.mod ? ` · mod ${ports.server.mod}` : ''}`]);
+  if (ports.webapp?.base) items.push(['webapp port', `base ${ports.webapp.base}${ports.webapp.mod ? ` · mod ${ports.webapp.mod}` : ''}`]);
+  if (manifest.env?.file) items.push(['env file', manifest.env.file]);
+  if (!items.length) {
+    return <div className="setup-hint">This manifest only sets the project name and naming templates — no tiers, roles or ports.</div>;
+  }
+  return (
+    <div className="manifest-summary" data-testid="manifest-summary">
+      {items.map(([k, v]) => (
+        <span key={k} className="manifest-summary-item"><span className="pc">{k}</span> {v}</span>
+      ))}
     </div>
   );
 }
