@@ -733,8 +733,11 @@ export async function writeProjectManifest(id, { yaml, apply_meta = true, overwr
   if (!text) throw new Error('manifest YAML is required');
   const dir = String(p.repo_root).replace(/\\/g, '/');
   const existing = loadManifest(dir);
-  if (existing.found && !existing.errors.length && !overwrite) {
+  if (existing.found && !existing.errors.length) {
     throw new Error(`${existing.file} already exists — edit it in the repo and ↻ Refresh from repo instead`);
+  }
+  if (existing.found && !overwrite) {
+    throw new Error(`${existing.file} exists but is invalid — pass overwrite:true to replace it with a valid manifest`);
   }
   const parsed = parseManifest(text, { dir });
   if (parsed.errors?.length) {
