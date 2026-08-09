@@ -830,6 +830,7 @@ function ManifestSection({ project, run, onProject }) {
   if (untouchedKnobs.current === null) untouchedKnobs.current = emptyManifestKnobs(project);
   const [step, setStep] = useState('idle');       // idle | knobs | preview (wizard states)
   const [editableYaml, setEditableYaml] = useState('');
+  const [minimalManifest, setMinimalManifest] = useState(false); // preview has no tiers/roles
   const [localBusy, setLocalBusy] = useState(false);
   const [wizardErr, setWizardErr] = useState(null);
   const [statusMsg, setStatusMsg] = useState(null);
@@ -949,6 +950,8 @@ function ManifestSection({ project, run, onProject }) {
   const previewDraft = () => wizard(async () => {
     const r = await buildProjectManifest(project.id, knobs);
     setEditableYaml(r.yaml);
+    // A manifest with no tiers and no roles is the old "generic yaml that does nothing" — say so.
+    setMinimalManifest(!r.manifest?.tiers && !r.manifest?.roles);
     setStep('preview');
   });
 
@@ -1049,6 +1052,13 @@ function ManifestSection({ project, run, onProject }) {
                   <div className="setup-hint">Edit anything before writing — the text below is what gets written to the repo.</div>
                 </div>
               </div>
+              {minimalManifest && (
+                <div className="manifest-minimal" data-testid="manifest-minimal">
+                  ⚠ This manifest declares <b>no tiers or roles</b> — the project will keep running on
+                  form defaults for its shape. Go back and add at least one compose file or role, or
+                  write it anyway (it only sets the name and naming).
+                </div>
+              )}
               <textarea className="setup-draft manifest-editor" value={editableYaml} rows={16}
                         onChange={(e) => { setEditableYaml(e.target.value); setWizardErr(null); }} spellCheck={false} />
               <div className="setup-row">
