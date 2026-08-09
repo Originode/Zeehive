@@ -59,7 +59,14 @@ function JsonView({ text }) {
 function DiffView({ text }) {
   const rows = parsePatch(text);
   if (!rows.length) {
-    return <div className="fview-empty">not a unified diff — showing the raw text</div>;
+    // A .diff/.patch name but no unified-diff hunks (a binary diff, a mode-only change, or a
+    // plain text file misnamed .diff) — show the raw text rather than nothing.
+    return (
+      <div className="fview-diff">
+        <div className="fview-note warn">⚠ not a unified diff — showing the raw text</div>
+        <pre className="fview-code">{text}</pre>
+      </div>
+    );
   }
   return (
     <div className="fview-diff" data-testid="fview-diff">

@@ -42,6 +42,7 @@ ok(/<MarkdownPreview source=\{file\.content\}/.test(fv), 'renders MarkdownPrevie
 ok(/import \{ parsePatch \} from '\.\/DiffViewer\.jsx'/.test(fv), 'reuses the diff row renderer (parsePatch)');
 ok(/fileViewerKind/.test(fv), 'the viewer consults the router');
 ok(/fview-overlay/.test(fv), 'renders as a modal overlay');
+ok(/not a unified diff/.test(fv), 'a .diff with no hunks falls back to the raw text');
 
 console.log('\n── the explorer: opening a file keeps the folder and opens the viewer ──');
 ok(/showFileViewer/.test(fe), 'FileExplorer imports the file viewer');
