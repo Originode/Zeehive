@@ -16,7 +16,7 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { createRequire } from 'node:module';
-import { one } from '../db/pool.js';
+import { q, one } from '../db/pool.js';
 import { ensureZeehiveKeypair, cxellSshDest } from './cxell.js';
 import { resolveContext } from './docker.js';
 import { resolveRealDbContainerCached } from './xell-db.js';
@@ -53,6 +53,48 @@ export const ZEE_LIVE_VIEW_FILE = '/tmp/zee-live-view.json';
 // Frames the browser must NOT write into xterm. Terminal data arrives as binary (Buffers), so a
 // text frame with this NUL-tagged prefix can never collide with terminal output.
 export const CTRL_PREFIX = '\u0000ZH';
+
+// ---- THE DOOR-SIDE WRITE LEDGER (TKT-159-3139) ----------------------------------------------
+// ANY write into a live cage must leave a row. The console terminal is a door: a {t:'i',d} frame
+// is keystrokes being typed into /api/zees/:id/terminal (a cxell zee's PTY) or
+// /api/containers/:id/terminal (a docker exec shell). Each input frame is recorded against the
+// migration-183 door_write_event table. Never awaited, never allowed to fail the write path: a
+// ledger that breaks the terminal is worse than no ledger.
+//
+// The `actor` is the conn identity IF resolvable -- today the websocket rides the authenticated
+// /api proxy with no per-socket principal, so it is null. The `input` is a SAFE representation:
+// control chars (escape sequences, backspace, bell...) are escaped so a human reading the row
+// sees WHAT was typed, never an ANSI stream that can spoof a screen.
+export function safeTerminalInput(d, cap = 2000) {
+  const s = String(d ?? '');
+  const cleaned = s
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (c) => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0'))
+    .replace(/\r/g, '\\r');
+  return cleaned.length > cap ? cleaned.slice(0, cap) + '...' : cleaned;
+}
+
+// One row per input frame. Fire-and-forget; a DB failure is logged once and the keystroke is
+// already on its way to the PTY regardless.
+export function recordDoorWrite({ door, xellId = null, zeeId = null, containerId = null, target = null, input }) {
+  const safe = safeTerminalInput(input);
+  if (!safe && !target) return;   // a blank frame with no target says nothing worth a row
+  q(
+    `INSERT INTO door_write_event (door, xell_id, zee_id, container_id, target, input)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+    [door, xellId, zeeId, containerId, target, safe],
+  ).catch((e) => logline('terminal', 'could not record door write (' + door + '): ' + String(e.message).slice(0, 160)));
+}
+
+// The CONSOLE-DOOR git committer. TKT-159-3139: a commit typed at the console terminal must be
+// distinguishable from one made by the headless zee -- both author as the zee slug (GIT_AUTHOR_*
+// from /etc/environment), but the COMMITTER names the door. These env vars are prepended to the
+// tmux command so every pane process (zee-attach.sh, the fallback login shell, a claude --resume)
+// inherits them; git prioritises GIT_COMMITTER_* over the xell-door git config set at spawn.
+export function consoleGitIdentityEnv(slug) {
+  const safeSlug = String(slug || '').replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 120);
+  return "GIT_COMMITTER_NAME='console' GIT_COMMITTER_EMAIL='" + safeSlug + "@console.zeehive.local' ";
+}
+
 
 // The remote command behind a chip click. `write` false = read-only poll (what the client is sent
 // on attach). Nothing from the client is interpolated: the view is reduced to two BOOLEANS here,
@@ -132,7 +174,11 @@ async function openTerminal(ws, zeeId) {
   // .tmux.conf get it too.
   // window-size latest: size the tmux window to the MOST RECENT client, so a lingering
   // half-closed attach from an earlier open can never clamp a fresh, bigger terminal.
-  const cmd = `tmux new -A -s zee -c /work/repo 'zee-attach.sh ${sid}' \\; set -g mouse on \\; set -g history-limit 50000 \\; set -g window-size latest`;
+  // CONSOLE-DOOR GIT IDENTITY (TKT-159-3139): prepend the console-door committer env so a commit
+  // typed at this terminal is attributed to the console door, not the xell door. The env rides
+  // the tmux command, so every pane process (zee-attach.sh, claude --resume, the login shell)
+  // inherits it.
+  const cmd = `${consoleGitIdentityEnv(zee.slug)}tmux new -A -s zee -c /work/repo 'zee-attach.sh ${sid}' \\; set -g mouse on \\; set -g history-limit 50000 \\; set -g window-size latest`;
 
   const conn = new Client();
   // Listen for client frames from the FIRST moment. The browser sends its real size the instant
@@ -165,7 +211,12 @@ async function openTerminal(ws, zeeId) {
 
   ws.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (msg.t === 'i') { if (stream) stream.write(msg.d); else earlyInput.push(msg.d); }
+    if (msg.t === 'i') {
+      // TKT-159-3139 door ledger: every keystroke into a live cage leaves a row.
+      recordDoorWrite({ door: 'console-terminal', xellId: zee.xell_id, zeeId: zee.id,
+                        target: zee.slug, input: msg.d });
+      if (stream) stream.write(msg.d); else earlyInput.push(msg.d);
+    }
     else if (msg.t === 'r' && msg.cols && msg.rows) {
       lastSize = { cols: msg.cols, rows: msg.rows };
       if (stream) stream.setWindow(msg.rows, msg.cols, 0, 0);
@@ -334,9 +385,15 @@ async function openContainerShell(ws, containerId) {
   const innerCmd = containerShellInnerCmd(sessionName);
   let execId;
   try {
+    // CONSOLE-DOOR GIT IDENTITY (TKT-159-3139): the exec env carries the console-door committer so
+    // a git commit typed in this shell is attributed to the console door, not a shared identity.
+    const shellSlug = String(c.name || c.id || 'console').replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 120);
     const created = await dockerReq(conn, 'POST', `/containers/${encodeURIComponent(name)}/exec`, {
       AttachStdin: true, AttachStdout: true, AttachStderr: true, Tty: true,
-      Env: ['TERM=xterm-256color', `ZEEHIVE_SHELL_MARK=${mark}`],
+      Env: [
+        'TERM=xterm-256color', `ZEEHIVE_SHELL_MARK=${mark}`,
+        'GIT_COMMITTER_NAME=console', `GIT_COMMITTER_EMAIL=${shellSlug}@console.zeehive.local`,
+      ],
       ...(workingDir ? { WorkingDir: workingDir } : {}),
       // Prefer tmux attach-or-create (session survives the modal); fall back to bash/sh.
       Cmd: ['/bin/sh', '-c', innerCmd],
@@ -381,7 +438,12 @@ async function openContainerShell(ws, containerId) {
     dockerReq(conn, 'POST', `/exec/${execId}/resize?h=${lastSize.rows}&w=${lastSize.cols}`).catch(() => { /* racing shell exit */ });
   ws.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (msg.t === 'i') { if (sock) sock.write(msg.d); else earlyInput.push(msg.d); }
+    if (msg.t === 'i') {
+      // TKT-159-3139 door ledger: every keystroke into a live cage leaves a row.
+      recordDoorWrite({ door: 'console-container', xellId: c.owner_xell_id, containerId: c.id,
+                        target: c.name, input: msg.d });
+      if (sock) sock.write(msg.d); else earlyInput.push(msg.d);
+    }
     else if (msg.t === 'r' && msg.cols && msg.rows) {
       lastSize = { cols: msg.cols, rows: msg.rows };
       if (sock) resize();

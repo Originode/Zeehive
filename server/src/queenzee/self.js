@@ -579,7 +579,20 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
 // there is nothing in it to resolve.
 async function selfHealSync(xell, ref) {
   const s = await syncCxellWithXource({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref });
-  if (s.state === 'merged' || s.state === 'up-to-date') return { ok: true, ...s };
+  if (s.state === 'merged' || s.state === 'up-to-date') {
+    // TKT-159-3139 door ledger: the queenzee's sync merge is a WRITE into a live cage (it merges
+    // current main into the zee's /work/repo). Record the queenzee door so a human auditing what
+    // happened to a tree sees the automated merge, distinct from a zee/human write. Best-effort:
+    // a failed ledger write must never fail a sync.
+    if (s.state === 'merged') {
+      q(
+        `INSERT INTO door_write_event (door, xell_id, target, input)
+         VALUES ('queenzee-sync', $1, $2, $3)`,
+        [xell.id, xell.slug, `sync merge of ${ref} into the cxell`],
+      ).catch((e) => logline('self', `could not record queenzee-sync door write: ${String(e.message).slice(0, 160)}`));
+    }
+    return { ok: true, ...s };
+  }
   if (s.state === 'conflict') {
     return {
       ok: false, status: 'needs-resolution', stage: 'sync', state: 'conflict', ref, sync: s,

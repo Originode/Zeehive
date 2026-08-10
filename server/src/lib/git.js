@@ -1,6 +1,20 @@
 // Read-only git helpers for the timeline rail.
 import { spawnSync, spawn } from 'node:child_process';
 
+// WHICH DOOR produced a commit, from its committer email (TKT-159-3139). The three doors:
+// in-cage git commits are committed by <slug>@xell.zeehive.local (the xell door); console-terminal
+// commits by <slug>@console.zeehive.local (the console door); queenzee merges by
+// queenzee@zeehive.local. Anything else (a human pushing by hand, an older commit from before the
+// scheme) reads as 'unknown' — never guessed.
+export function doorFromEmail(email) {
+  const e = String(email || '');
+  if (/@xell\.zeehive\.local$/.test(e)) return 'xell';
+  if (/@console\.zeehive\.local$/.test(e)) return 'console';
+  if (/^queenzee@zeehive\.local$/.test(e)) return 'queenzee';
+  if (/@zeehive\.local$/.test(e)) return 'zee';
+  return 'unknown';
+}
+
 // Inherited git-context env vars (a stray GIT_DIR from the launching shell) override `-C`
 // and make git act on the WRONG repo — e.g. Zeehive's .git, which has no `main`, yielding
 // "fatal: invalid reference: main". Strip them so git/scripts act only on the repo we point at.
