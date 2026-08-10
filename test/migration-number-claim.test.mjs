@@ -33,8 +33,8 @@ try {
   const src = join(tmp, 'src');
   mkdirSync(join(src, 'db', 'migrations'), { recursive: true });
   git(tmp, ['init', '-q', '-b', 'main', 'src']);
-  git(src, ['config', 'user.email', 'test@zeehive.local']);
-  git(src, ['config', 'user.name', 'test']);
+  git(src, ['config', 'user.email', 'queenzee@zeehive.local']);
+  git(src, ['config', 'user.name', 'Zeehive queenzee']);
   for (const f of ['001_init.sql', '084_x.sql', '085_a.sql', '085_b.sql']) {
     writeFileSync(join(src, 'db', 'migrations', f), '-- fixture\nSELECT 1;\n');
   }

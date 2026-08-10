@@ -44,13 +44,13 @@ const src = join(tmp, 'src');     // the xource repo (project.repo_root)
 const wt = join(tmp, 'wt');       // the xell's linked worktree
 git(tmp, ['init', '-q', '-b', 'main', 'src']);
 const cfg = (k, v) => git(src, ['config', k, v]);
-cfg('user.email', 'test@zeehive.local'); cfg('user.name', 'test');
+cfg('user.email', 'queenzee@zeehive.local'); cfg('user.name', 'Zeehive queenzee');
 cfg('receive.denyCurrentBranch', 'ignore'); // pushing to the checked-out main is fine in this test
 writeFileSync(join(src, 'a.txt'), 'A\n'); git(src, ['add', '.']); git(src, ['commit', '-qm', 'A (base)']);
 const shaA = git(src, ['rev-parse', 'HEAD']);
 // the xell branches off A, into a linked worktree
 git(src, ['worktree', 'add', '-q', '-b', 'spinoff/test', wt, shaA]);
-git(wt, ['config', 'user.email', 'zee@zeehive.local']); git(wt, ['config', 'user.name', 'zee']);
+git(wt, ['config', 'user.email', 'xell@xell.zeehive.local']); git(wt, ['config', 'user.name', 'xell']);
 // the zee does its work on the branch
 writeFileSync(join(wt, 'zee.txt'), 'zee work\n'); git(wt, ['add', '.']); git(wt, ['commit', '-qm', 'Z (zee work)']);
 const shaZ = git(wt, ['rev-parse', 'HEAD']);
