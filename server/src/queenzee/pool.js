@@ -29,7 +29,7 @@
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { provisionXell } from '../lib/provision.js';
-import { devMachines, liveXellCount, machinePoolSize, queenzeeHostCtx } from '../lib/machines.js';
+import { poolMachines, implicitPoolMachine, liveXellCount, machinePoolSize, queenzeeHostCtx } from '../lib/machines.js';
 import { reapXell } from './reaper.js';
 import { reconcileXell } from './landing.js';
 import { takeReadyXellForSweep, untakeSweptXell, explainSweepSkip, currentXells } from '../lib/xell-claim.js';
@@ -144,8 +144,29 @@ async function reconcileProject(projectId, target) {
   // machine path — otherwise mardale-prod's pool_size is a dead letter until someone happens
   // to refresh tiers.spinoff.compose into the column (the "mardale-prod never gets pool xells"
   // defect under its second diagnosis).
-  const machines = await devMachines(projectId);
-  if (!machines.length) return fillTrim(projectId, target, null);
+  const machines = await poolMachines(projectId);
+  if (!machines.length) {
+    // MACHINE-AWARE BY DEFAULT (docs/default-machine-pooling-decision-record.md): no
+    // machine_pool row for this project does not mean "no machine" — it means "the default
+    // one". The project-wide target pools on the one machine that can actually host the
+    // project (queenzee host for process projects; the machine holding its shared dev db for
+    // compose projects), machine-aware count and max_xells cap included. Only a hive with no
+    // machines — or none eligible — still takes the placeless legacy path.
+    const cfg = await one(`SELECT default_db_coupling FROM pool_config WHERE project_id=$1`, [projectId]);
+    const im = await implicitPoolMachine(projectId, {
+      isProcess: !placeable, coupling: cfg?.default_db_coupling || null });
+    if (im) {
+      const said = `implicit:${im.key}:${!placeable}`;
+      if (lastMachineGuardSaid.get(`${projectId}:implicit`) !== said) {
+        lastMachineGuardSaid.set(`${projectId}:implicit`, said);
+        logline('pool', `pooling for project ${String(projectId).slice(0, 8)} defaults to machine `
+          + `'${im.key}' (no per-machine config; project-wide target applies there${!placeable ? ', project-wide count: process xells all live on the queenzee host' : ''})`);
+      }
+      return fillTrim(projectId, target, !placeable ? { ...im, processLocal: true } : im)
+        .catch((e) => console.error(`[pool] ${im.key}:`, e.message));
+    }
+    return fillTrim(projectId, target, null);
+  }
   if (!placeable) {
     // Process-runner project with machines configured. Every one of its xells lives on the
     // QUEENZEE HOST by construction (worktree on the host fs, server/webapp as local processes,
@@ -189,6 +210,13 @@ async function reconcileProject(projectId, target) {
       const size = await machinePoolSize(host.id, projectId);
       return fillTrim(projectId, size, { ...host, processLocal: true })
         .catch((e) => console.error(`[pool] ${host.key}:`, e.message));
+    }
+    // Only remote rows configured (all dead letters): the DEFAULT still applies — pool the
+    // project-wide target on the queenzee-host machine row when one exists, legacy otherwise.
+    const im = await implicitPoolMachine(projectId, { isProcess: true });
+    if (im) {
+      return fillTrim(projectId, target, { ...im, processLocal: true })
+        .catch((e) => console.error(`[pool] ${im.key}:`, e.message));
     }
     return fillTrim(projectId, target, null);
   }

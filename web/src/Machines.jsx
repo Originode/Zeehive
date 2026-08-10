@@ -37,7 +37,7 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
   // pool logline, so an operator reading one can fix the project from the other.
   // Compose projects (no process runner) ARE placeable even when compose_spinoff is unset —
   // do not warn on that column alone.
-  const deadRows = (m) => m.enabled && m.dev_priority > 0 && !m.is_queenzee_host;
+  const deadRows = (m) => m.enabled && (m.dev_priority > 0 || m.pool_size > 0) && !m.is_queenzee_host;
   const machinePoolingDisabled = ms.some(deadRows) && !!spinoffIsProcess;
   const disabledMachines = ms.filter(deadRows).map((m) => m.key);
   const hostMachine = ms.find((m) => m.enabled && m.is_queenzee_host) || null;

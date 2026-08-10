@@ -58,6 +58,44 @@ export async function listMachines(projectId = null) {
       ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]));
 }
 
+// Machines whose machine_pool row activates them for THIS project's POOL — EITHER knob does:
+// pool_size>0 ("keep N warm here") or dev_priority>0 (a spawn target pools by its explicit
+// size, which may be 0). Before this, pool_size was dead until dev_priority was also set — a
+// pool number that pooled nothing (docs/default-machine-pooling-decision-record.md). This is
+// the POOL's list; devMachines below stays the SPAWN-target list (dev_priority>0 only), so a
+// pool_size alone warms xells on a machine without also aiming fresh dispatch spawns there.
+export async function poolMachines(projectId) {
+  if (!projectId) return [];
+  return q(
+    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device,
+            m.max_xells, m.enabled, m.notes, m.created_at,
+            mp.dev_priority AS dev_priority, COALESCE(mp.pool_size, 0) AS pool_size
+       FROM machine m JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
+      WHERE m.enabled AND (mp.dev_priority > 0 OR mp.pool_size > 0)
+      ORDER BY mp.dev_priority DESC, m.created_at`, [projectId]);
+}
+
+// The IMPLICIT pool machine — machine-aware pooling as the DEFAULT when machines exist
+// (docs/default-machine-pooling-decision-record.md): a project with NO machine_pool row pools
+// its project-wide target on the one machine that can actually HOST it, instead of falling
+// back to the placeless legacy path. Eligibility is the guard against "default = everywhere"
+// (a prod host, a machine with no dev db — places where provisioning would refuse):
+//   - process-runner project → the queenzee-host machine row (its xells live there, always);
+//   - coupling that needs the project's shared dev db → the OLDEST machine that HAS it;
+//   - couplings that don't (db-isolated, …) → the queenzee-host machine row.
+// null → no machines / none eligible → the legacy project-wide path, unchanged.
+export async function implicitPoolMachine(projectId, { isProcess = false, coupling = null } = {}) {
+  const ms = await q(`SELECT * FROM machine WHERE enabled ORDER BY created_at`);
+  if (!ms.length) return null;
+  const host = ms.find((m) => m.docker_ctx === queenzeeHostCtx()) || null;
+  if (isProcess) return host;
+  if (['db-shared-dev', 'db-clone'].includes(coupling || 'db-shared-dev')) {
+    for (const m of ms) if (await sharedDevDb(projectId, m.docker_ctx)) return m;
+    return null;
+  }
+  return host;
+}
+
 // This machine's warm-pool target for ONE project. No row → 0: a project pools nowhere it
 // hasn't been given a number.
 export async function machinePoolSize(machineId, projectId) {

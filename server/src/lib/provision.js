@@ -13,7 +13,8 @@ import { headCommit, cleanGitEnv } from './git.js';
 import { resolveSite } from './sites.js';
 import { namingFor, serverRoleIsProcess } from './manifest.js';
 import { resolveBash } from './bash.js';
-import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx } from './machines.js';
+import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx,
+         implicitPoolMachine, liveXellCount } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
@@ -763,10 +764,20 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // keep legacy placement exactly as before machines existed.
   // (docs/process-machine-pooling-decision-record.md)
   const isProcess = serverRoleIsProcess(project.manifest);
-  const machine = isProcess
+  const coupling = dbCoupling || cfg.default_db_coupling;
+  let machine = isProcess
     ? await machineForCtx(queenzeeHostCtx())
     : (machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine(projectId));
   if (!isProcess && machineCtx && !machine) throw new Error(`no machine row for docker context '${machineCtx}'`);
+  // MACHINE-AWARE BY DEFAULT (docs/default-machine-pooling-decision-record.md): a compose
+  // project with no explicit dev machine still places on the machine the POOL defaults to —
+  // the one holding its shared dev db — so a dispatch-time fresh spawn lands where the warm
+  // pool lives, not wherever the legacy site fallback points. Respect the machine-wide cap:
+  // an implicit default never overfills a host (null falls through to legacy placement).
+  if (!machine && !machineCtx && !isProcess) {
+    const im = await implicitPoolMachine(projectId, { isProcess: false, coupling });
+    if (im && (await liveXellCount(im.docker_ctx)) < im.max_xells) machine = im;
+  }
   const devSite = await resolveSite(projectId, 'dev');
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
   const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
@@ -782,7 +793,6 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // name, with the fix — not discovered as a crash-looping stack after provisioning. Only for
   // projects that HAVE a shared dev db somewhere: one with none at all (Zeehive itself) never
   // linked one before machines existed either, and must keep provisioning exactly as it did.
-  const coupling = dbCoupling || cfg.default_db_coupling;
   if (machine && ['db-shared-dev', 'db-clone'].includes(coupling)) {
     const anywhere = await one(
       `SELECT 1 FROM container WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared' LIMIT 1`,

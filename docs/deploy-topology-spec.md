@@ -104,7 +104,17 @@ network wiring) — read via `docker compose config --format json`, never copied
 
 #### A docker-backed spinoff server is what ENABLES machine placement
 
-The pool maintainer only runs the **machine-aware** path (per-machine pool sizes,
+**Machine-aware pooling is the DEFAULT once machine rows exist**
+([`default-machine-pooling-decision-record.md`](default-machine-pooling-decision-record.md)):
+a `machine_pool` row with EITHER knob set (`pool_size>0` or `dev_priority>0`) activates that
+machine for the project's pool, and a project with NO rows at all pools its project-wide
+`target_ready` on the one machine that can actually host it — the queenzee host for
+process-runner projects, the machine holding its shared dev db for compose projects — with
+the machine-aware count and `max_xells` cap. The legacy placeless path only remains for a
+hive with no machines (or none eligible). `dev_priority` alone still decides SPAWN targeting
+(`devMachines`).
+
+The pool maintainer only runs the **full per-machine placement** path (per-machine pool sizes,
 `machine_pool.dev_priority`, the machine-wide `max_xells` cap) when the project's spinoff
 **server role is not `runner: process`**. Compose-shaped projects (no process runner on
 `roles.server` / `tiers.spinoff`) stamp `docker_ctx` on the per-xell server container at

@@ -1243,14 +1243,14 @@ export default function App() {
         )}
         {/* The prewarmed-pool knob, right here in the status line so it never hides in project
             settings. Per-machine pool sizes (matrix column headers) replace this project-wide
-            target ONLY when they actually govern: a compose project needs any dev machine
-            configured (dev_priority>0); a process-runner project needs the QUEENZEE-HOST machine
-            configured — its xells all live there, so that row's pool_size is what the pool
-            honors (queenzee/pool.js; docs/process-machine-pooling-decision-record.md). When
-            neither holds, this project-wide knob is the working control and must stay visible —
-            otherwise it is buried in the ⚙ Spawn-template modal. Mirrors the server's own
-            reconcileProject branch. */}
-        {!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0
+            target ONLY when a machine is explicitly configured for the project — EITHER knob
+            (dev_priority>0 or pool_size>0); a process-runner project needs the QUEENZEE-HOST
+            machine configured, since only that row governs it (queenzee/pool.js). With NO
+            per-machine config this knob still governs — machine-aware by DEFAULT means the
+            pool spends this target on the project's default machine
+            (docs/default-machine-pooling-decision-record.md) — so it stays visible. Mirrors
+            the server's own reconcileProject branch. */}
+        {!(fleet.machines || []).some((m) => m.enabled && (m.dev_priority > 0 || m.pool_size > 0)
             && ((project.manifest?.roles?.server?.runner || project.manifest?.tiers?.spinoff?.runner) !== 'process'
                 || m.is_queenzee_host))
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
