@@ -1237,6 +1237,104 @@ export async function selfWorking(xell, { note = null } = {}) {
     message: 'Working ping recorded — the hive shows this xell as occ-working.' };
 }
 
+// ── POST /api/xell/self/handover — store the typed result on the execution this xell is on ──
+// The WELD (docs/hierarchical-workflow-adoption.md §3.2): a zee bound to a PLANE-3 execution can
+// hand its typed result over. INTERIM storage on execution.outputs until the stage-2 data plane
+// (ports) exists — deliberately NOT a state transition, and deliberately NOT a new write path into
+// the ledgers: the result is the WORK's output, not an observability row. The execution is resolved
+// from THIS xell's binding (xell.execution_id), never from an agent-named id — the identity half of
+// "every row in the observability chain is a byproduct of a door".
+export async function selfHandover(xell, { result = null } = {}) {
+  if (!xell.execution_id) {
+    return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to hand over' };
+  }
+  if (result === null || result === undefined || result === '') {
+    return { ok: false, error: 'handover needs --result "<json>" — the typed result to store on the execution' };
+  }
+  let parsed;
+  if (typeof result === 'string') {
+    try { parsed = JSON.parse(result); }
+    catch (e) { return { ok: false, error: `--result must be valid JSON: ${e.message}` }; }
+  } else {
+    parsed = result;
+  }
+  try {
+    const row = await one(
+      `UPDATE execution SET outputs = $2 WHERE id = $1
+       RETURNING id, state, outputs`,
+      [xell.execution_id, JSON.stringify(parsed)]);
+    if (!row) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+    return { ok: true, execution_id: row.id, state: row.state, outputs: row.outputs,
+      message: 'Result stored on execution.outputs (interim — the stage-2 data plane replaces this).' };
+  } catch (e) {
+    return { ok: false, error: `could not store the result on execution.outputs: ${String(e.message).slice(0, 200)}` };
+  }
+}
+
+// ── POST /api/xell/self/await — END the turn, hold a lease, mark the execution waiting ──
+// The ANTI-SPIN primitive (docs/hierarchical-workflow-adoption.md §3.1): a zee waiting on something
+// outside the model — a human gate, an external service, a timer — ends its turn NOW (tokens stop)
+// instead of polling, and the execution moves to 'waiting' under a HELD lease. When the wait
+// resolves the queenzee resumes (the lease lapses or is released, and the work wakes). The execution
+// is resolved from this xell's binding, never from an agent-named id. `hours` overrides the default
+// 24h lease window (the universal timeout: if the external signal never comes, the lease lapses and
+// the work requeues).
+export async function selfAwait(xell, { hours = null } = {}) {
+  if (!xell.execution_id) {
+    return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to wait on' };
+  }
+  const h = Number(hours) > 0 ? Number(hours) : 24;
+  const zee = await liveZee(xell.id);
+  if (!zee) return { ok: false, error: 'no live zee bound to this xell to await for' };
+  try {
+    const exec = await one(`SELECT id, state, entity_id FROM execution WHERE id=$1`, [xell.execution_id]);
+    if (!exec) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // END the current turn — the anti-spin half. The open turn (spawn/resume/interactive) closes as
+    // 'ended', stop_reason 'await', so the tokens stop. The zee row goes idle too (markZeeTurn), so
+    // the hive shows it resting rather than working.
+    const open = await one(
+      `SELECT id FROM zee_turn WHERE zee_id=$1 AND status='started' ORDER BY started_at DESC LIMIT 1`,
+      [zee.id]).catch(() => null);
+    if (open?.id) await endTurn(open.id, { status: 'ended', stopReason: 'await' });
+    await markZeeTurn(zee.id, 'idle', 'await');
+
+    // The entity that holds the wait — the execution's bound entity (the zee-as-entity, stamped at
+    // dispatch). If the execution has none (a dispatch that never bound one), create one for the zee
+    // so the lease has a holder. kind_hint is display-only — this is a display hint, not a branch.
+    let entityId = exec.entity_id;
+    if (!entityId) {
+      const ent = await one(
+        `INSERT INTO entity (name, kind_hint) VALUES ($1, 'agent') RETURNING id`,
+        [`agent:${zee.slug || zee.id}`]);
+      entityId = ent.id;
+      await q(`UPDATE execution SET entity_id=$2 WHERE id=$1`, [xell.execution_id, entityId]);
+    }
+
+    // HOLD the lease. Exactly one HELD lease per execution (lease_one_active_per_execution), so a
+    // second await while one is already held EXTENDS it rather than colliding — idempotent.
+    const held = await one(`SELECT id FROM lease WHERE execution_id=$1 AND state='held'`, [xell.execution_id]).catch(() => null);
+    if (held?.id) {
+      await q(`UPDATE lease SET expires_at = now() + ($2 || ' hours')::interval, heartbeat_at = now() WHERE id=$1`,
+        [held.id, h]);
+    } else {
+      await one(
+        `INSERT INTO lease (execution_id, entity_id, expires_at) VALUES ($1, $2, now() + ($3 || ' hours')::interval) RETURNING id`,
+        [xell.execution_id, entityId, h]);
+    }
+
+    // Mark the execution waiting — lease held, blocked on an external signal/timer/human.
+    await q(`UPDATE execution SET state='waiting' WHERE id=$1`, [xell.execution_id]);
+
+    return { ok: true, execution_id: xell.execution_id, state: 'waiting', lease_hours: h,
+      turn_ended: !!open?.id,
+      message: `Turn ended and the execution is now 'waiting' under a ${h}h held lease. `
+        + 'Tokens stop here — when the wait resolves, the queenzee resumes the work.' };
+  } catch (e) {
+    return { ok: false, error: `could not await: ${String(e.message).slice(0, 200)}` };
+  }
+}
+
 // ── GET /api/xell/self/provider-env — the RUNNABLE env for ONE provider (`zee creds --provider <key> --export`) ──
 // SERVER-COMPUTED, read-only, token-scoped. The cage holds every provider's raw token under
 // ZEE_PROVIDER_<KEY>_TOKEN, but a zee cannot RUN a vendor CLI from that: the vendor wants its own

@@ -74,6 +74,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
+         selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
          setLangfuseTracking,
@@ -1690,6 +1691,22 @@ router.post('/xell/self/turn', async (req, res) => {
 router.post('/xell/self/working', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfWorking(x, { note: req.body?.note || null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Store this xell's typed result on the PLANE-3 execution it is bound to (the observability-spine
+// weld — docs/hierarchical-workflow-adoption.md §3.2). Interim storage on execution.outputs until
+// the stage-2 data plane exists. The execution is resolved from xell.execution_id (never an
+// agent-named id). Token-scoped like every self verb.
+router.post('/xell/self/handover', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHandover(x, { result: req.body?.result ?? null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// END the current turn and put the execution this xell is on into 'waiting' under a held lease — the
+// anti-spin primitive. Token-scoped; the execution is resolved from xell.execution_id.
+router.post('/xell/self/await', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfAwait(x, { hours: req.body?.for ?? null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Which environment this xell is loaded with (masked — var NAMES only; the values live in the
