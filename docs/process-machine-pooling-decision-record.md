@@ -2,9 +2,9 @@
 
 **Date:** 2026-08-10
 **Author:** Architect (machine-aware-pooling-is-disabled-local-mard-eccb04)
-**Status:** Decided (design) — not yet implemented; supersedes nothing. The pool guard and
-banner described in §3.1 of `deploy-topology-spec.md` remain the CURRENT behaviour until a
-builder lands the changes in "Interfaces" below.
+**Status:** Implemented (2026-08-10, same xell — machines.js/provision.js/pool.js/Machines.jsx/
+App.jsx per "Interfaces" below; tests `pool-process-local-machine.test.mjs` +
+`machine-pooling-warning.test.mjs`; spec §3.1 updated). Supersedes nothing.
 
 ## Decision
 

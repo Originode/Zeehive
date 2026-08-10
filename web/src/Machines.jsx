@@ -27,35 +27,43 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
   const all = ROLES.flatMap((r) => (containers[r] || []).map((c) => ({ ...c, _role: r })));
 
   // THE SILENT DISABLE — the "mardale-prod never gets pool xells" defect (process-runner form).
-  // A machine is a dev spawn target for THIS project (dev_priority>0) but the spinoff server is
-  // runner:process, so the pool maintainer takes the legacy project-wide path and every
-  // per-machine pool/priority knob in this matrix is a dead letter. Same message as the
-  // server's pool logline, so an operator reading one can fix the project from the other.
+  // A REMOTE machine is a dev spawn target for THIS project (dev_priority>0) but the spinoff
+  // server is runner:process — a process xell's worktree, processes and cage all live on the
+  // queenzee host, so a remote machine can never host one and its pool/priority knobs are a
+  // dead letter. The QUEENZEE-HOST row (is_queenzee_host, computed by the server) is exempt:
+  // its pool_size GOVERNS a process project (counted project-wide by the pool — see
+  // queenzee/pool.js and docs/process-machine-pooling-decision-record.md), so configuring the
+  // pool there is the working knob, not a mistake to warn about. Same message as the server's
+  // pool logline, so an operator reading one can fix the project from the other.
   // Compose projects (no process runner) ARE placeable even when compose_spinoff is unset —
   // do not warn on that column alone.
-  const machinePoolingDisabled = ms.some((m) => m.enabled && m.dev_priority > 0) && !!spinoffIsProcess;
-  const disabledMachines = ms.filter((m) => m.enabled && m.dev_priority > 0).map((m) => m.key);
+  const deadRows = (m) => m.enabled && m.dev_priority > 0 && !m.is_queenzee_host;
+  const machinePoolingDisabled = ms.some(deadRows) && !!spinoffIsProcess;
+  const disabledMachines = ms.filter(deadRows).map((m) => m.key);
+  const hostMachine = ms.find((m) => m.enabled && m.is_queenzee_host) || null;
 
-  // The warning's "I don't want machine placement" exit: this project runs as bare processes, so
-  // the per-machine pool/priority rows it has can never take effect. Zero them (both knobs — a
-  // pool_size left >0 is read nowhere once dev_priority is 0) so the dead config stops tripping the
-  // warning everywhere: this banner, the server's pool logline, and any future matrix render. An
-  // operator who DOES want machine placement ignores the button and follows the compose-runner path
-  // the warning text names. Uses the same per-(machine,project) writers the knobs themselves call.
+  // The warning's "I don't want remote placement" exit: the REMOTE rows' pool/priority for this
+  // project can never take effect, so zero them (both knobs — a pool_size left >0 is read nowhere
+  // once dev_priority is 0) and the dead config stops tripping the warning everywhere: this
+  // banner, the server's pool logline, and any future matrix render. The queenzee-host row is
+  // deliberately NOT touched — its pool_size is the knob that governs a process project. An
+  // operator who DOES want remote placement ignores the button and follows the compose-runner
+  // path the warning text names. Uses the same per-(machine,project) writers the knobs call.
   const [clearing, setClearing] = useState(false);
   const clearDeadPooling = async () => {
     const names = disabledMachines.join(', ');
     if (!(await showConfirm(
       `Clear per-machine pooling for this project on: ${names}?\n\n`
-      + `This project's spinoff server is runner:process, so these machines' dev_priority and pool_size `
-      + `for THIS project are a dead letter — the pool always takes the project-wide target. Clearing `
-      + `sets both to 0 here and silences this warning. The machines themselves are untouched, and no `
-      + `other project's settings change.`,
+      + `This project's spinoff server is runner:process — its xells all live on the queenzee host, `
+      + `so these remote machines' dev_priority and pool_size for THIS project are a dead letter. `
+      + `Clearing sets both to 0 there and silences this warning. `
+      + (hostMachine ? `The ${hostMachine.key} column keeps its settings — its pool size governs this project. ` : '')
+      + `The machines themselves are untouched, and no other project's settings change.`,
       { okLabel: 'Clear per-machine pooling' }))) return;
     setClearing(true);
     try {
       for (const m of ms) {
-        if (!m.enabled || m.dev_priority <= 0) continue;
+        if (!deadRows(m)) continue;
         if (m.pool_size > 0) await setMachinePool(m.id, projectId, 0);
         await setMachinePriority(m.id, projectId, 0);
       }
@@ -109,19 +117,23 @@ export default function MachineMatrix({ machines, containers, projectId, spinoff
     <section className="matrix" data-testid="matrix"
              style={{ gridTemplateColumns: `max-content repeat(${cols.length}, minmax(120px, 1fr)) max-content` }}>
       {/* The machine-pooling-DISABLED banner: an operator who configured per-machine pooling must
-          be able to SEE why it is not happening. The same message as the server's pool logline
-          (queenzee/pool.js), naming the process-runner reason — so reading one lets you fix the
-          project from the other. */}
+          be able to SEE why it is not happening. Only REMOTE rows are named — the queenzee-host
+          row's pool size GOVERNS a process project, so it is the working knob, not dead config.
+          The same message as the server's pool logline (queenzee/pool.js), naming the
+          process-runner reason — so reading one lets you fix the project from the other. */}
       {machinePoolingDisabled && (
         <div className="mx-warn" data-testid="mx-pooling-disabled">
           <span>
-            ⚠ Machine-aware pooling is DISABLED: {disabledMachines.join(', ')} is configured for this
-            project (dev_priority&gt;0) but the spinoff server is <span className="mono">runner:process</span>
-            {' '}— per-machine pool sizes and priorities have no effect (process roles get no
-            docker_ctx, so the ready count is zero by construction). The project-wide pool target
-            applies. To place on machines, give the server a compose runner and a spinoff compose
-            file in <span className="mono">zeehive.yml</span>, then refresh the manifest — or, to
-            keep the project-wide pool, clear per-machine pooling on the right.
+            ⚠ Machine-aware pooling is DISABLED on {disabledMachines.join(', ')}: the spinoff server
+            is <span className="mono">runner:process</span>, so this project's xells all live on the
+            queenzee host — a remote machine can never host one (process roles get no docker_ctx, so
+            the ready count is zero by construction), and those machines' pool sizes and priorities
+            have no effect. {hostMachine
+              ? <>Pooling is governed by the <b>{hostMachine.key}</b> column — set the pool size there.</>
+              : <>The project-wide pool target applies.</>}
+            {' '}To place on remote machines, give the server a compose runner and a spinoff compose
+            file in <span className="mono">zeehive.yml</span>, then refresh the manifest — or clear
+            the dead per-machine pooling on the right.
           </span>
           <button className="mx-warn-clear" data-testid="mx-pooling-clear" disabled={clearing}
                   onClick={clearDeadPooling} title="Zero dev_priority and pool_size on the named machines for THIS project — removes the dead config and this warning">

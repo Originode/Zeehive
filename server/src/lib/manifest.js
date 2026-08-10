@@ -504,9 +504,11 @@ export function planComposeOnboarding(repoRoot, projectName, currentProject = {}
   }
 
   // Process-runner callout: adopting a spinoff compose does NOT strip process mode unless the
-  // human edits the yml themselves. Machine-aware pooling stays off for process servers.
+  // human edits the yml themselves. Remote machine placement stays off for process servers —
+  // the queenzee-host machine's pool still governs them (pool.js;
+  // docs/process-machine-pooling-decision-record.md).
   if (serverRoleIsProcess(proposed) && detectedTiers.spinoff) {
-    warnings.push('spinoff server stays runner:process — machine-aware pooling will remain off until the server role is a compose service (see pool.js)');
+    warnings.push('spinoff server stays runner:process — remote machine placement will remain off until the server role is a compose service (the queenzee-host machine\'s pool size still governs; see pool.js)');
   }
   if (detectedTiers.prod) {
     warnings.push('production containers are NOT modified: live prod stacks keep the compose_file already stamped on each container row; only the project.compose_prod column (and the yml, if written) change');
