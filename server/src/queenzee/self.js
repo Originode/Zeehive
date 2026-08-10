@@ -50,6 +50,7 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
 // interactive turn is recorded exactly like the two the queenzee starts (lib/turn-record.js).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
 import { startTurn, endTurn } from '../lib/turn-ledger.js';
+import { appendExecutionEvent } from '../lib/execution-events.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
@@ -1244,7 +1245,12 @@ export async function selfWorking(xell, { note = null } = {}) {
 // the ledgers: the result is the WORK's output, not an observability row. The execution is resolved
 // from THIS xell's binding (xell.execution_id), never from an agent-named id — the identity half of
 // "every row in the observability chain is a byproduct of a door".
-export async function selfHandover(xell, { result = null } = {}) {
+//
+// THE AUDIT TRAIL (the point of the append-only event log): the mutable outputs column is
+// overwritten by design, so the door ALSO appends an IMMUTABLE 'execution.handover' event carrying
+// the result — the record of "this zee handed over at T with this result" cannot be rewritten by a
+// later handover.
+export async function selfHandover(xell, { result = null, override = false } = {}) {
   if (!xell.execution_id) {
     return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to hand over' };
   }
@@ -1259,13 +1265,35 @@ export async function selfHandover(xell, { result = null } = {}) {
     parsed = result;
   }
   try {
+    const exec = await one(
+      `SELECT id, run_id, work_node_id, outputs FROM execution WHERE id=$1`, [xell.execution_id]);
+    if (!exec) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // A handover that would silently destroy a prior result is refused unless the caller EXPLICITLY
+    // overrides. The earlier result is still recoverable from the append-only event log (below) — the
+    // mutable column just cannot be the only record of what has happened.
+    if (exec.outputs !== null && exec.outputs !== undefined && !override) {
+      return { ok: false, error:
+        'execution.outputs already has a result — re-run with --override to replace it '
+        + '(the event log keeps the history of every handover).' };
+    }
+
     const row = await one(
       `UPDATE execution SET outputs = $2 WHERE id = $1
        RETURNING id, state, outputs`,
       [xell.execution_id, JSON.stringify(parsed)]);
-    if (!row) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // THE IMMUTABLE RECORD — the door's byproduct. Appended AFTER the write so the event exists iff
+    // the write happened (best-effort: a failure to log never fails the handover itself).
+    await appendExecutionEvent({
+      runId: exec.run_id, executionId: exec.id, workNodeId: exec.work_node_id,
+      type: 'execution.handover',
+      payload: { result: parsed, overrode: exec.outputs !== null && exec.outputs !== undefined },
+    });
+
     return { ok: true, execution_id: row.id, state: row.state, outputs: row.outputs,
-      message: 'Result stored on execution.outputs (interim — the stage-2 data plane replaces this).' };
+      message: (exec.outputs !== null && exec.outputs !== undefined ? 'Result REPLACED on execution.outputs' : 'Result stored on execution.outputs')
+        + ' (interim — the stage-2 data plane replaces this).' };
   } catch (e) {
     return { ok: false, error: `could not store the result on execution.outputs: ${String(e.message).slice(0, 200)}` };
   }
@@ -1279,6 +1307,10 @@ export async function selfHandover(xell, { result = null } = {}) {
 // is resolved from this xell's binding, never from an agent-named id. `hours` overrides the default
 // 24h lease window (the universal timeout: if the external signal never comes, the lease lapses and
 // the work requeues).
+//
+// THE AUDIT TRAIL: the mutable execution.state flip to 'waiting' is also recorded as an IMMUTABLE
+// 'execution.await' event carrying the lease window — so "this execution went to waiting at T under
+// an N-hour lease" is a fact no later overwrite can erase.
 export async function selfAwait(xell, { hours = null } = {}) {
   if (!xell.execution_id) {
     return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to wait on' };
@@ -1287,8 +1319,19 @@ export async function selfAwait(xell, { hours = null } = {}) {
   const zee = await liveZee(xell.id);
   if (!zee) return { ok: false, error: 'no live zee bound to this xell to await for' };
   try {
-    const exec = await one(`SELECT id, state, entity_id FROM execution WHERE id=$1`, [xell.execution_id]);
+    const exec = await one(
+      `SELECT id, run_id, work_node_id, state, entity_id FROM execution WHERE id=$1`, [xell.execution_id]);
     if (!exec) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // REFUSE TERMINAL STATES. A done/failed/skipped/cancelled/blocked/compensated execution is a
+    // finished piece of work — dragging it back into 'waiting' under a held lease would make the
+    // future lease sweeper treat it as a live zombie forever. Await is for work blocked on an
+    // external signal, not for re-opening the past.
+    const TERMINAL = ['done', 'failed', 'skipped', 'cancelled', 'blocked', 'compensated'];
+    if (TERMINAL.includes(exec.state)) {
+      return { ok: false, error:
+        `cannot await a '${exec.state}' execution — it has already finished; awaiting is only valid from a non-terminal state (running/ready/waiting/pending).` };
+    }
 
     // END the current turn — the anti-spin half. The open turn (spawn/resume/interactive) closes as
     // 'ended', stop_reason 'await', so the tokens stop. The zee row goes idle too (markZeeTurn), so
@@ -1300,21 +1343,33 @@ export async function selfAwait(xell, { hours = null } = {}) {
     await markZeeTurn(zee.id, 'idle', 'await');
 
     // The entity that holds the wait — the execution's bound entity (the zee-as-entity, stamped at
-    // dispatch). If the execution has none (a dispatch that never bound one), create one for the zee
-    // so the lease has a holder. kind_hint is display-only — this is a display hint, not a branch.
+    // dispatch). When the execution has none, RESOLVE-OR-CREATE by a STABLE KEY, never a blind
+    // insert: entities model durable actors (entity_load headroom, concurrency, capabilities,
+    // reliability), and "one zee maps to ONE entity reused across its executions" is what makes
+    // those mean anything. The stable key is `agent:<zee.id>` — the zee UUID is unique per zee and
+    // immutable, so every execution a zee awaits resolves to the same entity row.
     let entityId = exec.entity_id;
     if (!entityId) {
-      const ent = await one(
-        `INSERT INTO entity (name, kind_hint) VALUES ($1, 'agent') RETURNING id`,
-        [`agent:${zee.slug || zee.id}`]);
+      const key = `agent:${zee.id}`;
+      const existing = await one(`SELECT id FROM entity WHERE name=$1`, [key]).catch(() => null);
+      const ent = existing || await one(
+        `INSERT INTO entity (name, kind_hint) VALUES ($1, 'agent') RETURNING id`, [key]);
       entityId = ent.id;
       await q(`UPDATE execution SET entity_id=$2 WHERE id=$1`, [xell.execution_id, entityId]);
     }
 
     // HOLD the lease. Exactly one HELD lease per execution (lease_one_active_per_execution), so a
     // second await while one is already held EXTENDS it rather than colliding — idempotent.
-    const held = await one(`SELECT id FROM lease WHERE execution_id=$1 AND state='held'`, [xell.execution_id]).catch(() => null);
+    const held = await one(
+      `SELECT id, entity_id FROM lease WHERE execution_id=$1 AND state='held'`, [xell.execution_id]).catch(() => null);
     if (held?.id) {
+      // The holder is meaningful: one active lease per execution, and extending someone else's lease
+      // is a silent takeover. Refuse unless the holder is the entity this execution belongs to.
+      if (held.entity_id !== entityId) {
+        return { ok: false, error:
+          'the held lease on this execution belongs to a different entity — refusing to extend '
+          + "someone else's lease (release or expire it first, or wait for the lease to lapse)." };
+      }
       await q(`UPDATE lease SET expires_at = now() + ($2 || ' hours')::interval, heartbeat_at = now() WHERE id=$1`,
         [held.id, h]);
     } else {
@@ -1326,10 +1381,18 @@ export async function selfAwait(xell, { hours = null } = {}) {
     // Mark the execution waiting — lease held, blocked on an external signal/timer/human.
     await q(`UPDATE execution SET state='waiting' WHERE id=$1`, [xell.execution_id]);
 
+    // THE IMMUTABLE RECORD — the door's byproduct. Appended after the state flip.
+    await appendExecutionEvent({
+      runId: exec.run_id, executionId: exec.id, workNodeId: exec.work_node_id,
+      type: 'execution.await',
+      payload: { lease_hours: h, entity_id: entityId },
+    });
+
     return { ok: true, execution_id: xell.execution_id, state: 'waiting', lease_hours: h,
       turn_ended: !!open?.id,
       message: `Turn ended and the execution is now 'waiting' under a ${h}h held lease. `
-        + 'Tokens stop here — when the wait resolves, the queenzee resumes the work.' };
+        + 'Tokens stop here — when the wait resolves, the queenzee resumes the work. '
+        + 'This MUST be the last thing you do in this turn — stop talking after you call it.' };
   } catch (e) {
     return { ok: false, error: `could not await: ${String(e.message).slice(0, 200)}` };
   }

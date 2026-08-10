@@ -1699,7 +1699,7 @@ router.post('/xell/self/working', async (req, res) => {
 // agent-named id). Token-scoped like every self verb.
 router.post('/xell/self/handover', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
-    res.json(await selfHandover(x, { result: req.body?.result ?? null })); }
+    res.json(await selfHandover(x, { result: req.body?.result ?? null, override: req.body?.override === true })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // END the current turn and put the execution this xell is on into 'waiting' under a held lease — the
