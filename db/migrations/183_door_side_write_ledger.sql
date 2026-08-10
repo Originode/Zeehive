@@ -22,9 +22,14 @@ CREATE TABLE IF NOT EXISTS door_write_event (
   id           bigserial PRIMARY KEY,
   ts           timestamptz NOT NULL DEFAULT now(),
   door         text NOT NULL,             -- 'console-terminal' (zee SSH) | 'console-container' (docker exec shell)
-  xell_id      uuid REFERENCES xell(id) ON DELETE SET NULL,
-  zee_id       uuid REFERENCES zee(id) ON DELETE SET NULL,
-  container_id uuid REFERENCES container(id) ON DELETE SET NULL,
+  -- PLAIN uuid, deliberately NO FOREIGN KEY: this table is append-only, so an FK's ON DELETE
+  -- action would have to UPDATE or DELETE a row to satisfy the constraint — which the trigger
+  -- below forbids — and that would BLOCK reaping the xell/zee/container the row names (the
+  -- reaper hard-deletes containers, and a xell/zee can be decommissioned at any time). The
+  -- ids stay as untyped references; the `target` text names the row for a human reader.
+  xell_id      uuid,
+  zee_id       uuid,
+  container_id uuid,
   target       text,                      -- zee slug or container name the door opened
   actor        text,                      -- resolvable actor identity, else null (see header)
   input        text,                      -- safe representation of the write (control chars escaped, capped)
