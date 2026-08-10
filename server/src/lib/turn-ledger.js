@@ -48,17 +48,22 @@ export function lastAssistantText(msg) {
 // Start a turn. `kind` = spawn | resume | interactive. Returns the turn row, or null on
 // any failure (observability is best-effort by contract). The caller threads the id into
 // session_event rows so the play-by-play can be replayed per turn.
+//
+// `executionId` — the PLANE-3 execution (workflow weld) this turn advances. The QUEENZEE
+// stamps it when it starts a turn for a DISPATCHED execution; the caller resolves it from
+// the xell's execution_id binding (the source of truth). A turn with no execution keeps
+// execution_id NULL — every standalone turn and every historic turn is exactly that.
 export async function startTurn({ zee, xell = null, kind = 'spawn', sessionId = null, model = null,
-                                   startedAt = null, meta = null }) {
+                                   startedAt = null, meta = null, executionId = null }) {
   try {
     const row = await one(
-      `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, session_id, model, started_at, meta)
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, '{}'::jsonb))
+      `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, session_id, model, started_at, meta, execution_id)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, '{}'::jsonb), $9)
        RETURNING *`,
       [zee?.id || null, xell?.id || zee?.xell_id || null, xell?.project_id || null,
        kind, sessionId || zee?.claude_session_id || zee?.session_name || null,
        model || zee?.model || null, startedAt || null,
-       meta ? JSON.stringify(meta) : null]);
+       meta ? JSON.stringify(meta) : null, executionId || xell?.execution_id || null]);
     return row;
   } catch (e) {
     logline('turn', `could not start a turn ledger row (${String(e.message).slice(0, 120)})`);

@@ -1320,7 +1320,10 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   // PER-TURN LEDGER: a spawned turn is one unit of observability. The turn row is started
   // before the stream so the play-by-play events can be attributed to it (turn_id on
   // session_event). Best-effort — a null turn just means no per-turn attribution.
-  const turn = await startTurn({ zee, xell, kind: 'spawn', model, meta: { mode: m.key } });
+  // execution_id rides along when this xell is bound to a PLANE-3 execution (the weld — the
+  // queenzee stamps the execution on the turn it starts for a dispatched zee).
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model, meta: { mode: m.key },
+                                 executionId: xell.execution_id });
 
   const it = sdk.query({
     prompt: await briefing(xell.id, zee, task, { headless }), // the binding + rules, not a bare task
@@ -1549,8 +1552,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   broadcast('zee', zee);
   logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
   // PER-TURN LEDGER: same shape as the SDK spawn — one turn row per spawn, threaded into the
-  // play-by-play events. Best-effort.
-  const turn = await startTurn({ zee, xell, kind: 'spawn', model: ranModel, meta: { mode: m.key } });
+  // play-by-play events. Best-effort. execution_id rides along from the xell binding (the weld).
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model: ranModel, meta: { mode: m.key },
+                                 executionId: xell.execution_id });
 
   // The cxell runs on the queenzee's local daemon for now — its network reach is the firewall
   // allow-list, so co-location with the xell's app tier is unnecessary (they meet over TCP).

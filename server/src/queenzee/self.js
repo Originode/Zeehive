@@ -1201,7 +1201,8 @@ export async function selfTurn(xell, { state = null } = {}) {
     // observability, even though the queenzee cannot know its cost (no meter on this door). The
     // row is started so the turn exists in the timeline; its cost stays zero and metered=true is
     // left defaulted — it IS measured (measured zero), unlike an unmetered headless turn.
-    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model });
+    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model,
+                      executionId: xell.execution_id });
   } else {
     row = await markZeeTurn(zee.id, 'idle', 'end_turn');
     // Close the OPEN interactive turn (the latest one for this zee that is still 'started').
