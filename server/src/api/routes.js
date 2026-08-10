@@ -2610,6 +2610,20 @@ router.get('/gantt', async (req, res) => {
   } catch (err) { workErr(res, err); }
 });
 
+// STAGE 6 — THE WORKFLOW GANTT read model (lib/workflow-gantt.js): the hierarchical
+// workflow model's plan/work_node/execution/lease plane re-pointed as the timeline.
+// PLANNED from the CPM pass, ACTUAL from execution.started_at/finished_at, WAITING from
+// held leases on waiting executions; deps are the leaf-level union_edge; each row carries
+// its execution → turn → gateway waterfall for the drill-down. READ-ONLY — the CPM is the
+// deterministic pass, and every execution/lease/turn row is a byproduct of a door.
+router.get('/workflow/gantt', async (req, res) => {
+  try {
+    if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
+    const { workflowGanttModel } = await import('../lib/workflow-gantt.js');
+    res.json(await workflowGanttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
+  } catch (err) { workErr(res, err); }
+});
+
 
 // ── WORK TRACKER: assignment + deployment ─────────────────────────────────────
 // The verbs that turn a plan item into a running agent (lib/work-assign.js). Everything here is a

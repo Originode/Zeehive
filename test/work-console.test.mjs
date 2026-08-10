@@ -149,8 +149,11 @@ ok(/descendant/i.test(read('web/src/work/WorkItemDrawer.jsx')), 'the delete conf
 
 // ── the part-4 seam: Gantt keeps its name and its props ──
 const gantt = read('web/src/work/Gantt.jsx');
-ok(/export default function Gantt\(\s*\{\s*projectId,\s*rootId\s*\}/.test(gantt),
-   'Gantt.jsx exports `Gantt({ projectId, rootId })` — part 4 drops in without touching WorkConsole');
+// Stage 6 re-pointed the timeline at the model: the trace is the PROJECT's plan, so Gantt
+// takes projectId only. WorkConsole still passes rootId (the work-tracker scope); Gantt ignores
+// it — the model tree is a different tree and has no work_item meaning.
+ok(/export default function Gantt\(\s*\{\s*projectId\s*\}/.test(gantt),
+   'Gantt.jsx exports `Gantt({ projectId })` — stage 6 re-pointed the timeline at the model');
 ok(/<Gantt\s+projectId=\{[^}]*\}\s+rootId=\{[^}]*\}/.test(read('web/src/work/WorkConsole.jsx')),
    'WorkConsole passes exactly those two props to the timeline tab');
 

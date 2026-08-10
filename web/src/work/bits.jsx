@@ -18,7 +18,11 @@ import { HIVE_COLORS, hiveHeat } from '../hive/status.js';
 //      honeycomb is drawing two panes away; if the board invented its own greens the console would
 //      be telling a human two colours for one fact. So `HIVE_COLORS`/`hiveHeat` are imported from
 //      `web/src/hive/status.js` — never re-hexed here.
-export const KIND_GLYPH = { project: '▣', activity: '▤', task: '▸' };
+export const KIND_GLYPH = {
+  project: '▣', activity: '▤', task: '▸',
+  // the hierarchical workflow model's node kinds (stage 6 timeline renders work_node rows)
+  container: '▤', action: '▸', signal: '◇',
+};
 
 export function KindGlyph({ kind, className = '' }) {
   return (
