@@ -144,6 +144,74 @@ export async function eventsForTurn(turnId, { limit = 500 } = {}) {
   }
 }
 
+// The WELD read model — the nested drill-down tree (work_node → execution → turns → gateway calls)
+// for a xell's observability. docs/hierarchical-workflow-adoption.md §3.2: the chain
+// execution → zee_turn → llm_gateway_request is the waterfall, and this is its per-xell read shape.
+// A human expands a work node, sees its executions, expands one, sees the turns that advanced it,
+// expands a turn, sees the LLM gateway calls that made it up. Every row is a byproduct of a door —
+// this only READS. Best-effort like every observability read (503-not-throw).
+export async function workflowTreeForXell(xellId) {
+  if (!xellId) return [];
+  try {
+    const xell = await one(`SELECT execution_id FROM xell WHERE id=$1`, [xellId]);
+    const boundExecId = xell?.execution_id || null;
+    // The executions this xell's zees worked on: the xell's own binding (xell.execution_id) plus
+    // every execution a zee_turn of this xell was stamped with. DISTINCT because a turn-stamped
+    // execution may also BE the xell's binding.
+    const execs = await q(
+      `SELECT DISTINCT e.id, e.run_id, e.work_node_id, e.attempt, e.map_index, e.loop_iteration,
+              e.state, e.entity_id, e.inputs, e.outputs, e.error, e.effect_key,
+              e.started_at, e.finished_at, e.created_at,
+              wn.name AS work_node_name, wn.kind AS work_node_kind
+         FROM execution e
+         JOIN work_node wn ON wn.id = e.work_node_id
+         LEFT JOIN zee_turn t ON t.execution_id = e.id AND t.xell_id = $1
+        WHERE e.id = $2 OR t.id IS NOT NULL
+        ORDER BY wn.name, e.started_at`, [xellId, boundExecId]);
+    if (!execs.length) return [];
+    const execIds = execs.map((e) => e.id);
+    const turns = await q(
+      `SELECT t.*, z.name AS zee_name
+         FROM zee_turn t LEFT JOIN zee z ON z.id = t.zee_id
+        WHERE t.execution_id = ANY($1::uuid[])
+        ORDER BY t.started_at ASC`, [execIds]);
+    const turnIds = [...new Set(turns.map((t) => t.id))];
+    const reqs = turnIds.length ? await q(
+      `SELECT id, turn_id, provider, model, method, path, status,
+              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+              cost_usd, duration_ms, error, requested_at, completed_at
+         FROM llm_gateway_request WHERE turn_id = ANY($1::uuid[])
+        ORDER BY requested_at ASC`, [turnIds]) : [];
+    const reqsByTurn = new Map();
+    for (const r of reqs) {
+      if (!reqsByTurn.has(r.turn_id)) reqsByTurn.set(r.turn_id, []);
+      reqsByTurn.get(r.turn_id).push(r);
+    }
+    const turnsByExec = new Map();
+    for (const t of turns) {
+      if (!turnsByExec.has(t.execution_id)) turnsByExec.set(t.execution_id, []);
+      turnsByExec.get(t.execution_id).push({ ...t, gateway_requests: reqsByTurn.get(t.id) || [] });
+    }
+    const byNode = new Map();
+    for (const e of execs) {
+      const { work_node_name, work_node_kind, ...exec } = e;
+      if (!byNode.has(e.work_node_id)) {
+        byNode.set(e.work_node_id, {
+          work_node_id: e.work_node_id,
+          work_node_name: e.work_node_name,
+          work_node_kind: e.work_node_kind,
+          executions: [],
+        });
+      }
+      byNode.get(e.work_node_id).executions.push({ ...exec, turns: turnsByExec.get(e.id) || [] });
+    }
+    return [...byNode.values()];
+  } catch (e) {
+    logline('turn', `workflowTreeForXell failed (${String(e.message).slice(0, 120)})`);
+    return [];
+  }
+}
+
 // ── play-by-play feed persistence ─────────────────────────────────────────────────────────────
 //
 // intake.js's feed() (cxell path) and the SDK stream loop both call this so the same stream-json

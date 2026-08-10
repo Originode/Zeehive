@@ -1922,10 +1922,14 @@ router.get('/xells/:id/observability', async (req, res) => {
   try {
     const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
     if (!x) return res.status(404).json({ error: 'no such xell' });
-    const { turnsForXell } = await import('../lib/turn-ledger.js');
+    const { turnsForXell, workflowTreeForXell } = await import('../lib/turn-ledger.js');
     const turns = await turnsForXell(req.params.id, { zeeId: req.query.zee_id || null, limit: req.query.limit || 50 });
+    // The WELD tree — the nested drill-down waterfall (work_node → execution → turns → gateway
+    // calls) per work node, from the same read-only door. A turn with no execution lives in `turns`
+    // and nowhere here; an execution with turns appears in both.
+    const workflow = await workflowTreeForXell(req.params.id);
     // Per-turn event counts ride along so the UI can show "N events" without fetching them all.
-    res.json({ ok: true, xell_id: req.params.id, turns });
+    res.json({ ok: true, xell_id: req.params.id, turns, workflow });
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
