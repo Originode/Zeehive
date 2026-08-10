@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import MarkdownPreview from '@uiw/react-markdown-preview';
+import rehypeSanitize from 'rehype-sanitize';
 import '@uiw/react-markdown-preview/markdown.css';
 import { parsePatch } from './DiffViewer.jsx';
 import { fileViewerKind } from './fileViewerKind.js';
@@ -109,7 +110,15 @@ function Viewer({ file, onClose }) {
           {file.error ? <div className="fview-empty err">could not read the file: {file.error}</div>
             : file.binary ? <div className="fview-empty">binary file — not shown</div>
             : file.content == null ? <div className="fview-empty">loading…</div>
-            : kind === 'markdown' ? <MarkdownPreview source={file.content} wrapperElement={{ 'data-color-mode': 'dark' }} />
+            : kind === 'markdown'
+              ? <MarkdownPreview source={file.content} wrapperElement={{ 'data-color-mode': 'dark' }}
+                                 rehypePlugins={[rehypeSanitize]} />
+              // rehypeSanitize (default schema) MUST stay the last rehype plugin: the preview's
+              // built-in pipeline runs rehype-raw first, so a raw `<script>` or a `javascript:`
+              // href inside a .md file would otherwise reach the DOM — same-origin XSS in the
+              // console, and these files come from a zee's worktree or ANY fleet container,
+              // prod included. Sanitizing AFTER raw keeps the markup the file author wrote while
+              // stripping scripts, event-handler attributes and non-http(s) URLs.
             : kind === 'json' ? <JsonView text={file.content} />
             : kind === 'diff' ? <DiffView text={file.content} />
             : <pre className="fview-code">{file.content}</pre>}

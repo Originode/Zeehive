@@ -39,6 +39,9 @@ ok(/showFileViewer/.test(fv) && /closeFileViewer/.test(fv), 'exports showFileVie
 ok(/export function FileViewerHost/.test(fv), 'exports FileViewerHost (the root-mounted singleton host)');
 ok(/from '@uiw\/react-markdown-preview'/.test(fv), 'routes .md to @uiw/react-markdown-preview');
 ok(/<MarkdownPreview source=\{file\.content\}/.test(fv), 'renders MarkdownPreview with the file text');
+ok(/from 'rehype-sanitize'/.test(fv), 'imports rehype-sanitize');
+ok(/rehypePlugins=\{\[rehypeSanitize\]\}/.test(fv),
+   'and passes it as the last rehype plugin — the preview\'s rehype-raw runs first, so a raw <script> / javascript: href in a .md file would otherwise reach the DOM (same-origin XSS; these files come from a zee\'s worktree or any fleet container)');
 ok(/import \{ parsePatch \} from '\.\/DiffViewer\.jsx'/.test(fv), 'reuses the diff row renderer (parsePatch)');
 ok(/fileViewerKind/.test(fv), 'the viewer consults the router');
 ok(/fview-overlay/.test(fv), 'renders as a modal overlay');
