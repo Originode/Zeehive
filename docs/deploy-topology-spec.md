@@ -134,6 +134,14 @@ from repo). The field must name a real compose file whose services match the pro
 `roles` — the build path (`build-container.sh`) resolves it from the container row stamped
 at provision.
 
+**Accepted direction for process-runner projects** (not yet implemented):
+[`process-machine-pooling-decision-record.md`](process-machine-pooling-decision-record.md)
+decides that a `runner: process` project's per-machine pool config is honored on the ONE
+machine its xells factually live on — the queenzee-host machine row — counted project-wide
+(no `docker_ctx` join, so the zero-count runaway cannot recur), with the DISABLED warning
+narrowed to the remote rows that stay a dead letter. Until that lands, the guard above is
+the behaviour.
+
 #### Compose onboarding (detect → plan → human approves → meta-DB)
 
 When a project has `docker-compose*.yml` at the repo root but the meta-DB has not absorbed
