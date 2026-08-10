@@ -1,11 +1,11 @@
 // WORKFLOW STAGE 3 — run/execution/event/checkpoint — the DURABILITY plane
 // (docs/hierarchical-workflow-adoption.md §5, stage 3; design §8.1–8.5).
 //
-// This test proves migration 177 (workflow_stage3_run_execution_event_checkpoint) against a
-// REAL postgres with the full migration set applied. It is the stage-3 counterpart of
-// test/workflow-stage1.test.mjs and extends that suite's pattern — a standalone node script
-// with a header documenting coverage, a loud SKIP on a non-workflow db, and teardown in a
-// finally. Coverage:
+// This test proves migrations 177 (workflow_stage3_run_execution_event_checkpoint) and 178
+// (workflow_stage3_reconcile_append_only_purge_hatch) against a REAL postgres with the full
+// migration set applied. It is the stage-3 counterpart of test/workflow-stage1.test.mjs and
+// extends that suite's pattern — a standalone node script with a header documenting coverage,
+// a loud SKIP on a non-workflow db, and teardown in a finally. Coverage:
 //
 //   A. run round-trip — insert/select, state/version_policy/globals/correlation_id columns,
 //      defaults (state='pending', version_policy='pinned').
@@ -16,7 +16,14 @@
 //      means a plain retry and a map instance do not collide, but two plain rows at the same
 //      attempt do.
 //   C. event is append-only (I16) — UPDATE and DELETE both RAISE via event_append_only; the
-//      row is unchanged afterwards. event (run_id, seq) uniqueness is enforced.
+//      row is unchanged afterwards. event (run_id, seq) uniqueness is enforced. The 178 purge
+//      hatch: UPDATE raises even with zeehive.purge_events='on'; DELETE without the GUC raises;
+//      DELETE with the GUC succeeds (the admin/GDPR retention path that makes the run ON DELETE
+//      CASCADE honest).
+//   C2. TEARDOWN (the reason 178 exists): DELETE FROM run for a run that has an event must
+//      succeed once the session opts in to purge — the cascade must actually fire. A failed
+//      teardown is a FAIL (errors are never swallowed), and the suite ends with a residue
+//      assertion that 0 run/execution/event/checkpoint rows and the project are gone.
 //   D. effect_key idempotency (design §8.2) — the partial unique index exec_effect_key_idx on
 //      (run_id, effect_key) WHERE state='done' makes a second DONE execution with the same key
 //      in one run impossible, so the engine replays the recorded output; a FAILED attempt with
@@ -71,6 +78,21 @@ async function main() {
   const A2 = (await one(
     `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind)
      VALUES ($1,$2,'2','A2','action') RETURNING id`, [ver, R])).id;
+
+  // Run a query inside a transaction that has opted in to the 178 purge hatch
+  // (SET LOCAL — scoped to this transaction, never leaks into the session).
+  const withPurge = async (fn) => {
+    await q('BEGIN');
+    await q(`SET LOCAL zeehive.purge_events = 'on'`);
+    try {
+      const r = await fn();
+      await q('COMMIT');
+      return r;
+    } catch (e) {
+      await q('ROLLBACK').catch(() => {});
+      throw e;
+    }
+  };
 
   // track runs so teardown can delete them (run.plan_version_id has NO cascade — history)
   const runIds = [];
@@ -144,6 +166,20 @@ async function main() {
     await assertRefused(
       q(`INSERT INTO event (run_id, seq, type) VALUES ($1,1,'node.started')`, [runC]),
       'duplicate key', 'event (run_id, seq=1) duplicate is refused');
+
+    // the 178 purge hatch: UPDATE stays forbidden ALWAYS, even with the GUC on
+    await assertRefused(
+      withPurge(() => q(`UPDATE event SET type='tampered' WHERE id=$1`, [evt.id])),
+      'append-only', 'event UPDATE raises even with zeehive.purge_events on (no hatch for UPDATE)');
+    // ...and DELETE without the GUC still raises (already proven above), but DELETE with the
+    // GUC succeeds — the deliberate admin retention/GDPR purge path (and the thing that makes
+    // the run ON DELETE CASCADE honest, exercised again by the teardown)
+    await withPurge(() => q(`DELETE FROM event WHERE id=$1`, [evt.id]));
+    ok((await one(`SELECT count(*)::int AS n FROM event WHERE id=$1`, [evt.id])).n === 0,
+      `event DELETE succeeds when the session opts in to purge (zeehive.purge_events='on')`);
+    // leave an event on runC so the teardown must exercise the ON DELETE CASCADE through the
+    // event trigger with the GUC on — the exact path 178 exists to make honest
+    await q(`INSERT INTO event (run_id, seq, type) VALUES ($1,2,'node.left-for-teardown')`, [runC]);
 
     // ── D. effect_key idempotency (design §8.2) ──────────────────────────────
     console.log(`\nD. effect_key idempotency — done rows dedupe, failures may retry`);
@@ -242,15 +278,35 @@ async function main() {
     }
 
   } finally {
-    // tear down: runs first (run.plan_version_id has NO cascade — history is preserved on
-    // purpose), then the project cascade removes the plan/version/nodes.
-    for (const id of runIds) {
-      await q(`DELETE FROM event WHERE run_id=$1`, [id]).catch(() => {});
-      await q(`DELETE FROM checkpoint WHERE run_id=$1`, [id]).catch(() => {});
-      await q(`DELETE FROM execution WHERE run_id=$1`, [id]).catch(() => {});
-      await q(`DELETE FROM run WHERE id=$1`, [id]).catch(() => {});
+    // tear down: opt in to the 178 purge hatch, then DELETE FROM run and let the ON DELETE
+    // CASCADE remove event/checkpoint/execution with it (this is what the hatch is FOR — the
+    // cascade is honest now). A FAILED teardown prints and counts as a FAIL — never swallow.
+    try {
+      await q(`SET zeehive.purge_events = 'on'`);
+      for (const id of runIds) {
+        await q(`DELETE FROM run WHERE id=$1`, [id]);
+      }
+      // run.plan_version_id has NO cascade — history is preserved on purpose — so runs are
+      // deleted above, then the project cascade removes the plan/version/nodes.
+      await q(`DELETE FROM project WHERE id=$1`, [projectId]);
+      await q(`RESET zeehive.purge_events`);
+
+      // residue assertion: nothing of ours may survive, in any of the four stage-3 tables
+      const residue = await one(
+        `SELECT
+           (SELECT count(*)::int FROM run          WHERE id = ANY($1::uuid[]))  AS runs,
+           (SELECT count(*)::int FROM execution    WHERE run_id = ANY($1::uuid[])) AS execs,
+           (SELECT count(*)::int FROM event        WHERE run_id = ANY($1::uuid[])) AS evts,
+           (SELECT count(*)::int FROM checkpoint   WHERE run_id = ANY($1::uuid[])) AS cks,
+           (SELECT count(*)::int FROM project WHERE id = $2) AS projects`,
+        [runIds, projectId]);
+      ok(residue.runs === 0 && residue.execs === 0 && residue.evts === 0
+        && residue.cks === 0 && residue.projects === 0,
+        `teardown leaves no residue (runs=${residue.runs} execs=${residue.execs} evts=${residue.evts} cks=${residue.cks} projects=${residue.projects})`);
+    } catch (e) {
+      console.error(`  ✗ FAIL teardown: ${e.message.split('\n')[0].slice(0, 100)}`);
+      fail++;
     }
-    await q(`DELETE FROM project WHERE id=$1`, [projectId]).catch(() => {});
     await admin.end().catch(() => {});
   }
 
