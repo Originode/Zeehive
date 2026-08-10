@@ -312,6 +312,10 @@ async function main() {
     const zeeEntity = await one(`SELECT id, name FROM entity WHERE name=$1`, [`agent:${zee.id}`]);
     ok(!!zeeEntity, `the stable-key entity exists (agent:<zee.id>)`);
     entityIds.push(zeeEntity.id); // track for teardown (deleted after its leases cascade away with the runs)
+    // DEFECT 8: the SUCCESS path DOES stamp execution.entity_id — only the refusal path must not.
+    const exNoEntAfter = await one(`SELECT entity_id FROM execution WHERE id=$1`, [exNoEnt.id]);
+    ok(exNoEntAfter.entity_id === zeeEntity.id,
+      `a SUCCESSFUL await stamps execution.entity_id with the resolved entity (DEFECT 8 success half)`);
     const leaseNoEnt = await one(`SELECT entity_id FROM lease WHERE execution_id=$1 AND state='held'`, [exNoEnt.id]);
     ok(leaseNoEnt.entity_id === zeeEntity.id, `the lease is held by the resolve-or-created entity`);
     // a SECOND entity-less execution for the SAME zee reuses the SAME entity row — never a fresh insert
@@ -336,9 +340,14 @@ async function main() {
     entityIds.push(foreignEnt.id);
     const foreignRun = await one(`INSERT INTO run (plan_version_id) VALUES ($1) RETURNING id`, [ver]);
     runIds.push(foreignRun.id);
+    // DEFECT 8 scenario: an ENTITY-LESS execution with a FOREIGN-held lease. The resolve-or-create
+    // block resolves the awaiting zee's own entity; the OLD code then stamped execution.entity_id
+    // with it BEFORE the foreign-lease refusal — a false ownership claim (execution says one actor
+    // owns it, lease says a different actor holds it). With the stamp moved into the mutation half,
+    // a REFUSED await must leave execution.entity_id NULL.
     const foreignExec = await one(
-      `INSERT INTO execution (run_id, work_node_id, attempt, state, entity_id)
-       VALUES ($1,$2,1,'running',$3) RETURNING id`, [foreignRun.id, A1, ent.id]);
+      `INSERT INTO execution (run_id, work_node_id, attempt, state)
+       VALUES ($1,$2,1,'running') RETURNING id`, [foreignRun.id, A1]);
     // someone else already holds the one HELD lease on this execution
     await one(
       `INSERT INTO lease (execution_id, entity_id, expires_at) VALUES ($1, $2, now() + '1 day'::interval) RETURNING id`,
@@ -349,15 +358,17 @@ async function main() {
     const foreignRefusal = await selfAwait({ id: x.id, execution_id: foreignExec.id }, { hours: 24 });
     ok(foreignRefusal.ok === false && /different entity/.test(foreignRefusal.error),
       `awaiting an execution whose HELD lease belongs to another entity is REFUSED`);
-    // TKT-161: the foreign-lease refusal must be side-effect free — turn OPEN, zee NOT idle,
-    // execution unchanged, zero event rows.
+    // TKT-161 + DEFECT 8: the foreign-lease refusal must be side-effect free — turn OPEN, zee NOT
+    // idle, execution unchanged (including entity_id still NULL), zero event rows.
     const foreignTurnAfter = await one(`SELECT status, stop_reason FROM zee_turn WHERE id=$1`, [foreignTurn.id]);
     ok(foreignTurnAfter.status === 'started' && foreignTurnAfter.stop_reason === null,
       `a REFUSED foreign-lease await leaves the open turn 'started' with no stop_reason (${foreignTurnAfter.status}/${foreignTurnAfter.stop_reason})`);
     const zeeAfterForeignRefusal = await one(`SELECT status FROM zee WHERE id=$1`, [zee.id]);
     ok(zeeAfterForeignRefusal.status !== 'idle', `a REFUSED foreign-lease await leaves the zee NOT idle (${zeeAfterForeignRefusal.status})`);
-    const foreignExecAfter = await one(`SELECT state FROM execution WHERE id=$1`, [foreignExec.id]);
+    const foreignExecAfter = await one(`SELECT state, entity_id FROM execution WHERE id=$1`, [foreignExec.id]);
     ok(foreignExecAfter.state === 'running', `a REFUSED foreign-lease await leaves the execution unchanged (${foreignExecAfter.state})`);
+    ok(foreignExecAfter.entity_id === null,
+      `a REFUSED foreign-lease await does NOT stamp execution.entity_id (still NULL — DEFECT 8)`);
     const foreignEvts = (await one(`SELECT count(*)::int AS n FROM event WHERE run_id=$1`, [foreignRun.id])).n;
     ok(foreignEvts === 0, `a REFUSED foreign-lease await appends NO event row (${foreignEvts})`);
 

@@ -1345,7 +1345,10 @@ export async function selfAwait(xell, { hours = null } = {}) {
     //
     // VALIDATE-THEN-MUTATE (TKT-161): this block runs BEFORE the turn is ended and the zee parked,
     // because it feeds the foreign-lease refusal below. The only write that can have happened by a
-    // later refusal is this harmless entity row / execution.entity_id stamp — never a closed turn.
+    // later refusal is this entity ROW (creating it is genuinely benign — it is keyed, reused and
+    // lease-less, and entity_load counts leases, not stamps) — never a closed turn, and never the
+    // execution.entity_id OWNERSHIP stamp, which lives in the mutation half below (DEFECT 8: on a
+    // refused await the execution must not claim an owner that does not hold the lease).
     // MINOR (TKT-161): this resolve is SELECT-then-INSERT and entity.name has NO unique index, so
     // two CONCURRENT awaits for one zee could insert two 'agent:<zee.id>' rows. We deliberately do
     // NOT add an index here: entity is a cross-cutting table whose name is not globally unique by
@@ -1362,7 +1365,11 @@ export async function selfAwait(xell, { hours = null } = {}) {
       const ent = existing || await one(
         `INSERT INTO entity (name, kind_hint) VALUES ($1, 'agent') RETURNING id`, [key]);
       entityId = ent.id;
-      await q(`UPDATE execution SET entity_id=$2 WHERE id=$1`, [xell.execution_id, entityId]);
+      // NOTE: the execution.entity_id OWNERSHIP stamp is deliberately NOT here. It lives in the
+      // mutation half below, next to the lease write, after every refusal path has passed — so a
+      // REFUSED await never claims an owner for the execution (DEFECT 8). Creating the entity row
+      // above is the benign part: keyed, reused, lease-less, and entity_load counts leases, not
+      // stamps.
     }
 
     // HOLD the lease. Exactly one HELD lease per execution (lease_one_active_per_execution), so a
@@ -1393,6 +1400,13 @@ export async function selfAwait(xell, { hours = null } = {}) {
     await markZeeTurn(zee.id, 'idle', 'await');
 
     // Write/extend the lease — the mutation half, once the await is committed to.
+    // Stamp the execution's OWNER only now (DEFECT 8): the resolve-or-create above may have resolved
+    // an entity for a previously entity-less execution, but writing execution.entity_id on a REFUSED
+    // await would claim an owner that does not hold the lease. Only on the committed success path do
+    // we stamp ownership, right beside the lease that proves it.
+    if (entityId && !exec.entity_id) {
+      await q(`UPDATE execution SET entity_id=$2 WHERE id=$1`, [xell.execution_id, entityId]);
+    }
     if (held?.id) {
       await q(`UPDATE lease SET expires_at = now() + ($2 || ' hours')::interval, heartbeat_at = now() WHERE id=$1`,
         [held.id, h]);
