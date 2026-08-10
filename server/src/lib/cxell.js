@@ -938,6 +938,36 @@ export async function installZeeCliIntoCxell({ ctx = 'default', name }) {
   }
 }
 
+// PER-ACTOR GIT IDENTITY (TKT-159-3139). The zee-agent image bakes a SHARED git identity
+// (user.name 'zee' / zee@zeehive.local), so every in-cxell commit is unattributable. At spawn we
+// override it with the per-xell scheme: the AUTHOR names the acting zee (its slug) and the
+// COMMITTER names the door that wrote it (in-cage git = the xell door; the console terminal sets
+// its own console-door committer via terminal-bridge; queenzee merges keep the queenzee door via
+// -c in xellgit.js/cxell.js).
+//
+// git config user.name/user.email set BOTH the author and committer of a commit, so the global
+// config here is the DOOR identity (user.name 'xell'), and the zee's authorship rides in
+// GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL (which git prioritises over the config — set in the headless
+// exec env by runZee's caller and in /etc/environment by openCxellSsh, so a console-terminal
+// shell also authors as the slug). A commit therefore reads author=<slug>, committer=xell — the
+// door. Best-effort by contract: a failure to configure identity must never sink a spawn (the
+// baked shared identity is a safe fallback, and the ledgers still record what happened).
+export async function configureCxellGitIdentity({ ctx = 'default', slug, timeoutMs = 20000 } = {}) {
+  const name = cxellName(slug);
+  const safeSlug = String(slug || '').replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 120);
+  const email = `${safeSlug}@xell.zeehive.local`;
+  try {
+    const r = await dk(ctx, ['exec', name, 'bash', '-lc',
+      `git config --global user.name 'xell' && git config --global user.email '${email}'`
+      + ` && echo IDENTITY_OK`], { timeoutMs });
+    return { ok: /IDENTITY_OK/.test(r.out || ''), slug: safeSlug, email };
+  } catch (e) {
+    logline('cxell', `${name}: could not configure per-xell git identity (${String(e.message).slice(0, 200)}) — `
+      + 'in-cxell commits keep the baked shared identity until a rebuild fixes it');
+    return { ok: false, slug: safeSlug, email };
+  }
+}
+
 // Open the cxell's SSH door: install the Zeehive public key for `zee`, drop the agent CLI's
 // credential env into /etc/environment so an interactive (PAM) login shell comes up authenticated
 // — a docker-exec -e run gets the env directly, an SSH login does not — and start sshd. Root

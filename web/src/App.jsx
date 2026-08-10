@@ -2228,7 +2228,13 @@ function PrCard({ req, onDone, onDismiss }) {
           </button>
           <ul className="land-commits">
             {commits.slice(0, 8).map((c) => (
-              <li key={c.short}><code>{c.short}</code> {c.subject} <span className="land-author">{c.author}</span></li>
+              <li key={c.short}>
+                <code>{c.short}</code> {c.subject}{' '}
+                <span className="land-author">{c.author}</span>
+                {c.door && <span className="land-door" title={`committer: ${c.committer || ''} <${c.committer_email || ''}>`}>
+                  · {c.door}{c.committer && c.door !== c.committer ? ` / ${c.committer}` : ''}
+                </span>}
+              </li>
             ))}
             {commits.length > 8 && <li className="land-more">…and {commits.length - 8} more</li>}
           </ul>

@@ -1233,6 +1233,7 @@ a.cbox:hover { border-color: var(--accent); }
 .land-commits li { padding: 2px 0; color: var(--text); }
 .land-commits code { color: var(--accent); font-family: 'Cascadia Code', 'Consolas', monospace; }
 .land-author { color: var(--muted); }
+.land-door { color: var(--accent); opacity: 0.8; cursor: help; }
 .land-more { color: var(--muted); font-style: italic; }
 .land-err { color: var(--error); font-size: 12px; margin-top: 8px; }
 .land-approved { color: var(--up); font-size: 12.5px; margin-top: 10px; }

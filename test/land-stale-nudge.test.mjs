@@ -55,7 +55,7 @@ async function awaitResume() {
 const tmp = mkdtempSync(join(tmpdir(), 'land-stale-'));
 const src = join(tmp, 'src');
 git(tmp, ['init', '-q', '-b', 'main', 'src']);
-git(src, ['config', 'user.email', 'test@zeehive.local']); git(src, ['config', 'user.name', 'test']);
+git(src, ['config', 'user.email', 'queenzee@zeehive.local']); git(src, ['config', 'user.name', 'Zeehive queenzee']);
 writeFileSync(join(src, 'a.txt'), 'A\n'); git(src, ['add', '.']); git(src, ['commit', '-qm', 'A (base)']);
 const shaA = git(src, ['rev-parse', 'HEAD']);
 

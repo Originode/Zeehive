@@ -39,6 +39,11 @@
 //         maps to one durable actor), never a fresh identically-named insert.
 //      E4 (finding 5): await refuses to extend a HELD lease that belongs to a DIFFERENT entity — the
 //         holder is meaningful and extending someone else's lease is a silent takeover.
+//   F. (TKT-161-9AD1) REFUSED DOORS ARE SIDE-EFFECT FREE — validate-then-mutate: every refusal
+//      (the handover no-override refusal, the terminal-state await refusal and the foreign-lease
+//      await refusal) leaves the open turn 'started' with stop_reason NULL, the zee NOT idle, the
+//      execution state/outputs unchanged, and ZERO new event rows. A refused await used to close the
+//      turn and park the zee (which the spin detector's filters could not see) — this proves the fix.
 //
 // Everything it creates is torn down in a finally. It SKIPs loudly on a database that has not run
 // the weld migration (180).
@@ -74,6 +79,7 @@ async function main() {
   const one = async (text, params) => (await admin.query(text, params)).rows[0];
 
   const { startTurn, endTurn, workflowTreeForXell } = await import('../server/src/lib/turn-ledger.js');
+  const { markZeeTurn } = await import('../server/src/lib/turn-record.js');
   const { selfHandover, selfAwait } = await import('../server/src/queenzee/self.js');
 
   // throwaway project → xource → xell → zee, and project → plan → plan_version → work_node → run →
@@ -202,6 +208,19 @@ async function main() {
     const second = await selfHandover(x, { result: '{"translated":false}' });
     ok(second.ok === false && /override/.test(second.error),
       `a second handover on a non-null outputs is REFUSED with an --override sentence`);
+    // TKT-161: the REFUSAL is side-effect free — the turn stays OPEN, the zee stays as it was,
+    // execution.outputs are untouched, and no event row is appended.
+    const turnAfterHandRefusal = await one(`SELECT status, stop_reason FROM zee_turn WHERE id=$1`, [turnNoExec.id]);
+    ok(turnAfterHandRefusal.status === 'started' && turnAfterHandRefusal.stop_reason === null,
+      `a REFUSED handover leaves the open turn 'started' with no stop_reason (${turnAfterHandRefusal.status}/${turnAfterHandRefusal.stop_reason})`);
+    const zeeAfterHandRefusal = await one(`SELECT status FROM zee WHERE id=$1`, [zee.id]);
+    ok(zeeAfterHandRefusal.status !== 'idle', `a REFUSED handover leaves the zee NOT idle (${zeeAfterHandRefusal.status})`);
+    const exAfterHandRefusal = await one(`SELECT outputs FROM execution WHERE id=$1`, [ex.id]);
+    ok(exAfterHandRefusal.outputs?.count === 3 && exAfterHandRefusal.outputs?.translated === true,
+      `a REFUSED handover leaves execution.outputs untouched (${JSON.stringify(exAfterHandRefusal.outputs)})`);
+    const handEvtAfterRefusal = (await one(
+      `SELECT count(*)::int AS n FROM event WHERE run_id=$1 AND type='execution.handover'`, [run.id])).n;
+    ok(handEvtAfterRefusal === 1, `a REFUSED handover appends NO event row (${handEvtAfterRefusal} handover event)`);
     const overridden = await selfHandover(x, { result: '{"translated":false,"count":9}', override: true });
     ok(overridden.ok === true && overridden.outputs?.count === 9,
       `with --override the result is REPLACED (the event log keeps the history)`);
@@ -262,9 +281,23 @@ async function main() {
     const termExec = await one(
       `INSERT INTO execution (run_id, work_node_id, attempt, state, entity_id)
        VALUES ($1,$2,1,'done',$3) RETURNING id`, [termRun.id, A1, ent.id]);
+    // bring the zee back to WORKING with an open turn so the refusal's side-effect-freedom is provable
+    const termTurn = await startTurn({ zee, xell: x, kind: 'resume', model: 'opus', executionId: termExec.id });
+    await markZeeTurn(zee.id, 'working', 'resumed turn');
     const termRefusal = await selfAwait({ id: x.id, execution_id: termExec.id }, { hours: 24 });
     ok(termRefusal.ok === false && /'done'/.test(termRefusal.error),
       `awaiting a 'done' execution is REFUSED with the state named`);
+    // TKT-161: the terminal-state refusal must be side-effect free — turn OPEN, zee NOT idle,
+    // execution unchanged, zero event rows.
+    const termTurnAfter = await one(`SELECT status, stop_reason FROM zee_turn WHERE id=$1`, [termTurn.id]);
+    ok(termTurnAfter.status === 'started' && termTurnAfter.stop_reason === null,
+      `a REFUSED await leaves the open turn 'started' with no stop_reason (${termTurnAfter.status}/${termTurnAfter.stop_reason})`);
+    const zeeAfterTermRefusal = await one(`SELECT status FROM zee WHERE id=$1`, [zee.id]);
+    ok(zeeAfterTermRefusal.status !== 'idle', `a REFUSED await leaves the zee NOT idle (${zeeAfterTermRefusal.status})`);
+    const termExecAfter = await one(`SELECT state FROM execution WHERE id=$1`, [termExec.id]);
+    ok(termExecAfter.state === 'done', `a REFUSED await leaves the 'done' execution unchanged (${termExecAfter.state})`);
+    const termEvts = (await one(`SELECT count(*)::int AS n FROM event WHERE run_id=$1`, [termRun.id])).n;
+    ok(termEvts === 0, `a REFUSED await appends NO event row (${termEvts})`);
 
     // ── E3. (finding 4) RESOLVE-OR-CREATE BY THE STABLE ENTITY KEY ───────────
     console.log(`\nE3. entity resolve-or-create — one zee maps to one entity`);
@@ -279,6 +312,10 @@ async function main() {
     const zeeEntity = await one(`SELECT id, name FROM entity WHERE name=$1`, [`agent:${zee.id}`]);
     ok(!!zeeEntity, `the stable-key entity exists (agent:<zee.id>)`);
     entityIds.push(zeeEntity.id); // track for teardown (deleted after its leases cascade away with the runs)
+    // DEFECT 8: the SUCCESS path DOES stamp execution.entity_id — only the refusal path must not.
+    const exNoEntAfter = await one(`SELECT entity_id FROM execution WHERE id=$1`, [exNoEnt.id]);
+    ok(exNoEntAfter.entity_id === zeeEntity.id,
+      `a SUCCESSFUL await stamps execution.entity_id with the resolved entity (DEFECT 8 success half)`);
     const leaseNoEnt = await one(`SELECT entity_id FROM lease WHERE execution_id=$1 AND state='held'`, [exNoEnt.id]);
     ok(leaseNoEnt.entity_id === zeeEntity.id, `the lease is held by the resolve-or-created entity`);
     // a SECOND entity-less execution for the SAME zee reuses the SAME entity row — never a fresh insert
@@ -303,16 +340,37 @@ async function main() {
     entityIds.push(foreignEnt.id);
     const foreignRun = await one(`INSERT INTO run (plan_version_id) VALUES ($1) RETURNING id`, [ver]);
     runIds.push(foreignRun.id);
+    // DEFECT 8 scenario: an ENTITY-LESS execution with a FOREIGN-held lease. The resolve-or-create
+    // block resolves the awaiting zee's own entity; the OLD code then stamped execution.entity_id
+    // with it BEFORE the foreign-lease refusal — a false ownership claim (execution says one actor
+    // owns it, lease says a different actor holds it). With the stamp moved into the mutation half,
+    // a REFUSED await must leave execution.entity_id NULL.
     const foreignExec = await one(
-      `INSERT INTO execution (run_id, work_node_id, attempt, state, entity_id)
-       VALUES ($1,$2,1,'running',$3) RETURNING id`, [foreignRun.id, A1, ent.id]);
+      `INSERT INTO execution (run_id, work_node_id, attempt, state)
+       VALUES ($1,$2,1,'running') RETURNING id`, [foreignRun.id, A1]);
     // someone else already holds the one HELD lease on this execution
     await one(
       `INSERT INTO lease (execution_id, entity_id, expires_at) VALUES ($1, $2, now() + '1 day'::interval) RETURNING id`,
       [foreignExec.id, foreignEnt.id]);
+    // bring the zee back to WORKING with an open turn so the refusal's side-effect-freedom is provable
+    const foreignTurn = await startTurn({ zee, xell: x, kind: 'resume', model: 'opus', executionId: foreignExec.id });
+    await markZeeTurn(zee.id, 'working', 'resumed turn');
     const foreignRefusal = await selfAwait({ id: x.id, execution_id: foreignExec.id }, { hours: 24 });
     ok(foreignRefusal.ok === false && /different entity/.test(foreignRefusal.error),
       `awaiting an execution whose HELD lease belongs to another entity is REFUSED`);
+    // TKT-161 + DEFECT 8: the foreign-lease refusal must be side-effect free — turn OPEN, zee NOT
+    // idle, execution unchanged (including entity_id still NULL), zero event rows.
+    const foreignTurnAfter = await one(`SELECT status, stop_reason FROM zee_turn WHERE id=$1`, [foreignTurn.id]);
+    ok(foreignTurnAfter.status === 'started' && foreignTurnAfter.stop_reason === null,
+      `a REFUSED foreign-lease await leaves the open turn 'started' with no stop_reason (${foreignTurnAfter.status}/${foreignTurnAfter.stop_reason})`);
+    const zeeAfterForeignRefusal = await one(`SELECT status FROM zee WHERE id=$1`, [zee.id]);
+    ok(zeeAfterForeignRefusal.status !== 'idle', `a REFUSED foreign-lease await leaves the zee NOT idle (${zeeAfterForeignRefusal.status})`);
+    const foreignExecAfter = await one(`SELECT state, entity_id FROM execution WHERE id=$1`, [foreignExec.id]);
+    ok(foreignExecAfter.state === 'running', `a REFUSED foreign-lease await leaves the execution unchanged (${foreignExecAfter.state})`);
+    ok(foreignExecAfter.entity_id === null,
+      `a REFUSED foreign-lease await does NOT stamp execution.entity_id (still NULL — DEFECT 8)`);
+    const foreignEvts = (await one(`SELECT count(*)::int AS n FROM event WHERE run_id=$1`, [foreignRun.id])).n;
+    ok(foreignEvts === 0, `a REFUSED foreign-lease await appends NO event row (${foreignEvts})`);
 
   } finally {
     // tear down: runs cascade executions → leases/allocations; entities are deleted separately

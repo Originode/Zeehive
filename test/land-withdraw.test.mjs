@@ -52,12 +52,12 @@ const src = join(tmp, 'src');
 const wt = join(tmp, 'wt');
 git(tmp, ['init', '-q', '-b', 'main', 'src']);
 const cfg = (k, v) => git(src, ['config', k, v]);
-cfg('user.email', 'test@zeehive.local'); cfg('user.name', 'test');
+cfg('user.email', 'queenzee@zeehive.local'); cfg('user.name', 'Zeehive queenzee');
 cfg('receive.denyCurrentBranch', 'ignore');
 writeFileSync(join(src, 'a.txt'), 'A\n'); git(src, ['add', '.']); git(src, ['commit', '-qm', 'A (base)']);
 const shaA = git(src, ['rev-parse', 'HEAD']);
 git(src, ['worktree', 'add', '-q', '-b', 'spinoff/withdraw', wt, shaA]);
-git(wt, ['config', 'user.email', 'zee@zeehive.local']); git(wt, ['config', 'user.name', 'zee']);
+git(wt, ['config', 'user.email', 'xell@xell.zeehive.local']); git(wt, ['config', 'user.name', 'xell']);
 writeFileSync(join(wt, 'zee.txt'), 'first pass\n'); git(wt, ['add', '.']); git(wt, ['commit', '-qm', 'Z1 (first pass)']);
 
 // ── 2. throwaway rows ─────────────────────────────────────────────────────────

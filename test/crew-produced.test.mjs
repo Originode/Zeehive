@@ -68,7 +68,7 @@ try {
   const wt = (name, branch) => {
     const p = join(tmp, name);
     git(repo, 'worktree', 'add', '-q', '-b', branch, p, 'master');
-    git(p, 'config', 'user.email', 'zee@zeehive.local'); git(p, 'config', 'user.name', 'zee');
+    git(p, 'config', 'user.email', 'xell@xell.zeehive.local'); git(p, 'config', 'user.name', 'xell');
     return p;
   };
   const mgrWt = wt('mgr', 'spinoff/mgr');

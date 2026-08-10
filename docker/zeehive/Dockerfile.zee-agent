@@ -97,9 +97,13 @@ ENV NODE_NO_WARNINGS=1 \
 # the same idempotent seed at spawn as a belt-and-suspenders across future image changes.
 RUN node /usr/local/bin/cxell-claude-seed.mjs /home/zee/.claude.json && chmod 600 /home/zee/.claude.json
 
-# git identity for in-cxell commits; the land gate attributes the human merge
-RUN git config --global user.name "zee" \
-    && git config --global user.email "zee@zeehive.local" \
+# git identity for in-cxell commits. TKT-159-3139: the baked config is the DOOR identity
+# (user.name = the xell door), and the per-xell spawn override (cxell.js configureCxellGitIdentity)
+# sets the door email to <slug>@xell.zeehive.local; the AUTHOR of every commit names the acting zee
+# slug via GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL (set at spawn in /etc/environment and the headless
+# exec env). This baked line is only the fallback for a cage spawned before the override ran.
+RUN git config --global user.name "xell" \
+    && git config --global user.email "xell@xell.zeehive.local" \
     && git config --global init.defaultBranch main
 
 # tmux runs fullscreen (alternate buffer), so the dashboard's xterm has no scrollback of its
