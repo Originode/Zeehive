@@ -1,30 +1,25 @@
-// MACHINE-POOLING-WARNING test — the console's "Machine-aware pooling is DISABLED" banner.
+// MACHINE-POOLING dead-config surface — how the console tells an operator that a machine's
+// prio/pool knobs have NO EFFECT for a runner:process project.
 //
-// The user report that started this: "i always get this error in dashboard of zeehive" — a
-// process-runner project (e.g. Zeehive itself: server/webapp run as bare processes) that also
-// has machine rows configured (dev_priority>0) can never place xells on those machines. The
-// banner is the operator-facing half of the pool guard (queenzee/pool.js says the same thing
-// in its logline), so the per-machine knobs being dead must not be silent.
+// History, because this surface has now changed twice on operator reports:
+//   1. Originally a red BANNER ("Machine-aware pooling is DISABLED …") that fired on every
+//      render as long as any configured machine existed — report: "i always get this error".
+//   2. Then the banner narrowed to REMOTE rows (the queenzee-host row governs a process
+//      project — process-machine-pooling decision record) and gained a clear button.
+//   3. The operator's next message was a SCREENSHOT of the banner still filling the matrix.
+//      Since the default-pooling ship the remote config is HARMLESS (the host row or the
+//      implicit default governs; the zero-count runaway is structurally impossible), and
+//      harmless config is not an alert — so the banner is GONE. The no-effect state renders
+//      AT THE KNOBS: a remote column's prio/pool are dimmed (.mx-knob.dead,
+//      data-pooling-dead=<key>) with the reason in the tooltip, still editable.
+//      (docs/pooling-dead-config-demotion-decision-record.md)
 //
-// The defect this pins: the banner fired on EVERY render with no way to resolve it — the only
-// exit it named was "give the server a compose runner", which a process-runner project may
-// never want. Two fixes layered here:
-//   - the "clear per-machine pooling" exit: zero dev_priority AND pool_size on the named
-//     machines for THIS project (the same writers the knobs use);
-//   - per-machine pooling is now HONORED on the queenzee-host machine for process projects
-//     (its pool_size governs, counted project-wide — queenzee/pool.js;
-//     docs/process-machine-pooling-decision-record.md), so the banner names ONLY the remote
-//     rows, and configuring the pool on the host row raises no banner at all.
-//
-// Renders the REAL MachineMatrix through esbuild + SSR and asserts what an operator reads:
-//   1. process-runner + remote machines at dev_priority>0 → the banner AND the clear button
-//      draw, naming ONLY the remote machines, the process-runner reason, and the governing
-//      queenzee-host column;
-//   2. compose project (no process runner) with the same machines → NO banner (placeable);
-//   3. process-runner + machines at dev_priority=0 → NO banner (nothing configured to place);
-//   4. process-runner + ONLY the queenzee-host machine configured → NO banner (the working
-//      knob in peace — the whole point of the change);
-//   5. the clear button is the component's own data-testid so a click path can be driven.
+// Renders the REAL MachineMatrix through esbuild + SSR and asserts:
+//   1. process-runner project → NO banner, remote prio/pool knobs dimmed, queenzee-host
+//      knobs live;
+//   2. compose project with the SAME machines → nothing dimmed, no banner;
+//   3. the dimming does not depend on the knob values (a remote knob at 0 is dead too —
+//      typing a number there would do nothing, and the tooltip must say so BEFORE the typing).
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -56,46 +51,32 @@ try {
   // is_queenzee_host is computed by the server (lib/machines.js listMachines) — the fixtures
   // carry it the way the fleet read model delivers it to the matrix.
   const machines = [
-    { id: 'm1', key: 'local', docker_ctx: 'default', is_queenzee_host: true, enabled: true, can_build: true, dev_priority: 2, pool_size: 1 },
-    { id: 'm2', key: 'ugreen-nas', docker_ctx: 'ugreen-nas', is_queenzee_host: false, enabled: true, can_build: false, dev_priority: 1, pool_size: 2 },
-    { id: 'm3', key: 'mardale-prod', docker_ctx: 'mardale-prod', is_queenzee_host: false, enabled: true, can_build: true, dev_priority: 3, pool_size: 0 },
+    { id: 'm1', key: 'local', docker_ctx: 'default', is_queenzee_host: true, enabled: true, can_build: true, dev_priority: 1, pool_size: 1 },
+    { id: 'm2', key: 'ugreen-nas', docker_ctx: 'ugreen-nas', is_queenzee_host: false, enabled: true, can_build: false, dev_priority: 1, pool_size: 1 },
+    { id: 'm3', key: 'mardale-prod', docker_ctx: 'mardale-prod', is_queenzee_host: false, enabled: true, can_build: true, dev_priority: 0, pool_size: 0 },
   ];
+  const deadOn = (html, key) => new RegExp(`data-pooling-dead="${key}"`).test(html);
 
-  console.log('\n── process-runner project with machines configured (the Zeehive report) ──');
-  const warned = render({ machines, spinoffIsProcess: true });
-  ok(/mx-pooling-disabled/.test(warned), 'the DISABLED banner draws');
-  ok(/Machine-aware pooling is DISABLED on/.test(warned), '…with its title');
-  ok(/DISABLED on ugreen-nas, mardale-prod/.test(warned), '…naming ONLY the remote machines (dev_priority>0, not the queenzee host)');
-  ok(!/DISABLED on [^:]*local/.test(warned), '…never naming the queenzee-host machine as dead config');
-  ok(/runner:process/.test(warned), '…and the process-runner reason');
-  ok(/governed by the/.test(warned) && /<b>local<\/b>/.test(warned),
-     '…and says pooling is governed by the queenzee-host column (the working knob)');
-  ok(/mx-pooling-clear/.test(warned), '…and offers the "clear per-machine pooling" exit (data-testid=mx-pooling-clear)');
-  ok(/clear per-machine pooling/.test(warned), '…whose label says what it does');
-  ok(/compose runner/.test(warned), '…and the text still names the compose-runner path for remote placement');
+  console.log('\n── process-runner project (the operator screenshot: local / mardale-prod / ugreen-nas) ──');
+  const proc = render({ machines, spinoffIsProcess: true });
+  ok(!/mx-pooling-disabled|Machine-aware pooling is DISABLED/.test(proc),
+     'NO banner — harmless config is not an alert');
+  ok(deadOn(proc, 'ugreen-nas'), "the remote 'ugreen-nas' prio/pool knobs are dimmed (data-pooling-dead)");
+  ok(deadOn(proc, 'mardale-prod'),
+     "…and 'mardale-prod' too, even at prio/pool 0 — the knob is dead BEFORE a number is typed into it");
+  ok(!deadOn(proc, 'local'), "the queenzee-host 'local' knobs are LIVE — its pool size governs this project");
+  ok(/No effect for this project/.test(proc) && /runner:process/.test(proc),
+     'the reason lives in the dimmed knobs&#x27; tooltip (runner:process, xells run on the queenzee host)'.replace('&#x27;', "'"));
+  ok(/mx-knob dead/.test(proc), 'the dimmed knobs carry the .mx-knob.dead class the stylesheet dims');
 
   console.log('\n── compose project (no process runner) with the SAME machines ──');
-  const placeable = render({ machines, spinoffIsProcess: false });
-  ok(!/mx-pooling-disabled/.test(placeable), 'no banner — a compose project is machine-placeable');
-
-  console.log('\n── process-runner project but every machine at dev_priority=0 ──');
-  const off = render({
-    machines: machines.map((m) => ({ ...m, dev_priority: 0, pool_size: 0 })),
-    spinoffIsProcess: true,
-  });
-  ok(!/mx-pooling-disabled/.test(off), 'no banner — nothing is configured to place (prio 0)');
-
-  console.log('\n── process-runner project with ONLY the queenzee-host machine configured ──');
-  const peace = render({
-    machines: machines.map((m) => (m.is_queenzee_host ? m : { ...m, dev_priority: 0, pool_size: 0 })),
-    spinoffIsProcess: true,
-  });
-  ok(!/mx-pooling-disabled/.test(peace),
-     'no banner — the host row\'s pool governs a process project ("configure the pool per machine in peace")');
+  const compose = render({ machines, spinoffIsProcess: false });
+  ok(!/data-pooling-dead/.test(compose), 'nothing is dimmed — every machine can host a compose project');
+  ok(!/mx-pooling-disabled/.test(compose), 'and no banner either (it no longer exists at all)');
 
   console.log('\n── process-runner project with NO machines (legacy inventory) ──');
   const none = render({ machines: [], spinoffIsProcess: true });
-  ok(!/mx-pooling-disabled/.test(none), 'no banner — no dead per-machine config to warn about');
+  ok(!/data-pooling-dead|mx-pooling-disabled/.test(none), 'nothing to dim, nothing to warn');
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

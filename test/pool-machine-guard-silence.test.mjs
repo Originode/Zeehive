@@ -1,20 +1,25 @@
-// POOL MACHINE-GUARD — process-runner projects stay on the legacy path, LOUDLY.
+// POOL MACHINE-GUARD — a REMOTE machine's per-machine config has no effect on a
+// runner:process project, and the pool RECORDS that once per state change.
 //
-// A project with a machine_pool row (dev_priority>0, pool_size>0) whose spinoff server is
-// runner:process cannot take the machine-aware path: process servers are stamped with
-// docker_ctx=NULL (provision.js), so the machine-mode ready count (JOIN on
+// A remote machine_pool row on a process project cannot take effect: process servers are
+// stamped with docker_ctx=NULL (provision.js), so the machine-mode ready count (JOIN on
 // container.role='server' AND docker_ctx) is always ZERO and the pool would provision
 // pool_size more every tick — exactly the 167-xell pile-up the pool.js comment documents.
-// The guard is REAL. The defect this test pins is that the skip must be LOUD (and must name
-// the process-runner reason, not the old compose_spinoff red herring).
+// The guard is REAL and stays.
 //
-// Companion: test/pool-machine-placeable-without-compose.test.mjs — a compose-shaped project
-// (no process runner) with NULL compose_spinoff MUST take the machine path; that was the
-// "mardale-prod never gets pool xells" defect under its second diagnosis.
+// What CHANGED (docs/pooling-dead-config-demotion-decision-record.md): the line is
+// INFORMATIONAL now, not an alert. It used to carry the house `!!!` marker + console.error —
+// earned when dead config was a TRAP. Since the default-pooling ship the config is harmless
+// (the queenzee-host row or the implicit default governs) and the matrix shows the no-effect
+// state dimmed at the knobs, so a forever-firing alert would only bury the ops digest.
 //
-// This drives the real `ensureReady()` against this xell's postgres with a fixture machine +
-// machine_pool and a process-runner manifest, and asserts a pool logline names the skipped
-// machine and the process-runner reason.
+// Companions: test/pool-machine-placeable-without-compose.test.mjs (compose projects take the
+// machine path), test/pool-process-local-machine.test.mjs (the host row governs a process
+// project), test/machine-pooling-warning.test.mjs (the console's knob-level surface).
+//
+// This drives the real `ensureReady()` against this xell's postgres with a fixture REMOTE
+// machine + machine_pool and a process-runner manifest, and asserts the recorded line names
+// the machine and the process-runner reason — without alert dressing.
 import { randomUUID } from 'node:crypto';
 
 process.env.PROVISION_MODE = 'simulate';   // before any import: no machine may be touched
@@ -59,15 +64,15 @@ try {
   await ensureReady();
   const poolLines = recentLogs(2000).slice(mark).filter((l) => l.scope === 'pool').map((l) => l.msg);
 
-  console.log('\n── the process-runner skip is loud ──');
+  console.log('\n── the process-runner skip is recorded, informationally ──');
   const warned = poolLines.find((l) => l.includes(mkey));
   ok(!!warned, `a pool logline names the skipped machine '${mkey}'`);
   ok(!!warned && /runner:process|process role|process-runner/i.test(warned),
      '…and names the process-runner reason so an operator can fix the project from the message alone');
-  ok(!!warned && /machine-aware|machine placement|machine pooling/i.test(warned),
-     '…and says the machine config is being skipped (machine-aware pooling disabled)');
-  ok(!!warned && /^!!!/.test(warned.trim()),
-     '…and starts with the house "loud" marker (!!!) so a manager\'s ops digest (ops-review ALERT_RE) surfaces it');
+  ok(!!warned && /no effect|machine-aware|machine placement|machine pooling/i.test(warned),
+     '…and says the per-machine config has no effect here');
+  ok(!!warned && !/^!!!/.test(warned.trim()),
+     '…WITHOUT the "!!!" alert marker — harmless config must not page the ops digest (demotion record)');
   ok(!!warned && !/compose_spinoff is unset/.test(warned),
      '…and does NOT blame compose_spinoff (that column is not the placement predicate)');
 

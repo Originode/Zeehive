@@ -24,8 +24,9 @@
 // process-runner check (serverRoleIsProcess) — but it no longer deadens EVERY per-machine
 // knob: a process xell lives on the queenzee host by construction, so the QUEENZEE-HOST
 // machine's pool_size is honored (counted project-wide, runaway-proof) and only REMOTE rows
-// are skipped, rate-limited and LOUD (tests: test/pool-machine-guard-silence.test.mjs,
-// test/pool-process-local-machine.test.mjs; docs/process-machine-pooling-decision-record.md).
+// are skipped — recorded once per state change, informational (the matrix dims those knobs;
+// tests: test/pool-machine-guard-silence.test.mjs, test/pool-process-local-machine.test.mjs;
+// docs/process-machine-pooling-decision-record.md + pooling-dead-config-demotion record).
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { provisionXell } from '../lib/provision.js';
@@ -173,37 +174,30 @@ async function reconcileProject(projectId, target) {
     // the cage on the queenzee's own daemon), so per-machine pooling is honored on the ONE
     // machine that is — the queenzee-host row — counted PROJECT-WIDE (fillTrim's process-local
     // mode: no docker_ctx join, so the zero-count runaway that piled up 167 xells cannot recur).
-    // A REMOTE row stays a dead letter, and the loud guard narrows to name only those, so an
-    // operator can fix the config from the message alone. Rate-limited to once per state change
-    // (the same "say it when it CHANGES" rule monitor.js uses): the pool ticks every 15s, and a
-    // verbatim repeat would drown the lines that carry news.
-    // (docs/process-machine-pooling-decision-record.md)
+    // A REMOTE row stays a dead letter — recorded below once per state change (the same "say it
+    // when it CHANGES" rule monitor.js uses; the pool ticks every 15s, and a verbatim repeat
+    // would drown the lines that carry news), while the matrix shows the same fact dimmed at
+    // the knobs. (docs/process-machine-pooling-decision-record.md)
     const host = machines.find((m) => m.docker_ctx === queenzeeHostCtx());
     const remote = machines.filter((m) => m.docker_ctx !== queenzeeHostCtx());
     if (remote.length) {
-      // `!!!` is the house "loud" convention (ops-review.js ALERT_RE scans for it) — a manager's
-      // ops digest must catch this line, not just a human reading the terminal.
-      const msg = `!!! machine-aware pooling DISABLED on [${remote.map((m) => m.key).join(', ')}] `
+      // INFORMATIONAL, not an alert. This line used to carry the house `!!!` marker and a
+      // console.error — earned when dead remote config was a TRAP (the pool silently fell back
+      // to a different target). Since the default-pooling ship it is harmless: the queenzee-host
+      // row (or the implicit default below) governs, the runaway is structurally impossible, and
+      // the matrix shows the no-effect state dimmed at the knobs themselves. An alert that fires
+      // forever over harmless config buries the ops digest lines that carry news
+      // (docs/pooling-dead-config-demotion-decision-record.md). Ring-only, once per state change.
+      const msg = `per-machine pooling has no effect on [${remote.map((m) => m.key).join(', ')}] `
         + `for project ${String(projectId).slice(0, 8)}: the spinoff server is runner:process — a `
         + `process xell's worktree, processes and cage all live on the queenzee host, so a remote `
-        + `machine can never host one (server containers get docker_ctx=NULL for process roles; `
-        + `the machine-mode ready count is zero by construction). `
+        + `machine can never host one. `
         + (host
-          ? `Pooling for this project is governed by '${host.key}' (the queenzee-host machine). `
-          : `The project-wide pool target applies; to pool per machine, configure the queenzee-host `
-            + `machine ('${queenzeeHostCtx()}' context) instead. `)
-        + `To place on remote machines, give roles.server (or tiers.spinoff) a compose runner and a `
-        + `spinoff compose file, then refresh the manifest — or clear the remote machines' `
-        + `dev_priority/pool_size for this project.`;
-      const first = !lastMachineGuardSaid.has(projectId);
+          ? `Pooling is governed by '${host.key}' (the queenzee-host machine).`
+          : `The project-wide pool target applies on the queenzee host.`);
       if (lastMachineGuardSaid.get(projectId) !== msg) {
         lastMachineGuardSaid.set(projectId, msg);
         logline('pool', msg);
-        // The ring buffer is read in the console's terminal modal; stdout is the docker log.
-        // The FIRST occurrence is the "operator, look here" event; later state changes that alter
-        // the message log again but only to the ring, so a fix that rotates machines stays audible
-        // without repeating the same line every 15 seconds.
-        if (first) console.error(`[pool] ${msg}`);
       }
     }
     if (host) {

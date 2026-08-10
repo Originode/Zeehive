@@ -140,12 +140,14 @@ governs — counted PROJECT-WIDE (no `docker_ctx` join, so the runaway cannot re
 capped by its `max_xells` (`liveXellCount` counts NULL-ctx server rows into the queenzee
 host). Provisioning likewise pins a process xell's one docker-placed piece — the per-xell
 db container — to the queenzee host, whatever the machine priorities say. Only REMOTE
-machine rows stay a dead letter for such projects, and an operator who configured them
-must be TOLD: the pool logs `machine-aware pooling DISABLED on [<remote machines>] …
-runner:process` (once per state change), and the console's container matrix shows the
-same warning, naming only the remote rows. With no queenzee-host row configured, the
-legacy project-wide `pool_config.target_ready` applies unchanged. Rationale and rejected
-alternatives: [`process-machine-pooling-decision-record.md`](process-machine-pooling-decision-record.md).
+machine rows stay a dead letter for such projects — harmless, and shown as such: the
+container matrix renders those columns' prio/pool knobs DIMMED with the reason in the
+tooltip, and the pool records a once-per-state-change informational line (`per-machine
+pooling has no effect on […]`). It is deliberately NOT an alert — see
+[`pooling-dead-config-demotion-decision-record.md`](pooling-dead-config-demotion-decision-record.md).
+With no queenzee-host row configured, the project-wide `pool_config.target_ready`
+applies on the queenzee host. Rationale and rejected alternatives:
+[`process-machine-pooling-decision-record.md`](process-machine-pooling-decision-record.md).
 
 A compose project with machines configured is placeable **even when `compose_spinoff` is
 unset** — requiring that column was the "mardale-prod never gets pool xells" defect under

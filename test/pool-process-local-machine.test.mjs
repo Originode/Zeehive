@@ -114,11 +114,11 @@ try {
   ok(dbs.every((c) => c.docker_ctx === hostCtx),
      `every per-xell db is on '${hostCtx}' despite the remote machine's higher dev_priority (got ${[...new Set(dbs.map((c) => c.docker_ctx))].join(',')})`);
 
-  console.log('\n── the loud guard names ONLY the remote machine ──');
-  const warned = poolLines.find((l) => /machine-aware pooling DISABLED/i.test(l));
-  ok(!!warned, 'a DISABLED line was logged (the remote config is still a dead letter)');
-  const named = warned && (warned.match(/DISABLED on \[([^\]]*)\]/) || [])[1];
-  ok(named === remoteKey, `the DISABLED-on list is exactly the remote machine (got [${named}])`);
+  console.log('\n── the no-effect line names ONLY the remote machine ──');
+  const warned = poolLines.find((l) => /per-machine pooling has no effect on \[/.test(l));
+  ok(!!warned, 'a no-effect line was recorded (the remote config is still a dead letter — informational, not an alert)');
+  const named = warned && (warned.match(/no effect on \[([^\]]*)\]/) || [])[1];
+  ok(named === remoteKey, `the no-effect list is exactly the remote machine (got [${named}])`);
   ok(!!warned && warned.includes(`governed by '${hostKey}'`),
      `…and it says pooling is governed by the queenzee-host row '${hostKey}'`);
 
