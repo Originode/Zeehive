@@ -22,23 +22,40 @@ import { derivedTcpDsn } from './xell-db.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
+// The queenzee's OWN docker context — the daemon of the machine the queenzee runs on. A
+// process-runner role's container row carries docker_ctx=NULL, and the honest reading of that
+// NULL is "not a container — runs where the queenzee runs" (worktree on the host fs, server/
+// webapp as local processes, the cage hardcoded to this context in intake.js). So for counting
+// and placement, NULL belongs to THIS machine. One predicate in one place: pool.js,
+// provision.js and the console's is_queenzee_host field all resolve through here
+// (docs/process-machine-pooling-decision-record.md). If a queenzee ever runs against a
+// non-default primary context, this becomes config — not another hardcoded string elsewhere.
+export function queenzeeHostCtx() { return 'default'; }
+
+// is_queenzee_host is computed, never stored: the machine row whose context IS the queenzee's
+// own — the one machine a process-runner project's xells factually live on, and the one whose
+// per-project pool knobs govern such projects. The web reads this field rather than comparing
+// context strings itself.
+const withHostFlag = (rows) => rows.map((m) => ({ ...m, is_queenzee_host: m.docker_ctx === queenzeeHostCtx() }));
+
 // projectId (optional) scopes pool_size AND dev_priority to that project (machine_pool, 025+038) —
 // the matrix shows and edits THIS project's pool and spawn priority on each machine. Without it,
 // rows carry neither: there is no such thing as a machine-wide pool or priority anymore, only the
 // machine-wide max_xells cap.
 export async function listMachines(projectId = null) {
   if (!projectId) {
-    return q(`SELECT id, key, label, docker_ctx, host_ip, can_build, can_device,
-                     max_xells, enabled, notes, created_at
-                FROM machine ORDER BY created_at`);
+    return withHostFlag(await q(
+      `SELECT id, key, label, docker_ctx, host_ip, can_build, can_device,
+              max_xells, enabled, notes, created_at
+         FROM machine ORDER BY created_at`));
   }
-  return q(
+  return withHostFlag(await q(
     `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device,
             m.max_xells, m.enabled, m.notes, m.created_at,
             COALESCE(mp.pool_size, 0)    AS pool_size,
             COALESCE(mp.dev_priority, 0) AS dev_priority
        FROM machine m LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
-      ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]);
+      ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]));
 }
 
 // This machine's warm-pool target for ONE project. No row → 0: a project pools nowhere it
@@ -225,12 +242,16 @@ export async function checkMachineConnection(id) {
 // Live DEV xells on a machine, ACROSS every project — max_xells is a machine-wide cap (the host
 // only has so much muscle, whoever's xells they are). ready + claimed + working all count; only
 // retired ones and production don't. Counted through the server container because that is the
-// one row every dev xell owns and stamps with its run context.
+// one row every dev xell owns and stamps with its run context — and a NULL context (a
+// process-runner role: not a container) counts into the QUEENZEE-HOST machine, where those
+// xells factually run. Before this widening, process xells were invisible to every cap: the
+// 167-ready-xell pile of 2026-07-19 never touched max_xells.
 export async function liveXellCount(ctx) {
   const r = await one(
     `SELECT count(DISTINCT x.id)::int AS n
        FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
-      WHERE x.status <> 'retired' AND NOT x.is_production AND c.docker_ctx = $1`, [ctx]);
+      WHERE x.status <> 'retired' AND NOT x.is_production
+        AND (c.docker_ctx = $1 OR ($1 = $2 AND c.docker_ctx IS NULL))`, [ctx, queenzeeHostCtx()]);
   return r?.n || 0;
 }
 

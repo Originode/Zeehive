@@ -11,9 +11,9 @@ import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { headCommit, cleanGitEnv } from './git.js';
 import { resolveSite } from './sites.js';
-import { namingFor } from './manifest.js';
+import { namingFor, serverRoleIsProcess } from './manifest.js';
 import { resolveBash } from './bash.js';
-import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
+import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
@@ -753,8 +753,20 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // with room under max_xells — spec: "if local priority is higher, dev xells get spawned there
   // first"); legacy otherwise: the project's default dev site → deprecated project columns →
   // global env default (see lib/sites.js).
-  const machine = machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine(projectId);
-  if (machineCtx && !machine) throw new Error(`no machine row for docker context '${machineCtx}'`);
+  //
+  // EXCEPT a process-runner project: its xell lives on the queenzee host by construction
+  // (worktree on the host fs, server/webapp as local processes, the cage on the queenzee's own
+  // daemon), so the one docker-placed piece it has — the per-xell db container — must run there
+  // too. A remote machine at top dev_priority used to steer that container onto a daemon the
+  // local processes cannot reach over zee-hive-net (same-daemon network, container-name DSN).
+  // Pin to the queenzee-host machine row, or none — the dev-site/config fallbacks below then
+  // keep legacy placement exactly as before machines existed.
+  // (docs/process-machine-pooling-decision-record.md)
+  const isProcess = serverRoleIsProcess(project.manifest);
+  const machine = isProcess
+    ? await machineForCtx(queenzeeHostCtx())
+    : (machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine(projectId));
+  if (!isProcess && machineCtx && !machine) throw new Error(`no machine row for docker context '${machineCtx}'`);
   const devSite = await resolveSite(projectId, 'dev');
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
   const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;

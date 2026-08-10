@@ -119,10 +119,23 @@ server container* (`fillTrim`'s join on `container.role='server'` + the machine'
 server/webapp) stamps `docker_ctx=NULL` on those rows, so that count is always ZERO: fill
 would provision `pool_size` more every tick, trim would never see a surplus, and
 `max_xells` would never cap it. That is exactly how 167 ready Zeehive xells piled up on
-2026-07-19. So such projects keep the legacy project-wide `pool_config.target_ready`, and
-an operator who set per-machine numbers for them must be TOLD they are not in effect —
-the pool logs `machine-aware pooling DISABLED … runner:process` (once per state change),
-and the console's container matrix shows the same warning.
+2026-07-19.
+
+But a process xell is not machine-LESS — it lives on the **queenzee host**, always, by
+construction (worktree on the host fs, server/webapp as local processes, the cage on the
+queenzee's own daemon). So per-machine pooling is honored on that ONE machine: when the
+queenzee-host machine row (`lib/machines.js queenzeeHostCtx()`, surfaced to the console as
+`is_queenzee_host`) is configured for the project (`dev_priority>0`), its `pool_size`
+governs — counted PROJECT-WIDE (no `docker_ctx` join, so the runaway cannot recur) and
+capped by its `max_xells` (`liveXellCount` counts NULL-ctx server rows into the queenzee
+host). Provisioning likewise pins a process xell's one docker-placed piece — the per-xell
+db container — to the queenzee host, whatever the machine priorities say. Only REMOTE
+machine rows stay a dead letter for such projects, and an operator who configured them
+must be TOLD: the pool logs `machine-aware pooling DISABLED on [<remote machines>] …
+runner:process` (once per state change), and the console's container matrix shows the
+same warning, naming only the remote rows. With no queenzee-host row configured, the
+legacy project-wide `pool_config.target_ready` applies unchanged. Rationale and rejected
+alternatives: [`process-machine-pooling-decision-record.md`](process-machine-pooling-decision-record.md).
 
 A compose project with machines configured is placeable **even when `compose_spinoff` is
 unset** — requiring that column was the "mardale-prod never gets pool xells" defect under
@@ -133,14 +146,6 @@ role (not `runner: process`). To name the compose file explicitly: set
 from repo). The field must name a real compose file whose services match the project's
 `roles` — the build path (`build-container.sh`) resolves it from the container row stamped
 at provision.
-
-**Accepted direction for process-runner projects** (not yet implemented):
-[`process-machine-pooling-decision-record.md`](process-machine-pooling-decision-record.md)
-decides that a `runner: process` project's per-machine pool config is honored on the ONE
-machine its xells factually live on — the queenzee-host machine row — counted project-wide
-(no `docker_ctx` join, so the zero-count runaway cannot recur), with the DISABLED warning
-narrowed to the remote rows that stay a dead letter. Until that lands, the guard above is
-the behaviour.
 
 #### Compose onboarding (detect → plan → human approves → meta-DB)
 
