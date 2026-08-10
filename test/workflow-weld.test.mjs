@@ -21,10 +21,24 @@
 //   C. HANDOVER STORES THE TYPED RESULT (c) — zee handover --result '<json>' resolves the execution
 //      from the CALLER's xell binding (never an agent-named id) and INTERIM-stores the parsed JSON
 //      on execution.outputs (the stage-2 data plane replaces this). A malformed --result is refused.
+//      C2 (manager finding 2): a second handover on an execution whose outputs are already set is
+//      REFUSED unless --override — a silent overwrite would destroy the earlier result with no trace;
+//      with --override it succeeds and the event log (finding 1) keeps the history of both.
 //   D. AWAIT ENDS THE TURN AND HOLDS A LEASE (d) — zee await ends the open turn (tokens stop — the
 //      anti-spin primitive), marks the zee idle, holds a lease on the execution (the entity bound at
 //      dispatch; exactly one HELD lease — a second await extends rather than collides), and moves
 //      the execution to 'waiting'.
+//   E. (manager findings on the two doors)
+//      E1 (finding 1): both doors append IMMUTABLE events to the append-only log (177) — an
+//         'execution.handover' for every handover and an 'execution.await' for every await, with
+//         seq monotone per run, run_id/execution_id/work_node_id set.
+//      E2 (finding 3): await is REFUSED from a terminal state (done/failed/…/compensated) — a
+//         finished execution must not be dragged back into 'waiting' under a held lease.
+//      E3 (finding 4): when an execution has no entity, await RESOLVES-OR-CREATES by the stable key
+//         'agent:<zee.id>' — a second execution for the same zee reuses the SAME entity row (one zee
+//         maps to one durable actor), never a fresh identically-named insert.
+//      E4 (finding 5): await refuses to extend a HELD lease that belongs to a DIFFERENT entity — the
+//         holder is meaningful and extending someone else's lease is a silent takeover.
 //
 // Everything it creates is torn down in a finally. It SKIPs loudly on a database that has not run
 // the weld migration (180).
@@ -183,6 +197,18 @@ async function main() {
     const noBind = await selfHandover({ id: randomUUID(), execution_id: null }, { result: '{}' });
     ok(noBind.ok === false && /not bound/.test(noBind.error), `a xell with no execution binding is refused`);
 
+    // ── C2. (finding 2) A SECOND HANDOVER IS REFUSED UNLESS --override ────────
+    console.log(`\nC2. a second handover — refused without --override, allowed with it`);
+    const second = await selfHandover(x, { result: '{"translated":false}' });
+    ok(second.ok === false && /override/.test(second.error),
+      `a second handover on a non-null outputs is REFUSED with an --override sentence`);
+    const overridden = await selfHandover(x, { result: '{"translated":false,"count":9}', override: true });
+    ok(overridden.ok === true && overridden.outputs?.count === 9,
+      `with --override the result is REPLACED (the event log keeps the history)`);
+    const exAfter2 = await one(`SELECT outputs FROM execution WHERE id=$1`, [ex.id]);
+    ok(exAfter2.outputs?.count === 9 && exAfter2.outputs?.translated === false,
+      `execution.outputs now carries the overridden result`);
+
     // ── D. AWAIT ENDS THE TURN AND HOLDS A LEASE (d) ─────────────────────────
     console.log(`\nD. zee await — turn ends, lease held, execution waiting`);
     const awaitRes = await selfAwait(x, { hours: 48 });
@@ -206,6 +232,88 @@ async function main() {
       `SELECT count(*)::int AS n FROM lease WHERE execution_id=$1 AND state='held'`, [ex.id])).n;
     ok(leaseCount === 1, `exactly one HELD lease remains (the unique index, not a stack)`);
 
+    // ── E1. (finding 1) THE DOORS APPEND IMMUTABLE EVENTS ────────────────────
+    console.log(`\nE1. the append-only event log — the doors write immutable records`);
+    const events = (await q(
+      `SELECT type, seq, execution_id, work_node_id, payload FROM event WHERE run_id=$1 ORDER BY seq ASC`, [run.id])).rows;
+    const handTypes = events.filter(e => e.type === 'execution.handover');
+    ok(handTypes.length === 2, `two 'execution.handover' events were appended (${handTypes.length})`);
+    ok(handTypes[0].payload?.result?.count === 3 && handTypes[1].payload?.result?.count === 9,
+      `each handover event carries its result in the payload (the earlier one survives the overwrite)`);
+    ok(handTypes[0].payload?.overrode === false && handTypes[1].payload?.overrode === true,
+      `the first handover recorded overrode:false, the override recorded overrode:true`);
+    const awaitEvts = events.filter(e => e.type === 'execution.await');
+    ok(awaitEvts.length === 2, `two 'execution.await' events were appended (one per await — ${awaitEvts.length})`);
+    ok(awaitEvts[0]?.payload?.lease_hours === 48 && awaitEvts[1]?.payload?.lease_hours === 24,
+      `each await event carries the lease window that created it (${awaitEvts.map(e => e.payload?.lease_hours).join(',')})`);
+    ok(events.every(e => e.execution_id === ex.id && e.work_node_id === A1),
+      `every event is attributed to the execution and work node`);
+    ok(events.map(e => e.seq).join(',') === events.map((_, i) => i + 1).join(','),
+      `event seq is monotone per run (${events.map(e => e.seq).join(',')})`);
+    // the log is append-only — a door's record cannot be rewritten
+    await assertRefused(
+      q(`UPDATE event SET type='tampered' WHERE execution_id=$1`, [ex.id]),
+      'append-only', 'the event log REFUSES an UPDATE (append-only trigger)');
+
+    // ── E2. (finding 3) AWAIT IS REFUSED FROM A TERMINAL STATE ───────────────
+    console.log(`\nE2. await from a terminal state — refused`);
+    const termRun = await one(`INSERT INTO run (plan_version_id) VALUES ($1) RETURNING id`, [ver]);
+    runIds.push(termRun.id);
+    const termExec = await one(
+      `INSERT INTO execution (run_id, work_node_id, attempt, state, entity_id)
+       VALUES ($1,$2,1,'done',$3) RETURNING id`, [termRun.id, A1, ent.id]);
+    const termRefusal = await selfAwait({ id: x.id, execution_id: termExec.id }, { hours: 24 });
+    ok(termRefusal.ok === false && /'done'/.test(termRefusal.error),
+      `awaiting a 'done' execution is REFUSED with the state named`);
+
+    // ── E3. (finding 4) RESOLVE-OR-CREATE BY THE STABLE ENTITY KEY ───────────
+    console.log(`\nE3. entity resolve-or-create — one zee maps to one entity`);
+    const noEntRun = await one(`INSERT INTO run (plan_version_id) VALUES ($1) RETURNING id`, [ver]);
+    runIds.push(noEntRun.id);
+    const exNoEnt = await one(
+      `INSERT INTO execution (run_id, work_node_id, attempt, state) VALUES ($1,$2,1,'running') RETURNING id`,
+      [noEntRun.id, A1]);
+    await q(`UPDATE xell SET execution_id=$2 WHERE id=$1`, [x.id, exNoEnt.id]);
+    const entResolve = await selfAwait({ id: x.id, execution_id: exNoEnt.id }, { hours: 12 });
+    ok(entResolve.ok === true, `await on an entity-less execution succeeds (resolve-or-create)`);
+    const zeeEntity = await one(`SELECT id, name FROM entity WHERE name=$1`, [`agent:${zee.id}`]);
+    ok(!!zeeEntity, `the stable-key entity exists (agent:<zee.id>)`);
+    entityIds.push(zeeEntity.id); // track for teardown (deleted after its leases cascade away with the runs)
+    const leaseNoEnt = await one(`SELECT entity_id FROM lease WHERE execution_id=$1 AND state='held'`, [exNoEnt.id]);
+    ok(leaseNoEnt.entity_id === zeeEntity.id, `the lease is held by the resolve-or-created entity`);
+    // a SECOND entity-less execution for the SAME zee reuses the SAME entity row — never a fresh insert
+    const exNoEnt2 = await one(
+      `INSERT INTO execution (run_id, work_node_id, attempt, state) VALUES ($1,$2,2,'running') RETURNING id`,
+      [noEntRun.id, A1]);
+    await q(`UPDATE xell SET execution_id=$2 WHERE id=$1`, [x.id, exNoEnt2.id]);
+    const entResolve2 = await selfAwait({ id: x.id, execution_id: exNoEnt2.id }, { hours: 12 });
+    ok(entResolve2.ok === true, `await on a second entity-less execution succeeds`);
+    const zeeEntityCount = (await one(
+      `SELECT count(*)::int AS n FROM entity WHERE name=$1`, [`agent:${zee.id}`])).n;
+    ok(zeeEntityCount === 1, `exactly ONE entity row for the zee's stable key (${zeeEntityCount}) — reused, not re-created`);
+    const leaseNoEnt2 = await one(`SELECT entity_id FROM lease WHERE execution_id=$1 AND state='held'`, [exNoEnt2.id]);
+    ok(leaseNoEnt2.entity_id === zeeEntity.id, `the second lease is held by the SAME entity`);
+    // bind back to the main execution for any later assertions
+    await q(`UPDATE xell SET execution_id=$2 WHERE id=$1`, [x.id, ex.id]);
+
+    // ── E4. (finding 5) AWAIT REFUSES TO EXTEND A FOREIGN LEASE ──────────────
+    console.log(`\nE4. extending a lease held by a DIFFERENT entity — refused`);
+    const foreignEnt = await one(`INSERT INTO entity (name, kind_hint) VALUES ($1,'agent') RETURNING *`,
+      [`agent:foreign-${tag}`]);
+    entityIds.push(foreignEnt.id);
+    const foreignRun = await one(`INSERT INTO run (plan_version_id) VALUES ($1) RETURNING id`, [ver]);
+    runIds.push(foreignRun.id);
+    const foreignExec = await one(
+      `INSERT INTO execution (run_id, work_node_id, attempt, state, entity_id)
+       VALUES ($1,$2,1,'running',$3) RETURNING id`, [foreignRun.id, A1, ent.id]);
+    // someone else already holds the one HELD lease on this execution
+    await one(
+      `INSERT INTO lease (execution_id, entity_id, expires_at) VALUES ($1, $2, now() + '1 day'::interval) RETURNING id`,
+      [foreignExec.id, foreignEnt.id]);
+    const foreignRefusal = await selfAwait({ id: x.id, execution_id: foreignExec.id }, { hours: 24 });
+    ok(foreignRefusal.ok === false && /different entity/.test(foreignRefusal.error),
+      `awaiting an execution whose HELD lease belongs to another entity is REFUSED`);
+
   } finally {
     // tear down: runs cascade executions → leases/allocations; entities are deleted separately
     // (lease.entity_id has NO cascade); the project cascade removes xource/xell/zee/zee_turn,
@@ -221,18 +329,30 @@ async function main() {
         `SELECT
            (SELECT count(*)::int FROM run          WHERE id = ANY($1::uuid[]))  AS runs,
            (SELECT count(*)::int FROM execution    WHERE run_id = ANY($1::uuid[])) AS execs,
+           (SELECT count(*)::int FROM event        WHERE run_id = ANY($1::uuid[])) AS evts,
            (SELECT count(*)::int FROM entity       WHERE id = ANY($2::uuid[])) AS entities,
            (SELECT count(*)::int FROM llm_gateway_request WHERE project_id = $3) AS reqs,
            (SELECT count(*)::int FROM project WHERE id = $3) AS projects`,
         [runIds, entityIds, projectId]);
-      ok(residue.runs === 0 && residue.execs === 0 && residue.entities === 0
+      ok(residue.runs === 0 && residue.execs === 0 && residue.evts === 0 && residue.entities === 0
         && residue.reqs === 0 && residue.projects === 0,
-        `teardown leaves no residue (runs=${residue.runs} execs=${residue.execs} entities=${residue.entities} reqs=${residue.reqs} projects=${residue.projects})`);
+        `teardown leaves no residue (runs=${residue.runs} execs=${residue.execs} evts=${residue.evts} entities=${residue.entities} reqs=${residue.reqs} projects=${residue.projects})`);
     } catch (e) {
       console.error(`  ✗ FAIL teardown: ${e.message.split('\n')[0].slice(0, 100)}`);
       fail++;
     }
     await admin.end().catch(() => {});
+  }
+
+  // an assertion helper that expects the statement to FAIL
+  async function assertRefused(promise, label, what) {
+    try {
+      await promise;
+      ok(false, `${what} was NOT refused (${label})`);
+    } catch (e) {
+      ok(/append-only|duplicate key|invalid input value|violates|check constraint/.test(e.message),
+        `${what} refused (${label}: ${e.message.split('\n')[0].slice(0, 70)})`);
+    }
   }
 }
 
