@@ -23,7 +23,7 @@ import { spawnCreds, assertProviderDispatchable, dispatchProviderFor,
          credentialVendorMismatch, everyProviderEnv, allProviderTokenRows,
          recordXellProviderGrant, scrubSecrets } from '../lib/provider-tokens.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName, preppedImageIfPresent,
-         ensureZeehiveKeypair, openCxellSsh, prepareCxellAuth, seedCxellFirstRun,
+         ensureZeehiveKeypair, openCxellSsh, prepareCxellAuth, seedCxellFirstRun, configureCxellGitIdentity,
          installTurnHooksIntoCxell,
          writeFileIntoCxell, writeFileIntoCxellIfChanged,
          writeGeneratedDocIntoCxell,
@@ -1320,7 +1320,10 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   // PER-TURN LEDGER: a spawned turn is one unit of observability. The turn row is started
   // before the stream so the play-by-play events can be attributed to it (turn_id on
   // session_event). Best-effort — a null turn just means no per-turn attribution.
-  const turn = await startTurn({ zee, xell, kind: 'spawn', model, meta: { mode: m.key } });
+  // execution_id rides along when this xell is bound to a PLANE-3 execution (the weld — the
+  // queenzee stamps the execution on the turn it starts for a dispatched zee).
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model, meta: { mode: m.key },
+                                 executionId: xell.execution_id });
 
   const it = sdk.query({
     prompt: await briefing(xell.id, zee, task, { headless }), // the binding + rules, not a bare task
@@ -1549,8 +1552,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   broadcast('zee', zee);
   logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
   // PER-TURN LEDGER: same shape as the SDK spawn — one turn row per spawn, threaded into the
-  // play-by-play events. Best-effort.
-  const turn = await startTurn({ zee, xell, kind: 'spawn', model: ranModel, meta: { mode: m.key } });
+  // play-by-play events. Best-effort. execution_id rides along from the xell binding (the weld).
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model: ranModel, meta: { mode: m.key },
+                                 executionId: xell.execution_id });
 
   // The cxell runs on the queenzee's local daemon for now — its network reach is the firewall
   // allow-list, so co-location with the xell's app tier is unnecessary (they meet over TCP).
@@ -1722,8 +1726,18 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // model, the identity travels in the URL.
     const gwEnv = gatewayEnv({ xellToken, provider: adapter.provider });
     logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
+    // PER-ACTOR GIT IDENTITY (TKT-159-3139): the AUTHOR of every in-cxell commit names this zee
+    // (its slug), and the COMMITTER names the door (the xell door from the git config set below;
+    // the console terminal overrides the committer to the console door in terminal-bridge). The
+    // GIT_AUTHOR_* env reaches BOTH doors — /etc/environment (an attending human's SSH shell) and
+    // the headless exec env (runZee's extraEnv below) — because git prioritises it over the config.
+    const gitAuthorEnv = {
+      GIT_AUTHOR_NAME: xell.slug,
+      GIT_AUTHOR_EMAIL: `${xell.slug}@zeehive.local`,
+    };
+    await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
-                         agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env } });
+                         agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);
@@ -1899,7 +1913,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   };
 
   const handle = runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
-                          extraEnv: { ...lfEnv, ...everyEnv.env }, onEvent: feed });
+                          extraEnv: { ...lfEnv, ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.

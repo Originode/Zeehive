@@ -118,13 +118,13 @@ const wtA = join(tmp, 'wt-a');
 const wtB = join(tmp, 'wt-b');
 git(tmp, ['init', '-q', '-b', 'main', 'src']);
 const cfg = (k, v) => git(src, ['config', k, v]);
-cfg('user.email', 'test@zeehive.local'); cfg('user.name', 'test');
+cfg('user.email', 'queenzee@zeehive.local'); cfg('user.name', 'Zeehive queenzee');
 cfg('receive.denyCurrentBranch', 'ignore');
 writeFileSync(join(src, 'a.txt'), 'A\n'); git(src, ['add', '.']); git(src, ['commit', '-qm', 'A (base)']);
 const shaA = git(src, ['rev-parse', 'HEAD']);
 git(src, ['worktree', 'add', '-q', '-b', 'spinoff/alpha', wtA, shaA]);
 git(src, ['worktree', 'add', '-q', '-b', 'spinoff/bravo', wtB, shaA]);
-for (const wt of [wtA, wtB]) { git(wt, ['config', 'user.email', 'zee@zeehive.local']); git(wt, ['config', 'user.name', 'zee']); }
+for (const wt of [wtA, wtB]) { git(wt, ['config', 'user.email', 'xell@xell.zeehive.local']); git(wt, ['config', 'user.name', 'xell']); }
 const commit = (wt, file, text, msg) => {
   writeFileSync(join(wt, file), text); git(wt, ['add', '.']); git(wt, ['commit', '-qm', msg]);
   return git(wt, ['rev-parse', 'HEAD']);

@@ -74,6 +74,7 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
+         selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
          setLangfuseTracking,
@@ -1692,6 +1693,22 @@ router.post('/xell/self/working', async (req, res) => {
     res.json(await selfWorking(x, { note: req.body?.note || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Store this xell's typed result on the PLANE-3 execution it is bound to (the observability-spine
+// weld — docs/hierarchical-workflow-adoption.md §3.2). Interim storage on execution.outputs until
+// the stage-2 data plane exists. The execution is resolved from xell.execution_id (never an
+// agent-named id). Token-scoped like every self verb.
+router.post('/xell/self/handover', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHandover(x, { result: req.body?.result ?? null, override: req.body?.override === true })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// END the current turn and put the execution this xell is on into 'waiting' under a held lease — the
+// anti-spin primitive. Token-scoped; the execution is resolved from xell.execution_id.
+router.post('/xell/self/await', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfAwait(x, { hours: req.body?.for ?? null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Which environment this xell is loaded with (masked — var NAMES only; the values live in the
 // cxell's own .zeehive.env). Read-only, token-scoped. `zee env` maps here.
 router.get('/xell/self/provider-env', async (req, res) => {
@@ -1905,10 +1922,14 @@ router.get('/xells/:id/observability', async (req, res) => {
   try {
     const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
     if (!x) return res.status(404).json({ error: 'no such xell' });
-    const { turnsForXell } = await import('../lib/turn-ledger.js');
+    const { turnsForXell, workflowTreeForXell } = await import('../lib/turn-ledger.js');
     const turns = await turnsForXell(req.params.id, { zeeId: req.query.zee_id || null, limit: req.query.limit || 50 });
+    // The WELD tree — the nested drill-down waterfall (work_node → execution → turns → gateway
+    // calls) per work node, from the same read-only door. A turn with no execution lives in `turns`
+    // and nowhere here; an execution with turns appears in both.
+    const workflow = await workflowTreeForXell(req.params.id);
     // Per-turn event counts ride along so the UI can show "N events" without fetching them all.
-    res.json({ ok: true, xell_id: req.params.id, turns });
+    res.json({ ok: true, xell_id: req.params.id, turns, workflow });
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -2586,6 +2607,20 @@ router.get('/gantt', async (req, res) => {
   try {
     if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
     res.json(await ganttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
+  } catch (err) { workErr(res, err); }
+});
+
+// STAGE 6 — THE WORKFLOW GANTT read model (lib/workflow-gantt.js): the hierarchical
+// workflow model's plan/work_node/execution/lease plane re-pointed as the timeline.
+// PLANNED from the CPM pass, ACTUAL from execution.started_at/finished_at, WAITING from
+// held leases on waiting executions; deps are the leaf-level union_edge; each row carries
+// its execution → turn → gateway waterfall for the drill-down. READ-ONLY — the CPM is the
+// deterministic pass, and every execution/lease/turn row is a byproduct of a door.
+router.get('/workflow/gantt', async (req, res) => {
+  try {
+    if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
+    const { workflowGanttModel } = await import('../lib/workflow-gantt.js');
+    res.json(await workflowGanttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
   } catch (err) { workErr(res, err); }
 });
 

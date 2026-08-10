@@ -137,6 +137,12 @@ export const getBoard = (projectId, rootId) => call(`/api/board${pq({ project: p
 // gantt: tree-ordered rows with computed dates. Part 4 renders it; Gantt.jsx is a placeholder today.
 export const getGantt = (projectId, rootId) => call(`/api/gantt${pq({ project: projectId, root: rootId })}`);
 
+// STAGE 6 — THE WORKFLOW GANTT read model (the model's plan/work_node/execution/lease
+// plane as the timeline). PLANNED from CPM, ACTUAL from execution ledger, WAITING from
+// held leases on waiting executions; each row carries its execution→turn→gateway waterfall.
+export const getWorkflowGantt = (projectId, rootId) =>
+  call(`/api/workflow/gantt${pq({ project: projectId, root: rootId })}`);
+
 // ── who is ON an item: assign an existing xell, or deploy a new worker (part 3's verbs) ──────
 // These three are a different WEIGHT to everything above. `candidates` is a read model built for a
 // picker — only the xells the server would accept, each with a `why` line — so the console never

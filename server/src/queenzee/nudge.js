@@ -807,7 +807,7 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
     }
     const zee = await one(
       `SELECT z.id, z.claude_session_id, z.viewer_kind, z.entrypoint, z.model, z.status,
-              x.slug, x.project_id, rt.key AS runtime_key
+              x.slug, x.project_id, x.execution_id, rt.key AS runtime_key
          FROM zee z JOIN xell x ON x.id = z.xell_id
          LEFT JOIN agent_runtime rt ON rt.id = z.runtime_id
         WHERE z.xell_id = $1 AND z.entrypoint = 'cxell-cli'
@@ -869,9 +869,10 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
     }
     const startedAt = new Date();
     // PER-TURN LEDGER: a resume is its own turn (kind='resume'), distinct from the spawn that
-    // created the session. Best-effort.
+    // created the session. Best-effort. execution_id rides along from the xell binding (the weld).
     const turn = await startTurn({ zee, xell: { id: xellId, slug: zee.slug, project_id: zee.project_id },
-                                   kind: 'resume', sessionId: zee.claude_session_id, model: zee.model });
+                                   kind: 'resume', sessionId: zee.claude_session_id, model: zee.model,
+                                   executionId: zee.execution_id });
     // Fire and forget: the continuation turn can run for minutes; do NOT block the caller on it.
     nudgeCxellZee({
       ctx: 'default', name: cxellName(zee.slug),

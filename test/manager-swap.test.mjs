@@ -137,7 +137,7 @@ try {
   // exportCxellDiff pulls out of a real cage. The host worktree has never seen this commit.
   const cage = join(tmp, 'cage');
   execFileSync('git', ['clone', '-q', repo, cage]);
-  git(cage, 'config', 'user.email', 'z@z'); git(cage, 'config', 'user.name', 'zee');
+  git(cage, 'config', 'user.email', 'xell@xell.zeehive.local'); git(cage, 'config', 'user.name', 'xell');
   git(cage, 'checkout', '-q', 'spinoff/scout-work-aa11bb');
   writeFileSync(join(cage, 'SCOUT-NOTES.md'), '# what the scout found\n');
   git(cage, 'add', '-A'); git(cage, 'commit', '-qm', 'scout: the findings that must survive a swap');

@@ -50,6 +50,7 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
 // interactive turn is recorded exactly like the two the queenzee starts (lib/turn-record.js).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
 import { startTurn, endTurn } from '../lib/turn-ledger.js';
+import { appendExecutionEvent } from '../lib/execution-events.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
@@ -578,7 +579,20 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
 // there is nothing in it to resolve.
 async function selfHealSync(xell, ref) {
   const s = await syncCxellWithXource({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref });
-  if (s.state === 'merged' || s.state === 'up-to-date') return { ok: true, ...s };
+  if (s.state === 'merged' || s.state === 'up-to-date') {
+    // TKT-159-3139 door ledger: the queenzee's sync merge is a WRITE into a live cage (it merges
+    // current main into the zee's /work/repo). Record the queenzee door so a human auditing what
+    // happened to a tree sees the automated merge, distinct from a zee/human write. Best-effort:
+    // a failed ledger write must never fail a sync.
+    if (s.state === 'merged') {
+      q(
+        `INSERT INTO door_write_event (door, xell_id, target, input)
+         VALUES ('queenzee-sync', $1, $2, $3)`,
+        [xell.id, xell.slug, `sync merge of ${ref} into the cxell`],
+      ).catch((e) => logline('self', `could not record queenzee-sync door write: ${String(e.message).slice(0, 160)}`));
+    }
+    return { ok: true, ...s };
+  }
   if (s.state === 'conflict') {
     return {
       ok: false, status: 'needs-resolution', stage: 'sync', state: 'conflict', ref, sync: s,
@@ -1201,7 +1215,8 @@ export async function selfTurn(xell, { state = null } = {}) {
     // observability, even though the queenzee cannot know its cost (no meter on this door). The
     // row is started so the turn exists in the timeline; its cost stays zero and metered=true is
     // left defaulted — it IS measured (measured zero), unlike an unmetered headless turn.
-    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model });
+    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model,
+                      executionId: xell.execution_id });
   } else {
     row = await markZeeTurn(zee.id, 'idle', 'end_turn');
     // Close the OPEN interactive turn (the latest one for this zee that is still 'started').
@@ -1234,6 +1249,204 @@ export async function selfWorking(xell, { note = null } = {}) {
   const res = await pingWorking(zee, { note });
   return { ok: true, ...res, tend_nudge: nudge,
     message: 'Working ping recorded — the hive shows this xell as occ-working.' };
+}
+
+// ── POST /api/xell/self/handover — store the typed result on the execution this xell is on ──
+// The WELD (docs/hierarchical-workflow-adoption.md §3.2): a zee bound to a PLANE-3 execution can
+// hand its typed result over. INTERIM storage on execution.outputs until the stage-2 data plane
+// (ports) exists — deliberately NOT a state transition, and deliberately NOT a new write path into
+// the ledgers: the result is the WORK's output, not an observability row. The execution is resolved
+// from THIS xell's binding (xell.execution_id), never from an agent-named id — the identity half of
+// "every row in the observability chain is a byproduct of a door".
+//
+// THE AUDIT TRAIL (the point of the append-only event log): the mutable outputs column is
+// overwritten by design, so the door ALSO appends an IMMUTABLE 'execution.handover' event carrying
+// the result — the record of "this zee handed over at T with this result" cannot be rewritten by a
+// later handover.
+export async function selfHandover(xell, { result = null, override = false } = {}) {
+  if (!xell.execution_id) {
+    return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to hand over' };
+  }
+  if (result === null || result === undefined || result === '') {
+    return { ok: false, error: 'handover needs --result "<json>" — the typed result to store on the execution' };
+  }
+  let parsed;
+  if (typeof result === 'string') {
+    try { parsed = JSON.parse(result); }
+    catch (e) { return { ok: false, error: `--result must be valid JSON: ${e.message}` }; }
+  } else {
+    parsed = result;
+  }
+  try {
+    const exec = await one(
+      `SELECT id, run_id, work_node_id, outputs FROM execution WHERE id=$1`, [xell.execution_id]);
+    if (!exec) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // A handover that would silently destroy a prior result is refused unless the caller EXPLICITLY
+    // overrides. The earlier result is still recoverable from the append-only event log (below) — the
+    // mutable column just cannot be the only record of what has happened.
+    // VALIDATE-THEN-MUTATE (TKT-161): this refusal runs BEFORE the UPDATE — a refused handover must
+    // leave the turn open, the zee as it was, execution.outputs untouched and NO event appended,
+    // exactly the same side-effect-free rule the await door follows.
+    if (exec.outputs !== null && exec.outputs !== undefined && !override) {
+      return { ok: false, error:
+        'execution.outputs already has a result — re-run with --override to replace it '
+        + '(the event log keeps the history of every handover).' };
+    }
+
+    const row = await one(
+      `UPDATE execution SET outputs = $2 WHERE id = $1
+       RETURNING id, state, outputs`,
+      [xell.execution_id, JSON.stringify(parsed)]);
+
+    // THE IMMUTABLE RECORD — the door's byproduct. Appended AFTER the write so the event exists iff
+    // the write happened (best-effort: a failure to log never fails the handover itself).
+    await appendExecutionEvent({
+      runId: exec.run_id, executionId: exec.id, workNodeId: exec.work_node_id,
+      type: 'execution.handover',
+      payload: { result: parsed, overrode: exec.outputs !== null && exec.outputs !== undefined },
+    });
+
+    return { ok: true, execution_id: row.id, state: row.state, outputs: row.outputs,
+      message: (exec.outputs !== null && exec.outputs !== undefined ? 'Result REPLACED on execution.outputs' : 'Result stored on execution.outputs')
+        + ' (interim — the stage-2 data plane replaces this).' };
+  } catch (e) {
+    return { ok: false, error: `could not store the result on execution.outputs: ${String(e.message).slice(0, 200)}` };
+  }
+}
+
+// ── POST /api/xell/self/await — END the turn, hold a lease, mark the execution waiting ──
+// The ANTI-SPIN primitive (docs/hierarchical-workflow-adoption.md §3.1): a zee waiting on something
+// outside the model — a human gate, an external service, a timer — ends its turn NOW (tokens stop)
+// instead of polling, and the execution moves to 'waiting' under a HELD lease. When the wait
+// resolves the queenzee resumes (the lease lapses or is released, and the work wakes). The execution
+// is resolved from this xell's binding, never from an agent-named id. `hours` overrides the default
+// 24h lease window (the universal timeout: if the external signal never comes, the lease lapses and
+// the work requeues).
+//
+// THE AUDIT TRAIL: the mutable execution.state flip to 'waiting' is also recorded as an IMMUTABLE
+// 'execution.await' event carrying the lease window — so "this execution went to waiting at T under
+// an N-hour lease" is a fact no later overwrite can erase.
+export async function selfAwait(xell, { hours = null } = {}) {
+  if (!xell.execution_id) {
+    return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to wait on' };
+  }
+  const h = Number(hours) > 0 ? Number(hours) : 24;
+  const zee = await liveZee(xell.id);
+  if (!zee) return { ok: false, error: 'no live zee bound to this xell to await for' };
+  try {
+    const exec = await one(
+      `SELECT id, run_id, work_node_id, state, entity_id FROM execution WHERE id=$1`, [xell.execution_id]);
+    if (!exec) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // REFUSE TERMINAL STATES. A done/failed/skipped/cancelled/blocked/compensated execution is a
+    // finished piece of work — dragging it back into 'waiting' under a held lease would make the
+    // future lease sweeper treat it as a live zombie forever. Await is for work blocked on an
+    // external signal, not for re-opening the past.
+    const TERMINAL = ['done', 'failed', 'skipped', 'cancelled', 'blocked', 'compensated'];
+    if (TERMINAL.includes(exec.state)) {
+      return { ok: false, error:
+        `cannot await a '${exec.state}' execution — it has already finished; awaiting is only valid from a non-terminal state (running/ready/waiting/pending).` };
+    }
+
+    // The entity that holds the wait — the execution's bound entity (the zee-as-entity, stamped at
+    // dispatch). When the execution has none, RESOLVE-OR-CREATE by a STABLE KEY, never a blind
+    // insert: entities model durable actors (entity_load headroom, concurrency, capabilities,
+    // reliability), and "one zee maps to ONE entity reused across its executions" is what makes
+    // those mean anything. The stable key is `agent:<zee.id>` — the zee UUID is unique per zee and
+    // immutable, so every execution a zee awaits resolves to the same entity row.
+    //
+    // VALIDATE-THEN-MUTATE (TKT-161): this block runs BEFORE the turn is ended and the zee parked,
+    // because it feeds the foreign-lease refusal below. The only write that can have happened by a
+    // later refusal is this entity ROW (creating it is genuinely benign — it is keyed, reused and
+    // lease-less, and entity_load counts leases, not stamps) — never a closed turn, and never the
+    // execution.entity_id OWNERSHIP stamp, which lives in the mutation half below (DEFECT 8: on a
+    // refused await the execution must not claim an owner that does not hold the lease).
+    // MINOR (TKT-161): this resolve is SELECT-then-INSERT and entity.name has NO unique index, so
+    // two CONCURRENT awaits for one zee could insert two 'agent:<zee.id>' rows. We deliberately do
+    // NOT add an index here: entity is a cross-cutting table whose name is not globally unique by
+    // design (only our agent-keys happen to be uuid-unique), and an unconditional unique index is a
+    // schema change with existing-data risk for a race the await contract already rules out — a
+    // single agent process runs one turn at a time, await MUST be the last thing in a turn, and
+    // after the first await the turn is ended and the zee is idle, so a second await for the same
+    // zee arrives only from a LATER resumed turn that already finds the row. Worst case is a
+    // duplicate durable-actor row, benign for correctness (leases are keyed by id, never by name).
+    let entityId = exec.entity_id;
+    if (!entityId) {
+      const key = `agent:${zee.id}`;
+      const existing = await one(`SELECT id FROM entity WHERE name=$1`, [key]).catch(() => null);
+      const ent = existing || await one(
+        `INSERT INTO entity (name, kind_hint) VALUES ($1, 'agent') RETURNING id`, [key]);
+      entityId = ent.id;
+      // NOTE: the execution.entity_id OWNERSHIP stamp is deliberately NOT here. It lives in the
+      // mutation half below, next to the lease write, after every refusal path has passed — so a
+      // REFUSED await never claims an owner for the execution (DEFECT 8). Creating the entity row
+      // above is the benign part: keyed, reused, lease-less, and entity_load counts leases, not
+      // stamps.
+    }
+
+    // HOLD the lease. Exactly one HELD lease per execution (lease_one_active_per_execution), so a
+    // second await while one is already held EXTENDS it rather than colliding — idempotent.
+    const held = await one(
+      `SELECT id, entity_id FROM lease WHERE execution_id=$1 AND state='held'`, [xell.execution_id]).catch(() => null);
+    if (held?.id) {
+      // The holder is meaningful: one active lease per execution, and extending someone else's lease
+      // is a silent takeover. Refuse unless the holder is the entity this execution belongs to.
+      // This refusal runs BEFORE endTurn/markZeeTurn — a refused await must leave the turn OPEN and
+      // the zee NOT idle, or a later gateway call attaches to a closed turn (the exact failure the
+      // await manual, migration 181, warns about, produced by our own refusal path).
+      if (held.entity_id !== entityId) {
+        return { ok: false, error:
+          'the held lease on this execution belongs to a different entity — refusing to extend '
+          + "someone else's lease (release or expire it first, or wait for the lease to lapse)." };
+      }
+    }
+
+    // END the current turn — the anti-spin half. Only reached once EVERY refusal path has been
+    // passed, so a refused await never closes the turn or parks the zee. The open turn
+    // (spawn/resume/interactive) closes as 'ended', stop_reason 'await', so the tokens stop. The
+    // zee row goes idle too (markZeeTurn), so the hive shows it resting rather than working.
+    const open = await one(
+      `SELECT id FROM zee_turn WHERE zee_id=$1 AND status='started' ORDER BY started_at DESC LIMIT 1`,
+      [zee.id]).catch(() => null);
+    if (open?.id) await endTurn(open.id, { status: 'ended', stopReason: 'await' });
+    await markZeeTurn(zee.id, 'idle', 'await');
+
+    // Write/extend the lease — the mutation half, once the await is committed to.
+    // Stamp the execution's OWNER only now (DEFECT 8): the resolve-or-create above may have resolved
+    // an entity for a previously entity-less execution, but writing execution.entity_id on a REFUSED
+    // await would claim an owner that does not hold the lease. Only on the committed success path do
+    // we stamp ownership, right beside the lease that proves it.
+    if (entityId && !exec.entity_id) {
+      await q(`UPDATE execution SET entity_id=$2 WHERE id=$1`, [xell.execution_id, entityId]);
+    }
+    if (held?.id) {
+      await q(`UPDATE lease SET expires_at = now() + ($2 || ' hours')::interval, heartbeat_at = now() WHERE id=$1`,
+        [held.id, h]);
+    } else {
+      await one(
+        `INSERT INTO lease (execution_id, entity_id, expires_at) VALUES ($1, $2, now() + ($3 || ' hours')::interval) RETURNING id`,
+        [xell.execution_id, entityId, h]);
+    }
+
+    // Mark the execution waiting — lease held, blocked on an external signal/timer/human.
+    await q(`UPDATE execution SET state='waiting' WHERE id=$1`, [xell.execution_id]);
+
+    // THE IMMUTABLE RECORD — the door's byproduct. Appended after the state flip.
+    await appendExecutionEvent({
+      runId: exec.run_id, executionId: exec.id, workNodeId: exec.work_node_id,
+      type: 'execution.await',
+      payload: { lease_hours: h, entity_id: entityId },
+    });
+
+    return { ok: true, execution_id: xell.execution_id, state: 'waiting', lease_hours: h,
+      turn_ended: !!open?.id,
+      message: `Turn ended and the execution is now 'waiting' under a ${h}h held lease. `
+        + 'Tokens stop here — when the wait resolves, the queenzee resumes the work. '
+        + 'This MUST be the last thing you do in this turn — stop talking after you call it.' };
+  } catch (e) {
+    return { ok: false, error: `could not await: ${String(e.message).slice(0, 200)}` };
+  }
 }
 
 // ── GET /api/xell/self/provider-env — the RUNNABLE env for ONE provider (`zee creds --provider <key> --export`) ──

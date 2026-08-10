@@ -516,6 +516,8 @@ function usage() {
   zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
   zee work --new --title "..." [--body "..."] [--kind task|activity] [--parent <id>] [--ticket <code|id>] [--priority 1..5] [--status s]   MANAGER-only: CUT ONE CARD in your own project's plan and print its ID, so it pipes straight into "zee assign --item <id>". Creating a card dispatches nobody
   zee item [<id>] --status <s> [--progress N] [--note "..."]   report where the WORK has got to. A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
+  zee handover --result <json> [--override]   store your TYPED RESULT on the PLANE-3 execution this xell is bound to (interim — the stage-2 data plane replaces this). The execution is resolved from your xell binding, never named by you. Refused if outputs already has a result unless --override (the event log keeps the history)
+  zee await [--for <hours>]           END your turn now — the anti-spin primitive: tokens stop — hold a lease on the execution and mark it 'waiting' (default 24h window; --for overrides in hours). MUST be the last thing you do in this turn
 
  MANAGER-only (refused for a worker, with an explanation):
   zee conversations [--xell <slug>] [--full]   review your crew's uploaded CONVERSATION ARCHIVES (who said what while they worked). --xell narrows to one worker; --full prints its newest transcript
@@ -1230,6 +1232,25 @@ switch (cmd) {
       id, status: flag('status') || null,
       progress: progress == null ? null : Number(progress), note: flag('note') || null,
     }));
+    break;
+  }
+  case 'handover': {
+    // The WELD: a zee bound to a PLANE-3 execution hands its TYPED RESULT over. INTERIM storage on
+    // execution.outputs until the stage-2 data plane (ports) exists. The execution is resolved from
+    // the CALLER's xell binding — never an agent-named id (the identity half of "every row in the
+    // observability chain is a byproduct of a door"). A result already on outputs is REFUSED unless
+    // --override (the event log keeps the history of every handover).
+    const result = flag('result');
+    if (!result) { console.error('handover needs --result "<json>" — the typed result to store on the execution'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/handover', { result, override: rest.includes('--override') }));
+    break;
+  }
+  case 'await': {
+    // The ANTI-SPIN primitive: END the current turn NOW (tokens stop), hold a lease on the execution
+    // this xell is bound to, and mark it 'waiting'. The execution is resolved from the caller's xell
+    // binding. --for overrides the default 24h lease window in hours.
+    const forH = flag('for');
+    out(await req('POST', '/api/xell/self/await', forH ? { for: Number(forH) } : {}));
     break;
   }
   case 'mint-manager': {
