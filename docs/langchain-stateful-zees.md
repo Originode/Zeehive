@@ -68,11 +68,25 @@ is the message type system that makes "here is the history, continue it" a first
 ### 2.3 Tool binding
 
 A langchain tool is a named function with a JSON schema; the chat model can request its use and the
-driver can execute it. The WAVE-1 mechanism slice is built: a bounded in-process loop (`runLangchainAgentTurn`)
-bound to the read-only/report registry (`status`, `work`, `working`, `item` — `langchain-tools.js`),
-each tool calling the SAME handler `/api/xell/self/*` calls. The tools are queenzee-owned verbs, never
-free actions, so the gates stay first-class. Workspace-action tools (file/shell/SQL/docker/git) and
-the gated asks (wave 2) are NOT bound — see §8.3.
+driver can execute it. The loop (`runLangchainAgentTurn`) is bounded, in-process, and the tool LIST
+is the confinement: only the verbs in the registry (`langchain-tools.js`) are bindable, each calling
+the SAME handler `/api/xell/self/*` calls, and the loop resolves through the ALLOWLIST (`LANGCHAIN_TOOLS`),
+never through a caller-supplied array — an over-wide array cannot widen the loop.
+
+The bound verbs are the read-only/report verbs (`status`, `work`, `working`, `item`) and the
+wave-2 ASK verb `tend` (it asks for a human and executes nothing). `hint-land` / `hint-ship` are NOT
+bound yet — their write shape (a `session_event` annotating a request, plus the hint state) has been
+reported to the manager and is pending their call before they are added.
+
+**The confinement is the ALLOWLIST, not the gate.** The wave-2 argument that `land`/`ship`/`seed`
+are safe to bind "because they terminate on a human" is FALSE on this fleet. Measured on the fleet
+meta-DB (2026-08-11): `project.auto_approve_land` / `auto_approve_ship` / `auto_approve_seed` are
+`true` for Zeehive and omnibiz, and the gates decide without a human in the path — `landgate.js:188`
+→ `:250` (`status='landed', decided_by='auto-approve@policy'`), `shipgate.js:223`, `seedgate.js:199`;
+593 auto-approved lands, 287 auto-approved ships, 10 auto-approved seeds. A bound `land` puts a
+model-chosen commit on main, `ship` deploys production, `seed` writes prod rows. So `land`/`ship`/
+`seed` are NOT in the registry and never will be added by a test. Do NOT flip `auto_approve_*` to
+make a hold appear — that is fleet-wide policy.
 
 ## 3. What the queenzee keeps (everything that is not a single model call)
 
@@ -324,10 +338,11 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
 - `server/src/lib/langchain-zee.js` — the driver: `buildChatModel` (gateway-pointed langchain chat
   model), `loadConversation` / `appendConversation` / `resetConversation` (DB-backed memory),
   `runLangchainTurn` (single model call) and `runLangchainAgentTurn` (the bounded tool loop).
-- `server/src/lib/langchain-tools.js` — the WAVE-1 tool registry (`status`, `work`, `working`,
-  `item`), the allowlist that is the confinement. Each tool calls the SAME handler `/api/xell/self/*`
-  calls (selfStatus/selfWork/selfWorking/selfWorkItem), never a second copy; anything outside the
-  registry is refused visibly.
+- `server/src/lib/langchain-tools.js` — the tool registry (`status`, `work`, `working`, `item`,
+  `tend`), the allowlist that is the confinement. Each tool calls the SAME handler `/api/xell/self/*`
+  calls (selfStatus/selfWork/selfWorking/selfWorkItem/selfTend), never a second copy; anything
+  outside the registry is refused visibly. `working` carries the TEND GUARD (refuses while a tend is
+  open, so a model cannot silently clear a human's question).
 - `spawnLangchainZee` in the dispatch path — a real zee driven by the driver: creates the zee row,
   starts the turn, drives `runLangchainAgentTurn` (the loop, bound to the wave-1 registry), feeds
   the play-by-play, persists the conversation, ends the turn with the summed burn.
@@ -355,6 +370,13 @@ standalone test, not by a live zee.
   written per call).
 - The queenzee stays deterministic: langchain is invoked, never invoked-by; no graph, no framework
   loop.
+- **The confinement is the ALLOWLIST, not the gate.** `land`/`ship`/`seed` are NOT bindable because
+  this fleet auto-approves them — `project.auto_approve_land/ship/seed = true` for Zeehive and
+  omnibiz, so the gates act with `decided_by='auto-approve@policy'` and no human in the path
+  (landgate.js:188→250, shipgate.js:223, seedgate.js:199; measured: 593 auto-approved lands, 287
+  auto-approved ships, 10 auto-approved seeds). A bound `land`/`ship`/`seed` would be the ACT, not a
+  request. They stay absent from the registry. (This corrects an earlier draft that called the gated
+  verbs safe "because they terminate on a human" — on this fleet they do not.)
 - **Dependencies are the scoped langchain packages only** — `@langchain/anthropic`, `@langchain/openai`,
   `@langchain/core`. The `langchain` umbrella is deliberately NOT a dependency: it is never imported
   and it pulls the `@langchain/langgraph` runtime into the tree. `npm ls langgraph` is empty.
@@ -378,9 +400,11 @@ standalone test, not by a live zee.
    verbs. WAVE 1 (the mechanism slice) is BUILT: the loop runs in the queenzee process, bound ONLY
    to the read-only, no-side-effect registry verbs (`status`, `work`, `working`, `item`), a hard
    cap of 8 iterations with the cap visible when hit, and ONE handler shared with `/api/xell/self/*`
-   (never a second copy of a verb's logic). WAVE 2 (the gated asks: `tend`, `hint-land`, `hint-ship`,
-   `land`, `ship`, `seed`) is approved IN PRINCIPLE only after wave 1 is green AND a test shows a
-   bound `land` tool producing a HELD request, not a landing.
+   (never a second copy of a verb's logic). The wave-2 ASK verb `tend` is bound — it asks for a
+   human and executes nothing. `hint-land` / `hint-ship` are NOT bound yet (their write shape is
+   reported to the manager and pending their call). `land`/`ship`/`seed` are NOT bound and never will
+   be by a test: this fleet auto-approves them (§2.3, §8.2), so there is no human hold for a bound
+   ask to reach — the confinement is the allowlist, not the gate.
 3. **Cxell-sandboxed langchain agent (workspace action)** — the boundary for tools is drawn by WHAT
    A TOOL CAN DO, not by the existence of tools (this amends an earlier, too-coarse sentence here
    that said any tool ⇒ the cage). Read-only, no-side-effect verbs (`status`, `work`, `working`,

@@ -28,7 +28,7 @@ import { tool } from '@langchain/core/tools';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { gatewayEnv } from './gateway.js';
-import { toolList, runTool } from './langchain-tools.js';
+import { toolList, runTool, LANGCHAIN_TOOLS } from './langchain-tools.js';
 
 // openai + kimi speak the OpenAI dialect (/v1/chat/completions); everything else is Anthropic
 // dialect (/v1/messages — claude, deepseek; grok is /responses but Anthropic-shaped usage).
@@ -252,7 +252,13 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
   const userMsg = new HumanMessage(task ?? '');
   messages.push(userMsg);
 
-  const bound = tools.length ? chat.bindTools(tools.map((d) => buildTool(d, { xell }))) : chat;
+  // THE ALLOWLIST IS THE CONFINEMENT, STRUCTURALLY. Only tools in LANGCHAIN_TOOLS may be bound, and
+  // every execution resolves through the allowlist (runTool, which defaults to LANGCHAIN_TOOLS). A
+  // caller passing an over-wide `tools` array cannot widen the loop: `bindable` filters it down to
+  // the allowlist, so a verb outside it is never even offered to the model, and if the model asks
+  // for it anyway runTool refuses it. The loop never binds or runs a verb the allowlist does not name.
+  const bindable = tools.filter((d) => LANGCHAIN_TOOLS[d.name]);
+  const bound = bindable.length ? chat.bindTools(bindable.map((d) => buildTool(d, { xell }))) : chat;
   let iterations = 0;
   let capHit = false;
   let finalResp = null;
@@ -278,11 +284,12 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
     const calls = finalResp.tool_calls || [];
     if (!calls.length) break;                          // natural end — the model answered
     for (const tc of calls) {
-      // ONE dispatch path: runTool is the single place a tool is looked up and run (the allowlist
-      // refusal + the handler call). The loop tracks bound-ness (desc) for `executed`/`onTool`, but
-      // the actual execution always goes through runTool — no second lookup that could drift.
-      const desc = tools.find((d) => d.name === tc.name);
-      const content = await runTool(xell, { name: tc.name, args: tc.args || {} }, tools);
+      // ONE dispatch path: runTool (which resolves against the ALLOWLIST, never the caller's array)
+      // is the single place a tool is looked up and run — the allowlist refusal + the handler call.
+      // `desc` is the ALLOWLIST lookup (LANGCHAIN_TOOLS[tc.name]), so `executed`/`onTool` only ever
+      // record a verb the allowlist names; an over-wide caller array cannot leak a name in.
+      const desc = LANGCHAIN_TOOLS[tc.name];
+      const content = await runTool(xell, { name: tc.name, args: tc.args || {} });
       if (desc) executed.push({ name: tc.name, args: tc.args || {} });
       messages.push(new ToolMessage({ content: String(content).slice(0, TOOL_RESULT_CAP), tool_call_id: tc.id }));
       if (onTool && desc) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }

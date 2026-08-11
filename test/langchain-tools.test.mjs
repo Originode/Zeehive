@@ -186,10 +186,86 @@ try {
   ok(JSON.parse(refused2).ok === false, 'build is refused (the migration-at-boot hole)');
   const refused3 = await runTool(xell, { name: 'sync', args: {} });
   ok(JSON.parse(refused3).ok === false, 'sync is refused (it triggers a build)');
+  // The wave-2 gated asks are NEVER bindable on this fleet: auto_approve_land/ship/seed are true,
+  // so a bound land/ship/seed would ACT (put code on main / deploy prod / write prod rows) with no
+  // human. The confinement is the allowlist, not the gate — these must be absent.
+  const refusedLand = await runTool(xell, { name: 'land', args: {} });
+  ok(JSON.parse(refusedLand).ok === false, 'land is refused (auto_approve_land=true → no human hold)');
+  const refusedShip = await runTool(xell, { name: 'ship', args: {} });
+  ok(JSON.parse(refusedShip).ok === false, 'ship is refused (auto_approve_ship=true → deploys prod)');
+  const refusedSeed = await runTool(xell, { name: 'seed', args: {} });
+  ok(JSON.parse(refusedSeed).ok === false, 'seed is refused (auto_approve_seed=true → writes prod rows)');
   // The registry itself must not even CONTAIN the never-bindable verbs.
-  for (const neverBindable of ['run_bash', 'build', 'sync', 'db-catchup', 'catchup', 'swap', 'dispatch', 'say', 'suggest-done', 'zees', 'done', 'device', 'db-sandbox', 'prod', 'seed']) {
+  for (const neverBindable of ['run_bash', 'build', 'sync', 'db-catchup', 'catchup', 'swap', 'dispatch', 'say', 'suggest-done', 'zees', 'done', 'device', 'db-sandbox', 'prod', 'seed', 'land', 'ship']) {
     ok(!LANGCHAIN_TOOLS[neverBindable], `\`${neverBindable}\` is NOT in the tool registry`);
   }
+
+  // ── E. WAVE 2 — a bound `tend` ASKS (it does not act), and the ask is a tend_request ─────────
+  console.log('\n── E. wave 2: a bound `tend` produces a tend_request a human must answer ──');
+  ok(!!LANGCHAIN_TOOLS.tend, '`tend` IS in the tool registry (the escalation verb, bound)');
+  const tendRes = await runTool(xell, { name: 'tend', args: { reason: 'tool-loop test needs a human' } });
+  const tendJson = JSON.parse(tendRes);
+  eq(tendJson.ok, true, 'the bound tend tool succeeded');
+  ok(/Tend RAISED/.test(tendJson.message), 'the tend result says it RAISED an ask');
+  // The ask is a tend_request row a human must answer — not an act, not a gate.
+  const tendRow = await one(
+    `SELECT hook_event_name FROM session_event
+      WHERE xell_id=$1 AND hook_event_name='tend-request'
+      ORDER BY ts DESC LIMIT 1`, [xellId]);
+  eq(tendRow?.hook_event_name, 'tend-request', 'a tend_request event was written (the human-facing ask)');
+  // Clear it so the test does not leave a live tend on a throwaway xell.
+  await runTool(xell, { name: 'tend', args: { clear: true } });
+
+  // ── F. THE ALLOWLIST, NOT THE CALLER'S ARRAY — an over-wide tools array cannot widen the loop ──
+  console.log('\n── F. the loop resolves through the allowlist, not the caller\'s array ──');
+  // A (hypothetical) future caller passes the wave-1 list PLUS a forbidden verb. The loop must NOT
+  // bind or run it: bindable filters to LANGCHAIN_TOOLS, so the extra verb is refused even when the
+  // model asks for it.
+  const overWide = [...Object.values(LANGCHAIN_TOOLS), { name: 'run_bash', description: 'forbidden', schema: { type: 'object', properties: {}, required: [] }, run: async () => 'SHOULD NOT RUN' }];
+  const owServer = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (d) => (b += d));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        // A misbehaving model asks for run_bash (which is in the over-wide array but NOT the allowlist).
+        res.end(JSON.stringify({ id: 'ow1', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_ow', name: 'run_bash', input: { cmd: 'rm -rf /' } }], model: MODEL, stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 } }));
+      });
+    });
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${owServer.address().port}`;
+  const ow = await runLangchainAgentTurn({
+    xell, task: 'try to widen', provider: 'deepseek', model: MODEL,
+    apiKey: DEEPSEEK_KEY, xellToken, tools: overWide, maxIterations: 2,
+  });
+  ok(!ow.executed.some((t) => t.name === 'run_bash'), 'run_bash was NEVER executed even though the caller passed it in the array');
+  const owRefusal = ow.messages.some((m) => m._getType() === 'tool' && /not a bindable tool/.test(String(m.content)));
+  ok(owRefusal, 'the model\'s run_bash request was REFUSED by the allowlist (not run)');
+  await new Promise((r) => owServer.close(r));
+
+  // ── G. THE TEND GUARD — an open tend survives a model `working` call ───────────────────────
+  console.log('\n── G. the tend guard: `working` refuses while a tend is open, so the human\'s ask survives ──');
+  await runTool(xell, { name: 'tend', args: { reason: 'a human must decide X before I continue' } });
+  const openBefore = await one(
+    `SELECT hook_event_name FROM session_event
+      WHERE xell_id=$1 AND hook_event_name IN ('tend-request','tend-clear')
+      ORDER BY ts DESC LIMIT 1`, [xellId]);
+  eq(openBefore?.hook_event_name, 'tend-request', 'the tend is OPEN before the working call');
+  const guarded = await runTool(xell, { name: 'working', args: { note: 'loop filler' } });
+  const guardedJson = JSON.parse(guarded);
+  eq(guardedJson.ok, false, 'working is REFUSED while the tend is open');
+  ok(/OPEN tend/.test(guardedJson.error), 'the refusal names the open tend');
+  ok(/a human must decide X/.test(guardedJson.error), 'the refusal says WHAT the human was asked (the tend reason)');
+  const openAfter = await one(
+    `SELECT hook_event_name FROM session_event
+      WHERE xell_id=$1 AND hook_event_name IN ('tend-request','tend-clear')
+      ORDER BY ts DESC LIMIT 1`, [xellId]);
+  eq(openAfter?.hook_event_name, 'tend-request', 'the tend SURVIVED the working call (was not auto-cleared)');
+  // Clear the tend so the throwaway xell is left clean, and confirm `working` then succeeds.
+  await runTool(xell, { name: 'tend', args: { clear: true } });
+  const workingAfterClear = JSON.parse(await runTool(xell, { name: 'working', args: { note: 'now clear' } }));
+  eq(workingAfterClear.ok, true, 'working succeeds once the tend is cleared');
 
   // ── C. THE CAP — a model that never finishes is stopped VISIBLY ───────────────────────────
   console.log('\n── C. the cap: a model that keeps requesting tools is stopped at the hard cap ──');

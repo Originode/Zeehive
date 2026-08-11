@@ -24,44 +24,72 @@
 //   • build, sync, db-catchup — build boots a server that applies migrations at boot; sync triggers
 //     a build (the 2026-08-11 hole). A langchain zee can never reconcile git/db state through a tool.
 //   • manager verbs (swap, dispatch, say, suggest-done, zees) — a worker's reach is its own xell.
-//   • done, device, db-sandbox, prod, seed, land, ship — done out of the loop by design; the rest
-//     are infra/prod asks that must stay human-only. WAVE 2 (tend, hint-land, hint-ship, land, ship,
-//     seed) is approved IN PRINCIPLE but added ONLY after wave 1 is green AND a test shows a bound
-//     `land` producing a HELD request, not a landing.
-import { selfStatus, selfWorking, selfWork, selfWorkItem } from '../queenzee/self.js';
+//   • done, device, db-sandbox, prod — out of the loop by design; infra/human-only.
+//   • land, ship, seed — NOT BINDABLE, and never will be by a test. The wave-2 premise ("they
+//     terminate on a human") is FALSE on this fleet: project.auto_approve_land/ship/seed are TRUE
+//     for Zeehive and omnibiz, and the gates land/ship/seed with decided_by='auto-approve@policy'
+//     and no human in the path (landgate.js:188→250, shipgate.js:223, seedgate.js:199; measured:
+//     593 auto-approved lands, 287 auto-approved ships, 10 auto-approved seeds). A bound `land`
+//     puts a model-chosen commit on main, `ship` deploys production, `seed` writes prod rows. The
+//     confinement is the ALLOWLIST, not the gate — these are absent from it. Do NOT flip
+//     auto_approve_* to make a hold appear: that is fleet-wide policy, and this stays absent.
+import { selfStatus, selfWorking, selfWork, selfWorkItem, selfTend } from '../queenzee/self.js';
+import { tendState } from './status.js';
 
-// The four WAVE-1 verbs. Keyed BY NAME so the loop and runTool can look a request up in one step and
-// so the never-bindable check is a single property test: `LANGCHAIN_TOOLS[name]` is undefined for
+// The bound verbs. Keyed BY NAME so the loop and runTool can look a request up in one step and so
+// the never-bindable check is a single property test: `LANGCHAIN_TOOLS[name]` is undefined for
 // anything that is not bindable. Each entry: { name, description, schema (JSON schema), run(xell,
 // args) -> anything }. `xell` is the turn's xell (resolved by the queenzee), args are the model's.
+// Each description states what the verb WRITES (or that it is a pure select), because that is the
+// sentence the model reasons from.
+//
+// hint-land / hint-ship are NOT bound yet: their write shape (a session_event annotating a request,
+// nothing more) has been reported to the manager and is pending their call before they are added.
 export const LANGCHAIN_TOOLS = {
   status: {
     name: 'status',
-    description: 'Read THIS xell\'s status: the task, whether a landing/ship/done is pending a human, '
-      + 'the xell\'s containers and db binding. Read-only orientation.',
+    description: 'Reads THIS xell\'s status: the task, whether a landing/ship/done is pending a human, '
+      + 'the xell\'s containers and db binding. PURE SELECT — it writes nothing.',
     schema: { type: 'object', properties: {}, required: [] },
     run: (xell) => selfStatus(xell),
   },
   work: {
     name: 'work',
-    description: 'Read the work item THIS zee is executing — its plan, ticket and history (use `item` '
-      + 'to report progress on it). Read-only.',
+    description: 'Reads the work item THIS zee is executing — its plan, ticket and history. PURE '
+      + 'SELECT — it writes nothing (use `item` to report progress).',
     schema: { type: 'object', properties: {}, required: [] },
     run: (xell) => selfWork(xell),
   },
   working: {
     name: 'working',
-    description: 'Ping "I am actively working" with an optional note. WARNING: this also auto-clears '
-      + 'this xell\'s open tend (a question that was posted to a human) if one is open — it does not '
-      + 'RAISE a gate, but it can CLOSE one. Use it only when you are genuinely working, not as '
-      + 'conversational filler.',
+    description: 'Writes a "working" ping for THIS xell (a session_event + a zee status update) that '
+      + 'tells the fleet this zee is actively working. It opens no gate, but it AUTO-CLEARS an open '
+      + 'tend (a question posted to a human) — so if a tend is open the tool REFUSES rather than '
+      + 'silently dismissing the human\'s question. Use it only when you are genuinely working, never '
+      + 'as conversational filler.',
     schema: { type: 'object', properties: { note: { type: 'string' } }, required: [] },
-    run: (xell, args) => selfWorking(xell, { note: args?.note || null }),
+    run: async (xell, args) => {
+      // THE TEND GUARD (manager ruling 2026-08-11): `working` auto-clears an open tend (lib/status.js
+      // :383, inside pingWorking). A CLI zee's `zee working` is a deliberate act by something that can
+      // read the room; a model in a loop is not — emitting `working` as filler would silently dismiss
+      // a question posted to a human. So when a tend is OPEN, refuse WITHOUT calling selfWorking
+      // (which is what would clear it), and tell the model WHAT the human was asked so it can act.
+      // pingWorking is left untouched — this guard is on the TOOL path only.
+      const state = await tendState(xell.id);
+      if (state.open) {
+        return { ok: false, error: `working is REFUSED: this xell has an OPEN tend — a human was `
+          + `asked "${state.reason || state.full || '…'}" — and a working ping would auto-clear it. `
+          + 'Do not suppress the question with a ping; if you are genuinely working, tell the human '
+          + 'or answer the ask first.' };
+      }
+      return selfWorking(xell, { note: args?.note || null });
+    },
   },
   item: {
     name: 'item',
-    description: 'Report where THIS xell\'s work item has got to: status, progress (0-100), and an '
-      + 'optional note. A report of fact, never a gate.',
+    description: 'WRITES this xell\'s OWN work-item card: status, progress (0-100) and an optional '
+      + 'note, plus an event row. Scoped by the server to THIS xell\'s card — it cannot write another '
+      + 'item. It opens no gate and does not clear a tend.',
     schema: {
       type: 'object',
       properties: {
@@ -75,6 +103,15 @@ export const LANGCHAIN_TOOLS = {
       status: args?.status || null, progress: args?.progress ?? null, note: args?.note || null,
     }),
   },
+  tend: {
+    name: 'tend',
+    description: 'Writes "I need a human in the console" for THIS xell with a brief reason — a signal '
+      + 'shown beside this xell\'s hexagon. It EXECUTES nothing and opens no gate: it is a request '
+      + 'for attention, not an action. To RAISE you must give a reason (a bare tend is refused); pass '
+      + 'clear:true to lower it. It also auto-clears when you report working.',
+    schema: { type: 'object', properties: { reason: { type: 'string' }, clear: { type: 'boolean' } }, required: [] },
+    run: (xell, args) => selfTend(xell, { reason: args?.reason || null, clear: !!args?.clear }),
+  },
 };
 
 // The bindable tool list — what the loop binds. Only what is in this registry, nothing else.
@@ -83,14 +120,12 @@ export function toolList() {
 }
 
 // Run ONE tool by name — THE single dispatch path. The loop calls THIS (never a second lookup), and
-// it is the allowlist refusal. Returns the tool output as a string (the shape a ToolMessage carries).
-// A name not in the registry is REFUSED with a visible message the model can react to, never a
-// silent no-op and never a free run. `tools` is the registry to resolve against (the loop passes its
-// own list so an injected test list stays authoritative); it defaults to the global LANGCHAIN_TOOLS
-// and accepts either the keyed object or an array of descriptors.
-export async function runTool(xell, { name = null, args = {} } = {}, tools = LANGCHAIN_TOOLS) {
-  const list = Array.isArray(tools) ? tools : Object.values(tools);
-  const desc = list.find((d) => d.name === name);
+// it is the allowlist refusal. Resolves against the GLOBAL LANGCHAIN_TOOLS (the allowlist) — never a
+// caller-supplied list, so an over-wide caller array cannot leak a verb in. Returns the tool output
+// as a string (the shape a ToolMessage carries). A name not in the registry is REFUSED with a
+// visible message the model can react to, never a silent no-op and never a free run.
+export async function runTool(xell, { name = null, args = {} } = {}) {
+  const desc = LANGCHAIN_TOOLS[name];
   if (!desc) {
     return JSON.stringify({ ok: false, error: `"${name}" is not a bindable tool for this zee — the `
       + 'allowlist is the confinement and that verb is not on it.' });
