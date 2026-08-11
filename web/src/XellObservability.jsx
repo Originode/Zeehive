@@ -29,6 +29,8 @@ const fmtDur = (a, b) => {
 const fmtDt = (d) => (d ? new Date(d).toLocaleString() : '—');
 const kindLabel = (k) => ({ spawn: '🚀 spawn', resume: '↻ resume', interactive: '⌨ interactive' }[k] || k || '—');
 const statusLabel = (s) => ({ started: 'running', ended: '✓ done', errored: '✗ errored', paused: '⏸ paused' }[s] || s || '—');
+// Kind → icon for the trace-card badge. Distinct from the label so the badge can stay compact.
+const kindIcon = (k) => ({ spawn: '🚀', resume: '↻', interactive: '⌨' }[k] || '·');
 
 // The play-by-play event renderer — turns a session_event row into a readable line.
 function eventLine(ev) {
@@ -63,7 +65,7 @@ function eventLine(ev) {
   }
 }
 
-function TurnRow({ turn, open, onToggle }) {
+export function TurnRow({ turn, open, onToggle }) {
   const [events, setEvents] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -80,12 +82,18 @@ function TurnRow({ turn, open, onToggle }) {
   return (
     <div className={`ob-turn${open ? ' open' : ''}`}>
       <button className="ob-turn-h" onClick={toggle} aria-expanded={open}>
-        <span className="ob-turn-kind">{kindLabel(turn.kind)}</span>
-        <span className="ob-turn-status">{statusLabel(turn.status)}</span>
-        <span className="ob-turn-model">{turn.model || '—'}</span>
-        <span className="ob-turn-tok">{fmtTok(tokens)} tok</span>
-        <span className="ob-turn-cost">{fmtUsd(turn.cost_usd)}</span>
-        <span className="ob-turn-dur">{fmtDur(turn.started_at, turn.ended_at)}</span>
+        <span className={`ob-badge ${turn.status || ''}`} title={kindLabel(turn.kind)}>{kindIcon(turn.kind)}</span>
+        <span className="ob-turn-main">
+          <span className="ob-turn-top">
+            <span className="ob-turn-model">{turn.model || '—'}</span>
+            <span className={`ob-turn-status ${turn.status || ''}`}>{statusLabel(turn.status)}</span>
+            <span className="ob-turn-kind">{kindLabel(turn.kind)}</span>
+          </span>
+          {turn.summary && <span className="ob-turn-summary">{turn.summary}</span>}
+        </span>
+        <span className="ob-turn-tok" title="tokens">{fmtTok(tokens)} tok</span>
+        <span className="ob-turn-cost" title="cost">{fmtUsd(turn.cost_usd)}</span>
+        <span className="ob-turn-dur" title="duration">{fmtDur(turn.started_at, turn.ended_at)}</span>
         <span className="ob-turn-dt">{fmtDt(turn.started_at)}</span>
         <span className="ob-turn-chev">{open ? '▾' : '▸'}</span>
       </button>
@@ -146,7 +154,10 @@ function GatewayCallRow({ r, xellId }) {
     <div className="ob-gw-call">
       <div className="ob-turn-h" onClick={toggle} role="button" tabIndex={0}
            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } }}>
-        <span className="ob-turn-kind">{r.kind === 'chat-completions' ? '⚙ chat' : '📨 messages'}</span>
+        <span className={`ob-badge ${r.status === 200 ? 'ended' : 'errored'}`}
+              title={r.kind === 'chat-completions' ? 'chat-completions' : 'messages'}>
+          {r.kind === 'chat-completions' ? '⚙' : '📨'}
+        </span>
         <span className="ob-turn-status">{r.status === 200 ? '✓' : `✗ ${r.status || '?'}`}</span>
         <span className="ob-turn-model">{r.provider} · {r.model || '—'}</span>
         <span className="ob-turn-tok">{fmtTok(tokens)} tok</span>
@@ -314,6 +325,11 @@ export default function XellObservability({ xell, onClose }) {
     tokens: a.tokens + Number(t.input_tokens || 0) + Number(t.output_tokens || 0)
       + Number(t.cache_read_tokens || 0) + Number(t.cache_write_tokens || 0),
   }), { cost: 0, tokens: 0 });
+  // The token-share bar — each turn's tokens as a segment of a horizontal bar, so a human sees
+  // at a glance which turns dominated the burn. Mirrors the trace-viewer's summary strip.
+  const turnTok = turns.map((t) => Number(t.input_tokens || 0) + Number(t.output_tokens || 0)
+    + Number(t.cache_read_tokens || 0) + Number(t.cache_write_tokens || 0));
+  const maxTok = Math.max(...turnTok, 1);
 
   return (
     <div className="disp-overlay" onClick={onClose}>
@@ -344,10 +360,19 @@ export default function XellObservability({ xell, onClose }) {
               {tab === 'turns' && (
                 <>
                   <div className="xob-summary">
-                    <span><b>{turns.length}</b> turn(s) recorded</span>
-                    <span><b>{fmtUsd(sum.cost)}</b> total (shown window)</span>
-                    <span><b>{fmtTok(sum.tokens)}</b> tok (shown window)</span>
+                    <span className="xob-sum-item"><b>{turns.length}</b> turn(s)</span>
+                    <span className="xob-sum-item"><b>{fmtUsd(sum.cost)}</b> cost</span>
+                    <span className="xob-sum-item"><b>{fmtTok(sum.tokens)}</b> tok</span>
                   </div>
+                  {turns.length > 0 && (
+                    <div className="xob-tokbar" aria-label="token usage per turn">
+                      {turnTok.map((t, i) => (
+                        <span key={i} className="xob-tokbar-seg"
+                              style={{ width: `${(t / maxTok) * 100}%` }}
+                              title={`${fmtTok(t)} tok — ${turns[i]?.model || 'turn'}`} />
+                      ))}
+                    </div>
+                  )}
                   {turns.length === 0
                     ? <div className="xob-empty">
                         No turns recorded yet. A turn appears when a zee starts working in this xell
