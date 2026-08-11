@@ -22,6 +22,8 @@ import { loadManifest, projectDefaultsFromManifest, draftManifest, draftManifest
          planComposeOnboarding, manifestHash, parseManifest, listComposeFiles,
          detectComposeSuggestions } from './manifest.js';
 import { resolveSite } from './sites.js';
+import { dbRunner } from './work-items.js';
+import { syncProjectNode } from './work-node-sync.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, nudge, harness, reaper,
 // the .zeehive.env reconcile): 'real' touches machines, anything else models. The three OUTBOUND
@@ -159,6 +161,9 @@ export async function createProject(body) {
        ON CONFLICT (project_id) DO NOTHING`,
       [project.id, Number(body.pool_target) || 0, rt?.id || null]);
 
+    // A PROJECT IS A WORK_NODE (migration 193): the project's plan root node exists from
+    // birth, with the root work_item (created by the 058 trigger) hanging beneath it.
+    await syncProjectNode(dbRunner(client), project.id);
     await client.query('COMMIT');
     broadcast('project', project);
     // manifest warnings ride the response (missing compose files etc.) — advisory, not blocking
@@ -921,6 +926,9 @@ export async function updateProject(id, body = {}) {
   if (!sets.length) return project;
 
   const updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
+  // A PROJECT IS A WORK_NODE: a rename updates the project's plan root node too (a fresh
+  // node is materialised if the project never dual-wrote one).
+  if (body.name) await syncProjectNode(dbRunner(), id);
   // A changed main branch needs its xource row, or the pool can't provision from it.
   if (body.main_branch && body.main_branch !== project.main_branch) {
     await q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
