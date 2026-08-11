@@ -167,6 +167,23 @@ async function main() {
     ok(byNameG.get('D1')?.scheduled === false, `D1 (independent) is board-order only — scheduled=false (lane)`);
     ok(byNameG.get('B1')?.scheduled === true, `B1 (a declared dependency endpoint) is scheduled=true`);
     ok(byNameG.get(`gantt-sched-${tag}`)?.scheduled === true, `the project root (contains the declared chains) is scheduled=true`);
+
+    section('F. (f) duration PROVENANCE is visible per node and per plan');
+    // The read model must tell the three sources apart (migration 194's chain), per node and
+    // as a plan mix — a default bar is never dressed up as an estimate. This plan's 7 atoms:
+    // A1/A2/A3/B2/D1 (unestimated, no execution) → default; B1 (estimate 2h) → estimate; C1
+    // (closed execution 09:00→13:00) → actual. So the mix is {default:5, estimate:1, actual:1,
+    // atoms:7, on_default:71} — the honest headline "5 of 7 bars are guesswork".
+    ok(byNameG.get('A1')?.duration_source === 'default', `A1 (no estimate, no execution) → default (got ${byNameG.get('A1')?.duration_source})`);
+    ok(byNameG.get('B1')?.duration_source === 'estimate', `B1 (explicit estimate) → estimate (got ${byNameG.get('B1')?.duration_source})`);
+    ok(byNameG.get('C1')?.duration_source === 'actual', `C1 (closed execution) → actual (got ${byNameG.get('C1')?.duration_source})`);
+    ok(byNameG.get('D1')?.duration_source === 'default', `D1 (independent, unestimated) → default (got ${byNameG.get('D1')?.duration_source})`);
+    const mix = g.duration_mix;
+    ok(mix && mix.estimate === 1 && mix.actual === 1 && mix.default === 5 && mix.atoms === 7,
+      `duration_mix = {estimate:1, actual:1, default:5, atoms:7} (got ${JSON.stringify(mix)})`);
+    ok(mix && mix.on_default === 71, `on_default = 71% (got ${mix?.on_default}%)`);
+    // a container is a rollup, never an estimate/default — the provenance is the tree, not a lie
+    ok(byNameG.get('Act A')?.duration_source === 'rollup', `Act A (a container) → rollup (got ${byNameG.get('Act A')?.duration_source})`);
   } finally {
     try {
       await q(`DELETE FROM project WHERE id=$1`, [projectId]);

@@ -70,6 +70,7 @@ export default function Gantt({ projectId }) {
       {model !== null && (
         <GanttChart rows={model.rows || []} planName={model.plan_name} version={model.version}
                     hasDeclaredOrder={model.has_declared_order} edgeCounts={model.edge_counts}
+                    durationMix={model.duration_mix}
                     onOpen={setOpen} />
       )}
       {open && <WeldWaterfall row={open} onClose={() => setOpen(null)} />}
@@ -82,7 +83,7 @@ export default function Gantt({ projectId }) {
 // (test/workflow-stage6.test.mjs renders it over real rows and asserts on the markup). It owns
 // only view state — zoom, collapse, hover, the bar in focus — and asks its parent to open the
 // waterfall. The timeline never writes; onOpen is the only callback.
-export function GanttChart({ rows = [], planName = null, version = null, hasDeclaredOrder = null, edgeCounts = null, onOpen, today, initialCollapsed }) {
+export function GanttChart({ rows = [], planName = null, version = null, hasDeclaredOrder = null, edgeCounts = null, durationMix = null, onOpen, today, initialCollapsed }) {
   const [zoom, setZoom] = useState(() => {
     try { const z = localStorage.getItem(ZOOM_KEY); return ZOOMS.some((x) => x.key === z) ? z : ZOOMS[1].key; }
     catch { return ZOOMS[1].key; }
@@ -293,6 +294,14 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
           <b>Order is inferred.</b>
           <span>{inferredOrderBanner} Declare a real “after” with <code>zee dep</code> (or the
                 card’s “depends on” picker) and the chart will draw it as a chain.</span>
+        </div>
+      )}
+      {durationMix && durationMix.atoms > 0 && durationMix.on_default > 50 && !empty && !nothingDated && (
+        <div className="work-warn work-gorder" role="status">
+          <b>Mostly default durations.</b>
+          <span>{durationMix.default} of {durationMix.atoms} bars ({durationMix.on_default}%) use the
+                1-day default — no estimate, no measured actual. Those are placeholders, not facts;
+                the tooltip on each bar names which.</span>
         </div>
       )}
 
