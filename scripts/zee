@@ -515,7 +515,7 @@ function usage() {
  the work tracker (the PLAN this job is part of):
   zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
   zee work --new --title "..." [--body "..."] [--kind task|activity] [--parent <id>] [--ticket <code|id>] [--priority 1..5] [--status s]   MANAGER-only: CUT ONE CARD in your own project's plan and print its ID, so it pipes straight into "zee assign --item <id>". Creating a card dispatches nobody
-  zee item [<id>] --status <s> [--progress N] [--note "..."]   report where the WORK has got to. A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
+  zee item [<id>] --status <s> [--progress N] [--note "..."] [--estimate <hours>] [--starts-on YYYY-MM-DD] [--due-on YYYY-MM-DD]   report where the WORK has got to — and size the card for the gantt (--estimate/--starts-on/--due-on PATCH the work_item and dual-write the plan node). A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
   zee handover --result <json> [--override]   store your TYPED RESULT on the PLANE-3 execution this xell is bound to (interim — the stage-2 data plane replaces this). The execution is resolved from your xell binding, never named by you. Refused if outputs already has a result unless --override (the event log keeps the history)
   zee await [--for <hours>]           END your turn now — the anti-spin primitive: tokens stop — hold a lease on the execution and mark it 'waiting' (default 24h window; --for overrides in hours). MUST be the last thing you do in this turn
 
@@ -1213,14 +1213,19 @@ switch (cmd) {
     break;
   }
   case 'item': {
-    // Report where the WORK has got to. A manager may report any item in its own project; a worker
-    // only the one it is assigned to (and may omit the id — the server resolves it from your token).
-    // This moves the CARD. It never marks your xell done, lands anything or ships anything.
+    // Report where the WORK has got to (or size the card): a manager may report any item in its
+    // own project; a worker only the one it is assigned to (and may omit the id — the server
+    // resolves it from your token). --estimate/--starts-on/--due-on are the gantt's write path —
+    // they PATCH the work_item and dual-write work_node.estimate. This moves the CARD. It never
+    // marks your xell done, lands anything or ships anything.
     const id = flag('item') || positional();
     const progress = flag('progress');
+    const est = flag('estimate');
     out(await req('POST', '/api/xell/self/work/item', {
       id, status: flag('status') || null,
       progress: progress == null ? null : Number(progress), note: flag('note') || null,
+      estimate_hours: est == null ? null : Number(est),
+      starts_on: flag('starts-on') || null, due_on: flag('due-on') || null,
     }));
     break;
   }

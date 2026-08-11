@@ -2873,7 +2873,8 @@ export async function selfWorkAssign(xell, { item = null, task = null, model = n
 // A MANAGER may update any item in its own project; a WORKER may update ONLY the item it is assigned
 // to. Both are resolved from the CALLER'S TOKEN — an id that is not theirs is refused with a sentence,
 // never silently applied.
-export async function selfWorkItem(xell, { id = null, status = null, progress = null, note = null } = {}) {
+export async function selfWorkItem(xell, { id = null, status = null, progress = null, note = null,
+                                             estimate_hours = null, starts_on = null, due_on = null } = {}) {
   const { reportItemStatus, getItem, itemForXell } = await import('../lib/work-assign.js');
   const manager = isManager(xell);
 
@@ -2910,7 +2911,44 @@ export async function selfWorkItem(xell, { id = null, status = null, progress = 
   if (p != null && (!Number.isFinite(p) || p < 0 || p > 100)) {
     return { ok: false, error: `--progress must be a number 0-100 (got "${progress}")` };
   }
+
+  // ── the SCHEDULE half (the gantt's write path): an estimate and/or dates. The console's
+  // item drawer can always PATCH these (work-items.js updateWorkItem); the zee verb gains
+  // them here so a manager can size a card from the CLI. updateWorkItem owns the
+  // validation (assertSchedule) and the dual-write to work_node.estimate.
+  const est = estimate_hours == null ? null : Number(estimate_hours);
+  if (est != null && (!Number.isFinite(est) || est < 0)) {
+    return { ok: false, error: `--estimate must be hours >= 0 (got "${estimate_hours}")` };
+  }
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  if (starts_on != null && !DATE_RE.test(starts_on)) {
+    return { ok: false, error: `--starts-on must be YYYY-MM-DD (got "${starts_on}")` };
+  }
+  if (due_on != null && !DATE_RE.test(due_on)) {
+    return { ok: false, error: `--due-on must be YYYY-MM-DD (got "${due_on}")` };
+  }
+  const hasSchedule = est != null || starts_on != null || due_on != null;
+  const hasReport = status != null || progress != null || note != null;
+  if (!hasReport && !hasSchedule) {
+    return { ok: false, error: 'nothing to report — give --status, --progress, --note, '
+      + '--estimate, --starts-on or --due-on.' };
+  }
+
   try {
+    if (hasSchedule) {
+      const { updateWorkItem } = await import('../lib/work-items.js');
+      const patch = {};
+      if (est != null) patch.estimate_hours = est;
+      if (starts_on != null) patch.starts_on = starts_on;
+      if (due_on != null) patch.due_on = due_on;
+      await updateWorkItem(target.id, patch, { actor: xell.slug });
+    }
+    if (!hasReport) {
+      const fresh = await getItem(target.id);
+      return { ok: true, item: fresh,
+        message: `Schedule recorded on "${fresh.title}" — estimate ${fresh.estimate_hours ?? '—'}h, `
+          + `starts ${fresh.starts_on ?? '—'}, due ${fresh.due_on ?? '—'}.` };
+    }
     return await reportItemStatus(target.id, { status, progress: p, note, actor: xell.slug });
   } catch (e) {
     return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };

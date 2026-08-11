@@ -2536,7 +2536,9 @@ router.post('/xell/self/work/item', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     res.json(await selfWorkItem(x, { id: b.id || null, status: b.status || null,
-      progress: b.progress ?? null, note: b.note || null })); }
+      progress: b.progress ?? null, note: b.note || null,
+      estimate_hours: b.estimate_hours ?? null, starts_on: b.starts_on ?? null,
+      due_on: b.due_on ?? null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
