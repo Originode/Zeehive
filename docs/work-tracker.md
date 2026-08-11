@@ -200,9 +200,15 @@ ticket_comment(id, ticket_id, author, body, created_at)
 work_item(id, project_id, parent_id, kind, title, body, status, priority, ticket_id, xell_id,
           assignee, starts_on, due_on, estimate_hours, progress, sort_order, path, depth,
           created_by, created_at, updated_at, closed_at)
-work_item_dep(work_item_id, depends_on_id, created_at)         -- finish→start, for the gantt
 work_item_event(id, work_item_id, ts, kind, from_status, to_status, actor, detail jsonb)
 task.work_item_id                                              -- added for part 2
+
+> **REHAB 3/4**: `work_item_dep` is RETIRED (migration 188). finish→start edges now live in the
+> workflow model's `dependency` table (from_id = prerequisite, to_id = dependent, type 'FS'),
+> which the work-tracker readers (board/gantt/drawer) have read since REHAB 2/4 and the writers
+> have written since REHAB 3/4. `work_item` itself stays as the ATTRIBUTE ANNEX — it still carries
+> body, ticket_id, xell_id, progress, the exact stored status and the audit trail
+> (`work_item_event`), because the model does not own those yet.
 ```
 
 Migration **060** adds one constraint to the above: `work_item_dates_ordered` — `due_on` may
@@ -232,7 +238,7 @@ and the libraries do **not** re-check them — they let it raise and pass the se
 | `path` / `depth` follow a move, for the whole subtree | a stale lineage after a drag | `work_item_guard()` (BEFORE) + `work_item_reparent_descendants()` (AFTER, one level at a time, recursing only while a path actually changed) |
 | terminal status ⇒ `closed_at` set; leaving it ⇒ cleared | a reopened item that still reads as closed | `work_touch()` |
 | `ticket.number` is a per-project sequence | a uuid nobody can say out loud | `ticket_number_assign()`, under a transaction advisory lock so two concurrent inserts cannot collide |
-| no self-dependency, no dependency across projects | an unsolvable gantt | `work_item_dep_guard()` |
+| no self-dependency, no dependency across projects | an unsolvable gantt | the model's I5 trigger (REHAB 3/4: the retired `work_item_dep_guard()` stated it in words; `addDep` now states the same sentence first) |
 
 **`path`** is the materialized `'/'`-joined list of **ancestor ids, each followed by `/`**:
 a root is `''`, its child `'<root>/'`, a grandchild `'<root>/<child>/'`. So
