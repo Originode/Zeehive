@@ -209,31 +209,37 @@ poison B, and most of the transcript is the journey, not the conclusion.
 a brand-new xell starts with an empty conversation — COLD by construction. The same-xell test above
 does not stand in for the cross-xell case, and is not offered as such.
 
-**The proposed cross-xell design** (not yet built — the state model is agreed here before code follows):
+**The proposed cross-xell design** (not yet built — the state model is agreed here before code follows).
+**DECISION (2026-08-11): the carrier is a XELL-KEYED handover row — Option A.** The execution plane
+was considered and rejected as the carrier. Measured on the fleet meta-DB: `execution` has NO
+`xell_id` column, `entity` has ZERO rows, nothing sets `execution.entity_id`, and `execution.outputs`
+is empty in 0 of 160 rows. There is NO path from a xell to its execution today, in either direction,
+so a successor xell cannot find its predecessor's execution — and even if it could, the field is
+empty. Routing the handover through `execution` would require wiring xell↔execution (entity rows for
+xells, `execution.entity_id` populated, readers re-pointed) as a PREREQUISITE CARD with a human's
+name on it (…-abc363's scope) — this design does not silently absorb it. So the handover lives where
+it can actually be found.
 
+- **The carrier: a `xell_handover` row, keyed by `xell_id`** — the SAME key `zee_conversation` uses,
+  so it composes with what is already built. Written when the predecessor xell is retired/reaped;
+  read BY NAME when the successor is dispatched. Boring, reachable, no dependency on the empty
+  entity plane.
 - **What crosses the boundary: a CURATED handover**, not the transcript. The durable conclusions:
   what was decided, what was verified, what remains, the constraints that still bind, the next
   concrete step. What stays behind: dead ends, wrong turns, local paths, tool blow-by-blow.
-- **The carrier: the execution plane, via `stable_key` — NOT `entity_id`.** Measured on the fleet
-  meta-DB: `execution` has 160 rows, 160 with `work_node_id`, 0 with `entity_id`; `entity` has 0
-  rows. `execution.entity_id` is a DEAD PATH and must not be routed through. The live link is
-  `execution → work_node → ('work_item:'||wi.id = work_node.stable_key) → work_item.xell_id`, which
-  reaches a xell for 105 of 160 executions. That is the carrier.
-- **`execution.outputs` is EMPTY today (0 of 160 non-empty) — this change would be its FIRST
-  writer.** It is a documented, typed, nullable column, not a fiction; being the first writer is
-  fine, but the doc says so out loud rather than implying the plane already carries handovers.
-- **The case splits in two, because they are different problems:**
-  - **(a) SAME work item, NEW xell** — attempt N → N+1 on the SAME work_node. The carrier is obvious
-    and already populated: the successor reads the predecessor execution's `outputs` for its own
-    node. The successor xell is named by the dispatch (same `xell.execution_id` lineage).
+- **How the successor is NAMED** — the handover is read by name, and the name is one of:
+  - **(a) SAME work item, NEW xell** — the successor is dispatched on the SAME work_item; the
+    predecessor is the previous xell that held that work_item (via the work_item's xell history /
+    task row). The successor reads the predecessor's `xell_handover` for that work item.
   - **(b) DIFFERENT work item** — a successor CARD. The link is a `dependency` edge: **`from_id` is
     the PREDECESSOR, `to_id` the DEPENDENT** (get this backwards and the handover runs the wrong
     way). This is "chain" work already being designed by the …-16c430 xell; this design does NOT
-    invent a second carrier for it — it uses the same dependency edge, and the two efforts stay
-    aligned on one design for the edge.
-- **The link that authorises the handover:** a new xell must be NAMED as a successor — same
-  work_node (case a) or a dependency edge (case b). Without that link a new xell has no legitimate
-  claim on another xell's conversation and must not receive it.
+    invent a second carrier for it — it uses the same dependency edge to find the predecessor, then
+    reads that predecessor's `xell_handover`.
+  - **Explicit:** a manager dispatches "continue <xell>" — the dispatch names the predecessor
+    directly and reads its `xell_handover`.
+  Without one of these, a new xell has no legitimate claim on another xell's conversation and must
+  not receive it.
 - **Filtering:** any value scoped to the old cage (local paths, container names, session ids,
   claude_session references) is stripped before it crosses.
 
@@ -288,6 +294,14 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   and both calls land in `llm_gateway_request` through the real `gatewayProxy`. It also drives the
   real `spawnLangchainZee` path end to end (zee row, turn lifecycle, burn, gateway ledger).
 
+**STATUS: BUILT, TESTED, and NOT YET ENABLED on any zee.** Measured on the fleet meta-DB:
+`zee_conversation` has 0 rows across 0 xells — the migration is landed and applied (the table is
+live), but nothing has ever used it. That is consistent with the runtime being opt-in
+(`agent_runtime.enabled=false`). To try it, a human flips the switch and dispatches on the runtime:
+`UPDATE agent_runtime SET enabled=true WHERE key='langchain-stateful'`, then select the
+`langchain-stateful` runtime when dispatching a zee. Until then the driver is exercised only by the
+standalone test, not by a live zee.
+
 ### 8.2 Design constraints that hold
 
 - Model calls flow through the gateway (the gateway is the base URL; `llm_gateway_request` is
@@ -302,12 +316,13 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
 ### 8.3 Not built yet (next cards)
 
 1. **Cross-xell turnover** — the curated-handover design in §5.2: what a successor xell is handed
-   when it continues work from a different xell, carried on the execution plane via `stable_key`
-   (never `entity_id` — a dead path), written to `execution.outputs` as its FIRST writer (the column
-   is empty today), split into same-work-item (case a) and different-work-item (case b, the
-   dependency edge, kept aligned with …-16c430's chain work). The old xell's local paths and dead
-   ends are filtered out. This is the design gap this card names; it is the natural next card once
-   the state model is agreed and read.
+   when it continues work from a different xell, carried on a XELL-KEYED `xell_handover` row (the
+   same key `zee_conversation` uses — Option A, the agreed decision; the execution plane was
+   rejected as the carrier because it has no xell↔execution path and its `outputs` is empty).
+   Split into same-work-item (case a) and different-work-item (case b, the dependency edge, kept
+   aligned with …-16c430's chain work). The old xell's local paths and dead ends are filtered out.
+   This is the design gap this card names; it is the natural next card once the state model is
+   agreed and read.
 2. **Tool loop** — the driver currently makes one model call per turn. The multi-call loop (model →
    tool request → tool result → model → …) is the natural next step, with tools bound through
    langchain's tool interface and executed through queenzee-owned, gate-respecting verbs.
