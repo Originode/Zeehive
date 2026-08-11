@@ -16,6 +16,11 @@
 //      created/edited event, or nothing) gets NONE — no fabricated started_at.
 //
 // Everything it creates is torn down in a finally, whatever happens.
+//
+// REHAB 3/4: migration 188 RETIRED work_item_dep, but migration 185 (under test here) READS that
+// legacy table — 185 runs before 188 on a fresh database, so the historical behaviour is intact.
+// Against a fully-migrated database (where 188 already ran) the test recreates the legacy table
+// shape temporarily so it can still exercise 185's backfill, then drops it in cleanup.
 import pg from 'pg';
 import { readFileSync } from 'node:fs';
 
@@ -34,6 +39,20 @@ const q = (t, p) => client.query(t, p);
 const one = async (t, p) => (await client.query(t, p)).rows[0];
 const migrationSql = readFileSync(new URL('../db/migrations/185_rehab_backfill_work_items_into_workflow_model.sql', import.meta.url), 'utf8');
 
+// Recreate the retired work_item_dep table ONLY if migration 188 already dropped it. Returns true
+// when this test created it (so cleanup can drop it again).
+let createdDepTable = false;
+async function ensureDepTable() {
+  const e = (await one(`SELECT to_regclass('public.work_item_dep') IS NOT NULL AS e`)).e;
+  if (e) return;
+  await q(`CREATE TABLE work_item_dep (
+    work_item_id  uuid NOT NULL REFERENCES work_item ON DELETE CASCADE,
+    depends_on_id uuid NOT NULL REFERENCES work_item ON DELETE CASCADE,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (work_item_id, depends_on_id))`);
+  createdDepTable = true;
+}
+
 async function cleanup() {
   // run → execution (ON DELETE CASCADE via run_id), dependency (from/to ON DELETE CASCADE),
   // work_node (plan_version ON DELETE CASCADE), plan_version, plan, then project.
@@ -41,6 +60,7 @@ async function cleanup() {
   try { await q(`DELETE FROM run WHERE plan_version_id IN (SELECT pv.id FROM plan_version pv JOIN plan p ON p.id=pv.plan_id WHERE p.project_id IN ($1,$2))`, [P1, P2]); } catch { /* */ }
   try { await q(`DELETE FROM project WHERE id = ANY($1::uuid[])`, [[P1, P2]]); } catch { /* */ }
   try { await q(`DELETE FROM session_event WHERE source='rehab-test'`); } catch { /* */ }
+  if (createdDepTable) { try { await q(`DROP TABLE IF EXISTS work_item_dep`); } catch { /* */ } }
 }
 
 const insItem = async (id, projectId, parentId, kind, title, sortOrder, status, estimate, xellId = null, extra = {}) => {
@@ -66,6 +86,7 @@ async function counts() {
 try {
   await client.connect();
   await cleanup();
+  await ensureDepTable();
 
   section('seed the fixture (2 projects, 13 work_items, 3 deps, 14 events)');
   await q(`INSERT INTO project (id, name, repo_root, main_branch) VALUES ($1,'Project One','/tmp/p1','main')`, [P1]);

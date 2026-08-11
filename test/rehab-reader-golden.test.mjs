@@ -65,10 +65,26 @@ const T6 = 'c0000000-0000-4000-8000-000000000006';
 const sql185 = readFileSync(resolve(here, '..', 'db/migrations/185_rehab_backfill_work_items_into_workflow_model.sql'), 'utf8');
 const sql186 = readFileSync(resolve(here, '..', 'db/migrations/186_repair_rehab_dependency_direction_rank_encoding.sql'), 'utf8');
 
+// REHAB 3/4: migration 188 retired work_item_dep, but 185 (applied below) READS it — the backfill
+// runs before the drop on a fresh database. Against a fully-migrated db, recreate the legacy table
+// shape temporarily so the golden capture still exercises the historical backfill.
+let createdDepTable = false;
+async function ensureDepTable() {
+  const e = (await one(`SELECT to_regclass('public.work_item_dep') IS NOT NULL AS e`)).e;
+  if (e) return;
+  await q(`CREATE TABLE work_item_dep (
+    work_item_id  uuid NOT NULL REFERENCES work_item ON DELETE CASCADE,
+    depends_on_id uuid NOT NULL REFERENCES work_item ON DELETE CASCADE,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (work_item_id, depends_on_id))`);
+  createdDepTable = true;
+}
+
 async function cleanup() {
   try { await q(`DELETE FROM run WHERE plan_version_id IN (SELECT pv.id FROM plan_version pv JOIN plan p ON p.id=pv.plan_id WHERE p.project_id=$1)`, [P1]); } catch { /* */ }
   try { await q(`DELETE FROM ticket WHERE id=$1`, [TICKET]); } catch { /* */ }
   try { await q(`DELETE FROM project WHERE id=$1`, [P1]); } catch { /* */ }
+  if (createdDepTable) { try { await q(`DROP TABLE IF EXISTS work_item_dep`); } catch { /* */ } }
 }
 
 const insItem = async (id, projectId, parentId, kind, title, sortOrder, status, estimate, extra = {}) => {
@@ -176,6 +192,7 @@ function sorted(obj) {
 try {
   await client.connect();
   await cleanup();
+  await ensureDepTable();
 
   section('seed the fixture project');
   await seed();
