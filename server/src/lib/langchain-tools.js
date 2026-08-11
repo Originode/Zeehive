@@ -30,31 +30,33 @@
 //     `land` producing a HELD request, not a landing.
 import { selfStatus, selfWorking, selfWork, selfWorkItem } from '../queenzee/self.js';
 
-// The four WAVE-1 verbs. Each: { name, description, schema (JSON schema for the model), run(xell,
+// The four WAVE-1 verbs. Keyed BY NAME so the loop and runTool can look a request up in one step and
+// so the never-bindable check is a single property test: `LANGCHAIN_TOOLS[name]` is undefined for
+// anything that is not bindable. Each entry: { name, description, schema (JSON schema), run(xell,
 // args) -> anything }. `xell` is the turn's xell (resolved by the queenzee), args are the model's.
-export const LANGCHAIN_TOOLS = [
-  {
+export const LANGCHAIN_TOOLS = {
+  status: {
     name: 'status',
     description: 'Read THIS xell\'s status: the task, whether a landing/ship/done is pending a human, '
       + 'the xell\'s containers and db binding. Read-only orientation.',
     schema: { type: 'object', properties: {}, required: [] },
     run: (xell) => selfStatus(xell),
   },
-  {
+  work: {
     name: 'work',
     description: 'Read the work item THIS zee is executing — its plan, ticket and history (use `item` '
       + 'to report progress on it). Read-only.',
     schema: { type: 'object', properties: {}, required: [] },
     run: (xell) => selfWork(xell),
   },
-  {
+  working: {
     name: 'working',
     description: 'Ping "I am actively working" with an optional note. Reports a change of state, '
       + 'never a gate.',
     schema: { type: 'object', properties: { note: { type: 'string' } }, required: [] },
     run: (xell, args) => selfWorking(xell, { note: args?.note || null }),
   },
-  {
+  item: {
     name: 'item',
     description: 'Report where THIS xell\'s work item has got to: status, progress (0-100), and an '
       + 'optional note. A report of fact, never a gate.',
@@ -71,9 +73,26 @@ export const LANGCHAIN_TOOLS = [
       status: args?.status || null, progress: args?.progress ?? null, note: args?.note || null,
     }),
   },
-];
+};
 
 // The bindable tool list — what the loop binds. Only what is in this registry, nothing else.
 export function toolList() {
-  return LANGCHAIN_TOOLS;
+  return Object.values(LANGCHAIN_TOOLS);
+}
+
+// Run ONE tool by name, as the loop does — with the allowlist refusal. Returns the tool output as a
+// string (the shape a ToolMessage carries). A name not in the registry is REFUSED with a visible
+// message the model can react to, never a silent no-op and never a free run.
+export async function runTool(xell, { name = null, args = {} } = {}) {
+  const desc = LANGCHAIN_TOOLS[name];
+  if (!desc) {
+    return JSON.stringify({ ok: false, error: `"${name}" is not a bindable tool for this zee — the `
+      + 'allowlist is the confinement and that verb is not on it.' });
+  }
+  try {
+    const out = await desc.run(xell, args || {});
+    return typeof out === 'string' ? out : JSON.stringify(out);
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: `tool "${name}" error: ${String(e.message).slice(0, 300)}` });
+  }
 }

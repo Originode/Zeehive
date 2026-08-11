@@ -301,13 +301,22 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
   // journey; the durable exchange is the user task + the final assistant response.
   await appendConversation(xell.id, [userMsg, finalResp]);
 
+  // A CAPPED loop is a VISIBLE result, not a silent stop: the model never reached a final answer,
+  // so the text says exactly that (a loop that quietly truncates looks like a finished answer).
+  const capped = capHit;
+  const text = capped
+    ? `Tool loop stopped: capped at ${iterations} iterations without reaching a final answer.`
+    : messageText(finalResp.content);
+
   return {
-    text: messageText(finalResp.content),
+    text,
     usage: totalUsage,
     content: finalResp.content,
     messages,
     iterations,
+    capped,             // visible "the cap was hit" — never a silent truncation
     capHit,
+    toolCalls: executed, // the tools that actually ran ({name, args}) — for the play-by-play
     executed,
   };
 }
