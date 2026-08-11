@@ -33,7 +33,7 @@
 //     puts a model-chosen commit on main, `ship` deploys production, `seed` writes prod rows. The
 //     confinement is the ALLOWLIST, not the gate — these are absent from it. Do NOT flip
 //     auto_approve_* to make a hold appear: that is fleet-wide policy, and this stays absent.
-import { selfStatus, selfWorking, selfWork, selfWorkItem, selfTend } from '../queenzee/self.js';
+import { selfStatus, selfWorking, selfWork, selfWorkItem, selfTend, selfHint } from '../queenzee/self.js';
 import { tendState } from './status.js';
 
 // The bound verbs. Keyed BY NAME so the loop and runTool can look a request up in one step and so
@@ -43,8 +43,11 @@ import { tendState } from './status.js';
 // Each description states what the verb WRITES (or that it is a pure select), because that is the
 // sentence the model reasons from.
 //
-// hint-land / hint-ship are NOT bound yet: their write shape (a session_event annotating a request,
-// nothing more) has been reported to the manager and is pending their call before they are added.
+// hint-land / hint-ship are BOUND (manager authorisation 2026-08-11): each writes exactly one
+// session_event row (hook_event_name '<kind>hint-request'/'<kind>hint-clear') with the optional
+// reason, plus the xell's hint state (which lights the land?/ship? button) and an xell broadcast.
+// They open NO gate, push nothing, and there is no auto_approve path for a hint (landgate/shipgate
+// are not reached) — lib/status.js setHint (219-232).
 export const LANGCHAIN_TOOLS = {
   status: {
     name: 'status',
@@ -63,18 +66,22 @@ export const LANGCHAIN_TOOLS = {
   working: {
     name: 'working',
     description: 'Writes a "working" ping for THIS xell (a session_event + a zee status update) that '
-      + 'tells the fleet this zee is actively working. It opens no gate, but it AUTO-CLEARS an open '
-      + 'tend (a question posted to a human) — so if a tend is open the tool REFUSES rather than '
+      + 'tells the fleet this zee is actively working. It opens no gate. WARNING: `working` AUTO-CLEARS '
+      + 'an open tend (a question posted to a human) — so if a tend is open the tool REFUSES rather than '
       + 'silently dismissing the human\'s question. Use it only when you are genuinely working, never '
       + 'as conversational filler.',
     schema: { type: 'object', properties: { note: { type: 'string' } }, required: [] },
     run: async (xell, args) => {
-      // THE TEND GUARD (manager ruling 2026-08-11): `working` auto-clears an open tend (lib/status.js
-      // :383, inside pingWorking). A CLI zee's `zee working` is a deliberate act by something that can
-      // read the room; a model in a loop is not — emitting `working` as filler would silently dismiss
-      // a question posted to a human. So when a tend is OPEN, refuse WITHOUT calling selfWorking
-      // (which is what would clear it), and tell the model WHAT the human was asked so it can act.
-      // pingWorking is left untouched — this guard is on the TOOL path only.
+      // THE TEND GUARD (manager ruling 2026-08-11, APPROVED): `working` auto-clears an open tend
+      // (lib/status.js:383, inside pingWorking). A CLI zee's `zee working` is a deliberate act by
+      // something that can read the room; a model in a loop is not — emitting `working` as filler
+      // would silently dismiss a question posted to a human. So when a tend is OPEN, refuse WITHOUT
+      // calling selfWorking (which is what would clear it), and tell the model WHAT the human was
+      // asked so it can act. pingWorking is left untouched — this guard is on the TOOL path only.
+      // This is a KNOWN WART (the tool forks from the shared handler) with the better fix named:
+      // change pingWorking so `working` never auto-clears a tend for ANY zee — a fleet-wide decision
+      // owned by status.js, not a langchain-local patch. Until then, the guard is the conservative
+      // choice: it protects the human's question without changing behaviour for every CLI zee.
       const state = await tendState(xell.id);
       if (state.open) {
         return { ok: false, error: `working is REFUSED: this xell has an OPEN tend — a human was `
@@ -111,6 +118,24 @@ export const LANGCHAIN_TOOLS = {
       + 'clear:true to lower it. It also auto-clears when you report working.',
     schema: { type: 'object', properties: { reason: { type: 'string' }, clear: { type: 'boolean' } }, required: [] },
     run: (xell, args) => selfTend(xell, { reason: args?.reason || null, clear: !!args?.clear }),
+  },
+  'hint-land': {
+    name: 'hint-land',
+    description: 'WRITES one thing: a hint-request event (with the optional reason) that lights the '
+      + 'land? button on THIS xell\'s hexagon for a human to decide. Opens NO gate, pushes NOTHING, '
+      + 'and cannot land anything (there is no auto_approve path for a hint). Use when the work looks '
+      + 'land-ready but you are not certain; pass clear:true to lower it.',
+    schema: { type: 'object', properties: { reason: { type: 'string' }, clear: { type: 'boolean' } }, required: [] },
+    run: (xell, args) => selfHint(xell, 'land', { reason: args?.reason || null, clear: !!args?.clear }),
+  },
+  'hint-ship': {
+    name: 'hint-ship',
+    description: 'WRITES one thing: a hint-request event (with the optional reason) that lights the '
+      + 'ship? button on THIS xell\'s hexagon for a human to decide. Opens NO gate, pushes NOTHING, '
+      + 'and cannot ship anything (there is no auto_approve path for a hint). Use when the work looks '
+      + 'ship-ready but you are not certain; pass clear:true to lower it.',
+    schema: { type: 'object', properties: { reason: { type: 'string' }, clear: { type: 'boolean' } }, required: [] },
+    run: (xell, args) => selfHint(xell, 'ship', { reason: args?.reason || null, clear: !!args?.clear }),
   },
 };
 

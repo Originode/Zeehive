@@ -75,17 +75,20 @@ export async function spawnLangchainZee({ pid, xell, task, rt, model = null, m =
       onTool: ({ name, args }) => feed({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input: args }] } }),
     });
     const text = res.text || '';
-    feed({ type: 'result', is_error: false, result: text, usage: res.usage, tool_calls: res.executed });
+    // A turn that ended because the zee raised a tend (asked a human something) is a REAL stop with
+    // its own reason — the zee is waiting to be resumed, not finished. Everything else is end_turn.
+    const stopReason = res.endedForHuman ? 'asked-human' : 'end_turn';
+    feed({ type: 'result', is_error: false, result: text, usage: res.usage, tool_calls: res.executed, stop_reason: stopReason });
 
     const b = res.usage || { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, metered: false };
     await q(
       `UPDATE zee SET status='idle', cost_usd=$2, input_tokens=$3, output_tokens=$4,
-                      cache_read_tokens=$5, cache_write_tokens=$6, last_stop_reason='end_turn'
+                      cache_read_tokens=$5, cache_write_tokens=$6, last_stop_reason=$7
         WHERE id=$1`,
-      [zee.id, 0, b.input || 0, b.output || 0, b.cacheRead || 0, b.cacheWrite || 0]);
+      [zee.id, 0, b.input || 0, b.output || 0, b.cacheRead || 0, b.cacheWrite || 0, stopReason]);
     broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
-    await endTurn(turn?.id, { status: 'ended', burn: b, stopReason: 'end_turn', summary: text.slice(0, 500) });
-    logline('langchain', `langchain zee in ${xell.slug} finished ok (${(b.input || 0) + (b.output || 0)} tok)`);
+    await endTurn(turn?.id, { status: 'ended', burn: b, stopReason, summary: text.slice(0, 500) });
+    logline('langchain', `langchain zee in ${xell.slug} finished ok (${(b.input || 0) + (b.output || 0)} tok, ${stopReason})`);
     return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: null, session: sid,
              mode: m?.key, permission_mode: 'bypassPermissions', langchain: true };
   } catch (err) {

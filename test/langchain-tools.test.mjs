@@ -16,6 +16,15 @@
 //   D. CONFINEMENT. A tool NOT in the registry is refused (the allowlist IS the confinement), and
 //      the refusal is fed back to the model as a tool result the model can react to — the loop
 //      does not die, it continues with the refusal.
+//   E/E2. WAVE-2 ASKS. A bound `tend` produces a tend_request (asks, does not act); a bound
+//      `hint-land` writes a landhint-request event (annotates, nothing else).
+//   F. THE ALLOWLIST, NOT THE CALLER'S ARRAY. An over-wide `tools` array cannot widen the loop.
+//   G. LOOP-ENDS-TURN ON TEND. A model raising a tend (asking for a human) ENDS the turn with a
+//      visible "ended because a human was asked" result, naming the ask, with no further iterations.
+//   H. LOOP POLICY — WORKING-WHILE-TEND-OPEN. With a tend open, a loop iteration does NOT issue
+//      `working` (the model sees a visible loop-policy refusal) and the tend stays open. `working`
+//      is the plain shared handler — no wrapper/guard on the tool path; this is harness policy, the
+//      same shape and place as loop-ends-turn-on-tend.
 //
 // RUN:  DATABASE_URL=... PORT=4999 GATEWAY_PORT=4998 CXELL_API_BASE=http://127.0.0.1:4998 \
 //         node test/langchain-tools.test.mjs
@@ -216,6 +225,24 @@ try {
   // Clear it so the test does not leave a live tend on a throwaway xell.
   await runTool(xell, { name: 'tend', args: { clear: true } });
 
+  // ── E2. HINTS — authorised; each writes ONE session_event (hint-request/clear), no gate/act ──
+  console.log('\n── E2. wave 2: a bound hint-land writes a hint-request event, nothing else ──');
+  ok(!!LANGCHAIN_TOOLS['hint-land'], '`hint-land` IS in the tool registry (authorised)');
+  ok(!!LANGCHAIN_TOOLS['hint-ship'], '`hint-ship` IS in the tool registry (authorised)');
+  const hl = JSON.parse(await runTool(xell, { name: 'hint-land', args: { reason: 'looks land-ready' } }));
+  eq(hl.ok, true, 'the bound hint-land tool succeeded');
+  const hlRow = await one(
+    `SELECT hook_event_name FROM session_event
+      WHERE xell_id=$1 AND hook_event_name='landhint-request'
+      ORDER BY ts DESC LIMIT 1`, [xellId]);
+  eq(hlRow?.hook_event_name, 'landhint-request', 'hint-land wrote a landhint-request event (annotates, nothing else)');
+  await runTool(xell, { name: 'hint-land', args: { clear: true } });
+  const hlClear = await one(
+    `SELECT hook_event_name FROM session_event
+      WHERE xell_id=$1 AND hook_event_name='landhint-clear'
+      ORDER BY ts DESC LIMIT 1`, [xellId]);
+  eq(hlClear?.hook_event_name, 'landhint-clear', 'hint-land clear:true wrote the matching clear event');
+
   // ── F. THE ALLOWLIST, NOT THE CALLER'S ARRAY — an over-wide tools array cannot widen the loop ──
   console.log('\n── F. the loop resolves through the allowlist, not the caller\'s array ──');
   // A (hypothetical) future caller passes the wave-1 list PLUS a forbidden verb. The loop must NOT
@@ -244,28 +271,102 @@ try {
   ok(owRefusal, 'the model\'s run_bash request was REFUSED by the allowlist (not run)');
   await new Promise((r) => owServer.close(r));
 
-  // ── G. THE TEND GUARD — an open tend survives a model `working` call ───────────────────────
-  console.log('\n── G. the tend guard: `working` refuses while a tend is open, so the human\'s ask survives ──');
+  // ── G. LOOP-ENDS-TURN ON TEND — a model calling `tend` ENDS the turn with a visible reason ──
+  // (Manager ruling 2026-08-11: a tend means "I am waiting for a human"; the loop is the harness
+  // for a langchain zee, so raising a tend ends the turn — the same way a cxell zee ends and waits.
+  // This is a SEPARATE rule from the `working` tend-guard (H below): loop-ends-turn covers a tend
+  // the model raised ITSELF; the guard covers a model trying to CLEAR a tend someone else raised.)
+  console.log('\n── G. loop-ends-turn on tend: a model raising a tend ENDS the turn, visible, no more iterations ──');
+  const tendTurn = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (d) => (b += d));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        // The model raises a tend (asks for a human) — the loop must END after this, not continue.
+        res.end(JSON.stringify({ id: 'msg_t', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_t', name: 'tend', input: { reason: 'a human must decide X before I continue' } }], model: MODEL, stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 } }));
+      });
+    });
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${tendTurn.address().port}`;
+  const ended = await runLangchainAgentTurn({
+    xell, task: 'I need a human', provider: 'deepseek', model: MODEL,
+    apiKey: DEEPSEEK_KEY, xellToken, maxIterations: 3,
+  });
+  eq(ended.endedForHuman !== null, true, 'the loop reports it ENDED because a human was asked');
+  ok(/Turn ended: a human was asked/.test(ended.text), 'the result is a VISIBLE "ended because a human was asked"');
+  ok(/a human must decide X/.test(ended.text), 'the result NAMES the ask');
+  eq(ended.iterations, 1, 'the loop ended after ONE iteration (the tend call) — no further iterations');
+  eq(ended.capped, false, 'it did NOT hit the cap — it ended for a human, not from spinning');
+  // The tend is actually OPEN (the human-facing ask exists).
+  const tendOpen = await one(
+    `SELECT hook_event_name FROM session_event
+      WHERE xell_id=$1 AND hook_event_name='tend-request'
+      ORDER BY ts DESC LIMIT 1`, [xellId]);
+  eq(tendOpen?.hook_event_name, 'tend-request', 'the tend_request event was written (the ask a human must answer)');
+  await runTool(xell, { name: 'tend', args: { clear: true } });   // leave the throwaway xell clean
+  await new Promise((r) => tendTurn.close(r));
+
+  // ── H. LOOP POLICY — the loop does NOT issue `working` while a tend is open ───────────────
+  // (Manager ruling 2026-08-11: apply the SAME principle as loop-ends-turn — harness policy, not
+  // verb semantics. `working` stays the plain shared door for every caller; the loop simply is not
+  // permitted to reach for it while a human has been asked something. A human's question cannot be
+  // dissolved by loop filler. This is a POLICY assertion, not a fork assertion: it does not re-encode
+  // a wrapper on the tool, it asserts the loop declines to exercise the fleet-wide auto-clear.)
+  console.log('\n── H. loop policy: with a tend open, a loop iteration does NOT issue `working`, and the tend stays open ──');
   await runTool(xell, { name: 'tend', args: { reason: 'a human must decide X before I continue' } });
   const openBefore = await one(
     `SELECT hook_event_name FROM session_event
       WHERE xell_id=$1 AND hook_event_name IN ('tend-request','tend-clear')
       ORDER BY ts DESC LIMIT 1`, [xellId]);
-  eq(openBefore?.hook_event_name, 'tend-request', 'the tend is OPEN before the working call');
-  const guarded = await runTool(xell, { name: 'working', args: { note: 'loop filler' } });
-  const guardedJson = JSON.parse(guarded);
-  eq(guardedJson.ok, false, 'working is REFUSED while the tend is open');
-  ok(/OPEN tend/.test(guardedJson.error), 'the refusal names the open tend');
-  ok(/a human must decide X/.test(guardedJson.error), 'the refusal says WHAT the human was asked (the tend reason)');
+  eq(openBefore?.hook_event_name, 'tend-request', 'the tend is OPEN before the loop');
+  // A mock upstream that keeps asking for `working` — the loop must NOT run it while the tend is open.
+  const hServer = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (d) => (b += d));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'msg_h', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_h', name: 'working', input: { note: 'filler' } }], model: MODEL, stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 } }));
+      });
+    });
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${hServer.address().port}`;
+  const pol = await runLangchainAgentTurn({
+    xell, task: 'loop', provider: 'deepseek', model: MODEL,
+    apiKey: DEEPSEEK_KEY, xellToken, maxIterations: 3,
+  });
+  ok(!pol.executed.some((t) => t.name === 'working'), 'the loop NEVER executed `working` while the tend was open');
+  ok(pol.messages.some((m) => m._getType() === 'tool' && /working is REFUSED by loop policy/.test(String(m.content))),
+    'the model saw a VISIBLE loop-policy refusal for `working` (it could react, not a silent skip)');
   const openAfter = await one(
     `SELECT hook_event_name FROM session_event
       WHERE xell_id=$1 AND hook_event_name IN ('tend-request','tend-clear')
       ORDER BY ts DESC LIMIT 1`, [xellId]);
-  eq(openAfter?.hook_event_name, 'tend-request', 'the tend SURVIVED the working call (was not auto-cleared)');
-  // Clear the tend so the throwaway xell is left clean, and confirm `working` then succeeds.
+  eq(openAfter?.hook_event_name, 'tend-request', 'the tend SURVIVED the loop (was not auto-cleared)');
+  await new Promise((r) => hServer.close(r));
+  // Clear the tend so the throwaway xell is left clean; with it clear, the loop MAY run working.
   await runTool(xell, { name: 'tend', args: { clear: true } });
-  const workingAfterClear = JSON.parse(await runTool(xell, { name: 'working', args: { note: 'now clear' } }));
-  eq(workingAfterClear.ok, true, 'working succeeds once the tend is cleared');
+  const h2 = await new Promise((resolve) => {
+    const s = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (d) => (b += d));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'msg_h2', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_h2', name: 'working', input: { note: 'clear now' } }], model: MODEL, stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 } }));
+      });
+    });
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${h2.address().port}`;
+  const pol2 = await runLangchainAgentTurn({
+    xell, task: 'loop2', provider: 'deepseek', model: MODEL,
+    apiKey: DEEPSEEK_KEY, xellToken, maxIterations: 2,
+  });
+  ok(pol2.executed.some((t) => t.name === 'working'), 'with the tend cleared, the loop MAY run `working`');
+  await new Promise((r) => h2.close(r));
 
   // ── C. THE CAP — a model that never finishes is stopped VISIBLY ───────────────────────────
   console.log('\n── C. the cap: a model that keeps requesting tools is stopped at the hard cap ──');

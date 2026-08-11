@@ -74,9 +74,10 @@ the SAME handler `/api/xell/self/*` calls, and the loop resolves through the ALL
 never through a caller-supplied array — an over-wide array cannot widen the loop.
 
 The bound verbs are the read-only/report verbs (`status`, `work`, `working`, `item`) and the
-wave-2 ASK verb `tend` (it asks for a human and executes nothing). `hint-land` / `hint-ship` are NOT
-bound yet — their write shape (a `session_event` annotating a request, plus the hint state) has been
-reported to the manager and is pending their call before they are added.
+wave-2 ASK verbs (`tend`, `hint-land`, `hint-ship`). These ask or annotate; they cannot execute.
+`tend` asks for a human; `hint-land`/`hint-ship` each write a single `session_event`
+(`landhint-request`/`shiphint-request` or `-clear`) plus the hint state that lights the button —
+nothing else, no gate, no auto_approve path (manager authorisation 2026-08-11).
 
 **The confinement is the ALLOWLIST, not the gate.** The wave-2 argument that `land`/`ship`/`seed`
 are safe to bind "because they terminate on a human" is FALSE on this fleet. Measured on the fleet
@@ -339,10 +340,10 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   model), `loadConversation` / `appendConversation` / `resetConversation` (DB-backed memory),
   `runLangchainTurn` (single model call) and `runLangchainAgentTurn` (the bounded tool loop).
 - `server/src/lib/langchain-tools.js` — the tool registry (`status`, `work`, `working`, `item`,
-  `tend`), the allowlist that is the confinement. Each tool calls the SAME handler `/api/xell/self/*`
-  calls (selfStatus/selfWork/selfWorking/selfWorkItem/selfTend), never a second copy; anything
-  outside the registry is refused visibly. `working` carries the TEND GUARD (refuses while a tend is
-  open, so a model cannot silently clear a human's question).
+  `tend`, `hint-land`, `hint-ship`), the allowlist that is the confinement. Each tool calls the SAME
+  handler `/api/xell/self/*` calls (selfStatus/selfWork/selfWorking/selfWorkItem/selfTend/selfHint).
+  `working` carries the TEND GUARD (refuses while a tend is open — §8.2). Anything outside the
+  registry is refused visibly.
 - `spawnLangchainZee` in the dispatch path — a real zee driven by the driver: creates the zee row,
   starts the turn, drives `runLangchainAgentTurn` (the loop, bound to the wave-1 registry), feeds
   the play-by-play, persists the conversation, ends the turn with the summed burn.
@@ -354,10 +355,11 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   model requests `working`, the queenzee runs the SHARED `selfWorking` handler, the result feeds
   back and the model concludes; an unbound tool is refused visibly and the loop continues; the loop
   resolves through the ALLOWLIST even when the caller passes an over-wide `tools` array (the extra
-  verb is refused, never run); `tend` is bound and produces a `tend_request` a human answers; an
-  open tend SURVIVES a model `working` call (the tend guard refuses); a tool-happy model is stopped
-  at the cap with a VISIBLE capped result; every iteration is recorded in `llm_gateway_request`
-  attributed to the live zee + open turn.
+  verb is refused, never run); `tend` is bound and producing one ENDS the turn with a visible
+  "Turn ended: a human was asked" result; the `working` TEND GUARD makes an open tend SURVIVE a
+  model `working` call (the refusal names the ask); a tool-happy model is stopped at the cap with a
+  VISIBLE capped result; every iteration is recorded in `llm_gateway_request` attributed to the live
+  zee + open turn.
 
 **STATUS: BUILT, TESTED, and NOT YET ENABLED on any zee.** Measured on the fleet meta-DB:
 `zee_conversation` has 0 rows across 0 xells — the migration is landed and applied (the table is
@@ -383,6 +385,31 @@ standalone test, not by a live zee.
 - **Dependencies are the scoped langchain packages only** — `@langchain/anthropic`, `@langchain/openai`,
   `@langchain/core`. The `langchain` umbrella is deliberately NOT a dependency: it is never imported
   and it pulls the `@langchain/langgraph` runtime into the tree. `npm ls langgraph` is empty.
+- **Loop-ends-turn on tend.** A tool call that RAISES a tend (asks for a human) ends the turn after
+  that iteration, with a VISIBLE "Turn ended: a human was asked — '<reason>'" result, and the zee
+  waits to be resumed — exactly as a cxell zee ends its turn. This is HARNESS POLICY, not verb
+  semantics: `tend` still calls the same `selfTend` handler, writes the same row, shows the same
+  card — the door is unchanged. What belongs to the harness is whether the TURN continues; the
+  langchain loop IS the harness for a langchain zee. A `tend clear` does NOT end the turn (it is
+  answering, not asking). `hint-land`/`hint-ship` do NOT end the turn — a hint lights a button and
+  the zee keeps working; ending on a hint would invent a stop the fleet does not have.
+- **The `working` TEND GUARD — RESTORED (manager ruling 2026-08-11, approved).** `working` REFUSES
+  while a tend is open on this xell, and names WHAT the human was asked — so a model ping cannot
+  silently close the one channel a caged zee has to a human. The guard is on the TOOL path only: a
+  CLI zee's `zee working` still auto-clears (lib/status.js:383 inside `pingWorking`; `selfWorking`
+  computes `tendNudge` before the ping for this reason, self.js:1235), because a CLI zee is a
+  deliberate act that can read the room; a model in a loop is not. `pingWorking` is untouched.
+- **KNOWN WART (recorded — a deliberate fork, with the better fix named):** the guard forks the
+  verb — `working` means "refuse while a tend is open" to a langchain zee and "clear the tend" to a
+  cxell zee, with the divergence in this registry file rather than in status.js. That is a wart, not
+  the ideal shape; the tool IS the door to a queenzee verb, not a second copy of its rules. The
+  BETTER fix is to change `pingWorking` so `working` never auto-clears a tend for ANY zee — a
+  fleet-wide semantic change that belongs to the owner of status.js, not to a langchain-local patch
+  that makes one harness safer than the rest. Until that lands, the tool-layer guard is the
+  conservative choice: it protects the human's question without changing behaviour for every CLI
+  zee on the fleet. This wart is accepted; the hole (a model silently clearing a human's ask) is not.
+  Loop-ends-turn (above) is a SEPARATE rule covering a tend the model raised ITSELF; the guard covers
+  a model trying to clear a tend someone ELSE raised. Both are needed.
 - No gate changes, no `hooks/` changes, no prod writes.
 
 ### 8.3 Not built yet (next cards)
@@ -403,11 +430,12 @@ standalone test, not by a live zee.
    verbs. WAVE 1 (the mechanism slice) is BUILT: the loop runs in the queenzee process, bound ONLY
    to the read-only, no-side-effect registry verbs (`status`, `work`, `working`, `item`), a hard
    cap of 8 iterations with the cap visible when hit, and ONE handler shared with `/api/xell/self/*`
-   (never a second copy of a verb's logic). The wave-2 ASK verb `tend` is bound — it asks for a
-   human and executes nothing. `hint-land` / `hint-ship` are NOT bound yet (their write shape is
-   reported to the manager and pending their call). `land`/`ship`/`seed` are NOT bound and never will
-   be by a test: this fleet auto-approves them (§2.3, §8.2), so there is no human hold for a bound
-   ask to reach — the confinement is the allowlist, not the gate.
+   (never a second copy of a verb's logic). The wave-2 ASK verbs are bound — `tend` (asks for a
+   human, executes nothing, and RAISING it ends the turn — §8.2) and `hint-land`/`hint-ship` (each
+   writes a single `session_event` + the hint state, no gate, no auto_approve path; they do NOT end
+   the turn). `land`/`ship`/`seed` are NOT bound and never will be by a test: this fleet
+   auto-approves them (§2.3, §8.2), so there is no human hold for a bound ask to reach — the
+   confinement is the allowlist, not the gate.
 3. **Cxell-sandboxed langchain agent (workspace action)** — the boundary for tools is drawn by WHAT
    A TOOL CAN DO, not by the existence of tools (this amends an earlier, too-coarse sentence here
    that said any tool ⇒ the cage). Read-only, no-side-effect verbs (`status`, `work`, `working`,
