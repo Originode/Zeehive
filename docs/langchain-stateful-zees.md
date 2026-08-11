@@ -147,7 +147,37 @@ explicit decision.
   `ON DELETE SET NULL` so it outlives the xell). It is the *record of what happened*; `zee_conversation`
   is the *working memory a live xell carries into its next turn*. The two do not merge.
 
-## 5. How turnover is handed to the next zee
+### 4.4 Retention — how large this gets, on purpose
+
+`zee_conversation` is **working memory for live xells, not fleet history**, and the numbers are
+deliberately modest:
+
+- **Lifetime = the xell's lifetime.** `ON DELETE CASCADE` on reap. The table holds only the xells
+  currently alive; a reaped xell's rows are gone. It does NOT accumulate the way `llm_gateway_request`
+  (14,159 rows) or `zee_turn` (520 rows) do — those are the fleet's historical ledgers and have their
+  own retention story. `zee_conversation` is bounded by **live xell count × turns per live xell**, not
+  by total fleet history.
+- **Warm-start context is already capped.** `loadConversation` reads at most **100 messages** per
+  turn (the driver's default limit), so a long-lived xell's per-call context is bounded regardless of
+  how many rows its table holds. The table may grow; the model call never sees it all.
+- **Per-xell growth is unbounded in principle** (2 rows per turn). The concrete next card (§8.3) is a
+  per-xell cap with oldest-first summarisation, so a genuinely long-running xell both stops growing
+  its storage and keeps its warm-start context inside the model's budget.
+
+This is a made-on-purpose decision, not a default: live-xell working memory with a bounded read, and
+a cap card on the roadmap.
+
+## 5. How turnover is handed to the next zee — and the two boundaries it has to cross
+
+"Turnover between zees" crosses **two different boundaries**, and they need different answers. This
+change builds the first and explicitly does NOT build the second — saying so is the honest part.
+
+### 5.1 Same-xell turnover (a swap): BUILT and proven
+
+A swap (`zee swap --to <slug> --harness <key>`) is ZEEHIVE's crew handover verb: zee A is retired,
+zee B is dispatched **into the SAME xell** — same branch, same commits, same containers, same
+database, same card. The incoming zee literally inherits the work. Here the FULL conversation is the
+right thing to carry: B is continuing A's work in the same workspace, and A's context is B's context.
 
 The handover is **the conversation load at turn start**, and it is the queenzee's act, not
 langchain's:
@@ -158,19 +188,46 @@ langchain's:
 3. **A swap / resume / re-dispatch on the same xell** therefore starts warm: the new zee's first
    model call is seeded with the previous zee's conversation.
 
-Concretely, for a swap (manager `zee swap --to <slug> --harness <key>`):
+The outgoing zee's last turn already appended its messages (appendConversation runs at end of every
+langchain turn, and the collect-before-recreate in `swapZeeInXell` is untouched — commits are still
+rescued first). The incoming zee's `dispatchXell` → `spawnLangchainZee` loads the xell's
+`zee_conversation` before its first model call, so its **context** now actually reflects "you
+inherited this xell" — not just a sentence claiming it.
 
-- The outgoing zee's last turn already appended its messages (`appendConversation` runs at end of
-  every langchain turn, and the collect-before-recreate in `swapZeeInXell` is untouched — commits
-  are still rescued first).
-- The incoming zee's `dispatchXell` → `spawnLangchainZee` loads the xell's `zee_conversation`
-  before its first model call. Its task brief says "you inherited this xell" (the existing
-  `swapBrief`), and its **context** now actually reflects that — it reads the prior conversation,
-  not just a sentence claiming it.
+`test/langchain-zee.test.mjs` proves this with **two zee rows on one xell**: the second zee's model
+call carries the first zee's full exchange through the real gateway. That is turnover between ZEES
+within a xell.
 
-For a resume (`nudge`), the same: a resumed langchain zee loads the conversation and continues it.
-The queenzee's `nudge.js` decision to resume is unchanged; only the payload the resumed turn runs
-with is warmer.
+### 5.2 Cross-xell turnover (a brand-new xell): NOT built — scoped here
+
+"Zee A finishes or dies, zee B picks up **in a different xell**" is a different problem. A new xell is
+a fresh branch, a fresh clone, a fresh worktree. Replaying A's raw transcript into B is the **naive
+answer and probably the wrong one**: A's dead ends, wrong turns, local paths and session ids would
+poison B, and most of the transcript is the journey, not the conclusion.
+
+**What this change does NOT do:** `zee_conversation` is keyed by `xell_id` and dies with the xell, so
+a brand-new xell starts with an empty conversation — COLD by construction. The same-xell test above
+does not stand in for the cross-xell case, and is not offered as such.
+
+**The proposed cross-xell design** (not yet built — the state model is agreed here before code follows):
+
+- **What crosses the boundary: a CURATED handover**, not the transcript. The durable conclusions:
+  what was decided, what was verified, what remains, the constraints that still bind, the next
+  concrete step. What stays behind: dead ends, wrong turns, local paths, tool blow-by-blow.
+- **The carrier: an existing one.** ZEEHIVE already has a curated-handover primitive for work that
+  outlives a xell — the workflow plane's `execution.outputs`, written by `zee handover --result` and
+  inherited by any xell dispatched on the same execution (`xell.execution_id`). The langchain state
+  model should write a distilled summary there at the end of a xell's life, and a successor xell
+  dispatched on the same execution reads it as part of its brief. No new scheduler, no framework
+  decision — the queenzee's dispatch already decides when a successor starts.
+- **The link that authorises the handover:** a new xell must be NAMED as a successor (same execution,
+  or a manager explicitly dispatching "continue <xell>"). Without that link a new xell has no
+  legitimate claim on another xell's conversation and must not receive it.
+- **Filtering:** any value scoped to the old cage (local paths, container names, session ids,
+  claude_session references) is stripped before it crosses.
+
+Whether the cross-xell case is built in this card or as the immediate next card is a scoping call
+this design is written to make explicit.
 
 ## 6. The wiring (what the code does)
 
@@ -215,9 +272,10 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
 - `spawnLangchainZee` in the dispatch path — a real zee driven by the driver: creates the zee row,
   starts the turn, runs the model call through the gateway, persists the conversation, ends the
   turn with the burn.
-- `test/langchain-zee.test.mjs` — a standalone test that proves the turnover: two turns on one xell;
-  the second is seeded with the first's conversation, and both calls land in `llm_gateway_request`
-  through the real `gatewayProxy`.
+- `test/langchain-zee.test.mjs` — a standalone test that proves the SAME-XELL turnover (see §5.1):
+  two zee rows on one xell; the second zee's model call is seeded with the first zee's conversation,
+  and both calls land in `llm_gateway_request` through the real `gatewayProxy`. It also drives the
+  real `spawnLangchainZee` path end to end (zee row, turn lifecycle, burn, gateway ledger).
 
 ### 8.2 Design constraints that hold
 
@@ -225,20 +283,27 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   written per call).
 - The queenzee stays deterministic: langchain is invoked, never invoked-by; no graph, no framework
   loop.
+- **Dependencies are the scoped langchain packages only** — `@langchain/anthropic`, `@langchain/openai`,
+  `@langchain/core`. The `langchain` umbrella is deliberately NOT a dependency: it is never imported
+  and it pulls the `@langchain/langgraph` runtime into the tree. `npm ls langgraph` is empty.
 - No gate changes, no `hooks/` changes, no prod writes.
 
 ### 8.3 Not built yet (next cards)
 
-1. **Tool loop** — the driver currently makes one model call per turn. The multi-call loop (model →
+1. **Cross-xell turnover** — the curated-handover design in §5.2: what a successor xell is handed
+   when it continues work from a different xell, written to `execution.outputs` (`zee handover`) or a
+   new handoff row, with the old xell's local paths and dead ends filtered out. This is the design
+   gap this card names; it is the natural next card once the state model is agreed and read.
+2. **Tool loop** — the driver currently makes one model call per turn. The multi-call loop (model →
    tool request → tool result → model → …) is the natural next step, with tools bound through
    langchain's tool interface and executed through queenzee-owned, gate-respecting verbs.
-2. **Cxell-sandboxed langchain agent** — the first build runs the model call in the queenzee
+3. **Cxell-sandboxed langchain agent** — the first build runs the model call in the queenzee
    process (safe for a single model call: no tools, no file access). When the agent gains tools, it
    must run inside the cxell so the container remains the permission boundary; that means shipping
    langchain in the zee-agent image.
-3. **Conversation pruning / token budgeting** — a long-running xell's `zee_conversation` grows
+4. **Conversation pruning / token budgeting** — a long-running xell's `zee_conversation` grows
    without bound; the next card should add a per-xell cap (e.g. keep the last N messages, oldest
    summarized) so warm starts stay within a token budget.
-4. **Interactive turns** — the langchain runtime currently supports spawn/resume; an interactive
+5. **Interactive turns** — the langchain runtime currently supports spawn/resume; an interactive
    pane turn (a human typing into a langchain zee's session) needs a terminal bridge like the
    CLI path's `terminal-bridge.js`.
