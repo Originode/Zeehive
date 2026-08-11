@@ -2738,6 +2738,15 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 /* A CRITICAL planned bar (zero slack on the CPM pass) stands out; the crit chip in the name
    column says the same thing in words. */
 .work-gbar.crit, .work-gsum.crit { outline: 1px solid var(--accent); outline-offset: 1px; }
+/* THE HISTORY AXIS — a bar drawn on MEASURED actuals (timing_source 'actual', done work) sits
+   as a solid filled history bar; a PROJECTED bar (not yet done, CPM forecast) keeps the hollow
+   plan outline. An actual date and a projected date must never render identically. A `gap` bar
+   (done but no recorded start) shows an open start — the start is a hole, not invented. */
+.work-gbar.hist, .work-gsum.hist { background: var(--accent); opacity: .28; }
+.work-gbar.hist .work-gfill, .work-gsum.hist .work-gfill { display: block; }
+.work-gbar.gap, .work-gsum.gap { border-left: 2px dashed var(--down); }
+.work-gtip-r.hist { color: var(--accent); }
+.work-gtip-r.proj { color: var(--muted); }
 .work-gcrit { color: var(--accent); font-size: 9.5px; letter-spacing: .4px; text-transform: uppercase;
   border: 1px solid var(--accent); border-radius: 3px; padding: 0 3px; margin-left: 5px; flex: 0 0 auto; }
 .work-gorder { margin: 6px 0 0 292px; }

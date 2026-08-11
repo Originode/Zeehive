@@ -60,14 +60,14 @@ export async function workflowGanttModel({ projectId, rootId = null } = {}) {
         plan_id: null, plan_name: null, version: null, rows: [], span: null,
       };
     }
-    const { rows, span, has_declared_order, edge_counts, duration_mix } = await rowsForVersion(pv.plan_version_id, pv.root_node_id, pv);
+    const { rows, span, has_declared_order, edge_counts, duration_mix, time_axis } = await rowsForVersion(pv.plan_version_id, pv.root_node_id, pv);
     return {
       ok: true,
       root: rows.find((r) => r.id === pv.root_node_id) || null,
       project_id: projectId,
       plan_version_id: pv.plan_version_id,
       plan_id: pv.plan_id, plan_name: pv.plan_name, version: pv.version,
-      rows, span, has_declared_order, edge_counts, duration_mix,
+      rows, span, has_declared_order, edge_counts, duration_mix, time_axis,
     };
   }
   // root-scoped: the caller named a work_node id directly
@@ -78,29 +78,37 @@ export async function workflowGanttModel({ projectId, rootId = null } = {}) {
             pv.version, pv.root_node_id
        FROM plan_version pv JOIN plan p ON p.id = pv.plan_id
       WHERE pv.id = $1`, [rootNode.plan_version_id]);
-  const { rows, span, has_declared_order, edge_counts, duration_mix } = await rowsForVersion(pv.plan_version_id, rootNode.id, pv);
+  const { rows, span, has_declared_order, edge_counts, duration_mix, time_axis } = await rowsForVersion(pv.plan_version_id, rootNode.id, pv);
   return {
     ok: true,
     root: rows.find((r) => r.id === rootNode.id) || null,
     project_id: null,
     plan_version_id: pv.plan_version_id,
     plan_id: pv.plan_id, plan_name: pv.plan_name, version: pv.version,
-    rows, span, has_declared_order, edge_counts, duration_mix,
+    rows, span, has_declared_order, edge_counts, duration_mix, time_axis,
   };
 }
 
 // ── rows ────────────────────────────────────────────────────────────────────────
 async function rowsForVersion(versionId, rootId, pv) {
   const versionIdArg = versionId;
-  // The whole tree under the root, in tree order (depth-first by sibling_rank).
+  // The whole tree under the root, in tree order (depth-first by sibling_rank), with the
+  // work_item ANNEX joined so the derivation can see a node's DONE status and its DECLARED
+  // actuals (work_item.actual_start/actual_end — migration 159's derived columns). A node
+  // whose stable_key is not 'work_item:<id>' (a project node, a foreign test node) simply has
+  // no annex row.
   const tree = await q(
     `WITH RECURSIVE t AS (
         SELECT w.*, 1 AS depth FROM work_node w WHERE w.id = $1
         UNION ALL
         SELECT w.*, t.depth + 1 FROM work_node w JOIN t ON w.parent_id = t.id
      )
-     SELECT id, parent_id, name, kind, child_semantics, sibling_rank, estimate, depth
-       FROM t ORDER BY depth, sibling_rank`, [rootId]);
+     SELECT w.id, w.parent_id, w.name, w.kind, w.child_semantics, w.sibling_rank, w.estimate,
+            w.stable_key, w.depth,
+            wi.status, wi.actual_start, wi.actual_end
+       FROM t w
+       LEFT JOIN work_item wi ON wi.id::text = substring(w.stable_key, 11)
+      ORDER BY w.depth, w.sibling_rank`, [rootId]);
 
   // The CPM schedule (atoms + container spans) for the same version.
   const schedule = await q(
@@ -245,6 +253,11 @@ async function rowsForVersion(versionId, rootId, pv) {
     waitingOf.set(n.id, { start: wStart, end: wEnd });
   }
 
+  // NOW — the boundary the chart's history axis is drawn against. wn_cpm anchors everything
+  // forward from now(), so a completed node would render as if it starts today; this read model
+  // overrides that with the node's MEASURED history where it exists (see the row loop below).
+  const nowMs = Date.now();
+
   const rows = tree.map((n) => {
     const s = schedBy.get(n.id);
     const a = actualOf.get(n.id) || { start: null, end: null };
@@ -260,19 +273,63 @@ async function rowsForVersion(versionId, rootId, pv) {
         ? (n.estimate && intervalHours(n.estimate) > 0 ? 'estimate'
           : (exs.some((ex) => ex.started_at && ex.finished_at) ? 'actual' : 'default'))
         : 'rollup');
+
+    // ── THE HISTORY AXIS: WHERE the bar is DRAWN, and WHY ───────────────────────────
+    // A node whose work is DONE is drawn on its ACTUAL dates (work_item.actual_start/end —
+    // migration 159's derived columns — falling back to the rolled execution actuals), NOT
+    // forward from now(). A node that has not finished keeps the CPM projection. The two are
+    // distinguished by `timing_source` — 'actual' (measured) vs 'projected' (forecast) — so an
+    // actual date and a projected date never render identically, and `time_state` names which
+    // side of "current" the bar sits on. `gap` marks a done node with NO actual_start: the
+    // chart shows the absence rather than inventing a start (the manager's 2 Zeehive items).
+    // declared actuals (work_item) win; a container rolls its subtree's execution actuals up.
+    const aStart = n.actual_start || a.start;
+    const aEnd = n.actual_end || a.end;
+    // A node is DONE when its work_item status says so, OR a measured END exists — its own
+    // work_item.actual_end, a closed execution (finished_at), or the rolled-up end of a done
+    // subtree. Status alone misses a node with no work_item row whose execution is done; an end
+    // alone is the strongest evidence the work stopped. (A reopened item has no end again.)
+    const terminal = n.status === 'done' || n.status === 'cancelled' || !!aEnd;
+    let drawnStart = null, drawnEnd = null, timing_source, time_state, gap = false;
+    if (terminal) {
+      timing_source = 'actual';
+      gap = !aStart;
+      drawnStart = aStart ? iso(aStart) : null;
+      drawnEnd = aEnd ? iso(aEnd) : null;
+      // past = finished before now (even when the start is a gap — the END is what places it);
+      // current = finished today, or the startless gap (cannot be placed in the past).
+      time_state = aEnd && new Date(aEnd).getTime() < nowMs ? 'past' : 'current';
+    } else {
+      timing_source = 'projected';
+      // An in-flight node draws from its MEASURED start (actual_start) to its projected
+      // finish — that is exactly the "current" boundary: measured history ends where the
+      // projection begins. A not-yet-started node is pure projection (future).
+      const started = aStart && new Date(aStart).getTime() <= nowMs;
+      drawnStart = (started ? iso(aStart) : (s && s.earliest_start ? iso(s.earliest_start) : null));
+      drawnEnd = s && s.earliest_finish ? iso(s.earliest_finish) : null;
+      time_state = started ? 'current' : 'future';
+    }
+
     return {
       id: n.id, parent_id: n.parent_id, depth: n.depth, name: n.name,
       kind: n.kind, child_semantics: n.child_semantics,
       is_atom: !!(s && s.is_atom),
       duration_hours: s && s.duration ? intervalHours(s.duration) : null,
       duration_source,
+      // THE HISTORY AXIS (what the chart draws as the main bar): actual for done nodes,
+      // projected (CPM) for the rest. `timing_source` is the provenance — measured vs forecast.
+      drawn_start: drawnStart,
+      drawn_end: drawnEnd,
+      timing_source,
+      time_state,
+      gap,
       // CRITICAL IS WHAT THE CPM COMPUTED — truthful, not suppressed. The chart is the honesty
       // layer: edge_counts + the origin-carrying deps tell the reader WHICH edges the criticality
       // rests on (declared chains vs board-position inference), and the plan banner says the
       // ratio aloud. A consumer that wants the raw CPM still gets it.
       critical: !!(s && s.critical),
       slack: s && s.slack ? s.slack : null,
-      // PLANNED (CPM). Atoms carry their own earliest window; containers the subtree span.
+      // PLANNED (CPM) — the raw projection, kept as truth even where the drawn bar overrides it.
       planned_start: s && s.earliest_start ? iso(s.earliest_start) : null,
       planned_end: s && s.earliest_finish ? iso(s.earliest_finish) : null,
       latest_start: s && s.latest_start ? iso(s.latest_start) : null,
@@ -294,16 +351,31 @@ async function rowsForVersion(versionId, rootId, pv) {
     };
   });
 
-  // whole-chart extent for the timescale's window
+  // whole-chart extent for the timescale's window — driven by the DRAWN windows (which include
+  // real history for done nodes), so the axis spans start → current → todo → end.
   const scheduled = rows.filter((r) =>
-    (r.planned_start && r.planned_end) || (r.actual_start && r.actual_end)
+    (r.drawn_start && r.drawn_end) || (r.actual_start && r.actual_end)
     || (r.waiting_start && r.waiting_end));
   const span = scheduled.length
     ? {
-        start: minOf(scheduled.flatMap((r) => [r.planned_start, r.actual_start, r.waiting_start]).filter(Boolean)),
-        end: maxOf(scheduled.flatMap((r) => [r.planned_end, r.actual_end, r.waiting_end]).filter(Boolean)),
+        start: minOf(scheduled.flatMap((r) => [r.drawn_start, r.actual_start, r.waiting_start]).filter(Boolean)),
+        end: maxOf(scheduled.flatMap((r) => [r.drawn_end, r.actual_end, r.waiting_end]).filter(Boolean)),
       }
     : null;
+
+  // PER-PLAN TIME AXIS — how much of the plan is measured history vs forward projection,
+  // counted over ATOMS (the nodes wn_cpm sizes; containers roll up). `past`/`current`/`future`
+  // are the manager's acceptance test: before this card, wn_cpm anchored everything at now()
+  // so past was always 0; after, done atoms land on their actuals. A done atom with NO
+  // actual_start is counted `past` only when its END is in the past (a startless gap).
+  const atomStates = rows.filter((r) => r.is_atom);
+  const time_axis = {
+    past: atomStates.filter((r) => r.time_state === 'past').length,
+    current: atomStates.filter((r) => r.time_state === 'current').length,
+    future: atomStates.filter((r) => r.time_state === 'future').length,
+    atoms: atomStates.length,
+    gaps: atomStates.filter((r) => r.gap).length,
+  };
 
   // PER-PLAN PROVENANCE MIX — how much of this plan rests on each duration source. Counted over
   // ATOMS (the rows wn_duration actually sizes): declared estimates, observed closed-execution
@@ -320,7 +392,7 @@ async function rowsForVersion(versionId, rootId, pv) {
   duration_mix.on_default = duration_mix.atoms
     ? Math.round((duration_mix.default / duration_mix.atoms) * 100) : 0;
 
-  return { rows, span, has_declared_order: hasDeclaredOrder, edge_counts, duration_mix };
+  return { rows, span, has_declared_order: hasDeclaredOrder, edge_counts, duration_mix, time_axis };
 }
 
 const iso = (d) => (d instanceof Date ? d.toISOString() : String(d));

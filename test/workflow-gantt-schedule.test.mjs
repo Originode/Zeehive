@@ -27,6 +27,10 @@
 //      keeps it.
 //   D. (d) A CONTAINER'S DURATION ROLLS UP — the sequence container's duration is the sum of
 //      its atoms' effective durations, so the project node's span reaches the plan's end.
+//   E. (e) EDGE ORIGIN IS VISIBLE — declared chains vs board-position inference.
+//   F. (f) DURATION PROVENANCE is visible per node and per plan (estimate/actual/default/rollup).
+//   G. (g) THE HISTORY AXIS — a DONE node draws on its ACTUAL dates, not forward from now();
+//      past/current/future per plan; a done node with no recorded start is a visible GAP.
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -184,6 +188,50 @@ async function main() {
     ok(mix && mix.on_default === 71, `on_default = 71% (got ${mix?.on_default}%)`);
     // a container is a rollup, never an estimate/default — the provenance is the tree, not a lie
     ok(byNameG.get('Act A')?.duration_source === 'rollup', `Act A (a container) → rollup (got ${byNameG.get('Act A')?.duration_source})`);
+
+    section('G. (g) THE HISTORY AXIS — done nodes draw on their ACTUAL dates, not forward from now');
+    // The regression the directive's acceptance test caught: wn_cpm schedules EVERYTHING
+    // forward from now(), so completed work drew as if it starts today and past was always 0.
+    // The read model now anchors a DONE node on its measured actuals (work_item.actual_start/
+    // end — migration 159 — or the rolled execution actuals), keeps forward projection only for
+    // work that has not happened, and classifies each atom past/current/future with a `gap`
+    // flag for a done node whose start was never recorded (never invented).
+    // Seed, on the same project: 3 done items with real past actuals, 1 done with NO start
+    // (the gap), 1 in-flight (started, no end), 1 queued (no actuals).
+    const histRoot = await one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [rootItem.id]);
+    const histNode = async (title, status, aS, aE, rank) => {
+      const wi = await one(
+        `INSERT INTO work_item (project_id, parent_id, kind, title, status, sort_order, actual_start, actual_end, estimate_hours)
+         VALUES ($1,$2,'task',$3,$4,$5,$6,$7,8) RETURNING id`,
+        [projectId, rootItem.id, title, status, rank, aS, aE]);
+      await one(
+        `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, estimate, stable_key)
+         VALUES ($1,$2,$3,$4,'action','8 hours','work_item:'||$5) RETURNING id`,
+        [planVersionId, histRoot.id, String(rank), title, wi.id]);
+    };
+    await histNode('HDone A', 'done', '2026-07-29T09:00:00.000Z', '2026-07-30T17:00:00.000Z', 101);
+    await histNode('HDone B', 'done', '2026-08-01T09:00:00.000Z', '2026-08-02T17:00:00.000Z', 102);
+    await histNode('HGap', 'done', null, '2026-08-03T17:00:00.000Z', 103);      // done, no start
+    await histNode('HCurrent', 'working', '2026-08-10T09:00:00.000Z', null, 104); // in flight
+    await histNode('HFuture', 'queued', null, null, 105);                         // not started
+    const g2 = await workflowGanttModel({ projectId });
+    const h = g2.time_axis;
+    // The plan has 12 atoms now: the original 7 (A1,A2,A3,B1,B2,C1,D1 — C1 has a closed
+    // execution, so it is DONE) + the 5 history items. past = C1, HDone A, HDone B, HGap (4);
+    // current = HCurrent (1); future = the 7 not-started (A1,A2,A3,B1,B2,D1,HFuture).
+    ok(h && h.past === 4 && h.current === 1 && h.future === 7 && h.gaps === 1,
+      `time_axis = {past:4, current:1, future:7, gaps:1} — done in the past (incl. C1's closed execution), in-flight current, queued future, the startless done node a gap (got ${JSON.stringify(h)})`);
+    const byNameG2 = new Map(g2.rows.map((r) => [r.name, r]));
+    ok(byNameG2.get('HDone A')?.timing_source === 'actual' && byNameG2.get('HDone A')?.drawn_start === '2026-07-29T09:00:00.000Z',
+      `HDone A is drawn on its ACTUAL start (${byNameG2.get('HDone A')?.drawn_start}) — provenance 'actual'`);
+    ok(byNameG2.get('HDone A')?.time_state === 'past', `HDone A (ended 2026-07-30) is PAST (got ${byNameG2.get('HDone A')?.time_state})`);
+    ok(byNameG2.get('HGap')?.drawn_start === null && byNameG2.get('HGap')?.drawn_end && byNameG2.get('HGap')?.gap === true,
+      `HGap (done, no actual_start) shows the GAP — drawn_start null, end set, gap=true`);
+    ok(byNameG2.get('HCurrent')?.time_state === 'current'
+       && byNameG2.get('HCurrent')?.drawn_start === '2026-08-10T09:00:00.000Z',
+      `HCurrent (in flight) is CURRENT, drawn from its measured start (${byNameG2.get('HCurrent')?.drawn_start})`);
+    ok(byNameG2.get('HFuture')?.time_state === 'future' && byNameG2.get('HFuture')?.timing_source === 'projected',
+      `HFuture (queued) stays FUTURE / projected — forward scheduling only for not-yet-done work`);
   } finally {
     try {
       await q(`DELETE FROM project WHERE id=$1`, [projectId]);

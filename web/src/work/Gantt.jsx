@@ -120,14 +120,16 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
   }), [rows, collapsed, byId]);
   const visibleIds = useMemo(() => new Set(visible.map((r) => r.id)), [visible]);
 
-  // A row is "dated" when it has a PLANNED, ACTUAL or WAITING bar — the whole point of the
+  // THE EFFECTIVE WINDOW the main bar draws — the read model's DRAWN window (actual dates for
+  // done work, CPM projection for the rest — the history axis start → current → todo → end),
+  // A row is "dated" when it has a main, ACTUAL or WAITING bar — the whole point of the
   // actual/waiting layers is that a schedule with no plan dates still gets a window.
   const dated = useMemo(() => rows.filter((r) =>
-    r.planned_start || r.planned_end || r.actual_start || r.actual_end
+    winOf(r).start || winOf(r).end || r.actual_start || r.actual_end
     || r.waiting_start || r.waiting_end), [rows]);
 
   const win = useMemo(() => windowFor(
-    dated.flatMap((r) => [pDay(r.planned_start), pDay(r.planned_end),
+    dated.flatMap((r) => [pDay(winOf(r).start), pDay(winOf(r).end),
                            pDay(r.actual_start), pDay(r.actual_end),
                            pDay(r.waiting_start), pDay(r.waiting_end)]),
     { today: t0, zoom },
@@ -136,12 +138,14 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
   const width = axis.width;
   const todayX = diffDays(win.start, t0) >= 0 && diffDays(t0, win.end) > 0 ? xOf(t0, win.start, px) : null;
 
-  // Geometry, once per render: where every visible row's PLANNED bar sits. The actual and
-  // waiting bars share the same coordinate space and never disagree about "today".
+  // Geometry, once per render: where every visible row's main bar sits (the read model's
+  // history axis — actuals for done, projection for the rest). The actual and waiting bars
+  // share the same coordinate space and never disagree about "today".
   const geom = useMemo(() => {
     const m = new Map();
     visible.forEach((r, i) => {
-      const span = clampSpan(barSpan(pDay(r.planned_start), pDay(r.planned_end), win.start, px), width);
+      const w = winOf(r);
+      const span = clampSpan(barSpan(pDay(w.start), pDay(w.end), win.start, px), width);
       m.set(r.id, { i, top: i * ROW, span });
     });
     return m;
@@ -393,6 +397,7 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
                     <div className="work-gtrack" style={{ width }}>
                       {span && (
                         <div className={`${summary ? 'work-gsum' : 'work-gbar'}${r.critical && !noDeclaredOrder ? ' crit' : ''}${hot ? ' hot' : ''}`
+                                        + `${r.timing_source === 'actual' ? ' hist' : ''}${r.gap ? ' gap' : ''}`
                                         + `${span.inverted ? ' inverted' : ''}`}
                              data-gbar={r.id} data-testid="work-gbar"
                              style={{ left: span.x, width: span.w }}
@@ -401,7 +406,8 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
                              onMouseLeave={() => setTip(null)}>
                           <span className="work-gfill-bg" />
                           {summary && <><i className="work-gcap l" /><i className="work-gcap r" /></>}
-                          {span.open && <i className="work-gopen" title="no planned end — this end is open" />}
+                          {r.gap && <i className="work-gopen" title="done — but no recorded start: this end is a gap, not invented" />}
+                          {span.open && <i className="work-gopen" title="no projected end — this end is open" />}
                           {span.cutLeft && <i className="work-gcut l" title="it starts before this window" />}
                           {span.cutRight && <i className="work-gcut r" title="it continues past this window" />}
                         </div>
@@ -506,10 +512,16 @@ export function Tip({ row, x, y }) {
       <div className="work-gtip-t"><KindGlyph kind={row.kind} /> {row.name}</div>
       {row.critical &&
         <div className="work-gtip-r crit">on the critical path{row.slack ? '' : ' · zero slack'}</div>}
-      <div className="work-gtip-r">
-        <span>planned</span>
-        <span>{p(row.planned_start)} → {p(row.planned_end) || '…'}</span>
+      <div className={`work-gtip-r ${row.timing_source === 'actual' ? 'hist' : 'proj'}`}>
+        <span>{row.timing_source === 'actual' ? 'actual' : 'projected'}</span>
+        <span>
+          {row.gap ? 'no recorded start · ' : ''}
+          {p(winOf(row).start) || '…'} → {p(winOf(row).end) || '…'}
+        </span>
       </div>
+      {row.time_state && (
+        <div className="work-gtip-r"><span>when</span><span>{row.time_state}</span></div>
+      )}
       {row.duration_source && (
         <div className={`work-gtip-r dur ${row.duration_source}`}>
           <span>duration</span>
@@ -609,6 +621,16 @@ export function WeldWaterfall({ row, onClose }) {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────────────
+// THE EFFECTIVE WINDOW the main bar draws — the read model's DRAWN window (actual dates for
+// done work, CPM projection for the rest — the history axis start → current → todo → end),
+// falling back to the legacy `planned_*` a fixture or older consumer supplies. A DRAWN null is
+// meaningful (the startless gap) and must NOT fall back: only a fixture with NO drawn_* keys at
+// all does. Module scope because the tooltip uses it too.
+const winOf = (r) => ({
+  start: 'drawn_start' in r ? r.drawn_start : r.planned_start,
+  end: 'drawn_end' in r ? r.drawn_end : r.planned_end,
+});
+
 // An ISO timestamp → the LOCAL calendar day the bar sits on. dayKey() normalises the same way
 // the gantt has always normalised date-only columns; a timestamp is an instant, and its day is
 // where the bar belongs.
