@@ -51,8 +51,10 @@ export const LANGCHAIN_TOOLS = {
   },
   working: {
     name: 'working',
-    description: 'Ping "I am actively working" with an optional note. Reports a change of state, '
-      + 'never a gate.',
+    description: 'Ping "I am actively working" with an optional note. WARNING: this also auto-clears '
+      + 'this xell\'s open tend (a question that was posted to a human) if one is open — it does not '
+      + 'RAISE a gate, but it can CLOSE one. Use it only when you are genuinely working, not as '
+      + 'conversational filler.',
     schema: { type: 'object', properties: { note: { type: 'string' } }, required: [] },
     run: (xell, args) => selfWorking(xell, { note: args?.note || null }),
   },
@@ -80,11 +82,15 @@ export function toolList() {
   return Object.values(LANGCHAIN_TOOLS);
 }
 
-// Run ONE tool by name, as the loop does — with the allowlist refusal. Returns the tool output as a
-// string (the shape a ToolMessage carries). A name not in the registry is REFUSED with a visible
-// message the model can react to, never a silent no-op and never a free run.
-export async function runTool(xell, { name = null, args = {} } = {}) {
-  const desc = LANGCHAIN_TOOLS[name];
+// Run ONE tool by name — THE single dispatch path. The loop calls THIS (never a second lookup), and
+// it is the allowlist refusal. Returns the tool output as a string (the shape a ToolMessage carries).
+// A name not in the registry is REFUSED with a visible message the model can react to, never a
+// silent no-op and never a free run. `tools` is the registry to resolve against (the loop passes its
+// own list so an injected test list stays authoritative); it defaults to the global LANGCHAIN_TOOLS
+// and accepts either the keyed object or an array of descriptors.
+export async function runTool(xell, { name = null, args = {} } = {}, tools = LANGCHAIN_TOOLS) {
+  const list = Array.isArray(tools) ? tools : Object.values(tools);
+  const desc = list.find((d) => d.name === name);
   if (!desc) {
     return JSON.stringify({ ok: false, error: `"${name}" is not a bindable tool for this zee — the `
       + 'allowlist is the confinement and that verb is not on it.' });

@@ -28,7 +28,7 @@ import { tool } from '@langchain/core/tools';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { gatewayEnv } from './gateway.js';
-import { toolList } from './langchain-tools.js';
+import { toolList, runTool } from './langchain-tools.js';
 
 // openai + kimi speak the OpenAI dialect (/v1/chat/completions); everything else is Anthropic
 // dialect (/v1/messages — claude, deepseek; grok is /responses but Anthropic-shaped usage).
@@ -278,21 +278,14 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
     const calls = finalResp.tool_calls || [];
     if (!calls.length) break;                          // natural end — the model answered
     for (const tc of calls) {
+      // ONE dispatch path: runTool is the single place a tool is looked up and run (the allowlist
+      // refusal + the handler call). The loop tracks bound-ness (desc) for `executed`/`onTool`, but
+      // the actual execution always goes through runTool — no second lookup that could drift.
       const desc = tools.find((d) => d.name === tc.name);
-      let content;
-      if (!desc) {
-        content = `tool "${tc.name}" is not bound to this zee — the request was refused. Pick a bound tool.`;
-      } else {
-        try {
-          const out = await desc.run(xell, tc.args || {});
-          content = typeof out === 'string' ? out : JSON.stringify(out);
-          executed.push({ name: tc.name, args: tc.args || {} });
-        } catch (e) {
-          content = `tool "${tc.name}" error: ${String(e.message).slice(0, 300)}`;
-        }
-      }
+      const content = await runTool(xell, { name: tc.name, args: tc.args || {} }, tools);
+      if (desc) executed.push({ name: tc.name, args: tc.args || {} });
       messages.push(new ToolMessage({ content: String(content).slice(0, TOOL_RESULT_CAP), tool_call_id: tc.id }));
-      if (onTool) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
+      if (onTool && desc) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
     }
     if (iterations >= maxIterations) { capHit = true; break; }
   }
