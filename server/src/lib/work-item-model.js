@@ -118,14 +118,17 @@ export async function modelTree({ projectId, rootItemId } = {}) {
     params.push(projectId);
     // A PROJECT IS A WORK_NODE (migration 193): plan_version.root_node_id is now the PROJECT
     // node (stable_key 'project:<id>'), not the root work_item's node. The work tracker's
-    // cards are WORK_ITEMs — a project node is not a card — so the walk starts at the
-    // project node's first child (the root work_item), exactly where the pre-193 root sat.
+    // cards are WORK_ITEMs — a project node is not a card — so when (and only when) the root
+    // IS a project node, the walk starts at its first child (the root work_item), exactly
+    // where the pre-193 root sat. A pre-193 root (the root item itself) is unchanged.
     rootCte = `
       root AS (
-        SELECT COALESCE(
-                 (SELECT c.id FROM work_node c
-                   WHERE c.parent_id = pv.root_node_id ORDER BY c.sibling_rank LIMIT 1),
-                 pv.root_node_id) AS root_node_id
+        SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM work_node pn
+                  WHERE pn.id = pv.root_node_id AND pn.stable_key LIKE 'project:%')
+           THEN (SELECT c.id FROM work_node c
+                  WHERE c.parent_id = pv.root_node_id ORDER BY c.sibling_rank LIMIT 1)
+           ELSE pv.root_node_id END AS root_node_id
         FROM plan p JOIN plan_version pv ON pv.plan_id = p.id
         WHERE p.project_id = $1 AND pv.root_node_id IS NOT NULL
         ORDER BY p.created_at DESC, pv.version DESC LIMIT 1
