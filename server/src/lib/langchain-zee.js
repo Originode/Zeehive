@@ -24,9 +24,11 @@
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, AIMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
+import { tool } from '@langchain/core/tools';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { gatewayEnv } from './gateway.js';
+import { toolList } from './langchain-tools.js';
 
 // openai + kimi speak the OpenAI dialect (/v1/chat/completions); everything else is Anthropic
 // dialect (/v1/messages — claude, deepseek; grok is /responses but Anthropic-shaped usage).
@@ -199,5 +201,113 @@ export async function runLangchainTurn({ xell, task = null, provider = 'claude',
     usage: usageFromLc(resp),
     content: resp.content,
     messages,          // what the model actually saw (history + task) — for tests/observability
+  };
+}
+
+// ── the TOOL LOOP (the "deploy zees via langchain" mechanism slice — docs §8.3.1) ──────────────
+// Model → tool request → queenzee-owned verb → tool result → model, looping, with every gate still
+// in front of everything irreversible. The loop is the QUEENZEE'S, not langchain's: langchain only
+// makes each model call and exposes the tool_calls; this function decides to continue, what to run,
+// when to stop, and WHO the xell is (the identity comes from the turn, never from the model).
+//
+// CONFINEMENT IS THE TOOL LIST: only the tools in the registry (langchain-tools.js) are bindable,
+// and they call the SAME handlers /api/xell/self/* uses. A request for anything outside the registry
+// is answered with a refusal (visible to the model, so it can recover) rather than a silent no-op.
+// The never-bindable verbs (workspace action, build/sync, manager verbs, done) are simply not in the
+// registry — enforced by absence, never by a runtime check that could be argued around.
+//
+// HARD CAP: `maxIterations` (default 8) bounds the loop. When the cap is hit the result is a VISIBLE
+// `capHit` — a loop that quietly truncates looks like a finished answer, which is the exact failure
+// a tool loop must not have.
+export const MAX_TOOL_ITERATIONS = 8;
+// Each tool result feeds back into the model's context; an unbounded result would blow it (a
+// selfStatus payload, a long listing). Capped like the gateway's body capture.
+export const TOOL_RESULT_CAP = 4000;
+
+export function buildTool(desc, ctx) {
+  return tool(
+    desc.schema || { type: 'object', properties: {}, required: [] },
+    async (args) => {
+      const out = await desc.run(ctx.xell, args || {});
+      return typeof out === 'string' ? out : JSON.stringify(out);
+    },
+    { name: desc.name, description: desc.description },
+  );
+}
+
+// Run the agent turn: load the xell's conversation, add the task, then the bounded loop.
+// `tools` defaults to the WAVE-1 registry (status/work/working/item). `onAssistant` / `onTool`
+// let the caller (spawnLangchainZee) feed the play-by-play. Returns the final model response, the
+// accumulated messages, how many model calls ran, whether the cap was hit, and which tools ran.
+export async function runLangchainAgentTurn({ xell, task = null, provider = 'claude', model = null,
+                                               apiKey = null, xellToken = null, system = null,
+                                               tools = toolList(), maxIterations = MAX_TOOL_ITERATIONS,
+                                               onAssistant = null, onTool = null } = {}) {
+  const { baseUrl } = chatModelConfig({ provider, xellToken });
+  const chat = buildChatModel({ provider, model, apiKey, baseUrl });
+  const history = await loadConversation(xell.id);
+  const messages = [];
+  if (system) messages.push(new SystemMessage(system));
+  messages.push(...history);
+  const userMsg = new HumanMessage(task ?? '');
+  messages.push(userMsg);
+
+  const bound = tools.length ? chat.bindTools(tools.map((d) => buildTool(d, { xell }))) : chat;
+  let iterations = 0;
+  let capHit = false;
+  let finalResp = null;
+  const executed = [];
+  // The loop makes several model calls; the zee_turn burn is the SUM of them all (the gateway
+  // already records each call individually in llm_gateway_request; this is the per-turn total).
+  const totalUsage = { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, metered: false };
+  const addUsage = (u) => {
+    if (!u) return;
+    totalUsage.cost += Number(u.cost || 0);
+    totalUsage.input += Number(u.input || 0);
+    totalUsage.output += Number(u.output || 0);
+    totalUsage.cacheRead += Number(u.cacheRead || 0);
+    totalUsage.cacheWrite += Number(u.cacheWrite || 0);
+    totalUsage.metered = totalUsage.metered || !!u.metered;
+  };
+  while (true) {
+    iterations += 1;
+    finalResp = await bound.invoke(messages);
+    addUsage(usageFromLc(finalResp));
+    messages.push(finalResp);
+    if (onAssistant) { try { onAssistant(finalResp); } catch (e) { logline('langchain', `onAssistant threw (${String(e.message).slice(0, 80)})`); } }
+    const calls = finalResp.tool_calls || [];
+    if (!calls.length) break;                          // natural end — the model answered
+    for (const tc of calls) {
+      const desc = tools.find((d) => d.name === tc.name);
+      let content;
+      if (!desc) {
+        content = `tool "${tc.name}" is not bound to this zee — the request was refused. Pick a bound tool.`;
+      } else {
+        try {
+          const out = await desc.run(xell, tc.args || {});
+          content = typeof out === 'string' ? out : JSON.stringify(out);
+          executed.push({ name: tc.name, args: tc.args || {} });
+        } catch (e) {
+          content = `tool "${tc.name}" error: ${String(e.message).slice(0, 300)}`;
+        }
+      }
+      messages.push(new ToolMessage({ content: String(content).slice(0, TOOL_RESULT_CAP), tool_call_id: tc.id }));
+      if (onTool) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
+    }
+    if (iterations >= maxIterations) { capHit = true; break; }
+  }
+
+  // Persist the exchange so the NEXT zee on this xell starts warm. The tool interactions are the
+  // journey; the durable exchange is the user task + the final assistant response.
+  await appendConversation(xell.id, [userMsg, finalResp]);
+
+  return {
+    text: messageText(finalResp.content),
+    usage: totalUsage,
+    content: finalResp.content,
+    messages,
+    iterations,
+    capHit,
+    executed,
   };
 }
