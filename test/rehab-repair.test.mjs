@@ -47,14 +47,18 @@ try {
   const W = await import('../server/src/lib/work-items.js');
 
   // ── seed: project with two sibling activities + a dep ─────────────────────
+  // Durations are set so the wn_cpm assertion is meaningful: actB (prerequisite) is a 5h leaf,
+  // A1 (the leaf under actA, the dependent container) is a 3h leaf. After repair, actA's subtree
+  // cannot start before actB finishes.
   await q(`INSERT INTO project (id, name, repo_root, main_branch) VALUES ($1,'Repair Test','/tmp/rp','main')`, [PID]);
   const root = await W.projectRoot(PID);
-  const actA = await W.createWorkItem({ project_id: PID, parent_id: root.id, kind: 'activity', title: 'Act A', sort_order: 1000 });
-  const actB = await W.createWorkItem({ project_id: PID, parent_id: root.id, kind: 'activity', title: 'Act B', sort_order: 2000 });
+  const actA = await W.createWorkItem({ project_id: PID, parent_id: root.id, kind: 'activity', title: 'Act A', sort_order: 1000, estimate_hours: 2 });
+  const actB = await W.createWorkItem({ project_id: PID, parent_id: root.id, kind: 'activity', title: 'Act B', sort_order: 2000, estimate_hours: 5 });
   // actA depends on actB → actB is the PREREQUISITE, actA the DEPENDENT.
   await W.addDep(actA.id, actB.id, { actor: 'test' });
-  // make actA a container so it has children (shape → container)
-  await W.createWorkItem({ project_id: PID, parent_id: actA.id, kind: 'task', title: 'A1', sort_order: 1000 });
+  // make actA a container so it has children (shape → container); A1's estimate is what drives
+  // actA's subtree span in wn_cpm.
+  await W.createWorkItem({ project_id: PID, parent_id: actA.id, kind: 'task', title: 'A1', sort_order: 1000, estimate_hours: 3 });
 
   const nodeA = (await one(`SELECT id FROM work_node WHERE stable_key=$1`, [`work_item:${actA.id}`])).id;
   const nodeB = (await one(`SELECT id FROM work_node WHERE stable_key=$1`, [`work_item:${actB.id}`])).id;
@@ -83,6 +87,18 @@ try {
   const newRank = (await one(`SELECT sibling_rank FROM work_node WHERE id=$1`, [nodeA])).sibling_rank;
   ok(/^0000000000\d{10}\.\d{6}:/.test(newRank),
     `rank re-encoded to sign-safe fixed-width (${newRank.slice(0, 28)}…)`);
+
+  // The REPAIRED edge through the SCHEDULER, not just the row shape: actA (dependent) cannot start
+  // before actB (prerequisite) finishes — actA's earliest_start must be >= actB's earliest_finish,
+  // and the reverse must NOT hold (actB's start is not gated by actA).
+  const pvId = (await one(`SELECT wn.plan_version_id FROM work_node wn WHERE wn.id=$1`, [nodeA])).plan_version_id;
+  const cpmRows = (await q(`SELECT name, earliest_start, earliest_finish FROM wn_cpm($1, '2026-01-01T00:00:00Z')`, [pvId])).rows;
+  const cpmA = cpmRows.find((r) => r.name === 'Act A');
+  const cpmB = cpmRows.find((r) => r.name === 'Act B');
+  ok(cpmA && cpmB && new Date(cpmA.earliest_start) >= new Date(cpmB.earliest_finish),
+    `wn_cpm after repair: dependent (Act A) earliest_start (${cpmA?.earliest_start}) >= prerequisite (Act B) earliest_finish (${cpmB?.earliest_finish})`);
+  ok(cpmA && cpmB && new Date(cpmB.earliest_start) < new Date(cpmA.earliest_finish),
+    'and the reverse is not a dependency (prerequisite does not wait on the dependent)');
 
   // ── 2. 186 idempotent ────────────────────────────────────────────────────
   section('186 is idempotent — a second run changes zero rows');
