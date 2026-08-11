@@ -73,6 +73,19 @@ const liveZee = (xellId) => one(
   `SELECT id, xell_id, name, status, model, last_stop_reason FROM zee WHERE xell_id=$1
      AND status IN ('spawning','online','working','idle') ORDER BY created_at DESC LIMIT 1`, [xellId]);
 
+// The A2A envelope's ids, for the additive `a2a: {taskId, contextId}` on the say/report answers
+// (plan §5). The taskId a message belongs to is its own when it opened the task (a directive) and
+// the referencedTaskId when it is a reply — the same reading as a2a.js rowToMessage. Present only
+// when the row carries an envelope — postMessage now writes one on every message, but an old row or
+// a caller that bypassed postMessage may have none, and additive means additive: the CLI text UX is
+// untouched and old callers keep their exact answer shape.
+function a2aIds(row) {
+  const a2a = row?.meta?.a2a || null;
+  return a2a
+    ? { taskId: a2a.taskId || a2a.referencedTaskId || null, contextId: a2a.contextId || null }
+    : null;
+}
+
 // ── GET /api/xell/self/status — the read model a cxell zee orients from ────────
 // Everything it needs to know where it stands: its own status/task, whether a landing/ship/prod-bind
 // is pending a human, its containers and db binding. No secrets (the token itself never appears).
@@ -2322,8 +2335,11 @@ export async function selfSay(xell, { to = null, message = null, kind = 'directi
   // means the worker's finished turn was restarted with your message as its prompt (this is how you
   // re-task the zee that already holds the context); QUEUED means it is mid-turn and has not read it
   // yet; TYPED means an interactive session took the keystrokes. See lib/zee-turn.js.
+  // The A2A envelope's ids ride along additively (plan §5) — from the envelope postMessage wrote.
+  const a2a = a2aIds(r.message);
   return {
-    ok: true, ...r, delivery: r.delivery?.delivery || 'none',
+    ok: true, ...r, ...(a2a ? { a2a } : {}),
+    delivery: r.delivery?.delivery || 'none',
     message: deliveryReceipt(r.delivery?.delivery, worker.slug,
                              r.delivery?.reason || r.delivery?.error || null),
   };
@@ -2348,7 +2364,11 @@ export async function selfReport(xell, { message = null, kind = 'report' } = {})
   const r = await postMessage({ from: xell, to: manager, body: text, kind: kind === 'reflection' ? 'reflection' : 'report' });
   // Same three-way receipt as `zee say` (a manager reading its own worker's report is the other end
   // of the same delivery): RESUMED / QUEUED / TYPED, never one word for all three.
-  return { ok: true, ...r, addressed: true, delivery: r.delivery?.delivery || 'none',
+  // The A2A envelope's ids ride along additively (plan §5) — from the envelope postMessage wrote.
+  const a2a = a2aIds(r.message);
+  return {
+    ok: true, ...r, addressed: true, ...(a2a ? { a2a } : {}),
+    delivery: r.delivery?.delivery || 'none',
     message: `Sent to your manager (${manager.slug}). `
       + deliveryReceipt(r.delivery?.delivery, manager.slug, r.delivery?.reason || r.delivery?.error || null) };
 }
