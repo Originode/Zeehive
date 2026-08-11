@@ -44,7 +44,7 @@ import ShipPanel, { LockBadge } from './Ship.jsx';
 import LandingPad from './LandingPad.jsx';
 import { nick } from './nick.js';
 import { ContainerChip, ContainerMenu, isBuildable, isBusy } from './Container.jsx';
-import MachineMatrix from './Machines.jsx';
+import MachineTree from './Machines.jsx';
 import ZeeTerminal, { ContainerTerminal } from './ZeeTerminal.jsx';
 import ModeChip from './ModeChip.jsx';
 // a zee's badge: the AI PROVIDER's coin, wearing its harness (the honeycomb draws the same thing)
@@ -1341,13 +1341,15 @@ export default function App() {
 
       <BackupsPanel backup={fleet.backup} projectId={projectId || project.id} />
 
-      {/* The inventory as a role × machine MATRIX: one column per machine, so what-runs-where is
-          the panel's shape. Chips sit where they RUN; the ⇄ marker says where they compile. */}
-      <MachineMatrix machines={fleet.machines} containers={containers}
-                     projectId={projectId || project.id}
-                     spinoffIsProcess={(project.manifest?.roles?.server?.runner
-                       || project.manifest?.tiers?.spinoff?.runner) === 'process'}
-                     onMenu={openMenu} onChanged={refresh} />
+      {/* The container TREE — one node per machine (the master), its dev/prod deploy sites as the
+          branches, and the shared container rows grouped by role as the leaves. Chips sit where
+          they RUN; the ⇄ marker says where they compile. Per-xell stacks are a collapsible group
+          under their machine, separate from the deploy inventory. */}
+      <MachineTree machines={fleet.machines} containers={containers} sites={fleet.sites}
+                   projectId={projectId || project.id}
+                   spinoffIsProcess={(project.manifest?.roles?.server?.runner
+                     || project.manifest?.tiers?.spinoff?.runner) === 'process'}
+                   onMenu={openMenu} onChanged={refresh} />
 
       {/* The decision UI (held landing / open PR, with Approve/Reject) now renders INLINE under the
           "waiting on you" bar when its chip is clicked — next to nothing else, and the flower on the
