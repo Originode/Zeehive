@@ -211,19 +211,44 @@ does not stand in for the cross-xell case, and is not offered as such.
 
 **The proposed cross-xell design** (not yet built — the state model is agreed here before code follows).
 **DECISION (2026-08-11): the carrier is a XELL-KEYED handover row — Option A.** The execution plane
-was considered and rejected as the carrier. Measured on the fleet meta-DB: `execution` has NO
-`xell_id` column, `entity` has ZERO rows, nothing sets `execution.entity_id`, and `execution.outputs`
-is empty in 0 of 160 rows. There is NO path from a xell to its execution today, in either direction,
-so a successor xell cannot find its predecessor's execution — and even if it could, the field is
-empty. Routing the handover through `execution` would require wiring xell↔execution (entity rows for
-xells, `execution.entity_id` populated, readers re-pointed) as a PREREQUISITE CARD with a human's
-name on it (…-abc363's scope) — this design does not silently absorb it. So the handover lives where
-it can actually be found.
+was considered and rejected as the carrier. The rejection is about **coverage**, not absence of a
+path — an execution-linked handover is structurally unavailable to most of the fleet. Measured on
+the fleet meta-DB:
+
+    execution total                                161
+    execution with work_node_id                    161   (entity_id: 0)
+    xells holding a work_item                       81
+    XELL -> EXECUTION reachable                     80   of those 81
+    EXECUTION -> XELL reachable                    106   of 161
+    execution.outputs non-empty                      0   of 161
+    xells total                                    584
+    live xells                                      23
+
+The execution path exists and runs both ways — xell → `work_item.xell_id` → `work_node.stable_key`
+(`'work_item:'||id`) → `execution.work_node_id` reaches an execution for 80 of the 81 xells that
+hold a work item, and the reverse reaches 106 of 161 executions. But the path only exists for a xell
+that holds a WORK ITEM: 81 of 584 xells (~14%). Six xells in seven have none, so an execution-keyed
+handover is unavailable to most of the fleet — including, by construction, any xell cut for something
+that never became a card. A `xell_handover` row keyed by `xell_id` is available to all 584. THAT is
+why Option A wins: coverage, not absence of a path.
+
+Three reasons, in order of weight:
+
+1. **Coverage** — the execution path reaches only the ~14% of xells that hold a work item; a
+   xell-keyed row reaches every xell. (The path itself is real; the earlier draft's "no path in
+   either direction" was WRONG and is corrected here.)
+2. **Composition** — keyed by the SAME key `zee_conversation` uses (`xell_id`), so the handover row
+   composes with what is already built and is found the same way.
+3. **No fragile dependency** — `execution.outputs` is non-empty in 0 of 161 rows (it has never been
+   written), `execution.entity_id` is never set, `entity` has zero rows, and `work_node.stable_key`
+   is a string convention a rename would break. Routing through `execution` would require wiring
+   xell↔execution (entity rows for xells, `execution.entity_id` populated, readers re-pointed) as a
+   PREREQUISITE CARD with a human's name on it (…-abc363's scope) — this design does not silently
+   absorb it.
 
 - **The carrier: a `xell_handover` row, keyed by `xell_id`** — the SAME key `zee_conversation` uses,
   so it composes with what is already built. Written when the predecessor xell is retired/reaped;
-  read BY NAME when the successor is dispatched. Boring, reachable, no dependency on the empty
-  entity plane.
+  read BY NAME when the successor is dispatched. Boring, reachable, available to every xell.
 - **What crosses the boundary: a CURATED handover**, not the transcript. The durable conclusions:
   what was decided, what was verified, what remains, the constraints that still bind, the next
   concrete step. What stays behind: dead ends, wrong turns, local paths, tool blow-by-blow.
