@@ -119,6 +119,12 @@ try {
   const counts = mod.leafLaneCounts(forest[0].children[0]);
   ok(counts.get('queued') === 1 && counts.get('working') === 1, 'a collapsed row counts its leaves per lane');
 
+  // a project root with NO children is still a ROW (it was never a card before the matrix).
+  const emptyForest = mod.buildForest(mRoot, []);
+  ok(emptyForest.length === 1 && emptyForest[0].isRoot === true, 'buildForest marks the root');
+  ok(mod.flattenBands(emptyForest, new Set())[0].kind === 'row',
+     'a childless root renders as a row, not as a card in a lane');
+
   // collapse/expand: the flat band list is the exact contract of what is visible.
   const flat = mod.flattenBands(forest, new Set());
   ok(flat.map((b) => `${b.kind}:${(b.node || b.card).id}`).join() === 'row:r,row:a,leaf:l1,leaf:l2,tail:a,tail:r',

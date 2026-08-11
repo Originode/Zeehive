@@ -375,6 +375,7 @@ export function buildForest(root, columns) {
     const rootNode = byId.get(root.id);
     rootNode.children.push(...orphans);
     sortTree(rootNode.children);
+    rootNode.isRoot = true;                // the root is a ROW even with no children (it was never a card)
     return [rootNode];
   }
   sortTree(orphans);
@@ -395,7 +396,7 @@ export function flattenBands(forest, collapsed) {
   const out = [];
   const walk = (nodes, depth) => {
     for (const node of nodes) {
-      const isRow = (node.children || []).length > 0;
+      const isRow = node.isRoot || (node.children || []).length > 0;
       if (!isRow) { out.push({ kind: 'leaf', card: node, depth }); continue; }
       const isCollapsed = collapsed.has(node.id);
       out.push({ kind: 'row', node, depth, collapsed: isCollapsed });
@@ -416,7 +417,7 @@ export function buildIndex(forest) {
   const laneStacks = new Map();
   const walk = (nodes, rowId) => {
     for (const node of nodes) {
-      if ((node.children || []).length) {
+      if (node.isRoot || (node.children || []).length) {
         rowOf.set(node.id, node.id);
         laneStacks.set(node.id, new Map());
         walk(node.children, node.id);
