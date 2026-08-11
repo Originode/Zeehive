@@ -29,6 +29,7 @@ import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { gatewayEnv } from './gateway.js';
 import { toolList, runTool, LANGCHAIN_TOOLS } from './langchain-tools.js';
+import { tendState } from './status.js';
 
 // openai + kimi speak the OpenAI dialect (/v1/chat/completions); everything else is Anthropic
 // dialect (/v1/messages — claude, deepseek; grok is /responses but Anthropic-shaped usage).
@@ -290,10 +291,29 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
       // `desc` is the ALLOWLIST lookup (LANGCHAIN_TOOLS[tc.name]), so `executed`/`onTool` only ever
       // record a verb the allowlist names; an over-wide caller array cannot leak a name in.
       const desc = LANGCHAIN_TOOLS[tc.name];
-      const content = await runTool(xell, { name: tc.name, args: tc.args || {} });
-      if (desc) executed.push({ name: tc.name, args: tc.args || {} });
+      // LOOP POLICY — THE LOOP DOES NOT RUN `working` WHILE A TEND IS OPEN. A human's question must
+      // not be dissolved by loop filler. This is HARNESS POLICY, not verb semantics: `working` stays
+      // the plain shared handler (same door as every cxell zee); the loop simply does not reach for
+      // it while a tend is open. The fleet property — pingWorking auto-clears for ANY caller, cxell
+      // zees included (lib/status.js:383) — is a fleet-wide behaviour whose fix belongs in pingWorking
+      // for everybody (with a human), not a langchain-local patch. This policy only stops THIS loop
+      // from exercising it. The model gets a visible refusal it can react to, not a silent skip.
+      let policyRefused = null;
+      if (tc.name === 'working') {
+        const st = await tendState(xell.id);
+        if (st.open) {
+          policyRefused = { ok: false, error: `working is REFUSED by loop policy: this xell has an `
+            + `OPEN tend — a human was asked "${st.reason || st.full || '…'}" — and a working ping `
+            + 'would auto-clear it. Do not suppress the question with a ping; answer the ask or end '
+            + 'the turn.' };
+        }
+      }
+      const content = policyRefused
+        ? JSON.stringify(policyRefused)
+        : await runTool(xell, { name: tc.name, args: tc.args || {} });
+      if (desc && !policyRefused) executed.push({ name: tc.name, args: tc.args || {} });
       messages.push(new ToolMessage({ content: String(content).slice(0, TOOL_RESULT_CAP), tool_call_id: tc.id }));
-      if (onTool && desc) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
+      if (onTool && desc && !policyRefused) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
       // LOOP-ENDS-TURN ON TEND — harness policy, NOT verb semantics. A tend means "I am waiting for
       // a human." A zee that raises one and keeps iterating has not asked for anything — it has
       // logged a wish. What must be shared is the VERB'S EFFECT: `tend` still calls the SAME
