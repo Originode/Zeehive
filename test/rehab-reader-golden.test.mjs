@@ -14,6 +14,21 @@
 //   run with --capture to REGENERATE the fixture (only legitimately when the OLD reader's shape
 //   genuinely changed, i.e. never during this rehab).
 //
+// PROVING THE FIXTURE IS A GENUINE PRE-REHAB CAPTURE (how to re-run, instead of trusting this
+// header): check out the pre-rehab READER and run this test in COMPARE mode — if it passes, the
+// committed fixture byte-matches what the old readers emit, and since it ALSO passes against the
+// re-pointed readers, the shapes did not move.
+//
+//     git show 8af1c04^:server/src/lib/work-items.js > /tmp/wi.old   # the reader BEFORE 2/4
+//     cp /tmp/wi.old server/src/lib/work-items.js
+//     node test/rehab-reader-golden.test.mjs                          # COMPARE mode — must PASS
+//     git checkout server/src/lib/work-items.js                       # restore the re-pointed one
+//
+// The seed deliberately includes a FRACTIONAL sort_order (1500.5 — the kanban drag midpoint,
+// web/src/work/order.js:36) and a NEGATIVE one (-1 — the drop-before-the-first-slot case,
+// order.js:38), the two orderings migration 186's sign-safe sibling_rank encoding exists for. Do
+// not remove them: a seed without them would let the ordering collapse silently.
+//
 // Every row it creates is torn down in a finally, whatever happens.
 import pg from 'pg';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -44,6 +59,8 @@ const T1 = 'c0000000-0000-4000-8000-000000000001';
 const T2 = 'c0000000-0000-4000-8000-000000000002';
 const T3 = 'c0000000-0000-4000-8000-000000000003';
 const T4 = 'c0000000-0000-4000-8000-000000000004';
+const T5 = 'c0000000-0000-4000-8000-000000000005';
+const T6 = 'c0000000-0000-4000-8000-000000000006';
 
 const sql185 = readFileSync(resolve(here, '..', 'db/migrations/185_rehab_backfill_work_items_into_workflow_model.sql'), 'utf8');
 const sql186 = readFileSync(resolve(here, '..', 'db/migrations/186_repair_rehab_dependency_direction_rank_encoding.sql'), 'utf8');
@@ -87,6 +104,15 @@ async function seed() {
   await insItem(T2, P1, A1, 'task', 'Task Two', 2000, 'done', 5);
   await insItem(T3, P1, A2, 'task', 'Task Three', 1000, 'blocked', 6);
   await insItem(T4, P1, A2, 'task', 'Task Four', 2000, 'queued', 6);
+  // THE ORDERING EDGE CASES a kanban drag actually writes (web/src/work/order.js):
+  //   • the MIDPOINT — dropping between two cards writes the average of their sort_orders, which is
+  //     FRACTIONAL (line 36). Task Five is such a midpoint between Task One (1000) and Task Two (2000).
+  //   • the NEGATIVE HEAD-SLOT — dropping before the first card writes `after - 1`, which goes NEGATIVE
+  //     once the head has been pushed to 0 (line 38). Task Six is such a negative.
+  //   Both are exactly what the sibling_rank encoding broke before migration 186 (the old lpad scheme
+  //   mis-ordered them); a seed without them would let the order collapse silently and never notice.
+  await insItem(T5, P1, A1, 'task', 'Task Five', 1500.5, 'queued', 2);
+  await insItem(T6, P1, A1, 'task', 'Task Six', -1, 'queued', 1);
 
   // link a ticket to Task One
   await q(`UPDATE work_item SET ticket_id=$1 WHERE id=$2`, [TICKET, T1]);
