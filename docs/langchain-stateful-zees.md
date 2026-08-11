@@ -385,6 +385,18 @@ standalone test, not by a live zee.
 - **Dependencies are the scoped langchain packages only** — `@langchain/anthropic`, `@langchain/openai`,
   `@langchain/core`. The `langchain` umbrella is deliberately NOT a dependency: it is never imported
   and it pulls the `@langchain/langgraph` runtime into the tree. `npm ls langgraph` is empty.
+- **Loop-ends-turn on tend.** A tool call that RAISES a tend (asks for a human) ends the turn after
+  that iteration, with a VISIBLE "Turn ended: a human was asked — '<reason>'" result, and the zee
+  waits to be resumed — exactly as a cxell zee ends its turn. This is HARNESS POLICY, not verb
+  semantics: `tend` still calls the same `selfTend` handler, writes the same row, shows the same
+  card — the door is unchanged. What belongs to the harness is whether the TURN continues; the
+  langchain loop IS the harness for a langchain zee. A `tend clear` does NOT end the turn (it is
+  answering, not asking). `hint-land`/`hint-ship` do NOT end the turn — a hint lights a button and
+  the zee keeps working; ending on a hint would invent a stop the fleet does not have.
+- **The `working` TEND GUARD.** `working` REFUSES while a tend is open on this xell, and names WHAT
+  the human was asked — so a model ping cannot silently clear a question posted to a human. The
+  guard is on the TOOL path only (a CLI zee's `zee working` still auto-clears, because a CLI zee is
+  a deliberate act that can read the room). `pingWorking` is untouched.
 - No gate changes, no `hooks/` changes, no prod writes.
 
 ### 8.3 Not built yet (next cards)
@@ -406,10 +418,11 @@ standalone test, not by a live zee.
    to the read-only, no-side-effect registry verbs (`status`, `work`, `working`, `item`), a hard
    cap of 8 iterations with the cap visible when hit, and ONE handler shared with `/api/xell/self/*`
    (never a second copy of a verb's logic). The wave-2 ASK verbs are bound — `tend` (asks for a
-   human, executes nothing) and `hint-land`/`hint-ship` (each writes a single `session_event` +
-   the hint state, no gate, no auto_approve path). `land`/`ship`/`seed` are NOT bound and never will
-   be by a test: this fleet auto-approves them (§2.3, §8.2), so there is no human hold for a bound
-   ask to reach — the confinement is the allowlist, not the gate.
+   human, executes nothing, and RAISING it ends the turn — §8.2) and `hint-land`/`hint-ship` (each
+   writes a single `session_event` + the hint state, no gate, no auto_approve path; they do NOT end
+   the turn). `land`/`ship`/`seed` are NOT bound and never will be by a test: this fleet
+   auto-approves them (§2.3, §8.2), so there is no human hold for a bound ask to reach — the
+   confinement is the allowlist, not the gate.
 3. **Cxell-sandboxed langchain agent (workspace action)** — the boundary for tools is drawn by WHAT
    A TOOL CAN DO, not by the existence of tools (this amends an earlier, too-coarse sentence here
    that said any tool ⇒ the cage). Read-only, no-side-effect verbs (`status`, `work`, `working`,
