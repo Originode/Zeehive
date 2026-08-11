@@ -117,6 +117,12 @@ async function setupRows() {
      VALUES ($1,'headless-spawn',NULL,'none','working','headless','langchain',$2,'bypassPermissions','/work/repo','tool-loop-test')
      RETURNING id`, [xellId, MODEL]);
   zeeId = z.id;
+  // The gateway's resolveUpstream needs a deepseek account on the project to forward the call
+  // (it reads tokenForSpawn(project, 'deepseek') and returns 502 without one).
+  await q(
+    `INSERT INTO provider_token (project_id, provider, token, token_hint, label)
+     VALUES ($1, 'deepseek', $2, $3, 'langchain-tools-test')`,
+    [projectId, DEEPSEEK_KEY, `…${DEEPSEEK_KEY.slice(-4)}`]);
   const t = await one(
     `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, status, model)
      VALUES ($1,$2,$3,'spawn','started',$4) RETURNING id`, [zeeId, xellId, projectId, MODEL]);
