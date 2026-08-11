@@ -52,8 +52,17 @@
 
 -- ── the idempotency handle: one node per (plan_version, stable_key) ─────────────
 -- The model's stable_key column exists for exactly this ("identity across plan versions"); within
--- ONE plan_version a stable_key must be unique. The existing wn_stable_key_idx is non-unique, so
--- this adds the unique index that lets every backfilled insert be an ON CONFLICT upsert.
+-- ONE plan_version a stable_key must be unique. The existing wn_stable_key_idx (migration 176) is a
+-- plain NON-unique index, so this migration adds its own UNIQUE index — on the FULL composite
+-- (plan_version_id, stable_key), not a partial (WHERE stable_key IS NOT NULL) one, and NOT a
+-- NOT EXISTS guard. The unique index is the CONCURRENCY-SAFE route: every backfilled insert is
+-- `ON CONFLICT (plan_version_id, stable_key) DO NOTHING`, and under two concurrent runs the second
+-- transaction blocks on the first's uncommitted row and then swallows the duplicate — the database
+-- enforces the "one node per item" invariant regardless of how many runs overlap. (A NOT EXISTS
+-- guard would let two concurrent transactions both pass the check and both INSERT — it only passes
+-- the sequential "run it twice" test.) The plan/plan_version SELECT-then-INSERT is likewise
+-- sequential-run idempotent; the node-level uniqueness is what makes a concurrent double-run
+-- harmless.
 CREATE UNIQUE INDEX IF NOT EXISTS wn_stable_key_version_uniq
   ON work_node (plan_version_id, stable_key);
 
