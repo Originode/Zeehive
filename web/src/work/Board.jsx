@@ -456,7 +456,7 @@ export function RowBand({ node, depth, collapsed, columns, statuses, onToggle, o
       <div className="work-row-label" style={{ paddingLeft: 6 + depth * 13 }}>
         <button className={`work-chev${kids.length ? '' : ' none'}`} tabIndex={-1}
                 title={kids.length ? 'collapse / expand this row' : ''}
-                onClick={(e) => { e.stopPropagation(); onToggle(node.id); }}>
+                onClick={(e) => { e.stopPropagation(); if (kids.length) onToggle(node.id); }}>
           {kids.length ? (collapsed ? '▸' : '▾') : '·'}
         </button>
         <KindGlyph kind={node.kind} />
