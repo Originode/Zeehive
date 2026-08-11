@@ -14,9 +14,13 @@ import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, ZeeChip, statusLa
 // /api/work-statuses vocabulary (decision 1 below). But a work_node WITH children — any card in the
 // payload whose id is some other card's parent_id, plus board.root — renders as a collapsible ROW
 // spanning every lane, instead of a card in one column. A node with NO children renders as a CARD
-// in its status lane, under its nearest parent row. Nested containers nest as indented rows: every
-// band is one flex row (label rail + one cell per lane) and every band shares the SAME label width,
-// so a lane is the same horizontal strip at every nesting depth — the columns stay straight.
+// in its status lane, under its nearest parent row, and a row's direct-leaf cards PACK in their
+// lane — flex-wrap, several per row when the lane is wide enough, reading left-to-right then down
+// in sort order — so a lane of eight leaves is not eight rows tall. Nested containers nest as
+// indented rows: every band is one flex row (label rail + one cell per lane) and every band shares
+// the SAME label width, so a lane is the same horizontal strip at every nesting depth — the columns
+// stay straight. A COLLAPSED row keeps its full-width lane strip and tints the ONE lane that is its
+// own status, so where a collapsed row stands reads at a glance.
 //
 // COLLAPSE: the project root is AUTO-EXPANDED; every other row defaults collapsed, and a collapsed
 // row shows per-lane counts of the work hidden under it (a Jira-epic swimlane). The caret toggles;
@@ -235,14 +239,27 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
     if (!dragRef.current || dragRef.current.rowId !== rowId) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    if (dropAt?.rowId !== rowId || dropAt?.key !== key) setDropAt({ rowId, key, index });
+    if (dropAt?.zone !== 'tail' || dropAt?.rowId !== rowId || dropAt?.key !== key || dropAt?.index !== index)
+      setDropAt({ zone: 'tail', rowId, key, index });
   };
   const allowCard = (e, rowId, cardId, laneIndex) => {
     if (!dragRef.current || dragRef.current.rowId !== rowId) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
+    e.stopPropagation();                       // a card is its own target — the lane below must not also claim it
     const index = halfOf(e, laneIndex);
     if (dropAt?.cardId !== cardId || dropAt?.index !== index) setDropAt({ cardId, index });
+  };
+  // The lane of a leaf PACK is a drop target too: in the wrapped flow the gap BETWEEN two side-by-side
+  // cards is exactly where a reorder wants to land, and it is not a card. packIndex maps the pointer
+  // onto the lane's stack slot (the same index a card drop computes).
+  const allowPackLane = (e, rowId, key) => {
+    if (!dragRef.current || dragRef.current.rowId !== rowId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const index = packIndex(e);
+    if (dropAt?.zone !== 'pack' || dropAt?.rowId !== rowId || dropAt?.key !== key || dropAt?.index !== index)
+      setDropAt({ zone: 'pack', rowId, key, index });
   };
   const onDrop = (e, rowId, key, index) => {
     const id = dragRef.current?.id || e.dataTransfer.getData('text/plain');
@@ -331,6 +348,17 @@ export default function Board({ projectId, rootId, statuses: statusesProp, onOpe
                          onDragOver={allowLane} onDrop={onDrop} />
               );
             }
+            if (band.kind === 'leafpack') {
+              return (
+                <LeafPack key={`pack-${band.node.id}`} node={band.node} depth={band.depth}
+                          columns={columns} statuses={statuses} index={index}
+                          dragId={dragId} dropAt={dropAt}
+                          onOpen={onOpen} onCardKey={onCardKey}
+                          onDragStart={onDragStart} onDragEnd={endDrag}
+                          allowCard={allowCard} allowPackLane={allowPackLane}
+                          onDrop={onDrop} halfOf={halfOf} packIndex={packIndex} />
+              );
+            }
             const card = band.card;
             const rowId = index.rowOf.get(card.id);
             const stack = rowId ? (index.laneStacks.get(rowId)?.get(card.status) || []) : [];
@@ -389,9 +417,11 @@ function sortTree(nodes) {
 }
 
 // The flat band list the board draws, in tree order. A node WITH children is a ROW band; a node
-// with no children is a LEAF band. An expanded row's children follow it, then a TAIL band — the
-// per-lane append drop targets. A collapsed row hides its children AND its tail. Pure, so the
-// render test can assert exactly what collapse/expand shows.
+// with no children is a LEAF band (only a rootless top-level leaf — the board always has a root).
+// An expanded row's DIRECT leaves are grouped into one LEAFPACK band (all of the row's leaf cards,
+// packed per lane), its row children follow, then a TAIL band — the per-lane append drop targets.
+// A collapsed row hides its leaves, its children AND its tail. Pure, so the render test can assert
+// exactly what collapse/expand shows.
 export function flattenBands(forest, collapsed) {
   const out = [];
   const walk = (nodes, depth) => {
@@ -401,7 +431,14 @@ export function flattenBands(forest, collapsed) {
       const isCollapsed = collapsed.has(node.id);
       out.push({ kind: 'row', node, depth, collapsed: isCollapsed });
       if (isCollapsed) continue;
-      walk(node.children, depth + 1);
+      const leaves = [];
+      const subrows = [];
+      for (const c of node.children) {
+        if (c.isRoot || (c.children || []).length > 0) subrows.push(c);
+        else leaves.push(c);
+      }
+      if (leaves.length) out.push({ kind: 'leafpack', node, depth: depth + 1, leaves });
+      walk(subrows, depth + 1);
       out.push({ kind: 'tail', node, depth: depth + 1 });
     }
   };
@@ -466,8 +503,11 @@ export function RowBand({ node, depth, collapsed, columns, statuses, onToggle, o
       </div>
       {columns.map((col) => {
         const n = counts.get(col.key) || 0;
+        const own = collapsed && col.key === node.status;
         return (
-          <div key={col.key} className="work-row-lane" title={n ? `${n} ${col.label}` : undefined}>
+          <div key={col.key}
+               className={`work-row-lane${own ? ' is-own' : ''}${own ? ` work-st-${col.key}` : ''}`}
+               title={own ? `${n ? `${n} ${col.label} — ` : ''}this row's own status` : (n ? `${n} ${col.label}` : undefined)}>
             {collapsed && n ? (
               <span className="work-row-count"><b>{n}</b>{col.label}</span>
             ) : null}
@@ -487,12 +527,50 @@ export function RowTail({ node, depth, columns, index, dropAt, onDragOver, onDro
       <div className="work-row-label" style={{ paddingLeft: 6 + depth * 13 }} />
       {columns.map((col) => {
         const stack = index.laneStacks.get(rowId)?.get(col.key) || [];
-        const on = dropAt?.rowId === rowId && dropAt?.key === col.key;
+        const on = dropAt?.zone === 'tail' && dropAt?.rowId === rowId && dropAt?.key === col.key;
         return (
           <div key={col.key} className={`work-row-lane${on ? ' drop' : ''}`}
                onDragOver={(e) => onDragOver(e, rowId, col.key, stack.length)}
                onDrop={(e) => onDrop(e, rowId, col.key, stack.length)}>
             {!stack.length && <span className="work-row-empty">—</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// An expanded row's DIRECT leaves, packed into their lanes: one flex row (rail + one cell per lane),
+// each lane cell flex-wraps its own stack so cards sit several per row when the lane is wide enough,
+// reading left-to-right then down in sort order. Each card is still its own drop target (halfOf),
+// and the LANE is too — the wrapped gaps between side-by-side cards are where a reorder wants to
+// land, and packIndex turns a lane drop into the same stack slot a card drop would.
+export function LeafPack({ node, depth, columns, statuses, index, dragId, dropAt,
+                  onOpen, onCardKey, onDragStart, onDragEnd,
+                  allowCard, allowPackLane, onDrop, halfOf, packIndex }) {
+  const rowId = node.id;
+  return (
+    <div className="work-row work-leafpack" data-testid="work-row-leafpack" data-row={rowId}>
+      <div className="work-row-label" style={{ paddingLeft: 6 + depth * 13 }} />
+      {columns.map((col) => {
+        const stack = index.laneStacks.get(rowId)?.get(col.key) || [];
+        const colIndex = columns.findIndex((c) => c.key === col.key);
+        const on = dropAt?.zone === 'pack' && dropAt?.rowId === rowId && dropAt?.key === col.key;
+        return (
+          <div key={col.key} className={`work-row-lane${on ? ' drop' : ''}`}
+               onDragOver={(e) => allowPackLane(e, rowId, col.key)}
+               onDrop={(e) => onDrop(e, rowId, col.key, packIndex(e))}>
+            {stack.map((card, laneIndex) => (
+              <Card key={card.id} card={card} statuses={statuses}
+                    dragging={dragId === card.id}
+                    dropOn={dropAt?.cardId === card.id}
+                    onOpen={() => onOpen?.(card.id)}
+                    onKey={(e) => onCardKey(e, card, colIndex, laneIndex, stack.length)}
+                    onDragStart={(e) => onDragStart(e, card, card.status)}
+                    onDragEnd={onDragEnd}
+                    onDragOver={(e) => allowCard(e, rowId, card.id, laneIndex)}
+                    onDrop={(e) => onDrop(e, rowId, card.status, halfOf(e, laneIndex))} />
+            ))}
           </div>
         );
       })}
@@ -519,13 +597,29 @@ export function LeafBand({ card, depth, columns, statuses, dragging, dropOn, onO
   );
 }
 
-// WHICH SIDE of a card the pointer is on — above its middle means "insert before me", below means
-// "after me". Without this the only drop targets were the 6px gaps BETWEEN cards, and a drop on a
-// card itself bubbled to the column and silently sent it to the bottom: the commonest aim in the
-// whole board ("put this one just here") was the one that missed.
+// WHICH SIDE of a card the pointer is on — left of its middle means "insert before me", right means
+// "after me". Cards PACK side by side in a lane, so the before/after boundary is the VERTICAL line
+// through the card's middle (the reading order runs left-to-right, then down). Without this the only
+// drop targets were the gaps BETWEEN cards, and a drop on a card itself bubbled to the lane and
+// silently sent it to the bottom: the commonest aim in the whole board ("put this one just here")
+// was the one that missed.
 const halfOf = (e, index) => {
   const r = e.currentTarget.getBoundingClientRect();
-  return e.clientY < r.top + r.height / 2 ? index : index + 1;
+  return e.clientX < r.left + r.width / 2 ? index : index + 1;
+};
+
+// WHERE a drop in a PACKED lane lands: the first card whose left half the pointer is left of, else
+// the end of the stack. Cards are in DOM order = sort order, so comparing X against each card's
+// vertical midline gives the same stack slot a card drop would compute — a drop in the gap between
+// two side-by-side cards inserts between them, and a drop below the last wrapped row appends.
+const packIndex = (e) => {
+  const cards = e.currentTarget.querySelectorAll('[data-item]');
+  const x = e.clientX;
+  for (let i = 0; i < cards.length; i++) {
+    const r = cards[i].getBoundingClientRect();
+    if (x < r.left + r.width / 2) return i;
+  }
+  return cards.length;
 };
 
 // `onKey` is the keyboard half of the same move the drag makes (Board.onCardKey, bound per card to
@@ -544,6 +638,7 @@ export function Card({ card, statuses, dragging, dropOn, onDragStart, onDragEnd,
   return (
     <article className={`work-card${dragging ? ' dragging' : ''}${dropOn ? ' drop-on' : ''}`} draggable
              data-testid="work-card" data-item={card.id}
+             title={card.title}
              onDragStart={onDragStart} onDragEnd={onDragEnd}
              onDragOver={onDragOver} onDrop={onDrop}
              onClick={onOpen}

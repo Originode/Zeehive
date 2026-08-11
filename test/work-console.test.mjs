@@ -201,7 +201,7 @@ ok(/ref/.test(read('web/src/work/Tickets.jsx')),
 
 // ── two defects found by auditing the landed code, pinned so they cannot come back ──
 ok(/halfOf/.test(board) && /halfOf\(e, laneIndex\)/.test(board),
-   'a CARD is itself a drop target (upper half = before it) — not just the 6px gap between cards');
+   'a CARD is itself a drop target (left half = before it, in the packed flow) — not just the gaps between cards');
 ok(/dlg-overlay/.test(read('web/src/work/WorkConsole.jsx')),
    'Escape while a Dialog is open answers the dialog only — it does not also close the console');
 ok(/THE ZEE SEAM/.test(drawer), 'the drawer keeps a named seam for part 3\'s assign-a-zee control');

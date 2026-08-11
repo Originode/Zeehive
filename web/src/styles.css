@@ -2478,14 +2478,14 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-kind.k-activity { color: #9b8cff; }
 .work-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 auto;
   background: var(--unknown); }
-.work-st-queued    { background: #5b8cff; }
-.work-st-assigned  { background: #7c83f5; }
-.work-st-working   { background: #35c46b; }
-.work-st-blocked   { background: #e5554e; }
-.work-st-review    { background: #f2c518; }
-.work-st-shipping  { background: #f0913b; }
-.work-st-done      { background: #6fcf97; }
-.work-st-cancelled { background: #6b7688; }
+.work-st-queued    { background: #5b8cff; --st: #5b8cff; }
+.work-st-assigned  { background: #7c83f5; --st: #7c83f5; }
+.work-st-working   { background: #35c46b; --st: #35c46b; }
+.work-st-blocked   { background: #e5554e; --st: #e5554e; }
+.work-st-review    { background: #f2c518; --st: #f2c518; }
+.work-st-shipping  { background: #f0913b; --st: #f0913b; }
+.work-st-done      { background: #6fcf97; --st: #6fcf97; }
+.work-st-cancelled { background: #6b7688; --st: #6b7688; }
 .work-pips { display: inline-flex; gap: 2px; align-items: center; }
 .work-pips i { width: 4px; height: 4px; border-radius: 50%; background: var(--line); display: block; }
 .work-pips i.on { background: var(--muted); }
@@ -2605,9 +2605,37 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
 .work-row-count b { color: var(--text); font-size: 13px; }
 
+/* a COLLAPSED row still occupies its full-width lane strip; tint the ONE lane that is its own
+   status so where the row stands reads at a glance. The tint is `--st` — the same status colour
+   the dots above own, exposed as a variable — with a neutral accent fallback for a status the
+   vocabulary has no colour token for. */
+.work-row-band.collapsed .work-row-lane.is-own {
+  background: color-mix(in srgb, var(--st, var(--accent)) 12%, transparent);
+}
+
 /* a LEAF's row: the rail cell is an empty spacer, the card sits in its own lane. */
 .work-row.work-leaf .work-row-label { background: transparent; }
 .work-row-lane.has-card { padding: 4px; }
+
+/* a LEAF PACK: an expanded row's direct leaves, wrapped in their lanes — several per row when the
+   lane is wide enough, reading left-to-right then down in sort order. Cards shrink to a compact
+   chip; the kind glyph, the title (truncated; the full text is in the card's tooltip/aria-label)
+   and the zee chip survive. */
+.work-row.work-leafpack .work-row-label { background: transparent; }
+.work-row.work-leafpack .work-row-lane { display: flex; flex-direction: row; flex-wrap: wrap;
+  gap: 5px; align-content: flex-start; padding: 6px; }
+.work-row.work-leafpack .work-card { flex: 0 1 92px; min-width: 56px; max-width: 100%;
+  padding: 4px 6px; gap: 2px; }
+.work-row.work-leafpack .work-card-top { gap: 4px; }
+.work-row.work-leafpack .work-card-title { font-size: 11px; line-height: 1.25;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-row.work-leafpack .work-card-tkt { display: none; }
+.work-row.work-leafpack .work-crumb { display: none; }
+.work-row.work-leafpack .work-pips, .work-row.work-leafpack .work-due { display: none; }
+.work-row.work-leafpack .work-zee { max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 9.5px; padding: 0 4px; }
+.work-row.work-leafpack .work-drift { font-size: 10px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
 
 /* a row's TAIL: the append drop targets under an expanded row's children. Dashed top border
    says "drop here to land at the end of this lane" without shouting. */

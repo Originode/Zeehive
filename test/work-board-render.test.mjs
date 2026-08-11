@@ -38,7 +38,7 @@ try {
   // exist only for a test to import.
   await build({
     stdin: {
-      contents: "export { Card, RowBand, RowTail, LeafBand, buildForest, buildIndex, leafLaneCounts, flattenBands } from './web/src/work/Board.jsx';\n"
+      contents: "export { Card, RowBand, RowTail, LeafBand, LeafPack, buildForest, buildIndex, leafLaneCounts, flattenBands } from './web/src/work/Board.jsx';\n"
               + "export * as bits from './web/src/work/bits.jsx';\n",
       resolveDir: ROOT, sourcefile: 'render-entry.js', loader: 'js',
     },
@@ -125,10 +125,14 @@ try {
   ok(mod.flattenBands(emptyForest, new Set())[0].kind === 'row',
      'a childless root renders as a row, not as a card in a lane');
 
-  // collapse/expand: the flat band list is the exact contract of what is visible.
+  // collapse/expand: the flat band list is the exact contract of what is visible. A row's DIRECT
+  // leaves group into ONE leafpack band (packed per lane) instead of a full row per card.
   const flat = mod.flattenBands(forest, new Set());
-  ok(flat.map((b) => `${b.kind}:${(b.node || b.card).id}`).join() === 'row:r,row:a,leaf:l1,leaf:l2,tail:a,tail:r',
-     'a fully-expanded board draws rows, then children in tree order, then each row\'s tail');
+  ok(flat.map((b) => `${b.kind}:${(b.node || b.card).id}`).join() === 'row:r,row:a,leafpack:a,tail:a,tail:r',
+     'a fully-expanded board draws rows, then one leafpack per row, then each row\'s tail');
+  const pack = flat.find((b) => b.kind === 'leafpack');
+  ok(!!pack && pack.leaves.map((l) => l.id).join() === 'l1,l2',
+     'the leafpack carries the row\'s direct leaves, in sort order');
   const flatCollapsed = mod.flattenBands(forest, new Set(['a']));
   ok(flatCollapsed.map((b) => `${b.kind}:${(b.node || b.card).id}`).join() === 'row:r,row:a,tail:r',
      'collapsing a row hides its leaves AND its tail (the drop zones under it)');
@@ -166,6 +170,23 @@ try {
     }));
   } catch (e) { ok(false, `a leaf band renders without throwing — ${e.message}`); }
   ok(leafHtml.includes('Leaf one') && /work-card/.test(leafHtml), 'a leaf renders as a card in its lane');
+
+  // The LEAF PACK renders every leaf of the row's lanes in ONE row (the compact wrapped layout),
+  // each card still carrying its own drag/keyboard wiring so the wrapped flow stays operable.
+  let packHtml = '';
+  try {
+    packHtml = renderToStaticMarkup(React.createElement(mod.LeafPack, {
+      node: forest[0].children[0], depth: 2, columns: mColumns, statuses: mStatuses,
+      index: idx, dragId: null, dropAt: null,
+      onOpen: () => {}, onCardKey: () => {},
+      onDragStart: () => {}, onDragEnd: () => {}, allowCard: () => {}, allowPackLane: () => {},
+      onDrop: () => {}, halfOf: () => 0, packIndex: () => 0,
+    }));
+  } catch (e) { ok(false, `a leaf pack renders without throwing — ${e.message}`); }
+  ok(!!packHtml && packHtml.includes('Leaf one') && packHtml.includes('Leaf two'),
+     'a leaf pack renders BOTH leaves in their lanes');
+  ok(/work-card/.test(packHtml) && /work-leafpack/.test(packHtml),
+     '…as compact cards inside one leafpack row');
 
   let tailHtml = '';
   try {
