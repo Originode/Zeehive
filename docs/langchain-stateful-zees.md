@@ -210,49 +210,71 @@ a brand-new xell starts with an empty conversation — COLD by construction. The
 does not stand in for the cross-xell case, and is not offered as such.
 
 **The proposed cross-xell design** (not yet built — the state model is agreed here before code follows).
-**DECISION (2026-08-11): the carrier is the CARD — the work item.** This supersedes both the
-execution-plane carrier (the earlier `stable_key` draft) and a xell-keyed handover row, for the
-reason the CARD direction gives and the measurements back:
+**DECISION (2026-08-11): the carrier is a XELL-KEYED handover row — Option A.** The execution plane
+was considered and rejected as the carrier. The rejection is about **coverage**, not absence of a
+path — an execution-linked handover is structurally unavailable to most of the fleet. Measured on
+the fleet meta-DB:
 
-- The work item is the ONLY thing in this picture that already has a xell association
-  (`work_item.xell_id`), already **survives the xell being reaped** (`work_item.xell_id` is
-  `ON DELETE SET NULL`), and is already **what the dispatch names** — a successor xell is dispatched
-  onto the same work item.
-- `execution` cannot carry it: measured on the fleet meta-DB, `execution` has NO `xell_id` column,
-  `entity` has ZERO rows, nothing sets `execution.entity_id`, and `execution.outputs` is empty in 0
-  of 160 rows. There is NO xell→execution path today, in either direction — a successor cannot find
-  its predecessor's execution, and even if it could, the field is empty. Routing through `execution`
-  would require wiring xell↔execution (entity rows for xells, `execution.entity_id` populated,
-  readers re-pointed) as a PREREQUISITE CARD with a human's name on it (…-abc363's scope) — this
-  design does not silently absorb it.
-- A **xell-keyed** handover row is rejected for the same reason `zee_conversation` is working memory
-  and not the handover: keying by `xell_id` ties the handover to the cage, which is exactly the thing
-  that must NOT outlive it. The handover must survive the cage; only working memory dies with it.
+    execution total                                161
+    execution with work_node_id                    161   (entity_id: 0)
+    xells holding a work_item                       81
+    XELL -> EXECUTION reachable                     80   of those 81
+    EXECUTION -> XELL reachable                    106   of 161
+    execution.outputs non-empty                      0   of 161
+    xells total                                    584
+    live xells                                      23
 
-So the split is clean:
+The execution path exists and runs both ways — xell → `work_item.xell_id` → `work_node.stable_key`
+(`'work_item:'||id`) → `execution.work_node_id` reaches an execution for 80 of the 81 xells that
+hold a work item, and the reverse reaches 106 of 161 executions. But the path only exists for a xell
+that holds a WORK ITEM: 81 of 584 xells (~14%). Six xells in seven have none, so an execution-keyed
+handover is unavailable to most of the fleet — including, by construction, any xell cut for something
+that never became a card. A `xell_handover` row keyed by `xell_id` is available to all 584. THAT is
+why Option A wins: coverage, not absence of a path.
 
-- **Working memory** — `zee_conversation`, keyed by `xell_id`, `ON DELETE CASCADE` on reap. Dies with
-  the cage because it IS cage-scoped: a live zee's rolling context, useless to a brand-new cage.
-- **The handover** — keyed by the **work item**, surviving reap. The mechanism is a `work_item_event`
-  row with `kind='handover'` on the card: `work_item_event` is the EXISTING append-only audit trail
-  (`kind` is free text, `detail` is jsonb), so there is **no new table and no new carrier** — and it
-  is already rendered in the console next to the card a human is looking at. The latest
-  `kind='handover'` row for a work item IS the handover a successor reads.
+Three reasons, in order of weight:
+
+1. **Coverage** — the execution path reaches only the ~14% of xells that hold a work item; a
+   xell-keyed row reaches every xell. (The path itself is real; the earlier draft's "no path in
+   either direction" was WRONG and is corrected here.)
+2. **Composition** — keyed by the SAME key `zee_conversation` uses (`xell_id`), so the handover row
+   composes with what is already built and is found the same way.
+3. **No fragile dependency** — `execution.outputs` is non-empty in 0 of 161 rows (it has never been
+   written), `execution.entity_id` is never set, `entity` has zero rows, and `work_node.stable_key`
+   is a string convention a rename would break. Routing through `execution` would require wiring
+   xell↔execution (entity rows for xells, `execution.entity_id` populated, readers re-pointed) as a
+   PREREQUISITE CARD with a human's name on it (…-abc363's scope) — this design does not silently
+   absorb it.
+
+- **The carrier: a `xell_handover` row, keyed by `xell_id`** — the SAME key `zee_conversation` uses,
+  so it composes with what is already built. Written when the predecessor xell is retired/reaped;
+  read BY NAME when the successor is dispatched. Boring, reachable, available to every xell.
+
+> **LANDING NOTE (2026-08-11) — what actually happened, for the record.** This §5.2 landed as
+> Option A **after** the manager had directed the CARD (work-item) carrier. The coverage measurement
+> above is what settled it: a card-keyed handover has no carrier for six xells in seven (81 of 584
+> xells, ~14%, hold a work item), while a xell-keyed row is available to every xell. The manager
+> re-measured every number independently, agreed Option A is correct, and the CARD proposal was
+> withdrawn. An earlier report from this xell that "the CARD landed" was inaccurate — the landing
+> that went to main carried Option A — and the record is corrected here rather than left to read as
+> if the manager agreed with Option A all along. The working-memory/handover split stands
+> unchanged: `zee_conversation` (keyed by xell, dies with the cage) is working memory; the
+> xell-keyed `xell_handover` row (curated, not replayed, read only by a named successor, filtered
+> of cage-scoped values) is the handover.
 - **What crosses the boundary: a CURATED handover**, not the transcript. The durable conclusions:
   what was decided, what was verified, what remains, the constraints that still bind, the next
   concrete step. What stays behind: dead ends, wrong turns, local paths, tool blow-by-blow.
-- **How the successor is NAMED** — the handover is read off the work item the successor is dispatched
-  onto, and the naming is one of:
-  - **(a) SAME work item, NEW xell** — the successor is dispatched on the SAME work_item; it reads
-    that card's latest `kind='handover'` event. This is the unblocked half (does not need the
-    dependency-edge agreement).
+- **How the successor is NAMED** — the handover is read by name, and the name is one of:
+  - **(a) SAME work item, NEW xell** — the successor is dispatched on the SAME work_item; the
+    predecessor is the previous xell that held that work_item (via the work_item's xell history /
+    task row). The successor reads the predecessor's `xell_handover` for that work item.
   - **(b) DIFFERENT work item** — a successor CARD. The link is a `dependency` edge: **`from_id` is
     the PREDECESSOR, `to_id` the DEPENDENT** (get this backwards and the handover runs the wrong
     way). This is "chain" work already being designed by the …-16c430 xell; this design does NOT
-    invent a second carrier for it — it uses the same dependency edge, and the two efforts stay
-    aligned on one design for the edge.
-  - **Explicit:** a manager dispatches "continue <xell>" — the dispatch names the predecessor's work
-    item directly and the successor reads its handover.
+    invent a second carrier for it — it uses the same dependency edge to find the predecessor, then
+    reads that predecessor's `xell_handover`.
+  - **Explicit:** a manager dispatches "continue <xell>" — the dispatch names the predecessor
+    directly and reads its `xell_handover`.
   Without one of these, a new xell has no legitimate claim on another xell's conversation and must
   not receive it.
 - **Filtering:** any value scoped to the old cage (local paths, container names, session ids,
