@@ -226,13 +226,21 @@ export const MAX_TOOL_ITERATIONS = 8;
 export const TOOL_RESULT_CAP = 4000;
 
 export function buildTool(desc, ctx) {
+  // langchain's `tool(func, fields)` — the NAME and SCHEMA live in the SECOND argument (fields).
+  // The first argument is the func. Passing the schema first (the earlier bug) made the helper
+  // ignore the {name, description} object and emit a tool with NO name — which the REAL provider
+  // rejects ("tools[0]: missing field 'name'"), while the mock upstream (which never validates the
+  // tools array) happily accepted it. Found by the end-to-end exercise (2026-08-11).
   return tool(
-    desc.schema || { type: 'object', properties: {}, required: [] },
     async (args) => {
       const out = await desc.run(ctx.xell, args || {});
       return typeof out === 'string' ? out : JSON.stringify(out);
     },
-    { name: desc.name, description: desc.description },
+    {
+      name: desc.name,
+      description: desc.description,
+      schema: desc.schema || { type: 'object', properties: {}, required: [] },
+    },
   );
 }
 
@@ -252,6 +260,15 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
   messages.push(...history);
   const userMsg = new HumanMessage(task ?? '');
   messages.push(userMsg);
+
+  // PERSIST THE TASK UP FRONT (not only at the end) — the interruption fix. The previous shape
+  // appended the whole exchange ONCE after the loop finished, so a turn interrupted mid-tool-call
+  // (a provider 5xx, a network drop, a process kill) persisted NOTHING — the next turn started
+  // cold and the partial turn's context was gone. Found by the end-to-end exercise (2026-08-11).
+  // Now the user's task is persisted BEFORE any model call, so an interrupted turn keeps its task;
+  // the final assistant response is appended at the end (below). An interruption therefore loses at
+  // most the in-flight call, never the whole turn.
+  await appendConversation(xell.id, [userMsg]);
 
   // THE ALLOWLIST IS THE CONFINEMENT, STRUCTURALLY. Only tools in LANGCHAIN_TOOLS may be bound, and
   // every execution resolves through the allowlist (runTool, which defaults to LANGCHAIN_TOOLS). A
@@ -336,9 +353,18 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
     if (iterations >= maxIterations) { capHit = true; break; }
   }
 
-  // Persist the exchange so the NEXT zee on this xell starts warm. The tool interactions are the
-  // journey; the durable exchange is the user task + the final assistant response.
-  await appendConversation(xell.id, [userMsg, finalResp]);
+  // Persist the FINAL RESPONSE so the NEXT zee on this xell starts warm. The tool interactions are
+  // the journey; the durable exchange is the user task (persisted up front, above — the
+  // interruption fix) + this final assistant response. The task is NOT appended here again (it was
+  // written before the loop), so a completed turn has exactly one user + one assistant per turn.
+  // A turn that ended FOR A HUMAN (a tend raised) or hit the CAP produced no real answer — its
+  // last assistant message is a tool_use request or an unfinished thought, not something to replay
+  // as the assistant's reply. Persisting it would make the next turn see a stale assistant message
+  // that never resolved. So only a turn that actually ANSWERED appends its response; an interrupted
+  // / tended / capped turn keeps just the task, and the next turn re-derives from there.
+  if (!endedForHuman && !capHit) {
+    await appendConversation(xell.id, [finalResp]);
+  }
 
   // A CAPPED loop is a VISIBLE result, not a silent stop: the model never reached a final answer,
   // so the text says exactly that (a loop that quietly truncates looks like a finished answer).
