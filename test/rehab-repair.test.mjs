@@ -37,7 +37,7 @@ const migration186 = readFileSync(new URL('../db/migrations/186_repair_rehab_dep
 const { pool } = await import('../server/src/db/pool.js');
 
 async function cleanup() {
-  try { await q(`DELETE FROM project WHERE id = $1`, [PID]); } catch { /* */ }
+  try { await q(`DELETE FROM project WHERE id IN ($1,$2)`, [PID, '22222222-2222-4222-8222-222222222222']); } catch { /* */ }
 }
 
 try {
@@ -138,6 +138,38 @@ try {
   const dragExpected = [...vector, mid.sortOrder, head.sortOrder, tail.sortOrder].sort((a, b) => a - b);
   ok(JSON.stringify(dragRanks) === JSON.stringify(dragExpected),
     `drag sort_orders (fractional + negative) order correctly: ${JSON.stringify(dragRanks)}`);
+
+  // ── 4. 185 on a database with a foreign root (defect 3) ──────────────────
+  section('185 opens a new plan_version when the found version has a foreign root');
+  // A workflow test authored a plan with a root node (stable_key NULL) for the project.
+  const P2 = '22222222-2222-4222-8222-222222222222';
+  await q(`INSERT INTO project (id, name, repo_root, main_branch) VALUES ($1,'Foreign Root','/tmp/fr','main')`, [P2]);
+  const p2plan = (await q(`INSERT INTO plan (project_id, name) VALUES ($1,'test-plan') RETURNING id`, [P2])).rows[0].id;
+  const p2pv = (await q(`INSERT INTO plan_version (plan_id, version) VALUES ($1,1) RETURNING id`, [p2plan])).rows[0].id;
+  const foreignRoot = (await q(
+    `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, child_semantics)
+     VALUES ($1, NULL, '1', 'R', 'container', 'sequence') RETURNING id`, [p2pv])).rows[0].id;
+  await q(`UPDATE plan_version SET root_node_id=$1 WHERE id=$2`, [foreignRoot, p2pv]);
+
+  // Run 185 (fixed) — it must NOT abort on wn_one_root_per_version.
+  await client.query('BEGIN'); await client.query(migration185); await client.query('COMMIT');
+
+  const p2pvs = (await q(`SELECT pv.version, count(w.id) AS nodes FROM plan_version pv
+    LEFT JOIN work_node w ON w.plan_version_id=pv.id WHERE pv.plan_id=$1 GROUP BY pv.version ORDER BY pv.version`, [p2plan])).rows;
+  ok(p2pvs.length >= 2 && p2pvs[0].version === 1 && Number(p2pvs[0].nodes) === 1,
+    `foreign version untouched (v1 has the 1 foreign node): ${JSON.stringify(p2pvs)}`);
+  const p2rootNode = (await one(`SELECT wn.id, wn.plan_version_id FROM work_node wn WHERE wn.stable_key = (SELECT 'work_item:'||r.id::text FROM work_item r WHERE r.project_id=$1 AND r.kind='project')`, [P2]));
+  ok(!!p2rootNode && p2rootNode.plan_version_id !== p2pv,
+    `the project root has a work_node in a NEW plan_version (not the foreign v1): ${JSON.stringify(p2rootNode)}`);
+
+  // 185 must still be idempotent here — a second run changes nothing.
+  const p2before = await one(`SELECT (SELECT count(*)::int FROM plan_version WHERE plan_id=$1) AS pvs,
+    (SELECT count(*)::int FROM work_node wn JOIN plan_version pv ON pv.id=wn.plan_version_id WHERE pv.plan_id=$1) AS nodes`, [p2plan]);
+  await client.query('BEGIN'); await client.query(migration185); await client.query('COMMIT');
+  const p2after = await one(`SELECT (SELECT count(*)::int FROM plan_version WHERE plan_id=$1) AS pvs,
+    (SELECT count(*)::int FROM work_node wn JOIN plan_version pv ON pv.id=wn.plan_version_id WHERE pv.plan_id=$1) AS nodes`, [p2plan]);
+  ok(JSON.stringify(p2before) === JSON.stringify(p2after),
+    `185 idempotent with a foreign root present (${JSON.stringify(p2before)})`);
 
   console.log(fail ? `\n${fail} FAILURES` : '\nALL PASS');
   process.exitCode = fail ? 1 : 0;
