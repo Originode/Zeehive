@@ -2,20 +2,25 @@
 //
 // This is the "deploy zees via langchain" seam: the dispatch path routes a runtime whose
 // agent_runtime.driver='langchain' here instead of to a vendor CLI in a cxell. It creates the zee
-// row, claims the xell, starts the turn, runs ONE langchain model call through the gateway, persists
-// the conversation (so the NEXT zee on this xell starts warm), ends the turn, and returns the same
-// { ok, zee_id, xell_id, session, mode, permission_mode } contract the other spawn paths return.
+// row, claims the xell, starts the turn, drives the langchain agent turn (docs §8.3.1: the tool LOOP
+// in-process, bound ONLY to the wave-1 read/report verbs in langchain-tools.js — status/work/
+// working/item), persists the conversation (so the NEXT zee on this xell starts warm), ends the
+// turn, and returns the same { ok, zee_id, xell_id, session, mode, permission_mode } contract the
+// other spawn paths return.
 //
-// CONFINEMENT. A single model call with no tools needs no cage, so this runs in the queenzee
-// process. Tool execution (the next card) must move the agent loop inside the cxell; the design doc
-// names that explicitly. Until then a langchain zee's "work" is exactly one model call.
+// CONFINEMENT. The tool LIST is the confinement, and it is the wave-1 read/report registry only —
+// the manager's ruling (2026-08-11): an in-process loop bound to four read-only verbs cannot do
+// anything a single in-process model call cannot already do; it just does it more than once.
+// Workspace-action tools (bash/file/SQL/docker/git) and the gated asks (land/ship/seed — wave 2,
+// after wave 1 is green AND a test shows a bound `land` producing a HELD request) are NOT in the
+// registry, so the loop cannot reach them.
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { startTurn, endTurn, recordFeedEvent } from '../lib/turn-ledger.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { spawnCreds, scrubSecrets } from '../lib/provider-tokens.js';
-import { runLangchainTurn } from '../lib/langchain-zee.js';
+import { runLangchainAgentTurn } from '../lib/langchain-zee.js';
 
 export async function spawnLangchainZee({ pid, xell, task, rt, model = null, m = null, title = null,
                                           headless = true, provider = 'claude', providerTokenId = null } = {}) {
@@ -54,10 +59,23 @@ export async function spawnLangchainZee({ pid, xell, task, rt, model = null, m =
     broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
     feed({ type: 'system', subtype: 'init', session_id: sid });
 
-    const res = await runLangchainTurn({ xell, task, provider, model: ranModel, apiKey: token, xellToken });
+    const res = await runLangchainAgentTurn({
+      xell, task, provider, model: ranModel, apiKey: token, xellToken,
+      // Feed the play-by-play: each assistant message (with any tool_calls) as an `assistant` event,
+      // each executed tool as a `tool_use` block, and the final response as the `result`. The same
+      // SSE/feed contract the CLI path produces — a human replays the loop turn by turn.
+      onAssistant: (msg) => {
+        const content = [];
+        for (const b of msg?.content || []) {
+          if (b?.type === 'text' && b.text) content.push({ type: 'text', text: b.text });
+          if (b?.type === 'tool_use') content.push({ type: 'tool_use', name: b.name, input: b.input });
+        }
+        if (content.length) feed({ type: 'assistant', message: { content } });
+      },
+      onTool: ({ name, args }) => feed({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input: args }] } }),
+    });
     const text = res.text || '';
-    feed({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
-    feed({ type: 'result', is_error: false, result: text, usage: res.usage });
+    feed({ type: 'result', is_error: false, result: text, usage: res.usage, tool_calls: res.executed });
 
     const b = res.usage || { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, metered: false };
     await q(

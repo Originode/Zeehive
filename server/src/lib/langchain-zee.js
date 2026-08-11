@@ -24,9 +24,11 @@
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, AIMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
+import { tool } from '@langchain/core/tools';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { gatewayEnv } from './gateway.js';
+import { toolList, runTool, LANGCHAIN_TOOLS } from './langchain-tools.js';
 
 // openai + kimi speak the OpenAI dialect (/v1/chat/completions); everything else is Anthropic
 // dialect (/v1/messages — claude, deepseek; grok is /responses but Anthropic-shaped usage).
@@ -199,5 +201,122 @@ export async function runLangchainTurn({ xell, task = null, provider = 'claude',
     usage: usageFromLc(resp),
     content: resp.content,
     messages,          // what the model actually saw (history + task) — for tests/observability
+  };
+}
+
+// ── the TOOL LOOP (the "deploy zees via langchain" mechanism slice — docs §8.3.1) ──────────────
+// Model → tool request → queenzee-owned verb → tool result → model, looping, with every gate still
+// in front of everything irreversible. The loop is the QUEENZEE'S, not langchain's: langchain only
+// makes each model call and exposes the tool_calls; this function decides to continue, what to run,
+// when to stop, and WHO the xell is (the identity comes from the turn, never from the model).
+//
+// CONFINEMENT IS THE TOOL LIST: only the tools in the registry (langchain-tools.js) are bindable,
+// and they call the SAME handlers /api/xell/self/* uses. A request for anything outside the registry
+// is answered with a refusal (visible to the model, so it can recover) rather than a silent no-op.
+// The never-bindable verbs (workspace action, build/sync, manager verbs, done) are simply not in the
+// registry — enforced by absence, never by a runtime check that could be argued around.
+//
+// HARD CAP: `maxIterations` (default 8) bounds the loop. When the cap is hit the result is a VISIBLE
+// `capHit` — a loop that quietly truncates looks like a finished answer, which is the exact failure
+// a tool loop must not have.
+export const MAX_TOOL_ITERATIONS = 8;
+// Each tool result feeds back into the model's context; an unbounded result would blow it (a
+// selfStatus payload, a long listing). Capped like the gateway's body capture.
+export const TOOL_RESULT_CAP = 4000;
+
+export function buildTool(desc, ctx) {
+  return tool(
+    desc.schema || { type: 'object', properties: {}, required: [] },
+    async (args) => {
+      const out = await desc.run(ctx.xell, args || {});
+      return typeof out === 'string' ? out : JSON.stringify(out);
+    },
+    { name: desc.name, description: desc.description },
+  );
+}
+
+// Run the agent turn: load the xell's conversation, add the task, then the bounded loop.
+// `tools` defaults to the WAVE-1 registry (status/work/working/item). `onAssistant` / `onTool`
+// let the caller (spawnLangchainZee) feed the play-by-play. Returns the final model response, the
+// accumulated messages, how many model calls ran, whether the cap was hit, and which tools ran.
+export async function runLangchainAgentTurn({ xell, task = null, provider = 'claude', model = null,
+                                               apiKey = null, xellToken = null, system = null,
+                                               tools = toolList(), maxIterations = MAX_TOOL_ITERATIONS,
+                                               onAssistant = null, onTool = null } = {}) {
+  const { baseUrl } = chatModelConfig({ provider, xellToken });
+  const chat = buildChatModel({ provider, model, apiKey, baseUrl });
+  const history = await loadConversation(xell.id);
+  const messages = [];
+  if (system) messages.push(new SystemMessage(system));
+  messages.push(...history);
+  const userMsg = new HumanMessage(task ?? '');
+  messages.push(userMsg);
+
+  // THE ALLOWLIST IS THE CONFINEMENT, STRUCTURALLY. Only tools in LANGCHAIN_TOOLS may be bound, and
+  // every execution resolves through the allowlist (runTool, which defaults to LANGCHAIN_TOOLS). A
+  // caller passing an over-wide `tools` array cannot widen the loop: `bindable` filters it down to
+  // the allowlist, so a verb outside it is never even offered to the model, and if the model asks
+  // for it anyway runTool refuses it. The loop never binds or runs a verb the allowlist does not name.
+  const bindable = tools.filter((d) => LANGCHAIN_TOOLS[d.name]);
+  const bound = bindable.length ? chat.bindTools(bindable.map((d) => buildTool(d, { xell }))) : chat;
+  let iterations = 0;
+  let capHit = false;
+  let finalResp = null;
+  const executed = [];
+  // The loop makes several model calls; the zee_turn burn is the SUM of them all (the gateway
+  // already records each call individually in llm_gateway_request; this is the per-turn total).
+  const totalUsage = { cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, metered: false };
+  const addUsage = (u) => {
+    if (!u) return;
+    totalUsage.cost += Number(u.cost || 0);
+    totalUsage.input += Number(u.input || 0);
+    totalUsage.output += Number(u.output || 0);
+    totalUsage.cacheRead += Number(u.cacheRead || 0);
+    totalUsage.cacheWrite += Number(u.cacheWrite || 0);
+    totalUsage.metered = totalUsage.metered || !!u.metered;
+  };
+  while (true) {
+    iterations += 1;
+    finalResp = await bound.invoke(messages);
+    addUsage(usageFromLc(finalResp));
+    messages.push(finalResp);
+    if (onAssistant) { try { onAssistant(finalResp); } catch (e) { logline('langchain', `onAssistant threw (${String(e.message).slice(0, 80)})`); } }
+    const calls = finalResp.tool_calls || [];
+    if (!calls.length) break;                          // natural end — the model answered
+    for (const tc of calls) {
+      // ONE dispatch path: runTool (which resolves against the ALLOWLIST, never the caller's array)
+      // is the single place a tool is looked up and run — the allowlist refusal + the handler call.
+      // `desc` is the ALLOWLIST lookup (LANGCHAIN_TOOLS[tc.name]), so `executed`/`onTool` only ever
+      // record a verb the allowlist names; an over-wide caller array cannot leak a name in.
+      const desc = LANGCHAIN_TOOLS[tc.name];
+      const content = await runTool(xell, { name: tc.name, args: tc.args || {} });
+      if (desc) executed.push({ name: tc.name, args: tc.args || {} });
+      messages.push(new ToolMessage({ content: String(content).slice(0, TOOL_RESULT_CAP), tool_call_id: tc.id }));
+      if (onTool && desc) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
+    }
+    if (iterations >= maxIterations) { capHit = true; break; }
+  }
+
+  // Persist the exchange so the NEXT zee on this xell starts warm. The tool interactions are the
+  // journey; the durable exchange is the user task + the final assistant response.
+  await appendConversation(xell.id, [userMsg, finalResp]);
+
+  // A CAPPED loop is a VISIBLE result, not a silent stop: the model never reached a final answer,
+  // so the text says exactly that (a loop that quietly truncates looks like a finished answer).
+  const capped = capHit;
+  const text = capped
+    ? `Tool loop stopped: capped at ${iterations} iterations without reaching a final answer.`
+    : messageText(finalResp.content);
+
+  return {
+    text,
+    usage: totalUsage,
+    content: finalResp.content,
+    messages,
+    iterations,
+    capped,             // visible "the cap was hit" — never a silent truncation
+    capHit,
+    toolCalls: executed, // the tools that actually ran ({name, args}) — for the play-by-play
+    executed,
   };
 }

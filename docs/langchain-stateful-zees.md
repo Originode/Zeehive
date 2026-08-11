@@ -68,10 +68,25 @@ is the message type system that makes "here is the history, continue it" a first
 ### 2.3 Tool binding
 
 A langchain tool is a named function with a JSON schema; the chat model can request its use and the
-driver can execute it. **This is future work in the current build** (§8.3) — the first build drives
-a single model turn with no tool loop. When tool execution arrives, the tools must be queenzee-owned
-verbs (the `zee` CLI's gates, the repo's own scripts), not free actions, so the gates stay
-first-class.
+driver can execute it. The loop (`runLangchainAgentTurn`) is bounded, in-process, and the tool LIST
+is the confinement: only the verbs in the registry (`langchain-tools.js`) are bindable, each calling
+the SAME handler `/api/xell/self/*` calls, and the loop resolves through the ALLOWLIST (`LANGCHAIN_TOOLS`),
+never through a caller-supplied array — an over-wide array cannot widen the loop.
+
+The bound verbs are the read-only/report verbs (`status`, `work`, `working`, `item`) and the
+wave-2 ASK verb `tend` (it asks for a human and executes nothing). `hint-land` / `hint-ship` are NOT
+bound yet — their write shape (a `session_event` annotating a request, plus the hint state) has been
+reported to the manager and is pending their call before they are added.
+
+**The confinement is the ALLOWLIST, not the gate.** The wave-2 argument that `land`/`ship`/`seed`
+are safe to bind "because they terminate on a human" is FALSE on this fleet. Measured on the fleet
+meta-DB (2026-08-11): `project.auto_approve_land` / `auto_approve_ship` / `auto_approve_seed` are
+`true` for Zeehive and omnibiz, and the gates decide without a human in the path — `landgate.js:188`
+→ `:250` (`status='landed', decided_by='auto-approve@policy'`), `shipgate.js:223`, `seedgate.js:199`;
+593 auto-approved lands, 287 auto-approved ships, 10 auto-approved seeds. A bound `land` puts a
+model-chosen commit on main, `ship` deploys production, `seed` writes prod rows. So `land`/`ship`/
+`seed` are NOT in the registry and never will be added by a test. Do NOT flip `auto_approve_*` to
+make a hold appear — that is fleet-wide policy.
 
 ## 3. What the queenzee keeps (everything that is not a single model call)
 
@@ -322,14 +337,27 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
 - `db/migrations/192_...` — `zee_conversation` table + the `langchain-stateful` runtime row.
 - `server/src/lib/langchain-zee.js` — the driver: `buildChatModel` (gateway-pointed langchain chat
   model), `loadConversation` / `appendConversation` / `resetConversation` (DB-backed memory),
-  `runLangchainTurn` (load → invoke → append → return).
+  `runLangchainTurn` (single model call) and `runLangchainAgentTurn` (the bounded tool loop).
+- `server/src/lib/langchain-tools.js` — the tool registry (`status`, `work`, `working`, `item`,
+  `tend`), the allowlist that is the confinement. Each tool calls the SAME handler `/api/xell/self/*`
+  calls (selfStatus/selfWork/selfWorking/selfWorkItem/selfTend), never a second copy; anything
+  outside the registry is refused visibly. `working` carries the TEND GUARD (refuses while a tend is
+  open, so a model cannot silently clear a human's question).
 - `spawnLangchainZee` in the dispatch path — a real zee driven by the driver: creates the zee row,
-  starts the turn, runs the model call through the gateway, persists the conversation, ends the
-  turn with the burn.
-- `test/langchain-zee.test.mjs` — a standalone test that proves the SAME-XELL turnover (see §5.1):
-  two zee rows on one xell; the second zee's model call is seeded with the first zee's conversation,
-  and both calls land in `llm_gateway_request` through the real `gatewayProxy`. It also drives the
-  real `spawnLangchainZee` path end to end (zee row, turn lifecycle, burn, gateway ledger).
+  starts the turn, drives `runLangchainAgentTurn` (the loop, bound to the wave-1 registry), feeds
+  the play-by-play, persists the conversation, ends the turn with the summed burn.
+- `test/langchain-zee.test.mjs` — proves the SAME-XELL turnover (see §5.1): two zee rows on one
+  xell; the second zee's model call is seeded with the first zee's conversation, both calls land in
+  `llm_gateway_request` through the real `gatewayProxy`, and the real `spawnLangchainZee` path runs
+  end to end.
+- `test/langchain-tools.test.mjs` — proves the tool loop end to end through the real gateway: the
+  model requests `working`, the queenzee runs the SHARED `selfWorking` handler, the result feeds
+  back and the model concludes; an unbound tool is refused visibly and the loop continues; the loop
+  resolves through the ALLOWLIST even when the caller passes an over-wide `tools` array (the extra
+  verb is refused, never run); `tend` is bound and produces a `tend_request` a human answers; an
+  open tend SURVIVES a model `working` call (the tend guard refuses); a tool-happy model is stopped
+  at the cap with a VISIBLE capped result; every iteration is recorded in `llm_gateway_request`
+  attributed to the live zee + open turn.
 
 **STATUS: BUILT, TESTED, and NOT YET ENABLED on any zee.** Measured on the fleet meta-DB:
 `zee_conversation` has 0 rows across 0 xells — the migration is landed and applied (the table is
@@ -345,6 +373,13 @@ standalone test, not by a live zee.
   written per call).
 - The queenzee stays deterministic: langchain is invoked, never invoked-by; no graph, no framework
   loop.
+- **The confinement is the ALLOWLIST, not the gate.** `land`/`ship`/`seed` are NOT bindable because
+  this fleet auto-approves them — `project.auto_approve_land/ship/seed = true` for Zeehive and
+  omnibiz, so the gates act with `decided_by='auto-approve@policy'` and no human in the path
+  (landgate.js:188→250, shipgate.js:223, seedgate.js:199; measured: 593 auto-approved lands, 287
+  auto-approved ships, 10 auto-approved seeds). A bound `land`/`ship`/`seed` would be the ACT, not a
+  request. They stay absent from the registry. (This corrects an earlier draft that called the gated
+  verbs safe "because they terminate on a human" — on this fleet they do not.)
 - **Dependencies are the scoped langchain packages only** — `@langchain/anthropic`, `@langchain/openai`,
   `@langchain/core`. The `langchain` umbrella is deliberately NOT a dependency: it is never imported
   and it pulls the `@langchain/langgraph` runtime into the tree. `npm ls langgraph` is empty.
@@ -355,18 +390,32 @@ standalone test, not by a live zee.
 1. **Cross-xell turnover** — the curated-handover design in §5.2: what a successor xell is handed
    when it continues work from a different xell, carried on a XELL-KEYED `xell_handover` row (the
    same key `zee_conversation` uses — Option A, the agreed decision; the execution plane was
-   rejected as the carrier because it has no xell↔execution path and its `outputs` is empty).
+   rejected as the carrier on COVERAGE: a card/execution-linked handover is structurally unavailable
+   to the ~86% of xells that hold no work item, not because the xell↔execution path is absent — the
+   path exists, it just does not reach most of the fleet, and `execution.outputs` has never been
+   written).
    Split into same-work-item (case a) and different-work-item (case b, the dependency edge, kept
    aligned with …-16c430's chain work). The old xell's local paths and dead ends are filtered out.
    This is the design gap this card names; it is the natural next card once the state model is
    agreed and read.
-2. **Tool loop** — the driver currently makes one model call per turn. The multi-call loop (model →
-   tool request → tool result → model → …) is the natural next step, with tools bound through
-   langchain's tool interface and executed through queenzee-owned, gate-respecting verbs.
-3. **Cxell-sandboxed langchain agent** — the first build runs the model call in the queenzee
-   process (safe for a single model call: no tools, no file access). When the agent gains tools, it
-   must run inside the cxell so the container remains the permission boundary; that means shipping
-   langchain in the zee-agent image.
+2. **Tool loop** — the multi-call loop (model → tool request → tool result → model → …) with tools
+   bound through langchain's tool interface and executed through queenzee-owned, gate-respecting
+   verbs. WAVE 1 (the mechanism slice) is BUILT: the loop runs in the queenzee process, bound ONLY
+   to the read-only, no-side-effect registry verbs (`status`, `work`, `working`, `item`), a hard
+   cap of 8 iterations with the cap visible when hit, and ONE handler shared with `/api/xell/self/*`
+   (never a second copy of a verb's logic). The wave-2 ASK verb `tend` is bound — it asks for a
+   human and executes nothing. `hint-land` / `hint-ship` are NOT bound yet (their write shape is
+   reported to the manager and pending their call). `land`/`ship`/`seed` are NOT bound and never will
+   be by a test: this fleet auto-approves them (§2.3, §8.2), so there is no human hold for a bound
+   ask to reach — the confinement is the allowlist, not the gate.
+3. **Cxell-sandboxed langchain agent (workspace action)** — the boundary for tools is drawn by WHAT
+   A TOOL CAN DO, not by the existence of tools (this amends an earlier, too-coarse sentence here
+   that said any tool ⇒ the cage). Read-only, no-side-effect verbs (`status`, `work`, `working`,
+   `item`) may be bound in-process — they acquire no privilege a single in-process model call does
+   not already have. Any tool with WORKSPACE ACTION — file write, shell, SQL, docker, git, and
+   every gated verb — must run inside the cxell so the container remains the permission boundary,
+   and that waits on shipping langchain in the zee-agent image. Until the image lands, workspace
+   action is NOT bindable anywhere.
 4. **Conversation pruning / token budgeting** — a long-running xell's `zee_conversation` grows
    without bound; the next card should add a per-xell cap (e.g. keep the last N messages, oldest
    summarized) so warm starts stay within a token budget.
