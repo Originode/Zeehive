@@ -161,6 +161,12 @@ async function main() {
     ok(b1Dep && b1Dep.origin === 'dependency', `B1's edge from A3 is a DECLARED dependency (got ${b1Dep?.origin})`);
     const a2Dep = (byNameG.get('A2')?.deps || []).find((d) => d.id === byNameG.get('A1')?.id);
     ok(a2Dep && a2Dep.origin === 'sequence', `A2's edge from A1 is board-position inference (sequence), not a declared chain (got ${a2Dep?.origin})`);
+    // scheduled — a row participates in DECLARED order iff a dependency endpoint is in its
+    // subtree. D1 (independent) is board-order only → lane; B1 (a declared endpoint) and the
+    // project root (contains the declared edges) are scheduled.
+    ok(byNameG.get('D1')?.scheduled === false, `D1 (independent) is board-order only — scheduled=false (lane)`);
+    ok(byNameG.get('B1')?.scheduled === true, `B1 (a declared dependency endpoint) is scheduled=true`);
+    ok(byNameG.get(`gantt-sched-${tag}`)?.scheduled === true, `the project root (contains the declared chains) is scheduled=true`);
   } finally {
     try {
       await q(`DELETE FROM project WHERE id=$1`, [projectId]);
