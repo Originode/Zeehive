@@ -3155,6 +3155,15 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .xob-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; max-height: 66vh; overflow-y: auto; }
 .xob-summary { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text); padding: 8px 10px; background: var(--panel2); border-radius: 8px; }
 .xob-summary b { color: var(--accent); }
+.xob-sum-item { white-space: nowrap; }
+.xob-sum-item + .xob-sum-item { padding-left: 18px; border-left: 1px solid var(--line); }
+/* The token-share bar — each turn's token burn as a segment. A long bar of many segments says
+   "the burn is spread out"; one dominant segment says "one turn ate the window". */
+.xob-tokbar { display: flex; gap: 2px; height: 6px; border-radius: 3px; overflow: hidden;
+  background: var(--bg); border: 1px solid var(--line); padding: 1px; }
+.xob-tokbar-seg { background: var(--accent); border-radius: 2px; min-width: 2px;
+  transition: width .2s ease; }
+.xob-tokbar-seg:nth-child(even) { background: color-mix(in srgb, var(--accent) 75%, var(--bg)); }
 .xob-empty { color: var(--muted); font-size: 13px; line-height: 1.5; }
 .xob-turns { display: flex; flex-direction: column; gap: 6px; }
 .ob-turn { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }

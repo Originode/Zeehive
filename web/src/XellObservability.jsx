@@ -325,6 +325,11 @@ export default function XellObservability({ xell, onClose }) {
     tokens: a.tokens + Number(t.input_tokens || 0) + Number(t.output_tokens || 0)
       + Number(t.cache_read_tokens || 0) + Number(t.cache_write_tokens || 0),
   }), { cost: 0, tokens: 0 });
+  // The token-share bar — each turn's tokens as a segment of a horizontal bar, so a human sees
+  // at a glance which turns dominated the burn. Mirrors the trace-viewer's summary strip.
+  const turnTok = turns.map((t) => Number(t.input_tokens || 0) + Number(t.output_tokens || 0)
+    + Number(t.cache_read_tokens || 0) + Number(t.cache_write_tokens || 0));
+  const maxTok = Math.max(...turnTok, 1);
 
   return (
     <div className="disp-overlay" onClick={onClose}>
@@ -355,10 +360,19 @@ export default function XellObservability({ xell, onClose }) {
               {tab === 'turns' && (
                 <>
                   <div className="xob-summary">
-                    <span><b>{turns.length}</b> turn(s) recorded</span>
-                    <span><b>{fmtUsd(sum.cost)}</b> total (shown window)</span>
-                    <span><b>{fmtTok(sum.tokens)}</b> tok (shown window)</span>
+                    <span className="xob-sum-item"><b>{turns.length}</b> turn(s)</span>
+                    <span className="xob-sum-item"><b>{fmtUsd(sum.cost)}</b> cost</span>
+                    <span className="xob-sum-item"><b>{fmtTok(sum.tokens)}</b> tok</span>
                   </div>
+                  {turns.length > 0 && (
+                    <div className="xob-tokbar" aria-label="token usage per turn">
+                      {turnTok.map((t, i) => (
+                        <span key={i} className="xob-tokbar-seg"
+                              style={{ width: `${(t / maxTok) * 100}%` }}
+                              title={`${fmtTok(t)} tok — ${turns[i]?.model || 'turn'}`} />
+                      ))}
+                    </div>
+                  )}
                   {turns.length === 0
                     ? <div className="xob-empty">
                         No turns recorded yet. A turn appears when a zee starts working in this xell
