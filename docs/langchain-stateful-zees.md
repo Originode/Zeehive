@@ -356,10 +356,10 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   model requests `working`, the queenzee runs the SHARED `selfWorking` handler, the result feeds
   back and the model concludes; an unbound tool is refused visibly and the loop continues; the loop
   resolves through the ALLOWLIST even when the caller passes an over-wide `tools` array (the extra
-  verb is refused, never run); `tend` is bound and produces a `tend_request` a human answers; an
-  open tend SURVIVES a model `working` call (the tend guard refuses); a tool-happy model is stopped
-  at the cap with a VISIBLE capped result; every iteration is recorded in `llm_gateway_request`
-  attributed to the live zee + open turn.
+  verb is refused, never run); `tend` is bound and producing one ENDS the turn with a visible
+  "Turn ended: a human was asked" result; a tool-happy model is stopped at the cap with a VISIBLE
+  capped result; every iteration is recorded in `llm_gateway_request` attributed to the live zee +
+  open turn.
 
 **STATUS: BUILT, TESTED, and NOT YET ENABLED on any zee.** Measured on the fleet meta-DB:
 `zee_conversation` has 0 rows across 0 xells — the migration is landed and applied (the table is
@@ -393,10 +393,21 @@ standalone test, not by a live zee.
   langchain loop IS the harness for a langchain zee. A `tend clear` does NOT end the turn (it is
   answering, not asking). `hint-land`/`hint-ship` do NOT end the turn — a hint lights a button and
   the zee keeps working; ending on a hint would invent a stop the fleet does not have.
-- **The `working` TEND GUARD.** `working` REFUSES while a tend is open on this xell, and names WHAT
-  the human was asked — so a model ping cannot silently clear a question posted to a human. The
-  guard is on the TOOL path only (a CLI zee's `zee working` still auto-clears, because a CLI zee is
-  a deliberate act that can read the room). `pingWorking` is untouched.
+- **`working` is the PLAIN shared handler — no wrapper.** An earlier TEND GUARD on the `working`
+  tool (refusing while a tend is open) was REMOVED per the manager's ruling: it forked the verb —
+  made `working` mean "refuse" to a langchain zee and "clear the tend" to a cxell zee, with the
+  divergence in a file nobody editing status.js opens. The tool IS the door to `selfWorking`, not a
+  copy of it. What must be shared is the VERB'S EFFECT; whether the TURN continues is harness policy
+  (the loop-ends-turn rule above).
+- **KNOWN LIMITATION (recorded, deliberate):** with the guard gone, a model CAN still clear a tend
+  that SOMEONE ELSE raised — a manager, a human — by calling `working` mid-loop, because `working`
+  auto-clears an open tend (lib/status.js:383, inside `pingWorking`; `selfWorking` computes
+  `tendNudge` before the ping for this reason, self.js:1235). Loop-ends-turn only covers a tend the
+  model raised ITSELF. This is accepted deliberately: a cxell zee can do exactly the same thing
+  (`zee working` auto-clears whoever raised it), so the langchain zee is no worse than the fleet it
+  joins. If that auto-clear is wrong, it is wrong for EVERY zee and the fix belongs in `pingWorking`
+  for everybody — a decision nobody here owns — not a langchain-local patch that makes one harness
+  safer than the rest.
 - No gate changes, no `hooks/` changes, no prod writes.
 
 ### 8.3 Not built yet (next cards)
