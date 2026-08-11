@@ -92,6 +92,17 @@ export const deleteTicket = (id) => call(`/api/tickets/${encodeURIComponent(id)}
 export const addComment = (id, payload) => send(`/api/tickets/${encodeURIComponent(id)}/comments`, 'POST', payload);
 // items: [{title, kind, parent_id?, body?, priority?}] — the manager's "break this ticket down"
 // action. One round trip, because half a created tree is worse than none.
+// ATTACHMENTS — the evidence on a ticket (images, logs, json/xml). The list is metadata only;
+// bytes come from the download url, which the server always serves as a download with nosniff
+// (an attachment is content somebody OUTSIDE this fleet uploaded — see docs/ticketing-api.md).
+export const listTicketAttachments = (id) => call(`/api/tickets/${encodeURIComponent(id)}/attachments`);
+export const addTicketAttachment = (id, payload) =>
+  send(`/api/tickets/${encodeURIComponent(id)}/attachments`, "POST", payload);
+export const deleteTicketAttachment = (id, attachmentId) =>
+  call(`/api/tickets/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}`, { method: "DELETE" });
+export const attachmentUrl = (ticketId, attachmentId) =>
+  `/api/tickets/${encodeURIComponent(ticketId)}/attachments/${encodeURIComponent(attachmentId)}`;
+
 export const breakdownTicket = (id, items) => send(`/api/tickets/${encodeURIComponent(id)}/breakdown`, 'POST', { items });
 
 // ── telling a manager about a ticket ────────────────────────────────────────
