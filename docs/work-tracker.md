@@ -505,6 +505,11 @@ which is not ISO 8601 and gives `NaN` or a silently different day depending on t
 
 ## The endpoints
 
+These are the CONSOLE endpoints, authenticated as the console. A DEPLOYED project — omnibiz
+filing into its own board from somebody else's server — comes in through a second, key-authenticated
+door at `/api/ext/v1`, documented in [ticketing-api.md](ticketing-api.md). It creates ORDINARY rows in
+these same tables: everything below applies to an externally-filed ticket unchanged.
+
 | method | path | notes |
 |---|---|---|
 | GET | `/api/work-statuses` | the vocabulary: labels, order, terminal, legal transitions, kinds |
@@ -514,6 +519,8 @@ which is not ISO 8601 and gives `NaN` or a silently different day depending on t
 | PATCH | `/api/tickets/:id` | title/body/kind/status/priority/reporter/assignee/labels/work_item_id |
 | DELETE | `/api/tickets/:id` | work items survive, `unlinked_work_items` says how many |
 | POST | `/api/tickets/:id/comments` | `{author, body}` |
+| GET/POST | `/api/tickets/:id/attachments` | the evidence on a ticket — images and text logs, metadata on the way out, `content_base64`/`text` on the way in |
+| GET/DELETE | `/api/tickets/:id/attachments/:attachmentId` | download the raw bytes (always a download, `nosniff`), or remove one |
 | POST | `/api/tickets/:id/breakdown` | `{items:[…], actor}` → the created tree. **One transaction**: all six items or none |
 | GET | `/api/tickets/:id/managers` | the manager zees of this ticket's project, resolved live, each with `live` + a `why` line |
 | POST | `/api/tickets/:id/notify` | `{xell_id, by}` → tells that manager about the ticket. Answers `{code, delivered, delivery, note}` |

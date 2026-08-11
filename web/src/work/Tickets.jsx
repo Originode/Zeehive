@@ -3,6 +3,7 @@ import { showAlert, showConfirm } from '../Dialog.jsx';
 import {
   addComment, breakdownTicket, createTicket, deleteWorkItem, getTicket, getTicketManagers,
   listTickets, notifyTicketManager, patchTicket,
+  addTicketAttachment, deleteTicketAttachment, attachmentUrl,
 } from './workApi.js';
 import { Breadcrumb, ErrLine, KindGlyph, Pips, StatusDot, legalNext, statusLabel } from './bits.jsx';
 
@@ -178,6 +179,7 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
   const t = d?.ticket || d;
   const comments = d?.comments || t?.comments || [];
   const items = d?.work_items || t?.work_items || [];
+  const attachments = d?.attachments || t?.attachments || [];
   const parsed = useMemo(() => parsePlan(plan), [plan]);
 
   const post = async () => {
@@ -294,6 +296,14 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
         {t.reporter && <span className="work-muted">reported by {t.reporter}</span>}
         {(t.labels || []).map((l) => <span key={l} className="work-label">{l}</span>)}
         <span className="work-muted">{statusLabel(statuses, t.status)}</span>
+        {/* WHERE IT CAME FROM. A ticket filed through /api/ext/v1 by a deployed project carries its
+            source and its own id; a human reading the board should never have to guess whether the
+            reporter was a person or omnibiz's helpdesk (docs/ticketing-api.md). */}
+        {t.source && <span className="work-label" title={`filed through the external ticketing API by ${t.source}`}>⇢ {t.source}</span>}
+        {t.external_ref && (t.external_url
+          ? <a className="work-label" href={t.external_url} target="_blank" rel="noreferrer"
+               title="open this ticket where it was reported">{t.external_ref} ↗</a>
+          : <span className="work-label" title="the reporter's own id for this">{t.external_ref}</span>)}
       </div>
       <NotifyManager ticketId={id} onError={setErr} />
       {t.body && <div className="work-tbody">{t.body}</div>}
@@ -356,6 +366,8 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
         </div>
       </section>
 
+      <Attachments ticketId={id} rows={attachments} onChanged={load} onError={setErr} />
+
       <section className="work-sec">
         <header className="work-sec-h"><span>comments ({comments.length})</span></header>
         <div className="work-sec-b">
@@ -375,6 +387,86 @@ function TicketDetail({ id, projectId, statuses, onClose, onChanged, onOpenItem 
         </div>
       </section>
     </div>
+  );
+}
+
+// ── EVIDENCE: the attachments on a ticket ────────────────────────────────────
+//
+// A ticket filed by a deployed project arrives WITH its proof — the screenshot, the stack trace,
+// the json the gateway returned (docs/ticketing-api.md). Without this panel that evidence exists
+// only in the database, and the zee who has to fix the thing is back to asking for it.
+//
+// Bytes are never inlined into this page. Images are shown through the download url (the server
+// sends every attachment as a download with X-Content-Type-Options: nosniff, because this is
+// content somebody OUTSIDE the fleet uploaded), and everything else is a link.
+const KIND_GLYPH = { image: "🖼", log: "📄", data: "{ }", file: "📎" };
+const prettyBytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB`
+  : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
+
+function Attachments({ ticketId, rows = [], onChanged, onError }) {
+  const [busy, setBusy] = useState(false);
+  const [shown, setShown] = useState(null);      // attachment id previewed inline
+
+  // A console upload rides the same lib as the API's: read the file, base64 it, POST it. The
+  // server owns the allow-list and the size limits, so a refusal here is the server's sentence.
+  const upload = async (file) => {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < buf.length; i += 8192) bin += String.fromCharCode(...buf.subarray(i, i + 8192));
+      await addTicketAttachment(ticketId, {
+        filename: file.name, content_type: file.type || undefined,
+        content_base64: btoa(bin), uploaded_by: "human@console",
+      });
+      await onChanged?.();
+    } catch (e) { onError?.(e); } finally { setBusy(false); }
+  };
+
+  const drop = async (a) => {
+    if (!await showConfirm(`Delete "${a.filename}"?\n\nThe bytes go with it — if the reporter's system still has the file it can be re-attached, otherwise this is the only copy.`,
+                           { variant: "danger", okLabel: "Delete" })) return;
+    setBusy(true);
+    try { await deleteTicketAttachment(ticketId, a.id); await onChanged?.(); }
+    catch (e) { onError?.(e); } finally { setBusy(false); }
+  };
+
+  return (
+    <section className="work-sec">
+      <header className="work-sec-h">
+        <span>attachments ({rows.length})</span>
+        <label className="work-mini" style={{ cursor: "pointer" }}>
+          {busy ? "…" : "＋ attach"}
+          <input type="file" style={{ display: "none" }} disabled={busy}
+                 onChange={(e) => { upload(e.target.files?.[0]); e.target.value = ""; }} />
+        </label>
+      </header>
+      <div className="work-sec-b">
+        {rows.map((a) => {
+          const url = a.download_url || attachmentUrl(ticketId, a.id);
+          return (
+            <div key={a.id} className="work-row" style={{ cursor: "default" }}>
+              <span title={a.content_type}>{KIND_GLYPH[a.kind] || KIND_GLYPH.file}</span>
+              <a className="work-row-t" href={url} target="_blank" rel="noreferrer"
+                 title={`${a.content_type} · sha256 ${(a.sha256 || "").slice(0, 12)}…`}>{a.filename}</a>
+              <span className="work-muted">{prettyBytes(a.size_bytes || 0)}</span>
+              {a.source && <span className="work-muted" title="how it arrived">{a.source}</span>}
+              {a.kind === "image" && (
+                <button className="work-mini" onClick={() => setShown(shown === a.id ? null : a.id)}>
+                  {shown === a.id ? "hide" : "view"}
+                </button>
+              )}
+              <button className="work-mini" disabled={busy} onClick={() => drop(a)} title="delete this attachment">🗑</button>
+              {shown === a.id && (
+                <img src={url} alt={a.filename} style={{ maxWidth: "100%", display: "block", marginTop: 6 }} />
+              )}
+            </div>
+          );
+        })}
+        {!rows.length && <div className="work-none">no evidence attached</div>}
+      </div>
+    </section>
   );
 }
 
