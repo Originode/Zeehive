@@ -2985,8 +2985,8 @@ export async function selfWorkItem(xell, { id = null, status = null, progress = 
     if (!hasReport) {
       const fresh = await getItem(target.id);
       return { ok: true, item: fresh,
-        message: `Schedule recorded on "${fresh.title}" — estimate ${fresh.estimate_hours ?? '—'}h, `
-          + `starts ${fresh.starts_on ?? '—'}, due ${fresh.due_on ?? '—'}.` };
+        message: `Schedule recorded on "${target.title}" — estimate ${est}h, `
+          + `starts ${starts_on ?? '—'}, due ${due_on ?? '—'}.` };
     }
     return await reportItemStatus(target.id, { status, progress: p, note, actor: xell.slug });
   } catch (e) {
