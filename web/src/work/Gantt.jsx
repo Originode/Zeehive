@@ -69,6 +69,7 @@ export default function Gantt({ projectId }) {
       {model === null && !err && <div className="work-empty">loading the timeline…</div>}
       {model !== null && (
         <GanttChart rows={model.rows || []} planName={model.plan_name} version={model.version}
+                    hasDeclaredOrder={model.has_declared_order} edgeCounts={model.edge_counts}
                     onOpen={setOpen} />
       )}
       {open && <WeldWaterfall row={open} onClose={() => setOpen(null)} />}
@@ -81,7 +82,7 @@ export default function Gantt({ projectId }) {
 // (test/workflow-stage6.test.mjs renders it over real rows and asserts on the markup). It owns
 // only view state — zoom, collapse, hover, the bar in focus — and asks its parent to open the
 // waterfall. The timeline never writes; onOpen is the only callback.
-export function GanttChart({ rows = [], planName = null, version = null, onOpen, today, initialCollapsed }) {
+export function GanttChart({ rows = [], planName = null, version = null, hasDeclaredOrder = null, onOpen, today, initialCollapsed }) {
   const [zoom, setZoom] = useState(() => {
     try { const z = localStorage.getItem(ZOOM_KEY); return ZOOMS.some((x) => x.key === z) ? z : ZOOMS[1].key; }
     catch { return ZOOMS[1].key; }
@@ -194,11 +195,14 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
 
   // A dependency whose anchored predecessor has no bar cannot be drawn — and silence reads as
   // "that dependency was deleted". So every undrawable edge is collected WITH ITS REASON.
+  // deps are now { id, origin } — a sequence-origin predecessor is board order (drawn as a lane,
+  // not an arrow), a dependency-origin one is a declared chain.
   const hiddenDeps = useMemo(() => {
     const m = new Map();
     for (const r of visible) {
       const miss = [];
-      for (const depId of r.deps || []) {
+      for (const dep of r.deps || []) {
+        const depId = typeof dep === 'string' ? dep : dep.id;   // legacy fixture: a bare id = a real dep
         const anchor = visibleAnchor(depId);
         if (!anchor || anchor === r.id) continue;
         if (geom.get(anchor)?.span) continue;
@@ -220,7 +224,9 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
     for (const r of visible) {
       const to = geom.get(r.id);
       if (!to?.span) continue;
-      for (const depId of r.deps || []) {
+      for (const dep of r.deps || []) {
+        const depId = typeof dep === 'string' ? dep : dep.id;   // legacy fixture: a bare id = a real dep
+        const origin = typeof dep === 'string' ? 'dependency' : dep.origin;
         const fromId = visibleAnchor(depId);
         if (!fromId || fromId === r.id) continue;
         const from = geom.get(fromId);
@@ -228,7 +234,7 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
         const key = `${fromId}->${r.id}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        out.push({ key, itemId: r.id, depId: fromId, from, to, dep: byId.get(fromId), row: r });
+        out.push({ key, itemId: r.id, depId: fromId, origin, from, to, dep: byId.get(fromId), row: r });
       }
     }
     return out;
@@ -237,6 +243,11 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
   const rowsH = Math.max(ROW, visible.length * ROW);
   const empty = !rows.length;
   const nothingDated = !empty && !dated.length;
+  // NO ORDER DECLARED — the version has zero dependency-origin edges. The CPM may still compute
+  // an all-critical path (it schedules whatever edges it has — here, sequence-only, i.e. board
+  // position laundered into a schedule), but the chart must present that as the absence it is:
+  // a plan-level chip, no per-bar critical claims, and the sequence edges drawn as board order.
+  const noDeclaredOrder = hasDeclaredOrder === false;
 
   return (
     <div className="work-gchart">
@@ -265,6 +276,15 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
           <b>No dated work yet.</b>
           <span>Nothing here has a plan, an execution or a held lease, so there is nothing to place
                 on a timeline.</span>
+        </div>
+      )}
+      {noDeclaredOrder && !empty && !nothingDated && (
+        <div className="work-warn work-gorder" role="status">
+          <b>No order declared.</b>
+          <span>This plan has no dependency chains, so the CPM has nothing to rank — the hatched
+                bars are board order, not a schedule, and no bar is critical. Declare a real “after”
+                with <code>zee dep</code> (or the card’s “depends on” picker) and the chart will
+                draw it as a chain.</span>
         </div>
       )}
 
@@ -327,12 +347,13 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
                       <KindGlyph kind={r.kind} />
                       <button className="work-gtitle" title={`${r.name} — click to open the waterfall`}
                               onClick={() => onOpen?.(r)}>{r.name}</button>
-                      {r.critical && <span className="work-gcrit" title="on the critical path (zero slack)">crit</span>}
+                      {hasDeclaredOrder !== false && r.critical &&
+                        <span className="work-gcrit" title="on the critical path (zero slack)">crit</span>}
                     </div>
                     <div className="work-gtrack" style={{ width }}>
                       {span && (
-                        <div className={`${summary ? 'work-gsum' : 'work-gbar'}${r.critical ? ' crit' : ''}${hot ? ' hot' : ''}`
-                                        + `${span.inverted ? ' inverted' : ''}`}
+                        <div className={`${summary ? 'work-gsum' : 'work-gbar'}${r.critical && !noDeclaredOrder ? ' crit' : ''}${hot ? ' hot' : ''}`
+                                        + `${r.scheduled === false ? ' lane' : ''}${span.inverted ? ' inverted' : ''}`}
                              data-gbar={r.id} data-testid="work-gbar"
                              style={{ left: span.x, width: span.w }}
                              onClick={() => onOpen?.(r)}
@@ -389,10 +410,16 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
                 {arrows.map((a) => {
                   const on = focus === a.itemId || focus === a.depId;
                   const d = arrowPath(a.from, a.to);
+                  // A SEQUENCE-origin edge is board position, not a declared chain — drawn as a
+                  // muted board-order line with NO arrowhead. A DEPENDENCY-origin edge is a real
+                  // "after" — the arrowhead stays. The two are never visually the same.
+                  const seq = a.origin === 'sequence';
                   return (
-                    <g key={a.key} className={`work-garrow${on ? ' on' : ''}`}>
-                      <path d={d} className="work-garrow-line" markerEnd="url(#work-garrowhead)" />
-                      <title>{`${a.row?.name} depends on ${a.dep?.name || 'another node'}`}</title>
+                    <g key={a.key} className={`work-garrow${on ? ' on' : ''}${seq ? ' seq' : ''}`}>
+                      <path d={d} className="work-garrow-line" markerEnd={seq ? undefined : 'url(#work-garrowhead)'} />
+                      <title>{seq
+                        ? `${a.row?.name} is ordered after ${a.dep?.name || 'another node'} on the board — board order, not a declared chain`
+                        : `${a.row?.name} depends on ${a.dep?.name || 'another node'}`}</title>
                     </g>
                   );
                 })}
@@ -437,7 +464,9 @@ export function Tip({ row, x, y }) {
   return (
     <div className="work-gtip" style={{ left: Math.min(x + 14, viewportW() - 290), top: y + 16 }}>
       <div className="work-gtip-t"><KindGlyph kind={row.kind} /> {row.name}</div>
-      {row.critical && <div className="work-gtip-r crit">on the critical path{row.slack ? '' : ' · zero slack'}</div>}
+      {row.scheduled === false && <div className="work-gtip-r lane">board order — not scheduled</div>}
+      {row.scheduled !== false && row.critical &&
+        <div className="work-gtip-r crit">on the critical path{row.slack ? '' : ' · zero slack'}</div>}
       <div className="work-gtip-r">
         <span>planned</span>
         <span>{p(row.planned_start)} → {p(row.planned_end) || '…'}</span>
