@@ -352,9 +352,12 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   end to end.
 - `test/langchain-tools.test.mjs` — proves the tool loop end to end through the real gateway: the
   model requests `working`, the queenzee runs the SHARED `selfWorking` handler, the result feeds
-  back and the model concludes; an unbound tool is refused visibly and the loop continues; a
-  tool-happy model is stopped at the cap with a VISIBLE capped result; every iteration is recorded
-  in `llm_gateway_request` attributed to the live zee + open turn.
+  back and the model concludes; an unbound tool is refused visibly and the loop continues; the loop
+  resolves through the ALLOWLIST even when the caller passes an over-wide `tools` array (the extra
+  verb is refused, never run); `tend` is bound and produces a `tend_request` a human answers; an
+  open tend SURVIVES a model `working` call (the tend guard refuses); a tool-happy model is stopped
+  at the cap with a VISIBLE capped result; every iteration is recorded in `llm_gateway_request`
+  attributed to the live zee + open turn.
 
 **STATUS: BUILT, TESTED, and NOT YET ENABLED on any zee.** Measured on the fleet meta-DB:
 `zee_conversation` has 0 rows across 0 xells — the migration is landed and applied (the table is
