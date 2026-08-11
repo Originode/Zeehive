@@ -341,8 +341,10 @@ export async function inboxFor(xellId, { all = false, limit = 50 } = {}) {
     id: r.id, from: r.from_slug, kind: r.kind, body: r.body,
     at: r.created_at, was_unread: unread.includes(r.id),
     // The A2A envelope's ids, additively — present only when the row carries one (plan §5: old
-    // rows stay exactly as they were; no backfill, DR-4).
-    ...(r.meta?.a2a ? { a2a: { taskId: r.meta.a2a.taskId || null, contextId: r.meta.a2a.contextId || null } } : {}),
+    // rows stay exactly as they were; no backfill, DR-4). taskId is the row's own when it opened
+    // the task, else the referencedTaskId — the task the reply belongs to (a2a.js rowToMessage).
+    ...(r.meta?.a2a ? { a2a: { taskId: r.meta.a2a.taskId || r.meta.a2a.referencedTaskId || null,
+                               contextId: r.meta.a2a.contextId || null } } : {}),
   }));
 }
 

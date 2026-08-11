@@ -199,11 +199,16 @@ if (!url) {
     eq(soloA2a.referencedTaskId, undefined, '…and nothing to reference');
 
     // 5. inboxFor carries the ids additively — the zee inbox answer gains a2a per message.
-    //    The directive was sent TO the worker, so it is the worker's inbox that holds it.
+    //    The directive was sent TO the worker, so it is the worker's inbox that holds it; the
+    //    report was sent TO the manager, and it surfaces the task it ANSWERS as its taskId.
     const inbox = await inboxFor(worker.id, { all: true });
     const dir = inbox.find((m) => m.id === d.message.id);
     ok(dir && dir.a2a && dir.a2a.taskId === dA2a.taskId && dir.a2a.contextId === dA2a.contextId,
        'inboxFor includes a2a:{taskId, contextId} on an enveloped message');
+    const mgrInbox = await inboxFor(manager.id, { all: true });
+    const rep = mgrInbox.find((m) => m.id === r.message.id);
+    ok(rep && rep.a2a && rep.a2a.taskId === dA2a.taskId,
+       '…and a REPLY surfaces the task it references as its taskId (a2a.taskId || referencedTaskId)');
 
     console.log(`    (directive taskId=${dA2a.taskId.slice(0, 8)}…, contextId=${dA2a.contextId.slice(0, 8)}…, `
       + `report referenced=${rA2a.referencedTaskId.slice(0, 8)}…)`);
