@@ -32,6 +32,15 @@
 //   • the ZEE CHIP: liveZees() already derives a xell's hive status from the same signals fleet.js
 //     feeds it. It is used verbatim rather than re-derived a second way.
 //   • the ID CONTRACT: assertId — malformed → 400 naming the field, well-formed but unknown → 404.
+//
+// ── REHAB 2/4 — WHY "WHO HAS IT" STILL READS work_item.xell_id ─────────────────
+// The model's lease plane (migration 179) is where "who has it" belongs, but the rehab 1/4
+// dual-write writes EXECUTIONS only — no lease rows are written for work items yet. Re-pointing
+// these reads (getItem's xell_id, the busy check, candidatesFor, itemForXell, worksync's tick) at
+// the lease table would show every card unassigned and every busy check passing — a DIFFERENT board
+// than users see today, which the rehab forbids. Writing leases is a WRITER change deferred with the
+// conflation retirement (rehab 3/4). Until then the assignee link is work_item.xell_id, kept in step
+// by the dual-write, and this file's READ of it is documented as the conflation it is.
 import { q, one, pool } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';

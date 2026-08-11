@@ -88,6 +88,7 @@ import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, sugge
          crewFor, messagesForXell } from '../lib/managers.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
+import { workStatusModelVocabulary } from '../lib/model-status.js';
 import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
          addDep, removeDep, boardModel, ganttModel, assertId, httpStatusOf } from '../lib/work-items.js';
 import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
@@ -2421,7 +2422,14 @@ const projectOf = (req) => req.query.project || req.body?.project || req.body?.p
 // The vocabulary itself — labels, column order, terminal flags and the legal transitions, straight
 // from lib/work-status.js. It is an endpoint so the console never hardcodes a column list of its
 // own; that duplication is exactly what let hive-status and the web palette drift before.
-router.get('/work-statuses', (_req, res) => res.json(workStatusVocabulary()));
+// REHAB 2/4 — the vocabulary now also carries the MODEL's run-plane → work_status mapping
+// (lib/model-status.js, the ONE mapping every reader uses), so a client can learn "a 'waiting'
+// execution renders as review" without importing a server module. It is additive: the columns and
+// transitions are unchanged.
+router.get('/work-statuses', (_req, res) => res.json({
+  ...workStatusVocabulary(),
+  model_lifecycle: workStatusModelVocabulary(),
+}));
 
 // ── tickets ──────────────────────────────────────────────────────────────────
 router.get('/tickets', async (req, res) => {
