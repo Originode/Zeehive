@@ -412,9 +412,8 @@ function EditSections({ project, onChanged, onProject }) {
         <ManifestSection project={project} run={run} onProject={onProject} />
       </>}
       {tab === 'deploy' && <>
-        <SitesSection project={project} run={run} busy={busy} />
+        <DeployTree project={project} run={run} busy={busy} />
         <WireguardSection project={project} run={run} busy={busy} />
-        <InventorySection project={project} run={run} busy={busy} />
       </>}
       {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
@@ -1334,6 +1333,290 @@ function ManifestSummary({ manifest }) {
       {items.map(([k, v]) => (
         <span key={k} className="manifest-summary-item"><span className="pc">{k}</span> {v}</span>
       ))}
+    </div>
+  );
+}
+
+// ── Deploy sites & inventory as a MASTER-DETAIL TREE ──────────────────────────
+// One node per MACHINE (the master), its dev/prod deploy TYPES as the branches, and the shared
+// container inventory grouped by ROLE under each. This is the shape the data actually nests in: a
+// deploy site names WHERE a tier runs on a machine, and the shared container rows are what runs
+// there. Before this, Sites and Inventory were two flat lists that did not say how they relate —
+// a machine, a deploy type and a container all lived on the same tab but read as three unrelated
+// surfaces. The tree is one surface: machine → dev/prod → db/server/app.
+//
+// A machine with no deploy sites or containers still shows (its "+ site" affordance is how a
+// branch comes into being); a tier with a site but no containers shows an empty inventory (a
+// place you can add one); a tier with containers but no site shows a "add site" hint. Per-xell
+// spinoff stacks are a xell's throwaway stack, not deploy inventory, so they are not here.
+const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', infra: 'Infra' };
+
+function DeployTree({ project, run, busy, initial = {} }) {
+  // `initial` seeds the state (the render test passes a fixture; the live console does not, so the
+  // mount effect fetches). Keeping the fetch as the live path means the tree is always current.
+  const [machines, setMachines] = useState(initial.machines || []);
+  const [sites, setSites] = useState(initial.sites || []);
+  const [containers, setContainers] = useState(initial.containers || []);
+  const load = useCallback(() => {
+    getMachines().then(setMachines).catch(() => setMachines([]));
+    getSites(project.id).then(setSites).catch(() => setSites([]));
+    getSharedContainers(project.id).then(setContainers).catch(() => setContainers([]));
+  }, [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+
+  // No machines yet → the pre-machine world: the old flat Sites + Inventory sections, unchanged.
+  if (!machines.length) {
+    return (<>
+      <SitesSection project={project} run={run} busy={busy} />
+      <InventorySection project={project} run={run} busy={busy} />
+    </>);
+  }
+
+  const siteCtx = new Map((sites || []).map((s) => [s.id, s.docker_ctx]));
+  const ctxOf = (c) => c.docker_ctx || (c.site_id ? siteCtx.get(c.site_id) : null) || null;
+  const known = new Set(machines.map((m) => m.docker_ctx));
+  const elsewhere = containers.filter((c) => !known.has(ctxOf(c)));
+  const nodes = machines.map((m) => ({
+    m,
+    devSites: sites.filter((s) => s.docker_ctx === m.docker_ctx && s.tier === 'dev'),
+    prodSites: sites.filter((s) => s.docker_ctx === m.docker_ctx && s.tier === 'prod'),
+    dev: containers.filter((c) => ctxOf(c) === m.docker_ctx && c.tier === 'dev'),
+    prod: containers.filter((c) => ctxOf(c) === m.docker_ctx && c.tier === 'prod'),
+  }));
+
+  return (
+    <section className="deploy-tree" data-testid="deploy-tree">
+      {nodes.map((n) => (
+        <DeployMachine key={n.m.id} node={n} sites={sites}
+                       project={project} run={wrapped} busy={busy} />
+      ))}
+      {elsewhere.length > 0 && (
+        <div className="dt-machine elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them">
+          <div className="dt-machine-head"><b>elsewhere</b></div>
+          <div className="dt-body">
+            <DeployBranch tier="dev" sites={[]} containers={elsewhere.filter((c) => c.tier === 'dev')}
+                          machine={null} project={project} run={wrapped} busy={busy} />
+            <DeployBranch tier="prod" sites={[]} containers={elsewhere.filter((c) => c.tier === 'prod')}
+                          machine={null} project={project} run={wrapped} busy={busy} />
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DeployMachine({ node, sites, project, run, busy }) {
+  const { m, devSites, prodSites, dev, prod } = node;
+  return (
+    <div className="dt-machine" data-testid={`deploy-machine-${m.key}`}>
+      <div className="dt-machine-head" title={`${m.label || m.key}\ncontext: ${m.docker_ctx}${m.host_ip ? `\nhost: ${m.host_ip}` : ''}${m.notes ? `\n${m.notes}` : ''}`}>
+        <b className="dt-machine-key">{m.key}</b>
+        <span className="mono">{m.docker_ctx}</span>
+        <span className="pc">{m.host_ip ? `host ${m.host_ip}` : 'local'}</span>
+        {m.can_build && <span className="dt-badge">🔨 builds</span>}
+        <AddSiteInline machine={m} sites={sites} project={project} run={run} busy={busy} />
+      </div>
+      <div className="dt-body">
+        <DeployBranch tier="dev" sites={devSites} containers={dev}
+                      machine={m} project={project} run={run} busy={busy} />
+        <DeployBranch tier="prod" sites={prodSites} containers={prod}
+                      machine={m} project={project} run={run} busy={busy} />
+      </div>
+    </div>
+  );
+}
+
+// One deploy TYPE (dev | prod) on a machine: the site(s) that name the branch, then the shared
+// container inventory grouped by role. A branch with a site but no containers is a place you can
+// add one; a branch with containers but no site tells you to add the site.
+function DeployBranch({ tier, sites, containers, machine, project, run, busy }) {
+  const site = sites[0];
+  if (!sites.length && !containers.length) return null;
+  return (
+    <div className="dt-branch" data-tier={tier} data-testid={`deploy-branch-${tier}`}>
+      <div className="dt-branch-label">{tier}</div>
+      <div className="dt-branch-body">
+        <div className="dt-branch-sites">
+          {sites.map((s) => <SiteEditor key={s.id} site={s} run={run} busy={busy} />)}
+          {!sites.length && (
+            <div className="pc">no {tier} deploy site on {machine?.key ?? 'this host'} yet — add one above.</div>
+          )}
+        </div>
+        {containers.length > 0 && (
+          <div className="dt-branch-inv">
+            {ROLES.map((role) => {
+              const cs = containers.filter((c) => c.role === role);
+              if (!cs.length) return null;
+              return (
+                <div className="dt-role" key={role} data-role={role}>
+                  <span className="invlabel">{ROLE_LABEL[role]}:</span>
+                  <div className="dt-rows">
+                    {cs.map((c) => <InvRow key={c.id} c={c} run={run} busy={busy} />)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <AddSharedContainer project={project} tier={tier} ctx={machine?.docker_ctx || null}
+                            run={run} busy={busy} />
+        {tier === 'prod' && site && <DiscoverSite site={site} project={project} busy={busy} />}
+      </div>
+    </div>
+  );
+}
+
+// Add a shared container to THIS branch — the tier and docker context come from the branch, so a
+// container you add under "local ▾ dev" lands exactly there, never on the project's default site.
+function AddSharedContainer({ project, tier, ctx, run, busy }) {
+  const [f, setF] = useState({ name: '', role: 'server', build_script: '' });
+  const [open, setOpen] = useState(false);
+  const add = () => run(async () => {
+    await createSharedContainer(project.id, {
+      name: f.name.trim(), role: f.role, tier,
+      docker_ctx: ctx || undefined, build_script: f.build_script.trim() || null,
+    });
+    setF({ name: '', role: 'server', build_script: '' });
+  });
+  if (!open) {
+    return <button type="button" className="ghost dt-addbtn" onClick={() => setOpen(true)}>＋ {tier} container</button>;
+  }
+  return (
+    <div className="setup-row dt-add">
+      <input placeholder="container name" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} />
+      <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })}>
+        {ROLES.map((r) => <option key={r}>{r}</option>)}
+      </select>
+      <input placeholder="build script (optional)" value={f.build_script}
+             onChange={(e) => setF({ ...f, build_script: e.target.value })} />
+      <button type="button" disabled={busy || !f.name.trim()} onClick={add}>Add</button>
+      <button type="button" className="ghost" onClick={() => setOpen(false)}>✕</button>
+    </div>
+  );
+}
+
+// Add a deploy site ON a machine — the machine's context is pre-filled, so the site is born in
+// the branch it belongs to instead of being a bare context string typed from memory.
+function AddSiteInline({ machine, sites, project, run, busy }) {
+  const [open, setOpen] = useState(false);
+  const [f, setF] = useState({ tier: 'dev', key: '', host: machine.host_ip || '' });
+  const add = () => run(async () => {
+    await createSite(project.id, {
+      key: f.key.trim() || `${f.tier}-${machine.key}`,
+      tier: f.tier,
+      docker_ctx: machine.docker_ctx,
+      host: f.host.trim() || null,
+      docker_endpoint: null,
+      is_default: f.tier === 'prod' && !(sites || []).some((s) => s.tier === 'prod'),
+    });
+    setOpen(false); setF({ tier: 'dev', key: '', host: machine.host_ip || '' });
+  });
+  if (!open) {
+    return <button type="button" className="ghost" onClick={() => setOpen(true)} title={`Add a deploy site on ${machine.key}`}>＋ site</button>;
+  }
+  return (
+    <div className="setup-row dt-addsite">
+      <select value={f.tier} onChange={(e) => setF({ ...f, tier: e.target.value })}>
+        <option value="dev">dev</option><option value="prod">prod</option>
+      </select>
+      <input placeholder={`site key (e.g. ${f.tier}-${machine.key})`} value={f.key}
+             onChange={(e) => setF({ ...f, key: e.target.value })} />
+      <input placeholder="host (IP or DNS)" value={f.host} onChange={(e) => setF({ ...f, host: e.target.value })} />
+      <button type="button" disabled={busy} onClick={add}>Add</button>
+      <button type="button" className="ghost" onClick={() => setOpen(false)}>✕</button>
+    </div>
+  );
+}
+
+// Discover + adopt the running containers on ONE prod site, shown under that prod branch. The
+// standalone DiscoverPanel (used by the no-machines fallback) picks from all prod sites; here the
+// branch already names the site, so this is the scoped version.
+function DiscoverSite({ site, project, busy }) {
+  const [open, setOpen] = useState(false);
+  const [result, setResult] = useState(null);
+  const [sel, setSel] = useState({});
+  const [working, setWorking] = useState(false);
+  const discover = async () => {
+    setWorking(true); setResult(null); setSel({});
+    try {
+      const r = await discoverSite(site.id);
+      setResult(r);
+      if (r.ok) {
+        const next = {};
+        for (const c of r.containers) {
+          const adoptable = !(c.already_modeled && c.linked_to_prod);
+          next[c.name] = { checked: adoptable, role: c.inferred_role || '' };
+        }
+        setSel(next);
+      }
+    } catch (e) { setResult({ ok: false, error: e.message }); }
+    finally { setWorking(false); }
+  };
+  const adopt = async () => {
+    const containers = (result?.containers || [])
+      .filter((c) => sel[c.name]?.checked && !(c.already_modeled && c.linked_to_prod))
+      .map((c) => ({ name: c.name, role: sel[c.name].role, image_tag: c.image,
+                     compose_project: c.compose_project,
+                     host_port: c.ports?.[0]?.public || null,
+                     internal_port: c.ports?.[0]?.private || null }));
+    const bad = containers.find((c) => !['db', 'server', 'webapp', 'infra'].includes(c.role));
+    if (bad) { await showAlert(`Choose a role for "${bad.name}" before adopting.`, { variant: 'error' }); return; }
+    if (containers.length === 0) { await showAlert('Nothing selected to adopt.'); return; }
+    setWorking(true);
+    try {
+      const r = await adoptContainers(site.id, containers);
+      setResult(null);
+      await showAlert(`Adopted ${r.adopted.length}, linked ${r.linked.length} to production`
+        + `${r.skipped.length ? `, ${r.skipped.length} already modeled` : ''}.`);
+    } catch (e) { await showAlert(e.message, { variant: 'error' }); }
+    finally { setWorking(false); }
+  };
+  const disabled = busy || working;
+  return (
+    <div className="dt-discover">
+      <button type="button" disabled={disabled} onClick={() => { setOpen((o) => !o); if (!open && !result) discover(); }}>
+        {working ? '…' : open ? '▾ Discover' : '🔍 Discover running stack'}
+      </button>
+      {open && result && !result.ok && <div className="pc dt-disc-err">⚠ {result.error}</div>}
+      {open && result?.ok && result.count === 0 && (
+        <div className="pc">Context <span className="mono">{result.docker_ctx}</span> is reachable but has no containers.</div>
+      )}
+      {open && result?.ok && result.count > 0 && (
+        <div className="dt-disc-list">
+          {result.containers.map((c) => {
+            const done = c.already_modeled && c.linked_to_prod;
+            const s = sel[c.name] || {};
+            return (
+              <div key={c.name} className="setup-row discover-row" style={{ opacity: done ? 0.55 : 1 }}>
+                <input type="checkbox" checked={!!s.checked} disabled={disabled || done} onChange={() => setSel((x) => ({ ...x, [c.name]: { ...x[c.name], checked: !x[c.name]?.checked } }))}
+                       title={done ? 'already adopted' : 'select to adopt'} />
+                <span className="mono" title={`${c.image || ''} · ${c.status || c.state || ''}`}>{c.name}</span>
+                <span className="pc" title="published ports">
+                  {c.compose_service ? `${c.compose_project}/${c.compose_service}` : (c.labelled ? '—' : 'unlabelled')}
+                  {c.ports?.length ? ` :${c.ports.map((p) => p.public).join(',')}` : ''}
+                </span>
+                {done
+                  ? <span className="pc" style={{ color: 'var(--ok, #6a6)' }}>adopted ✓</span>
+                  : c.already_modeled
+                    ? <><select value={s.role || ''} disabled><option>{c.modeled_as?.role}</option></select>
+                        <span className="pc">modeled — will link to prod</span></>
+                    : <>
+                        <select value={s.role || ''} disabled={disabled} onChange={(e) => setSel((x) => ({ ...x, [c.name]: { ...x[c.name], role: e.target.value } }))}>
+                          <option value="">role?</option>
+                          {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                        </select>
+                        <span className="pc" title="why this role was guessed">{c.role_reason}</span>
+                      </>}
+              </div>
+            );
+          })}
+          <div className="setup-row" style={{ marginTop: 4 }}>
+            <button type="button" disabled={disabled} onClick={adopt}>＋ Adopt selected</button>
+            <span className="pc">build script stays empty — set it below to make a container shippable.</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

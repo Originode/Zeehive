@@ -263,6 +263,37 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .invrow .mono { flex: 1.4; font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 .invrow .pc { width: 52px; }
 
+/* Deploy tab: the machine → dev/prod → role inventory TREE (master-detail). One node per
+   machine, its dev/prod deploy types as the branches, the shared containers grouped by role. */
+.deploy-tree { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 12px; }
+.dt-machine { border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+.dt-machine.elsewhere { opacity: .7; }
+.dt-machine-head { display: flex; align-items: center; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+.dt-machine-key { font-size: 14px; }
+.dt-machine-head .pc { color: var(--muted); font-size: 11px; }
+.dt-machine-head .mono { font-size: 11px; color: var(--muted); }
+.dt-machine-head .ghost { margin-left: auto; }
+.dt-badge { font-size: 10px; color: var(--ready); border: 1px solid rgba(91,140,255,.35);
+  border-radius: 4px; padding: 0 5px; }
+.dt-body { margin: 8px 0 0 10px; display: flex; flex-direction: column; gap: 10px; }
+.dt-branch { border-left: 2px solid var(--line); padding: 0 0 2px 10px; }
+.dt-branch-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600;
+  margin-bottom: 4px; }
+.dt-branch[data-tier="dev"] .dt-branch-label { color: var(--ready); }
+.dt-branch[data-tier="prod"] .dt-branch-label { color: var(--down); }
+.dt-branch-body { display: flex; flex-direction: column; gap: 6px; }
+.dt-branch-sites .siteed { margin-top: 0; }
+.dt-branch-inv { display: flex; flex-direction: column; gap: 2px; }
+.dt-role { display: flex; align-items: baseline; gap: 8px; }
+.dt-role .invlabel { color: var(--muted); min-width: 62px; font-size: 13px; }
+.dt-rows { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+.dt-rows .invrow { padding: 2px 0; }
+.dt-addbtn { margin-top: 4px; }
+.dt-add, .dt-addsite { margin-top: 4px; }
+.dt-discover { margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 6px; }
+.dt-disc-err { color: var(--danger, #d66); }
+.dt-disc-list { margin-top: 6px; }
+
 /* project edit panel (deploy sites): wider popup, compact per-site rows */
 .projpop.wide { width: 440px; }
 .siterow { display: flex; align-items: center; gap: 5px; }
