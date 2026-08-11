@@ -195,6 +195,31 @@ try {
   const gwRows2 = await requestsForXell(xellId);
   ok(gwRows2.length >= 2, `the gateway recorded both turns' calls (${gwRows2.length} rows)`);
 
+  // ── C. the REAL spawn path (spawnLangchainZee) drives a langchain zee end to end ───────────
+  console.log('\n── C. spawnLangchainZee — a real zee turn driven by the driver ──');
+  const { spawnLangchainZee } = await import('../server/src/queenzee/langchain-spawn.js');
+  // The handover again: retire the current live zee so the spawn path can take the xell (a swap
+  // does exactly this — retire, then dispatch the incoming zee).
+  await q(`UPDATE zee SET status='stopped' WHERE id=$1`, [zee2.id]);
+  const rt = await one(`SELECT * FROM agent_runtime WHERE key='langchain-stateful'`);
+  ok(!!rt && rt.driver === 'langchain', 'the langchain-stateful runtime row exists with driver=langchain');
+  const beforeSpawn = mockRequests.length;
+  const spawnOut = await spawnLangchainZee({
+    pid: projectId, xell: await one(`SELECT * FROM xell WHERE id=$1`, [xellId]),
+    task: 'spawn path question', rt, model: MODEL, provider: 'deepseek',
+  });
+  ok(spawnOut.ok === true, `spawnLangchainZee returned ok (${JSON.stringify(spawnOut).slice(0, 120)})`);
+  ok(mockRequests.length === beforeSpawn + 1, 'the spawn path made exactly one model call through the gateway');
+  const spawnZee = await one(`SELECT * FROM zee WHERE id=$1`, [spawnOut.zee_id]);
+  eq(spawnZee.status, 'idle', 'the spawned zee ended idle (a completed turn)');
+  eq(spawnZee.entrypoint, 'langchain', 'the spawned zee is entrypoint=langchain');
+  const spawnTurn = await one(`SELECT * FROM zee_turn WHERE zee_id=$1 ORDER BY started_at DESC LIMIT 1`, [spawnOut.zee_id]);
+  eq(spawnTurn.status, 'ended', 'the spawned zee\'s turn ended');
+  const spawnConv = await loadConversation(xellId);
+  ok(spawnConv.length > 4, `the spawn path persisted its exchange too (${spawnConv.length} messages now)`);
+  const spawnGw = await requestsForXell(xellId);
+  ok(spawnGw.length >= 3, `the spawn path\'s model call is in the gateway ledger (${spawnGw.length} rows)`);
+
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
   process.env.DEEPSEEK_ANTHROPIC_BASE_URL = '';
@@ -202,10 +227,9 @@ try {
   if (gwServer) await new Promise((r) => gwServer.close(r));
   if (turn1) await q(`DELETE FROM zee_turn WHERE id=$1`, [turn1.id]).catch(() => {});
   if (turn2) await q(`DELETE FROM zee_turn WHERE id=$1`, [turn2.id]).catch(() => {});
-  if (zee1) await q(`DELETE FROM zee WHERE id=$1`, [zee1.id]).catch(() => {});
-  if (zee2) await q(`DELETE FROM zee WHERE id=$1`, [zee2.id]).catch(() => {});
   if (xellId) await q(`DELETE FROM zee_conversation WHERE xell_id=$1`, [xellId]).catch(() => {});
   if (xellId) await q(`DELETE FROM llm_gateway_request WHERE xell_id=$1`, [xellId]).catch(() => {});
+  if (xellId) await q(`DELETE FROM zee WHERE xell_id=$1`, [xellId]).catch(() => {});
   if (xellId) await q(`DELETE FROM xell WHERE id=$1`, [xellId]).catch(() => {});
   if (xourceId) await q(`DELETE FROM xource WHERE id=$1`, [xourceId]).catch(() => {});
   if (projectId) await q(`DELETE FROM project WHERE id=$1`, [projectId]).catch(() => {});

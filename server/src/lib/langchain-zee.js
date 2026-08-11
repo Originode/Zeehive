@@ -107,11 +107,14 @@ export function messageText(content) {
 }
 
 // The usage a langchain AIMessage carries — mapped to the zee_turn burn shape
-// ({ input, output, cacheRead, cacheWrite, metered }). null when the provider reported none.
+// ({ cost, input, output, cacheRead, cacheWrite, metered }). cost is 0: the langchain model does
+// not report a price, and the GATEWAY ledger (llm_gateway_request) prices the call authoritatively
+// from the model spec. null when the provider reported none.
 export function usageFromLc(resp) {
   const u = resp?.usage_metadata;
   if (!u) return null;
   return {
+    cost: 0,
     input: Number(u.input_tokens || 0) || 0,
     output: Number(u.output_tokens || 0) || 0,
     cacheRead: Number(u.input_token_details?.cache_read || 0) || 0,

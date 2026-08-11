@@ -67,7 +67,6 @@ export async function spawnLangchainZee({ pid, xell, task, rt, model = null, m =
       [zee.id, 0, b.input || 0, b.output || 0, b.cacheRead || 0, b.cacheWrite || 0]);
     broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
     await endTurn(turn?.id, { status: 'ended', burn: b, stopReason: 'end_turn', summary: text.slice(0, 500) });
-
     logline('langchain', `langchain zee in ${xell.slug} finished ok (${(b.input || 0) + (b.output || 0)} tok)`);
     return { ok: true, zee_id: zee.id, xell_id: xell.id, cxell: null, session: sid,
              mode: m?.key, permission_mode: 'bypassPermissions', langchain: true };
