@@ -1627,6 +1627,15 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     ? await preppedImageIfPresent({ ctx: 'default', baseImage: cxellImage || undefined, prep }).catch(() => null)
     : null;
   let sshPort = null;
+  // PER-ACTOR GIT IDENTITY (TKT-159-3139): the AUTHOR of every in-cxell commit names this zee
+  // (its slug), and the COMMITTER names the door (the xell door from the git config set below;
+  // the console terminal overrides the committer to the console door in terminal-bridge). The
+  // GIT_AUTHOR_* env reaches BOTH doors — /etc/environment (an attending human's SSH shell) and
+  // the headless exec env (runZee's extraEnv below) — because git prioritises it over the config.
+  const gitAuthorEnv = {
+    GIT_AUTHOR_NAME: xell.slug,
+    GIT_AUTHOR_EMAIL: `${xell.slug}@zeehive.local`,
+  };
   try {
     // reuse: keep the cage PROVISIONING already created and installed into (`when: 'provision'`).
     // It is honoured only when that cage is running on the image we want; otherwise this is the
@@ -1726,15 +1735,6 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // model, the identity travels in the URL.
     const gwEnv = gatewayEnv({ xellToken, provider: adapter.provider });
     logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
-    // PER-ACTOR GIT IDENTITY (TKT-159-3139): the AUTHOR of every in-cxell commit names this zee
-    // (its slug), and the COMMITTER names the door (the xell door from the git config set below;
-    // the console terminal overrides the committer to the console door in terminal-bridge). The
-    // GIT_AUTHOR_* env reaches BOTH doors — /etc/environment (an attending human's SSH shell) and
-    // the headless exec env (runZee's extraEnv below) — because git prioritises it over the config.
-    const gitAuthorEnv = {
-      GIT_AUTHOR_NAME: xell.slug,
-      GIT_AUTHOR_EMAIL: `${xell.slug}@zeehive.local`,
-    };
     await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
                          agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });

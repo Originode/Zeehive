@@ -26,6 +26,7 @@
 import { q as rawQ, one as rawOne, pool } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
+import { syncWorkNode, removeWorkNode, syncDependency, removeDependency, syncExecutionState } from './work-node-sync.js';
 import {
   WORK_STATUS_KEYS, WORK_STATUS, WORK_ITEM_KINDS, workLabel, isWorkStatus, canTransition,
   nextStatuses, statusFromHive, isTerminal,
@@ -484,7 +485,16 @@ export async function projectRoot(projectId, client = null) {
 // `client`/`pending` are only supplied by a caller that has already opened a transaction (see
 // inTransaction). Reads go through the same client so this sees the siblings created moments ago in
 // the same breakdown — which is what makes each new item's sort_order land after them.
-export async function createWorkItem(input = {}, { client = null, pending = null } = {}) {
+//
+// REHAB 1/4 DUAL-WRITE: creating a work_item also writes the workflow model's work_node for it
+// (same transaction — if the node write fails the item write rolls back with it). A caller that
+// passes no client gets a fresh transaction so the pair is atomic even when called standalone.
+export async function createWorkItem(input = {}, opts = {}) {
+  if (opts.client) return createWorkItemInTx(input, opts);
+  return inTransaction((tx) => createWorkItemInTx(input, { ...opts, ...tx }));
+}
+
+async function createWorkItemInTx(input = {}, { client = null, pending = null } = {}) {
   const db = dbRunner(client);
   const title = String(input.title || '').trim();
   if (!title) throw bad('title required');
@@ -547,18 +557,30 @@ export async function createWorkItem(input = {}, { client = null, pending = null
      input.starts_on ?? null, input.due_on ?? null, input.estimate_hours ?? null,
      input.progress ?? null, sortOrder, input.actor || input.created_by || null]);
 
+  // REHAB 1/4 DUAL-WRITE: the workflow model's work_node for this item. Recursively
+  // materialises the plan/plan_version/root node for a project whose plan does not exist yet.
+  await syncWorkNode(db, row);
+
   await emit(row, 'created', { to: row.status, actor: input.actor || input.created_by || null,
                                detail: { kind: row.kind, title: row.title, parent_id: row.parent_id } },
              { client, pending });
   return shapeItem(row);
 }
 
-export async function updateWorkItem(id, patch = {}, { actor = null } = {}) {
+// REHAB 1/4 DUAL-WRITE: updating a work_item also updates its work_node (same transaction).
+// Self-transactional when called without a client, so the pair is atomic.
+export async function updateWorkItem(id, patch = {}, opts = {}) {
+  if (opts.client) return updateWorkItemInTx(id, patch, opts);
+  return inTransaction((tx) => updateWorkItemInTx(id, patch, { ...opts, ...tx }));
+}
+
+async function updateWorkItemInTx(id, patch = {}, { client = null, pending = null, actor = null } = {}) {
+  const db = dbRunner(client);
   assertId(id);
   if (patch.parent_id) assertId(patch.parent_id, 'parent work item id');
   if (patch.ticket_id) assertId(patch.ticket_id, 'ticket id');
   if (patch.xell_id) assertId(patch.xell_id, 'xell id');
-  const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
+  const before = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
 
   // A parent_id (or an explicit reparent) in a PATCH is a MOVE — it rewrites the path of every
@@ -572,12 +594,13 @@ export async function updateWorkItem(id, patch = {}, { actor = null } = {}) {
   let current = before;
   let moved = false;
   if ('parent_id' in patch && patch.parent_id !== before.parent_id) {
-    current = await moveWorkItem(id, { parent_id: patch.parent_id, sort_order: patch.sort_order }, { actor });
+    current = await moveWorkItem(id, { parent_id: patch.parent_id, sort_order: patch.sort_order },
+      { actor, client, pending });
     moved = true;
   }
   // Status is validated against nextStatuses and gets its own 'status' event.
   if ('status' in patch && patch.status !== before.status) {
-    current = await setStatus(id, patch.status, { actor });
+    current = await setStatus(id, patch.status, { actor, client, pending });
   }
 
   // The dates are validated as a PAIR against what the row will actually hold: a PATCH carrying
@@ -599,21 +622,33 @@ export async function updateWorkItem(id, patch = {}, { actor = null } = {}) {
   }
   if (!sets.length) return shapeItem(current);
 
-  const row = await one(`UPDATE work_item SET ${sets.join(', ')} WHERE id=$1 RETURNING ${COLS}`, params);
+  const row = await db.one(`UPDATE work_item SET ${sets.join(', ')} WHERE id=$1 RETURNING ${COLS}`, params);
+  // REHAB 1/4 DUAL-WRITE: keep the work_node in step (name/estimate/kind/sort_order/parent).
+  await syncWorkNode(db, row);
   // Naming a zee (or un-naming one) is its own kind of event: part 2 and the console both want to
   // read "when was a zee put on this" without parsing an edit diff.
   const kind = 'xell_id' in changed || 'assignee' in changed ? 'assigned' : 'edited';
-  await emit(row, kind, { actor, detail: changed });
+  await emit(row, kind, { actor, detail: changed }, { client, pending });
   return shapeItem(row);
 }
 
 // A MOVE: a new parent and/or a new rank among siblings. The database enforces same-project,
 // the nesting rank and cycles, and rewrites path/depth for the whole subtree; here we only turn
 // its refusal into a sentence and record the event.
-export async function moveWorkItem(id, { parent_id: parentId, sort_order: sortOrder } = {}, { actor = null } = {}) {
+//
+// REHAB 1/4 DUAL-WRITE: a move re-parents the work_item's work_node (parent_id + sibling_rank) in
+// the same transaction. Descendants follow automatically (work_node is a parent-pointer tree).
+export async function moveWorkItem(id, move = {}, opts = {}) {
+  if (opts.client) return moveWorkItemInTx(id, move, opts);
+  return inTransaction((tx) => moveWorkItemInTx(id, move, { ...opts, ...tx }));
+}
+
+async function moveWorkItemInTx(id, { parent_id: parentId, sort_order: sortOrder } = {},
+                                { client = null, pending = null, actor = null } = {}) {
+  const db = dbRunner(client);
   assertId(id);
   if (parentId) assertId(parentId, 'parent work item id');
-  const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
+  const before = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
   if (before.kind === 'project') {
     throw refuse(`"${before.title}" is the project's root item — it is the top of the tree and cannot be moved under anything.`);
@@ -624,16 +659,19 @@ export async function moveWorkItem(id, { parent_id: parentId, sort_order: sortOr
   // will ACTUALLY land beside instead of among the roots.
   let nextParent = parentId === undefined ? before.parent_id : (parentId || null);
   if (nextParent === null && before.kind !== 'project') {
-    nextParent = (await projectRoot(before.project_id))?.id ?? null;
+    nextParent = (await projectRoot(before.project_id, client))?.id ?? null;
   }
   const rank = sortOrder != null ? Number(sortOrder)
-    : (nextParent === before.parent_id ? Number(before.sort_order) : await nextSortOrder(nextParent));
+    : (nextParent === before.parent_id ? Number(before.sort_order) : await nextSortOrder(nextParent, client));
 
-  const row = await one(
+  const row = await db.one(
     `UPDATE work_item SET parent_id=$2, sort_order=$3 WHERE id=$1 RETURNING ${COLS}`,
     [id, nextParent, rank]);
+  // REHAB 1/4 DUAL-WRITE: the work_node follows the item to its new parent/rank.
+  await syncWorkNode(db, row);
   await emit(row, 'moved', { actor, detail: { from_parent: before.parent_id, to_parent: row.parent_id,
-                                              from_sort: Number(before.sort_order), to_sort: Number(row.sort_order) } });
+                                              from_sort: Number(before.sort_order), to_sort: Number(row.sort_order) } },
+             { client, pending });
   return shapeItem(row);
 }
 
@@ -644,9 +682,15 @@ export async function moveWorkItem(id, { parent_id: parentId, sort_order: sortOr
 // tracker that auto-closes has, at some point, closed real open work on somebody's behalf. The read
 // models expose open_children instead, so a UI can warn ("3 children still open — close them too?")
 // and the human answers.
-export async function setStatus(id, status, { actor = null, cascade = false } = {}) {
+export async function setStatus(id, status, opts = {}) {
+  if (opts.client) return setStatusInTx(id, status, opts);
+  return inTransaction((tx) => setStatusInTx(id, status, { ...opts, ...tx }));
+}
+
+async function setStatusInTx(id, status, { client = null, pending = null, actor = null, cascade = false } = {}) {
+  const db = dbRunner(client);
   assertId(id);
-  const before = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
+  const before = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!before) return null;
   if (!isWorkStatus(status)) {
     throw bad(`unknown status "${status}" — one of: ${WORK_STATUS_KEYS.join(', ')}`);
@@ -655,18 +699,23 @@ export async function setStatus(id, status, { actor = null, cascade = false } = 
     throw refuse(`cannot move "${before.title}" from ${before.status} to ${status}`
       + ` — legal next statuses are: ${nextStatuses(before.status).join(', ')}`);
   }
-  const row = await one(`UPDATE work_item SET status=$2 WHERE id=$1 RETURNING ${COLS}`, [id, status]);
-  await emit(row, 'status', { from: before.status, to: status, actor });
+  const row = await db.one(`UPDATE work_item SET status=$2 WHERE id=$1 RETURNING ${COLS}`, [id, status]);
+  // REHAB 1/4 DUAL-WRITE: a status change is the LIFECYCLE side of the model — write the
+  // execution (creating it only when the item actually leaves 'queued', never before).
+  await syncExecutionState(db, id, status);
+  await emit(row, 'status', { from: before.status, to: status, actor }, { client, pending });
 
   let cascaded = 0;
   if (cascade) {
-    const kids = await q(
+    const kids = await db.q(
       `SELECT id, status FROM work_item WHERE path LIKE $1 AND status <> $2`,
       [`${subtreePrefix(before)}%`, status]);
     for (const k of kids) {
       if (!canTransition(k.status, status)) continue;
-      const r = await one(`UPDATE work_item SET status=$2 WHERE id=$1 RETURNING ${COLS}`, [k.id, status]);
-      await emit(r, 'status', { from: k.status, to: status, actor, detail: { cascaded_from: id } });
+      const r = await db.one(`UPDATE work_item SET status=$2 WHERE id=$1 RETURNING ${COLS}`, [k.id, status]);
+      await syncExecutionState(db, k.id, status);
+      await emit(r, 'status', { from: k.status, to: status, actor, detail: { cascaded_from: id } },
+                 { client, pending });
       cascaded++;
     }
   }
@@ -678,46 +727,76 @@ export async function setStatus(id, status, { actor = null, cascade = false } = 
 // Deleting cascades in the database (parent_id ON DELETE CASCADE), so the ANSWER says how many rows
 // went with it — a delete that silently takes eleven descendants is the one destructive act in this
 // module, and the caller is told the number before and after.
-export async function deleteWorkItem(id) {
+export async function deleteWorkItem(id, opts = {}) {
+  if (opts.client) return deleteWorkItemInTx(id, opts);
+  return inTransaction((tx) => deleteWorkItemInTx(id, tx));
+}
+
+async function deleteWorkItemInTx(id, { client = null, pending = null } = {}) {
+  const db = dbRunner(client);
   assertId(id);
-  const item = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
+  const item = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
   if (!item) return null;
   if (item.kind === 'project') {
     throw refuse(`"${item.title}" is the root item of its project and cannot be deleted — every `
       + 'other work item hangs off it, and the project row itself owns it (delete the project to '
       + 'delete the tree).');
   }
-  const counts = await one(
+  const counts = await db.one(
     `SELECT count(*)::int AS n FROM work_item WHERE path LIKE $1`, [`${subtreePrefix(item)}%`]);
-  await q(`DELETE FROM work_item WHERE id=$1`, [id]);
-  broadcast('work', { kind: 'deleted', item: shapeItem(item), descendants: counts?.n ?? 0 });
+  // REHAB 1/4 DUAL-WRITE: delete the work_node subtree (and its executions — execution.
+  // work_node_id is RESTRICT, so a node with executions cannot be deleted) BEFORE the work_item
+  // row; the work_item delete cascades to child items, the work_node delete cascades to child nodes.
+  await removeWorkNode(db, id);
+  await db.q(`DELETE FROM work_item WHERE id=$1`, [id]);
+  const event = ['work', { kind: 'deleted', item: shapeItem(item), descendants: counts?.n ?? 0 }];
+  if (pending) pending.push(event); else broadcast(...event);
   return { ok: true, deleted: shapeItem(item), descendants: counts?.n ?? 0 };
 }
 
 // ── dependencies ─────────────────────────────────────────────────────────────
-export async function addDep(workItemId, dependsOnId, { actor = null } = {}) {
+export async function addDep(workItemId, dependsOnId, opts = {}) {
+  if (opts.client) return addDepInTx(workItemId, dependsOnId, opts);
+  return inTransaction((tx) => addDepInTx(workItemId, dependsOnId, { ...opts, ...tx }));
+}
+
+async function addDepInTx(workItemId, dependsOnId, { client = null, pending = null, actor = null } = {}) {
+  const db = dbRunner(client);
   assertId(workItemId);
   if (!dependsOnId) throw bad('depends_on_id required');
   assertId(dependsOnId, 'depends_on_id');
-  const row = await one(
+  const row = await db.one(
     `INSERT INTO work_item_dep (work_item_id, depends_on_id) VALUES ($1,$2)
      ON CONFLICT DO NOTHING RETURNING *`, [workItemId, dependsOnId]);
-  await logWorkEvent(workItemId, 'edited', { actor, detail: { added_dep: dependsOnId } });
-  const item = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [workItemId]);
-  broadcast('work', { kind: 'dep', item: shapeItem(item) });
+  // REHAB 1/4 DUAL-WRITE: the workflow model's dependency row (flips the LCA container to
+  // 'freeform' so the model's I5 trigger accepts it).
+  await syncDependency(db, workItemId, dependsOnId);
+  await logWorkEvent(workItemId, 'edited', { actor, detail: { added_dep: dependsOnId } }, { client });
+  const item = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [workItemId]);
+  const event = ['work', { kind: 'dep', item: shapeItem(item) }];
+  if (pending) pending.push(event); else broadcast(...event);
   return { ok: true, dep: row || { work_item_id: workItemId, depends_on_id: dependsOnId, existing: true } };
 }
 
-export async function removeDep(workItemId, dependsOnId, { actor = null } = {}) {
+export async function removeDep(workItemId, dependsOnId, opts = {}) {
+  if (opts.client) return removeDepInTx(workItemId, dependsOnId, opts);
+  return inTransaction((tx) => removeDepInTx(workItemId, dependsOnId, { ...opts, ...tx }));
+}
+
+async function removeDepInTx(workItemId, dependsOnId, { client = null, pending = null, actor = null } = {}) {
+  const db = dbRunner(client);
   assertId(workItemId);
   assertId(dependsOnId, 'depends_on_id');
-  const rows = await q(
+  const rows = await db.q(
     `DELETE FROM work_item_dep WHERE work_item_id=$1 AND depends_on_id=$2 RETURNING *`,
     [workItemId, dependsOnId]);
   if (!rows.length) return null;
-  await logWorkEvent(workItemId, 'edited', { actor, detail: { removed_dep: dependsOnId } });
-  const item = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [workItemId]);
-  broadcast('work', { kind: 'dep', item: shapeItem(item) });
+  // REHAB 1/4 DUAL-WRITE: remove the workflow model's dependency row.
+  await removeDependency(db, workItemId, dependsOnId);
+  await logWorkEvent(workItemId, 'edited', { actor, detail: { removed_dep: dependsOnId } }, { client });
+  const item = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [workItemId]);
+  const event = ['work', { kind: 'dep', item: shapeItem(item) }];
+  if (pending) pending.push(event); else broadcast(...event);
   return { ok: true, removed: rows[0] };
 }
 
