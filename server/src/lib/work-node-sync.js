@@ -196,12 +196,16 @@ const hasChildren = (db, workItemId) => db.one(`SELECT 1 FROM work_item WHERE pa
 // chain on first write. Returns the work_node id.
 export async function syncWorkNode(db, row) {
   if (!row?.id) return null;
-  const existing = await db.one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [row.id]);
+  let existing = await db.one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [row.id]);
   const est = row.estimate_hours == null ? null : `${row.estimate_hours * 3600000} milliseconds`;
 
   // The plan → project-node → root-item chain must exist before ANY work_item node can be
   // placed: the project node is the plan's root, and the root work_item hangs beneath it.
   const { planVersionId, rootNodeId: projectNodeId } = await ensurePlanVersion(db, row.project_id);
+
+  // ensurePlanVersion may have just created THIS item's node (the root work_item) — re-check
+  // so a direct syncWorkNode on the root item takes the upsert path, never a duplicate insert.
+  if (!existing) existing = await db.one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [row.id]);
 
   if (!existing) {
     // the parent chain: a project root hangs under the PROJECT node; anything else under its
