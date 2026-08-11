@@ -33,6 +33,10 @@ import { cxellDiff } from './cxell.js';
 import { reasonPair, briefReason } from './status.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { sendMessageToXell } from '../queenzee/nudge.js';
+// The A2A envelope builder — pure (lib/a2a.js); the lookups that feed it live in postMessage's
+// envelopeFor below, so the mapping module stays a table you can read against the plan §3.3.
+import { buildEnvelope } from './a2a.js';
+import { randomUUID } from 'node:crypto';
 
 // ── who is what ──────────────────────────────────────────────────────────────
 export const isManager = (xell) => xell?.zee_type === 'manager';
@@ -234,15 +238,46 @@ export async function workerOf(managerXellId, slugOrId) {
 // delivery types the text into the recipient's live cxell session so a conversation actually happens
 // where the agent — and any watching human — is looking. Delivery failure is recorded, never thrown:
 // an undelivered message is still a message, and pretending otherwise loses it.
+//
+// The A2A ENVELOPE (plan §4, DR-3) rides in meta.a2a: ids only, plus the one stored flag (canceled).
+// The two lookups below are the ONLY non-pure part of the stamp — the envelope itself is built by
+// the pure buildEnvelope (lib/a2a.js). contextId is reused across the ordered (from,to) pair — the
+// first exchange mints it, every later one inherits it; referencedTaskId is the most recent
+// directive the RECIPIENT sent the SENDER, which is the task a report/message answers.
+async function envelopeFor({ messageId, from, to, kind }) {
+  let contextId = null;
+  if (from?.id && to?.id) {
+    const prior = await one(
+      `SELECT meta->'a2a' AS a2a FROM zee_message
+        WHERE from_xell_id=$1 AND to_xell_id=$2 AND meta->'a2a'->>'contextId' IS NOT NULL
+        ORDER BY created_at DESC LIMIT 1`, [from.id, to.id]);
+    contextId = prior?.a2a?.contextId || null;
+  }
+  let referencedTaskId = null;
+  if (from?.id && to?.id && kind !== 'directive') {
+    const dir = await one(
+      `SELECT meta->'a2a'->>'taskId' AS task_id FROM zee_message
+        WHERE from_xell_id=$1 AND to_xell_id=$2 AND kind='directive'
+          AND meta->'a2a'->>'taskId' IS NOT NULL
+        ORDER BY created_at DESC LIMIT 1`, [to.id, from.id]);
+    referencedTaskId = dir?.task_id || null;
+  }
+  return buildEnvelope({ messageId, kind, contextId, referencedTaskId });
+}
+
 export async function postMessage({ from, to, body, kind = 'message', by = null, deliver = true }) {
   const text = String(body || '').trim();
   if (!text) throw new Error('a message needs a body');
+  // The row id is minted here, not by the DEFAULT, because the A2A envelope reuses it as
+  // messageId (DR-3: the row stays authoritative, the envelope stores identity only).
+  const messageId = randomUUID();
+  const envelope = await envelopeFor({ messageId, from, to, kind });
   const row = await one(
-    `INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb) RETURNING *`,
-    [from?.project_id || to?.project_id, from?.id || null, from?.slug || by || 'queenzee',
+    `INSERT INTO zee_message (id, project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING *`,
+    [messageId, from?.project_id || to?.project_id, from?.id || null, from?.slug || by || 'queenzee',
      to?.id || null, to?.slug || null, kind, text.slice(0, 20000),
-     JSON.stringify({ by: by || from?.slug || 'queenzee' })]);
+     JSON.stringify({ by: by || from?.slug || 'queenzee', a2a: envelope })]);
 
   let delivery = { sent: false, reason: 'delivery not attempted' };
   if (deliver && to?.id) {
@@ -305,6 +340,9 @@ export async function inboxFor(xellId, { all = false, limit = 50 } = {}) {
   return rows.map((r) => ({
     id: r.id, from: r.from_slug, kind: r.kind, body: r.body,
     at: r.created_at, was_unread: unread.includes(r.id),
+    // The A2A envelope's ids, additively — present only when the row carries one (plan §5: old
+    // rows stay exactly as they were; no backfill, DR-4).
+    ...(r.meta?.a2a ? { a2a: { taskId: r.meta.a2a.taskId || null, contextId: r.meta.a2a.contextId || null } } : {}),
   }));
 }
 
