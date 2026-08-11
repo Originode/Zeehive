@@ -355,18 +355,30 @@ standalone test, not by a live zee.
 1. **Cross-xell turnover** — the curated-handover design in §5.2: what a successor xell is handed
    when it continues work from a different xell, carried on a XELL-KEYED `xell_handover` row (the
    same key `zee_conversation` uses — Option A, the agreed decision; the execution plane was
-   rejected as the carrier because it has no xell↔execution path and its `outputs` is empty).
+   rejected as the carrier on COVERAGE: a card/execution-linked handover is structurally unavailable
+   to the ~86% of xells that hold no work item, not because the xell↔execution path is absent — the
+   path exists, it just does not reach most of the fleet, and `execution.outputs` has never been
+   written).
    Split into same-work-item (case a) and different-work-item (case b, the dependency edge, kept
    aligned with …-16c430's chain work). The old xell's local paths and dead ends are filtered out.
    This is the design gap this card names; it is the natural next card once the state model is
    agreed and read.
-2. **Tool loop** — the driver currently makes one model call per turn. The multi-call loop (model →
-   tool request → tool result → model → …) is the natural next step, with tools bound through
-   langchain's tool interface and executed through queenzee-owned, gate-respecting verbs.
-3. **Cxell-sandboxed langchain agent** — the first build runs the model call in the queenzee
-   process (safe for a single model call: no tools, no file access). When the agent gains tools, it
-   must run inside the cxell so the container remains the permission boundary; that means shipping
-   langchain in the zee-agent image.
+2. **Tool loop** — the multi-call loop (model → tool request → tool result → model → …) with tools
+   bound through langchain's tool interface and executed through queenzee-owned, gate-respecting
+   verbs. WAVE 1 (the mechanism slice) is BUILT: the loop runs in the queenzee process, bound ONLY
+   to the read-only, no-side-effect registry verbs (`status`, `work`, `working`, `item`), a hard
+   cap of 8 iterations with the cap visible when hit, and ONE handler shared with `/api/xell/self/*`
+   (never a second copy of a verb's logic). WAVE 2 (the gated asks: `tend`, `hint-land`, `hint-ship`,
+   `land`, `ship`, `seed`) is approved IN PRINCIPLE only after wave 1 is green AND a test shows a
+   bound `land` tool producing a HELD request, not a landing.
+3. **Cxell-sandboxed langchain agent (workspace action)** — the boundary for tools is drawn by WHAT
+   A TOOL CAN DO, not by the existence of tools (this amends an earlier, too-coarse sentence here
+   that said any tool ⇒ the cage). Read-only, no-side-effect verbs (`status`, `work`, `working`,
+   `item`) may be bound in-process — they acquire no privilege a single in-process model call does
+   not already have. Any tool with WORKSPACE ACTION — file write, shell, SQL, docker, git, and
+   every gated verb — must run inside the cxell so the container remains the permission boundary,
+   and that waits on shipping langchain in the zee-agent image. Until the image lands, workspace
+   action is NOT bindable anywhere.
 4. **Conversation pruning / token budgeting** — a long-running xell's `zee_conversation` grows
    without bound; the next card should add a per-xell cap (e.g. keep the last N messages, oldest
    summarized) so warm starts stay within a token budget.
