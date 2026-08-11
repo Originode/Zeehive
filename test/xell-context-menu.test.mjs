@@ -64,6 +64,36 @@ ok(!kinds(ml).includes('ship'),
 ok(kinds(xellContextMenuItems(mgr, shippable)).includes('ship'),
    'a landed+clean manager is offered ship — ship is deliberately NOT blocked for a manager');
 
+// ── 2.5 HELD AT THE GATE — the send-'zee land'/'zee ship' rows ────────────────
+console.log('\nthe held-gate rows appear only while the gate is holding');
+const heldLand = { ...worker, hive_status: 'occ-landRequest' };
+const heldShip = { ...worker, hive_status: 'occ-shipRequest' };
+const kindsOf = (x, d) => kinds(xellContextMenuItems(x, d));
+ok(kindsOf(heldLand, clean).includes('sendLand'),
+   'a worker with a held landing (occ-landRequest) is offered “send zee land”');
+ok(!kindsOf(heldLand, clean).includes('sendShip'),
+   '…and not “send zee ship”');
+ok(kindsOf(heldShip, clean).includes('sendShip'),
+   'a worker with a held ship (occ-shipRequest) is offered “send zee ship”');
+ok(!kindsOf(heldShip, clean).includes('sendLand'),
+   '…and not “send zee land”');
+ok(!kindsOf(worker, clean).includes('sendLand') && !kindsOf(worker, clean).includes('sendShip'),
+   'a worker with nothing held gets neither');
+ok(!kindsOf({ ...worker, hive_status: 'occ-landHint' }, clean).includes('sendLand')
+   && !kindsOf({ ...worker, hive_status: 'occ-shipHint' }, clean).includes('sendShip'),
+   'a HINT is not a held gate — no send row for landHint/shipHint');
+ok(!kindsOf({ ...worker, hive_status: 'occ-landHolding' }, clean).includes('sendLand'),
+   'a queued landing (occ-landHolding) is not a held gate — the zee must NOT re-push while queued');
+ok(!kindsOf({ ...mgr, hive_status: 'occ-landRequest' }, landable).includes('sendLand'),
+   'a MANAGER with a held landing gets no “send zee land”');
+ok(!kindsOf({ ...worker, is_production: true, hive_status: 'occ-landRequest' }, clean).includes('sendLand'),
+   'production gets no “send zee land” even with a held-landing status');
+const heldLandMenu = xellContextMenuItems(heldLand, clean);
+ok(heldLandMenu[0].kind === 'sendLand',
+   'the held-gate row LEADS the menu — the most actionable thing on a held hex');
+ok(heldLandMenu.find((it) => it.kind === 'sendLand')?.label === '⬆ Send “zee land” to zee',
+   'the row names the exact command (“zee land”) and where it goes (to zee)');
+
 // ── 3. a context menu needs WORDS, not the flower's icon-only labels ──────────
 console.log('\nthe menu rows are human-readable');
 ok(wm.find((it) => it.kind === 'terminal')?.label === '⌨ Terminal',
@@ -96,6 +126,17 @@ ok(/xellContextMenuItems\(x, diff\)/.test(src), 'the menu rows come from the sha
 ok(/className="ctxmenu/.test(src) && /\.ctxmenu/.test(css),
    'the menu reuses the existing .ctxmenu styling (it reads as a context menu, not a new widget)');
 ok(/ctxitem-danger/.test(css), 'and the destructive rows reuse the red item styling');
+
+// ── 4.5 the wiring: a held-gate row types the verb through the message door ───
+console.log('\nthe held-gate rows type the verb into the live session');
+const app = readFileSync('web/src/App.jsx', 'utf8');
+ok(/sendXellMessage,/.test(app), 'App imports sendXellMessage (the operator-message door)');
+ok(/kind === 'sendLand' \|\| kind === 'sendShip'/.test(app),
+   'App dispatches both held-gate kinds in handleFlowerAction');
+ok(/text: `zee \$\{verb\}`/.test(app),
+   'it sends the literal “zee <verb>” command as the message text');
+ok(/r\?\.sent/.test(app), 'and reports the delivery result (sent / not delivered)');
+ok(!/sendXellMessage/.test(src), 'HiveCanvas itself never calls the door — the menu only names the verb');
 
 // ── 5. closing: one menu at a time, close on outside interaction ──────────────
 console.log('\nthe menu closes like the container menu');

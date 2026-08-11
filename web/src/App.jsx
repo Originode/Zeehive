@@ -3,6 +3,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
+         sendXellMessage,
          extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
          routePrompt, deployRouter, redeployRouter,
@@ -979,6 +980,24 @@ export default function App() {
         setTimeout(() => dismissToast(id), 6000);
       }).catch((e) => { updateToast(id, { kind: 'error', title: 'Nudge failed', body: e?.message || String(e), onRetry: null });
         setTimeout(() => dismissToast(id), 6000); });
+      return;
+    }
+    // The context menu's HELD-GATE rows: send the literal 'zee land'/'zee ship' into the zee's live
+    // session (the same operator-message door the 📨 composer uses). Only reachable from the context
+    // menu, and only when the gate is holding — see xellContextMenuItems.
+    if (kind === 'sendLand' || kind === 'sendShip') {
+      const verb = kind === 'sendLand' ? 'land' : 'ship';
+      const id = `sendverb-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Sending “zee ${verb}” to ${x.slug}…`,
+        body: 'typing it into its live session' });
+      sendXellMessage(x.id, { text: `zee ${verb}` }).then((r) => {
+        if (r?.sent) updateToast(id, { kind: 'success', title: `Sent “zee ${verb}” to ${x.slug}`, onRetry: null,
+          body: 'typed into its live session over SSH' });
+        else updateToast(id, { kind: 'error', title: `“zee ${verb}” not delivered`, onRetry: null,
+          body: r?.reason || r?.error || 'no live zee to reach' });
+        setTimeout(() => dismissToast(id), 7000);
+      }).catch((e) => { updateToast(id, { kind: 'error', title: `“zee ${verb}” failed`, body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 7000); });
       return;
     }
     if (kind === 'pull') {
