@@ -252,6 +252,26 @@ so bars are real; the critical path is not yet meaningful. That is a **data gap,
 is the chain-capture path (`zee dep` + the console `depends on` picker), and chains must come from
 real "after" relationships as work is cut — never be invented to make the chart look non-degenerate.
 
+**The other half of the gap is dates and estimates, not chains.** Measured on the live plans the
+same day: **0 of 519 work items carry an estimate or a start/due date** — so every bar is a 1-day
+default (194's fallback) and every schedule is anchored at `now()`. The chart is honest about this
+(the duration_source tooltip says "1-day default"; the edge banner says when order is inferred), but
+it means the bars are placeholders until a human enters real data. What a human would actually enter,
+per card, for the chart to mean something:
+
+- **an `estimate`** (hours) on every task — the only thing that makes a bar's *length* real (194's
+  first choice; otherwise the default 1 day stands, or the measured actual once the task has run);
+- **a `starts_on` / `due_on`** on the cards that anchor the plan — the only thing that makes the
+  *window* real (the CPM otherwise anchors everything at the project start `now()` and lays bars
+  forward from there);
+- **a `dependency` chain** between cards that are really "after" each other — the only thing that
+  makes *slack and criticality* meaningful (the other half of this section).
+
+All three are already writable: the console drawer PATCHes `estimate_hours` / `starts_on` / `due_on`
+and the `depends on` picker writes the model edge, and a manager can do the same from the CLI with
+`zee item --estimate/--starts-on/--due-on` and `zee dep`. Nothing more needs to be built — the chart
+means something as soon as the data is entered.
+
 Migration **060** adds one constraint to the above: `work_item_dates_ordered` — `due_on` may
 not precede `starts_on` (see "The schedule invariant" below). It repairs any already-inverted row
 by **clearing `due_on`** rather than swapping the pair or pinning it to `starts_on`: an inverted
