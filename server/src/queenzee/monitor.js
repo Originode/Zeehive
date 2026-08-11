@@ -127,7 +127,12 @@ export async function monitorTick() {
   // `claude agents --json`, where it can never appear (seen live 2026-07-21: the first codex
   // probe read inactive within a tick).
   const cxell = zees.filter((z) => z.runtime_driver === 'cxell-cli');
-  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote' && z.runtime_driver !== 'cxell-cli');
+  // langchain-driver zees (driver='langchain', migration 192) have NO vendor CLI session to probe:
+  // their liveness is the queenzee's own await (a single in-process model call per turn), not a
+  // cage process or a claude session. They are excluded from the local bucket so the agents-json
+  // probe does not mislabel them 'not active' within a tick.
+  const local = zees.filter((z) => z.runtime_key !== 'claude-code-remote' && z.runtime_driver !== 'cxell-cli'
+    && z.runtime_driver !== 'langchain');
   const remote = zees.filter((z) => z.runtime_key === 'claude-code-remote');
 
   // cxell: the agent CLI runs INSIDE the container, so it is NOT in the host's `claude agents
