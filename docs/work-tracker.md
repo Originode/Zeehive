@@ -238,6 +238,20 @@ direction already resolved to the leaf level) for a whole plan at once, and the 
 chains queries `dependency` directly: `WHERE from_id = $node` gives its successors (things that wait
 on it), `WHERE to_id = $node` gives its predecessors (things it waits on).
 
+### What the durations card actually changed (read this before you trust a critical-path claim)
+
+Migration **194** (the durations-from-evidence change) makes every plan's **durations** real:
+an explicit `estimate` wins, else the measured actual from closed executions, else a stated 1-day
+default — so a gantt draws bars of evidence-derived length on every plan. What it does **not** do is
+make **slack and criticality** meaningful everywhere: those are computed by CPM from `dependency`
+edges, and a plan with no edges has every node trivially critical with one identical slack value —
+the maths is correct, there is just nothing to rank. Measured on the live plans (2026-08-11): the
+Zeehive plan (3 edges) is a real gantt — 69 distinct slack values, 20/164 critical; the omnibiz plan
+(**0 edges**) still comes back 355/355 critical with 1 slack value. Durations vary there (17 distinct),
+so bars are real; the critical path is not yet meaningful. That is a **data gap, not a bug**: the fix
+is the chain-capture path (`zee dep` + the console `depends on` picker), and chains must come from
+real "after" relationships as work is cut — never be invented to make the chart look non-degenerate.
+
 Migration **060** adds one constraint to the above: `work_item_dates_ordered` — `due_on` may
 not precede `starts_on` (see "The schedule invariant" below). It repairs any already-inverted row
 by **clearing `due_on`** rather than swapping the pair or pinning it to `starts_on`: an inverted
