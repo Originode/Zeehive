@@ -22,6 +22,7 @@ import { logline } from '../lib/logbus.js';
 import { spawnCreds, assertProviderDispatchable, dispatchProviderFor,
          credentialVendorMismatch, everyProviderEnv, allProviderTokenRows,
          recordXellProviderGrant, scrubSecrets } from '../lib/provider-tokens.js';
+import { spawnLangchainZee } from './langchain-spawn.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName, preppedImageIfPresent,
          ensureZeehiveKeypair, openCxellSsh, prepareCxellAuth, seedCxellFirstRun, configureCxellGitIdentity,
          installTurnHooksIntoCxell,
@@ -1284,6 +1285,12 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
   if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });
+  // LANGCHAIN runtime → the queenzee drives the zee's model calls with langchain (a library, not a
+  // scheduler — docs/langchain-stateful-zees.md). A single model call per turn runs in-process with
+  // no cage; tool execution is the next card and must move the loop into the cxell. The runtime is
+  // opt-in (agent_runtime.enabled=false, migration 192) so the fleet default never lands here by
+  // accident.
+  if (rt?.driver === 'langchain') return spawnLangchainZee({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
   // CXELLD runtime → the CLI runs INSIDE the xell's zee-agent container (structural confinement).
   if (rt?.driver === 'cxell-cli') return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
 
