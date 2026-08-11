@@ -27,9 +27,15 @@ import { createWorkItem, projectRoot, logWorkEvent, nestItems, assertId, isUuid,
 // tracker's ticket link (ticket_id is a work_item noun the model does not carry). The tree shape,
 // depth and order are the model's; the item attributes ride along from work_item.
 import { modelTree } from './work-item-model.js';
+import { listAttachments } from './ticket-attachments.js';
 
+// `source`/`external_ref`/`external_url`/`api_key_id` (migration 190) are PROVENANCE: they are
+// null for every ticket a human filed in the console and carry the integration's own handle for a
+// ticket that arrived through the external ticketing API (/api/ext/v1 — lib/ticket-intake.js). They
+// ride in COLS so every existing read path shows where a ticket came from without a second query.
 const COLS = `id, project_id, number, title, body, kind, status, priority, reporter, assignee,
-              labels, work_item_id, created_at, updated_at, closed_at`;
+              labels, work_item_id, source, external_ref, external_url, api_key_id,
+              created_at, updated_at, closed_at`;
 
 // THE TICKET CODE — the short handle a human copies and a zee is told.
 //
@@ -158,10 +164,14 @@ export async function getTicket(id) {
                     progress: r.progress, depth: r.model_depth - 1, xell_id: r.xell_id,
                     assignee: r.assignee, starts_on: r.starts_on, due_on: r.due_on }));
   const project = await one(`SELECT id, name FROM project WHERE id=$1`, [row.project_id]);
+  // The evidence (190) — METADATA only. The bytes are served by the download route, one at a time,
+  // so reading a ticket never carries 50 MB of screenshots into a console render.
+  const attachments = await listAttachments(id);
   return {
     ...shapeTicket(row),
     project,
     comments,
+    attachments,
     work_items: items.map((w) => ({ ...w, status_label: workLabel(w.status) })),
     work_items_count: items.length,
     open_work_items_count: items.filter((w) => !['done', 'cancelled'].includes(w.status)).length,
@@ -182,20 +192,27 @@ export async function createTicket(input = {}) {
   if (input.status && !isWorkStatus(input.status)) throw bad(`unknown status "${input.status}"`);
 
   const row = await one(
-    `INSERT INTO ticket (project_id, title, body, kind, status, priority, reporter, assignee, labels)
+    `INSERT INTO ticket (project_id, title, body, kind, status, priority, reporter, assignee, labels,
+                         source, external_ref, external_url, api_key_id)
      VALUES ($1,$2,$3,coalesce($4::ticket_kind,'feature'),coalesce($5::work_status,'queued'),
-             coalesce($6::int,3),$7,$8,coalesce($9::text[],'{}'))
+             coalesce($6::int,3),$7,$8,coalesce($9::text[],'{}'),$10,$11,$12,$13)
      RETURNING ${COLS}`,
     [projectId, title, input.body ?? null, input.kind ?? null, input.status ?? null,
      input.priority ?? null, input.reporter ?? null, input.assignee ?? null,
-     Array.isArray(input.labels) ? input.labels : null]);
+     Array.isArray(input.labels) ? input.labels : null,
+     input.source ?? null, input.external_ref ?? null, input.external_url ?? null,
+     input.api_key_id ?? null]);
   broadcast('work', { kind: 'ticket-created', ticket: shapeTicket(row) });
   return shapeTicket(row);
 }
 
 // priority is 1..5 and 1 is MOST urgent (docs/work-tracker.md, policy 5). Default 3 is the
 // middle of the scale. NB: machine_pool.dev_priority is the OPPOSITE convention — higher wins.
-const TICKET_EDITABLE = ['title', 'body', 'kind', 'priority', 'reporter', 'assignee', 'labels', 'work_item_id'];
+// `external_url` is editable (an integration re-points the link back into its own system);
+// `external_ref`, `source` and `api_key_id` are NOT — they are the provenance a repeat POST is
+// deduped on, and a mutable idempotency key is not one.
+const TICKET_EDITABLE = ['title', 'body', 'kind', 'priority', 'reporter', 'assignee', 'labels',
+                         'work_item_id', 'external_url'];
 
 export async function updateTicket(id, patch = {}, { actor = null } = {}) {
   assertId(id, 'ticket id');

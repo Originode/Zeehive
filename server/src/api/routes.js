@@ -93,6 +93,14 @@ import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkI
 import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
          breakdownTicket, ticketManagers, notifyManagerOfTicket } from '../lib/tickets.js';
 import { listReflections, fileReflectionAsTicket } from '../lib/reflections.js';
+// EXTERNAL TICKETING API (190) — a deployed project files/monitors/updates its own tickets with a
+// per-project key, and attaches the evidence (images, logs). docs/ticketing-api.md.
+import { listProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
+         authenticateApiKey } from '../lib/project-api-keys.js';
+import { listAttachments, getAttachment, addAttachment, deleteAttachment,
+         attachmentLimits } from '../lib/ticket-attachments.js';
+import { externalCreateTicket, externalListTickets, externalGetTicket, externalUpdateTicket,
+         externalComment, externalAttach, externalAttachments, externalMeta } from '../lib/ticket-intake.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
 import { xourceState, cleanXourceNow, commitXourceStaged, commitXourceDirty, stashXource, listXourceCleanRequests,
@@ -663,6 +671,38 @@ router.put('/projects/:id/tokens/:provider', async (req, res) => {
 router.delete('/projects/:id/tokens/:provider', async (req, res) => {
   try { res.json(await deleteProviderToken(req.params.id, req.params.provider)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// ── project API keys: the credential a DEPLOYED project files tickets with (190) ─────────────
+// Same masked-read-model shape as the provider accounts above: the plaintext key exists exactly
+// once, in the answer to the POST that minted it, and no read can ever hand it back (only the
+// sha256 hash is stored). A key that has filed tickets is REVOKED, not deleted — the board must
+// keep being able to say where those tickets came from.
+router.get('/projects/:id/api-keys', async (req, res) => {
+  try { res.json(await listProjectApiKeys(req.params.id)); }
+  catch (err) { workErr(res, err); }
+});
+router.post('/projects/:id/api-keys', async (req, res) => {
+  try {
+    res.status(201).json(await createProjectApiKey(req.params.id, {
+      label: req.body?.label, scopes: req.body?.scopes ?? null,
+      created_by: req.body?.by || 'human@console',
+    }));
+  } catch (err) { workErr(res, err); }
+});
+router.post('/projects/:id/api-keys/:keyId/revoke', async (req, res) => {
+  try {
+    const out = await revokeProjectApiKey(req.params.keyId, { by: req.body?.by || 'human@console' });
+    if (!out) return res.status(404).json({ error: 'no such API key' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+router.delete('/projects/:id/api-keys/:keyId', async (req, res) => {
+  try {
+    const out = await deleteProjectApiKey(req.params.keyId);
+    if (!out) return res.status(404).json({ error: 'no such API key' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
 });
 
 // Regenerate a xell's .zeehive.env projection (spec §3.4) — e.g. after a site edit or a rename.
@@ -2305,6 +2345,58 @@ router.post('/tickets/:id/notify', async (req, res) => {
   } catch (err) { workErr(res, err); }
 });
 
+// Serving an attachment's BYTES, for both doors (the console's and the external API's). Always as
+// a download and never inline: these bytes were uploaded by somebody else's machine, so rendering
+// one in this origin (an image/svg+xml is a script) is the one mistake an attachment feature makes.
+// nosniff stops a browser second-guessing the declared type; the filename is already sanitised at
+// upload (lib/ticket-attachments.js) and is quoted here as well.
+function sendAttachment(res, a) {
+  res.setHeader('Content-Type', a.content_type);
+  res.setHeader('Content-Length', a.size_bytes);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', `attachment; filename="${String(a.filename).replace(/"/g, '')}"`);
+  res.setHeader('X-Attachment-Sha256', a.sha256);
+  res.send(a.content);
+}
+
+// ── ticket attachments, console side (190) ───────────────────────────────────
+// The evidence a ticket carries: images and text logs, stored as bytea in the meta-DB. The LIST is
+// metadata only (a ticket read must never drag 50 MB of screenshots through a console render); the
+// bytes come one at a time from the download route below. The same rows the external API writes —
+// this is the human's door onto them.
+router.get('/tickets/:id/attachments', async (req, res) => {
+  try { res.json(await listAttachments(req.params.id)); }
+  catch (err) { workErr(res, err); }
+});
+
+router.post('/tickets/:id/attachments', async (req, res) => {
+  try {
+    const a = await addAttachment(req.params.id, req.body || {},
+      { uploadedBy: req.body?.uploaded_by || 'human@console', source: 'console' });
+    if (!a) return res.status(404).json({ error: 'no such ticket' });
+    res.status(201).json(a);
+  } catch (err) { workErr(res, err); }
+});
+
+// DOWNLOAD — the raw bytes. Always as an ATTACHMENT and always nosniff: an attachment is content
+// somebody else's machine uploaded, so it is never rendered in the console's own origin (an
+// image/svg+xml served inline is a script running as the console).
+router.get('/tickets/:id/attachments/:attachmentId', async (req, res) => {
+  try {
+    const a = await getAttachment(req.params.attachmentId, { ticketId: req.params.id });
+    if (!a) return res.status(404).json({ error: 'no such attachment' });
+    sendAttachment(res, a);
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/tickets/:id/attachments/:attachmentId', async (req, res) => {
+  try {
+    const out = await deleteAttachment(req.params.attachmentId, { ticketId: req.params.id });
+    if (!out) return res.status(404).json({ error: 'no such attachment' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
 // The hinge: a ticket becomes a plan. { items: [{title, kind?, parent_id?|ref-of-an-earlier-item, …}] }
 router.post('/tickets/:id/breakdown', async (req, res) => {
   try {
@@ -2315,6 +2407,143 @@ router.post('/tickets/:id/breakdown', async (req, res) => {
     res.status(201).json(out);
   } catch (err) { workErr(res, err); }
 });
+
+// ── THE EXTERNAL TICKETING API: /api/ext/v1 (190) ────────────────────────────
+//
+// The door a DEPLOYED project comes in through. omnibiz — running on somebody else's server, with
+// no xell, no token and no console — holds a per-project key and files, monitors and updates its
+// own tickets here, with the images and logs attached. What lands is an ordinary `ticket` row on
+// the project's own board, so a zee works on it with the verbs it already has.
+//
+// Why a SEPARATE path rather than a key on /api/tickets: /api is the console's surface and takes
+// a project id from the caller. This one must not — the project comes from the KEY (see
+// lib/ticket-intake.js rule 1), and putting the two authentication models on one path is how a
+// missing check on one route silently becomes a cross-project read. Everything under /ext/v1 is
+// key-authenticated, scoped to that key's project, and refuses a body that names a project at all.
+//
+// Versioned in the path because this is the ONE surface in this repo whose callers we do not
+// deploy: an integrator's code cannot be updated in lockstep, so a breaking change gets /v2 and
+// /v1 keeps answering.
+const extErr = (res, err) => res.status(httpStatusOf(err)).json({
+  ok: false, error: String(err?.message || err || 'unknown error'),
+});
+
+// The auth gate. Resolves the key, checks the scope, and hands the handler { key, project }.
+// Answers 401 (no/unknown/revoked key) or 403 (a live key without the scope) with a sentence that
+// says WHICH — an integrator debugging somebody else's server cannot read our logs.
+async function extAuth(req, res, scope) {
+  const m = /^Bearer\s+(.+)$/i.exec((req.get('authorization') || '').trim());
+  const presented = m ? m[1].trim() : (req.get('x-zeehive-api-key') || '').trim();
+  let out;
+  try {
+    out = await authenticateApiKey(presented, { scope, ip: req.ip || req.socket?.remoteAddress || null });
+  } catch (err) {
+    // The gate itself failed (the meta-DB is unreachable, say). That is OURS, not the caller's, and
+    // it must be a 503 rather than a 401 — an integration told "unknown key" would revoke a
+    // perfectly good credential and re-mint it. It must also never become an unhandled rejection.
+    res.status(503).json({ ok: false,
+      error: `the ticketing API could not check your key right now: ${String(err?.message || err)}. `
+        + 'Your key is fine — retry.' });
+    return null;
+  }
+  if (!out.ok) { res.status(out.status || 401).json({ ok: false, error: out.reason }); return null; }
+  // A body that names a project is REFUSED rather than ignored: a caller that thinks it is
+  // choosing a project is a caller that will one day be surprised, and silence would let it
+  // believe the field did something.
+  if (req.body && (req.body.project || req.body.project_id)) {
+    res.status(400).json({ ok: false,
+      error: 'do not send a project — an API key files into its OWN project, and naming one here '
+        + `would be ignored. This key files into "${out.project.name}".` });
+    return null;
+  }
+  return out;
+}
+
+// WHO AM I — the integrator's first call: which project this key files into, what the API accepts,
+// and the attachment limits, generated from the same constants the server validates against.
+router.get('/ext/v1/whoami', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  res.json(externalMeta(auth));
+});
+
+router.post('/ext/v1/tickets', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try {
+    const out = await externalCreateTicket(auth, req.body || {});
+    // 200 for a DEDUPED repeat, 201 for a ticket that was actually created — the status alone tells
+    // a retrying caller which of the two happened, without parsing the body.
+    res.status(out.deduped ? 200 : 201).json(out);
+  } catch (err) { extErr(res, err); }
+});
+
+router.get('/ext/v1/tickets', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try {
+    res.json(await externalListTickets(auth, {
+      status: req.query.status || null, kind: req.query.kind || null,
+      q: req.query.q || null, external_ref: req.query.external_ref || null,
+    }));
+  } catch (err) { extErr(res, err); }
+});
+
+// MONITOR one — status, the conversation, the evidence, and what the fleet is doing about it.
+// :ref is an id, a code (TKT-52-2518), a ref (#52) or a bare number, resolved INSIDE this key's
+// project (numbers are per project, so an unscoped number would name two tickets).
+router.get('/ext/v1/tickets/:ref', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try { res.json(await externalGetTicket(auth, req.params.ref)); }
+  catch (err) { extErr(res, err); }
+});
+
+router.patch('/ext/v1/tickets/:ref', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try { res.json(await externalUpdateTicket(auth, req.params.ref, req.body || {})); }
+  catch (err) { extErr(res, err); }
+});
+
+router.post('/ext/v1/tickets/:ref/comments', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try { res.status(201).json(await externalComment(auth, req.params.ref, req.body || {})); }
+  catch (err) { extErr(res, err); }
+});
+
+router.get('/ext/v1/tickets/:ref/attachments', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try { res.json(await externalAttachments(auth, req.params.ref)); }
+  catch (err) { extErr(res, err); }
+});
+
+router.post('/ext/v1/tickets/:ref/attachments', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try { res.status(201).json(await externalAttach(auth, req.params.ref, req.body || {})); }
+  catch (err) { extErr(res, err); }
+});
+
+// Download evidence back out — the same bytes, byte for byte, with the sha256 the upload answered
+// with. A caller's OWN attachment id, scoped to a ticket in its OWN project: an attachment that
+// belongs to another project's ticket is a 404 here, never a read.
+router.get('/ext/v1/tickets/:ref/attachments/:attachmentId', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try {
+    const t = await externalGetTicket(auth, req.params.ref);           // 404s outside the project
+    const a = await getAttachment(req.params.attachmentId, { ticketId: t.id });
+    if (!a) return res.status(404).json({ ok: false, error: 'no such attachment on that ticket' });
+    sendAttachment(res, a);
+  } catch (err) { extErr(res, err); }
+});
+
+// The attachment limits, without a key — the one thing an integrator needs BEFORE it has one, so a
+// build script can check a file size without holding a credential. No project, no ticket, no data.
+router.get('/ext/v1/limits', (_req, res) => res.json({ ok: true, attachments: attachmentLimits() }));
 
 // ── reflections (the ledger) ─────────────────────────────────────────────────
 //
