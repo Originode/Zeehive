@@ -68,10 +68,11 @@ is the message type system that makes "here is the history, continue it" a first
 ### 2.3 Tool binding
 
 A langchain tool is a named function with a JSON schema; the chat model can request its use and the
-driver can execute it. **This is future work in the current build** (§8.3) — the first build drives
-a single model turn with no tool loop. When tool execution arrives, the tools must be queenzee-owned
-verbs (the `zee` CLI's gates, the repo's own scripts), not free actions, so the gates stay
-first-class.
+driver can execute it. The WAVE-1 mechanism slice is built: a bounded in-process loop (`runLangchainAgentTurn`)
+bound to the read-only/report registry (`status`, `work`, `working`, `item` — `langchain-tools.js`),
+each tool calling the SAME handler `/api/xell/self/*` calls. The tools are queenzee-owned verbs, never
+free actions, so the gates stay first-class. Workspace-action tools (file/shell/SQL/docker/git) and
+the gated asks (wave 2) are NOT bound — see §8.3.
 
 ## 3. What the queenzee keeps (everything that is not a single model call)
 
@@ -322,14 +323,23 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
 - `db/migrations/192_...` — `zee_conversation` table + the `langchain-stateful` runtime row.
 - `server/src/lib/langchain-zee.js` — the driver: `buildChatModel` (gateway-pointed langchain chat
   model), `loadConversation` / `appendConversation` / `resetConversation` (DB-backed memory),
-  `runLangchainTurn` (load → invoke → append → return).
+  `runLangchainTurn` (single model call) and `runLangchainAgentTurn` (the bounded tool loop).
+- `server/src/lib/langchain-tools.js` — the WAVE-1 tool registry (`status`, `work`, `working`,
+  `item`), the allowlist that is the confinement. Each tool calls the SAME handler `/api/xell/self/*`
+  calls (selfStatus/selfWork/selfWorking/selfWorkItem), never a second copy; anything outside the
+  registry is refused visibly.
 - `spawnLangchainZee` in the dispatch path — a real zee driven by the driver: creates the zee row,
-  starts the turn, runs the model call through the gateway, persists the conversation, ends the
-  turn with the burn.
-- `test/langchain-zee.test.mjs` — a standalone test that proves the SAME-XELL turnover (see §5.1):
-  two zee rows on one xell; the second zee's model call is seeded with the first zee's conversation,
-  and both calls land in `llm_gateway_request` through the real `gatewayProxy`. It also drives the
-  real `spawnLangchainZee` path end to end (zee row, turn lifecycle, burn, gateway ledger).
+  starts the turn, drives `runLangchainAgentTurn` (the loop, bound to the wave-1 registry), feeds
+  the play-by-play, persists the conversation, ends the turn with the summed burn.
+- `test/langchain-zee.test.mjs` — proves the SAME-XELL turnover (see §5.1): two zee rows on one
+  xell; the second zee's model call is seeded with the first zee's conversation, both calls land in
+  `llm_gateway_request` through the real `gatewayProxy`, and the real `spawnLangchainZee` path runs
+  end to end.
+- `test/langchain-tools.test.mjs` — proves the tool loop end to end through the real gateway: the
+  model requests `working`, the queenzee runs the SHARED `selfWorking` handler, the result feeds
+  back and the model concludes; an unbound tool is refused visibly and the loop continues; a
+  tool-happy model is stopped at the cap with a VISIBLE capped result; every iteration is recorded
+  in `llm_gateway_request` attributed to the live zee + open turn.
 
 **STATUS: BUILT, TESTED, and NOT YET ENABLED on any zee.** Measured on the fleet meta-DB:
 `zee_conversation` has 0 rows across 0 xells — the migration is landed and applied (the table is
