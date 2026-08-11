@@ -520,6 +520,7 @@ function usage() {
   zee await [--for <hours>]           END your turn now — the anti-spin primitive: tokens stop — hold a lease on the execution and mark it 'waiting' (default 24h window; --for overrides in hours). MUST be the last thing you do in this turn
 
  MANAGER-only (refused for a worker, with an explanation):
+  zee dep --item <dependent-id> --on <prerequisite-id> [--remove]   CHAIN two cards in YOUR project: \`--item\` (the dependent) waits for \`--on\` (the prerequisite) — a dependency edge in the model. Nesting (parent_id) says part-of; a chain (dependency) says AFTER, and the gantt's critical path runs along chains. \`--remove\` takes the edge away. The console drawer has the same picker; this is the CLI half
   zee conversations [--xell <slug>] [--full]   review your crew's uploaded CONVERSATION ARCHIVES (who said what while they worked). --xell narrows to one worker; --full prints its newest transcript
   zee zees                           YOUR CREW: every worker you dispatched — slug, branch, hive status, what it waits on, WHAT IT HAS PRODUCED (landings + its unlanded diff) and its last message
   zee assign --item <id> --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify]   DEPLOY a worker for a WORK ITEM — the ONLY way any manager (router included) deploys. The brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text; the item admits at most one live worker, so a second deploy on the same item is REFUSED. Cut a card with \`zee work --new --title "…"\` (or break a ticket down) and pipe its id here: \`zee assign --item <id> --task "…"\`. Returns the new worker's slug. --provider names the AI provider the worker runs on (a ROUTER's decision, riding the board deploy). --visual-verify turns on per-xell VISUAL VERIFICATION (see dispatch)
@@ -1226,6 +1227,22 @@ switch (cmd) {
       progress: progress == null ? null : Number(progress), note: flag('note') || null,
       estimate_hours: est == null ? null : Number(est),
       starts_on: flag('starts-on') || null, due_on: flag('due-on') || null,
+    }));
+    break;
+  }
+  case 'dep': {
+    // CHAIN-vs-NESTING: `--item` (the dependent) waits for `--on` (the prerequisite) — the
+    // model dependency the gantt's critical path runs along. The console drawer has the same
+    // picker; this is the CLI half of "capture chains going forward". MANAGER only.
+    const item = flag('item') || positional();
+    const on = flag('on') || flag('depends-on');
+    if (!item || !on) {
+      console.error('dep needs --item <dependent-id> --on <prerequisite-id> (a chain: this work '
+        + 'waits for that work). `--remove` takes the edge away.');
+      process.exit(1);
+    }
+    out(await req('POST', '/api/xell/self/work/dep', {
+      item, on, remove: rest.includes('--remove'),
     }));
     break;
   }

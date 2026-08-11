@@ -2823,6 +2823,45 @@ export async function selfWorkUnassign(xell, { item = null, reason = null } = {}
   };
 }
 
+// POST /api/xell/self/work/dep — `zee dep` (MANAGER only).
+// The CHAIN-vs-NESTING verb: a card may DEPEND ON another card (a "chain": this work waits
+// for that work). Nesting (parent_id) says "part of"; a dependency says "after". A
+// start-to-end-goal gantt draws the chain as the critical path, so a manager captures it
+// here: `zee dep --item <dependent> --on <prerequisite>` writes the model dependency
+// (dependency.from_id = prerequisite, to_id = dependent), and `--remove` deletes it. The
+// console's item drawer has the same picker (addDep/removeDep); this is the CLI half.
+export async function selfWorkDep(xell, { item = null, on = null, remove = false } = {}) {
+  const guard = requireManager(xell, 'dep');
+  if (guard) return guard;
+  if (!item || !on) {
+    return { ok: false, error: 'dep needs --item <dependent-id> --on <prerequisite-id> '
+      + '(a chain: this work waits for that work). `--remove` takes the edge away.' };
+  }
+  const { addDep, removeDep } = await import('../lib/work-items.js');
+  const { getItem } = await import('../lib/work-assign.js');
+  let a, b;
+  try { [a, b] = await Promise.all([getItem(item), getItem(on)]); }
+  catch (e) { return { ok: false, error: e.message }; }
+  if (!a || !b) return { ok: false, error: 'one of the two items does not exist' };
+  if (a.project_id !== xell.project_id || b.project_id !== xell.project_id) {
+    return { ok: false, status: 'refused', error:
+      `both ends of a chain must be in YOUR project — "${a.title}" is in ${a.project_id}, `
+      + `"${b.title}" is in ${b.project_id}.` };
+  }
+  try {
+    if (remove) {
+      await removeDep(a.id, b.id, { actor: xell.slug });
+      return { ok: true, message: `Removed the chain: "${a.title}" no longer waits for "${b.title}".` };
+    }
+    await addDep(a.id, b.id, { actor: xell.slug });
+    return { ok: true, message: `Chained: "${a.title}" now waits for "${b.title}". The gantt draws `
+      + `"${b.title}" before "${a.title}", and the chain is what the critical path runs along. `
+      + `(Undo with --remove.)` };
+  } catch (e) {
+    return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
+  }
+}
+
 // POST /api/xell/self/work/assign — `zee assign` (MANAGER only).
 // Deploys a WORKER for a work item, through the SAME dispatch path `zee dispatch` uses: the worker is
 // still stamped manager_xell_id, still seated next to its manager, still gets its own throwaway db,
