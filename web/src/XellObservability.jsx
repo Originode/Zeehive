@@ -65,7 +65,7 @@ function eventLine(ev) {
   }
 }
 
-function TurnRow({ turn, open, onToggle }) {
+export function TurnRow({ turn, open, onToggle }) {
   const [events, setEvents] = useState(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
