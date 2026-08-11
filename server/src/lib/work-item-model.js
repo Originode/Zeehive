@@ -122,12 +122,11 @@ export async function modelTree({ projectId, rootItemId } = {}) {
     rootCte = `
       root AS (
         SELECT wn.id AS root_node_id
-        FROM plan p
-        JOIN plan_version pv ON pv.plan_id = p.id
-        JOIN work_node pn ON pn.plan_version_id = pv.id
-                         AND pn.stable_key = 'project:' || p.project_id::text
-        JOIN work_node wn ON wn.parent_id = pn.id AND wn.stable_key LIKE 'work_item:%'
-        WHERE p.project_id = $1
+        FROM work_item ri
+        JOIN work_node wn ON wn.stable_key = 'work_item:' || ri.id::text
+        JOIN plan_version pv ON pv.id = wn.plan_version_id
+        JOIN plan p ON p.id = pv.plan_id
+        WHERE ri.project_id = $1 AND ri.kind = 'project'
         ORDER BY p.created_at DESC, pv.version DESC
         LIMIT 1
       )`;
