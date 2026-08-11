@@ -4,6 +4,36 @@
       "items": [
         {
           "breadcrumb": [
+            "Golden Project",
+            "Activity One"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000006",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000001",
+          "sort_order": -1,
+          "status": "queued",
+          "ticket": null,
+          "title": "Task Six"
+        },
+        {
+          "breadcrumb": [
+            "Golden Project",
+            "Activity One"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000005",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000001",
+          "sort_order": 1500.5,
+          "status": "queued",
+          "ticket": null,
+          "title": "Task Five"
+        },
+        {
+          "breadcrumb": [
             "Golden Project"
           ],
           "depth": 1,
@@ -49,7 +79,7 @@
           "depth": 1,
           "id": "b0000000-0000-4000-8000-000000000001",
           "live_status": null,
-          "open_children": 1,
+          "open_children": 3,
           "parent_id": "99999999-0000-4000-8000-000000000000",
           "sort_order": 1000,
           "status": "working",
@@ -169,6 +199,21 @@
       "unscheduled": false
     },
     {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [],
+      "depth": 2,
+      "due_on": null,
+      "id": "c0000000-0000-4000-8000-000000000006",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "span_days": null,
+      "starts_on": null,
+      "status": "queued",
+      "title": "Task Six",
+      "unscheduled": true
+    },
+    {
       "computed_end": "2026-01-03",
       "computed_start": "2026-01-02",
       "deps": [],
@@ -182,6 +227,21 @@
       "status": "working",
       "title": "Task One",
       "unscheduled": false
+    },
+    {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [],
+      "depth": 2,
+      "due_on": null,
+      "id": "c0000000-0000-4000-8000-000000000005",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "span_days": null,
+      "starts_on": null,
+      "status": "queued",
+      "title": "Task Five",
+      "unscheduled": true
     },
     {
       "computed_end": null,
@@ -276,6 +336,15 @@
     },
     {
       "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000006",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "sort_order": -1,
+      "status": "queued",
+      "title": "Task Six"
+    },
+    {
+      "depth": 2,
       "id": "c0000000-0000-4000-8000-000000000001",
       "kind": "task",
       "parent_id": "b0000000-0000-4000-8000-000000000001",
@@ -291,6 +360,15 @@
       "sort_order": 1000,
       "status": "blocked",
       "title": "Task Three"
+    },
+    {
+      "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000005",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "sort_order": 1500.5,
+      "status": "queued",
+      "title": "Task Five"
     },
     {
       "depth": 2,
