@@ -22,6 +22,8 @@ import { loadManifest, projectDefaultsFromManifest, draftManifest, draftManifest
          planComposeOnboarding, manifestHash, parseManifest, listComposeFiles,
          detectComposeSuggestions } from './manifest.js';
 import { resolveSite } from './sites.js';
+import { dbRunner, inTransaction } from './work-items.js';
+import { syncProjectNode } from './work-node-sync.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, nudge, harness, reaper,
 // the .zeehive.env reconcile): 'real' touches machines, anything else models. The three OUTBOUND
@@ -158,6 +160,12 @@ export async function createProject(body) {
        VALUES ($1,$2,'sparse-overlay','db-shared-dev',$3,3600)
        ON CONFLICT (project_id) DO NOTHING`,
       [project.id, Number(body.pool_target) || 0, rt?.id || null]);
+
+    // DUAL-WRITE — "a project is just a work_node": the project row's ROOT node
+    // (stable_key='project:<project_id>') is created in the same transaction. The 058 trigger
+    // has already made the root work_item by now; syncProjectNode materialises the plan,
+    // plan_version, the project node and the root work_item node under it.
+    await syncProjectNode(dbRunner(client), project.id);
 
     await client.query('COMMIT');
     broadcast('project', project);
@@ -906,29 +914,36 @@ const PATCHABLE = [
 ];
 
 export async function updateProject(id, body = {}) {
-  const project = await one(`SELECT * FROM project WHERE id = $1`, [id]);
-  if (!project) throw new Error('project not found');
+  return inTransaction(async ({ client, pending }) => {
+    const db = dbRunner(client);
+    const project = await db.one(`SELECT * FROM project WHERE id = $1`, [id]);
+    if (!project) throw new Error('project not found');
 
-  const sets = [], vals = [id];
-  for (const f of PATCHABLE) {
-    if (body[f] === undefined) continue;
-    const v = typeof body[f] === 'string' ? (body[f].trim() || null) : body[f];
-    if (f === 'name' && !v) throw new Error('project name cannot be empty');
-    if (f === 'main_branch' && !v) throw new Error('main_branch cannot be empty');
-    vals.push(v);
-    sets.push(`${f} = $${vals.length}`);
-  }
-  if (!sets.length) return project;
+    const sets = [], vals = [id];
+    for (const f of PATCHABLE) {
+      if (body[f] === undefined) continue;
+      const v = typeof body[f] === 'string' ? (body[f].trim() || null) : body[f];
+      if (f === 'name' && !v) throw new Error('project name cannot be empty');
+      if (f === 'main_branch' && !v) throw new Error('main_branch cannot be empty');
+      vals.push(v);
+      sets.push(`${f} = $${vals.length}`);
+    }
+    if (!sets.length) return project;
 
-  const updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
-  // A changed main branch needs its xource row, or the pool can't provision from it.
-  if (body.main_branch && body.main_branch !== project.main_branch) {
-    await q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
-             ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
-            [id, updated.main_branch, headCommit(updated.repo_root, updated.main_branch)]);
-  }
-  broadcast('project', updated);
-  return updated;
+    const updated = await db.one(`UPDATE project SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
+    // A changed main branch needs its xource row, or the pool can't provision from it.
+    if (body.main_branch && body.main_branch !== project.main_branch) {
+      await db.q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+                  ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
+                 [id, updated.main_branch, headCommit(updated.repo_root, updated.main_branch)]);
+    }
+    // DUAL-WRITE — renaming the project keeps its ROOT node's name in step (same transaction).
+    if (body.name && body.name !== project.name) {
+      await syncProjectNode(db, id);
+    }
+    pending.push(['project', updated]);
+    return updated;
+  });
 }
 
 // Remove a project. Refused while any of its zees is live (unless force) — you don't want
