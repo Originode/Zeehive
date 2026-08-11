@@ -34,7 +34,6 @@
 //     confinement is the ALLOWLIST, not the gate — these are absent from it. Do NOT flip
 //     auto_approve_* to make a hold appear: that is fleet-wide policy, and this stays absent.
 import { selfStatus, selfWorking, selfWork, selfWorkItem, selfTend, selfHint } from '../queenzee/self.js';
-import { tendState } from './status.js';
 
 // The bound verbs. Keyed BY NAME so the loop and runTool can look a request up in one step and so
 // the never-bindable check is a single property test: `LANGCHAIN_TOOLS[name]` is undefined for
@@ -66,27 +65,15 @@ export const LANGCHAIN_TOOLS = {
   working: {
     name: 'working',
     description: 'Writes a "working" ping for THIS xell (a session_event + a zee status update) that '
-      + 'tells the fleet this zee is actively working. It opens no gate, but it AUTO-CLEARS an open '
-      + 'tend (a question posted to a human) — so if a tend is open the tool REFUSES rather than '
-      + 'silently dismissing the human\'s question. Use it only when you are genuinely working, never '
-      + 'as conversational filler.',
+      + 'tells the fleet this zee is actively working. It opens no gate. NOTE: like the shared `zee '
+      + 'working` verb, it AUTO-CLEARS an open tend (a question posted to a human) — the same shared '
+      + 'semantics as every cxell zee; it is not langchain-specific. Use it only when you are '
+      + 'genuinely working, never as conversational filler.',
     schema: { type: 'object', properties: { note: { type: 'string' } }, required: [] },
-    run: async (xell, args) => {
-      // THE TEND GUARD (manager ruling 2026-08-11): `working` auto-clears an open tend (lib/status.js
-      // :383, inside pingWorking). A CLI zee's `zee working` is a deliberate act by something that can
-      // read the room; a model in a loop is not — emitting `working` as filler would silently dismiss
-      // a question posted to a human. So when a tend is OPEN, refuse WITHOUT calling selfWorking
-      // (which is what would clear it), and tell the model WHAT the human was asked so it can act.
-      // pingWorking is left untouched — this guard is on the TOOL path only.
-      const state = await tendState(xell.id);
-      if (state.open) {
-        return { ok: false, error: `working is REFUSED: this xell has an OPEN tend — a human was `
-          + `asked "${state.reason || state.full || '…'}" — and a working ping would auto-clear it. `
-          + 'Do not suppress the question with a ping; if you are genuinely working, tell the human '
-          + 'or answer the ask first.' };
-      }
-      return selfWorking(xell, { note: args?.note || null });
-    },
+    // PLAIN SHARED HANDLER — no wrapper, no branch, no langchain-only behaviour. The tool IS the
+    // door to selfWorking, exactly as `zee working` is for a cxell zee. What must be shared is the
+    // VERB'S EFFECT; the loop decides whether the TURN continues, which is harness policy.
+    run: (xell, args) => selfWorking(xell, { note: args?.note || null }),
   },
   item: {
     name: 'item',
