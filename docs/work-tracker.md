@@ -211,6 +211,47 @@ task.work_item_id                                              -- added for part
 > (`work_item_event`), because the model does not own those yet.
 ```
 
+### CHAIN vs NESTING — the edge is a public contract
+
+Two different "ordering" ideas live on the plan, and they are told apart **from the rows alone**:
+
+- **NESTING** — `work_node.parent_id` (or, on the tracker's attribute annex, `work_item.parent_id`).
+  It says **"part of"**: a task belongs to its activity, an activity to its project. Every node except
+  the plan root has exactly one parent. There is no ordering *between separate items* here.
+- **CHAIN** — a row in the `dependency` table. It says **"after"**: one item waits for another item.
+  The two endpoints are **separate nodes** — the model's I6 trigger refuses an ancestor/descendant
+  pair (a chain may not duplicate a nesting relation). The gantt's critical path runs along chains.
+
+**The direction is load-bearing, and the retired table meant the opposite.** In the model,
+`dependency.from_id` is the **PREDECESSOR** (the thing that must finish first) and `dependency.to_id`
+is the **DEPENDENT** (the thing that waits): `from_id → to_id` reads "from finishes, then to starts".
+The retired `work_item_dep` table stored this **the other way round** — `work_item_id` was the
+DEPENDENT and `depends_on_id` was the PREREQUISITE — so anyone carrying a mental model from the old
+table will hand the edge over backwards. The write verb (console `depends on` picker, `zee dep
+--item <dependent> --on <prerequisite>`) takes the DEPENDENT first and the PREREQUISITE second, and
+the writer (`lib/work-items.js` `addDep`) flips them into `from_id=prerequisite, to_id=dependent`.
+
+**The readers/walkers a caller should use:** there is no standalone JS predecessor/successor helper —
+the gantt reads `union_edge` (the leaf-expanded view: sibling order + every dependency, with the
+direction already resolved to the leaf level) for a whole plan at once, and the model's SQL helpers
+(`wn_first_leaves` / `wn_last_leaves` / `wn_ancestors`) walk the TREE. A caller that needs one node's
+chains queries `dependency` directly: `WHERE from_id = $node` gives its successors (things that wait
+on it), `WHERE to_id = $node` gives its predecessors (things it waits on).
+
+### What the durations card actually changed (read this before you trust a critical-path claim)
+
+Migration **194** (the durations-from-evidence change) makes every plan's **durations** real:
+an explicit `estimate` wins, else the measured actual from closed executions, else a stated 1-day
+default — so a gantt draws bars of evidence-derived length on every plan. What it does **not** do is
+make **slack and criticality** meaningful everywhere: those are computed by CPM from `dependency`
+edges, and a plan with no edges has every node trivially critical with one identical slack value —
+the maths is correct, there is just nothing to rank. Measured on the live plans (2026-08-11): the
+Zeehive plan (3 edges) is a real gantt — 69 distinct slack values, 20/164 critical; the omnibiz plan
+(**0 edges**) still comes back 355/355 critical with 1 slack value. Durations vary there (17 distinct),
+so bars are real; the critical path is not yet meaningful. That is a **data gap, not a bug**: the fix
+is the chain-capture path (`zee dep` + the console `depends on` picker), and chains must come from
+real "after" relationships as work is cut — never be invented to make the chart look non-degenerate.
+
 Migration **060** adds one constraint to the above: `work_item_dates_ordered` — `due_on` may
 not precede `starts_on` (see "The schedule invariant" below). It repairs any already-inverted row
 by **clearing `due_on`** rather than swapping the pair or pinning it to `starts_on`: an inverted
