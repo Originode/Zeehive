@@ -1,0 +1,233 @@
+// WORK-ITEM MODEL — the workflow model read layer for the work tracker (REHAB 2/4).
+//
+// REHAB 2/4 re-points every work-tracker READER at the hierarchical workflow model: the tree the
+// board and drawer draw, the order siblings sit in, the kind a node is, the dependency edges and
+// the actuals all come from the model (work_node / dependency / execution / lease) instead of the
+// legacy work_item tables. work_item keeps being WRITTEN by rehab 1/4's dual-write and is NOT
+// dropped until rehab 3/4 — so it is still here as the ATTRIBUTE STORE for the fields the model
+// genuinely does not carry (see the mapping below), and every re-pointed reader can be checked
+// against the old shape side by side.
+//
+// ── WHAT COMES FROM WHERE ──────────────────────────────────────────────────────
+//   MODEL (authoritative)                 LEGACY work_item (attribute lookup only)
+//   ─────────────────────                 ─────────────────────────────────────
+//   the tree: which rows exist, their     title, body, status, priority, ticket_id,
+//     parentage, depth, sibling order       xell_id, assignee, starts_on, due_on,
+//     (sibling_rank), node_kind from         estimate_hours, progress, sort_order,
+//     shape (container vs action)            path, created_by, created_at/updated_at,
+//   dependency edges (dependency)           closed_at, id (the API's identity — the
+//   actuals (execution.started_at/          console PATCHes work_items, so the model
+//     finished_at)                          read MUST return work_item ids)
+//   "who has it" (lease → entity)          the exact stored status (see the status
+//                                           mapping below)
+//
+// ── THE STATUS MAPPING (the trap REHAB 2/4 exists to defuse) ─────────────────
+// work_item.status is a single column that conflates PLAN state and RUN state. The model splits
+// them: plan shape on work_node, run state on execution.state, "who has it" on lease. The ONE
+// mapping from the run plane back to the work vocabulary lives in lib/model-status.js and is used
+// by every reader — never re-derived per file. See that module for the exact table and its known
+// limit (the run plane cannot tell the tracker's `review` from `shipping` — both are 'waiting' —
+// so a reader that renders a BOARD COLUMN still reads work_item.status, which is exactly the
+// conflation rehab 3/4 will retire).
+//
+// ── THE KEY ───────────────────────────────────────────────────────────────────
+// work_node.stable_key = 'work_item:<uuid>' is the identity bridge (migration 185). The join is
+// wi.id::text = substring(wn.stable_key, 11) — 'work_item:' is 10 chars, the uuid starts at 11.
+import { q as rawQ, one as rawOne } from '../db/pool.js';
+
+const q = rawQ;
+const one = rawOne;
+
+// The project → plan → latest published version's root work_node, or null when the project has no
+// usable plan. Mirrors lib/workflow-gantt.js planVersionForProject.
+export async function modelRootForProject(projectId) {
+  return one(
+    `SELECT pv.id AS plan_version_id, p.id AS plan_id, p.name AS plan_name,
+            pv.version, pv.root_node_id
+       FROM plan p
+       JOIN plan_version pv ON pv.plan_id = p.id
+      WHERE p.project_id = $1 AND pv.root_node_id IS NOT NULL
+      ORDER BY p.created_at DESC, pv.version DESC
+      LIMIT 1`, [projectId]);
+}
+
+// The root work_node for a work_item id (the node whose stable_key names that item), or null.
+export async function modelNodeForWorkItem(workItemId) {
+  if (!workItemId) return null;
+  return one(`SELECT * FROM work_node WHERE stable_key = 'work_item:' || $1::text`, [workItemId]);
+}
+
+// ── the tree ──────────────────────────────────────────────────────────────────
+// The whole subtree under a root node in MODEL tree order (depth-first by sibling_rank), each row
+// carrying the work_node columns + the joined work_item row. `model_depth` is 1-based (the root is
+// 1); the API convention is 0-based, so readers subtract 1.
+//
+// `rootItemId` is a work_item id (the API's identity); when given, the walk starts at that item's
+// node. Otherwise `projectId` resolves the project's plan root.
+export async function modelTree({ projectId, rootItemId } = {}) {
+  const params = [];
+  let rootCte;
+  if (rootItemId) {
+    params.push(rootItemId);
+    rootCte = `
+      root AS (
+        SELECT id AS root_node_id FROM work_node WHERE stable_key = 'work_item:' || $1::text
+      )`;
+  } else {
+    params.push(projectId);
+    rootCte = `
+      root AS (
+        SELECT pv.root_node_id
+        FROM plan p JOIN plan_version pv ON pv.plan_id = p.id
+        WHERE p.project_id = $1 AND pv.root_node_id IS NOT NULL
+        ORDER BY p.created_at DESC, pv.version DESC LIMIT 1
+      )`;
+  }
+  const rows = await q(`
+    WITH RECURSIVE ${rootCte},
+    t AS (
+      SELECT wn.id AS node_id, wn.parent_id AS node_parent_id, wn.sibling_rank,
+             wn.plan_version_id, wn.kind AS node_kind, wn.child_semantics,
+             wn.stable_key, wn.estimate AS node_estimate, wn.priority AS node_priority,
+             substring(pwn.stable_key, 11) AS model_parent_item_id,
+             wi.*,
+             1 AS model_depth
+      FROM work_node wn
+      JOIN root ON wn.id = root.root_node_id
+      LEFT JOIN work_node pwn ON pwn.id = wn.parent_id
+      LEFT JOIN work_item wi ON wi.id::text = substring(wn.stable_key, 11)
+      UNION ALL
+      SELECT wn.id, wn.parent_id, wn.sibling_rank,
+             wn.plan_version_id, wn.kind, wn.child_semantics,
+             wn.stable_key, wn.estimate, wn.priority,
+             substring(pwn.stable_key, 11),
+             wi.*,
+             t.model_depth + 1
+      FROM work_node wn
+      JOIN t ON wn.parent_id = t.node_id
+      LEFT JOIN work_node pwn ON pwn.id = wn.parent_id
+      LEFT JOIN work_item wi ON wi.id::text = substring(wn.stable_key, 11)
+    )
+    SELECT * FROM t
+    ORDER BY model_depth, sibling_rank`, params);
+  return rows;
+}
+
+// The work_item id a node's stable_key names, or null for a foreign node.
+export function workItemIdOf(node) {
+  const s = node?.stable_key;
+  return (typeof s === 'string' && s.startsWith('work_item:')) ? s.slice(10) : null;
+}
+
+// The ancestors of a work_item, nearest-first, as work_item rows (the model's parent chain). A
+// foreign ancestor (a work_node with no work_item) contributes nothing — the tracker's breadcrumb
+// is made of tracker items.
+export async function modelAncestorsForWorkItem(workItemId) {
+  const rows = await q(
+    `WITH RECURSIVE up AS (
+       SELECT wn.parent_id AS node_id, 1 AS depth
+       FROM work_node wn WHERE wn.stable_key = 'work_item:' || $1::text AND wn.parent_id IS NOT NULL
+       UNION ALL
+       SELECT wn.parent_id, up.depth + 1
+       FROM up JOIN work_node wn ON wn.id = up.node_id
+       WHERE wn.parent_id IS NOT NULL
+     )
+     SELECT wi.*, up.depth
+       FROM up
+       JOIN work_node wn ON wn.id = up.node_id
+       JOIN work_item wi ON wi.id::text = substring(wn.stable_key, 11)
+      ORDER BY up.depth`, [workItemId]);
+  return rows;
+}
+
+// ── dependency edges ──────────────────────────────────────────────────────────
+// dependency.from_id is the PREREQUISITE, to_id the DEPENDENT (the 186 repair fixed 185's reversal
+// and the dual-write has written it this way ever since). Map the model's node-level edges onto
+// work_item ids so the API can keep naming items.
+//
+// Returns { depsBy, dependentsBy } where depsBy.get(itemId) = [prereq itemIds...] and
+// dependentsBy.get(itemId) = [dependent itemIds...].
+export async function modelDepsForItems(itemIds) {
+  const depsBy = new Map();
+  const dependentsBy = new Map();
+  if (!itemIds || !itemIds.length) return { depsBy, dependentsBy };
+  // Edges where EITHER end is one of the given items: an edge (from=prereq → to=dependent) both
+  // makes `to` depend on `from` AND makes `from` a prerequisite of `to` — a reader asking about a
+  // single item needs both halves (getWorkItem's deps AND dependents).
+  const rows = await q(
+    `SELECT d.from_id, d.to_id,
+            substring(wf.stable_key, 11) AS from_item_id,
+            substring(wt.stable_key, 11) AS to_item_id
+       FROM dependency d
+       JOIN work_node wf ON wf.id = d.from_id
+       JOIN work_node wt ON wt.id = d.to_id
+      WHERE wf.stable_key LIKE 'work_item:%' AND wt.stable_key LIKE 'work_item:%'
+        AND (wf.stable_key IN (SELECT 'work_item:' || unnest($1::uuid[])::text)
+          OR wt.stable_key  IN (SELECT 'work_item:' || unnest($1::uuid[])::text))`,
+    [itemIds]);
+  for (const r of rows) {
+    const dep = r.to_item_id;       // the item that WAITS
+    const prereq = r.from_item_id;  // the item it waits on
+    if (!depsBy.has(dep)) depsBy.set(dep, []);
+    depsBy.get(dep).push(prereq);
+    if (!dependentsBy.has(prereq)) dependentsBy.set(prereq, []);
+    dependentsBy.get(prereq).push(dep);
+  }
+  return { depsBy, dependentsBy };
+}
+
+// ── actuals from the run plane ────────────────────────────────────────────────
+// execution.started_at / finished_at are the record's proof of when a work_item RAN. A container
+// node's actuals roll up from its subtree (the same rule the work-item gantt applied to work_item
+// actuals). Returns Map<itemId, { start, end }> where start/end are Date or null.
+export async function modelActualsForItems(itemIds) {
+  const actuals = new Map();
+  if (!itemIds || !itemIds.length) return actuals;
+  const rows = await q(
+    `SELECT substring(wn.stable_key, 11) AS item_id,
+            min(e.started_at) AS started_at,
+            max(e.finished_at) AS finished_at
+       FROM execution e
+       JOIN work_node wn ON wn.id = e.work_node_id
+      WHERE wn.stable_key LIKE 'work_item:%'
+        AND wn.stable_key IN (SELECT 'work_item:' || unnest($1::uuid[])::text)
+      GROUP BY 1`, [itemIds]);
+  for (const r of rows) actuals.set(r.item_id, { start: r.started_at || null, end: r.finished_at || null });
+  return actuals;
+}
+
+// ── executions + leases for a set of items (the run plane, for the drawer's waterfall / the
+//    gantt's waiting layer). Returns { execsByItem, leasesByExec }.
+export async function modelExecutionsForItems(itemIds) {
+  const execsByItem = new Map();
+  if (!itemIds || !itemIds.length) return { execsByItem, leasesByExec: new Map() };
+  const execs = await q(
+    `SELECT e.id, e.run_id, e.work_node_id, e.state, e.attempt, e.started_at, e.finished_at,
+            e.outputs, e.error,
+            en.name AS entity_name, en.kind_hint AS entity_kind_hint,
+            substring(wn.stable_key, 11) AS item_id
+       FROM execution e
+       JOIN work_node wn ON wn.id = e.work_node_id
+       LEFT JOIN entity en ON en.id = e.entity_id
+      WHERE wn.stable_key LIKE 'work_item:%'
+        AND wn.stable_key IN (SELECT 'work_item:' || unnest($1::uuid[])::text)
+      ORDER BY e.started_at ASC NULLS LAST, e.id`, [itemIds]);
+  for (const ex of execs) {
+    if (!execsByItem.has(ex.item_id)) execsByItem.set(ex.item_id, []);
+    execsByItem.get(ex.item_id).push(ex);
+  }
+  const execIds = execs.map((e) => e.id);
+  const leases = execIds.length
+    ? await q(
+        `SELECT l.id, l.execution_id, l.entity_id, l.state, l.claimed_at, l.expires_at,
+                l.released_at, en.name AS entity_name
+           FROM lease l LEFT JOIN entity en ON en.id = l.entity_id
+          WHERE l.execution_id = ANY($1::uuid[])`, [execIds])
+    : [];
+  const leasesByExec = new Map();
+  for (const l of leases) {
+    if (!leasesByExec.has(l.execution_id)) leasesByExec.set(l.execution_id, []);
+    leasesByExec.get(l.execution_id).push(l);
+  }
+  return { execsByItem, leasesByExec };
+}

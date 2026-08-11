@@ -31,6 +31,11 @@ import {
   WORK_STATUS_KEYS, WORK_STATUS, WORK_ITEM_KINDS, workLabel, isWorkStatus, canTransition,
   nextStatuses, statusFromHive, isTerminal,
 } from './work-status.js';
+// REHAB 2/4 — the workflow model is the source of truth for the PLAN SHAPE (tree, order, deps,
+// actuals). work_item is still WRITTEN by the dual-write and still supplies the API's identity +
+// the fields the model does not carry (see work-item-model.js's header for the exact split).
+import { modelRootForProject, modelTree, modelDepsForItems, modelActualsForItems, modelExecutionsForItems,
+         modelAncestorsForWorkItem } from './work-item-model.js';
 
 // ── how a refusal becomes an HTTP STATUS ─────────────────────────────────────
 //
@@ -159,6 +164,14 @@ function shapeItem(row) {
     status_label: workLabel(row.status),
     next_statuses: nextStatuses(row.status),
   };
+}
+
+// REHAB 2/4 — shape a MODEL TREE row (work-node.js modelTree) as the API's work item. The tree's
+// parentage and depth come from the MODEL (the parent node's stable_key → parent work_item id, and
+// the recursive walk); the work_item columns ride along as the attribute store.
+function shapeModelItem(row) {
+  if (!row || !row.id) return null;                       // a foreign node (no work_item) is not a tracker item
+  return shapeItem({ ...row, parent_id: row.model_parent_item_id ?? row.parent_id, depth: row.model_depth - 1 });
 }
 
 // ── ids ──────────────────────────────────────────────────────────────────────
@@ -371,24 +384,58 @@ function assertFilters({ status, kind }) {
   }
 }
 
+// REHAB 2/4 — re-pointed at the MODEL. The rows come from the work_node tree (modelTree), the order
+// from the model's sibling_rank, and the filters still apply to the work_item attribute columns
+// (status/kind/ticket are tracker nouns the model does not carry). Ordering is (model depth,
+// work_item sort_order, created_at) — the same flat order the pre-rehab reader produced, with the
+// model's depth standing in for the legacy stored depth.
 export async function listWorkItems({ projectId, status, kind, ticketId, rootId, tree } = {}) {
   if (projectId) assertId(projectId, 'project id');
   if (ticketId) assertId(ticketId, 'ticket id');
   if (rootId) assertId(rootId, 'work item id');
   assertFilters({ status, kind });
+  if (!projectId && !rootId) {
+    // Unscoped (lists every work item in the fleet): the model's nodes span many plans, so fall
+    // back to the legacy flat read for this rare call — the board/drawer routes always scope.
+    return listWorkItemsLegacyUnscoped({ status, kind, ticketId, tree });
+  }
+
+  // The MODEL tree is the source: rootId → that item's subtree (including it); projectId → the
+  // project's whole tree (the flat list INCLUDES the root — the pre-rehab read did).
+  const rows = rootId
+    ? await modelTree({ rootItemId: rootId })
+    : await modelTree({ projectId });
+  if (!rows.length) return tree ? [] : [];
+
+  const seen = new Set();
+  const items = [];
+  for (const r of rows) {
+    if (!r.id) continue;                                  // a foreign node is not a tracker item
+    if (status && !(Array.isArray(status) ? status.includes(r.status) : r.status === status)) continue;
+    if (kind && !(Array.isArray(kind) ? kind.includes(r.kind) : r.kind === kind)) continue;
+    if (ticketId && r.ticket_id !== ticketId) continue;
+    if (seen.has(r.id)) continue;                          // a node appears once even across plan versions
+    seen.add(r.id);
+    items.push(shapeModelItem(r));
+  }
+  // Flat order: model depth, then the tracker's sort_order (the rank the model encodes, surfaced
+  // as the number the console drags), then created_at — byte-identical to the pre-rehab reader.
+  items.sort((a, b) => (a.depth - b.depth)
+    || ((a.sort_order ?? 0) - (b.sort_order ?? 0))
+    || (new Date(a.created_at) - new Date(b.created_at)));
+  return tree ? nestItems(items) : items;
+}
+
+// The unscoped flat read (no project, no root): every work_item in the fleet, legacy-shaped. This
+// is the one listWorkItems call the model cannot drive (a work_node belongs to a plan; "every plan"
+// is not a tree), and it was already a rare administrative read — the routes always scope.
+async function listWorkItemsLegacyUnscoped({ status, kind, ticketId, tree } = {}) {
   const where = [];
   const params = [];
   const add = (sql, val) => { params.push(val); where.push(sql.replace('?', `$${params.length}`)); };
-  if (projectId) add('project_id = ?', projectId);
   if (status) add(Array.isArray(status) ? 'status = ANY(?::work_status[])' : 'status = ?', status);
   if (kind) add(Array.isArray(kind) ? 'kind = ANY(?::work_item_kind[])' : 'kind = ?', kind);
   if (ticketId) add('ticket_id = ?', ticketId);
-  if (rootId) {
-    const root = await one(`SELECT id, path FROM work_item WHERE id=$1`, [rootId]);
-    if (!root) return tree ? [] : [];
-    params.push(root.id); params.push(`${subtreePrefix(root)}%`);
-    where.push(`(id = $${params.length - 1} OR path LIKE $${params.length})`);
-  }
   const rows = await q(
     `SELECT ${COLS} FROM work_item
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -399,32 +446,47 @@ export async function listWorkItems({ projectId, status, kind, ticketId, rootId,
 
 export async function getWorkItem(id) {
   assertId(id);
-  const row = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [id]);
-  if (!row) return null;
-  const item = shapeItem(row);
+  // REHAB 2/4 — the item and its subtree come from the MODEL tree; the ancestors from the model's
+  // parent chain; the deps from the dependency table; the counts from the model subtree. The ticket
+  // and events are still the tracker's own ledgers (the model has no ticket link and the rehab does
+  // not write the model's append-only event table), and the exact stored status still comes from
+  // work_item.status (see model-status.js — the run plane cannot tell review from shipping).
+  const tree = await modelTree({ rootItemId: id });
+  const row = tree.find((r) => r.model_depth === 1) || null;
+  if (!row || !row.id) return null;
+  const item = shapeModelItem(row);
 
-  const ancIds = item.ancestor_ids;
-  const ancRows = ancIds.length
-    ? await q(`SELECT ${COLS} FROM work_item WHERE id = ANY($1::uuid[])`, [ancIds])
+  // modelAncestorsForWorkItem returns NEAREST-first; the API's ancestors/breadcrumb are oldest-first.
+  const ancestors = (await modelAncestorsForWorkItem(id)).reverse().map(shapeItem);
+  // The item's global depth = how many ancestors it has (the model walk starts at the item itself,
+  // so the subtree-local depth 0 is not its place in the project tree).
+  item.depth = ancestors.length;
+
+  const children = tree
+    .filter((r) => r.model_depth === 2 && r.id)
+    .map(shapeModelItem)
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)
+      || (new Date(a.created_at) - new Date(b.created_at)));
+
+  const { depsBy, dependentsBy } = await modelDepsForItems([id]);
+  const depIds = depsBy.get(id) || [];
+  const depRows = depIds.length
+    ? await q(`SELECT id, title, kind, status, due_on, sort_order, created_at FROM work_item WHERE id = ANY($1::uuid[])`, [depIds])
     : [];
-  // ordered by the PATH, not by whatever order postgres returned: the path IS the lineage
-  const ancById = new Map(ancRows.map((a) => [a.id, shapeItem(a)]));
-  const ancestors = ancIds.map((aid) => ancById.get(aid)).filter(Boolean);
-
-  const children = (await q(
-    `SELECT ${COLS} FROM work_item WHERE parent_id=$1 ORDER BY sort_order, created_at`, [id]
-  )).map(shapeItem);
-
-  const deps = (await q(
-    `SELECT w.id, w.title, w.kind, w.status, w.due_on FROM work_item_dep d
-       JOIN work_item w ON w.id = d.depends_on_id
-      WHERE d.work_item_id=$1 ORDER BY w.sort_order, w.created_at`, [id]
-  )).map((d) => ({ ...d, due_on: asDate(d.due_on), status_label: workLabel(d.status) }));
-  const dependents = (await q(
-    `SELECT w.id, w.title, w.kind, w.status, w.due_on FROM work_item_dep d
-       JOIN work_item w ON w.id = d.work_item_id
-      WHERE d.depends_on_id=$1 ORDER BY w.sort_order, w.created_at`, [id]
-  )).map((d) => ({ ...d, due_on: asDate(d.due_on), status_label: workLabel(d.status) }));
+  const deps = depRows
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)
+      || (new Date(a.created_at) - new Date(b.created_at)))
+    .map((d) => ({ id: d.id, title: d.title, kind: d.kind, status: d.status,
+                   due_on: asDate(d.due_on), status_label: workLabel(d.status) }));
+  const dependentIds = dependentsBy.get(id) || [];
+  const dependentRows = dependentIds.length
+    ? await q(`SELECT id, title, kind, status, due_on, sort_order, created_at FROM work_item WHERE id = ANY($1::uuid[])`, [dependentIds])
+    : [];
+  const dependents = dependentRows
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)
+      || (new Date(a.created_at) - new Date(b.created_at)))
+    .map((d) => ({ id: d.id, title: d.title, kind: d.kind, status: d.status,
+                   due_on: asDate(d.due_on), status_label: workLabel(d.status) }));
 
   const ticket = item.ticket_id
     ? await one(`SELECT id, number, title, kind, status, priority FROM ticket WHERE id=$1`, [item.ticket_id])
@@ -436,12 +498,11 @@ export async function getWorkItem(id) {
 
   const zee = item.xell_id ? (await liveZees([item.xell_id])).get(item.xell_id) || null : null;
 
-  // The counts a UI warns with. open_children exists because closing a parent does NOT close its
-  // children (see setStatus) — the read model says so out loud instead of the UI guessing.
-  const counts = await one(
-    `SELECT count(*)::int AS descendants,
-            count(*) FILTER (WHERE status NOT IN ('done','cancelled'))::int AS open_descendants
-       FROM work_item WHERE path LIKE $1`, [`${subtreePrefix(item)}%`]);
+  // The counts a UI warns with, counted from the MODEL subtree (the tree under this item). open_children
+  // exists because closing a parent does NOT close its children (see setStatus) — the read model says
+  // so out loud instead of the UI guessing.
+  const descendants = tree.filter((r) => r.model_depth > 1 && r.id);
+  const openDescendants = descendants.filter((r) => !isTerminal(r.status)).length;
   const openChildren = children.filter((c) => !isTerminal(c.status)).length;
 
   return {
@@ -450,8 +511,8 @@ export async function getWorkItem(id) {
     breadcrumb: ancestors.map((a) => a.title),
     children,
     open_children: openChildren,
-    descendant_count: counts?.descendants ?? 0,
-    open_descendant_count: counts?.open_descendants ?? 0,
+    descendant_count: descendants.length,
+    open_descendant_count: openDescendants,
     deps,
     dependents,
     ticket,
@@ -808,22 +869,24 @@ async function removeDepInTx(workItemId, dependsOnId, { client = null, pending =
 // here ever writes it back. That separation is the whole point: a zee going idle for a minute must
 // not silently drag somebody's card into another column.
 export async function boardModel({ projectId, rootId } = {}) {
-  let root = null;
-  if (rootId) root = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [rootId]);
-  else if (projectId) root = await projectRoot(projectId);
-  if (!root && !projectId) throw bad('project or root required');
+  if (projectId) assertId(projectId, 'project id');
+  if (rootId) assertId(rootId);
+  if (!projectId && !rootId) throw bad('project or root required');
 
-  const params = [];
-  let where = '';
-  if (root) {
-    params.push(`${subtreePrefix(root)}%`);
-    where = `WHERE path LIKE $1`;                    // the subtree, excluding the root itself
-  } else {
-    params.push(projectId);
-    where = `WHERE project_id = $1 AND kind <> 'project'`;
-  }
-  const rows = (await q(`SELECT ${COLS} FROM work_item ${where} ORDER BY sort_order, created_at`, params))
-    .map(shapeItem);
+  // REHAB 2/4 — the ROWS come from the MODEL tree (work_node). The board EXCLUDES the root (a
+  // project's root item is not a card), exactly as the pre-rehab `path LIKE subtree%` read did.
+  const treeRows = rootId
+    ? await modelTree({ rootItemId: rootId })
+    : await modelTree({ projectId });
+  const rows = treeRows
+    .filter((r) => r.id && r.model_depth > 1)          // foreign nodes + the root are not cards
+    .map(shapeModelItem)
+    .filter(Boolean)
+    // the board's within-column order is the tracker's sort_order (the number the console drags)
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)
+      || (new Date(a.created_at) - new Date(b.created_at)));
+  const rootRow = treeRows.find((r) => r.model_depth === 1) || null;
+  const root = rootRow ? shapeModelItem(rootRow) : null;
 
   // one batched read for every zee on the board, and one for every ticket referenced
   const zees = await liveZees(rows.map((r) => r.xell_id));
@@ -840,12 +903,16 @@ export async function boardModel({ projectId, rootId } = {}) {
         .map((a) => [a.id, a.title]))
     : new Map();
 
-  const openBySubtree = new Map();   // how many open descendants each card still has
-  const counts = await q(
-    `SELECT parent_id, count(*) FILTER (WHERE status NOT IN ('done','cancelled'))::int AS open
-       FROM work_item WHERE parent_id = ANY($1::uuid[]) GROUP BY parent_id`,
-    [rows.map((r) => r.id)]);
-  for (const c of counts) openBySubtree.set(c.parent_id, c.open);
+  // open_children — how many OPEN (non-terminal) children each card has. Counted from the MODEL
+  // tree (a card's children are its node's children), not from work_item.parent_id.
+  const openBySubtree = new Map();
+  for (const r of treeRows) {
+    if (!r.id || r.model_depth <= 1) continue;
+    const pid = r.model_parent_item_id;
+    if (!pid) continue;
+    if (!openBySubtree.has(pid)) openBySubtree.set(pid, 0);
+    if (!isTerminal(r.status)) openBySubtree.set(pid, openBySubtree.get(pid) + 1);
+  }
 
   const card = (r) => {
     const zee = r.xell_id ? zees.get(r.xell_id) || null : null;
@@ -870,7 +937,7 @@ export async function boardModel({ projectId, rootId } = {}) {
     items: rows.filter((r) => r.status === key).map(card),
   })).sort((a, b) => a.order - b.order);
 
-  return { root: root ? shapeItem(root) : null, project_id: projectId || root?.project_id || null,
+  return { root: root || null, project_id: projectId || root?.project_id || null,
            columns, total: rows.length };
 }
 
@@ -889,27 +956,38 @@ export async function boardModel({ projectId, rootId } = {}) {
 export async function ganttModel({ projectId, rootId } = {}) {
   if (projectId) assertId(projectId, 'project id');
   if (rootId) assertId(rootId);
-  let root = null;
-  if (rootId) root = await one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [rootId]);
-  else if (projectId) root = await projectRoot(projectId);
-  if (!root && !projectId) throw bad('project or root required');
+  if (!projectId && !rootId) throw bad('project or root required');
 
-  const params = [];
-  let where;
-  if (root) { params.push(root.id, `${subtreePrefix(root)}%`); where = `WHERE id=$1 OR path LIKE $2`; }
-  else { params.push(projectId); where = `WHERE project_id=$1`; }
-  const rows = (await q(`SELECT ${COLS} FROM work_item ${where} ORDER BY depth, sort_order, created_at`, params))
-    .map(shapeItem);
+  // REHAB 2/4 — the ROWS come from the MODEL tree (work_node), the DEPS from the dependency table,
+  // and the ACTUALS from execution. The gantt includes the root (it draws a top-level bar), exactly
+  // as the pre-rehab read did.
+  const treeRows = rootId
+    ? await modelTree({ rootItemId: rootId })
+    : await modelTree({ projectId });
+  const rows = treeRows.map(shapeModelItem).filter(Boolean);
+  const root = treeRows.find((r) => r.model_depth === 1) ? shapeModelItem(treeRows.find((r) => r.model_depth === 1)) : null;
 
-  const deps = rows.length
-    ? await q(`SELECT work_item_id, depends_on_id FROM work_item_dep
-                WHERE work_item_id = ANY($1::uuid[])`, [rows.map((r) => r.id)])
-    : [];
-  const depsBy = new Map();
-  for (const d of deps) {
-    if (!depsBy.has(d.work_item_id)) depsBy.set(d.work_item_id, []);
-    depsBy.get(d.work_item_id).push(d.depends_on_id);
+  // actuals from the RUN PLANE: execution.started_at/finished_at are the record's proof of when an
+  // item RAN (the pre-rehab reader took work_item.actual_*, which migration 159 derives from the
+  // event ledger; the backfill's executions carry the same timestamps, so the two agree).
+  //
+  // ONE documented fallback: the run plane CLEARS finished_at when a terminal item is reopened (the
+  // dual-write's syncExecutionState sets it NULL on the way back to queued), while the legacy
+  // work_item.actual_end PERSISTS "this ended once". The model's single execution row has no room
+  // for that history (a reopened item would need a fresh ATTEMPT row), so the gantt prefers the
+  // execution and falls back to the legacy column when the run plane has no end — a reopened item
+  // still draws its "it ended once" bar, exactly as it did before the rehab.
+  const itemIds = rows.map((r) => r.id);
+  const actuals = await modelActualsForItems(itemIds);
+  for (const r of rows) {
+    const a = actuals.get(r.id);
+    if (a) {
+      r.actual_start = a.start || r.actual_start || null;
+      r.actual_end = a.end || r.actual_end || null;
+    }
   }
+
+  const { depsBy } = await modelDepsForItems(itemIds);
 
   const forest = nestItems(rows);
   const ordered = flattenTree(forest);
@@ -993,7 +1071,7 @@ export async function ganttModel({ projectId, rootId } = {}) {
   }, null);
 
   return {
-    root: root ? shapeItem(root) : null,
+    root: root || null,
     project_id: projectId || root?.project_id || null,
     rows: ganttRows,
     unscheduled_count: ganttRows.filter((r) => r.unscheduled).length,
