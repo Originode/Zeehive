@@ -3,10 +3,31 @@
 // REHAB 2/4 re-points every work-tracker READER at the hierarchical workflow model: the tree the
 // board and drawer draw, the order siblings sit in, the kind a node is, the dependency edges and
 // the actuals all come from the model (work_node / dependency / execution / lease) instead of the
-// legacy work_item tables. work_item keeps being WRITTEN by rehab 1/4's dual-write and is NOT
-// dropped until rehab 3/4 — so it is still here as the ATTRIBUTE STORE for the fields the model
-// genuinely does not carry (see the mapping below), and every re-pointed reader can be checked
-// against the old shape side by side.
+// legacy work_item tables.
+//
+// ── THE DESIGN (REHAB 3/4, option ii): work_item IS THE ATTRIBUTE ANNEX ────────
+// The rehab retires the PLAN/RUN conflation, NOT the work_item table. work_item remains the
+// annex that carries the attributes the model demonstrably does not own yet — body (work_node has
+// no body column), ticket_id, xell_id/assignee (the lease plane is empty: 0 rows), progress, the
+// exact stored status (the run plane collapses review/shipping to 'waiting'), the actual_* dates,
+// created_by and the audit trail (work_item_event — the 244 human comments have no home in the
+// model). The dual-write of those attribute columns therefore CONTINUES (title, body, status,
+// priority, ticket_id, starts_on, due_on, progress, sort_order, parent_id, xell_id); stopping it
+// would make a model-created work_node draw a BLANK CARD through the LEFT JOIN below.
+//
+// What IS retired is what the model demonstrably owns:
+//   • work_item_dep — fully mirrored in `dependency` (3 rows); the writes stopped (addDep/
+//     removeDep write the model edge only) and the table was dropped (migration 188).
+//   • the plan shape (work_node.parent_id / sibling_rank) and run state (execution) — the readers
+//     below read those from the model; work_item.parent_id and work_item.sort_order remain only
+//     as the attribute store the console PATCHes (sort_order is the number a kanban drag writes,
+//     and the API must keep returning it, so the columns stay until the model grows the field).
+//   • "who has it" stays on work_item.xell_id — see lib/work-assign.js's REHAB 3/4 note: the lease
+//     plane has no rows, so re-pointing the assignee reads there would render every card
+//     unassigned. Writing leases is a WRITER change for a later card.
+//
+// work_item keeps being WRITTEN by rehab 1/4's dual-write (the annex columns above) and every
+// re-pointed reader can be checked against the old shape side by side.
 //
 // ── WHAT COMES FROM WHERE ──────────────────────────────────────────────────────
 //   MODEL (authoritative)                 LEGACY work_item (attribute lookup only)

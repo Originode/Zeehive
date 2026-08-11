@@ -36,13 +36,30 @@ const migration185 = readFileSync(new URL('../db/migrations/185_rehab_backfill_w
 const migration186 = readFileSync(new URL('../db/migrations/186_repair_rehab_dependency_direction_rank_encoding.sql', import.meta.url), 'utf8');
 const { pool } = await import('../server/src/db/pool.js');
 
+// REHAB 3/4: migration 188 retired work_item_dep, but 186 (under test here) READS it — the repair
+// runs before the drop on a fresh database. Against a fully-migrated db, recreate the legacy table
+// shape temporarily so the repair still exercises its dep loop, then drop it in cleanup.
+let createdDepTable = false;
+async function ensureDepTable() {
+  const e = (await one(`SELECT to_regclass('public.work_item_dep') IS NOT NULL AS e`)).e;
+  if (e) return;
+  await q(`CREATE TABLE work_item_dep (
+    work_item_id  uuid NOT NULL REFERENCES work_item ON DELETE CASCADE,
+    depends_on_id uuid NOT NULL REFERENCES work_item ON DELETE CASCADE,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (work_item_id, depends_on_id))`);
+  createdDepTable = true;
+}
+
 async function cleanup() {
   try { await q(`DELETE FROM project WHERE id IN ($1,$2)`, [PID, '22222222-2222-4222-8222-222222222222']); } catch { /* */ }
+  if (createdDepTable) { try { await q(`DROP TABLE IF EXISTS work_item_dep`); } catch { /* */ } }
 }
 
 try {
   await client.connect();
   await cleanup();
+  await ensureDepTable();
 
   const W = await import('../server/src/lib/work-items.js');
 
@@ -56,6 +73,10 @@ try {
   const actB = await W.createWorkItem({ project_id: PID, parent_id: root.id, kind: 'activity', title: 'Act B', sort_order: 2000, estimate_hours: 5 });
   // actA depends on actB → actB is the PREREQUISITE, actA the DEPENDENT.
   await W.addDep(actA.id, actB.id, { actor: 'test' });
+  // REHAB 3/4: addDep no longer writes the retired work_item_dep, but migration 186 (under test
+  // here) REPAIRS dependency direction FROM that legacy table — seed the legacy row too so 186's
+  // dep-repair loop has the edge to fix.
+  await q(`INSERT INTO work_item_dep (work_item_id, depends_on_id) VALUES ($1,$2)`, [actA.id, actB.id]);
   // make actA a container so it has children (shape → container); A1's estimate is what drives
   // actA's subtree span in wn_cpm.
   await W.createWorkItem({ project_id: PID, parent_id: actA.id, kind: 'task', title: 'A1', sort_order: 1000, estimate_hours: 3 });

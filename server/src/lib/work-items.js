@@ -825,6 +825,10 @@ async function deleteWorkItemInTx(id, { client = null, pending = null } = {}) {
 }
 
 // ── dependencies ─────────────────────────────────────────────────────────────
+// REHAB 3/4 — the workflow model's `dependency` table is the ONE source of truth for edges.
+// The legacy work_item_dep table is retired (it was fully mirrored by the dual-write, and every
+// reader was re-pointed at the model in REHAB 2/4): addDep/removeDep write the model edge and
+// the audit event only, never work_item_dep.
 export async function addDep(workItemId, dependsOnId, opts = {}) {
   if (opts.client) return addDepInTx(workItemId, dependsOnId, opts);
   return inTransaction((tx) => addDepInTx(workItemId, dependsOnId, { ...opts, ...tx }));
@@ -835,17 +839,32 @@ async function addDepInTx(workItemId, dependsOnId, { client = null, pending = nu
   assertId(workItemId);
   if (!dependsOnId) throw bad('depends_on_id required');
   assertId(dependsOnId, 'depends_on_id');
-  const row = await db.one(
-    `INSERT INTO work_item_dep (work_item_id, depends_on_id) VALUES ($1,$2)
-     ON CONFLICT DO NOTHING RETURNING *`, [workItemId, dependsOnId]);
-  // REHAB 1/4 DUAL-WRITE: the workflow model's dependency row (flips the LCA container to
-  // 'freeform' so the model's I5 trigger accepts it).
+  // The retired work_item_dep guard (058) used to refuse a self-dependency and a cross-project
+  // dependency with a sentence a human can read. The model's I5 trigger enforces the same
+  // impossibilities, but its message ("I5 violated: …") is a constraint name, not a sentence — so
+  // the same refusals are stated here first, in the tracker's own words, and the model trigger
+  // stays as the backstop. The statuses match the old guard's (every one of its RAISE EXCEPTIONs
+  // surfaced as a 409 via pgStatus).
+  if (workItemId === dependsOnId) {
+    throw refuse('a work item cannot depend on itself');
+  }
+  const [wi, dep] = await Promise.all([
+    db.one(`SELECT project_id FROM work_item WHERE id=$1`, [workItemId]),
+    db.one(`SELECT project_id FROM work_item WHERE id=$1`, [dependsOnId]),
+  ]);
+  if (!wi || !dep) throw refuse('both ends of a dependency must exist');
+  if (wi.project_id !== dep.project_id) {
+    throw refuse('a dependency may not cross projects');
+  }
+  // The model's dependency row (from_id = the PREREQUISITE's node, to_id = the DEPENDENT's node)
+  // and the LCA-container 'freeform' flip are the whole write — syncDependency does both, and the
+  // model's I5/I6 triggers refuse an edge the model cannot hold (rolled back with this transaction).
   await syncDependency(db, workItemId, dependsOnId);
   await logWorkEvent(workItemId, 'edited', { actor, detail: { added_dep: dependsOnId } }, { client });
   const item = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [workItemId]);
   const event = ['work', { kind: 'dep', item: shapeItem(item) }];
   if (pending) pending.push(event); else broadcast(...event);
-  return { ok: true, dep: row || { work_item_id: workItemId, depends_on_id: dependsOnId, existing: true } };
+  return { ok: true, dep: { work_item_id: workItemId, depends_on_id: dependsOnId } };
 }
 
 export async function removeDep(workItemId, dependsOnId, opts = {}) {
@@ -857,17 +876,23 @@ async function removeDepInTx(workItemId, dependsOnId, { client = null, pending =
   const db = dbRunner(client);
   assertId(workItemId);
   assertId(dependsOnId, 'depends_on_id');
-  const rows = await db.q(
-    `DELETE FROM work_item_dep WHERE work_item_id=$1 AND depends_on_id=$2 RETURNING *`,
-    [workItemId, dependsOnId]);
-  if (!rows.length) return null;
-  // REHAB 1/4 DUAL-WRITE: remove the workflow model's dependency row.
+  // The model row is the source of truth, so "does this edge exist" is a model question. The
+  // dependency rows cascade off work_node, so if either end has no node the edge cannot exist.
+  const exists = await db.one(
+    `SELECT d.id FROM dependency d
+       JOIN work_node a ON a.id = d.from_id
+       JOIN work_node b ON b.id = d.to_id
+      WHERE a.stable_key = 'work_item:' || $1::text
+        AND b.stable_key = 'work_item:' || $2::text
+        AND d.type = 'FS'`,
+    [dependsOnId, workItemId]);
+  if (!exists) return null;
   await removeDependency(db, workItemId, dependsOnId);
   await logWorkEvent(workItemId, 'edited', { actor, detail: { removed_dep: dependsOnId } }, { client });
   const item = await db.one(`SELECT ${COLS} FROM work_item WHERE id=$1`, [workItemId]);
   const event = ['work', { kind: 'dep', item: shapeItem(item) }];
   if (pending) pending.push(event); else broadcast(...event);
-  return { ok: true, removed: rows[0] };
+  return { ok: true, removed: { work_item_id: workItemId, depends_on_id: dependsOnId } };
 }
 
 // ── the BOARD read model ─────────────────────────────────────────────────────

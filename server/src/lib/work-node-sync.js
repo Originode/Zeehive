@@ -5,10 +5,17 @@
 // SHIPPED AND BACKFILLED, and every legacy writer must keep BOTH shapes true at once.
 // This module is the bridge: given a work_item row (or the ids that identify one), it
 // writes the matching row in the workflow model — a work_node for a work_item, a
-// dependency row for a work_item_dep edge, an execution for a status change — in the
+// dependency row for a dependency edge, an execution for a status change — in the
 // SAME transaction as the legacy write (the caller is inside BEGIN; a failure here
 // rolls the whole pair back, which is the point: a half-written pair is worse than no
 // rehab).
+//
+// REHAB 3/4 — the legacy `work_item_dep` table is RETIRED (migration 188). The model's
+// `dependency` table is the ONE source of truth for edges; this module's syncDependency /
+// removeDependency are no longer the "model half" of a work_item_dep dual-write — they ARE the
+// write, called directly by work-items.js addDep/removeDep. work_item itself stays as the
+// ATTRIBUTE ANNEX (see work-item-model.js's header for the design), so syncWorkNode and
+// syncExecutionState still keep the model in step with the surviving work_item attribute columns.
 //
 // WHY THE WORK_ITEM ID IS THE KEY: every backfilled and dual-written node carries
 // work_node.stable_key = 'work_item:<uuid>' (the migration's idempotency handle). The
@@ -211,17 +218,17 @@ export async function removeWorkNode(db, workItemId) {
 }
 
 // ── dependency ──────────────────────────────────────────────────────────────────
-// Add a dependency row for a work_item_dep edge. The model refuses an explicit dependency
-// unless its LCA container is 'freeform' (I5), so the LCA is flipped first — the same rule
-// the backfill used to choose child_semantics. An ancestor-edge (I6) fails loudly, which is
-// correct: a legacy edge that was silently legal must not half-land here.
+// Add a dependency row for a work_item dependency edge (workItemId depends on dependsOnId).
+// The model refuses an explicit dependency unless its LCA container is 'freeform' (I5), so the
+// LCA is flipped first — the same rule the backfill used to choose child_semantics. An
+// ancestor-edge (I6) fails loudly, which is correct: an edge the model cannot hold must not
+// half-land here.
 //
 // DIRECTION IS LOAD-BEARING. dependency.from_id is the PREDECESSOR (the thing that must finish
-// before the dependent starts); dependency.to_id is the DEPENDENT (successor). The legacy
-// work_item_dep table means the opposite of the order it is written in: for item X,
-// work-items.js:418 reads "what X depends on" as `JOIN work_item w ON w.id = d.depends_on_id
-// WHERE d.work_item_id = X` — so work_item_id is the DEPENDENT and depends_on_id is the
-// PREREQUISITE. Therefore the model edge is from_id=node(depends_on_id) → to_id=node(work_item_id).
+// before the dependent starts); dependency.to_id is the DEPENDENT (successor). The retired
+// work_item_dep table meant the opposite of its write order — work_item_id was the DEPENDENT and
+// depends_on_id the PREREQUISITE — so the model edge is from_id=node(depends_on_id) →
+// to_id=node(work_item_id).
 export async function syncDependency(db, workItemId, dependsOnId) {
   // prerequisite (predecessor) → dependent (successor)
   const fromId = await nodeIdFor(db, dependsOnId);

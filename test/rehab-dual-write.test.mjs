@@ -7,8 +7,11 @@
 //      from estimate_hours) in the same transaction.
 //   2. UPDATE — editing a work_item edits its work_node.
 //   3. STATUS — a status change writes/updates the execution (the LIFECYCLE side).
-//   4. DEP — a work_item_dep edge becomes a dependency row (type FS) and flips the LCA
-//      container to freeform; removing it removes the dependency row.
+//   4. DEP — a dependency edge (workItemId depends on dependsOnId) becomes a dependency row
+//      (type FS, from_id = prerequisite, to_id = dependent) and flips the LCA container to
+//      freeform; removing it removes the dependency row. REHAB 3/4: the model's dependency table
+//      is the ONE source of truth — the legacy work_item_dep table is retired, so addDep/removeDep
+//      no longer write it.
 //   5. DELETE — deleting a work_item deletes its work_node (and its subtree's executions).
 //   6. THE TRANSACTIONAL PAIR — the whole point of the rehab: if the model half of a dual-write
 //      fails, the legacy half fails with it. Proved twice, both by making the model write fail
@@ -16,7 +19,7 @@
 //        a. CREATE: a BEFORE INSERT trigger on work_node that raises for one specific item —
 //           createWorkItem must throw AND leave no work_item row behind.
 //        b. DEP: a dependency edge whose endpoints are in an ancestor relationship is refused by
-//           the model's I6 trigger — addDep must throw AND leave no work_item_dep row behind.
+//           the model's I6 trigger — addDep must throw AND leave no dependency row behind.
 //
 // Everything it creates is torn down in a finally, whatever happens.
 import pg from 'pg';
@@ -101,7 +104,7 @@ try {
   ok(!!execDone && execDone.finished_at != null, 'done → execution state done, finished_at stamped');
 
   // ── 4. DEP dual-write ─────────────────────────────────────────────────────
-  section('dep: a work_item_dep edge is also a dependency row');
+  section('dep: a dependency edge is a dependency row (the model is the one source)');
   // addDep(task, t2) = "task depends on t2" → t2 is the PREREQUISITE, task the DEPENDENT.
   // dependency.from_id is the prerequisite, to_id the dependent.
   const t2 = await W.createWorkItem({ project_id: PID, parent_id: act.id, kind: 'task', title: 'Task Two', sort_order: 2000, estimate_hours: 4 });
@@ -177,14 +180,21 @@ try {
     `createWorkItem threw when the work_node insert failed (${createThrew ? createThrew.message.slice(0, 50) : 'no throw'})`);
   ok(!doomedItem, 'and the work_item row rolled back with it — no half-written pair');
 
-  // (b) DEP: an ancestor-edge is refused by the model (I6) — the dep pair must roll back.
+  // (b) DEP: an ancestor-edge is refused by the model (I6) — the pair must roll back. The legacy
+  // work_item_dep half is gone (REHAB 3/4), so "rolled back" means no dependency row landed.
   let depThrew = null;
   try {
     await W.addDep(task.id, act.id, { actor: 'test' });  // task depends on its own parent → I6
   } catch (e) { depThrew = e; }
-  const legDep = await one(`SELECT * FROM work_item_dep WHERE work_item_id=$1 AND depends_on_id=$2`, [task.id, act.id]);
+  const modelDep = await one(
+    `SELECT d.id FROM dependency d
+       JOIN work_node a ON a.id = d.from_id
+       JOIN work_node b ON b.id = d.to_id
+      WHERE a.stable_key = 'work_item:' || $1::text
+        AND b.stable_key = 'work_item:' || $2::text`,
+    [act.id, task.id]);
   ok(depThrew, 'addDep threw when the dependency row violated I6 (ancestor edge)');
-  ok(!legDep, 'and the work_item_dep row rolled back with it');
+  ok(!modelDep, 'and no dependency row landed — the model write rolled back with the transaction');
 
   await q(`DROP TRIGGER IF EXISTS ${TRIGGER_NAME} ON work_node`);
   await q(`DROP FUNCTION IF EXISTS rehab_test_node_boom()`);
