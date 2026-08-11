@@ -359,7 +359,10 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   "Turn ended: a human was asked" result; the LOOP policy refuses to run `working` while a tend is
   open (an open tend SURVIVES a model `working` request, visibly); a tool-happy model is stopped at the cap with a
   VISIBLE capped result; every iteration is recorded in `llm_gateway_request` attributed to the live
-  zee + open turn.
+  zee + open turn. It ALSO proves, provider-free: every bound tool has a non-empty name (A0 — the
+  buildTool arg-order regression that the mock let through), TURNOVER (I — a second turn on the same
+  xell is seeded with the first's conversation), and INTERRUPTION (I2 — a mid-loop throw, simulated
+  with a non-retryable 400, keeps the task because it is persisted up front).
 
 **STATUS: BUILT, TESTED, and NOT YET ENABLED on any zee.** Measured on the fleet meta-DB:
 `zee_conversation` has 0 rows across 0 xells — the migration is landed and applied (the table is
