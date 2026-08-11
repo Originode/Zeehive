@@ -1,24 +1,11 @@
-// The container TREE — one node per MACHINE (the master), its deploy SITES (dev/prod) as the
-// branches, and the shared container rows grouped by role as the leaves. This is the answer to
-// "what runs where AND what is shippable", in the shape of how the data actually nests:
+// The container MATRIX — the inventory as role-rows × machine-columns. One column per machine
+// (023), so "what runs WHERE" is the shape of the panel instead of a tooltip fact. A container
+// chip sits in the column of the context it RUNS on; where it COMPILES is the chip's ⇄ marker
+// (a machine that can't build — the NAS — runs images built elsewhere).
 //
-//   machine (the physical docker host — a column of its own controls)
-//   ├── dev   ← the project's dev deploy site on this machine
-//   │   ├── DB · Server · App   ← the shared dev container rows, by role
-//   └── prod  ← the prod deploy site on this machine
-//       ├── DB · Server · App   ← the shared prod container rows (a ship needs ≥1 with a build script)
-//
-// The dashboard used to show machines as grid COLUMNS × roles as ROWS, and the Deploy tab held
-// the sites + inventory as two flat lists — the same data in three places, none of which showed
-// the nesting. This one tree is the single surface: a machine is the master, its dev/prod sites
-// are the deploy-type branches, and the shared containers are the inventory per type. Per-xell
-// spinoff stacks are a xell's throwaway stack, not deploy inventory, so they sit in a collapsible
-// "xell stacks" group under their machine.
-//
-// The machine node keeps its control surface: dev spawn priority, pool size / max cap, can-build,
-// can-device, the connection probe, ＋prod (place a production site here), and — when the machine
-// has no shared dev db for this project — the one-click provision that makes it able to host
-// xells at all. "+ machine" adds a host as the hive grows.
+// The column header is the machine's control surface: dev spawn priority, pool size / max cap,
+// can-build, and — when the machine has no shared dev db for this project — the one-click
+// provision that makes it able to host xells at all. "+ machine" adds a host as the hive grows.
 import React, { useState, useEffect } from 'react';
 import { ContainerChip } from './Container.jsx';
 import { getDockerContexts, createMachine, updateMachine, deleteMachine, provisionMachineDevDb,
@@ -31,10 +18,10 @@ const BASE_ROLES = ['db', 'server', 'webapp', 'other'];
 
 const fail = (what) => (e) => showAlert(`${what} failed: ${e?.error || e?.message || e}`, { variant: 'error' });
 
-export default function MachineTree({ machines, containers, sites = [], projectId, spinoffIsProcess, onMenu, onChanged }) {
+export default function MachineMatrix({ machines, containers, projectId, spinoffIsProcess, onMenu, onChanged }) {
   const ms = machines || [];
   // The device row is opt-in: shown only when this project actually uses devices (a device chip
-  // exists, or a machine is marked can_device), so ordinary projects keep 4 role groups.
+  // exists, or a machine is marked can_device), so ordinary projects keep a 4-row matrix.
   const usesDevices = (containers.device || []).length > 0 || ms.some((m) => m.can_device);
   const ROLES = usesDevices ? ['db', 'server', 'webapp', 'device', 'other'] : BASE_ROLES;
   const all = ROLES.flatMap((r) => (containers[r] || []).map((c) => ({ ...c, _role: r })));
@@ -42,25 +29,31 @@ export default function MachineTree({ machines, containers, sites = [], projectI
   // PROCESS PROJECTS: a remote machine's prio/pool knobs have NO EFFECT — a process xell's
   // worktree, processes and cage all live on the queenzee host, so a remote machine can never
   // host one. The queenzee-host row (is_queenzee_host, computed by the server) is the working
-  // knob: its pool_size governs the project (queenzee/pool.js). Harmless config is not an alert;
-  // the state shows at the knobs themselves (dimmed, reason in the tooltip).
+  // knob: its pool_size governs the project (queenzee/pool.js). This used to be a red BANNER
+  // that fired on every render as long as any remote knob was >0 — the operator's screenshot
+  // said the rest (docs/pooling-dead-config-demotion-decision-record.md): since the
+  // default-pooling ship the config is HARMLESS (the host row governs, the runaway is
+  // structurally impossible), and harmless config is not an alert. The state now shows at the
+  // knobs themselves: remote prio/pool render DIMMED with the reason in their tooltip, and
+  // stay editable so an operator can still zero them.
   const poolingDeadFor = (m) => !!spinoffIsProcess && !m.is_queenzee_host;
 
-  // Where a container lives, for tree placement: its own run context — or, for a PROCESS role
-  // (docker_ctx NULL, probed by URL), its deploy site's context.
+  // Where a container lives, for column placement: its own run context — or, for a PROCESS role
+  // (docker_ctx NULL, probed by URL: the self-shipped queenzee), its deploy site's context. A
+  // process on machine 'local' belongs in local's column, not in limbo.
   const ctxOf = (c) => c.docker_ctx || c.site_docker_ctx || null;
 
-  // Containers whose context matches no machine row still must be SEEN — an "elsewhere" node
-  // appears only when such containers exist, and disappears when the machines fully describe the fleet.
+  // Containers whose context matches no machine row (or has none at all) still must be SEEN —
+  // an "elsewhere" column appears only when such containers exist, and disappears when the
+  // machines fully describe the fleet.
   const known = new Set(ms.map((m) => m.docker_ctx));
   const orphans = all.filter((c) => !known.has(ctxOf(c)));
-  // The DEPLOY inventory is the shared rows (dev/prod); everything else is a per-xell stack.
-  const shared = all.filter((c) => c.isolation === 'shared');
-  const perXell = all.filter((c) => c.isolation !== 'shared');
+  const cols = [...ms.map((m) => ({ kind: 'machine', m })),
+                ...(orphans.length ? [{ kind: 'elsewhere' }] : [])];
 
-  // No machines yet → the tree degrades to the old one-row-per-role inventory, plus the
+  // No machines yet → the matrix degrades to the old one-row-per-role inventory, plus the
   // "+ machine" affordance that starts the migration to machine-aware placement.
-  if (!ms.length && !orphans.length) {
+  if (!cols.length) {
     return (
       <section className="inventory" data-testid="matrix">
         {ROLES.map((role) => (
@@ -77,153 +70,50 @@ export default function MachineTree({ machines, containers, sites = [], projectI
     );
   }
 
-  // The shared containers of ONE deploy type (dev|prod) on a machine, plus the site(s) that name
-  // that branch. A branch exists if it has containers OR a site (a prod site with nothing adopted
-  // yet is still a branch you can ship to / discover into).
-  const nodes = ms.map((m) => {
-    const ctx = m.docker_ctx;
-    const here = (c) => ctxOf(c) === ctx;
-    const devSites = sites.filter((s) => s.docker_ctx === ctx && s.tier === 'dev');
-    const prodSites = sites.filter((s) => s.docker_ctx === ctx && s.tier === 'prod');
-    return {
-      m,
-      devContainers: shared.filter((c) => here(c) && c.tier === 'dev'),
-      prodContainers: shared.filter((c) => here(c) && c.tier === 'prod'),
-      stacks: perXell.filter(here),
-      devSites,
-      prodSites,
-    };
-  });
+  const cell = (role, col) => {
+    const cs = col.kind === 'machine'
+      ? all.filter((c) => c._role === role && ctxOf(c) === col.m.docker_ctx)
+      : orphans.filter((c) => c._role === role);
+    return cs.length
+      ? cs.map((c) => <ContainerChip key={c.id} c={c} onMenu={onMenu} />)
+      : <span className="cbox empty">—</span>;
+  };
 
   return (
-    <section className="machine-tree" data-testid="matrix">
-      {nodes.map((n) => (
-        <MachineNode key={n.m.id} m={n.m} projectId={projectId}
-                     poolingDead={poolingDeadFor(n.m)}
-                     hasDevDb={n.devContainers.length > 0}
-                     devDbElsewhere={shared.some((c) => c.tier === 'dev')}
-                     empty={n.devContainers.length + n.prodContainers.length + n.stacks.length === 0
-                            && n.devSites.length + n.prodSites.length === 0}
-                     sites={[...n.devSites, ...n.prodSites]}
-                     devContainers={n.devContainers} prodContainers={n.prodContainers}
-                     stacks={n.stacks} ROLES={ROLES} onMenu={onMenu} onChanged={onChanged} />
-      ))}
-      {orphans.length > 0 && (
-        <div className="mt-node elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them into a column">
-          <div className="mt-node-head"><span className="mt-toggle dead">▸</span><b>elsewhere</b></div>
-          {ROLES.map((role) => {
-            const cs = orphans.filter((c) => c._role === role);
-            if (!cs.length) return null;
-            return (
-              <div className="mt-role" key={role} data-role={role}>
-                <span className="invlabel">{ROLE_LABEL[role]}:</span>
-                <span className="boxes">{cs.map((c) => <ContainerChip key={c.id} c={c} onMenu={onMenu} />)}</span>
-              </div>
-            );
-          })}
-        </div>
-      )}
+    <section className="matrix" data-testid="matrix"
+             style={{ gridTemplateColumns: `max-content repeat(${cols.length}, minmax(120px, 1fr)) max-content` }}>
+      {/* header row */}
+      <span className="mx-corner" />
+      {cols.map((col, i) => {
+        const devDb = (c) => c._role === 'db' && c.tier === 'dev' && c.isolation === 'shared';
+        return col.kind === 'machine'
+        ? <MachineHead key={col.m.id} m={col.m} projectId={projectId}
+                       poolingDead={poolingDeadFor(col.m)}
+                       // Spec: a xell never crosses docker contexts for its database, so every dev
+                       // machine wants this project's own dev db. Missing-here-but-exists-elsewhere
+                       // is a WARNING (spawns here are being refused); missing-everywhere is the
+                       // quiet bootstrap affordance for the project's first one.
+                       hasDevDb={all.some((c) => devDb(c) && c.docker_ctx === col.m.docker_ctx)}
+                       devDbElsewhere={all.some(devDb)}
+                       empty={!all.some((c) => ctxOf(c) === col.m.docker_ctx)}
+                       onChanged={onChanged} />
+        : <div key={`col-${i}`} className="mx-head elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them into a column">elsewhere</div>;
+      })}
       <AddMachine projectId={projectId} onChanged={onChanged} />
+      {/* one row per role */}
+      {ROLES.map((role) => (
+        <React.Fragment key={role}>
+          <span className="invlabel mx-role">{ROLE_LABEL[role]}:</span>
+          {cols.map((col, i) => (
+            <span className="boxes mx-cell" key={`${role}-${i}`} data-role={role}
+                  data-machine={col.kind === 'machine' ? col.m.key : 'elsewhere'}>
+              {cell(role, col)}
+            </span>
+          ))}
+          <span className="mx-pad" />
+        </React.Fragment>
+      ))}
     </section>
-  );
-}
-
-// One machine = the master node. Its header is the control surface (MachineHead below); the body
-// is its dev/prod deploy branches + any per-xell stacks, all collapsible.
-function MachineNode({ m, projectId, poolingDead, hasDevDb, devDbElsewhere, empty, sites,
-                       devContainers, prodContainers, stacks, ROLES, onMenu, onChanged }) {
-  const [open, setOpen] = useState(true);
-  return (
-    <div className={`mt-node${m.enabled ? '' : ' off'}`} data-testid={`machine-${m.key}`}>
-      <div className="mt-node-head">
-        <button className="mt-toggle" data-testid={`mt-toggle-${m.key}`} onClick={() => setOpen((o) => !o)}
-                title={open ? 'collapse this machine' : 'expand this machine'}>{open ? '▾' : '▸'}</button>
-        <MachineHead m={m} projectId={projectId} poolingDead={poolingDead}
-                     hasDevDb={hasDevDb} devDbElsewhere={devDbElsewhere} empty={empty}
-                     onChanged={onChanged} />
-      </div>
-      {open && (
-        <div className="mt-body">
-          <DeployBranch tier="dev" label="dev" containers={devContainers}
-                        sites={sites.filter((s) => s.tier === 'dev')} onMenu={onMenu} ROLES={ROLES} />
-          <DeployBranch tier="prod" label="prod" containers={prodContainers}
-                        sites={sites.filter((s) => s.tier === 'prod')} onMenu={onMenu} ROLES={ROLES} />
-          {stacks.length > 0 && (
-            <PerXellGroup stacks={stacks} ROLES={ROLES} onMenu={onMenu} />
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// A deploy TYPE branch (dev | prod) under a machine: the site that names it, and the shared
-// container rows grouped by role. A branch with a site but no containers yet still shows (empty)
-// — it is a place you can provision into, not a place that is missing.
-function DeployBranch({ tier, label, containers, sites, onMenu, ROLES }) {
-  const [open, setOpen] = useState(true);
-  const site = sites[0];
-  if (!containers.length && !sites.length) return null;
-  return (
-    <div className="mt-branch" data-tier={tier}>
-      <div className="mt-branch-head">
-        <button className="mt-toggle" onClick={() => setOpen((o) => !o)}
-                title={open ? 'collapse this deploy type' : 'expand this deploy type'}>{open ? '▾' : '▸'}</button>
-        <b className="mt-branch-tier">{label}</b>
-        {site && (
-          <span className="pc" title={`deploy site · context ${site.docker_ctx}`}>
-            {site.key}{site.is_default ? ' ●' : ''}{site.host ? ` · ${site.host}` : ''}
-          </span>
-        )}
-        <span className="pc">{containers.length} shared</span>
-      </div>
-      {open && (
-        <div className="mt-branch-body">
-          {ROLES.map((role) => {
-            const cs = containers.filter((c) => c._role === role);
-            if (!cs.length) return null;
-            return (
-              <div className="mt-role" key={role} data-role={role}>
-                <span className="invlabel">{ROLE_LABEL[role]}:</span>
-                <span className="boxes">{cs.map((c) => <ContainerChip key={c.id} c={c} onMenu={onMenu} />)}</span>
-              </div>
-            );
-          })}
-          {containers.length === 0 && <span className="cbox empty">—</span>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// A machine's per-xell spinoff stacks — a xell's throwaway stack (its own server/webapp/db), NOT
-// deploy inventory. Kept visible so "what runs on this machine" still includes xells, collapsed by
-// default so the deploy tree stays the tree.
-function PerXellGroup({ stacks, ROLES, onMenu }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="mt-branch xells" data-tier="spinoff">
-      <div className="mt-branch-head">
-        <button className="mt-toggle" onClick={() => setOpen((o) => !o)}
-                title={open ? 'collapse xell stacks' : 'expand the per-xell stacks on this machine'}>{open ? '▾' : '▸'}</button>
-        <b className="mt-branch-tier">xell stacks</b>
-        <span className="pc">{stacks.length} per-xell — see the hive for the xells themselves</span>
-      </div>
-      {open && (
-        <div className="mt-branch-body">
-          {ROLES.map((role) => {
-            const cs = stacks.filter((c) => c._role === role);
-            if (!cs.length) return null;
-            return (
-              <div className="mt-role" key={role} data-role={role}>
-                <span className="invlabel">{ROLE_LABEL[role]}:</span>
-                <span className="boxes">{cs.map((c) => <ContainerChip key={c.id} c={c} onMenu={onMenu} />)}</span>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -231,9 +121,9 @@ function PerXellGroup({ stacks, ROLES, onMenu }) {
 // every change PATCHes and refreshes, so what you read is always the server's truth.
 function MachineHead({ m, projectId, poolingDead = false, hasDevDb, devDbElsewhere, empty, onChanged }) {
   const [busy, setBusy] = useState(false);
-  // Connection check state — the "can the queenzee reach this host with the settings on its row?"
-  // probe. null = not checked yet; { checking:true } = in flight; a checkMachineConnection() result
-  // = the verdict (ok + reachable, or ok:false + error).
+  // Connection check state — the Deploy tab's per-machine "can the queenzee reach this host with
+  // the settings on its row?" probe. null = not checked yet; { checking:true } = in flight; a
+  // checkMachineConnection() result = the verdict (ok + reachable, or ok:false + error).
   const [conn, setConn] = useState(null);
   const check = async () => {
     setConn({ checking: true });
@@ -250,7 +140,7 @@ function MachineHead({ m, projectId, poolingDead = false, hasDevDb, devDbElsewhe
   const provisionDb = async () => {
     if (!(await showConfirm(`Provision ${m.key}'s own shared dev DB?\n\nThis stands up a fresh dev postgres ON ${m.key} (${m.docker_ctx}) and restores the latest prod backup into it — additive, touches nothing else. It takes a few minutes; watch the queenzee terminal.\n\nWithout it, ${m.key} cannot host dev xells.`, { okLabel: 'Provision' }))) return;
     setBusy(true);
-    try { await provisionMachineDevDb(m.id, projectId); showAlert(`Provisioning started on ${m.key} — the DB chip appears under its dev branch when it's ready (watch the terminal).`); }
+    try { await provisionMachineDevDb(m.id, projectId); showAlert(`Provisioning started on ${m.key} — the DB chip appears in this column when it's ready (watch the terminal).`); }
     catch (e) { fail('Dev DB provision')(e); }
     finally { setBusy(false); }
   };
@@ -309,11 +199,11 @@ function MachineHead({ m, projectId, poolingDead = false, hasDevDb, devDbElsewhe
   );
 
   return (
-    <div className={`mx-head${m.enabled ? '' : ' off'}`} data-testid={`machine-head-${m.key}`}>
+    <div className={`mx-head${m.enabled ? '' : ' off'}`} data-testid={`machine-${m.key}`}>
       <div className="mx-name" title={`${m.label || m.key}\ncontext: ${m.docker_ctx}${m.host_ip ? `\nhost: ${m.host_ip}` : ''}${m.notes ? `\n${m.notes}` : ''}`}>
         <b>{m.key}</b>
         <button className="mx-prod" data-testid={`mx-prod-${m.key}`} disabled={busy} onClick={addProd}
-                title={`Place a PRODUCTION on ${m.key} — creates the prod deploy site + its production xell here`}>＋prod</button>
+                title={`Place a PRODUCTION on ${m.key} — creates the prod site + its production xell here`}>＋prod</button>
         <MachineConn m={m} conn={conn} onCheck={check} />
         {empty && <button className="mx-del" title="Remove this machine row" onClick={remove}>✕</button>}
       </div>

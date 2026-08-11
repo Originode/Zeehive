@@ -1,7 +1,7 @@
 // ZEEHIVE server: HTTP API + queenzee loops (poller now; pool/maintenance added in later steps).
 import express from 'express';
 import { config } from './config.js';
-import { router } from './api/routes.js';
+import { router, a2aRouter } from './api/routes.js';
 import { startPoller } from './queenzee/poller.js';
 import { startPool } from './queenzee/pool.js';
 import { startMaintenance } from './queenzee/maintenance.js';
@@ -71,6 +71,9 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'zeehive', ts: Date.now() }));
+// The A2A read side (P2) — mounted at the ORIGIN ROOT (not under /api), because
+// /.well-known/agent-card.json is RFC 8615 origin-root and the /a2a/v1 paths are the wire contract.
+app.use(a2aRouter);
 app.use('/api', router);
 
 // SINGLE-QUEENZEE LOCK. Two queenzees ticking loops against one meta-DB reconcile against each

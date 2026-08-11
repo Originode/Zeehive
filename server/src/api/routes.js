@@ -85,6 +85,9 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdReq
          selfProviderEnv } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
+import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
+import { A2AError, cardVisibleXellIds, taskVisibleXellIds, loadTask,
+         dispatchA2A, agentCardFor, directoryFor } from '../lib/a2a-read.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
 import { workStatusModelVocabulary } from '../lib/model-status.js';
@@ -2733,8 +2736,8 @@ router.post('/xell/self/work/new', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     res.json(await selfWorkNew(x, { title: b.title || null, body: b.body || null, kind: b.kind || null,
-      parent: b.parent || null, ticket: b.ticket || null, priority: b.priority ?? null,
-      status: b.status || null })); }
+      parent: b.parent || null, after: b.after || null, ticket: b.ticket || null,
+      priority: b.priority ?? null, status: b.status || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/xell/self/work/breakdown', async (req, res) => {
@@ -2927,3 +2930,133 @@ router.get('/stream', async (req, res) => {
 // visual-verify offers, bookmarks, the console nginx /xell-web block — 302 onto the direct port,
 // path preserved. New URLs are minted as direct ports and never come here.
 router.use('/xell-web/:slug', webappRedirect);
+
+// ── A2A READ + WRITE SIDE (P2 + P3) — docs/a2a-protocol-plan.md §3, DR-2/DR-5 ──
+// The fleet speaks A2A v1.0 at ONE place — this router, mounted at the ORIGIN ROOT in index.js
+// (NOT under /api), because the well-known card is RFC 8615 origin-root and the /a2a/v1 paths are
+// the wire contract. P2 read + P3 write are internal-only: every authenticated route resolves the
+// caller from its xell token exactly like /api/xell/self/* (resolveSelf above), and crew scoping
+// is unchanged — a worker may address its manager, a manager its crew. External zhk_ keys are
+// PHASE 4.
+//
+// The read/write-model half (task projection, cards, SendMessage/CancelTask) lives in
+// lib/a2a-read.js; the pure shapes live in lib/a2a.js. This router is the HTTP surface only:
+// auth, the A2A-Version gate, and the SSE transport for SubscribeToTask / SendStreamingMessage.
+export const a2aRouter = Router();
+
+function a2aBase(req) {
+  // The base a card points at is wherever the caller reached us — a card must be usable by the
+  // client that asked for it, not baked to a host the caller may not be able to see.
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function rpcResult(res, id, result) {
+  return res.json({ jsonrpc: '2.0', id: id ?? null, result });
+}
+
+// ── the fleet card — RFC 8615 origin root; ANONYMOUS (the A2A entry point) ──
+// DR-6: "even the directory requires a credential", but the fleet card is the discovery door — a
+// client has to be able to find that A2A is spoken at all before it can authenticate. It describes
+// the service and points at the directory; it enumerates no agents.
+a2aRouter.get('/.well-known/agent-card.json', async (req, res) => {
+  try { res.json(buildFleetCard({ base: a2aBase(req) })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── the directory — live agents the caller's credential may see, each with its card URL ──
+a2aRouter.get('/a2a/v1/agents', async (req, res) => {
+  try {
+    const caller = await resolveSelf(req, res); if (!caller) return;
+    res.json(await directoryFor(caller, a2aBase(req)));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── the per-agent card — GENERATED per request from live rows (house rule 7) ──
+// 404 for a slug the caller may not see or that names no live xell — never confirm existence.
+a2aRouter.get('/a2a/v1/agents/:slug/card', async (req, res) => {
+  try {
+    const caller = await resolveSelf(req, res); if (!caller) return;
+    const visible = await cardVisibleXellIds(caller);
+    const agent = await one(`SELECT * FROM xell WHERE slug=$1 AND status <> 'retired'`, [req.params.slug]);
+    if (!agent || !visible.has(agent.id)) { res.status(404).json({ error: `no agent card for "${req.params.slug}"` }); return; }
+    const card = await agentCardFor(agent, a2aBase(req));
+    if (!card) { res.status(404).json({ error: `no agent card for "${req.params.slug}"` }); return; }
+    res.json(card);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── the JSON-RPC endpoint — POST /a2a/v1/agents/:slug ──
+// Content-Type: application/json (415 otherwise); A2A-Version: 1.0 (VersionNotSupportedError
+// -32009 for wrong/missing — checked BEFORE method dispatch, per DR-5 "implemented from day one").
+a2aRouter.post('/a2a/v1/agents/:slug', async (req, res) => {
+  try {
+    const caller = await resolveSelf(req, res); if (!caller) return;
+    // The :slug is the agent being ADDRESSED; the caller must be able to read its card. Task data
+    // is scoped separately by the caller's own conversation visibility (taskVisibleXellIds).
+    const cardVisible = await cardVisibleXellIds(caller);
+    const agent = await one(`SELECT * FROM xell WHERE slug=$1 AND status <> 'retired'`, [req.params.slug]);
+    if (!agent || !cardVisible.has(agent.id)) { res.status(404).json({ error: `no agent "${req.params.slug}"` }); return; }
+
+    if (!/^application\/json\b/i.test(req.get('content-type') || '')) {
+      return res.status(415).json({ error: 'Content-Type must be application/json' });
+    }
+    const versionError = a2aVersionError(req.get('a2a-version'));
+    if (versionError) {
+      return res.json({ jsonrpc: '2.0', id: req.body?.id ?? null, error: versionError });
+    }
+    const body = req.body || {};
+    if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
+      return res.json({ jsonrpc: '2.0', id: body.id ?? null,
+        error: { code: -32600, message: 'InvalidRequest', data: { message: 'request must be JSON-RPC 2.0 with a method' } } });
+    }
+
+    const taskVisible = await taskVisibleXellIds(caller);
+    const result = await dispatchA2A(caller, body.method, body.params || {}, { visible: taskVisible, agent });
+
+    // SubscribeToTask and SendStreamingMessage swap the JSON result for an SSE stream (plan §3.2):
+    // first event is the Task, then task_status_update events on the existing zee-message broadcast
+    // bus. For SubscribeToTask the Task is the read snapshot; for SendStreamingMessage the send has
+    // already happened and the first Task is the state right after the send.
+    if (body.method === 'SubscribeToTask' || body.method === 'SendStreamingMessage') {
+      let taskId = body.params.taskId;
+      let task = result.task || null;
+      if (body.method === 'SendStreamingMessage') {
+        taskId = result.message?.taskId;
+        task = taskId ? await loadTask(taskId, taskVisible).catch(() => null) : null;
+      }
+      if (!task) { return res.status(500).json({ error: 'no task for the requested stream' }); }
+      res.set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.flushHeaders?.();
+      res.write(`event: task\ndata: ${JSON.stringify(task)}\n\n`);
+      let closed = false;
+      const onEvent = (e) => {
+        if (closed || e.type !== 'zee-message') return;
+        void (async () => {
+          try {
+            const row = await one(`SELECT * FROM zee_message WHERE id=$1`, [e.payload?.id]).catch(() => null);
+            const a2a = row?.meta?.a2a;
+            if (!a2a || (a2a.taskId !== taskId && a2a.referencedTaskId !== taskId)) return;
+            const fresh = await loadTask(taskId, taskVisible).catch(() => null);
+            if (!fresh || closed) return;
+            res.write(`event: task_status_update\ndata: ${JSON.stringify({
+              taskId, status: fresh.status, timestamp: new Date().toISOString(), task: fresh })}\n\n`);
+          } catch { /* client gone / db blip — drop the event */ }
+        })();
+      };
+      bus.on('event', onEvent);
+      const ping = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, 20000);
+      req.on('close', () => { closed = true; clearInterval(ping); bus.off('event', onEvent); });
+      return;
+    }
+
+    return rpcResult(res, body.id, result);
+  } catch (err) {
+    if (err instanceof A2AError) return res.json(err.toJSONRPC(req.body?.id ?? null));
+    res.status(500).json({ error: err.message });
+  }
+});

@@ -143,35 +143,86 @@ try {
 
   // ── 1. `zee work --new` — ONE card, and the id the next command needs ────
   {
-    const made = await selfWorkNew(manager, { title: 'pv: cut by the manager', body: 'the detail' });
+    // PARENT-FIRST: a top-level cut establishes the parent work_node, so it must be an ACTIVITY.
+    // A leaf task with no parent is refused below — the guard this suite is the contract for.
+    const made = await selfWorkNew(manager, { title: 'pv: the activity', body: 'the plan', kind: 'activity' });
     ok(made.ok && made.item?.id, `\`zee work --new\` creates a work item (${made.item?.id})`);
     ok(made.id === made.item.id, 'and answers with the ID at the top level — what `zee assign --item` takes');
     ok(made.item.project_id === PID, "in the caller's OWN project, resolved from the token");
     const root = await projectRoot(PID);
     ok(made.item.parent_id === root.id, 'parented on the project ROOT when no --parent is given');
-    ok(made.item.kind === 'task' && made.item.status === 'queued',
+    ok(made.item.kind === 'activity' && made.item.status === 'queued',
        `with the domain's own defaults (${made.item.kind}, ${made.item.status})`);
     ok((await events(made.item.id)).some((e) => e.kind === 'created' && e.actor === manager.slug),
        "the ledger records who cut it (kind:'created', actor = the manager's slug)");
     ok(/zee assign --item/.test(made.message), 'and the answer names the very next verb, with the id in it');
 
-    const activity = await selfWorkNew(manager, { title: 'pv: an activity', kind: 'activity' });
-    const child = await selfWorkNew(manager, { title: 'pv: a task under it', parent: activity.item.id });
-    ok(child.ok && child.item.parent_id === activity.item.id && child.item.depth === activity.item.depth + 1,
+    const stray = await selfWorkNew(manager, { title: 'pv: a task with no home' });
+    ok(stray.ok === false && stray.status === 'refused'
+       && /establish the parent work_node/.test(stray.error)
+       && /--kind activity/.test(stray.error) && /--parent/.test(stray.error)
+       && /zee ticket/.test(stray.error),
+       'a parentless TASK is refused with a sentence: establish the parent activity, nest, or ticket it');
+    const straySpelled = await selfWorkNew(manager, { title: 'pv: a task with no home', kind: 'task' });
+    ok(straySpelled.ok === false && /establish the parent work_node/.test(straySpelled.error),
+       '…and spelling --kind task out loud changes nothing — a task is a task');
+    const strayAct = await selfWorkNew(manager, { title: 'pv: another top-level activity', kind: 'activity' });
+    ok(strayAct.ok, 'a parentless ACTIVITY is still allowed — that is how a parent is established');
+
+    const child = await selfWorkNew(manager, { title: 'pv: a task under it', parent: made.item.id });
+    ok(child.ok && child.item.parent_id === made.item.id && child.item.depth === made.item.depth + 1,
        '--parent hangs the new card under an existing item (depth follows)');
 
-    const byCode = await selfWorkNew(manager, { title: 'pv: linked by code', ticket: ticket.code });
+    const byCode = await selfWorkNew(manager,
+      { title: 'pv: linked by code', ticket: ticket.code, parent: made.item.id });
     ok(byCode.ok && byCode.item.ticket_id === ticket.id,
        `--ticket takes the CODE a human reads (${ticket.code})`);
-    const byRef = await selfWorkNew(manager, { title: 'pv: linked by ref', ticket: `#${ticket.number}` });
+    const byRef = await selfWorkNew(manager,
+      { title: 'pv: linked by ref', ticket: `#${ticket.number}`, parent: made.item.id });
     ok(byRef.ok && byRef.item.ticket_id === ticket.id, `…the bare ref (#${ticket.number})…`);
-    const byId = await selfWorkNew(manager, { title: 'pv: linked by id', ticket: ticket.id });
+    const byId = await selfWorkNew(manager, { title: 'pv: linked by id', ticket: ticket.id, parent: made.item.id });
     ok(byId.ok && byId.item.ticket_id === ticket.id, '…and the uuid');
     ok(byCode.ticket?.code === ticket.code, 'and it echoes which ticket it linked');
 
-    const priority = await selfWorkNew(manager, { title: 'pv: urgent', priority: 1, status: 'blocked' });
+    const priority = await selfWorkNew(manager,
+      { title: 'pv: urgent', priority: 1, status: 'blocked', parent: made.item.id });
     ok(priority.ok && priority.item.priority === 1 && priority.item.status === 'blocked',
        '--priority and --status are passed through to the domain');
+  }
+
+  // ── 1b. `--after <sibling-id>` — nest under the sibling's parent AND chain, in one call ────
+  {
+    const parent = (await selfWorkNew(manager, { title: 'pv: chain home', kind: 'activity' })).item;
+    const first = (await selfWorkNew(manager, { title: 'pv: first in the chain', parent: parent.id })).item;
+    const second = await selfWorkNew(manager, { title: 'pv: second in the chain', after: first.id });
+    ok(second.ok && second.item?.id, '`--after <sibling-id>` creates the card in one call');
+    ok(second.item.parent_id === parent.id,
+       "…nested under the sibling's SAME parent (not under the sibling itself)");
+    ok(second.after?.id === first.id && second.after?.title === first.title,
+       '…and the answer echoes which sibling it was chained after');
+    const read = await selfWork(manager, { item: second.item.id });
+    ok(read.ok && read.item.deps?.some((d) => d.id === first.id),
+       '…and the FS dependency is visible in `zee work` — the new card WAITS FOR the sibling');
+    ok(/nested under/.test(second.message) && /waits for/.test(second.message),
+       'and the answer names BOTH effects: the nesting and the chain');
+
+    const root = await projectRoot(PID);
+    const afterRoot = await selfWorkNew(manager, { title: 'pv: after the root', after: root.id });
+    ok(afterRoot.ok === false && afterRoot.status === 'refused' && /no parent to nest a sibling under/.test(afterRoot.error),
+       '--after the project ROOT is refused — a root is not a sibling');
+    const other = (await selfWorkNew(manager, { title: 'pv: a different home', kind: 'activity' })).item;
+    const disagree = await selfWorkNew(manager,
+      { title: 'pv: two homes', after: first.id, parent: other.id });
+    ok(disagree.ok === false && /disagree/.test(disagree.error) && /ONE home/.test(disagree.error),
+       '--after with a --parent that names a DIFFERENT home is refused (one home, not two)');
+    const afterForeign = await selfWorkNew(manager,
+      { title: 'pv: reaching across', after: (await projectRoot(FID)).id });
+    ok(afterForeign.ok === false && /another project/.test(afterForeign.error),
+       '…and so is --after a sibling in another project');
+    const afterGone = await selfWorkNew(manager,
+      { title: 'pv: gone sibling', after: '00000000-0000-4000-8000-0000000000ff' });
+    ok(afterGone.ok === false && /no work item/.test(afterGone.error),
+       '…and an unknown sibling is a 404 sentence, like --parent');
   }
 
   // ── 2. `zee breakdown` — a ticket becomes a TREE, in one transaction ─────
@@ -259,7 +310,9 @@ try {
 
   // ── 3. `zee unassign` — the card goes back to being plan ─────────────────
   {
-    const card = (await selfWorkNew(manager, { title: 'pv: the card a dead zee held' })).item;
+    // A parent-first plan has ONE home activity; every card this section assigns lives under it.
+    const home = (await selfWorkNew(manager, { title: 'pv: unassign home', kind: 'activity' })).item;
+    const card = (await selfWorkNew(manager, { title: 'pv: the card a dead zee held', parent: home.id })).item;
     await WA.assignWorkItem(card.id, { xell_id: worker.id, actor: 'test@human' });
     await WA.reportItemStatus(card.id, { status: 'working', actor: 'test@human' });
 
@@ -292,7 +345,7 @@ try {
     // The verb exists for a xell that died at spawn, so it must stay ONE call for that case. But it
     // will as readily detach a xell that is mid-turn: that worker's `zee work` goes blank and its
     // `zee item` is refused from then on, with nobody told. It is not refused — it is SAID.
-    const live = (await selfWorkNew(manager, { title: 'pv: a running zee is on this' })).item;
+    const live = (await selfWorkNew(manager, { title: 'pv: a running zee is on this', parent: home.id })).item;
     await WA.assignWorkItem(live.id, { xell_id: spare.id, actor: 'test@human' });
     const onLive = await selfWorkUnassign(manager, { item: live.id });
     ok(onLive.ok, 'unassigning a LIVE worker still WORKS (it is not refused)');
@@ -307,7 +360,7 @@ try {
     ok(onLive.xell_was_live === true, 'and the answer carries the fact as data, not only prose');
 
     // …and the case it was built for stays a one-liner with no scolding.
-    const dead = (await selfWorkNew(manager, { title: 'pv: the card of a xell that died' })).item;
+    const dead = (await selfWorkNew(manager, { title: 'pv: the card of a xell that died', parent: home.id })).item;
     await WA.assignWorkItem(dead.id, { xell_id: spare.id, actor: 'test@human' });
     await client.query(`UPDATE xell SET status='retired' WHERE id=$1`, [spare.id]);
     const onDead = await selfWorkUnassign(manager, { item: dead.id, reason: 'died at spawn' });
@@ -319,6 +372,10 @@ try {
 
   // ── 4. the refusals: a WORKER, and every cross-project reach ─────────────
   {
+    // A parent-first plan has ONE home activity; the cross-project/ticket/priority refusals below
+    // are reached with a --parent (a parentless task would be refused by the parent-first guard
+    // first, which is a DIFFERENT sentence and a different test).
+    const home = (await selfWorkNew(manager, { title: 'pv: refusal home', kind: 'activity' })).item;
     const before = await items();
     const beforeF = await items(FID);
     for (const [what, answer] of [
@@ -340,12 +397,14 @@ try {
     // (and is refused as the wrong code for that ticket — never silently resolved to it) or names a
     // number it does not have (and is refused as missing). Both are exercised, because the collision
     // is the one that could have handed the caller a row it did not ask for.
-    const foreignTicket = await selfWorkNew(manager, { title: 'pv: reaching across', ticket: fticket.code });
+    const foreignTicket = await selfWorkNew(manager,
+      { title: 'pv: reaching across', ticket: fticket.code, parent: home.id });
     ok(foreignTicket.ok === false && /does not name ticket/.test(foreignTicket.error)
        && foreignTicket.error.includes(ticket.code),
        `…and so is another project's code that collides with one of ours (${fticket.code} → refused, `
        + `and told which ticket ${ticket.code} really is)`);
-    const foreignTicket2 = await selfWorkNew(manager, { title: 'pv: reaching across', ticket: fticket2.code });
+    const foreignTicket2 = await selfWorkNew(manager,
+      { title: 'pv: reaching across', ticket: fticket2.code, parent: home.id });
     ok(foreignTicket2.ok === false && /no ticket .* in your project/.test(foreignTicket2.error),
        "…and a foreign code whose number we do not have at all");
     const foreignBreakdown = await selfWorkBreakdown(manager, { ticket: fticket2.code, items: [{ title: 'x' }] });
@@ -355,7 +414,8 @@ try {
     // are not, so `--ticket <id>` read the whole ticket table. Unfixed, the first of these linked a
     // card in OUR project to somebody else's ticket (briefing its worker with that ticket's body) and
     // the second cut items into the OTHER project's plan and moved their ticket out of queued.
-    const foreignTicketId = await selfWorkNew(manager, { title: 'pv: reaching across by id', ticket: fticket.id });
+    const foreignTicketId = await selfWorkNew(manager,
+      { title: 'pv: reaching across by id', ticket: fticket.id, parent: home.id });
     ok(foreignTicketId.ok === false && /no ticket .* in your project/.test(foreignTicketId.error),
        "…and a foreign ticket named by its UUID (--ticket <id>), not just by its code");
     const foreignBreakdownId = await selfWorkBreakdown(manager, { ticket: fticket.id, items: [{ title: 'x' }] });
@@ -363,7 +423,7 @@ try {
        "…and breaking down another project's ticket named by its UUID");
     ok((await client.query(`SELECT status, work_item_id FROM ticket WHERE id=$1`, [fticket.id])).rows[0].status === 'queued',
        'and that refused breakdown left the foreign ticket untouched (still queued, no work item)');
-    const fItem = (await selfWorkNew(fmanager, { title: 'pv: their own card' })).item;
+    const fItem = (await selfWorkNew(fmanager, { title: 'pv: their own card', kind: 'activity' })).item;
     const foreignUnassign = await selfWorkUnassign(manager, { item: fItem.id });
     ok(foreignUnassign.ok === false && /another project/.test(foreignUnassign.error),
        "…and unassigning a card on somebody else's plan");
@@ -391,12 +451,12 @@ try {
     const secondRoot = await selfWorkNew(manager, { title: 'pv: a second root', kind: 'project' });
     ok(secondRoot.ok === false && !/constraint/.test(secondRoot.error) && /root/i.test(secondRoot.error),
        'kind=project is refused with a sentence (one root per project), not a unique-constraint error');
-    const bigPriority = await selfWorkNew(manager, { title: 'pv: shouty', priority: 99 });
+    const bigPriority = await selfWorkNew(manager, { title: 'pv: shouty', priority: 99, parent: home.id });
     ok(bigPriority.ok === false && !/constraint/.test(bigPriority.error) && /1(–|-| to )5/.test(bigPriority.error),
        'and priority 99 is refused with the range, not a check-constraint error');
-    const zeroPriority = await selfWorkNew(manager, { title: 'pv: zero', priority: 0 });
+    const zeroPriority = await selfWorkNew(manager, { title: 'pv: zero', priority: 0, parent: home.id });
     ok(zeroPriority.ok === false && /1(–|-| to )5/.test(zeroPriority.error), '…same at the other end (0)');
-    const okPriority = await selfWorkNew(manager, { title: 'pv: legal priority', priority: 5 });
+    const okPriority = await selfWorkNew(manager, { title: 'pv: legal priority', priority: 5, parent: home.id });
     ok(okPriority.ok && okPriority.item.priority === 5, '…and a legal one still goes through');
   }
 
@@ -412,6 +472,9 @@ try {
     ok(/rest\.includes\('--new'\)/.test(cli), 'and `zee work --new`');
     ok(cli.includes('/api/xell/self/work/new') && cli.includes('/api/xell/self/work/breakdown')
        && cli.includes('/api/xell/self/work/unassign'), 'each posting to its own route');
+    ok(/--after <sibling-id>/.test(cli) && /\bafter: flag\('after'\)/.test(cli),
+       'the CLI advertises and sends --after <sibling-id>');
+    ok(/after: b\.after/.test(routes), 'and the route passes it through to the verb');
 
     // The manual is a harness memory row (080), so this reads the DB — the same source
     // test/cxell-cli-drift.test.mjs lints. `dev-lead` and `queenzee-minister` inherit `manager`.

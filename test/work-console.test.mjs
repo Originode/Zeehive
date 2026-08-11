@@ -200,7 +200,7 @@ ok(/ref/.test(read('web/src/work/Tickets.jsx')),
    'the breakdown editor nests with the API\'s backwards-resolving `ref` handles (one atomic call)');
 
 // ── two defects found by auditing the landed code, pinned so they cannot come back ──
-ok(/halfOf/.test(board) && /onDragOver=\{\(e\) => allow\(e, col\.key, halfOf/.test(board),
+ok(/halfOf/.test(board) && /halfOf\(e, laneIndex\)/.test(board),
    'a CARD is itself a drop target (upper half = before it) — not just the 6px gap between cards');
 ok(/dlg-overlay/.test(read('web/src/work/WorkConsole.jsx')),
    'Escape while a Dialog is open answers the dialog only — it does not also close the console');
@@ -319,7 +319,7 @@ ok(placement(kcol, 'a', 0 + 2).sortOrder === 2.5 && placement(kcol, 'c', 2 - 1).
 // handler must be a PROP Card accepts and the board passes, per card, with its column and row.
 ok(/function Card\(\{[^}]*\bonKey\b/.test(board), 'Card DECLARES onKey as a prop (not a free identifier)');
 ok(/onKey=\{[^}]*onCardKey\(/.test(board), 'and the board PASSES it, bound to that card');
-ok(/onCardKey\(e, card, colIndex, i\)/.test(board),
+ok(/onCardKey\(e, card, colIndex, laneIndex, stack\.length\)/.test(board),
    'bound to the card\'s own column and row — the two indices the move is computed from');
 
 // ── the one place this console could corrupt a plan ───────────────────────────────────────────

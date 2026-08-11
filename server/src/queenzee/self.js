@@ -73,6 +73,19 @@ const liveZee = (xellId) => one(
   `SELECT id, xell_id, name, status, model, last_stop_reason FROM zee WHERE xell_id=$1
      AND status IN ('spawning','online','working','idle') ORDER BY created_at DESC LIMIT 1`, [xellId]);
 
+// The A2A envelope's ids, for the additive `a2a: {taskId, contextId}` on the say/report answers
+// (plan §5). The taskId a message belongs to is its own when it opened the task (a directive) and
+// the referencedTaskId when it is a reply — the same reading as a2a.js rowToMessage. Present only
+// when the row carries an envelope — postMessage now writes one on every message, but an old row or
+// a caller that bypassed postMessage may have none, and additive means additive: the CLI text UX is
+// untouched and old callers keep their exact answer shape.
+function a2aIds(row) {
+  const a2a = row?.meta?.a2a || null;
+  return a2a
+    ? { taskId: a2a.taskId || a2a.referencedTaskId || null, contextId: a2a.contextId || null }
+    : null;
+}
+
 // ── GET /api/xell/self/status — the read model a cxell zee orients from ────────
 // Everything it needs to know where it stands: its own status/task, whether a landing/ship/prod-bind
 // is pending a human, its containers and db binding. No secrets (the token itself never appears).
@@ -2322,8 +2335,11 @@ export async function selfSay(xell, { to = null, message = null, kind = 'directi
   // means the worker's finished turn was restarted with your message as its prompt (this is how you
   // re-task the zee that already holds the context); QUEUED means it is mid-turn and has not read it
   // yet; TYPED means an interactive session took the keystrokes. See lib/zee-turn.js.
+  // The A2A envelope's ids ride along additively (plan §5) — from the envelope postMessage wrote.
+  const a2a = a2aIds(r.message);
   return {
-    ok: true, ...r, delivery: r.delivery?.delivery || 'none',
+    ok: true, ...r, ...(a2a ? { a2a } : {}),
+    delivery: r.delivery?.delivery || 'none',
     message: deliveryReceipt(r.delivery?.delivery, worker.slug,
                              r.delivery?.reason || r.delivery?.error || null),
   };
@@ -2348,7 +2364,11 @@ export async function selfReport(xell, { message = null, kind = 'report' } = {})
   const r = await postMessage({ from: xell, to: manager, body: text, kind: kind === 'reflection' ? 'reflection' : 'report' });
   // Same three-way receipt as `zee say` (a manager reading its own worker's report is the other end
   // of the same delivery): RESUMED / QUEUED / TYPED, never one word for all three.
-  return { ok: true, ...r, addressed: true, delivery: r.delivery?.delivery || 'none',
+  // The A2A envelope's ids ride along additively (plan §5) — from the envelope postMessage wrote.
+  const a2a = a2aIds(r.message);
+  return {
+    ok: true, ...r, addressed: true, ...(a2a ? { a2a } : {}),
+    delivery: r.delivery?.delivery || 'none',
     message: `Sent to your manager (${manager.slug}). `
       + deliveryReceipt(r.delivery?.delivery, manager.slug, r.delivery?.reason || r.delivery?.error || null) };
 }
@@ -2659,20 +2679,33 @@ export async function selfWork(xell, { board = false, item = null } = {}) {
 // project. It answers with the item, and the CLI prints the ID first, because the next thing a
 // manager does with a fresh card is `zee assign --item <id>`.
 export async function selfWorkNew(xell, { title = null, body = null, kind = null, parent = null,
-                                          ticket = null, priority = null, status = null } = {}) {
+                                          after = null, ticket = null, priority = null, status = null } = {}) {
   const guard = requireManager(xell, 'work --new');
   if (guard) return guard;
   if (!String(title || '').trim()) {
     return { ok: false, error: 'a work item needs --title "…" — the one line that becomes the card. '
       + 'The detail (what to change, how to verify it) goes in --body, and a worker is briefed from both.' };
   }
-  const { createWorkItem } = await import('../lib/work-items.js');
+  const { createWorkItem, addDep, inTransaction } = await import('../lib/work-items.js');
   const { getItem } = await import('../lib/work-assign.js');
   const { resolveTicket } = await import('../lib/tickets.js');
+
+  // PARENT-FIRST — the guard this verb exists to make real. A manager establishes ONE parent
+  // work_node (an activity) and chains children under it; a leaf TASK cut at top level is a stray
+  // card nobody can report against. Only the parent-establishing cut — `--kind activity` — is
+  // allowed at top level. A --parent or --after gives the task a home too, so those are exempt.
+  const kindNow = kind || 'task';
+  if (!parent && !after && kindNow === 'task') {
+    return { ok: false, status: 'refused', error:
+      'a task needs a home — establish the parent work_node first (`zee work --new --kind activity '
+      + '--title "…"`), nest this one under it with --parent, or file a ticket (`zee ticket`) if it '
+      + 'is outside the current plan.' };
+  }
 
   // A parent in another project would move the whole item there (createWorkItem inherits the
   // parent's project). Refused by name, before anything is written.
   let parentId = null;
+  let parentRow = null;
   if (parent) {
     let row;
     try { row = await getItem(parent); }
@@ -2681,7 +2714,36 @@ export async function selfWorkNew(xell, { title = null, body = null, kind = null
       return { ok: false, status: 'refused', error:
         `work item ${parent} ("${row.title}") is in another project. You cut YOUR project's plan only.` };
     }
+    parentRow = row;
     parentId = row.id;
+  }
+  // --after <sibling-id>: the chain shorthand — land the new card under the sibling's SAME parent
+  // and make it wait for the sibling, in ONE call (the pair is one transaction below). The sibling
+  // must have a parent (a root is the project's top, not a sibling), and --parent, when both are
+  // given, must name the same home.
+  let afterRow = null;
+  if (after) {
+    let row;
+    try { row = await getItem(after); }
+    catch (e) { return { ok: false, error: e.message }; }
+    if (row.project_id !== xell.project_id) {
+      return { ok: false, status: 'refused', error:
+        `work item ${after} ("${row.title}") is in another project. You cut YOUR project's plan only.` };
+    }
+    if (!row.parent_id) {
+      return { ok: false, status: 'refused', error:
+        `"${row.title}" is the project's root — it has no parent to nest a sibling under. \`--after\` `
+        + 'chains a new card beside an EXISTING sibling; give the new card a home with --parent, or '
+        + 'cut it as --kind activity.' };
+    }
+    if (parentRow && parentRow.id !== row.parent_id) {
+      return { ok: false, status: 'refused', error:
+        `--parent "${parentRow.title}" and --after "${row.title}" disagree: a --after card nests under `
+        + `the SIBLING's parent, and "${row.title}" does not live under "${parentRow.title}". Give the `
+        + 'new card ONE home — keep --parent or keep --after, not both.' };
+    }
+    afterRow = row;
+    parentId = row.parent_id;
   }
   let ticketRow = null;
   if (ticket) {
@@ -2694,20 +2756,39 @@ export async function selfWorkNew(xell, { title = null, body = null, kind = null
     }
   }
 
+  const create = (opts = {}) => createWorkItem({
+    project_id: xell.project_id, parent_id: parentId, title, body,
+    kind: kindNow, ticket_id: ticketRow?.id || null,
+    priority: priority ?? null, status: status || null, actor: xell.slug }, opts);
   let item;
   try {
-    item = await createWorkItem({
-      project_id: xell.project_id, parent_id: parentId, title, body,
-      kind: kind || 'task', ticket_id: ticketRow?.id || null,
-      priority: priority ?? null, status: status || null, actor: xell.slug });
+    // --after creates the card AND the chain in one transaction, so a failure between the two can
+    // never leave a card that is not chained (or a chain on a card that was never cut).
+    item = afterRow
+      ? await inTransaction(async (tx) => {
+          const made = await create({ client: tx.client, pending: tx.pending });
+          await addDep(made.id, afterRow.id, { actor: xell.slug, client: tx.client, pending: tx.pending });
+          return made;
+        })
+      : await create();
   } catch (e) { return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message }; }
   logline('self', `${xell.slug} cut work item "${item.title}" (${item.kind}, ${item.status})`
+    + `${afterRow ? `, chained after "${afterRow.title}"` : ''}`
     + `${ticketRow ? ` for ${ticketRow.code}` : ''}`);
+  const parentTitle = afterRow
+    ? (await one(`SELECT title FROM work_item WHERE id=$1`, [afterRow.parent_id]))?.title || null
+    : null;
   return {
-    ok: true, item, id: item.id, ticket: ticketRow ? { id: ticketRow.id, code: ticketRow.code } : null,
-    message: `Created "${item.title}" (${item.kind}, ${item.status}) — ${item.id}. Deploy a worker for it `
-      + `with \`zee assign --item ${item.id} --task "…"\`, or hang children off it with `
-      + `\`zee work --new --parent ${item.id} --title "…"\`. Creating a card dispatches nobody.`,
+    ok: true, item, id: item.id, after: afterRow ? { id: afterRow.id, title: afterRow.title } : null,
+    ticket: ticketRow ? { id: ticketRow.id, code: ticketRow.code } : null,
+    message: afterRow
+      ? `Created "${item.title}" (${item.kind}, ${item.status}) — ${item.id}, nested under `
+        + `"${parentTitle || afterRow.parent_id}" and chained after "${afterRow.title}" — it waits for `
+        + `"${afterRow.title}" (the gantt draws "${afterRow.title}" first). Deploy a worker for it with `
+        + `\`zee assign --item ${item.id} --task "…"\`. Creating a card dispatches nobody.`
+      : `Created "${item.title}" (${item.kind}, ${item.status}) — ${item.id}. Deploy a worker for it `
+        + `with \`zee assign --item ${item.id} --task "…"\`, or hang children off it with `
+        + `\`zee work --new --parent ${item.id} --title "…"\`. Creating a card dispatches nobody.`,
   };
 }
 
