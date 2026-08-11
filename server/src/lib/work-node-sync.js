@@ -33,13 +33,25 @@ const bad = (m) => httpError(400, m);
 const SEQ = 'sequence';
 const FREE = 'freeform';
 
-// The zero-padded numeric sibling_rank used by the backfill (lexical order == numeric order,
-// uuid suffix as a deterministic uniqueness tiebreaker). sort_order is a double precision;
-// a NULL/undefined becomes 0.
+// The fixed-width, SIGN-SAFE numeric sibling_rank (lexical order == numeric order, uuid suffix
+// as a deterministic uniqueness tiebreaker). sort_order is a double precision (a NULL/undefined
+// becomes 0) and a drag can write a FRACTIONAL midpoint (web/src/work/order.js:36) or a
+// NEGATIVE value (order.js:38 — `after - 1` into the first slot once a column head reaches 0),
+// so the old lpad(n::text,20,'0') scheme is wrong for both: right-padding a decimal point
+// misaligns the digits (1500.5 sorts after 3000) and a negative sign sorts before the digits.
+//
+// This scheme adds a +1e9 offset (cast to numeric FIRST so the double's exact value is
+// preserved — 1500.5::numeric is 1500.5) and formats as a fixed 20-digit integer part + a
+// 6-digit fractional part, which orders correctly for any sort_order in (-1e9, ~9.9e9) and
+// keeps the '.' at the same character position on every rank so lexical order never crosses it.
+// The SAME formula is used in migration 186 to re-encode existing ranks, so new writes and
+// backfilled rows stay in one consistent format.
 function rankSql(order, id) {
   const n = order == null ? 0 : Number(order);
   const val = Number.isFinite(n) ? n : 0;
-  return `lpad((${val})::numeric::text, 20, '0') || ':' || $${id}`;
+  // FM (fill mode) strips the sign-position blank to_char otherwise emits for a positive number,
+  // so the rank is exactly the fixed-width digits + '.000000' — a clean, uniform format.
+  return `to_char((${val})::numeric + 1000000000, 'FM00000000000000000000.000000') || ':' || $${id}`;
 }
 
 // ── plan / plan_version / root node ─────────────────────────────────────────────
@@ -74,6 +86,21 @@ export async function ensurePlanVersion(db, projectId) {
   if (rootItem) {
     rootNode = await db.one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [rootItem.id]);
     if (!rootNode) {
+      // If the found plan_version already has a parentless node that is NOT ours (a plan a
+      // workflow test — or any other writer — authored before this project was dual-written),
+      // inserting a second parentless node would violate wn_one_root_per_version. Open a NEW
+      // version and put our tree there, leaving the foreign version untouched. Idempotent: on a
+      // re-run OUR root is already in this version, so no new version is opened.
+      const ourRootInVersion = await db.one(
+        `SELECT id FROM work_node WHERE plan_version_id=$1 AND stable_key='work_item:'||$2`, [pv.id, rootItem.id]);
+      const foreignRoot = !ourRootInVersion && (await db.one(
+        `SELECT id FROM work_node WHERE plan_version_id=$1 AND parent_id IS NULL`, [pv.id]));
+      if (foreignRoot) {
+        pv = await db.one(
+          `INSERT INTO plan_version (plan_id, version)
+           VALUES ($1, (SELECT COALESCE(max(version),0)+1 FROM plan_version WHERE plan_id=$1))
+           RETURNING id`, [plan.id]);
+      }
       const est = rootItem.estimate_hours == null ? null : rootItem.estimate_hours * 3600000; // ms → interval handled below
       rootNode = await db.one(
         `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, child_semantics, estimate, stable_key)
@@ -188,9 +215,17 @@ export async function removeWorkNode(db, workItemId) {
 // unless its LCA container is 'freeform' (I5), so the LCA is flipped first — the same rule
 // the backfill used to choose child_semantics. An ancestor-edge (I6) fails loudly, which is
 // correct: a legacy edge that was silently legal must not half-land here.
+//
+// DIRECTION IS LOAD-BEARING. dependency.from_id is the PREDECESSOR (the thing that must finish
+// before the dependent starts); dependency.to_id is the DEPENDENT (successor). The legacy
+// work_item_dep table means the opposite of the order it is written in: for item X,
+// work-items.js:418 reads "what X depends on" as `JOIN work_item w ON w.id = d.depends_on_id
+// WHERE d.work_item_id = X` — so work_item_id is the DEPENDENT and depends_on_id is the
+// PREREQUISITE. Therefore the model edge is from_id=node(depends_on_id) → to_id=node(work_item_id).
 export async function syncDependency(db, workItemId, dependsOnId) {
-  const fromId = await nodeIdFor(db, workItemId);
-  const toId = await nodeIdFor(db, dependsOnId);
+  // prerequisite (predecessor) → dependent (successor)
+  const fromId = await nodeIdFor(db, dependsOnId);
+  const toId = await nodeIdFor(db, workItemId);
   if (!fromId || !toId) {
     throw bad(`cannot dual-write dependency ${workItemId} → ${dependsOnId}: one end has no work_node yet`);
   }
@@ -206,8 +241,8 @@ export async function syncDependency(db, workItemId, dependsOnId) {
 }
 
 export async function removeDependency(db, workItemId, dependsOnId) {
-  const fromId = await nodeIdFor(db, workItemId);
-  const toId = await nodeIdFor(db, dependsOnId);
+  const fromId = await nodeIdFor(db, dependsOnId);
+  const toId = await nodeIdFor(db, workItemId);
   if (!fromId || !toId) return null;
   await db.q(`DELETE FROM dependency WHERE from_id=$1 AND to_id=$2 AND type='FS'`, [fromId, toId]);
   return { ok: true, fromId, toId };

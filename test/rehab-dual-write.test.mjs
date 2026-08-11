@@ -63,7 +63,7 @@ try {
   ok(actNode.name === 'Activity A' && actNode.kind === 'action' && actNode.child_semantics === null,
     'node name/kind from shape (leaf activity = action, no semantics)');
   ok(actNode.estimate && actNode.estimate.hours === 5, `estimate_hours 5 → node estimate 5h (got ${JSON.stringify(actNode.estimate)})`);
-  ok(actNode.sibling_rank === '00000000000000001000:' + act.id, 'sibling_rank from sort_order (padded + id tiebreak)');
+  ok(actNode.sibling_rank === '00000000001000001000.000000:' + act.id, 'sibling_rank from sort_order (sign-safe fixed-width + id tiebreak)');
 
   const task = await W.createWorkItem({
     project_id: PID, parent_id: act.id, kind: 'task', title: 'Task One', sort_order: 1000,
@@ -102,24 +102,45 @@ try {
 
   // ── 4. DEP dual-write ─────────────────────────────────────────────────────
   section('dep: a work_item_dep edge is also a dependency row');
-  const t2 = await W.createWorkItem({ project_id: PID, parent_id: act.id, kind: 'task', title: 'Task Two', sort_order: 2000 });
+  // addDep(task, t2) = "task depends on t2" → t2 is the PREREQUISITE, task the DEPENDENT.
+  // dependency.from_id is the prerequisite, to_id the dependent.
+  const t2 = await W.createWorkItem({ project_id: PID, parent_id: act.id, kind: 'task', title: 'Task Two', sort_order: 2000, estimate_hours: 4 });
   await W.addDep(task.id, t2.id, { actor: 'test' });
   const depRow = await one(
     `SELECT d.* FROM dependency d
       JOIN work_node a ON a.id=d.from_id JOIN work_node b ON b.id=d.to_id
       WHERE a.stable_key=$1 AND b.stable_key=$2 AND d.type='FS'`,
+    [`work_item:${t2.id}`, `work_item:${task.id}`]);
+  ok(!!depRow, 'addDep → an FS dependency row from prerequisite (t2) to dependent (task)');
+  const depRowReversed = await one(
+    `SELECT d.* FROM dependency d
+      JOIN work_node a ON a.id=d.from_id JOIN work_node b ON b.id=d.to_id
+      WHERE a.stable_key=$1 AND b.stable_key=$2 AND d.type='FS'`,
     [`work_item:${task.id}`, `work_item:${t2.id}`]);
-  ok(!!depRow, 'addDep → an FS dependency row');
+  ok(!depRowReversed, 'and NOT the reversed direction (dependent → prerequisite)');
   const lcaNode = await one(`SELECT child_semantics FROM work_node WHERE id=$1`,
     [(await one(`SELECT wn_lca((SELECT id FROM work_node WHERE stable_key=$1),(SELECT id FROM work_node WHERE stable_key=$2)) AS id`,
       [`work_item:${task.id}`, `work_item:${t2.id}`])).id]);
   ok(lcaNode.child_semantics === 'freeform', 'the LCA container flipped to freeform (I5)');
+
+  // DIRECTION through wn_cpm — the scheduler, not a re-read of the mapping: the dependent's
+  // earliest_start must move to the prerequisite's earliest_finish (t2 has a 4h estimate, task has
+  // 7h from the update above), and the reverse must NOT hold.
+  const pvId = (await one(`SELECT wn.plan_version_id FROM work_node wn WHERE wn.stable_key=$1`, [`work_item:${task.id}`])).plan_version_id;
+  const cpmRows = (await q(`SELECT name, earliest_start, earliest_finish FROM wn_cpm($1, '2026-01-01T00:00:00Z')`, [pvId])).rows;
+  const cpmTask = cpmRows.find((r) => r.name === 'Task One (renamed)');
+  const cpmT2 = cpmRows.find((r) => r.name === 'Task Two');
+  ok(cpmTask && cpmT2 && new Date(cpmTask.earliest_start) >= new Date(cpmT2.earliest_finish),
+    `wn_cpm: dependent (task) earliest_start (${cpmTask?.earliest_start}) >= prerequisite (t2) earliest_finish (${cpmT2?.earliest_finish})`);
+  ok(cpmTask && cpmT2 && new Date(cpmT2.earliest_start) < new Date(cpmTask.earliest_finish),
+    'and the prerequisite does not wait on the dependent (reverse is not a dependency)');
+
   await W.removeDep(task.id, t2.id, { actor: 'test' });
   const depGone = await one(
     `SELECT d.* FROM dependency d
       JOIN work_node a ON a.id=d.from_id JOIN work_node b ON b.id=d.to_id
       WHERE a.stable_key=$1 AND b.stable_key=$2`,
-    [`work_item:${task.id}`, `work_item:${t2.id}`]);
+    [`work_item:${t2.id}`, `work_item:${task.id}`]);
   ok(!depGone, 'removeDep → the dependency row is gone');
 
   // ── 5. DELETE dual-write ──────────────────────────────────────────────────

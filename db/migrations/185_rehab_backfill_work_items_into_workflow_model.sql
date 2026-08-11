@@ -152,6 +152,19 @@ BEGIN
       IF v_pv_id IS NULL THEN
         INSERT INTO plan_version (plan_id, version) VALUES (v_plan_id, 1)
         RETURNING id INTO v_pv_id;
+      ELSE
+        -- If this plan_version already has a parentless node that is NOT ours (a plan a workflow
+        -- test — or any other writer — authored before this backfill), inserting the project root
+        -- as a second parentless node would violate wn_one_root_per_version. Open a NEW version
+        -- and put our tree there, leaving the foreign version untouched. Idempotent: on a re-run
+        -- OUR root is already in this version (stable_key matches), so no new version is opened.
+        IF NOT EXISTS (SELECT 1 FROM work_node
+                        WHERE plan_version_id = v_pv_id AND stable_key = 'work_item:' || wi.id::text)
+           AND EXISTS (SELECT 1 FROM work_node WHERE plan_version_id = v_pv_id AND parent_id IS NULL) THEN
+          INSERT INTO plan_version (plan_id, version)
+          VALUES (v_plan_id, (SELECT COALESCE(max(version), 0) + 1 FROM plan_version WHERE plan_id = v_plan_id))
+          RETURNING id INTO v_pv_id;
+        END IF;
       END IF;
       v_parent_id := NULL;
     ELSE
@@ -184,7 +197,11 @@ BEGIN
       v_sem := NULL;
     END IF;
 
-    v_rank := lpad(wi.sort_order::numeric::text, 20, '0') || ':' || wi.id::text;
+    -- SIGN-SAFE fixed-width encoding (see the rank note in work-node-sync.js): a drag can write
+    -- a fractional midpoint or a negative value, and lpad(n::text,20,'0') orders both wrong.
+    -- +1e9 offset cast to numeric FIRST (preserves the double), fixed 20+6 digits, same '.' position.
+    -- FM strips to_char's sign-position blank so the rank is exactly the fixed-width digits.
+    v_rank := to_char(wi.sort_order::numeric + 1000000000, 'FM00000000000000000000.000000') || ':' || wi.id::text;
     v_est  := wi.estimate_hours * interval '1 hour';
 
     INSERT INTO work_node
@@ -204,9 +221,14 @@ BEGIN
   -- ── the dependency edges ──────────────────────────────────────────────────
   -- LCA containers were flipped to 'freeform' above, so the model's I5 trigger passes. An
   -- ancestor-edge (I6) fails loudly — TOTAL means the 3 edges are 3 dependency rows.
+  --
+  -- DIRECTION: dependency.from_id is the PREDECESSOR, to_id the DEPENDENT. The legacy
+  -- work_item_dep table means the opposite of its write order (work_item_id is the DEPENDENT,
+  -- depends_on_id the PREREQUISITE — see work-items.js:418), so the model edge is
+  -- from_id = node(depends_on_id) → to_id = node(work_item_id).
   FOR dep IN SELECT * FROM work_item_dep LOOP
-    SELECT id INTO v_node_id FROM work_node WHERE stable_key = 'work_item:' || dep.work_item_id::text;
-    SELECT id INTO v_parent_id FROM work_node WHERE stable_key = 'work_item:' || dep.depends_on_id::text;
+    SELECT id INTO v_node_id FROM work_node WHERE stable_key = 'work_item:' || dep.depends_on_id::text;
+    SELECT id INTO v_parent_id FROM work_node WHERE stable_key = 'work_item:' || dep.work_item_id::text;
     INSERT INTO dependency (from_id, to_id, type) VALUES (v_node_id, v_parent_id, 'FS')
     ON CONFLICT (from_id, to_id, type) DO NOTHING;
   END LOOP;
@@ -321,12 +343,14 @@ BEGIN
     RAISE EXCEPTION 'REHAB backfill: % project root(s) lack a plan+plan_version+root_node with root_node_id set', v_bad;
   END IF;
 
+  -- Direction-aware: dependency.from_id is the PREREQUISITE (depends_on_id), to_id the DEPENDENT
+  -- (work_item_id) — see the dep section above. A row in the wrong direction is a missing row here.
   SELECT count(*) INTO v_bad FROM work_item_dep d
     WHERE NOT EXISTS (
       SELECT 1 FROM work_node a JOIN work_node b ON true
       JOIN dependency dp ON dp.from_id = a.id AND dp.to_id = b.id AND dp.type = 'FS'
-      WHERE a.stable_key = 'work_item:' || d.work_item_id::text
-        AND b.stable_key = 'work_item:' || d.depends_on_id::text);
+      WHERE a.stable_key = 'work_item:' || d.depends_on_id::text
+        AND b.stable_key = 'work_item:' || d.work_item_id::text);
   IF v_bad > 0 THEN
     RAISE EXCEPTION 'REHAB backfill: % work_item_dep edge(s) have no FS dependency row', v_bad;
   END IF;

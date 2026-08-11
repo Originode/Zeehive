@@ -150,6 +150,28 @@ try {
   ok(after1.work_node === nItems, `every work_item (incl. roots) has exactly one work_node: ${nItems} (got ${after1.work_node})`);
   ok(after1.dependency === 3, `3 work_item_dep edges → 3 dependency rows (got ${after1.dependency})`);
 
+  // DIRECTION: dependency.from_id is the PREREQUISITE (depends_on_id), to_id the DEPENDENT
+  // (work_item_id) — the legacy table means the opposite of its write order.
+  const dirBad = (await one(`SELECT count(*)::int AS n FROM work_item_dep d
+    WHERE NOT EXISTS (
+      SELECT 1 FROM work_node a JOIN work_node b ON true
+      JOIN dependency dp ON dp.from_id=a.id AND dp.to_id=b.id AND dp.type='FS'
+      WHERE a.stable_key='work_item:'||d.depends_on_id::text
+        AND b.stable_key='work_item:'||d.work_item_id::text)`)).n;
+  ok(dirBad === 0, `dependency direction: from_id is the prerequisite (${dirBad} wrong)`);
+
+  // DIRECTION through wn_cpm: the dependent (Task Two, t2) cannot start until the prerequisite
+  // (Task One, t1) finishes — its earliest_start must be >= t1's earliest_finish. This is the
+  // scheduler's reading, not a re-read of the mapping.
+  const pv1 = (await one(`SELECT pv.id FROM plan_version pv JOIN plan p ON p.id=pv.plan_id WHERE p.project_id=$1`, [P1])).id;
+  const cpmRows = (await q(`SELECT node_id, name, earliest_start, earliest_finish FROM wn_cpm($1, '2026-01-01T00:00:00Z')`, [pv1])).rows;
+  const t1r = cpmRows.find((r) => r.name === 'Task One');
+  const t2r = cpmRows.find((r) => r.name === 'Task Two');
+  ok(t1r && t2r && new Date(t2r.earliest_start) >= new Date(t1r.earliest_finish),
+    `wn_cpm: dependent (Task Two) earliest_start (${t2r?.earliest_start}) >= prerequisite (Task One) earliest_finish (${t1r?.earliest_finish})`);
+  ok(t1r && t2r && new Date(t1r.earliest_start) < new Date(t2r.earliest_finish),
+    `and the reverse is not a dependency (prerequisite does not wait on the dependent)`);
+
   const missing = (await one(`SELECT count(*)::int AS n FROM work_item wi WHERE wi.kind <> 'project'
     AND NOT EXISTS (SELECT 1 FROM work_node wn WHERE wn.stable_key = 'work_item:' || wi.id::text)`)).n;
   ok(missing === 0, `every non-project work_item has a node (${missing} missing)`);
