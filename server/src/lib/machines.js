@@ -10,6 +10,7 @@
 //   the console   — the container matrix renders one column per machine, and this module's CRUD
 //                   is what its "+ machine" / knobs call.
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
@@ -37,6 +38,20 @@ export function queenzeeHostCtx() { return 'default'; }
 // per-project pool knobs govern such projects. The web reads this field rather than comparing
 // context strings itself.
 const withHostFlag = (rows) => rows.map((m) => ({ ...m, is_queenzee_host: m.docker_ctx === queenzeeHostCtx() }));
+
+// The host a machine's shared dev db is RECORDED at. The three explicit places first (the machine
+// row, the project, the config), then the QUEENZEE-HOST fallback: a local machine's published
+// ports ARE the host's own, so a db provisioned there is reachable at host.docker.internal from a
+// containerized queenzee/cxell, else localhost from the host. A REMOTE machine with none of the
+// three stays null — fail closed (db-dsn-needs-a-host): its address is genuinely unknown, and
+// guessing 'localhost' would point every consumer at a silent wrong database. This is what keeps a
+// freshly provisioned local dev db from wearing the chip's "no URL recorded" tooltip.
+export function machineDbHost(m, project, cfg) {
+  return m.host_ip || project.dev_host_ip || cfg.devHostIp
+    || (m.docker_ctx === queenzeeHostCtx()
+        ? (existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost')
+        : null);
+}
 
 // projectId (optional) scopes pool_size AND dev_priority to that project (machine_pool, 025+038) —
 // the matrix shows and edits THIS project's pool and spawn priority on each machine. Without it,
@@ -399,7 +414,7 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   const name = source?.name ? `${source.name}_${mkey}`
     : prodDb ? `${devLogical}_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
-  const host = m.host_ip || project.dev_host_ip || config.devHostIp;
+  const host = machineDbHost(m, project, config);
   const dbUser = project.db_user || config.prodDbUser || 'postgres';
   const dbName = project.db_name || config.prodDbName || 'omnibiz';
 
@@ -421,7 +436,7 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
       port = Number(res.port) || 0;
     }
     // FAIL CLOSED WHEN NO HOST IS KNOWN. This used to interpolate `host` straight into the string,
-    // and `host` is `m.host_ip || project.dev_host_ip || config.devHostIp` — all three of which can
+    // and `host` was `m.host_ip || project.dev_host_ip || config.devHostIp` — all three of which can
     // be null. The result was a conn_ref of `postgresql://zeehive@null:32772/zeehive`, which is not
     // a broken address so much as a POISONED one: it is stored on the container row, copied into
     // every xell's .zeehive.env as DATABASE_URL, and it fails as `getaddrinfo ENOTFOUND null` — in
@@ -429,10 +444,12 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
     // from. (Found from inside a cxell on 2026-08-03: a dev xell whose server container could not
     // boot, on a db that was listening the whole time.)
     //
-    // derivedTcpDsn is the function that already owns this rule ("no address is a fixable state, a
-    // guessed one is a silent wrong database") and it returns null rather than compose one. Same
-    // rule here, and the same one prod-readonly.js decideReaderAddress applies for prod: no host →
-    // no conn_ref, and a line saying exactly which of the three places to fill it in.
+    // host now resolves through machineDbHost: the QUEENZEE-HOST (local) machine falls back to
+    // host.docker.internal / localhost so a local dev db gets a real conn_ref instead of the chip's
+    // "no URL recorded". A REMOTE machine with none of the three explicit places still leaves host
+    // null, and derivedTcpDsn is the function that owns the fail-closed rule ("no address is a
+    // fixable state, a guessed one is a silent wrong database") — it returns null rather than
+    // compose one, and a line says exactly which of the three places to fill in.
     const conn = derivedTcpDsn({ host, host_port: port || 5432 }, { user: dbUser, name: dbName });
     if (!conn) {
       logline('machine', `!!! dev db ${name} on ${m.key} has NO reachable host address — machine.host_ip, `
