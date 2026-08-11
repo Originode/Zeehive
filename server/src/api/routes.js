@@ -2736,8 +2736,8 @@ router.post('/xell/self/work/new', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     res.json(await selfWorkNew(x, { title: b.title || null, body: b.body || null, kind: b.kind || null,
-      parent: b.parent || null, ticket: b.ticket || null, priority: b.priority ?? null,
-      status: b.status || null })); }
+      parent: b.parent || null, after: b.after || null, ticket: b.ticket || null,
+      priority: b.priority ?? null, status: b.status || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/xell/self/work/breakdown', async (req, res) => {
