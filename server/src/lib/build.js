@@ -126,9 +126,19 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
 
   // runner: process (spec §6.1) — there is no image and no compose; the hammer's verb here is
   // (re)START the role in its worktree. Build-context knobs are meaningless for a process.
+  //
+  // THE ROW OUTRANKS THE MANIFEST. Provision records what a container IS (a process row carries
+  // image_tag=NULL AND docker_ctx=NULL; a compose row carries both), and a build must honor
+  // what was provisioned, not what the manifest says TODAY — the manifest cache moves under
+  // live xells (the process→compose cutover of the compose-authorship decision record), and a
+  // docker build against a row with no image and no context can only fail. So: old xells keep
+  // process builds for their whole lives, new xells build containers, and the flip is a
+  // per-xell fact instead of a fleet-wide cliff. The manifest check remains for rows from
+  // before naming stamped image_tag.
   const runner = project?.manifest?.roles?.[c.role]?.runner
     || project?.manifest?.tiers?.spinoff?.runner || null;
-  if (runner === 'process') return startProcessRole(c, xell, project);
+  const isProcessRow = !c.image_tag && !c.docker_ctx;
+  if (isProcessRow || (runner === 'process' && !c.image_tag)) return startProcessRole(c, xell, project);
 
   if (buildCtx !== undefined) c = await setBuildCtxRow(c, buildCtx);
   // Validate the build target NOW (before flipping to 'building'), so a foreign context with no
@@ -136,7 +146,7 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
   const target = await resolveBuildTarget(c);
   const siblings = await q(
     `SELECT role, host_port FROM container WHERE owner_xell_id=$1 AND role = ANY($2)`,
-    [c.owner_xell_id, [...BUILDABLE]]);
+    [c.owner_xell_id, [...BUILDABLE, 'db']]);
   const portOf = (role) => siblings.find((s) => s.role === role)?.host_port;
   const recorded = {
     BUILD_COMPOSE_FILE: c.compose_file,
@@ -146,6 +156,10 @@ export async function buildContainer(containerId, { hot = false, buildCtx } = {}
     SPINOFF_SLUG: xell.slug,
     SPINOFF_SERVER_PORT: portOf('server'),
     SPINOFF_WEB_PORT: portOf('webapp'),
+    // The GENERATED spinoff compose publishes a per-xell db on ${SPINOFF_DB_PORT} — the row's
+    // recorded port (provision stamped it) rides along like the server/web ones. NULL for
+    // projects with no per-xell db row; the compose default then applies.
+    SPINOFF_DB_PORT: portOf('db'),
     // Split-build handoff (all no-ops when buildCtx === runCtx / no registry — see build-container.sh).
     BUILD_BUILD_CTX: target.buildCtx,
     BUILD_REGISTRY: target.registry,

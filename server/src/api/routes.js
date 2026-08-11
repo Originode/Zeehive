@@ -39,7 +39,7 @@ import { remoteAvailable } from '../lib/claude-cli.js';
 import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
-         getProjectManifest, refreshProjectManifest, draftProjectManifest,
+         getProjectManifest, refreshProjectManifest, generateProjectCompose, draftProjectManifest,
          buildManifestDraft, writeProjectManifest,
          getComposeOnboardingPlan, applyComposeOnboarding,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
@@ -787,6 +787,13 @@ router.get('/projects/:id/manifest', async (req, res) => {
 });
 router.post('/projects/:id/manifest/refresh', async (req, res) => {
   try { res.json(await refreshProjectManifest(await resolveProjectParam(req.params.id))); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Generate the spinoff compose PROJECTION from the manifest (compose-authorship): preview by
+// default; { write: true } writes it into the repo — only ever over a ZEEHIVE-generated file
+// (marker check in lib/compose-gen.js); a project-owned compose is refused, with the reason.
+router.post('/projects/:id/compose/generate', async (req, res) => {
+  try { res.json(await generateProjectCompose(await resolveProjectParam(req.params.id), { write: req.body?.write === true })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Draft generation; {write:true} writes zeehive.yml into the repo root (refused if one exists) —
