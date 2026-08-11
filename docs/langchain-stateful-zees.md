@@ -79,7 +79,7 @@ first-class.
 |---|---|---|
 | **spawn / claim / pool** | queenzee | a xell is claimed, a zee row is created, the pool sweep still owns ready rows |
 | **landing / ship / seed / prod gates** | queenzee + human | untouched — langchain never sees a gate |
-| **scheduling (when a turn runs, resumes, reaps)** | queenzee loops | `intake.js`, `nudge.js`, `reaper.js`, `monitor.js` unchanged |
+| **scheduling (when a turn runs, resumes, reaps)** | queenzee loops | `intake.js`, `nudge.js`, `reaper.js` unchanged; `monitor.js` only EXCLUDES `driver='langchain'` zees from its CLI-liveness probe (they have no cage/CLI session to probe) |
 | **the gateway + ledgers** | queenzee | every langchain call flows through `gatewayProxy` → `llm_gateway_request` |
 | **turn lifecycle** | queenzee | `startTurn` / `endTurn` in `turn-ledger.js` |
 | **the harness brief** | queenzee | the task text the zee is given is built by the existing briefing machinery |
