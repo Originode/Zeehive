@@ -4,7 +4,6 @@ import { hostname } from 'node:os';
 import { q, one } from '../db/pool.js';
 import { projectHeads } from './git.js';
 import { listMachines } from './machines.js';
-import { listSites } from './sites.js';
 import { hiveStatus, hiveLabel } from './hive-status.js';
 import { pauseState, projectPauseState, PAUSED_STOP_REASON } from './fleet-pause.js';
 import { buildLandingPad } from '../queenzee/landingpad.js';
@@ -655,10 +654,6 @@ export async function getFleet(projectId) {
     status: { total, inUse, working, ready: work.filter((x) => x.status === 'ready').length },
     containers: groups,
     machines,
-    // The deploy SITES (dev/prod, per docker_ctx) — the master-detail tree's deploy-type
-    // branches: a machine is the master, its sites the dev/prod branches, and the shared
-    // container rows the inventory under each. The dashboard renders them together.
-    sites: await listSites(pid),
     backup,
     xells,
     fleet_burn: fleetBurn,

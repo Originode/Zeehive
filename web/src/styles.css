@@ -872,33 +872,6 @@ a.cbox:hover { border-color: var(--accent); }
 .mx-addform button:hover:not(:disabled) { border-color: var(--accent); }
 .mx-addform .mx-cancel { border: none; background: none; color: var(--muted); }
 
-/* The container TREE — machine (master) → deploy type (dev/prod) → role-grouped inventory.
-   Replaces the role×machine grid: the nesting is the point, so each level indents and each
-   branch has its own toggle. */
-.machine-tree { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 4px;
-  padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
-.mt-node { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px 8px; }
-.mt-node.off { opacity: .45; }
-.mt-node.elsewhere { color: var(--muted); font-style: italic; }
-.mt-node-head { display: flex; align-items: flex-start; gap: 4px; }
-.mt-node-head .mx-head { flex: 1; border-bottom: none; }
-.mt-toggle { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 11px;
-  padding: 3px 4px 0 0; line-height: 1; }
-.mt-toggle:hover { color: var(--text); }
-.mt-toggle.dead { cursor: default; }
-.mt-body { margin: 6px 0 0 14px; display: flex; flex-direction: column; gap: 6px; }
-.mt-branch { border-left: 2px solid var(--line); padding: 2px 0 2px 8px; }
-.mt-branch-head { display: flex; align-items: center; gap: 7px; font-size: 12px; }
-.mt-branch-tier { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-.mt-branch[data-tier="dev"] .mt-branch-tier { color: #6fb3e0; }
-.mt-branch[data-tier="prod"] .mt-branch-tier { color: #f2c14e; }
-.mt-branch.xells .mt-branch-tier { color: var(--muted); }
-.mt-branch-head .pc { color: var(--muted); font-size: 11px; }
-.mt-branch-body { margin: 4px 0 2px 16px; display: flex; flex-direction: column; gap: 3px; }
-.mt-role { display: flex; align-items: baseline; gap: 8px; }
-.mt-role .invlabel { min-width: 62px; }
-.mt-node.elsewhere .mt-role .invlabel { font-style: normal; }
-
 /* auto-approve policy switches (statusline) */
 .autoappr-group { margin-left: 18px; font-size: 14px; display: inline-flex; align-items: center; gap: 8px; }
 .autoappr-group .k { color: var(--muted); }
