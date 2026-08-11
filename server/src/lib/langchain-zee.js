@@ -262,6 +262,7 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
   let iterations = 0;
   let capHit = false;
   let finalResp = null;
+  let endedForHuman = null;   // { reason } — the loop ENDED because a tend was RAISED (not cleared)
   const executed = [];
   // The loop makes several model calls; the zee_turn burn is the SUM of them all (the gateway
   // already records each call individually in llm_gateway_request; this is the per-turn total).
@@ -293,7 +294,25 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
       if (desc) executed.push({ name: tc.name, args: tc.args || {} });
       messages.push(new ToolMessage({ content: String(content).slice(0, TOOL_RESULT_CAP), tool_call_id: tc.id }));
       if (onTool && desc) { try { onTool({ name: tc.name, args: tc.args || {} }); } catch (e) { logline('langchain', `onTool threw (${String(e.message).slice(0, 80)})`); } }
+      // LOOP-ENDS-TURN ON TEND — harness policy, NOT verb semantics. A tend means "I am waiting for
+      // a human." A zee that raises one and keeps iterating has not asked for anything — it has
+      // logged a wish. What must be shared is the VERB'S EFFECT: `tend` still calls the SAME
+      // selfTend handler, writes the same row, shows the same card — the door is unchanged. What
+      // belongs to the harness is WHETHER THE TURN CONTINUES. A cxell zee's harness decides when its
+      // turn ends; this loop IS the harness for a langchain zee, so "raising a tend ends this turn"
+      // is harness policy, not verb semantics. A CLEAR (tend clear=true) does NOT end the turn — it
+      // is answering, not asking. hint-land/hint-ship do NOT end the turn either — a hint blocks
+      // nothing by construction (it lights a button) and the zee keeps working; ending on a hint
+      // would invent a stop the fleet does not have.
+      if (tc.name === 'tend' && !tc.args?.clear) {
+        try {
+          const parsed = JSON.parse(content);
+          if (parsed.ok) endedForHuman = { reason: parsed.message || 'a human was asked' };
+        } catch { /* not JSON — fall through, the tend was refused (e.g. no reason) */ }
+        if (endedForHuman) break;
+      }
     }
+    if (endedForHuman) break;   // the turn is over — the zee is waiting to be resumed
     if (iterations >= maxIterations) { capHit = true; break; }
   }
 
@@ -303,10 +322,15 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
 
   // A CAPPED loop is a VISIBLE result, not a silent stop: the model never reached a final answer,
   // so the text says exactly that (a loop that quietly truncates looks like a finished answer).
+  // A loop that ENDED FOR A HUMAN (a tend was raised) is also a VISIBLE result: the zee asked a
+  // human something, so the turn is over — exactly as a cxell zee ends its turn and waits to be
+  // resumed. The text names the ask, not a silent break.
   const capped = capHit;
-  const text = capped
-    ? `Tool loop stopped: capped at ${iterations} iterations without reaching a final answer.`
-    : messageText(finalResp.content);
+  const text = endedForHuman
+    ? `Turn ended: a human was asked — "${endedForHuman.reason}". The zee is waiting to be resumed.`
+    : capped
+      ? `Tool loop stopped: capped at ${iterations} iterations without reaching a final answer.`
+      : messageText(finalResp.content);
 
   return {
     text,
@@ -314,6 +338,7 @@ export async function runLangchainAgentTurn({ xell, task = null, provider = 'cla
     content: finalResp.content,
     messages,
     iterations,
+    endedForHuman,      // the turn ended because a tend was raised (the ask a human must answer)
     capped,             // visible "the cap was hit" — never a silent truncation
     capHit,
     toolCalls: executed, // the tools that actually ran ({name, args}) — for the play-by-play

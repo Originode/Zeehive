@@ -74,9 +74,10 @@ the SAME handler `/api/xell/self/*` calls, and the loop resolves through the ALL
 never through a caller-supplied array — an over-wide array cannot widen the loop.
 
 The bound verbs are the read-only/report verbs (`status`, `work`, `working`, `item`) and the
-wave-2 ASK verb `tend` (it asks for a human and executes nothing). `hint-land` / `hint-ship` are NOT
-bound yet — their write shape (a `session_event` annotating a request, plus the hint state) has been
-reported to the manager and is pending their call before they are added.
+wave-2 ASK verbs (`tend`, `hint-land`, `hint-ship`). These ask or annotate; they cannot execute.
+`tend` asks for a human; `hint-land`/`hint-ship` each write a single `session_event`
+(`landhint-request`/`shiphint-request` or `-clear`) plus the hint state that lights the button —
+nothing else, no gate, no auto_approve path (manager authorisation 2026-08-11).
 
 **The confinement is the ALLOWLIST, not the gate.** The wave-2 argument that `land`/`ship`/`seed`
 are safe to bind "because they terminate on a human" is FALSE on this fleet. Measured on the fleet
@@ -339,10 +340,11 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
   model), `loadConversation` / `appendConversation` / `resetConversation` (DB-backed memory),
   `runLangchainTurn` (single model call) and `runLangchainAgentTurn` (the bounded tool loop).
 - `server/src/lib/langchain-tools.js` — the tool registry (`status`, `work`, `working`, `item`,
-  `tend`), the allowlist that is the confinement. Each tool calls the SAME handler `/api/xell/self/*`
-  calls (selfStatus/selfWork/selfWorking/selfWorkItem/selfTend), never a second copy; anything
-  outside the registry is refused visibly. `working` carries the TEND GUARD (refuses while a tend is
-  open, so a model cannot silently clear a human's question).
+  `tend`, `hint-land`, `hint-ship`), the allowlist that is the confinement. Each tool calls the SAME
+  handler `/api/xell/self/*` calls (selfStatus/selfWork/selfWorking/selfWorkItem/selfTend/selfHint),
+  never a second copy — `working` is the PLAIN shared handler, no wrapper, no langchain-only branch.
+  Anything outside the registry is refused visibly. (An earlier TEND GUARD on the `working` tool was
+  REMOVED per the manager's ruling: it forked the verb — see §8.2.)
 - `spawnLangchainZee` in the dispatch path — a real zee driven by the driver: creates the zee row,
   starts the turn, drives `runLangchainAgentTurn` (the loop, bound to the wave-1 registry), feeds
   the play-by-play, persists the conversation, ends the turn with the summed burn.
@@ -383,6 +385,18 @@ standalone test, not by a live zee.
 - **Dependencies are the scoped langchain packages only** — `@langchain/anthropic`, `@langchain/openai`,
   `@langchain/core`. The `langchain` umbrella is deliberately NOT a dependency: it is never imported
   and it pulls the `@langchain/langgraph` runtime into the tree. `npm ls langgraph` is empty.
+- **Loop-ends-turn on tend.** A tool call that RAISES a tend (asks for a human) ends the turn after
+  that iteration, with a VISIBLE "Turn ended: a human was asked — '<reason>'" result, and the zee
+  waits to be resumed — exactly as a cxell zee ends its turn. This is HARNESS POLICY, not verb
+  semantics: `tend` still calls the same `selfTend` handler, writes the same row, shows the same
+  card — the door is unchanged. What belongs to the harness is whether the TURN continues; the
+  langchain loop IS the harness for a langchain zee. A `tend clear` does NOT end the turn (it is
+  answering, not asking). `hint-land`/`hint-ship` do NOT end the turn — a hint lights a button and
+  the zee keeps working; ending on a hint would invent a stop the fleet does not have.
+- **The `working` TEND GUARD.** `working` REFUSES while a tend is open on this xell, and names WHAT
+  the human was asked — so a model ping cannot silently clear a question posted to a human. The
+  guard is on the TOOL path only (a CLI zee's `zee working` still auto-clears, because a CLI zee is
+  a deliberate act that can read the room). `pingWorking` is untouched.
 - No gate changes, no `hooks/` changes, no prod writes.
 
 ### 8.3 Not built yet (next cards)
@@ -403,11 +417,12 @@ standalone test, not by a live zee.
    verbs. WAVE 1 (the mechanism slice) is BUILT: the loop runs in the queenzee process, bound ONLY
    to the read-only, no-side-effect registry verbs (`status`, `work`, `working`, `item`), a hard
    cap of 8 iterations with the cap visible when hit, and ONE handler shared with `/api/xell/self/*`
-   (never a second copy of a verb's logic). The wave-2 ASK verb `tend` is bound — it asks for a
-   human and executes nothing. `hint-land` / `hint-ship` are NOT bound yet (their write shape is
-   reported to the manager and pending their call). `land`/`ship`/`seed` are NOT bound and never will
-   be by a test: this fleet auto-approves them (§2.3, §8.2), so there is no human hold for a bound
-   ask to reach — the confinement is the allowlist, not the gate.
+   (never a second copy of a verb's logic). The wave-2 ASK verbs are bound — `tend` (asks for a
+   human, executes nothing, and RAISING it ends the turn — §8.2) and `hint-land`/`hint-ship` (each
+   writes a single `session_event` + the hint state, no gate, no auto_approve path; they do NOT end
+   the turn). `land`/`ship`/`seed` are NOT bound and never will be by a test: this fleet
+   auto-approves them (§2.3, §8.2), so there is no human hold for a bound ask to reach — the
+   confinement is the allowlist, not the gate.
 3. **Cxell-sandboxed langchain agent (workspace action)** — the boundary for tools is drawn by WHAT
    A TOOL CAN DO, not by the existence of tools (this amends an earlier, too-coarse sentence here
    that said any tool ⇒ the cage). Read-only, no-side-effect verbs (`status`, `work`, `working`,
