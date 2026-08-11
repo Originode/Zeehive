@@ -210,34 +210,49 @@ a brand-new xell starts with an empty conversation — COLD by construction. The
 does not stand in for the cross-xell case, and is not offered as such.
 
 **The proposed cross-xell design** (not yet built — the state model is agreed here before code follows).
-**DECISION (2026-08-11): the carrier is a XELL-KEYED handover row — Option A.** The execution plane
-was considered and rejected as the carrier. Measured on the fleet meta-DB: `execution` has NO
-`xell_id` column, `entity` has ZERO rows, nothing sets `execution.entity_id`, and `execution.outputs`
-is empty in 0 of 160 rows. There is NO path from a xell to its execution today, in either direction,
-so a successor xell cannot find its predecessor's execution — and even if it could, the field is
-empty. Routing the handover through `execution` would require wiring xell↔execution (entity rows for
-xells, `execution.entity_id` populated, readers re-pointed) as a PREREQUISITE CARD with a human's
-name on it (…-abc363's scope) — this design does not silently absorb it. So the handover lives where
-it can actually be found.
+**DECISION (2026-08-11): the carrier is the CARD — the work item.** This supersedes both the
+execution-plane carrier (the earlier `stable_key` draft) and a xell-keyed handover row, for the
+reason the CARD direction gives and the measurements back:
 
-- **The carrier: a `xell_handover` row, keyed by `xell_id`** — the SAME key `zee_conversation` uses,
-  so it composes with what is already built. Written when the predecessor xell is retired/reaped;
-  read BY NAME when the successor is dispatched. Boring, reachable, no dependency on the empty
-  entity plane.
+- The work item is the ONLY thing in this picture that already has a xell association
+  (`work_item.xell_id`), already **survives the xell being reaped** (`work_item.xell_id` is
+  `ON DELETE SET NULL`), and is already **what the dispatch names** — a successor xell is dispatched
+  onto the same work item.
+- `execution` cannot carry it: measured on the fleet meta-DB, `execution` has NO `xell_id` column,
+  `entity` has ZERO rows, nothing sets `execution.entity_id`, and `execution.outputs` is empty in 0
+  of 160 rows. There is NO xell→execution path today, in either direction — a successor cannot find
+  its predecessor's execution, and even if it could, the field is empty. Routing through `execution`
+  would require wiring xell↔execution (entity rows for xells, `execution.entity_id` populated,
+  readers re-pointed) as a PREREQUISITE CARD with a human's name on it (…-abc363's scope) — this
+  design does not silently absorb it.
+- A **xell-keyed** handover row is rejected for the same reason `zee_conversation` is working memory
+  and not the handover: keying by `xell_id` ties the handover to the cage, which is exactly the thing
+  that must NOT outlive it. The handover must survive the cage; only working memory dies with it.
+
+So the split is clean:
+
+- **Working memory** — `zee_conversation`, keyed by `xell_id`, `ON DELETE CASCADE` on reap. Dies with
+  the cage because it IS cage-scoped: a live zee's rolling context, useless to a brand-new cage.
+- **The handover** — keyed by the **work item**, surviving reap. The mechanism is a `work_item_event`
+  row with `kind='handover'` on the card: `work_item_event` is the EXISTING append-only audit trail
+  (`kind` is free text, `detail` is jsonb), so there is **no new table and no new carrier** — and it
+  is already rendered in the console next to the card a human is looking at. The latest
+  `kind='handover'` row for a work item IS the handover a successor reads.
 - **What crosses the boundary: a CURATED handover**, not the transcript. The durable conclusions:
   what was decided, what was verified, what remains, the constraints that still bind, the next
   concrete step. What stays behind: dead ends, wrong turns, local paths, tool blow-by-blow.
-- **How the successor is NAMED** — the handover is read by name, and the name is one of:
-  - **(a) SAME work item, NEW xell** — the successor is dispatched on the SAME work_item; the
-    predecessor is the previous xell that held that work_item (via the work_item's xell history /
-    task row). The successor reads the predecessor's `xell_handover` for that work item.
+- **How the successor is NAMED** — the handover is read off the work item the successor is dispatched
+  onto, and the naming is one of:
+  - **(a) SAME work item, NEW xell** — the successor is dispatched on the SAME work_item; it reads
+    that card's latest `kind='handover'` event. This is the unblocked half (does not need the
+    dependency-edge agreement).
   - **(b) DIFFERENT work item** — a successor CARD. The link is a `dependency` edge: **`from_id` is
     the PREDECESSOR, `to_id` the DEPENDENT** (get this backwards and the handover runs the wrong
     way). This is "chain" work already being designed by the …-16c430 xell; this design does NOT
-    invent a second carrier for it — it uses the same dependency edge to find the predecessor, then
-    reads that predecessor's `xell_handover`.
-  - **Explicit:** a manager dispatches "continue <xell>" — the dispatch names the predecessor
-    directly and reads its `xell_handover`.
+    invent a second carrier for it — it uses the same dependency edge, and the two efforts stay
+    aligned on one design for the edge.
+  - **Explicit:** a manager dispatches "continue <xell>" — the dispatch names the predecessor's work
+    item directly and the successor reads its handover.
   Without one of these, a new xell has no legitimate claim on another xell's conversation and must
   not receive it.
 - **Filtering:** any value scoped to the old cage (local paths, container names, session ids,
