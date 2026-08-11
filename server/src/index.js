@@ -15,7 +15,6 @@ import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
-import { reconcileLangfuseBaseUrl } from './lib/langfuse.js';
 import { logHarnessSummary } from './lib/harness.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool, q } from './db/pool.js';
@@ -148,13 +147,6 @@ try {
   // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
   // a harness that would brief a zee with a blank page is invisible otherwise.
   await logHarnessSummary();
-  // Langfuse self-heal: a row provisioned pre-container-aware-base_url keeps localhost, which a
-  // containerized queenzee cannot reach. Best-effort, never fatal (see reconcileLangfuseBaseUrl).
-  await reconcileLangfuseBaseUrl();
-  // NOTE: the v4 events_only→dual heal (reconcileLangfuseWriteMode) is deliberately NOT run here.
-  // The first version auto-fired `docker compose up -d` on the live langfuse stack at boot with an
-  // incomplete interpolation env and took observability down (2026-08-03). New stacks are dual by
-  // default; flipping an existing stack is the human's "Heal write mode" click / /api/langfuse/heal.
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }

@@ -48,11 +48,11 @@ The fleet already had the *ingredients* but not the *grain*:
   right number for a fleet burn, the wrong grain for "what did THIS turn do and cost?". A
   xell that hosted three zees (a swap, a resume) or one zee that ran three turns cannot say
   which turn spent what.
-- **Langfuse** (migration 114) is the system-wide LLM observability stack — it records traces
-  per finished turn and the console has a "View Langfuse" verb that opens the session. But it
-  is a **separate self-hosted instance** (its own UI, its own login), and it only works when
-  the plugin is provisioned + enabled. The ask is a **native console surface**, available
-  without any external stack.
+- **Langfuse** (migration 114) was the system-wide LLM observability stack — it recorded traces
+  per finished turn and the console had a "View Langfuse" verb that opened the session. But it
+  was a **separate self-hosted instance** (its own UI, its own login), and it only worked when
+  the plugin was provisioned + enabled. It has since been removed entirely (replaced by the
+  gateway spine). The ask is a **native console surface**, available without any external stack.
 - **session_event** is the append-only log of hook/fleet events — but it is sparse: tend
   pings, hints, refusals. The rich play-by-play feed (assistant blocks, tool calls, results)
   that intake.js's `feed()` receives is broadcast on the SSE bus as `'zee-output'` and then
@@ -72,8 +72,9 @@ in the console** — without requiring Langfuse or an upload.
 - **Rejected because:** Langfuse is a separate self-hosted stack (opt-in, provisioned by a
   human; disabled by default). The ask is a native surface that works without it. The console
   would depend on an external instance being up, and the "play-by-play" in Langfuse is the
-  *session* view, not per-turn attribution in the ZEEHIVE honeycomb's own words. Langfuse
-  stays as the deep-dive companion (the existing "View Langfuse" verb), not the primary.
+  *session* view, not per-turn attribution in the ZEEHIVE honeycomb's own words. Langfuse was
+  kept as the deep-dive companion (the "View Langfuse" verb), not the primary — until the
+  gateway spine made it redundant and it was removed.
 
 ### Option B: Store the whole transcript per turn (a `xell_conversation` per turn)
 - **For:** Complete fidelity; the transcript IS the play-by-play.

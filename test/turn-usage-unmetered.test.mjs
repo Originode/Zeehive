@@ -5,8 +5,9 @@
 // input_tokens=0, output_tokens=0, last_stop_reason=NULL — empty telemetry that reads exactly like
 // "never ran", and that already produced one wrong ticket (TKT-98, retracted by TKT-100). TKT-100
 // quantified it fleet-wide (opus worst, fable clean) and TKT-101-C2C6 narrowed the mechanism: the
-// Langfuse trace and the zee row read the SAME result.usage, so the hole is where result.usage is
-// PRODUCED — a turn whose provider/runtime result carries no usage/cost books a silent zero.
+// observability consumers and the zee row read the SAME result.usage, so the hole is where
+// result.usage is PRODUCED — a turn whose provider/runtime result carries no usage/cost books a
+// silent zero.
 //
 // WHAT IS FENCED HERE:
 //   A. usageFrom tells the caller whether it actually SAW usage data (`metered`), instead of folding

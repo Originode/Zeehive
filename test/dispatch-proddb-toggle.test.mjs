@@ -35,7 +35,7 @@ ok(/data-testid="dispatch-proddb-block"/.test(disp),
 const gateOpen = disp.indexOf('{(!routerGate || routerMode) && (');
 ok(gateOpen > 0, 'the router-gate-hidden controls region still exists');
 // Find the matching close of that region by the next top-level ")}" after the disp-controls that
-// ends with the Langfuse field — the proddb block comment names the bug it closes.
+// ends with the visual-verification field — the proddb block comment names the bug it closes.
 const proddbBlock = disp.indexOf('data-testid="dispatch-proddb-block"');
 ok(proddbBlock > gateOpen, 'the proddb block appears after the router-gate open');
 const hiddenSlice = disp.slice(gateOpen, proddbBlock);

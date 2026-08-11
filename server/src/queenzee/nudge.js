@@ -15,7 +15,6 @@ import { one } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { cxellName, nudgeCxellZee, sendKeysToCxellZee, writeFileIntoCxell } from '../lib/cxell.js';
 import { adapterFor, usageFrom, resultFrom } from '../lib/cxell-runtimes.js';
-import { postTurnToLangfuse } from '../lib/langfuse.js';
 import { decideMessageDelivery } from '../lib/zee-turn.js';
 import { resumeTurnDeath } from '../lib/turn-death.js';
 import { predecessorActionDigest } from '../lib/predecessor-digest.js';
@@ -899,15 +898,6 @@ async function nudgeCxell(xellId, { by = 'human', prompt, why = 'nudge', log, on
         // same understatement this ticket exists to end.
         const row = await markZeeTurn(zee.id, death ? 'errored' : 'idle',
                                       death ? death.message.slice(0, 200) : 'end_turn', burn);
-        // LANGFUSE: the resumed turn is a trace like any other (best-effort, never throws — the same
-        // call intake.js makes when a spawned turn returns). Without it every continuation a zee ran
-        // was missing from the observability stack, not just from the row.
-        await postTurnToLangfuse({
-          xell: { id: xellId, slug: zee.slug, project_id: zee.project_id },
-          zee: row || { id: zee.id, model: zee.model, claude_session_id: zee.claude_session_id },
-          sessionId: zee.claude_session_id, model: zee.model, result: r?.result || null,
-          startTime: startedAt, endTime: new Date(),
-        });
         // PER-TURN LEDGER: close the resumed turn with its own burn + summary.
         await endTurn(turn?.id, {
           status: death ? 'errored' : 'ended',

@@ -41,9 +41,9 @@
 // upstream also reports cost (Anthropic's total_cost_usd), that is used instead. A model with no
 // known price records cost 0 + a meta note (never a wrong estimate).
 //
-// BEST-EFFORT, NEVER THROWS — the same contract as Langfuse ingestion: a recording failure must
-// not fail the AI call the human is waiting on. Every write is awaited but catch-guarded, and
-// the proxy itself is the only thing that can fail the request (a dead provider is a 502).
+// BEST-EFFORT, NEVER THROWS — a recording failure must not fail the AI call the human is waiting
+// on. Every write is awaited but catch-guarded, and the proxy itself is the only thing that can
+// fail the request (a dead provider is a 502).
 import http from 'node:http';
 import https from 'node:https';
 import zlib from 'node:zlib';

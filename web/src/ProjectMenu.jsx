@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ProjectSetup from './ProjectSetup.jsx';
 import HarnessManager from './HarnessManager.jsx';
-import LangfusePanel from './LangfusePanel.jsx';
 import { showConfirm } from './Dialog.jsx';
 
 // Two separate controls beside the "Project:" label:
@@ -15,7 +14,6 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
   const [setup, setSetup] = useState(null);   // false=closed, null-project=create, project=edit
   const [showSetup, setShowSetup] = useState(false);
   const [showHarness, setShowHarness] = useState(false);   // harness web-UI bridge (Hermes) setup
-  const [showLangfuse, setShowLangfuse] = useState(false); // the one system-wide observability instance
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
   const ref = useRef(null);
@@ -101,8 +99,6 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
           <button className="projpop-add" onClick={() => openSetup(null)}>＋ Onboard a project</button>
           {/* Harnesses are system-wide (not per-project), so their manager lives here, not in ProjectSetup. */}
           <button className="projpop-add" onClick={() => { setShowHarness(true); setOpen(false); }}>⚙ Harnesses — personas</button>
-          {/* Langfuse is ONE instance for the whole system — same system-wide home. */}
-          <button className="projpop-add" onClick={() => { setShowLangfuse(true); setOpen(false); }}>⚗ Langfuse — observability</button>
         </div>
       )}
       {showSetup && (
@@ -110,7 +106,6 @@ export default function ProjectMenu({ projects, currentId, onSelect, onCreate, o
                       onChanged={onChanged} onSelect={onSelect} />
       )}
       {showHarness && <HarnessManager onClose={() => setShowHarness(false)} />}
-      {showLangfuse && <LangfusePanel onClose={() => setShowLangfuse(false)} />}
     </span>
   );
 }

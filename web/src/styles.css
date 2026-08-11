@@ -2943,24 +2943,6 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .disp-overlap code { font-size: 11px; }
 .disp-overlap-note { display: block; margin-top: 5px; color: var(--muted); }
 
-/* LANGFUSE PANEL — the one system-wide observability instance. Uses the shared .disp modal
-   language; these are the langfuse-specific touches: a status dot that reads up/provisioning/
-   down/off, a monospace fact box, and a compact recent-traces list. */
-.disp-mono { font-family: 'Cascadia Code', 'SF Mono', monospace; font-size: 11px; color: var(--text);
-  line-height: 1.5; word-break: break-all; }
-.langfuse-status { font-size: 12px; font-weight: 600; letter-spacing: .03em; }
-.langfuse-status.up { color: var(--add, #35c46b); }
-.langfuse-status.provisioning { color: var(--warn, #e0a53b); }
-.langfuse-status.down, .langfuse-status.error { color: var(--down); }
-.langfuse-status.off { color: var(--muted); }
-a.langfuse-ui { color: var(--accent); font-weight: 600; text-decoration: none; }
-a.langfuse-ui:hover { text-decoration: underline; }
-.langfuse-reveal { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
-.langfuse-traces { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column;
-  gap: 3px; max-height: 220px; overflow-y: auto; }
-.langfuse-traces li { padding: 4px 8px; background: var(--panel2); border-radius: 6px; }
-
 /* ── the ZEE AVATAR: an AI-provider coin, wearing its harness ──────────────────
    The DOM twin of the honeycomb's drawZeeAvatar (web/src/hive/HiveCanvas.jsx), from the same two
    registries (providerArt.js / harnessGear.js): the PROVIDER is the badge (a brand coin) and the

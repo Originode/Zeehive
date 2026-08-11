@@ -89,7 +89,6 @@ export default function Dispatch({ projectId, projectName,
   const [headless, setHeadless] = useState(true); // default headless (fire-and-forget)
   const [prodDb, setProdDb] = useState(false);    // OFF by default — LIVE production data, opt-in only
   const [visualVerify, setVisualVerify] = useState(false); // OFF by default — per-xell VISUAL VERIFICATION (build the webapp, offer the link to a human)
-  const [langfuseTracking, setLangfuseTracking] = useState(true); // ON by default — per-xell LANGFUSE tracking (trace turns + inject LANGFUSE_* into the cage)
   const [images, setImages] = useState([]);       // [{ id, name, data(dataURL), size }]
   const [err, setErr] = useState(null);
   const [empty, setEmpty] = useState(true);       // drives the placeholder + submit-disabled state
@@ -430,9 +429,6 @@ export default function Dispatch({ projectId, projectName,
     // Always sent (explicit true/false) — unlike prodDb, this is a per-xell boolean a re-dispatch
     // must be able to CLEAR when the human turns the toggle off, not just set when on.
     visual_verify: !!visualVerify,
-    // Same per-xell boolean discipline as visual_verify: the Langfuse tracking switch (default ON)
-    // is always sent, so turning the toggle OFF on a re-dispatch clears a prior ON.
-    langfuse_tracking: !!langfuseTracking,
     // the config layer this zee wears (persona/skills) — chosen in this composer (or left to
     // the project default / the router). undefined → omit (project default); '' → core only
     // (null); a key → that harness.
@@ -1081,21 +1077,6 @@ export default function Dispatch({ projectId, projectName,
               <div className="disp-hint">The zee builds the webapp and offers the live link to a human in the console — a look, not a gate.</div>
             </div>
 
-            {/* Langfuse tracking. A per-xell switch, ON by default: the queenzee records a trace of
-                this xell's turns to Langfuse and injects LANGFUSE_* into its cage. Turning it OFF
-                means no trace and no LANGFUSE_* env — the observability record simply skips it. */}
-            <div className="disp-field">
-              <label className="disp-label">Langfuse tracking</label>
-              <div className="disp-sup" role="group" aria-label="Langfuse tracking">
-                <button className={`disp-seg ${!langfuseTracking ? 'on' : ''}`} data-testid="dispatch-lf-off"
-                        title="No trace is posted for this xell's turns and its cage gets no LANGFUSE_* env."
-                        onClick={() => setLangfuseTracking(false)}>off</button>
-                <button className={`disp-seg ${langfuseTracking ? 'on' : ''}`} data-testid="dispatch-lf-on"
-                        title="The queenzee posts a trace of every finished turn to Langfuse and injects LANGFUSE_* into the cage (the default)."
-                        onClick={() => setLangfuseTracking(true)}>⚗ on</button>
-              </div>
-              <div className="disp-hint">When off, this xell's turns are not traced to Langfuse and its cage gets no LANGFUSE_* env — the default is on.</div>
-            </div>
             </>
             )}
           </div>
