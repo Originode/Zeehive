@@ -233,11 +233,19 @@ async function rowsForVersion(versionId, rootId, pv) {
     const a = actualOf.get(n.id) || { start: null, end: null };
     const w = waitingOf.get(n.id) || { start: null, end: null };
     const exs = execsByNode.get(n.id) || [];
+    // WHERE the bar's duration came from (migration 194) — so a 1-day bar that is a DEFAult
+    // is never mistaken for a 1-day ESTIMATE. estimate → actual (closed executions) → default.
+    const duration_source = !s ? null
+      : (s.is_atom
+        ? (n.estimate ? 'estimate'
+          : (exs.some((ex) => ex.started_at && ex.finished_at) ? 'actual' : 'default'))
+        : 'rollup');
     return {
       id: n.id, parent_id: n.parent_id, depth: n.depth, name: n.name,
       kind: n.kind, child_semantics: n.child_semantics,
       is_atom: !!(s && s.is_atom),
       duration_hours: s && s.duration ? intervalHours(s.duration) : null,
+      duration_source,
       critical: !!(s && s.critical),
       slack: s && s.slack ? s.slack : null,
       // PLANNED (CPM). Atoms carry their own earliest window; containers the subtree span.
