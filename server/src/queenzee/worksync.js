@@ -54,6 +54,12 @@
 //
 // Same shape as queenzee/dbclone.js: a pure-script tick, loud in the log, disabled with
 // WORKSYNC_ENABLED=false, and every failure isolated per item so one bad row cannot stop the sweep.
+//
+// REHAB 2/4 — this tick still reads "which items have a zee" from work_item.xell_id. The model's
+// lease plane is where that belongs, but the rehab 1/4 dual-write writes executions only, so there
+// is no lease data to read (see lib/work-assign.js's REHAB 2/4 note). Writing leases is deferred
+// with the conflation retirement (3/4); until then the tick is the legacy projection, kept honest
+// by the documented split in lib/work-item-model.js.
 import { q } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { statusFromHive, isTerminal, WORK_STATUS_KEYS, canTransition } from '../lib/work-status.js';
