@@ -24,7 +24,8 @@
 //   6. the union_edge view expands per link type (sequence order + expanded deps).
 //   7. wn_lca on deep trees; wn_first_leaves/wn_last_leaves on a nested container.
 //   8. wn_duration: sequence = Σ, parallel = max, freeform = documented max fallback,
-//      leaf without estimate = 0, and a nested parallel-inside-sequence rollup.
+//      leaf without estimate defaults to 1 day (migration 194), and a nested
+//      parallel-inside-sequence rollup.
 //   9. child_semantics restricted to sequence/parallel/freeform today ('choice' refused).
 //  10. wn_effective_policy resolves nearest-non-null up the ancestor chain, and a child
 //      override wins over the root default (retry, timeout, priority).
@@ -195,8 +196,10 @@ async function main() {
     ok((await one(`SELECT wn_duration($1) AS d`, [Seq])).d?.hours === 5, `sequence duration = 2h+3h = 5h (got ${(await one(`SELECT wn_duration($1) AS d`, [Seq])).d})`);
     ok((await one(`SELECT wn_duration($1) AS d`, [Par])).d?.hours === 3, `parallel duration = max(2h,3h) = 3h (got ${(await one(`SELECT wn_duration($1) AS d`, [Par])).d})`);
     ok((await one(`SELECT wn_duration($1) AS d`, [F])).d?.hours === 3, `freeform duration = max fallback = 3h (got ${(await one(`SELECT wn_duration($1) AS d`, [F])).d})`);
+    // 194: an unestimated leaf is no longer silently zero — it falls back to the stated
+    // 1-day default (86400s), so the CPM has something to schedule.
     const leafZero = await one(`SELECT EXTRACT(EPOCH FROM wn_duration($1)) AS s`, [A1]);
-    ok(Number(leafZero.s) === 0, `leaf without estimate = 0 (got ${leafZero.s}s)`);
+    ok(Number(leafZero.s) === 86400, `leaf without estimate defaults to 1 day (got ${leafZero.s}s)`);
     // nested parallel-inside-sequence, asserted as exact interval text
     const dPar = await one(`SELECT wn_duration($1)::text AS d`, [DP]);
     const dSeq = await one(`SELECT wn_duration($1)::text AS d`, [DR]);
