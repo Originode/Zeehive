@@ -64,7 +64,6 @@ import { Breadcrumb, Due, ErrLine, KindGlyph, Pips, StatusDot, ZeeChip, statusLa
 // rewrite a manager's plan from a poller, which is precisely the authority a board must not have.
 
 const COLLAPSE_KEY = 'zeehive.work.board.collapsed.';
-const LABEL_W = 250;                     // the left rail's width — every band shares it, so lanes align
 
 export default function Board({ projectId, rootId, statuses: statusesProp, onOpen, reloadKey = 0 }) {
   const [statuses, setStatuses] = useState(statusesProp || null);
