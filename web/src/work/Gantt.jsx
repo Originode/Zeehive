@@ -409,6 +409,16 @@ export function GanttChart({ rows = [], planName = null, version = null, onOpen,
 
 // ── the pieces ──────────────────────────────────────────────────────────────────────────────────
 
+// WHAT A BAR'S DURATION MEANS (migration 194) — the tooltip names the SOURCE so a 1-day bar
+// that is a DEFAULT is never mistaken for a 1-day ESTIMATE. estimate → measured actual from
+// closed executions → the stated 1-day default. Containers roll up from children.
+export const DURATION_SOURCE = {
+  estimate: 'estimated',
+  actual: 'measured from executions',
+  default: '1-day default (no estimate)',
+  rollup: 'rollup of children',
+};
+
 // finish → start, routed above the successor's row. `from` is the predecessor's geometry.
 function arrowPath(from, to) {
   const x1 = from.span.x + from.span.w;
@@ -432,6 +442,12 @@ export function Tip({ row, x, y }) {
         <span>planned</span>
         <span>{p(row.planned_start)} → {p(row.planned_end) || '…'}</span>
       </div>
+      {row.duration_source && (
+        <div className={`work-gtip-r dur ${row.duration_source}`}>
+          <span>duration</span>
+          <span>{DURATION_SOURCE[row.duration_source] || row.duration_source}</span>
+        </div>
+      )}
       {row.slack != null && <div className="work-gtip-r"><span>slack</span><span>{row.slack}</span></div>}
       {!!row.actual_start && (
         <div className="work-gtip-r actual">

@@ -110,7 +110,7 @@ import { listCredentialInjectRequests, decideCredentialInject, dismissCredential
          raiseRotationRequest } from '../lib/credential-inject.js';
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
-import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkAssign,
+import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
          selfWorkItem } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
@@ -2749,6 +2749,17 @@ router.post('/xell/self/work/unassign', async (req, res) => {
     res.json(await selfWorkUnassign(x, { item: b.item || null, reason: b.reason || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// MANAGER only: CHAIN two cards — `item` waits for `on` (a dependency edge in the model).
+// The console drawer has the same picker; this is the CLI half of "capture chains going
+// forward" (nesting says part-of, a chain says after — the gantt's critical path runs along
+// chains). --remove deletes the edge.
+router.post('/xell/self/work/dep', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    res.json(await selfWorkDep(x, { item: b.item || null, on: b.on || null,
+      remove: !!b.remove })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // MANAGER only: deploy a worker for one of MY project's work items (same dispatch path as `zee dispatch`).
 router.post('/xell/self/work/assign', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
@@ -2765,7 +2776,9 @@ router.post('/xell/self/work/item', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     res.json(await selfWorkItem(x, { id: b.id || null, status: b.status || null,
-      progress: b.progress ?? null, note: b.note || null })); }
+      progress: b.progress ?? null, note: b.note || null,
+      estimate_hours: b.estimate_hours ?? null, starts_on: b.starts_on ?? null,
+      due_on: b.due_on ?? null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
