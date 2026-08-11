@@ -2738,18 +2738,8 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 /* A CRITICAL planned bar (zero slack on the CPM pass) stands out; the crit chip in the name
    column says the same thing in words. */
 .work-gbar.crit, .work-gsum.crit { outline: 1px solid var(--accent); outline-offset: 1px; }
-/* A LANE — a row with NO declared order (no dependency chain in its subtree). Drawn hatched
-   and flat: it is board display position, visibly NOT a schedule. The "order is inferred"
-   version banner says the same thing one level up; a lane is the per-row echo. */
-.work-gbar.lane, .work-gsum.lane {
-  outline: 1px dashed var(--muted); outline-offset: 1px;
-  background-image: repeating-linear-gradient(45deg, transparent 0 4px, var(--muted) 4px 5px);
-  background-blend-mode: multiply;
-  opacity: .85;
-}
 .work-gcrit { color: var(--accent); font-size: 9.5px; letter-spacing: .4px; text-transform: uppercase;
   border: 1px solid var(--accent); border-radius: 3px; padding: 0 3px; margin-left: 5px; flex: 0 0 auto; }
-.work-gtip-r.lane { color: var(--muted); font-style: italic; }
 .work-gorder { margin: 6px 0 0 292px; }
 .work-gorder.quiet { opacity: .75; }
 .work-gbar.ghosting, .work-gsum.ghosting { opacity: .8; outline: 1px dashed var(--accent); }

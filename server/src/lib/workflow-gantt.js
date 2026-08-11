@@ -222,22 +222,6 @@ async function rowsForVersion(versionId, rootId, pv) {
     return out;
   };
 
-  // Whether a row participates in DECLARED order: a 'dependency'-origin edge ENDPOINT (either
-  // end — a node that feeds a declared chain is as much a part of it as the node it constrains)
-  // anywhere in its subtree. A row with only 'sequence'-origin edges (or none) is board ORDER,
-  // not a schedule — the chart draws it as a lane (hatched) and never presents its criticality
-  // as a real finding. This deliberately does NOT treat child_semantics='sequence' as declared
-  // order: the backfill defaulted every work container to sequence, which is exactly the
-  // manufactured-order lie this card exists to un-tell (the lane + the banner say so).
-  const scheduledOf = new Map();
-  const depEndpoints = new Set();   // every node that is an ENDPOINT of a dependency-origin edge
-  for (const e of edges) if (e.origin === 'dependency') { depEndpoints.add(e.from_id); depEndpoints.add(e.to_id); }
-  for (const n of tree) {
-    let depInSubtree = false;
-    for (const sid of subtree(n.id)) { if (depEndpoints.has(sid)) { depInSubtree = true; break; } }
-    scheduledOf.set(n.id, depInSubtree);
-  }
-
   // Roll actuals + waiting up: for each row, min/max over its subtree's executions.
   const actualOf = new Map();   // node id -> { start, end }
   const waitingOf = new Map();  // node id -> { start, end }
@@ -287,9 +271,6 @@ async function rowsForVersion(versionId, rootId, pv) {
       // rests on (declared chains vs board-position inference), and the plan banner says the
       // ratio aloud. A consumer that wants the raw CPM still gets it.
       critical: !!(s && s.critical),
-      // SCHEDULED — whether this row participates in DECLARED order (a real zee-dep chain in
-      // its subtree). false = board order only → the chart draws it as a lane, not a schedule.
-      scheduled: scheduledOf.get(n.id) || false,
       slack: s && s.slack ? s.slack : null,
       // PLANNED (CPM). Atoms carry their own earliest window; containers the subtree span.
       planned_start: s && s.earliest_start ? iso(s.earliest_start) : null,

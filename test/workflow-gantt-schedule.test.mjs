@@ -161,12 +161,12 @@ async function main() {
     ok(b1Dep && b1Dep.origin === 'dependency', `B1's edge from A3 is a DECLARED dependency (got ${b1Dep?.origin})`);
     const a2Dep = (byNameG.get('A2')?.deps || []).find((d) => d.id === byNameG.get('A1')?.id);
     ok(a2Dep && a2Dep.origin === 'sequence', `A2's edge from A1 is board-position inference (sequence), not a declared chain (got ${a2Dep?.origin})`);
-    // scheduled — a row participates in DECLARED order iff a dependency endpoint is in its
-    // subtree. D1 (independent) is board-order only → lane; B1 (a declared endpoint) and the
-    // project root (contains the declared edges) are scheduled.
-    ok(byNameG.get('D1')?.scheduled === false, `D1 (independent) is board-order only — scheduled=false (lane)`);
-    ok(byNameG.get('B1')?.scheduled === true, `B1 (a declared dependency endpoint) is scheduled=true`);
-    ok(byNameG.get(`gantt-sched-${tag}`)?.scheduled === true, `the project root (contains the declared chains) is scheduled=true`);
+    // The declared-vs-inference property is carried by EDGE ORIGIN (the design d497f912 landed):
+    // a declared chain's edges read 'dependency', a board-order-only row has no edges at all.
+    // D1 (independent) has no edges — it is board order, not a schedule, exactly as the retired
+    // 'scheduled' flag used to say; B1's predecessor is a declared edge. (Section B already
+    // proves D1 is NOT critical — a board-order-only row gets no false critical claim.)
+    ok((byNameG.get('D1')?.deps || []).length === 0, `D1 (independent) has no edges — board-order only (got ${(byNameG.get('D1')?.deps || []).length})`);
 
     section('F. (f) duration PROVENANCE is visible per node and per plan');
     // The read model must tell the three sources apart (migration 194's chain), per node and
