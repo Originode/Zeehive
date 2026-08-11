@@ -54,6 +54,10 @@ const CAPTURE = process.argv.includes('--capture');
 // 5s: the real 354-node plan measures 1.1-1.9s warm / ~3.6s cold on the fleet meta-DB
 // (verified after 189 shipped); the pre-change function timed out >120s on it. Headroom
 // for the cold run, still ~25x below the old runtime so a regression fails loudly.
+// PROVISIONAL after 194: re-measured at 4.2-5.1s warm on the real plan (one run over the
+// 5s target). Expected to fall once migration 197 ships (it removes the container loop's
+// redundant per-atom execution lookups); the target is to be re-checked then. The
+// byte-identical golden diff is the valuable half and is never widened.
 const CPMS_TARGET_MS = 5000;
 
 let fail = 0;
