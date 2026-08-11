@@ -1411,26 +1411,6 @@ export async function dismissVisualVerify(xellId, offerId, by = 'human@console')
   return data;
 }
 
-// ── LANGFUSE TRACKING (per-xell) ─────────────────────────────────────────────
-// The per-xell Langfuse tracking switch (default ON). A human flips it from the terminal window
-// header; a manager sets it at dispatch/assign. When OFF the queenzee records no trace for the
-// xell's turns and injects no LANGFUSE_* into its cage.
-export async function setXellLangfuseTracking(id, langfuseTracking, by = 'human@console') {
-  const r = await fetch(`/api/xells/${id}/langfuse-tracking`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ langfuse_tracking: !!langfuseTracking, by }),
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || `langfuse-tracking update failed (${r.status})`);
-  return data;
-}
-// The "View Langfuse" session link for one xell — computed SERVER-side (ui_url + the Langfuse
-// project + the zee's session id → /project/<lfProjectId>/sessions/<id>). The console opens the
-// url (via the auto-login popup) in a new window.
-export const getXellLangfuseSession = (id, zeeId = null) =>
-  fetch(`/api/xells/${id}/langfuse-session${zeeId ? `?zee_id=${encodeURIComponent(zeeId)}` : ''}`)
-    .then((r) => r.json());
-
 // ── XELL OBSERVABILITY — the per-turn ledger the console's right-click action renders ──────────
 // Read-only: turns are written by the turn ledger (server/src/lib/turn-ledger.js) at turn
 // boundaries. `getXellObservability` lists turns newest-first; `getTurnEvents` fetches the
@@ -1508,30 +1488,3 @@ export async function dismissDoneSuggestion(id, by = 'human@console') {
   return data;
 }
 
-// ── LANGFUSE PLUGIN — the single system-wide LLM observability stack ──────────
-// Config is masked server-side; provision/teardown are human actions (mode-gated); reveal is the
-// human-only full-value door. Traces are a read from the instance's public API, best-effort.
-export const getLangfuseConfig = () => fetch('/api/langfuse/config').then((r) => r.json());
-export const getLangfuseStatus = () => fetch('/api/langfuse/status').then((r) => r.json());
-export const provisionLangfuse = (body = {}) =>
-  siteCall('/api/langfuse/provision', 'POST', { by: 'human@console', ...body });
-export const teardownLangfuse = (by = 'human@console') =>
-  siteCall('/api/langfuse/teardown', 'POST', { by });
-export const getLangfuseTraces = (limit = 20) =>
-  fetch(`/api/langfuse/traces?limit=${limit}`).then((r) => r.json());
-export const revealLangfuse = async (by = 'human@console') => {
-  // TKT-104 / TKT-108-E589: /langfuse/reveal no longer returns the credential directly — it mints
-  // a ONE-TIME, short-TTL token (refusing a caged zee and any caller that cannot present the console
-  // origin), and the credential leaves the server only on a same-origin redemption of that token.
-  // The browser sends the Origin header automatically, so the panel flow is unchanged.
-  const minted = await siteCall('/api/langfuse/reveal', 'POST', { by });
-  if (!minted.redeem || !minted.token) throw new Error(minted.error || 'reveal refused — no redemption URL');
-  return siteCall(minted.redeem, 'POST', { token: minted.token });
-};
-export const getLangfuseProjects = () => fetch('/api/langfuse/projects').then((r) => r.json());
-export const syncLangfuseProjects = (by = 'human@console') =>
-  siteCall('/api/langfuse/projects/sync', 'POST', { by });
-export const reinjectLangfuseAutoLogin = (by = 'human@console') =>
-  siteCall('/api/langfuse/reinject', 'POST', { by });
-export const healLangfuseWriteMode = (by = 'human@console') =>
-  siteCall('/api/langfuse/heal', 'POST', { by });

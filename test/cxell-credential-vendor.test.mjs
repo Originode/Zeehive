@@ -154,7 +154,7 @@ try {
 
   clearLog();
   const run = runZee({ ctx: 'default', name: 'cxell_test', prompt: 'go', model: 'deepseek-chat',
-                       adapter: deepseek, token: DEEPSEEK_TOK, extraEnv: { LANGFUSE_BASE_URL: 'http://lf' },
+                       adapter: deepseek, token: DEEPSEEK_TOK, extraEnv: { ZEEHIVE_EXTRA_TEST: 'http://example' },
                        onEvent: () => {} });
   await run.done.catch(() => {});   // the fake docker prints no result event; the exec is the point
   const runLog = readLog();
@@ -162,10 +162,10 @@ try {
      'the MATCHING credential goes through untouched — the guard is a filter, not a rewrite');
   ok(/-e ANTHROPIC_BASE_URL=https:\/\/api\.deepseek\.com\/anthropic/.test(runLog),
      '…with the adapter’s own base URL, so the key and the endpoint are the same vendor’s');
-  ok(/-e LANGFUSE_BASE_URL=http:\/\/lf/.test(runLog),
-     '…and extraEnv (langfuse et al) still rides along');
+  ok(/-e ZEEHIVE_EXTRA_TEST=http:\/\/example/.test(runLog),
+     '…and extraEnv still rides along');
   const adapterIdx = runLog.indexOf('ANTHROPIC_AUTH_TOKEN');
-  ok(runLog.indexOf('LANGFUSE_BASE_URL') < adapterIdx,
+  ok(runLog.indexOf('ZEEHIVE_EXTRA_TEST') < adapterIdx,
      'the adapter’s env comes LAST, so it still wins over extraEnv on a duplicate key (docker keeps the last -e)');
 
   // ── 4. the door: the RESUME, which is why the guard is not just a dispatch check ─────────────

@@ -25,15 +25,11 @@
 //   E. the boring cases: a turn that prints no result event books nothing and still ends cleanly; a
 //      resume that could not RUN charges nothing at all; an errored result is still charged (the
 //      tokens were spent whether or not the turn ended well).
-//   F. LANGFUSE gets the resumed turn as a trace, with its cost — the observability stack was
-//      missing every continuation, not just the row.
 //
-// Everything it creates is deleted in a finally, whatever happens — including the Langfuse config,
-// which is SNAPSHOTTED and restored (this may run against a shared dev db where it is live).
+// Everything it creates is deleted in a finally, whatever happens.
 process.env.PROVISION_MODE = 'real';   // read once at import: the real queenzee resumes real cages
 process.env.TKB_NOTIFY = '0';
 
-import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -100,28 +96,10 @@ const RESULT = (over = {}) => JSON.stringify({
 });
 const TURN_COST = 1.25, TURN_TOK = 1200 + 340 + 90000 + 5000;
 
-// A stand-in Langfuse: records the trace bodies posted to it.
-const traces = [];
-const lf = createServer((req, res) => {
-  let body = '';
-  req.on('data', (d) => (body += d));
-  req.on('end', () => {
-    traces.push({ path: req.url, body: (() => { try { return JSON.parse(body); } catch { return null; } })() });
-    res.writeHead(207, { 'content-type': 'application/json' }); res.end('{}');
-  });
-});
-await new Promise((r) => lf.listen(0, '127.0.0.1', r));
-const LF_PORT = lf.address().port;
-const lfBefore = await one(`SELECT * FROM langfuse_config WHERE id=true`).catch(() => null);
-
 const PID = '00000000-0000-4000-8000-0000000f6001';
 const SID = 'ffffffff-6000-4222-8333-444444444444';
 const cleanup = async () => {
   try { await q(`DELETE FROM project WHERE id=$1`, [PID]); } catch { /* already gone */ }
-  if (lfBefore) {
-    await q(`UPDATE langfuse_config SET enabled=$1, base_url=$2, public_key=$3, secret_key=$4 WHERE id=true`,
-      [lfBefore.enabled, lfBefore.base_url, lfBefore.public_key, lfBefore.secret_key]).catch(() => {});
-  }
 };
 
 const waitFor = async (fn, ms = 15000) => {
@@ -250,30 +228,8 @@ try {
   ok(errored.status === 'errored' && /rate limited/.test(errored.last_stop_reason || ''),
      '…and the DEATH is still recorded as a death (the revive ladder\'s own read — the burn is booked '
      + 'in the same statement, not instead of it)');
-
-  // ── F. LANGFUSE SEES THE CONTINUATION ───────────────────────────────────────────────────────
-  console.log('\n── F. the resumed turn reaches Langfuse as a trace ──');
-  await q(`UPDATE langfuse_config SET enabled=true, base_url=$1, public_key='pk-test', secret_key='sk-test'
-            WHERE id=true`, [`http://127.0.0.1:${LF_PORT}`]);
-  const x6 = await mkXell('turnacct-traced');
-  const z6 = await mkZee(x6.id, { sid: '55555555-6000-4222-8333-444444444444' });
-  traces.length = 0;
-  process.env.DOCKER_FAKE_STREAM_JSON = RESULT();
-  await nudge.nudgeXellAfterLand(x6.id, { by: 'human@console' });
-  ok(await waitFor(() => traces.length > 0),
-     'the queenzee POSTs a trace for the resumed turn — every continuation used to be missing from '
-     + 'the observability stack entirely');
-  const span = traces[0]?.body?.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0];
-  const attr = (k) => span?.attributes?.find((a) => a.key === k)?.value;
-  ok(traces[0]?.path?.includes('/api/public/otel/v1/traces'), 'to the OTel door intake.js posts to');
-  ok(Number(attr('cost_usd')?.doubleValue ?? attr('cost_usd')?.stringValue) === TURN_COST,
-     `carrying THIS turn's cost ($${TURN_COST}), not the row's running total`);
-  ok(attr('xell_slug')?.stringValue === 'turnacct-traced', 'and naming the xell that ran it');
-  await idle(z6.id);
-  delete process.env.DOCKER_FAKE_STREAM_JSON;
 } finally {
   await cleanup();
-  try { lf.close(); } catch { /* already down */ }
   await pool.end().catch(() => {});
 }
 

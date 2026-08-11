@@ -34,7 +34,6 @@ import { turnStopReason } from '../lib/turn-record.js';
 import { startTurn, endTurn, lastAssistantText, recordFeedEvent } from '../lib/turn-ledger.js';
 import { gatewayEnv } from '../lib/gateway.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
-import { langfuseClientEnv, postTurnToLangfuse } from '../lib/langfuse.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
 import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harnessBridge, assignHarness, defaultHarnessId,
@@ -299,12 +298,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
                                      // leaves whatever the xell already has — a caller says nothing and
                                      // gets nothing changed, exactly like zee_type above. An explicit
                                      // true or false always lands.
-                                     visual_verify = null,
-                                     // PER-XELL LANGFUSE TRACKING (default ON): a human (or a manager)
-                                     // turns it off to stop this xell's turns being traced to Langfuse
-                                     // and to keep LANGFUSE_* out of its cage. Same NULL-preserves shape
-                                     // as visual_verify — a re-dispatch that says nothing changes nothing.
-                                     langfuse_tracking = null }) {
+                                     visual_verify = null }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -441,13 +435,6 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
     // plain re-dispatch into an existing xell must not silently reset a flag a human set earlier.
     if (targetId && visual_verify !== null) {
       await q(`UPDATE xell SET visual_verify=$2 WHERE id=$1`, [targetId, !!visual_verify]);
-    }
-
-    // PER-XELL LANGFUSE TRACKING: store the switch on the xell BEFORE the spawn, so spawnCxell reads it
-    // when deciding whether to inject LANGFUSE_* (and postTurnToLangfuse skips its turns). Same
-    // NULL-preserves shape as visual_verify above.
-    if (targetId && langfuse_tracking !== null) {
-      await q(`UPDATE xell SET langfuse_tracking=$2 WHERE id=$1`, [targetId, !!langfuse_tracking]);
     }
 
     // Point the xell at the right database BEFORE the zee starts — a pooled xell comes up on the
@@ -1432,11 +1419,6 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
             // zero. Only the marker and the idle transition are written.
             await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, stop]);
           }
-          // LANGFUSE: record the finished turn as a trace (best-effort, never blocks the completion).
-          await postTurnToLangfuse({
-            xell, zee, sessionId: sid, model, result: msg,
-            startTime: zee.attached_at || new Date(), endTime: new Date(),
-          });
           // PER-TURN LEDGER: close the spawned turn with ITS OWN burn and a summary of what it said.
           await endTurn(turn?.id, {
             status: msg?.is_error ? 'errored' : 'ended',
@@ -1573,22 +1555,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // the skill-file materialization below and the "your skills come from your harness" line.
   const harnessRow = await harnessForXell(xell.id);
   const harness = harnessRow ? await effectiveHarness(harnessRow) : null;
-  // LANGFUSE: when the global observability plugin is enabled, every cxell zee is injected with
-  // LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL so anything in the cage can
-  // speak the instance (a manager's curl to the public API, worker instrumentation). Merged into
-  // the SAME agentEnv both openCxellSsh (/etc/environment for SSH logins) and runZee (-e for the
-  // headless CLI) read, so it reaches the headless run and an attending human's shell alike.
-  // PER-XELL SWITCH: when langfuse_tracking is OFF, no LANGFUSE_* is injected at all (the flag is
-  // default ON; a false here means the human/manager opted this xell out). Best-effort — never
-  // sinks a spawn.
-  const lfEnv = await langfuseClientEnv(xell.project_id, { tracking: xell.langfuse_tracking !== false })
-    .catch(() => ({}));
   // THE EVERY-PROVIDER SET, BESIDE the dispatched vendor's env (which stays byte-identical to
   // today): every DISPATCHABLE provider's freshest ACTIVE account, each under its own NON-COLLIDING
   // namespaced var (ZEE_PROVIDER_<KEY>_TOKEN + a ZEE_PROVIDERS manifest). github is never in the set
   // (infra credential); a mis-attributed token is skipped, never injected under the wrong vendor's
   // name (everyProviderEnv applies the SAME credentialVendorMismatch the active env goes through).
-  // Best-effort, exactly like lfEnv: a DB read failure must not sink a cage that still has the
+  // Best-effort: a DB read failure must not sink a cage that still has the
   // dispatched provider's env. Both doors get it — /etc/environment (openCxellSsh, an attending
   // human's shell) and the headless exec env (runZee) — so a zee finds its keys either way.
   const everyEnv = await allProviderTokenRows(pid)
@@ -1726,7 +1698,6 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // viewer_url below becomes a literal ssh:// deeplink into this cxell. The xell identity token
     // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
-    if (Object.keys(lfEnv).length) logline('cxell', `${name}: LANGFUSE_* env injected (observability on)`);
     // THE LLM GATEWAY — point every provider base-url at the queenzee gateway carrying this
     // xell's identity in the PATH (/x/<xellToken>/<provider>/...). The gateway then records EVERY
     // AI call (spawn, resume, interactive) attributed to this xell. The gateway env OVERRIDES the
@@ -1737,7 +1708,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
     await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
-                         agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });
+                         agentEnv: { ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);
@@ -1913,7 +1884,7 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   };
 
   const handle = runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
-                          extraEnv: { ...lfEnv, ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
+                          extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.
@@ -2021,11 +1992,6 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
                               reason: String(result?.result || 'error'), source: 'turn' });
       }
-      // LANGFUSE: record the finished turn as a trace (best-effort, never blocks the completion).
-      await postTurnToLangfuse({
-        xell, zee: row, sessionId: sid, model, result,
-        startTime: zee.attached_at || new Date(), endTime: new Date(),
-      });
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
         status: errored ? 'errored' : 'ended',

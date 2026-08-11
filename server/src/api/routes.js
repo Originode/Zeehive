@@ -77,7 +77,6 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdReq
          selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
-         setLangfuseTracking,
          selfUploadConversation, selfConversations,
          selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
          selfSay, selfReport, selfInbox,
@@ -101,11 +100,6 @@ import { xourceState, cleanXourceNow, commitXourceStaged, commitXourceDirty, sta
 import { listManagerMintRequests, decideManagerMint, dismissManagerMint } from '../lib/manager-mint.js';
 import { listCredentialInjectRequests, decideCredentialInject, dismissCredentialInject,
          raiseRotationRequest } from '../lib/credential-inject.js';
-import { langfuseConfig, langfuseStatus, provisionLangfuse, teardownLangfuse,
-         listLangfuseTraces, revealLangfuse, listLangfuseProjects, syncLangfuseProjects,
-         langfuseSigninPage, redeemLangfuseSigninToken, signedInHtml, injectAutoLoginPage,
-         reconcileLangfuseWriteMode, xellLangfuseSession, mintLangfuseRevealToken,
-         redeemLangfuseRevealToken } from '../lib/langfuse.js';
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
 import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkAssign,
@@ -358,30 +352,6 @@ router.post('/xells/:id/visual-verify', async (req, res) => {
         { offerId: b.dismiss === true ? null : b.dismiss, by }));
     }
     return res.json(await setVisualVerify(req.params.id, { visual_verify: !!b.visual_verify, by }));
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-
-// ── PER-XELL LANGFUSE TRACKING (human side) ──────────────────────────────────
-// The per-xell Langfuse tracking switch (default ON). A human flips it from the xell terminal
-// window header; a manager sets it at dispatch/assign (`--langfuse` / `--no-langfuse`). When OFF
-// the queenzee records no trace for this xell's turns and injects no LANGFUSE_* into its cage.
-router.post('/xells/:id/langfuse-tracking', async (req, res) => {
-  try {
-    const b = req.body || {};
-    res.json(await setLangfuseTracking(req.params.id,
-      { langfuse_tracking: !!b.langfuse_tracking, by: b.by || 'human@console' }));
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-// "View Langfuse" — the console asks the SERVER for this xell's Langfuse SESSION link (ui_url +
-// Langfuse project + the zee's session id → /project/<lfProjectId>/sessions/<id>), so the link is
-// computed where the keys and the map live. Resolves from stored state (the xell's 1:1 mapping,
-// then langfuse_config.system_project_id) with the live public-API read as a last-resort fallback
-// that writes back what it learns (TKT-127). Returns { ok:true, url } or { ok:false, reason } (e.g.
-// langfuse-disabled · langfuse-tracking-off · no-session · no-project · langfuse-unreachable). The
-// console opens the url (via the auto-login popup) in a new window.
-router.get('/xells/:id/langfuse-session', async (req, res) => {
-  try {
-    res.json(await xellLangfuseSession({ xellId: req.params.id, zeeId: req.query.zee_id || null }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -2218,177 +2188,6 @@ router.post('/credential-inject/requests/:id/dismiss', async (req, res) => {
   catch (err) { res.status(404).json({ error: err.message }); }
 });
 
-// ── LANGFUSE PLUGIN — ONE system-wide LLM observability instance ──────────────
-// The human surface (console panel). Provision/teardown are real docker actions, gated like every
-// other real side effect (PROVISION_MODE=real runs the compose; simulate models the config row);
-// read models are masked (provider-token discipline) and the reveal door is the human-only second
-// full-value exit, exactly like environments/export.
-router.get('/langfuse/config', async (req, res) => {
-  try { res.json(await langfuseConfig()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-router.get('/langfuse/status', async (req, res) => {
-  try { res.json(await langfuseStatus()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-router.post('/langfuse/provision', async (req, res) => {
-  try {
-    res.json(await provisionLangfuse({
-      by: req.body?.by || 'human@console',
-      hostPort: req.body?.host_port ?? null,
-      orgName: req.body?.org_name ?? null,
-      orgPublicKey: req.body?.org_public_key || null,
-      orgSecretKey: req.body?.org_secret_key || null,
-    }));
-  }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-router.post('/langfuse/teardown', async (req, res) => {
-  try { res.json(await teardownLangfuse({ by: req.body?.by || 'human@console' })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-router.get('/langfuse/traces', async (req, res) => {
-  try { res.json(await listLangfuseTraces({ limit: Number(req.query.limit) || 20 })); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-// TKT-104 / TKT-108-E589: /langfuse/reveal is a HUMAN-CONSOLE verb, not a fleet verb. It used to
-// return the full Langfuse credential set (admin_password included) to ANY caller that could reach
-// the API — the same disclosure class TKT-95 closed on /signin, and isCagedZee alone is NOT enough
-// (an unauthenticated caller simply omits the bearer token and sails through). The route now follows
-// the signin-token pattern: a caged zee is refused, and the route returns only a ONE-TIME, short-TTL
-// reveal token (migration 144) that must be redeemed at /langfuse/reveal/redeem before the
-// credential leaves the server. A caller that cannot present the console's own origin is refused at
-// the mint (403), and a caller that obtains a token cannot redeem it without the SAME origin (by
-// hostname — a bar, not a wall, exactly like the signin redemption's Origin check).
-router.post('/langfuse/reveal', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/reveal is a human-console verb — refused for a caged zee' });
-    }
-    const base = redeemBaseOf(req);
-    const minted = await mintLangfuseRevealToken(req.get('origin') || '', base);
-    if (!minted.ok) return res.status(minted.status || 400).json({ ok: false, error: minted.error });
-    res.json({ ok: true, token: minted.token, redeem: base ? `${base.replace(/\/+$/, '')}/api/langfuse/reveal/redeem` : null });
-  } catch (err) { res.status(404).json({ error: err.message }); }
-});
-// Redeem a one-time reveal token: the console POSTs the token it just minted (same-origin — the
-// browser sends its Origin automatically) and receives the stored credential set ONCE. Same
-// human-console rule as the mint (a caged zee is refused) plus the token is single-use, short-TTL,
-// and scoped to the minting console origin by hostname — a token minted by one origin cannot be
-// redeemed by another, and a second redemption matches no row.
-router.post('/langfuse/reveal/redeem', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/reveal/redeem is a human-console verb — refused for a caged zee' });
-    }
-    const r = await redeemLangfuseRevealToken(req.body?.token, req.get('origin') || '');
-    if (!r.ok) return res.status(r.status || 400).json({ ok: false, error: r.error });
-    res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// The 1:1 ZEEHIVE project ↔ Langfuse project mapping: read + sync.
-router.get('/langfuse/projects', async (req, res) => {
-  try { res.json(await listLangfuseProjects()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-router.post('/langfuse/projects/sync', async (req, res) => {
-  try { res.json(await syncLangfuseProjects({ by: req.body?.by || 'human@console' })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-// AUTO SIGN-IN: redirect the popup to the SAME-ORIGIN auto-login page inside Langfuse
-// (generated/zeehive-auto-login.html, injected into the langfuse-web container at provision).
-// The page runs on the Langfuse origin, so its CSRF fetch + credentials POST carry the cookie and
-// the session lands. GET is fine — no DB write, no docker side effect; the popup needs a bare URL.
-//
-// TKT-95: this is a HUMAN-CONSOLE verb, not a fleet verb. A caged zee presenting its
-// ZEEHIVE_XELL_TOKEN is refused (the console never sends a bearer token). The credential itself
-// never rides in the redirect — the server mints a one-time, short-TTL signin token and the
-// auto-login page redeems it against /langfuse/signin/redeem, so the admin password never appears
-// in a URL, query string or Location header. An attacker that simply omits a bearer token is
-// indistinguishable from the console (there is no console auth primitive — the console is a static
-// SPA behind an nginx proxy with no session), so the one-time-token flow is the second half that
-// removes the credential from the response even for such callers.
-async function isCagedZee(req) {
-  const auth = req.get('authorization') || '';
-  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
-  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
-  if (!token) return null;
-  const xell = await xellForToken(token);
-  return xell || null;
-}
-// The browser-facing base the auto-login page should POST its token redemption to. It must be a URL
-// the BROWSER can reach (it just came through the same proxy that delivered this request): prefer
-// the standard reverse-proxy forwarded headers, else the Host header the server actually saw. In the
-// prod webapp nginx the Host is forwarded as $http_host (host:port — see nginx-web.conf), in the
-// vite dev proxy as the API target (changeOrigin) — both are browser-reachable by construction.
-function redeemBaseOf(req) {
-  const fwdHost = (req.get('x-forwarded-host') || '').split(',')[0].trim();
-  const fwdProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim() || 'http';
-  const host = fwdHost || req.get('host') || '';
-  if (!host) return null;
-  return `${fwdProto}://${host}`;
-}
-router.get('/langfuse/signin', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/signin is a human-console verb — refused for a caged zee' });
-    }
-    // `next` (a LANGFUSE-ORIGIN session url, e.g. from /xells/:id/langfuse-session) is honoured by
-    // the auto-login page as its post-login callback — so "View Langfuse" lands straight on the
-    // zee's session without a login page. langfuseSigninPage guards it against an open redirect.
-    const s = await langfuseSigninPage(req.query.next ? String(req.query.next) : null, { redeemBase: redeemBaseOf(req) });
-    if (!s.ok) return res.status(503).json({ ok: false, error: s.error });
-    res.redirect(302, s.redirect);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// Redeem a one-time signin token: the auto-login page POSTs the token it was redirected with and
-// receives the stored admin credential + the safe post-login callback ONCE. Same human-console rule
-// as /langfuse/signin (a caged zee is refused), plus an Origin check: the page lives on the
-// Langfuse origin (base_url), so its cross-origin fetch carries `Origin: <langfuse base_url
-// origin>`; a script that lacks it is refused. Origin is spoofable, so this is a bar, not a wall —
-// the one-time single-use TTL token is the real protection — but it stops the naive "curl signin,
-// then curl redeem" disclosure in one request.
-router.post('/langfuse/signin/redeem', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/signin/redeem is a human-console verb — refused for a caged zee' });
-    }
-    const origin = req.get('origin') || '';
-    const cfg = await one(`SELECT base_url FROM langfuse_config WHERE id=true`);
-    const allowed = cfg?.base_url ? new URL(cfg.base_url).origin : null;
-    if (!allowed || origin !== allowed) {
-      return res.status(403).json({ ok: false, error: 'signin token redemption refused — the auto-login page must present the Langfuse origin' });
-    }
-    const r = await redeemLangfuseSigninToken(req.body?.token);
-    if (!r.ok) return res.status(400).json({ ok: false, error: r.error });
-    res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// The post-login "you may close this tab" page (same-origin through the nginx /api proxy).
-router.get('/langfuse/signed-in', (_req, res) => {
-  res.type('text/html').send(signedInHtml());
-});
-// Re-inject the auto-login page into an ALREADY-RUNNING langfuse-web container (an instance
-// provisioned before this feature has no page yet; injection runs on provision, this heals live).
-router.post('/langfuse/reinject', async (req, res) => {
-  try {
-    const r = await injectAutoLoginPage();
-    res.json({ ok: !r?.err, ...r });
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-// Heal a running stack stuck in v4 `events_only` write mode → dual, without a queenzee restart.
-// The heal is deliberately HUMAN-TRIGGERED only (the first auto-boot version fired compose up on
-// the live stack with an incomplete interpolation env and took it down — 2026-08-03), so this is
-// the ONE door to flip an already-running stack. Real mode only — simulate answers { ok:false } so
-// the button reads honestly instead of claiming a heal that never ran.
-router.post('/langfuse/heal', async (req, res) => {
-  try {
-    const r = await reconcileLangfuseWriteMode({ force: !!req.body?.force });
-    if (r === null) return res.status(400).json({ ok: false, error: 'Nothing to heal — Langfuse is not enabled, not running, or already in dual write mode (simulate mode never heals).' });
-    res.json({ ok: true, ...r });
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-
 // ── WORK TRACKER: tickets + the work-item hierarchy (058) ────────────────────
 //
 // The layer that records what the work IS, rather than which agents are running. Project-scoped by
@@ -2727,7 +2526,7 @@ router.post('/xell/self/work/assign', async (req, res) => {
     const b = req.body || {};
     res.json(await selfWorkAssign(x, { item: b.item || null, task: b.task || null, model: b.model || null,
       mode: b.mode || null, harness: b.harness || null, title: b.title || null,
-      visual_verify: b.visual_verify || false, langfuse_tracking: b.langfuse_tracking ?? null,
+      visual_verify: b.visual_verify || false,
       provider: b.provider || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });

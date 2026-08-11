@@ -164,9 +164,9 @@ services:
       # bootstrap; see the identity rule in the header.
       CXELL_IMAGE: ${CXELL_IMAGE:-ghcr.io/originode/zeehive-zee-agent:latest}
       CXELL_API_BASE: http://zeehive_server:4700
-    # host-gateway for the Langfuse plugin: the queenzee reaches the langfuse stack (published on
-    # the HOST by docker compose -p zeehive-langfuse) at host.docker.internal:<port>. Docker Desktop
-    # adds that name automatically; native Linux needs the alias, exactly like the web service above.
+    # host-gateway: a containerized queenzee reaches host-published services at
+    # host.docker.internal:<port>. Docker Desktop adds that name automatically; native Linux needs
+    # the alias, exactly like the web service above.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

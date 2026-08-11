@@ -3,8 +3,8 @@
 // The provision code (lib/prod-readonly.js, landed on main) mints FUTURE manager roles without the
 // table-level SELECT on the secret-bearing tables. But every role minted BEFORE that landed still
 // holds `GRANT SELECT ON ALL TABLES` — including every stored secret in plaintext (provider_token
-// .token, environment_var.value, the langfuse_config/langfuse_project_map keys and passwords, and
-// xell.prod_ro_dsn). This test proves migration 143 closes both holes on EXISTING roles:
+// .token, environment_var.value, and xell.prod_ro_dsn). This test proves migration 143 closes both
+// holes on EXISTING roles:
 //
 //   A. a legacy role (old blanket grants) whose xell is LIVE is HARDENED — every secret column is
 //      refused by postgres while *_hint columns and counts stay readable;
@@ -83,7 +83,6 @@ async function main() {
   try {
     // seed one row per secret surface (all values FAKE)
     await admin.query(`INSERT INTO provider_token (project_id, provider, token, token_hint) VALUES ($1,'claude','sk-ant-fake','sk-ant-hint')`, [projectId]);
-    await admin.query(`UPDATE langfuse_config SET admin_password='fake-pw', admin_password_hint='fake-pw-hint', secret_key='sk-fake', secret_key_hint='sk-fake-hint' WHERE id=true`);
     await admin.query(`UPDATE xell SET prod_ro_dsn='postgresql://zee_ro_x:pw@h:1/d' WHERE id=$1`, [liveXellId]);
 
     // Mint two roles the OLD way (table-level SELECT on everything, incl. sequences + default privs)
@@ -132,13 +131,10 @@ async function main() {
     };
     await refuse('provider_token.token', 'SELECT token FROM provider_token');
     await refuse('environment_var.value', 'SELECT value FROM environment_var');
-    await refuse('langfuse_config.admin_password', 'SELECT admin_password FROM langfuse_config');
-    await refuse('langfuse_config.secret_key', 'SELECT secret_key FROM langfuse_config');
     await refuse('xell.prod_ro_dsn', 'SELECT prod_ro_dsn FROM xell');
     await refuse('SELECT * over provider_token', 'SELECT * FROM provider_token');
     await read('token_hint', 'SELECT token_hint FROM provider_token', 'sk-ant-hint');
     await read('provider_token count', 'SELECT count(*) FROM provider_token', '1');
-    await read('langfuse admin_password_hint', 'SELECT admin_password_hint FROM langfuse_config', 'fake-pw-hint');
     await read('xell slug (non-secret)', `SELECT slug FROM xell WHERE status='working'`, liveSlug);
     await ro.end().catch(() => {});
 
@@ -154,7 +150,6 @@ async function main() {
     await admin.query(`DELETE FROM xell WHERE project_id=$1`, [projectId]).catch(() => {});
     await admin.query(`DELETE FROM xource WHERE id=$1`, [xourceId]).catch(() => {});
     await admin.query(`DELETE FROM provider_token WHERE project_id=$1`, [projectId]).catch(() => {});
-    await admin.query(`UPDATE langfuse_config SET admin_password=NULL, admin_password_hint=NULL, secret_key=NULL, secret_key_hint=NULL WHERE id=true`).catch(() => {});
     await admin.query(`DELETE FROM project WHERE id=$1`, [projectId]).catch(() => {});
     await admin.end().catch(() => {});
   }

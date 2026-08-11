@@ -990,19 +990,6 @@ export async function setVisualVerify(xellId, { visual_verify = false, by = 'hum
   return { ok: true, xell: { id: row.id, slug: row.slug, visual_verify: row.visual_verify } };
 }
 
-// PER-XELL LANGFUSE TRACKING (default ON) — the human-side knob (terminal window header). Turning it
-// OFF means this xell's turns are not traced to Langfuse and its cage gets no LANGFUSE_* env. Same
-// shape as setVisualVerify: a per-xell boolean on the xell row, broadcast so the console refreshes.
-export async function setLangfuseTracking(xellId, { langfuse_tracking = true, by = 'human@console' } = {}) {
-  const xell = await one(`SELECT slug FROM xell WHERE id=$1`, [xellId]);
-  if (!xell) throw new Error('no such xell');
-  const row = await one(`UPDATE xell SET langfuse_tracking=$2 WHERE id=$1 RETURNING *`,
-    [xellId, !!langfuse_tracking]);
-  broadcast('xell', row);
-  logline('self', `langfuse tracking ${row.langfuse_tracking ? 'ON' : 'OFF'} for ${xell.slug} by ${by}`);
-  return { ok: true, xell: { id: row.id, slug: row.slug, langfuse_tracking: row.langfuse_tracking } };
-}
-
 // Dismiss a visual-verify offer (the console card's ✕). With no offerId, dismisses the xell's open
 // offers. View-only, like a seed/landing dismiss: it never changes what was offered, it just stops
 // the card rendering.
@@ -1627,7 +1614,7 @@ function managerBriefBlock(managerSlug, what = 'dispatched you and is watching t
 //   • no manager harness on a worker → it cannot be handed the manager's verbs.
 export async function selfDispatch(xell, { task = null, model = null, mode = null, harness = null,
                                            title = null, runtime = null, visual_verify = false,
-                                           langfuse_tracking = null, work_item_id = null,
+                                           work_item_id = null,
                                            // WHICH AI PROVIDER the worker runs on (139). Added for
                                            // the ROUTER (a manager-type zee whose whole job is
                                            // deciding this), and real for any manager: dispatchXell
@@ -1749,9 +1736,6 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
       ...(visual_verify ? { visual_verify: true } : {}),
-      // --langfuse / --no-langfuse: explicit true or false always lands; omission (null) preserves
-      // whatever the target xell already has (dispatchXell's NULL-preserves shape).
-      ...(langfuse_tracking === true || langfuse_tracking === false ? { langfuse_tracking } : {}),
       ...(provider ? { provider } : {}),
       // A ROUTER does not stamp its dispatched worker into a crew (151): the worker is deployed onto
       // a card, not under the router. A manager stamps itself so the honeycomb seats the worker next
@@ -2847,7 +2831,6 @@ export async function selfWorkUnassign(xell, { item = null, reason = null } = {}
 // extra the manager types, so a well-cut plan briefs a worker for free.
 export async function selfWorkAssign(xell, { item = null, task = null, model = null, mode = null,
                                              harness = null, title = null, visual_verify = false,
-                                             langfuse_tracking = null,
                                              // WHICH AI PROVIDER the worker runs on (139): the
                                              // ROUTER's whole job is deciding this, so it must reach
                                              // the board deployment the same way it reaches any other
@@ -2868,7 +2851,7 @@ export async function selfWorkAssign(xell, { item = null, task = null, model = n
   }
   try {
     const out = await deployWorkItem(row.id, {
-      task, model, mode, harness, title, visual_verify, langfuse_tracking, provider,
+      task, model, mode, harness, title, visual_verify, provider,
       actor: xell.slug, managerXellId: xell.id });
     // A ROUTER deploys a worker onto a card but is NOT its manager (151): the worker reports to
     // nobody, and the card is what follows it. A MANAGER's deploy stamps the worker into its crew.

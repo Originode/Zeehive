@@ -8,13 +8,12 @@
 //      SELECT on the NON-secret columns only, the column list computed from information_schema at
 //      runtime;
 //   3. therefore denies the secret columns themselves — provider_token.token,
-//      environment_var.value, the langfuse_config keys + admin_password, the langfuse_project_map
-//      keys, and xell.prod_ro_dsn — with `permission denied`.
+//      environment_var.value, and xell.prod_ro_dsn — with `permission denied`.
 //
 // This is a REAL postgres test, both directions: it mints a throwaway role from the generated SQL
 // against the database DATABASE_URL points at (a clone with the full schema), connects as that role,
 // and asserts `permission denied` for every secret column AND that a manager's normal reads (xell,
-// zee, work_item, ticket, langfuse_config's non-secret columns, and the *_hint / is_secret columns)
+// zee, work_item, ticket, provider_token, environment_var and the *_hint / is_secret columns)
 // still answer. Then it runs dropProdReaderSql — the exact SQL the reaper runs — and asserts the
 // role is GONE (pg_roles has no row), which is the direction that used to fail: the old drop path
 // left every reaped manager's role on the cluster.
@@ -43,13 +42,6 @@ const readerDsn = `postgresql://${role}:${encodeURIComponent(password)}@${dbUrl.
 const DENIED = [
   { table: 'provider_token',       col: 'token' },
   { table: 'environment_var',      col: 'value' },
-  { table: 'langfuse_config',      col: 'admin_password' },
-  { table: 'langfuse_config',      col: 'secret_key' },
-  { table: 'langfuse_config',      col: 'org_secret_key' },
-  { table: 'langfuse_config',      col: 'public_key' },
-  { table: 'langfuse_config',      col: 'org_public_key' },
-  { table: 'langfuse_project_map', col: 'secret_key' },
-  { table: 'langfuse_project_map', col: 'public_key' },
   { table: 'xell',                 col: 'prod_ro_dsn' },
 ];
 
@@ -60,12 +52,8 @@ const NORMAL_READS = [
   { table: 'zee',                  cols: ['id', 'status'] },
   { table: 'work_item',            cols: ['id', 'title', 'status'] },
   { table: 'ticket',               cols: ['id', 'title', 'status'] },
-  { table: 'langfuse_config',      cols: ['enabled', 'status', 'host_port', 'base_url',
-                                          'admin_password_hint', 'public_key_hint', 'secret_key_hint',
-                                          'org_public_key_hint', 'org_secret_key_hint'] },
   { table: 'provider_token',       cols: ['id', 'provider', 'token_hint', 'last_used_at'] },
   { table: 'environment_var',      cols: ['id', 'name', 'is_secret'] },
-  { table: 'langfuse_project_map', cols: ['id', 'langfuse_project_name', 'public_key_hint', 'secret_key_hint'] },
 ];
 
 let reader = null;

@@ -71,8 +71,7 @@ Why this fixes the report **by construction**:
   (and the deepseek adapter sets it to `api.deepseek.com/anthropic`); codex reads
   `OPENAI_BASE_URL`; kimi reads `KIMI_MODEL_BASE_URL`. Pointing those at the gateway is a
   change of VALUE, not a new mechanism.
-- There is no LiteLLM instance anywhere in the fleet today (the existing "gateway_url" in
-  langfuse_config is a planned-but-unused passthrough). This is greenfield.
+- There is no LiteLLM instance anywhere in the fleet today. This is greenfield.
 
 ## Options Considered
 

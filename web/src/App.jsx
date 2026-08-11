@@ -5,7 +5,7 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
          extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
-         getXellLangfuseSession, routePrompt, deployRouter, redeployRouter,
+         routePrompt, deployRouter, redeployRouter,
          squashHelps, squashOffer } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
 import MessageComposer from './MessageComposer.jsx';
@@ -19,20 +19,6 @@ import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 
-// The server's /xells/:id/langfuse-session refusal codes are machine reasons; a human gets a line
-// that says WHAT is missing and what to do about it. 'no-project' used to hide five different
-// states behind one code (TKT-127) — the server now distinguishes them, and this maps each to an
-// actionable sentence (a bare reason string is shown as-is rather than inventing one).
-function langfuseSessionRefusal(r) {
-  switch (r?.reason) {
-    case 'no-session': return 'This zee has no Langfuse session yet — one is recorded after its first finished turn.';
-    case 'no-project': return 'Langfuse has never told us its project id, and it could not be learned. Check the Langfuse stack / provisioning.';
-    case 'langfuse-unreachable': return 'The Langfuse instance is unreachable — is the stack healthy?';
-    case 'langfuse-disabled': return 'Langfuse is not enabled on this fleet.';
-    case 'langfuse-tracking-off': return 'Langfuse tracking is off for this xell.';
-    default: return r?.reason || r?.error || 'Langfuse session unavailable for this xell';
-  }
-}
 import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
@@ -907,23 +893,6 @@ export default function App() {
       setObsXell(x);
       return;
     }
-    if (kind === 'langfuse') {
-      // "View Langfuse" — opens THIS zee's Langfuse SESSION in a new window. The URL is computed
-      // SERVER-side (ui_url + the Langfuse project + the zee's session id); the flower only shows
-      // this verb when the plugin is enabled AND the xell's langfuse_tracking flag is on. The url
-      // is opened THROUGH the /api/langfuse/signin auto-login popup (?next=…), so the new window
-      // lands on the session already signed in — a human is never dumped on a login page. When the
-      // server refuses, it names WHICH thing is missing (TKT-127) — shown as a line a human can act
-      // on rather than a bare reason code.
-      getXellLangfuseSession(x.id, x.zee_id || null).then((r) => {
-        if (r?.ok && r.url) {
-          window.open(`/api/langfuse/signin?next=${encodeURIComponent(r.url)}`, '_blank');
-        } else {
-          showAlert(langfuseSessionRefusal(r), { variant: 'info' });
-        }
-      }).catch((e) => showAlert('Could not open the Langfuse session: ' + (e?.message || e), { variant: 'error' }));
-      return;
-    }
     if (kind === 'build') {
       if (x.stack.some(isBusy)) { showAlert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
@@ -1071,8 +1040,6 @@ export default function App() {
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
                        xellId={termXell.id}
-                       langfuseTracking={termXell.langfuse_tracking !== false}
-                       langfuseEnabled={!!fleet?.langfuse?.enabled}
                        onClose={() => setTermXell(null)} />
         )}
         {envXell && (
@@ -1796,8 +1763,6 @@ function XellCard({ x, diff, fleet, onDone, onMenu, prodLock, projectId, landing
         {cxell && termOpen && (
           <ZeeTerminal zeeId={x.zee_id} slug={x.slug} viewerUrl={x.viewer_url}
                        xellId={x.id}
-                       langfuseTracking={x.langfuse_tracking !== false}
-                       langfuseEnabled={!!fleet?.langfuse?.enabled}
                        onClose={() => setTermOpen(false)} />
         )}
         {!isProd && <Row k="zee" v={working ? x.zee_name : '—'} highlight={working} testid="zee-name" />}
