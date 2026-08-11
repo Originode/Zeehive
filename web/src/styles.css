@@ -2751,6 +2751,7 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
   border: 1px solid var(--accent); border-radius: 3px; padding: 0 3px; margin-left: 5px; flex: 0 0 auto; }
 .work-gtip-r.lane { color: var(--muted); font-style: italic; }
 .work-gorder { margin: 6px 0 0 292px; }
+.work-gorder.quiet { opacity: .75; }
 .work-gbar.ghosting, .work-gsum.ghosting { opacity: .8; outline: 1px dashed var(--accent); }
 .work-gbar.hot, .work-gsum.hot { box-shadow: 0 0 0 1px var(--accent); }
 .work-gbar.over, .work-gsum.over { box-shadow: 0 0 0 1px var(--down); }

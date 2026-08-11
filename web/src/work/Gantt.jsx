@@ -253,6 +253,10 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
   //     reflects list position, not constraints").
   const noDeclaredOrder = hasDeclaredOrder === false;
   const ec = edgeCounts || null;
+  // The critical-path smell: how many atoms are critical, for the banner that flags a mostly
+  // synthesised order. "100% critical" is a tell — a real plan essentially never looks like that.
+  const allAtoms = rows.filter((r) => r.is_atom).length;
+  const critPct = allAtoms ? Math.round((rows.filter((r) => r.is_atom && r.critical).length / allAtoms) * 100) : 0;
   const inferredOrderBanner = ec && ec.sequence > 0
     ? `${ec.sequence} of ${ec.total} scheduling edge${ec.total === 1 ? '' : 's'} ${ec.sequence === 1 ? 'is' : 'are'} `
       + `inferred from board order; ${ec.dependency === 0
@@ -296,12 +300,31 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
                 card’s “depends on” picker) and the chart will draw it as a chain.</span>
         </div>
       )}
-      {durationMix && durationMix.atoms > 0 && durationMix.on_default > 50 && !empty && !nothingDated && (
+      {/* DURATION MIX — ALWAYS surfaced (never gated on a threshold), so a reader never has to
+          know a threshold exists to find out what they are looking at. The loud banner is for the
+          high-default case; the plain line is for every plan. */}
+      {durationMix && durationMix.atoms > 0 && !empty && !nothingDated && (
+        <div className={`work-warn work-gorder${durationMix.on_default > 50 ? '' : ' quiet'}`} role="status">
+          <b>{durationMix.on_default > 50 ? 'Mostly default durations.' : 'Duration mix.'}</b>
+          <span>
+            {durationMix.estimate} estimated · {durationMix.actual} measured · {durationMix.default} on
+            the 1-day default, of {durationMix.atoms} bars ({durationMix.on_default}% default).
+            {durationMix.on_default > 50
+              ? ' The default bars are placeholders, not facts — the tooltip on each names which.'
+              : ' A default bar is a placeholder, not a fact — the tooltip names it.'}
+          </span>
+        </div>
+      )}
+      {/* THE CRITICAL PATH ITSELF — qualified when the ORDER is synthesised. omnibiz is 362/362
+          critical: that is an EDGE artefact (a pure board-sort synthesised chain), not a duration
+          one, and it must not present as a real finding. When most edges are inferred, the
+          critical path is a smell, not a result. */}
+      {ec && ec.total > 0 && ec.sequence > 0 && ec.sequence / ec.total > 0.5 && !empty && !nothingDated && (
         <div className="work-warn work-gorder" role="status">
-          <b>Mostly default durations.</b>
-          <span>{durationMix.default} of {durationMix.atoms} bars ({durationMix.on_default}%) use the
-                1-day default — no estimate, no measured actual. Those are placeholders, not facts;
-                the tooltip on each bar names which.</span>
+          <b>Critical path is not meaningful.</b>
+          <span>Most ({ec.sequence} of {ec.total}) scheduling edges are inferred from board order,
+                so the critical path reflects list position, not constraints — {critPct}% of {allAtoms} atoms
+                critical is a smell, not a result.</span>
         </div>
       )}
 
