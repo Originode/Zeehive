@@ -2475,6 +2475,19 @@ function doneTip(x) {
 // the flower's read-mostly interactions), then the verb buttons in petal order 1→6.
 export function xellContextMenuItems(x, diff) {
   const items = [];
+  // HELD AT THE GATE — the zee's land/ship request is waiting on a human and the zee is the one
+  // blocked, so the human already looking at the hexagon can send the literal 'zee land'/'zee ship'
+  // into its live session without opening a terminal. The row appears ONLY while the gate is actually
+  // holding (hive_status occ-landRequest/occ-shipRequest) — never for a hint and never for a zee not
+  // waiting — so a human cannot re-send a verb at a zee that has nothing pending. Not on a manager or
+  // production: those carry no land/ship verbs (the same rule petalVerbs encodes).
+  if (!x.is_production && !isManagerXell(x)) {
+    if (x.hive_status === 'occ-landRequest') {
+      items.push({ kind: 'sendLand', label: '⬆ Send “zee land” to zee', tone: '' });
+    } else if (x.hive_status === 'occ-shipRequest') {
+      items.push({ kind: 'sendShip', label: '🚀 Send “zee ship” to zee', tone: '' });
+    }
+  }
   // The two DIFF petals (commit/source stat, own stat) open the diff viewer on a worker's flower; a
   // manager's petals 5/6 are CREW and PROD·AGE instead, so a manager gets neither (same rule as
   // diffPetal()). Production keeps only the SOURCE side — "what is deployed vs the origin mirror" —
