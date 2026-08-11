@@ -60,14 +60,14 @@ export async function workflowGanttModel({ projectId, rootId = null } = {}) {
         plan_id: null, plan_name: null, version: null, rows: [], span: null,
       };
     }
-    const { rows, span, has_declared_order, edge_counts } = await rowsForVersion(pv.plan_version_id, pv.root_node_id, pv);
+    const { rows, span, has_declared_order, edge_counts, duration_mix } = await rowsForVersion(pv.plan_version_id, pv.root_node_id, pv);
     return {
       ok: true,
       root: rows.find((r) => r.id === pv.root_node_id) || null,
       project_id: projectId,
       plan_version_id: pv.plan_version_id,
       plan_id: pv.plan_id, plan_name: pv.plan_name, version: pv.version,
-      rows, span, has_declared_order, edge_counts,
+      rows, span, has_declared_order, edge_counts, duration_mix,
     };
   }
   // root-scoped: the caller named a work_node id directly
@@ -78,14 +78,14 @@ export async function workflowGanttModel({ projectId, rootId = null } = {}) {
             pv.version, pv.root_node_id
        FROM plan_version pv JOIN plan p ON p.id = pv.plan_id
       WHERE pv.id = $1`, [rootNode.plan_version_id]);
-  const { rows, span, has_declared_order, edge_counts } = await rowsForVersion(pv.plan_version_id, rootNode.id, pv);
+  const { rows, span, has_declared_order, edge_counts, duration_mix } = await rowsForVersion(pv.plan_version_id, rootNode.id, pv);
   return {
     ok: true,
     root: rows.find((r) => r.id === rootNode.id) || null,
     project_id: null,
     plan_version_id: pv.plan_version_id,
     plan_id: pv.plan_id, plan_name: pv.plan_name, version: pv.version,
-    rows, span, has_declared_order, edge_counts,
+    rows, span, has_declared_order, edge_counts, duration_mix,
   };
 }
 
@@ -266,11 +266,14 @@ async function rowsForVersion(versionId, rootId, pv) {
     const a = actualOf.get(n.id) || { start: null, end: null };
     const w = waitingOf.get(n.id) || { start: null, end: null };
     const exs = execsByNode.get(n.id) || [];
-    // WHERE the bar's duration came from (migration 194) — so a 1-day bar that is a DEFAult
-    // is never mistaken for a 1-day ESTIMATE. estimate → actual (closed executions) → default.
+    // WHERE the bar's duration came from — the PROVENANCE, mirroring migration 194's fallback
+    // chain exactly (wn_duration): a positive work_node.estimate is DECLARED; else a closed
+    // execution (started_at AND finished_at) is the OBSERVED actual; else the 1-day DEFAULT.
+    // A zero/negative estimate is treated as absent, exactly as 194's NULLIF does. The chart
+    // must render the three differently — a default bar is never dressed up as an estimate.
     const duration_source = !s ? null
       : (s.is_atom
-        ? (n.estimate ? 'estimate'
+        ? (n.estimate && intervalHours(n.estimate) > 0 ? 'estimate'
           : (exs.some((ex) => ex.started_at && ex.finished_at) ? 'actual' : 'default'))
         : 'rollup');
     return {
@@ -321,7 +324,22 @@ async function rowsForVersion(versionId, rootId, pv) {
       }
     : null;
 
-  return { rows, span, has_declared_order: hasDeclaredOrder, edge_counts };
+  // PER-PLAN PROVENANCE MIX — how much of this plan rests on each duration source. Counted over
+  // ATOMS (the rows wn_duration actually sizes): declared estimates, observed closed-execution
+  // actuals, and the 1-day default. `on_default` is the honest headline — a plan whose bars are
+  // mostly default is a plan whose schedule is mostly guesswork. The manager's measured numbers
+  // for the fleet are: Zeehive 71 of 164 atoms on the default (43%), omnibiz 323 of 362 (89%).
+  const atomSources = rows.filter((r) => r.is_atom && r.duration_source);
+  const duration_mix = {
+    estimate: atomSources.filter((r) => r.duration_source === 'estimate').length,
+    actual: atomSources.filter((r) => r.duration_source === 'actual').length,
+    default: atomSources.filter((r) => r.duration_source === 'default').length,
+    atoms: atomSources.length,
+  };
+  duration_mix.on_default = duration_mix.atoms
+    ? Math.round((duration_mix.default / duration_mix.atoms) * 100) : 0;
+
+  return { rows, span, has_declared_order: hasDeclaredOrder, edge_counts, duration_mix };
 }
 
 const iso = (d) => (d instanceof Date ? d.toISOString() : String(d));
