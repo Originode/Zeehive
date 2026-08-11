@@ -2567,6 +2567,61 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-card-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .work-drift { color: var(--building); font-size: 11px; border-top: 1px dashed var(--line); padding-top: 3px; }
 
+/* ── the MATRIX board — status columns × swimlane rows ──────────────────────
+   The flat kanban's columns become a grid: the left rail holds one ROW per parent work_node
+   (indented by depth), and the status lanes sit to its right. Every band — a row header, a row's
+   tail drop zone, or a leaf card's row — is ONE flex row (a fixed-width rail cell + one cell per
+   lane, all `flex: 1 1 0`), so a lane is the same horizontal strip at every nesting depth and the
+   columns stay straight. The whole matrix is one scroller, and the header is sticky at the top. */
+.work-matrix { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.work-mhead { position: sticky; top: 0; z-index: 5; display: flex; align-items: stretch;
+  border: 1px solid var(--line); border-bottom: 0; border-radius: 10px 10px 0 0;
+  background: var(--bg); }
+.work-mh-label { flex: 0 0 250px; display: flex; align-items: center; padding: 7px 10px;
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+  background: var(--panel2); border-right: 1px solid var(--line); border-radius: 10px 0 0 0; }
+.work-mhead .work-col-h { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line);
+  border-bottom: 0; background: var(--panel); }
+.work-mbody { display: flex; flex-direction: column; border: 1px solid var(--line);
+  border-top: 0; border-radius: 0 0 10px 10px; overflow: hidden; }
+
+/* one band: rail + lane cells. Every band shares these two, so lanes align across depths. */
+.work-row { display: flex; align-items: stretch; border-bottom: 1px solid var(--line); }
+.work-row:last-child { border-bottom: 0; }
+.work-row-label { flex: 0 0 250px; display: flex; align-items: center; gap: 5px; padding: 4px 6px;
+  min-height: 34px; background: var(--panel); border-right: 1px solid var(--line); }
+.work-row-lane { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line); padding: 4px;
+  display: flex; flex-direction: column; justify-content: flex-start; }
+
+/* a container ROW: the swimlane header. Slightly raised so the plan reads as plan. */
+.work-row-band { background: rgba(255,255,255,.025); }
+.work-row-band .work-row-label { background: var(--panel2); }
+.work-row-title { flex: 1 1 auto; min-width: 0; background: none; border: 0; color: var(--text);
+  text-align: left; font-size: 12.5px; padding: 1px 2px; cursor: pointer; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.work-row-title:hover { color: var(--accent); }
+.work-row-band .work-row-lane { align-items: center; justify-content: center; }
+.work-row-count { color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
+  display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
+.work-row-count b { color: var(--text); font-size: 13px; }
+
+/* a LEAF's row: the rail cell is an empty spacer, the card sits in its own lane. */
+.work-row.work-leaf .work-row-label { background: transparent; }
+.work-row-lane.has-card { padding: 4px; }
+
+/* a row's TAIL: the append drop targets under an expanded row's children. Dashed top border
+   says "drop here to land at the end of this lane" without shouting. */
+.work-tail { min-height: 22px; }
+.work-tail .work-row-label { background: transparent; border-right-color: var(--line); }
+.work-tail .work-row-lane { border-top: 1px dashed var(--line); justify-content: center; min-height: 22px; }
+.work-row-empty { color: var(--unknown); font-size: 11px; }
+
+/* drop feedback — a lane under the pointer, or the card the pointer is on */
+.work-row-lane.drop { background: rgba(91,140,255,.08); box-shadow: inset 0 0 0 1px var(--accent); }
+.work-card.drop-on { outline: 2px solid var(--accent); outline-offset: 1px; }
+.work-row:focus-within { background: var(--panel2); }
+.work-row-band:focus-within .work-row-label { background: var(--panel2); }
+
 /* ── the drawer ────────────────────────────────────────────────────────────── */
 .work-drawer { flex: 0 0 380px; border-left: 1px solid var(--line); background: var(--panel);
   display: flex; flex-direction: column; overflow: hidden; }

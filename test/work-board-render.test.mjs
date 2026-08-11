@@ -38,7 +38,7 @@ try {
   // exist only for a test to import.
   await build({
     stdin: {
-      contents: "export { Card } from './web/src/work/Board.jsx';\n"
+      contents: "export { Card, RowBand, RowTail, LeafBand, buildForest, buildIndex, leafLaneCounts, flattenBands } from './web/src/work/Board.jsx';\n"
               + "export * as bits from './web/src/work/bits.jsx';\n",
       resolveDir: ROOT, sourcefile: 'render-entry.js', loader: 'js',
     },
@@ -80,6 +80,95 @@ try {
     renderToStaticMarkup(React.createElement(mod.Card, { card: { id: 'x', title: 'bare' }, statuses }));
   } catch (e) { bare = e; }
   ok(!bare, `a card with only an id and a title renders too${bare ? ` — ${bare.message}` : ''}`);
+
+  // ── the MATRIX: swimlane rows per parent, cards in lanes ─────────────────────────────────────
+  // The board's new shape: a work_node WITH children renders as a collapsible ROW spanning every
+  // lane (its own status becomes a dot in the row header); a node with NO children renders as a
+  // CARD in its status lane under its nearest parent row. The pure builders (buildForest /
+  // buildIndex / leafLaneCounts / flattenBands) are exercised on a real payload, and the band
+  // components are RENDERED so a free identifier throws here, in node, the way it does in a
+  // browser — exactly why this test renders Card instead of grepping for it.
+  const mStatuses = [
+    { key: 'queued', label: 'queued', order: 1 },
+    { key: 'working', label: 'working', order: 2 },
+  ];
+  const mRoot = { id: 'r', title: 'The Root', kind: 'project', status: 'queued', sort_order: 0 };
+  const mColumns = [
+    { key: 'queued', label: 'queued', items: [
+      { id: 'a', title: 'Activity A', kind: 'activity', status: 'queued', parent_id: 'r', sort_order: 1 },
+      { id: 'l1', title: 'Leaf one', kind: 'task', status: 'queued', parent_id: 'a', sort_order: 1 },
+    ]},
+    { key: 'working', label: 'working', items: [
+      { id: 'l2', title: 'Leaf two', kind: 'task', status: 'working', parent_id: 'a', sort_order: 2 },
+    ]},
+  ];
+
+  const forest = mod.buildForest(mRoot, mColumns);
+  ok(forest.length === 1 && forest[0].id === 'r', 'buildForest returns the root as the single top-level row');
+  ok(forest[0].children.length === 1 && forest[0].children[0].id === 'a',
+     '…with the container (a card that is somebody\'s parent) as its child');
+  ok(forest[0].children[0].children.length === 2, '…and the container holding both leaves, sorted');
+
+  const idx = mod.buildIndex(forest);
+  ok(idx.rowOf.get('l1') === 'a' && idx.rowOf.get('l2') === 'a', 'a leaf belongs to its NEAREST parent row');
+  ok(idx.rowOf.get('a') === 'a', 'a container is its own row');
+  const aStacks = idx.laneStacks.get('a');
+  ok(aStacks.get('queued').map((c) => c.id).join() === 'l1', 'the row\'s queued lane holds its queued leaf');
+  ok(aStacks.get('working').map((c) => c.id).join() === 'l2', 'and its working lane holds the working leaf');
+
+  const counts = mod.leafLaneCounts(forest[0].children[0]);
+  ok(counts.get('queued') === 1 && counts.get('working') === 1, 'a collapsed row counts its leaves per lane');
+
+  // collapse/expand: the flat band list is the exact contract of what is visible.
+  const flat = mod.flattenBands(forest, new Set());
+  ok(flat.map((b) => `${b.kind}:${(b.node || b.card).id}`).join() === 'row:r,row:a,leaf:l1,leaf:l2,tail:a,tail:r',
+     'a fully-expanded board draws rows, then children in tree order, then each row\'s tail');
+  const flatCollapsed = mod.flattenBands(forest, new Set(['a']));
+  ok(flatCollapsed.map((b) => `${b.kind}:${(b.node || b.card).id}`).join() === 'row:r,row:a,tail:r',
+     'collapsing a row hides its leaves AND its tail (the drop zones under it)');
+
+  // RENDER the bands — a free identifier throws here, exactly as it does in Chrome.
+  let rowHtml = '';
+  try {
+    rowHtml = renderToStaticMarkup(React.createElement(mod.RowBand, {
+      node: forest[0], depth: 0, collapsed: false, columns: mColumns, statuses: mStatuses,
+      onToggle: () => {}, onOpen: () => {},
+    }));
+  } catch (e) { ok(false, `a container row renders without throwing — ${e.message}`); }
+  ok(!!rowHtml && rowHtml.includes('The Root'), 'a container row renders and shows the parent title');
+  ok(rowHtml.includes('▾'), 'and the caret says it is expanded');
+
+  let collapsedHtml = '';
+  try {
+    collapsedHtml = renderToStaticMarkup(React.createElement(mod.RowBand, {
+      node: forest[0].children[0], depth: 1, collapsed: true, columns: mColumns, statuses: mStatuses,
+      onToggle: () => {}, onOpen: () => {},
+    }));
+  } catch (e) { ok(false, `a collapsed row renders without throwing — ${e.message}`); }
+  ok(collapsedHtml.includes('Activity A') && collapsedHtml.includes('▸'),
+     'a collapsed row shows its title and the caret closed');
+  ok(/queued/.test(collapsedHtml) && /working/.test(collapsedHtml),
+     '…and the per-lane counts it hides (queued / working)');
+
+  let leafHtml = '';
+  try {
+    leafHtml = renderToStaticMarkup(React.createElement(mod.LeafBand, {
+      card: { id: 'l1', title: 'Leaf one', kind: 'task', status: 'queued' }, depth: 2,
+      columns: mColumns, statuses: mStatuses,
+      onOpen: () => {}, onKey: () => {},
+      onDragStart: () => {}, onDragEnd: () => {}, onDragOver: () => {}, onDrop: () => {},
+    }));
+  } catch (e) { ok(false, `a leaf band renders without throwing — ${e.message}`); }
+  ok(leafHtml.includes('Leaf one') && /work-card/.test(leafHtml), 'a leaf renders as a card in its lane');
+
+  let tailHtml = '';
+  try {
+    tailHtml = renderToStaticMarkup(React.createElement(mod.RowTail, {
+      node: forest[0].children[0], depth: 1, columns: mColumns, index: idx, dropAt: null,
+      onDragOver: () => {}, onDrop: () => {},
+    }));
+  } catch (e) { ok(false, `a row tail renders without throwing — ${e.message}`); }
+  ok(/work-tail/.test(tailHtml), 'an expanded row renders its tail (the per-lane append drop targets)');
 
   // ── the shared bits, including the formatter a refactor deleted ─────────────────────────────
   ok(typeof mod.bits.fmtWhen === 'function',
