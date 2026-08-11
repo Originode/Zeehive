@@ -131,6 +131,13 @@ A new `agent_runtime` row with `driver='langchain'` — the seam the dispatch al
 registry way to say "a zee can be driven by langchain", alongside claude-code-cxell, codex, kimi,
 deepseek, grok.
 
+**Opt-in by default.** The row is inserted with `enabled=false`, so it can never become a pool
+default by accident — a dispatch only lands on it when a human explicitly selects the
+`langchain-stateful` runtime. This is deliberate: a langchain zee has no cxell process to probe
+(the monitor excludes `driver='langchain'` from its CLI-liveness pass), and the non-caged model-call
+loop is the first step of a longer rollout (see §8.3). Making it a fleet default is a later,
+explicit decision.
+
 ### 4.3 What is NOT state
 
 - **The gate decisions, the landing requests, the ship cards** — already rows, already durable,
