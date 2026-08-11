@@ -104,7 +104,10 @@ export async function modelNodeForWorkItem(workItemId) {
 // 1); the API convention is 0-based, so readers subtract 1.
 //
 // `rootItemId` is a work_item id (the API's identity); when given, the walk starts at that item's
-// node. Otherwise `projectId` resolves the project's plan root.
+// node. Otherwise `projectId` resolves the project's WORK ITEM tree root — the root work_item node
+// (stable_key='work_item:<root item id>'), NOT the project node (stable_key='project:<project_id>'
+// — the model's plan root, which the board/gantt/list must skip: a project node has no work_item
+// row to join to).
 export async function modelTree({ projectId, rootItemId } = {}) {
   const params = [];
   let rootCte;
@@ -118,10 +121,15 @@ export async function modelTree({ projectId, rootItemId } = {}) {
     params.push(projectId);
     rootCte = `
       root AS (
-        SELECT pv.root_node_id
-        FROM plan p JOIN plan_version pv ON pv.plan_id = p.id
-        WHERE p.project_id = $1 AND pv.root_node_id IS NOT NULL
-        ORDER BY p.created_at DESC, pv.version DESC LIMIT 1
+        SELECT wn.id AS root_node_id
+        FROM plan p
+        JOIN plan_version pv ON pv.plan_id = p.id
+        JOIN work_node pn ON pn.plan_version_id = pv.id
+                         AND pn.stable_key = 'project:' || p.project_id::text
+        JOIN work_node wn ON wn.parent_id = pn.id AND wn.stable_key LIKE 'work_item:%'
+        WHERE p.project_id = $1
+        ORDER BY p.created_at DESC, pv.version DESC
+        LIMIT 1
       )`;
   }
   const rows = await q(`
