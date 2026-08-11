@@ -144,3 +144,94 @@ export function rowToTask({ opening, replies = [], tendOpen = false } = {}) {
 export function executionOutputsToArtifacts(_execution = null) {
   return [];
 }
+
+// ── A2A v1.0 ERROR CODES — the exact spec numbers (plan §3.2, DR-5) ─────────
+// The refusal methods and the version gate answer with these EXACT codes. A conforming client
+// matches on code, so the numbers are part of the wire contract, not prose. Read from the v1.0.1
+// spec, not recalled: -32001 TaskNotFound, -32003 PushNotificationNotSupported, -32007
+// ExtendedAgentCardNotConfigured, -32009 VersionNotSupported (the full table is plan §3.2).
+export const A2A_ERROR = {
+  TaskNotFound:                    { code: -32001, name: 'TaskNotFoundError' },
+  TaskNotCancelable:               { code: -32002, name: 'TaskNotCancelableError' },
+  PushNotificationNotSupported:    { code: -32003, name: 'PushNotificationNotSupportedError' },
+  ContentTypeNotSupported:         { code: -32005, name: 'ContentTypeNotSupportedError' },
+  ExtendedAgentCardNotConfigured:  { code: -32007, name: 'ExtendedAgentCardNotConfiguredError' },
+  VersionNotSupported:             { code: -32009, name: 'VersionNotSupportedError' },
+};
+
+// The A2A-Version gate — the JSON-RPC error for a wrong/missing version, or null for "1.0".
+// Pure so the wire contract is testable without HTTP (DR-5: VersionNotSupportedError from day one).
+export function a2aVersionError(version) {
+  const v = String(version || '').trim();
+  if (v === '1.0') return null;
+  return { code: A2A_ERROR.VersionNotSupported.code,
+           message: A2A_ERROR.VersionNotSupported.name,
+           data: { message: `A2A-Version header must be "1.0" (got "${v || 'missing'}")` } };
+}
+
+// ── AGENT CARDS — plan §3.1 discovery ──────────────────────────────────────
+// Both cards are PURE functions of plain facts: the caller (lib/a2a-read.js) gathers the xell row,
+// the zee name, the harness skills, the task brief, and the base URL the request reached us at, and
+// passes them in — house rule 7: names/containers/status are DATA, never baked into a static file.
+// The per-agent card is GENERATED per request from live rows; there is no static card anywhere.
+export function buildFleetCard({ base, consoleUrl = null, version = '0.1.0' } = {}) {
+  return {
+    name: 'ZEEHIVE',
+    description: 'The ZEEHIVE queenzee as a mediated multi-agent A2A service — each live zee is an '
+      + 'A2A agent behind this single endpoint (docs/a2a-protocol-plan.md §2, DR-2).',
+    // The root card describes the service and points at the directory (plan §3.1); the top-level
+    // url is the A2A v1.0 required field.
+    url: `${base}/a2a/v1/agents`,
+    supportedInterfaces: [{
+      url: `${base}/a2a/v1/agents`,
+      protocolBinding: 'JSONRPC',
+      protocolVersion: '1.0',
+    }],
+    provider: { organization: 'ZEEHIVE', url: consoleUrl || base },
+    version,
+    capabilities: { streaming: true, pushNotifications: false, extendedAgentCard: false },
+    securitySchemes: { bearer: { type: 'http', scheme: 'bearer' } },
+    securityRequirements: [{ bearer: [] }],
+    defaultInputModes: ['text/plain'],
+    defaultOutputModes: ['text/plain'],
+  };
+}
+
+export function buildAgentCard({ xell, base, consoleUrl = null, zeeName = null, skills = [], taskBrief = null } = {}) {
+  const slug = xell?.slug || 'unknown';
+  const shortSha = xell?.head_commit ? String(xell.head_commit).slice(0, 8) : 'unknown';
+  // description = the task brief's first line + the harness label (plan §3.1); the brief is clipped
+  // to one line so a card stays a card, not a briefing.
+  const briefLine = taskBrief ? String(taskBrief).trim().split('\n')[0].slice(0, 160) : null;
+  const description = [
+    briefLine,
+    xell?.harness_label ? `Harness: ${xell.harness_label}` : null,
+  ].filter(Boolean).join(' — ') || `ZEEHIVE agent ${slug}`;
+  // The skills array: one AgentSkill per harness skill (id = the skill key, description = its
+  // When: line), plus one for the zee's task (plan §3.1) — the task is the agent's current job.
+  const skillList = skills.map((s) => ({ id: s.name, description: s.when || null }));
+  if (briefLine) skillList.push({ id: 'task', description: briefLine });
+  return {
+    // name = the zee's codename + the xell slug (DR-4: the slug is the durable agent identity).
+    name: zeeName ? `${zeeName} · ${slug}` : slug,
+    description,
+    url: `${base}/a2a/v1/agents/${slug}`,
+    supportedInterfaces: [{
+      url: `${base}/a2a/v1/agents/${slug}`,
+      protocolBinding: 'JSONRPC',
+      // tenant is the spec's own field for "multiple agents served behind a single A2A endpoint"
+      // (a2a.proto AgentInterface.tenant, plan §3.1) — here the xell slug.
+      tenant: slug,
+      protocolVersion: '1.0',
+    }],
+    provider: { organization: 'ZEEHIVE', url: consoleUrl || base },
+    // version = the xell's head commit short sha — the honest version of an agent that is a worktree.
+    version: shortSha,
+    capabilities: { streaming: true, pushNotifications: false, extendedAgentCard: false },
+    securitySchemes: { bearer: { type: 'http', scheme: 'bearer' } },
+    securityRequirements: [{ bearer: [] }],
+    defaultInputModes: ['text/plain'],
+    defaultOutputModes: ['text/plain'],
+    skills: skillList,
+  };
+}
