@@ -160,13 +160,6 @@ export async function skillsForHarness(harnessId) {
   return eff?.skills || [];
 }
 
-// The harness label for a xell (the card's description), or null.
-async function harnessLabelFor(harnessId) {
-  if (!harnessId) return null;
-  const h = await one(`SELECT label FROM harness WHERE id=$1 AND enabled`, [harnessId]);
-  return h?.label || null;
-}
-
 // The per-agent card, GENERATED per request from live rows (house rule 7). One query gathers the
 // xell + its latest live zee's name + its harness label + its latest task brief; the skills come
 // from the harness row. Pure buildAgentCard (lib/a2a.js) does the shaping.
@@ -195,7 +188,7 @@ export async function agentCardFor(xell, base, { consoleUrl = null } = {}) {
 
 // The directory (plan §3.1 extension — A2A defines no registry): live agents the caller's
 // credential may see, each with its card URL.
-export async function directoryFor(caller, base, { consoleUrl = null } = {}) {
+export async function directoryFor(caller, base) {
   const visible = await cardVisibleXellIds(caller);
   if (!visible.size) return { agents: [], count: 0 };
   const rows = await q(

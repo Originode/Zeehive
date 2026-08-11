@@ -85,7 +85,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdReq
          selfProviderEnv } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
-import { buildFleetCard, A2A_ERROR, a2aVersionError } from '../lib/a2a.js';
+import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
 import { A2AError, cardVisibleXellIds, taskVisibleXellIds, loadTask,
          dispatchA2A, agentCardFor, directoryFor } from '../lib/a2a-read.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
