@@ -33,7 +33,7 @@
 //     puts a model-chosen commit on main, `ship` deploys production, `seed` writes prod rows. The
 //     confinement is the ALLOWLIST, not the gate — these are absent from it. Do NOT flip
 //     auto_approve_* to make a hold appear: that is fleet-wide policy, and this stays absent.
-import { selfStatus, selfWorking, selfWork, selfWorkItem, selfTend } from '../queenzee/self.js';
+import { selfStatus, selfWorking, selfWork, selfWorkItem, selfTend, selfHint } from '../queenzee/self.js';
 import { tendState } from './status.js';
 
 // The bound verbs. Keyed BY NAME so the loop and runTool can look a request up in one step and so
@@ -43,8 +43,11 @@ import { tendState } from './status.js';
 // Each description states what the verb WRITES (or that it is a pure select), because that is the
 // sentence the model reasons from.
 //
-// hint-land / hint-ship are NOT bound yet: their write shape (a session_event annotating a request,
-// nothing more) has been reported to the manager and is pending their call before they are added.
+// hint-land / hint-ship are BOUND (manager authorisation 2026-08-11): each writes exactly one
+// session_event row (hook_event_name '<kind>hint-request'/'<kind>hint-clear') with the optional
+// reason, plus the xell's hint state (which lights the land?/ship? button) and an xell broadcast.
+// They open NO gate, push nothing, and there is no auto_approve path for a hint (landgate/shipgate
+// are not reached) — lib/status.js setHint (219-232).
 export const LANGCHAIN_TOOLS = {
   status: {
     name: 'status',
@@ -111,6 +114,24 @@ export const LANGCHAIN_TOOLS = {
       + 'clear:true to lower it. It also auto-clears when you report working.',
     schema: { type: 'object', properties: { reason: { type: 'string' }, clear: { type: 'boolean' } }, required: [] },
     run: (xell, args) => selfTend(xell, { reason: args?.reason || null, clear: !!args?.clear }),
+  },
+  'hint-land': {
+    name: 'hint-land',
+    description: 'WRITES one thing: a hint-request event (with the optional reason) that lights the '
+      + 'land? button on THIS xell\'s hexagon for a human to decide. Opens NO gate, pushes NOTHING, '
+      + 'and cannot land anything (there is no auto_approve path for a hint). Use when the work looks '
+      + 'land-ready but you are not certain; pass clear:true to lower it.',
+    schema: { type: 'object', properties: { reason: { type: 'string' }, clear: { type: 'boolean' } }, required: [] },
+    run: (xell, args) => selfHint(xell, 'land', { reason: args?.reason || null, clear: !!args?.clear }),
+  },
+  'hint-ship': {
+    name: 'hint-ship',
+    description: 'WRITES one thing: a hint-request event (with the optional reason) that lights the '
+      + 'ship? button on THIS xell\'s hexagon for a human to decide. Opens NO gate, pushes NOTHING, '
+      + 'and cannot ship anything (there is no auto_approve path for a hint). Use when the work looks '
+      + 'ship-ready but you are not certain; pass clear:true to lower it.',
+    schema: { type: 'object', properties: { reason: { type: 'string' }, clear: { type: 'boolean' } }, required: [] },
+    run: (xell, args) => selfHint(xell, 'ship', { reason: args?.reason || null, clear: !!args?.clear }),
   },
 };
 
