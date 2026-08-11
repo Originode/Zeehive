@@ -60,14 +60,14 @@ export async function workflowGanttModel({ projectId, rootId = null } = {}) {
         plan_id: null, plan_name: null, version: null, rows: [], span: null,
       };
     }
-    const { rows, span } = await rowsForVersion(pv.plan_version_id, pv.root_node_id, pv);
+    const { rows, span, has_declared_order, edge_counts } = await rowsForVersion(pv.plan_version_id, pv.root_node_id, pv);
     return {
       ok: true,
       root: rows.find((r) => r.id === pv.root_node_id) || null,
       project_id: projectId,
       plan_version_id: pv.plan_version_id,
       plan_id: pv.plan_id, plan_name: pv.plan_name, version: pv.version,
-      rows, span,
+      rows, span, has_declared_order, edge_counts,
     };
   }
   // root-scoped: the caller named a work_node id directly
@@ -78,14 +78,14 @@ export async function workflowGanttModel({ projectId, rootId = null } = {}) {
             pv.version, pv.root_node_id
        FROM plan_version pv JOIN plan p ON p.id = pv.plan_id
       WHERE pv.id = $1`, [rootNode.plan_version_id]);
-  const { rows, span } = await rowsForVersion(pv.plan_version_id, rootNode.id, pv);
+  const { rows, span, has_declared_order, edge_counts } = await rowsForVersion(pv.plan_version_id, rootNode.id, pv);
   return {
     ok: true,
     root: rows.find((r) => r.id === rootNode.id) || null,
     project_id: null,
     plan_version_id: pv.plan_version_id,
     plan_id: pv.plan_id, plan_name: pv.plan_name, version: pv.version,
-    rows, span,
+    rows, span, has_declared_order, edge_counts,
   };
 }
 
@@ -111,8 +111,22 @@ async function rowsForVersion(versionId, rootId, pv) {
   const schedBy = new Map(schedule.map((s) => [s.node_id, s]));
 
   // The union graph's leaf-level dependency edges for this version (origin + lag + type).
+  // `origin` distinguishes a DECLARED chain ('dependency' — a real zee-dep edge, a human's
+  // "after") from a manufactured one ('sequence' — sibling display order the CPM treats as
+  // finish→start, the backfill's default labelling). Measured on the fleet (2026-08-11): the
+  // omnibiz plan's union_edge is 322 'sequence' and 0 'dependency' — its "all critical" is the
+  // manufacture showing through, NOT a constraint the human declared. The chart labels the
+  // inference rather than suppressing it: `edge_counts` drives the plan banner, each edge
+  // carries its origin into the row's deps, and the chart draws the two differently.
   const edges = await q(
-    `SELECT from_id, to_id, type, lag FROM union_edge WHERE plan_version_id = $1`, [versionIdArg]);
+    `SELECT from_id, to_id, type, lag, origin FROM union_edge WHERE plan_version_id = $1`, [versionIdArg]);
+  const depEdges = edges.filter((e) => e.origin === 'dependency');
+  const hasDeclaredOrder = depEdges.length > 0;
+  const edge_counts = {
+    total: edges.length,
+    sequence: edges.length - depEdges.length,
+    dependency: depEdges.length,
+  };
 
   const nodeIds = tree.map((n) => n.id);
 
@@ -178,11 +192,14 @@ async function rowsForVersion(versionId, rootId, pv) {
     turnsByExec.get(t.execution_id).push({ ...t, gateway_requests: reqsByTurn.get(t.id) || [] });
   }
 
-  // deps by successor (leaf-level): a row lists the ids it waits on
+  // deps by successor (leaf-level): a row lists the edges it waits on, EACH WITH ITS ORIGIN.
+  // origin is the honesty: 'dependency' = a DECLARED chain (a real zee-dep edge, a human's
+  // "after"); 'sequence' = sibling display order the CPM schedules but nobody declared. The
+  // chart draws the two differently (dependency → arrowhead; sequence → dashed, no arrow).
   const depsBy = new Map();
   for (const e of edges) {
     if (!depsBy.has(e.to_id)) depsBy.set(e.to_id, []);
-    depsBy.get(e.to_id).push(e.from_id);
+    depsBy.get(e.to_id).push({ id: e.from_id, origin: e.origin });
   }
 
   // parent map + subtree leaf lists for ACTUAL/WAITING roll-up to containers.
@@ -246,6 +263,10 @@ async function rowsForVersion(versionId, rootId, pv) {
       is_atom: !!(s && s.is_atom),
       duration_hours: s && s.duration ? intervalHours(s.duration) : null,
       duration_source,
+      // CRITICAL IS WHAT THE CPM COMPUTED — truthful, not suppressed. The chart is the honesty
+      // layer: edge_counts + the origin-carrying deps tell the reader WHICH edges the criticality
+      // rests on (declared chains vs board-position inference), and the plan banner says the
+      // ratio aloud. A consumer that wants the raw CPM still gets it.
       critical: !!(s && s.critical),
       slack: s && s.slack ? s.slack : null,
       // PLANNED (CPM). Atoms carry their own earliest window; containers the subtree span.
@@ -281,7 +302,7 @@ async function rowsForVersion(versionId, rootId, pv) {
       }
     : null;
 
-  return { rows, span };
+  return { rows, span, has_declared_order: hasDeclaredOrder, edge_counts };
 }
 
 const iso = (d) => (d instanceof Date ? d.toISOString() : String(d));
