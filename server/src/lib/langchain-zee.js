@@ -226,13 +226,21 @@ export const MAX_TOOL_ITERATIONS = 8;
 export const TOOL_RESULT_CAP = 4000;
 
 export function buildTool(desc, ctx) {
+  // langchain's `tool(func, fields)` — the NAME and SCHEMA live in the SECOND argument (fields).
+  // The first argument is the func. Passing the schema first (the earlier bug) made the helper
+  // ignore the {name, description} object and emit a tool with NO name — which the REAL provider
+  // rejects ("tools[0]: missing field 'name'"), while the mock upstream (which never validates the
+  // tools array) happily accepted it. Found by the end-to-end exercise (2026-08-11).
   return tool(
-    desc.schema || { type: 'object', properties: {}, required: [] },
     async (args) => {
       const out = await desc.run(ctx.xell, args || {});
       return typeof out === 'string' ? out : JSON.stringify(out);
     },
-    { name: desc.name, description: desc.description },
+    {
+      name: desc.name,
+      description: desc.description,
+      schema: desc.schema || { type: 'object', properties: {}, required: [] },
+    },
   );
 }
 
