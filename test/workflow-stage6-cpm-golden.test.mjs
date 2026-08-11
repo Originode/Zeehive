@@ -24,11 +24,16 @@
 // file) and run this test in CAPTURE mode — the committed fixture must be written
 // byte-identical; then restore 189's function and the COMPARE mode must pass.
 //
-// TIMING ASSERTION: the same 354-node plan must complete in under CPMS_TARGET_MS (1s).
-// The pre-optimisation function took ~10.7s on a sandbox and timed out at 120s on the
-// live meta-DB for the real 354-node plan; the optimised function measures ~60ms on this
-// sandbox. 1s is a ~15x margin over the measured optimised time, far below the old
-// runtime, so a silent regression back to the per-node view rebuilds fails loudly.
+// TIMING ASSERTION: the same 354-node plan must complete in under CPMS_TARGET_MS (5s).
+// The threshold is set from the REAL FLEET verification of migration 189, not the sandbox:
+// on the live meta-DB, the real 354-node / 320-edge plan (ccc2b1fa) measures 1.1-1.9s warm
+// and ~3.6s cold with the optimised function (union_edge alone is ~330ms there), while the
+// SAME-SHAPE synthetic fixture in this test measures ~60ms on a near-empty sandbox. The
+// pre-optimisation function exceeded 120s on that real plan. 5s covers the observed cold
+// cost with headroom and is still ~25x below the pre-change runtime, so a silent regression
+// back to the per-node view rebuilds fails loudly. Do NOT tighten this from a sandbox
+// measurement — the real plan is the reference. The output comparison (the byte-identical
+// golden diff) is the valuable half and must never be widened.
 //
 // The seed deliberately includes the plan shape that used to be slowest: a large sequence
 // container (67 children — the sibling-order expansion is where the view's LATERAL leaf
@@ -46,7 +51,10 @@ if (!url) { console.error('DATABASE_URL required'); process.exit(2); }
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = resolve(here, 'fixtures', 'workflow-stage6-cpm-golden.json');
 const CAPTURE = process.argv.includes('--capture');
-const CPMS_TARGET_MS = 1000;
+// 5s: the real 354-node plan measures 1.1-1.9s warm / ~3.6s cold on the fleet meta-DB
+// (verified after 189 shipped); the pre-change function timed out >120s on it. Headroom
+// for the cold run, still ~25x below the old runtime so a regression fails loudly.
+const CPMS_TARGET_MS = 5000;
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
