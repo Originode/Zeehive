@@ -783,9 +783,12 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
   const devSiteId = devSite?.id || null;
   // A machine row with no host_ip used to produce literal "http://null:PORT" URLs — a URL the
-  // health prober can never answer. localhost is always true for same-machine process roles and
-  // harmless as a fallback elsewhere.
-  const urlHost = devHost || 'localhost';
+  // health prober can never answer. For a CONTAINERIZED queenzee whose host-machine row carries
+  // no host_ip, 'localhost' is wrong for every consumer (the queenzee container's own loopback,
+  // the cage's own loopback — neither is the host's published ports); host.docker.internal is
+  // what both actually reach the host on. The host era keeps 'localhost' (true there).
+  const urlHost = devHost
+    || (devCtx === queenzeeHostCtx() && existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost');
   const url = `http://${urlHost}:${ports.webPort}`;
 
   // A xell's app tier must never reach across docker contexts for its database, so a machine
@@ -957,6 +960,28 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
          VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10) RETURNING id`,
         [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort, connRef,
          xell.id, devSiteId, mode === 'real' ? 'up' : 'unknown']);
+      await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
+    } else if (coupling === 'db-isolated' && project.manifest?.roles?.db?.service) {
+      // COMPOSE-era per-xell db (compose-authorship decision record): the db service comes up
+      // WITH the generated compose stack (first `zee build`), so nothing is docker-run here —
+      // but the ROW must exist now: it is where the cage's DATABASE_URL comes from (bindingFor
+      // / .zeehive.env), and the matrix/reaper track the container through it. conn_ref is
+      // ALWAYS the TCP form: the spin stack has its own compose network (not zee-hive-net), so
+      // a container-name DSN would resolve for nobody — the published host port is the door,
+      // on whatever machine the stack runs.
+      const nmDb = namingFor(project, 'db', slug);
+      const mdb = project.manifest?.db || {};
+      const dbName = mdb.name || project.db_name || 'app';
+      const dbUser = mdb.user || project.db_user || 'postgres';
+      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
+      const { rows: [dbc] } = await client.query(
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,compose_project,compose_file,owner_xell_id,site_id,health)
+         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11,'down') RETURNING id`,
+        [projectId, nmDb.container, dbImage, devCtx, urlHost, dbPort,
+         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`,
+         namingFor(project, 'db', slug).composeProject, project.compose_spinoff,
+         xell.id, devSiteId]);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
     }
 

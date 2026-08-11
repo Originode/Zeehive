@@ -1,8 +1,12 @@
 # zeehive.yml — ZEEHIVE is a project of ZEEHIVE (docs/deploy-topology-spec.md §6).
-# The orchestrator's own shape: server + web run as LOCAL PROCESSES (runner: process — health is
-# probed by URL, not docker ps); only databases are containers. A Zeehive xell gets its own
-# per-xell meta-DB container plus the safety env below, so a nested queenzee can never touch
-# real state (§6.2).
+# The orchestrator's own shape, CONTAINERIZED spinoffs (compose-authorship decision record):
+# a Zeehive xell's app tier is a per-xell compose stack — nested queenzee + web + its own
+# meta-DB — generated into docker-compose.spinoff.yml by ZEEHIVE itself (lib/compose-gen.js;
+# the file is marked GENERATED and is ZEEHIVE's to regenerate). Containerized spinoffs are what
+# makes Zeehive xells PLACEABLE on other machines: the same generated compose runs on any
+# daemon via docker --context, and WHERE it runs stays meta-DB data (machine/machine_pool),
+# never file content. The §6.2 safety env below is baked into the generated compose too, so a
+# nested queenzee is safe even outside the harness.
 version: 1
 project: zeehive
 
@@ -13,14 +17,16 @@ env:
 
 tiers:
   prod:
-    compose: docker-compose.yml          # the pinned meta-DB only; server/web are processes
+    compose: docker-compose.yml          # the pinned meta-DB only; prod server/web ship via docker/zeehive/
   spinoff:
-    runner: process
+    compose: docker-compose.spinoff.yml  # GENERATED — see header comment in the file itself
     ports:
-      server: { env: PORT, base: 4800, mod: 90 }
-      webapp: { env: ZEEHIVE_WEB_PORT, base: 5300, mod: 90 }
-    # Safety defaults every Zeehive xell inherits via .zeehive.env — a nested queenzee is a
-    # subject under test, not a manager: it provisions nothing real and reaps nothing real.
+      server: { env: PORT, base: 4800, mod: 90, internal: 4700 }
+      webapp: { env: ZEEHIVE_WEB_PORT, base: 5300, mod: 90, internal: 5180 }
+      db:     { base: 5500, mod: 90, internal: 5432 }
+    # Safety defaults every Zeehive xell inherits — via .zeehive.env for the cage, and baked
+    # into the generated compose for the containers: a nested queenzee is a subject under
+    # test, not a manager: it provisions nothing real and reaps nothing real.
     env:
       BUILD_MODE: simulate
       PROVISION_MODE: simulate
@@ -29,9 +35,13 @@ tiers:
       POOL_TARGET_READY: "0"
 
 roles:
-  server: { service: server, buildable: false, runner: process, start: "npm run server" }
-  webapp: { service: web, buildable: false, runner: process, start: "npm run web" }
-  db:     { service: db, buildable: false }
+  # service names in a project-OWNED compose (docker-compose.yml for prod); the GENERATED
+  # spinoff compose names services by ROLE (build-container.sh contract). dockerfile/build_args
+  # feed the generator.
+  server: { service: server, buildable: true, dockerfile: docker/zeehive/Dockerfile.server }
+  webapp: { service: web, buildable: true, dockerfile: docker/zeehive/Dockerfile.web,
+            build_args: { ZEEHIVE_API_UPSTREAM: "server:4700" } }
+  db:     { service: db, buildable: false, image: postgres:17-alpine }
 
 naming:
   container: { db: "zeehive_db_spin_{slug}" }

@@ -17,6 +17,7 @@ import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
          remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
+import { generateSpinoffCompose, writeGeneratedCompose } from './compose-gen.js';
 import { loadManifest, projectDefaultsFromManifest, draftManifest, draftManifestFromKnobs,
          planComposeOnboarding, manifestHash, parseManifest, listComposeFiles,
          detectComposeSuggestions } from './manifest.js';
@@ -419,6 +420,25 @@ export async function getProjectManifest(id) {
       : { found: false },
     drift: repo.found ? repo.hash !== p.manifest_hash : false,
   };
+}
+
+// Generate (and optionally write) the project's SPINOFF COMPOSE from its manifest — the
+// compose-authorship model (docs/compose-authorship-decision-record.md): the compose file is a
+// PROJECTION ZEEHIVE authors, marked GENERATED, standalone-runnable, and only ever written over
+// a file carrying the marker — a project's own (onboarded) compose is never touched. Machine
+// facts never appear in the output; placement stays meta-DB data.
+export async function generateProjectCompose(id, { write = false } = {}) {
+  const p = await one(`SELECT id, name, repo_root, manifest, compose_spinoff FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  const repo = loadManifest(p.repo_root);
+  const manifest = (repo.found && repo.manifest) ? repo.manifest : p.manifest;
+  if (!manifest) throw new Error('no manifest (repo zeehive.yml or cached) to generate from');
+  const file = manifest.tiers?.spinoff?.compose || p.compose_spinoff || 'docker-compose.spinoff.yml';
+  const { yaml } = generateSpinoffCompose({ name: p.name, manifest });
+  if (!write) return { file, yaml, wrote: false };
+  const r = writeGeneratedCompose(p.repo_root, file, yaml);
+  if (r.wrote) logline('projects', `generated ${file} for ${p.name} (compose-authorship projection)`);
+  return { file, yaml, ...r };
 }
 
 // Re-read the repo's zeehive.yml and re-apply its declared fields to the row. Only the fields the

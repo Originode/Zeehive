@@ -14,5 +14,12 @@ RUN npm --workspace web run build
 
 FROM nginx:alpine
 COPY docker/zeehive/nginx-web.conf /etc/nginx/conf.d/default.conf
+# WHERE /api lives. Default = the prod shape (queenzee on the host / sibling container reached
+# via the host gateway) — an argless build is byte-identical to before this ARG existed. The
+# GENERATED spinoff compose overrides it to its own sibling server service ("server:4700"), so
+# a per-xell webapp talks to ITS OWN nested queenzee wherever the stack runs — including a
+# remote machine, where host.docker.internal:4700 would name the wrong (or no) API.
+ARG ZEEHIVE_API_UPSTREAM=host.docker.internal:4700
+RUN sed -i "s|host\.docker\.internal:4700|${ZEEHIVE_API_UPSTREAM}|g" /etc/nginx/conf.d/default.conf
 COPY --from=build /src/web/dist /usr/share/nginx/html
 EXPOSE 5180
