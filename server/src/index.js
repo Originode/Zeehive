@@ -60,8 +60,12 @@ app.use(express.json({ limit: '30mb' }));
 // permissive CORS for the local Vite dev app + localhost hooks
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  // Authorization + PATCH/DELETE are here for the EXTERNAL ticketing API (/api/ext/v1, migration
+  // 190): an integration that calls it from a browser sends a bearer key and PATCHes its ticket,
+  // and a preflight that omits either fails the call with no server-side trace at all. It grants
+  // nothing — every /ext/v1 route authenticates the key itself.
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Zeehive-Api-Key');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });

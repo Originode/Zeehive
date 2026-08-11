@@ -18,6 +18,7 @@ import {
   previewProjectDoc,
   getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
   getWireguard, mintWireguardPeer, setWireguardEndpoint,
+  getProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -371,6 +372,7 @@ const SETUP_TABS = [
   { key: 'docs', label: 'Docs', gates: [] },
   { key: 'env', label: 'Environments', gates: [] },
   { key: 'providers', label: 'Providers', gates: [] },
+  { key: 'ticketapi', label: 'Ticket API', gates: [] },
   { key: 'pool', label: 'Pool', gates: ['pool'] },
   { key: 'danger', label: '⚠ Danger', gates: [], danger: true },
 ];
@@ -417,6 +419,7 @@ function EditSections({ project, onChanged, onProject }) {
       {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
+      {tab === 'ticketapi' && <ApiKeysSection project={project} run={run} busy={busy} />}
       {tab === 'pool' && <SpawnSection project={project} run={run} />}
       {tab === 'danger' && <>
         <XourceSection project={project} onChanged={() => { reload(); onChanged?.(); }} />
@@ -2173,6 +2176,100 @@ function TokensSection({ project, run, busy }) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// ── ticket API keys: the credential a DEPLOYED project files tickets with ─────
+// The outside of the work tracker (docs/ticketing-api.md). A key names ONE project, so a deployed
+// system — omnibiz, say — can only ever file into its own board; the console is where a human mints
+// one and hands it over. The plaintext exists ONCE, in the answer to the mint: the panel shows it
+// until the human dismisses it, and after that every read is a masked hint (lib/project-api-keys.js).
+function ApiKeysSection({ project, run, busy }) {
+  const [keys, setKeys] = useState(null);
+  const [label, setLabel] = useState('');
+  const [minted, setMinted] = useState(null);   // the plaintext, shown once
+  const [copied, setCopied] = useState(false);
+  const load = useCallback(() => getProjectApiKeys(project.id).then(setKeys).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const mint = () => run(async () => {
+    const out = await createProjectApiKey(project.id, label.trim());
+    setMinted(out); setLabel(''); await load();
+  });
+  const copy = async (text) => {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); }
+    catch { /* clipboard denied — the key is visible to select anyway */ }
+  };
+  // Revoke is the normal end of a key. Delete is offered only for one that filed nothing; the
+  // server refuses the rest (a ticket must keep saying where it came from), so this asks first.
+  const revoke = async (k) => {
+    if (await showConfirm(`Revoke "${k.label}"?\n\nThe next call with this key is refused. Anything it already filed stays on the board.`,
+                          { variant: 'danger', okLabel: 'Revoke' })) {
+      run(async () => { await revokeProjectApiKey(project.id, k.id); await load(); });
+    }
+  };
+  const drop = async (k) => {
+    if (await showConfirm(`Delete "${k.label}"?\n\nIt filed nothing, so nothing loses its provenance.`,
+                          { variant: 'danger', okLabel: 'Delete' })) {
+      run(async () => { await deleteProjectApiKey(project.id, k.id); await load(); });
+    }
+  };
+
+  const live = (keys || []).filter((k) => !k.revoked);
+  return (
+    <div className="setup-sec">
+      <h3>Ticketing API keys <span className="pc">(what a deployed {project.name} presents to <span className="mono">/api/ext/v1</span> to file, monitor and update tickets on THIS board — see docs/ticketing-api.md)</span></h3>
+      <div className="pc" style={{ marginBottom: 8 }}>
+        A key names one project and nothing else: the caller never sends a project id, so it cannot
+        reach another board. Tickets filed through it are ordinary tickets — break them down and
+        assign zees exactly as usual.
+      </div>
+
+      {minted && (
+        <div className="siteed" data-testid="api-key-minted">
+          <div className="setup-row"><span className="gate g-pass">✓ minted “{minted.label}”</span>
+            <span className="pc">copy it now — this is the only time it is shown</span></div>
+          <div className="setup-row">
+            <input className="mono" readOnly value={minted.key} onFocus={(e) => e.target.select()} />
+            <button type="button" onClick={() => copy(minted.key)}>{copied ? '✓ copied' : '⧉ copy'}</button>
+            <button type="button" className="ghost" onClick={() => setMinted(null)}>done</button>
+          </div>
+          <div className="pc">Store it as a secret in the deployed project, then:</div>
+          <input className="mono" readOnly onFocus={(e) => e.target.select()}
+                 value={`curl -X POST $ZEEHIVE/api/ext/v1/tickets -H "Authorization: Bearer ${minted.key}" -H "Content-Type: application/json" -d '{"title":"…","external_ref":"YOUR-ID"}'`} />
+        </div>
+      )}
+
+      {(keys || []).map((k) => (
+        <div className="setup-row" key={k.id} data-testid="api-key-row">
+          {k.revoked ? (
+            <span className="gate g-warn" title={k.revoked_by ? `revoked by ${k.revoked_by}` : 'revoked'}>
+              ⏸ <b>{k.label}</b> · <span className="mono">{k.key_hint}</span> · revoked
+            </span>
+          ) : (
+            <span className="gate g-pass" title={(k.scopes || []).join(', ')}>
+              ✓ <b>{k.label}</b> · <span className="mono">{k.key_hint}</span>
+              {k.last_used_at ? ` · used ${new Date(k.last_used_at).toLocaleDateString()}` : ' · never used'}
+              {k.tickets_filed ? ` · ${k.tickets_filed} ticket${k.tickets_filed === 1 ? '' : 's'} filed` : ''}
+            </span>
+          )}
+          {!k.revoked && <button type="button" className="projpop-del" disabled={busy}
+                                 title="Revoke this key — the next call with it is refused"
+                                 onClick={() => revoke(k)}>⏸</button>}
+          {!k.tickets_filed && <button type="button" className="projpop-del" disabled={busy}
+                                       title="Delete this key (it filed nothing)" onClick={() => drop(k)}>🗑</button>}
+        </div>
+      ))}
+      {keys && !keys.length && <div className="pc">No keys yet — nothing outside ZEEHIVE can file a ticket here.</div>}
+
+      <div className="setup-row" style={{ marginTop: 8 }}>
+        <input value={label} placeholder="label — who holds it, e.g. “omnibiz helpdesk”"
+               onChange={(e) => setLabel(e.target.value)}
+               onKeyDown={(e) => { if (e.key === 'Enter' && label.trim()) { e.preventDefault(); mint(); } }} />
+        <button type="button" disabled={busy || !label.trim()} onClick={mint}>＋ Mint a key</button>
+      </div>
+      {live.length > 0 && <div className="pc">Read/write on tickets. Revoke a key the moment it leaks — a revoked key is refused on its next call.</div>}
     </div>
   );
 }

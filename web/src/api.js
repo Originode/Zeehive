@@ -398,6 +398,18 @@ export const pauseProviderAccount = (projectId, accountId, reason) =>
     { reason: reason || undefined });
 export const resumeProviderAccount = (projectId, accountId) =>
   siteCall(`/api/projects/${projectId}/tokens/account/${accountId}/resume`, 'POST');
+// ── project API keys — the credential a DEPLOYED project presents to /api/ext/v1 (migration 190).
+// The plaintext key comes back ONCE, on create; every later read carries key_hint alone, so the
+// console must show it at mint time or never (lib/project-api-keys.js). ─────────
+export const getProjectApiKeys = (projectId) =>
+  fetch(`/api/projects/${projectId}/api-keys`).then((r) => jorreject(r, "could not load the API keys"));
+export const createProjectApiKey = (projectId, label, scopes) =>
+  siteCall(`/api/projects/${projectId}/api-keys`, "POST", { label, scopes: scopes || undefined });
+export const revokeProjectApiKey = (projectId, keyId) =>
+  siteCall(`/api/projects/${projectId}/api-keys/${keyId}/revoke`, "POST");
+export const deleteProjectApiKey = (projectId, keyId) =>
+  siteCall(`/api/projects/${projectId}/api-keys/${keyId}`, "DELETE");
+
 export const putProviderToken = (projectId, provider, token) =>
   siteCall(`/api/projects/${projectId}/tokens/${provider}`, 'PUT', { token });
 export const deleteProviderToken = (projectId, provider) =>

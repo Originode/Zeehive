@@ -104,7 +104,10 @@ export async function modelNodeForWorkItem(workItemId) {
 // 1); the API convention is 0-based, so readers subtract 1.
 //
 // `rootItemId` is a work_item id (the API's identity); when given, the walk starts at that item's
-// node. Otherwise `projectId` resolves the project's plan root.
+// node. Otherwise `projectId` resolves the project's WORK ITEM tree root — the root work_item node
+// (stable_key='work_item:<root item id>'), NOT the project node (stable_key='project:<project_id>'
+// — the model's plan root, which the board/gantt/list must skip: a project node has no work_item
+// row to join to).
 export async function modelTree({ projectId, rootItemId } = {}) {
   const params = [];
   let rootCte;
@@ -116,22 +119,16 @@ export async function modelTree({ projectId, rootItemId } = {}) {
       )`;
   } else {
     params.push(projectId);
-    // A PROJECT IS A WORK_NODE (migration 193): plan_version.root_node_id is now the PROJECT
-    // node (stable_key 'project:<id>'), not the root work_item's node. The work tracker's
-    // cards are WORK_ITEMs — a project node is not a card — so when (and only when) the root
-    // IS a project node, the walk starts at its first child (the root work_item), exactly
-    // where the pre-193 root sat. A pre-193 root (the root item itself) is unchanged.
     rootCte = `
       root AS (
-        SELECT CASE WHEN EXISTS (
-                 SELECT 1 FROM work_node pn
-                  WHERE pn.id = pv.root_node_id AND pn.stable_key LIKE 'project:%')
-           THEN (SELECT c.id FROM work_node c
-                  WHERE c.parent_id = pv.root_node_id ORDER BY c.sibling_rank LIMIT 1)
-           ELSE pv.root_node_id END AS root_node_id
-        FROM plan p JOIN plan_version pv ON pv.plan_id = p.id
-        WHERE p.project_id = $1 AND pv.root_node_id IS NOT NULL
-        ORDER BY p.created_at DESC, pv.version DESC LIMIT 1
+        SELECT wn.id AS root_node_id
+        FROM work_item ri
+        JOIN work_node wn ON wn.stable_key = 'work_item:' || ri.id::text
+        JOIN plan_version pv ON pv.id = wn.plan_version_id
+        JOIN plan p ON p.id = pv.plan_id
+        WHERE ri.project_id = $1 AND ri.kind = 'project'
+        ORDER BY p.created_at DESC, pv.version DESC
+        LIMIT 1
       )`;
   }
   const rows = await q(`

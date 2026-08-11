@@ -61,11 +61,20 @@ function rankSql(order, id) {
   return `to_char((${val})::numeric + 1000000000, 'FM00000000000000000000.000000') || ':' || $${id}`;
 }
 
-// ── plan / plan_version / project node / root item node ─────────────────────────
-// Ensure a plan + plan_version exist for a project, and the PROJECT node (the plan's root,
-// stable_key 'project:<project_id>' — migration 193) with the project's ROOT work_item node
-// hanging beneath it. Returns the plan_version id and the PROJECT node id. Called on every
-// dual-write so a project created after the backfill materialises its plan on first write.
+// ── plan / plan_version / project root node ─────────────────────────────────────
+// Ensure a plan + plan_version exist for a project, and (lazily) that the project's ROOT
+// work_node (stable_key='project:<project_id>', kind container) exists. Returns the plan_version
+// id and the project root node id. Called on every dual-write so a project created after the
+// backfill materialises its plan on first write.
+//
+// THE PROJECT ROOT NODE — "a project is just a work_node": the project node is the version's
+// single root (parent NULL, plan_version.root_node_id), and the project's root work_item node
+// (stable_key='work_item:<root item id>') hangs under it. Migration 191 backfilled the existing
+// projects; this is the same shape for new ones. The ONE-ROOT SWAP below is the code mirror of
+// the migration's: when the root work_item node already exists as the version's root, the project
+// node is inserted as its child first (the version still has one root), the root work_item node is
+// re-parented under it, then the project node is made the root — never two parentless nodes at
+// once, so wn_one_root_per_version (166) is never violated.
 export async function ensurePlanVersion(db, projectId) {
   const project = await db.one(`SELECT id, name FROM project WHERE id=$1`, [projectId]);
   if (!project) throw bad(`project ${projectId} does not exist — cannot dual-write a work_node for it`);
@@ -86,98 +95,97 @@ export async function ensurePlanVersion(db, projectId) {
     pv = await db.one(`INSERT INTO plan_version (plan_id, version) VALUES ($1,1) RETURNING id`, [plan.id]);
   }
 
-  // The PROJECT node — the plan's root (stable_key 'project:<project_id>', migration 193).
-  let projectNode = await db.one(
-    `SELECT id FROM work_node WHERE plan_version_id=$1 AND stable_key='project:'||$2`, [pv.id, projectId]);
-  if (!projectNode) {
-    const rootItem = await db.one(
-      `SELECT id, title FROM work_item WHERE project_id=$1 AND kind='project' LIMIT 1`, [projectId]);
-    // Is the root-item node in THIS version? If it is, it is the version's root — the pre-193
-    // shape this function re-roots.
-    const rootItemNodeHere = rootItem ? await db.one(
-      `SELECT id FROM work_node WHERE plan_version_id=$1 AND stable_key='work_item:'||$2`, [pv.id, rootItem.id]) : null;
+  // The root work_item (created by the project trigger, 058) and its node, which hangs under the
+  // project node. Both may be missing on a project whose plan was only just materialised.
+  const rootItem = await db.one(
+    `SELECT * FROM work_item WHERE project_id=$1 AND kind='project' LIMIT 1`, [projectId]);
+  let rootNode = rootItem ? await db.one(
+    `SELECT id, parent_id, plan_version_id FROM work_node WHERE stable_key='work_item:'||$1`, [rootItem.id]) : null;
 
-    if (!rootItemNodeHere) {
-      // The root-item node is not in this version. If a FOREIGN root occupies the version (a
-      // plan a workflow test — or any other writer — authored), opening a second parentless
-      // node would violate wn_one_root_per_version, so open a NEW version and put the
-      // project's tree there — migration 185's rule: our tree gets a clean version, the
-      // foreign tree keeps its own untouched.
-      const foreignRoot = await db.one(
-        `SELECT id FROM work_node WHERE plan_version_id=$1 AND parent_id IS NULL`, [pv.id]);
-      if (foreignRoot) {
-        pv = await db.one(
-          `INSERT INTO plan_version (plan_id, version)
-           VALUES ($1, (SELECT COALESCE(max(version),0)+1 FROM plan_version WHERE plan_id=$1))
-           RETURNING id`, [plan.id]);
-      }
+  // The project's ROOT node: stable_key='project:<project_id>', kind container, parent NULL.
+  let projectNode = await db.one(`SELECT id FROM work_node WHERE stable_key='project:'||$1`, [projectId]);
+
+  if (!projectNode) {
+    // If the found plan_version already has a parentless node that is neither the project node
+    // nor the root work_item node (a plan a workflow test — or any other writer — authored before
+    // this project was dual-written), inserting a second parentless node would violate
+    // wn_one_root_per_version. Open a NEW version and put our tree there, leaving the foreign
+    // version untouched. Idempotent: on a re-run OUR node is already in this version, so no new
+    // version is opened.
+    const ourRootInVersion = rootNode ? (await db.one(
+      `SELECT id FROM work_node WHERE plan_version_id=$1 AND stable_key='work_item:'||$2`, [pv.id, rootItem.id])) : null;
+    const foreignRoot = !ourRootInVersion && (await db.one(
+      `SELECT id FROM work_node WHERE plan_version_id=$1 AND parent_id IS NULL`, [pv.id]));
+    if (foreignRoot) {
+      pv = await db.one(
+        `INSERT INTO plan_version (plan_id, version)
+         VALUES ($1, (SELECT COALESCE(max(version),0)+1 FROM plan_version WHERE plan_id=$1))
+         RETURNING id`, [plan.id]);
+    }
+
+    // Only the root work_item node that lives in THIS version can take part in the one-root swap.
+    // A root work_item node in an older version belongs to that version's tree — after opening a
+    // new version the new tree is empty, so the project node can be the root directly.
+    const rootInThisVersion = rootNode && rootNode.plan_version_id === pv.id ? rootNode : null;
+
+    if (rootInThisVersion) {
+      // ONE-ROOT SWAP (mirror of migration 191): the project node starts as a child of the root
+      // work_item node so the version never holds two parentless nodes; the root work_item node
+      // is re-parented under it; then the project node becomes the single root.
       projectNode = await db.one(
         `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, child_semantics, stable_key)
-         VALUES ($1,NULL,'root:'||$2,$3,'container','sequence','project:'||$4) RETURNING id`,
-        [pv.id, projectId, project.name, projectId]);
+         VALUES ($1, $2, ${rankSql(0, 4)}, $3, 'container', 'sequence', 'project:'||$4)
+         RETURNING id`,
+        [pv.id, rootInThisVersion.id, project.name, projectId]);
+      await db.q(`UPDATE work_node SET parent_id=$2 WHERE id=$1`, [rootInThisVersion.id, projectNode.id]);
+      await db.q(`UPDATE work_node SET parent_id=NULL WHERE id=$1`, [projectNode.id]);
     } else {
-      // Pre-193 shape: the root-item node is this version's root. Refuse if it is not — a
-      // foreign tree must not be silently re-rooted.
-      const currentRoot = await db.one(
-        `SELECT id FROM work_node WHERE plan_version_id=$1 AND parent_id IS NULL`, [pv.id]);
-      if (!currentRoot || currentRoot.id !== rootItemNodeHere.id) {
-        throw bad(`project ${projectId}: plan_version ${pv.id} has a root that is neither the `
-          + 'project node nor the root-item node — refusing to re-root a foreign tree');
-      }
-      // Re-root dance (migration 193): project node under the root item (sentinel rank, no
-      // real rank starts with '@') → re-parent the root item under it → lift the project node
-      // to the root. No work_node triggers fire, and this is inside the caller's transaction.
-      const created = await db.one(
+      // No root work_item node in this version — the version is empty (or just created); the
+      // project node can be the root directly.
+      projectNode = await db.one(
         `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, child_semantics, stable_key)
-         VALUES ($1,$2,'@pn:'||$3,$4,'container','sequence','project:'||$5) RETURNING id`,
-        [pv.id, currentRoot.id, projectId, project.name, projectId]);
-      await db.q(`UPDATE work_node SET parent_id=$1 WHERE id=$2`, [created.id, rootItemNodeHere.id]);
-      await db.q(`UPDATE work_node SET parent_id=NULL, sibling_rank='root:'||$1 WHERE id=$2`,
-        [created.id, created.id]);
-      projectNode = created;
+         VALUES ($1, NULL, ${rankSql(0, 3)}, $2, 'container', 'sequence', 'project:'||$3)
+         RETURNING id`,
+        [pv.id, project.name, projectId]);
     }
     await db.q(`UPDATE plan_version SET root_node_id=$2 WHERE id=$1 AND root_node_id IS DISTINCT FROM $2`,
       [pv.id, projectNode.id]);
   }
 
-  // The ROOT ITEM node (058's singleton) — a CHILD of the project node, IN THE CURRENT
-  // VERSION. The project's whole work_item tree hangs beneath it, so the plan root → project
-  // node → root item → … chain is what the gantt starts from ("a project is just a
-  // work_node"). Version-scoped: a node with the same stable_key in an OLD version is a
-  // stale snapshot and must not be re-parented across versions.
-  const rootItem = await db.one(
-    `SELECT * FROM work_item WHERE project_id=$1 AND kind='project' LIMIT 1`, [projectId]);
+  // The root work_item node hangs UNDER the project node (lazily created if missing in this
+  // version, re-parented if a pre-project-node writer left it as this version's root).
   if (rootItem) {
-    const rootItemNode = await db.one(
-      `SELECT id FROM work_node WHERE plan_version_id=$1 AND stable_key='work_item:'||$2`, [pv.id, rootItem.id]);
-    if (!rootItemNode) {
+    const rootInThisVersion = rootNode && rootNode.plan_version_id === pv.id ? rootNode : null;
+    if (!rootInThisVersion) {
       const est = rootItem.estimate_hours == null ? null : `${rootItem.estimate_hours * 3600000} milliseconds`;
-      await db.one(
+      rootNode = await db.one(
         `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, child_semantics, estimate, stable_key)
          VALUES ($1, $2, ${rankSql(rootItem.sort_order, 6)}, $3, 'container', $4::child_semantics, $5, 'work_item:'||$6)
          RETURNING id`,
         [pv.id, projectNode.id, rootItem.title, SEQ, est, rootItem.id]);
-    } else {
-      await db.q(`UPDATE work_node SET parent_id=$1 WHERE id=$2 AND parent_id IS DISTINCT FROM $1`,
-        [projectNode.id, rootItemNode.id]);
+    } else if (rootInThisVersion.parent_id !== projectNode.id) {
+      // Re-parent under the project node (idempotent — a no-op when already correct).
+      await db.q(`UPDATE work_node SET parent_id=$2 WHERE id=$1`, [rootInThisVersion.id, projectNode.id]);
     }
   }
 
-  return { planVersionId: pv.id, rootNodeId: projectNode?.id || null };
+  return { planVersionId: pv.id, rootNodeId: projectNode.id };
 }
 
-// A PROJECT IS A WORK_NODE (migration 193) — ensure the project's plan root node exists and
-// carries the project's current name. Called from projects.js on create/rename so a project
-// has its node from birth (the root work_item node hangs beneath it; the dual-write's
-// syncWorkNode keeps that in step).
+// ── project dual-write (create / rename) ─────────────────────────────────────────
+// Maintain the project's ROOT node in step with the `project` row. Creating or renaming a project
+// calls this in the same transaction (projects.js) — the project row is the attribute annex, the
+// node is the model half, exactly as work_item ↔ work_node. The node's name follows the project
+// name; the plan/plan_version/root work_item node are materialised lazily on first need.
 export async function syncProjectNode(db, projectId) {
   const project = await db.one(`SELECT id, name FROM project WHERE id=$1`, [projectId]);
-  if (!project) return null;
-  const { rootNodeId } = await ensurePlanVersion(db, projectId);
-  if (!rootNodeId) return null;
-  await db.q(`UPDATE work_node SET name=$2, updated_at=now() WHERE id=$1 AND name IS DISTINCT FROM $2`,
-    [rootNodeId, project.name]);
-  return { projectNodeId: rootNodeId };
+  if (!project) throw bad(`project ${projectId} does not exist — cannot dual-write its root work_node`);
+  const { planVersionId, rootNodeId } = await ensurePlanVersion(db, projectId);
+  if (rootNodeId) {
+    await db.q(`UPDATE work_node SET name=$2, updated_at=now() WHERE id=$1 AND name IS DISTINCT FROM $2`,
+      [rootNodeId, project.name]);
+  }
+  return { planVersionId, rootNodeId };
 }
 
 // Resolve the work_node id for a work_item id (stable_key lookup).
@@ -199,43 +207,37 @@ export async function syncWorkNode(db, row) {
   let existing = await db.one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [row.id]);
   const est = row.estimate_hours == null ? null : `${row.estimate_hours * 3600000} milliseconds`;
 
-  // The plan → project-node → root-item chain must exist before ANY work_item node can be
-  // placed: the project node is the plan's root, and the root work_item hangs beneath it.
-  const { planVersionId, rootNodeId: projectNodeId } = await ensurePlanVersion(db, row.project_id);
-
-  // ensurePlanVersion may have just created THIS item's node (the root work_item) — re-check
-  // so a direct syncWorkNode on the root item takes the upsert path, never a duplicate insert.
-  if (!existing) existing = await db.one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [row.id]);
-
   if (!existing) {
-    // the parent chain: a project root hangs under the PROJECT node; anything else under its
-    // parent item's node (recursively ensured).
-    let parentNodeId = null;
-    if (row.kind === 'project') {
-      parentNodeId = projectNodeId;
-    } else if (row.parent_id) {
-      const parent = await db.one(`SELECT * FROM work_item WHERE id=$1`, [row.parent_id]);
-      if (parent) parentNodeId = await syncWorkNode(db, parent);
+    // ensure plan_version (+ lazy project root node) and the parent chain
+    const { planVersionId } = await ensurePlanVersion(db, row.project_id);
+    // ensurePlanVersion materialises the project root work_item node — re-check so we don't
+    // insert a duplicate of a node it just created (the project root's own sync).
+    existing = await db.one(`SELECT id FROM work_node WHERE stable_key='work_item:'||$1`, [row.id]);
+    if (!existing) {
+      let parentNodeId = null;
+      if (row.kind !== 'project' && row.parent_id) {
+        const parent = await db.one(`SELECT * FROM work_item WHERE id=$1`, [row.parent_id]);
+        if (parent) parentNodeId = await syncWorkNode(db, parent);
+      }
+      // node_kind from shape: a project root is always a container; otherwise container iff it
+      // currently has at least one child work_item.
+      const isContainer = row.kind === 'project' || !!(await hasChildren(db, row.id));
+      const node = await db.one(
+        `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, child_semantics, estimate, stable_key)
+         VALUES ($1, $2, ${rankSql(row.sort_order, 7)}, $3, $4::node_kind, $5::child_semantics, $6, 'work_item:'||$7)
+         RETURNING id`,
+        [planVersionId, parentNodeId, row.title, isContainer ? 'container' : 'action',
+         isContainer ? SEQ : null, est, row.id]);
+      return node.id;
     }
-    // node_kind from shape: a project root is always a container; otherwise container iff it
-    // currently has at least one child work_item.
-    const isContainer = row.kind === 'project' || !!(await hasChildren(db, row.id));
-    const node = await db.one(
-      `INSERT INTO work_node (plan_version_id, parent_id, sibling_rank, name, kind, child_semantics, estimate, stable_key)
-       VALUES ($1, $2, ${rankSql(row.sort_order, 7)}, $3, $4::node_kind, $5::child_semantics, $6, 'work_item:'||$7)
-       RETURNING id`,
-      [planVersionId, parentNodeId, row.title, isContainer ? 'container' : 'action',
-       isContainer ? SEQ : null, est, row.id]);
-    return node.id;
   }
 
   // Upsert path: keep the node in step with the work_item row. child_semantics PRESERVES
   // 'freeform' once set (a dependency LCA — see syncDependency); a sequence container stays
   // sequence unless a dep flips it.
   const isContainer = row.kind === 'project' || !!(await hasChildren(db, row.id));
-  const parentNodeId = row.kind === 'project'
-    ? projectNodeId
-    : (row.parent_id ? await nodeIdFor(db, row.parent_id) : null);
+  const parentNodeId = (row.kind !== 'project' && row.parent_id)
+    ? await nodeIdFor(db, row.parent_id) : null;
   const node = await db.one(
     `UPDATE work_node SET
        parent_id = COALESCE($1, parent_id),
