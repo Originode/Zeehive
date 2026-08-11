@@ -35,6 +35,7 @@
 import { q, one, pool } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
+import { syncExecutionState } from './work-node-sync.js';
 import {
   getWorkItem, listWorkItems, flattenTree, liveZees, logWorkEvent, inTransaction, dbRunner, assertId,
 } from './work-items.js';
@@ -170,6 +171,9 @@ export async function assignWorkItem(id, { xell_id, actor = 'human@console' } = 
     }
     if (moved) {
       await db.q(`UPDATE work_item SET status='assigned' WHERE id=$1`, [item.id]);
+      // REHAB 1/4 DUAL-WRITE: queued → assigned is the item leaving the not-started state —
+      // write the execution (creating it if this is the first sign of work).
+      await syncExecutionState(db, item.id, 'assigned');
       await logWorkEvent(item.id, 'status', { from: item.status, to: 'assigned', actor,
         detail: { because: `assigned to ${xell.slug}` } }, { client });
     }
@@ -480,6 +484,8 @@ export async function reportItemStatus(id, { status = null, progress = null, not
     const db = dbRunner(client);
     if (moved) {
       await db.q(`UPDATE work_item SET status=$2 WHERE id=$1`, [item.id, status]);
+      // REHAB 1/4 DUAL-WRITE: the reported status is the LIFECYCLE side — write the execution.
+      await syncExecutionState(db, item.id, status);
       await logWorkEvent(item.id, 'status', { from: item.status, to: status, actor,
         detail: note ? { note } : null }, { client });
     }

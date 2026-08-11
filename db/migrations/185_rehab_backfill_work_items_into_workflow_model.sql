@@ -57,6 +57,35 @@
 CREATE UNIQUE INDEX IF NOT EXISTS wn_stable_key_version_uniq
   ON work_node (plan_version_id, stable_key);
 
+-- ── runs follow their plan_version when a project is deleted ────────────────────
+-- 177 created run.plan_version_id with NO ON DELETE CASCADE ("history is preserved on purpose").
+-- The rehab's dual-write changes the bargain: from this migration on, EVERY project that works an
+-- item accumulates run/execution rows, and the legacy model cascades a project's deletion to ALL
+-- of its work (work_item, work_item_event, work_item_dep). Leaving runs RESTRICT would make the
+-- most ordinary cleanup — delete a project — fail with an FK violation the moment a single item
+-- changed status. So runs now follow the plan_version's deletion, matching the legacy cascade.
+DO $$ BEGIN
+  ALTER TABLE run DROP CONSTRAINT run_plan_version_id_fkey;
+EXCEPTION WHEN undefined_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE run ADD CONSTRAINT run_plan_version_id_fkey
+    FOREIGN KEY (plan_version_id) REFERENCES plan_version(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- execution.work_node_id is RESTRICT (a node with executions cannot be deleted), which is right
+-- for a DIRECT delete but breaks the multi-path cascade a project deletion now triggers: the
+-- project cascade removes plan_version → run (→ execution) AND plan_version → work_node in ONE
+-- statement, and an immediate FK would refuse the work_node half while the execution half is still
+-- mid-cascade. DEFERRABLE INITIALLY DEFERRED moves the check to statement end — the RESTRICT
+-- semantics for a direct single-row delete are unchanged, and the interleaved cascade passes.
+DO $$ BEGIN
+  ALTER TABLE execution DROP CONSTRAINT execution_work_node_id_fkey;
+EXCEPTION WHEN undefined_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE execution ADD CONSTRAINT execution_work_node_id_fkey
+    FOREIGN KEY (work_node_id) REFERENCES work_node(id) DEFERRABLE INITIALLY DEFERRED;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 -- ── PART 1: work_node backfill (plans, plan_versions, the whole tree) ──────────
 DO $backfill$
 DECLARE
