@@ -2588,7 +2588,9 @@ router.post('/work-items/:id/deps', async (req, res) => {
     // well-formed id that names nothing is a 404. Without the check the existence probe below
     // hands postgres a bad uuid and the caller gets a cast error instead of either answer.
     assertId(req.params.id);
-    const item = await one(`SELECT id FROM work_item WHERE id=$1`, [req.params.id]);
+    // REHAB 2/4 — the existence probe is now the MODEL's: a work item exists when its work_node
+    // does (stable_key = 'work_item:<id>'). The dual-write keeps the two in step.
+    const item = await one(`SELECT id FROM work_node WHERE stable_key = 'work_item:' || $1::text`, [req.params.id]);
     if (!item) return res.status(404).json({ error: 'no such work item' });
     res.status(201).json(await addDep(req.params.id, req.body?.depends_on_id, { actor: req.body?.actor || null }));
   } catch (err) { workErr(res, err); }

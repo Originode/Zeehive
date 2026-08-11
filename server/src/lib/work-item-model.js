@@ -18,8 +18,28 @@
 //   dependency edges (dependency)           closed_at, id (the API's identity — the
 //   actuals (execution.started_at/          console PATCHes work_items, so the model
 //     finished_at)                          read MUST return work_item ids)
-//   "who has it" (lease → entity)          the exact stored status (see the status
-//                                           mapping below)
+//                                          the exact stored status (see the status
+//                                          mapping below)
+//
+// ── WHAT REHAB 2/4 RE-POINTED, AND WHAT (HONESTLY) STAYS ON WORK_ITEM ─────────
+// Re-pointed at the model (the PLAN SHAPE): lib/work-items.js listWorkItems, getWorkItem,
+// boardModel, ganttModel — the tree, order, deps and actuals now come from the model tables, and
+// the API routes those functions serve (GET /api/work-items, /:id, /board, /gantt) are the readers
+// the console draws. lib/work-actuals.js's derivation functions are unchanged (they are the RULES
+// the legacy actuals trigger implements, still used by refreshWorkItemActual).
+//
+// Still reading work_item (fields the model does NOT carry at rehab-2/4 fidelity), with the reason
+// documented where each is:
+//   • "who has it" — work_item.xell_id / assignee, read by lib/work-assign.js (busy check,
+//     candidatesFor, itemForXell) and queenzee/worksync.js. The model's lease plane exists (179)
+//     but the rehab 1/4 dual-write does NOT write leases for work items (it writes executions
+//     only), so there is no lease data to read — re-pointing these to lease would show every card
+//     unassigned. Writing leases is a WRITER change, deferred with the conflation retirement (3/4).
+//   • ticket_id — the ticket link is a tracker noun; work_node has no ticket column and no join.
+//   • work_item_event — the audit ledger; the model's append-only event table is not written by
+//     the dual-write. getWorkItem still serves the tracker's own ledger.
+//   • the exact stored status — the run plane collapses review/shipping to 'waiting'; see
+//     lib/model-status.js for the ONE mapping and its documented limit.
 //
 // ── THE STATUS MAPPING (the trap REHAB 2/4 exists to defuse) ─────────────────
 // work_item.status is a single column that conflates PLAN state and RUN state. The model splits

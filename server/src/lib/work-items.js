@@ -456,6 +456,15 @@ export async function getWorkItem(id) {
   if (!row || !row.id) return null;
   const item = shapeModelItem(row);
 
+  // actuals from the RUN PLANE (execution), the same preference the gantt uses: the run plane is
+  // where "when did this RAN" lives after rehab 2/4. Fall back to the legacy work_item actuals when
+  // the execution has none (a reopened item whose finished_at was cleared — see ganttModel).
+  const [actual] = [...(await modelActualsForItems([id]).then((m) => [m.get(id)]))];
+  if (actual) {
+    item.actual_start = actual.start || item.actual_start || null;
+    item.actual_end = actual.end || item.actual_end || null;
+  }
+
   // modelAncestorsForWorkItem returns NEAREST-first; the API's ancestors/breadcrumb are oldest-first.
   const ancestors = (await modelAncestorsForWorkItem(id)).reverse().map(shapeItem);
   // The item's global depth = how many ancestors it has (the model walk starts at the item itself,
