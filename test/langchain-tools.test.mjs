@@ -32,7 +32,7 @@ import http from 'node:http';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken } from '../server/src/lib/xell-token.js';
 import { gatewayProxy, requestsForXell } from '../server/src/lib/gateway.js';
-import { runLangchainAgentTurn, messageText } from '../server/src/lib/langchain-zee.js';
+import { runLangchainAgentTurn, messageText, loadConversation, resetConversation } from '../server/src/lib/langchain-zee.js';
 import { LANGCHAIN_TOOLS, runTool } from '../server/src/lib/langchain-tools.js';
 import { fakeTokens } from './_bin/tokens.mjs';
 
@@ -154,6 +154,23 @@ try {
   const { xell } = await setupRows();
   const xellToken = await mintXellToken(xellId);
   ok(!!xellToken, 'the xell has an identity token for the gateway path');
+
+  // ── A0. EVERY BOUND TOOL HAS A NON-EMPTY NAME — the defect the mock let through ─────────────
+  // The buildTool arg-order bug made every bound tool have NO name. The real provider rejects a
+  // nameless tool ("tools[0]: missing field name"); the mock upstream never validated the tools
+  // array, so the green suite looked healthy while the runtime was completely non-functional.
+  // This is the cheap assertion that would have caught it before it reached a real provider.
+  console.log('\n── A0. every bound tool has a non-empty name (the buildTool arg-order regression) ──');
+  const bindableTools = Object.values(LANGCHAIN_TOOLS);
+  ok(bindableTools.length >= 4, `the registry has tools to bind (${bindableTools.length})`);
+  for (const t of bindableTools) {
+    ok(typeof t.name === 'string' && t.name.trim().length > 0, `tool has a non-empty name (${JSON.stringify(t.name)})`);
+    ok(typeof t.run === 'function', `tool ${t.name} has a run function`);
+  }
+  // And buildTool actually EMITS the name on the langchain tool object (the exact regression).
+  const { buildTool } = await import('../server/src/lib/langchain-zee.js');
+  const built = buildTool(bindableTools[0], { xell });
+  ok(typeof built.name === 'string' && built.name.length > 0, `buildTool emits a named langchain tool (got "${built.name}")`);
 
   // ── A. THE LOOP — model → tool → shared handler → result → model ───────────────────────────
   console.log('\n── A. the loop: the model requests `working`, the queenzee runs the SHARED handler ──');
@@ -396,6 +413,99 @@ try {
   ok(/capped at 3 iterations/.test(capped.text), 'the result is a VISIBLE capped message, not a silent stop');
   ok(capped.toolCalls.length === 3, 'three tool requests were made before the cap');
   await new Promise((r) => alwaysTool.close(r));
+
+  // ── I. TURNOVER + INTERRUPTION (provider-free) — state survives the handoff, and a mid-turn
+  //       interruption keeps the task ──────────────────────────────────────────────────────────
+  // The manager's directive: "stateful zees with proper turnover between them." The E2E exercise
+  // proved it against the real provider; this section proves the same WITHOUT a provider so it runs
+  // in CI. Two turns on one xell: the second is seeded with the first's conversation. Then a
+  // THIRD turn is interrupted (the mock throws mid-invoke) — the task must already be persisted
+  // (the up-front appendConversation fix), so a resume keeps it.
+  console.log('\n── I. turnover + interruption (provider-free): state survives the handoff, interruption keeps the task ──');
+  // This xell's conversation has been accumulating across sections A-H; reset it so THIS section
+  // measures turnover cleanly (2 messages per completed turn).
+  await resetConversation(xellId);
+  // A mock that answers with plain text on the FIRST call, then on the SECOND call returns a
+  // tool_use for `working` (so the loop has a tool exchange), then a final text. The conversation
+  // carries user + assistant per completed turn.
+  const turnoverServer = await new Promise((resolve) => {
+    let call = 0;
+    const s = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => (body += d));
+      req.on('end', () => {
+        call += 1;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        if (call === 1) {
+          res.end(JSON.stringify({ id: 't1', type: 'message', role: 'assistant', content: [{ type: 'text', text: 'turn one answer' }], model: MODEL, stop_reason: 'end_turn', usage: { input_tokens: 5, output_tokens: 5 } }));
+        } else if (call === 2) {
+          res.end(JSON.stringify({ id: 't2', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_i', name: 'working', input: {} }], model: MODEL, stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 } }));
+        } else {
+          res.end(JSON.stringify({ id: 't3', type: 'message', role: 'assistant', content: [{ type: 'text', text: 'turn one done after working' }], model: MODEL, stop_reason: 'end_turn', usage: { input_tokens: 5, output_tokens: 5 } }));
+        }
+      });
+    });
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${turnoverServer.address().port}`;
+  const tt1 = await runLangchainAgentTurn({
+    xell, task: 'first turn task', provider: 'deepseek', model: MODEL,
+    apiKey: DEEPSEEK_KEY, xellToken, maxIterations: 4,
+  });
+  eq(tt1.iterations, 1, 'turn one ran 1 iteration (the mock answers text directly)');
+  const convI1 = await loadConversation(xellId);
+  eq(convI1.length, 2, 'turn one persisted exactly user + assistant (2 messages, no dupes)');
+  // Turn 2: same xell, warm start.
+  const tt2 = await runLangchainAgentTurn({
+    xell, task: 'second turn task', provider: 'deepseek', model: MODEL,
+    apiKey: DEEPSEEK_KEY, xellToken, maxIterations: 4,
+  });
+  const convI2 = await loadConversation(xellId);
+  eq(convI2.length, 4, 'turn two carried turn one + added its own user+assistant (4 messages)');
+  ok(convI2.some((m) => m._getType() === 'human' && /first turn task/.test(String(m.content))), 'turn two\'s history still has turn one\'s task (warm start)');
+  await new Promise((r) => turnoverServer.close(r));
+
+  // ── INTERRUPTION: a turn that THROWS mid-loop must keep its task (the up-front persist) ─────
+  console.log('\n── I2. interruption: a turn that throws mid-loop keeps its task (persisted up front) ──');
+  const interruptServer = await new Promise((resolve) => {
+    let call = 0;
+    const s = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => (body += d));
+      req.on('end', () => {
+        call += 1;
+        if (call === 1) {
+          // First invoke: ask for a tool, then the SECOND invoke will throw (network drop).
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ id: 'i1', type: 'message', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_int', name: 'working', input: {} }], model: MODEL, stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 } }));
+        } else {
+          // The in-flight second call DIES. This must be NON-RETRYABLE: a 5xx is wrong because the
+          // SDK is CORRECT to retry a 5xx (that is what hung the first version of this test). An
+          // interruption is not a server error — it is a client-side abort / connection drop. A 4xx
+          // (here a 400) is non-retryable and makes the loop throw immediately, which is the shape
+          // of a real mid-tool-call interruption (a network drop aborts the request, it does not
+          // get retried).
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'simulated interruption (non-retryable 400)' }));
+        }
+      });
+    });
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${interruptServer.address().port}`;
+  const beforeInt = (await loadConversation(xellId)).length;
+  let threw = false;
+  try {
+    await runLangchainAgentTurn({
+      xell, task: 'interrupted task', provider: 'deepseek', model: MODEL,
+      apiKey: DEEPSEEK_KEY, xellToken, maxIterations: 4,
+    });
+  } catch (e) { threw = true; }
+  eq(threw, true, 'the interrupted turn THREW (the second model call died)');
+  const convInt = await loadConversation(xellId);
+  eq(convInt.length, beforeInt + 1, 'the interrupted turn persisted its TASK (up-front fix) — the next turn starts with it');
+  ok(convInt.some((m) => m._getType() === 'human' && /interrupted task/.test(String(m.content))), 'the interrupted turn\'s task IS in the conversation (a resume sees it)');
+  await new Promise((r) => interruptServer.close(r));
 
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
