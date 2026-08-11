@@ -214,15 +214,26 @@ does not stand in for the cross-xell case, and is not offered as such.
 - **What crosses the boundary: a CURATED handover**, not the transcript. The durable conclusions:
   what was decided, what was verified, what remains, the constraints that still bind, the next
   concrete step. What stays behind: dead ends, wrong turns, local paths, tool blow-by-blow.
-- **The carrier: an existing one.** ZEEHIVE already has a curated-handover primitive for work that
-  outlives a xell — the workflow plane's `execution.outputs`, written by `zee handover --result` and
-  inherited by any xell dispatched on the same execution (`xell.execution_id`). The langchain state
-  model should write a distilled summary there at the end of a xell's life, and a successor xell
-  dispatched on the same execution reads it as part of its brief. No new scheduler, no framework
-  decision — the queenzee's dispatch already decides when a successor starts.
-- **The link that authorises the handover:** a new xell must be NAMED as a successor (same execution,
-  or a manager explicitly dispatching "continue <xell>"). Without that link a new xell has no
-  legitimate claim on another xell's conversation and must not receive it.
+- **The carrier: the execution plane, via `stable_key` — NOT `entity_id`.** Measured on the fleet
+  meta-DB: `execution` has 160 rows, 160 with `work_node_id`, 0 with `entity_id`; `entity` has 0
+  rows. `execution.entity_id` is a DEAD PATH and must not be routed through. The live link is
+  `execution → work_node → ('work_item:'||wi.id = work_node.stable_key) → work_item.xell_id`, which
+  reaches a xell for 105 of 160 executions. That is the carrier.
+- **`execution.outputs` is EMPTY today (0 of 160 non-empty) — this change would be its FIRST
+  writer.** It is a documented, typed, nullable column, not a fiction; being the first writer is
+  fine, but the doc says so out loud rather than implying the plane already carries handovers.
+- **The case splits in two, because they are different problems:**
+  - **(a) SAME work item, NEW xell** — attempt N → N+1 on the SAME work_node. The carrier is obvious
+    and already populated: the successor reads the predecessor execution's `outputs` for its own
+    node. The successor xell is named by the dispatch (same `xell.execution_id` lineage).
+  - **(b) DIFFERENT work item** — a successor CARD. The link is a `dependency` edge: **`from_id` is
+    the PREDECESSOR, `to_id` the DEPENDENT** (get this backwards and the handover runs the wrong
+    way). This is "chain" work already being designed by the …-16c430 xell; this design does NOT
+    invent a second carrier for it — it uses the same dependency edge, and the two efforts stay
+    aligned on one design for the edge.
+- **The link that authorises the handover:** a new xell must be NAMED as a successor — same
+  work_node (case a) or a dependency edge (case b). Without that link a new xell has no legitimate
+  claim on another xell's conversation and must not receive it.
 - **Filtering:** any value scoped to the old cage (local paths, container names, session ids,
   claude_session references) is stripped before it crosses.
 
@@ -291,9 +302,12 @@ same drill-down waterfall (`execution → zee_turn → llm_gateway_request`) the
 ### 8.3 Not built yet (next cards)
 
 1. **Cross-xell turnover** — the curated-handover design in §5.2: what a successor xell is handed
-   when it continues work from a different xell, written to `execution.outputs` (`zee handover`) or a
-   new handoff row, with the old xell's local paths and dead ends filtered out. This is the design
-   gap this card names; it is the natural next card once the state model is agreed and read.
+   when it continues work from a different xell, carried on the execution plane via `stable_key`
+   (never `entity_id` — a dead path), written to `execution.outputs` as its FIRST writer (the column
+   is empty today), split into same-work-item (case a) and different-work-item (case b, the
+   dependency edge, kept aligned with …-16c430's chain work). The old xell's local paths and dead
+   ends are filtered out. This is the design gap this card names; it is the natural next card once
+   the state model is agreed and read.
 2. **Tool loop** — the driver currently makes one model call per turn. The multi-call loop (model →
    tool request → tool result → model → …) is the natural next step, with tools bound through
    langchain's tool interface and executed through queenzee-owned, gate-respecting verbs.
