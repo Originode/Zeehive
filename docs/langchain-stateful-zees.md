@@ -416,6 +416,23 @@ standalone test, not by a live zee.
   a tend for ANY zee — belongs in `pingWorking` for everybody and is a fleet-wide behaviour change;
   it is with a human (alongside the `auto_approve_*` flags), tracked as **TKT-165-FFBB**, not a
   langchain-local patch.
+- **Verified end-to-end against a real provider (2026-08-11).** The loop was exercised in-cage
+  against the live gateway with a real deepseek call: (1) a real multi-turn task drove real tool
+  calls (status/work/item) through the gateway, each attributed to the xell + turn; (2) TURNOVER —
+  a second turn on the same xell carried the first turn's state (the model summarised what the
+  previous turn established, from the persisted `zee_conversation`); (3) LOOP POLICY — with a tend
+  open, the model trying `working` received the VISIBLE loop-policy refusal as tool content and
+  acknowledged it ("I could not ping working... the loop policy refused it"), and the tend
+  survived; (4) the two fixes below were forced by this run.
+- **The two fixes the E2E run forced, recorded:** (a) `buildTool` passed its arguments in the wrong
+  order — the langchain `tool(func, fields)` helper ignored the third `{name, description}` object,
+  so every bound tool had NO name and the real provider rejected it ("tools[0]: missing field
+  name"); the mock upstream never validated the tools array, which is why the unit suite stayed
+  green. (b) `appendConversation` ran only at the END of the loop, so a turn interrupted mid-tool-
+  call (provider 5xx / network drop / process kill) persisted NOTHING — the next turn started cold.
+  Now the user's task is persisted up front and the final response appended only when the turn
+  actually answered; an interruption loses at most the in-flight call. Both are covered by the
+  provider-free test sections (A0, I, I2).
 - No gate changes, no `hooks/` changes, no prod writes.
 
 ### 8.3 Not built yet (next cards)
