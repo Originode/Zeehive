@@ -142,6 +142,25 @@ async function main() {
     ok(projRow && projRow.is_atom === false, `the project node is reported as a container`);
     const actA = sched.find((s) => s.name === 'Act A');
     ok(actA && Math.abs(dur(actA) - 72) < 0.01, `Act A (sequence of 3×1-day) rolls up to 3 days (got ${dur(actA)}h)`);
+
+    section('E. (e) edge ORIGIN is visible — declared chains vs board-position inference');
+    // The read model carries, per row, its edges WITH their origin (the ruling's contract):
+    // 'dependency' = a declared zee-dep chain; 'sequence' = sibling display order the CPM
+    // schedules but nobody declared. The union graph for this plan is: A1→A2, A2→A3, B1→B2
+    // (sequence-origin, from the sequence containers) + A3→B1, B2→C1 (dependency-origin, the
+    // two edges the test declared) — so edge_counts = {total:5, sequence:3, dependency:2} and
+    // has_declared_order is true. The chart's banner (ratio) and the dashed-vs-arrowhead edge
+    // drawing both read from these two fields.
+    const { workflowGanttModel } = await import(resolve(dirname(fileURLToPath(import.meta.url)), '../server/src/lib/workflow-gantt.js'));
+    const g = await workflowGanttModel({ projectId });
+    ok(g.has_declared_order === true, `has_declared_order is true (2 declared chains exist)`);
+    ok(g.edge_counts && g.edge_counts.total === 5 && g.edge_counts.sequence === 3 && g.edge_counts.dependency === 2,
+      `edge_counts = {total:5, sequence:3, dependency:2} (got ${JSON.stringify(g.edge_counts)})`);
+    const byNameG = new Map(g.rows.map((r) => [r.name, r]));
+    const b1Dep = (byNameG.get('B1')?.deps || []).find((d) => d.id === byNameG.get('A3')?.id);
+    ok(b1Dep && b1Dep.origin === 'dependency', `B1's edge from A3 is a DECLARED dependency (got ${b1Dep?.origin})`);
+    const a2Dep = (byNameG.get('A2')?.deps || []).find((d) => d.id === byNameG.get('A1')?.id);
+    ok(a2Dep && a2Dep.origin === 'sequence', `A2's edge from A1 is board-position inference (sequence), not a declared chain (got ${a2Dep?.origin})`);
   } finally {
     try {
       await q(`DELETE FROM project WHERE id=$1`, [projectId]);

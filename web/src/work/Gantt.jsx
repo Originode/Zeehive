@@ -82,7 +82,7 @@ export default function Gantt({ projectId }) {
 // (test/workflow-stage6.test.mjs renders it over real rows and asserts on the markup). It owns
 // only view state — zoom, collapse, hover, the bar in focus — and asks its parent to open the
 // waterfall. The timeline never writes; onOpen is the only callback.
-export function GanttChart({ rows = [], planName = null, version = null, hasDeclaredOrder = null, onOpen, today, initialCollapsed }) {
+export function GanttChart({ rows = [], planName = null, version = null, hasDeclaredOrder = null, edgeCounts = null, onOpen, today, initialCollapsed }) {
   const [zoom, setZoom] = useState(() => {
     try { const z = localStorage.getItem(ZOOM_KEY); return ZOOMS.some((x) => x.key === z) ? z : ZOOMS[1].key; }
     catch { return ZOOMS[1].key; }
@@ -195,8 +195,8 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
 
   // A dependency whose anchored predecessor has no bar cannot be drawn — and silence reads as
   // "that dependency was deleted". So every undrawable edge is collected WITH ITS REASON.
-  // deps are now { id, origin } — a sequence-origin predecessor is board order (drawn as a lane,
-  // not an arrow), a dependency-origin one is a declared chain.
+  // deps are now { id, origin } — a sequence-origin predecessor is board order (drawn as a
+  // dashed arrow with no arrowhead), a dependency-origin one is a declared chain.
   const hiddenDeps = useMemo(() => {
     const m = new Map();
     for (const r of visible) {
@@ -243,11 +243,21 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
   const rowsH = Math.max(ROW, visible.length * ROW);
   const empty = !rows.length;
   const nothingDated = !empty && !dated.length;
-  // NO ORDER DECLARED — the version has zero dependency-origin edges. The CPM may still compute
-  // an all-critical path (it schedules whatever edges it has — here, sequence-only, i.e. board
-  // position laundered into a schedule), but the chart must present that as the absence it is:
-  // a plan-level chip, no per-bar critical claims, and the sequence edges drawn as board order.
+  // ORDER HONESTY — the CPM schedules whatever edges it has, and the union graph includes
+  // sequence-origin edges (sibling board position) as finish→start. Whether those are the ONLY
+  // edges, or a minority next to real chains, is a claim the chart must label, not hide:
+  //   • hasDeclaredOrder — at least one 'dependency'-origin edge exists (a real zee-dep chain);
+  //   • edgeCounts — the ratio, driven into the plan banner ("322 of 322 scheduling edges are
+  //     inferred from board order; no dependencies have been declared, so this critical path
+  //     reflects list position, not constraints").
   const noDeclaredOrder = hasDeclaredOrder === false;
+  const ec = edgeCounts || null;
+  const inferredOrderBanner = ec && ec.sequence > 0
+    ? `${ec.sequence} of ${ec.total} scheduling edge${ec.total === 1 ? '' : 's'} ${ec.sequence === 1 ? 'is' : 'are'} `
+      + `inferred from board order; ${ec.dependency === 0
+        ? 'no dependencies have been declared, so this critical path reflects list position, not constraints'
+        : `${ec.dependency} declared chain${ec.dependency === 1 ? '' : 's'} — only those are real constraints`}.`
+    : null;
 
   return (
     <div className="work-gchart">
@@ -278,13 +288,11 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
                 on a timeline.</span>
         </div>
       )}
-      {noDeclaredOrder && !empty && !nothingDated && (
+      {inferredOrderBanner && !empty && !nothingDated && (
         <div className="work-warn work-gorder" role="status">
-          <b>No order declared.</b>
-          <span>This plan has no dependency chains, so the CPM has nothing to rank — the hatched
-                bars are board order, not a schedule, and no bar is critical. Declare a real “after”
-                with <code>zee dep</code> (or the card’s “depends on” picker) and the chart will
-                draw it as a chain.</span>
+          <b>Order is inferred.</b>
+          <span>{inferredOrderBanner} Declare a real “after” with <code>zee dep</code> (or the
+                card’s “depends on” picker) and the chart will draw it as a chain.</span>
         </div>
       )}
 
@@ -353,7 +361,7 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
                     <div className="work-gtrack" style={{ width }}>
                       {span && (
                         <div className={`${summary ? 'work-gsum' : 'work-gbar'}${r.critical && !noDeclaredOrder ? ' crit' : ''}${hot ? ' hot' : ''}`
-                                        + `${r.scheduled === false ? ' lane' : ''}${span.inverted ? ' inverted' : ''}`}
+                                        + `${span.inverted ? ' inverted' : ''}`}
                              data-gbar={r.id} data-testid="work-gbar"
                              style={{ left: span.x, width: span.w }}
                              onClick={() => onOpen?.(r)}
@@ -418,7 +426,7 @@ export function GanttChart({ rows = [], planName = null, version = null, hasDecl
                     <g key={a.key} className={`work-garrow${on ? ' on' : ''}${seq ? ' seq' : ''}`}>
                       <path d={d} className="work-garrow-line" markerEnd={seq ? undefined : 'url(#work-garrowhead)'} />
                       <title>{seq
-                        ? `${a.row?.name} is ordered after ${a.dep?.name || 'another node'} on the board — board order, not a declared chain`
+                        ? `${a.row?.name} is ordered after ${a.dep?.name || 'another node'} — order inferred from board position (sort_order), not a declared dependency`
                         : `${a.row?.name} depends on ${a.dep?.name || 'another node'}`}</title>
                     </g>
                   );
@@ -464,8 +472,7 @@ export function Tip({ row, x, y }) {
   return (
     <div className="work-gtip" style={{ left: Math.min(x + 14, viewportW() - 290), top: y + 16 }}>
       <div className="work-gtip-t"><KindGlyph kind={row.kind} /> {row.name}</div>
-      {row.scheduled === false && <div className="work-gtip-r lane">board order — not scheduled</div>}
-      {row.scheduled !== false && row.critical &&
+      {row.critical &&
         <div className="work-gtip-r crit">on the critical path{row.slack ? '' : ' · zero slack'}</div>}
       <div className="work-gtip-r">
         <span>planned</span>
