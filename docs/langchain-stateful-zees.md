@@ -411,7 +411,8 @@ standalone test, not by a live zee.
   does not already hand out. The langchain loop declines to exercise it by policy, but the auto-clear
   itself is a FLEET property, not a langchain one. The real fix — making `working` never auto-clear
   a tend for ANY zee — belongs in `pingWorking` for everybody and is a fleet-wide behaviour change;
-  it is with a human (alongside the `auto_approve_*` flags), not a langchain-local patch.
+  it is with a human (alongside the `auto_approve_*` flags), tracked as **TKT-165-FFBB**, not a
+  langchain-local patch.
 - No gate changes, no `hooks/` changes, no prod writes.
 
 ### 8.3 Not built yet (next cards)
