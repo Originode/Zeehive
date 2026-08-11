@@ -179,8 +179,8 @@ do not offer gRPC.
 
 **Options considered.**
 
-- **A · Direct implementation** *(chosen)*. For: the surface is small (five methods that act,
-  four that refuse with spec error codes); the repo's server has zero framework dependencies
+- **A · Direct implementation** *(chosen)*. For: the surface is small (six methods that act,
+  five that refuse with spec error codes — the plan's §3.2 table); the repo's server has zero framework dependencies
   today and its precedent is explicit — langgraph was refused because *"its pitch is owning
   the control flow, and ZEEHIVE already owns control flow"* (docs/langchain-stateful-zees.md).
   An A2A server SDK is built around an `AgentExecutor` interface that wants to own exactly the
