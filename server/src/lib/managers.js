@@ -244,7 +244,7 @@ export async function workerOf(managerXellId, slugOrId) {
 // the pure buildEnvelope (lib/a2a.js). contextId is reused across the ordered (from,to) pair — the
 // first exchange mints it, every later one inherits it; referencedTaskId is the most recent
 // directive the RECIPIENT sent the SENDER, which is the task a report/message answers.
-async function envelopeFor({ messageId, from, to, kind }) {
+async function envelopeFor({ messageId, from, to, kind, referencedTaskId = null }) {
   let contextId = null;
   if (from?.id && to?.id) {
     const prior = await one(
@@ -253,25 +253,28 @@ async function envelopeFor({ messageId, from, to, kind }) {
         ORDER BY created_at DESC LIMIT 1`, [from.id, to.id]);
     contextId = prior?.a2a?.contextId || null;
   }
-  let referencedTaskId = null;
-  if (from?.id && to?.id && kind !== 'directive') {
+  // An explicit referencedTaskId (the A2A write side naming the task a reply answers) wins over the
+  // derived one — a reply must never be orphaned by an intervening directive. Existing callers pass
+  // null and get the derived lookup, unchanged.
+  let referenced = referencedTaskId;
+  if (!referenced && from?.id && to?.id && kind !== 'directive') {
     const dir = await one(
       `SELECT meta->'a2a'->>'taskId' AS task_id FROM zee_message
         WHERE from_xell_id=$1 AND to_xell_id=$2 AND kind='directive'
           AND meta->'a2a'->>'taskId' IS NOT NULL
         ORDER BY created_at DESC LIMIT 1`, [to.id, from.id]);
-    referencedTaskId = dir?.task_id || null;
+    referenced = dir?.task_id || null;
   }
-  return buildEnvelope({ messageId, kind, contextId, referencedTaskId });
+  return buildEnvelope({ messageId, kind, contextId, referencedTaskId: referenced });
 }
 
-export async function postMessage({ from, to, body, kind = 'message', by = null, deliver = true }) {
+export async function postMessage({ from, to, body, kind = 'message', by = null, deliver = true, referencedTaskId = null }) {
   const text = String(body || '').trim();
   if (!text) throw new Error('a message needs a body');
   // The row id is minted here, not by the DEFAULT, because the A2A envelope reuses it as
   // messageId (DR-3: the row stays authoritative, the envelope stores identity only).
   const messageId = randomUUID();
-  const envelope = await envelopeFor({ messageId, from, to, kind });
+  const envelope = await envelopeFor({ messageId, from, to, kind, referencedTaskId });
   const row = await one(
     `INSERT INTO zee_message (id, project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body, meta)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING *`,

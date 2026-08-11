@@ -137,6 +137,44 @@ export function rowToTask({ opening, replies = [], tendOpen = false } = {}) {
   return task;
 }
 
+// ── WRITE SIDE — the pure half (plan §3.2, P3) ──────────────────────────────
+// The write methods (SendMessage / SendStreamingMessage / CancelTask) map onto the SAME
+// store-then-deliver machinery the zee verbs use: postMessage is unchanged (DR-3 — the row stays
+// authoritative; the envelope is the only A2A mark on it). What the write side adds on top is
+// PURE and lives here so it is table-tested standalone like the rest of this module:
+//
+//   partsToBody    — SendMessage's parts → the zee_message body. v1 supports TEXT parts only (the
+//                    cards' defaultInputModes is ["text/plain"]): DataPart ({ data }) and FilePart
+//                    ({ file }) answer ContentTypeNotSupportedError (-32005), the exact spec code.
+//   cancelVerdict  — CancelTask's "can this task still be canceled?" check. The plan's §3.2 rule is
+//                    verbatim: the envelope is marked canceled iff the task is still undelivered/
+//                    queued. The moment delivery says 'resumed'/'typed' the turn is running, and a
+//                    peer's RPC must never interrupt a turn (that is a human's fleet-pause, not a
+//                    peer's CancelTask). A task with a reply already happened — not cancelable either.
+export function partsToBody(parts = []) {
+  if (!Array.isArray(parts) || parts.length === 0) {
+    return { body: null, error: 'message.parts must be a non-empty array' };
+  }
+  const chunks = [];
+  for (const part of parts) {
+    if (!part || typeof part !== 'object') return { body: null, error: 'each message part must be an object' };
+    if (typeof part.text === 'string') { chunks.push(part.text); continue; }
+    // DataPart ({ data }) and FilePart ({ file }) — and anything else that is not a text part —
+    // are not supported in v1. The error is the exact spec code; the caller throws it.
+    return { body: null, error: A2A_ERROR.ContentTypeNotSupported.name };
+  }
+  const body = chunks.join('\n').trim();
+  if (!body) return { body: null, error: 'message body is empty after trimming text parts' };
+  return { body };
+}
+
+export function cancelVerdict({ delivery = null, hasReply = false } = {}) {
+  const d = delivery?.delivery || null;
+  if (d === 'resumed' || d === 'typed') return { allowed: false, reason: 'the turn is running' };
+  if (hasReply) return { allowed: false, reason: 'the task already has a reply' };
+  return { allowed: true };
+}
+
 // ── C7 SEAM (plan §4, NOT built) — execution outputs ⇄ A2A Artifacts ────────
 // When the stage-2 data plane lands, `execution.outputs` from `zee handover` maps 1:1 onto A2A
 // Artifacts (artifactId = execution id, parts = [{ data: outputs }]). Named so the mapping has a

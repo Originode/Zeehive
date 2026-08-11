@@ -1,20 +1,25 @@
-// THE A2A READ SIDE — the DB half of the projection (docs/a2a-protocol-plan.md §3, P2).
+// THE A2A READ + WRITE SIDE — the DB half of the projection (docs/a2a-protocol-plan.md §3, P2 + P3).
 //
-// lib/a2a.js is the PURE half (rowToMessage / rowToTask / the card builders); THIS module is the
-// non-pure half — the queries that gather rows from zee_message and turn them into A2A Tasks and
-// cards. It exists so the read-model functions are testable standalone against DATABASE_URL (the
-// same reason postMessage lives in lib/managers.js rather than in the routes). The HTTP wiring —
-// auth (resolveSelf), A2A-Version, Content-Type, the SSE transport — lives in routes.js's a2aRouter.
+// lib/a2a.js is the PURE half (rowToMessage / rowToTask / the card builders / partsToBody /
+// cancelVerdict); THIS module is the non-pure half — the queries that gather rows from zee_message
+// and turn them into A2A Tasks and cards, and the write methods (SendMessage / SendStreamingMessage
+// / CancelTask) that map an A2A call onto postMessage and the canceled envelope state. It exists so
+// the read/write-model functions are testable standalone against DATABASE_URL (the same reason
+// postMessage lives in lib/managers.js rather than in the routes). The HTTP wiring — auth
+// (resolveSelf), A2A-Version, Content-Type, the SSE transport — lives in routes.js's a2aRouter.
 //
-// Scoping is plan §3.4, unchanged from zee say / zee report: a worker may READ its manager, a
-// manager may read its CREW (cardVisibleXellIds — the directory and the per-agent cards). For
-// TASKS the scope is the caller's own conversations (taskVisibleXellIds): a worker sees tasks it
-// is a participant in, a manager sees tasks involving itself or any of its crew. A2A adds no reach
-// that messagesForXell (lib/managers.js) does not already have.
+// Scoping is plan §3.4, unchanged from zee say / zee report: a worker may ADDRESS its manager, a
+// manager may address its CREW (cardVisibleXellIds — the directory, the per-agent cards, and who a
+// SendMessage may be sent to). For TASKS the scope is the caller's own conversations
+// (taskVisibleXellIds): a worker sees tasks it is a participant in, a manager sees tasks involving
+// itself or any of its crew. A2A adds no reach that messagesForXell (lib/managers.js) does not
+// already have. CancelTask is sender-only on top of that (plan §3.2): only the xell that OPENED the
+// task may cancel it, and only while it is still undelivered/queued.
 import { q, one } from '../db/pool.js';
-import { rowToTask, buildAgentCard, A2A_ERROR } from './a2a.js';
+import { rowToTask, rowToMessage, buildAgentCard, A2A_ERROR, partsToBody, cancelVerdict } from './a2a.js';
+import { broadcast } from './events.js';
 import { effectiveHarness } from './harness.js';
-import { isManager } from './managers.js';
+import { isManager, postMessage } from './managers.js';
 
 const JSONRPC_INVALID_PARAMS = { code: -32602, name: 'InvalidParams' };
 const JSONRPC_METHOD_NOT_FOUND = { code: -32601, name: 'MethodNotFound' };
@@ -130,15 +135,87 @@ export async function subscribeSnapshot(caller, taskId, { visible = null } = {})
   return { task };
 }
 
+// SendMessage — plan §3.2, DR-3/DR-6. The SENDER is the caller resolved from the credential (the
+// route's resolveSelf), NEVER the payload; the RECIPIENT is the agent at the :slug the route
+// already card-checked. Text parts are concatenated into the body; DataPart/FilePart answer
+// ContentTypeNotSupportedError (-32005). A message with no taskId OPENS a task (kind='directive',
+// which mints the taskId); a message that names an existing task is a REPLY (kind='message', and
+// its referencedTaskId is the named task — honored over the derived one so a reply can never be
+// orphaned by an intervening directive). The row is written by the UNCHANGED postMessage — the
+// envelope is the only A2A mark (DR-3).
+export async function sendMessage(caller, agent, message = {}, { visible = null } = {}) {
+  if (!message || typeof message !== 'object') throw new A2AError(JSONRPC_INVALID_PARAMS, 'params.message is required');
+  const parsed = partsToBody(message?.parts);
+  if (parsed.error) {
+    if (parsed.error === A2A_ERROR.ContentTypeNotSupported.name) {
+      throw new A2AError(A2A_ERROR.ContentTypeNotSupported,
+        'v1 supports text parts only — DataPart/FilePart are not supported');
+    }
+    throw new A2AError(JSONRPC_INVALID_PARAMS, parsed.error);
+  }
+  const taskId = message?.taskId || null;
+  const kind = taskId ? 'message' : 'directive';
+  let referencedTaskId = null;
+  if (kind === 'message') {
+    const vis = visible || await taskVisibleXellIds(caller);
+    const task = await loadTask(taskId, vis);
+    if (!task) throw new A2AError(A2A_ERROR.TaskNotFound, `no task "${taskId}"`);
+    referencedTaskId = taskId;
+  }
+  const result = await postMessage({ from: caller, to: agent, body: parsed.body, kind, referencedTaskId });
+  return { message: rowToMessage(result.message) };
+}
+
+// CancelTask — plan §3.2. Sender-only: only the xell that OPENED the task may cancel it, and only
+// while the task is still undelivered/queued (cancelVerdict — the moment delivery says
+// 'resumed'/'typed' the turn is running and a peer's RPC must never interrupt it). Marks the
+// envelope's stored state 'canceled' (the ONLY stored state; every other state is derived, §3.3).
+// Cancel never interrupts a turn. Visibility is the read side's rule — a task the caller is not a
+// participant of is TaskNotFound (-32001, never leaked); a visible task it did not send is
+// TaskNotCancelableError (-32002).
+export async function cancelTask(caller, taskId, { visible = null } = {}) {
+  if (!taskId || typeof taskId !== 'string') throw new A2AError(JSONRPC_INVALID_PARAMS, 'params.taskId is required');
+  const vis = visible || await taskVisibleXellIds(caller);
+  const opening = await one(
+    `SELECT * FROM zee_message WHERE meta->'a2a'->>'taskId'=$1 AND kind='directive'`, [taskId]);
+  if (!opening) throw new A2AError(A2A_ERROR.TaskNotFound, `no task "${taskId}"`);
+  if (!vis.has(opening.from_xell_id) && !vis.has(opening.to_xell_id)) {
+    throw new A2AError(A2A_ERROR.TaskNotFound, `no task "${taskId}"`);
+  }
+  if (opening.from_xell_id !== caller.id) {
+    throw new A2AError(A2A_ERROR.TaskNotCancelable, `task "${taskId}" can only be canceled by its sender`);
+  }
+  const replies = await q(
+    `SELECT id FROM zee_message WHERE meta->'a2a'->>'referencedTaskId'=$1`, [taskId]);
+  const verdict = cancelVerdict({ delivery: opening.delivery, hasReply: replies.length > 0 });
+  if (!verdict.allowed) {
+    throw new A2AError(A2A_ERROR.TaskNotCancelable, `task "${taskId}" is not cancelable — ${verdict.reason}`);
+  }
+  await q(
+    `UPDATE zee_message SET meta = jsonb_set(meta, '{a2a,state}', '"canceled"') WHERE id=$1`, [opening.id]);
+  // Let a streaming client see the state change: the SubscribeToTask/SendStreamingMessage SSE
+  // handler filters the zee-message bus and re-loads the task from this row.
+  broadcast('zee-message', { id: opening.id, to_xell_id: opening.to_xell_id,
+                             from_xell_id: opening.from_xell_id, kind: opening.kind });
+  const task = await loadTask(taskId, vis);
+  return { task };
+}
+
 // The A2A JSON-RPC dispatch table (plan §3.2) — the refusal methods answer with their exact spec
-// codes, unknown methods with JSON-RPC MethodNotFound. SubscribeToTask returns its snapshot here;
-// the route swaps the JSON response for an SSE stream. `visible` is an optional precomputed
-// task-visible set (the route computes it once); the methods derive it when absent.
-export async function dispatchA2A(caller, method, params = {}, { visible = null } = {}) {
+// codes, unknown methods with JSON-RPC MethodNotFound. SubscribeToTask returns its snapshot here
+// and SendStreamingMessage returns its sent Message here; the route swaps the JSON response for an
+// SSE stream for both. `visible` is an optional precomputed task-visible set (the route computes it
+// once); the methods derive it when absent. `agent` is the addressed xell (the :slug) the write
+// methods send to — already card-checked by the route.
+export async function dispatchA2A(caller, method, params = {}, { visible = null, agent = null } = {}) {
   switch (method) {
     case 'GetTask': return getTask(caller, params?.taskId, { visible });
     case 'ListTasks': return listTasks(caller, { visible });
     case 'SubscribeToTask': return subscribeSnapshot(caller, params?.taskId, { visible });
+    case 'SendMessage':
+    case 'SendStreamingMessage':
+      return sendMessage(caller, agent, params?.message, { visible });
+    case 'CancelTask': return cancelTask(caller, params?.taskId, { visible });
     case 'PushNotificationConfig':
       throw new A2AError(A2A_ERROR.PushNotificationNotSupported,
         'push notifications are not supported by this server');

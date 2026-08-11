@@ -2931,16 +2931,17 @@ router.get('/stream', async (req, res) => {
 // path preserved. New URLs are minted as direct ports and never come here.
 router.use('/xell-web/:slug', webappRedirect);
 
-// ── A2A READ SIDE (P2) — docs/a2a-protocol-plan.md §3, DR-2/DR-5 ───────────────
+// ── A2A READ + WRITE SIDE (P2 + P3) — docs/a2a-protocol-plan.md §3, DR-2/DR-5 ──
 // The fleet speaks A2A v1.0 at ONE place — this router, mounted at the ORIGIN ROOT in index.js
 // (NOT under /api), because the well-known card is RFC 8615 origin-root and the /a2a/v1 paths are
-// the wire contract. P2 is internal-only: every authenticated route resolves the caller from its
-// xell token exactly like /api/xell/self/* (resolveSelf above), and crew scoping is unchanged — a
-// worker may read its manager, a manager its crew. External zhk_ keys are PHASE 4.
+// the wire contract. P2 read + P3 write are internal-only: every authenticated route resolves the
+// caller from its xell token exactly like /api/xell/self/* (resolveSelf above), and crew scoping
+// is unchanged — a worker may address its manager, a manager its crew. External zhk_ keys are
+// PHASE 4.
 //
-// The read-model half (task projection, cards) lives in lib/a2a-read.js; the pure shapes live in
-// lib/a2a.js. This router is the HTTP surface only: auth, the A2A-Version gate, and the SSE
-// transport for SubscribeToTask.
+// The read/write-model half (task projection, cards, SendMessage/CancelTask) lives in
+// lib/a2a-read.js; the pure shapes live in lib/a2a.js. This router is the HTTP surface only:
+// auth, the A2A-Version gate, and the SSE transport for SubscribeToTask / SendStreamingMessage.
 export const a2aRouter = Router();
 
 function a2aBase(req) {
@@ -3010,11 +3011,20 @@ a2aRouter.post('/a2a/v1/agents/:slug', async (req, res) => {
     }
 
     const taskVisible = await taskVisibleXellIds(caller);
-    const result = await dispatchA2A(caller, body.method, body.params || {}, { visible: taskVisible });
+    const result = await dispatchA2A(caller, body.method, body.params || {}, { visible: taskVisible, agent });
 
-    // SubscribeToTask swaps the JSON result for an SSE stream (plan §3.2): first event is the
-    // Task, then task_status_update events on the existing zee-message broadcast bus.
-    if (body.method === 'SubscribeToTask') {
+    // SubscribeToTask and SendStreamingMessage swap the JSON result for an SSE stream (plan §3.2):
+    // first event is the Task, then task_status_update events on the existing zee-message broadcast
+    // bus. For SubscribeToTask the Task is the read snapshot; for SendStreamingMessage the send has
+    // already happened and the first Task is the state right after the send.
+    if (body.method === 'SubscribeToTask' || body.method === 'SendStreamingMessage') {
+      let taskId = body.params.taskId;
+      let task = result.task || null;
+      if (body.method === 'SendStreamingMessage') {
+        taskId = result.message?.taskId;
+        task = taskId ? await loadTask(taskId, taskVisible).catch(() => null) : null;
+      }
+      if (!task) { return res.status(500).json({ error: 'no task for the requested stream' }); }
       res.set({
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -3022,9 +3032,8 @@ a2aRouter.post('/a2a/v1/agents/:slug', async (req, res) => {
         'X-Accel-Buffering': 'no',
       });
       res.flushHeaders?.();
-      res.write(`event: task\ndata: ${JSON.stringify(result.task)}\n\n`);
+      res.write(`event: task\ndata: ${JSON.stringify(task)}\n\n`);
       let closed = false;
-      const taskId = body.params.taskId;
       const onEvent = (e) => {
         if (closed || e.type !== 'zee-message') return;
         void (async () => {
