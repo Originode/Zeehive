@@ -139,7 +139,9 @@ export async function syncWorkNode(db, row) {
        sibling_rank = ${rankSql(row.sort_order, 6)},
        name = $2,
        kind = $3::node_kind,
-       child_semantics = (CASE WHEN work_node.child_semantics = 'freeform' THEN 'freeform' ELSE $4 END)::child_semantics,
+       child_semantics = CASE WHEN $3::node_kind = 'container' THEN
+                          (CASE WHEN work_node.child_semantics = 'freeform' THEN 'freeform' ELSE $4::child_semantics END)
+                        ELSE NULL END,
        estimate = $5,
        updated_at = now()
      WHERE stable_key = 'work_item:'||$6

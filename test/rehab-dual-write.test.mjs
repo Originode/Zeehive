@@ -130,6 +130,14 @@ try {
   const actNode3 = await one(`SELECT * FROM work_node WHERE stable_key=$1`, [`work_item:${act.id}`]);
   ok(!!actNode3, 'the sibling work_node survives');
 
+  // A container that loses its last child reverts to an 'action' (shape rule) and must NOT keep
+  // child_semantics — the model's wn_i2 leaf check forbids it.
+  await W.deleteWorkItem(task.id);   // the remaining child — act now has none
+  await W.updateWorkItem(act.id, { title: 'Activity A (now a leaf)' });
+  const actNode4 = await one(`SELECT * FROM work_node WHERE stable_key=$1`, [`work_item:${act.id}`]);
+  ok(actNode4.kind === 'action' && actNode4.child_semantics === null,
+    'a container that lost its last child reverts to action with NULL semantics (no wn_i2 violation)');
+
   // ── 6. THE TRANSACTIONAL PAIR ─────────────────────────────────────────────
   section('the pair is transactional — a model write failure rolls the legacy write back');
   // (a) CREATE: make the work_node insert fail on purpose.
