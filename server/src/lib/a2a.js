@@ -58,7 +58,6 @@ export function buildEnvelope({
 //   input-required  a live task the recipient has flagged as needing a human;
 //   submitted / working — the delivery verdict, for tasks that are simply live.
 export function deriveTaskState({
-  delivered = false,
   delivery = null,        // the delivery verdict: 'none' | 'queued' | 'typed' | 'resumed'
   deliveryReason = null,  // the reason carried by a 'none' verdict (rejection detection)
   undelivered = false,    // delivery was corrected to undelivered (messageUndelivered's marker)
@@ -116,7 +115,6 @@ export function rowToTask({ opening, replies = [], tendOpen = false } = {}) {
   if (!a2a?.taskId) return null;   // only a task-opening row makes a Task
   const messages = [rowToMessage(opening), ...replies.map(rowToMessage)].filter(Boolean);
   const state = deriveTaskState({
-    delivered: opening.delivered,
     delivery: opening.delivery?.delivery || null,
     deliveryReason: opening.delivery?.reason || null,
     undelivered: !!opening.delivery?.undelivered,

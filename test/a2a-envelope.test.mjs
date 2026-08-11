@@ -76,7 +76,6 @@ console.log('\n── A2. deriveTaskState: the §3.3 table, row by row ──');
 {
   const d = (over = {}) => deriveTaskState({ delivery: 'none', ...over });
   eq(d().state, 'submitted', 'row stored, delivery none → submitted (the durable inbox IS submission)');
-  eq(d({ delivered: false }).state, 'submitted', '…delivered=false reads the same way');
   eq(d({ delivery: 'queued' }).state, 'submitted', 'delivery queued (recipient mid-turn) → submitted');
   eq(d({ delivery: 'resumed' }).state, 'working', 'delivery resumed → working');
   eq(d({ delivery: 'typed' }).state, 'working', 'delivery typed → working');
