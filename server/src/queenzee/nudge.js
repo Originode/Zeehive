@@ -535,8 +535,8 @@ const MESSAGE_PROMPT = ({ by, body, files = [], bodyPath = null }) => [
 //   • TYPED   — an interactive session is what is there to talk to (a runtime that cannot re-invoke
 //     a finished session, or no session id captured), so the keystrokes go in as they always did.
 //
-// Anything richer than short single-line text — any image, or multi-line / long text — is still
-// written into the cxell as real files under `.zee-inbox/<ts>/` (images verbatim, the body as
+// Anything richer than short single-line text — any attachment, or multi-line / long text — is still
+// written into the cxell as real files under `.zee-inbox/<ts>/` (files verbatim, the body as
 // `message.md`) whichever delivery follows: a prompt cannot carry an image, and Claude opens an
 // image from a path. Delivery is fire-and-forget and best-effort — this NEVER throws; it returns
 // { sent, delivery, reason?/error? } so the route/UI/manager can report which of the three happened.
@@ -549,12 +549,12 @@ const MESSAGE_PROMPT = ({ by, body, files = [], bodyPath = null }) => [
 // that case; the message row was not, so a manager's own history said a worker had been told
 // something it never heard. Given the id, a failed delivery corrects its own record (see
 // messageUndelivered).
-export async function sendMessageToXell(xellId, { text = '', images = [], by = 'human',
+export async function sendMessageToXell(xellId, { text = '', attachments = [], by = 'human',
                                                   mode = PROVISION_MODE, messageId = null } = {}) {
   try {
     const body = String(text || '').trim();
-    const imgs = (Array.isArray(images) ? images : []).filter((i) => i && i.data);
-    if (!body && !imgs.length) return { sent: false, delivery: 'none', reason: 'empty message (no text or images)' };
+    const atts = (Array.isArray(attachments) ? attachments : []).filter((i) => i && i.data);
+    if (!body && !atts.length) return { sent: false, delivery: 'none', reason: 'empty message (no text or attachments)' };
     // PAUSED: refused, and refused HONESTLY. This is the door the 📨 button, the Hermes inbound
     // bridge and a manager's `zee say` all come through, and every one of them ends in a message
     // TYPED into a session — i.e. a zee starting a turn. Queueing it into the cage instead would be
@@ -595,7 +595,7 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
     }
 
     // Rich message → hand it over as files; plain short text → type it inline.
-    const rich = imgs.length > 0 || body.includes('\n') || body.length > 300;
+    const rich = atts.length > 0 || body.includes('\n') || body.length > 300;
     let typed = body;
     let bodyPath = null;
     const written = [];
@@ -604,18 +604,18 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
     if (rich) {
       const ts = new Date().toISOString().replace(/[:.]/g, '-');
       const dir = `.zee-inbox/${ts}`;
-      for (let i = 0; i < imgs.length; i++) {
-        const b64 = String(imgs[i].data).replace(/^data:[^,]*,/, '');
-        const rel = `${dir}/image-${i + 1}${msgImageExt(imgs[i].name, imgs[i].type)}`;
+      for (let i = 0; i < atts.length; i++) {
+        const b64 = String(atts[i].data).replace(/^data:[^,]*,/, '');
+        const rel = `${dir}/${attachmentFileName(atts[i].name, atts[i].type, i + 1)}`;
         try { written.push((await writeFileIntoCxell({ slug: zee.slug, relPath: rel, base64: b64 })).path); }
-        catch (e) { failed.push(imgs[i].name || rel); logline('message', `${zee.slug}: could not write attachment ${rel} (${String(e.message).slice(0, 120)})`); }
+        catch (e) { failed.push(atts[i].name || rel); logline('message', `${zee.slug}: could not write attachment ${rel} (${String(e.message).slice(0, 120)})`); }
       }
       // Every attachment failed to land — don't type a pointer to files that aren't there and don't
-      // report a clean send. The operator needs to know the images did NOT reach the zee (this is the
-      // "attach image fails silently" case: writes threw, yet the UI showed success).
-      if (imgs.length && !written.length) {
+      // report a clean send. The operator needs to know the attachments did NOT reach the zee (this is the
+      // "attach file fails silently" case: writes threw, yet the UI showed success).
+      if (atts.length && !written.length) {
         return { sent: false, delivery: 'none', failed,
-                 reason: `could not deliver ${imgs.length} image attachment(s) into the cxell — ${failed.join(', ')}` };
+                 reason: `could not deliver ${atts.length} attachment(s) into the cxell — ${failed.join(', ')}` };
       }
       const md = ['# Operator message', `_sent ${new Date().toISOString()} by ${by}_`, '',
         body || '(no text — see attachments)', '',
@@ -625,7 +625,7 @@ export async function sendMessageToXell(xellId, { text = '', images = [], by = '
       try { bodyPath = (await writeFileIntoCxell({ slug: zee.slug, relPath: bodyPath, text: md })).path; }
       catch (e) { logline('message', `${zee.slug}: could not write message body (${String(e.message).slice(0, 120)})`); }
       typed = `📨 New operator message — please read ${bodyPath}`
-        + (written.length ? ` and view the ${written.length} attached image(s): ${written.join(', ')}` : '')
+        + (written.length ? ` and view the ${written.length} attached file(s): ${written.join(', ')}` : '')
         + (body ? `. Summary: ${body.replace(/\s+/g, ' ').slice(0, 160)}` : '');
     }
 
@@ -720,13 +720,26 @@ async function messageUndelivered(messageId, slug = null, why = 'unknown') {
   }
 }
 
-// Pick a sane file extension for an attachment from its name, else its mime type, else default png.
-function msgImageExt(name = '', type = '') {
+// Pick a sane file extension for an attachment from its name, else its mime type, else none.
+function msgFileExt(name = '', type = '') {
   const m = String(name).match(/\.([A-Za-z0-9]{1,5})$/);
   if (m) return `.${m[1].toLowerCase()}`;
   const sub = String(type).split('/')[1];
   if (sub) return `.${sub.replace('jpeg', 'jpg').replace('svg+xml', 'svg').replace(/[^a-z0-9]/gi, '')}`;
-  return '.png';
+  return '';
+}
+
+// The filename an attachment lands under in `.zee-inbox/<ts>/` — the caller's own name when it is a
+// sane one, else a generic `attachment-<n>` + an extension inferred from the mime type. Preserving
+// the real name matters now that any file type can be attached: a zee told to read `orders.csv`
+// should find `orders.csv`, not `image-3.csv`.
+function attachmentFileName(name = '', type = '', n = 1) {
+  const clean = String(name || '')
+    .replace(/[^A-Za-z0-9._-]/g, '_')       // kill path separators and shell-hostile chars
+    .replace(/^\.+/, '')                     // no leading dots (hidden files / traversal)
+    .slice(0, 80);
+  if (clean && clean !== '.') return clean;
+  return `attachment-${n}${msgFileExt(name, type)}`;
 }
 
 // STATUS delivery: resolve this xell's live cxell zee and TYPE `text` into the interactive session

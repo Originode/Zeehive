@@ -328,7 +328,7 @@ export function auditBody(head, prompt, tail = '') {
 // VERBATIM plus a snapshot of the effective router policy, so the router always obeys the knobs
 // as they are NOW, not as they were when it was briefed. Stored in zee_message (kind 'directive',
 // the human→zee kind) for the same audit trail every crew conversation gets; delivery itself goes
-// through sendMessageToXell so pasted images ride along as real files.
+// through sendMessageToXell so pasted files ride along as real files.
 //
 // `custom` is the composer's optional CUSTOM DEPLOYMENT panel (see resolveCustomDeployment): the
 // human's explicit provider/model/mode/harness decision, rendered as its own block after the
@@ -455,7 +455,7 @@ export async function routeRawPrompt({ project, prompt, images = [], harness_hin
     } finally { client.release(); }
   })();
   const { sendMessageToXell } = await import('../queenzee/nudge.js');
-  const delivery = await sendMessageToXell(router.xell_id, { text: body, images, by, messageId: row.id });
+  const delivery = await sendMessageToXell(router.xell_id, { text: body, attachments: images, by, messageId: row.id });
   await q(
     `UPDATE zee_message SET delivered=$2, delivery=$3::jsonb
       WHERE id=$1 AND NOT COALESCE((delivery->>'undelivered')::boolean, false)`,

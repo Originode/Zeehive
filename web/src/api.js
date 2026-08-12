@@ -225,9 +225,10 @@ export const updateHarness = (key, body) => fetch(`/api/harnesses/${key}`, { met
 export const deleteHarness = (key) => fetch(`/api/harnesses/${key}`, { method: 'DELETE' }).then((r) => r.json());
 
 // Dispatch a human-composed prompt EXACTLY like a /xell dispatch: the queenzee claims a ready xell
-// for this project and spawns a zee into its worktree with the task (and any pasted images).
-// `images` is [{ name, data }] where data is a base64 data URL. Throws with the server's message
-// (e.g. "no ready xell available") so the composer can surface it without losing the prompt.
+// for this project and spawns a zee into its worktree with the task (and any pasted files).
+// `images` is [{ name, data }] where data is a base64 data URL — a legacy field name that carries
+// any file attachment. Throws with the server's message (e.g. "no ready xell available") so the
+// composer can surface it without losing the prompt.
 // IS SOMEBODY ALREADY IN THIS WORK? (#33) A read-only preflight the dispatch dialog calls as the prompt
 // is written, so the answer is in front of you BEFORE the button rather than in the receipt after it.
 // Advisory: it never refuses a dispatch, and a failure answers "no warnings" rather than throwing.
@@ -1168,8 +1169,8 @@ export const prXell = (id, note) => xellVerb(id, 'pr', { note });
 // means there was no live cxell zee to reach.
 export const nudgeXell = (id) => xellVerb(id, 'nudge');
 
-// Send a composed operator message — long text and/or image attachments ([{ name, type, data }],
-// data being a base64 / data-URL string) — to the xell's live cxell zee. Images and long text are
+// Send a composed operator message — long text and/or FILE attachments ([{ name, type, data }],
+// data being a base64 / data-URL string) — to the xell's live cxell zee. Files and long text are
 // handed over as files in the cxell's .zee-inbox with a pointer typed into the live session; short
 // text is typed inline. Resolves { sent, attachments?, reason? } — sent:false (not a throw) means
 // there was no live cxell zee to reach.

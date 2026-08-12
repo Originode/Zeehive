@@ -1085,7 +1085,7 @@ router.post('/harness-bridge/:slug/message', async (req, res) => {
     if (!gate.allowed) return res.status(403).json({ sent: false, reason: gate.reason });
     const auth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     if (auth !== process.env.HARNESS_BRIDGE_TOKEN) return res.status(401).json({ sent: false, reason: 'bad bridge token' });
-    res.json(await sendMessageToXell(b.xellId, { text: req.body?.text || '', images: req.body?.images || [], by: `hermes:${req.body?.by || 'web-ui'}` }));
+    res.json(await sendMessageToXell(b.xellId, { text: req.body?.text || '', attachments: req.body?.images || [], by: `hermes:${req.body?.by || 'web-ui'}` }));
   } catch (err) { res.status(500).json({ sent: false, error: err.message }); }
 });
 // Apply the xell's pending server/sql/migrations + ops files (at ITS branch head) to ITS OWN
@@ -1524,13 +1524,14 @@ router.post('/xells/:id/nudge', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// Send a COMPOSED message — long text and/or image attachments — to this xell's live cxell zee, for
-// when the raw terminal is too clumsy. Images and long/multi-line text are handed to the zee as real
+// Send a COMPOSED message — long text and/or FILE attachments — to this xell's live cxell zee, for
+// when the raw terminal is too clumsy. Files and long/multi-line text are handed to the zee as real
 // files under its .zee-inbox and a pointer is typed into the live session; short text is typed inline.
-// Body: { text, images: [{ name, type, data }], by }. Returns { sent, attachments?, reason?/error? }.
+// Body: { text, images: [{ name, type, data }], by }. `images` is a legacy name — it carries any file
+// attachment. Returns { sent, attachments?, reason?/error? }.
 router.post('/xells/:id/message', async (req, res) => {
   try { res.json(await sendMessageToXell(req.params.id, {
-    text: req.body?.text || '', images: req.body?.images || [], by: req.body?.by || 'human@console' })); }
+    text: req.body?.text || '', attachments: req.body?.images || [], by: req.body?.by || 'human@console' })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 

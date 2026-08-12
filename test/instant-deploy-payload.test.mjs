@@ -557,14 +557,15 @@ try {
      && /cAccounts\.length > 1/.test(src),
      'account picker is gated on >1 unpaused account of the resolved provider');
 
-  // Pasted images ride the dispatch body as base64 data URLs, so an oversized attachment fails the
+  // Pasted files ride the dispatch body as base64 data URLs, so an oversized attachment fails the
   // whole POST. Dispatch enforces the same 20 MB ceiling as MessageComposer (MAX_BYTES), before
   // the request ever leaves — matching the server's 30mb json limit and the nginx client_max_body_size.
+  // The wire field is `images` (legacy name) but it carries any file attachment.
   ok(/const MAX_BYTES = 20 \* 1024 \* 1024/.test(src),
      'Dispatch carries the same 20 MB per-composition ceiling as MessageComposer');
   ok(/total > MAX_BYTES/.test(src) && /Attachments exceed 20 MB/.test(src)
-     && /images: images\.map\(\(\{ name, data \}\) => \(\{ name, data \}\)\)/.test(src),
-     'addImage refuses an oversized attachment with a named error, and images ride the payload');
+     && /images: attachments\.map\(\(\{ name, data \}\) => \(\{ name, data \}\)\)/.test(src),
+     'addFile refuses an oversized attachment with a named error, and attachments ride the payload');
 } catch (e) {
   console.error('\n✗ FAIL — mount threw:', e.stack || e);
   fail++;

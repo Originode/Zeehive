@@ -1503,6 +1503,12 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 50%; background: rgba(0,0,0,.65); color: #fff; cursor: pointer; font-size: 11px;
   line-height: 1; display: flex; align-items: center; justify-content: center; }
 .disp-img-x:hover { background: var(--down); }
+.disp-filechip { position: relative; display: flex; align-items: center; gap: 6px; max-width: 260px;
+  padding: 6px 26px 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2);
+  font-size: 12px; }
+.disp-filechip .disp-file-icon { font-size: 15px; }
+.disp-filechip .disp-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disp-filechip .disp-img-x { position: absolute; top: 4px; right: 4px; }
 .disp-imgnote { color: var(--muted); font-size: 11px; }
 
 .disp-controls { display: flex; flex-wrap: wrap; gap: 16px; }
@@ -2294,6 +2300,12 @@ a.cbox:hover { border-color: var(--accent); }
 .msg-thumb-x { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%;
   border: none; background: rgba(6,8,12,.75); color: #fff; cursor: pointer; font-size: 10px; line-height: 1; }
 .msg-thumb-x:hover { background: var(--down, #e5554e); }
+.msg-filechip { position: relative; display: flex; align-items: center; gap: 6px; max-width: 240px;
+  padding: 6px 26px 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel2);
+  font-size: 12px; }
+.msg-filechip .msg-file-icon { font-size: 15px; }
+.msg-filechip .msg-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-filechip .msg-thumb-x { position: absolute; top: 4px; right: 4px; }
 .msg-err { font-size: 12px; color: var(--down, #e5554e); }
 .msg-foot { display: flex; align-items: center; gap: 12px; }
 .msg-attach { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; color: var(--text);

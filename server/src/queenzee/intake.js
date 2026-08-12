@@ -236,14 +236,14 @@ function titleFromTask(task) {
   return null;
 }
 
-// Pasted images ride the dispatch body as base64 data URLs (the dashboard "+" composer lets a
-// human paste a screenshot into the prompt). Decode them into the TARGET worktree so the spawned
+// Pasted files ride the dispatch body as base64 data URLs (the dashboard "+" composer lets a human
+// paste a screenshot or a log into the prompt). Decode them into the TARGET worktree so the spawned
 // zee can Read them by a path relative to its cwd — the same way a human would hand it a file.
-// Returns the worktree-relative paths saved (drops any that fail; never throws — a bad image must
-// not sink the dispatch). The folder gets a `.gitignore` of `*` so pasted screenshots never show
+// Returns the worktree-relative paths saved (drops any that fail; never throws — a bad attachment
+// must not sink the dispatch). The folder gets a `.gitignore` of `*` so pasted files never show
 // up as dirty files or get accidentally committed by the zee.
-function saveDispatchImages(worktreePath, images) {
-  if (!worktreePath || !existsSync(worktreePath) || !Array.isArray(images) || !images.length) return [];
+function saveDispatchAttachments(worktreePath, attachments) {
+  if (!worktreePath || !existsSync(worktreePath) || !Array.isArray(attachments) || !attachments.length) return [];
   const dir = resolve(worktreePath, '.zeehive', 'prompt-attachments');
   try {
     mkdirSync(dir, { recursive: true });
@@ -251,20 +251,24 @@ function saveDispatchImages(worktreePath, images) {
   } catch (e) { logline('intake', `could not prepare attachments dir: ${e.message}`); return []; }
   const stamp = Date.now();
   const saved = [];
-  images.forEach((img, i) => {
-    const data = typeof img === 'string' ? img : img?.data;
+  attachments.forEach((att, i) => {
+    const data = typeof att === 'string' ? att : att?.data;
     if (!data) return;
     const m = /^data:([^;,]+)?(?:;base64)?,(.*)$/s.exec(data);
-    const mime = (m && m[1]) || 'image/png';
+    const mime = (m && m[1]) || 'application/octet-stream';
     const b64 = m ? m[2] : data;
-    const ext = (mime.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'png';
-    const raw = (typeof img === 'object' && img?.name) ? String(img.name) : '';
+    // The extension is only a hint for a file with no name; an unknown/octet-stream type degrades to
+    // `.bin` rather than inventing a misleading image extension.
+    const ext = (mime === 'application/octet-stream'
+      ? 'bin'
+      : (mime.split('/')[1] || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 8)) || 'bin';
+    const raw = (typeof att === 'object' && att?.name) ? String(att.name) : '';
     const base = raw.replace(/\.[^.]*$/, '').replace(/[^a-z0-9._-]/gi, '_').slice(0, 40) || `pasted-${i + 1}`;
     const rel = `.zeehive/prompt-attachments/${stamp}-${i + 1}-${base}.${ext}`;
     try {
       writeFileSync(resolve(worktreePath, rel), Buffer.from(b64, 'base64'));
       saved.push(rel);
-    } catch (e) { logline('intake', `could not save pasted image #${i + 1}: ${e.message}`); }
+    } catch (e) { logline('intake', `could not save pasted file #${i + 1}: ${e.message}`); }
   });
   return saved;
 }
@@ -496,15 +500,16 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
       }
     }
 
-    // Pasted images: save them into the (possibly just-renamed) target worktree and append a
+    // Pasted files: save them into the (possibly just-renamed) target worktree and append a
     // reference block so the zee is handed PATHS to Read, not a base64 blob in its prompt. Done
     // AFTER the rename above, which moves the worktree folder — so we re-read the current path.
+    // `images` is the wire field's legacy name — it carries any file attachment now.
     if (targetId && Array.isArray(images) && images.length) {
       const wt = (await one(`SELECT worktree_path FROM xell WHERE id=$1`, [targetId]))?.worktree_path;
-      const saved = saveDispatchImages(wt, images);
+      const saved = saveDispatchAttachments(wt, images);
       if (saved.length) {
-        taskText += `\n\n## Attached images\n`
-          + `The human pasted ${saved.length} image(s) into this prompt. They are saved in your `
+        taskText += `\n\n## Attached files\n`
+          + `The human pasted ${saved.length} file(s) into this prompt. They are saved in your `
           + `worktree — open and read them (paths are relative to your worktree root):\n`
           + saved.map((p) => `- ${p}`).join('\n');
       }

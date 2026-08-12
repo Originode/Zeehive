@@ -62,7 +62,7 @@ are structural (above), never in this file.
    Deploying takes **no prompt text** — a router's brief is fixed (`DEFAULT_ROUTER_BRIEF`); a human
    picks only the **provider and model** it thinks with (`POST /api/router/deploy`).
 2. **Router live** → the composer's submit becomes **Route via router**: the raw prompt (+ pasted
-   images) goes to the router as a `🧭 ROUTING REQUEST` (`POST /api/router/route`) — stored in
+   files) goes to the router as a `🧭 ROUTING REQUEST` (`POST /api/router/route`) — stored in
    `zee_message` (kind `directive`) and delivered into its live session. The message carries the
    raw prompt **verbatim**, the effective policy snapshot, the providers currently outside their
    schedule window, and the persona button the human pressed (marked *hint, not decision*).

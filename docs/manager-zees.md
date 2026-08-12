@@ -212,8 +212,9 @@ One composer, and the manager variant differs only where a manager genuinely dif
   `GET /api/dispatch/options?zee_type=manager&harness=…` whenever that changes, which is what keeps
   the providers, accounts and models it offers to the ones the spawn would actually accept.
 
-Model, autonomy mode, supervision (headless/attended) and pasted images are the shared controls, and
-`createManagerZee` forwards all of them — `headless` and `images` used to be dropped on the floor.
+Model, autonomy mode, supervision (headless/attended) and pasted attachments are the shared controls,
+and `createManagerZee` forwards all of them — `headless` and `images` (the wire field's legacy name)
+used to be dropped on the floor.
 
 ## The verbs
 
