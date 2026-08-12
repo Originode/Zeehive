@@ -683,7 +683,16 @@ export async function backupProd(projectId) {
       + '(pg_dump locks every table for its duration). It runs automatically once prod is released.');
   }
 
-  const pool = await one(`SELECT backup_dir, backup_ctx, max_backups, backup_tables FROM pool_config WHERE project_id=$1`, [projectId]);
+  const pool = await one(`SELECT backup_dir, backup_ctx, max_backups, backup_tables, backup_paused FROM pool_config WHERE project_id=$1`, [projectId]);
+  // PAUSED → no NEW backups, automatic or manual. This is the stop-switch for a retry storm: a
+  // destination that is genuinely broken stays broken, and every retry re-runs the same failing
+  // dump. The operator fixes the destination, then flips the flag back. An in-flight backup is
+  // NOT interrupted here (that is the Cancel button); restore/delete/duplicate are unaffected
+  // (they read existing backups, they do not mint new dumps of prod).
+  if (pool?.backup_paused) {
+    throw new Error('backups are PAUSED for this project — no new backup will start until it is resumed '
+      + '(the panel\'s ⏸/▶ toggle, or backup settings). The pause does not touch existing backups.');
+  }
   // The configured default table selection. Empty ⇒ full-database dump (today's behaviour).
   const tables = validTableSelection(pool?.backup_tables, 'backup_tables');
   const dir = backupDirFor(pool);
@@ -1131,6 +1140,27 @@ export async function setBackupConfig({ project, backup_dir, backup_ctx, backup_
     + `${tables.length ? ` · scoped to ${tables.length} table(s)` : ' · full database'}`
     + `${plugins.length ? ` · plugins: ${plugins.join(', ')}` : ''}`);
   await housekeepBackups(proj, row.max_backups);
+  return row;
+}
+
+// PAUSE/RESUME the project's prod backups — the stop-switch for a retry storm. `paused:true`
+// means the scheduler starts NO new backup (policy OR retry) and a manual "Back up now" is
+// refused, until a human flips it back. A one-column change, so it is its own verb rather than
+// a round-trip through the whole settings form — the panel's ⏸/▶ toggle is the fastest thing a
+// human can reach when they see a failing backup re-run itself every ten minutes. An in-flight
+// backup is not interrupted (that is Cancel); restore/delete/duplicate are untouched.
+export async function setBackupPaused({ project, paused }) {
+  const proj = project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`))?.id;
+  if (!proj) throw new Error('no project');
+  if (typeof paused !== 'boolean') throw new Error('paused must be a boolean');
+  const row = await one(
+    `UPDATE pool_config SET backup_paused=$2 WHERE project_id=$1
+       RETURNING backup_paused`,
+    [proj, paused]);
+  if (!row) throw new Error('no pool_config for project');
+  broadcast('project', { id: proj, backup: { backup_paused: row.backup_paused } });
+  logline('maint', paused ? 'prod backup PAUSED — no new backups (auto or manual) until resumed'
+                          : 'prod backup resumed — running on its normal schedule again');
   return row;
 }
 
@@ -1604,9 +1634,20 @@ export async function reconcileInterruptedJobs() {
 // The FAILURE STREAK is read from the ledger rather than held in memory: the incident that produced
 // this ticket was a server restart, and state that forgets across a restart is state that forgets
 // exactly when it matters. Returns the whole decision so the caller can log the reason it acted on.
+//
+// PAUSE: a paused project is never due, on ANY schedule — policy OR retry. This is the other half
+// of the stop-switch (the first half refuses a manual "Back up now" in backupProd). A paused
+// project must not schedule anything, or the retry storm the pause exists to stop would just wait
+// for the pause to lift and re-fire. `checkBackupFreshness` is NOT suppressed: the restore point
+// is stale precisely because no backups are running, and the operator who paused deserves the
+// alert, not silence.
 export async function backupDue(projectId, now = Date.now()) {
-  const cfg = await one(`SELECT backup_interval_sec FROM pool_config WHERE project_id=$1`, [projectId]);
+  const cfg = await one(`SELECT backup_interval_sec, backup_paused FROM pool_config WHERE project_id=$1`, [projectId]);
   const interval = cfg?.backup_interval_sec ?? DEFAULT_INTERVAL_SEC;
+  if (cfg?.backup_paused) {
+    return { due: false, kind: 'paused', dueAt: null, waitSec: null,
+             reason: 'backups are PAUSED for this project — no backup will start until it is resumed' };
+  }
   const lastAttempt = await one(
     `SELECT id, taken_at, status FROM db_snapshot WHERE project_id=$1 AND source='prod'
       ORDER BY taken_at DESC LIMIT 1`, [projectId]);
@@ -1724,11 +1765,23 @@ export function startMaintenance() {
   // What we last SAID about a retry, per project, so a 10-minute retry window does not print a line
   // every 60-second tick. Log noise is the same disease as alert noise, one screen down.
   const saidRetry = new Map();
+  // Whether a project is currently PAUSED, per our own logs — so the pause/resume transition says
+  // exactly one line each way, not a line every tick.
+  const saidPaused = new Map();
   const tick = async () => {
     try {
       const projects = await q(`SELECT id FROM project`);
       for (const p of projects) {
         const d = await backupDue(p.id);
+        const wasPaused = saidPaused.get(p.id);
+        const isPaused = d.kind === 'paused';
+        if (isPaused && !wasPaused) {
+          saidPaused.set(p.id, true);
+          logline('maint', `prod backup PAUSED — ${d.reason}`);
+        } else if (!isPaused && wasPaused) {
+          saidPaused.delete(p.id);
+          logline('maint', 'prod backup resumed — running on its normal schedule again');
+        }
         if (d.due) {
           const busy = await prodBusyReason(p.id);
           if (busy) {

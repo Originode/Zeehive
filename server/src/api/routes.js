@@ -22,7 +22,7 @@ import { listProjectDocs, createProjectDoc, updateProjectDoc, deleteProjectDoc,
          previewProjectDoc } from '../lib/project-docs.js';
 import { targetCatalogue } from '../lib/agent-docs.js';
 import { markTaskDone, createTask } from '../queenzee/tasks.js';
-import { backupProd, refreshStaleXellDbs, setBackupConfig, revealBackup, restoreBackup, deleteBackup, cancelBackup, duplicateProdInto } from '../queenzee/maintenance.js';
+import { backupProd, refreshStaleXellDbs, setBackupConfig, setBackupPaused, revealBackup, restoreBackup, deleteBackup, cancelBackup, duplicateProdInto } from '../queenzee/maintenance.js';
 import { monitorTick } from '../queenzee/monitor.js';
 import { diffOneContainerAgainstProd, diffCandidates } from '../queenzee/proddiff.js';
 import { checkContainers, decommissionContainer } from '../queenzee/containers.js';
@@ -2828,7 +2828,7 @@ router.post('/maintenance/refresh', async (req, res) => {
 router.get('/backups', async (req, res) => {
   const proj = req.query.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
   const cfg = await one(
-    `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables, backup_plugins FROM pool_config WHERE project_id=$1`, [proj]);
+    `SELECT backup_dir, backup_ctx, backup_interval_sec, max_backups, backup_tables, backup_plugins, backup_paused FROM pool_config WHERE project_id=$1`, [proj]);
   // tables = this dump's scoped selection (null = full db). toc_summary->tables = every table the
   // archive contains, so the restore picker offers exactly what can be restored out of THIS backup.
   const rows = await q(
@@ -2865,6 +2865,13 @@ router.get('/backups', async (req, res) => {
 });
 router.post('/backups/config', async (req, res) => {
   try { res.json(await setBackupConfig(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Pause/resume this project's backups — the stop-switch for a retry storm (a failed backup that
+// keeps re-doing itself). While paused, the scheduler starts no new backup and a manual
+// "Back up now" is refused; an in-flight one is not interrupted (Cancel does that).
+router.post('/backups/pause', async (req, res) => {
+  try { res.json(await setBackupPaused(req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/backups/run', async (req, res) => {

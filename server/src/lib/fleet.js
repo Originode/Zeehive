@@ -497,6 +497,7 @@ export async function getFleet(projectId) {
       max_backups: pool?.max_backups ?? 14,
       backup_tables: pool?.backup_tables ?? null,   // null/[] ⇒ full-database backups (the default)
       backup_plugins: pool?.backup_plugins ?? null, // null/[] ⇒ no extensions pre-created on restore
+      backup_paused: !!pool?.backup_paused,         // true ⇒ no NEW backups (auto or manual) until resumed
     },
     last: lastBackup,
     last_attempt: lastAttempt || null,

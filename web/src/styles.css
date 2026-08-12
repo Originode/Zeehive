@@ -1068,9 +1068,20 @@ a.cbox:hover { border-color: var(--accent); }
   font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
 .bkstale { color: #d9a441; border: 1px solid #d9a441; border-radius: 6px; padding: 1px 7px;
   font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
+/* A PAUSED backup: the stop-switch is ON, so the "retry in 8 min" sentence below is replaced by
+   "paused — no backups will start". Blue like the pause state, not amber: nothing is failing, a
+   human deliberately stopped NEW backups. */
+.bkpaused { color: #7fb8e6; border: 1px solid #7fb8e6; border-radius: 6px; padding: 1px 7px;
+  font-size: 10px; letter-spacing: .04em; white-space: nowrap; cursor: help; }
+.bknext.bk-paused-note { color: #7fb8e6; border-color: #7fb8e6; }
 .bkcog { margin-left: auto; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
   width: 30px; height: 30px; border-radius: 8px; font-size: 15px; cursor: pointer; line-height: 1; }
 .bkcog:hover { color: var(--text); border-color: var(--accent); }
+.bkpausebtn { background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+  width: 30px; height: 30px; border-radius: 8px; font-size: 14px; cursor: pointer; line-height: 1; }
+.bkpausebtn:hover { color: var(--text); border-color: var(--accent); }
+.bkpausebtn.paused { color: #7fb8e6; border-color: #7fb8e6; }
+.bkpausebtn:disabled { opacity: .5; cursor: default; }
 
 /* all-backups modal (reuses the .term-overlay backdrop) */
 .bkmodal { width: min(860px, 94vw); max-height: 80vh; background: #0a0d12; border: 1px solid var(--line);
