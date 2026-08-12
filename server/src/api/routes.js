@@ -79,7 +79,7 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdReq
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
          selfUploadConversation, selfConversations,
          selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
-         selfSay, selfReport, selfInbox,
+         selfSay, selfReport, selfInbox, selfA2ASend,
          selfSuggestDone, selfXourceClean, selfMintManager, selfHarnessList, selfHarnessGet, selfHarnessCreate, selfHarnessUpdate,
          selfHarnessDelete, selfOps, selfTicketCreate, selfTicketList,
          selfProviderEnv } from '../queenzee/self.js';
@@ -1816,6 +1816,13 @@ router.post('/xell/self/say', async (req, res) => {
 router.post('/xell/self/report', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     res.json(await selfReport(x, { message: req.body?.message, kind: req.body?.kind || 'report' })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// `zee a2a <card-url> --message "…"` — send an A2A SendMessage to an EXTERNAL agent card URL,
+// queenzee-mediated and recorded (phase 4, plan §6). The sender is the calling xell, never a payload.
+router.post('/xell/self/a2a', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfA2ASend(x, { card_url: req.body?.card_url, message: req.body?.message })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.get('/xell/self/inbox', async (req, res) => {

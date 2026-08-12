@@ -506,6 +506,7 @@ function usage() {
   zee seed --file server/sql/seeds/<name>.sql [--file ...] --reason "..." | --status   ASK a human to approve a LANDED seed file; the QUEENZEE then runs it on PRODUCTION (you never touch prod). Land it first — a seed runs from main. Write it IDEMPOTENT (ON CONFLICT DO NOTHING): seeds are not ledgered
   zee verify-webapp                    OFFER your built webapp to a human in the console (Open link / dismiss). For a VISUAL-VERIFICATION xell: build with \`zee build webapp --wait\`, then call this. NOT gated, nothing irreversible — never land/ship for this
   zee upload-conversation [--reason "…"]   UPLOAD this xell's conversation to the queenzee (archived; a manager can review it). NOT gated. Reads your own session transcript and stores it — the "upload conversations on done" harness setting does this automatically at \`zee done\`
+  zee a2a <card-url> --message "..."   send an A2A SendMessage to an EXTERNAL agent's card URL — QUEENZEE-mediated (you never dial the external server) and RECORDED at the transport layer like the LLM gateway. NOT gated. The queenzee fetches the card, reads the JSON-RPC endpoint it declares, and POSTs the message; the answer is the external server's JSON-RPC result (or a clear refusal)
   zee done --summary "..." | --clear   propose done (a human confirms with "Mark done"); --clear WITHDRAWS the proposal if you are back at work
 
  crew (a zee that has a manager, or IS one):
@@ -910,6 +911,19 @@ switch (cmd) {
     const sessionId = newest.f.replace(/\.jsonl$/, '') || null;
     out(await req('POST', '/api/xell/self/upload-conversation', {
       content, session_id: sessionId, title, reason: flag('reason') || null }));
+    break;
+  }
+  case 'a2a': {
+    // Send an A2A SendMessage to an EXTERNAL agent's card URL — QUEENZEE-mediated (the zee never
+    // dials the external server; the queenzee makes the HTTP call) and RECORDED at the transport
+    // layer (a2a_outbound_request, migration 201) like the LLM gateway records its calls. The
+    // queenzee fetches the card, reads the JSON-RPC endpoint it declares, and POSTs the message.
+    // NOT gated — this is your own xell making an outbound call, like `zee build`.
+    const cardUrl = positional();
+    const message = flag('message');
+    if (!cardUrl) { console.error('a2a needs <card-url> — the external agent\'s A2A card URL'); process.exit(1); }
+    if (!message) { console.error('a2a needs --message "…" — what you want to say to the external agent'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/a2a', { card_url: cardUrl, message }));
     break;
   }
   case 'conversations': {
