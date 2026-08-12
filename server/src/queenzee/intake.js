@@ -22,8 +22,9 @@ import { logline } from '../lib/logbus.js';
 import { spawnCreds, assertProviderDispatchable, dispatchProviderFor,
          credentialVendorMismatch, everyProviderEnv, allProviderTokenRows,
          recordXellProviderGrant, scrubSecrets } from '../lib/provider-tokens.js';
+import { spawnLangchainZee } from './langchain-spawn.js';
 import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell, cxellName, preppedImageIfPresent,
-         ensureZeehiveKeypair, openCxellSsh, prepareCxellAuth, seedCxellFirstRun,
+         ensureZeehiveKeypair, openCxellSsh, prepareCxellAuth, seedCxellFirstRun, configureCxellGitIdentity,
          installTurnHooksIntoCxell,
          writeFileIntoCxell, writeFileIntoCxellIfChanged,
          writeGeneratedDocIntoCxell,
@@ -31,10 +32,9 @@ import { ensureCxell, cloneIntoCxell, warmCxell, sealCxell, runZee, removeCxell,
 import { adapterFor, decideRuntimePairing, providerModels, effectiveModelFor,
          usageFrom } from '../lib/cxell-runtimes.js';
 import { turnStopReason } from '../lib/turn-record.js';
-import { startTurn, endTurn, lastAssistantText } from '../lib/turn-ledger.js';
+import { startTurn, endTurn, lastAssistantText, recordFeedEvent } from '../lib/turn-ledger.js';
 import { gatewayEnv } from '../lib/gateway.js';
 import { spawnPrepFor, summarizePrepSteps, bakesImage, prewarmsCage } from '../lib/spawn-prep.js';
-import { langfuseClientEnv, postTurnToLangfuse } from '../lib/langfuse.js';
 import { mintXellToken } from '../lib/xell-token.js';
 import { deviceForXell, deviceLoop, deviceConfig, attachDeviceXhip } from '../lib/devices.js';
 import { harnessForXell, effectiveHarness, harnessLayerText, harnessFiles, harnessBridge, assignHarness, defaultHarnessId,
@@ -47,6 +47,7 @@ import { isManager } from '../lib/managers.js';
 import { registerHarnessBridge } from '../lib/harness-bridge.js';
 import { fleetPaused, PAUSED_REASON, PAUSED_STOP_REASON } from '../lib/fleet-pause.js';
 import { noteTurnDeath } from './revive.js';
+import { SPIN_STOP_REASON } from '../lib/spin-detector.js';
 
 // PROVISION_MODE=real actually creates the git worktree (and app tier unless
 // PROVISION_APP_TIER=false); 'simulate' models it in the DB only. Same knob as the pool.
@@ -298,12 +299,7 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
                                      // leaves whatever the xell already has — a caller says nothing and
                                      // gets nothing changed, exactly like zee_type above. An explicit
                                      // true or false always lands.
-                                     visual_verify = null,
-                                     // PER-XELL LANGFUSE TRACKING (default ON): a human (or a manager)
-                                     // turns it off to stop this xell's turns being traced to Langfuse
-                                     // and to keep LANGFUSE_* out of its cage. Same NULL-preserves shape
-                                     // as visual_verify — a re-dispatch that says nothing changes nothing.
-                                     langfuse_tracking = null }) {
+                                     visual_verify = null }) {
   if (!task) throw new Error('task (prompt) required to dispatch');
   const m = resolveMode(mode); // validates 1–5 up front, before anything is spawned
   // Same handover as claim, plus: a named xell_id decides the project by itself — the dispatcher's
@@ -440,13 +436,6 @@ export async function dispatchXell({ xell_id, task, runtime, project, cwd, mode,
     // plain re-dispatch into an existing xell must not silently reset a flag a human set earlier.
     if (targetId && visual_verify !== null) {
       await q(`UPDATE xell SET visual_verify=$2 WHERE id=$1`, [targetId, !!visual_verify]);
-    }
-
-    // PER-XELL LANGFUSE TRACKING: store the switch on the xell BEFORE the spawn, so spawnCxell reads it
-    // when deciding whether to inject LANGFUSE_* (and postTurnToLangfuse skips its turns). Same
-    // NULL-preserves shape as visual_verify above.
-    if (targetId && langfuse_tracking !== null) {
-      await q(`UPDATE xell SET langfuse_tracking=$2 WHERE id=$1`, [targetId, !!langfuse_tracking]);
     }
 
     // Point the xell at the right database BEFORE the zee starts — a pooled xell comes up on the
@@ -1296,6 +1285,12 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
 
   // REMOTE runtime → run the literal `claude remote` CLI, not the local SDK.
   if (rt?.key === 'claude-code-remote') return spawnRemote({ pid, xell, task, rt, model, m, title, headless });
+  // LANGCHAIN runtime → the queenzee drives the zee's model calls with langchain (a library, not a
+  // scheduler — docs/langchain-stateful-zees.md). A single model call per turn runs in-process with
+  // no cage; tool execution is the next card and must move the loop into the cxell. The runtime is
+  // opt-in (agent_runtime.enabled=false, migration 192) so the fleet default never lands here by
+  // accident.
+  if (rt?.driver === 'langchain') return spawnLangchainZee({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
   // CXELLD runtime → the CLI runs INSIDE the xell's zee-agent container (structural confinement).
   if (rt?.driver === 'cxell-cli') return spawnCxell({ pid, xell, task, rt, model, m, title, headless, provider, providerTokenId });
 
@@ -1319,7 +1314,10 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
   // PER-TURN LEDGER: a spawned turn is one unit of observability. The turn row is started
   // before the stream so the play-by-play events can be attributed to it (turn_id on
   // session_event). Best-effort — a null turn just means no per-turn attribution.
-  const turn = await startTurn({ zee, xell, kind: 'spawn', model, meta: { mode: m.key } });
+  // execution_id rides along when this xell is bound to a PLANE-3 execution (the weld — the
+  // queenzee stamps the execution on the turn it starts for a dispatched zee).
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model, meta: { mode: m.key },
+                                 executionId: xell.execution_id });
 
   const it = sdk.query({
     prompt: await briefing(xell.id, zee, task, { headless }), // the binding + rules, not a bare task
@@ -1404,14 +1402,11 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
         }
         // THE PLAY-BY-PLAY LEDGER (SDK path): persist the same events the cxell feed persists,
         // attributed to the current turn (turn_id). Best-effort — never blocks the stream.
-        if (turn?.id && msg?.type && msg.type !== 'system') {
-          q(`INSERT INTO session_event (source, hook_event_name, zee_id, xell_id, turn_id, agent_id, tool_name, raw)
-             VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)`,
-            ['cxell-feed', msg.type, zee.id, xell.id, turn.id,
-             sid || null,
-             msg.type === 'assistant' ? (msg.message?.content?.[0]?.type === 'tool_use' ? msg.message.content[0].name : null) : null,
-             JSON.stringify(msg)]).catch(() => {});
-        }
+        // Failures are counted + logged inside recordFeedEvent (never a silent catch — that is
+        // exactly how the fleet-wide empty play-by-play went unnoticed).
+        if (turn?.id) void recordFeedEvent({
+          turnId: turn.id, zeeId: zee.id, xellId: xell.id, event: msg, sessionId: sid,
+        });
         if (msg?.type === 'result') {
           // Persist full usage for the fleet burn tracker (was cost_usd only). Best-effort on the
           // SDK path: if the result exposes `usage`, tokens land too. A result with NEITHER usage
@@ -1431,11 +1426,6 @@ export async function spawnHeadless({ projectId, xellId, task, runtime, model = 
             // zero. Only the marker and the idle transition are written.
             await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, stop]);
           }
-          // LANGFUSE: record the finished turn as a trace (best-effort, never blocks the completion).
-          await postTurnToLangfuse({
-            xell, zee, sessionId: sid, model, result: msg,
-            startTime: zee.attached_at || new Date(), endTime: new Date(),
-          });
           // PER-TURN LEDGER: close the spawned turn with ITS OWN burn and a summary of what it said.
           await endTurn(turn?.id, {
             status: msg?.is_error ? 'errored' : 'ended',
@@ -1551,8 +1541,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   broadcast('zee', zee);
   logline('intake', `caging zee in ${xell.slug} — building the cxell (mode requested: ${m.key}; cxell always runs bypass inside)`);
   // PER-TURN LEDGER: same shape as the SDK spawn — one turn row per spawn, threaded into the
-  // play-by-play events. Best-effort.
-  const turn = await startTurn({ zee, xell, kind: 'spawn', model: ranModel, meta: { mode: m.key } });
+  // play-by-play events. Best-effort. execution_id rides along from the xell binding (the weld).
+  const turn = await startTurn({ zee, xell, kind: 'spawn', model: ranModel, meta: { mode: m.key },
+                                 executionId: xell.execution_id });
 
   // The cxell runs on the queenzee's local daemon for now — its network reach is the firewall
   // allow-list, so co-location with the xell's app tier is unnecessary (they meet over TCP).
@@ -1571,22 +1562,12 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
   // the skill-file materialization below and the "your skills come from your harness" line.
   const harnessRow = await harnessForXell(xell.id);
   const harness = harnessRow ? await effectiveHarness(harnessRow) : null;
-  // LANGFUSE: when the global observability plugin is enabled, every cxell zee is injected with
-  // LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL so anything in the cage can
-  // speak the instance (a manager's curl to the public API, worker instrumentation). Merged into
-  // the SAME agentEnv both openCxellSsh (/etc/environment for SSH logins) and runZee (-e for the
-  // headless CLI) read, so it reaches the headless run and an attending human's shell alike.
-  // PER-XELL SWITCH: when langfuse_tracking is OFF, no LANGFUSE_* is injected at all (the flag is
-  // default ON; a false here means the human/manager opted this xell out). Best-effort — never
-  // sinks a spawn.
-  const lfEnv = await langfuseClientEnv(xell.project_id, { tracking: xell.langfuse_tracking !== false })
-    .catch(() => ({}));
   // THE EVERY-PROVIDER SET, BESIDE the dispatched vendor's env (which stays byte-identical to
   // today): every DISPATCHABLE provider's freshest ACTIVE account, each under its own NON-COLLIDING
   // namespaced var (ZEE_PROVIDER_<KEY>_TOKEN + a ZEE_PROVIDERS manifest). github is never in the set
   // (infra credential); a mis-attributed token is skipped, never injected under the wrong vendor's
   // name (everyProviderEnv applies the SAME credentialVendorMismatch the active env goes through).
-  // Best-effort, exactly like lfEnv: a DB read failure must not sink a cage that still has the
+  // Best-effort: a DB read failure must not sink a cage that still has the
   // dispatched provider's env. Both doors get it — /etc/environment (openCxellSsh, an attending
   // human's shell) and the headless exec env (runZee) — so a zee finds its keys either way.
   const everyEnv = await allProviderTokenRows(pid)
@@ -1625,6 +1606,15 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     ? await preppedImageIfPresent({ ctx: 'default', baseImage: cxellImage || undefined, prep }).catch(() => null)
     : null;
   let sshPort = null;
+  // PER-ACTOR GIT IDENTITY (TKT-159-3139): the AUTHOR of every in-cxell commit names this zee
+  // (its slug), and the COMMITTER names the door (the xell door from the git config set below;
+  // the console terminal overrides the committer to the console door in terminal-bridge). The
+  // GIT_AUTHOR_* env reaches BOTH doors — /etc/environment (an attending human's SSH shell) and
+  // the headless exec env (runZee's extraEnv below) — because git prioritises it over the config.
+  const gitAuthorEnv = {
+    GIT_AUTHOR_NAME: xell.slug,
+    GIT_AUTHOR_EMAIL: `${xell.slug}@zeehive.local`,
+  };
   try {
     // reuse: keep the cage PROVISIONING already created and installed into (`when: 'provision'`).
     // It is honoured only when that cage is running on the image we want; otherwise this is the
@@ -1715,7 +1705,6 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // viewer_url below becomes a literal ssh:// deeplink into this cxell. The xell identity token
     // rides into /etc/environment too, so an attending SSH shell's `zee` CLI is authenticated.
     const { publicKey } = ensureZeehiveKeypair();
-    if (Object.keys(lfEnv).length) logline('cxell', `${name}: LANGFUSE_* env injected (observability on)`);
     // THE LLM GATEWAY — point every provider base-url at the queenzee gateway carrying this
     // xell's identity in the PATH (/x/<xellToken>/<provider>/...). The gateway then records EVERY
     // AI call (spawn, resume, interactive) attributed to this xell. The gateway env OVERRIDES the
@@ -1724,8 +1713,9 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     // model, the identity travels in the URL.
     const gwEnv = gatewayEnv({ xellToken, provider: adapter.provider });
     logline('cxell', `${name}: provider base-urls pointed at the LLM gateway (${gwEnv.ANTHROPIC_BASE_URL || '(off)'})`);
+    await configureCxellGitIdentity({ ctx, slug: xell.slug });
     await openCxellSsh({ ctx, name, publicKey, xellToken, runtimeKey: adapter.key,
-                         agentEnv: { ...lfEnv, ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env } });
+                         agentEnv: { ...adapter.env({ token, baseUrl, model: ranModel }), ...gwEnv, ...everyEnv.env, ...gitAuthorEnv } });
     const viewerUrl = `ssh://zee@127.0.0.1:${sshPort}`;
     await q(`UPDATE zee SET viewer_kind='ssh-terminal', viewer_url=$2 WHERE id=$1`, [zee.id, viewerUrl]);
     logline('cxell', `${name}: attend door open — ${viewerUrl}`);
@@ -1890,21 +1880,18 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
     }
     // THE PLAY-BY-PLAY LEDGER: persist the same feed events the SSE bus carries, attributed to the
     // current turn (turn_id) so a human can replay one turn's moves. Best-effort — never blocks or
-    // fails the feed. The raw event is stored in `raw`, exactly like the hook log stores its own.
-    if (turn?.id && ev?.type && ev.type !== 'system') {
-      q(`INSERT INTO session_event (source, hook_event_name, zee_id, xell_id, turn_id, agent_id, tool_name, raw)
-         VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)`,
-        ['cxell-feed', ev.type, zee.id, xell.id, turn.id,
-         ev.session_id || sid || null,
-         ev.type === 'assistant' ? (ev.message?.content?.[0]?.type === 'tool_use' ? ev.message.content[0].name : null) : null,
-         JSON.stringify(ev)]).catch(() => {});
-    }
+    // fails the feed. Failures are counted + logged inside recordFeedEvent (never a silent catch —
+    // the previous VALUES ('cxell-feed', $2, … $8) shape failed every insert with "could not
+    // determine data type of parameter $1", and .catch(() => {}) hid it fleet-wide).
+    if (turn?.id) void recordFeedEvent({
+      turnId: turn.id, zeeId: zee.id, xellId: xell.id, event: ev, sessionId: sid,
+    });
     // the raw feed for a future per-zee pane — small envelope, full event
     broadcast('zee-output', { zee_id: zee.id, xell_id: xell.id, slug: xell.slug, event: ev });
   };
 
   const handle = runZee({ ctx, name, prompt, model: ranModel, adapter, token, xellToken, baseUrl,
-                          extraEnv: { ...lfEnv, ...everyEnv.env }, onEvent: feed });
+                          extraEnv: { ...everyEnv.env, ...gitAuthorEnv }, onEvent: feed });
 
   // Report only what actually happened: await the init event (or an early death) before
   // claiming the spawn succeeded — same contract as the SDK path.
@@ -1964,6 +1951,26 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await endTurn(turn?.id, { status: 'paused', burn: b, stopReason: PAUSED_STOP_REASON });
         return;
       }
+      // A turn the SPIN DETECTOR ended is not an error either. Judge it from the TURN row, not the
+      // zee's last_stop_reason: that persists across turns, so a PREVIOUS spin-ended turn's marker
+      // would mislabel a later clean exit as a spin — the exact observability lie the review named.
+      // The detector closes THIS turn with stop_reason='spin-detector' (endTurn, one-shot), so the
+      // turn row is the single source of truth for what ended it. Preserve the spin end exactly as
+      // the fleet-pause branch above does: book the burn on the zee row (a spin turn spent what it
+      // spent), keep the zee idle. The turn row needs no touch — the detector already closed it, and
+      // a closed turn is never re-stamped (endTurn's ended_at IS NULL guard).
+      const spinClosed = turn?.id
+        ? (await one(`SELECT stop_reason FROM zee_turn WHERE id=$1`, [turn.id]).catch(() => null))?.stop_reason === SPIN_STOP_REASON
+        : false;
+      if (spinClosed) {
+        await q(`UPDATE zee SET cost_usd=$2, input_tokens=$3, output_tokens=$4,
+                                cache_read_tokens=$5, cache_write_tokens=$6,
+                                status='idle', last_stop_reason=$7 WHERE id=$1`,
+          [zee.id, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite, SPIN_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (repetition without progress)`);
+        return;
+      }
       const errored = result?.is_error;
       // A result with NEITHER usage nor total_cost_usd is UNMETERED — the turn ran and the fleet
       // cannot know what it cost (kimi, or a provider whose result carries no meter). The marker is
@@ -1992,11 +1999,6 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         await noteTurnDeath({ zeeId: zee.id, xellId: xell.id, slug: xell.slug,
                               reason: String(result?.result || 'error'), source: 'turn' });
       }
-      // LANGFUSE: record the finished turn as a trace (best-effort, never blocks the completion).
-      await postTurnToLangfuse({
-        xell, zee: row, sessionId: sid, model, result,
-        startTime: zee.attached_at || new Date(), endTime: new Date(),
-      });
       // PER-TURN LEDGER: close the spawned cxell turn with its own burn + summary.
       await endTurn(turn?.id, {
         status: errored ? 'errored' : 'ended',
@@ -2014,6 +2016,19 @@ async function spawnCxell({ pid, xell, task, rt, model, m = DISPATCH_MODES[5], t
         broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
         logline('intake', `cxell zee in ${xell.slug} stopped: the fleet is PAUSED (its turn was interrupted, not failed)`);
         await endTurn(turn?.id, { status: 'paused', burn: null, stopReason: PAUSED_STOP_REASON });
+        return;
+      }
+      // Same spin-detector guard as the resolve path — keyed on the TURN row, never the zee's stale
+      // last_stop_reason (a previous spin-ended turn's marker must not mislabel a later clean exit):
+      // a SIGINT'd exec usually REJECTS, so this is the branch a spin end most often lands in. The
+      // detector already closed the turn; keep the zee idle.
+      const spinClosed = turn?.id
+        ? (await one(`SELECT stop_reason FROM zee_turn WHERE id=$1`, [turn.id]).catch(() => null))?.stop_reason === SPIN_STOP_REASON
+        : false;
+      if (spinClosed) {
+        await q(`UPDATE zee SET status='idle', last_stop_reason=$2 WHERE id=$1`, [zee.id, SPIN_STOP_REASON]);
+        broadcast('zee', await one(`SELECT * FROM zee WHERE id=$1`, [zee.id]));
+        logline('intake', `cxell zee in ${xell.slug} stopped: the SPIN DETECTOR ended its turn (its exec died)`);
         return;
       }
       await q(`UPDATE zee SET status='errored', last_stop_reason=$2 WHERE id=$1`, [zee.id, scrubSecrets(String(err.message)).slice(0, 200)]);

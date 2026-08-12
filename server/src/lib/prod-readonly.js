@@ -43,8 +43,6 @@ export function roRoleName(slug) {
 const SECRET_COLUMNS = {
   provider_token: ['token'],
   environment_var: ['value'],
-  langfuse_config: ['public_key', 'secret_key', 'admin_password', 'org_public_key', 'org_secret_key'],
-  langfuse_project_map: ['public_key', 'secret_key'],
   xell: ['prod_ro_dsn'],
 };
 

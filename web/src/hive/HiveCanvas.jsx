@@ -1197,8 +1197,8 @@ export default function HiveCanvas({ xells, diffs, timeline, orientation, honeyS
           tooltip.el.innerHTML = '<span class="hive-tooltip-k"></span><span class="hive-tooltip-t"></span>';
           wrapRef.current?.appendChild(tooltip.el);
         }
-        // Re-render when the kind OR the per-button tip changes (a dynamic tip, e.g. the langfuse
-        // verb's "no session yet" vs the default, would otherwise stay stale across buttons).
+        // Re-render when the kind OR the per-button tip changes (a dynamic tip, e.g. done's
+        // "confirm" vs "mark", would otherwise stay stale across buttons).
         if (tooltip.kind !== b.kind || (b.tip && tooltip.tip !== b.tip)) {
           tooltip.kind = b.kind;
           tooltip.tip = b.tip || null;
@@ -2379,19 +2379,11 @@ export function petalVerbs(x, diff) {
   v[2] = cxell
     ? (xPaused ? ['resume', 'terminal', 'nudge'] : ['pause', 'terminal', 'nudge'])
     : (xPaused ? ['resume'] : ['pause']);
-  // MACHINE petal — env / message / directives / langfuse. Directives is ALWAYS offered: every xell
+  // MACHINE petal — env / message / directives. Directives is ALWAYS offered: every xell
   // has a brief it was given (task_text), and the panel shows that first even when there is no
   // manager⇄worker conversation yet. Hiding it for "unmanaged" workers made the button look missing
   // on the majority of hexes, and the context menu inherits this list.
   v[4] = cxell ? ['env', 'message', 'directives'] : ['env', 'directives'];
-  // LANGFUSE — "View Langfuse" opens THIS zee's Langfuse SESSION in a new window. Shown whenever
-  // the plugin is enabled AND this xell's per-xell langfuse_tracking flag is on (the toggle lives
-  // in the terminal window header and the dispatch prompt). A session-less zee still gets the verb
-  // (rather than silently hiding it) so the flower tooltip can say WHY there is nothing to open
-  // yet — a session appears after the zee's first finished turn (TKT-127).
-  if (x.langfuse_enabled && x.langfuse_tracking !== false) {
-    v[4] = [...v[4], 'langfuse'];
-  }
   // OBSERVABILITY — the per-turn ledger is always available: every xell can have turns recorded
   // (a spawn, a resume, an interactive turn). Read-only, so it shows even on a production xell
   // (production has no working tree but can have a burn history).
@@ -2420,14 +2412,14 @@ export function petalVerbs(x, diff) {
   return v;
 }
 
-// kind → the label drawn ON the flower. Crowded petals (MACHINE with env/message/directives/langfuse,
+// kind → the label drawn ON the flower. Crowded petals (MACHINE with env/message/directives,
 // BRANCH with swap+done) overflowed the hexagon when the labels carried words — so the flower is
 // icon-only for those verbs, matching terminal/nudge/pause. The context menu keeps the full words
 // (VERB_MENU_LABEL); hover tooltips (VERB_TOOLTIP) name the icon on the canvas.
 const VERB_LABEL = {
   build: '🔨', terminal: '⌨', nudge: '💬', env: '❖', message: '📨',
   pull: '↓', land: '⬆', pr: 'PR', ship: '🚀', swap: '♻',
-  pause: '⏸', resume: '▶', directives: '🧭', langfuse: '⚗', observability: '◉',
+  pause: '⏸', resume: '▶', directives: '🧭', observability: '◉',
 };
 const VERB_ACCENT = { nudge: 'working', message: 'working', land: 'working', ship: 'prod',
   done: 'error', swap: 'working', pause: 'error', resume: 'working' };
@@ -2447,7 +2439,6 @@ const VERB_TOOLTIP = {
   pause: 'Pause this xell — interrupts its zee mid-turn',
   resume: 'Resume this xell — calls the zee back',
   directives: 'See this xell\'s directive — the brief it was given (a manager\'s programme), and the conversation around it',
-  langfuse: 'Open this zee\'s Langfuse session in a new window',
   observability: 'Open the per-turn observability ledger — what the zee did, what it cost',
 };
 
@@ -2457,7 +2448,7 @@ const VERB_TOOLTIP = {
 const VERB_MENU_LABEL = {
   build: '🔨 Build', terminal: '⌨ Terminal', nudge: '💬 Nudge',
   env: '❖ Environment', message: '📨 Message', directives: '🧭 Directives',
-  langfuse: '⚗ View Langfuse', observability: '◉ Observability',
+  observability: '◉ Observability',
   pull: '↓ Pull', land: '⬆ Land', pr: 'PR', ship: '🚀 Ship',
   swap: '♻ Swap zee', pause: '⏸ Pause', resume: '▶ Resume',
 };
@@ -2484,6 +2475,19 @@ function doneTip(x) {
 // the flower's read-mostly interactions), then the verb buttons in petal order 1→6.
 export function xellContextMenuItems(x, diff) {
   const items = [];
+  // HELD AT THE GATE — the zee's land/ship request is waiting on a human and the zee is the one
+  // blocked, so the human already looking at the hexagon can send the literal 'zee land'/'zee ship'
+  // into its live session without opening a terminal. The row appears ONLY while the gate is actually
+  // holding (hive_status occ-landRequest/occ-shipRequest) — never for a hint and never for a zee not
+  // waiting — so a human cannot re-send a verb at a zee that has nothing pending. Not on a manager or
+  // production: those carry no land/ship verbs (the same rule petalVerbs encodes).
+  if (!x.is_production && !isManagerXell(x)) {
+    if (x.hive_status === 'occ-landRequest') {
+      items.push({ kind: 'sendLand', label: '⬆ Send “zee land” to zee', tone: '' });
+    } else if (x.hive_status === 'occ-shipRequest') {
+      items.push({ kind: 'sendShip', label: '🚀 Send “zee ship” to zee', tone: '' });
+    }
+  }
   // The two DIFF petals (commit/source stat, own stat) open the diff viewer on a worker's flower; a
   // manager's petals 5/6 are CREW and PROD·AGE instead, so a manager gets neither (same rule as
   // diffPetal()). Production keeps only the SOURCE side — "what is deployed vs the origin mirror" —
@@ -2545,14 +2549,9 @@ function drawFlowerButtons(ctx, centers, size, x, diff) {
   const accent = { working: G, prod: P, error: D };
   for (const [petal, kinds] of Object.entries(verbs)) {
     row(Number(petal), (kinds || []).map((kind) => {
-      // Dynamic tips: done reads its state; langfuse explains a session-less zee instead of hiding.
+      // Dynamic tips: done reads its state.
       let tip = null;
       if (kind === 'done') tip = doneTip(x);
-      else if (kind === 'langfuse') {
-        tip = (x.claude_session_id || x.session_name)
-          ? VERB_TOOLTIP.langfuse
-          : 'No Langfuse session recorded for this zee yet — one appears after its first finished turn';
-      }
       return {
         kind,
         label: kind === 'done' ? doneIcon(x) : VERB_LABEL[kind] || kind,

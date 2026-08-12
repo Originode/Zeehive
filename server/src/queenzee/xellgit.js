@@ -14,7 +14,7 @@ import { spawnSync, spawn } from 'node:child_process';
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline, activity } from '../lib/logbus.js';
-import { cleanGitEnv, worktreeBound } from '../lib/git.js';
+import { cleanGitEnv, worktreeBound, doorFromEmail } from '../lib/git.js';
 
 // The catch-up creates COMMITS in the host worktree — a stash of stray worktree noise, and the
 // merge of the xource tip into the zee's branch. Those need a committer identity, and the queenzee
@@ -306,11 +306,16 @@ export async function requestPullIn(xellId, { by = 'human@console', note = null 
   if (existing) return { ok: true, request: existing, note: 'this PR is already open' };
 
   const SEP = '\x1f';
-  const log = git(project.repo_root, ['log', `--pretty=format:%h${SEP}%s${SEP}%an`, '-n', '50',
+  // TKT-159-3139: carry the per-commit committer + door, not just author — a human accepting a PR
+  // must see who wrote each commit and which door applied it, the same provenance a landing shows.
+  const log = git(project.repo_root, ['log',
+    `--pretty=format:%h${SEP}%s${SEP}%an${SEP}%ae${SEP}%cn${SEP}%ce`, '-n', '50',
     `${tip.out}..${head.out}`]);
   const commits = log.ok ? log.out.split('\n').filter(Boolean).map((l) => {
-    const [short, subject, author] = l.split(SEP);
-    return { short, subject, author };
+    const [short, subject, author, authorEmail, committer, committerEmail] = l.split(SEP);
+    return { short, subject, author, author_email: authorEmail || null,
+             committer: committer || null, committer_email: committerEmail || null,
+             door: doorFromEmail(committerEmail) };
   }) : [];
 
   const ss = git(project.repo_root, ['diff', '--shortstat', tip.out, head.out]);

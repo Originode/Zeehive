@@ -50,6 +50,7 @@ import { setTend, tendState, tendNudge, setHint, hintOpen, pingWorking, briefRea
 // interactive turn is recorded exactly like the two the queenzee starts (lib/turn-record.js).
 import { markZeeTurn, claimZeeTurn } from '../lib/turn-record.js';
 import { startTurn, endTurn } from '../lib/turn-ledger.js';
+import { appendExecutionEvent } from '../lib/execution-events.js';
 import { attachDeviceXhip, detachDeviceXhip, deviceForXell, deviceLoop } from '../lib/devices.js';
 import { isManager, refuseForManager, crewFor, workerOf, postMessage, inboxFor, suggestDone,
          notifyManagerOfSwap, notifyManagerOfHalfSwap, deliveryReceipt,
@@ -71,6 +72,19 @@ import { uploadConversationArchive, conversationsForManager, harnessArchivalSett
 const liveZee = (xellId) => one(
   `SELECT id, xell_id, name, status, model, last_stop_reason FROM zee WHERE xell_id=$1
      AND status IN ('spawning','online','working','idle') ORDER BY created_at DESC LIMIT 1`, [xellId]);
+
+// The A2A envelope's ids, for the additive `a2a: {taskId, contextId}` on the say/report answers
+// (plan §5). The taskId a message belongs to is its own when it opened the task (a directive) and
+// the referencedTaskId when it is a reply — the same reading as a2a.js rowToMessage. Present only
+// when the row carries an envelope — postMessage now writes one on every message, but an old row or
+// a caller that bypassed postMessage may have none, and additive means additive: the CLI text UX is
+// untouched and old callers keep their exact answer shape.
+function a2aIds(row) {
+  const a2a = row?.meta?.a2a || null;
+  return a2a
+    ? { taskId: a2a.taskId || a2a.referencedTaskId || null, contextId: a2a.contextId || null }
+    : null;
+}
 
 // ── GET /api/xell/self/status — the read model a cxell zee orients from ────────
 // Everything it needs to know where it stands: its own status/task, whether a landing/ship/prod-bind
@@ -578,7 +592,20 @@ export async function selfWithdrawLand(xell, { reason = null, request = null } =
 // there is nothing in it to resolve.
 async function selfHealSync(xell, ref) {
   const s = await syncCxellWithXource({ ctx: 'default', slug: xell.slug, worktree: xell.worktree_path, ref });
-  if (s.state === 'merged' || s.state === 'up-to-date') return { ok: true, ...s };
+  if (s.state === 'merged' || s.state === 'up-to-date') {
+    // TKT-159-3139 door ledger: the queenzee's sync merge is a WRITE into a live cage (it merges
+    // current main into the zee's /work/repo). Record the queenzee door so a human auditing what
+    // happened to a tree sees the automated merge, distinct from a zee/human write. Best-effort:
+    // a failed ledger write must never fail a sync.
+    if (s.state === 'merged') {
+      q(
+        `INSERT INTO door_write_event (door, xell_id, target, input)
+         VALUES ('queenzee-sync', $1, $2, $3)`,
+        [xell.id, xell.slug, `sync merge of ${ref} into the cxell`],
+      ).catch((e) => logline('self', `could not record queenzee-sync door write: ${String(e.message).slice(0, 160)}`));
+    }
+    return { ok: true, ...s };
+  }
   if (s.state === 'conflict') {
     return {
       ok: false, status: 'needs-resolution', stage: 'sync', state: 'conflict', ref, sync: s,
@@ -976,19 +1003,6 @@ export async function setVisualVerify(xellId, { visual_verify = false, by = 'hum
   return { ok: true, xell: { id: row.id, slug: row.slug, visual_verify: row.visual_verify } };
 }
 
-// PER-XELL LANGFUSE TRACKING (default ON) — the human-side knob (terminal window header). Turning it
-// OFF means this xell's turns are not traced to Langfuse and its cage gets no LANGFUSE_* env. Same
-// shape as setVisualVerify: a per-xell boolean on the xell row, broadcast so the console refreshes.
-export async function setLangfuseTracking(xellId, { langfuse_tracking = true, by = 'human@console' } = {}) {
-  const xell = await one(`SELECT slug FROM xell WHERE id=$1`, [xellId]);
-  if (!xell) throw new Error('no such xell');
-  const row = await one(`UPDATE xell SET langfuse_tracking=$2 WHERE id=$1 RETURNING *`,
-    [xellId, !!langfuse_tracking]);
-  broadcast('xell', row);
-  logline('self', `langfuse tracking ${row.langfuse_tracking ? 'ON' : 'OFF'} for ${xell.slug} by ${by}`);
-  return { ok: true, xell: { id: row.id, slug: row.slug, langfuse_tracking: row.langfuse_tracking } };
-}
-
 // Dismiss a visual-verify offer (the console card's ✕). With no offerId, dismisses the xell's open
 // offers. View-only, like a seed/landing dismiss: it never changes what was offered, it just stops
 // the card rendering.
@@ -1201,7 +1215,8 @@ export async function selfTurn(xell, { state = null } = {}) {
     // observability, even though the queenzee cannot know its cost (no meter on this door). The
     // row is started so the turn exists in the timeline; its cost stays zero and metered=true is
     // left defaulted — it IS measured (measured zero), unlike an unmetered headless turn.
-    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model });
+    await startTurn({ zee, kind: 'interactive', sessionId: zee.claude_session_id, model: zee.model,
+                      executionId: xell.execution_id });
   } else {
     row = await markZeeTurn(zee.id, 'idle', 'end_turn');
     // Close the OPEN interactive turn (the latest one for this zee that is still 'started').
@@ -1234,6 +1249,204 @@ export async function selfWorking(xell, { note = null } = {}) {
   const res = await pingWorking(zee, { note });
   return { ok: true, ...res, tend_nudge: nudge,
     message: 'Working ping recorded — the hive shows this xell as occ-working.' };
+}
+
+// ── POST /api/xell/self/handover — store the typed result on the execution this xell is on ──
+// The WELD (docs/hierarchical-workflow-adoption.md §3.2): a zee bound to a PLANE-3 execution can
+// hand its typed result over. INTERIM storage on execution.outputs until the stage-2 data plane
+// (ports) exists — deliberately NOT a state transition, and deliberately NOT a new write path into
+// the ledgers: the result is the WORK's output, not an observability row. The execution is resolved
+// from THIS xell's binding (xell.execution_id), never from an agent-named id — the identity half of
+// "every row in the observability chain is a byproduct of a door".
+//
+// THE AUDIT TRAIL (the point of the append-only event log): the mutable outputs column is
+// overwritten by design, so the door ALSO appends an IMMUTABLE 'execution.handover' event carrying
+// the result — the record of "this zee handed over at T with this result" cannot be rewritten by a
+// later handover.
+export async function selfHandover(xell, { result = null, override = false } = {}) {
+  if (!xell.execution_id) {
+    return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to hand over' };
+  }
+  if (result === null || result === undefined || result === '') {
+    return { ok: false, error: 'handover needs --result "<json>" — the typed result to store on the execution' };
+  }
+  let parsed;
+  if (typeof result === 'string') {
+    try { parsed = JSON.parse(result); }
+    catch (e) { return { ok: false, error: `--result must be valid JSON: ${e.message}` }; }
+  } else {
+    parsed = result;
+  }
+  try {
+    const exec = await one(
+      `SELECT id, run_id, work_node_id, outputs FROM execution WHERE id=$1`, [xell.execution_id]);
+    if (!exec) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // A handover that would silently destroy a prior result is refused unless the caller EXPLICITLY
+    // overrides. The earlier result is still recoverable from the append-only event log (below) — the
+    // mutable column just cannot be the only record of what has happened.
+    // VALIDATE-THEN-MUTATE (TKT-161): this refusal runs BEFORE the UPDATE — a refused handover must
+    // leave the turn open, the zee as it was, execution.outputs untouched and NO event appended,
+    // exactly the same side-effect-free rule the await door follows.
+    if (exec.outputs !== null && exec.outputs !== undefined && !override) {
+      return { ok: false, error:
+        'execution.outputs already has a result — re-run with --override to replace it '
+        + '(the event log keeps the history of every handover).' };
+    }
+
+    const row = await one(
+      `UPDATE execution SET outputs = $2 WHERE id = $1
+       RETURNING id, state, outputs`,
+      [xell.execution_id, JSON.stringify(parsed)]);
+
+    // THE IMMUTABLE RECORD — the door's byproduct. Appended AFTER the write so the event exists iff
+    // the write happened (best-effort: a failure to log never fails the handover itself).
+    await appendExecutionEvent({
+      runId: exec.run_id, executionId: exec.id, workNodeId: exec.work_node_id,
+      type: 'execution.handover',
+      payload: { result: parsed, overrode: exec.outputs !== null && exec.outputs !== undefined },
+    });
+
+    return { ok: true, execution_id: row.id, state: row.state, outputs: row.outputs,
+      message: (exec.outputs !== null && exec.outputs !== undefined ? 'Result REPLACED on execution.outputs' : 'Result stored on execution.outputs')
+        + ' (interim — the stage-2 data plane replaces this).' };
+  } catch (e) {
+    return { ok: false, error: `could not store the result on execution.outputs: ${String(e.message).slice(0, 200)}` };
+  }
+}
+
+// ── POST /api/xell/self/await — END the turn, hold a lease, mark the execution waiting ──
+// The ANTI-SPIN primitive (docs/hierarchical-workflow-adoption.md §3.1): a zee waiting on something
+// outside the model — a human gate, an external service, a timer — ends its turn NOW (tokens stop)
+// instead of polling, and the execution moves to 'waiting' under a HELD lease. When the wait
+// resolves the queenzee resumes (the lease lapses or is released, and the work wakes). The execution
+// is resolved from this xell's binding, never from an agent-named id. `hours` overrides the default
+// 24h lease window (the universal timeout: if the external signal never comes, the lease lapses and
+// the work requeues).
+//
+// THE AUDIT TRAIL: the mutable execution.state flip to 'waiting' is also recorded as an IMMUTABLE
+// 'execution.await' event carrying the lease window — so "this execution went to waiting at T under
+// an N-hour lease" is a fact no later overwrite can erase.
+export async function selfAwait(xell, { hours = null } = {}) {
+  if (!xell.execution_id) {
+    return { ok: false, error: 'this xell is not bound to a workflow execution (xell.execution_id is NULL) — nothing to wait on' };
+  }
+  const h = Number(hours) > 0 ? Number(hours) : 24;
+  const zee = await liveZee(xell.id);
+  if (!zee) return { ok: false, error: 'no live zee bound to this xell to await for' };
+  try {
+    const exec = await one(
+      `SELECT id, run_id, work_node_id, state, entity_id FROM execution WHERE id=$1`, [xell.execution_id]);
+    if (!exec) return { ok: false, error: 'no such execution — this xell\'s execution binding is stale' };
+
+    // REFUSE TERMINAL STATES. A done/failed/skipped/cancelled/blocked/compensated execution is a
+    // finished piece of work — dragging it back into 'waiting' under a held lease would make the
+    // future lease sweeper treat it as a live zombie forever. Await is for work blocked on an
+    // external signal, not for re-opening the past.
+    const TERMINAL = ['done', 'failed', 'skipped', 'cancelled', 'blocked', 'compensated'];
+    if (TERMINAL.includes(exec.state)) {
+      return { ok: false, error:
+        `cannot await a '${exec.state}' execution — it has already finished; awaiting is only valid from a non-terminal state (running/ready/waiting/pending).` };
+    }
+
+    // The entity that holds the wait — the execution's bound entity (the zee-as-entity, stamped at
+    // dispatch). When the execution has none, RESOLVE-OR-CREATE by a STABLE KEY, never a blind
+    // insert: entities model durable actors (entity_load headroom, concurrency, capabilities,
+    // reliability), and "one zee maps to ONE entity reused across its executions" is what makes
+    // those mean anything. The stable key is `agent:<zee.id>` — the zee UUID is unique per zee and
+    // immutable, so every execution a zee awaits resolves to the same entity row.
+    //
+    // VALIDATE-THEN-MUTATE (TKT-161): this block runs BEFORE the turn is ended and the zee parked,
+    // because it feeds the foreign-lease refusal below. The only write that can have happened by a
+    // later refusal is this entity ROW (creating it is genuinely benign — it is keyed, reused and
+    // lease-less, and entity_load counts leases, not stamps) — never a closed turn, and never the
+    // execution.entity_id OWNERSHIP stamp, which lives in the mutation half below (DEFECT 8: on a
+    // refused await the execution must not claim an owner that does not hold the lease).
+    // MINOR (TKT-161): this resolve is SELECT-then-INSERT and entity.name has NO unique index, so
+    // two CONCURRENT awaits for one zee could insert two 'agent:<zee.id>' rows. We deliberately do
+    // NOT add an index here: entity is a cross-cutting table whose name is not globally unique by
+    // design (only our agent-keys happen to be uuid-unique), and an unconditional unique index is a
+    // schema change with existing-data risk for a race the await contract already rules out — a
+    // single agent process runs one turn at a time, await MUST be the last thing in a turn, and
+    // after the first await the turn is ended and the zee is idle, so a second await for the same
+    // zee arrives only from a LATER resumed turn that already finds the row. Worst case is a
+    // duplicate durable-actor row, benign for correctness (leases are keyed by id, never by name).
+    let entityId = exec.entity_id;
+    if (!entityId) {
+      const key = `agent:${zee.id}`;
+      const existing = await one(`SELECT id FROM entity WHERE name=$1`, [key]).catch(() => null);
+      const ent = existing || await one(
+        `INSERT INTO entity (name, kind_hint) VALUES ($1, 'agent') RETURNING id`, [key]);
+      entityId = ent.id;
+      // NOTE: the execution.entity_id OWNERSHIP stamp is deliberately NOT here. It lives in the
+      // mutation half below, next to the lease write, after every refusal path has passed — so a
+      // REFUSED await never claims an owner for the execution (DEFECT 8). Creating the entity row
+      // above is the benign part: keyed, reused, lease-less, and entity_load counts leases, not
+      // stamps.
+    }
+
+    // HOLD the lease. Exactly one HELD lease per execution (lease_one_active_per_execution), so a
+    // second await while one is already held EXTENDS it rather than colliding — idempotent.
+    const held = await one(
+      `SELECT id, entity_id FROM lease WHERE execution_id=$1 AND state='held'`, [xell.execution_id]).catch(() => null);
+    if (held?.id) {
+      // The holder is meaningful: one active lease per execution, and extending someone else's lease
+      // is a silent takeover. Refuse unless the holder is the entity this execution belongs to.
+      // This refusal runs BEFORE endTurn/markZeeTurn — a refused await must leave the turn OPEN and
+      // the zee NOT idle, or a later gateway call attaches to a closed turn (the exact failure the
+      // await manual, migration 181, warns about, produced by our own refusal path).
+      if (held.entity_id !== entityId) {
+        return { ok: false, error:
+          'the held lease on this execution belongs to a different entity — refusing to extend '
+          + "someone else's lease (release or expire it first, or wait for the lease to lapse)." };
+      }
+    }
+
+    // END the current turn — the anti-spin half. Only reached once EVERY refusal path has been
+    // passed, so a refused await never closes the turn or parks the zee. The open turn
+    // (spawn/resume/interactive) closes as 'ended', stop_reason 'await', so the tokens stop. The
+    // zee row goes idle too (markZeeTurn), so the hive shows it resting rather than working.
+    const open = await one(
+      `SELECT id FROM zee_turn WHERE zee_id=$1 AND status='started' ORDER BY started_at DESC LIMIT 1`,
+      [zee.id]).catch(() => null);
+    if (open?.id) await endTurn(open.id, { status: 'ended', stopReason: 'await' });
+    await markZeeTurn(zee.id, 'idle', 'await');
+
+    // Write/extend the lease — the mutation half, once the await is committed to.
+    // Stamp the execution's OWNER only now (DEFECT 8): the resolve-or-create above may have resolved
+    // an entity for a previously entity-less execution, but writing execution.entity_id on a REFUSED
+    // await would claim an owner that does not hold the lease. Only on the committed success path do
+    // we stamp ownership, right beside the lease that proves it.
+    if (entityId && !exec.entity_id) {
+      await q(`UPDATE execution SET entity_id=$2 WHERE id=$1`, [xell.execution_id, entityId]);
+    }
+    if (held?.id) {
+      await q(`UPDATE lease SET expires_at = now() + ($2 || ' hours')::interval, heartbeat_at = now() WHERE id=$1`,
+        [held.id, h]);
+    } else {
+      await one(
+        `INSERT INTO lease (execution_id, entity_id, expires_at) VALUES ($1, $2, now() + ($3 || ' hours')::interval) RETURNING id`,
+        [xell.execution_id, entityId, h]);
+    }
+
+    // Mark the execution waiting — lease held, blocked on an external signal/timer/human.
+    await q(`UPDATE execution SET state='waiting' WHERE id=$1`, [xell.execution_id]);
+
+    // THE IMMUTABLE RECORD — the door's byproduct. Appended after the state flip.
+    await appendExecutionEvent({
+      runId: exec.run_id, executionId: exec.id, workNodeId: exec.work_node_id,
+      type: 'execution.await',
+      payload: { lease_hours: h, entity_id: entityId },
+    });
+
+    return { ok: true, execution_id: xell.execution_id, state: 'waiting', lease_hours: h,
+      turn_ended: !!open?.id,
+      message: `Turn ended and the execution is now 'waiting' under a ${h}h held lease. `
+        + 'Tokens stop here — when the wait resolves, the queenzee resumes the work. '
+        + 'This MUST be the last thing you do in this turn — stop talking after you call it.' };
+  } catch (e) {
+    return { ok: false, error: `could not await: ${String(e.message).slice(0, 200)}` };
+  }
 }
 
 // ── GET /api/xell/self/provider-env — the RUNNABLE env for ONE provider (`zee creds --provider <key> --export`) ──
@@ -1414,7 +1627,7 @@ function managerBriefBlock(managerSlug, what = 'dispatched you and is watching t
 //   • no manager harness on a worker → it cannot be handed the manager's verbs.
 export async function selfDispatch(xell, { task = null, model = null, mode = null, harness = null,
                                            title = null, runtime = null, visual_verify = false,
-                                           langfuse_tracking = null, work_item_id = null,
+                                           work_item_id = null,
                                            // WHICH AI PROVIDER the worker runs on (139). Added for
                                            // the ROUTER (a manager-type zee whose whole job is
                                            // deciding this), and real for any manager: dispatchXell
@@ -1536,9 +1749,6 @@ export async function selfDispatch(xell, { task = null, model = null, mode = nul
       ...(model ? { model } : {}), ...(mode ? { mode } : {}), ...(runtime ? { runtime } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
       ...(visual_verify ? { visual_verify: true } : {}),
-      // --langfuse / --no-langfuse: explicit true or false always lands; omission (null) preserves
-      // whatever the target xell already has (dispatchXell's NULL-preserves shape).
-      ...(langfuse_tracking === true || langfuse_tracking === false ? { langfuse_tracking } : {}),
       ...(provider ? { provider } : {}),
       // A ROUTER does not stamp its dispatched worker into a crew (151): the worker is deployed onto
       // a card, not under the router. A manager stamps itself so the honeycomb seats the worker next
@@ -2125,8 +2335,11 @@ export async function selfSay(xell, { to = null, message = null, kind = 'directi
   // means the worker's finished turn was restarted with your message as its prompt (this is how you
   // re-task the zee that already holds the context); QUEUED means it is mid-turn and has not read it
   // yet; TYPED means an interactive session took the keystrokes. See lib/zee-turn.js.
+  // The A2A envelope's ids ride along additively (plan §5) — from the envelope postMessage wrote.
+  const a2a = a2aIds(r.message);
   return {
-    ok: true, ...r, delivery: r.delivery?.delivery || 'none',
+    ok: true, ...r, ...(a2a ? { a2a } : {}),
+    delivery: r.delivery?.delivery || 'none',
     message: deliveryReceipt(r.delivery?.delivery, worker.slug,
                              r.delivery?.reason || r.delivery?.error || null),
   };
@@ -2151,7 +2364,11 @@ export async function selfReport(xell, { message = null, kind = 'report' } = {})
   const r = await postMessage({ from: xell, to: manager, body: text, kind: kind === 'reflection' ? 'reflection' : 'report' });
   // Same three-way receipt as `zee say` (a manager reading its own worker's report is the other end
   // of the same delivery): RESUMED / QUEUED / TYPED, never one word for all three.
-  return { ok: true, ...r, addressed: true, delivery: r.delivery?.delivery || 'none',
+  // The A2A envelope's ids ride along additively (plan §5) — from the envelope postMessage wrote.
+  const a2a = a2aIds(r.message);
+  return {
+    ok: true, ...r, addressed: true, ...(a2a ? { a2a } : {}),
+    delivery: r.delivery?.delivery || 'none',
     message: `Sent to your manager (${manager.slug}). `
       + deliveryReceipt(r.delivery?.delivery, manager.slug, r.delivery?.reason || r.delivery?.error || null) };
 }
@@ -2462,20 +2679,33 @@ export async function selfWork(xell, { board = false, item = null } = {}) {
 // project. It answers with the item, and the CLI prints the ID first, because the next thing a
 // manager does with a fresh card is `zee assign --item <id>`.
 export async function selfWorkNew(xell, { title = null, body = null, kind = null, parent = null,
-                                          ticket = null, priority = null, status = null } = {}) {
+                                          after = null, ticket = null, priority = null, status = null } = {}) {
   const guard = requireManager(xell, 'work --new');
   if (guard) return guard;
   if (!String(title || '').trim()) {
     return { ok: false, error: 'a work item needs --title "…" — the one line that becomes the card. '
       + 'The detail (what to change, how to verify it) goes in --body, and a worker is briefed from both.' };
   }
-  const { createWorkItem } = await import('../lib/work-items.js');
+  const { createWorkItem, addDep, inTransaction } = await import('../lib/work-items.js');
   const { getItem } = await import('../lib/work-assign.js');
   const { resolveTicket } = await import('../lib/tickets.js');
+
+  // PARENT-FIRST — the guard this verb exists to make real. A manager establishes ONE parent
+  // work_node (an activity) and chains children under it; a leaf TASK cut at top level is a stray
+  // card nobody can report against. Only the parent-establishing cut — `--kind activity` — is
+  // allowed at top level. A --parent or --after gives the task a home too, so those are exempt.
+  const kindNow = kind || 'task';
+  if (!parent && !after && kindNow === 'task') {
+    return { ok: false, status: 'refused', error:
+      'a task needs a home — establish the parent work_node first (`zee work --new --kind activity '
+      + '--title "…"`), nest this one under it with --parent, or file a ticket (`zee ticket`) if it '
+      + 'is outside the current plan.' };
+  }
 
   // A parent in another project would move the whole item there (createWorkItem inherits the
   // parent's project). Refused by name, before anything is written.
   let parentId = null;
+  let parentRow = null;
   if (parent) {
     let row;
     try { row = await getItem(parent); }
@@ -2484,7 +2714,36 @@ export async function selfWorkNew(xell, { title = null, body = null, kind = null
       return { ok: false, status: 'refused', error:
         `work item ${parent} ("${row.title}") is in another project. You cut YOUR project's plan only.` };
     }
+    parentRow = row;
     parentId = row.id;
+  }
+  // --after <sibling-id>: the chain shorthand — land the new card under the sibling's SAME parent
+  // and make it wait for the sibling, in ONE call (the pair is one transaction below). The sibling
+  // must have a parent (a root is the project's top, not a sibling), and --parent, when both are
+  // given, must name the same home.
+  let afterRow = null;
+  if (after) {
+    let row;
+    try { row = await getItem(after); }
+    catch (e) { return { ok: false, error: e.message }; }
+    if (row.project_id !== xell.project_id) {
+      return { ok: false, status: 'refused', error:
+        `work item ${after} ("${row.title}") is in another project. You cut YOUR project's plan only.` };
+    }
+    if (!row.parent_id) {
+      return { ok: false, status: 'refused', error:
+        `"${row.title}" is the project's root — it has no parent to nest a sibling under. \`--after\` `
+        + 'chains a new card beside an EXISTING sibling; give the new card a home with --parent, or '
+        + 'cut it as --kind activity.' };
+    }
+    if (parentRow && parentRow.id !== row.parent_id) {
+      return { ok: false, status: 'refused', error:
+        `--parent "${parentRow.title}" and --after "${row.title}" disagree: a --after card nests under `
+        + `the SIBLING's parent, and "${row.title}" does not live under "${parentRow.title}". Give the `
+        + 'new card ONE home — keep --parent or keep --after, not both.' };
+    }
+    afterRow = row;
+    parentId = row.parent_id;
   }
   let ticketRow = null;
   if (ticket) {
@@ -2497,20 +2756,39 @@ export async function selfWorkNew(xell, { title = null, body = null, kind = null
     }
   }
 
+  const create = (opts = {}) => createWorkItem({
+    project_id: xell.project_id, parent_id: parentId, title, body,
+    kind: kindNow, ticket_id: ticketRow?.id || null,
+    priority: priority ?? null, status: status || null, actor: xell.slug }, opts);
   let item;
   try {
-    item = await createWorkItem({
-      project_id: xell.project_id, parent_id: parentId, title, body,
-      kind: kind || 'task', ticket_id: ticketRow?.id || null,
-      priority: priority ?? null, status: status || null, actor: xell.slug });
+    // --after creates the card AND the chain in one transaction, so a failure between the two can
+    // never leave a card that is not chained (or a chain on a card that was never cut).
+    item = afterRow
+      ? await inTransaction(async (tx) => {
+          const made = await create({ client: tx.client, pending: tx.pending });
+          await addDep(made.id, afterRow.id, { actor: xell.slug, client: tx.client, pending: tx.pending });
+          return made;
+        })
+      : await create();
   } catch (e) { return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message }; }
   logline('self', `${xell.slug} cut work item "${item.title}" (${item.kind}, ${item.status})`
+    + `${afterRow ? `, chained after "${afterRow.title}"` : ''}`
     + `${ticketRow ? ` for ${ticketRow.code}` : ''}`);
+  const parentTitle = afterRow
+    ? (await one(`SELECT title FROM work_item WHERE id=$1`, [afterRow.parent_id]))?.title || null
+    : null;
   return {
-    ok: true, item, id: item.id, ticket: ticketRow ? { id: ticketRow.id, code: ticketRow.code } : null,
-    message: `Created "${item.title}" (${item.kind}, ${item.status}) — ${item.id}. Deploy a worker for it `
-      + `with \`zee assign --item ${item.id} --task "…"\`, or hang children off it with `
-      + `\`zee work --new --parent ${item.id} --title "…"\`. Creating a card dispatches nobody.`,
+    ok: true, item, id: item.id, after: afterRow ? { id: afterRow.id, title: afterRow.title } : null,
+    ticket: ticketRow ? { id: ticketRow.id, code: ticketRow.code } : null,
+    message: afterRow
+      ? `Created "${item.title}" (${item.kind}, ${item.status}) — ${item.id}, nested under `
+        + `"${parentTitle || afterRow.parent_id}" and chained after "${afterRow.title}" — it waits for `
+        + `"${afterRow.title}" (the gantt draws "${afterRow.title}" first). Deploy a worker for it with `
+        + `\`zee assign --item ${item.id} --task "…"\`. Creating a card dispatches nobody.`
+      : `Created "${item.title}" (${item.kind}, ${item.status}) — ${item.id}. Deploy a worker for it `
+        + `with \`zee assign --item ${item.id} --task "…"\`, or hang children off it with `
+        + `\`zee work --new --parent ${item.id} --title "…"\`. Creating a card dispatches nobody.`,
   };
 }
 
@@ -2626,6 +2904,45 @@ export async function selfWorkUnassign(xell, { item = null, reason = null } = {}
   };
 }
 
+// POST /api/xell/self/work/dep — `zee dep` (MANAGER only).
+// The CHAIN-vs-NESTING verb: a card may DEPEND ON another card (a "chain": this work waits
+// for that work). Nesting (parent_id) says "part of"; a dependency says "after". A
+// start-to-end-goal gantt draws the chain as the critical path, so a manager captures it
+// here: `zee dep --item <dependent> --on <prerequisite>` writes the model dependency
+// (dependency.from_id = prerequisite, to_id = dependent), and `--remove` deletes it. The
+// console's item drawer has the same picker (addDep/removeDep); this is the CLI half.
+export async function selfWorkDep(xell, { item = null, on = null, remove = false } = {}) {
+  const guard = requireManager(xell, 'dep');
+  if (guard) return guard;
+  if (!item || !on) {
+    return { ok: false, error: 'dep needs --item <dependent-id> --on <prerequisite-id> '
+      + '(a chain: this work waits for that work). `--remove` takes the edge away.' };
+  }
+  const { addDep, removeDep } = await import('../lib/work-items.js');
+  const { getItem } = await import('../lib/work-assign.js');
+  let a, b;
+  try { [a, b] = await Promise.all([getItem(item), getItem(on)]); }
+  catch (e) { return { ok: false, error: e.message }; }
+  if (!a || !b) return { ok: false, error: 'one of the two items does not exist' };
+  if (a.project_id !== xell.project_id || b.project_id !== xell.project_id) {
+    return { ok: false, status: 'refused', error:
+      `both ends of a chain must be in YOUR project — "${a.title}" is in ${a.project_id}, `
+      + `"${b.title}" is in ${b.project_id}.` };
+  }
+  try {
+    if (remove) {
+      await removeDep(a.id, b.id, { actor: xell.slug });
+      return { ok: true, message: `Removed the chain: "${a.title}" no longer waits for "${b.title}".` };
+    }
+    await addDep(a.id, b.id, { actor: xell.slug });
+    return { ok: true, message: `Chained: "${a.title}" now waits for "${b.title}". The gantt draws `
+      + `"${b.title}" before "${a.title}", and the chain is what the critical path runs along. `
+      + `(Undo with --remove.)` };
+  } catch (e) {
+    return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };
+  }
+}
+
 // POST /api/xell/self/work/assign — `zee assign` (MANAGER only).
 // Deploys a WORKER for a work item, through the SAME dispatch path `zee dispatch` uses: the worker is
 // still stamped manager_xell_id, still seated next to its manager, still gets its own throwaway db,
@@ -2634,7 +2951,6 @@ export async function selfWorkUnassign(xell, { item = null, reason = null } = {}
 // extra the manager types, so a well-cut plan briefs a worker for free.
 export async function selfWorkAssign(xell, { item = null, task = null, model = null, mode = null,
                                              harness = null, title = null, visual_verify = false,
-                                             langfuse_tracking = null,
                                              // WHICH AI PROVIDER the worker runs on (139): the
                                              // ROUTER's whole job is deciding this, so it must reach
                                              // the board deployment the same way it reaches any other
@@ -2655,7 +2971,7 @@ export async function selfWorkAssign(xell, { item = null, task = null, model = n
   }
   try {
     const out = await deployWorkItem(row.id, {
-      task, model, mode, harness, title, visual_verify, langfuse_tracking, provider,
+      task, model, mode, harness, title, visual_verify, provider,
       actor: xell.slug, managerXellId: xell.id });
     // A ROUTER deploys a worker onto a card but is NOT its manager (151): the worker reports to
     // nobody, and the card is what follows it. A MANAGER's deploy stamps the worker into its crew.
@@ -2677,7 +2993,8 @@ export async function selfWorkAssign(xell, { item = null, task = null, model = n
 // A MANAGER may update any item in its own project; a WORKER may update ONLY the item it is assigned
 // to. Both are resolved from the CALLER'S TOKEN — an id that is not theirs is refused with a sentence,
 // never silently applied.
-export async function selfWorkItem(xell, { id = null, status = null, progress = null, note = null } = {}) {
+export async function selfWorkItem(xell, { id = null, status = null, progress = null, note = null,
+                                             estimate_hours = null, starts_on = null, due_on = null } = {}) {
   const { reportItemStatus, getItem, itemForXell } = await import('../lib/work-assign.js');
   const manager = isManager(xell);
 
@@ -2714,7 +3031,44 @@ export async function selfWorkItem(xell, { id = null, status = null, progress = 
   if (p != null && (!Number.isFinite(p) || p < 0 || p > 100)) {
     return { ok: false, error: `--progress must be a number 0-100 (got "${progress}")` };
   }
+
+  // ── the SCHEDULE half (the gantt's write path): an estimate and/or dates. The console's
+  // item drawer can always PATCH these (work-items.js updateWorkItem); the zee verb gains
+  // them here so a manager can size a card from the CLI. updateWorkItem owns the
+  // validation (assertSchedule) and the dual-write to work_node.estimate.
+  const est = estimate_hours == null ? null : Number(estimate_hours);
+  if (est != null && (!Number.isFinite(est) || est < 0)) {
+    return { ok: false, error: `--estimate must be hours >= 0 (got "${estimate_hours}")` };
+  }
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  if (starts_on != null && !DATE_RE.test(starts_on)) {
+    return { ok: false, error: `--starts-on must be YYYY-MM-DD (got "${starts_on}")` };
+  }
+  if (due_on != null && !DATE_RE.test(due_on)) {
+    return { ok: false, error: `--due-on must be YYYY-MM-DD (got "${due_on}")` };
+  }
+  const hasSchedule = est != null || starts_on != null || due_on != null;
+  const hasReport = status != null || progress != null || note != null;
+  if (!hasReport && !hasSchedule) {
+    return { ok: false, error: 'nothing to report — give --status, --progress, --note, '
+      + '--estimate, --starts-on or --due-on.' };
+  }
+
   try {
+    if (hasSchedule) {
+      const { updateWorkItem } = await import('../lib/work-items.js');
+      const patch = {};
+      if (est != null) patch.estimate_hours = est;
+      if (starts_on != null) patch.starts_on = starts_on;
+      if (due_on != null) patch.due_on = due_on;
+      await updateWorkItem(target.id, patch, { actor: xell.slug });
+    }
+    if (!hasReport) {
+      const fresh = await getItem(target.id);
+      return { ok: true, item: fresh,
+        message: `Schedule recorded on "${target.title}" — estimate ${est}h, `
+          + `starts ${starts_on ?? '—'}, due ${due_on ?? '—'}.` };
+    }
     return await reportItemStatus(target.id, { status, progress: p, note, actor: xell.slug });
   } catch (e) {
     return { ok: false, status: e.status === 409 ? 'refused' : 'error', error: e.message };

@@ -54,10 +54,18 @@
 //
 // Same shape as queenzee/dbclone.js: a pure-script tick, loud in the log, disabled with
 // WORKSYNC_ENABLED=false, and every failure isolated per item so one bad row cannot stop the sweep.
+//
+// REHAB 3/4 — this tick still reads "which items have a zee" from work_item.xell_id. The model's
+// lease plane is where that belongs, but the lease table has ZERO rows: the rehab 1/4 dual-write
+// writes executions only, so there is no lease data to read (see lib/work-assign.js's REHAB 3/4
+// note). Writing leases is deferred out of the conflation retirement; until then the tick is the
+// legacy projection, kept honest by the documented split in lib/work-item-model.js (work_item is
+// the ATTRIBUTE ANNEX).
 import { q } from '../db/pool.js';
 import { logline } from '../lib/logbus.js';
 import { statusFromHive, isTerminal, WORK_STATUS_KEYS, canTransition } from '../lib/work-status.js';
-import { liveZees, logWorkEvent } from '../lib/work-items.js';
+import { liveZees, logWorkEvent, inTransaction, dbRunner } from '../lib/work-items.js';
+import { syncExecutionState } from '../lib/work-node-sync.js';
 // The board announces itself in the SAME shape part 1 documents for these kinds ({ kind, item }) —
 // a card the console cannot patch is a card that only moves on a refresh.
 import { announceWorkItem } from '../lib/work-assign.js';
@@ -135,9 +143,16 @@ export async function workSyncTick() {
       if (!inFlight(next)) continue;         // never done/cancelled from a tick
       if (!canTransition(row.status, next)) continue;   // and never an illegal transition
 
-      await q(`UPDATE work_item SET status=$2 WHERE id=$1`, [row.id, next]);
-      await logWorkEvent(row.id, 'status', { from: row.status, to: next, actor: 'queenzee',
-        detail: { hive_status: hive, xell_slug: row.xell_slug, by: 'worksync' } });
+      // REHAB 1/4 DUAL-WRITE: the board move is a status change — the work_item and its
+      // execution must land together (one transaction; if the execution write fails the card
+      // does not move).
+      await inTransaction(async ({ client }) => {
+        const db = dbRunner(client);
+        await db.q(`UPDATE work_item SET status=$2 WHERE id=$1`, [row.id, next]);
+        await syncExecutionState(db, row.id, next);
+        await logWorkEvent(row.id, 'status', { from: row.status, to: next, actor: 'queenzee',
+          detail: { hive_status: hive, xell_slug: row.xell_slug, by: 'worksync' } }, { client });
+      });
       await announceWorkItem('status', row.id);
       logline('worksync',
         `"${row.title}" ${row.status} → ${next} — ${row.xell_slug} is ${hive} (the board moved itself)`);

@@ -514,14 +514,17 @@ function usage() {
 
  the work tracker (the PLAN this job is part of):
   zee work [--board] [--item <id>] [--json]   MANAGER: your project's work items in tree order (--board drops the project root — a root is not a card). WORKER: the ONE item you are assigned to, with its ancestors, ticket, children and history
-  zee work --new --title "..." [--body "..."] [--kind task|activity] [--parent <id>] [--ticket <code|id>] [--priority 1..5] [--status s]   MANAGER-only: CUT ONE CARD in your own project's plan and print its ID, so it pipes straight into "zee assign --item <id>". Creating a card dispatches nobody
-  zee item [<id>] --status <s> [--progress N] [--note "..."]   report where the WORK has got to. A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
+  zee work --new --title "..." [--body "..."] [--kind task|activity] [--parent <id>] [--after <sibling-id>] [--ticket <code|id>] [--priority 1..5] [--status s]   MANAGER-only: CUT ONE CARD in your own project's plan and print its ID, so it pipes straight into "zee assign --item <id>". PARENT-FIRST: a task needs a home — cut the parent as --kind activity, nest tasks under it with --parent, or chain a task after an existing sibling with --after (which also adds the FS dependency: the new card waits for that sibling). Creating a card dispatches nobody
+  zee item [<id>] --status <s> [--progress N] [--note "..."] [--estimate <hours>] [--starts-on YYYY-MM-DD] [--due-on YYYY-MM-DD]   report where the WORK has got to — and size the card for the gantt (--estimate/--starts-on/--due-on PATCH the work_item and dual-write the plan node). A worker may report only its OWN item (omit the id — it is resolved from your token); a manager any item in its project. It moves the CARD only: your own done/land/ship stay your verbs and a human's gates
+  zee handover --result <json> [--override]   store your TYPED RESULT on the PLANE-3 execution this xell is bound to (interim — the stage-2 data plane replaces this). The execution is resolved from your xell binding, never named by you. Refused if outputs already has a result unless --override (the event log keeps the history)
+  zee await [--for <hours>]           END your turn now — the anti-spin primitive: tokens stop — hold a lease on the execution and mark it 'waiting' (default 24h window; --for overrides in hours). MUST be the last thing you do in this turn
 
  MANAGER-only (refused for a worker, with an explanation):
+  zee dep --item <dependent-id> --on <prerequisite-id> [--remove]   CHAIN two cards in YOUR project: \`--item\` (the dependent) waits for \`--on\` (the prerequisite) — a dependency edge in the model. Nesting (parent_id) says part-of; a chain (dependency) says AFTER, and the gantt's critical path runs along chains. \`--remove\` takes the edge away. The console drawer has the same picker; this is the CLI half
   zee conversations [--xell <slug>] [--full]   review your crew's uploaded CONVERSATION ARCHIVES (who said what while they worked). --xell narrows to one worker; --full prints its newest transcript
   zee zees                           YOUR CREW: every worker you dispatched — slug, branch, hive status, what it waits on, WHAT IT HAS PRODUCED (landings + its unlanded diff) and its last message
-  zee assign --item <id> --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse]   DEPLOY a worker for a WORK ITEM — the ONLY way any manager (router included) deploys. The brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text; the item admits at most one live worker, so a second deploy on the same item is REFUSED. Cut a card with \`zee work --new --title "…"\` (or break a ticket down) and pipe its id here: \`zee assign --item <id> --task "…"\`. Returns the new worker's slug. --provider names the AI provider the worker runs on (a ROUTER's decision, riding the board deploy). --visual-verify turns on per-xell VISUAL VERIFICATION (see dispatch); --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (see dispatch)
-  zee dispatch --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--langfuse|--no-langfuse] [--title "..."]   REFUSED for EVERY manager, router included (the board — \`zee work --new\` + \`zee assign --item <id> --task "…"\` — is the only deployment path; a router routes prompts onto cards and does not manage the workers it deploys). It spawns a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness. --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and offers the live link to a human in the console; --langfuse/--no-langfuse sets the per-xell Langfuse tracking switch (default ON — --no-langfuse stops this xell's turns being traced to Langfuse)
+  zee assign --item <id> --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify]   DEPLOY a worker for a WORK ITEM — the ONLY way any manager (router included) deploys. The brief is built from the item itself (title, body, ancestors, ticket, dates) plus your --task text; the item admits at most one live worker, so a second deploy on the same item is REFUSED. Cut a card with \`zee work --new --title "…"\` (or break a ticket down) and pipe its id here: \`zee assign --item <id> --task "…"\`. Returns the new worker's slug. --provider names the AI provider the worker runs on (a ROUTER's decision, riding the board deploy). --visual-verify turns on per-xell VISUAL VERIFICATION (see dispatch)
+  zee dispatch --task "..." [--provider key] [--model m] [--mode 1..5] [--harness key] [--visual-verify] [--title "..."]   REFUSED for EVERY manager, router included (the board — \`zee work --new\` + \`zee assign --item <id> --task "…"\` — is the only deployment path; a router routes prompts onto cards and does not manage the workers it deploys). It spawns a WORKER zee that reports to you (seated next to you in the honeycomb). It gets its own throwaway db; you cannot hand it prod, the manager role, or the manager harness. --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and offers the live link to a human in the console
   zee breakdown --ticket <code|id> --items <file.json>   turn a TICKET into a whole work-item TREE in one call (a JSON array of {title, kind?, body?, parent_id?, ref?, priority?, starts_on?, due_on?} — those keys and no others, so an entry naming a zee/status/progress is refused; a later item may name an earlier one's "ref" as its parent_id). One transaction — either the whole plan exists or the ticket is untouched. ADDITIVE: running it twice cuts a second set
   zee unassign --item <id> [--reason "..."]   take the zee OFF a work item, freeing the card for a new "zee assign" (the verb the "unassign it first" refusal has been asking for). The item's STATUS is left alone and the xell is untouched — this reaps nobody
   zee swap --to <slug> --harness <key> [--task "..."] [--model m] [--mode 1..5]   replace the ZEE working one of YOUR xells with a fresh one wearing a different worker harness, KEEPING the xell: same branch, same commits, same containers, same db, same card. How one piece of work gets a Scout, then a Builder, then a Reviewer. The outgoing zee's commits are collected out of its cage FIRST (refused rather than risked) and the incoming zee is briefed on what it INHERITED. REFUSED: a xell that is not your crew, a manager target, a manager harness, and any xell with a human gate open on it (a landing, a ship, a done suggestion)
@@ -978,12 +981,6 @@ switch (cmd) {
       // --visual-verify turns on per-xell VISUAL VERIFICATION: the worker builds the webapp and
       // offers the live link to a human in the console (`zee verify-webapp`).
       ...(rest.includes('--visual-verify') ? { visual_verify: true } : {}),
-      // --langfuse / --no-langfuse sets the per-xell LANGFUSE TRACKING switch (default ON). The
-      // explicit pair, not a single flag: the default is ON, so "turn it off" (--no-langfuse) is
-      // the interesting verb and must be representable; neither flag → the target keeps what it has.
-      ...(rest.includes('--no-langfuse') ? { langfuse_tracking: false }
-        : rest.includes('--langfuse') ? { langfuse_tracking: true }
-        : {}),
     }));
     break;
   }
@@ -1128,7 +1125,8 @@ switch (cmd) {
       }
       const r = await req('POST', '/api/xell/self/work/new', {
         title, body: flag('body') || null, kind: flag('kind') || null,
-        parent: flag('parent') || null, ticket: flag('ticket') || null,
+        parent: flag('parent') || null, after: flag('after') || null,
+        ticket: flag('ticket') || null,
         priority: priority == null ? null : Number(priority), status: flag('status') || null,
       });
       if (rest.includes('--json')) { out(r); break; }
@@ -1182,10 +1180,6 @@ switch (cmd) {
       ...(flag('provider') ? { provider: flag('provider') } : {}),
       // Same per-xell VISUAL VERIFICATION opt-in as `zee dispatch --visual-verify`.
       ...(rest.includes('--visual-verify') ? { visual_verify: true } : {}),
-      // Same per-xell LANGFUSE TRACKING switch as `zee dispatch --langfuse|--no-langfuse`.
-      ...(rest.includes('--no-langfuse') ? { langfuse_tracking: false }
-        : rest.includes('--langfuse') ? { langfuse_tracking: true }
-        : {}),
     }));
     break;
   }
@@ -1221,15 +1215,55 @@ switch (cmd) {
     break;
   }
   case 'item': {
-    // Report where the WORK has got to. A manager may report any item in its own project; a worker
-    // only the one it is assigned to (and may omit the id — the server resolves it from your token).
-    // This moves the CARD. It never marks your xell done, lands anything or ships anything.
+    // Report where the WORK has got to (or size the card): a manager may report any item in its
+    // own project; a worker only the one it is assigned to (and may omit the id — the server
+    // resolves it from your token). --estimate/--starts-on/--due-on are the gantt's write path —
+    // they PATCH the work_item and dual-write work_node.estimate. This moves the CARD. It never
+    // marks your xell done, lands anything or ships anything.
     const id = flag('item') || positional();
     const progress = flag('progress');
+    const est = flag('estimate');
     out(await req('POST', '/api/xell/self/work/item', {
       id, status: flag('status') || null,
       progress: progress == null ? null : Number(progress), note: flag('note') || null,
+      estimate_hours: est == null ? null : Number(est),
+      starts_on: flag('starts-on') || null, due_on: flag('due-on') || null,
     }));
+    break;
+  }
+  case 'dep': {
+    // CHAIN-vs-NESTING: `--item` (the dependent) waits for `--on` (the prerequisite) — the
+    // model dependency the gantt's critical path runs along. The console drawer has the same
+    // picker; this is the CLI half of "capture chains going forward". MANAGER only.
+    const item = flag('item') || positional();
+    const on = flag('on') || flag('depends-on');
+    if (!item || !on) {
+      console.error('dep needs --item <dependent-id> --on <prerequisite-id> (a chain: this work '
+        + 'waits for that work). `--remove` takes the edge away.');
+      process.exit(1);
+    }
+    out(await req('POST', '/api/xell/self/work/dep', {
+      item, on, remove: rest.includes('--remove'),
+    }));
+    break;
+  }
+  case 'handover': {
+    // The WELD: a zee bound to a PLANE-3 execution hands its TYPED RESULT over. INTERIM storage on
+    // execution.outputs until the stage-2 data plane (ports) exists. The execution is resolved from
+    // the CALLER's xell binding — never an agent-named id (the identity half of "every row in the
+    // observability chain is a byproduct of a door"). A result already on outputs is REFUSED unless
+    // --override (the event log keeps the history of every handover).
+    const result = flag('result');
+    if (!result) { console.error('handover needs --result "<json>" — the typed result to store on the execution'); process.exit(1); }
+    out(await req('POST', '/api/xell/self/handover', { result, override: rest.includes('--override') }));
+    break;
+  }
+  case 'await': {
+    // The ANTI-SPIN primitive: END the current turn NOW (tokens stop), hold a lease on the execution
+    // this xell is bound to, and mark it 'waiting'. The execution is resolved from the caller's xell
+    // binding. --for overrides the default 24h lease window in hours.
+    const forH = flag('for');
+    out(await req('POST', '/api/xell/self/await', forH ? { for: Number(forH) } : {}));
     break;
   }
   case 'mint-manager': {

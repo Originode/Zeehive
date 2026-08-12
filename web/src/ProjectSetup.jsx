@@ -1,11 +1,12 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import {
   createProject, updateProject, probeRepo, probeRemote, cloneProject, pullProject,
   githubAccess, pushProject, pullRequestProject, squashHelps, squashOffer,
   getReadiness, getSites, createSite, updateSite, deleteSite,
   getPoolConfig, patchPoolConfig, getSharedContainers, createSharedContainer, patchSharedContainer,
-  deleteSharedContainer, refreshProjectManifest, draftProjectManifest,
+  deleteSharedContainer, getProjectManifestInfo, refreshProjectManifest,
+  buildProjectManifest, writeProjectManifest,
   getComposeOnboardingPlan, applyComposeOnboarding,
   getDockerContexts, getRuntimes, getHarnesses,
   getMachines, getProviderTokens, addProviderToken, deleteProviderAccount,
@@ -17,6 +18,7 @@ import {
   previewProjectDoc,
   getXourceState, cleanXourceNow, getXourceCleanRequests, decideXourceClean, dismissXourceClean,
   getWireguard, mintWireguardPeer, setWireguardEndpoint,
+  getProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
 } from './api.js';
 import { showConfirm, showAlert, showPrompt } from './Dialog.jsx';
 
@@ -370,6 +372,7 @@ const SETUP_TABS = [
   { key: 'docs', label: 'Docs', gates: [] },
   { key: 'env', label: 'Environments', gates: [] },
   { key: 'providers', label: 'Providers', gates: [] },
+  { key: 'ticketapi', label: 'Ticket API', gates: [] },
   { key: 'pool', label: 'Pool', gates: ['pool'] },
   { key: 'danger', label: '⚠ Danger', gates: [], danger: true },
 ];
@@ -409,13 +412,13 @@ function EditSections({ project, onChanged, onProject }) {
         <ManifestSection project={project} run={run} onProject={onProject} />
       </>}
       {tab === 'deploy' && <>
-        <SitesSection project={project} run={run} busy={busy} />
+        <DeployTree project={project} run={run} busy={busy} />
         <WireguardSection project={project} run={run} busy={busy} />
-        <InventorySection project={project} run={run} busy={busy} />
       </>}
       {tab === 'docs' && <ProjectDocsSection project={project} run={run} busy={busy} />}
       {tab === 'env' && <EnvironmentsSection project={project} run={run} busy={busy} />}
       {tab === 'providers' && <TokensSection project={project} run={run} busy={busy} />}
+      {tab === 'ticketapi' && <ApiKeysSection project={project} run={run} busy={busy} />}
       {tab === 'pool' && <SpawnSection project={project} run={run} />}
       {tab === 'danger' && <>
         <XourceSection project={project} onChanged={() => { reload(); onChanged?.(); }} />
@@ -818,22 +821,69 @@ function BasicsSection({ project, run, onProject }) {
 }
 
 function ManifestSection({ project, run, onProject }) {
-  const [draft, setDraft] = useState(null);
+  // GET /manifest — { stored, repo, drift } — is the "is there a manifest in the repo" truth.
+  const [info, setInfo] = useState(null);
+  // Wizard data: the compose-file scan (file list + tier/role guesses) that pre-fills the form.
+  const [suggest, setSuggest] = useState(null);
+  const [knobs, setKnobs] = useState(() => emptyManifestKnobs(project));
+  // The untouched form, captured once, so the compose-scan pre-fill can't clobber a human who
+  // already started typing by the time the scan comes back.
+  const untouchedKnobs = useRef(null);
+  if (untouchedKnobs.current === null) untouchedKnobs.current = emptyManifestKnobs(project);
+  const [step, setStep] = useState('idle');       // idle | knobs | preview (wizard states)
+  const [editableYaml, setEditableYaml] = useState('');
+  const [minimalManifest, setMinimalManifest] = useState(false); // preview has no tiers/roles
+  const [localBusy, setLocalBusy] = useState(false);
+  const [wizardErr, setWizardErr] = useState(null);
+  const [statusMsg, setStatusMsg] = useState(null);
   const [plan, setPlan] = useState(null);
   const [writeYml, setWriteYml] = useState(true);
   const [applyMeta, setApplyMeta] = useState(true);
   const [planErr, setPlanErr] = useState(null);
+  // 'create' = no manifest yet; 'regenerate' = an INVALID manifest is being rebuilt (write
+  // passes overwrite:true). The wizard itself is identical; only the intro + write differ.
+  const [mode, setMode] = useState('create');
 
-  const refresh = () => run(async () => { const p = await refreshProjectManifest(project.id); onProject(p); setDraft(null); setPlan(null); });
-  const makeDraft = () => run(async () => setDraft((await draftProjectManifest(project.id, false)).draft));
-  const writeDraft = async () => {
-    if (!(await showConfirm(
-      `Write zeehive.yml into ${project.repo_root}?\n\n`
-      + 'This is the ONE file ZEEHIVE may create in a project repo. It will be refused if one already exists. '
-      + 'You still need to commit it. Production containers are not touched.',
-      { okLabel: 'Write zeehive.yml', title: 'Write draft to repo' }))) return;
-    await run(async () => { await draftProjectManifest(project.id, true); setDraft(null); });
+  const loadInfo = useCallback(() => {
+    getProjectManifestInfo(project.id).then(setInfo).catch(() => {});
+  }, [project.id]);
+  useEffect(() => { loadInfo(); }, [loadInfo]);
+
+  const repo = info?.repo;
+  const repoFound = repo?.found === true;
+  const repoValid = repoFound && !(repo.errors || []).length;
+  const regenerating = mode === 'regenerate';
+
+  // Seed the wizard's compose-file scan once, so the form can offer detected files and
+  // role guesses. Only meaningful when there's no manifest yet (the wizard is hidden otherwise).
+  const loadSuggest = useCallback(() => {
+    buildProjectManifest(project.id, {}).then((r) => {
+      if (!r?.suggestions) return;
+      setSuggest(r.suggestions);
+      // Pre-fill from the scan ONLY if the human hasn't typed anything yet.
+      setKnobs((k) => (JSON.stringify(k) === JSON.stringify(untouchedKnobs.current)
+        ? { ...k, ...knobsFromSuggestions(r.suggestions, project) }
+        : k));
+    }).catch(() => {});
+  }, [project.id, project]);
+  useEffect(() => {
+    if (info && !repoValid) loadSuggest();
+  }, [info, repoValid, loadSuggest]);
+
+  // Wrap a wizard mutation: local busy for button disabling, surface errors inline (the parent
+  // `run` helper only covers the section-level buttons, not the wizard's), then re-read state.
+  const wizard = async (fn) => {
+    setLocalBusy(true); setWizardErr(null); setStatusMsg(null);
+    try { const r = await fn(); loadInfo(); return r; }
+    catch (e) { setWizardErr(e.message || String(e)); throw e; }
+    finally { setLocalBusy(false); }
   };
+
+  const refresh = () => run(async () => {
+    const p = await refreshProjectManifest(project.id);
+    onProject(p);
+    setStatusMsg('✓ Re-read zeehive.yml — the meta-DB cache now matches the repo.');
+  });
 
   // Compose onboarding: detect compose files → show the plan → human approves → apply.
   // The server re-plans on apply and refuses without approved:true.
@@ -842,7 +892,6 @@ function ManifestSection({ project, run, onProject }) {
     try {
       const p = await getComposeOnboardingPlan(project.id);
       setPlan(p);
-      // Default the write toggle to ON only when the plan would actually touch a file.
       setWriteYml((p.files_to_modify || []).length > 0);
       setApplyMeta(true);
     } catch (e) {
@@ -886,6 +935,7 @@ function ManifestSection({ project, run, onProject }) {
     }));
     if (result?.project) onProject(result.project);
     setPlan(null);
+    loadInfo();
     await showAlert(
       `Compose onboarding applied.`
       + (result?.written?.length ? `\nWrote: ${result.written.map((w) => `${w.action} ${w.path}`).join(', ')}` : '\nNo files written.')
@@ -893,126 +943,329 @@ function ManifestSection({ project, run, onProject }) {
       { title: 'Onboarding complete' });
   };
 
+  const fillFromCompose = () => {
+    if (!suggest) return;
+    setKnobs((k) => ({ ...k, ...knobsFromSuggestions(suggest, project) }));
+    setStatusMsg('Filled the tiers and roles from the detected compose files. Adjust anything, then Preview.');
+  };
+
+  const previewDraft = () => wizard(async () => {
+    const r = await buildProjectManifest(project.id, knobs);
+    setEditableYaml(r.yaml);
+    // A manifest with no tiers and no roles is the old "generic yaml that does nothing" — say so.
+    setMinimalManifest(!r.manifest?.tiers && !r.manifest?.roles);
+    setStep('preview');
+  });
+
+  const writeDraft = async () => {
+    if (!(await showConfirm(
+      `${regenerating ? 'Replace' : 'Create'} zeehive.yml in ${project.repo_root}?\n\n`
+      + 'This is the ONE file ZEEHIVE writes into a project repo. '
+      + (regenerating
+        ? 'The current file is invalid and WILL be overwritten.'
+        : 'It will be refused if a valid one already exists. ')
+      + 'After it is written you still need to commit it in the repo.\n\n'
+      + 'The meta-DB project row is updated to match (compose files, ports, roles). '
+      + 'Production containers are not touched.',
+      { okLabel: regenerating ? 'Replace zeehive.yml' : 'Create zeehive.yml', title: 'Write manifest to repo' }))) return;
+    await wizard(async () => {
+      const p = await writeProjectManifest(project.id, { yaml: editableYaml, apply_meta: true, overwrite: regenerating });
+      onProject(p);
+      setMode('create');
+      setStep('idle');
+      setStatusMsg('✓ zeehive.yml created and applied to the meta-DB. Commit it in the repo, then come back any time to ↻ Re-read it.');
+    });
+  };
+
+  // ── render ────────────────────────────────────────────────────────────────
+  const composeListId = `zh-cf-${project.id}`;
+  const svcListId = `zh-svc-${project.id}`;
+  const allServices = [...new Set((suggest?.files || []).flatMap((f) => f.services || []))];
+
   return (
     <div className="setup-sec" data-testid="manifest-section">
-      <h3>Manifest <span className="pc">{project.manifest_hash ? `cached @ ${project.manifest_hash}` : 'none cached'}</span></h3>
-      <p className="setup-hint">
-        The repo&apos;s <span className="mono">zeehive.yml</span> is the shape truth; the meta-DB holds a
-        cache (<span className="mono">project.manifest</span> + compose columns) the pool and provision
-        paths read. Compose onboarding detects <span className="mono">docker-compose*.yml</span>, shows
-        every file and column that would change, and applies only after you approve — live production
-        containers are never rewritten.
-      </p>
-      <div className="setup-row">
-        <button type="button" onClick={refresh} title="Re-read zeehive.yml into the meta-DB cache">↻ Refresh from repo</button>
-        <button type="button" className="ghost" onClick={makeDraft}>Generate draft</button>
-        {draft && <button type="button" onClick={writeDraft}>Write zeehive.yml to repo…</button>}
-        <button type="button" data-testid="compose-plan-btn"
-                title="Detect compose files and preview meta-DB + yml changes before anything is written"
-                onClick={loadPlan}>Plan compose onboarding</button>
-      </div>
-      {draft && <textarea className="setup-draft" readOnly value={draft} rows={12} />}
-      {planErr && <div className="projpop-err" data-testid="compose-plan-err">{planErr}</div>}
-      {plan && (
-        <div className="compose-plan" data-testid="compose-plan">
-          <h4>Compose onboarding plan</h4>
-          {!plan.applicable && (
-            <div className="setup-hint">{plan.reason || 'Nothing to apply — already configured.'}</div>
-          )}
-          <div className="compose-plan-block">
-            <div className="compose-plan-label">Detected compose files</div>
-            {(plan.compose_files || []).length === 0
-              ? <div className="setup-hint">none at repo root</div>
-              : <ul className="compose-plan-list">
-                  {plan.compose_files.map((f) => (
-                    <li key={f.file}>
-                      <span className="mono">{f.file}</span>
-                      {f.tier_guess ? <span className="pc"> → tier {f.tier_guess}</span> : <span className="pc"> → (no tier guess)</span>}
-                      {f.services?.length ? <span className="pc"> · services: {f.services.join(', ')}</span> : null}
-                    </li>
-                  ))}
-                </ul>}
+      <h3>Manifest <span className="pc">(zeehive.yml — the repo&apos;s shape truth)</span></h3>
+
+      {!info ? (
+        <div className="setup-hint">Checking the repo for a manifest…</div>
+      ) : repoValid ? (
+        <>
+          <div className="gates">
+            <span className="gate g-pass">✓ {repo.file} valid</span>
+            {info.drift
+              ? <span className="gate g-warn" title="The repo file changed since it was last read into the meta-DB">△ cached @ {project.manifest_hash || '—'} — repo differs, re-read</span>
+              : <span className="gate g-pass" title="The meta-DB cache matches the repo file">✓ cached @ {project.manifest_hash || '—'}</span>}
           </div>
-          <div className="compose-plan-block">
-            <div className="compose-plan-label">Files that would be modified</div>
-            {(plan.files_to_modify || []).length === 0
-              ? <div className="setup-hint">none — meta-DB only (or already in sync)</div>
-              : <ul className="compose-plan-list">
-                  {plan.files_to_modify.map((f) => (
-                    <li key={f.path}>
-                      <b>{f.action.toUpperCase()}</b>{' '}
-                      <span className="mono">{f.path}</span>
-                      <div className="pc">{f.detail}</div>
-                    </li>
-                  ))}
-                </ul>}
+          <ManifestSummary manifest={project.manifest} />
+          <div className="setup-row">
+            <button type="button" onClick={refresh}
+                    title="Re-read zeehive.yml into the meta-DB cache (the pool and provision paths read the cache)">
+              ↻ Re-read from repo</button>
+            <span className="setup-hint" style={{ margin: 0 }}>The repo file is the truth — edit <span className="mono">zeehive.yml</span> in the repo, then re-read here.</span>
           </div>
-          <div className="compose-plan-block">
-            <div className="compose-plan-label">Meta-DB project row changes</div>
-            {(plan.meta_changes || []).length === 0
-              ? <div className="setup-hint">none</div>
-              : <ul className="compose-plan-list">
-                  {plan.meta_changes.map((c) => (
-                    <li key={c.column}>
-                      <span className="mono">{c.column}</span>
-                      {': '}
-                      <span className="pc">{c.from == null || c.from === '' ? '—' : String(c.from)}</span>
-                      {' → '}
-                      <b>{String(c.to)}</b>
-                    </li>
-                  ))}
-                </ul>}
+          {statusMsg && <div className="manifest-msg" data-testid="manifest-msg">{statusMsg}</div>}
+        </>
+      ) : (repoFound && !regenerating) ? (
+        <>
+          <div className="gates"><span className="gate g-fail">✗ {repo.file} INVALID</span></div>
+          <div className="projpop-err" data-testid="manifest-invalid-err">
+            {(repo.errors || []).map((e, i) => <div key={i}>{e}</div>)}
           </div>
-          <div className="compose-plan-block compose-plan-safe">
-            <div className="compose-plan-label">Guaranteed untouched</div>
-            <ul className="compose-plan-list">
-              <li>Production and spinoff <b>container rows</b> (live stacks keep their stamped compose_file)</li>
-              <li><span className="mono">deploy_site.compose_file</span></li>
-            </ul>
+          <div className="setup-row">
+            <button type="button" onClick={refresh}>↻ Re-read from repo</button>
+            <button type="button" className="ghost" onClick={() => { setMode('regenerate'); setStep('knobs'); setWizardErr(null); }}
+                    title="Rebuild zeehive.yml from the form — the generated file replaces the invalid one">Regenerate from the form</button>
+            <span className="setup-hint" style={{ margin: 0 }}>Fix the file in the repo, or rebuild it from the form.</span>
           </div>
-          {(plan.warnings || []).length > 0 && (
-            <div className="compose-plan-block">
-              <div className="compose-plan-label">Warnings</div>
-              <ul className="compose-plan-list">
-                {plan.warnings.map((w, i) => <li key={i} className="compose-plan-warn">⚠ {w}</li>)}
-              </ul>
+        </>
+      ) : (
+        <>
+          {/* ── the "no manifest yet" wizard (also shown when regenerating an INVALID manifest) ── */}
+          <p className="setup-hint">
+            {regenerating ? (
+              <>Your <span className="mono">zeehive.yml</span> is invalid. Rebuild it in two steps — the generated
+              file will <b>replace</b> the broken one.</>
+            ) : (
+              <>No <span className="mono">zeehive.yml</span> yet — the project is running on form defaults.
+              Build one in two steps: describe the shape, review the generated file, then write it to the repo.</>
+            )}
+          </p>
+          {regenerating && (
+            <div className="setup-row" style={{ margin: '0 0 6px' }}>
+              <button type="button" className="ghost" onClick={() => { setMode('create'); setStep('idle'); setWizardErr(null); }}
+                      disabled={localBusy}>← Cancel — keep the invalid file</button>
             </div>
           )}
-          {plan.proposed_yml && (
-            <details className="compose-plan-yml">
-              <summary>Proposed zeehive.yml preview</summary>
-              <textarea className="setup-draft" readOnly value={plan.proposed_yml} rows={14} />
-            </details>
+
+          {suggest?.files?.length > 0 && (
+            <div className="manifest-detect">
+              Detected {suggest.files.length} compose file{suggest.files.length === 1 ? '' : 's'}:
+              {' '}<span className="mono">{suggest.files.map((f) => f.file).join(', ')}</span>
+              {' '}<button type="button" className="ghost" onClick={fillFromCompose} disabled={localBusy}>Use them to fill the form</button>
+            </div>
           )}
-          {plan.applicable && (
-            <div className="compose-plan-actions">
-              <label className="compose-plan-check">
-                <input type="checkbox" checked={writeYml} onChange={(e) => setWriteYml(e.target.checked)}
-                       disabled={(plan.files_to_modify || []).length === 0} />
-                Write / update <span className="mono">zeehive.yml</span> in the repo
-                {(plan.files_to_modify || []).length === 0 ? ' (nothing to write)' : ''}
-              </label>
-              <label className="compose-plan-check">
-                <input type="checkbox" checked={applyMeta} onChange={(e) => setApplyMeta(e.target.checked)} />
-                Apply manifest + compose columns to the meta-DB project row
-              </label>
-              <div className="setup-row">
-                <button type="button" data-testid="compose-apply-btn"
-                        disabled={!writeYml && !applyMeta}
-                        onClick={applyPlan}>
-                  Review &amp; approve…
-                </button>
-                <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss plan</button>
+
+          {step === 'preview' ? (
+            <div className="manifest-step" data-testid="manifest-preview">
+              <div className="manifest-step-head">
+                <span className="manifest-step-num">2</span>
+                <div>
+                  <b>Review the generated zeehive.yml</b>
+                  <div className="setup-hint">Edit anything before writing — the text below is what gets written to the repo.</div>
+                </div>
               </div>
+              {minimalManifest && (
+                <div className="manifest-minimal" data-testid="manifest-minimal">
+                  ⚠ This manifest declares <b>no tiers or roles</b> — the project will keep running on
+                  form defaults for its shape. Go back and add at least one compose file or role, or
+                  write it anyway (it only sets the name and naming).
+                </div>
+              )}
+              <textarea className="setup-draft manifest-editor" value={editableYaml} rows={16}
+                        onChange={(e) => { setEditableYaml(e.target.value); setWizardErr(null); }} spellCheck={false} />
+              <div className="setup-row">
+                <button type="button" className="ghost" onClick={() => { setStep('knobs'); setWizardErr(null); }} disabled={localBusy}>← Back to step 1</button>
+                <button type="button" data-testid="manifest-write-btn" onClick={writeDraft} disabled={localBusy}>
+                  Write zeehive.yml to repo + apply…
+                </button>
+              </div>
+              {wizardErr && <div className="projpop-err" data-testid="manifest-write-err">{wizardErr}</div>}
+            </div>
+          ) : (
+            <div className="manifest-step" data-testid="manifest-knobs">
+              <div className="manifest-step-head">
+                <span className="manifest-step-num">1</span>
+                <div>
+                  <b>Describe the shape</b>
+                  <div className="setup-hint">Which compose file runs each environment, which service plays each role. Blank = not used.</div>
+                </div>
+              </div>
+
+              <datalist id={composeListId}>
+                {(suggest?.files || []).map((f) => <option key={f.file} value={f.file} />)}
+              </datalist>
+              <datalist id={svcListId}>
+                {allServices.map((s) => <option key={s} value={s} />)}
+              </datalist>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Compose files — which file runs each environment</div>
+                <div className="setup-grid">
+                  {MANIFEST_TIERS.map((tier) => (
+                    <label key={tier}>{tier} <span className="pc">({tierHint(tier)})</span>
+                      <input list={composeListId} placeholder="none"
+                             value={knobs.tiers[tier].compose}
+                             onChange={(e) => setKnobs({ ...knobs, tiers: { ...knobs.tiers, [tier]: { compose: e.target.value } } })} />
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Roles — which compose service plays each role</div>
+                <div className="setup-grid">
+                  {MANIFEST_ROLES.map(([role, label]) => (
+                    <label key={role}>{label} <span className="pc">({role})</span>
+                      <input list={svcListId} placeholder="none"
+                             value={knobs.roles[role].service}
+                             onChange={(e) => setKnobs({ ...knobs, roles: { ...knobs.roles, [role]: { service: e.target.value } } })} />
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Ports <span className="pc">(spinoff — per-xell ports are base + slot % mod)</span></div>
+                <div className="setup-grid">
+                  <label>Server port base
+                    <input type="number" value={knobs.ports.server_base} placeholder="3100"
+                           onChange={(e) => setKnobs({ ...knobs, ports: { ...knobs.ports, server_base: e.target.value } })} /></label>
+                  <label>Webapp port base
+                    <input type="number" value={knobs.ports.webapp_base} placeholder="5200"
+                           onChange={(e) => setKnobs({ ...knobs, ports: { ...knobs.ports, webapp_base: e.target.value } })} /></label>
+                  <label>Slot mod
+                    <input type="number" value={knobs.ports.slot_mod} placeholder="90"
+                           onChange={(e) => setKnobs({ ...knobs, ports: { ...knobs.ports, slot_mod: e.target.value } })} /></label>
+                </div>
+              </div>
+
+              <div className="manifest-knob-group">
+                <div className="manifest-knob-label">Environment</div>
+                <div className="setup-grid">
+                  <label>Env file
+                    <input value={knobs.env_file} placeholder=".env"
+                           onChange={(e) => setKnobs({ ...knobs, env_file: e.target.value })} /></label>
+                </div>
+              </div>
+
+              <div className="setup-row">
+                <button type="button" data-testid="manifest-preview-btn" onClick={previewDraft} disabled={localBusy}>
+                  Preview zeehive.yml →
+                </button>
+                {statusMsg && <span className="manifest-msg">{statusMsg}</span>}
+              </div>
+              {wizardErr && <div className="projpop-err" data-testid="manifest-preview-err">{wizardErr}</div>}
             </div>
           )}
-          {!plan.applicable && (
-            <div className="setup-row">
-              <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss</button>
-            </div>
-          )}
-        </div>
+
+          {statusMsg && step !== 'knobs' && <div className="manifest-msg" data-testid="manifest-msg">{statusMsg}</div>}
+        </>
       )}
+
+      {planErr && <div className="projpop-err" data-testid="compose-plan-err">{planErr}</div>}
+
+      {/* Advanced: compose onboarding — the automatic detect → plan → approve path. */}
+      <details className="manifest-advanced" data-testid="manifest-advanced">
+          <summary>Advanced — auto-detect from compose files (onboarding plan)</summary>
+          <div className="setup-hint">
+            Scans <span className="mono">docker-compose*.yml</span>, shows every file and meta-DB column that
+            would change, and applies only after you approve. Live production containers are never rewritten.
+          </div>
+          <button type="button" data-testid="compose-plan-btn"
+                  title="Detect compose files and preview meta-DB + yml changes before anything is written"
+                  onClick={loadPlan}>Plan compose onboarding</button>
+          {plan && (
+            <div className="compose-plan" data-testid="compose-plan">
+              <h4>Compose onboarding plan</h4>
+              {!plan.applicable && (
+                <div className="setup-hint">{plan.reason || 'Nothing to apply — already configured.'}</div>
+              )}
+              <div className="compose-plan-block">
+                <div className="compose-plan-label">Detected compose files</div>
+                {(plan.compose_files || []).length === 0
+                  ? <div className="setup-hint">none at repo root</div>
+                  : <ul className="compose-plan-list">
+                      {plan.compose_files.map((f) => (
+                        <li key={f.file}>
+                          <span className="mono">{f.file}</span>
+                          {f.tier_guess ? <span className="pc"> → tier {f.tier_guess}</span> : <span className="pc"> → (no tier guess)</span>}
+                          {f.services?.length ? <span className="pc"> · services: {f.services.join(', ')}</span> : null}
+                        </li>
+                      ))}
+                    </ul>}
+              </div>
+              <div className="compose-plan-block">
+                <div className="compose-plan-label">Files that would be modified</div>
+                {(plan.files_to_modify || []).length === 0
+                  ? <div className="setup-hint">none — meta-DB only (or already in sync)</div>
+                  : <ul className="compose-plan-list">
+                      {plan.files_to_modify.map((f) => (
+                        <li key={f.path}>
+                          <b>{f.action.toUpperCase()}</b>{' '}
+                          <span className="mono">{f.path}</span>
+                          <div className="pc">{f.detail}</div>
+                        </li>
+                      ))}
+                    </ul>}
+              </div>
+              <div className="compose-plan-block">
+                <div className="compose-plan-label">Meta-DB project row changes</div>
+                {(plan.meta_changes || []).length === 0
+                  ? <div className="setup-hint">none</div>
+                  : <ul className="compose-plan-list">
+                      {plan.meta_changes.map((c) => (
+                        <li key={c.column}>
+                          <span className="mono">{c.column}</span>
+                          {': '}
+                          <span className="pc">{c.from == null || c.from === '' ? '—' : String(c.from)}</span>
+                          {' → '}
+                          <b>{String(c.to)}</b>
+                        </li>
+                      ))}
+                    </ul>}
+              </div>
+              <div className="compose-plan-block compose-plan-safe">
+                <div className="compose-plan-label">Guaranteed untouched</div>
+                <ul className="compose-plan-list">
+                  <li>Production and spinoff <b>container rows</b> (live stacks keep their stamped compose_file)</li>
+                  <li><span className="mono">deploy_site.compose_file</span></li>
+                </ul>
+              </div>
+              {(plan.warnings || []).length > 0 && (
+                <div className="compose-plan-block">
+                  <div className="compose-plan-label">Warnings</div>
+                  <ul className="compose-plan-list">
+                    {plan.warnings.map((w, i) => <li key={i} className="compose-plan-warn">⚠ {w}</li>)}
+                  </ul>
+                </div>
+              )}
+              {plan.proposed_yml && (
+                <details className="compose-plan-yml">
+                  <summary>Proposed zeehive.yml preview</summary>
+                  <textarea className="setup-draft" readOnly value={plan.proposed_yml} rows={14} />
+                </details>
+              )}
+              {plan.applicable && (
+                <div className="compose-plan-actions">
+                  <label className="compose-plan-check">
+                    <input type="checkbox" checked={writeYml} onChange={(e) => setWriteYml(e.target.checked)}
+                           disabled={(plan.files_to_modify || []).length === 0} />
+                    Write / update <span className="mono">zeehive.yml</span> in the repo
+                    {(plan.files_to_modify || []).length === 0 ? ' (nothing to write)' : ''}
+                  </label>
+                  <label className="compose-plan-check">
+                    <input type="checkbox" checked={applyMeta} onChange={(e) => setApplyMeta(e.target.checked)} />
+                    Apply manifest + compose columns to the meta-DB project row
+                  </label>
+                  <div className="setup-row">
+                    <button type="button" data-testid="compose-apply-btn"
+                            disabled={!writeYml && !applyMeta}
+                            onClick={applyPlan}>
+                      Review &amp; approve…
+                    </button>
+                    <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss plan</button>
+                  </div>
+                </div>
+              )}
+              {!plan.applicable && (
+                <div className="setup-row">
+                  <button type="button" className="ghost" onClick={() => setPlan(null)}>Dismiss</button>
+                </div>
+              )}
+            </div>
+          )}
+        </details>
+
       <div className="setup-grid" style={{ marginTop: 8 }}>
         <label>compose_spinoff <span className="pc">(meta-DB)</span>
           <input readOnly value={project.compose_spinoff || ''} placeholder="(unset)" /></label>
@@ -1021,6 +1274,349 @@ function ManifestSection({ project, run, onProject }) {
         <label>compose_dev <span className="pc">(meta-DB)</span>
           <input readOnly value={project.compose_dev || ''} placeholder="(unset)" /></label>
       </div>
+    </div>
+  );
+}
+
+// ── manifest wizard helpers ────────────────────────────────────────────────
+const MANIFEST_TIERS = ['dev', 'spinoff', 'prod'];
+const MANIFEST_ROLES = [['server', 'Server (API)'], ['webapp', 'Webapp (UI)'], ['db', 'Database']];
+const tierHint = (t) => ({ dev: 'your machine / dev site', spinoff: 'per-xell sandbox', prod: 'deploy target' }[t] || t);
+
+function emptyManifestKnobs(project) {
+  return {
+    env_file: project.env_file || '.env',
+    tiers: { dev: { compose: '' }, spinoff: { compose: '' }, prod: { compose: '' } },
+    roles: { server: { service: '' }, webapp: { service: '' }, db: { service: '' } },
+    ports: { server_base: project.port_server_base || 3100, webapp_base: project.port_web_base || 5200, slot_mod: project.port_slot_mod || 90 },
+  };
+}
+function knobsFromSuggestions(suggest, project) {
+  const base = emptyManifestKnobs(project);
+  return {
+    ...base,
+    tiers: {
+      dev: { compose: suggest.compose?.dev || '' },
+      spinoff: { compose: suggest.compose?.spinoff || '' },
+      prod: { compose: suggest.compose?.prod || '' },
+    },
+    roles: {
+      server: { service: suggest.roles?.server || '' },
+      webapp: { service: suggest.roles?.webapp || '' },
+      db: { service: suggest.roles?.db || '' },
+    },
+  };
+}
+
+// A human-readable digest of what a manifest DECLARES — the "what will this actually do"
+// answer for an existing zeehive.yml, instead of the raw cached hash.
+function ManifestSummary({ manifest }) {
+  if (!manifest || typeof manifest !== 'object') return null;
+  const tiers = manifest.tiers || {};
+  const roles = manifest.roles || {};
+  const ports = tiers.spinoff?.ports || {};
+  const items = [];
+  for (const t of ['dev', 'spinoff', 'prod']) {
+    if (tiers[t]?.compose) items.push([`tier ${t}`, `compose ${tiers[t].compose}`]);
+  }
+  for (const [r, label] of MANIFEST_ROLES) {
+    if (roles[r]?.service) items.push([`role ${r}`, `service “${roles[r].service}”${roles[r].buildable === false ? ' (shared, not built)' : ''}`]);
+  }
+  if (ports.server?.base) items.push(['server port', `base ${ports.server.base}${ports.server.mod ? ` · mod ${ports.server.mod}` : ''}`]);
+  if (ports.webapp?.base) items.push(['webapp port', `base ${ports.webapp.base}${ports.webapp.mod ? ` · mod ${ports.webapp.mod}` : ''}`]);
+  if (manifest.env?.file) items.push(['env file', manifest.env.file]);
+  if (!items.length) {
+    return <div className="setup-hint">This manifest only sets the project name and naming templates — no tiers, roles or ports.</div>;
+  }
+  return (
+    <div className="manifest-summary" data-testid="manifest-summary">
+      {items.map(([k, v]) => (
+        <span key={k} className="manifest-summary-item"><span className="pc">{k}</span> {v}</span>
+      ))}
+    </div>
+  );
+}
+
+// ── Deploy sites & inventory as a MASTER-DETAIL TREE ──────────────────────────
+// One node per MACHINE (the master), its dev/prod deploy TYPES as the branches, and the shared
+// container inventory grouped by ROLE under each. This is the shape the data actually nests in: a
+// deploy site names WHERE a tier runs on a machine, and the shared container rows are what runs
+// there. Before this, Sites and Inventory were two flat lists that did not say how they relate —
+// a machine, a deploy type and a container all lived on the same tab but read as three unrelated
+// surfaces. The tree is one surface: machine → dev/prod → db/server/app.
+//
+// A machine with no deploy sites or containers still shows (its "+ site" affordance is how a
+// branch comes into being); a tier with a site but no containers shows an empty inventory (a
+// place you can add one); a tier with containers but no site shows a "add site" hint. Per-xell
+// spinoff stacks are a xell's throwaway stack, not deploy inventory, so they are not here.
+const ROLE_LABEL = { db: 'DB', server: 'Server', webapp: 'App', infra: 'Infra' };
+
+function DeployTree({ project, run, busy, initial = {} }) {
+  // `initial` seeds the state (the render test passes a fixture; the live console does not, so the
+  // mount effect fetches). Keeping the fetch as the live path means the tree is always current.
+  const [machines, setMachines] = useState(initial.machines || []);
+  const [sites, setSites] = useState(initial.sites || []);
+  const [containers, setContainers] = useState(initial.containers || []);
+  const load = useCallback(() => {
+    getMachines().then(setMachines).catch(() => setMachines([]));
+    getSites(project.id).then(setSites).catch(() => setSites([]));
+    getSharedContainers(project.id).then(setContainers).catch(() => setContainers([]));
+  }, [project.id]);
+  useEffect(() => { load(); }, [load]);
+  const wrapped = (fn) => run(async () => { await fn(); await load(); });
+
+  // No machines yet → the pre-machine world: the old flat Sites + Inventory sections, unchanged.
+  if (!machines.length) {
+    return (<>
+      <SitesSection project={project} run={run} busy={busy} />
+      <InventorySection project={project} run={run} busy={busy} />
+    </>);
+  }
+
+  const siteCtx = new Map((sites || []).map((s) => [s.id, s.docker_ctx]));
+  const ctxOf = (c) => c.docker_ctx || (c.site_id ? siteCtx.get(c.site_id) : null) || null;
+  const known = new Set(machines.map((m) => m.docker_ctx));
+  const elsewhere = containers.filter((c) => !known.has(ctxOf(c)));
+  const nodes = machines.map((m) => ({
+    m,
+    devSites: sites.filter((s) => s.docker_ctx === m.docker_ctx && s.tier === 'dev'),
+    prodSites: sites.filter((s) => s.docker_ctx === m.docker_ctx && s.tier === 'prod'),
+    dev: containers.filter((c) => ctxOf(c) === m.docker_ctx && c.tier === 'dev'),
+    prod: containers.filter((c) => ctxOf(c) === m.docker_ctx && c.tier === 'prod'),
+  }));
+
+  return (
+    <section className="deploy-tree" data-testid="deploy-tree">
+      {nodes.map((n) => (
+        <DeployMachine key={n.m.id} node={n} sites={sites}
+                       project={project} run={wrapped} busy={busy} />
+      ))}
+      {elsewhere.length > 0 && (
+        <div className="dt-machine elsewhere" title="Containers whose docker context matches no machine row — add the machine to claim them">
+          <div className="dt-machine-head"><b>elsewhere</b></div>
+          <div className="dt-body">
+            <DeployBranch tier="dev" sites={[]} containers={elsewhere.filter((c) => c.tier === 'dev')}
+                          machine={null} project={project} run={wrapped} busy={busy} />
+            <DeployBranch tier="prod" sites={[]} containers={elsewhere.filter((c) => c.tier === 'prod')}
+                          machine={null} project={project} run={wrapped} busy={busy} />
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DeployMachine({ node, sites, project, run, busy }) {
+  const { m, devSites, prodSites, dev, prod } = node;
+  return (
+    <div className="dt-machine" data-testid={`deploy-machine-${m.key}`}>
+      <div className="dt-machine-head" title={`${m.label || m.key}\ncontext: ${m.docker_ctx}${m.host_ip ? `\nhost: ${m.host_ip}` : ''}${m.notes ? `\n${m.notes}` : ''}`}>
+        <b className="dt-machine-key">{m.key}</b>
+        <span className="mono">{m.docker_ctx}</span>
+        <span className="pc">{m.host_ip ? `host ${m.host_ip}` : 'local'}</span>
+        {m.can_build && <span className="dt-badge">🔨 builds</span>}
+        <AddSiteInline machine={m} sites={sites} project={project} run={run} busy={busy} />
+      </div>
+      <div className="dt-body">
+        <DeployBranch tier="dev" sites={devSites} containers={dev}
+                      machine={m} project={project} run={run} busy={busy} />
+        <DeployBranch tier="prod" sites={prodSites} containers={prod}
+                      machine={m} project={project} run={run} busy={busy} />
+      </div>
+    </div>
+  );
+}
+
+// One deploy TYPE (dev | prod) on a machine: the site(s) that name the branch, then the shared
+// container inventory grouped by role. A branch with a site but no containers is a place you can
+// add one; a branch with containers but no site tells you to add the site.
+function DeployBranch({ tier, sites, containers, machine, project, run, busy }) {
+  const site = sites[0];
+  if (!sites.length && !containers.length) return null;
+  return (
+    <div className="dt-branch" data-tier={tier} data-testid={`deploy-branch-${tier}`}>
+      <div className="dt-branch-label">{tier}</div>
+      <div className="dt-branch-body">
+        <div className="dt-branch-sites">
+          {sites.map((s) => <SiteEditor key={s.id} site={s} run={run} busy={busy} />)}
+          {!sites.length && (
+            <div className="pc">no {tier} deploy site on {machine?.key ?? 'this host'} yet — add one above.</div>
+          )}
+        </div>
+        {containers.length > 0 && (
+          <div className="dt-branch-inv">
+            {ROLES.map((role) => {
+              const cs = containers.filter((c) => c.role === role);
+              if (!cs.length) return null;
+              return (
+                <div className="dt-role" key={role} data-role={role}>
+                  <span className="invlabel">{ROLE_LABEL[role]}:</span>
+                  <div className="dt-rows">
+                    {cs.map((c) => <InvRow key={c.id} c={c} run={run} busy={busy} />)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <AddSharedContainer project={project} tier={tier} ctx={machine?.docker_ctx || null}
+                            run={run} busy={busy} />
+        {tier === 'prod' && site && <DiscoverSite site={site} project={project} busy={busy} />}
+      </div>
+    </div>
+  );
+}
+
+// Add a shared container to THIS branch — the tier and docker context come from the branch, so a
+// container you add under "local ▾ dev" lands exactly there, never on the project's default site.
+function AddSharedContainer({ project, tier, ctx, run, busy }) {
+  const [f, setF] = useState({ name: '', role: 'server', build_script: '' });
+  const [open, setOpen] = useState(false);
+  const add = () => run(async () => {
+    await createSharedContainer(project.id, {
+      name: f.name.trim(), role: f.role, tier,
+      docker_ctx: ctx || undefined, build_script: f.build_script.trim() || null,
+    });
+    setF({ name: '', role: 'server', build_script: '' });
+  });
+  if (!open) {
+    return <button type="button" className="ghost dt-addbtn" onClick={() => setOpen(true)}>＋ {tier} container</button>;
+  }
+  return (
+    <div className="setup-row dt-add">
+      <input placeholder="container name" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} />
+      <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })}>
+        {ROLES.map((r) => <option key={r}>{r}</option>)}
+      </select>
+      <input placeholder="build script (optional)" value={f.build_script}
+             onChange={(e) => setF({ ...f, build_script: e.target.value })} />
+      <button type="button" disabled={busy || !f.name.trim()} onClick={add}>Add</button>
+      <button type="button" className="ghost" onClick={() => setOpen(false)}>✕</button>
+    </div>
+  );
+}
+
+// Add a deploy site ON a machine — the machine's context is pre-filled, so the site is born in
+// the branch it belongs to instead of being a bare context string typed from memory.
+function AddSiteInline({ machine, sites, project, run, busy }) {
+  const [open, setOpen] = useState(false);
+  const [f, setF] = useState({ tier: 'dev', key: '', host: machine.host_ip || '' });
+  const add = () => run(async () => {
+    await createSite(project.id, {
+      key: f.key.trim() || `${f.tier}-${machine.key}`,
+      tier: f.tier,
+      docker_ctx: machine.docker_ctx,
+      host: f.host.trim() || null,
+      docker_endpoint: null,
+      is_default: f.tier === 'prod' && !(sites || []).some((s) => s.tier === 'prod'),
+    });
+    setOpen(false); setF({ tier: 'dev', key: '', host: machine.host_ip || '' });
+  });
+  if (!open) {
+    return <button type="button" className="ghost" onClick={() => setOpen(true)} title={`Add a deploy site on ${machine.key}`}>＋ site</button>;
+  }
+  return (
+    <div className="setup-row dt-addsite">
+      <select value={f.tier} onChange={(e) => setF({ ...f, tier: e.target.value })}>
+        <option value="dev">dev</option><option value="prod">prod</option>
+      </select>
+      <input placeholder={`site key (e.g. ${f.tier}-${machine.key})`} value={f.key}
+             onChange={(e) => setF({ ...f, key: e.target.value })} />
+      <input placeholder="host (IP or DNS)" value={f.host} onChange={(e) => setF({ ...f, host: e.target.value })} />
+      <button type="button" disabled={busy} onClick={add}>Add</button>
+      <button type="button" className="ghost" onClick={() => setOpen(false)}>✕</button>
+    </div>
+  );
+}
+
+// Discover + adopt the running containers on ONE prod site, shown under that prod branch. The
+// standalone DiscoverPanel (used by the no-machines fallback) picks from all prod sites; here the
+// branch already names the site, so this is the scoped version.
+function DiscoverSite({ site, project, busy }) {
+  const [open, setOpen] = useState(false);
+  const [result, setResult] = useState(null);
+  const [sel, setSel] = useState({});
+  const [working, setWorking] = useState(false);
+  const discover = async () => {
+    setWorking(true); setResult(null); setSel({});
+    try {
+      const r = await discoverSite(site.id);
+      setResult(r);
+      if (r.ok) {
+        const next = {};
+        for (const c of r.containers) {
+          const adoptable = !(c.already_modeled && c.linked_to_prod);
+          next[c.name] = { checked: adoptable, role: c.inferred_role || '' };
+        }
+        setSel(next);
+      }
+    } catch (e) { setResult({ ok: false, error: e.message }); }
+    finally { setWorking(false); }
+  };
+  const adopt = async () => {
+    const containers = (result?.containers || [])
+      .filter((c) => sel[c.name]?.checked && !(c.already_modeled && c.linked_to_prod))
+      .map((c) => ({ name: c.name, role: sel[c.name].role, image_tag: c.image,
+                     compose_project: c.compose_project,
+                     host_port: c.ports?.[0]?.public || null,
+                     internal_port: c.ports?.[0]?.private || null }));
+    const bad = containers.find((c) => !['db', 'server', 'webapp', 'infra'].includes(c.role));
+    if (bad) { await showAlert(`Choose a role for "${bad.name}" before adopting.`, { variant: 'error' }); return; }
+    if (containers.length === 0) { await showAlert('Nothing selected to adopt.'); return; }
+    setWorking(true);
+    try {
+      const r = await adoptContainers(site.id, containers);
+      setResult(null);
+      await showAlert(`Adopted ${r.adopted.length}, linked ${r.linked.length} to production`
+        + `${r.skipped.length ? `, ${r.skipped.length} already modeled` : ''}.`);
+    } catch (e) { await showAlert(e.message, { variant: 'error' }); }
+    finally { setWorking(false); }
+  };
+  const disabled = busy || working;
+  return (
+    <div className="dt-discover">
+      <button type="button" disabled={disabled} onClick={() => { setOpen((o) => !o); if (!open && !result) discover(); }}>
+        {working ? '…' : open ? '▾ Discover' : '🔍 Discover running stack'}
+      </button>
+      {open && result && !result.ok && <div className="pc dt-disc-err">⚠ {result.error}</div>}
+      {open && result?.ok && result.count === 0 && (
+        <div className="pc">Context <span className="mono">{result.docker_ctx}</span> is reachable but has no containers.</div>
+      )}
+      {open && result?.ok && result.count > 0 && (
+        <div className="dt-disc-list">
+          {result.containers.map((c) => {
+            const done = c.already_modeled && c.linked_to_prod;
+            const s = sel[c.name] || {};
+            return (
+              <div key={c.name} className="setup-row discover-row" style={{ opacity: done ? 0.55 : 1 }}>
+                <input type="checkbox" checked={!!s.checked} disabled={disabled || done} onChange={() => setSel((x) => ({ ...x, [c.name]: { ...x[c.name], checked: !x[c.name]?.checked } }))}
+                       title={done ? 'already adopted' : 'select to adopt'} />
+                <span className="mono" title={`${c.image || ''} · ${c.status || c.state || ''}`}>{c.name}</span>
+                <span className="pc" title="published ports">
+                  {c.compose_service ? `${c.compose_project}/${c.compose_service}` : (c.labelled ? '—' : 'unlabelled')}
+                  {c.ports?.length ? ` :${c.ports.map((p) => p.public).join(',')}` : ''}
+                </span>
+                {done
+                  ? <span className="pc" style={{ color: 'var(--ok, #6a6)' }}>adopted ✓</span>
+                  : c.already_modeled
+                    ? <><select value={s.role || ''} disabled><option>{c.modeled_as?.role}</option></select>
+                        <span className="pc">modeled — will link to prod</span></>
+                    : <>
+                        <select value={s.role || ''} disabled={disabled} onChange={(e) => setSel((x) => ({ ...x, [c.name]: { ...x[c.name], role: e.target.value } }))}>
+                          <option value="">role?</option>
+                          {ROLES.map((r) => <option key={r} value={r}>{r}</option>)}
+                        </select>
+                        <span className="pc" title="why this role was guessed">{c.role_reason}</span>
+                      </>}
+              </div>
+            );
+          })}
+          <div className="setup-row" style={{ marginTop: 4 }}>
+            <button type="button" disabled={disabled} onClick={adopt}>＋ Adopt selected</button>
+            <span className="pc">build script stays empty — set it below to make a container shippable.</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1867,6 +2463,100 @@ function TokensSection({ project, run, busy }) {
   );
 }
 
+// ── ticket API keys: the credential a DEPLOYED project files tickets with ─────
+// The outside of the work tracker (docs/ticketing-api.md). A key names ONE project, so a deployed
+// system — omnibiz, say — can only ever file into its own board; the console is where a human mints
+// one and hands it over. The plaintext exists ONCE, in the answer to the mint: the panel shows it
+// until the human dismisses it, and after that every read is a masked hint (lib/project-api-keys.js).
+function ApiKeysSection({ project, run, busy }) {
+  const [keys, setKeys] = useState(null);
+  const [label, setLabel] = useState('');
+  const [minted, setMinted] = useState(null);   // the plaintext, shown once
+  const [copied, setCopied] = useState(false);
+  const load = useCallback(() => getProjectApiKeys(project.id).then(setKeys).catch(() => {}), [project.id]);
+  useEffect(() => { load(); }, [load]);
+
+  const mint = () => run(async () => {
+    const out = await createProjectApiKey(project.id, label.trim());
+    setMinted(out); setLabel(''); await load();
+  });
+  const copy = async (text) => {
+    try { await navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 1500); }
+    catch { /* clipboard denied — the key is visible to select anyway */ }
+  };
+  // Revoke is the normal end of a key. Delete is offered only for one that filed nothing; the
+  // server refuses the rest (a ticket must keep saying where it came from), so this asks first.
+  const revoke = async (k) => {
+    if (await showConfirm(`Revoke "${k.label}"?\n\nThe next call with this key is refused. Anything it already filed stays on the board.`,
+                          { variant: 'danger', okLabel: 'Revoke' })) {
+      run(async () => { await revokeProjectApiKey(project.id, k.id); await load(); });
+    }
+  };
+  const drop = async (k) => {
+    if (await showConfirm(`Delete "${k.label}"?\n\nIt filed nothing, so nothing loses its provenance.`,
+                          { variant: 'danger', okLabel: 'Delete' })) {
+      run(async () => { await deleteProjectApiKey(project.id, k.id); await load(); });
+    }
+  };
+
+  const live = (keys || []).filter((k) => !k.revoked);
+  return (
+    <div className="setup-sec">
+      <h3>Ticketing API keys <span className="pc">(what a deployed {project.name} presents to <span className="mono">/api/ext/v1</span> to file, monitor and update tickets on THIS board — see docs/ticketing-api.md)</span></h3>
+      <div className="pc" style={{ marginBottom: 8 }}>
+        A key names one project and nothing else: the caller never sends a project id, so it cannot
+        reach another board. Tickets filed through it are ordinary tickets — break them down and
+        assign zees exactly as usual.
+      </div>
+
+      {minted && (
+        <div className="siteed" data-testid="api-key-minted">
+          <div className="setup-row"><span className="gate g-pass">✓ minted “{minted.label}”</span>
+            <span className="pc">copy it now — this is the only time it is shown</span></div>
+          <div className="setup-row">
+            <input className="mono" readOnly value={minted.key} onFocus={(e) => e.target.select()} />
+            <button type="button" onClick={() => copy(minted.key)}>{copied ? '✓ copied' : '⧉ copy'}</button>
+            <button type="button" className="ghost" onClick={() => setMinted(null)}>done</button>
+          </div>
+          <div className="pc">Store it as a secret in the deployed project, then:</div>
+          <input className="mono" readOnly onFocus={(e) => e.target.select()}
+                 value={`curl -X POST $ZEEHIVE/api/ext/v1/tickets -H "Authorization: Bearer ${minted.key}" -H "Content-Type: application/json" -d '{"title":"…","external_ref":"YOUR-ID"}'`} />
+        </div>
+      )}
+
+      {(keys || []).map((k) => (
+        <div className="setup-row" key={k.id} data-testid="api-key-row">
+          {k.revoked ? (
+            <span className="gate g-warn" title={k.revoked_by ? `revoked by ${k.revoked_by}` : 'revoked'}>
+              ⏸ <b>{k.label}</b> · <span className="mono">{k.key_hint}</span> · revoked
+            </span>
+          ) : (
+            <span className="gate g-pass" title={(k.scopes || []).join(', ')}>
+              ✓ <b>{k.label}</b> · <span className="mono">{k.key_hint}</span>
+              {k.last_used_at ? ` · used ${new Date(k.last_used_at).toLocaleDateString()}` : ' · never used'}
+              {k.tickets_filed ? ` · ${k.tickets_filed} ticket${k.tickets_filed === 1 ? '' : 's'} filed` : ''}
+            </span>
+          )}
+          {!k.revoked && <button type="button" className="projpop-del" disabled={busy}
+                                 title="Revoke this key — the next call with it is refused"
+                                 onClick={() => revoke(k)}>⏸</button>}
+          {!k.tickets_filed && <button type="button" className="projpop-del" disabled={busy}
+                                       title="Delete this key (it filed nothing)" onClick={() => drop(k)}>🗑</button>}
+        </div>
+      ))}
+      {keys && !keys.length && <div className="pc">No keys yet — nothing outside ZEEHIVE can file a ticket here.</div>}
+
+      <div className="setup-row" style={{ marginTop: 8 }}>
+        <input value={label} placeholder="label — who holds it, e.g. “omnibiz helpdesk”"
+               onChange={(e) => setLabel(e.target.value)}
+               onKeyDown={(e) => { if (e.key === 'Enter' && label.trim()) { e.preventDefault(); mint(); } }} />
+        <button type="button" disabled={busy || !label.trim()} onClick={mint}>＋ Mint a key</button>
+      </div>
+      {live.length > 0 && <div className="pc">Read/write on tickets. Revoke a key the moment it leaks — a revoked key is refused on its next call.</div>}
+    </div>
+  );
+}
+
 function SpawnSection({ project, run }) {
   const [pc, setPc] = useState(null);
   const [runtimes, setRuntimes] = useState([]);
@@ -1915,6 +2605,11 @@ function SpawnSection({ project, run }) {
         <label>Refresh interval (sec)
           <input type="number" min="60" defaultValue={pc.refresh_interval_sec}
                  onBlur={(e) => Number(e.target.value) !== pc.refresh_interval_sec && save({ refresh_interval_sec: Number(e.target.value) })} /></label>
+        <label className="setup-check">Capture LLM gateway bodies
+          <input type="checkbox" checked={pc.gateway_body_capture !== false}
+                 onChange={(e) => save({ gateway_body_capture: e.target.checked })} />
+          <span className="pc">(store the request/response body behind each gateway call for the observability drill-down — 14-day retention, secrets scrubbed)</span>
+        </label>
       </div>
       <PrepEditor pc={pc} save={save} />
     </div>

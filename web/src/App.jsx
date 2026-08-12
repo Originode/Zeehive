@@ -3,9 +3,10 @@ import { getFleet, getTimeline, getDiffs, getLogs, subscribe, GIT_TYPES, markDon
          getProjects, createProject, deleteProject, setPoolTarget, buildXell, revealWorktree,
          reapXell, pushXell, pullXell, prXell, acceptPull, updateProject, dismissLanding,
          streamFleetXells, dispatchTask, nudgeXell, requestShipXell, getProviderTokens, runBackup,
+         sendXellMessage,
          extractXellEnv, attachXellDevice, detachXellDevice, swapXellZee,
          pauseXell, resumeXell, githubAccess, pushProject, pullRequestProject, pullProject, commitXourceDirty,
-         getXellLangfuseSession, routePrompt, deployRouter, redeployRouter,
+         routePrompt, deployRouter, redeployRouter,
          squashHelps, squashOffer } from './api.js';
 import { promptButton, hasAnyAccount } from './promptButtons.js';
 import MessageComposer from './MessageComposer.jsx';
@@ -19,20 +20,6 @@ import ProjectSetup from './ProjectSetup.jsx';
 
 const buildErr = (e) => showAlert('Build failed: ' + (e?.error || e?.message || e), { variant: 'error' });
 
-// The server's /xells/:id/langfuse-session refusal codes are machine reasons; a human gets a line
-// that says WHAT is missing and what to do about it. 'no-project' used to hide five different
-// states behind one code (TKT-127) — the server now distinguishes them, and this maps each to an
-// actionable sentence (a bare reason string is shown as-is rather than inventing one).
-function langfuseSessionRefusal(r) {
-  switch (r?.reason) {
-    case 'no-session': return 'This zee has no Langfuse session yet — one is recorded after its first finished turn.';
-    case 'no-project': return 'Langfuse has never told us its project id, and it could not be learned. Check the Langfuse stack / provisioning.';
-    case 'langfuse-unreachable': return 'The Langfuse instance is unreachable — is the stack healthy?';
-    case 'langfuse-disabled': return 'Langfuse is not enabled on this fleet.';
-    case 'langfuse-tracking-off': return 'Langfuse tracking is off for this xell.';
-    default: return r?.reason || r?.error || 'Langfuse session unavailable for this xell';
-  }
-}
 import HiveCanvas from './hive/HiveCanvas.jsx';
 // the manager↔crew relation, read by every view that draws it (honeycomb, wires, graph — and the DOM)
 import { crewLinks } from './hive/crew.js';
@@ -907,23 +894,6 @@ export default function App() {
       setObsXell(x);
       return;
     }
-    if (kind === 'langfuse') {
-      // "View Langfuse" — opens THIS zee's Langfuse SESSION in a new window. The URL is computed
-      // SERVER-side (ui_url + the Langfuse project + the zee's session id); the flower only shows
-      // this verb when the plugin is enabled AND the xell's langfuse_tracking flag is on. The url
-      // is opened THROUGH the /api/langfuse/signin auto-login popup (?next=…), so the new window
-      // lands on the session already signed in — a human is never dumped on a login page. When the
-      // server refuses, it names WHICH thing is missing (TKT-127) — shown as a line a human can act
-      // on rather than a bare reason code.
-      getXellLangfuseSession(x.id, x.zee_id || null).then((r) => {
-        if (r?.ok && r.url) {
-          window.open(`/api/langfuse/signin?next=${encodeURIComponent(r.url)}`, '_blank');
-        } else {
-          showAlert(langfuseSessionRefusal(r), { variant: 'info' });
-        }
-      }).catch((e) => showAlert('Could not open the Langfuse session: ' + (e?.message || e), { variant: 'error' }));
-      return;
-    }
     if (kind === 'build') {
       if (x.stack.some(isBusy)) { showAlert('A container is busy (building/restoring) — wait for it to finish.'); return; }
       buildXell(x.id, false).catch(buildErr); return;
@@ -1012,6 +982,24 @@ export default function App() {
         setTimeout(() => dismissToast(id), 6000); });
       return;
     }
+    // The context menu's HELD-GATE rows: send the literal 'zee land'/'zee ship' into the zee's live
+    // session (the same operator-message door the 📨 composer uses). Only reachable from the context
+    // menu, and only when the gate is holding — see xellContextMenuItems.
+    if (kind === 'sendLand' || kind === 'sendShip') {
+      const verb = kind === 'sendLand' ? 'land' : 'ship';
+      const id = `sendverb-${x.id}-${Date.now()}`;
+      pushToast({ id, kind: 'progress', title: `Sending “zee ${verb}” to ${x.slug}…`,
+        body: 'typing it into its live session' });
+      sendXellMessage(x.id, { text: `zee ${verb}` }).then((r) => {
+        if (r?.sent) updateToast(id, { kind: 'success', title: `Sent “zee ${verb}” to ${x.slug}`, onRetry: null,
+          body: 'typed into its live session over SSH' });
+        else updateToast(id, { kind: 'error', title: `“zee ${verb}” not delivered`, onRetry: null,
+          body: r?.reason || r?.error || 'no live zee to reach' });
+        setTimeout(() => dismissToast(id), 7000);
+      }).catch((e) => { updateToast(id, { kind: 'error', title: `“zee ${verb}” failed`, body: e?.message || String(e), onRetry: null });
+        setTimeout(() => dismissToast(id), 7000); });
+      return;
+    }
     if (kind === 'pull') {
       const dirty = diff?.dirty || 0;
       if (!(await showConfirm(`Pull ${src} into ${x.slug}?\n\nMerges ${src} into ${x.slug}'s working tree on disk`
@@ -1071,8 +1059,6 @@ export default function App() {
         {termXell && (
           <ZeeTerminal zeeId={termXell.zee_id} slug={termXell.slug} viewerUrl={termXell.viewer_url}
                        xellId={termXell.id}
-                       langfuseTracking={termXell.langfuse_tracking !== false}
-                       langfuseEnabled={!!fleet?.langfuse?.enabled}
                        onClose={() => setTermXell(null)} />
         )}
         {envXell && (
@@ -1243,14 +1229,16 @@ export default function App() {
         )}
         {/* The prewarmed-pool knob, right here in the status line so it never hides in project
             settings. Per-machine pool sizes (matrix column headers) replace this project-wide
-            target ONLY when they actually govern — i.e. a dev machine exists AND the spinoff
-            server is NOT runner:process (compose-backed app tier that stamps docker_ctx). A
-            process-runner project (e.g. Zeehive itself) always pools by the project-wide target
-            no matter how many machines exist (see queenzee/pool.js), so its knob must stay
-            visible here — otherwise the ONLY working control is buried in the ⚙ Spawn-template
-            modal. Mirrors the server's own `!machines.length || serverRoleIsProcess` branch. */}
-        {(!(fleet.machines || []).some((m) => m.enabled && m.dev_priority > 0)
-          || (project.manifest?.roles?.server?.runner || project.manifest?.tiers?.spinoff?.runner) === 'process')
+            target ONLY when a machine is explicitly configured for the project — EITHER knob
+            (dev_priority>0 or pool_size>0); a process-runner project needs the QUEENZEE-HOST
+            machine configured, since only that row governs it (queenzee/pool.js). With NO
+            per-machine config this knob still governs — machine-aware by DEFAULT means the
+            pool spends this target on the project's default machine
+            (docs/default-machine-pooling-decision-record.md) — so it stays visible. Mirrors
+            the server's own reconcileProject branch. */}
+        {!(fleet.machines || []).some((m) => m.enabled && (m.dev_priority > 0 || m.pool_size > 0)
+            && ((project.manifest?.roles?.server?.runner || project.manifest?.tiers?.spinoff?.runner) !== 'process'
+                || m.is_queenzee_host))
           && <PoolTarget pool={fleet.pool} projectId={projectId || project.id} />}
         <AutoApprove project={project} projectId={projectId || project.id} onChanged={refresh} />
         {/* ONE "+ prompt" BUTTON — opens the composer with no pinned harness. The router layer
@@ -1794,8 +1782,6 @@ function XellCard({ x, diff, fleet, onDone, onMenu, prodLock, projectId, landing
         {cxell && termOpen && (
           <ZeeTerminal zeeId={x.zee_id} slug={x.slug} viewerUrl={x.viewer_url}
                        xellId={x.id}
-                       langfuseTracking={x.langfuse_tracking !== false}
-                       langfuseEnabled={!!fleet?.langfuse?.enabled}
                        onClose={() => setTermOpen(false)} />
         )}
         {!isProd && <Row k="zee" v={working ? x.zee_name : '—'} highlight={working} testid="zee-name" />}
@@ -2226,7 +2212,13 @@ function PrCard({ req, onDone, onDismiss }) {
           </button>
           <ul className="land-commits">
             {commits.slice(0, 8).map((c) => (
-              <li key={c.short}><code>{c.short}</code> {c.subject} <span className="land-author">{c.author}</span></li>
+              <li key={c.short}>
+                <code>{c.short}</code> {c.subject}{' '}
+                <span className="land-author">{c.author}</span>
+                {c.door && <span className="land-door" title={`committer: ${c.committer || ''} <${c.committer_email || ''}>`}>
+                  · {c.door}{c.committer && c.door !== c.committer ? ` / ${c.committer}` : ''}
+                </span>}
+              </li>
             ))}
             {commits.length > 8 && <li className="land-more">…and {commits.length - 8} more</li>}
           </ul>

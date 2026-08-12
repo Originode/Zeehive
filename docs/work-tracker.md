@@ -200,10 +200,77 @@ ticket_comment(id, ticket_id, author, body, created_at)
 work_item(id, project_id, parent_id, kind, title, body, status, priority, ticket_id, xell_id,
           assignee, starts_on, due_on, estimate_hours, progress, sort_order, path, depth,
           created_by, created_at, updated_at, closed_at)
-work_item_dep(work_item_id, depends_on_id, created_at)         -- finish→start, for the gantt
 work_item_event(id, work_item_id, ts, kind, from_status, to_status, actor, detail jsonb)
 task.work_item_id                                              -- added for part 2
+
+> **REHAB 3/4**: `work_item_dep` is RETIRED (migration 188). finish→start edges now live in the
+> workflow model's `dependency` table (from_id = prerequisite, to_id = dependent, type 'FS'),
+> which the work-tracker readers (board/gantt/drawer) have read since REHAB 2/4 and the writers
+> have written since REHAB 3/4. `work_item` itself stays as the ATTRIBUTE ANNEX — it still carries
+> body, ticket_id, xell_id, progress, the exact stored status and the audit trail
+> (`work_item_event`), because the model does not own those yet.
 ```
+
+### CHAIN vs NESTING — the edge is a public contract
+
+Two different "ordering" ideas live on the plan, and they are told apart **from the rows alone**:
+
+- **NESTING** — `work_node.parent_id` (or, on the tracker's attribute annex, `work_item.parent_id`).
+  It says **"part of"**: a task belongs to its activity, an activity to its project. Every node except
+  the plan root has exactly one parent. There is no ordering *between separate items* here.
+- **CHAIN** — a row in the `dependency` table. It says **"after"**: one item waits for another item.
+  The two endpoints are **separate nodes** — the model's I6 trigger refuses an ancestor/descendant
+  pair (a chain may not duplicate a nesting relation). The gantt's critical path runs along chains.
+
+**The direction is load-bearing, and the retired table meant the opposite.** In the model,
+`dependency.from_id` is the **PREDECESSOR** (the thing that must finish first) and `dependency.to_id`
+is the **DEPENDENT** (the thing that waits): `from_id → to_id` reads "from finishes, then to starts".
+The retired `work_item_dep` table stored this **the other way round** — `work_item_id` was the
+DEPENDENT and `depends_on_id` was the PREREQUISITE — so anyone carrying a mental model from the old
+table will hand the edge over backwards. The write verb (console `depends on` picker, `zee dep
+--item <dependent> --on <prerequisite>`) takes the DEPENDENT first and the PREREQUISITE second, and
+the writer (`lib/work-items.js` `addDep`) flips them into `from_id=prerequisite, to_id=dependent`.
+
+**The readers/walkers a caller should use:** there is no standalone JS predecessor/successor helper —
+the gantt reads `union_edge` (the leaf-expanded view: sibling order + every dependency, with the
+direction already resolved to the leaf level) for a whole plan at once, and the model's SQL helpers
+(`wn_first_leaves` / `wn_last_leaves` / `wn_ancestors`) walk the TREE. A caller that needs one node's
+chains queries `dependency` directly: `WHERE from_id = $node` gives its successors (things that wait
+on it), `WHERE to_id = $node` gives its predecessors (things it waits on).
+
+### What the durations card actually changed (read this before you trust a critical-path claim)
+
+Migration **194** (the durations-from-evidence change) makes every plan's **durations** real:
+an explicit `estimate` wins, else the measured actual from closed executions, else a stated 1-day
+default — so a gantt draws bars of evidence-derived length on every plan. What it does **not** do is
+make **slack and criticality** meaningful everywhere: those are computed by CPM from `dependency`
+edges, and a plan with no edges has every node trivially critical with one identical slack value —
+the maths is correct, there is just nothing to rank. Measured on the live plans (2026-08-11): the
+Zeehive plan (3 edges) is a real gantt — 69 distinct slack values, 20/164 critical; the omnibiz plan
+(**0 edges**) still comes back 355/355 critical with 1 slack value. Durations vary there (17 distinct),
+so bars are real; the critical path is not yet meaningful. That is a **data gap, not a bug**: the fix
+is the chain-capture path (`zee dep` + the console `depends on` picker), and chains must come from
+real "after" relationships as work is cut — never be invented to make the chart look non-degenerate.
+
+**The other half of the gap is dates and estimates, not chains.** Measured on the live plans the
+same day: **0 of 519 work items carry an estimate or a start/due date** — so every bar is a 1-day
+default (194's fallback) and every schedule is anchored at `now()`. The chart is honest about this
+(the duration_source tooltip says "1-day default"; the edge banner says when order is inferred), but
+it means the bars are placeholders until a human enters real data. What a human would actually enter,
+per card, for the chart to mean something:
+
+- **an `estimate`** (hours) on every task — the only thing that makes a bar's *length* real (194's
+  first choice; otherwise the default 1 day stands, or the measured actual once the task has run);
+- **a `starts_on` / `due_on`** on the cards that anchor the plan — the only thing that makes the
+  *window* real (the CPM otherwise anchors everything at the project start `now()` and lays bars
+  forward from there);
+- **a `dependency` chain** between cards that are really "after" each other — the only thing that
+  makes *slack and criticality* meaningful (the other half of this section).
+
+All three are already writable: the console drawer PATCHes `estimate_hours` / `starts_on` / `due_on`
+and the `depends on` picker writes the model edge, and a manager can do the same from the CLI with
+`zee item --estimate/--starts-on/--due-on` and `zee dep`. Nothing more needs to be built — the chart
+means something as soon as the data is entered.
 
 Migration **060** adds one constraint to the above: `work_item_dates_ordered` — `due_on` may
 not precede `starts_on` (see "The schedule invariant" below). It repairs any already-inverted row
@@ -232,7 +299,7 @@ and the libraries do **not** re-check them — they let it raise and pass the se
 | `path` / `depth` follow a move, for the whole subtree | a stale lineage after a drag | `work_item_guard()` (BEFORE) + `work_item_reparent_descendants()` (AFTER, one level at a time, recursing only while a path actually changed) |
 | terminal status ⇒ `closed_at` set; leaving it ⇒ cleared | a reopened item that still reads as closed | `work_touch()` |
 | `ticket.number` is a per-project sequence | a uuid nobody can say out loud | `ticket_number_assign()`, under a transaction advisory lock so two concurrent inserts cannot collide |
-| no self-dependency, no dependency across projects | an unsolvable gantt | `work_item_dep_guard()` |
+| no self-dependency, no dependency across projects | an unsolvable gantt | the model's I5 trigger (REHAB 3/4: the retired `work_item_dep_guard()` stated it in words; `addDep` now states the same sentence first) |
 
 **`path`** is the materialized `'/'`-joined list of **ancestor ids, each followed by `/`**:
 a root is `''`, its child `'<root>/'`, a grandchild `'<root>/<child>/'`. So
@@ -430,7 +497,8 @@ table above.
 { root, project_id, unscheduled_count,
   span: { start, end, days } | null,
   rows: [ { id, parent_id, depth, kind, title, status, status_label,
-            starts_on, due_on, computed_start, computed_end, span_days,
+            starts_on, due_on, actual_start, actual_end,
+            computed_start, computed_end, computed_actual_start, computed_actual_end, span_days,
             progress, rolled_progress, estimate_hours, assignee, xell_id,
             unscheduled, deps: [id…] } ] }
 ```
@@ -442,6 +510,15 @@ root-inclusion table). Roll-ups:
   `min(children start) … max(children end)`. A parent **with** its own dates keeps them: someone
   stated them on purpose. Only the missing end is rolled — a parent with a `starts_on` and no
   `due_on` keeps its start and rolls its end.
+- `actual_start` / `actual_end` — the **DERIVED** actuals, from migration 159. These are what the
+  record *proves* happened (the first event into assigned/working, or the first zee_turn of a linked
+  xell = start; the terminal event, or the first landed landing = end), maintained by triggers as a
+  byproduct of the queenzee's own event writes — **never agent-submitted**. They are distinct from
+  `starts_on`/`due_on` (the PLAN) and the gantt draws them as a separate read-only bar. A null
+  `actual_end` is "still in flight".
+- `computed_actual_start` / `computed_actual_end` — the actual span rolled up the same way as the
+  plan: a parent whose own ledger is silent (a project/activity is rarely assigned to a zee) still
+  gets the real bar its subtree earned. A parent **with** its own actuals keeps them.
 - `rolled_progress` — a parent with no explicit progress is the **leaf-count-weighted** average of
   its children's rolled progress (each child weighs the number of leaves beneath it, *not* its
   number of direct children), so a branch with nine subtasks outweighs a branch with one.
@@ -449,13 +526,16 @@ root-inclusion table). Roll-ups:
   **"No explicit progress" is implemented as `progress === 0`.** There is no way to state a
   deliberate 0% on a parent — it will always show the rolled average instead. Leaves always report
   their own `progress` as `rolled_progress`.
-- `unscheduled: true` — no dates anywhere in the subtree. Those rows come back with **nulls** and
-  the flag, and `unscheduled_count` totals them. The UI **lists** them; it does not invent dates,
-  because an invented date is indistinguishable from a real one the moment it is on screen.
+- `unscheduled: true` — **no dates anywhere in the subtree, planned OR actual**. Those rows come back
+  with **nulls** and the flag, and `unscheduled_count` totals them. The UI **lists** them; it does
+  not invent dates, because an invented date is indistinguishable from a real one the moment it is
+  on screen. A row whose PLAN is empty but whose RECORD has actuals draws a real bar and is not
+  listed.
 - `span_days` (per row) and `span: {start, end, days}` (per model) — how wide the bar is, and how
   wide the whole chart is, in **whole inclusive days** (a task starting and ending the same day is
   `1`, not `0`). `null` when the row is unscheduled, and `span` is `null` when nothing is scheduled
-  at all.
+  at all. The model's `span` includes the actual extent too — a chart whose bars are all actuals
+  (the 470-item / 0-plan case this exists for) still gets a window.
 
 ### The schedule invariant, and the span that is *not* one
 
@@ -486,6 +566,11 @@ which is not ISO 8601 and gives `NaN` or a silently different day depending on t
 
 ## The endpoints
 
+These are the CONSOLE endpoints, authenticated as the console. A DEPLOYED project — omnibiz
+filing into its own board from somebody else's server — comes in through a second, key-authenticated
+door at `/api/ext/v1`, documented in [ticketing-api.md](ticketing-api.md). It creates ORDINARY rows in
+these same tables: everything below applies to an externally-filed ticket unchanged.
+
 | method | path | notes |
 |---|---|---|
 | GET | `/api/work-statuses` | the vocabulary: labels, order, terminal, legal transitions, kinds |
@@ -495,6 +580,8 @@ which is not ISO 8601 and gives `NaN` or a silently different day depending on t
 | PATCH | `/api/tickets/:id` | title/body/kind/status/priority/reporter/assignee/labels/work_item_id |
 | DELETE | `/api/tickets/:id` | work items survive, `unlinked_work_items` says how many |
 | POST | `/api/tickets/:id/comments` | `{author, body}` |
+| GET/POST | `/api/tickets/:id/attachments` | the evidence on a ticket — images and text logs, metadata on the way out, `content_base64`/`text` on the way in |
+| GET/DELETE | `/api/tickets/:id/attachments/:attachmentId` | download the raw bytes (always a download, `nosniff`), or remove one |
 | POST | `/api/tickets/:id/breakdown` | `{items:[…], actor}` → the created tree. **One transaction**: all six items or none |
 | GET | `/api/tickets/:id/managers` | the manager zees of this ticket's project, resolved live, each with `live` + a `why` line |
 | POST | `/api/tickets/:id/notify` | `{xell_id, by}` → tells that manager about the ticket. Answers `{code, delivered, delivery, note}` |

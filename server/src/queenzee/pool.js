@@ -12,21 +12,25 @@
 // order so the preferred machine warms first. With no machines, the legacy project-wide
 // `pool_config.target_ready` applies unchanged on the one dev site.
 //
-// The machine-aware path ALSO requires a placeable per-xell app tier: the server role must
-// NOT be `runner: process`. Machine mode counts ready xells through their owned server
-// container (JOIN on role='server' + docker_ctx), and a process server is stamped with
-// docker_ctx=NULL (provision.js), so that count is zero by construction and fill would pile
-// up pool_size per tick. That used to be gated on `project.compose_spinoff` — the wrong
+// The FULL machine-aware path (per-machine placement) requires a placeable per-xell app tier:
+// the server role must NOT be `runner: process`. Machine mode counts ready xells through their
+// owned server container (JOIN on role='server' + docker_ctx), and a process server is stamped
+// with docker_ctx=NULL (provision.js), so that count is zero by construction and fill would
+// pile up pool_size per tick. That used to be gated on `project.compose_spinoff` — the wrong
 // predicate. Compose projects stamp docker_ctx even when compose_spinoff is unset (the compose
 // file is a build detail; build-container.sh defaults to docker-compose.spinoff.yml), so the
 // old guard left mardale-prod's per-machine pool sizes as a dead letter on every compose
-// project that had not refreshed tiers.spinoff.compose into the column. The guard is now the
-// process-runner check (serverRoleIsProcess); when it fires it is rate-limited and LOUD
-// (test: test/pool-machine-guard-silence.test.mjs).
+// project that had not refreshed tiers.spinoff.compose into the column. The guard is the
+// process-runner check (serverRoleIsProcess) — but it no longer deadens EVERY per-machine
+// knob: a process xell lives on the queenzee host by construction, so the QUEENZEE-HOST
+// machine's pool_size is honored (counted project-wide, runaway-proof) and only REMOTE rows
+// are skipped — recorded once per state change, informational (the matrix dims those knobs;
+// tests: test/pool-machine-guard-silence.test.mjs, test/pool-process-local-machine.test.mjs;
+// docs/process-machine-pooling-decision-record.md + pooling-dead-config-demotion record).
 import { config } from '../config.js';
 import { q, one } from '../db/pool.js';
 import { provisionXell } from '../lib/provision.js';
-import { devMachines, liveXellCount, machinePoolSize } from '../lib/machines.js';
+import { poolMachines, implicitPoolMachine, liveXellCount, machinePoolSize, queenzeeHostCtx } from '../lib/machines.js';
 import { reapXell } from './reaper.js';
 import { reconcileXell } from './landing.js';
 import { takeReadyXellForSweep, untakeSweptXell, explainSweepSkip, currentXells } from '../lib/xell-claim.js';
@@ -129,47 +133,84 @@ async function reconcileProject(projectId, target) {
   // Machine mode counts a project's ready xells THROUGH their owned server container
   // (fillTrim's join on role='server' + docker_ctx). A process-runner project (e.g. Zeehive
   // itself: bare worktree + process server/webapp) stamps docker_ctx=NULL on those rows, so
-  // that count is ALWAYS ZERO no matter how many ready xells exist: fill provisions pool_size
-  // more every tick, trim never sees a surplus, and max_xells (counted the same way) never
-  // caps it. That is exactly how 167 ready Zeehive xells piled up by 2026-07-19 — and the
-  // per-tick reconcile sweep over all of them is what froze the API. Machine placement is
-  // meaningless for bare processes anyway (they live on the queenzee's host), so such
-  // projects use the legacy project-wide target, whose count has no join.
+  // that count is ALWAYS ZERO no matter how many ready xells exist: fill would provision
+  // pool_size more every tick, trim would never see a surplus. That is exactly how 167 ready
+  // Zeehive xells piled up by 2026-07-19 — and the per-tick reconcile sweep over all of them
+  // is what froze the API. But a process xell is not machine-LESS: it lives on the queenzee
+  // host, always, by construction — so such projects honor the QUEENZEE-HOST machine's
+  // pool_size (counted project-wide, no join) and only the REMOTE rows are a dead letter.
   //
   // compose_spinoff is NOT the predicate: a compose project with machines configured but an
   // empty compose_spinoff column still stamps docker_ctx at provision, and must take the
   // machine path — otherwise mardale-prod's pool_size is a dead letter until someone happens
   // to refresh tiers.spinoff.compose into the column (the "mardale-prod never gets pool xells"
   // defect under its second diagnosis).
-  const machines = await devMachines(projectId);
-  if (!machines.length || !placeable) {
-    // When a machine_pool row exists (dev_priority>0, pool_size>0) but the project cannot place
-    // (process-runner server), this guard takes the legacy path and the whole per-machine config
-    // is a dead letter. Say it out loud: naming the skipped machines AND the reason, so an
-    // operator can fix the project from the message alone. Rate-limited to once per state change
-    // (the same "say it when it CHANGES" rule monitor.js uses): the pool ticks every 15s, and a
-    // verbatim repeat would drown the lines that carry news.
-    const skipped = machines.map((m) => m.key);
-    if (skipped.length && !placeable) {
-      // `!!!` is the house "loud" convention (ops-review.js ALERT_RE scans for it) — a manager's
-      // ops digest must catch this line, not just a human reading the terminal.
-      const msg = `!!! machine-aware pooling DISABLED for project ${String(projectId).slice(0, 8)}: `
-        + `machine(s) [${skipped.join(', ')}] are configured (dev_priority>0 / pool_size>0) but `
-        + `the spinoff server is runner:process — machine placement needs a docker-backed app tier `
-        + `(server containers get docker_ctx=NULL for process roles, so the ready count is zero by `
-        + `construction). Per-machine pool sizes have no effect; the project-wide pool target applies. `
-        + `To place on machines, give roles.server (or tiers.spinoff) a compose runner and a spinoff `
-        + `compose file, then refresh the manifest.`;
-      const first = !lastMachineGuardSaid.has(projectId);
+  const machines = await poolMachines(projectId);
+  if (!machines.length) {
+    // MACHINE-AWARE BY DEFAULT (docs/default-machine-pooling-decision-record.md): no
+    // machine_pool row for this project does not mean "no machine" — it means "the default
+    // one". The project-wide target pools on the one machine that can actually host the
+    // project (queenzee host for process projects; the machine holding its shared dev db for
+    // compose projects), machine-aware count and max_xells cap included. Only a hive with no
+    // machines — or none eligible — still takes the placeless legacy path.
+    const cfg = await one(`SELECT default_db_coupling FROM pool_config WHERE project_id=$1`, [projectId]);
+    const im = await implicitPoolMachine(projectId, {
+      isProcess: !placeable, coupling: cfg?.default_db_coupling || null });
+    if (im) {
+      const said = `implicit:${im.key}:${!placeable}`;
+      if (lastMachineGuardSaid.get(`${projectId}:implicit`) !== said) {
+        lastMachineGuardSaid.set(`${projectId}:implicit`, said);
+        logline('pool', `pooling for project ${String(projectId).slice(0, 8)} defaults to machine `
+          + `'${im.key}' (no per-machine config; project-wide target applies there${!placeable ? ', project-wide count: process xells all live on the queenzee host' : ''})`);
+      }
+      return fillTrim(projectId, target, !placeable ? { ...im, processLocal: true } : im)
+        .catch((e) => console.error(`[pool] ${im.key}:`, e.message));
+    }
+    return fillTrim(projectId, target, null);
+  }
+  if (!placeable) {
+    // Process-runner project with machines configured. Every one of its xells lives on the
+    // QUEENZEE HOST by construction (worktree on the host fs, server/webapp as local processes,
+    // the cage on the queenzee's own daemon), so per-machine pooling is honored on the ONE
+    // machine that is — the queenzee-host row — counted PROJECT-WIDE (fillTrim's process-local
+    // mode: no docker_ctx join, so the zero-count runaway that piled up 167 xells cannot recur).
+    // A REMOTE row stays a dead letter — recorded below once per state change (the same "say it
+    // when it CHANGES" rule monitor.js uses; the pool ticks every 15s, and a verbatim repeat
+    // would drown the lines that carry news), while the matrix shows the same fact dimmed at
+    // the knobs. (docs/process-machine-pooling-decision-record.md)
+    const host = machines.find((m) => m.docker_ctx === queenzeeHostCtx());
+    const remote = machines.filter((m) => m.docker_ctx !== queenzeeHostCtx());
+    if (remote.length) {
+      // INFORMATIONAL, not an alert. This line used to carry the house `!!!` marker and a
+      // console.error — earned when dead remote config was a TRAP (the pool silently fell back
+      // to a different target). Since the default-pooling ship it is harmless: the queenzee-host
+      // row (or the implicit default below) governs, the runaway is structurally impossible, and
+      // the matrix shows the no-effect state dimmed at the knobs themselves. An alert that fires
+      // forever over harmless config buries the ops digest lines that carry news
+      // (docs/pooling-dead-config-demotion-decision-record.md). Ring-only, once per state change.
+      const msg = `per-machine pooling has no effect on [${remote.map((m) => m.key).join(', ')}] `
+        + `for project ${String(projectId).slice(0, 8)}: the spinoff server is runner:process — a `
+        + `process xell's worktree, processes and cage all live on the queenzee host, so a remote `
+        + `machine can never host one. `
+        + (host
+          ? `Pooling is governed by '${host.key}' (the queenzee-host machine).`
+          : `The project-wide pool target applies on the queenzee host.`);
       if (lastMachineGuardSaid.get(projectId) !== msg) {
         lastMachineGuardSaid.set(projectId, msg);
         logline('pool', msg);
-        // The ring buffer is read in the console's terminal modal; stdout is the docker log.
-        // The FIRST occurrence is the "operator, look here" event; later state changes that alter
-        // the message log again but only to the ring, so a fix that rotates machines stays audible
-        // without repeating the same line every 15 seconds.
-        if (first) console.error(`[pool] ${msg}`);
       }
+    }
+    if (host) {
+      const size = await machinePoolSize(host.id, projectId);
+      return fillTrim(projectId, size, { ...host, processLocal: true })
+        .catch((e) => console.error(`[pool] ${host.key}:`, e.message));
+    }
+    // Only remote rows configured (all dead letters): the DEFAULT still applies — pool the
+    // project-wide target on the queenzee-host machine row when one exists, legacy otherwise.
+    const im = await implicitPoolMachine(projectId, { isProcess: true });
+    if (im) {
+      return fillTrim(projectId, target, { ...im, processLocal: true })
+        .catch((e) => console.error(`[pool] ${im.key}:`, e.message));
     }
     return fillTrim(projectId, target, null);
   }
@@ -180,8 +221,13 @@ async function reconcileProject(projectId, target) {
 }
 
 // Fill to / trim past `target` ready xells — on one machine (m) or project-wide (m = null).
+// m.processLocal marks the process-runner special case: the queenzee-host machine of a project
+// whose xells ALL live there by construction. Its ready set is the project-wide query — the
+// docker_ctx join would count zero forever (process server rows carry docker_ctx=NULL), which
+// is the runaway this flag exists to avoid — while the machine's max_xells still caps the fill
+// below (liveXellCount counts NULL-ctx rows into the queenzee host).
 async function fillTrim(projectId, target, m) {
-  const ready = m
+  const ready = m && !m.processLocal
     ? await q(
       `SELECT x.id, x.slug, x.worktree_path FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
         WHERE x.project_id=$1 AND x.status='ready' AND NOT x.is_production AND c.docker_ctx=$2

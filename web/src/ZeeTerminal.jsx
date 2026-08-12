@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import FileExplorer from './FileExplorer.jsx';
 import FeedChips from './FeedChips.jsx';
 import MessageComposer from './MessageComposer.jsx';
-import { setXellLangfuseTracking, baseUrl } from './api.js';
+import { baseUrl } from './api.js';
 import { mountTerm } from './termHost.js';
 import { getTermEngine, getTermTheme, setTermTheme } from './termPref.js';
 
@@ -37,7 +37,7 @@ const CTRL_PREFIX = '\u0000ZH';
 // ✱/⚒ chips (gated on `explorerZeeId` — a container shell has no feed to filter).
 // `xell` ({ id, slug }, cxell zees only) lights up 💬 talk — the composer that CONVERSES with the
 // zee whether or not it is mid-turn (see the talk block below).
-export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, explorerContainer = null, xell = null, langfuseEnabled = false, onToggleLangfuse = null, onClose }) {
+export function TerminalModal({ wsPath, title, prod = false, foot = null, explorerZeeId = null, explorerContainer = null, xell = null, onClose }) {
   const holder = useRef(null);
   const termRef = useRef(null);   // termHost handle (xterm or wterm) — write/focus/getSelection/…
   const wsRef = useRef(null);
@@ -318,18 +318,6 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
                 💬 talk
               </button>
             )}
-            {/* PER-XELL LANGFUSE TRACKING knob (human side): shown when the Langfuse plugin is
-                enabled. Clicking flips the xell's switch — OFF means this zee's turns are not traced
-                to Langfuse and its cage gets no LANGFUSE_* env. */}
-            {xell?.id && langfuseEnabled && onToggleLangfuse && (
-              <button className={`term-x lf${xell.langfuse_tracking !== false ? ' on' : ''}`}
-                      data-testid="langfuse-toggle" onClick={onToggleLangfuse}
-                      title={xell.langfuse_tracking !== false
-                        ? 'Langfuse tracking is ON — traces of this zee\'s turns are posted to Langfuse. Click to turn OFF.'
-                        : 'Langfuse tracking is OFF — no traces are posted for this zee\'s turns and its cage gets no LANGFUSE_* env. Click to turn ON.'}>
-                ⚗ {xell.langfuse_tracking !== false ? 'on' : 'off'}
-              </button>
-            )}
             <button className={`term-x${clipOpen ? ' on' : ''}${clip && !clipOpen ? ' dot' : ''}`} data-testid="clip-toggle"
                     onClick={() => setClipOpen((v) => !v)}
                     title="Clipboard — selections you Shift+drag land here (works even when the OS clipboard is blocked)">📋</button>
@@ -385,11 +373,8 @@ export function TerminalModal({ wsPath, title, prod = false, foot = null, explor
 // `tmux new -A -s zee` inside the cxell — so this is the same interactive `claude` you'd get over
 // SSH, prompt by prompt, and disconnecting leaves the session running (tmux). The SSH line below
 // is that exact door for Claude Code desktop's "Add SSH host" — the deeplink IS the SSH connection.
-export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, langfuseTracking = true, langfuseEnabled = false, onClose }) {
+export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, onClose }) {
   const [copied, setCopied] = useState(false);
-  // The Langfuse tracking switch, kept locally so the header knob reflects the click instantly and
-  // reverts if the server refuses. Initialised from the xell row's flag (default ON).
-  const [lf, setLf] = useState(!!langfuseTracking);
 
   // ssh://zee@127.0.0.1:PORT → a copy-pasteable ssh command (external attach)
   let sshCmd = null;
@@ -400,20 +385,6 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, lan
 
   const copy = async () => {
     try { await navigator.clipboard.writeText(sshCmd); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* */ }
-  };
-
-  // Flip the per-xell Langfuse tracking switch. Optimistic (the knob reflects the click at once);
-  // on a refusal the flag is reverted and the error logged — a console knob must never throw.
-  const toggleLangfuse = async () => {
-    if (!xellId) return;
-    const next = !lf;
-    setLf(next);
-    try {
-      await setXellLangfuseTracking(xellId, next);
-    } catch (e) {
-      setLf(!next);
-      console.error('langfuse tracking toggle failed', e);
-    }
   };
 
   const foot = (
@@ -431,8 +402,7 @@ export default function ZeeTerminal({ zeeId, slug, viewerUrl, xellId = null, lan
 
   return <TerminalModal wsPath={`/api/zees/${zeeId}/terminal`} title={slug} foot={foot}
                         explorerZeeId={zeeId}
-                        xell={xellId ? { id: xellId, slug, langfuse_tracking: lf } : null}
-                        langfuseEnabled={langfuseEnabled} onToggleLangfuse={toggleLangfuse}
+                        xell={xellId ? { id: xellId, slug } : null}
                         onClose={onClose} />;
 }
 

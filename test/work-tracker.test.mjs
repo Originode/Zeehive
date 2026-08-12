@@ -349,6 +349,10 @@ try {
      'a queued item is in the queued column');
 
   section('the gantt');
+  // A genuinely dateless row, created BEFORE the model so it is in the rows below — its ledger has
+  // a 'created' event and nothing else, so it has no actual and no plan, and the gantt must list it
+  // rather than invent dates for it.
+  const noDates = await W.createWorkItem({ project_id: PID, title: 'never started', kind: 'task' });
   const gantt = await W.ganttModel({ projectId: PID });
   const byId = new Map(gantt.rows.map((r) => [r.id, r]));
   ok(gantt.rows[0].id === root.id && gantt.rows[0].depth === 0, 'rows come back in TREE order, root first');
@@ -362,9 +366,16 @@ try {
      'a parent with no dates spans min(children start) … max(children end)');
   ok(byId.get(root.id).computed_start === '2026-08-03' && byId.get(root.id).computed_end === '2026-08-07',
      'and the roll-up climbs all the way to the root');
-  ok(byId.get(taskC.id).unscheduled === true && byId.get(taskC.id).computed_start === null,
-     'a row with no dates anywhere is FLAGGED unscheduled and returned with nulls — no invented dates');
+  // taskC was cancelled (and reopened) by the cascade test above, so the RECORD proves it ended once
+  // — it is no longer "undated". The genuinely dateless row created above is what the unscheduled
+  // flag is for: its ledger has no start AND no end, so the gantt has nothing to draw and lists it.
+  ok(byId.get(noDates.id).unscheduled === true && byId.get(noDates.id).computed_start === null
+     && byId.get(noDates.id).actual_start === null && byId.get(noDates.id).actual_end === null,
+     'a row with no dates anywhere (no plan, no actual) is FLAGGED unscheduled — no invented dates');
+  ok(byId.get(taskC.id).unscheduled === false && byId.get(taskC.id).actual_end !== null,
+     'a row the RECORD ended (a terminal event, even one later reopened) is not undated');
   ok(gantt.unscheduled_count >= 1, `the model counts them (${gantt.unscheduled_count}) so the UI can list them`);
+  await W.deleteWorkItem(noDates.id);   // it served its assertion; the tree below expects its original shape
   ok(byId.get(taskB.id).rolled_progress === 50 && byId.get(taskB.id).progress === 50,
      'a leaf rolls up to its own progress');
   ok(byId.get(act2.id).progress === 0 && byId.get(act2.id).rolled_progress > 0,

@@ -22,12 +22,24 @@
 //      with the kimi key.
 //   C. Unknown xell identity → 401, and NO row is written.
 //   D. The gateway is best-effort: a dead upstream → 502 with a completed error row, never a hang.
+//   E. GZIP SSE upstream — the meter reads compressed streams. The CLI sends Accept-Encoding:
+//      gzip,br (the exact header that zeroed the meter for claude + grok); the gateway overrides
+//      it to identity upstream, and the mock STILL gzips. Both dialects (messages + chat-completions)
+//      must record NONZERO tokens AND cost from the decompressed stream, and the accept-encoding
+//      override must reach the upstream.
+//   G. GROK response-model capture — the request omits the model (grok's CLI does), the RESPONSE
+//      carries grok-4.5; the gateway must capture it into the row (model no longer NULL) and price
+//      it (grok-4.5 has a spec price → cost > 0). grok's upstream is mockable via GROK_XAI_API_BASE_URL.
+//   H. An UNKNOWN model is LOUD, not a believable $0: tokens record but no spec price exists, so
+//      cost stays 0 AND meta.unpriced names the model — the note that announces a future mismatch.
 import http from 'node:http';
+import zlib from 'node:zlib';
 import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken } from '../server/src/lib/xell-token.js';
 import { gatewayProxy, gatewayHello, requestsForXell } from '../server/src/lib/gateway.js';
+import { bodiesForRequest, gatewayBodyCaptureEnabled } from '../server/src/lib/gateway-bodies.js';
 
 let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? '✓' : '✗ FAIL'} ${m}`); if (!c) fail++; };
@@ -52,6 +64,67 @@ function startMockUpstream() {
         res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":11,"output_tokens":5,"cache_read_input_tokens":2,"cache_creation_input_tokens":1,"total_cost_usd":0.0005}}\n\n');
         res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
       }
+      res.end();
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({ server, seen, port: server.address().port }));
+  });
+}
+
+// A mock upstream that GZIPS its SSE body REGARDLESS of what the client asked for — the
+// degenerate case the meter must survive: the CLI sends Accept-Encoding: gzip,br, and even
+// though the gateway overrides it to identity upstream, a real upstream (or a transparent
+// proxy) can still send a compressed body. A compressed body is binary to chunk.toString()
+// and matches no SSE event, so without decompression the meter reads 0 tokens. This mock
+// proves the proxy decompresses before parsing. It records what it received so the test can
+// assert the accept-encoding override too.
+function startGzipMockUpstream() {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => body += c);
+    req.on('end', () => {
+      const rec = { method: req.method, url: req.url, auth: req.headers.authorization || null,
+                    acceptEncoding: req.headers['accept-encoding'] || null };
+      seen.push(rec);
+      let sse;
+      if (req.url.includes('/chat/completions')) {
+        sse = 'data: {"choices":[]}\n\n'
+            + 'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}\n\n'
+            + 'data: [DONE]\n\n';
+      } else {
+        sse = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n'
+            + 'event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2,"cache_creation_input_tokens":1}}\n\n'
+            + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+      }
+      const gz = zlib.gzipSync(Buffer.from(sse, 'utf8'));
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip',
+                           'cache-control': 'no-cache' });
+      res.end(gz);
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({ server, seen, port: server.address().port }));
+  });
+}
+
+// A mock for the xAI RESPONSES API (grok): answers /responses with an Anthropic-shaped SSE whose
+// completed event carries BOTH the model and the usage — exactly what the real grok CLI gets. The
+// mock's request bodies are echoed into the usage/model so the test can drive the request/response
+// split (a request that omits the model → the model comes from the response).
+function startGrokMockUpstream({ model = 'grok-4.5' } = {}) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => body += c);
+    req.on('end', () => {
+      const rec = { method: req.method, url: req.url, auth: req.headers.authorization || null };
+      seen.push(rec);
+      const sse = `event: response.created\ndata: {"type":"response.created","response":{"id":"rsp_1","model":"${model}"}}\n\n`
+        + `event: response.completed\ndata: {"type":"response.completed","response":{"id":"rsp_1","model":"${model}","usage":{"input_tokens":12,"output_tokens":7}}}\n\n`;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write(sse);
       res.end();
     });
   });
@@ -104,6 +177,7 @@ async function completedRow(xellId) {
 
 const mock = await startMockUpstream();
 const gw = await startGatewayApp();
+let gzMock = null;   // section E — a gzip upstream (closed in the finally)
 // Point the gateway at the mock. The openai/kimi bases CARRY their version path like the real
 // upstreams (api.openai.com/v1, api.kimi.com/coding/v1), so the doubling bug joinUpstreamPath
 // fixes is exercised rather than dodged.
@@ -115,6 +189,7 @@ process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
 // to api.anthropic.com (main), and setting ANTHROPIC_BASE_URL would be a no-op for it.
 
 const fixtures = [];
+let gkMock = null;   // section G — a grok /responses upstream (closed in the finally)
 try {
   // The Anthropic-dialect section runs through the DEEPSEEK provider, not claude: providerUpstreamUrl
   // deliberately hard-codes claude to api.anthropic.com (main), so a claude call cannot be pointed
@@ -146,6 +221,16 @@ try {
   eq(row?.status, 200, 'status 200');
   eq(mock.seen.at(-1)?.url, '/v1/messages?beta=true', 'the upstream received the stripped forward path');
   ok(mock.seen.at(-1)?.auth?.includes('sk-mockdeepseek123456789'), 'the upstream got the PROVIDER key, not the xell token');
+  // BODY CAPTURE (migration 162, lib/gateway-bodies.js): the request DELTA + the REASSEMBLED
+  // response SSE. The default switch (no pool_config row) is ON.
+  const aBody = await bodiesForRequest(row.id);
+  ok(!!aBody, 'the proxy captured the request/response bodies');
+  eq(aBody?.request_body, '{"role":"user","content":"hi"}', 'the request body is the DELTA (the last message), not the whole conversation');
+  eq(aBody?.request_truncated, false, 'a small request body is not truncated');
+  ok(aBody?.response_body?.includes('event: message_start'), 'the response body is the REASSEMBLED SSE text');
+  ok(aBody?.response_body?.includes('event: message_stop'), 'the response body carries the final SSE event');
+  ok(aBody?.response_body?.includes('"input_tokens":11'), 'the usage event is in the reassembled response body');
+  eq(aBody?.response_truncated, false, 'a short SSE response is not truncated');
 
   console.log('\n── B. OpenAI dialect — /v1/chat/completions through the proxy ──');
   const fx2 = await makeFixture('openai', 'sk-mockopenai123456789012');
@@ -221,6 +306,138 @@ try {
   ok(!!row4, 'the failed forward is still recorded');
   eq(row4?.status, 502, 'the row carries the 502 status');
 
+  console.log('\n── E. gzip SSE upstream — the meter reads compressed streams ──');
+  // The CLI (fetch below) sends Accept-Encoding: gzip, br — the exact header that made the live
+  // meter read 0 tokens for claude + grok. The gateway overrides it to identity upstream, and
+  // the mock STILL gzips (the degenerate upstream / transparent-proxy case), so this proves the
+  // decompress-before-parse half too: tokens AND cost must read nonzero from a compressed body.
+  gzMock = await startGzipMockUpstream();
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${gzMock.port}`;
+  process.env.OPENAI_BASE_URL = `http://127.0.0.1:${gzMock.port}/v1`;
+  const gzSeenBase = gzMock.seen.length;
+  // Anthropic dialect (deepseek → /v1/messages): the model deepseek-chat has a price in
+  // ai_model_spec (migration 163), so the upstream reporting no cost must still derive one.
+  const fxGz1 = await makeFixture('deepseek', 'sk-mockdeepseek123456789');
+  fixtures.push(fxGz1);
+  const gzRes = await fetch(`http://127.0.0.1:${gw.port}/x/${fxGz1.xellToken}/deepseek/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockdeepseek123456789',
+               'accept-encoding': 'gzip, br' },
+    body: JSON.stringify({ model: 'deepseek-chat', max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const gzBody = await gzRes.text();
+  ok(gzRes.status === 200, 'gzip SSE forwarded with 200');
+  ok(gzBody.includes('event: message_delta'), 'the DECOMPRESSED SSE reaches the client (fetch decoded it)');
+  ok(gzBody.includes('"input_tokens":10'), 'the usage event is in the forwarded stream');
+  const gzRec = gzMock.seen.at(-1);
+  ok(gzRec?.url === '/v1/messages', 'the gzip upstream received the messages forward path');
+  ok(gzRec?.acceptEncoding === 'identity' || gzRec?.acceptEncoding == null,
+    `the upstream got identity, NOT the CLI gzip/br (got ${JSON.stringify(gzRec?.acceptEncoding)})`);
+  const gzRow = await completedRow(fxGz1.xellId);
+  eq(Number(gzRow?.input_tokens), 10, 'gzip messages: input tokens read from the compressed stream');
+  eq(Number(gzRow?.output_tokens), 5, 'gzip messages: output tokens');
+  eq(Number(gzRow?.cache_read_tokens), 2, 'gzip messages: cache read tokens');
+  eq(Number(gzRow?.cache_write_tokens), 1, 'gzip messages: cache write tokens');
+  eq(Number(gzRow?.total_tokens), 18, 'gzip messages: total = input + output + cache read + cache write');
+  ok(Number(gzRow?.cost_usd) > 0, `gzip messages: cost is nonzero (got ${Number(gzRow?.cost_usd)})`);
+  ok(Number(gzRow?.cost_usd) > 0.000004 && Number(gzRow?.cost_usd) < 0.000006,
+    `gzip messages: cost = 10×0.28 + 5×0.42 per mtok = 4.9e-6 (got ${Number(gzRow?.cost_usd)})`);
+  // Body capture (migration 162) must store the DECOMPRESSED SSE text, not binary gzip — the
+  // drill-down panel renders text, and a binary blob would be the same class of bug as the meter.
+  const gzBodyCap = await bodiesForRequest(gzRow.id);
+  ok(gzBodyCap?.response_body?.includes('event: message_delta'),
+    'the captured response body is the DECOMPRESSED SSE text, not binary gzip');
+
+  // OpenAI dialect (openai → /v1/chat/completions): gpt-5.6-sol has a price, so cost derives.
+  const fxGz2 = await makeFixture('openai', 'sk-mockopenai123456789012');
+  fixtures.push(fxGz2);
+  const gzRes2 = await fetch(`http://127.0.0.1:${gw.port}/x/${fxGz2.xellToken}/openai/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockopenai123456789012',
+               'accept-encoding': 'gzip, br' },
+    body: JSON.stringify({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const gzBody2 = await gzRes2.text();
+  ok(gzRes2.status === 200, 'gzip openai stream forwarded with 200');
+  ok(gzBody2.includes('[DONE]'), 'openai SSE passes through decompressed');
+  ok(gzMock.seen.at(-1)?.url === '/v1/chat/completions', 'the gzip upstream received the chat-completions forward path');
+  const gzRow2 = await completedRow(fxGz2.xellId);
+  eq(Number(gzRow2?.input_tokens), 10, 'gzip openai: prompt tokens');
+  eq(Number(gzRow2?.output_tokens), 5, 'gzip openai: completion tokens');
+  eq(Number(gzRow2?.total_tokens), 15, 'gzip openai: total tokens');
+  ok(Number(gzRow2?.cost_usd) > 0, `gzip openai: cost is nonzero (got ${Number(gzRow2?.cost_usd)})`);
+  ok(Number(gzRow2?.cost_usd) > 0.00006 && Number(gzRow2?.cost_usd) < 0.00007,
+    `gzip openai: cost = 10×1.25 + 5×10 per mtok = 6.25e-5 (got ${Number(gzRow2?.cost_usd)})`);
+  ok(gzMock.seen.length === gzSeenBase + 2, 'exactly the two gzip requests hit the gzip upstream');
+  // Point the bases back at the plain mock for the remaining sections.
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
+  process.env.OPENAI_BASE_URL = `http://127.0.0.1:${mock.port}/v1`;
+
+  console.log('\n── G. grok — the model comes from the RESPONSE, not the request ──');
+  // grok's CLI omits the model from the request (4 of 6 prod grok rows carry model NULL — those
+  // rows can never price). The gateway must capture the model the RESPONSE names, update the row,
+  // and price it. grok's upstream IS mockable via GROK_XAI_API_BASE_URL (unlike claude).
+  gkMock = await startGrokMockUpstream();
+  process.env.GROK_XAI_API_BASE_URL = `http://127.0.0.1:${gkMock.port}`;
+  const fxGk = await makeFixture('grok', 'xai-grokmocktoken1234567890');
+  fixtures.push(fxGk);
+  const gkRes = await fetch(`http://127.0.0.1:${gw.port}/x/${fxGk.xellToken}/grok/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer xai-grokmocktoken1234567890' },
+    body: JSON.stringify({ input: 'hi', max_output_tokens: 10 }),   // NO model field — grok's shape
+  });
+  const gkBody = await gkRes.text();
+  ok(gkRes.status === 200, 'grok /responses forwarded with 200');
+  ok(gkBody.includes('response.completed'), 'the grok SSE passes through');
+  ok(gkMock.seen.at(-1)?.url === '/responses', 'the grok upstream received /responses');
+  ok(gkMock.seen.at(-1)?.auth?.includes('xai-grokmocktoken1234567890'), 'the grok upstream got the XAI key');
+  const gkRow = await completedRow(fxGk.xellId);
+  eq(gkRow?.provider, 'grok', 'provider is grok');
+  eq(gkRow?.model, 'grok-4.5', 'the model is captured from the RESPONSE (the request had none) — no longer NULL');
+  eq(Number(gkRow?.input_tokens), 12, 'grok input tokens (from the nested response.usage)');
+  eq(Number(gkRow?.output_tokens), 7, 'grok output tokens');
+  eq(Number(gkRow?.total_tokens), 19, 'grok total tokens');
+  ok(Number(gkRow?.cost_usd) > 0, `grok cost is nonzero — the captured model priced against grok-4.5 (got ${Number(gkRow?.cost_usd)})`);
+  ok(Number(gkRow?.cost_usd) > 0.0001 && Number(gkRow?.cost_usd) < 0.0002,
+    `grok cost = 12×3 + 7×15 per mtok = 1.41e-4 (got ${Number(gkRow?.cost_usd)})`);
+
+  console.log('\n── H. an UNKNOWN model is loud, not a believable $0 ──');
+  // tokens move but no spec price exists AND the upstream reports no cost → cost stays 0 AND the
+  // row records meta.unpriced, so a future mismatch announces itself instead of reading as $0.
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${gzMock.port}`;
+  const fxUnk = await makeFixture('deepseek', 'sk-mockdeepseek123456789');
+  fixtures.push(fxUnk);
+  const unkRes = await fetch(`http://127.0.0.1:${gw.port}/x/${fxUnk.xellToken}/deepseek/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockdeepseek123456789' },
+    body: JSON.stringify({ model: 'no-such-model-xyz', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  ok(unkRes.status === 200, 'an unknown model still streams 200');
+  const unkRow = await completedRow(fxUnk.xellId);
+  eq(Number(unkRow?.total_tokens), 18, 'tokens still record for an unknown model');
+  eq(Number(unkRow?.cost_usd), 0, 'cost stays 0 — never a wrong estimate');
+  eq(unkRow?.meta?.unpriced?.model, 'no-such-model-xyz', 'the row says WHY it is unpriced (meta.unpriced)');
+  eq(unkRow?.meta?.unpriced?.provider, 'deepseek', 'meta.unpriced names the provider');
+  // Point deepseek back at the plain mock for the remaining sections.
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
+
+  console.log('\n── F. per-project switch OFF → the proxy stores no bodies ──');
+  // Section D pointed DEEPSEEK_ANTHROPIC_BASE_URL at a DEAD port — point it back at the mock.
+  process.env.DEEPSEEK_ANTHROPIC_BASE_URL = `http://127.0.0.1:${mock.port}`;
+  const fxOff = await makeFixture('deepseek', 'sk-mockdeepseek123456789');
+  fixtures.push(fxOff);
+  await one(`INSERT INTO pool_config (project_id, gateway_body_capture) VALUES ($1, false)`, [fxOff.projectId]);
+  eq(await gatewayBodyCaptureEnabled(fxOff.projectId), false, 'the switch reads OFF');
+  const resOff = await fetch(`http://127.0.0.1:${gw.port}/x/${fxOff.xellToken}/deepseek/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk-mockdeepseek123456789' },
+    body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  ok(resOff.status === 200, 'a call still succeeds with capture OFF');
+  const offRow = await completedRow(fxOff.xellId);
+  eq(offRow?.status, 200, 'the ledger row is written even with capture OFF');
+  eq(await bodiesForRequest(offRow?.id), null, 'NO body row is stored while the switch is OFF');
+
   console.log(`\n${fail ? fail + ' FAILED' : 'all good'}`);
 } finally {
   for (const fx of fixtures) {
@@ -232,6 +449,8 @@ try {
   }
   gw.server.close();
   mock.server.close();
+  if (typeof gzMock !== 'undefined' && gzMock.server) gzMock.server.close();
+  if (typeof gkMock !== 'undefined' && gkMock.server) gkMock.server.close();
   await pool.end();
 }
 process.exit(fail ? 1 : 0);

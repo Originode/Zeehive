@@ -48,17 +48,22 @@ export function lastAssistantText(msg) {
 // Start a turn. `kind` = spawn | resume | interactive. Returns the turn row, or null on
 // any failure (observability is best-effort by contract). The caller threads the id into
 // session_event rows so the play-by-play can be replayed per turn.
+//
+// `executionId` — the PLANE-3 execution (workflow weld) this turn advances. The QUEENZEE
+// stamps it when it starts a turn for a DISPATCHED execution; the caller resolves it from
+// the xell's execution_id binding (the source of truth). A turn with no execution keeps
+// execution_id NULL — every standalone turn and every historic turn is exactly that.
 export async function startTurn({ zee, xell = null, kind = 'spawn', sessionId = null, model = null,
-                                   startedAt = null, meta = null }) {
+                                   startedAt = null, meta = null, executionId = null }) {
   try {
     const row = await one(
-      `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, session_id, model, started_at, meta)
-       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, '{}'::jsonb))
+      `INSERT INTO zee_turn (zee_id, xell_id, project_id, kind, session_id, model, started_at, meta, execution_id)
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, '{}'::jsonb), $9)
        RETURNING *`,
       [zee?.id || null, xell?.id || zee?.xell_id || null, xell?.project_id || null,
        kind, sessionId || zee?.claude_session_id || zee?.session_name || null,
        model || zee?.model || null, startedAt || null,
-       meta ? JSON.stringify(meta) : null]);
+       meta ? JSON.stringify(meta) : null, executionId || xell?.execution_id || null]);
     return row;
   } catch (e) {
     logline('turn', `could not start a turn ledger row (${String(e.message).slice(0, 120)})`);
@@ -70,6 +75,11 @@ export async function startTurn({ zee, xell = null, kind = 'spawn', sessionId = 
 // ({ cost, input, output, cacheRead, cacheWrite, metered }). `summary` is the last
 // assistant text the turn produced (its answer). `stopReason` is the turn's end reason
 // (end_turn, an error message, PAUSED_STOP_REASON, …). Returns the updated row or null.
+//
+// `ended_at IS NULL` in the WHERE makes the end a ONE-SHOT act: a turn that already ended
+// (ended_at set) is never re-stamped — a second writer (the spin detector racing intake, a
+// double-fired completion handler) gets null back instead of overwriting the ending state. A
+// ledger we are building trust in must not let a late writer relabel a turn that ended naturally.
 export async function endTurn(turnId, { status = 'ended', burn = null, stopReason = null,
                                         summary = null, endedAt = null, meta = null } = {}) {
   if (!turnId) return null;
@@ -83,11 +93,11 @@ export async function endTurn(turnId, { status = 'ended', burn = null, stopReaso
               metered = $9, stop_reason = COALESCE($10, stop_reason),
               summary = COALESCE($11, summary),
               meta = meta || COALESCE($12, '{}'::jsonb)
-        WHERE id = $1 RETURNING *`,
+        WHERE id = $1 AND ended_at IS NULL RETURNING *`,
       [turnId, status, endedAt || null, b.cost, b.input, b.output, b.cacheRead, b.cacheWrite,
        b.metered !== false, stopReason || null, summary || null,
        meta ? JSON.stringify(meta) : null]);
-    if (!row) logline('turn', `endTurn: no zee_turn row ${String(turnId).slice(0, 8)} to close`);
+    if (!row) logline('turn', `endTurn: no OPEN zee_turn row ${String(turnId).slice(0, 8)} to close (already ended, or absent)`);
     return row;
   } catch (e) {
     logline('turn', `could not end turn ${String(turnId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
@@ -134,4 +144,141 @@ export async function eventsForTurn(turnId, { limit = 500 } = {}) {
   }
 }
 
-export default { startTurn, endTurn, turnsForXell, eventsForTurn, TURN_KIND, TURN_STATUS };
+// The WELD read model — the nested drill-down tree (work_node → execution → turns → gateway calls)
+// for a xell's observability. docs/hierarchical-workflow-adoption.md §3.2: the chain
+// execution → zee_turn → llm_gateway_request is the waterfall, and this is its per-xell read shape.
+// A human expands a work node, sees its executions, expands one, sees the turns that advanced it,
+// expands a turn, sees the LLM gateway calls that made it up. Every row is a byproduct of a door —
+// this only READS. Best-effort like every observability read (503-not-throw).
+export async function workflowTreeForXell(xellId) {
+  if (!xellId) return [];
+  try {
+    const xell = await one(`SELECT execution_id FROM xell WHERE id=$1`, [xellId]);
+    const boundExecId = xell?.execution_id || null;
+    // The executions this xell's zees worked on: the xell's own binding (xell.execution_id) plus
+    // every execution a zee_turn of this xell was stamped with. DISTINCT because a turn-stamped
+    // execution may also BE the xell's binding.
+    const execs = await q(
+      `SELECT DISTINCT e.id, e.run_id, e.work_node_id, e.attempt, e.map_index, e.loop_iteration,
+              e.state, e.entity_id, e.inputs, e.outputs, e.error, e.effect_key,
+              e.started_at, e.finished_at, e.created_at,
+              wn.name AS work_node_name, wn.kind AS work_node_kind
+         FROM execution e
+         JOIN work_node wn ON wn.id = e.work_node_id
+         LEFT JOIN zee_turn t ON t.execution_id = e.id AND t.xell_id = $1
+        WHERE e.id = $2 OR t.id IS NOT NULL
+        ORDER BY wn.name, e.started_at`, [xellId, boundExecId]);
+    if (!execs.length) return [];
+    const execIds = execs.map((e) => e.id);
+    const turns = await q(
+      `SELECT t.*, z.name AS zee_name
+         FROM zee_turn t LEFT JOIN zee z ON z.id = t.zee_id
+        WHERE t.execution_id = ANY($1::uuid[])
+        ORDER BY t.started_at ASC`, [execIds]);
+    const turnIds = [...new Set(turns.map((t) => t.id))];
+    const reqs = turnIds.length ? await q(
+      `SELECT id, turn_id, provider, model, method, path, status,
+              input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+              cost_usd, duration_ms, error, requested_at, completed_at
+         FROM llm_gateway_request WHERE turn_id = ANY($1::uuid[])
+        ORDER BY requested_at ASC`, [turnIds]) : [];
+    const reqsByTurn = new Map();
+    for (const r of reqs) {
+      if (!reqsByTurn.has(r.turn_id)) reqsByTurn.set(r.turn_id, []);
+      reqsByTurn.get(r.turn_id).push(r);
+    }
+    const turnsByExec = new Map();
+    for (const t of turns) {
+      if (!turnsByExec.has(t.execution_id)) turnsByExec.set(t.execution_id, []);
+      turnsByExec.get(t.execution_id).push({ ...t, gateway_requests: reqsByTurn.get(t.id) || [] });
+    }
+    const byNode = new Map();
+    for (const e of execs) {
+      const { work_node_name, work_node_kind, ...exec } = e;
+      if (!byNode.has(e.work_node_id)) {
+        byNode.set(e.work_node_id, {
+          work_node_id: e.work_node_id,
+          work_node_name: e.work_node_name,
+          work_node_kind: e.work_node_kind,
+          executions: [],
+        });
+      }
+      byNode.get(e.work_node_id).executions.push({ ...exec, turns: turnsByExec.get(e.id) || [] });
+    }
+    return [...byNode.values()];
+  } catch (e) {
+    logline('turn', `workflowTreeForXell failed (${String(e.message).slice(0, 120)})`);
+    return [];
+  }
+}
+
+// ── play-by-play feed persistence ─────────────────────────────────────────────────────────────
+//
+// intake.js's feed() (cxell path) and the SDK stream loop both call this so the same stream-json
+// events the SSE bus carries as 'zee-output' also land in session_event WITH turn_id. Without
+// that column the Turns tab's expandable log is empty by construction.
+//
+// THE BUG THIS REPLACES: the original hot-path INSERT used
+//   VALUES ('cxell-feed', $2, $3, $4, $5, $6, $7, $8)
+// with an 8-element params array whose $1 was never referenced. Postgres rejects that with
+// "could not determine data type of parameter $1", and the call was `.catch(() => {})` — so every
+// feed event failed invisibly forever. Fleet evidence (2026-08-08): 1,815 session_event rows,
+// zero with turn_id, and the 'cxell-feed' source never appeared. Observability that cannot be
+// told apart from "never shipped" is not observability.
+//
+// CONTRACT: best-effort, never throws, never blocks the feed (callers fire-and-forget). A failure
+// is LOUD — a process-local counter + a logline on every miss — so a silent empty play-by-play
+// cannot happen again without a trail.
+
+let _feedOk = 0;
+let _feedFail = 0;
+
+/** Process-local counters for the play-by-play writer. Exposed so a test (and ops) can see silence. */
+export function feedWriteStats() {
+  return { ok: _feedOk, failed: _feedFail };
+}
+
+/** Test/ops helper — reset the counters without restarting the process. */
+export function resetFeedWriteStats() {
+  _feedOk = 0;
+  _feedFail = 0;
+}
+
+/**
+ * Persist one stream-json feed event against a turn. Skips system/init noise (same filter the
+ * original inline INSERT used). Returns the inserted row, or null when skipped/failed.
+ *
+ * @param {{ turnId: string, zeeId?: string, xellId?: string, event: object, sessionId?: string }} args
+ */
+export async function recordFeedEvent({ turnId, zeeId = null, xellId = null, event = null, sessionId = null } = {}) {
+  if (!turnId || !event?.type || event.type === 'system') return null;
+  const toolName = event.type === 'assistant'
+    && event.message?.content?.[0]?.type === 'tool_use'
+    ? (event.message.content[0].name || null)
+    : null;
+  try {
+    // $1..$8 contiguous — do NOT start at $2 with a literal source. Postgres cannot type an
+    // unreferenced $1 and the insert then fails every time (the fleet-empty play-by-play bug).
+    const row = await one(
+      `INSERT INTO session_event
+         (source, hook_event_name, zee_id, xell_id, turn_id, claude_session_id, tool_name, raw)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, ts, source, hook_event_name, turn_id, zee_id, xell_id, tool_name`,
+      ['cxell-feed', event.type, zeeId || null, xellId || null, turnId,
+       event.session_id || sessionId || null, toolName,
+       JSON.stringify(event)]);
+    _feedOk += 1;
+    return row;
+  } catch (e) {
+    _feedFail += 1;
+    logline('turn', `play-by-play write FAILED (#${_feedFail} total, ok=${_feedOk}): `
+      + `${String(e.message).slice(0, 160)}`);
+    return null;
+  }
+}
+
+export default {
+  startTurn, endTurn, turnsForXell, eventsForTurn,
+  recordFeedEvent, feedWriteStats, resetFeedWriteStats,
+  TURN_KIND, TURN_STATUS,
+};

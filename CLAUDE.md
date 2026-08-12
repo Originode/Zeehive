@@ -190,6 +190,7 @@ docs/            specs and rationale (see the doc map)
 | **your verbs as a caged zee** | `.zeehive/harness/memory/cxell-zee-manual.md` (in your xell) |
 | a zee that runs other zees | [docs/manager-zees.md](docs/manager-zees.md) |
 | tickets, work items, the board | [docs/work-tracker.md](docs/work-tracker.md) (nouns) · [docs/work-tracker-verbs.md](docs/work-tracker-verbs.md) (verbs) |
+| a DEPLOYED project files/monitors its own tickets over HTTP (keys, attachments) | [docs/ticketing-api.md](docs/ticketing-api.md) |
 | harnesses (persona/skill/memory layers) — and where their text lives | [docs/harness-proposal.md](docs/harness-proposal.md) (§3.1) |
 | the role-specialised worker personas (Scout, Builder, Reviewer, …) | [docs/dev-crew.md](docs/dev-crew.md) |
 | the manager harness that runs that crew | [docs/dev-crew-lead.md](docs/dev-crew-lead.md) |

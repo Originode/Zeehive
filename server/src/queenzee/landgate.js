@@ -10,7 +10,7 @@
 import { q, one } from '../db/pool.js';
 import { broadcast } from '../lib/events.js';
 import { logline, activity } from '../lib/logbus.js';
-import { gitLog, diffStat, cleanGitEnv, headCommit } from '../lib/git.js';
+import { gitLog, diffStat, cleanGitEnv, headCommit, doorFromEmail } from '../lib/git.js';
 import { spawnSync } from 'node:child_process';
 import { notifyLandRequest } from '../lib/notify.js';
 import { nudgeXellAfterLand, nudgeXellForStaleLanding, nudgeXellForClearedRunway,
@@ -77,15 +77,25 @@ export async function syncXellAfterLand(xellId, landedSha) {
 // The commits a push would ADD to main (old..new), newest first — what the human actually reviews.
 // Safe to read from the xource: xell worktrees SHARE its object store, so the zee's commits are
 // already there; the push only moves the ref. (Nothing is quarantined for a same-repo push.)
-function pushedCommits(repoRoot, oldSha, newSha, limit = 50) {
+//
+// TKT-159-3139 (diff provenance): each entry now carries the COMMITTER + door as well as the
+// author, so a human reviewing a landing can see WHO wrote it (author = the zee slug) and WHICH
+// DOOR applied it (committer = xell door for in-cage commits, console door for console-terminal
+// input, queenzee door for queenzee merges). `door` is derived from the committer email; the
+// land_request.commits jsonb is free-form, so older rows with just {short,subject,author} keep
+// rendering.
+export function pushedCommits(repoRoot, oldSha, newSha, limit = 50) {
   const range = !oldSha || ZERO.test(oldSha) ? newSha : `${oldSha}..${newSha}`;
   const SEP = '\x1f';
-  const r = spawnSync('git', ['-C', repoRoot, 'log', `--pretty=format:%h${SEP}%s${SEP}%an`,
+  const r = spawnSync('git', ['-C', repoRoot, 'log',
+    `--pretty=format:%h${SEP}%s${SEP}%an${SEP}%ae${SEP}%cn${SEP}%ce`,
     '-n', String(limit), range], { encoding: 'utf8', timeout: 15000, windowsHide: true, env: cleanGitEnv() });
   if (r.status !== 0) return [];
   return (r.stdout || '').split('\n').filter(Boolean).map((line) => {
-    const [short, subject, author] = line.split(SEP);
-    return { short, subject, author };
+    const [short, subject, author, authorEmail, committer, committerEmail] = line.split(SEP);
+    return { short, subject, author, author_email: authorEmail || null,
+             committer: committer || null, committer_email: committerEmail || null,
+             door: doorFromEmail(committerEmail) };
   });
 }
 

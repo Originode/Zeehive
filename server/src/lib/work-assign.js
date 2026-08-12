@@ -32,9 +32,21 @@
 //   • the ZEE CHIP: liveZees() already derives a xell's hive status from the same signals fleet.js
 //     feeds it. It is used verbatim rather than re-derived a second way.
 //   • the ID CONTRACT: assertId — malformed → 400 naming the field, well-formed but unknown → 404.
+//
+// ── REHAB 3/4 — "WHO HAS IT" STAYS ON work_item.xell_id (a documented deferral) ─
+// The model's lease plane (migration 179) is where "who has it" belongs, but the lease table has
+// ZERO rows: the rehab 1/4 dual-write writes executions only, no leases. Re-pointing these reads
+// (getItem's xell_id, the busy check, candidatesFor, itemForXell, worksync's tick) at the lease
+// table today would show every card unassigned and every busy check passing — a DIFFERENT board
+// than users see today, which the rehab forbids. Writing leases and backfilling the existing
+// holders is a WRITER change deferred out of the conflation retirement (the model does not yet
+// demonstrably own "who has it"). Until then the assignee link is work_item.xell_id — the annex
+// authority, kept in step by the dual-write — and this file's READ of it is documented as the
+// conflation it is.
 import { q, one, pool } from '../db/pool.js';
 import { broadcast } from './events.js';
 import { logline } from './logbus.js';
+import { syncExecutionState } from './work-node-sync.js';
 import {
   getWorkItem, listWorkItems, flattenTree, liveZees, logWorkEvent, inTransaction, dbRunner, assertId,
 } from './work-items.js';
@@ -170,6 +182,9 @@ export async function assignWorkItem(id, { xell_id, actor = 'human@console' } = 
     }
     if (moved) {
       await db.q(`UPDATE work_item SET status='assigned' WHERE id=$1`, [item.id]);
+      // REHAB 1/4 DUAL-WRITE: queued → assigned is the item leaving the not-started state —
+      // write the execution (creating it if this is the first sign of work).
+      await syncExecutionState(db, item.id, 'assigned');
       await logWorkEvent(item.id, 'status', { from: item.status, to: 'assigned', actor,
         detail: { because: `assigned to ${xell.slug}` } }, { client });
     }
@@ -275,7 +290,7 @@ export function briefForWorkItem({ item, ancestors = [], ticket = null, extra = 
 // `dispatchFn` is a TEST SEAM (and only that): the test suite must be able to prove the brief, the
 // stamping and the assignment without spawning a real agent. Production callers never pass it.
 export async function deployWorkItem(id, { task = null, model = null, mode = null, harness = null,
-                                           title = null, visual_verify = false, langfuse_tracking = null,
+                                           title = null, visual_verify = false,
                                            provider = null,
                                            actor = 'human@console', managerXellId = null,
                                            dispatchFn = null } = {}) {
@@ -302,7 +317,7 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
         + 'for this item right now. Wait for it to settle, or unassign the item first.');
     }
     return await deployWorkItemHeld(id, plain, { task, model, mode, harness, title, visual_verify,
-                                                 langfuse_tracking, provider, actor, managerXellId, dispatchFn });
+                                                 provider, actor, managerXellId, dispatchFn });
   } finally {
     await lockClient.query(`SELECT pg_advisory_unlock(${deployLockKeySql})`, [id]).catch(() => {});
     lockClient.release();
@@ -313,7 +328,7 @@ export async function deployWorkItem(id, { task = null, model = null, mode = nul
 // this: the "already deployed" check, the brief, the (slow) spawn, and the link. Kept as its own
 // function so the outer lock has one caller and one finally, and the body below is unchanged.
 async function deployWorkItemHeld(id, plain, { task = null, model = null, mode = null, harness = null,
-                                               title = null, visual_verify = false, langfuse_tracking = null,
+                                               title = null, visual_verify = false,
                                                provider = null,
                                                actor = 'human@console', managerXellId = null,
                                                dispatchFn = null } = {}) {
@@ -338,7 +353,7 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
   let out;
   if (dispatchFn) {
     out = await dispatchFn({ task: brief, title: title || full.title, model, mode, harness,
-                             visual_verify, langfuse_tracking, provider, item: full });
+                             visual_verify, provider, item: full });
   } else if (managerXellId) {
     const manager = await one(`SELECT * FROM xell WHERE id=$1`, [managerXellId]);
     if (!manager) throw missing(`no manager xell ${managerXellId}`);
@@ -347,7 +362,7 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
     // already LANDED on this card, and the brief alone cannot carry that — briefForWorkItem writes the
     // ticket as a bare "(#64)", which the brief reader deliberately ignores.
     out = await selfDispatch(manager, { task: brief, title: title || full.title, model, mode, harness,
-                                        visual_verify, langfuse_tracking, provider, work_item_id: full.id });
+                                        visual_verify, provider, work_item_id: full.id });
     if (out?.ok === false) throw refuse(out.error || 'the dispatch was refused');
   } else {
     const { dispatchXell } = await import('../queenzee/intake.js');
@@ -356,8 +371,6 @@ async function deployWorkItemHeld(id, plain, { task = null, model = null, mode =
       ...(model ? { model } : {}), ...(mode ? { mode } : {}),
       ...(harness !== null && harness !== undefined ? { harness } : {}),
       ...(visual_verify ? { visual_verify: true } : {}),
-      // --langfuse / --no-langfuse: explicit true/false lands; omission (null) preserves the target.
-      ...(langfuse_tracking === true || langfuse_tracking === false ? { langfuse_tracking } : {}),
       ...(provider ? { provider } : {}),
     });
   }
@@ -480,6 +493,8 @@ export async function reportItemStatus(id, { status = null, progress = null, not
     const db = dbRunner(client);
     if (moved) {
       await db.q(`UPDATE work_item SET status=$2 WHERE id=$1`, [item.id, status]);
+      // REHAB 1/4 DUAL-WRITE: the reported status is the LIFECYCLE side — write the execution.
+      await syncExecutionState(db, item.id, status);
       await logWorkEvent(item.id, 'status', { from: item.status, to: status, actor,
         detail: note ? { note } : null }, { client });
     }

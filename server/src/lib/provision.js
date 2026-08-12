@@ -11,9 +11,10 @@ import { config } from '../config.js';
 import { broadcast } from '../lib/events.js';
 import { headCommit, cleanGitEnv } from './git.js';
 import { resolveSite } from './sites.js';
-import { namingFor } from './manifest.js';
+import { namingFor, serverRoleIsProcess } from './manifest.js';
 import { resolveBash } from './bash.js';
-import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor } from './machines.js';
+import { pickDevMachine, machineForCtx, sharedDevDb, defaultBuildCtxFor, queenzeeHostCtx,
+         implicitPoolMachine, liveXellCount } from './machines.js';
 import { dbIdentity } from './projects.js';
 import { derivedTcpDsn } from './xell-db.js';
 import { resolveEnvironmentFor, fullVarsFor, isOnProduction } from './environments.js';
@@ -753,16 +754,41 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // with room under max_xells — spec: "if local priority is higher, dev xells get spawned there
   // first"); legacy otherwise: the project's default dev site → deprecated project columns →
   // global env default (see lib/sites.js).
-  const machine = machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine(projectId);
-  if (machineCtx && !machine) throw new Error(`no machine row for docker context '${machineCtx}'`);
+  //
+  // EXCEPT a process-runner project: its xell lives on the queenzee host by construction
+  // (worktree on the host fs, server/webapp as local processes, the cage on the queenzee's own
+  // daemon), so the one docker-placed piece it has — the per-xell db container — must run there
+  // too. A remote machine at top dev_priority used to steer that container onto a daemon the
+  // local processes cannot reach over zee-hive-net (same-daemon network, container-name DSN).
+  // Pin to the queenzee-host machine row, or none — the dev-site/config fallbacks below then
+  // keep legacy placement exactly as before machines existed.
+  // (docs/process-machine-pooling-decision-record.md)
+  const isProcess = serverRoleIsProcess(project.manifest);
+  const coupling = dbCoupling || cfg.default_db_coupling;
+  let machine = isProcess
+    ? await machineForCtx(queenzeeHostCtx())
+    : (machineCtx ? await machineForCtx(machineCtx) : await pickDevMachine(projectId));
+  if (!isProcess && machineCtx && !machine) throw new Error(`no machine row for docker context '${machineCtx}'`);
+  // MACHINE-AWARE BY DEFAULT (docs/default-machine-pooling-decision-record.md): a compose
+  // project with no explicit dev machine still places on the machine the POOL defaults to —
+  // the one holding its shared dev db — so a dispatch-time fresh spawn lands where the warm
+  // pool lives, not wherever the legacy site fallback points. Respect the machine-wide cap:
+  // an implicit default never overfills a host (null falls through to legacy placement).
+  if (!machine && !machineCtx && !isProcess) {
+    const im = await implicitPoolMachine(projectId, { isProcess: false, coupling });
+    if (im && (await liveXellCount(im.docker_ctx)) < im.max_xells) machine = im;
+  }
   const devSite = await resolveSite(projectId, 'dev');
   const devCtx = machine?.docker_ctx || devSite?.docker_ctx || config.dockerCtx;
   const devHost = machine?.host_ip || (machine ? null : devSite?.host) || project.dev_host_ip || config.devHostIp;
   const devSiteId = devSite?.id || null;
   // A machine row with no host_ip used to produce literal "http://null:PORT" URLs — a URL the
-  // health prober can never answer. localhost is always true for same-machine process roles and
-  // harmless as a fallback elsewhere.
-  const urlHost = devHost || 'localhost';
+  // health prober can never answer. For a CONTAINERIZED queenzee whose host-machine row carries
+  // no host_ip, 'localhost' is wrong for every consumer (the queenzee container's own loopback,
+  // the cage's own loopback — neither is the host's published ports); host.docker.internal is
+  // what both actually reach the host on. The host era keeps 'localhost' (true there).
+  const urlHost = devHost
+    || (devCtx === queenzeeHostCtx() && existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost');
   const url = `http://${urlHost}:${ports.webPort}`;
 
   // A xell's app tier must never reach across docker contexts for its database, so a machine
@@ -770,7 +796,6 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
   // name, with the fix — not discovered as a crash-looping stack after provisioning. Only for
   // projects that HAVE a shared dev db somewhere: one with none at all (Zeehive itself) never
   // linked one before machines existed either, and must keep provisioning exactly as it did.
-  const coupling = dbCoupling || cfg.default_db_coupling;
   if (machine && ['db-shared-dev', 'db-clone'].includes(coupling)) {
     const anywhere = await one(
       `SELECT 1 FROM container WHERE project_id=$1 AND role='db' AND tier='dev' AND isolation='shared' LIMIT 1`,
@@ -935,6 +960,28 @@ export async function provisionXell({ projectId, mode = 'simulate', sourceCoupli
          VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10) RETURNING id`,
         [projectId, nmDb.container, dbImage, devCtx, devHost, dbPort, connRef,
          xell.id, devSiteId, mode === 'real' ? 'up' : 'unknown']);
+      await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
+    } else if (coupling === 'db-isolated' && project.manifest?.roles?.db?.service) {
+      // COMPOSE-era per-xell db (compose-authorship decision record): the db service comes up
+      // WITH the generated compose stack (first `zee build`), so nothing is docker-run here —
+      // but the ROW must exist now: it is where the cage's DATABASE_URL comes from (bindingFor
+      // / .zeehive.env), and the matrix/reaper track the container through it. conn_ref is
+      // ALWAYS the TCP form: the spin stack has its own compose network (not zee-hive-net), so
+      // a container-name DSN would resolve for nobody — the published host port is the door,
+      // on whatever machine the stack runs.
+      const nmDb = namingFor(project, 'db', slug);
+      const mdb = project.manifest?.db || {};
+      const dbName = mdb.name || project.db_name || 'app';
+      const dbUser = mdb.user || project.db_user || 'postgres';
+      const dbPort = (Number(spinTier.ports?.db?.base) || 5500) + ports.slot;
+      const dbImage = project.manifest?.roles?.db?.image || 'postgres:17-alpine';
+      const { rows: [dbc] } = await client.query(
+        `INSERT INTO container (project_id,role,tier,isolation,name,image_tag,docker_ctx,host,host_port,internal_port,conn_ref,compose_project,compose_file,owner_xell_id,site_id,health)
+         VALUES ($1,'db','spinoff','per-xell',$2,$3,$4,$5,$6,5432,$7,$8,$9,$10,$11,'down') RETURNING id`,
+        [projectId, nmDb.container, dbImage, devCtx, urlHost, dbPort,
+         `postgresql://${dbUser}@${urlHost}:${dbPort}/${dbName}`,
+         namingFor(project, 'db', slug).composeProject, project.compose_spinoff,
+         xell.id, devSiteId]);
       await client.query(`INSERT INTO xell_uses_container (xell_id,container_id,relation) VALUES ($1,$2,'owns')`, [xell.id, dbc.id]);
     }
 

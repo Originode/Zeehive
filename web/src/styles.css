@@ -125,6 +125,8 @@ body { margin: 0; background: var(--bg); color: var(--text); }
   background: var(--bg); border: 1px solid var(--line); color: var(--text);
   border-radius: 6px; padding: 5px 8px; font-size: 12px; min-width: 0; }
 .setup-grid input:focus, .setup-row input:focus { outline: none; border-color: var(--accent); }
+.setup-grid label.setup-check { flex-direction: row; align-items: center; gap: 6px; }
+.setup-grid label.setup-check .pc { flex-basis: 100%; }
 .setup-row { display: flex; align-items: center; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
 
 /* Docs tab: one editor per SOURCE text, with the provider files it generates ticked below it. A
@@ -194,6 +196,33 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .compose-plan-check { display: flex; align-items: center; gap: 8px; font-size: 12px;
   margin: 4px 0; color: var(--text); cursor: pointer; }
 .compose-plan-check .mono { font-family: 'Cascadia Code', monospace; font-size: 11px; }
+/* Manifest wizard — the "no zeehive.yml yet" two-step flow + the existing-manifest digest */
+.manifest-msg { color: var(--up, #35c46b); font-size: 12px; line-height: 1.4; }
+.manifest-detect { font-size: 12px; color: var(--muted); background: rgba(53,196,107,.06);
+  border: 1px solid rgba(53,196,107,.3); border-radius: 6px; padding: 6px 10px; margin: 6px 0; }
+.manifest-detect .mono { font-family: 'Cascadia Code', monospace; font-size: 11px; }
+.manifest-step { margin: 10px 0; padding: 10px 12px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 8px; }
+.manifest-step-head { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 8px; }
+.manifest-step-num { flex: none; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--accent); color: #0b0e14; font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center; }
+.manifest-step-head b { font-size: 13px; }
+.manifest-editor { margin-top: 0; }
+.manifest-knob-group { margin: 10px 0 4px; }
+.manifest-knob-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); margin-bottom: 4px; }
+.manifest-knob-label .pc { text-transform: none; letter-spacing: 0; }
+.manifest-advanced { margin-top: 10px; font-size: 12px; }
+.manifest-advanced > summary { cursor: pointer; color: var(--muted); }
+.manifest-advanced > summary:hover { color: var(--text); }
+.manifest-summary { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.manifest-summary-item { font-size: 12px; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 5px; padding: 3px 8px; color: var(--text); }
+.manifest-summary-item .pc { color: var(--muted); margin-right: 4px; }
+.manifest-minimal { font-size: 12px; color: var(--building, #e0a53b);
+  border: 1px solid rgba(224,165,59,.4); background: rgba(224,165,59,.07);
+  border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; line-height: 1.4; }
 /* readiness gates + probe chips */
 .gates { display: flex; flex-wrap: wrap; gap: 6px; }
 .gate { border-radius: 5px; border: 1px solid var(--line); padding: 2px 8px; font-size: 11px;
@@ -233,6 +262,37 @@ body { margin: 0; background: var(--bg); color: var(--text); }
 .invhead span { flex: 1; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
 .invrow .mono { flex: 1.4; font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 .invrow .pc { width: 52px; }
+
+/* Deploy tab: the machine → dev/prod → role inventory TREE (master-detail). One node per
+   machine, its dev/prod deploy types as the branches, the shared containers grouped by role. */
+.deploy-tree { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 12px; }
+.dt-machine { border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+.dt-machine.elsewhere { opacity: .7; }
+.dt-machine-head { display: flex; align-items: center; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+.dt-machine-key { font-size: 14px; }
+.dt-machine-head .pc { color: var(--muted); font-size: 11px; }
+.dt-machine-head .mono { font-size: 11px; color: var(--muted); }
+.dt-machine-head .ghost { margin-left: auto; }
+.dt-badge { font-size: 10px; color: var(--ready); border: 1px solid rgba(91,140,255,.35);
+  border-radius: 4px; padding: 0 5px; }
+.dt-body { margin: 8px 0 0 10px; display: flex; flex-direction: column; gap: 10px; }
+.dt-branch { border-left: 2px solid var(--line); padding: 0 0 2px 10px; }
+.dt-branch-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600;
+  margin-bottom: 4px; }
+.dt-branch[data-tier="dev"] .dt-branch-label { color: var(--ready); }
+.dt-branch[data-tier="prod"] .dt-branch-label { color: var(--down); }
+.dt-branch-body { display: flex; flex-direction: column; gap: 6px; }
+.dt-branch-sites .siteed { margin-top: 0; }
+.dt-branch-inv { display: flex; flex-direction: column; gap: 2px; }
+.dt-role { display: flex; align-items: baseline; gap: 8px; }
+.dt-role .invlabel { color: var(--muted); min-width: 62px; font-size: 13px; }
+.dt-rows { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+.dt-rows .invrow { padding: 2px 0; }
+.dt-addbtn { margin-top: 4px; }
+.dt-add, .dt-addsite { margin-top: 4px; }
+.dt-discover { margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 6px; }
+.dt-disc-err { color: var(--danger, #d66); }
+.dt-disc-list { margin-top: 6px; }
 
 /* project edit panel (deploy sites): wider popup, compact per-site rows */
 .projpop.wide { width: 440px; }
@@ -730,12 +790,6 @@ a.cbox:hover { border-color: var(--accent); }
 .matrix { display: grid; gap: 4px 14px; align-items: start; margin: 10px 0 4px;
   padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
 .matrix .mx-corner, .matrix .mx-pad { min-width: 0; }
-/* The machine-pooling-DISABLED banner (mardale-prod never gets pool xells) — an operator who
-   configured per-machine pooling must SEE why it is not happening. Same family as .mx-devdb:
-   the warning colour, full width, above the grid. */
-.mx-warn { grid-column: 1 / -1; font-size: 11px; line-height: 1.5;
-  background: rgba(217,85,59,.12); color: #ffb4a2; border: 1px solid rgba(217,85,59,.35);
-  border-radius: 6px; padding: 6px 8px; margin-bottom: 2px; }
 .mx-head { font-size: 12px; padding: 2px 4px 6px; border-bottom: 1px solid var(--line); }
 .mx-head.off { opacity: .45; }
 .mx-head.elsewhere { color: var(--muted); font-style: italic; align-self: end; }
@@ -783,6 +837,10 @@ a.cbox:hover { border-color: var(--accent); }
   border-radius: 5px; padding: 2px 6px; font-size: 12px; }
 .mx-knobs { display: flex; align-items: center; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
 .mx-knob { display: inline-flex; align-items: center; gap: 3px; color: var(--muted); }
+/* a knob that has NO EFFECT for the project in view (a remote machine's prio/pool on a
+   runner:process project) — dimmed, reason in the tooltip, still editable so old numbers can
+   be zeroed. This replaced the red full-width banner (pooling-dead-config-demotion record). */
+.mx-knob.dead { opacity: .4; }
 .mx-knob .k { font-size: 10px; }
 .mx-knob input { width: 38px; background: var(--panel2); border: 1px solid var(--line); color: var(--text);
   border-radius: 4px; padding: 1px 3px; font-size: 11px; }
@@ -1197,6 +1255,7 @@ a.cbox:hover { border-color: var(--accent); }
 .land-commits li { padding: 2px 0; color: var(--text); }
 .land-commits code { color: var(--accent); font-family: 'Cascadia Code', 'Consolas', monospace; }
 .land-author { color: var(--muted); }
+.land-door { color: var(--accent); opacity: 0.8; cursor: help; }
 .land-more { color: var(--muted); font-style: italic; }
 .land-err { color: var(--error); font-size: 12px; margin-top: 8px; }
 .land-approved { color: var(--up); font-size: 12.5px; margin-top: 10px; }
@@ -2088,7 +2147,7 @@ a.cbox:hover { border-color: var(--accent); }
 .fx-crumb:disabled { opacity: .3; cursor: default; }
 .fx-cwd { flex: 1; min-width: 0; color: var(--muted); font-family: 'Cascadia Code', monospace;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
-.fx-list, .fx-file { flex: 1; min-height: 0; overflow: auto; }
+.fx-list { flex: 1; min-height: 0; overflow: auto; }
 .fx-row { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
   background: none; border: 0; color: var(--text); cursor: pointer; padding: 3px 10px;
   font-family: 'Cascadia Code', monospace; font-size: 12px; }
@@ -2100,13 +2159,43 @@ a.cbox:hover { border-color: var(--accent); }
 .fx-empty, .fx-err { padding: 10px; color: var(--muted); font-size: 12px;
   font-family: 'Cascadia Code', monospace; }
 .fx-err { color: #e5554e; white-space: pre-wrap; }
-.fx-fhead { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
-  border-bottom: 1px solid var(--line); background: var(--panel2); position: sticky; top: 0; }
-.fx-fname { font-family: 'Cascadia Code', monospace; font-size: 12px; color: var(--text);
-  flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.fx-fmeta { color: var(--muted); font-size: 11px; }
-.fx-code { margin: 0; padding: 8px 10px; font-family: 'Cascadia Code', monospace; font-size: 12px;
+
+/* ── the ROUTED FILE VIEWER (opens a file from the explorer in a modal chosen by file type) ──
+   Files no longer dump raw text into the explorer sidebar — they open in FileViewer.jsx, which
+   routes by extension (markdown → @uiw/react-markdown-preview, json → formatted, diff → the
+   dv-* row renderer, else plain text). Reuses the dv-* styles for the diff kind. */
+.fview-overlay { position: fixed; inset: 0; z-index: 96; display: flex; align-items: center;
+  justify-content: center; padding: 4vh 3vw; background: rgba(4,6,10,.66);
+  backdrop-filter: blur(3px); animation: dlg-fade .14s ease-out; }
+.fview { display: flex; flex-direction: column; width: min(1200px, 94vw); height: min(88vh, 900px);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+  box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+.fview-head { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel2); flex: 0 0 auto; }
+.fview-fname { font-family: 'Cascadia Code', monospace; font-size: 13px; font-weight: 600; color: var(--text); }
+.fview-path { font-size: 11.5px; color: var(--muted); min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.fview-meta { font-family: 'Cascadia Code', monospace; font-size: 11.5px; color: var(--muted); }
+.fview-kind { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--accent); border: 1px solid var(--line); border-radius: 8px; padding: 0 6px;
+  font-family: 'Cascadia Code', monospace; }
+.fview-spacer { flex: 1 1 auto; }
+.fview-x { background: none; border: 0; color: var(--muted); font-size: 15px; cursor: pointer;
+  padding: 0 4px; }
+.fview-x:hover { color: var(--text); }
+.fview-body { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+.fview-empty { padding: 24px; color: var(--muted); font-size: 12.5px;
+  font-family: 'Cascadia Code', monospace; }
+.fview-empty.err { color: #e5554e; white-space: pre-wrap; }
+.fview-note { padding: 6px 14px; font-size: 11.5px; color: var(--muted); }
+.fview-note.warn { color: var(--building); }
+.fview-code { margin: 0; padding: 12px 14px; font-family: 'Cascadia Code', monospace; font-size: 12px;
   color: #c9d3e0; white-space: pre; }
+.fview-diff { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; line-height: 1.45;
+  padding: 8px 0; }
+.fview-json .fview-code { color: #c9d3e0; }
+/* The markdown preview fills the body and scrolls with it. */
+.fview-body > .wmde-markdown { flex: 1 1 auto; min-height: 0; padding: 12px 16px; }
 
 /* ── "show file" path box in the explorer ── */
 .fx-go { display: flex; gap: 4px; padding: 4px 8px; border-bottom: 1px solid var(--line); }
@@ -2389,14 +2478,14 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-kind.k-activity { color: #9b8cff; }
 .work-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 auto;
   background: var(--unknown); }
-.work-st-queued    { background: #5b8cff; }
-.work-st-assigned  { background: #7c83f5; }
-.work-st-working   { background: #35c46b; }
-.work-st-blocked   { background: #e5554e; }
-.work-st-review    { background: #f2c518; }
-.work-st-shipping  { background: #f0913b; }
-.work-st-done      { background: #6fcf97; }
-.work-st-cancelled { background: #6b7688; }
+.work-st-queued    { background: #5b8cff; --st: #5b8cff; }
+.work-st-assigned  { background: #7c83f5; --st: #7c83f5; }
+.work-st-working   { background: #35c46b; --st: #35c46b; }
+.work-st-blocked   { background: #e5554e; --st: #e5554e; }
+.work-st-review    { background: #f2c518; --st: #f2c518; }
+.work-st-shipping  { background: #f0913b; --st: #f0913b; }
+.work-st-done      { background: #6fcf97; --st: #6fcf97; }
+.work-st-cancelled { background: #6b7688; --st: #6b7688; }
 .work-pips { display: inline-flex; gap: 2px; align-items: center; }
 .work-pips i { width: 4px; height: 4px; border-radius: 50%; background: var(--line); display: block; }
 .work-pips i.on { background: var(--muted); }
@@ -2477,6 +2566,89 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-card-tkt { color: var(--accent); font-size: 11px; font-family: 'Cascadia Code', monospace; }
 .work-card-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .work-drift { color: var(--building); font-size: 11px; border-top: 1px dashed var(--line); padding-top: 3px; }
+
+/* ── the MATRIX board — status columns × swimlane rows ──────────────────────
+   The flat kanban's columns become a grid: the left rail holds one ROW per parent work_node
+   (indented by depth), and the status lanes sit to its right. Every band — a row header, a row's
+   tail drop zone, or a leaf card's row — is ONE flex row (a fixed-width rail cell + one cell per
+   lane, all `flex: 1 1 0`), so a lane is the same horizontal strip at every nesting depth and the
+   columns stay straight. The whole matrix is one scroller, and the header is sticky at the top. */
+.work-matrix { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.work-mhead { position: sticky; top: 0; z-index: 5; display: flex; align-items: stretch;
+  border: 1px solid var(--line); border-bottom: 0; border-radius: 10px 10px 0 0;
+  background: var(--bg); }
+.work-mh-label { flex: 0 0 250px; display: flex; align-items: center; padding: 7px 10px;
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+  background: var(--panel2); border-right: 1px solid var(--line); border-radius: 10px 0 0 0; }
+.work-mhead .work-col-h { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line);
+  border-bottom: 0; background: var(--panel); }
+.work-mbody { display: flex; flex-direction: column; border: 1px solid var(--line);
+  border-top: 0; border-radius: 0 0 10px 10px; overflow: hidden; }
+
+/* one band: rail + lane cells. Every band shares these two, so lanes align across depths. */
+.work-row { display: flex; align-items: stretch; border-bottom: 1px solid var(--line); }
+.work-row:last-child { border-bottom: 0; }
+.work-row-label { flex: 0 0 250px; display: flex; align-items: center; gap: 5px; padding: 4px 6px;
+  min-height: 34px; background: var(--panel); border-right: 1px solid var(--line); }
+.work-row-lane { flex: 1 1 0; min-width: 0; border-left: 1px solid var(--line); padding: 4px;
+  display: flex; flex-direction: column; justify-content: flex-start; }
+
+/* a container ROW: the swimlane header. Slightly raised so the plan reads as plan. */
+.work-row-band { background: rgba(255,255,255,.025); }
+.work-row-band .work-row-label { background: var(--panel2); }
+.work-row-title { flex: 1 1 auto; min-width: 0; background: none; border: 0; color: var(--text);
+  text-align: left; font-size: 12.5px; padding: 1px 2px; cursor: pointer; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.work-row-title:hover { color: var(--accent); }
+.work-row-band .work-row-lane { align-items: center; justify-content: center; }
+.work-row-count { color: var(--muted); font-size: 10.5px; letter-spacing: .02em;
+  display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; }
+.work-row-count b { color: var(--text); font-size: 13px; }
+
+/* a COLLAPSED row still occupies its full-width lane strip; tint the ONE lane that is its own
+   status so where the row stands reads at a glance. The tint is `--st` — the same status colour
+   the dots above own, exposed as a variable — with a neutral accent fallback for a status the
+   vocabulary has no colour token for. */
+.work-row-band.collapsed .work-row-lane.is-own {
+  background: color-mix(in srgb, var(--st, var(--accent)) 12%, transparent);
+}
+
+/* a LEAF's row: the rail cell is an empty spacer, the card sits in its own lane. */
+.work-row.work-leaf .work-row-label { background: transparent; }
+.work-row-lane.has-card { padding: 4px; }
+
+/* a LEAF PACK: an expanded row's direct leaves, wrapped in their lanes — several per row when the
+   lane is wide enough, reading left-to-right then down in sort order. Cards shrink to a compact
+   chip; the kind glyph, the title (truncated; the full text is in the card's tooltip/aria-label)
+   and the zee chip survive. */
+.work-row.work-leafpack .work-row-label { background: transparent; }
+.work-row.work-leafpack .work-row-lane { display: flex; flex-direction: row; flex-wrap: wrap;
+  gap: 5px; align-content: flex-start; padding: 6px; }
+.work-row.work-leafpack .work-card { flex: 0 1 92px; min-width: 56px; max-width: 100%;
+  padding: 4px 6px; gap: 2px; }
+.work-row.work-leafpack .work-card-top { gap: 4px; }
+.work-row.work-leafpack .work-card-title { font-size: 11px; line-height: 1.25;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-row.work-leafpack .work-card-tkt { display: none; }
+.work-row.work-leafpack .work-crumb { display: none; }
+.work-row.work-leafpack .work-pips, .work-row.work-leafpack .work-due { display: none; }
+.work-row.work-leafpack .work-zee { max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 9.5px; padding: 0 4px; }
+.work-row.work-leafpack .work-drift { font-size: 10px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+
+/* a row's TAIL: the append drop targets under an expanded row's children. Dashed top border
+   says "drop here to land at the end of this lane" without shouting. */
+.work-tail { min-height: 22px; }
+.work-tail .work-row-label { background: transparent; border-right-color: var(--line); }
+.work-tail .work-row-lane { border-top: 1px dashed var(--line); justify-content: center; min-height: 22px; }
+.work-row-empty { color: var(--unknown); font-size: 11px; }
+
+/* drop feedback — a lane under the pointer, or the card the pointer is on */
+.work-row-lane.drop { background: rgba(91,140,255,.08); box-shadow: inset 0 0 0 1px var(--accent); }
+.work-card.drop-on { outline: 2px solid var(--accent); outline-offset: 1px; }
+.work-row:focus-within { background: var(--panel2); }
+.work-row-band:focus-within .work-row-label { background: var(--panel2); }
 
 /* ── the drawer ────────────────────────────────────────────────────────────── */
 .work-drawer { flex: 0 0 380px; border-left: 1px solid var(--line); background: var(--panel);
@@ -2661,12 +2833,38 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-gtrack { position: relative; flex: 0 0 auto; height: 100%; }
 
 /* a leaf bar, and the summary bracket a parent draws instead (a plan must read as a plan) */
-/* touch-action:none is what makes the gesture exist on a touchscreen at all: without it the browser
-   claims the drag for panning and a bar can only be dragged with a mouse. */
-.work-gbar, .work-gsum { position: absolute; top: 5px; height: 16px; border-radius: 4px;
-  cursor: grab; z-index: 2; touch-action: none; }
-.work-gbar.rolled, .work-gsum { cursor: default; }
-.work-gsum { top: 8px; height: 10px; }
+.work-gbar, .work-gsum { position: absolute; top: 2px; height: 9px; border-radius: 4px;
+  cursor: pointer; z-index: 2; }
+.work-gsum { top: 3px; height: 7px; }
+/* The ACTUAL bar — what the record PROVES happened, read-only. A thin line under the plan's bar
+   (ROW is 30px: plan 2–11, actual 13–17, waiting 19–23) and never draggable: actuals are
+   derived facts, not a submission surface. */
+.work-gbar.actual { top: 13px; height: 4px; cursor: pointer; border-radius: 2px; z-index: 1; }
+.work-gbar.actual .work-gfill-bg { opacity: .55; border-radius: 2px; }
+.work-gbar.actual .work-gopen { border-radius: 2px; }
+/* The WAITING bar — a HELD LEASE on a 'waiting' execution (a gate wait becomes a visible bar).
+   The same read-only thin line as actual, at the third track; the tooltip names the exact
+   claimed/expires instants. */
+.work-gbar.waiting { top: 19px; height: 4px; cursor: pointer; border-radius: 2px; z-index: 1; }
+.work-gbar.waiting .work-gfill-bg { opacity: .45; border-radius: 2px;
+  background-image: repeating-linear-gradient(45deg, var(--building) 0 3px, transparent 3px 7px); }
+.work-gbar.waiting .work-gopen { border-radius: 2px; }
+/* A CRITICAL planned bar (zero slack on the CPM pass) stands out; the crit chip in the name
+   column says the same thing in words. */
+.work-gbar.crit, .work-gsum.crit { outline: 1px solid var(--accent); outline-offset: 1px; }
+/* THE HISTORY AXIS — a bar drawn on MEASURED actuals (timing_source 'actual', done work) sits
+   as a solid filled history bar; a PROJECTED bar (not yet done, CPM forecast) keeps the hollow
+   plan outline. An actual date and a projected date must never render identically. A `gap` bar
+   (done but no recorded start) shows an open start — the start is a hole, not invented. */
+.work-gbar.hist, .work-gsum.hist { background: var(--accent); opacity: .28; }
+.work-gbar.hist .work-gfill, .work-gsum.hist .work-gfill { display: block; }
+.work-gbar.gap, .work-gsum.gap { border-left: 2px dashed var(--down); }
+.work-gtip-r.hist { color: var(--accent); }
+.work-gtip-r.proj { color: var(--muted); }
+.work-gcrit { color: var(--accent); font-size: 9.5px; letter-spacing: .4px; text-transform: uppercase;
+  border: 1px solid var(--accent); border-radius: 3px; padding: 0 3px; margin-left: 5px; flex: 0 0 auto; }
+.work-gorder { margin: 6px 0 0 292px; }
+.work-gorder.quiet { opacity: .75; }
 .work-gbar.ghosting, .work-gsum.ghosting { opacity: .8; outline: 1px dashed var(--accent); }
 .work-gbar.hot, .work-gsum.hot { box-shadow: 0 0 0 1px var(--accent); }
 .work-gbar.over, .work-gsum.over { box-shadow: 0 0 0 1px var(--down); }
@@ -2691,6 +2889,11 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-garrow { color: var(--muted); opacity: .22; }
 .work-garrow.on { opacity: 1; color: var(--accent); }
 .work-garrow-line { fill: none; stroke: currentColor; stroke-width: 1.2; }
+/* A SEQUENCE-origin edge — board position, not a declared chain. Dashed, flat, no arrowhead:
+   visibly board ORDER, never the same as a declared dependency arrow. */
+.work-garrow.seq { opacity: .14; }
+.work-garrow.seq .work-garrow-line { stroke-dasharray: 3 3; stroke-width: 1; }
+.work-garrow.seq.on { opacity: .55; color: var(--muted); }
 .work-garrow-hit { fill: none; stroke: transparent; stroke-width: 9; pointer-events: none; cursor: pointer; }
 .work-garrow.on .work-garrow-hit { pointer-events: stroke; }
 /* …except while a dependency is being drawn, when an arrow lying over the target bar would swallow
@@ -2714,6 +2917,33 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .work-gtip { position: fixed; z-index: 90; max-width: 280px; background: var(--panel2);
   border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font-size: 12px;
   box-shadow: 0 10px 26px rgba(0,0,0,.55); pointer-events: none; display: flex; flex-direction: column; gap: 3px; }
+.work-gtip-r.crit, .work-wf-crit { color: var(--accent); font-weight: 600; }
+.work-gtip-r.actual, .work-gtip-r.waiting { color: var(--muted); }
+.work-gtip-r.waiting span:first-child { color: var(--building); }
+
+/* the WELD WATERFALL — clicking a bar opens the row's execution → turn → gateway drill-down.
+   READ-ONLY: every line is a byproduct of a door (the CPM pass, the turn ledger, the gateway). */
+.work-waterfall { position: relative; max-width: 640px; width: 92vw; max-height: 82vh; overflow: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.6); display: flex; flex-direction: column; }
+.work-wf-h { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.work-wf-t { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 6px; }
+.work-wf-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; padding: 6px 12px; font-size: 11.5px;
+  color: var(--muted); border-bottom: 1px solid var(--line); }
+.work-wf-exec { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.work-wf-exec-h { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 12px; align-items: center; }
+.work-wf-turn { margin: 6px 0 4px 14px; padding: 6px 8px; background: var(--panel2);
+  border-radius: 6px; border: 1px solid var(--line); }
+.work-wf-turn-h { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--muted); }
+.work-wf-gw { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--muted);
+  margin: 3px 0 2px 10px; }
+.work-wf-none { font-size: 11px; color: var(--unknown); margin: 3px 0 2px 10px; font-style: italic; }
+.work-wf-state { font-size: 10px; text-transform: uppercase; letter-spacing: .3px; padding: 1px 4px;
+  border-radius: 3px; background: var(--panel2); border: 1px solid var(--line); }
+.work-wf-state.st-done, .work-wf-state.st-ok { color: var(--up); border-color: var(--up); }
+.work-wf-state.st-waiting, .work-wf-state.st-running { color: var(--building); border-color: var(--building); }
+.work-wf-state.st-failed, .work-wf-state.st-err { color: var(--down); border-color: var(--down); }
 .work-gtip-t { font-size: 12.5px; display: flex; align-items: center; gap: 5px; }
 .work-gtip-r { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
 .work-gtip-r.late { color: var(--down); }
@@ -2842,24 +3072,6 @@ button.land-stat { display: flex; align-items: baseline; gap: 8px; width: 100%; 
 .disp-overlap li { margin: 2px 0; }
 .disp-overlap code { font-size: 11px; }
 .disp-overlap-note { display: block; margin-top: 5px; color: var(--muted); }
-
-/* LANGFUSE PANEL — the one system-wide observability instance. Uses the shared .disp modal
-   language; these are the langfuse-specific touches: a status dot that reads up/provisioning/
-   down/off, a monospace fact box, and a compact recent-traces list. */
-.disp-mono { font-family: 'Cascadia Code', 'SF Mono', monospace; font-size: 11px; color: var(--text);
-  line-height: 1.5; word-break: break-all; }
-.langfuse-status { font-size: 12px; font-weight: 600; letter-spacing: .03em; }
-.langfuse-status.up { color: var(--add, #35c46b); }
-.langfuse-status.provisioning { color: var(--warn, #e0a53b); }
-.langfuse-status.down, .langfuse-status.error { color: var(--down); }
-.langfuse-status.off { color: var(--muted); }
-a.langfuse-ui { color: var(--accent); font-weight: 600; text-decoration: none; }
-a.langfuse-ui:hover { text-decoration: underline; }
-.langfuse-reveal { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
-.langfuse-traces { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column;
-  gap: 3px; max-height: 220px; overflow-y: auto; }
-.langfuse-traces li { padding: 4px 8px; background: var(--panel2); border-radius: 6px; }
 
 /* ── the ZEE AVATAR: an AI-provider coin, wearing its harness ──────────────────
    The DOM twin of the honeycomb's drawZeeAvatar (web/src/hive/HiveCanvas.jsx), from the same two
@@ -3030,20 +3242,48 @@ a.langfuse-ui:hover { text-decoration: underline; }
 .xob-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; max-height: 66vh; overflow-y: auto; }
 .xob-summary { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text); padding: 8px 10px; background: var(--panel2); border-radius: 8px; }
 .xob-summary b { color: var(--accent); }
+.xob-sum-item { white-space: nowrap; }
+.xob-sum-item + .xob-sum-item { padding-left: 18px; border-left: 1px solid var(--line); }
+/* The token-share bar — each turn's token burn as a segment. A long bar of many segments says
+   "the burn is spread out"; one dominant segment says "one turn ate the window". */
+.xob-tokbar { display: flex; gap: 2px; height: 6px; border-radius: 3px; overflow: hidden;
+  background: var(--bg); border: 1px solid var(--line); padding: 1px; }
+.xob-tokbar-seg { background: var(--accent); border-radius: 2px; min-width: 2px;
+  transition: width .2s ease; }
+.xob-tokbar-seg:nth-child(even) { background: color-mix(in srgb, var(--accent) 75%, var(--bg)); }
 .xob-empty { color: var(--muted); font-size: 13px; line-height: 1.5; }
 .xob-turns { display: flex; flex-direction: column; gap: 6px; }
-.ob-turn { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.ob-turn { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }
 .ob-turn-h { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px 10px; background: var(--panel2); border: none; cursor: pointer; font-size: 12px; }
 .ob-turn-h:hover { background: color-mix(in srgb, var(--panel2) 80%, var(--accent) 8%); }
-.ob-turn-kind { font-weight: 600; min-width: 92px; }
-.ob-turn-status { color: var(--accent); min-width: 70px; }
-.ob-turn-status:has(~ .ob-turn-model) { }
-.ob-turn-model { color: var(--muted); min-width: 70px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ob-turn-tok { color: var(--muted); min-width: 64px; text-align: right; }
-.ob-turn-cost { color: var(--text); min-width: 64px; text-align: right; }
-.ob-turn-dur { color: var(--muted); min-width: 64px; text-align: right; }
-.ob-turn-dt { color: var(--muted); min-width: 130px; text-align: right; }
-.ob-turn-chev { color: var(--muted); margin-left: auto; }
+/* The trace-card badge — a compact kind/status chip leading each turn row. Colour follows the
+   turn's STATUS (running=amber, done=green, errored=red, paused=muted) so a scan of the list reads
+   the fleet's health the same way the hive hexagons do. */
+.ob-badge { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+  border-radius: 7px; background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+  font-size: 12px; flex: none; }
+.ob-badge.ended { color: var(--up); border-color: color-mix(in srgb, var(--up) 45%, var(--line)); }
+.ob-badge.errored { color: var(--down); border-color: color-mix(in srgb, var(--down) 45%, var(--line)); }
+.ob-badge.started { color: var(--building); border-color: color-mix(in srgb, var(--building) 45%, var(--line)); }
+.ob-badge.paused { color: var(--muted); border-color: var(--line); }
+/* The main column of a turn row: model + status on line one, the turn summary below it. */
+.ob-turn-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ob-turn-top { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.ob-turn-model { color: var(--text); font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ob-turn-main .ob-turn-model { flex: 0 1 auto; }
+.ob-turn-status { min-width: auto; font-size: 11px; flex: none; }
+.ob-turn-status.started { color: var(--building); }
+.ob-turn-status.ended { color: var(--up); }
+.ob-turn-status.errored { color: var(--down); }
+.ob-turn-status.paused { color: var(--muted); }
+.ob-turn-kind { color: var(--muted); font-weight: 400; font-size: 11px; flex: none; }
+.ob-turn-summary { color: var(--muted); font-size: 11px; line-height: 1.4; overflow: hidden;
+  text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; }
+.ob-turn-tok { color: var(--muted); min-width: 64px; text-align: right; flex: none; }
+.ob-turn-cost { color: var(--text); min-width: 64px; text-align: right; flex: none; }
+.ob-turn-dur { color: var(--muted); min-width: 64px; text-align: right; flex: none; }
+.ob-turn-dt { color: var(--muted); min-width: 118px; text-align: right; flex: none; font-size: 11px; }
+.ob-turn-chev { color: var(--muted); margin-left: auto; flex: none; }
 .ob-turn-body { padding: 10px 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
 .ob-summary { color: var(--text); line-height: 1.5; }
 .ob-stop { color: #e5554e; }
@@ -3080,6 +3320,14 @@ a.langfuse-ui:hover { text-decoration: underline; }
 .ob-gw-calls { display: flex; flex-direction: column; }
 .ob-gw-call { border-bottom: 1px solid var(--line); }
 .ob-gw-call:last-child { border-bottom: none; }
-.ob-gw-call .ob-turn-h { cursor: default; }
+/* The whole header is the expander now — clicking a call toggles its bodies. */
+.ob-gw-call .ob-turn-h { cursor: pointer; }
+.ob-gw-call .ob-turn-h:hover { background: color-mix(in srgb, var(--panel2) 80%, var(--accent) 8%); }
+.ob-gw-body-btn { color: var(--accent); font-size: 10px; margin-left: auto; min-width: 44px; text-align: right; }
 .ob-gw-attrib { display: flex; gap: 12px; flex-wrap: wrap; padding: 2px 10px 6px 10px; font-size: 10px; color: var(--muted); }
 .ob-gw-attrib code { font-size: 10px; }
+.ob-gw-bodies { display: flex; flex-direction: column; gap: 6px; padding: 6px 10px 10px 10px; background: var(--panel); border-top: 1px solid var(--line); }
+.ob-gw-warn { font-size: 10px; line-height: 1.5; color: #b8860b; background: color-mix(in srgb, #b8860b 8%, var(--panel2)); border: 1px solid color-mix(in srgb, #b8860b 35%, var(--line)); border-radius: 6px; padding: 5px 8px; }
+.ob-gw-body-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.ob-gw-body { margin: 0; padding: 6px 8px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; max-height: 220px; overflow-y: auto; }
+.ob-gw-trunc { display: block; color: #e0a53b; font-size: 10px; margin-bottom: 4px; }

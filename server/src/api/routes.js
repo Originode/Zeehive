@@ -39,7 +39,8 @@ import { remoteAvailable } from '../lib/claude-cli.js';
 import { prodLockStatus } from '../queenzee/deploylock.js';
 import { proposeDone, xellStatus } from '../queenzee/tasks.js';
 import { listProjects, createProject, updateProject, deleteProject,
-         getProjectManifest, refreshProjectManifest, draftProjectManifest,
+         getProjectManifest, refreshProjectManifest, generateProjectCompose, draftProjectManifest,
+         buildManifestDraft, writeProjectManifest,
          getComposeOnboardingPlan, applyComposeOnboarding,
          probeRepo, listDirs, projectReadiness, getPoolConfig, updatePoolConfig,
          cloneProject, pullProject, githubAccess, pushProject, pullRequestProject } from '../lib/projects.js';
@@ -73,9 +74,9 @@ import { requestShip, listShipRequests, decideShip, shipStatus, holdProdLock, fo
 import { xellForToken } from '../lib/xell-token.js';
 import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdRequest, selfDone, selfBuild, selfBuildStatus,
          selfTend, selfHint, selfWorking, selfTurn, selfDevice, selfCatchup, selfMigrationNumber,
+         selfHandover, selfAwait,
          listProdBindRequests, decideProdBind,
          selfSeedRequest, selfSeedStatus, selfVerifyWebapp, setVisualVerify, dismissVisualVerifyOffer,
-         setLangfuseTracking,
          selfUploadConversation, selfConversations,
          selfCrew, selfDispatch, selfSwap, swapXellZeeAsHuman,
          selfSay, selfReport, selfInbox,
@@ -84,13 +85,25 @@ import { selfStatus, selfLand, selfWithdrawLand, selfSync, selfShip, selfProdReq
          selfProviderEnv } from '../queenzee/self.js';
 import { listDoneSuggestions, decideDoneSuggestion, dismissDoneSuggestion, suggestDone,
          crewFor, messagesForXell } from '../lib/managers.js';
+import { buildFleetCard, a2aVersionError } from '../lib/a2a.js';
+import { A2AError, cardVisibleXellIds, taskVisibleXellIds, loadTask,
+         dispatchA2A, agentCardFor, directoryFor } from '../lib/a2a-read.js';
 import { createManagerZee } from '../lib/manager-spawn.js';
 import { workStatusVocabulary } from '../lib/work-status.js';
+import { workStatusModelVocabulary } from '../lib/model-status.js';
 import { listWorkItems, getWorkItem, createWorkItem, updateWorkItem, deleteWorkItem,
          addDep, removeDep, boardModel, ganttModel, assertId, httpStatusOf } from '../lib/work-items.js';
 import { listTickets, getTicket, createTicket, updateTicket, deleteTicket, addComment,
          breakdownTicket, ticketManagers, notifyManagerOfTicket } from '../lib/tickets.js';
 import { listReflections, fileReflectionAsTicket } from '../lib/reflections.js';
+// EXTERNAL TICKETING API (190) — a deployed project files/monitors/updates its own tickets with a
+// per-project key, and attaches the evidence (images, logs). docs/ticketing-api.md.
+import { listProjectApiKeys, createProjectApiKey, revokeProjectApiKey, deleteProjectApiKey,
+         authenticateApiKey } from '../lib/project-api-keys.js';
+import { listAttachments, getAttachment, addAttachment, deleteAttachment,
+         attachmentLimits } from '../lib/ticket-attachments.js';
+import { externalCreateTicket, externalListTickets, externalGetTicket, externalUpdateTicket,
+         externalComment, externalAttach, externalAttachments, externalMeta } from '../lib/ticket-intake.js';
 import { listProdSeedRequests, decideProdSeed, seedRequestSql, dismissSeedRequest,
          requestProdSeed } from '../queenzee/seedgate.js';
 import { xourceState, cleanXourceNow, commitXourceStaged, commitXourceDirty, stashXource, listXourceCleanRequests,
@@ -98,14 +111,9 @@ import { xourceState, cleanXourceNow, commitXourceStaged, commitXourceDirty, sta
 import { listManagerMintRequests, decideManagerMint, dismissManagerMint } from '../lib/manager-mint.js';
 import { listCredentialInjectRequests, decideCredentialInject, dismissCredentialInject,
          raiseRotationRequest } from '../lib/credential-inject.js';
-import { langfuseConfig, langfuseStatus, provisionLangfuse, teardownLangfuse,
-         listLangfuseTraces, revealLangfuse, listLangfuseProjects, syncLangfuseProjects,
-         langfuseSigninPage, redeemLangfuseSigninToken, signedInHtml, injectAutoLoginPage,
-         reconcileLangfuseWriteMode, xellLangfuseSession, mintLangfuseRevealToken,
-         redeemLangfuseRevealToken } from '../lib/langfuse.js';
 // WORK TRACKER — putting a zee ON a work item (lib/work-assign.js) and the cxell verbs for it.
 import { assignWorkItem, unassignWorkItem, deployWorkItem, candidatesFor } from '../lib/work-assign.js';
-import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkAssign,
+import { selfWork, selfWorkNew, selfWorkBreakdown, selfWorkUnassign, selfWorkDep, selfWorkAssign,
          selfWorkItem } from '../queenzee/self.js';
 import { webappRedirect } from '../lib/webapp-proxy.js';
 import { wireguardStatus, mintPeerConfig, ensureWireguardServer, markPeerDownloaded } from '../lib/wireguard.js';
@@ -355,30 +363,6 @@ router.post('/xells/:id/visual-verify', async (req, res) => {
         { offerId: b.dismiss === true ? null : b.dismiss, by }));
     }
     return res.json(await setVisualVerify(req.params.id, { visual_verify: !!b.visual_verify, by }));
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-
-// ── PER-XELL LANGFUSE TRACKING (human side) ──────────────────────────────────
-// The per-xell Langfuse tracking switch (default ON). A human flips it from the xell terminal
-// window header; a manager sets it at dispatch/assign (`--langfuse` / `--no-langfuse`). When OFF
-// the queenzee records no trace for this xell's turns and injects no LANGFUSE_* into its cage.
-router.post('/xells/:id/langfuse-tracking', async (req, res) => {
-  try {
-    const b = req.body || {};
-    res.json(await setLangfuseTracking(req.params.id,
-      { langfuse_tracking: !!b.langfuse_tracking, by: b.by || 'human@console' }));
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-// "View Langfuse" — the console asks the SERVER for this xell's Langfuse SESSION link (ui_url +
-// Langfuse project + the zee's session id → /project/<lfProjectId>/sessions/<id>), so the link is
-// computed where the keys and the map live. Resolves from stored state (the xell's 1:1 mapping,
-// then langfuse_config.system_project_id) with the live public-API read as a last-resort fallback
-// that writes back what it learns (TKT-127). Returns { ok:true, url } or { ok:false, reason } (e.g.
-// langfuse-disabled · langfuse-tracking-off · no-session · no-project · langfuse-unreachable). The
-// console opens the url (via the auto-login popup) in a new window.
-router.get('/xells/:id/langfuse-session', async (req, res) => {
-  try {
-    res.json(await xellLangfuseSession({ xellId: req.params.id, zeeId: req.query.zee_id || null }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -692,6 +676,38 @@ router.delete('/projects/:id/tokens/:provider', async (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
+// ── project API keys: the credential a DEPLOYED project files tickets with (190) ─────────────
+// Same masked-read-model shape as the provider accounts above: the plaintext key exists exactly
+// once, in the answer to the POST that minted it, and no read can ever hand it back (only the
+// sha256 hash is stored). A key that has filed tickets is REVOKED, not deleted — the board must
+// keep being able to say where those tickets came from.
+router.get('/projects/:id/api-keys', async (req, res) => {
+  try { res.json(await listProjectApiKeys(req.params.id)); }
+  catch (err) { workErr(res, err); }
+});
+router.post('/projects/:id/api-keys', async (req, res) => {
+  try {
+    res.status(201).json(await createProjectApiKey(req.params.id, {
+      label: req.body?.label, scopes: req.body?.scopes ?? null,
+      created_by: req.body?.by || 'human@console',
+    }));
+  } catch (err) { workErr(res, err); }
+});
+router.post('/projects/:id/api-keys/:keyId/revoke', async (req, res) => {
+  try {
+    const out = await revokeProjectApiKey(req.params.keyId, { by: req.body?.by || 'human@console' });
+    if (!out) return res.status(404).json({ error: 'no such API key' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+router.delete('/projects/:id/api-keys/:keyId', async (req, res) => {
+  try {
+    const out = await deleteProjectApiKey(req.params.keyId);
+    if (!out) return res.status(404).json({ error: 'no such API key' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
 // Regenerate a xell's .zeehive.env projection (spec §3.4) — e.g. after a site edit or a rename.
 router.post('/xells/:id/env', async (req, res) => {
   try { res.json(await emitXellEnv(req.params.id)); }
@@ -787,11 +803,36 @@ router.post('/projects/:id/manifest/refresh', async (req, res) => {
   try { res.json(await refreshProjectManifest(await resolveProjectParam(req.params.id))); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Generate the spinoff compose PROJECTION from the manifest (compose-authorship): preview by
+// default; { write: true } writes it into the repo — only ever over a ZEEHIVE-generated file
+// (marker check in lib/compose-gen.js); a project-owned compose is refused, with the reason.
+router.post('/projects/:id/compose/generate', async (req, res) => {
+  try { res.json(await generateProjectCompose(await resolveProjectParam(req.params.id), { write: req.body?.write === true })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Draft generation; {write:true} writes zeehive.yml into the repo root (refused if one exists) —
 // the human reviews and commits it. The ONE artifact ZEEHIVE may write into a project repo.
 router.post('/projects/:id/manifest/draft', async (req, res) => {
   try { res.json(await draftProjectManifest(await resolveProjectParam(req.params.id), { write: req.body?.write === true })); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+// The "no manifest yet" wizard: build a zeehive.yml PREVIEW from console form values (knobs),
+// without writing anything. The human reviews/edits the YAML, then POSTs it to …/manifest/write.
+router.post('/projects/:id/manifest/build', async (req, res) => {
+  try { res.json(await buildManifestDraft(await resolveProjectParam(req.params.id), req.body?.knobs || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// Write the human-approved zeehive.yml into the repo root and apply it to the meta-DB row.
+// Refused when a valid manifest already exists (the repo file is the truth); the human edits
+// that file and ↻ Refreshes instead.
+router.post('/projects/:id/manifest/write', async (req, res) => {
+  try {
+    res.json(await writeProjectManifest(await resolveProjectParam(req.params.id), {
+      yaml: req.body?.yaml,
+      apply_meta: req.body?.apply_meta !== false,
+      overwrite: req.body?.overwrite === true,
+    }));
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 // Compose onboarding — detect docker-compose*.yml, propose meta-DB (+ optional yml) changes,
 // apply only after the human approves. Production container rows are never written.
@@ -1673,6 +1714,22 @@ router.post('/xell/self/working', async (req, res) => {
     res.json(await selfWorking(x, { note: req.body?.note || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// Store this xell's typed result on the PLANE-3 execution it is bound to (the observability-spine
+// weld — docs/hierarchical-workflow-adoption.md §3.2). Interim storage on execution.outputs until
+// the stage-2 data plane exists. The execution is resolved from xell.execution_id (never an
+// agent-named id). Token-scoped like every self verb.
+router.post('/xell/self/handover', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfHandover(x, { result: req.body?.result ?? null, override: req.body?.override === true })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// END the current turn and put the execution this xell is on into 'waiting' under a held lease — the
+// anti-spin primitive. Token-scoped; the execution is resolved from xell.execution_id.
+router.post('/xell/self/await', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    res.json(await selfAwait(x, { hours: req.body?.for ?? null })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // Which environment this xell is loaded with (masked — var NAMES only; the values live in the
 // cxell's own .zeehive.env). Read-only, token-scoped. `zee env` maps here.
 router.get('/xell/self/provider-env', async (req, res) => {
@@ -1886,10 +1943,14 @@ router.get('/xells/:id/observability', async (req, res) => {
   try {
     const x = await one(`SELECT id FROM xell WHERE id=$1`, [req.params.id]);
     if (!x) return res.status(404).json({ error: 'no such xell' });
-    const { turnsForXell } = await import('../lib/turn-ledger.js');
+    const { turnsForXell, workflowTreeForXell } = await import('../lib/turn-ledger.js');
     const turns = await turnsForXell(req.params.id, { zeeId: req.query.zee_id || null, limit: req.query.limit || 50 });
+    // The WELD tree — the nested drill-down waterfall (work_node → execution → turns → gateway
+    // calls) per work node, from the same read-only door. A turn with no execution lives in `turns`
+    // and nowhere here; an execution with turns appears in both.
+    const workflow = await workflowTreeForXell(req.params.id);
     // Per-turn event counts ride along so the UI can show "N events" without fetching them all.
-    res.json({ ok: true, xell_id: req.params.id, turns });
+    res.json({ ok: true, xell_id: req.params.id, turns, workflow });
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -1912,6 +1973,46 @@ router.get('/xells/:id/gateway-requests', async (req, res) => {
     if (!x) return res.status(404).json({ error: 'no such xell' });
     const { requestsForXell } = await import('../lib/gateway.js');
     res.json({ ok: true, xell_id: req.params.id, requests: await requestsForXell(req.params.id) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// THE BODIES of ONE gateway request (lib/gateway-bodies.js → llm_gateway_body, migration 162).
+// The list endpoint ships NO body text (bodies are big and cold); a human expanding one call
+// fetches exactly that call's request/response bodies here. Scoped to the xell so a request id
+// from another xell is not readable.
+router.get('/xells/:id/gateway-requests/:requestId/body', async (req, res) => {
+  try {
+    const reqRow = await one(
+      `SELECT id FROM llm_gateway_request WHERE id=$1 AND xell_id=$2`,
+      [req.params.requestId, req.params.id]);
+    if (!reqRow) return res.status(404).json({ error: 'no such request for this xell' });
+    const { bodiesForRequest } = await import('../lib/gateway-bodies.js');
+    const body = await bodiesForRequest(req.params.requestId);
+    if (!body) return res.status(404).json({ error: 'no bodies captured for this request (the project switch may be off, or it predates capture)' });
+    res.json({ ok: true, xell_id: req.params.id, ...body });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+// THE PER-PROJECT BODY-CAPTURE SWITCH (pool_config.gateway_body_capture, migration 162) —
+// default ON. Read returns the current value; POST flips it. A human turns capture off for a
+// project whose bodies they do not want stored (privacy/size); the ledger row is written either way.
+router.get('/gateway/body-capture', async (req, res) => {
+  try {
+    const proj = req.query.project || (await one(`SELECT id FROM project ORDER BY created_at LIMIT 1`)).id;
+    const { gatewayBodyCaptureEnabled } = await import('../lib/gateway-bodies.js');
+    res.json({ ok: true, project_id: proj, gateway_body_capture: await gatewayBodyCaptureEnabled(proj) });
+  }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/gateway/body-capture', async (req, res) => {
+  try {
+    const proj = req.body?.project;
+    if (!proj) return res.status(400).json({ error: 'project required' });
+    const enabled = req.body?.gateway_body_capture !== false;
+    const { setGatewayBodyCapture } = await import('../lib/gateway-bodies.js');
+    const val = await setGatewayBodyCapture(proj, enabled);
+    broadcast('project', { id: proj, gateway_body_capture: val });
+    res.json({ ok: true, project_id: proj, gateway_body_capture: val });
   }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -2130,177 +2231,6 @@ router.post('/credential-inject/requests/:id/dismiss', async (req, res) => {
   catch (err) { res.status(404).json({ error: err.message }); }
 });
 
-// ── LANGFUSE PLUGIN — ONE system-wide LLM observability instance ──────────────
-// The human surface (console panel). Provision/teardown are real docker actions, gated like every
-// other real side effect (PROVISION_MODE=real runs the compose; simulate models the config row);
-// read models are masked (provider-token discipline) and the reveal door is the human-only second
-// full-value exit, exactly like environments/export.
-router.get('/langfuse/config', async (req, res) => {
-  try { res.json(await langfuseConfig()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-router.get('/langfuse/status', async (req, res) => {
-  try { res.json(await langfuseStatus()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-router.post('/langfuse/provision', async (req, res) => {
-  try {
-    res.json(await provisionLangfuse({
-      by: req.body?.by || 'human@console',
-      hostPort: req.body?.host_port ?? null,
-      orgName: req.body?.org_name ?? null,
-      orgPublicKey: req.body?.org_public_key || null,
-      orgSecretKey: req.body?.org_secret_key || null,
-    }));
-  }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-router.post('/langfuse/teardown', async (req, res) => {
-  try { res.json(await teardownLangfuse({ by: req.body?.by || 'human@console' })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-router.get('/langfuse/traces', async (req, res) => {
-  try { res.json(await listLangfuseTraces({ limit: Number(req.query.limit) || 20 })); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-// TKT-104 / TKT-108-E589: /langfuse/reveal is a HUMAN-CONSOLE verb, not a fleet verb. It used to
-// return the full Langfuse credential set (admin_password included) to ANY caller that could reach
-// the API — the same disclosure class TKT-95 closed on /signin, and isCagedZee alone is NOT enough
-// (an unauthenticated caller simply omits the bearer token and sails through). The route now follows
-// the signin-token pattern: a caged zee is refused, and the route returns only a ONE-TIME, short-TTL
-// reveal token (migration 144) that must be redeemed at /langfuse/reveal/redeem before the
-// credential leaves the server. A caller that cannot present the console's own origin is refused at
-// the mint (403), and a caller that obtains a token cannot redeem it without the SAME origin (by
-// hostname — a bar, not a wall, exactly like the signin redemption's Origin check).
-router.post('/langfuse/reveal', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/reveal is a human-console verb — refused for a caged zee' });
-    }
-    const base = redeemBaseOf(req);
-    const minted = await mintLangfuseRevealToken(req.get('origin') || '', base);
-    if (!minted.ok) return res.status(minted.status || 400).json({ ok: false, error: minted.error });
-    res.json({ ok: true, token: minted.token, redeem: base ? `${base.replace(/\/+$/, '')}/api/langfuse/reveal/redeem` : null });
-  } catch (err) { res.status(404).json({ error: err.message }); }
-});
-// Redeem a one-time reveal token: the console POSTs the token it just minted (same-origin — the
-// browser sends its Origin automatically) and receives the stored credential set ONCE. Same
-// human-console rule as the mint (a caged zee is refused) plus the token is single-use, short-TTL,
-// and scoped to the minting console origin by hostname — a token minted by one origin cannot be
-// redeemed by another, and a second redemption matches no row.
-router.post('/langfuse/reveal/redeem', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/reveal/redeem is a human-console verb — refused for a caged zee' });
-    }
-    const r = await redeemLangfuseRevealToken(req.body?.token, req.get('origin') || '');
-    if (!r.ok) return res.status(r.status || 400).json({ ok: false, error: r.error });
-    res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// The 1:1 ZEEHIVE project ↔ Langfuse project mapping: read + sync.
-router.get('/langfuse/projects', async (req, res) => {
-  try { res.json(await listLangfuseProjects()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-router.post('/langfuse/projects/sync', async (req, res) => {
-  try { res.json(await syncLangfuseProjects({ by: req.body?.by || 'human@console' })); }
-  catch (err) { res.status(400).json({ error: err.message }); }
-});
-// AUTO SIGN-IN: redirect the popup to the SAME-ORIGIN auto-login page inside Langfuse
-// (generated/zeehive-auto-login.html, injected into the langfuse-web container at provision).
-// The page runs on the Langfuse origin, so its CSRF fetch + credentials POST carry the cookie and
-// the session lands. GET is fine — no DB write, no docker side effect; the popup needs a bare URL.
-//
-// TKT-95: this is a HUMAN-CONSOLE verb, not a fleet verb. A caged zee presenting its
-// ZEEHIVE_XELL_TOKEN is refused (the console never sends a bearer token). The credential itself
-// never rides in the redirect — the server mints a one-time, short-TTL signin token and the
-// auto-login page redeems it against /langfuse/signin/redeem, so the admin password never appears
-// in a URL, query string or Location header. An attacker that simply omits a bearer token is
-// indistinguishable from the console (there is no console auth primitive — the console is a static
-// SPA behind an nginx proxy with no session), so the one-time-token flow is the second half that
-// removes the credential from the response even for such callers.
-async function isCagedZee(req) {
-  const auth = req.get('authorization') || '';
-  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
-  const token = m ? m[1].trim() : (req.get('x-zeehive-xell-token') || '').trim();
-  if (!token) return null;
-  const xell = await xellForToken(token);
-  return xell || null;
-}
-// The browser-facing base the auto-login page should POST its token redemption to. It must be a URL
-// the BROWSER can reach (it just came through the same proxy that delivered this request): prefer
-// the standard reverse-proxy forwarded headers, else the Host header the server actually saw. In the
-// prod webapp nginx the Host is forwarded as $http_host (host:port — see nginx-web.conf), in the
-// vite dev proxy as the API target (changeOrigin) — both are browser-reachable by construction.
-function redeemBaseOf(req) {
-  const fwdHost = (req.get('x-forwarded-host') || '').split(',')[0].trim();
-  const fwdProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim() || 'http';
-  const host = fwdHost || req.get('host') || '';
-  if (!host) return null;
-  return `${fwdProto}://${host}`;
-}
-router.get('/langfuse/signin', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/signin is a human-console verb — refused for a caged zee' });
-    }
-    // `next` (a LANGFUSE-ORIGIN session url, e.g. from /xells/:id/langfuse-session) is honoured by
-    // the auto-login page as its post-login callback — so "View Langfuse" lands straight on the
-    // zee's session without a login page. langfuseSigninPage guards it against an open redirect.
-    const s = await langfuseSigninPage(req.query.next ? String(req.query.next) : null, { redeemBase: redeemBaseOf(req) });
-    if (!s.ok) return res.status(503).json({ ok: false, error: s.error });
-    res.redirect(302, s.redirect);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// Redeem a one-time signin token: the auto-login page POSTs the token it was redirected with and
-// receives the stored admin credential + the safe post-login callback ONCE. Same human-console rule
-// as /langfuse/signin (a caged zee is refused), plus an Origin check: the page lives on the
-// Langfuse origin (base_url), so its cross-origin fetch carries `Origin: <langfuse base_url
-// origin>`; a script that lacks it is refused. Origin is spoofable, so this is a bar, not a wall —
-// the one-time single-use TTL token is the real protection — but it stops the naive "curl signin,
-// then curl redeem" disclosure in one request.
-router.post('/langfuse/signin/redeem', async (req, res) => {
-  try {
-    if (await isCagedZee(req)) {
-      return res.status(403).json({ ok: false, error: 'langfuse/signin/redeem is a human-console verb — refused for a caged zee' });
-    }
-    const origin = req.get('origin') || '';
-    const cfg = await one(`SELECT base_url FROM langfuse_config WHERE id=true`);
-    const allowed = cfg?.base_url ? new URL(cfg.base_url).origin : null;
-    if (!allowed || origin !== allowed) {
-      return res.status(403).json({ ok: false, error: 'signin token redemption refused — the auto-login page must present the Langfuse origin' });
-    }
-    const r = await redeemLangfuseSigninToken(req.body?.token);
-    if (!r.ok) return res.status(400).json({ ok: false, error: r.error });
-    res.json(r);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// The post-login "you may close this tab" page (same-origin through the nginx /api proxy).
-router.get('/langfuse/signed-in', (_req, res) => {
-  res.type('text/html').send(signedInHtml());
-});
-// Re-inject the auto-login page into an ALREADY-RUNNING langfuse-web container (an instance
-// provisioned before this feature has no page yet; injection runs on provision, this heals live).
-router.post('/langfuse/reinject', async (req, res) => {
-  try {
-    const r = await injectAutoLoginPage();
-    res.json({ ok: !r?.err, ...r });
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-// Heal a running stack stuck in v4 `events_only` write mode → dual, without a queenzee restart.
-// The heal is deliberately HUMAN-TRIGGERED only (the first auto-boot version fired compose up on
-// the live stack with an incomplete interpolation env and took it down — 2026-08-03), so this is
-// the ONE door to flip an already-running stack. Real mode only — simulate answers { ok:false } so
-// the button reads honestly instead of claiming a heal that never ran.
-router.post('/langfuse/heal', async (req, res) => {
-  try {
-    const r = await reconcileLangfuseWriteMode({ force: !!req.body?.force });
-    if (r === null) return res.status(400).json({ ok: false, error: 'Nothing to heal — Langfuse is not enabled, not running, or already in dual write mode (simulate mode never heals).' });
-    res.json({ ok: true, ...r });
-  } catch (err) { res.status(400).json({ error: err.message }); }
-});
-
 // ── WORK TRACKER: tickets + the work-item hierarchy (058) ────────────────────
 //
 // The layer that records what the work IS, rather than which agents are running. Project-scoped by
@@ -2334,7 +2264,14 @@ const projectOf = (req) => req.query.project || req.body?.project || req.body?.p
 // The vocabulary itself — labels, column order, terminal flags and the legal transitions, straight
 // from lib/work-status.js. It is an endpoint so the console never hardcodes a column list of its
 // own; that duplication is exactly what let hive-status and the web palette drift before.
-router.get('/work-statuses', (_req, res) => res.json(workStatusVocabulary()));
+// REHAB 2/4 — the vocabulary now also carries the MODEL's run-plane → work_status mapping
+// (lib/model-status.js, the ONE mapping every reader uses), so a client can learn "a 'waiting'
+// execution renders as review" without importing a server module. It is additive: the columns and
+// transitions are unchanged.
+router.get('/work-statuses', (_req, res) => res.json({
+  ...workStatusVocabulary(),
+  model_lifecycle: workStatusModelVocabulary(),
+}));
 
 // ── tickets ──────────────────────────────────────────────────────────────────
 router.get('/tickets', async (req, res) => {
@@ -2411,6 +2348,58 @@ router.post('/tickets/:id/notify', async (req, res) => {
   } catch (err) { workErr(res, err); }
 });
 
+// Serving an attachment's BYTES, for both doors (the console's and the external API's). Always as
+// a download and never inline: these bytes were uploaded by somebody else's machine, so rendering
+// one in this origin (an image/svg+xml is a script) is the one mistake an attachment feature makes.
+// nosniff stops a browser second-guessing the declared type; the filename is already sanitised at
+// upload (lib/ticket-attachments.js) and is quoted here as well.
+function sendAttachment(res, a) {
+  res.setHeader('Content-Type', a.content_type);
+  res.setHeader('Content-Length', a.size_bytes);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', `attachment; filename="${String(a.filename).replace(/"/g, '')}"`);
+  res.setHeader('X-Attachment-Sha256', a.sha256);
+  res.send(a.content);
+}
+
+// ── ticket attachments, console side (190) ───────────────────────────────────
+// The evidence a ticket carries: images and text logs, stored as bytea in the meta-DB. The LIST is
+// metadata only (a ticket read must never drag 50 MB of screenshots through a console render); the
+// bytes come one at a time from the download route below. The same rows the external API writes —
+// this is the human's door onto them.
+router.get('/tickets/:id/attachments', async (req, res) => {
+  try { res.json(await listAttachments(req.params.id)); }
+  catch (err) { workErr(res, err); }
+});
+
+router.post('/tickets/:id/attachments', async (req, res) => {
+  try {
+    const a = await addAttachment(req.params.id, req.body || {},
+      { uploadedBy: req.body?.uploaded_by || 'human@console', source: 'console' });
+    if (!a) return res.status(404).json({ error: 'no such ticket' });
+    res.status(201).json(a);
+  } catch (err) { workErr(res, err); }
+});
+
+// DOWNLOAD — the raw bytes. Always as an ATTACHMENT and always nosniff: an attachment is content
+// somebody else's machine uploaded, so it is never rendered in the console's own origin (an
+// image/svg+xml served inline is a script running as the console).
+router.get('/tickets/:id/attachments/:attachmentId', async (req, res) => {
+  try {
+    const a = await getAttachment(req.params.attachmentId, { ticketId: req.params.id });
+    if (!a) return res.status(404).json({ error: 'no such attachment' });
+    sendAttachment(res, a);
+  } catch (err) { workErr(res, err); }
+});
+
+router.delete('/tickets/:id/attachments/:attachmentId', async (req, res) => {
+  try {
+    const out = await deleteAttachment(req.params.attachmentId, { ticketId: req.params.id });
+    if (!out) return res.status(404).json({ error: 'no such attachment' });
+    res.json(out);
+  } catch (err) { workErr(res, err); }
+});
+
 // The hinge: a ticket becomes a plan. { items: [{title, kind?, parent_id?|ref-of-an-earlier-item, …}] }
 router.post('/tickets/:id/breakdown', async (req, res) => {
   try {
@@ -2421,6 +2410,143 @@ router.post('/tickets/:id/breakdown', async (req, res) => {
     res.status(201).json(out);
   } catch (err) { workErr(res, err); }
 });
+
+// ── THE EXTERNAL TICKETING API: /api/ext/v1 (190) ────────────────────────────
+//
+// The door a DEPLOYED project comes in through. omnibiz — running on somebody else's server, with
+// no xell, no token and no console — holds a per-project key and files, monitors and updates its
+// own tickets here, with the images and logs attached. What lands is an ordinary `ticket` row on
+// the project's own board, so a zee works on it with the verbs it already has.
+//
+// Why a SEPARATE path rather than a key on /api/tickets: /api is the console's surface and takes
+// a project id from the caller. This one must not — the project comes from the KEY (see
+// lib/ticket-intake.js rule 1), and putting the two authentication models on one path is how a
+// missing check on one route silently becomes a cross-project read. Everything under /ext/v1 is
+// key-authenticated, scoped to that key's project, and refuses a body that names a project at all.
+//
+// Versioned in the path because this is the ONE surface in this repo whose callers we do not
+// deploy: an integrator's code cannot be updated in lockstep, so a breaking change gets /v2 and
+// /v1 keeps answering.
+const extErr = (res, err) => res.status(httpStatusOf(err)).json({
+  ok: false, error: String(err?.message || err || 'unknown error'),
+});
+
+// The auth gate. Resolves the key, checks the scope, and hands the handler { key, project }.
+// Answers 401 (no/unknown/revoked key) or 403 (a live key without the scope) with a sentence that
+// says WHICH — an integrator debugging somebody else's server cannot read our logs.
+async function extAuth(req, res, scope) {
+  const m = /^Bearer\s+(.+)$/i.exec((req.get('authorization') || '').trim());
+  const presented = m ? m[1].trim() : (req.get('x-zeehive-api-key') || '').trim();
+  let out;
+  try {
+    out = await authenticateApiKey(presented, { scope, ip: req.ip || req.socket?.remoteAddress || null });
+  } catch (err) {
+    // The gate itself failed (the meta-DB is unreachable, say). That is OURS, not the caller's, and
+    // it must be a 503 rather than a 401 — an integration told "unknown key" would revoke a
+    // perfectly good credential and re-mint it. It must also never become an unhandled rejection.
+    res.status(503).json({ ok: false,
+      error: `the ticketing API could not check your key right now: ${String(err?.message || err)}. `
+        + 'Your key is fine — retry.' });
+    return null;
+  }
+  if (!out.ok) { res.status(out.status || 401).json({ ok: false, error: out.reason }); return null; }
+  // A body that names a project is REFUSED rather than ignored: a caller that thinks it is
+  // choosing a project is a caller that will one day be surprised, and silence would let it
+  // believe the field did something.
+  if (req.body && (req.body.project || req.body.project_id)) {
+    res.status(400).json({ ok: false,
+      error: 'do not send a project — an API key files into its OWN project, and naming one here '
+        + `would be ignored. This key files into "${out.project.name}".` });
+    return null;
+  }
+  return out;
+}
+
+// WHO AM I — the integrator's first call: which project this key files into, what the API accepts,
+// and the attachment limits, generated from the same constants the server validates against.
+router.get('/ext/v1/whoami', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  res.json(externalMeta(auth));
+});
+
+router.post('/ext/v1/tickets', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try {
+    const out = await externalCreateTicket(auth, req.body || {});
+    // 200 for a DEDUPED repeat, 201 for a ticket that was actually created — the status alone tells
+    // a retrying caller which of the two happened, without parsing the body.
+    res.status(out.deduped ? 200 : 201).json(out);
+  } catch (err) { extErr(res, err); }
+});
+
+router.get('/ext/v1/tickets', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try {
+    res.json(await externalListTickets(auth, {
+      status: req.query.status || null, kind: req.query.kind || null,
+      q: req.query.q || null, external_ref: req.query.external_ref || null,
+    }));
+  } catch (err) { extErr(res, err); }
+});
+
+// MONITOR one — status, the conversation, the evidence, and what the fleet is doing about it.
+// :ref is an id, a code (TKT-52-2518), a ref (#52) or a bare number, resolved INSIDE this key's
+// project (numbers are per project, so an unscoped number would name two tickets).
+router.get('/ext/v1/tickets/:ref', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try { res.json(await externalGetTicket(auth, req.params.ref)); }
+  catch (err) { extErr(res, err); }
+});
+
+router.patch('/ext/v1/tickets/:ref', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try { res.json(await externalUpdateTicket(auth, req.params.ref, req.body || {})); }
+  catch (err) { extErr(res, err); }
+});
+
+router.post('/ext/v1/tickets/:ref/comments', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try { res.status(201).json(await externalComment(auth, req.params.ref, req.body || {})); }
+  catch (err) { extErr(res, err); }
+});
+
+router.get('/ext/v1/tickets/:ref/attachments', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try { res.json(await externalAttachments(auth, req.params.ref)); }
+  catch (err) { extErr(res, err); }
+});
+
+router.post('/ext/v1/tickets/:ref/attachments', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:write');
+  if (!auth) return;
+  try { res.status(201).json(await externalAttach(auth, req.params.ref, req.body || {})); }
+  catch (err) { extErr(res, err); }
+});
+
+// Download evidence back out — the same bytes, byte for byte, with the sha256 the upload answered
+// with. A caller's OWN attachment id, scoped to a ticket in its OWN project: an attachment that
+// belongs to another project's ticket is a 404 here, never a read.
+router.get('/ext/v1/tickets/:ref/attachments/:attachmentId', async (req, res) => {
+  const auth = await extAuth(req, res, 'tickets:read');
+  if (!auth) return;
+  try {
+    const t = await externalGetTicket(auth, req.params.ref);           // 404s outside the project
+    const a = await getAttachment(req.params.attachmentId, { ticketId: t.id });
+    if (!a) return res.status(404).json({ ok: false, error: 'no such attachment on that ticket' });
+    sendAttachment(res, a);
+  } catch (err) { extErr(res, err); }
+});
+
+// The attachment limits, without a key — the one thing an integrator needs BEFORE it has one, so a
+// build script can check a file size without holding a credential. No project, no ticket, no data.
+router.get('/ext/v1/limits', (_req, res) => res.json({ ok: true, attachments: attachmentLimits() }));
 
 // ── reflections (the ledger) ─────────────────────────────────────────────────
 //
@@ -2501,7 +2627,9 @@ router.post('/work-items/:id/deps', async (req, res) => {
     // well-formed id that names nothing is a 404. Without the check the existence probe below
     // hands postgres a bad uuid and the caller gets a cast error instead of either answer.
     assertId(req.params.id);
-    const item = await one(`SELECT id FROM work_item WHERE id=$1`, [req.params.id]);
+    // REHAB 2/4 — the existence probe is now the MODEL's: a work item exists when its work_node
+    // does (stable_key = 'work_item:<id>'). The dual-write keeps the two in step.
+    const item = await one(`SELECT id FROM work_node WHERE stable_key = 'work_item:' || $1::text`, [req.params.id]);
     if (!item) return res.status(404).json({ error: 'no such work item' });
     res.status(201).json(await addDep(req.params.id, req.body?.depends_on_id, { actor: req.body?.actor || null }));
   } catch (err) { workErr(res, err); }
@@ -2527,6 +2655,20 @@ router.get('/gantt', async (req, res) => {
   try {
     if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
     res.json(await ganttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
+  } catch (err) { workErr(res, err); }
+});
+
+// STAGE 6 — THE WORKFLOW GANTT read model (lib/workflow-gantt.js): the hierarchical
+// workflow model's plan/work_node/execution/lease plane re-pointed as the timeline.
+// PLANNED from the CPM pass, ACTUAL from execution.started_at/finished_at, WAITING from
+// held leases on waiting executions; deps are the leaf-level union_edge; each row carries
+// its execution → turn → gateway waterfall for the drill-down. READ-ONLY — the CPM is the
+// deterministic pass, and every execution/lease/turn row is a byproduct of a door.
+router.get('/workflow/gantt', async (req, res) => {
+  try {
+    if (!req.query.project && !req.query.root) return res.status(400).json({ error: 'project or root required' });
+    const { workflowGanttModel } = await import('../lib/workflow-gantt.js');
+    res.json(await workflowGanttModel({ projectId: req.query.project || null, rootId: req.query.root || null }));
   } catch (err) { workErr(res, err); }
 });
 
@@ -2594,8 +2736,8 @@ router.post('/xell/self/work/new', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     res.json(await selfWorkNew(x, { title: b.title || null, body: b.body || null, kind: b.kind || null,
-      parent: b.parent || null, ticket: b.ticket || null, priority: b.priority ?? null,
-      status: b.status || null })); }
+      parent: b.parent || null, after: b.after || null, ticket: b.ticket || null,
+      priority: b.priority ?? null, status: b.status || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/xell/self/work/breakdown', async (req, res) => {
@@ -2610,13 +2752,24 @@ router.post('/xell/self/work/unassign', async (req, res) => {
     res.json(await selfWorkUnassign(x, { item: b.item || null, reason: b.reason || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
+// MANAGER only: CHAIN two cards — `item` waits for `on` (a dependency edge in the model).
+// The console drawer has the same picker; this is the CLI half of "capture chains going
+// forward" (nesting says part-of, a chain says after — the gantt's critical path runs along
+// chains). --remove deletes the edge.
+router.post('/xell/self/work/dep', async (req, res) => {
+  try { const x = await resolveSelf(req, res); if (!x) return;
+    const b = req.body || {};
+    res.json(await selfWorkDep(x, { item: b.item || null, on: b.on || null,
+      remove: !!b.remove })); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 // MANAGER only: deploy a worker for one of MY project's work items (same dispatch path as `zee dispatch`).
 router.post('/xell/self/work/assign', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     res.json(await selfWorkAssign(x, { item: b.item || null, task: b.task || null, model: b.model || null,
       mode: b.mode || null, harness: b.harness || null, title: b.title || null,
-      visual_verify: b.visual_verify || false, langfuse_tracking: b.langfuse_tracking ?? null,
+      visual_verify: b.visual_verify || false,
       provider: b.provider || null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -2626,7 +2779,9 @@ router.post('/xell/self/work/item', async (req, res) => {
   try { const x = await resolveSelf(req, res); if (!x) return;
     const b = req.body || {};
     res.json(await selfWorkItem(x, { id: b.id || null, status: b.status || null,
-      progress: b.progress ?? null, note: b.note || null })); }
+      progress: b.progress ?? null, note: b.note || null,
+      estimate_hours: b.estimate_hours ?? null, starts_on: b.starts_on ?? null,
+      due_on: b.due_on ?? null })); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -2775,3 +2930,133 @@ router.get('/stream', async (req, res) => {
 // visual-verify offers, bookmarks, the console nginx /xell-web block — 302 onto the direct port,
 // path preserved. New URLs are minted as direct ports and never come here.
 router.use('/xell-web/:slug', webappRedirect);
+
+// ── A2A READ + WRITE SIDE (P2 + P3) — docs/a2a-protocol-plan.md §3, DR-2/DR-5 ──
+// The fleet speaks A2A v1.0 at ONE place — this router, mounted at the ORIGIN ROOT in index.js
+// (NOT under /api), because the well-known card is RFC 8615 origin-root and the /a2a/v1 paths are
+// the wire contract. P2 read + P3 write are internal-only: every authenticated route resolves the
+// caller from its xell token exactly like /api/xell/self/* (resolveSelf above), and crew scoping
+// is unchanged — a worker may address its manager, a manager its crew. External zhk_ keys are
+// PHASE 4.
+//
+// The read/write-model half (task projection, cards, SendMessage/CancelTask) lives in
+// lib/a2a-read.js; the pure shapes live in lib/a2a.js. This router is the HTTP surface only:
+// auth, the A2A-Version gate, and the SSE transport for SubscribeToTask / SendStreamingMessage.
+export const a2aRouter = Router();
+
+function a2aBase(req) {
+  // The base a card points at is wherever the caller reached us — a card must be usable by the
+  // client that asked for it, not baked to a host the caller may not be able to see.
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function rpcResult(res, id, result) {
+  return res.json({ jsonrpc: '2.0', id: id ?? null, result });
+}
+
+// ── the fleet card — RFC 8615 origin root; ANONYMOUS (the A2A entry point) ──
+// DR-6: "even the directory requires a credential", but the fleet card is the discovery door — a
+// client has to be able to find that A2A is spoken at all before it can authenticate. It describes
+// the service and points at the directory; it enumerates no agents.
+a2aRouter.get('/.well-known/agent-card.json', async (req, res) => {
+  try { res.json(buildFleetCard({ base: a2aBase(req) })); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── the directory — live agents the caller's credential may see, each with its card URL ──
+a2aRouter.get('/a2a/v1/agents', async (req, res) => {
+  try {
+    const caller = await resolveSelf(req, res); if (!caller) return;
+    res.json(await directoryFor(caller, a2aBase(req)));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── the per-agent card — GENERATED per request from live rows (house rule 7) ──
+// 404 for a slug the caller may not see or that names no live xell — never confirm existence.
+a2aRouter.get('/a2a/v1/agents/:slug/card', async (req, res) => {
+  try {
+    const caller = await resolveSelf(req, res); if (!caller) return;
+    const visible = await cardVisibleXellIds(caller);
+    const agent = await one(`SELECT * FROM xell WHERE slug=$1 AND status <> 'retired'`, [req.params.slug]);
+    if (!agent || !visible.has(agent.id)) { res.status(404).json({ error: `no agent card for "${req.params.slug}"` }); return; }
+    const card = await agentCardFor(agent, a2aBase(req));
+    if (!card) { res.status(404).json({ error: `no agent card for "${req.params.slug}"` }); return; }
+    res.json(card);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── the JSON-RPC endpoint — POST /a2a/v1/agents/:slug ──
+// Content-Type: application/json (415 otherwise); A2A-Version: 1.0 (VersionNotSupportedError
+// -32009 for wrong/missing — checked BEFORE method dispatch, per DR-5 "implemented from day one").
+a2aRouter.post('/a2a/v1/agents/:slug', async (req, res) => {
+  try {
+    const caller = await resolveSelf(req, res); if (!caller) return;
+    // The :slug is the agent being ADDRESSED; the caller must be able to read its card. Task data
+    // is scoped separately by the caller's own conversation visibility (taskVisibleXellIds).
+    const cardVisible = await cardVisibleXellIds(caller);
+    const agent = await one(`SELECT * FROM xell WHERE slug=$1 AND status <> 'retired'`, [req.params.slug]);
+    if (!agent || !cardVisible.has(agent.id)) { res.status(404).json({ error: `no agent "${req.params.slug}"` }); return; }
+
+    if (!/^application\/json\b/i.test(req.get('content-type') || '')) {
+      return res.status(415).json({ error: 'Content-Type must be application/json' });
+    }
+    const versionError = a2aVersionError(req.get('a2a-version'));
+    if (versionError) {
+      return res.json({ jsonrpc: '2.0', id: req.body?.id ?? null, error: versionError });
+    }
+    const body = req.body || {};
+    if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
+      return res.json({ jsonrpc: '2.0', id: body.id ?? null,
+        error: { code: -32600, message: 'InvalidRequest', data: { message: 'request must be JSON-RPC 2.0 with a method' } } });
+    }
+
+    const taskVisible = await taskVisibleXellIds(caller);
+    const result = await dispatchA2A(caller, body.method, body.params || {}, { visible: taskVisible, agent });
+
+    // SubscribeToTask and SendStreamingMessage swap the JSON result for an SSE stream (plan §3.2):
+    // first event is the Task, then task_status_update events on the existing zee-message broadcast
+    // bus. For SubscribeToTask the Task is the read snapshot; for SendStreamingMessage the send has
+    // already happened and the first Task is the state right after the send.
+    if (body.method === 'SubscribeToTask' || body.method === 'SendStreamingMessage') {
+      let taskId = body.params.taskId;
+      let task = result.task || null;
+      if (body.method === 'SendStreamingMessage') {
+        taskId = result.message?.taskId;
+        task = taskId ? await loadTask(taskId, taskVisible).catch(() => null) : null;
+      }
+      if (!task) { return res.status(500).json({ error: 'no task for the requested stream' }); }
+      res.set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.flushHeaders?.();
+      res.write(`event: task\ndata: ${JSON.stringify(task)}\n\n`);
+      let closed = false;
+      const onEvent = (e) => {
+        if (closed || e.type !== 'zee-message') return;
+        void (async () => {
+          try {
+            const row = await one(`SELECT * FROM zee_message WHERE id=$1`, [e.payload?.id]).catch(() => null);
+            const a2a = row?.meta?.a2a;
+            if (!a2a || (a2a.taskId !== taskId && a2a.referencedTaskId !== taskId)) return;
+            const fresh = await loadTask(taskId, taskVisible).catch(() => null);
+            if (!fresh || closed) return;
+            res.write(`event: task_status_update\ndata: ${JSON.stringify({
+              taskId, status: fresh.status, timestamp: new Date().toISOString(), task: fresh })}\n\n`);
+          } catch { /* client gone / db blip — drop the event */ }
+        })();
+      };
+      bus.on('event', onEvent);
+      const ping = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, 20000);
+      req.on('close', () => { closed = true; clearInterval(ping); bus.off('event', onEvent); });
+      return;
+    }
+
+    return rpcResult(res, body.id, result);
+  } catch (err) {
+    if (err instanceof A2AError) return res.json(err.toJSONRPC(req.body?.id ?? null));
+    res.status(500).json({ error: err.message });
+  }
+});

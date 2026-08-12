@@ -41,16 +41,23 @@
 // upstream also reports cost (Anthropic's total_cost_usd), that is used instead. A model with no
 // known price records cost 0 + a meta note (never a wrong estimate).
 //
-// BEST-EFFORT, NEVER THROWS — the same contract as Langfuse ingestion: a recording failure must
-// not fail the AI call the human is waiting on. Every write is awaited but catch-guarded, and
-// the proxy itself is the only thing that can fail the request (a dead provider is a 502).
+// BEST-EFFORT, NEVER THROWS — a recording failure must not fail the AI call the human is waiting
+// on. Every write is awaited but catch-guarded, and the proxy itself is the only thing that can
+// fail the request (a dead provider is a 502).
 import http from 'node:http';
 import https from 'node:https';
+import zlib from 'node:zlib';
+import { StringDecoder } from 'node:string_decoder';
 import { q, one } from '../db/pool.js';
 import { logline } from './logbus.js';
 import { config } from '../config.js';
 import { xellForToken } from './xell-token.js';
 import { tokenForSpawn, PROVIDERS } from './provider-tokens.js';
+// Body capture lives in its OWN module (gateway-bodies.js) so a future rewrite of the
+// proxy path — e.g. the meter fix landing on this file in parallel — merges cleanly: the
+// gateway only calls a handful of named functions, it does not own the capture logic.
+import { BODY_CAP, gatewayBodyCaptureEnabled, secretValuesForProject, captureRequestText,
+         scrubBodyText, persistBodies } from './gateway-bodies.js';
 
 // The gateway's own port. The queenzee API stays on PORT; the gateway is a SEPARATE listener so
 // it can never shadow API routes (/v1/messages is not an API route, but keeping the two doors
@@ -120,9 +127,15 @@ export function usageFromStream(text = '', kind = 'messages') {
   }
   // Any other `data: {…}` SSE carrying a usage object — the xAI Responses API (grok, which routes
   // through /responses and reports usage as input_tokens/output_tokens in its completed event), and
-  // any future Anthropic-dialect variant. Same shape as the chat-completions branch.
+  // any future Anthropic-dialect variant. The xAI Responses API nests usage under `response.usage`
+  // (its completed event carries the WHOLE response object), so BOTH the flat and the nested shape
+  // are checked — a top-level-only check is how grok tokens would read 0 after decompression.
   for (const m of text.matchAll(/data: (\{.*\})/g)) {
-    try { const j = JSON.parse(m[1]); if (j.usage) return j.usage; } catch { /* partial */ }
+    try {
+      const j = JSON.parse(m[1]);
+      if (j.usage) return j.usage;
+      if (j.response?.usage) return j.response.usage;
+    } catch { /* partial */ }
   }
   // A non-SSE JSON body (a single message response).
   if (!text.includes('event:') && !text.includes('data: {')) {
@@ -131,24 +144,57 @@ export function usageFromStream(text = '', kind = 'messages') {
   return null;
 }
 
-// Look up a model's $/1M input + output price from ai_model_spec. Returns null when unknown.
+// The model id from a response body/SSE text — used when the REQUEST carried no model (grok's
+// CLI omits it; the ledger then recorded model NULL, and those rows can never price). Every
+// dialect names the model in its first response object: Anthropic message_start carries
+// `message.model`, OpenAI's first chunk carries `model`, and the xAI Responses API completed
+// event carries `model`. Grep the FIRST `"model"` key. Pure so the capture is testable.
+export function modelFromStream(text = '') {
+  if (!text) return null;
+  const m = /"model"\s*:\s*"([^"]+)"/.exec(text);
+  return m ? m[1] : null;
+}
+
+// Look up a model's $/1M token prices from ai_model_spec (migration 163). The ledger records the
+// WIRE id the CLI sent (claude-opus-5); the spec row is keyed by the SHORT alias (opus) and lists
+// its known wire ids in wire_ids (migration 164 — GROUND TRUTH, an explicit per-id alias, never a
+// regex/strip: an id absent from the list is UNPRICED, not guessed, so a repriced claude-opus-6 is
+// loud instead of silently priced at the opus-5 row). Matches key OR wire_ids. Returns null when
+// the provider/model is unknown, the spec query fails (a DB predating the price columns), or the
+// model has no price rows. The prices are per MILLION tokens (mtok) — costOf divides by 1e6.
+const asNum = (v) => (v == null ? null : Number(v));
 export async function modelPrice(provider, model) {
   if (!provider || !model) return null;
   const spec = await one(
-    `SELECT key, label FROM ai_model_spec WHERE provider=$1 AND key=$2 AND enabled`, [provider, model])
+    `SELECT key, label,
+            input_price_per_mtok, output_price_per_mtok,
+            cache_read_price_per_mtok, cache_write_price_per_mtok
+       FROM ai_model_spec
+      WHERE provider=$1 AND enabled AND (key=$2 OR $2 = ANY(wire_ids))`, [provider, model])
     .catch(() => null);
-  // ai_model_spec carries no price columns today (context_window/max_output only); the price
-  // table is a future migration. Until then, cost is recorded as 0 + a meta flag rather than an
-  // invented figure — the upstream's own total_cost_usd is used when the provider reports one.
   if (!spec) return null;
-  return { found: true, key: spec.key, label: spec.label, price: null };
+  return {
+    found: true, key: spec.key, label: spec.label,
+    inputPerMtok: asNum(spec.input_price_per_mtok),
+    outputPerMtok: asNum(spec.output_price_per_mtok),
+    cacheReadPerMtok: asNum(spec.cache_read_price_per_mtok),
+    cacheWritePerMtok: asNum(spec.cache_write_price_per_mtok),
+  };
 }
 
 // Derive cost in USD from usage. When the upstream reported a cost (Anthropic total_cost_usd),
-// use it. Otherwise 0 until per-model prices land (never a wrong estimate).
+// that is authoritative and used as-is. Otherwise the cost is computed from the tokens the
+// upstream reported × the model's per-mtok price (migration 163): tokens/1e6 × $per-mtok for
+// input, output, cache read and cache write. A model with no known price records cost 0 — never
+// a wrong estimate (the same contract the header comment above promises).
 export function costOf({ upstreamCost = null, price = null, usage = null } = {}) {
   if (upstreamCost != null) return Number(upstreamCost) || 0;
-  return 0;
+  if (!price || !usage) return 0;
+  const input = (Number(usage.input) || 0) * (price.inputPerMtok ?? 0);
+  const output = (Number(usage.output) || 0) * (price.outputPerMtok ?? 0);
+  const cacheRead = (Number(usage.cacheRead) || 0) * (price.cacheReadPerMtok ?? 0);
+  const cacheWrite = (Number(usage.cacheWrite) || 0) * (price.cacheWritePerMtok ?? 0);
+  return (input + output + cacheRead + cacheWrite) / 1e6 || 0;
 }
 
 // ── the recorder ──────────────────────────────────────────────────────────────────────────────
@@ -210,6 +256,9 @@ export async function recordRequest({ xell, zeeId = null, turnId = null, kind, p
 }
 
 // Complete a recorded request with the upstream's verdict. Never throws. Exported for the test.
+// `fields.meta` is MERGED into the row's existing meta jsonb (used to flag unpriced models);
+// `fields.model` UPDATES the model column when non-null (used when the model was only found in
+// the response, not the request). Neither is required — existing callers pass neither.
 export async function completeRequest(rowId, fields) {
   if (!rowId) return;
   try {
@@ -217,15 +266,28 @@ export async function completeRequest(rowId, fields) {
       `UPDATE llm_gateway_request
           SET status=$2, input_tokens=$3, output_tokens=$4, cache_read_tokens=$5,
               cache_write_tokens=$6, total_tokens=$7, cost_usd=$8, duration_ms=$9,
-              error=$10, completed_at=now()
+              error=$10, model=COALESCE($11, model), meta = meta || $12::jsonb,
+              completed_at=now()
         WHERE id=$1`,
       [rowId, fields.status ?? null,
        fields.input || 0, fields.output || 0, fields.cacheRead || 0, fields.cacheWrite || 0,
        (fields.input || 0) + (fields.output || 0) + (fields.cacheRead || 0) + (fields.cacheWrite || 0),
-       fields.cost ?? 0, fields.durationMs ?? null, fields.error ?? null]);
+       fields.cost ?? 0, fields.durationMs ?? null, fields.error ?? null,
+       fields.model ?? null, JSON.stringify(fields.meta || {})]);
   } catch (e) {
     logline('gateway', `could not complete gateway request ${String(rowId).slice(0, 8)} (${String(e.message).slice(0, 120)})`);
   }
+}
+
+// An unpriced model is LOUD, not silent: the first row whose tokens are nonzero but whose model
+// has no ai_model_spec price logs (provider, model) ONCE per process and flags the row in meta
+// (completeRequest) — so the next mismatch is visible in the ledger instead of a believable $0.
+const seenUnpriced = new Set();
+export function logUnpriced(provider, model) {
+  const key = `${provider}|${model}`;
+  if (seenUnpriced.has(key)) return;
+  seenUnpriced.add(key);
+  logline('gateway', `no ai_model_spec price for ${provider}/${model} — cost recorded 0 (see meta.unpriced)`);
 }
 
 // ── the proxy ─────────────────────────────────────────────────────────────────────────────────
@@ -348,11 +410,33 @@ export async function gatewayProxy(req, res) {
   // ── record the request fact ──
   // recordRequest resolves the LIVE zee + OPEN turn for the xell itself (zeeTurnForXell), so the
   // read model's zee join is populated and the row carries zee_id + turn_id. Best-effort: a
-  // missing live zee / open turn records xell-only, never fails the AI call.
+  // missing live zee / open turn records xell-only, never fails the AI call. The price lookup is
+  // started NOW (before the upstream round-trip) so the cost is ready when the stream completes —
+  // it reads ai_model_spec (migration 163), never fails the call.
+  const model = modelFromBody(req.body);
   const rowId = await recordRequest({
-    xell, kind, provider: upstream.provider, model: modelFromBody(req.body),
+    xell, kind, provider: upstream.provider, model,
     method: req.method, path: parsed.forward,
   });
+  const pricePromise = modelPrice(upstream.provider, model);
+
+  // ── body capture (the cold half — gateway-bodies.js) ──
+  // Bodies go on a SEPARATE table keyed by the request row, capped ~32KB, scrubbed of
+  // secrets, and switched per-project (pool_config.gateway_body_capture, default ON). All
+  // best-effort: a capture failure must never fail the AI call, and the ledger row above
+  // is written whether or not the bodies land. The request body is the DELTA (the last
+  // message), not the whole resent conversation prefix. `secrets` is fetched once and used
+  // by BOTH bodies, so a capture does not read provider_token twice.
+  let captureOn = false;
+  let requestCap = null;        // { text, truncated } — the scrubbed, capped request delta
+  let secretValues = [];        // this project's provider tokens, for scrubbing the response
+  if (rowId) {
+    captureOn = await gatewayBodyCaptureEnabled(xell?.project_id);
+    if (captureOn) {
+      secretValues = await secretValuesForProject(xell?.project_id);
+      requestCap = captureRequestText(req.body, { secretValues });
+    }
+  }
 
   // ── forward ──
   const hopByHop = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -364,6 +448,12 @@ export async function gatewayProxy(req, res) {
   // key over the wire beyond what it already holds in its cage env.
   headers.authorization = `Bearer ${upstream.token}`;
   headers.host = new URL(upstream.upstreamUrl).host;
+  // The CLI's Accept-Encoding (gzip/br) is NOT forwarded. A compressed SSE response body is
+  // binary to chunk.toString() and matches no SSE usage event — the meter reads 0 tokens for
+  // every compressed provider (claude 0/53, grok 0/29; identity-encoded deepseek worked 88/89).
+  // Ask the upstream for identity so the stream is plain text. The response is ALSO decompressed
+  // before parsing (below), so even an upstream that gzips anyway cannot hide its usage.
+  headers['accept-encoding'] = 'identity';
   // The body is already parsed (express.json); forward it as a string with an explicit
   // content-length. Piping req (a chunked stream) to an https request without content-length is
   // what made the upstream hang up. The AI request body is JSON text; reserialize it.
@@ -385,25 +475,91 @@ export async function gatewayProxy(req, res) {
   }, (proxyRes) => {
     // Stream the response through. For SSE, this must be unbuffered.
     res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    // The client gets the RAW bytes (it sent Accept-Encoding and can decode what it asked for);
+    // the METER reads the DECOMPRESSED stream. accept-encoding was overridden to identity above,
+    // so a well-behaved upstream sends plain SSE — but an upstream (or a transparent proxy) may
+    // still gzip/br, and a compressed body is binary to chunk.toString() and matches no SSE
+    // event. Decompress before parsing so usage + cost read nonzero. The decompressor errors
+    // (a truncated stream) are caught — best-effort, the completion still records what was read.
     proxyRes.pipe(res);
+    const encoding = String(proxyRes.headers['content-encoding'] || '').toLowerCase();
+    const inflate = encoding === 'gzip' ? zlib.createGunzip()
+      : encoding === 'deflate' ? zlib.createInflate()
+      : encoding === 'br' ? zlib.createBrotliDecompress()
+      : null;
+    const meter = inflate ? proxyRes.pipe(inflate) : proxyRes;
     // Read the upstream's final usage from the stream for the completion UPDATE. A bounded tail is
     // kept across chunks so an SSE event SPLIT by a TCP segment (event header in one chunk, the
     // rest in the next) is still parsed — per-chunk parsing alone silently misses a split usage
     // event and records 0 tokens (verified with a fragmenting mock upstream).
     let usage = null;
     let sseTail = '';
-    proxyRes.on('data', (chunk) => {
+    // The response BODY capture, gated on captureOn (the per-project switch). The REASSEMBLED
+    // text (raw chunks appended, NOT the sseTail-carry text — that would repeat the tail on
+    // every chunk) is accumulated up to the cap, then the truncated flag latches and the
+    // buffer stops growing — the "never buffer unbounded" half of the spec. A StringDecoder
+    // joins the chunks, so a multi-byte UTF-8 char split across a TCP segment reassembles
+    // correctly instead of becoming a replacement char. 4096 bytes of sseTail continue to
+    // ride regardless, so usage parsing is unaffected by the cap.
+    let respText = '';
+    let respTruncated = false;
+    const decoder = new StringDecoder('utf8');
+    meter.on('data', (chunk) => {
       const text = sseTail + chunk.toString();
       sseTail = text.slice(-4096);
       const u = usageFromStream(text, upstream.kind);
       if (u) usage = u;
+      if (captureOn && !respTruncated) {
+        respText += decoder.write(chunk);
+        if (respText.length > BODY_CAP) {
+          respText = respText.slice(0, BODY_CAP);
+          respTruncated = true;
+        }
+      }
     });
-    proxyRes.on('end', () => {
+    let finished = false;
+    const finish = async () => {
+      if (finished) return;
+      finished = true;
+      if (captureOn && !respTruncated) respText += decoder.end();
       const u = normalizeUsage(usage, upstream.kind);
+      // The model may exist in the RESPONSE when the request did not carry one (grok's CLI omits
+      // it — the ledger then recorded model NULL, which can never price). Extract it and price
+      // against it; the row's model column is updated to match. Nothing else re-runs: a response
+      // model found here changes the price lookup, never the request facts.
+      let m = model;
+      let price = await pricePromise;
+      if (!m && respText) m = modelFromStream(respText);
+      if (m && m !== model) price = await modelPrice(upstream.provider, m).catch(() => null);
+      // An unpriced model is LOUD, not silent: tokens moved, no spec price AND no upstream cost,
+      // so cost is a believable $0. Log it once and flag the row so the ledger shows why. When the
+      // upstream reported its own cost, the row is priced — no flag, no noise.
+      const upstreamCost = usage?.total_cost_usd ?? null;
+      const hasTokens = (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite || 0) > 0;
+      let metaPatch = null;
+      if (hasTokens && upstreamCost == null && !price) {
+        logUnpriced(upstream.provider, m);
+        metaPatch = { unpriced: { provider: upstream.provider, model: m } };
+      }
       completeRequest(rowId, {
         status: proxyRes.statusCode || 502, ...u, durationMs: Date.now() - t0,
-        cost: costOf({ upstreamCost: usage?.total_cost_usd ?? null }),
+        cost: costOf({ upstreamCost, price, usage: u }),
+        model: (m && m !== model) ? m : undefined,
+        meta: metaPatch || undefined,
       });
+      if (captureOn) {
+        const resp = scrubBodyText(respText, { secretValues });
+        persistBodies({
+          rowId, projectId: xell?.project_id,
+          requestBody: requestCap?.text ?? null, requestTruncated: requestCap?.truncated ?? false,
+          responseBody: resp || null, responseTruncated: respTruncated,
+        });
+      }
+    };
+    meter.on('end', finish);
+    if (inflate) inflate.on('error', (e) => {
+      logline('gateway', `gateway decompress failed (${String(e.message).slice(0, 120)})`);
+      finish();
     });
   });
   proxyReq.on('error', (e) => {
@@ -411,6 +567,15 @@ export async function gatewayProxy(req, res) {
       res.status(502).json({ error: `gateway upstream unreachable: ${e.message}` });
     } else { try { res.destroy(); } catch { /* already gone */ } }
     completeRequest(rowId, { status: 502, error: e.message, durationMs: Date.now() - t0 });
+    // The request body is already captured (it was read before the forward); persist it with
+    // no response — the call failed before producing one.
+    if (captureOn) {
+      persistBodies({
+        rowId, projectId: xell?.project_id,
+        requestBody: requestCap?.text ?? null, requestTruncated: requestCap?.truncated ?? false,
+        responseBody: null, responseTruncated: false,
+      });
+    }
   });
   if (body) proxyReq.write(body);
   proxyReq.end();
@@ -451,9 +616,9 @@ export async function requestsForXell(xellId, { limit = 50 } = {}) {
 }
 
 export default { GATEWAY_PORT, gatewayBaseUrl, gatewayProxy, gatewayHello, requestsForXell,
-                 normalizeUsage, usageFromStream, modelPrice, costOf, providerUpstreamUrl,
-                 joinUpstreamPath, parseGatewayPath, recordRequest, completeRequest, gatewayEnv,
-                 zeeTurnForXell };
+                 normalizeUsage, usageFromStream, modelFromStream, modelPrice, costOf, logUnpriced,
+                 providerUpstreamUrl, joinUpstreamPath, parseGatewayPath, recordRequest,
+                 completeRequest, gatewayEnv, zeeTurnForXell };
 
 // ── the cxell-facing env ──────────────────────────────────────────────────────────────────────
 // The base URL every cxell CLI points at the gateway, per provider, carrying the xell's identity

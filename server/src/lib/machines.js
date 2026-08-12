@@ -10,6 +10,7 @@
 //   the console   — the container matrix renders one column per machine, and this module's CRUD
 //                   is what its "+ machine" / knobs call.
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { q, one } from '../db/pool.js';
 import { config } from '../config.js';
@@ -22,23 +23,92 @@ import { derivedTcpDsn } from './xell-db.js';
 
 const MODE = process.env.PROVISION_MODE === 'real' ? 'real' : 'simulate';
 
+// The queenzee's OWN docker context — the daemon of the machine the queenzee runs on. A
+// process-runner role's container row carries docker_ctx=NULL, and the honest reading of that
+// NULL is "not a container — runs where the queenzee runs" (worktree on the host fs, server/
+// webapp as local processes, the cage hardcoded to this context in intake.js). So for counting
+// and placement, NULL belongs to THIS machine. One predicate in one place: pool.js,
+// provision.js and the console's is_queenzee_host field all resolve through here
+// (docs/process-machine-pooling-decision-record.md). If a queenzee ever runs against a
+// non-default primary context, this becomes config — not another hardcoded string elsewhere.
+export function queenzeeHostCtx() { return 'default'; }
+
+// is_queenzee_host is computed, never stored: the machine row whose context IS the queenzee's
+// own — the one machine a process-runner project's xells factually live on, and the one whose
+// per-project pool knobs govern such projects. The web reads this field rather than comparing
+// context strings itself.
+const withHostFlag = (rows) => rows.map((m) => ({ ...m, is_queenzee_host: m.docker_ctx === queenzeeHostCtx() }));
+
+// The host a machine's shared dev db is RECORDED at. The three explicit places first (the machine
+// row, the project, the config), then the QUEENZEE-HOST fallback: a local machine's published
+// ports ARE the host's own, so a db provisioned there is reachable at host.docker.internal from a
+// containerized queenzee/cxell, else localhost from the host. A REMOTE machine with none of the
+// three stays null — fail closed (db-dsn-needs-a-host): its address is genuinely unknown, and
+// guessing 'localhost' would point every consumer at a silent wrong database. This is what keeps a
+// freshly provisioned local dev db from wearing the chip's "no URL recorded" tooltip.
+export function machineDbHost(m, project, cfg) {
+  return m.host_ip || project.dev_host_ip || cfg.devHostIp
+    || (m.docker_ctx === queenzeeHostCtx()
+        ? (existsSync('/.dockerenv') ? 'host.docker.internal' : 'localhost')
+        : null);
+}
+
 // projectId (optional) scopes pool_size AND dev_priority to that project (machine_pool, 025+038) —
 // the matrix shows and edits THIS project's pool and spawn priority on each machine. Without it,
 // rows carry neither: there is no such thing as a machine-wide pool or priority anymore, only the
 // machine-wide max_xells cap.
 export async function listMachines(projectId = null) {
   if (!projectId) {
-    return q(`SELECT id, key, label, docker_ctx, host_ip, can_build, can_device,
-                     max_xells, enabled, notes, created_at
-                FROM machine ORDER BY created_at`);
+    return withHostFlag(await q(
+      `SELECT id, key, label, docker_ctx, host_ip, can_build, can_device,
+              max_xells, enabled, notes, created_at
+         FROM machine ORDER BY created_at`));
   }
-  return q(
+  return withHostFlag(await q(
     `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device,
             m.max_xells, m.enabled, m.notes, m.created_at,
             COALESCE(mp.pool_size, 0)    AS pool_size,
             COALESCE(mp.dev_priority, 0) AS dev_priority
        FROM machine m LEFT JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
-      ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]);
+      ORDER BY COALESCE(mp.dev_priority, 0) DESC, m.created_at`, [projectId]));
+}
+
+// Machines whose machine_pool row activates them for THIS project's POOL — EITHER knob does:
+// pool_size>0 ("keep N warm here") or dev_priority>0 (a spawn target pools by its explicit
+// size, which may be 0). Before this, pool_size was dead until dev_priority was also set — a
+// pool number that pooled nothing (docs/default-machine-pooling-decision-record.md). This is
+// the POOL's list; devMachines below stays the SPAWN-target list (dev_priority>0 only), so a
+// pool_size alone warms xells on a machine without also aiming fresh dispatch spawns there.
+export async function poolMachines(projectId) {
+  if (!projectId) return [];
+  return q(
+    `SELECT m.id, m.key, m.label, m.docker_ctx, m.host_ip, m.can_build, m.can_device,
+            m.max_xells, m.enabled, m.notes, m.created_at,
+            mp.dev_priority AS dev_priority, COALESCE(mp.pool_size, 0) AS pool_size
+       FROM machine m JOIN machine_pool mp ON mp.machine_id = m.id AND mp.project_id = $1
+      WHERE m.enabled AND (mp.dev_priority > 0 OR mp.pool_size > 0)
+      ORDER BY mp.dev_priority DESC, m.created_at`, [projectId]);
+}
+
+// The IMPLICIT pool machine — machine-aware pooling as the DEFAULT when machines exist
+// (docs/default-machine-pooling-decision-record.md): a project with NO machine_pool row pools
+// its project-wide target on the one machine that can actually HOST it, instead of falling
+// back to the placeless legacy path. Eligibility is the guard against "default = everywhere"
+// (a prod host, a machine with no dev db — places where provisioning would refuse):
+//   - process-runner project → the queenzee-host machine row (its xells live there, always);
+//   - coupling that needs the project's shared dev db → the OLDEST machine that HAS it;
+//   - couplings that don't (db-isolated, …) → the queenzee-host machine row.
+// null → no machines / none eligible → the legacy project-wide path, unchanged.
+export async function implicitPoolMachine(projectId, { isProcess = false, coupling = null } = {}) {
+  const ms = await q(`SELECT * FROM machine WHERE enabled ORDER BY created_at`);
+  if (!ms.length) return null;
+  const host = ms.find((m) => m.docker_ctx === queenzeeHostCtx()) || null;
+  if (isProcess) return host;
+  if (['db-shared-dev', 'db-clone'].includes(coupling || 'db-shared-dev')) {
+    for (const m of ms) if (await sharedDevDb(projectId, m.docker_ctx)) return m;
+    return null;
+  }
+  return host;
 }
 
 // This machine's warm-pool target for ONE project. No row → 0: a project pools nowhere it
@@ -225,12 +295,16 @@ export async function checkMachineConnection(id) {
 // Live DEV xells on a machine, ACROSS every project — max_xells is a machine-wide cap (the host
 // only has so much muscle, whoever's xells they are). ready + claimed + working all count; only
 // retired ones and production don't. Counted through the server container because that is the
-// one row every dev xell owns and stamps with its run context.
+// one row every dev xell owns and stamps with its run context — and a NULL context (a
+// process-runner role: not a container) counts into the QUEENZEE-HOST machine, where those
+// xells factually run. Before this widening, process xells were invisible to every cap: the
+// 167-ready-xell pile of 2026-07-19 never touched max_xells.
 export async function liveXellCount(ctx) {
   const r = await one(
     `SELECT count(DISTINCT x.id)::int AS n
        FROM xell x JOIN container c ON c.owner_xell_id = x.id AND c.role='server'
-      WHERE x.status <> 'retired' AND NOT x.is_production AND c.docker_ctx = $1`, [ctx]);
+      WHERE x.status <> 'retired' AND NOT x.is_production
+        AND (c.docker_ctx = $1 OR ($1 = $2 AND c.docker_ctx IS NULL))`, [ctx, queenzeeHostCtx()]);
   return r?.n || 0;
 }
 
@@ -340,7 +414,7 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
   const name = source?.name ? `${source.name}_${mkey}`
     : prodDb ? `${devLogical}_${mkey}`
     : namingFor(project, 'db', `dev-${m.key}`).container;
-  const host = m.host_ip || project.dev_host_ip || config.devHostIp;
+  const host = machineDbHost(m, project, config);
   const dbUser = project.db_user || config.prodDbUser || 'postgres';
   const dbName = project.db_name || config.prodDbName || 'omnibiz';
 
@@ -362,7 +436,7 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
       port = Number(res.port) || 0;
     }
     // FAIL CLOSED WHEN NO HOST IS KNOWN. This used to interpolate `host` straight into the string,
-    // and `host` is `m.host_ip || project.dev_host_ip || config.devHostIp` — all three of which can
+    // and `host` was `m.host_ip || project.dev_host_ip || config.devHostIp` — all three of which can
     // be null. The result was a conn_ref of `postgresql://zeehive@null:32772/zeehive`, which is not
     // a broken address so much as a POISONED one: it is stored on the container row, copied into
     // every xell's .zeehive.env as DATABASE_URL, and it fails as `getaddrinfo ENOTFOUND null` — in
@@ -370,10 +444,12 @@ export async function provisionDevDb(projectId, machineId, { snapshotId = null }
     // from. (Found from inside a cxell on 2026-08-03: a dev xell whose server container could not
     // boot, on a db that was listening the whole time.)
     //
-    // derivedTcpDsn is the function that already owns this rule ("no address is a fixable state, a
-    // guessed one is a silent wrong database") and it returns null rather than compose one. Same
-    // rule here, and the same one prod-readonly.js decideReaderAddress applies for prod: no host →
-    // no conn_ref, and a line saying exactly which of the three places to fill it in.
+    // host now resolves through machineDbHost: the QUEENZEE-HOST (local) machine falls back to
+    // host.docker.internal / localhost so a local dev db gets a real conn_ref instead of the chip's
+    // "no URL recorded". A REMOTE machine with none of the three explicit places still leaves host
+    // null, and derivedTcpDsn is the function that owns the fail-closed rule ("no address is a
+    // fixable state, a guessed one is a silent wrong database") — it returns null rather than
+    // compose one, and a line says exactly which of the three places to fill in.
     const conn = derivedTcpDsn({ host, host_port: port || 5432 }, { user: dbUser, name: dbName });
     if (!conn) {
       logline('machine', `!!! dev db ${name} on ${m.key} has NO reachable host address — machine.host_ip, `

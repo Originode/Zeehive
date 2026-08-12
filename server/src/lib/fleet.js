@@ -279,7 +279,7 @@ export function containerShellCmd(project, c) {
 
 // Attach a xell's resolved container stack + xource/deploy heads. Mutates and returns `x`. One
 // stack query per xell — the streamable unit of work.
-async function decorateXell(x, heads, deployed, project, { paused = false, projectPaused = false, langfuseEnabled = false } = {}) {
+async function decorateXell(x, heads, deployed, project, { paused = false, projectPaused = false } = {}) {
   const stack = await q(
     `SELECT c.id, c.role, c.name, c.url, c.tier, c.health, c.owner_xell_id, c.isolation,
             c.hot_build, c.last_build_commit, c.last_built_at, c.busy_since, c.busy_op,
@@ -309,10 +309,6 @@ async function decorateXell(x, heads, deployed, project, { paused = false, proje
   const dcfg = deviceConfig(project);
   x.device_enabled = !x.is_production && dcfg.enabled;
   x.device_kind = dcfg.kind;
-  // Is the Langfuse plugin enabled FLEET-WIDE? Gates the flower's "View Langfuse" verb (which also
-  // needs x.langfuse_tracking on) and the terminal-window knob. Read once per snapshot, set here so
-  // the pure petalVerbs(x, diff) can read it off the row it already gets.
-  x.langfuse_enabled = langfuseEnabled;
   // pretty-print the name column exactly like the mockup expects
   x.zee_display_name = x.zee_status === 'working' ? x.zee_name : null;
 
@@ -404,12 +400,8 @@ export async function streamXells(projectId, onXell) {
   const { paused } = await pauseState();
   const projPause = await projectPauseState(project.id);
   const projectPaused = projPause.paused;
-  // The LANGFUSE plugin's enabled state, read ONCE for the whole stream exactly as getFleet does —
-  // without it every STREAMED xell gets langfuse_enabled=false, and the console (whose gridXells
-  // prefers streamed rows) never renders the flower's "⚗ View Langfuse" verb.
-  const langfuseEnabled = !!(await one(`SELECT enabled FROM langfuse_config WHERE id=true`).catch(() => null))?.enabled;
   for (const x of rows) {
-    await decorateXell(x, heads, deployed, project, { paused, projectPaused, langfuseEnabled });
+    await decorateXell(x, heads, deployed, project, { paused, projectPaused });
     await onXell(x);
   }
   return project;
@@ -463,12 +455,8 @@ export async function getFleet(projectId) {
   const pause = await pauseState();
   const projPause = await projectPauseState(project.id);
   const projectPaused = projPause.paused;
-  // The LANGFUSE plugin's enabled state, read ONCE for the whole snapshot: the flower's "View
-  // Langfuse" verb shows only when the plugin is enabled AND the xell's own langfuse_tracking flag
-  // is on, and the terminal-window knob shows only when the plugin is on.
-  const langfuseEnabled = !!(await one(`SELECT enabled FROM langfuse_config WHERE id=true`).catch(() => null))?.enabled;
   for (const x of xells) await decorateXell(x, heads, deployed, project,
-    { paused: pause.paused, projectPaused, langfuseEnabled });
+    { paused: pause.paused, projectPaused });
 
   // FLEET-CUMULATIVE BURN: what every run across the whole project consumed (tokens + $), summed
   // over all zees. Computed straight from the zee rows (one query) rather than adding up the per-xell
@@ -677,9 +665,6 @@ export async function getFleet(projectId) {
     prod_bind: prodBind,
     prod_seed: prodSeed,
     visual_verify_offers: visualVerifyOffers,
-    // The Langfuse plugin's enabled state (the console's terminal-window knob + the flower's View
-    // Langfuse gate both need it; xells carry the per-xell flag + x.langfuse_enabled).
-    langfuse: { enabled: langfuseEnabled },
     prod_lock: prodLock || null,
     landing_pad: landingPad,
     done_suggestions: doneSuggestions,

@@ -17,9 +17,13 @@ import { resolveBash } from './bash.js';
 import { probeRemote, cloneFromRemote, pullRemote, parseGitProgress,
          remoteAccess, pushRemote, openPullRequest, mergePullRequest } from './remote-git.js';
 import { setProviderToken, tokenForSpawn } from './provider-tokens.js';
-import { loadManifest, projectDefaultsFromManifest, draftManifest, planComposeOnboarding,
-         manifestHash, parseManifest } from './manifest.js';
+import { generateSpinoffCompose, writeGeneratedCompose } from './compose-gen.js';
+import { loadManifest, projectDefaultsFromManifest, draftManifest, draftManifestFromKnobs,
+         planComposeOnboarding, manifestHash, parseManifest, listComposeFiles,
+         detectComposeSuggestions } from './manifest.js';
 import { resolveSite } from './sites.js';
+import { dbRunner, inTransaction } from './work-items.js';
+import { syncProjectNode } from './work-node-sync.js';
 
 // Same switch every other real-side-effect module reads (landgate, xellgit, nudge, harness, reaper,
 // the .zeehive.env reconcile): 'real' touches machines, anything else models. The three OUTBOUND
@@ -156,6 +160,12 @@ export async function createProject(body) {
        VALUES ($1,$2,'sparse-overlay','db-shared-dev',$3,3600)
        ON CONFLICT (project_id) DO NOTHING`,
       [project.id, Number(body.pool_target) || 0, rt?.id || null]);
+
+    // DUAL-WRITE — "a project is just a work_node": the project row's ROOT node
+    // (stable_key='project:<project_id>') is created in the same transaction. The 058 trigger
+    // has already made the root work_item by now; syncProjectNode materialises the plan,
+    // plan_version, the project node and the root work_item node under it.
+    await syncProjectNode(dbRunner(client), project.id);
 
     await client.query('COMMIT');
     broadcast('project', project);
@@ -420,6 +430,25 @@ export async function getProjectManifest(id) {
   };
 }
 
+// Generate (and optionally write) the project's SPINOFF COMPOSE from its manifest — the
+// compose-authorship model (docs/compose-authorship-decision-record.md): the compose file is a
+// PROJECTION ZEEHIVE authors, marked GENERATED, standalone-runnable, and only ever written over
+// a file carrying the marker — a project's own (onboarded) compose is never touched. Machine
+// facts never appear in the output; placement stays meta-DB data.
+export async function generateProjectCompose(id, { write = false } = {}) {
+  const p = await one(`SELECT id, name, repo_root, manifest, compose_spinoff FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  const repo = loadManifest(p.repo_root);
+  const manifest = (repo.found && repo.manifest) ? repo.manifest : p.manifest;
+  if (!manifest) throw new Error('no manifest (repo zeehive.yml or cached) to generate from');
+  const file = manifest.tiers?.spinoff?.compose || p.compose_spinoff || 'docker-compose.spinoff.yml';
+  const { yaml } = generateSpinoffCompose({ name: p.name, manifest });
+  if (!write) return { file, yaml, wrote: false };
+  const r = writeGeneratedCompose(p.repo_root, file, yaml);
+  if (r.wrote) logline('projects', `generated ${file} for ${p.name} (compose-authorship projection)`);
+  return { file, yaml, ...r };
+}
+
 // Re-read the repo's zeehive.yml and re-apply its declared fields to the row. Only the fields the
 // manifest actually declares change; sites/contexts are untouched (machine facts, spec §3.2).
 export async function refreshProjectManifest(id) {
@@ -593,7 +622,7 @@ export async function getPoolConfig(projectId) {
 }
 
 const POOL_PATCHABLE = ['target_ready', 'default_source_coupling', 'default_db_coupling',
-                        'refresh_interval_sec', 'default_build_ctx'];
+                        'refresh_interval_sec', 'default_build_ctx', 'gateway_body_capture'];
 // Every coupling a xell can hold. The two prod ones are listed so a bad value still gets the honest
 // "must be one of" error, then refused individually below as DEFAULTS (prod access is per-xell).
 const DB_COUPLINGS = ['db-shared-dev', 'db-clone', 'db-isolated', 'db-shared-prod', 'db-prod-readonly'];
@@ -696,6 +725,71 @@ export async function draftProjectManifest(id, { write = false } = {}) {
     writeFileSync(resolve(String(p.repo_root).replace(/\\/g, '/'), 'zeehive.yml'), draft);
   }
   return { draft, written: !!write, already_has: existing.found || false };
+}
+
+// The knob-driven draft (the "no manifest yet" wizard): the console's form values become a
+// zeehive.yml PREVIEW without writing anything. The human reviews/edits the YAML, then calls
+// writeProjectManifest with the final text.
+export async function buildManifestDraft(id, knobs = {}) {
+  const p = await one(`SELECT id, name, repo_root FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  const existing = loadManifest(p.repo_root);
+  if (existing.found && !existing.errors.length) {
+    throw new Error(`${existing.file} already exists — this project already has a manifest; `
+      + 'edit the file in the repo and ↻ Refresh from repo instead');
+  }
+  const { manifest, yaml } = draftManifestFromKnobs(p.name, knobs);
+  return {
+    yaml,
+    manifest,
+    already_has: existing.found || false,
+    compose_files: listComposeFiles(p.repo_root),
+    suggestions: detectComposeSuggestions(p.repo_root),
+  };
+}
+
+// Write a zeehive.yml the human built in the wizard (or hand-edited) into the repo root, and
+// apply its declared fields to the meta-DB row — the same projection refreshProjectManifest
+// performs, in the same function that already owns the ONE file ZEEHIVE may write into a
+// project repo. Refused when a valid manifest already exists (the repo file is the truth);
+// `overwrite` is only honoured when the existing file is INVALID (parse errors) — a human
+// replacing a broken file, never a clobber of a working one.
+export async function writeProjectManifest(id, { yaml, apply_meta = true, overwrite = false } = {}) {
+  const p = await one(`SELECT * FROM project WHERE id=$1`, [id]);
+  if (!p) throw new Error('project not found');
+  const text = String(yaml || '').trim();
+  if (!text) throw new Error('manifest YAML is required');
+  const dir = String(p.repo_root).replace(/\\/g, '/');
+  const existing = loadManifest(dir);
+  if (existing.found && !existing.errors.length) {
+    throw new Error(`${existing.file} already exists — edit it in the repo and ↻ Refresh from repo instead`);
+  }
+  if (existing.found && !overwrite) {
+    throw new Error(`${existing.file} exists but is invalid — pass overwrite:true to replace it with a valid manifest`);
+  }
+  const parsed = parseManifest(text, { dir });
+  if (parsed.errors?.length) {
+    throw new Error(`invalid zeehive.yml: ${parsed.errors.join('; ')}`);
+  }
+  const target = resolve(dir, existing.file || 'zeehive.yml');
+  writeFileSync(target, text);
+
+  let updated = p;
+  if (apply_meta) {
+    const md = projectDefaultsFromManifest(parsed.manifest);
+    const sets = ['manifest = $2', 'manifest_hash = $3', 'manifest_at = now()'];
+    const vals = [id, JSON.stringify(parsed.manifest), manifestHash(text)];
+    for (const [k, v] of Object.entries(md)) {
+      if (v === undefined || v === null) continue;
+      vals.push(v);
+      sets.push(`${k} = $${vals.length}`);
+    }
+    updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, vals);
+    broadcast('project', updated);
+  }
+  logline('projects', `wrote ${existing.file || 'zeehive.yml'} + applied manifest for ${p.name}`
+    + (apply_meta ? '' : ' (meta-DB skipped)'));
+  return { ...updated, written: true, file: existing.file || 'zeehive.yml', applied_meta: apply_meta };
 }
 
 // ── compose onboarding: detect compose files → plan → human approves → apply ─
@@ -820,29 +914,36 @@ const PATCHABLE = [
 ];
 
 export async function updateProject(id, body = {}) {
-  const project = await one(`SELECT * FROM project WHERE id = $1`, [id]);
-  if (!project) throw new Error('project not found');
+  return inTransaction(async ({ client, pending }) => {
+    const db = dbRunner(client);
+    const project = await db.one(`SELECT * FROM project WHERE id = $1`, [id]);
+    if (!project) throw new Error('project not found');
 
-  const sets = [], vals = [id];
-  for (const f of PATCHABLE) {
-    if (body[f] === undefined) continue;
-    const v = typeof body[f] === 'string' ? (body[f].trim() || null) : body[f];
-    if (f === 'name' && !v) throw new Error('project name cannot be empty');
-    if (f === 'main_branch' && !v) throw new Error('main_branch cannot be empty');
-    vals.push(v);
-    sets.push(`${f} = $${vals.length}`);
-  }
-  if (!sets.length) return project;
+    const sets = [], vals = [id];
+    for (const f of PATCHABLE) {
+      if (body[f] === undefined) continue;
+      const v = typeof body[f] === 'string' ? (body[f].trim() || null) : body[f];
+      if (f === 'name' && !v) throw new Error('project name cannot be empty');
+      if (f === 'main_branch' && !v) throw new Error('main_branch cannot be empty');
+      vals.push(v);
+      sets.push(`${f} = $${vals.length}`);
+    }
+    if (!sets.length) return project;
 
-  const updated = await one(`UPDATE project SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
-  // A changed main branch needs its xource row, or the pool can't provision from it.
-  if (body.main_branch && body.main_branch !== project.main_branch) {
-    await q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
-             ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
-            [id, updated.main_branch, headCommit(updated.repo_root, updated.main_branch)]);
-  }
-  broadcast('project', updated);
-  return updated;
+    const updated = await db.one(`UPDATE project SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
+    // A changed main branch needs its xource row, or the pool can't provision from it.
+    if (body.main_branch && body.main_branch !== project.main_branch) {
+      await db.q(`INSERT INTO xource (project_id, ref, head_commit, read_only) VALUES ($1,$2,$3,true)
+                  ON CONFLICT (project_id, ref) DO UPDATE SET head_commit = COALESCE(EXCLUDED.head_commit, xource.head_commit)`,
+                 [id, updated.main_branch, headCommit(updated.repo_root, updated.main_branch)]);
+    }
+    // DUAL-WRITE — renaming the project keeps its ROOT node's name in step (same transaction).
+    if (body.name && body.name !== project.name) {
+      await syncProjectNode(db, id);
+    }
+    pending.push(['project', updated]);
+    return updated;
+  });
 }
 
 // Remove a project. Refused while any of its zees is live (unless force) — you don't want

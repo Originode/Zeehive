@@ -1,0 +1,435 @@
+{
+  "board": [
+    {
+      "items": [
+        {
+          "breadcrumb": [
+            "Golden Project",
+            "Activity One"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000006",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000001",
+          "sort_order": -1,
+          "status": "queued",
+          "ticket": null,
+          "title": "Task Six"
+        },
+        {
+          "breadcrumb": [
+            "Golden Project",
+            "Activity One"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000005",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000001",
+          "sort_order": 1500.5,
+          "status": "queued",
+          "ticket": null,
+          "title": "Task Five"
+        },
+        {
+          "breadcrumb": [
+            "Golden Project"
+          ],
+          "depth": 1,
+          "id": "b0000000-0000-4000-8000-000000000002",
+          "live_status": null,
+          "open_children": 2,
+          "parent_id": "99999999-0000-4000-8000-000000000000",
+          "sort_order": 2000,
+          "status": "queued",
+          "ticket": null,
+          "title": "Activity Two"
+        },
+        {
+          "breadcrumb": [
+            "Golden Project",
+            "Activity Two"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000004",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000002",
+          "sort_order": 2000,
+          "status": "queued",
+          "ticket": null,
+          "title": "Task Four"
+        }
+      ],
+      "key": "queued",
+      "order": 0
+    },
+    {
+      "items": [],
+      "key": "assigned",
+      "order": 1
+    },
+    {
+      "items": [
+        {
+          "breadcrumb": [
+            "Golden Project"
+          ],
+          "depth": 1,
+          "id": "b0000000-0000-4000-8000-000000000001",
+          "live_status": null,
+          "open_children": 3,
+          "parent_id": "99999999-0000-4000-8000-000000000000",
+          "sort_order": 1000,
+          "status": "working",
+          "ticket": null,
+          "title": "Activity One"
+        },
+        {
+          "breadcrumb": [
+            "Golden Project",
+            "Activity One"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000001",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000001",
+          "sort_order": 1000,
+          "status": "working",
+          "ticket": {
+            "id": "aaaaaaaa-0000-4000-8000-000000000001",
+            "number": 42,
+            "title": "The Golden Ticket"
+          },
+          "title": "Task One"
+        }
+      ],
+      "key": "working",
+      "order": 2
+    },
+    {
+      "items": [
+        {
+          "breadcrumb": [
+            "Golden Project",
+            "Activity Two"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000003",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000002",
+          "sort_order": 1000,
+          "status": "blocked",
+          "ticket": null,
+          "title": "Task Three"
+        }
+      ],
+      "key": "blocked",
+      "order": 3
+    },
+    {
+      "items": [],
+      "key": "review",
+      "order": 4
+    },
+    {
+      "items": [],
+      "key": "shipping",
+      "order": 5
+    },
+    {
+      "items": [
+        {
+          "breadcrumb": [
+            "Golden Project",
+            "Activity One"
+          ],
+          "depth": 2,
+          "id": "c0000000-0000-4000-8000-000000000002",
+          "live_status": null,
+          "open_children": 0,
+          "parent_id": "b0000000-0000-4000-8000-000000000001",
+          "sort_order": 2000,
+          "status": "done",
+          "ticket": null,
+          "title": "Task Two"
+        }
+      ],
+      "key": "done",
+      "order": 6
+    },
+    {
+      "items": [],
+      "key": "cancelled",
+      "order": 7
+    }
+  ],
+  "gantt": [
+    {
+      "computed_end": "2026-01-05",
+      "computed_start": "2026-01-01",
+      "deps": [],
+      "depth": 0,
+      "due_on": null,
+      "id": "99999999-0000-4000-8000-000000000000",
+      "kind": "project",
+      "parent_id": null,
+      "span_days": 5,
+      "starts_on": null,
+      "status": "queued",
+      "title": "Golden Project",
+      "unscheduled": false
+    },
+    {
+      "computed_end": "2026-01-05",
+      "computed_start": "2026-01-01",
+      "deps": [],
+      "depth": 1,
+      "due_on": "2026-01-05",
+      "id": "b0000000-0000-4000-8000-000000000001",
+      "kind": "activity",
+      "parent_id": "99999999-0000-4000-8000-000000000000",
+      "span_days": 5,
+      "starts_on": "2026-01-01",
+      "status": "working",
+      "title": "Activity One",
+      "unscheduled": false
+    },
+    {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [],
+      "depth": 2,
+      "due_on": null,
+      "id": "c0000000-0000-4000-8000-000000000006",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "span_days": null,
+      "starts_on": null,
+      "status": "queued",
+      "title": "Task Six",
+      "unscheduled": true
+    },
+    {
+      "computed_end": "2026-01-03",
+      "computed_start": "2026-01-02",
+      "deps": [],
+      "depth": 2,
+      "due_on": "2026-01-03",
+      "id": "c0000000-0000-4000-8000-000000000001",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "span_days": 2,
+      "starts_on": "2026-01-02",
+      "status": "working",
+      "title": "Task One",
+      "unscheduled": false
+    },
+    {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [],
+      "depth": 2,
+      "due_on": null,
+      "id": "c0000000-0000-4000-8000-000000000005",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "span_days": null,
+      "starts_on": null,
+      "status": "queued",
+      "title": "Task Five",
+      "unscheduled": true
+    },
+    {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [
+        "c0000000-0000-4000-8000-000000000001"
+      ],
+      "depth": 2,
+      "due_on": null,
+      "id": "c0000000-0000-4000-8000-000000000002",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "span_days": 2,
+      "starts_on": null,
+      "status": "done",
+      "title": "Task Two",
+      "unscheduled": false
+    },
+    {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [],
+      "depth": 1,
+      "due_on": null,
+      "id": "b0000000-0000-4000-8000-000000000002",
+      "kind": "activity",
+      "parent_id": "99999999-0000-4000-8000-000000000000",
+      "span_days": null,
+      "starts_on": null,
+      "status": "queued",
+      "title": "Activity Two",
+      "unscheduled": false
+    },
+    {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [],
+      "depth": 2,
+      "due_on": null,
+      "id": "c0000000-0000-4000-8000-000000000003",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000002",
+      "span_days": null,
+      "starts_on": null,
+      "status": "blocked",
+      "title": "Task Three",
+      "unscheduled": false
+    },
+    {
+      "computed_end": null,
+      "computed_start": null,
+      "deps": [],
+      "depth": 2,
+      "due_on": null,
+      "id": "c0000000-0000-4000-8000-000000000004",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000002",
+      "span_days": null,
+      "starts_on": null,
+      "status": "queued",
+      "title": "Task Four",
+      "unscheduled": true
+    }
+  ],
+  "list": [
+    {
+      "depth": 0,
+      "id": "99999999-0000-4000-8000-000000000000",
+      "kind": "project",
+      "parent_id": null,
+      "sort_order": 1000,
+      "status": "queued",
+      "title": "Golden Project"
+    },
+    {
+      "depth": 1,
+      "id": "b0000000-0000-4000-8000-000000000001",
+      "kind": "activity",
+      "parent_id": "99999999-0000-4000-8000-000000000000",
+      "sort_order": 1000,
+      "status": "working",
+      "title": "Activity One"
+    },
+    {
+      "depth": 1,
+      "id": "b0000000-0000-4000-8000-000000000002",
+      "kind": "activity",
+      "parent_id": "99999999-0000-4000-8000-000000000000",
+      "sort_order": 2000,
+      "status": "queued",
+      "title": "Activity Two"
+    },
+    {
+      "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000006",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "sort_order": -1,
+      "status": "queued",
+      "title": "Task Six"
+    },
+    {
+      "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000001",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "sort_order": 1000,
+      "status": "working",
+      "title": "Task One"
+    },
+    {
+      "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000003",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000002",
+      "sort_order": 1000,
+      "status": "blocked",
+      "title": "Task Three"
+    },
+    {
+      "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000005",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "sort_order": 1500.5,
+      "status": "queued",
+      "title": "Task Five"
+    },
+    {
+      "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000002",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000001",
+      "sort_order": 2000,
+      "status": "done",
+      "title": "Task Two"
+    },
+    {
+      "depth": 2,
+      "id": "c0000000-0000-4000-8000-000000000004",
+      "kind": "task",
+      "parent_id": "b0000000-0000-4000-8000-000000000002",
+      "sort_order": 2000,
+      "status": "queued",
+      "title": "Task Four"
+    }
+  ],
+  "oneItem": {
+    "breadcrumb": [
+      "Golden Project",
+      "Activity One"
+    ],
+    "dependents": [
+      {
+        "due_on": null,
+        "id": "c0000000-0000-4000-8000-000000000002",
+        "kind": "task",
+        "status": "done",
+        "status_label": "done",
+        "title": "Task Two"
+      }
+    ],
+    "deps": [],
+    "depth": 2,
+    "descendant_count": 0,
+    "id": "c0000000-0000-4000-8000-000000000001",
+    "kind": "task",
+    "open_children": 0,
+    "open_descendant_count": 0,
+    "parent_id": "b0000000-0000-4000-8000-000000000001",
+    "sort_order": 1000,
+    "status": "working",
+    "status_label": "working",
+    "ticket": {
+      "id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "kind": "feature",
+      "number": 42,
+      "priority": 2,
+      "status": "queued",
+      "title": "The Golden Ticket"
+    },
+    "title": "Task One"
+  },
+  "project_id": "11111111-1111-4111-8111-111111111111",
+  "root": {
+    "depth": 0,
+    "id": "99999999-0000-4000-8000-000000000000",
+    "status": "queued",
+    "title": "Golden Project"
+  }
+}

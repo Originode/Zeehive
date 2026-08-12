@@ -1,7 +1,7 @@
 // ZEEHIVE server: HTTP API + queenzee loops (poller now; pool/maintenance added in later steps).
 import express from 'express';
 import { config } from './config.js';
-import { router } from './api/routes.js';
+import { router, a2aRouter } from './api/routes.js';
 import { startPoller } from './queenzee/poller.js';
 import { startPool } from './queenzee/pool.js';
 import { startMaintenance } from './queenzee/maintenance.js';
@@ -15,7 +15,6 @@ import { recoverOrphanBuilds } from './lib/build.js';
 import { reconcileXellEnvs } from './lib/provision.js';
 import { runMigrations } from './db/migrate.js';
 import { ensureSelfProject } from './lib/self-onboard.js';
-import { reconcileLangfuseBaseUrl } from './lib/langfuse.js';
 import { logHarnessSummary } from './lib/harness.js';
 import { startHarnessBridge } from './lib/harness-bridge.js';
 import { pool, q } from './db/pool.js';
@@ -29,6 +28,7 @@ import { refreshZeeLiveInLiveCxells, cxellName } from './lib/cxell.js';
 import { startLandReaper } from './queenzee/landgate.js';
 import { startLandingPad } from './queenzee/landingpad.js';
 import { startRevive } from './queenzee/revive.js';
+import { startSpinDetector } from './queenzee/spin.js';
 import { startImageJanitor } from './lib/images.js';
 import { logline } from './lib/logbus.js';
 
@@ -60,13 +60,20 @@ app.use(express.json({ limit: '30mb' }));
 // permissive CORS for the local Vite dev app + localhost hooks
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  // Authorization + PATCH/DELETE are here for the EXTERNAL ticketing API (/api/ext/v1, migration
+  // 190): an integration that calls it from a browser sends a bearer key and PATCHes its ticket,
+  // and a preflight that omits either fails the call with no server-side trace at all. It grants
+  // nothing — every /ext/v1 route authenticates the key itself.
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Zeehive-Api-Key');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'zeehive', ts: Date.now() }));
+// The A2A read side (P2) — mounted at the ORIGIN ROOT (not under /api), because
+// /.well-known/agent-card.json is RFC 8615 origin-root and the /a2a/v1 paths are the wire contract.
+app.use(a2aRouter);
 app.use('/api', router);
 
 // SINGLE-QUEENZEE LOCK. Two queenzees ticking loops against one meta-DB reconcile against each
@@ -86,10 +93,45 @@ app.use('/api', router);
 if (config.queenzeeInproc) {
   const LOCK_KEY = 715533001; // arbitrary constant: "the queenzee of this meta-DB"
   const client = await pool.connect(); // deliberately never released
-  const deadline = Date.now() + 90000;
+  const START_TIME = Date.now(); // ≈ this boot; a lock holder older than this predates us
+  const deadline = START_TIME + 90000;
+  const ghostSweepAt = Date.now() + 10000; // give a live holder a moment before suspecting ghosts
+  let ghostSwept = false;
   for (;;) {
     const r = await client.query('SELECT pg_try_advisory_lock($1) AS got', [LOCK_KEY]);
     if (r.rows[0].got) break;
+    // GHOST HOLDERS (outage 2026-08-08): force-removed server containers leave postgres backends
+    // behind that still hold this advisory lock — and docker reuses IPs, so the ghost can share
+    // the NEW server's own address. A ghost is provably dead when it connects from OUR address
+    // but predates OUR boot: the previous tenant of this IP. Terminate exactly those, loudly.
+    // A holder from a DIFFERENT address is never touched — a legitimate second queenzee must
+    // still be refused; that is this guard's whole point.
+    if (!ghostSwept && Date.now() > ghostSweepAt) {
+      ghostSwept = true;
+      try {
+        const g = await client.query(
+          `SELECT a.pid, a.client_addr::text AS addr, a.backend_start,
+                  pg_terminate_backend(a.pid) AS terminated
+             FROM pg_locks l
+             JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.locktype = 'advisory'
+              AND l.classid = ($1::bigint >> 32)::int
+              AND l.objid   = ($1::bigint & x'FFFFFFFF'::bigint)::int
+              AND l.granted
+              AND a.pid <> pg_backend_pid()
+              AND a.client_addr IS NOT NULL              -- unix-socket holders are NOT provable
+              AND a.client_addr = inet_client_addr()     -- ghosts share OUR (reused) address
+              AND a.backend_start < to_timestamp($2::double precision / 1000)`,
+          [LOCK_KEY, START_TIME],
+        );
+        for (const row of g.rows) {
+          console.error(`[zeehive] terminating ghost lock holder pid ${row.pid} — same address as us (${row.addr}), backend_start ${row.backend_start.toISOString?.() ?? row.backend_start} predates this boot`);
+        }
+        if (!g.rows.length) console.log('[zeehive] lock holder is not a provable ghost (different address or newer than this boot) — waiting it out');
+      } catch (e) {
+        console.error('[zeehive] ghost lock sweep failed (waiting the full 90s instead):', e.message);
+      }
+    }
     if (Date.now() > deadline) {
       console.error('[zeehive] ANOTHER QUEENZEE holds the meta-DB lock — refusing to double-drive the fleet. Exiting.');
       process.exit(1);
@@ -112,13 +154,6 @@ try {
   // repo to fail to find. What is still worth doing at boot: SAY what the rows actually carry, because
   // a harness that would brief a zee with a blank page is invisible otherwise.
   await logHarnessSummary();
-  // Langfuse self-heal: a row provisioned pre-container-aware-base_url keeps localhost, which a
-  // containerized queenzee cannot reach. Best-effort, never fatal (see reconcileLangfuseBaseUrl).
-  await reconcileLangfuseBaseUrl();
-  // NOTE: the v4 events_only→dual heal (reconcileLangfuseWriteMode) is deliberately NOT run here.
-  // The first version auto-fired `docker compose up -d` on the live langfuse stack at boot with an
-  // incomplete interpolation env and took observability down (2026-08-03). New stacks are dual by
-  // default; flipping an existing stack is the human's "Heal write mode" click / /api/langfuse/heal.
 } catch (e) {
   console.error('[zeehive] BOOT MIGRATIONS FAILED (staying up on the schema we have):', e.message);
   try { logline('api', `boot migrations FAILED: ${e.message}`); } catch { /* logbus needs the db too */ }
@@ -184,6 +219,9 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   // on a 5/15/45-minute ladder; a turn a dead CREDENTIAL cut is never resumed and raises a human
   // naming the account (queenzee/revive.js).
   startRevive();
+  // A per-turn budget from the gateway ledger: end a turn that is burning tokens on a poll loop and
+  // tell its manager (queenzee/spin.js — the interim alarm; the lease/await model is the cure).
+  startSpinDetector();
   startImageJanitor();
   startProdDiff();
   startDbCloneWatch();

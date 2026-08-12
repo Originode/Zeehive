@@ -45,8 +45,8 @@ const src = join(tmp, 'xource');
 // `-C` + relative-subdir form does not create the subdir in this environment's git.
 mkdirSync(src, { recursive: true });
 git(src, ['init', '-q', '-b', 'main']);
-git(src, ['config', 'user.email', 'test@zeehive.local']);
-git(src, ['config', 'user.name', 'test']);
+git(src, ['config', 'user.email', 'queenzee@zeehive.local']);
+git(src, ['config', 'user.name', 'Zeehive queenzee']);
 git(src, ['config', 'receive.denyCurrentBranch', 'ignore']);
 writeFileSync(join(src, 'a.txt'), 'A\n');
 git(src, ['add', '.']);

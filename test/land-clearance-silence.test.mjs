@@ -78,7 +78,7 @@ const tmp = mkdtempSync(join(tmpdir(), 'land-silence-'));
 const src = join(tmp, 'src');
 git(tmp, ['init', '-q', '-b', 'main', 'src']);
 const cfg = (k, v) => git(src, ['config', k, v]);
-cfg('user.email', 'test@zeehive.local'); cfg('user.name', 'test');
+cfg('user.email', 'queenzee@zeehive.local'); cfg('user.name', 'Zeehive queenzee');
 cfg('receive.denyCurrentBranch', 'ignore');
 writeFileSync(join(src, 'base.txt'), 'base\n'); git(src, ['add', '.']); git(src, ['commit', '-qm', 'base']);
 const base = git(src, ['rev-parse', 'HEAD']);
@@ -86,8 +86,8 @@ const wt = {};
 for (const name of ['alpha', 'bravo', 'chuck']) {
   wt[name] = join(tmp, `wt-${name}`);
   git(src, ['worktree', 'add', '-q', '-b', `spinoff/${name}`, wt[name], base]);
-  git(wt[name], ['config', 'user.email', 'zee@zeehive.local']);
-  git(wt[name], ['config', 'user.name', 'zee']);
+  git(wt[name], ['config', 'user.email', 'xell@xell.zeehive.local']);
+  git(wt[name], ['config', 'user.name', 'xell']);
   writeFileSync(join(wt[name], `${name}.txt`), `${name}\n`);
   git(wt[name], ['add', '.']); git(wt[name], ['commit', '-qm', `${name} work`]);
 }

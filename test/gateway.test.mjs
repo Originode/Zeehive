@@ -22,13 +22,20 @@
 //   G. zee/turn linkage — recordRequest resolves the live zee + open turn when zeeId is absent.
 //   H. joinUpstreamPath — the proxy's own path join (used by gatewayProxy) stays correct even
 //      when the upstream base DOES carry a version segment (an operator-set base with /v1).
+//   I. costOf — the upstream's total_cost_usd wins when present; otherwise cost is derived from
+//      tokens × the model's per-mtok price (migration 163); no price → 0, never a wrong estimate.
+//   J. modelPrice — resolves a WIRE model id (claude-opus-5) to its spec row (key opus, 15/75) via
+//      the explicit wire_ids column (migration 164); an id NOT listed (claude-opus-6) is null —
+//      unpriced, never guessed; unknown model/provider → null.
+//   K. modelFromStream — the model id extracted from a response body/SSE when the request omitted
+//      it (grok); and completeRequest MERGES a meta note (the unpriced flag) into the row.
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { q, one, pool } from '../server/src/db/pool.js';
 import { mintXellToken, xellForToken } from '../server/src/lib/xell-token.js';
 import { parseGatewayPath, normalizeUsage, gatewayEnv, recordRequest, completeRequest,
-         requestsForXell, gatewayHello, usageFromStream, providerUpstreamUrl,
-         joinUpstreamPath, zeeTurnForXell } from '../server/src/lib/gateway.js';
+         requestsForXell, gatewayHello, usageFromStream, modelFromStream, providerUpstreamUrl,
+         joinUpstreamPath, zeeTurnForXell, modelPrice, costOf } from '../server/src/lib/gateway.js';
 
 // providerUpstreamUrl reads these from the PROCESS env (the queenzee's own operator overrides).
 // This test must assert the DEFAULTS, so clear any the caller's shell may have set (e.g. a zee
@@ -140,6 +147,25 @@ eq(joinUpstreamPath('https://api.openai.com', '/v1/chat/completions'), '/v1/chat
 // the forward path still carries its query string through every join.
 eq(joinUpstreamPath('https://api.openai.com/v1', '/v1/chat/completions?model=x'), '/v1/chat/completions?model=x', 'query string survives the overlap drop');
 
+// ── I. cost derivation — costOf + modelPrice ─────────────────────────────────────────────────
+console.log('\n── I. cost derivation — costOf + modelPrice ──');
+// The upstream's total_cost_usd is authoritative when present (Anthropic reports one).
+eq(costOf({ upstreamCost: 0.0005, usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 } }), 0.0005, 'upstream cost wins when present');
+eq(costOf({ upstreamCost: 0 }), 0, 'upstream cost of 0 stays 0');
+// No upstream cost → derive from usage × the model's per-mtok price (migration 163).
+// deepseek-chat: $0.28/M input, $0.42/M output → 10 in + 5 out = (10×0.28 + 5×0.42)/1e6 = 4.9e-6.
+const dsPrice = { inputPerMtok: 0.28, outputPerMtok: 0.42, cacheReadPerMtok: null, cacheWritePerMtok: null };
+const dsCost = costOf({ usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, price: dsPrice });
+ok(Math.abs(dsCost - 0.0000049) < 1e-12, `cost derived from tokens × price (messages shape) — 10×0.28 + 5×0.42 per mtok = 4.9e-6 (got ${dsCost})`);
+// Cache prices add in when present (claude opus: $1.50/M cache read, $18.75/M cache write).
+const opusPrice = { inputPerMtok: 15, outputPerMtok: 75, cacheReadPerMtok: 1.5, cacheWritePerMtok: 18.75 };
+eq(costOf({ usage: { input: 1000, output: 500, cacheRead: 100, cacheWrite: 50 }, price: opusPrice }),
+  (1000*15 + 500*75 + 100*1.5 + 50*18.75) / 1e6, 'cache read/write priced in when known');
+// No price → 0 (never a wrong estimate); no usage → 0.
+eq(costOf({ usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, price: null }), 0, 'no price → cost 0');
+eq(costOf({ price: dsPrice, usage: null }), 0, 'no usage → cost 0');
+eq(costOf({}), 0, 'empty → cost 0');
+
 // ── E. the wiring ────────────────────────────────────────────────────────────────────────────
 console.log('\n── E. the gateway is wired ──');
 const index = readFileSync('server/src/index.js', 'utf8');
@@ -173,6 +199,12 @@ const frag2 = 'lta","usage":{"input_tokens":10,"output_tokens":5}}\n\nevent: mes
 eq(usageFromStream(frag1, 'messages'), null, 'a partial event alone → null');
 eq(usageFromStream(frag2, 'messages'), null, 'the completing fragment alone has no event header → null');
 eq(usageFromStream(frag1 + frag2, 'messages')?.input_tokens, 10, 'concatenated split event → usage recovered');
+// The xAI Responses API (grok) nests usage under `response.usage` in its completed event — a
+// top-level-only parse would read grok tokens as 0 even after decompression.
+const grokStream = 'event: response.created\ndata: {"type":"response.created","response":{"id":"rsp_1"}}\n\n'
+  + 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"rsp_1","model":"grok-4.5","usage":{"input_tokens":12,"output_tokens":7}}}\n\n';
+eq(usageFromStream(grokStream, 'messages')?.input_tokens, 12, 'xAI nested response.usage → input tokens');
+eq(usageFromStream(grokStream, 'messages')?.output_tokens, 7, 'xAI nested response.usage → output tokens');
 
 // ── C. the round-trip ────────────────────────────────────────────────────────────────────────
 console.log('\n── C. record → complete → read ──');
@@ -212,6 +244,46 @@ try {
   const helloRes = { statusCode: 0, json: (b) => { helloRes.body = b; }, status: (c) => { helloRes.statusCode = c; return helloRes; } };
   gatewayHello(null, helloRes);
   ok(helloRes.statusCode === 200 && helloRes.body?.ok === true, 'the hello probe answers 200');
+
+  // ── J. modelPrice — a WIRE model id resolves to its spec row via wire_ids (migration 164) ──
+  console.log('\n── J. modelPrice — the per-mtok prices costOf() reads, wire id → spec row ──');
+  // The regression this card exists for: the ledger records the WIRE id (claude-opus-5), the spec
+  // is keyed on the alias (opus). Migration 164's wire_ids column makes the match GROUND TRUTH.
+  const mPrice = await modelPrice('deepseek', 'deepseek-chat');
+  eq(mPrice?.found, true, 'a model with a price row resolves');
+  eq(mPrice?.inputPerMtok, 0.28, 'deepseek-chat input price');
+  eq(mPrice?.outputPerMtok, 0.42, 'deepseek-chat output price');
+  eq(mPrice?.cacheReadPerMtok, null, 'deepseek has no cache price (null, not 0)');
+  const opus = await modelPrice('claude', 'claude-opus-5');
+  eq(opus?.found, true, 'claude-opus-5 resolves to a price (the exact prod wire id)');
+  eq(opus?.key, 'opus', 'claude-opus-5 resolves to the opus SPEC row, not a new one');
+  eq(opus?.inputPerMtok, 15, 'opus input price 15/M from the wire id');
+  eq(opus?.outputPerMtok, 75, 'opus output price 75/M from the wire id');
+  const fable = await modelPrice('claude', 'claude-fable-5');
+  eq(fable?.key, 'fable', 'claude-fable-5 resolves to the fable spec row');
+  eq(fable?.inputPerMtok, 5, 'fable input price 5/M');
+  eq(await modelPrice('claude', 'claude-sonnet-5')?.key ?? (await modelPrice('claude', 'claude-sonnet-5'))?.key, 'sonnet', 'claude-sonnet-5 resolves to sonnet');
+  // Ground truth, never a guess: an id NOT in the wire_ids list is unpriced (null), NOT priced at
+  // the current generation's rate — the day Anthropic ships a repriced claude-opus-6 it must be
+  // loud, not silently priced at the opus-5 row.
+  eq(await modelPrice('claude', 'claude-opus-6'), null, 'claude-opus-6 (a repriced next gen) → null, never guessed');
+  eq(await modelPrice('claude', 'claude-unknown-9'), null, 'an unknown wire id → null');
+  eq(await modelPrice('deepseek', 'no-such-model-xyz'), null, 'unknown model → null');
+  eq(await modelPrice('deepseek', null), null, 'null model → null');
+  eq(await modelPrice(null, 'x'), null, 'null provider → null');
+
+  // ── K. modelFromStream + the meta note ─────────────────────────────────────────────────────
+  console.log('\n── K. modelFromStream — model from the response when the request omitted it ──');
+  eq(modelFromStream('event: message_start\ndata: {"type":"message_start","message":{"model":"claude-opus-5"}}\n\n'), 'claude-opus-5', 'anthropic message_start model');
+  eq(modelFromStream('data: {"type":"response.completed","model":"grok-4.5","response":{}}'), 'grok-4.5', 'xAI response.completed model');
+  eq(modelFromStream('data: {"choices":[{"index":0}],"model":"gpt-5.6-sol"}\n\n'), 'gpt-5.6-sol', 'openai chunk model');
+  eq(modelFromStream('event: message_stop\ndata: {"type":"message_stop"}\n\n'), null, 'no model in the stream → null');
+  eq(modelFromStream(''), null, 'empty → null');
+  // completeRequest MERGES the meta note (the unpriced flag) into the row's existing meta.
+  await completeRequest(rid, { status: 200, input: 1, output: 1, cost: 0, meta: { unpriced: { provider: 'deepseek', model: 'no-such-model' } } });
+  const metaRow = await one(`SELECT meta FROM llm_gateway_request WHERE id=$1`, [rid]);
+  eq(metaRow?.meta?.unpriced?.model, 'no-such-model', 'the meta note lands on the row (an unpriced model says WHY it is 0)');
+  await completeRequest(rid, { status: 200, input: 6, output: 9, cost: 0 });
 
   // ── G. zee/turn linkage — a request is attributed to the live zee + open turn ──────────────
   console.log('\n── G. zee/turn linkage — zee_id + turn_id at record time ──');

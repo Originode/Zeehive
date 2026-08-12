@@ -161,7 +161,7 @@ try {
   await q(`UPDATE xell SET manager_xell_id=$1 WHERE id=$2`, [xb.id, worker.id]);
   // A message it sent (zee_message.from_xell_id).
   await q(`INSERT INTO zee_message (project_id, from_xell_id, from_slug, to_xell_id, to_slug, kind, body)
-           VALUES ($1,$2,$3,$4,$5,'directive','please land the langfuse fix now')`,
+           VALUES ($1,$2,$3,$4,$5,'directive','please land the gateway fix now')`,
           [PID, xb.id, xb.slug, worker.id, worker.slug]);
   // A done suggestion it raised (done_suggestion.manager_xell_id).
   await q(`INSERT INTO done_suggestion (project_id, manager_xell_id, manager_slug, target_xell_id, target_slug, reason)
@@ -187,7 +187,7 @@ try {
      'it lists the done suggestion this manager raised (done_suggestion)');
   ok(!!digest && digest.includes('work item assigned on "Serialise runs"'),
      'it lists the work-item op (work_item_event.actor = this xell)');
-  ok(!!digest && digest.includes('please land the langfuse fix now'),
+  ok(!!digest && digest.includes('please land the gateway fix now'),
      'and it quotes the message body so the revived run does not have to guess what it said');
 
   // A zee with NO ledger activity gets no digest block — the revive is not padded with an empty

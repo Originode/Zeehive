@@ -149,8 +149,11 @@ ok(/descendant/i.test(read('web/src/work/WorkItemDrawer.jsx')), 'the delete conf
 
 // ── the part-4 seam: Gantt keeps its name and its props ──
 const gantt = read('web/src/work/Gantt.jsx');
-ok(/export default function Gantt\(\s*\{\s*projectId,\s*rootId\s*\}/.test(gantt),
-   'Gantt.jsx exports `Gantt({ projectId, rootId })` — part 4 drops in without touching WorkConsole');
+// Stage 6 re-pointed the timeline at the model: the trace is the PROJECT's plan, so Gantt
+// takes projectId only. WorkConsole still passes rootId (the work-tracker scope); Gantt ignores
+// it — the model tree is a different tree and has no work_item meaning.
+ok(/export default function Gantt\(\s*\{\s*projectId\s*\}/.test(gantt),
+   'Gantt.jsx exports `Gantt({ projectId })` — stage 6 re-pointed the timeline at the model');
 ok(/<Gantt\s+projectId=\{[^}]*\}\s+rootId=\{[^}]*\}/.test(read('web/src/work/WorkConsole.jsx')),
    'WorkConsole passes exactly those two props to the timeline tab');
 
@@ -197,8 +200,8 @@ ok(/ref/.test(read('web/src/work/Tickets.jsx')),
    'the breakdown editor nests with the API\'s backwards-resolving `ref` handles (one atomic call)');
 
 // ── two defects found by auditing the landed code, pinned so they cannot come back ──
-ok(/halfOf/.test(board) && /onDragOver=\{\(e\) => allow\(e, col\.key, halfOf/.test(board),
-   'a CARD is itself a drop target (upper half = before it) — not just the 6px gap between cards');
+ok(/halfOf/.test(board) && /halfOf\(e, laneIndex\)/.test(board),
+   'a CARD is itself a drop target (left half = before it, in the packed flow) — not just the gaps between cards');
 ok(/dlg-overlay/.test(read('web/src/work/WorkConsole.jsx')),
    'Escape while a Dialog is open answers the dialog only — it does not also close the console');
 ok(/THE ZEE SEAM/.test(drawer), 'the drawer keeps a named seam for part 3\'s assign-a-zee control');
@@ -316,7 +319,7 @@ ok(placement(kcol, 'a', 0 + 2).sortOrder === 2.5 && placement(kcol, 'c', 2 - 1).
 // handler must be a PROP Card accepts and the board passes, per card, with its column and row.
 ok(/function Card\(\{[^}]*\bonKey\b/.test(board), 'Card DECLARES onKey as a prop (not a free identifier)');
 ok(/onKey=\{[^}]*onCardKey\(/.test(board), 'and the board PASSES it, bound to that card');
-ok(/onCardKey\(e, card, colIndex, i\)/.test(board),
+ok(/onCardKey\(e, card, colIndex, laneIndex, stack\.length\)/.test(board),
    'bound to the card\'s own column and row — the two indices the move is computed from');
 
 // ── the one place this console could corrupt a plan ───────────────────────────────────────────

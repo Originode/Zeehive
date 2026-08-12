@@ -7,6 +7,8 @@ import { broadcast } from '../lib/events.js';
 import { logline } from '../lib/logbus.js';
 import { dockerPs, stopAndRemoveContainer, removeImage } from '../lib/docker.js';
 import { deviceBootState } from '../lib/devices.js';
+import { machineDbHost } from '../lib/machines.js';
+import { derivedTcpDsn } from '../lib/xell-db.js';
 import { config } from '../config.js';
 
 // Probe every context → { ctx: Map<name,info> | null }, where info = { state, xell, project,
@@ -178,6 +180,42 @@ export async function probePublishedRole(c, { timeout = 3000 } = {}) {
   }
 }
 
+// ── address reconciliation for HOSTLESS db rows (the "no URL recorded" heal) ──────
+// A dev db provisioned before machineDbHost existed (or on a machine whose host was set
+// later) can leave a container row with host_port recorded but host/conn_ref NULL — a db
+// that is UP and listening, whose chip says "no URL recorded" (db-dsn-needs-a-host). The
+// provision path now writes the address up front; this heals the rows it already wrote.
+//
+// Only ever FILLS a missing address, and only the exact broken shape: role='db', host IS
+// NULL, host_port IS NOT NULL, conn_ref IS NULL. A row whose host or conn_ref is already
+// present is untouched — this never overwrites an address a human or a later provision
+// recorded. Idempotent: a healed row no longer matches the shape, so the next tick skips it.
+export async function healHostlessDbRows() {
+  const broken = await q(
+    `SELECT c.id, c.name, c.docker_ctx, c.host_port, c.project_id
+       FROM container c
+      WHERE c.role='db' AND c.host IS NULL AND c.host_port IS NOT NULL AND c.conn_ref IS NULL`);
+  let healed = 0;
+  for (const c of broken) {
+    const [machine, project] = await Promise.all([
+      c.docker_ctx ? one(`SELECT * FROM machine WHERE docker_ctx=$1`, [c.docker_ctx]).catch(() => null) : null,
+      one(`SELECT * FROM project WHERE id=$1`, [c.project_id]).catch(() => null),
+    ]);
+    const host = machineDbHost(machine || {}, project || {}, config);
+    if (!host) continue;                       // still no derivable address — leave it, fail closed
+    const conn = derivedTcpDsn({ host, host_port: c.host_port },
+      { user: project?.db_user || config.prodDbUser || 'postgres',
+        name: project?.db_name || config.prodDbName || 'omnibiz' });
+    if (!conn) continue;
+    const row = await one(
+      `UPDATE container SET host=$1, conn_ref=$2 WHERE id=$3 RETURNING *`,
+      [host, conn, c.id]).catch(() => null);
+    if (row) { broadcast('container', row); healed++; }
+  }
+  if (healed) logline('containers', `healed ${healed} hostless db row(s) — recorded a URL for a database that had only a port`);
+  return healed;
+}
+
 // Orphan memory: which labeled-but-unmodeled containers we've already reported, so the log
 // says it once per appearance instead of every 30-second tick.
 let knownOrphans = '';
@@ -185,6 +223,10 @@ let knownOrphans = '';
 let lastHealthLine = '';
 
 export async function checkContainers() {
+  // Address self-heal first: a db row that has only a port gets its URL filled in (see
+  // healHostlessDbRows). Cheap and idempotent — a healthy fleet matches no rows and skips.
+  await healHostlessDbRows();
+
   // project/xell identity rides along so labeled containers match exactly (sanitized project
   // token = what the compose labels carry, mirroring lib/manifest.js sanitizeName).
   const containers = await q(

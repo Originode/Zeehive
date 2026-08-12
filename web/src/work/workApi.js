@@ -92,6 +92,17 @@ export const deleteTicket = (id) => call(`/api/tickets/${encodeURIComponent(id)}
 export const addComment = (id, payload) => send(`/api/tickets/${encodeURIComponent(id)}/comments`, 'POST', payload);
 // items: [{title, kind, parent_id?, body?, priority?}] — the manager's "break this ticket down"
 // action. One round trip, because half a created tree is worse than none.
+// ATTACHMENTS — the evidence on a ticket (images, logs, json/xml). The list is metadata only;
+// bytes come from the download url, which the server always serves as a download with nosniff
+// (an attachment is content somebody OUTSIDE this fleet uploaded — see docs/ticketing-api.md).
+export const listTicketAttachments = (id) => call(`/api/tickets/${encodeURIComponent(id)}/attachments`);
+export const addTicketAttachment = (id, payload) =>
+  send(`/api/tickets/${encodeURIComponent(id)}/attachments`, "POST", payload);
+export const deleteTicketAttachment = (id, attachmentId) =>
+  call(`/api/tickets/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}`, { method: "DELETE" });
+export const attachmentUrl = (ticketId, attachmentId) =>
+  `/api/tickets/${encodeURIComponent(ticketId)}/attachments/${encodeURIComponent(attachmentId)}`;
+
 export const breakdownTicket = (id, items) => send(`/api/tickets/${encodeURIComponent(id)}/breakdown`, 'POST', { items });
 
 // ── telling a manager about a ticket ────────────────────────────────────────
@@ -136,6 +147,12 @@ export const removeDep = (id, depId) =>
 export const getBoard = (projectId, rootId) => call(`/api/board${pq({ project: projectId, root: rootId })}`);
 // gantt: tree-ordered rows with computed dates. Part 4 renders it; Gantt.jsx is a placeholder today.
 export const getGantt = (projectId, rootId) => call(`/api/gantt${pq({ project: projectId, root: rootId })}`);
+
+// STAGE 6 — THE WORKFLOW GANTT read model (the model's plan/work_node/execution/lease
+// plane as the timeline). PLANNED from CPM, ACTUAL from execution ledger, WAITING from
+// held leases on waiting executions; each row carries its execution→turn→gateway waterfall.
+export const getWorkflowGantt = (projectId, rootId) =>
+  call(`/api/workflow/gantt${pq({ project: projectId, root: rootId })}`);
 
 // ── who is ON an item: assign an existing xell, or deploy a new worker (part 3's verbs) ──────
 // These three are a different WEIGHT to everything above. `candidates` is a read model built for a
