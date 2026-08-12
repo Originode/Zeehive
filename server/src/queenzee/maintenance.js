@@ -165,14 +165,31 @@ function execAsync(cmd, args, { timeout = 600000, onLine, signal } = {}) {
 // `signal` (optional): an AbortSignal. When it aborts, BOTH children are SIGKILLed and the promise
 // resolves with `cancelled: true` — the src (the dump) stops immediately, and the dst (the writer)
 // is torn down so it cannot finalize a truncated file as "ok".
-function execPipe(a, b, { timeout = 1800000, onLine, signal } = {}) {
+//
+// WHY IT CANNOT HANG — the failure this function is built around. The data stream is
+// `src.stdout.pipe(dst.stdin)`, and node's pipe UNPIPES the source the moment the destination's
+// stdin errors (EPIPE — the destination process died). An unpiped source's stdout stops being read,
+// the OS pipe buffer fills, and the source process (pg_dump / cat) blocks on write forever. The
+// promise below waits for BOTH children to close, so a dst that died early — a failed `docker run`
+// on the destination context (image not pullable, volume unmountable), a pg_restore that rejected
+// the archive — left the source orphaned and the backup stuck at "Dumping database to remote host…"
+// until the 30-minute timeout finally killed it. The close handlers therefore tear the OTHER side
+// down when one side ends first: a dst that closes before the src is done means the src was
+// unpiped and is blocking → SIGKILL it; a src that closes before the dst is done means the EOF the
+// pipe would have sent never arrived → end the dst's stdin so it flushes and exits. The normal
+// case (src finishes → pipe ends dst.stdin → dst writes the file, prints its size, exits 0) is
+// untouched: dst closing before src is ALWAYS abnormal, and src closing first always ends the
+// dst's stdin (idempotent when the pipe already did).
+// Exported for the regression test (test/exec-pipe-hang.test.mjs) which reproduces the orphan with
+// plain shell processes — no docker, no database.
+export function execPipe(a, b, { timeout = 1800000, onLine, signal } = {}) {
   return new Promise((resolveP) => {
     let dstOut = '', srcErr = '', dstErr = '', timedOut = false, cancelled = false, srcDone = false, dstDone = false;
     let bufSrcErr = '', bufDstOut = '', bufDstErr = '';
     let srcStatus = null, dstStatus = null, src, dst;
     const killBoth = () => {
-      try { src.kill('SIGKILL'); } catch { /* gone */ }
-      try { dst.kill('SIGKILL'); } catch { /* gone */ }
+      try { src?.kill('SIGKILL'); } catch { /* gone */ }
+      try { dst?.kill('SIGKILL'); } catch { /* gone */ }
     };
     const finish = () => {
       if (!srcDone || !dstDone) return;
@@ -203,17 +220,35 @@ function execPipe(a, b, { timeout = 1800000, onLine, signal } = {}) {
       }
       return b;
     };
-    src.stdout.pipe(dst.stdin);
+    // Guard the streams with `?.` — a process that FAILED to spawn (docker missing on PATH) has a
+    // null stdout, and touching it would throw mid-setup and orphan the other side (the child is
+    // already spawned; only the handlers below would never be attached to clean it up).
+    src.stdout?.pipe(dst.stdin);
     // if pg_dump dies, tear down the writer so it can't finalize a truncated file as "ok"
-    src.stdout.on('error', () => { try { dst.stdin.destroy(); } catch { /* gone */ } });
-    dst.stdin.on('error', () => { /* dst exited early; src close will surface the real status */ });
+    src.stdout?.on('error', () => { try { dst.stdin?.destroy(); } catch { /* gone */ } });
+    dst.stdin?.on('error', () => { /* dst exited early; src close will surface the real status */ });
     src.stderr?.on('data', (d) => { srcErr += d; bufSrcErr = feedLines(d, bufSrcErr); });
     dst.stdout?.on('data', (d) => { dstOut += d; bufDstOut = feedLines(d, bufDstOut); });
     dst.stderr?.on('data', (d) => { dstErr += d; bufDstErr = feedLines(d, bufDstErr); });
     src.on('error', (e) => { srcErr += String(e?.message || e); srcStatus = srcStatus ?? -1; srcDone = true; finish(); });
     dst.on('error', (e) => { dstErr += String(e?.message || e); dstStatus = dstStatus ?? -1; dstDone = true; finish(); });
-    src.on('close', (code) => { srcStatus = code; srcDone = true; finish(); });
-    dst.on('close', (code) => { dstStatus = code; dstDone = true; finish(); });
+    src.on('close', (code) => {
+      srcStatus = code; srcDone = true;
+      // Source ended. If the destination is still waiting on stdin (a source that errored before
+      // producing data never pipes an EOF), end it so the writer flushes and exits instead of
+      // blocking on input that will never come.
+      if (!dstDone) { try { dst.stdin?.end(); } catch { /* gone */ } }
+      finish();
+    });
+    dst.on('close', (code) => {
+      dstStatus = code; dstDone = true;
+      // Destination ended before the source was done — normally a failed `docker run` on the
+      // destination context. Node's pipe already unpiped the source on the EPIPE, so its stdout is
+      // no longer read; the OS pipe fills and the source process (pg_dump / cat) blocks forever.
+      // Kill it so the pipe resolves now with the dst's real error instead of after the timeout.
+      if (!srcDone) { try { src?.kill('SIGKILL'); } catch { /* gone */ } }
+      finish();
+    });
   });
 }
 
